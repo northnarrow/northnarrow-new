@@ -58,6 +58,35 @@ jobs:
         if: matrix.task == 'test'
         run: cargo test --workspace --verbose
 
+  test-privileged:
+    name: test-privileged (compile-only)
+    runs-on: ubuntu-latest
+    # Tappa 3 ships ignored integration tests that actually kill
+    # processes (need root or CAP_KILL). CI cannot run them, but it
+    # still verifies they compile so they can never silently rot.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-privileged-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-privileged-
+            ${{ runner.os }}-cargo-
+
+      - name: Compile workspace tests (including ignored)
+        run: cargo test --workspace --no-run --verbose
+
   ebpf-build:
     name: ebpf-build (ubuntu-latest)
     runs-on: ubuntu-latest
