@@ -14,6 +14,12 @@ pub const TASK_COMM_LEN: usize = 16;
 /// this are truncated; they always end with a `\0` if there is room.
 pub const FILENAME_LEN: usize = 256;
 
+/// Maximum length of a DNS QNAME we record (RFC 1035 §2.3.4).
+pub const QNAME_LEN: usize = 253;
+
+/// IPv6 / padded-IPv4 address byte length.
+pub const ADDR_LEN: usize = 16;
+
 /// One process exec event as captured by the eBPF tracepoint.
 ///
 /// Layout MUST stay identical between the eBPF program and userland.
@@ -43,6 +49,155 @@ impl ProcessSpawnRaw {
             gid: 0,
             comm: [0u8; TASK_COMM_LEN],
             filename: [0u8; FILENAME_LEN],
+            timestamp_ns: 0,
+        }
+    }
+}
+
+/// File open event (LSM `file_open` hook).
+///
+/// `flags` is the kernel `f_flags` (O_RDONLY etc.) at open time; it
+/// is reduced to a `u32` because BPF helpers don't expose the full
+/// `int` width portably across architectures.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FileOpenRaw {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub flags: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+    pub filename: [u8; FILENAME_LEN],
+    pub timestamp_ns: u64,
+}
+
+impl FileOpenRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+            flags: 0,
+            comm: [0u8; TASK_COMM_LEN],
+            filename: [0u8; FILENAME_LEN],
+            timestamp_ns: 0,
+        }
+    }
+}
+
+/// Pre-exec validation event (LSM `bprm_check_security`).
+///
+/// Distinct from `ProcessSpawnRaw` (post-exec tracepoint): this fires
+/// before the new image runs, which is the kernel's last opportunity
+/// to refuse the exec. Tappa 4 only emits telemetry; Tappa 7 will
+/// turn this hook into an enforcement point.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct ExecCheckRaw {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub _pad0: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+    pub filename: [u8; FILENAME_LEN],
+    pub timestamp_ns: u64,
+}
+
+impl ExecCheckRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            pid: 0,
+            ppid: 0,
+            uid: 0,
+            _pad0: 0,
+            comm: [0u8; TASK_COMM_LEN],
+            filename: [0u8; FILENAME_LEN],
+            timestamp_ns: 0,
+        }
+    }
+}
+
+/// Outbound TCP connect attempt (kprobe `tcp_v[46]_connect`).
+///
+/// `src_addr`/`dst_addr` are 16 bytes regardless of family: IPv4
+/// addresses are stored in the first 4 bytes with the rest zeroed.
+/// Ports are network-order shorts converted to host order before
+/// emission so userland doesn't have to know.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct TcpConnectRaw {
+    pub pid: u32,
+    pub uid: u32,
+    pub family: u8,
+    pub _pad0: [u8; 1],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub _pad1: [u8; 2],
+    pub src_addr: [u8; ADDR_LEN],
+    pub dst_addr: [u8; ADDR_LEN],
+    pub comm: [u8; TASK_COMM_LEN],
+    pub timestamp_ns: u64,
+}
+
+impl TcpConnectRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            pid: 0,
+            uid: 0,
+            family: 0,
+            _pad0: [0; 1],
+            src_port: 0,
+            dst_port: 0,
+            _pad1: [0; 2],
+            src_addr: [0; ADDR_LEN],
+            dst_addr: [0; ADDR_LEN],
+            comm: [0u8; TASK_COMM_LEN],
+            timestamp_ns: 0,
+        }
+    }
+}
+
+/// DNS query (kprobe `udp_sendmsg` filtered to dest port 53).
+///
+/// `query_name` is the **raw label-encoded QNAME** copied from the
+/// UDP payload — the userland sensor decodes it to dotted notation.
+/// Doing the decoding outside eBPF keeps the verifier happy and the
+/// hot path bounded.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct DnsQueryRaw {
+    pub pid: u32,
+    pub uid: u32,
+    pub qtype: u16,
+    pub _pad0: [u8; 2],
+    pub dns_server: [u8; ADDR_LEN],
+    pub family: u8,
+    pub _pad1: [u8; 1],
+    pub qname_len: u16,
+    pub query_name: [u8; QNAME_LEN],
+    pub _pad2: [u8; 3],
+    pub comm: [u8; TASK_COMM_LEN],
+    pub timestamp_ns: u64,
+}
+
+impl DnsQueryRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            pid: 0,
+            uid: 0,
+            qtype: 0,
+            _pad0: [0; 2],
+            dns_server: [0; ADDR_LEN],
+            family: 0,
+            _pad1: [0; 1],
+            qname_len: 0,
+            query_name: [0u8; QNAME_LEN],
+            _pad2: [0; 3],
+            comm: [0u8; TASK_COMM_LEN],
             timestamp_ns: 0,
         }
     }
