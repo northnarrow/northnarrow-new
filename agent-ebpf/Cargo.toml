@@ -1,0 +1,47 @@
+[package]
+name = "northnarrow-agent-ebpf"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/northnarrow/northnarrow-new"
+authors = ["NorthNarrow"]
+description = "NorthNarrow eBPF programs (no_std, target bpfel-unknown-none). NOT a workspace member."
+
+[[bin]]
+name = "northnarrow-agent-ebpf"
+path = "src/main.rs"
+
+# Deliberately NOT a workspace member: this crate uses a different
+# toolchain (nightly + rust-src) and a different target
+# (bpfel-unknown-none). See agent-ebpf/rust-toolchain.toml and
+# agent-ebpf/.cargo/config.toml. The xtask runner builds it.
+
+[dependencies]
+aya-ebpf = "0.1"
+northnarrow-common = { path = "../common", default-features = false }
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "thin"
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = "thin"
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+[workspace]
+# Sub-workspace: explicitly empty. Prevents the parent Cargo.toml from
+# trying to share workspace settings (different toolchain + target).

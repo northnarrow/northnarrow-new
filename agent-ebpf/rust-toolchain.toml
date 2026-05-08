@@ -1,0 +1,7 @@
+# The eBPF program needs nightly because the bpfel-unknown-none target
+# is tier-3 and ships no prebuilt artifacts; we build core/alloc from
+# source via -Zbuild-std. Userland (parent workspace) stays on stable.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+profile = "minimal"
