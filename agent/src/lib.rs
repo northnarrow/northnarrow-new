@@ -1,11 +1,8 @@
 //! NorthNarrow agent library.
 //!
-//! Tappa 0 placeholder: the agent crate exists so the workspace builds
-//! and so future modules (sensors, decision engine, response executors)
-//! land here without restructuring.
+//! Tappa 1: hosts the first sensor (`sensors::exec`). Decision and
+//! response modules are placeholders that land starting Tappa 2.
 
-#![forbid(unsafe_code)]
-
-pub mod sensors {}
+pub mod sensors;
 pub mod decision {}
 pub mod response {}
