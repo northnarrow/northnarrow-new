@@ -1,0 +1,25 @@
+[package]
+name = "northnarrow-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NorthNarrow agent daemon (Linux-first, 100% Rust XDR sensor + responder)."
+
+[[bin]]
+name = "northnarrow-agent"
+path = "src/main.rs"
+
+[lib]
+name = "northnarrow_agent"
+path = "src/lib.rs"
+
+[dependencies]
+common = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

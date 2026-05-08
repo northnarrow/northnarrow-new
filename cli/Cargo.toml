@@ -1,0 +1,18 @@
+[package]
+name = "northnarrow-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NorthNarrow control CLI (status, alerts, isolation, recovery)."
+
+[[bin]]
+name = "northnarrow"
+path = "src/main.rs"
+
+[dependencies]
+common = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
