@@ -11,7 +11,7 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
+  userland:
     name: ${{ matrix.task }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -53,5 +53,48 @@ jobs:
         run: cargo build --workspace --verbose
 
       - name: cargo test --workspace
+        # Integration tests that need root are #[ignore]d, so the
+        # default `cargo test` run is unprivileged.
         if: matrix.task == 'test'
         run: cargo test --workspace --verbose
+
+  ebpf-build:
+    name: ebpf-build (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (bpf-linker dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-dev libpolly-18-dev clang lld
+
+      - name: Install nightly Rust + rust-src for build-std
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src,rustfmt,clippy
+          rustup default stable
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            agent-ebpf/target
+          key: ${{ runner.os }}-cargo-ebpf-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ebpf-
+
+      - name: cargo xtask build-ebpf
+        run: cargo xtask build-ebpf
+
+      - name: Verify eBPF object exists
+        run: |
+          test -f agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
+          file agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
