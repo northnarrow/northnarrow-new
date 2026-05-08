@@ -1,15 +1,17 @@
 //! NorthNarrow agent daemon entrypoint.
 //!
-//! Tappa 3: load the eBPF exec sensor, route every event through the
-//! [`RuleEngine`], and dispatch the resulting verdict to the
-//! [`Executor`] which actually performs the action (KillProcess /
-//! KillProcessTree). Other actions are still NOPs awaiting Tappa 5.
+//! Tappa 4: the agent loads a single eBPF object exposing six
+//! programs (process exec, file open, exec validation, TCP v4/v6
+//! connect, UDP/DNS) via [`SensorMultiplexer`]. Every decoded event
+//! flows through the [`RuleEngine`] (only `ProcessSpawn` matches
+//! current rules) and any verdict is enacted by the [`Executor`]
+//! exactly as in Tappa 3.
 
 use anyhow::{Context, Result};
 use common::Event;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::response::Executor;
-use northnarrow_agent::sensors::ExecSensor;
+use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -29,10 +31,13 @@ async fn main() -> Result<()> {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
 
-    let mut sensor = ExecSensor::start()
+    let mut sensor = SensorMultiplexer::start()
         .await
-        .context("starting the exec sensor")?;
-    info!("exec sensor attached: tracing sched/sched_process_exec");
+        .context("starting the sensor multiplexer")?;
+    info!(
+        sensors = "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query",
+        "sensor multiplexer attached"
+    );
 
     let engine = RuleEngine::with_default_rules();
     info!(rules = engine.rule_count(), "decision engine ready");
@@ -71,16 +76,64 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Log the spawn, evaluate the rule engine, dispatch the action.
+/// Categorise + log + evaluate + (maybe) execute.
 ///
-/// The kill syscalls are blocking and `verify_dead` retries can sleep
-/// up to 50 ms, so we offload to `spawn_blocking`. The agent's main
-/// task keeps draining the sensor channel meanwhile.
+/// Tappa 4 ships five sensors; Tappa 2 rules only match `ProcessSpawn`,
+/// so non-spawn events flow through as DEBUG telemetry and bypass the
+/// engine. The kill syscalls + verify retries can sleep up to 50 ms,
+/// so any execution dispatch goes through `spawn_blocking`.
 async fn process_event(engine: &RuleEngine, executor: &Executor, event: Event) {
-    info!(event = ?event, "process spawn detected");
+    match &event {
+        Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
+        Event::FileOpen {
+            filename,
+            comm,
+            pid,
+            ..
+        } => {
+            debug!(pid, comm = %comm, filename = %filename, "file open")
+        }
+        Event::ExecCheck {
+            filename,
+            comm,
+            pid,
+            ..
+        } => {
+            debug!(pid, comm = %comm, filename = %filename, "exec_check")
+        }
+        Event::TcpConnect {
+            dst_addr,
+            dst_port,
+            family,
+            comm,
+            pid,
+            ..
+        } => {
+            debug!(
+                pid, comm = %comm, family,
+                dst = %render_addr(*family, dst_addr),
+                dst_port,
+                "tcp_connect"
+            )
+        }
+        Event::DnsQuery {
+            dns_server,
+            family,
+            comm,
+            pid,
+            query_name,
+            ..
+        } => {
+            debug!(
+                pid, comm = %comm,
+                server = %render_addr(*family, dns_server),
+                query = %query_name,
+                "dns_query"
+            )
+        }
+    }
 
     let Some(verdict) = engine.evaluate(&event) else {
-        debug!(event = ?event, "process spawn produced no verdict");
         return;
     };
 
@@ -114,6 +167,19 @@ async fn process_event(engine: &RuleEngine, executor: &Executor, event: Event) {
         elapsed_us = report.elapsed.as_micros() as u64,
         "EXECUTED"
     );
+}
+
+/// Render a 16-byte address according to family (`2` = AF_INET → first
+/// 4 bytes; `10` = AF_INET6 → full v6).
+fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    if family == 2 {
+        Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()
+    } else if family == 10 {
+        Ipv6Addr::from(*bytes).to_string()
+    } else {
+        format!("family={family}")
+    }
 }
 
 /// Raise `RLIMIT_MEMLOCK` to infinity so older kernels accept large
