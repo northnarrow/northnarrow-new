@@ -16,6 +16,11 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
+mod dns_query;
+mod exec_check;
+mod file_open;
+mod tcp_connect;
+
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
