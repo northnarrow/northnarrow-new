@@ -1,12 +1,14 @@
 //! NorthNarrow agent daemon entrypoint.
 //!
-//! Tappa 2: load the eBPF process-exec sensor and route every event
-//! through the hardcoded [`RuleEngine`]. Verdicts are LOGGED ONLY —
-//! no response action is executed yet. Tappa 3 wires real KillProcess.
+//! Tappa 3: load the eBPF exec sensor, route every event through the
+//! [`RuleEngine`], and dispatch the resulting verdict to the
+//! [`Executor`] which actually performs the action (KillProcess /
+//! KillProcessTree). Other actions are still NOPs awaiting Tappa 5.
 
 use anyhow::{Context, Result};
 use common::Event;
 use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::ExecSensor;
 use tokio::signal;
 use tracing::{debug, info, warn};
@@ -33,9 +35,13 @@ async fn main() -> Result<()> {
     info!("exec sensor attached: tracing sched/sched_process_exec");
 
     let engine = RuleEngine::with_default_rules();
+    info!(rules = engine.rule_count(), "decision engine ready");
+
+    let executor = Executor::new();
     info!(
-        rules = engine.rule_count(),
-        "decision engine ready (would-execute mode)"
+        own_pid = executor.own_pid(),
+        protected = executor.protected().len(),
+        "response executor ready (KillProcess + KillProcessTree active)"
     );
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -44,7 +50,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             evt = sensor.next_event() => match evt {
-                Some(e) => process_event(&engine, e),
+                Some(e) => process_event(&engine, &executor, e).await,
                 None => {
                     warn!("sensor pump exited; shutting down");
                     break;
@@ -65,27 +71,49 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Log the spawn, run the rule engine, log the verdict (if any).
+/// Log the spawn, evaluate the rule engine, dispatch the action.
 ///
-/// Tappa 2 contract: the agent does NOT execute the verdict's action.
-/// `KillProcess` becomes a `would_kill_pid` tag in the warn log.
-fn process_event(engine: &RuleEngine, event: Event) {
+/// The kill syscalls are blocking and `verify_dead` retries can sleep
+/// up to 50 ms, so we offload to `spawn_blocking`. The agent's main
+/// task keeps draining the sensor channel meanwhile.
+async fn process_event(engine: &RuleEngine, executor: &Executor, event: Event) {
     info!(event = ?event, "process spawn detected");
-    if let Some(verdict) = engine.evaluate(&event) {
-        warn!(
-            rule = %verdict.rule_id,
-            rule_name = %verdict.rule_name,
-            category = %verdict.category,
-            action = ?verdict.action,
-            severity = ?verdict.severity,
-            would_target_pid = verdict.event_pid,
-            target_filename = %verdict.event_filename,
-            reasoning = %verdict.reasoning,
-            "VERDICT (would-execute mode, no action taken in Tappa 2)"
-        );
-    } else {
+
+    let Some(verdict) = engine.evaluate(&event) else {
         debug!(event = ?event, "process spawn produced no verdict");
-    }
+        return;
+    };
+
+    warn!(
+        rule = %verdict.rule_id,
+        rule_name = %verdict.rule_name,
+        category = %verdict.category,
+        action = ?verdict.action,
+        severity = ?verdict.severity,
+        target_pid = verdict.event_pid,
+        target_filename = %verdict.event_filename,
+        reasoning = %verdict.reasoning,
+        "VERDICT"
+    );
+
+    let exec = executor.clone();
+    let action = verdict.action.clone();
+    let target_pid = verdict.event_pid;
+    let report = match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "executor task join failed");
+            return;
+        }
+    };
+
+    info!(
+        action = ?report.action,
+        primary = ?report.primary,
+        additional_count = report.additional.len(),
+        elapsed_us = report.elapsed.as_micros() as u64,
+        "EXECUTED"
+    );
 }
 
 /// Raise `RLIMIT_MEMLOCK` to infinity so older kernels accept large
