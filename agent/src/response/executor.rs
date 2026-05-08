@@ -1,5 +1,5 @@
 //! Dispatcher: turns a `(ResponseAction, target_pid)` into an
-//! [`ExecutionReport`]. Refuses unimplemented actions politely.
+//! [`ExecutionReport`].
 
 use std::{
     collections::HashSet,
@@ -9,7 +9,10 @@ use std::{
 
 use common::ResponseAction;
 
-use super::{kill, ExecutionOutcome, ExecutionReport};
+use super::{
+    block_outbound, kill, network_isolation, quarantine, throttle, ExecutionOutcome,
+    ExecutionReport, ExecutorConfig,
+};
 
 /// Hard floor on PIDs we're willing to touch. Anything below this is
 /// almost certainly a kernel thread or core service (PID 1, kthreadd,
@@ -24,12 +27,21 @@ const PID_PROTECTION_FLOOR: u32 = 100;
 pub struct Executor {
     own_pid: u32,
     protected: Arc<HashSet<u32>>,
+    config: Arc<ExecutorConfig>,
 }
 
 impl Executor {
     /// Build a default executor with `init`, `kthreadd`, and the
-    /// agent's own PID in the protected set.
+    /// agent's own PID in the protected set, and a default
+    /// [`ExecutorConfig`].
     pub fn new() -> Self {
+        Self::with_config(ExecutorConfig::from_env())
+    }
+
+    /// Build an executor with an explicit [`ExecutorConfig`]. Useful
+    /// for tests and for binaries that want to tweak paths or
+    /// dry-run mode without touching env vars.
+    pub fn with_config(config: ExecutorConfig) -> Self {
         let own_pid = std::process::id();
         let mut protected = HashSet::new();
         protected.insert(0);
@@ -39,6 +51,7 @@ impl Executor {
         Self {
             own_pid,
             protected: Arc::new(protected),
+            config: Arc::new(config),
         }
     }
 
@@ -52,12 +65,21 @@ impl Executor {
         &self.protected
     }
 
+    /// Active configuration (read-only).
+    pub fn config(&self) -> &ExecutorConfig {
+        &self.config
+    }
+
     /// Run `action` against `target_pid`. Always returns; never panics.
     pub fn execute(&self, action: ResponseAction, target_pid: u32) -> ExecutionReport {
         let start = Instant::now();
         let mut additional: Vec<ExecutionOutcome> = Vec::new();
 
-        let primary = if target_pid != 0 && target_pid < PID_PROTECTION_FLOOR {
+        // The PID protection floor only applies to actions that
+        // operate on a specific PID. `FullNetworkIsolation` is
+        // host-wide and ignores `target_pid` entirely.
+        let pid_scoped = !matches!(action, ResponseAction::FullNetworkIsolation);
+        let primary = if pid_scoped && target_pid != 0 && target_pid < PID_PROTECTION_FLOOR {
             ExecutionOutcome::Refused {
                 pid: target_pid,
                 reason: "PID below protection floor (kernel thread / core service)",
@@ -74,13 +96,18 @@ impl Executor {
                     additional = kids;
                     p
                 }
-                ResponseAction::BlockOutbound
-                | ResponseAction::FullNetworkIsolation
-                | ResponseAction::Quarantine
-                | ResponseAction::ThrottleProcess => ExecutionOutcome::Refused {
-                    pid: target_pid,
-                    reason: "Action not implemented until Tappa 5",
-                },
+                ResponseAction::BlockOutbound => block_outbound::block_outbound_for_pid(
+                    target_pid,
+                    &self.protected,
+                    &self.config,
+                ),
+                ResponseAction::FullNetworkIsolation => network_isolation::engage(&self.config),
+                ResponseAction::Quarantine => {
+                    quarantine::quarantine_process_binary(target_pid, &self.protected, &self.config)
+                }
+                ResponseAction::ThrottleProcess => {
+                    throttle::throttle_pid(target_pid, &self.protected, &self.config)
+                }
             }
         };
 

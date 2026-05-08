@@ -1,27 +1,36 @@
-//! Response executors (Tappa 3).
+//! Response executors.
 //!
-//! Tappa 3 ships the first real action: `KillProcess` (and its tree
-//! variant) actually kill processes via `SIGKILL`. The rest of the
-//! [`ResponseAction`](common::ResponseAction) enum (BlockOutbound,
-//! FullNetworkIsolation, Quarantine, ThrottleProcess) is intentionally
-//! unimplemented and rejected with a `Refused` outcome until Tappa 5.
+//! - Tappa 3: `KillProcess` / `KillProcessTree` via SIGKILL.
+//! - Tappa 5: `BlockOutbound`, `FullNetworkIsolation`, `Quarantine`,
+//!   `ThrottleProcess` — the full arsenal.
+//!
+//! Each action lives in its own module under this directory and is
+//! reached through [`Executor::execute`]. All operations are
+//! idempotent (re-running them on the same target is a no-op) and
+//! reversible (each module exposes a paired undo function).
 
+pub mod block_outbound;
+pub mod config;
 pub mod executor;
 pub mod kill;
+pub mod network_isolation;
+pub mod quarantine;
+pub mod throttle;
 
+pub use config::ExecutorConfig;
 pub use executor::Executor;
 
 use std::time::Duration;
 
 use common::ResponseAction;
 
-/// Outcome of a single execution attempt against one target PID.
+/// Outcome of a single execution attempt.
 ///
-/// `Killed` is the only "we definitively did the thing" success.
-/// `AlreadyGone` is also a non-error: from the agent's perspective the
-/// target is gone, which is what was requested. The remaining variants
-/// describe specific failure modes the caller may want to surface
-/// differently in dashboards.
+/// Tappa 3's PID-centric variants are joined in Tappa 5 by four
+/// outcomes that map to the new actions. `Killed` and `Quarantined`
+/// are "we definitively did the thing" successes; the rest are
+/// specific failure modes the caller may want to surface differently
+/// in dashboards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionOutcome {
     /// SIGKILL accepted; target no longer exists in /proc.
@@ -36,8 +45,31 @@ pub enum ExecutionOutcome {
     /// implemented yet, ...). `reason` is a static string so it is
     /// safe to include in metrics labels.
     Refused { pid: u32, reason: &'static str },
-    /// Any other syscall failure; `errno` carries the raw value.
+    /// Any other syscall / I/O failure; `errno` carries the raw value
+    /// when one is available, or 0 when the failure is logical.
     Failed { pid: u32, errno: i32 },
+
+    // ---- Tappa 5 ----
+    /// `BlockOutbound`: the PID was placed into the
+    /// `northnarrow.slice/blocked.scope` cgroup and an `nftables`
+    /// drop rule against that cgroup is now in effect.
+    Blocked { pid: u32 },
+    /// `FullNetworkIsolation`: the host-wide isolation ruleset is
+    /// installed; the persistence flag has been written.
+    NetworkIsolated,
+    /// `Quarantine`: the target's executable was encrypted into the
+    /// vault and the original file was unlinked.
+    Quarantined {
+        original_path: String,
+        vault_id: String,
+    },
+    /// `ThrottleProcess`: the PID was placed in
+    /// `northnarrow.slice/throttled.scope` with hard limits.
+    Throttled {
+        pid: u32,
+        cpu_max_pct: u8,
+        io_weight: u16,
+    },
 }
 
 /// Aggregate report for one verdict execution.

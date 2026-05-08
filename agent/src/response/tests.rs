@@ -37,21 +37,46 @@ fn execute_log_action_is_a_noop_refusal() {
 }
 
 #[test]
-fn execute_unimplemented_action_is_refused() {
-    let exec = Executor::new();
-    for a in [
-        ResponseAction::BlockOutbound,
-        ResponseAction::FullNetworkIsolation,
-        ResponseAction::Quarantine,
-        ResponseAction::ThrottleProcess,
-    ] {
-        let report = exec.execute(a.clone(), 12345);
-        match report.primary {
-            ExecutionOutcome::Refused { reason, .. } => {
-                assert!(reason.contains("Tappa 5"), "{a:?} → {reason}")
-            }
-            other => panic!("{a:?} → unexpected outcome: {other:?}"),
+fn execute_dispatches_new_actions_via_dry_run() {
+    // Tappa 5: every action now has an implementation. With
+    // dry_run = true the executor returns the success outcome
+    // for each one without touching nft / cgroup / fs.
+    let config = super::ExecutorConfig {
+        dry_run: true,
+        ..super::ExecutorConfig::default()
+    };
+    let exec = Executor::with_config(config);
+
+    let pid = 12345;
+    match exec.execute(ResponseAction::BlockOutbound, pid).primary {
+        ExecutionOutcome::Blocked { pid: p } => assert_eq!(p, pid),
+        other => panic!("BlockOutbound → {other:?}"),
+    }
+    match exec
+        .execute(ResponseAction::FullNetworkIsolation, 0)
+        .primary
+    {
+        ExecutionOutcome::NetworkIsolated => (),
+        other => panic!("FullNetworkIsolation → {other:?}"),
+    }
+    match exec.execute(ResponseAction::Quarantine, pid).primary {
+        // /proc/12345/exe almost certainly doesn't exist; that's
+        // fine, the dispatch path is what we're testing.
+        ExecutionOutcome::AlreadyGone { pid: p } => assert_eq!(p, pid),
+        ExecutionOutcome::Quarantined { .. } => {} // possible if pid is real
+        other => panic!("Quarantine → {other:?}"),
+    }
+    match exec.execute(ResponseAction::ThrottleProcess, pid).primary {
+        ExecutionOutcome::Throttled {
+            pid: p,
+            cpu_max_pct,
+            io_weight,
+        } => {
+            assert_eq!(p, pid);
+            assert_eq!(cpu_max_pct, 10);
+            assert_eq!(io_weight, 10);
         }
+        other => panic!("ThrottleProcess → {other:?}"),
     }
 }
 
