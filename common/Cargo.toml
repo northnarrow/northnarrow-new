@@ -6,11 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared types for the NorthNarrow XDR (events, verdicts, response actions)."
+description = "Shared types for the NorthNarrow XDR (events, verdicts, response actions, kernel↔userland wire types)."
 
 [lib]
 name = "northnarrow_common"
 path = "src/lib.rs"
 
+[features]
+default = ["std"]
+# `std` enables the userland-rich types (Event, Verdict, ResponseAction)
+# and bytemuck Pod derives. Disable it from the eBPF crate, which only
+# needs the raw wire types.
+std = ["dep:serde", "dep:bytemuck"]
+
 [dependencies]
-serde = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+bytemuck = { version = "1", default-features = false, features = ["derive"], optional = true }
