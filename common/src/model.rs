@@ -68,11 +68,23 @@ pub enum ResponseAction {
 }
 
 /// Decision produced by the engine for a given event.
+///
+/// `rule_id` is the stable identifier (e.g. `"R001_ExecFromTmp"`) used
+/// for telemetry and correlation; `event_pid` / `event_filename` /
+/// `timestamp_ns` snapshot the relevant pieces of the triggering
+/// event so a verdict can be logged or routed without keeping the
+/// original `Event` around.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub category: String,
     pub action: ResponseAction,
     pub severity: Severity,
     pub reasoning: String,
+    pub event_pid: u32,
+    pub event_filename: String,
+    pub timestamp_ns: u64,
 }
 
 #[cfg(test)]
