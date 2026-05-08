@@ -39,6 +39,11 @@ enum Cmd {
         /// Build the userland in release mode.
         #[arg(long)]
         release: bool,
+        /// Comma-separated cargo features for the userland build,
+        /// e.g. `--features demo-tappa5`. Forwarded as
+        /// `--features <list>` to `cargo build --workspace`.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
     },
     /// Build, then run the agent with sudo (needs CAP_BPF/root).
     Run {
@@ -48,6 +53,9 @@ enum Cmd {
         /// Skip `sudo` wrapper (caller already has the caps).
         #[arg(long)]
         no_sudo: bool,
+        /// Comma-separated cargo features for the userland build.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
         /// Extra args forwarded to the agent.
         #[arg(last = true)]
         args: Vec<String>,
@@ -73,19 +81,20 @@ fn run(cli: Cli) -> Result<()> {
             ensure_bpf_linker()?;
             build_ebpf(release)?;
         }
-        Cmd::Build { release } => {
+        Cmd::Build { release, features } => {
             ensure_bpf_linker()?;
             build_ebpf(true)?; // eBPF always release
-            build_userland(release)?;
+            build_userland(release, &features)?;
         }
         Cmd::Run {
             release,
             no_sudo,
+            features,
             args,
         } => {
             ensure_bpf_linker()?;
             build_ebpf(true)?;
-            build_userland(release)?;
+            build_userland(release, &features)?;
             run_agent(release, no_sudo, &args)?;
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
@@ -205,16 +214,24 @@ fn build_ebpf(release: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_userland(release: bool) -> Result<()> {
+fn build_userland(release: bool, features: &[String]) -> Result<()> {
     let root = repo_root()?;
     println!(
-        "xtask: building userland workspace ({})",
-        if release { "release" } else { "dev" }
+        "xtask: building userland workspace ({}{})",
+        if release { "release" } else { "dev" },
+        if features.is_empty() {
+            String::new()
+        } else {
+            format!(", features={}", features.join(","))
+        }
     );
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&root).args(["build", "--workspace"]);
     if release {
         cmd.arg("--release");
+    }
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
     }
     scrub_cargo_env(&mut cmd);
     let status = cmd

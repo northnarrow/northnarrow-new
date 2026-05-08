@@ -15,6 +15,9 @@ mod r008_hidden_home_binary;
 mod r009_root_exec_from_user_path;
 mod r010_binary_in_webroot;
 
+#[cfg(feature = "demo-tappa5")]
+pub mod test_actions;
+
 pub use r001_exec_from_tmp::R001ExecFromTmp;
 pub use r002_exec_from_dev_shm::R002ExecFromDevShm;
 pub use r003_exec_from_var_tmp::R003ExecFromVarTmp;
@@ -41,6 +44,23 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(R003ExecFromVarTmp),
         Box::new(R005NetcatExec),
         Box::new(R008HiddenHomeBinary),
+    ]
+}
+
+/// Demo rule set for Tappa 5. Returned only when the `demo-tappa5`
+/// feature is enabled. These rules trigger the four new
+/// ResponseActions on filename-suffix matches; they should never run
+/// in production.
+#[cfg(feature = "demo-tappa5")]
+pub fn demo_tappa5_rules() -> Vec<Box<dyn Rule>> {
+    use test_actions::{
+        R901TestBlockOutbound, R902TestNetworkIsolation, R903TestQuarantine, R904TestThrottle,
+    };
+    vec![
+        Box::new(R901TestBlockOutbound),
+        Box::new(R902TestNetworkIsolation),
+        Box::new(R903TestQuarantine),
+        Box::new(R904TestThrottle),
     ]
 }
 

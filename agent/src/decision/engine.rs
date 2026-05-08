@@ -29,6 +29,25 @@ impl RuleEngine {
         e
     }
 
+    /// Engine pre-loaded with the Tappa 5 demo rules (R901..=R904)
+    /// FIRST, then R001..=R010. Demo rules win over the production
+    /// rules so a `/tmp/payload.block-outbound` exec triggers
+    /// `R901` (BlockOutbound) instead of being killed by `R001`.
+    /// This ordering only ships in the `demo-tappa5` build; the
+    /// regression demo (`/tmp/nn-test-payload`) still goes through
+    /// R001 → KillProcess because its filename has no demo suffix.
+    #[cfg(feature = "demo-tappa5")]
+    pub fn with_default_rules_and_demo_tappa5() -> Self {
+        let mut e = Self::new();
+        for r in super::rules::demo_tappa5_rules() {
+            e.add_rule(r);
+        }
+        for r in super::rules::default_rules() {
+            e.add_rule(r);
+        }
+        e
+    }
+
     /// Append a rule. Order is preserved.
     pub fn add_rule(&mut self, rule: Box<dyn Rule>) {
         self.rules.push(rule);

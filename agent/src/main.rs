@@ -39,8 +39,15 @@ async fn main() -> Result<()> {
         "sensor multiplexer attached"
     );
 
+    #[cfg(feature = "demo-tappa5")]
+    let engine = RuleEngine::with_default_rules_and_demo_tappa5();
+    #[cfg(not(feature = "demo-tappa5"))]
     let engine = RuleEngine::with_default_rules();
-    info!(rules = engine.rule_count(), "decision engine ready");
+    info!(
+        rules = engine.rule_count(),
+        demo_tappa5 = cfg!(feature = "demo-tappa5"),
+        "decision engine ready"
+    );
 
     let executor = Executor::new();
     info!(
