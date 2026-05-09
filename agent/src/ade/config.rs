@@ -25,6 +25,12 @@ pub struct AdeConfig {
     pub language: String,
     pub timeout: Duration,
     pub host_role: Option<String>,
+    /// Sub-tappa 6.8: how many threads candle's CPU kernels are
+    /// allowed to use. `None` lets [`AdeConfig::effective_threads`]
+    /// pick a sensible default based on the host's physical-core
+    /// count; `Some(n)` overrides it explicitly via the
+    /// `--ade-threads` CLI flag.
+    pub num_threads: Option<usize>,
 }
 
 impl AdeConfig {
@@ -47,6 +53,24 @@ impl AdeConfig {
         self.timeout = timeout;
         self
     }
+
+    /// Resolved thread count for candle's CPU kernels.
+    ///
+    /// When `num_threads` is `Some(n)`, returns `n` clamped to a
+    /// minimum of 1. When `None`, falls back to
+    /// `physical_cores - 1` (also clamped to ≥ 1) so the OS keeps a
+    /// core for housekeeping. On the Hetzner CCX23 reference host
+    /// (4 vCPU / 2 physical) the default is 1; on a 16-core
+    /// workstation it would be 15.
+    pub fn effective_threads(&self) -> usize {
+        match self.num_threads {
+            Some(n) => n.max(1),
+            None => {
+                let cores = num_cpus::get_physical();
+                cores.saturating_sub(1).max(1)
+            }
+        }
+    }
 }
 
 impl Default for AdeConfig {
@@ -61,6 +85,33 @@ impl Default for AdeConfig {
             language: "it-IT".to_string(),
             timeout: Duration::from_secs(15),
             host_role: None,
+            num_threads: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_threads_default_is_at_least_one() {
+        let cfg = AdeConfig::default();
+        let n = cfg.effective_threads();
+        assert!(n >= 1, "effective_threads must always be >= 1, got {n}");
+    }
+
+    #[test]
+    fn effective_threads_honours_explicit_override() {
+        let mut cfg = AdeConfig::default();
+        cfg.num_threads = Some(4);
+        assert_eq!(cfg.effective_threads(), 4);
+    }
+
+    #[test]
+    fn effective_threads_clamps_zero_to_one() {
+        let mut cfg = AdeConfig::default();
+        cfg.num_threads = Some(0);
+        assert_eq!(cfg.effective_threads(), 1);
     }
 }

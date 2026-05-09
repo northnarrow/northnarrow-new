@@ -449,6 +449,11 @@ fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>
         });
     }
 
+    // Sub-tappa 6.8: pin rayon worker count before any candle code
+    // initialises the global thread pool. Honours an existing
+    // RAYON_NUM_THREADS so an operator can override at the shell.
+    backend_candle::CandleBackend::configure_threads(config.effective_threads());
+
     match backend_candle::CandleBackend::load(&config.model_path) {
         Ok(backend) => {
             tracing::info!(

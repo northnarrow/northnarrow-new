@@ -107,6 +107,34 @@ impl CandleBackend {
         Self::load_with_tokenizer(model_path, &tokenizer_path)
     }
 
+    /// Sub-tappa 6.8: pin the rayon worker count *before* candle does
+    /// any compute. rayon initialises its global pool lazily on first
+    /// use and reads `RAYON_NUM_THREADS` at that moment; once the
+    /// pool exists the env var is ignored, so the call must precede
+    /// any backend operation.
+    ///
+    /// No-op if the env var is already set (operator override) or
+    /// if the rayon pool has already been built (`is_initialized`
+    /// returns true).
+    pub fn configure_threads(num_threads: usize) {
+        if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+            tracing::debug!("RAYON_NUM_THREADS already set, leaving operator override in place");
+            return;
+        }
+        let n = num_threads.max(1);
+        // `set_var` is unsafe on Rust 2024+; we are still on
+        // edition 2021 (pinned in workspace.package) where it is
+        // safe to call before any threads have been spawned that
+        // read the environment. CandleBackend::load is the very
+        // first ADE-side code that touches rayon, so this point is
+        // race-free.
+        std::env::set_var("RAYON_NUM_THREADS", n.to_string());
+        tracing::info!(
+            threads = n,
+            "ADE rayon worker count pinned via RAYON_NUM_THREADS"
+        );
+    }
+
     pub fn load_with_tokenizer(model_path: &Path, tokenizer_path: &Path) -> Result<Self, AdeError> {
         let device = Device::Cpu;
 

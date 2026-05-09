@@ -1272,6 +1272,7 @@ dependencies = [
  "libc",
  "nix",
  "northnarrow-common",
+ "num_cpus",
  "parking_lot",
  "procfs",
  "rand 0.8.6",

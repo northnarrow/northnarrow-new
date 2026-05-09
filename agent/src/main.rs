@@ -59,6 +59,12 @@ struct Cli {
     /// Override the ADE system prompt path.
     #[arg(long = "ade-prompt", value_name = "PATH")]
     ade_prompt: Option<PathBuf>,
+
+    /// Override the rayon worker count candle uses for CPU
+    /// inference. Defaults to `physical_cores - 1` (Sub-tappa 6.8).
+    /// Setting `RAYON_NUM_THREADS` in the environment takes priority.
+    #[arg(long = "ade-threads", value_name = "N")]
+    ade_threads: Option<usize>,
 }
 
 #[tokio::main]
@@ -116,6 +122,9 @@ async fn main() -> Result<()> {
         }
         if let Some(secs) = cli.ade_timeout {
             cfg.timeout = Duration::from_secs(secs);
+        }
+        if let Some(n) = cli.ade_threads {
+            cfg.num_threads = Some(n);
         }
         match AdeEngine::new(cfg).await {
             Ok(engine) => {

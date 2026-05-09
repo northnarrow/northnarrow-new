@@ -52,6 +52,10 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "std"
 clap = { workspace = true }
 parking_lot = "0.12"
 
+# Sub-tappa 6.8: physical-core auto-detection for AdeConfig.effective_threads.
+# Already a transitive dep of tokio/rayon; declaring it here pins the API.
+num_cpus = "1.16"
+
 # Sub-tappa 6.1: real LLM inference backend (candle, Llama 3.1 GGUF).
 # CPU-only by default; CUDA/Metal can be enabled via candle features
 # behind an `ade-gpu` flag in a follow-up sub-tappa.
