@@ -87,6 +87,71 @@ jobs:
       - name: Compile workspace tests (including ignored)
         run: cargo test --workspace --no-run --verbose
 
+  ade-build:
+    # Tappa 6 — verifies the ADE module compiles cleanly without
+    # ever pulling a GGUF model or any C++ dependency. The default
+    # `MockBackend` is the only backend on the build path.
+    name: ade-build (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup component add clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ade-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ade-build-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build (ADE module)
+        run: cargo build -p northnarrow-agent --lib --verbose
+
+      - name: cargo clippy (ADE-touched crates)
+        run: cargo clippy -p northnarrow-agent -p northnarrow-common --all-targets -- -D warnings
+
+  ade-unit-test:
+    # Tappa 6 — runs every ADE unit test (parser validation, escalate
+    # transform, prompt builder, mock backend, engine end-to-end with
+    # mocks). NEVER downloads a model and NEVER hits the network.
+    name: ade-unit-test (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ade-test-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ade-test-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo test (ADE + correlation + ade_types)
+        run: |
+          cargo test -p northnarrow-agent --lib ade::
+          cargo test -p northnarrow-agent --lib correlation::
+          cargo test -p northnarrow-common --lib ade_types::
+
   ebpf-build:
     name: ebpf-build (ubuntu-latest)
     runs-on: ubuntu-latest
