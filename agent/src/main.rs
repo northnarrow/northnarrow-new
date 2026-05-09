@@ -126,6 +126,14 @@ async fn main() -> Result<()> {
         if let Some(n) = cli.ade_threads {
             cfg.num_threads = Some(n);
         }
+        // Sub-tappa 6.8 audit: this is the ONLY AdeEngine::new call
+        // in the agent's hot path — model weights, tokenizer, KV
+        // state machine and the rayon pool are loaded ONCE at
+        // startup and the resulting handle is shared into
+        // process_event via Arc<AdeEngine> (cheap to clone). Any
+        // future change that constructs a new engine inside the
+        // event loop would silently re-pay the ~5 GiB GGUF mmap
+        // and the warmup pass, so guard this invariant in review.
         match AdeEngine::new(cfg).await {
             Ok(engine) => {
                 info!(
