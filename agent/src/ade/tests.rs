@@ -222,7 +222,10 @@ async fn engine_rejects_missing_system_prompt() {
 async fn ignored_ade_loads_real_model_path() {
     let cfg = AdeConfig::default();
     if !cfg.model_path.exists() {
-        eprintln!("skipping: model not present at {}", cfg.model_path.display());
+        eprintln!(
+            "skipping: model not present at {}",
+            cfg.model_path.display()
+        );
         return;
     }
     if !cfg.system_prompt_path.exists() {

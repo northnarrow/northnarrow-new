@@ -41,9 +41,7 @@ pub fn transform_to_escalate(
     meta: &EscalateMeta<'_>,
 ) -> AdeVerdict {
     let (pid, filename) = match event {
-        Event::ProcessSpawn {
-            pid, filename, ..
-        }
+        Event::ProcessSpawn { pid, filename, .. }
         | Event::FileOpen { pid, filename, .. }
         | Event::ExecCheck { pid, filename, .. } => (*pid, filename.clone()),
         Event::TcpConnect { pid, comm, .. } | Event::DnsQuery { pid, comm, .. } => {

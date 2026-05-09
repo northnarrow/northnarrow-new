@@ -107,9 +107,9 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             comm,
             filename,
             ..
-        } => format!(
-            "- exec_check pid={pid} ppid={ppid} uid={uid} comm={comm} filename={filename}"
-        ),
+        } => {
+            format!("- exec_check pid={pid} ppid={ppid} uid={uid} comm={comm} filename={filename}")
+        }
         Event::TcpConnect {
             pid,
             uid,
@@ -117,7 +117,9 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             family,
             dst_port,
             ..
-        } => format!("- tcp_connect pid={pid} uid={uid} comm={comm} family={family} dst_port={dst_port}"),
+        } => format!(
+            "- tcp_connect pid={pid} uid={uid} comm={comm} family={family} dst_port={dst_port}"
+        ),
         Event::DnsQuery {
             pid,
             uid,
@@ -134,8 +136,7 @@ pub(crate) fn format_event_line(event: &Event) -> String {
 /// Multi-line block used for the focal event so the model has every
 /// detail at a glance.
 fn format_event_block(event: &Event) -> String {
-    serde_json::to_string_pretty(event)
-        .unwrap_or_else(|_| format!("{event:?}"))
+    serde_json::to_string_pretty(event).unwrap_or_else(|_| format!("{event:?}"))
 }
 
 #[cfg(test)]

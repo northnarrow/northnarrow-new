@@ -23,8 +23,7 @@ pub struct AdeConfig {
 
 impl AdeConfig {
     /// Default model path used by Tappa 6 (founder-supplied GGUF).
-    pub const DEFAULT_MODEL_PATH: &'static str =
-        "/home/forty/models/gemma-4-E4B-it-Q4_K_M.gguf";
+    pub const DEFAULT_MODEL_PATH: &'static str = "/home/forty/models/gemma-4-E4B-it-Q4_K_M.gguf";
 
     /// Default system prompt path (relative to repo root).
     pub const DEFAULT_SYSTEM_PROMPT_PATH: &'static str = "dataset/system_prompt_v1.md";

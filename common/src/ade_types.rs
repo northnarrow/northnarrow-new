@@ -214,10 +214,9 @@ impl AdeVerdict {
             AdeAction::BlockNetwork => ResponseAction::BlockOutbound,
             AdeAction::Isolate => ResponseAction::FullNetworkIsolation,
             AdeAction::Throttle => ResponseAction::ThrottleProcess,
-            AdeAction::Allow
-            | AdeAction::Monitor
-            | AdeAction::Alert
-            | AdeAction::Escalate => ResponseAction::Log,
+            AdeAction::Allow | AdeAction::Monitor | AdeAction::Alert | AdeAction::Escalate => {
+                ResponseAction::Log
+            }
         }
     }
 

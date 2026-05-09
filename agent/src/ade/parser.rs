@@ -18,14 +18,10 @@ pub enum ValidationError {
     #[error("schema_version mismatch: expected {expected}, got {got}")]
     SchemaVersionMismatch { expected: String, got: String },
 
-    #[error(
-        "rule violation: confidence < 0.40 requires verdict=Escalate, got verdict={verdict}"
-    )]
+    #[error("rule violation: confidence < 0.40 requires verdict=Escalate, got verdict={verdict}")]
     ConfidenceLowVerdictMismatch { verdict: String },
 
-    #[error(
-        "rule violation: verdict={verdict} requires confidence >= 0.40, got {confidence:.4}"
-    )]
+    #[error("rule violation: verdict={verdict} requires confidence >= 0.40, got {confidence:.4}")]
     VerdictRequiresHigherConfidence { verdict: String, confidence: f64 },
 
     #[error("rule violation: verdict=Isolate requires confidence >= 0.85 AND severity=Critical")]
@@ -274,8 +270,8 @@ fn has_at_most_two_decimals(v: f64) -> bool {
 mod tests {
     use super::*;
     use common::ade_types::{
-        AlternativeExplanations, EscalationPackage, Evidence, FollowUp, MitreAttack,
-        AdeMetadata, ReasoningSteps, RecommendedAction, ThreatClassification,
+        AdeMetadata, AlternativeExplanations, EscalationPackage, Evidence, FollowUp, MitreAttack,
+        ReasoningSteps, RecommendedAction, ThreatClassification,
     };
 
     fn base_verdict() -> AdeVerdict {
@@ -344,10 +340,7 @@ mod tests {
         let mut v = base_verdict();
         v.schema_version = "0.9.0".into();
         let err = parser().validate(&v).unwrap_err();
-        assert!(matches!(
-            err,
-            ValidationError::SchemaVersionMismatch { .. }
-        ));
+        assert!(matches!(err, ValidationError::SchemaVersionMismatch { .. }));
     }
 
     #[test]
@@ -658,8 +651,7 @@ mod tests {
             "recommended_action":{"action":"Alert","justification":"x"},
             "follow_up":{"policy":"None"},
             "metadata":{"model_id":"x","model_quantization":"Q4","backend":"mock","host_id":"h","agent_version":"v","inference_latency_ms":0}
-        }"#
-            + "\n```";
+        }"# + "\n```";
         parser().parse(&raw).expect("fence-stripping parser");
     }
 }

@@ -182,16 +182,12 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             filename_for_pkg = filename.clone();
             category = classify_process(comm, filename);
         }
-        Event::FileOpen {
-            pid, filename, ..
-        } => {
+        Event::FileOpen { pid, filename, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = filename.clone();
             category = MockCategory::Unknown;
         }
-        Event::ExecCheck {
-            pid, filename, ..
-        } => {
+        Event::ExecCheck { pid, filename, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = filename.clone();
             category = MockCategory::Unknown;
@@ -216,13 +212,9 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
         MockCategory::Cryptominer => kill_verdict(trace_id, now, metadata),
         MockCategory::Ransomware => killtree_verdict(trace_id, now, metadata),
         MockCategory::Recon => alert_verdict(trace_id, now, metadata),
-        MockCategory::Unknown => escalate_verdict(
-            trace_id,
-            now,
-            metadata,
-            pid_for_pkg,
-            filename_for_pkg,
-        ),
+        MockCategory::Unknown => {
+            escalate_verdict(trace_id, now, metadata, pid_for_pkg, filename_for_pkg)
+        }
     }
 }
 

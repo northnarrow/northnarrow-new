@@ -76,12 +76,7 @@ impl CorrelationBuffer {
 
     /// Up to `max_hits` events related to `focal`, ordered oldest
     /// first.
-    pub fn get_correlated(
-        &self,
-        focal: &Event,
-        lookback_ns: u64,
-        max_hits: usize,
-    ) -> Vec<Event> {
+    pub fn get_correlated(&self, focal: &Event, lookback_ns: u64, max_hits: usize) -> Vec<Event> {
         let q = self.inner.queue.read();
         let focal_ts = event_timestamp_ns(focal);
         let (focal_pid, focal_ppid, focal_filename) = focal_keys(focal);
@@ -199,8 +194,12 @@ mod tests {
         assert_eq!(buf.len(), 3);
         let snap = buf.snapshot();
         // pid=1 evicted
-        assert!(!snap.iter().any(|e| matches!(e, Event::ProcessSpawn { pid: 1, .. })));
-        assert!(snap.iter().any(|e| matches!(e, Event::ProcessSpawn { pid: 4, .. })));
+        assert!(!snap
+            .iter()
+            .any(|e| matches!(e, Event::ProcessSpawn { pid: 1, .. })));
+        assert!(snap
+            .iter()
+            .any(|e| matches!(e, Event::ProcessSpawn { pid: 4, .. })));
     }
 
     #[test]
@@ -228,7 +227,9 @@ mod tests {
         let focal = spawn(99, 5, "/d", 100_000_000_000);
         let hits = buf.get_correlated(&focal, 1, 50);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|e| matches!(e, Event::ProcessSpawn { ppid: 5, .. })));
+        assert!(hits
+            .iter()
+            .all(|e| matches!(e, Event::ProcessSpawn { ppid: 5, .. })));
     }
 
     #[test]

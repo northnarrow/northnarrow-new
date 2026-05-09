@@ -30,7 +30,8 @@ impl HostContext {
     /// `CARGO_PKG_VERSION`. Any failure falls back to a stable
     /// placeholder so ADE can still emit a verdict.
     pub fn discover() -> Self {
-        let hostname = read_proc_kernel("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".to_string());
+        let hostname =
+            read_proc_kernel("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".to_string());
         let kernel_version =
             read_proc_kernel("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string());
         let host_id = std::fs::read_to_string("/etc/machine-id")

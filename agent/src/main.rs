@@ -2,13 +2,25 @@
 //!
 //! Tappa 4: the agent loads a single eBPF object exposing six
 //! programs (process exec, file open, exec validation, TCP v4/v6
-//! connect, UDP/DNS) via [`SensorMultiplexer`]. Every decoded event
-//! flows through the [`RuleEngine`] (only `ProcessSpawn` matches
-//! current rules) and any verdict is enacted by the [`Executor`]
-//! exactly as in Tappa 3.
+//! connect, UDP/DNS) via [`SensorMultiplexer`].
+//!
+//! Tappa 6 cascades each event through:
+//!
+//!   sensor → rule_engine → (match? execute : ade.evaluate) → execute?
+//!
+//! ADE is invoked only when the rule engine produces no verdict, so
+//! Tappa 3+5 regression behaviour is preserved exactly: `R001` still
+//! kills `/tmp/nn-test-payload` before ADE ever sees the event.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use common::Event;
+use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
+use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
@@ -16,8 +28,34 @@ use tokio::signal;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "northnarrow-agent",
+    version,
+    about = "NorthNarrow XDR agent daemon (Linux)."
+)]
+struct Cli {
+    /// Disable the Active Defense Engine (rule engine only).
+    #[arg(long = "no-ade", default_value_t = false)]
+    no_ade: bool,
+
+    /// Override the GGUF model path used by ADE.
+    #[arg(long = "ade-model", value_name = "PATH")]
+    ade_model: Option<PathBuf>,
+
+    /// Override the ADE inference timeout (seconds).
+    #[arg(long = "ade-timeout", value_name = "SECS")]
+    ade_timeout: Option<u64>,
+
+    /// Override the ADE system prompt path.
+    #[arg(long = "ade-prompt", value_name = "PATH")]
+    ade_prompt: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -56,13 +94,55 @@ async fn main() -> Result<()> {
         "response executor ready (KillProcess + KillProcessTree active)"
     );
 
+    let ade_engine = if cli.no_ade {
+        info!("ADE disabled by --no-ade");
+        None
+    } else {
+        let mut cfg = AdeConfig::default();
+        if let Some(p) = cli.ade_model.clone() {
+            cfg.model_path = p;
+        }
+        if let Some(p) = cli.ade_prompt.clone() {
+            cfg.system_prompt_path = p;
+        }
+        if let Some(secs) = cli.ade_timeout {
+            cfg.timeout = Duration::from_secs(secs);
+        }
+        match AdeEngine::new(cfg).await {
+            Ok(engine) => {
+                info!(
+                    backend = engine.backend_name(),
+                    model_path = %engine.config().model_path.display(),
+                    warmup_latency_ms = engine.warmup_latency_ms(),
+                    timeout_s = engine.config().timeout.as_secs(),
+                    "ADE engine ready"
+                );
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!(?e, "ADE engine unavailable, fallback to rule-only mode");
+                None
+            }
+        }
+    };
+
+    let correlation = CorrelationBuffer::with_default_capacity();
+    let host = HostContext::discover();
+
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
     loop {
         tokio::select! {
             evt = sensor.next_event() => match evt {
-                Some(e) => process_event(&engine, &executor, e).await,
+                Some(e) => process_event(
+                    &engine,
+                    &executor,
+                    ade_engine.as_deref(),
+                    &correlation,
+                    &host,
+                    e,
+                ).await,
                 None => {
                     warn!("sensor pump exited; shutting down");
                     break;
@@ -79,6 +159,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(ade) = &ade_engine {
+        let snap = ade.stats();
+        info!(
+            total = snap.total_inferences,
+            success = snap.successful_verdicts,
+            malformed = snap.malformed_outputs,
+            timeouts = snap.timeouts,
+            backend_errors = snap.backend_errors,
+            avg_ms = snap.avg_latency_ms,
+            p50_ms = snap.p50_latency_ms,
+            p95_ms = snap.p95_latency_ms,
+            p99_ms = snap.p99_latency_ms,
+            "ADE shutdown stats"
+        );
+    }
+
     info!("NorthNarrow agent stopped.");
     Ok(())
 }
@@ -89,7 +185,20 @@ async fn main() -> Result<()> {
 /// so non-spawn events flow through as DEBUG telemetry and bypass the
 /// engine. The kill syscalls + verify retries can sleep up to 50 ms,
 /// so any execution dispatch goes through `spawn_blocking`.
-async fn process_event(engine: &RuleEngine, executor: &Executor, event: Event) {
+///
+/// Tappa 6: every event also lands in the correlation buffer (so ADE
+/// has recent context), and unmatched events get routed through ADE
+/// when the engine is enabled.
+async fn process_event(
+    engine: &RuleEngine,
+    executor: &Executor,
+    ade: Option<&AdeEngine>,
+    correlation: &CorrelationBuffer,
+    host: &HostContext,
+    event: Event,
+) {
+    correlation.push(event.clone());
+
     match &event {
         Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
         Event::FileOpen {
@@ -140,25 +249,91 @@ async fn process_event(engine: &RuleEngine, executor: &Executor, event: Event) {
         }
     }
 
-    let Some(verdict) = engine.evaluate(&event) else {
+    if let Some(verdict) = engine.evaluate(&event) {
+        warn!(
+            rule = %verdict.rule_id,
+            rule_name = %verdict.rule_name,
+            category = %verdict.category,
+            action = ?verdict.action,
+            severity = ?verdict.severity,
+            target_pid = verdict.event_pid,
+            target_filename = %verdict.event_filename,
+            reasoning = %verdict.reasoning,
+            "VERDICT (rule)"
+        );
+
+        let exec = executor.clone();
+        let action = verdict.action.clone();
+        let target_pid = verdict.event_pid;
+        let report =
+            match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "executor task join failed");
+                    return;
+                }
+            };
+
+        info!(
+            action = ?report.action,
+            primary = ?report.primary,
+            additional_count = report.additional.len(),
+            elapsed_us = report.elapsed.as_micros() as u64,
+            "EXECUTED"
+        );
+        return;
+    }
+
+    let Some(ade) = ade else {
         return;
     };
 
+    // Only ProcessSpawn / ExecCheck warrant ADE evaluation today;
+    // FileOpen / TCP / DNS volumes are too high to feed the LLM and
+    // they don't have an immediate executor mapping anyway.
+    if !matches!(&event, Event::ProcessSpawn { .. } | Event::ExecCheck { .. }) {
+        return;
+    }
+
+    debug!("no rule matched, escalating to ADE");
+    let context = EventContext {
+        recent_events: correlation.get_correlated_default(&event),
+        host_context: host.clone(),
+    };
+
+    info!("ADE inference started");
+    let verdict = match ade.evaluate(&event, &context).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(?e, "ADE error, defaulting to log-only");
+            return;
+        }
+    };
+
+    info!(
+        latency_ms = verdict.metadata.inference_latency_ms,
+        "ADE inference completed"
+    );
     warn!(
-        rule = %verdict.rule_id,
-        rule_name = %verdict.rule_name,
-        category = %verdict.category,
-        action = ?verdict.action,
-        severity = ?verdict.severity,
-        target_pid = verdict.event_pid,
-        target_filename = %verdict.event_filename,
-        reasoning = %verdict.reasoning,
-        "VERDICT"
+        action = %verdict.verdict,
+        severity = %verdict.severity,
+        confidence = verdict.confidence,
+        trace_id = %verdict.trace_id,
+        reasoning = %verdict.reasoning.step_5_decision,
+        "VERDICT (ADE)"
     );
 
+    if !verdict.requires_execution() {
+        info!(action = %verdict.verdict, "ADE verdict logged, no execution needed");
+        return;
+    }
+
     let exec = executor.clone();
-    let action = verdict.action.clone();
-    let target_pid = verdict.event_pid;
+    let action = verdict.to_response_action();
+    let target_pid = match &event {
+        Event::ProcessSpawn { pid, .. } | Event::ExecCheck { pid, .. } => *pid,
+        _ => return,
+    };
     let report = match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
         Ok(r) => r,
         Err(e) => {
@@ -166,13 +341,12 @@ async fn process_event(engine: &RuleEngine, executor: &Executor, event: Event) {
             return;
         }
     };
-
     info!(
         action = ?report.action,
         primary = ?report.primary,
         additional_count = report.additional.len(),
         elapsed_us = report.elapsed.as_micros() as u64,
-        "EXECUTED"
+        "EXECUTED (from ADE)"
     );
 }
 

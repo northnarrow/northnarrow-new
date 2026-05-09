@@ -218,9 +218,7 @@ impl AdeEngine {
     }
 }
 
-fn build_default_backend(
-    config: &AdeConfig,
-) -> Result<Arc<dyn InferenceBackend>, AdeError> {
+fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>, AdeError> {
     // Tappa 6 ships only `MockBackend`. The model path must still
     // exist so the metadata accurately advertises the founder's
     // GGUF; future native backends will swap themselves in here.
