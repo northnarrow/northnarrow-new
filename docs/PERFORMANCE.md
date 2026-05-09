@@ -155,3 +155,19 @@ each lever in isolation.
   termination by simply emitting fewer tokens).
 - Smaller model — Foundation-Sec 8B stays the production choice.
 - Speculative decoding / draft models.
+
+## Empirical Measurements — May 2026 (post Sub-tappa 6.8)
+
+Hardware: Hetzner CCX23 (AMD EPYC, 2 physical cores + SMT, AVX2+FMA, 16 GB RAM)
+Model: Foundation-Sec-8B-Reasoning Q4_K_M (4.6 GB)
+Build: target-cpu=native + LTO fat
+Threads: 2 (--ade-threads 2)
+
+| Metric        | Baseline (pre-6.8) | Post-6.8 | Speedup |
+|---------------|--------------------|---------|---------|
+| Load model    | 6,700 ms           | 5,943 ms | ×1.13   |
+| Warmup        | 750 ms             | 123 ms   | ×6.10   |
+| Decode rate   | 0.94 tok/s         | 3.69 tok/s | ×3.93 |
+
+Estimated end-to-end speedup with streaming JSON early termination: ~×8-10.
+Typical ADE inference: from ~25 min to ~3-5 min.
