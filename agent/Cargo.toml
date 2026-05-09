@@ -60,6 +60,10 @@ candle-transformers = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+# Sub-tappa 6.6: ADE prompt-injection hardening (base64 encoding of
+# untrusted strings inside the structured prompt).
+base64 = "0.22"
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
