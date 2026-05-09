@@ -6,11 +6,19 @@
 //!
 //! Tappa 6 cascades each event through:
 //!
-//!   sensor → rule_engine → (match? execute : ade.evaluate) → execute?
+//!   sensor → posture.observe → rule_engine
+//!     → (match? execute : ade.evaluate → posture.modulate → execute?)
 //!
 //! ADE is invoked only when the rule engine produces no verdict, so
 //! Tappa 3+5 regression behaviour is preserved exactly: `R001` still
 //! kills `/tmp/nn-test-payload` before ADE ever sees the event.
+//!
+//! Sub-tappa 6.5: every event is also fed to the
+//! [`PostureMachine`](northnarrow_agent::posture::PostureMachine), a
+//! 4-tier defensive posture that persists across events. ADE
+//! verdicts are passed through `posture.modulate_verdict` before
+//! execution so an ambiguous `Allow` in `OBSERVING` becomes an
+//! `Alert` once the posture has lifted to `ALERTED+`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +30,7 @@ use common::Event;
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal;
@@ -129,6 +138,25 @@ async fn main() -> Result<()> {
     let correlation = CorrelationBuffer::with_default_capacity();
     let host = HostContext::discover();
 
+    let posture = PostureMachine::new();
+    info!("posture state machine initialized (state: OBSERVING)");
+
+    // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
+    // idle, ENGAGED→ALERTED after 24h idle). COMBAT never decays
+    // here; it requires an admin-signed release. The 60 s cadence is
+    // a coarse heartbeat, not a precise deadline.
+    let posture_decay = posture.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            if let Some(new_state) = posture_decay.tick_decay() {
+                info!(state = %new_state.kind(), "posture decay transition");
+            }
+        }
+    });
+
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
@@ -141,6 +169,7 @@ async fn main() -> Result<()> {
                     ade_engine.as_deref(),
                     &correlation,
                     &host,
+                    &posture,
                     e,
                 ).await,
                 None => {
@@ -195,8 +224,17 @@ async fn process_event(
     ade: Option<&AdeEngine>,
     correlation: &CorrelationBuffer,
     host: &HostContext,
+    posture: &PostureMachine,
     event: Event,
 ) {
+    // Run posture detection BEFORE we push the focal event into the
+    // correlation buffer — the trigger detector counts the focal as
+    // a fresh +1 on top of `recent`, and `recent` already containing
+    // the focal would double-count it.
+    let recent_for_posture = correlation.snapshot();
+    if let Some(new_state) = posture.observe(&event, &recent_for_posture) {
+        warn!(state = %new_state.kind(), "POSTURE TRANSITION");
+    }
     correlation.push(event.clone());
 
     match &event {
@@ -322,6 +360,20 @@ async fn process_event(
         reasoning = %verdict.reasoning.step_5_decision,
         "VERDICT (ADE)"
     );
+
+    let raw_action = verdict.verdict;
+    let raw_severity = verdict.severity;
+    let verdict = posture.modulate_verdict(verdict);
+    if verdict.verdict != raw_action || verdict.severity != raw_severity {
+        info!(
+            posture = %posture.current_kind(),
+            from_action = %raw_action,
+            from_severity = %raw_severity,
+            to_action = %verdict.verdict,
+            to_severity = %verdict.severity,
+            "verdict modulated by posture"
+        );
+    }
 
     if !verdict.requires_execution() {
         info!(action = %verdict.verdict, "ADE verdict logged, no execution needed");
