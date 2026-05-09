@@ -51,6 +51,23 @@ pub enum InjectionFlag {
     NonPrintable,
     /// Right-to-left override / bidi-control char.
     BidiControl,
+    /// Same prompt-override family as [`InstructionKeyword`] but in a
+    /// non-English locale. `lang` is an ISO 639-1 code (`ru`, `zh`,
+    /// `ja`, `ar`, `it`, `es`, `fr`, `de`, `pt`); `keyword` is the
+    /// matched phrase.
+    MultilingualKeyword { lang: String, keyword: String },
+    /// String decoded as ROT13 contained an instruction keyword.
+    RotEncoded { original: String, decoded: String },
+    /// Filename looked like a system binary with a single character
+    /// substituted by a visually similar one (`/usr/bin/l5` for
+    /// `/usr/bin/ls`).
+    VisualSubstitution {
+        suspected_target: String,
+        actual: String,
+    },
+    /// Variant of a known instruction keyword with a non-canonical
+    /// separator (`northnarrow-` instead of `northnarrow:`).
+    VariantSeparator { canonical: String, variant: String },
 }
 
 impl InjectionFlag {
@@ -59,12 +76,16 @@ impl InjectionFlag {
     fn weight(&self) -> f32 {
         match self {
             InjectionFlag::InstructionKeyword(_) => 0.40,
+            InjectionFlag::MultilingualKeyword { .. } => 0.40,
             InjectionFlag::SpecialToken(_) => 0.45,
-            InjectionFlag::HomoglyphDetected(_) => 0.20,
+            InjectionFlag::HomoglyphDetected(_) => 0.30,
             InjectionFlag::ZeroWidthChar => 0.20,
             InjectionFlag::OverlongArgv(_) => 0.25,
             InjectionFlag::NonPrintable => 0.10,
             InjectionFlag::BidiControl => 0.30,
+            InjectionFlag::RotEncoded { .. } => 0.45,
+            InjectionFlag::VisualSubstitution { .. } => 0.40,
+            InjectionFlag::VariantSeparator { .. } => 0.40,
         }
     }
 }
@@ -115,6 +136,17 @@ impl SanitizedEvent {
                 InjectionFlag::OverlongArgv(n) => format!("overlong_argv:{n}"),
                 InjectionFlag::NonPrintable => "non_printable".to_string(),
                 InjectionFlag::BidiControl => "bidi_control".to_string(),
+                InjectionFlag::MultilingualKeyword { lang, keyword } => {
+                    format!("multilingual[{lang}]:{keyword}")
+                }
+                InjectionFlag::RotEncoded { decoded, .. } => format!("rot13:{decoded}"),
+                InjectionFlag::VisualSubstitution {
+                    suspected_target,
+                    actual,
+                } => format!("visual_sub:{actual}~{suspected_target}"),
+                InjectionFlag::VariantSeparator { canonical, variant } => {
+                    format!("variant_sep:{variant}~{canonical}")
+                }
             });
         }
         out.join(",")
@@ -200,6 +232,121 @@ const HOMOGLYPHS: &[(char, char)] = &[
     ('Х', 'X'),
     ('У', 'Y'),
 ];
+
+/// Multilingual prompt-override phrases. ISO 639-1 code first, then
+/// the lower-cased phrase. Detection is case-insensitive on both the
+/// raw input and the homoglyph-normalised form.
+///
+/// Coverage is intentionally narrow: only the highest-recurrence
+/// "ignore previous", "approve all", "always allow", "system
+/// override" families. Adding more languages or richer dictionaries
+/// is a follow-up.
+const MULTILINGUAL_KEYWORDS: &[(&str, &str)] = &[
+    // Italian
+    ("it", "ignora precedenti"),
+    ("it", "ignora tutto"),
+    ("it", "permetti sempre"),
+    ("it", "consenti sempre"),
+    ("it", "approva tutto"),
+    ("it", "autorizzazione amministratore"),
+    ("it", "override sistema"),
+    // Spanish
+    ("es", "ignora previo"),
+    ("es", "ignora todo"),
+    ("es", "permitir siempre"),
+    ("es", "aprobar todo"),
+    ("es", "anular sistema"),
+    ("es", "sobreescribir reglas"),
+    // French
+    ("fr", "ignorer précédent"),
+    ("fr", "ignorer tout"),
+    ("fr", "toujours autoriser"),
+    ("fr", "approuver tout"),
+    ("fr", "remplacer système"),
+    ("fr", "outrepasser règles"),
+    // German
+    ("de", "ignoriere vorherige"),
+    ("de", "alle erlauben"),
+    ("de", "immer zulassen"),
+    ("de", "system überschreiben"),
+    ("de", "regeln umgehen"),
+    // Portuguese
+    ("pt", "ignorar anterior"),
+    ("pt", "ignorar tudo"),
+    ("pt", "permitir sempre"),
+    ("pt", "aprovar tudo"),
+    ("pt", "substituir sistema"),
+    // Russian (Cyrillic + transliteration)
+    ("ru", "разрешить"),
+    ("ru", "разрешить всегда"),
+    ("ru", "одобрить"),
+    ("ru", "игнорировать"),
+    ("ru", "обойти правила"),
+    ("ru", "razreshit"),
+    ("ru", "odobrit"),
+    ("ru", "ignorirovat"),
+    // Chinese (Simplified)
+    ("zh", "总是允许"),
+    ("zh", "总是允许批准"),
+    ("zh", "忽略"),
+    ("zh", "覆盖"),
+    ("zh", "批准全部"),
+    ("zh", "允许全部"),
+    // Japanese
+    ("ja", "全て許可"),
+    ("ja", "常に許可"),
+    ("ja", "無視"),
+    ("ja", "上書き"),
+    ("ja", "承認"),
+    // Arabic
+    ("ar", "تجاهل"),
+    ("ar", "السماح دائما"),
+    ("ar", "الموافقة على الكل"),
+    ("ar", "تجاوز"),
+];
+
+/// System binaries an attacker might try to impersonate via a single
+/// visual substitution (`l5` for `ls`). Lower-case, basenames only.
+const SYSTEM_BINARY_LOOKALIKES: &[&str] = &[
+    "ls", "cat", "top", "ssh", "sudo", "su", "bash", "sh", "chmod", "chown", "mount", "mv", "cp",
+    "rm", "ps", "kill", "ping", "curl", "wget", "scp", "ssh-add", "sshd", "iptables", "tar",
+    "gzip", "find", "grep", "awk", "sed", "id", "whoami", "uname",
+];
+
+/// Visual-substitution lookup table. Each entry maps a Latin glyph
+/// onto the digits / punctuation that look like it. The table is
+/// queried in both directions: `looks_like(c1, c2)` returns true if
+/// either substitution is a known lookalike.
+const VISUAL_SUBS: &[(char, &[char])] = &[
+    ('l', &['1', 'I', '|']),
+    ('s', &['5', '$']),
+    ('o', &['0', 'O']),
+    ('a', &['4', '@']),
+    ('e', &['3']),
+    ('g', &['9', '6']),
+    ('b', &['8']),
+    ('t', &['7', '+']),
+    ('z', &['2']),
+    ('i', &['1', 'l', '|']),
+];
+
+/// Base words whose `:` separator may be replaced by `-`, `_`, `.`,
+/// `|`, ` ` to evade keyword matching. Each entry stays as a *base*
+/// — the detector enumerates the separator variants at runtime.
+const VARIANT_SEPARATOR_BASES: &[&str] = &[
+    "northnarrow",
+    "north narrow",
+    "system",
+    "admin",
+    "override",
+    "force allow",
+    "approve all",
+    "always allow",
+    "ignore previous",
+    "ignore all",
+];
+
+const VARIANT_TRAILING_SEPS: &[char] = &['-', '_', '.', '|', ' '];
 
 /// Top-level entry point: produce a `SanitizedEvent` from `event`.
 pub fn sanitize_event_for_ade(event: &Event) -> SanitizedEvent {
@@ -335,7 +482,227 @@ fn sanitize_string(input: &str, cap: usize, flags: &mut Vec<InjectionFlag>) -> S
             buf = buf.replace(tok, &"?".repeat(tok.len()));
         }
     }
+
+    // Sub-tappa 6.6.1 layer extensions.
+    //
+    // Multilingual detection runs against the *truncated* (raw,
+    // pre-homoglyph) input so Cyrillic-only or Han-only keywords
+    // don't get mangled by homoglyph replacement (which targets
+    // Latin lookalikes). The other detectors run on the cleaned
+    // `buf`.
+    detect_multilingual_keywords(&truncated, &buf, &lower, flags);
+    detect_rot13_keywords(&buf, flags);
+    detect_visual_substitution(&buf, flags);
+    detect_variant_separators(&buf, &lower, flags);
+
     buf
+}
+
+/// Multilingual keyword search.
+///
+/// Runs against three views simultaneously:
+///
+/// - `raw_truncated` — the original input pre-homoglyph (catches
+///   Cyrillic / Chinese / Japanese / Arabic phrases whose letters
+///   would otherwise be mangled by the Latin-targeted homoglyph
+///   replacement).
+/// - `buf` — the sanitised, homoglyph-normalised string (catches
+///   Latin-script multilinguals: Italian, Spanish, …).
+/// - `lower` plus a `_-.`→` ` separator pass so `permetti_sempre`
+///   matches `permetti sempre`.
+fn detect_multilingual_keywords(
+    raw_truncated: &str,
+    buf: &str,
+    lower: &str,
+    flags: &mut Vec<InjectionFlag>,
+) {
+    let normalised: String = lower
+        .chars()
+        .map(|c| match c {
+            '_' | '-' | '.' => ' ',
+            _ => c,
+        })
+        .collect();
+    let raw_lower = raw_truncated.to_lowercase();
+    let raw_normalised: String = raw_lower
+        .chars()
+        .map(|c| match c {
+            '_' | '-' | '.' => ' ',
+            _ => c,
+        })
+        .collect();
+    for (lang, kw) in MULTILINGUAL_KEYWORDS {
+        let needle = *kw;
+        if normalised.contains(needle)
+            || lower.contains(needle)
+            || buf.contains(needle)
+            || raw_lower.contains(needle)
+            || raw_normalised.contains(needle)
+            || raw_truncated.contains(needle)
+        {
+            flags.push(InjectionFlag::MultilingualKeyword {
+                lang: (*lang).to_string(),
+                keyword: needle.to_string(),
+            });
+        }
+    }
+}
+
+/// ROT13 evasion check. Only applied to ASCII-only strings of length
+/// ≥ `MIN_ROT13_LEN`; we strip word separators (`_`, `-`, `.`) and
+/// run the result against the EN keyword dictionary. A match raises
+/// [`InjectionFlag::RotEncoded`] carrying both the original and the
+/// decoded form.
+const MIN_ROT13_LEN: usize = 8;
+
+fn detect_rot13_keywords(buf: &str, flags: &mut Vec<InjectionFlag>) {
+    if buf.len() < MIN_ROT13_LEN {
+        return;
+    }
+    if !buf.is_ascii() {
+        return;
+    }
+    let stripped: String = buf
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .collect();
+    if stripped.chars().filter(|c| c.is_ascii_alphabetic()).count() < MIN_ROT13_LEN {
+        return;
+    }
+    let separators_pattern: String = buf
+        .chars()
+        .map(|c| match c {
+            '_' | '-' | '.' => ' ',
+            other => other,
+        })
+        .collect();
+    let decoded_lower = normalize_rot13(&separators_pattern.to_lowercase());
+    for kw in INSTRUCTION_KEYWORDS {
+        if decoded_lower.contains(kw) {
+            flags.push(InjectionFlag::RotEncoded {
+                original: separators_pattern.clone(),
+                decoded: decoded_lower.clone(),
+            });
+            return;
+        }
+    }
+}
+
+/// Letter-by-letter ROT13 on ASCII; everything else passes through.
+fn normalize_rot13(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='M' | 'a'..='m' => ((c as u8) + 13) as char,
+            'N'..='Z' | 'n'..='z' => ((c as u8) - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+/// Detect filenames that look like a system binary with a single
+/// character substituted by a visual lookalike (`l5` for `ls`).
+///
+/// Heuristic: take the *basename* (last `/`-separated segment), trim
+/// trailing extensions, lower-case it. For each [`SYSTEM_BINARY_LOOKALIKES`]
+/// candidate, compute a one-character distance with the visual table
+/// — if exactly one position differs and the differing pair is a
+/// known lookalike, raise the flag.
+fn detect_visual_substitution(buf: &str, flags: &mut Vec<InjectionFlag>) {
+    let Some(last_seg) = buf.rsplit('/').next() else {
+        return;
+    };
+    let stem = last_seg
+        .split('.')
+        .next()
+        .unwrap_or(last_seg)
+        .to_lowercase();
+    if stem.is_empty() {
+        return;
+    }
+    if SYSTEM_BINARY_LOOKALIKES.contains(&stem.as_str()) {
+        // Exact match — not a substitution attempt.
+        return;
+    }
+    for target in SYSTEM_BINARY_LOOKALIKES {
+        if target.chars().count() != stem.chars().count() {
+            continue;
+        }
+        if visual_one_swap(target, &stem) {
+            flags.push(InjectionFlag::VisualSubstitution {
+                suspected_target: (*target).to_string(),
+                actual: stem.clone(),
+            });
+            return;
+        }
+    }
+}
+
+/// Returns true when `candidate` differs from `target` only by
+/// known visual-lookalike substitutions. We don't bound the number
+/// of substitutions (so `55h` still matches `ssh`); we only require
+/// that *every* differing position is a registered lookalike pair
+/// and that there's at least one substitution (an exact match is
+/// not a "swap").
+fn visual_one_swap(target: &str, candidate: &str) -> bool {
+    let t: Vec<char> = target.chars().collect();
+    let c: Vec<char> = candidate.chars().collect();
+    if t.len() != c.len() {
+        return false;
+    }
+    let mut diffs = 0usize;
+    for (a, b) in t.iter().zip(c.iter()) {
+        if a == b {
+            continue;
+        }
+        diffs += 1;
+        if !visual_lookalike(*a, *b) {
+            return false;
+        }
+    }
+    diffs >= 1
+}
+
+fn visual_lookalike(a: char, b: char) -> bool {
+    for (base, lookalikes) in VISUAL_SUBS {
+        if (*base == a && lookalikes.contains(&b)) || (*base == b && lookalikes.contains(&a)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect variant-separator forms of well-known instruction
+/// keywords: `northnarrow-` for `northnarrow:`, `system_override`
+/// for `system override`, etc.
+fn detect_variant_separators(buf: &str, lower: &str, flags: &mut Vec<InjectionFlag>) {
+    for base in VARIANT_SEPARATOR_BASES {
+        let canonical_colon = format!("{base}:");
+        // Already caught by the canonical keyword path.
+        if lower.contains(&canonical_colon) {
+            continue;
+        }
+        for sep in VARIANT_TRAILING_SEPS {
+            let variant_form = format!("{base}{sep}");
+            if lower.contains(&variant_form) || buf.to_lowercase().contains(&variant_form) {
+                flags.push(InjectionFlag::VariantSeparator {
+                    canonical: canonical_colon.clone(),
+                    variant: variant_form,
+                });
+                return; // one hit per base is enough
+            }
+        }
+        // "north-narrow" → match "north narrow" with separator
+        // already replaced. Guard against double-counting.
+        let with_dashes = base.replace(' ', "-");
+        let with_underscores = base.replace(' ', "_");
+        if base.contains(' ') && (lower.contains(&with_dashes) || lower.contains(&with_underscores))
+        {
+            flags.push(InjectionFlag::VariantSeparator {
+                canonical: canonical_colon.clone(),
+                variant: with_dashes,
+            });
+        }
+    }
 }
 
 /// Redact a special token so the *flag string* doesn't itself echo
@@ -412,6 +779,14 @@ fn dedup_flags(flags: Vec<InjectionFlag>) -> Vec<InjectionFlag> {
             InjectionFlag::OverlongArgv(_) => "oa".to_string(),
             InjectionFlag::NonPrintable => "np".to_string(),
             InjectionFlag::BidiControl => "bd".to_string(),
+            InjectionFlag::MultilingualKeyword { lang, keyword } => {
+                format!("mk:{lang}:{keyword}")
+            }
+            InjectionFlag::RotEncoded { decoded, .. } => format!("rot:{decoded}"),
+            InjectionFlag::VisualSubstitution {
+                suspected_target, ..
+            } => format!("vs:{suspected_target}"),
+            InjectionFlag::VariantSeparator { canonical, .. } => format!("vsep:{canonical}"),
         };
         let n = counts.entry(key).or_insert(0);
         if *n < 2 {
@@ -522,5 +897,161 @@ mod tests {
         let s = sanitize_event_for_ade(&spawn(nasty));
         assert!(s.injection_score <= 1.0);
         assert!(s.injection_score >= 0.5);
+    }
+
+    // ====== Sub-tappa 6.6.1 — extended detectors ======
+
+    fn dns(query: &str) -> Event {
+        Event::DnsQuery {
+            pid: 1,
+            uid: 1000,
+            comm: "x".into(),
+            query_name: query.into(),
+            query_type: 1,
+            dns_server: [0u8; 16],
+            family: 2,
+            timestamp_ns: 0,
+        }
+    }
+
+    #[test]
+    fn test_multilingual_keyword_russian_cyrillic() {
+        let s = sanitize_event_for_ade(&spawn("/tmp/разрешить.bin"));
+        assert!(
+            s.injection_flags.iter().any(|f| matches!(
+                f,
+                InjectionFlag::MultilingualKeyword { lang, .. } if lang == "ru"
+            )),
+            "expected MultilingualKeyword(ru), got {:?}",
+            s.injection_flags
+        );
+        assert!(s.injection_score >= 0.4);
+    }
+
+    #[test]
+    fn test_multilingual_keyword_chinese() {
+        let s = sanitize_event_for_ade(&spawn("/tmp/总是允许.bin"));
+        assert!(s.injection_flags.iter().any(|f| matches!(
+            f,
+            InjectionFlag::MultilingualKeyword { lang, .. } if lang == "zh"
+        )));
+    }
+
+    #[test]
+    fn test_multilingual_keyword_italian() {
+        let s = sanitize_event_for_ade(&spawn("/tmp/permetti_sempre.sh"));
+        assert!(s.injection_flags.iter().any(|f| matches!(
+            f,
+            InjectionFlag::MultilingualKeyword { lang, .. } if lang == "it"
+        )));
+    }
+
+    #[test]
+    fn test_rot13_simple() {
+        // ROT13("ignore_previous") = "vtaber_cerivbhf"
+        let s = sanitize_event_for_ade(&spawn("/tmp/vtaber_cerivbhf.sh"));
+        assert!(
+            s.injection_flags
+                .iter()
+                .any(|f| matches!(f, InjectionFlag::RotEncoded { .. })),
+            "expected RotEncoded, got {:?}",
+            s.injection_flags
+        );
+    }
+
+    #[test]
+    fn test_rot13_no_false_positive() {
+        // A mundane filename with no ROT13-decodable instruction.
+        let s = sanitize_event_for_ade(&spawn("/usr/bin/python3"));
+        assert!(!s
+            .injection_flags
+            .iter()
+            .any(|f| matches!(f, InjectionFlag::RotEncoded { .. })));
+    }
+
+    #[test]
+    fn test_visual_substitution_ls() {
+        let s = sanitize_event_for_ade(&spawn("/usr/bin/l5"));
+        assert!(
+            s.injection_flags.iter().any(|f| matches!(
+                f,
+                InjectionFlag::VisualSubstitution { suspected_target, actual }
+                if suspected_target == "ls" && actual == "l5"
+            )),
+            "expected VisualSubstitution(ls~l5), got {:?}",
+            s.injection_flags
+        );
+    }
+
+    #[test]
+    fn test_visual_substitution_ssh() {
+        let s = sanitize_event_for_ade(&spawn("/usr/bin/55h"));
+        assert!(s.injection_flags.iter().any(|f| matches!(
+            f,
+            InjectionFlag::VisualSubstitution { suspected_target, .. } if suspected_target == "ssh"
+        )));
+    }
+
+    #[test]
+    fn test_visual_substitution_legitimate_pass() {
+        // python3 has a digit but is in no lookalike pair.
+        let s = sanitize_event_for_ade(&spawn("/usr/bin/python3"));
+        assert!(!s
+            .injection_flags
+            .iter()
+            .any(|f| matches!(f, InjectionFlag::VisualSubstitution { .. })));
+    }
+
+    #[test]
+    fn test_variant_separator_dash() {
+        let s = sanitize_event_for_ade(&dns("northnarrow-rule-allow-this-user.example.com"));
+        assert!(
+            s.injection_flags
+                .iter()
+                .any(|f| matches!(f, InjectionFlag::VariantSeparator { .. })),
+            "expected VariantSeparator, got {:?}",
+            s.injection_flags
+        );
+    }
+
+    #[test]
+    fn test_variant_separator_underscore() {
+        let s = sanitize_event_for_ade(&spawn("/tmp/northnarrow_admin_grant.bin"));
+        assert!(s
+            .injection_flags
+            .iter()
+            .any(|f| matches!(f, InjectionFlag::VariantSeparator { .. })));
+    }
+
+    #[test]
+    fn test_variant_separator_north_narrow() {
+        let s = sanitize_event_for_ade(&spawn("/tmp/north-narrow_override.bin"));
+        assert!(s
+            .injection_flags
+            .iter()
+            .any(|f| matches!(f, InjectionFlag::VariantSeparator { .. })));
+    }
+
+    #[test]
+    fn test_score_aggregation_multiple_flags() {
+        // multilingual (it) + variant separator + visual sub.
+        let s = sanitize_event_for_ade(&spawn("/usr/bin/l5_permetti_sempre_northnarrow-grant"));
+        let kinds: Vec<&InjectionFlag> = s.injection_flags.iter().collect();
+        let has_ml = kinds
+            .iter()
+            .any(|f| matches!(f, InjectionFlag::MultilingualKeyword { .. }));
+        let has_vsep = kinds
+            .iter()
+            .any(|f| matches!(f, InjectionFlag::VariantSeparator { .. }));
+        assert!(
+            has_ml && has_vsep,
+            "expected ml + variant_sep, got {:?}",
+            s.injection_flags
+        );
+        assert!(
+            s.injection_score >= 0.7,
+            "score should aggregate across families, got {}",
+            s.injection_score
+        );
     }
 }
