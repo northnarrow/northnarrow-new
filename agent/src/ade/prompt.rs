@@ -1,10 +1,17 @@
 //! Prompt assembly for ADE.
 //!
-//! The system prompt is loaded once at startup; per-event prompts
-//! sandwich the (canonical) event JSON between the system prompt and
-//! a short reminder of the output contract. Recent correlated events
-//! and host context get folded in as compact lines so a 2K-token
-//! context window stays roomy enough for the example block.
+//! The prompt has two parts:
+//!
+//! - the [`SystemPrompt`] — loaded once at startup, holds the schema,
+//!   the 5-step procedure, and few-shot examples.
+//! - the per-event "user" message — host context, correlated events,
+//!   and the focal event itself.
+//!
+//! Wrapping the two parts into a chat template is the backend's
+//! responsibility (Llama 3.1 wants `<|begin_of_text|>` /
+//! `<|start_header_id|>` markers; the mock backend doesn't care).
+//! See [`PromptParts::into_llama3_chat`] and
+//! [`PromptParts::into_plain_text`].
 //!
 //! Truncation strategy when the prompt grows past
 //! `max_context_tokens`: drop oldest correlated events first; never
@@ -38,36 +45,76 @@ impl SystemPrompt {
     }
 }
 
-/// Build the full prompt sent to the model for a single event.
+/// Split prompt: system role + user role. Backends apply their own
+/// chat template.
+#[derive(Debug, Clone)]
+pub struct PromptParts {
+    pub system: String,
+    pub user: String,
+}
+
+impl PromptParts {
+    /// Llama 3.1 chat template. The leading `<|begin_of_text|>` is
+    /// included literally because backends typically pass
+    /// `add_special_tokens=false` to the tokenizer to keep the
+    /// template explicit and reproducible.
+    pub fn into_llama3_chat(self) -> String {
+        format!(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n\
+             {system}<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\n\
+             {user}<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n",
+            system = self.system,
+            user = self.user,
+        )
+    }
+
+    /// Plain concatenation — used by `MockBackend` (which ignores
+    /// the prompt content anyway) and by older test fixtures.
+    pub fn into_plain_text(self) -> String {
+        format!("{}\n\n{}", self.system, self.user)
+    }
+}
+
+/// Build the structured prompt for a single event. Returns
+/// `(system, user)` parts; the backend formats the chat template.
 pub fn build_event_prompt(
     system: &SystemPrompt,
     config: &AdeConfig,
     event: &Event,
     context: &EventContext,
-) -> String {
-    let mut buf = String::with_capacity(system.raw.len() + 1024);
-    buf.push_str(&system.raw);
-    buf.push_str("\n\n## Contesto host\n");
-    push_host_context(&mut buf, &context.host_context);
+) -> PromptParts {
+    let mut user = String::with_capacity(1024);
+    user.push_str("## Contesto host\n");
+    push_host_context(&mut user, &context.host_context);
     if let Some(role) = &config.host_role {
-        buf.push_str(&format!("- host_role: {role}\n"));
+        user.push_str(&format!("- host_role: {role}\n"));
     }
-    buf.push_str(&format!("- language_used: {}\n", config.language));
+    user.push_str(&format!("- language_used: {}\n", config.language));
 
     if !context.recent_events.is_empty() {
-        buf.push_str("\n## Eventi correlati recenti\n");
-        // Newest first; the trace context only really helps for the
-        // last few events anyway.
+        user.push_str("\n## Eventi correlati recenti\n");
+        // Newest-first scan, then take 20: the freshest correlated
+        // events matter most for the analyst's hypothesis.
         for e in context.recent_events.iter().rev().take(20) {
-            buf.push_str(&format_event_line(e));
-            buf.push('\n');
+            user.push_str(&format_event_line(e));
+            user.push('\n');
         }
     }
 
-    buf.push_str("\n## Evento da analizzare\n");
-    buf.push_str(&format_event_block(event));
-    buf.push_str("\n\n## Output\nProduci ora il JSON ADE v1.0.0 conforme allo schema.\n");
-    buf
+    user.push_str("\n## Evento da analizzare\n");
+    user.push_str(&format_event_block(event));
+    user.push_str(
+        "\n\n## Output\n\
+         Produci ora il JSON ADE v1.0.0 conforme allo schema. \
+         Niente prosa prima/dopo. Niente code fences.\n",
+    );
+
+    PromptParts {
+        system: system.raw.clone(),
+        user,
+    }
 }
 
 fn push_host_context(buf: &mut String, ctx: &HostContext) {
@@ -156,7 +203,7 @@ mod tests {
     #[test]
     fn build_event_prompt_includes_event_and_host() {
         let sys = SystemPrompt {
-            raw: "PROMPT\n".into(),
+            raw: "PROMPT".into(),
         };
         let cfg = AdeConfig::default();
         let event = Event::ProcessSpawn {
@@ -172,18 +219,18 @@ mod tests {
             recent_events: vec![],
             host_context: host(),
         };
-        let p = build_event_prompt(&sys, &cfg, &event, &ctx);
-        assert!(p.contains("PROMPT"));
-        assert!(p.contains("hostname: h1"));
-        assert!(p.contains("language_used: it-IT"));
-        assert!(p.contains("/bin/ls"));
-        assert!(p.contains("Evento da analizzare"));
+        let parts = build_event_prompt(&sys, &cfg, &event, &ctx);
+        assert_eq!(parts.system, "PROMPT");
+        assert!(parts.user.contains("hostname: h1"));
+        assert!(parts.user.contains("language_used: it-IT"));
+        assert!(parts.user.contains("/bin/ls"));
+        assert!(parts.user.contains("Evento da analizzare"));
     }
 
     #[test]
     fn build_event_prompt_includes_recent_events_when_present() {
         let sys = SystemPrompt {
-            raw: "PROMPT\n".into(),
+            raw: "PROMPT".into(),
         };
         let cfg = AdeConfig::default();
         let focal = Event::ProcessSpawn {
@@ -208,8 +255,38 @@ mod tests {
             recent_events: vec![recent],
             host_context: host(),
         };
-        let p = build_event_prompt(&sys, &cfg, &focal, &ctx);
-        assert!(p.contains("Eventi correlati recenti"));
-        assert!(p.contains("/tmp/parent"));
+        let parts = build_event_prompt(&sys, &cfg, &focal, &ctx);
+        assert!(parts.user.contains("Eventi correlati recenti"));
+        assert!(parts.user.contains("/tmp/parent"));
+    }
+
+    #[test]
+    fn llama3_chat_template_round_trip_has_required_markers() {
+        let parts = PromptParts {
+            system: "S".into(),
+            user: "U".into(),
+        };
+        let s = parts.into_llama3_chat();
+        assert!(s.starts_with("<|begin_of_text|>"));
+        assert!(s.contains("<|start_header_id|>system<|end_header_id|>"));
+        assert!(s.contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(s.contains("<|start_header_id|>assistant<|end_header_id|>"));
+        assert!(s.contains("<|eot_id|>"));
+        assert!(s.contains("\nS<|eot_id|>"));
+        assert!(s.contains("\nU<|eot_id|>"));
+        // Trailing newlines after the assistant header give the model
+        // a clean place to start its first JSON token.
+        assert!(s.ends_with("<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn plain_text_template_concatenates_system_and_user() {
+        let parts = PromptParts {
+            system: "S".into(),
+            user: "U".into(),
+        };
+        let s = parts.into_plain_text();
+        assert!(s.starts_with("S"));
+        assert!(s.ends_with("U"));
     }
 }

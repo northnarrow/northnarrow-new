@@ -80,8 +80,18 @@ impl VerdictParser {
     }
 
     pub fn parse(&self, raw: &str) -> Result<AdeVerdict, ValidationError> {
-        let trimmed = strip_code_fences(raw);
-        let verdict: AdeVerdict = serde_json::from_str(trimmed)
+        // Reasoning models (Foundation-Sec-8B-Reasoning, Qwen-R1, …)
+        // emit `<think> … </think>` before the final answer. We
+        // discard the chain of thought — it can leak details we
+        // don't want stamped into the verdict, and it isn't part of
+        // the schema. If `<think>` is opened but never closed, that
+        // means the model exhausted its budget without committing
+        // to a verdict → MalformedJson, which the engine folds into
+        // an Escalate Tier1.
+        let post_think = strip_thinking_block(raw)?;
+        let trimmed = strip_code_fences(post_think);
+        let json_slice = extract_first_json_object(trimmed).unwrap_or(trimmed);
+        let verdict: AdeVerdict = serde_json::from_str(json_slice)
             .map_err(|e| ValidationError::MalformedJson(e.to_string()))?;
         self.validate(&verdict)?;
         Ok(verdict)
@@ -220,6 +230,63 @@ fn strip_code_fences(raw: &str) -> &str {
         return rest.trim().strip_suffix("```").unwrap_or(rest).trim();
     }
     trimmed
+}
+
+/// Removes a `<think> … </think>` reasoning block if present.
+/// Returns the substring AFTER `</think>`. If the block is opened
+/// but never closed, returns `Err` — the engine will fold this into
+/// an Escalate Tier1 verdict.
+fn strip_thinking_block(raw: &str) -> Result<&str, ValidationError> {
+    let trimmed = raw.trim_start();
+    let Some(open_idx) = trimmed.find("<think>") else {
+        return Ok(raw);
+    };
+    let after_open = &trimmed[open_idx + "<think>".len()..];
+    let close_rel = after_open.find("</think>").ok_or_else(|| {
+        ValidationError::MalformedJson(
+            "model opened <think> but never produced </think> — likely \
+             ran out of token budget mid-reasoning"
+                .into(),
+        )
+    })?;
+    Ok(after_open[close_rel + "</think>".len()..].trim_start())
+}
+
+/// Extract the first balanced `{ … }` JSON object from `s`. Useful
+/// when reasoning models emit prose around the answer despite the
+/// prompt's instructions.
+///
+/// Returns `None` if no balanced object is found.
+fn extract_first_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Lower-case canonical UUID v4: 8-4-4-4-12 hex with the version
@@ -631,6 +698,55 @@ mod tests {
             "future_field_2027":"safe to ignore"
         }"#;
         parser().parse(raw).expect("forward-compatible");
+    }
+
+    #[test]
+    fn strips_reasoning_block_before_parse() {
+        let raw = "<think>let me think about this carefully\n\
+                   the user wants me to alert on nmap...</think>\n\
+                   {\"schema_version\":\"1.0.0\",\
+                   \"trace_id\":\"00000000-0000-4000-8000-000000000000\",\
+                   \"timestamp_utc\":\"2026-05-09T08:00:00Z\",\
+                   \"language_used\":\"it-IT\",\
+                   \"verdict\":\"Alert\",\
+                   \"severity\":\"Medium\",\
+                   \"confidence\":0.65,\
+                   \"threat_classification\":{\"family\":\"u\",\"kind\":\"k\",\"novelty\":0.5},\
+                   \"reasoning\":{\"step_1_extract\":\"x\",\"step_2_pattern_match\":\"x\",\"step_3_criticality\":\"x\",\"step_4_alternative_explanations\":{\"legitimate_uses\":[\"x\"],\"assessment\":\"x\"},\"step_5_decision\":\"x\"},\
+                   \"evidence\":{\"primary_indicators\":[\"x\"]},\
+                   \"mitre_attack\":{\"tactic\":[\"TA0002\"]},\
+                   \"recommended_action\":{\"action\":\"Alert\",\"justification\":\"x\"},\
+                   \"follow_up\":{\"policy\":\"None\"},\
+                   \"metadata\":{\"model_id\":\"x\",\"model_quantization\":\"Q4\",\"backend\":\"candle\",\"host_id\":\"h\",\"agent_version\":\"v\",\"inference_latency_ms\":0}}";
+        let v = parser().parse(raw).expect("parse after thinking");
+        assert_eq!(v.verdict, AdeAction::Alert);
+    }
+
+    #[test]
+    fn unclosed_thinking_block_is_malformed() {
+        let raw = "<think>let me think...\n\nlots of words and tokens but never </ tag";
+        let err = parser().parse(raw).unwrap_err();
+        assert!(matches!(err, ValidationError::MalformedJson(_)));
+    }
+
+    #[test]
+    fn extracts_balanced_json_with_prose_around_it() {
+        let raw = "blah blah\n\n{\"schema_version\":\"1.0.0\",\
+                   \"trace_id\":\"00000000-0000-4000-8000-000000000000\",\
+                   \"timestamp_utc\":\"2026-05-09T08:00:00Z\",\
+                   \"language_used\":\"it-IT\",\
+                   \"verdict\":\"Alert\",\
+                   \"severity\":\"Medium\",\
+                   \"confidence\":0.65,\
+                   \"threat_classification\":{\"family\":\"u\",\"kind\":\"k\",\"novelty\":0.5},\
+                   \"reasoning\":{\"step_1_extract\":\"x\",\"step_2_pattern_match\":\"x\",\"step_3_criticality\":\"x\",\"step_4_alternative_explanations\":{\"legitimate_uses\":[\"x\"],\"assessment\":\"x\"},\"step_5_decision\":\"x\"},\
+                   \"evidence\":{\"primary_indicators\":[\"x\"]},\
+                   \"mitre_attack\":{\"tactic\":[\"TA0002\"]},\
+                   \"recommended_action\":{\"action\":\"Alert\",\"justification\":\"x\"},\
+                   \"follow_up\":{\"policy\":\"None\"},\
+                   \"metadata\":{\"model_id\":\"x\",\"model_quantization\":\"Q4\",\"backend\":\"candle\",\"host_id\":\"h\",\"agent_version\":\"v\",\"inference_latency_ms\":0}}\nfinal note ignored";
+        let v = parser().parse(raw).expect("parse with prose around");
+        assert_eq!(v.verdict, AdeAction::Alert);
     }
 
     #[test]

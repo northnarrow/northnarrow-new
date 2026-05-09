@@ -52,6 +52,14 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "std"
 clap = { workspace = true }
 parking_lot = "0.12"
 
+# Sub-tappa 6.1: real LLM inference backend (candle, Llama 3.1 GGUF).
+# CPU-only by default; CUDA/Metal can be enabled via candle features
+# behind an `ade-gpu` flag in a follow-up sub-tappa.
+candle-core = { version = "0.10", default-features = false }
+candle-transformers = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"

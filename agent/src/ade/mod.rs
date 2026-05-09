@@ -17,6 +17,7 @@
 //!
 //! All public types are re-exported from this module.
 
+pub mod backend_candle;
 pub mod config;
 pub mod context;
 pub mod error;
@@ -116,12 +117,16 @@ impl AdeEngine {
         event: &Event,
         context: &EventContext,
     ) -> Result<AdeVerdict, AdeError> {
-        let prompt = prompt::build_event_prompt(
+        let parts = prompt::build_event_prompt(
             &self.inner.system_prompt,
             &self.inner.config,
             event,
             context,
         );
+        let prompt = match self.inner.backend.chat_template() {
+            inference::ChatTemplate::Llama3 => parts.into_llama3_chat(),
+            inference::ChatTemplate::Plain => parts.into_plain_text(),
+        };
 
         let backend = self.inner.backend.clone();
         let event_owned = event.clone();
@@ -218,14 +223,40 @@ impl AdeEngine {
     }
 }
 
+/// Build the production backend with a graceful fallback chain.
+///
+/// Order: Candle (Llama 3.1 GGUF) → Mock (last resort).
+///
+/// Sub-tappa 6.1 ships the Candle path as the production backend.
+/// If candle fails for any reason (missing tokenizer, GGUF parse
+/// error, OOM during weight load) we log loudly and fall back to
+/// `MockBackend` so the agent stays alive and the rule engine still
+/// runs. CI runs without a model and naturally rejects ahead of
+/// this branch via `ModelMissing`.
 fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>, AdeError> {
-    // Tappa 6 ships only `MockBackend`. The model path must still
-    // exist so the metadata accurately advertises the founder's
-    // GGUF; future native backends will swap themselves in here.
     if !config.model_path.exists() {
         return Err(AdeError::ModelMissing {
             path: config.model_path.clone(),
         });
     }
+
+    match backend_candle::CandleBackend::load(&config.model_path) {
+        Ok(backend) => {
+            tracing::info!(
+                backend = "candle-llama3.1",
+                model = %config.model_path.display(),
+                "ADE backend loaded"
+            );
+            return Ok(Arc::new(backend));
+        }
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                model = %config.model_path.display(),
+                "candle backend failed to load, falling back to MockBackend"
+            );
+        }
+    }
+
     Ok(Arc::new(MockBackend::from_model_path(&config.model_path)))
 }

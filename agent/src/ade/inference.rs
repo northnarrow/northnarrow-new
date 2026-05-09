@@ -46,13 +46,26 @@ use common::Event;
 
 use super::error::AdeError;
 
+/// Chat template a backend wants the engine to apply when assembling
+/// the prompt. The engine uses [`super::prompt::PromptParts`] as the
+/// canonical split; this enum just selects the wrapper format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplate {
+    /// Plain `system\n\nuser` concatenation. Used by `MockBackend`
+    /// (which ignores prompt content anyway) and any backend whose
+    /// model wasn't trained with a chat template.
+    Plain,
+    /// Llama 3.1 `<|begin_of_text|>` + `<|start_header_id|>` markers.
+    Llama3,
+}
+
 /// Pluggable inference backend.
 ///
 /// Implementations must be `Send + Sync` so the engine can hand out
 /// `Arc<dyn InferenceBackend>` across tokio tasks. `generate` is
 /// expected to block; the engine wraps it in `spawn_blocking`.
 pub trait InferenceBackend: Send + Sync {
-    /// Display name (`"mock"`, `"llama-cpp"`, `"candle-gemma3"`, …).
+    /// Display name (`"mock"`, `"candle-llama3.1"`, …).
     fn name(&self) -> &str;
 
     /// Quantization label exposed in metadata (`"Q4_K_M"`, `"f16"`, …).
@@ -61,8 +74,14 @@ pub trait InferenceBackend: Send + Sync {
     /// Model identifier exposed in metadata.
     fn model_id(&self) -> &str;
 
+    /// Chat template format the backend expects. Defaults to plain.
+    fn chat_template(&self) -> ChatTemplate {
+        ChatTemplate::Plain
+    }
+
     /// Synchronous text-completion. Returns the raw model output
-    /// without any post-processing.
+    /// without any post-processing (the engine's parser strips
+    /// `<think>` blocks and code fences).
     fn generate(
         &self,
         prompt: &str,

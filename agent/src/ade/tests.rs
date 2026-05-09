@@ -271,3 +271,52 @@ async fn ignored_ade_loads_real_model_path() {
         Arc::new(MockBackend::from_model_path(&cfg.model_path));
     let _engine = AdeEngine::new_with_backend(cfg, backend).await.unwrap();
 }
+
+/// Sub-tappa 6.1 — exercises the real Candle backend if the
+/// founder's GGUF is on disk. Skipped silently when the model is
+/// missing (CI). Run with:
+///     cargo test -p northnarrow-agent --release \
+///         -- --ignored ade::tests::ignored_candle_real_inference
+#[tokio::test]
+#[ignore]
+async fn ignored_candle_real_inference() {
+    use crate::ade::backend_candle::CandleBackend;
+
+    let cfg = AdeConfig::default();
+    if !cfg.model_path.exists() {
+        eprintln!(
+            "skipping: model not present at {}",
+            cfg.model_path.display()
+        );
+        return;
+    }
+    if CandleBackend::locate_tokenizer(&cfg.model_path).is_none() {
+        eprintln!("skipping: tokenizer.json not present next to model");
+        return;
+    }
+    if !cfg.system_prompt_path.exists() {
+        eprintln!("skipping: prompt not present");
+        return;
+    }
+
+    let backend = CandleBackend::load(&cfg.model_path).expect("candle load");
+    let backend: Arc<dyn InferenceBackend> = Arc::new(backend);
+    let engine = AdeEngine::new_with_backend(cfg, backend).await.unwrap();
+
+    let event = Event::ProcessSpawn {
+        pid: 9999,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "xmrig".into(),
+        filename: "/tmp/.cache/x".into(),
+        timestamp_ns: 0,
+    };
+    let ctx = EventContext {
+        recent_events: vec![],
+        host_context: HostContext::discover(),
+    };
+    let v = engine.evaluate(&event, &ctx).await.expect("real inference");
+    eprintln!("verdict={} confidence={:.2}", v.verdict, v.confidence);
+    assert_eq!(v.metadata.backend, "candle-llama3.1");
+}

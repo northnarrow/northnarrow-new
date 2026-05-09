@@ -186,7 +186,8 @@ where
         let mut drained = 0u32;
         while let Some(item) = inner.next() {
             drained += 1;
-            match bytemuck::try_from_bytes::<T>(item.as_ref()) {
+            let bytes: &[u8] = item.as_ref();
+            match bytemuck::try_from_bytes::<T>(bytes) {
                 Ok(raw) => {
                     if tx.send(Event::from(raw)).await.is_err() {
                         return Ok(());
@@ -195,7 +196,7 @@ where
                 Err(e) => warn!(
                     label,
                     expected = std::mem::size_of::<T>(),
-                    got = item.as_ref().len(),
+                    got = bytes.len(),
                     error = %e,
                     "ringbuf entry rejected"
                 ),
