@@ -9,5 +9,6 @@
 pub mod ade;
 pub mod correlation;
 pub mod decision;
+pub mod posture;
 pub mod response;
 pub mod sensors;
