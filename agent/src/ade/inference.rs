@@ -59,6 +59,17 @@ pub enum ChatTemplate {
     Llama3,
 }
 
+/// Token-streaming control returned from a `generate_streaming`
+/// callback (Sub-tappa 6.8). The backend checks this after every
+/// decoded token and stops the loop when `Stop` is returned, freeing
+/// the engine to terminate inference as soon as the verdict JSON is
+/// complete instead of running to `max_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamControl {
+    Continue,
+    Stop,
+}
+
 /// Pluggable inference backend.
 ///
 /// Implementations must be `Send + Sync` so the engine can hand out
@@ -90,6 +101,35 @@ pub trait InferenceBackend: Send + Sync {
         temperature: f32,
         top_p: f32,
     ) -> Result<String, AdeError>;
+
+    /// Streaming text-completion (Sub-tappa 6.8).
+    ///
+    /// Calls `on_token` once per decoded token chunk and stops the
+    /// decode loop the moment the callback returns
+    /// [`StreamControl::Stop`]. The default implementation falls
+    /// back to [`Self::generate`] and emits the full output as a
+    /// single callback at the end — every backend stays compatible
+    /// without overriding, only `CandleBackend` actually streams
+    /// per-token.
+    ///
+    /// Returns the full text generated up to (and including) the
+    /// terminating chunk, regardless of how the loop ended.
+    fn generate_streaming(
+        &self,
+        prompt: &str,
+        focal_event: &Event,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        mut on_token: Box<dyn FnMut(&str) -> StreamControl + Send>,
+    ) -> Result<String, AdeError> {
+        let raw = self.generate(prompt, focal_event, max_tokens, temperature, top_p)?;
+        // Emit the entire output as one chunk so callers that fold
+        // a streaming JSON detector still see every byte. We ignore
+        // the returned StreamControl: there is nothing else to feed.
+        let _ = on_token(&raw);
+        Ok(raw)
+    }
 
     /// Best-effort warmup. Default impl is a no-op; backends that
     /// have a measurable cold start should override it.

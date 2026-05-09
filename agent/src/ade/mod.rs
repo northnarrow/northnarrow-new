@@ -51,7 +51,7 @@ pub use dual_verify::{
 };
 pub use error::AdeError;
 pub use escalate::{transform_to_escalate, EscalateMeta};
-pub use inference::{InferenceBackend, MockBackend};
+pub use inference::{InferenceBackend, MockBackend, StreamControl};
 pub use parser::{ValidationError, VerdictParser};
 pub use rag_integration::{build_rag_query_from_event, format_rag_block};
 pub use sanitize::{sanitize_event_for_ade, InjectionFlag, SanitizedEvent};
