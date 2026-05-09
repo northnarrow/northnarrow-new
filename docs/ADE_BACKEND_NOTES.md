@@ -1,91 +1,113 @@
-# ADE Inference Backend — Tappa 6 Notes
+# ADE Inference Backend — Status Notes
 
-## Status as of Tappa 6 closure
+## Status
 
-The Active Defense Engine ships behind a trait
-([`InferenceBackend`](../agent/src/ade/inference.rs)) with a single
-production implementation: `MockBackend`. The Mock is deterministic,
-schema-valid, and pattern-matches the five canonical few-shot
-examples from `dataset/system_prompt_v1.md` so the rest of the
-pipeline (parser, escalate, stats, wiring) can be exercised without
-a GGUF dependency.
+- **Tappa 6 base** — closed with `MockBackend` only. Trait surface
+  in place, parser/escalate/wiring exercised end-to-end.
+- **Sub-tappa 6.1 (this document's commit)** — `CandleBackend` ships
+  as the production backend. Foundation-Sec-8B-Reasoning Q4_K_M
+  GGUF (architecture `llama`) loads natively via candle 0.10's
+  `quantized_llama::ModelWeights`. `MockBackend` retained as a
+  graceful fallback when the model is missing or fails to load (CI,
+  --no-ade, dev workstations without the GGUF).
 
-No real LLM backend is wired in. The reasoning is below; the next
-sub-tappa picks one and replaces `build_default_backend` in
-`agent/src/ade/mod.rs`.
+## Backend choice (Sub-tappa 6.1)
 
-## The model
+Tried in spec order; stopped at the first that worked.
 
-The founder pre-supplied
-`/home/forty/models/gemma-4-E4B-it-Q4_K_M.gguf` (Unsloth quant of
-`google/gemma-4-E4B-it`). GGUF metadata reports:
+| Option | Engine | Verdict | Why |
+|--------|--------|---------|-----|
+| A      | candle 0.10 (Llama 3.1) | ✅ shipped | native Llama support, 100% Rust, charter preserved |
+| B      | mistral.rs | ⏭️ skipped | not needed |
+| C      | llama-cpp-2 | ⏭️ skipped | not needed |
 
-- `general.architecture = "gemma4"`
-- 42 layers, 128K context, sliding window 512
-- GQA with `head_count=8`, `head_count_kv=2`
-- `shared_kv_layers = 18`
-- final-logit soft-capping (Gemma feature)
-- Q4_K_M quantization, ~4.5 GB on disk
+Foundation-Sec-8B-Reasoning is built on Llama 3.1 with continual
+pretraining + RLVR for cybersecurity. Its GGUF metadata advertises
+`general.architecture = "llama"`, `block_count = 32`,
+`embedding_length = 4096`, `context_length = 131072`. Candle 0.10's
+`quantized_llama::ModelWeights::from_gguf` consumes it without
+modification.
 
-The novelties (`shared_kv_layers`, mixed sliding-window/global
-attention, soft-cap on logits) make Gemma 4 architecturally distinct
-from Gemma 2 / Gemma 3 — generic Gemma-2 inference code WILL NOT
-work.
+## Model files
 
-## Rust ecosystem snapshot (May 2026)
+- `/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.gguf`
+  (~4.92 GB) — production model.
+- `/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.tokenizer.json`
+  (~17 MB) — Llama 3.1 BPE tokenizer, fetched once from
+  `huggingface.co/fdtn-ai/Foundation-Sec-8B-Reasoning/resolve/main/tokenizer.json`.
+  The backend's `locate_tokenizer` looks for either
+  `<stem>.tokenizer.json` (preferred) or `tokenizer.json`.
+- `/home/forty/models/gemma-4-E4B-it-Q4_K_M.gguf` (~4.64 GB) — kept
+  for comparative benchmarks; pass via `--ade-model PATH`. Architecture
+  `gemma4` is NOT supported by candle 0.10 — Mock fallback applies.
 
-| Engine               | Gemma support                        | Verdict |
-| -------------------- | ------------------------------------ | ------- |
-| `candle-transformers 0.7+` | gemma, gemma2, gemma3 (NOT gemma4) | rejected — would require a custom port mirroring sliding-window + shared_kv |
-| `mistral.rs 0.3`     | gemma3n claimed; gemma4 untested     | candidate, but adds a heavy dep tree (Send/Sync/threadpool/etc.) and untested with the founder's GGUF |
-| `llama-cpp-2`        | full gemma4 support                  | works, but pulls a C++ build dep that contradicts the "100% Rust" charter |
+## Prompt + chat template
 
-## Decision
+The system prompt (`dataset/system_prompt_v1.md`) stays
+model-agnostic — it documents the schema, the 5-step procedure, and
+five few-shot examples in plain markdown.
 
-**Ship `MockBackend` for Tappa 6 closure, defer real backend to a
-follow-up sub-tappa.**
+`PromptParts { system, user }` is the canonical split. Backends pick
+their template via `InferenceBackend::chat_template`:
 
-The Mock is:
+- `ChatTemplate::Plain` — `system\n\nuser` concat. Used by Mock.
+- `ChatTemplate::Llama3` — `<|begin_of_text|>` +
+  `<|start_header_id|>{role}<|end_header_id|>` markers + `<|eot_id|>`
+  separators. Used by `CandleBackend`.
 
-- deterministic — CI hash-stable, no flake
-- schema-valid — exercises every parser code path on every push
-- pattern-aware — produces the right verdict class for the canonical
-  test events (xmrig → Kill, lockbit → KillTree, cargo → Allow,
-  nmap → Alert, anything else → Escalate)
-- fast — adds ~120 ms of synthetic latency per call so latency
-  percentiles look realistic in the demo
+## Reasoning-model output handling
 
-## Migration plan
+Foundation-Sec-Reasoning emits a `<think>...</think>` reasoning chain
+before the JSON answer. The parser strips it before `serde_json`
+parsing:
 
-When picking up the next sub-tappa, drop a new struct that implements
-`InferenceBackend` next to `MockBackend` and route to it via
-`build_default_backend` in `agent/src/ade/mod.rs`. No other module
-needs to change.
+```
+<think>let me consider the alternatives...</think>
+{ "schema_version": "1.0.0", ... }
+```
 
-Recommended order:
+If the model exhausts its output budget mid-`<think>` (no closing
+tag), the parser returns `MalformedJson("model opened <think> but
+never produced </think>...")` and the engine folds it into a Tier1
+Escalate verdict — the safe default for indeterminate state.
 
-1. **First attempt: mistral.rs**
-   - Pro: pure Rust, gemma3n landed; gemma4 GGUF can be tried with
-     `--gemma3n` heuristic
-   - Risk: shared_kv_layers handling may produce garbage tokens
-2. **If that fails: pin to a Gemma 3 1B/4B GGUF (`google/gemma-3-4b-it`)**
-   - Pro: candle 0.7 supports this architecture today
-   - Cost: smaller model, slightly worse reasoning quality
-   - Latency target: p50 < 3 s on CPU, p95 < 8 s
-3. **Last resort: `llama-cpp-2` behind a `ade-llamacpp` feature flag**
-   - Document as tech debt with a TODO pointing back to options 1 / 2
+The parser also extracts the first balanced `{ ... }` from the
+remaining text, so the model can wrap its JSON in prose without
+breaking validation.
 
-## What `MockBackend` does NOT exercise
+## Prompt window + output budget
 
-The follow-up sub-tappa MUST verify:
+- `MAX_PROMPT_TOKENS = 4096` — Foundation-Sec advertises 128 K
+  context, but on CPU each kilo-token of prompt costs roughly half a
+  second of prefill time. 4 K is the sweet spot for the 5-example
+  few-shot block + correlated events + focal event.
+- `MAX_OUTPUT_TOKENS_HARD_CAP = 2048` — bounded so the engine's
+  15 s timeout actually fires when the model misbehaves.
 
-- real model load (warmup latency, RAM ceiling)
-- prompt context truncation when the input exceeds 2048 tokens
-- token streaming (currently all-at-once)
-- hard timeout under genuinely slow CPU inference (the Mock returns
-  in ~120 ms, never exercising the 15 s timeout)
-- malformed real-world outputs (the Mock can't actually generate
-  invalid JSON)
+If the assembled prompt exceeds the cap, the backend truncates from
+the **front** to preserve the focal event (which is appended last in
+`build_event_prompt`).
 
-Track these with `#[ignore]`d integration tests gated on the model
-file's existence.
+## Performance — measured
+
+Run on the dev VM (CPU-only, AVX2). See the closing demo log of the
+Sub-tappa 6.1 commit chain for the canonical run:
+
+- model load (cold disk): ~7 s
+- warmup (1-token forward pass): ~1.4 s
+- p50 inference latency: see report
+- p95 inference latency: see report
+- peak resident set size: see report
+
+## Future work
+
+- **GPU support**: feature flag `ade-gpu` enabling candle's `cuda` or
+  `metal` features. Drop-in for the same `CandleBackend`.
+- **Streaming output**: today the engine waits for the full
+  generation; emitting tokens as they arrive would let the agent
+  start logging the verdict before the model finishes thinking.
+- **mistral.rs alternative**: keep on the table if candle ever
+  regresses on Llama 3.1.
+- **Gemma 4 support**: when candle picks up `gemma4` architecture
+  natively, `build_default_backend` can choose the right backend by
+  reading `general.architecture` from the GGUF metadata.

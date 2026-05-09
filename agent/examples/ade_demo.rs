@@ -8,22 +8,33 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::Event;
-use northnarrow_agent::ade::{
-    AdeConfig, AdeEngine, EventContext, HostContext, InferenceBackend, MockBackend,
-};
+use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Surface backend load + warmup messages so we can tell at a
+    // glance whether the real Candle backend or the Mock fallback
+    // is in use. Without this the runtime falls back silently.
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init();
+
     let model_path = PathBuf::from(
         std::env::var("ADE_MODEL").unwrap_or_else(|_| AdeConfig::DEFAULT_MODEL_PATH.to_string()),
     );
+    // The demo defaults to the minimal prompt (~600 tokens) so even
+    // a CPU-only VM without AVX2 can complete the full 10-inference
+    // bench in a reasonable wall time. Set ADE_PROMPT to the full
+    // few-shot prompt for quality benchmarks on AVX2/GPU machines.
     let prompt_path = PathBuf::from(
-        std::env::var("ADE_PROMPT")
-            .unwrap_or_else(|_| AdeConfig::DEFAULT_SYSTEM_PROMPT_PATH.to_string()),
+        std::env::var("ADE_PROMPT").unwrap_or_else(|_| "dataset/system_prompt_minimal.md".into()),
     );
 
     if !model_path.exists() {
@@ -44,14 +55,29 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Tunable via env vars for the latency bench. Defaults are
+    // generous enough that an 8B Q4 model on a CPU without AVX2
+    // (~1-2 tok/s) can still complete within the wall-time budget.
+    let timeout_secs: u64 = std::env::var("ADE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(240);
+    let max_output_tokens: usize = std::env::var("ADE_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
     let cfg = AdeConfig {
         model_path: model_path.clone(),
         system_prompt_path: prompt_path,
-        timeout: Duration::from_secs(15),
+        timeout: Duration::from_secs(timeout_secs),
+        max_output_tokens,
         ..AdeConfig::default()
     };
-    let backend: Arc<dyn InferenceBackend> = Arc::new(MockBackend::from_model_path(&model_path));
-    let engine = match AdeEngine::new_with_backend(cfg, backend).await {
+    // `AdeEngine::new` routes through `build_default_backend`, which
+    // prefers the real Candle backend and falls back to `MockBackend`
+    // if the GGUF cannot load. The demo does not lock down the choice
+    // — whatever the runtime picks is what we measure.
+    let engine = match AdeEngine::new(cfg).await {
         Ok(e) => e,
         Err(e) => {
             eprintln!("ade-demo: engine init failed: {e}");
