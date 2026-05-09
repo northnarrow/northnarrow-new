@@ -27,9 +27,7 @@ use common::Event;
 /// stay within the embedder's hot path.
 pub fn build_rag_query_from_event(event: &Event) -> String {
     match event {
-        Event::ProcessSpawn {
-            comm, filename, ..
-        } => format!("process {comm} from {filename}"),
+        Event::ProcessSpawn { comm, filename, .. } => format!("process {comm} from {filename}"),
         Event::FileOpen { filename, .. } => format!("file open {filename}"),
         Event::ExecCheck { filename, .. } => format!("exec check {filename}"),
         Event::TcpConnect {

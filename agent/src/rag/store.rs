@@ -100,7 +100,7 @@ impl RagStore {
     pub fn insert_batch(&mut self, docs: Vec<KbDocument>, embeddings: Vec<Vec<f32>>) -> usize {
         debug_assert_eq!(docs.len(), embeddings.len());
         let mut inserted = 0;
-        for (d, e) in docs.into_iter().zip(embeddings.into_iter()) {
+        for (d, e) in docs.into_iter().zip(embeddings) {
             let before = self.docs.len();
             self.insert(d, e);
             if self.docs.len() != before {

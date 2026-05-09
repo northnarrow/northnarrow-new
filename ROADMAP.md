@@ -236,6 +236,67 @@ ADE schema invariato (v1.0.0). Posture machine, structured prompt,
 sanity check, dual verify (gli altri 3 strati di Sub-tappa 6.6)
 non modificati.
 
+### Sub-tappa 6.7 — RAG knowledge base architetturale (chiusa)
+
+Aggiunge un layer di Retrieval-Augmented Generation tra l'evento
+e l'inferenza: prima che ADE chiami il modello, una knowledge base
+locale curata di 30 documenti viene interrogata via cosine
+similarity e gli hit più rilevanti vengono iniettati nel prompt
+come blocco TRUSTED. Risultato: ADE riconosce TTPs, IoCs, e
+threat-tooling che il modello base non conosce
+(post-knowledge-cutoff).
+
+Componenti:
+
+- `common::rag_types` — tipi serializzabili (`KbCategory`,
+  `KbDocument`, `RagDocument`, `RagResult`, `KB_EMBEDDING_DIM=384`).
+- `agent::rag::embedder` — `RagEmbedder` con embedding deterministico
+  via FNV-1a-hashed character 3- e 4-grams in 384 buckets,
+  L2-normalizzato. Stand-in per un futuro bge-small-en-v1.5 caricato
+  via candle.
+- `agent::rag::store` — `RagStore` in-memory con scan lineare
+  cosine top-k filtrato da soglia di similarità. Scelto al posto
+  di LanceDB perché lancedb 0.10 trascina datafusion + arrow-array
+  e raddoppia il tempo di compilazione, senza benefici a scala
+  30 documenti (lo scan lineare è in microsecondi).
+- `agent::rag::retrieval` — `RagEngine::with_seed(model_path)` +
+  `retrieve(RagQuery)`. Default top_k=3, min_similarity=0.15
+  (calibrata sul stand-in n-gram; con bge-small reale andrebbe
+  alzata a ~0.4).
+- `agent::rag::kb_seed` — 30 documenti hardcoded distribuiti
+  esattamente per la spec: 10 MITRE technique, 5 Sigma rule, 5
+  LOLBAS, 5 Linux pattern, 5 threat tool.
+- `agent::ade::rag_integration` — `build_rag_query_from_event`
+  (process spawn → "process {comm} from {filename}", DNS →
+  "dns query from {comm} to {qname}", TCP → "...port {port}", …)
+  e `format_rag_block` (rende RagResult come blocco TRUSTED nel
+  prompt strutturato, posizionato dopo l'host context e prima dei
+  dati untrusted).
+- `agent::ade::AdeEngine::with_rag(rag)` — wiring opt-in che
+  preserva byte-identicamente il comportamento pre-6.7 quando il
+  RAG è assente (tutti i test esistenti continuano a passare).
+
+Esempi (manual-run, non in CI):
+
+- `examples/rag_demo.rs` — 5 query canoniche → top-3 hit per query.
+- `examples/ade_with_rag.rs` — stesso evento (Cobalt Strike beacon)
+  valutato side-by-side con e senza RAG.
+
+Test: 32 nuovi test sempre-on (8 embedder, 7 store, 4 kb_seed, 8
+retrieval, 5 rag_integration). 0 ignored introdotti dalla 6.7. ADE
+schema invariato (v1.0.0).
+
+Deviazioni dalla spec (autorizzate dalla spec stessa, documentate
+nei commit):
+
+- LanceDB → vector store custom in-memory (deps troppo pesanti).
+- bge-small candle → hashed n-gram embedder (BERT GGUF non è
+  first-class in candle 0.10, fuori dal MINIMAL scope).
+
+Materiale per Sub-tappa 6.7+: caricamento bge-small reale via
+candle, persistenza on-disk del KB, ingestion da MITRE GitHub /
+Sigma / LOLBAS, threshold-tuning con embeddings semantici.
+
 ---
 
 ## Tappa 7 — Anti-tamper Linux

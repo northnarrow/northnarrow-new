@@ -142,6 +142,21 @@ impl RagEngine {
     }
 }
 
+// Helper trait used only inside tests for cleaner assertions.
+#[cfg(test)]
+trait TagsContainLossless {
+    fn tags_contain_lossless(&self, needle: &str) -> bool;
+}
+
+#[cfg(test)]
+impl TagsContainLossless for RagDocument {
+    fn tags_contain_lossless(&self, needle: &str) -> bool {
+        self.content.to_lowercase().contains(needle)
+            || self.title.to_lowercase().contains(needle)
+            || self.id.to_lowercase().contains(needle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,10 +165,7 @@ mod tests {
     fn engine_seeds_curated_kb() {
         let e = RagEngine::with_seed(None).expect("seed");
         let n = e.document_count();
-        assert!(
-            (28..=32).contains(&n),
-            "expected ~30 seeded docs, got {n}"
-        );
+        assert!((28..=32).contains(&n), "expected ~30 seeded docs, got {n}");
     }
 
     #[test]
@@ -282,20 +294,5 @@ mod tests {
                 "default threshold returned 0 docs for canonical query {q:?}"
             );
         }
-    }
-}
-
-// Helper trait used only inside tests for cleaner assertions.
-#[cfg(test)]
-trait TagsContainLossless {
-    fn tags_contain_lossless(&self, needle: &str) -> bool;
-}
-
-#[cfg(test)]
-impl TagsContainLossless for RagDocument {
-    fn tags_contain_lossless(&self, needle: &str) -> bool {
-        self.content.to_lowercase().contains(needle)
-            || self.title.to_lowercase().contains(needle)
-            || self.id.to_lowercase().contains(needle)
     }
 }
