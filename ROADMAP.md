@@ -297,6 +297,91 @@ Materiale per Sub-tappa 6.7+: caricamento bge-small reale via
 candle, persistenza on-disk del KB, ingestion da MITRE GitHub /
 Sigma / LOLBAS, threshold-tuning con embeddings semantici.
 
+### Sub-tappa 6.8 — Performance Optimization Pass (chiusa)
+
+Tre leve CPU-side per portare la latency end-to-end di ADE da
+~25 minuti (1500 token a 0.94 tok/s decode su Hetzner CCX23) verso
+i ~5 minuti necessari per uso realtime, senza GPU, senza redesign
+schema, senza cambiare modello (Foundation-Sec 8B Q4_K_M resta).
+
+Strati introdotti:
+
+- **Strato 1 — Hardware diagnostic.** `examples/diag_hw.rs`
+  stampa CPU model, ISA flags, fisici/logici, RAM, e due
+  micro-bench (matmul f32 single-thread + sequential read 1 GB)
+  che identificano se il deployment host è compute-bound o
+  memory-bound. Baseline CCX23: AMD EPYC Milan, AVX2+FMA+F16C,
+  ~19 GFLOPS single-thread, ~36 GB/s — documentato in
+  `docs/PERFORMANCE_HARDWARE.md`.
+- **Strato 2 — Build flags.** `.cargo/config.toml` esporta
+  `target-cpu=native` (FMA + AVX-512 quando presenti).
+  `[profile.release]` passa da `lto = "thin"` a `lto = "fat"`,
+  `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Build
+  time ~30 s → ~160 s su CCX23 (peak link RAM ~6-8 GiB, gestibile).
+  Profilo `release-bench` separato preserva i symbol per `perf`.
+  Speedup atteso: 1.3-1.5× su candle CPU kernels.
+- **Strato 3 — Thread tuning.** `AdeConfig` espone
+  `num_threads: Option<usize>` con `effective_threads()` che
+  default-a `physical_cores − 1`. `CandleBackend::configure_threads`
+  pinna `RAYON_NUM_THREADS` prima del primo init del global pool
+  rayon. CLI `--ade-threads N` ovverride. `examples/bench_threads.rs`
+  walkka N ∈ {1,2,3,4} in subprocess (rayon è lazy-init una volta
+  per processo) e stampa l'optimum. Documentato in
+  `docs/PERFORMANCE_THREADS.md`.
+- **Strato 4 — Streaming + early JSON termination.** Il levere
+  più grosso. `InferenceBackend.generate_streaming` (con
+  `StreamControl::Continue|Stop`) è opzionale e default-impl
+  cade su `generate` con singolo callback finale (Mock + altri
+  backend restano byte-compatibili). `CandleBackend` implementa
+  streaming reale: dopo ogni token decoded, tokenizer.decode
+  incrementale produce solo il suffisso nuovo, UTF-8-boundary
+  aware. `agent::ade::streaming_parser::StreamingJsonDetector`
+  traccia brace-depth, string-mode, escape-mode lungo lo stream
+  e segnala completamento al primo `}` outermost.
+  `AdeEngine::evaluate` cabla detector + `Stop`: appena il JSON
+  chiude, il decode loop si ferma. Atteso: ~1500 → ~400-500
+  token decoded per inferenza, 3-4× wall-time saving su host
+  memory-bound.
+- **Strato 5 — Persistent backend audit.** Verificato per
+  ispezione che `AdeEngine::new` viene chiamato una sola volta
+  in `agent/src/main.rs`, fuori dal loop eventi, e l'`Arc<AdeEngine>`
+  risultante viene condiviso in `process_event` per ogni iterazione.
+  Comment-guard aggiunto al construction site per impedire
+  regressioni future.
+
+Test: 12 nuovi test sempre-on (8 `StreamingJsonDetector` + 3
+`AdeConfig::effective_threads` + 1 integrazione streaming/non-
+streaming verdict-equality). Totale workspace: 277 test passati,
+0 falliti, 5 ignored. Schema `AdeVerdict` invariato (v1.0.0).
+ADE pipeline (sanitize, sanity_check, dual_verify, RAG, posture)
+invariata.
+
+Speedup teorico combinato (NON misurato in autopilot — sarà
+benchato dal founder con `bench_threads` + run reale di
+`ade_demo` post-deploy): ~5×, pari a ~5 minuti per output tipico
+di 1500 token su CCX23.
+
+Out of scope, rinviato a sub-tappa successive:
+
+- GPU / Metal / CUDA support → Sub-tappa 6.9+.
+- Schema redesign per output compatto → Sub-tappa 6.9 Compact
+  Output (renderebbe lo streaming meno necessario, ma sono
+  ortogonali e indipendenti).
+- Modello più piccolo (Foundation-Sec 8B resta production
+  choice).
+- Speculative decoding / draft models.
+
+Deviazioni dalla spec autorizzate, documentate nei commit:
+
+- `lld` non è disponibile sull'host CCX23 (May 2026); la
+  link-arg `-fuse-ld=lld` è stata omessa, default-linker
+  preservato. Build time aumentato di ~30 s rispetto al lld
+  ipotetico, accettabile.
+- Default `effective_threads()` ritorna 1 sul CCX23
+  (2 physical → 2-1 = 1) ma il bench atteso identifica 2-3
+  come optimum reale; il default è conservativo, l'override
+  via CLI è il path produzione.
+
 ---
 
 ## Tappa 7 — Anti-tamper Linux

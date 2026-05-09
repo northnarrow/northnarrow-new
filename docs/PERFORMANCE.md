@@ -120,13 +120,16 @@ Sub-tappa 6.8 adds:
 
 ## 4. Persistent backend (verified)
 
-`AdeEngine::new` is called **once** in `agent/src/main.rs`, before
-the event loop starts, and the resulting `Arc<AdeEngine>` is shared
-into `process_event` for every event. Model weights, tokenizer, and
-KV-cache state machine are all loaded once and amortised across the
-agent's lifetime.
+`AdeEngine::new` is called **once** in `agent/src/main.rs:129`,
+before the event loop starts, and the resulting `Arc<AdeEngine>` is
+shared into `process_event` for every event. Model weights,
+tokenizer, KV-cache state machine, and the rayon pool are all
+loaded once and amortised across the agent's lifetime.
 
-This is verified — no fix needed in 6.8. Re-audit if `process_event`
+This is verified — no fix needed in 6.8. The construction site
+carries a load-bearing comment so a future change that moves the
+call into the hot path fails the next audit instead of silently
+re-paying the ~5 GiB GGUF mmap per event. Re-audit if `process_event`
 ever grows a path that constructs a new engine on the hot path.
 
 ## Combined target
