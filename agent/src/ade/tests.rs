@@ -322,3 +322,35 @@ async fn ignored_candle_real_inference() {
     eprintln!("verdict={} confidence={:.2}", v.verdict, v.confidence);
     assert_eq!(v.metadata.backend, "candle-llama3.1");
 }
+
+/// Sub-tappa 6.7: end-to-end smoke test that the engine evaluates
+/// successfully when wired with a [`RagEngine`]. Uses the
+/// deterministic `MockBackend` so the test is hermetic.
+#[tokio::test]
+async fn engine_with_rag_evaluates_successfully() {
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let cfg = cfg_with(prompt.path(), model.path());
+    let backend: Arc<dyn InferenceBackend> = Arc::new(MockBackend::new());
+    let engine = AdeEngine::new_with_backend(cfg, backend).await.unwrap();
+
+    let rag = Arc::new(crate::rag::RagEngine::with_seed(None).expect("seed kb"));
+    let engine = engine.with_rag(rag);
+    assert!(engine.has_rag(), "engine should expose has_rag = true");
+
+    let event = Event::ProcessSpawn {
+        pid: 4242,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "xmrig".into(),
+        filename: "/tmp/.cache/x".into(),
+        timestamp_ns: 0,
+    };
+    let ctx = EventContext {
+        recent_events: vec![],
+        host_context: HostContext::discover(),
+    };
+    let v = engine.evaluate(&event, &ctx).await.unwrap();
+    assert_eq!(v.verdict, AdeAction::Kill);
+}

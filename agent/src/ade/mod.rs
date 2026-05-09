@@ -26,6 +26,7 @@ pub mod escalate;
 pub mod inference;
 pub mod parser;
 pub mod prompt;
+pub mod rag_integration;
 pub mod sanitize;
 pub mod sanity_check;
 pub mod stats;
@@ -39,6 +40,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use common::ade_types::AdeVerdict;
+use common::rag_types::RagResult;
 use common::Event;
 use uuid::Uuid;
 
@@ -51,9 +53,12 @@ pub use error::AdeError;
 pub use escalate::{transform_to_escalate, EscalateMeta};
 pub use inference::{InferenceBackend, MockBackend};
 pub use parser::{ValidationError, VerdictParser};
+pub use rag_integration::{build_rag_query_from_event, format_rag_block};
 pub use sanitize::{sanitize_event_for_ade, InjectionFlag, SanitizedEvent};
 pub use sanity_check::{verify_verdict_coherence, SanityCheckResult};
 pub use stats::{AdeStats, AdeStatsSnapshot};
+
+use crate::rag::{RagEngine, RagQuery};
 
 /// Public Active Defense Engine handle.
 ///
@@ -72,6 +77,12 @@ struct EngineInner {
     host: HostContext,
     stats: AdeStats,
     warmup_latency_ms: u64,
+    /// Optional RAG engine wired in Sub-tappa 6.7. When `Some`, every
+    /// `evaluate` call runs a top-k retrieval before inference and
+    /// splices the curated knowledge into the structured prompt.
+    /// `None` reproduces the pre-6.7 behaviour byte-for-byte (existing
+    /// tests assume this).
+    rag: Option<Arc<RagEngine>>,
 }
 
 impl AdeEngine {
@@ -110,10 +121,38 @@ impl AdeEngine {
             host,
             stats: AdeStats::default(),
             warmup_latency_ms,
+            rag: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Returns a fresh handle wired with a [`RagEngine`].
+    ///
+    /// The previous handle is left untouched (Arc-shared `EngineInner`
+    /// would be cheap to clone but we want to preserve `is_ready`-like
+    /// callers that still hold the no-RAG variant).
+    pub fn with_rag(self, rag: Arc<RagEngine>) -> Self {
+        let prev = &self.inner;
+        let inner = EngineInner {
+            config: prev.config.clone(),
+            backend: prev.backend.clone(),
+            parser: VerdictParser::new(),
+            system_prompt: prev.system_prompt.clone(),
+            host: prev.host.clone(),
+            stats: AdeStats::default(),
+            warmup_latency_ms: prev.warmup_latency_ms,
+            rag: Some(rag),
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Whether this engine has a RAG knowledge base wired in.
+    pub fn has_rag(&self) -> bool {
+        self.inner.rag.is_some()
     }
 
     /// Run inference on the focal event with a context bundle.
@@ -157,11 +196,25 @@ impl AdeEngine {
             ));
         }
 
-        let parts = structured_prompt::build_structured_prompt(
+        // Sub-tappa 6.7: optional RAG retrieval before prompt build.
+        let rag_result: Option<RagResult> = self.inner.rag.as_ref().map(|rag| {
+            let query_text = build_rag_query_from_event(event);
+            let r = rag.retrieve(RagQuery::new(&query_text));
+            tracing::debug!(
+                hits = r.documents.len(),
+                embed_ms = r.query_embedding_ms,
+                retrieve_ms = r.retrieval_ms,
+                "ADE RAG retrieval"
+            );
+            r
+        });
+
+        let parts = structured_prompt::build_structured_prompt_with_rag(
             &self.inner.system_prompt,
             &self.inner.config,
             &sanitized,
             context,
+            rag_result.as_ref(),
         );
         let prompt = match self.inner.backend.chat_template() {
             inference::ChatTemplate::Llama3 => parts.into_llama3_chat(),
