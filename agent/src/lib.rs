@@ -1,9 +1,13 @@
 //! NorthNarrow agent library.
 //!
-//! Tappa 3: sensors deliver events, the [`decision`] engine produces
-//! verdicts, and the [`response`] executor turns them into real
-//! actions (currently `KillProcess` and `KillProcessTree`).
+//! - [`sensors`]   — eBPF-driven event sources.
+//! - [`decision`]  — deterministic rule engine (Tappa 2).
+//! - [`response`]  — concrete executors (Tappa 3 + Tappa 5).
+//! - [`ade`]       — Active Defense Engine, LLM second brain (Tappa 6).
+//! - [`correlation`] — bounded buffer of recent events fed into ADE.
 
+pub mod ade;
+pub mod correlation;
 pub mod decision;
 pub mod response;
 pub mod sensors;
