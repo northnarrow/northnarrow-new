@@ -22,3 +22,6 @@ std = ["dep:serde", "dep:bytemuck"]
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 bytemuck = { version = "1", default-features = false, features = ["derive", "min_const_generics"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"

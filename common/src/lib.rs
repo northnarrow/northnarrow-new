@@ -24,3 +24,7 @@ pub mod wire;
 mod model;
 #[cfg(feature = "std")]
 pub use model::*;
+
+/// Active Defense Engine (ADE) verdict schema (v1.0.0).
+#[cfg(feature = "std")]
+pub mod ade_types;
