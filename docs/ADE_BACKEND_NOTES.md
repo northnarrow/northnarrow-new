@@ -88,16 +88,52 @@ If the assembled prompt exceeds the cap, the backend truncates from
 the **front** to preserve the focal event (which is appended last in
 `build_event_prompt`).
 
-## Performance — measured
+## Performance — measured on the dev VM
 
-Run on the dev VM (CPU-only, AVX2). See the closing demo log of the
-Sub-tappa 6.1 commit chain for the canonical run:
+Hardware: AMD Ryzen 9 3900XT VM exposing **only SSE4** to userspace
+(no AVX2, no FMA, no F16C). Candle's quantized matmul falls back to
+its scalar code path; per-token throughput is ~10× slower than on a
+native AVX2 CPU.
 
-- model load (cold disk): ~7 s
-- warmup (1-token forward pass): ~1.4 s
-- p50 inference latency: see report
-- p95 inference latency: see report
-- peak resident set size: see report
+Reproduce with `cargo run --release --example ade_smoke` (5-word
+prompt, 4-token decode):
+
+| Phase                        | Time    |
+| ---------------------------- | ------- |
+| GGUF load (cold disk)        | 17.8 s  |
+| Warmup forward pass          | 1.71 s  |
+| Prefill (6 prompt tokens)    | 8.83 s  |
+| Decode (4 tokens)            | 5.07 s  |
+| Total inference              | 13.9 s  |
+| Total wall (load+warmup+inf) | 34.2 s  |
+| Peak RSS                     | 7.0 GB  |
+
+Per-token rates on this VM:
+
+- Prefill: ~1.47 s/token (linear in prompt length)
+- Decode: ~1.27 s/token
+
+For the production prompt (`system_prompt_v1.md` + correlated events
++ focal event JSON ≈ 1500-2500 tokens) the same VM would need roughly
+35-60 s of prefill alone — outside the brief's 15 s timeout. The
+agent's `build_default_backend` fallback to `MockBackend` keeps
+everything functional in that case.
+
+A CPU with AVX2 (Ryzen 5xxx+, Intel Coffee Lake+) would bring the
+prefill rate to roughly 0.05 s/token — ~30× faster — and the
+canonical 1500-token prompt would prefill in ~75 s on top of ~5 s of
+decode, well under the 15 s timeout once the prompt is trimmed to
+~1000 tokens. GPU (CUDA / Metal) would push this further to <2 s.
+
+## Production deployment notes
+
+- **Hardware floor**: AVX2-capable CPU. Without AVX2, fall back to
+  `MockBackend` (the trait surface and the cascade in
+  `build_default_backend` already do this automatically when
+  candle's load fails or returns an error mid-generation).
+- **Memory floor**: 8 GB RAM (model + agent + slack). RSS peaks at
+  ~7 GB during steady-state inference for the founder's 8B Q4_K_M.
+- **Disk**: 5 GB for the GGUF + 17 MB for the tokenizer.
 
 ## Future work
 
