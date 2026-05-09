@@ -193,6 +193,49 @@ modello le veda.
 ADE schema invariato (v1.0.0). Posture machine (Sub-tappa 6.5)
 non modificata. Rule engine, sensori, executor non modificati.
 
+### Sub-tappa 6.6.1 — Layer 1 detectors estesi (chiusa)
+
+Chiude le 4 famiglie di attacchi che in 6.6 superavano Layer 1
+(sanitization) e arrivavano fino a Layer 3/4:
+
+- **Multilingual keyword dictionary** — IT/ES/FR/DE/PT/RU/ZH/JA/AR.
+  La detection runna su tre viste: input troncato grezzo (per
+  catturare cirillico / Han / arabo prima della homoglyph
+  replacement), il `buf` sanificato (per il latino), e il
+  `lower`+`_-.→spazio` normalizzato. Nuovo flag
+  `MultilingualKeyword { lang, keyword }`.
+- **ROT13 normalizer** — su stringhe ASCII di lunghezza ≥ 8 senza
+  caratteri non-Latini, applica `normalize_rot13` e ricontrolla
+  contro il dizionario EN. Nuovo flag
+  `RotEncoded { original, decoded }`.
+- **Visual substitution detector** — confronta il basename del
+  filename contro una lista di binari di sistema
+  (`SYSTEM_BINARY_LOOKALIKES`: ls, ssh, sudo, …) usando una
+  tabella di lookalike (`l↔1↔I↔|`, `s↔5↔$`, `o↔0↔O`, …). Match
+  quando ogni posizione che differisce è un lookalike registrato.
+  Nuovo flag `VisualSubstitution { suspected_target, actual }`.
+- **Variant separator detector** — riconosce
+  `northnarrow-`/`_`/`.`/`|`/spazio (e simili per `system:`,
+  `[INST]`, ecc.) come tentativi di evadere il match canonico
+  `northnarrow:`. Nuovo flag
+  `VariantSeparator { canonical, variant }`.
+
+Score weights: ognuno dei 4 nuovi flag pesa 0.40-0.45 (in linea
+con `InstructionKeyword`); HomoglyphDetected sale da 0.20 a 0.30
+per riflettere la sua natura multi-script.
+
+12 unit test nuovi nel modulo `agent::ade::sanitize::tests`.
+
+Effetto sul demo `ade_attacks`: D1, D2, C4, G3, G4 — i 5 attacchi
+che in 6.6 erano marcati come "slip Layer 1" — ora producono
+`injection_score ≥ 0.40` al primo strato, e in molti casi
+sufficiente a innescare l'early-reject Tier1Review (soglia 0.90)
+quando si combinano con altri segnali.
+
+ADE schema invariato (v1.0.0). Posture machine, structured prompt,
+sanity check, dual verify (gli altri 3 strati di Sub-tappa 6.6)
+non modificati.
+
 ---
 
 ## Tappa 7 — Anti-tamper Linux
