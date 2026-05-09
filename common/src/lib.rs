@@ -32,3 +32,7 @@ pub mod ade_types;
 /// Adaptive Defensive Posture types (Sub-tappa 6.5).
 #[cfg(feature = "std")]
 pub mod posture_types;
+
+/// RAG knowledge-base types (Sub-tappa 6.7).
+#[cfg(feature = "std")]
+pub mod rag_types;
