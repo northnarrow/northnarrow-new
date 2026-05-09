@@ -40,7 +40,7 @@ use tokenizers::Tokenizer;
 use common::Event;
 
 use super::error::AdeError;
-use super::inference::{ChatTemplate, InferenceBackend};
+use super::inference::{ChatTemplate, InferenceBackend, StreamControl};
 
 /// Soft cap on output tokens — keeps generation time bounded even if
 /// the caller asks for more than the engine can deliver in 15 s.
@@ -197,6 +197,26 @@ impl CandleBackend {
         top_p: f32,
         budget: Duration,
     ) -> Result<String, AdeError> {
+        // Non-streaming path: hand a no-op callback that always
+        // returns Continue. The shared core delivers the same output
+        // whether streaming is used or not.
+        self.run_inference_streaming(prompt, max_tokens, temperature, top_p, budget, &mut |_| {
+            StreamControl::Continue
+        })
+    }
+
+    fn run_inference_streaming<F>(
+        &self,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        budget: Duration,
+        on_token: &mut F,
+    ) -> Result<String, AdeError>
+    where
+        F: FnMut(&str) -> StreamControl,
+    {
         let started = Instant::now();
         let max_tokens = max_tokens.min(MAX_OUTPUT_TOKENS_HARD_CAP);
 
@@ -234,6 +254,13 @@ impl CandleBackend {
         let mut weights = self.inner.lock();
         let mut next_token: u32;
 
+        // Streaming bookkeeping: incremental decode produces the
+        // text suffix added by the latest token. We keep the rolling
+        // decoded length so we only emit *new* characters to the
+        // callback and bail out the moment the caller signals Stop.
+        let mut decoded_text_len: usize = 0;
+        let mut early_stop = false;
+
         // 1) Pre-fill: hand the whole prompt to the model in one shot
         //    and sample the first response token. The KV cache after
         //    this call holds positions 0..prompt_len.
@@ -262,45 +289,73 @@ impl CandleBackend {
             "candle prefill done"
         );
 
+        // Emit the prefill-sampled token so the caller's detector
+        // sees the very first byte. Skip if the streaming detector
+        // already says Stop (degenerate case).
+        if let Some(chunk) = decode_chunk(&self.tokenizer, &output_tokens, &mut decoded_text_len)? {
+            if matches!(on_token(&chunk), StreamControl::Stop) {
+                early_stop = true;
+            }
+        }
+
         // 2) Decode: feed the just-sampled token at the next free
         //    cache slot (`index_pos`), get logits, sample the
         //    successor. Loop bound = max_tokens − 1 because we
         //    already produced one token in the prefill step.
         let decode_started = Instant::now();
         let mut budget_breached = false;
-        for index_pos in prompt_len..prompt_len + max_tokens.saturating_sub(1) {
-            if self.eos_tokens.contains(&next_token) {
-                break;
+        if !early_stop {
+            for index_pos in prompt_len..prompt_len + max_tokens.saturating_sub(1) {
+                if self.eos_tokens.contains(&next_token) {
+                    break;
+                }
+                if started.elapsed() >= budget {
+                    budget_breached = true;
+                    break;
+                }
+                // Heartbeat every 16 tokens so a slow CPU run is
+                // observable from the agent log.
+                if index_pos % 16 == 0 {
+                    tracing::trace!(
+                        index_pos,
+                        decoded_so_far = output_tokens.len(),
+                        decode_ms = decode_started.elapsed().as_millis() as u64,
+                        "candle decode step"
+                    );
+                }
+                let input = Tensor::new(&[next_token], &self.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| AdeError::Backend(format!("decode tensor: {e}")))?;
+                let logits = weights
+                    .weights
+                    .forward(&input, index_pos)
+                    .map_err(|e| AdeError::Backend(format!("decode forward: {e}")))?;
+                let logits = logits
+                    .squeeze(0)
+                    .map_err(|e| AdeError::Backend(format!("squeeze decode: {e}")))?;
+                next_token = logits_processor
+                    .sample(&logits)
+                    .map_err(|e| AdeError::Backend(format!("sample decode: {e}")))?;
+                all_tokens.push(next_token);
+                output_tokens.push(next_token);
+
+                // Streaming hand-off. If the tokenizer can't surface
+                // a fresh chunk yet (multi-byte UTF-8 mid-sequence),
+                // we still keep going — the next token will close
+                // the boundary.
+                if let Some(chunk) =
+                    decode_chunk(&self.tokenizer, &output_tokens, &mut decoded_text_len)?
+                {
+                    if matches!(on_token(&chunk), StreamControl::Stop) {
+                        early_stop = true;
+                        tracing::debug!(
+                            decoded_tokens = output_tokens.len(),
+                            "candle decode terminated early by streaming callback"
+                        );
+                        break;
+                    }
+                }
             }
-            if started.elapsed() >= budget {
-                budget_breached = true;
-                break;
-            }
-            // Heartbeat every 16 tokens so a slow CPU run is
-            // observable from the agent log.
-            if index_pos % 16 == 0 {
-                tracing::trace!(
-                    index_pos,
-                    decoded_so_far = output_tokens.len(),
-                    decode_ms = decode_started.elapsed().as_millis() as u64,
-                    "candle decode step"
-                );
-            }
-            let input = Tensor::new(&[next_token], &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| AdeError::Backend(format!("decode tensor: {e}")))?;
-            let logits = weights
-                .weights
-                .forward(&input, index_pos)
-                .map_err(|e| AdeError::Backend(format!("decode forward: {e}")))?;
-            let logits = logits
-                .squeeze(0)
-                .map_err(|e| AdeError::Backend(format!("squeeze decode: {e}")))?;
-            next_token = logits_processor
-                .sample(&logits)
-                .map_err(|e| AdeError::Backend(format!("sample decode: {e}")))?;
-            all_tokens.push(next_token);
-            output_tokens.push(next_token);
         }
         drop(weights);
 
@@ -317,6 +372,13 @@ impl CandleBackend {
                 decode_ms,
                 "candle backend hit budget mid-generation"
             );
+        } else if early_stop {
+            tracing::debug!(
+                output_tokens = output_tokens.len(),
+                total_ms = elapsed_ms,
+                decode_ms,
+                "candle inference complete (early stop)"
+            );
         } else {
             tracing::debug!(
                 output_tokens = output_tokens.len(),
@@ -327,6 +389,32 @@ impl CandleBackend {
         }
         Ok(raw)
     }
+}
+
+/// Incremental decode helper: produces only the *new* suffix added
+/// by the latest token, advancing `decoded_text_len` to match. Returns
+/// `None` when the BPE has not yet committed to a stable boundary
+/// (typically a multi-byte UTF-8 start in mid-stream); the next call
+/// will surface the deferred bytes.
+fn decode_chunk(
+    tokenizer: &Tokenizer,
+    output_tokens: &[u32],
+    decoded_text_len: &mut usize,
+) -> Result<Option<String>, AdeError> {
+    let full = tokenizer
+        .decode(output_tokens, false)
+        .map_err(|e| AdeError::Backend(format!("decode chunk: {e}")))?;
+    if full.len() <= *decoded_text_len {
+        return Ok(None);
+    }
+    // Slice the suffix at a UTF-8 char boundary; if the tokenizer
+    // landed mid-codepoint, defer until the next round.
+    if !full.is_char_boundary(*decoded_text_len) {
+        return Ok(None);
+    }
+    let suffix = full[*decoded_text_len..].to_string();
+    *decoded_text_len = full.len();
+    Ok(Some(suffix))
 }
 
 impl InferenceBackend for CandleBackend {
@@ -356,6 +444,28 @@ impl InferenceBackend for CandleBackend {
         // how aggressively we self-abort if the caller didn't.
         let budget = Duration::from_secs(120);
         self.run_inference(prompt, max_tokens, temperature, top_p, budget)
+    }
+
+    fn generate_streaming(
+        &self,
+        prompt: &str,
+        _focal_event: &Event,
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        mut on_token: Box<dyn FnMut(&str) -> StreamControl + Send>,
+    ) -> Result<String, AdeError> {
+        let budget = Duration::from_secs(120);
+        // Adapt the trait's Box<dyn FnMut> into the &mut F shape
+        // run_inference_streaming wants without a second allocation.
+        self.run_inference_streaming(
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            budget,
+            &mut |s: &str| on_token(s),
+        )
     }
 
     fn warmup(&self) -> Result<(), AdeError> {
