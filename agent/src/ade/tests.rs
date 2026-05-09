@@ -44,7 +44,9 @@ async fn engine_evaluates_and_returns_valid_verdict() {
     let engine = AdeEngine::new_with_backend(cfg, backend).await.unwrap();
 
     let event = Event::ProcessSpawn {
-        pid: 42,
+        // Use a non-system pid so the dual-verifier confirms the Kill
+        // (Sub-tappa 6.6 rejects Kill against pid < 1000).
+        pid: 4242,
         ppid: 1,
         uid: 1000,
         gid: 1000,

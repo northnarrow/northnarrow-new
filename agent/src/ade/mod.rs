@@ -20,12 +20,16 @@
 pub mod backend_candle;
 pub mod config;
 pub mod context;
+pub mod dual_verify;
 pub mod error;
 pub mod escalate;
 pub mod inference;
 pub mod parser;
 pub mod prompt;
+pub mod sanitize;
+pub mod sanity_check;
 pub mod stats;
+pub mod structured_prompt;
 
 #[cfg(test)]
 mod tests;
@@ -40,10 +44,15 @@ use uuid::Uuid;
 
 pub use config::AdeConfig;
 pub use context::{EventContext, HostContext};
+pub use dual_verify::{
+    is_critical_action, CriticalActionVerifier, DeterministicVerifier, VerificationResult,
+};
 pub use error::AdeError;
 pub use escalate::{transform_to_escalate, EscalateMeta};
 pub use inference::{InferenceBackend, MockBackend};
 pub use parser::{ValidationError, VerdictParser};
+pub use sanitize::{sanitize_event_for_ade, InjectionFlag, SanitizedEvent};
+pub use sanity_check::{verify_verdict_coherence, SanityCheckResult};
 pub use stats::{AdeStats, AdeStatsSnapshot};
 
 /// Public Active Defense Engine handle.
@@ -112,15 +121,46 @@ impl AdeEngine {
     /// Always returns a schema-valid [`AdeVerdict`]: parse failures
     /// are folded into an Escalate Tier1 verdict, timeouts and
     /// backend errors are surfaced as `AdeError`.
+    ///
+    /// Sub-tappa 6.6 wraps the inference call in four hardening
+    /// layers:
+    ///
+    /// 1. **Sanitize** the event before it reaches the prompt
+    ///    builder. If the [`SanitizedEvent::injection_score`] crosses
+    ///    [`HIGH_INJECTION_SCORE_REJECT`] the engine bypasses the
+    ///    LLM entirely and returns a synthetic Escalate.
+    /// 2. Build a **structured prompt** that splits trusted context
+    ///    from untrusted event data with explicit XML-style markers.
+    /// 3. **Sanity-check** the parsed verdict for obvious
+    ///    contradictions (high injection score + Allow, severe MITRE
+    ///    tactic + Allow, severe IoC + Low severity, …). On
+    ///    anomaly we replace the verdict with Escalate Tier1.
+    /// 4. For verdicts that map to a destructive executor action,
+    ///    run a [`DeterministicVerifier`] second-opinion. Rejection
+    ///    yields a Tier3 escalation.
     pub async fn evaluate(
         &self,
         event: &Event,
         context: &EventContext,
     ) -> Result<AdeVerdict, AdeError> {
-        let parts = prompt::build_event_prompt(
+        let sanitized = sanitize::sanitize_event_for_ade(event);
+        if sanitized.injection_score >= HIGH_INJECTION_SCORE_REJECT {
+            tracing::warn!(
+                score = sanitized.injection_score,
+                flags = %sanitized.flags_summary(),
+                "high injection score, escalating without ADE call"
+            );
+            return Ok(make_escalate_for_injection(
+                event,
+                &sanitized,
+                self.escalate_meta(0),
+            ));
+        }
+
+        let parts = structured_prompt::build_structured_prompt(
             &self.inner.system_prompt,
             &self.inner.config,
-            event,
+            &sanitized,
             context,
         );
         let prompt = match self.inner.backend.chat_template() {
@@ -176,6 +216,49 @@ impl AdeEngine {
                     v.trace_id = Uuid::new_v4().to_string();
                 }
                 self.inner.stats.record_success(elapsed_ms);
+
+                // Layer 3: sanity check.
+                match sanity_check::verify_verdict_coherence(&v, &sanitized) {
+                    SanityCheckResult::Coherent => {}
+                    SanityCheckResult::AnomalyDetected {
+                        reason,
+                        forced_verdict,
+                    } => {
+                        tracing::warn!(?reason, "ADE sanity check anomaly: forcing Escalate");
+                        v = *forced_verdict;
+                    }
+                    SanityCheckResult::InconsistencyFlagged { reason } => {
+                        tracing::info!(?reason, "ADE verdict flagged inconsistent (kept)");
+                    }
+                }
+
+                // Layer 4: critical-action dual verification.
+                if dual_verify::is_critical_action(v.verdict) {
+                    let verifier = dual_verify::DeterministicVerifier;
+                    match verifier.verify(&v, event) {
+                        VerificationResult::Confirmed => {}
+                        VerificationResult::Rejected { reason } => {
+                            tracing::warn!(
+                                ?reason,
+                                action = %v.verdict,
+                                "critical-action verifier rejected verdict; escalating Tier3"
+                            );
+                            v = make_escalate_for_verifier(
+                                event,
+                                &v,
+                                &reason,
+                                self.escalate_meta(elapsed_ms),
+                            );
+                        }
+                        VerificationResult::Inconclusive => {
+                            tracing::info!(
+                                action = %v.verdict,
+                                "critical-action verifier inconclusive (kept)"
+                            );
+                        }
+                    }
+                }
+
                 Ok(v)
             }
             Err(parse_err) => {
@@ -195,6 +278,17 @@ impl AdeEngine {
                     &meta,
                 ))
             }
+        }
+    }
+
+    fn escalate_meta(&self, latency_ms: u64) -> EscalateMeta<'_> {
+        EscalateMeta {
+            model_id: self.inner.backend.model_id(),
+            model_quantization: self.inner.backend.quantization(),
+            backend: self.inner.backend.name(),
+            host: &self.inner.host,
+            language: &self.inner.config.language,
+            inference_latency_ms: latency_ms,
         }
     }
 
@@ -221,6 +315,68 @@ impl AdeEngine {
     pub fn is_ready(&self) -> bool {
         true
     }
+}
+
+/// Injection score at-or-above this threshold causes
+/// [`AdeEngine::evaluate`] to skip the LLM entirely and return a
+/// synthetic Escalate. Ratchet up if you see false positives in the
+/// audit log, but never above 0.95 — the sanity check is the second
+/// safety net.
+pub const HIGH_INJECTION_SCORE_REJECT: f32 = 0.90;
+
+/// Synthetic Escalate verdict produced when the input event is so
+/// suspicious we refuse to spend an inference round-trip on it.
+///
+/// We re-use [`escalate::transform_to_escalate`] for schema validity
+/// and stamp the injection flags into the escalation package's
+/// `key_questions` so the analyst sees what tripped the alarm.
+fn make_escalate_for_injection(
+    event: &Event,
+    sanitized: &SanitizedEvent,
+    meta: EscalateMeta<'_>,
+) -> AdeVerdict {
+    let mut v = transform_to_escalate(
+        event,
+        &format!(
+            "input rejected pre-inference (injection_score={:.2})",
+            sanitized.injection_score
+        ),
+        None,
+        &meta,
+    );
+    if let Some(pkg) = v.escalation_package.as_mut() {
+        pkg.summary = format!(
+            "Pre-inference rejection: injection_score={:.2}, flags={}",
+            sanitized.injection_score,
+            sanitized.flags_summary()
+        );
+        pkg.key_questions
+            .insert(0, "Was this filename adversarial?".into());
+    }
+    v.evidence
+        .primary_indicators
+        .push(format!("injection_flags:{}", sanitized.flags_summary()));
+    v
+}
+
+/// Synthetic Escalate when the deterministic verifier rejects a
+/// destructive verdict.
+fn make_escalate_for_verifier(
+    event: &Event,
+    rejected: &AdeVerdict,
+    reason: &str,
+    meta: EscalateMeta<'_>,
+) -> AdeVerdict {
+    let mut v = transform_to_escalate(
+        event,
+        &format!("verifier rejected {} action: {reason}", rejected.verdict),
+        Some(&serde_json::to_string(rejected).unwrap_or_default()),
+        &meta,
+    );
+    if let Some(tier) = v.escalation_tier.as_mut() {
+        *tier = common::ade_types::EscalationTier::Tier3Review;
+    }
+    v
 }
 
 /// Build the production backend with a graceful fallback chain.
