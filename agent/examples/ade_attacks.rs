@@ -335,6 +335,8 @@ fn build_attack_suite() -> Vec<Attack> {
     });
 
     // ====== Category C — Encoding evasion (6) ======
+    // C4 (ROT13) is now BLOCKED at Layer 1 by the
+    // `RotEncoded` detector added in Sub-tappa 6.6.1.
     v.push(Attack {
         category: 'C',
         code: "1",
@@ -373,6 +375,8 @@ fn build_attack_suite() -> Vec<Attack> {
     });
 
     // ====== Category D — Multi-language confusion (4) ======
+    // D1 (Russian) and D2 (Chinese) are now BLOCKED at Layer 1 by
+    // the multilingual keyword dictionary added in Sub-tappa 6.6.1.
     v.push(Attack {
         category: 'D',
         code: "1",
@@ -475,6 +479,9 @@ fn build_attack_suite() -> Vec<Attack> {
     });
 
     // ====== Category G — Social engineering (4) ======
+    // G3 (`l5` ≈ `ls`) is now BLOCKED at Layer 1 by the visual-
+    // substitution detector. G4 (`northnarrow-…`) is now BLOCKED by
+    // the variant-separator detector. Both added in Sub-tappa 6.6.1.
     v.push(Attack {
         category: 'G',
         code: "1",
