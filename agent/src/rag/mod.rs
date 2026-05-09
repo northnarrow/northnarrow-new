@@ -32,8 +32,10 @@
 //! - Live ingestion from MITRE GitHub, Sigma, LOLBAS.
 
 pub mod embedder;
+pub mod store;
 
 pub use embedder::{cosine_similarity, RagEmbedder};
+pub use store::{RagStore, StoreHit};
 
 #[cfg(test)]
 mod tests;
