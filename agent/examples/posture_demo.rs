@@ -53,10 +53,7 @@ fn main() {
     println!("[phase 2] ADE verdict: Allow + None");
     let raw = baseline_verdict(AdeAction::Allow, AdeSeverity::None);
     let modulated = machine.modulate_verdict(raw.clone());
-    println!(
-        "  raw: action={} severity={}",
-        raw.verdict, raw.severity
-    );
+    println!("  raw: action={} severity={}", raw.verdict, raw.severity);
     println!(
         "  posture-modulated: action={} severity={}",
         modulated.verdict, modulated.severity
@@ -70,7 +67,10 @@ fn main() {
     println!("[phase 3] simulate netcat exec (exploit attempt)");
     let nc = spawn(99, 1, "ncat", "/usr/bin/ncat", 400);
     if let Some(state) = machine.observe(&nc, &[]) {
-        println!("  POSTURE TRANSITION → {} (trigger: confirmed exploit)", state.kind());
+        println!(
+            "  POSTURE TRANSITION → {} (trigger: confirmed exploit)",
+            state.kind()
+        );
     }
     println!("  posture: {}\n", machine.current_kind());
 
@@ -88,7 +88,10 @@ fn main() {
     // ---- Phase 5: COMBAT lock and admin override -------------------
     println!("[phase 5] confirm COMBAT does not auto-decay, then admin override");
     let auto = machine.tick_decay();
-    println!("  tick_decay returned: {:?}", auto.map(|s| s.kind().to_string()));
+    println!(
+        "  tick_decay returned: {:?}",
+        auto.map(|s| s.kind().to_string())
+    );
     println!("  posture (still): {}", machine.current_kind());
     let unauth = machine.admin_release_combat(false);
     println!("  admin_release(false): {:?}", unauth.err());
