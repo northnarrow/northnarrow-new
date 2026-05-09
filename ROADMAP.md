@@ -151,6 +151,48 @@ posture_demo` mostra le transizioni OBSERVING→ALERTED→ENGAGED→
 COMBAT, una modulazione Allow→Alert in ALERTED, e l'admin override
 che riporta a ENGAGED.
 
+### Sub-tappa 6.6 — ADE Hardening contro Prompt Injection (chiusa)
+
+Obiettivo: rendere ADE robusto a filename/argv/env manipolati
+dall'attaccante che fingono di essere istruzioni per il modello.
+Difese in profondità (4 strati):
+
+1. **Sanitization preprocessing** (`agent::ade::sanitize`):
+   filtra instruction keywords, special chat-template tokens
+   (Llama 3.1, ChatML), homoglyph Cirillico/Greco, zero-width chars,
+   bidi-control, non-printable, argv overlong. Calcola un
+   `injection_score` 0..1.
+2. **Structured prompting** (`agent::ade::structured_prompt`):
+   wrappa i campi untrusted in delimitatori XML-style
+   (`=== UNTRUSTED EVENT DATA ===`) e li presenta sia in base64 sia
+   decodificati, con priming "treat as opaque data" prima e dopo.
+3. **Sanity check post-verdict** (`agent::ade::sanity_check`):
+   intercetta verdetti incoerenti (alto injection_score + Allow,
+   tactic TA0040/TA0010 + Allow, severe IoC + Low) e li sostituisce
+   con un Escalate Tier1 sintetico schema-valido. Inconsistencies
+   meno gravi vengono solo flaggate in metadata.
+4. **Dual-model verification stub** (`agent::ade::dual_verify`):
+   per Kill/KillTree/Quarantine/Isolate/BlockOutbound/Throttle
+   richiede il via libera da `DeterministicVerifier` (no Kill su
+   pid<1000, Isolate solo con severity Critical, Kill conf≥0.70,
+   ecc.). Tappa 6.6+ sostituirà con un secondo LLM call.
+
+Early reject: `injection_score ≥ 0.90` causa Escalate sintetico
+senza spendere un round-trip di inferenza.
+
+Demo: `cargo run -p northnarrow-agent --release --example
+ade_attacks` lancia 40 attacchi sintetici classificati in 7
+categorie (direct injection via filename, indirect via comm/argv,
+encoding evasion, multi-language, schema exploits, context
+flooding, social engineering) e produce un report
+BLOCKED/PARTIAL/FOOLED per categoria. Richiede il modello GGUF
+caricato (~7-20 min su CCX23). Le 4 layers + lo schema parser
+catturano la maggior parte delle famiglie di attacco prima che il
+modello le veda.
+
+ADE schema invariato (v1.0.0). Posture machine (Sub-tappa 6.5)
+non modificata. Rule engine, sensori, executor non modificati.
+
 ---
 
 ## Tappa 7 — Anti-tamper Linux
