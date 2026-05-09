@@ -92,7 +92,12 @@ async fn main() -> ExitCode {
     );
 
     let host = HostContext::discover();
-    let events = synthetic_events();
+    let mut events = synthetic_events();
+    if let Ok(n) = std::env::var("ADE_DEMO_LIMIT") {
+        if let Ok(n) = n.parse::<usize>() {
+            events.truncate(n);
+        }
+    }
 
     for (label, event) in &events {
         let ctx = EventContext {
