@@ -209,6 +209,8 @@ impl CandleBackend {
         // 1) Pre-fill: hand the whole prompt to the model in one shot
         //    and sample the first response token. The KV cache after
         //    this call holds positions 0..prompt_len.
+        let prefill_started = Instant::now();
+        tracing::debug!(prompt_tokens = prompt_len, "candle prefill starting");
         {
             let input = Tensor::new(prompt_tokens.as_slice(), &self.device)
                 .and_then(|t| t.unsqueeze(0))
@@ -226,11 +228,17 @@ impl CandleBackend {
             all_tokens.push(next_token);
             output_tokens.push(next_token);
         }
+        tracing::debug!(
+            prompt_tokens = prompt_len,
+            prefill_ms = prefill_started.elapsed().as_millis() as u64,
+            "candle prefill done"
+        );
 
         // 2) Decode: feed the just-sampled token at the next free
         //    cache slot (`index_pos`), get logits, sample the
         //    successor. Loop bound = max_tokens − 1 because we
         //    already produced one token in the prefill step.
+        let decode_started = Instant::now();
         let mut budget_breached = false;
         for index_pos in prompt_len..prompt_len + max_tokens.saturating_sub(1) {
             if self.eos_tokens.contains(&next_token) {
@@ -239,6 +247,16 @@ impl CandleBackend {
             if started.elapsed() >= budget {
                 budget_breached = true;
                 break;
+            }
+            // Heartbeat every 16 tokens so a slow CPU run is
+            // observable from the agent log.
+            if index_pos % 16 == 0 {
+                tracing::trace!(
+                    index_pos,
+                    decoded_so_far = output_tokens.len(),
+                    decode_ms = decode_started.elapsed().as_millis() as u64,
+                    "candle decode step"
+                );
             }
             let input = Tensor::new(&[next_token], &self.device)
                 .and_then(|t| t.unsqueeze(0))
@@ -262,11 +280,21 @@ impl CandleBackend {
             .tokenizer
             .decode(&output_tokens, false)
             .map_err(|e| AdeError::Backend(format!("decode tokens: {e}")))?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let decode_ms = decode_started.elapsed().as_millis() as u64;
         if budget_breached {
             tracing::warn!(
                 tokens = output_tokens.len(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
+                total_ms = elapsed_ms,
+                decode_ms,
                 "candle backend hit budget mid-generation"
+            );
+        } else {
+            tracing::debug!(
+                output_tokens = output_tokens.len(),
+                total_ms = elapsed_ms,
+                decode_ms,
+                "candle inference complete"
             );
         }
         Ok(raw)
