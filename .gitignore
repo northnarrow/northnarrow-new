@@ -30,3 +30,4 @@ tarpaulin-report.html
 # Misc
 *.bak
 *.tmp
+.claude/
