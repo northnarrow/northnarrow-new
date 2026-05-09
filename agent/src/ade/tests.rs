@@ -213,6 +213,41 @@ async fn engine_rejects_missing_system_prompt() {
     assert!(matches!(err, AdeError::SystemPromptLoad { .. }));
 }
 
+/// Tappa 3 regression: an event that the rule engine matches MUST be
+/// killed by the rule path before ADE is ever consulted. ADE is
+/// strictly a fallback — `engine.evaluate(&event).is_some()` short
+/// circuits the main loop, mirroring `agent/src/main.rs::process_event`.
+#[tokio::test]
+async fn rule_engine_short_circuits_before_ade_for_tmp_payload() {
+    use crate::decision::RuleEngine;
+
+    let rule_engine = RuleEngine::with_default_rules();
+
+    // /tmp/nn-test-payload is the canonical Tappa 3 regression event.
+    let event = Event::ProcessSpawn {
+        pid: 12345,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "nn-test-payload".into(),
+        filename: "/tmp/nn-test-payload".into(),
+        timestamp_ns: 0,
+    };
+
+    let v = rule_engine
+        .evaluate(&event)
+        .expect("R001 must fire on /tmp/* exec");
+    assert_eq!(v.rule_id, "R001_ExecFromTmp");
+    assert_eq!(
+        v.action,
+        common::ResponseAction::KillProcess,
+        "Tappa 3 regression: R001 must still kill /tmp/nn-test-payload"
+    );
+    // The main loop short-circuits when `evaluate` returns Some(_),
+    // so ADE is never invoked. The assertion is structural: the rule
+    // path returns first.
+}
+
 // ---- ignored: requires the founder's GGUF + a real backend.
 //
 // These are wired up so they compile in CI but stay opt-in. Run with:

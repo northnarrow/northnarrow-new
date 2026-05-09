@@ -62,6 +62,10 @@ enum Cmd {
     },
     /// Parse the eBPF ELF object via aya-obj and dump diagnostics.
     InspectEbpf,
+    /// Run a hermetic ADE demo: 10 synthetic events through the
+    /// engine, dump verdicts + p50/p95/p99 latency. Does not need
+    /// root, eBPF, or a real GGUF — uses MockBackend.
+    AdeDemo,
 }
 
 fn main() -> ExitCode {
@@ -98,6 +102,30 @@ fn run(cli: Cli) -> Result<()> {
             run_agent(release, no_sudo, &args)?;
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
+        Cmd::AdeDemo => ade_demo()?,
+    }
+    Ok(())
+}
+
+/// Hermetic demo: spins up an AdeEngine with the deterministic
+/// MockBackend, runs ten synthetic events, prints verdicts and
+/// stats. No GGUF, no eBPF, no root.
+fn ade_demo() -> Result<()> {
+    let root = repo_root()?;
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&root).args([
+        "run",
+        "--quiet",
+        "--release",
+        "--example",
+        "ade_demo",
+        "--package",
+        "northnarrow-agent",
+    ]);
+    scrub_cargo_env(&mut cmd);
+    let status = cmd.status().with_context(|| "failed to spawn ade-demo")?;
+    if !status.success() {
+        bail!("ade-demo exited with {status}");
     }
     Ok(())
 }
