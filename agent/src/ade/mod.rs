@@ -30,6 +30,7 @@ pub mod rag_integration;
 pub mod sanitize;
 pub mod sanity_check;
 pub mod stats;
+pub mod streaming_parser;
 pub mod structured_prompt;
 
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub use rag_integration::{build_rag_query_from_event, format_rag_block};
 pub use sanitize::{sanitize_event_for_ade, InjectionFlag, SanitizedEvent};
 pub use sanity_check::{verify_verdict_coherence, SanityCheckResult};
 pub use stats::{AdeStats, AdeStatsSnapshot};
+pub use streaming_parser::StreamingJsonDetector;
 
 use crate::rag::{RagEngine, RagQuery};
 
