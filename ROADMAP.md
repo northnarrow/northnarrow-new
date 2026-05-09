@@ -113,6 +113,44 @@ Obiettivo: decisioni euristiche su casi ambigui.
 Demo: binario sconosciuto eseguito. Regole non lo classificano.
 LLM lo analizza (filename, syscalls, network behavior) e decide.
 
+### Sub-tappa 6.1 — Backend candle reale (chiusa)
+
+- Backend candle Llama 3.1 GGUF Q4_K_M, 100% Rust.
+- Foundation-Sec-8B-Reasoning come modello di default.
+- Smoke test runnable + bench example.
+- Tracing prefill/decode + ADE_DEMO_LIMIT.
+
+### Sub-tappa 6.5 — Adaptive Defensive Posture (chiusa)
+
+- State machine 4-tier persistente cross-eventi: OBSERVING → ALERTED
+  → ENGAGED → COMBAT (ordinati per gravità).
+- `agent::posture::PostureMachine` come handle Arc-backed,
+  Send + Sync. `observe(event, recent_events)` notifica eventi e
+  ritorna Some(stato) sulle transizioni; `modulate_verdict(v)`
+  applica severity-inflation + Allow→Alert in ALERTED+; `tick_decay`
+  fa decadere la posture (1h ALERTED→OBSERVING, 24h ENGAGED→
+  ALERTED, COMBAT mai).
+- `common::posture_types` per i tipi serializable (audit log).
+- 12 trigger-types (Reconnaissance, SuspiciousDns, SensitiveFileAccess,
+  Lolbas, ExploitAttempt, AdjacentCompromise, HeavyReconnaissance,
+  CriticalFileModification, ConfirmedIntrusion, PersistenceMechanism,
+  LateralMovement, ExfiltrationPattern).
+- Decay timer su `std::time::Instant` (immune a NTP).
+- Exit da COMBAT: stub `admin_release_combat(bool)`. Tappa 8 lo
+  sostituisce con verifier Ed25519.
+- ADE schema invariato (v1.0.0). Modulazione preserva la regola
+  `Allow ⇔ severity == None`.
+
+Differenziatore strutturale: tutti gli EDR commerciali 2026
+valutano gli eventi in isolamento. NorthNarrow no — la posture
+ricorda quel che ha visto e diventa più aggressiva man mano che le
+prove si accumulano.
+
+Demo: `cargo run -p northnarrow-agent --release --example
+posture_demo` mostra le transizioni OBSERVING→ALERTED→ENGAGED→
+COMBAT, una modulazione Allow→Alert in ALERTED, e l'admin override
+che riporta a ENGAGED.
+
 ---
 
 ## Tappa 7 — Anti-tamper Linux
