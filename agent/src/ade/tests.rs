@@ -354,3 +354,155 @@ async fn engine_with_rag_evaluates_successfully() {
     let v = engine.evaluate(&event, &ctx).await.unwrap();
     assert_eq!(v.verdict, AdeAction::Kill);
 }
+
+/// Sub-tappa 6.8 wiring smoke test.
+///
+/// Two backends emit the same JSON payload but through different
+/// trait methods: `WholeBlobBackend` returns it from `generate`,
+/// while `ChunkingBackend` streams it byte-by-byte through
+/// `generate_streaming`. The engine must produce the same verdict
+/// in both cases — streaming is a wall-time optimisation, not a
+/// schema change.
+#[tokio::test]
+async fn evaluate_produces_identical_verdict_with_or_without_streaming() {
+    use super::inference::StreamControl;
+
+    const RAW: &str = r#"{
+        "schema_version": "1.0.0",
+        "trace_id": "00000000-0000-4000-8000-000000000000",
+        "timestamp_utc": "2026-05-09T00:00:00Z",
+        "language_used": "it-IT",
+        "verdict": "Kill",
+        "severity": "High",
+        "confidence": 0.94,
+        "threat_classification": {"family":"x","kind":"process_spawn","novelty":0.1},
+        "reasoning": {
+            "step_1_extract": "x",
+            "step_2_pattern_match": "x",
+            "step_3_criticality": "x",
+            "step_4_alternative_explanations": {"legitimate_uses": [], "assessment": "x"},
+            "step_5_decision": "Kill"
+        },
+        "evidence": {"primary_indicators": ["x"], "secondary_indicators": []},
+        "mitre_attack": {"tactic": ["TA0040"], "technique": ["T1496"]},
+        "recommended_action": {"action":"Kill","justification":"x","side_effects":[]},
+        "follow_up": {"policy":"Monitor","monitoring_duration_s": 300},
+        "metadata": {
+            "model_id": "test",
+            "model_quantization": "none",
+            "backend": "test",
+            "host_id": "h",
+            "agent_version": "0.0.1",
+            "inference_latency_ms": 0
+        }
+    }"#;
+
+    struct WholeBlobBackend;
+    impl InferenceBackend for WholeBlobBackend {
+        fn name(&self) -> &str {
+            "whole-blob"
+        }
+        fn quantization(&self) -> &str {
+            "none"
+        }
+        fn model_id(&self) -> &str {
+            "whole"
+        }
+        fn generate(
+            &self,
+            _p: &str,
+            _e: &Event,
+            _m: usize,
+            _t: f32,
+            _tp: f32,
+        ) -> Result<String, error::AdeError> {
+            Ok(RAW.to_string())
+        }
+    }
+
+    struct ChunkingBackend;
+    impl InferenceBackend for ChunkingBackend {
+        fn name(&self) -> &str {
+            "chunking"
+        }
+        fn quantization(&self) -> &str {
+            "none"
+        }
+        fn model_id(&self) -> &str {
+            "chunk"
+        }
+        fn generate(
+            &self,
+            _p: &str,
+            _e: &Event,
+            _m: usize,
+            _t: f32,
+            _tp: f32,
+        ) -> Result<String, error::AdeError> {
+            // Should never be called — the engine uses
+            // generate_streaming, and we override that below.
+            Ok(RAW.to_string())
+        }
+        fn generate_streaming(
+            &self,
+            _p: &str,
+            _e: &Event,
+            _m: usize,
+            _t: f32,
+            _tp: f32,
+            mut on_token: Box<dyn FnMut(&str) -> StreamControl + Send>,
+        ) -> Result<String, error::AdeError> {
+            // Stream one byte at a time — exercises the detector's
+            // progressive-feed path. Bail out as soon as the
+            // detector says Stop, mirroring CandleBackend behaviour.
+            let mut buf = String::new();
+            for ch in RAW.chars() {
+                let mut tmp = [0u8; 4];
+                let s = ch.encode_utf8(&mut tmp);
+                buf.push_str(s);
+                if let StreamControl::Stop = on_token(s) {
+                    return Ok(buf);
+                }
+            }
+            Ok(buf)
+        }
+    }
+
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+
+    let cfg_a = cfg_with(prompt.path(), model.path());
+    let engine_a = AdeEngine::new_with_backend(cfg_a, Arc::new(WholeBlobBackend))
+        .await
+        .unwrap();
+
+    let cfg_b = cfg_with(prompt.path(), model.path());
+    let engine_b = AdeEngine::new_with_backend(cfg_b, Arc::new(ChunkingBackend))
+        .await
+        .unwrap();
+
+    let event = Event::ProcessSpawn {
+        pid: 4242,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "xmrig".into(),
+        filename: "/tmp/x".into(),
+        timestamp_ns: 0,
+    };
+    let ctx = || EventContext {
+        recent_events: vec![],
+        host_context: HostContext::discover(),
+    };
+
+    let va = engine_a.evaluate(&event, &ctx()).await.unwrap();
+    let vb = engine_b.evaluate(&event, &ctx()).await.unwrap();
+
+    assert_eq!(va.verdict, vb.verdict);
+    assert_eq!(va.severity, vb.severity);
+    assert_eq!(
+        va.threat_classification.family,
+        vb.threat_classification.family
+    );
+    assert_eq!(va.recommended_action.action, vb.recommended_action.action);
+}

@@ -103,15 +103,19 @@ mod tests {
 
     #[test]
     fn effective_threads_honours_explicit_override() {
-        let mut cfg = AdeConfig::default();
-        cfg.num_threads = Some(4);
+        let cfg = AdeConfig {
+            num_threads: Some(4),
+            ..AdeConfig::default()
+        };
         assert_eq!(cfg.effective_threads(), 4);
     }
 
     #[test]
     fn effective_threads_clamps_zero_to_one() {
-        let mut cfg = AdeConfig::default();
-        cfg.num_threads = Some(0);
+        let cfg = AdeConfig {
+            num_threads: Some(0),
+            ..AdeConfig::default()
+        };
         assert_eq!(cfg.effective_threads(), 1);
     }
 }

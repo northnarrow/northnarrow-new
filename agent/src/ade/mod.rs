@@ -230,10 +230,30 @@ impl AdeEngine {
         let top_p = self.inner.config.top_p;
 
         let start = Instant::now();
+        // Sub-tappa 6.8: stream the decode through a brace-tracking
+        // detector and signal Stop the moment the verdict JSON
+        // closes. Backends without per-token streaming (MockBackend)
+        // get a single end-of-output callback via the trait's
+        // default impl — same observable behaviour, just no early
+        // termination saving.
         let raw_result = tokio::time::timeout(
             self.inner.config.timeout,
             tokio::task::spawn_blocking(move || {
-                backend.generate(&prompt, &event_owned, max_tokens, temp, top_p)
+                let mut detector = StreamingJsonDetector::new();
+                backend.generate_streaming(
+                    &prompt,
+                    &event_owned,
+                    max_tokens,
+                    temp,
+                    top_p,
+                    Box::new(move |chunk: &str| {
+                        if detector.feed(chunk) {
+                            inference::StreamControl::Stop
+                        } else {
+                            inference::StreamControl::Continue
+                        }
+                    }),
+                )
             }),
         )
         .await;
