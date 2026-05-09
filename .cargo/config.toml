@@ -1,2 +1,15 @@
 [alias]
 xtask = "run --quiet --package xtask --release --"
+
+# Sub-tappa 6.8: workspace builds opt into target-cpu=native so LLVM
+# can emit FMA fused mul-adds, AVX-512 lanes when present, and any
+# other host-specific instructions candle's CPU kernels rely on for
+# memory-bound LLM decode. The flag inflates the binary's hardware
+# requirement to "the build host or newer" — for the agent that's a
+# feature, not a bug, because we only ship from the deployment host.
+#
+# `lld` would shave a few seconds off link time but is not available
+# on the production host (Hetzner CCX23, May 2026); leaving the
+# default linker keeps `cargo build --release` self-contained.
+[build]
+rustflags = ["-C", "target-cpu=native"]

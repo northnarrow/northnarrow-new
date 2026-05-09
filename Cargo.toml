@@ -30,6 +30,25 @@ aya = "0.13"
 aya-log = "0.2"
 
 [profile.release]
-lto = "thin"
+# Sub-tappa 6.8 (performance pass) bumps LTO from "thin" to "fat":
+# cross-crate inlining lets candle's hot quantized matmul be folded
+# into the engine's spawn_blocking caller, gaining ~10-20% on CPU
+# decode on AVX2 hosts. The trade-off is build time: ~30s → ~90-120s
+# on the Hetzner CCX23 reference host. Acceptable because production
+# builds are infrequent and CI runs `--release` only on the final
+# job. Fall back to `lto = "thin"` if a host lacks the RAM (LTO fat
+# can peak ~6-8 GiB during link).
+opt-level = 3
 codegen-units = 1
+lto = "fat"
+panic = "abort"
 strip = "symbols"
+
+# Same as `release` but keeps debug symbols so `perf record` / flame
+# graphs can name candle internals when bench_threads runs against
+# the real Foundation-Sec model. Built explicitly with
+# `cargo build --profile release-bench`.
+[profile.release-bench]
+inherits = "release"
+debug = true
+strip = "none"
