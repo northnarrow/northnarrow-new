@@ -28,3 +28,7 @@ pub use model::*;
 /// Active Defense Engine (ADE) verdict schema (v1.0.0).
 #[cfg(feature = "std")]
 pub mod ade_types;
+
+/// Adaptive Defensive Posture types (Sub-tappa 6.5).
+#[cfg(feature = "std")]
+pub mod posture_types;
