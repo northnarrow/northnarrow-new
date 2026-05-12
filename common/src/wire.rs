@@ -203,6 +203,21 @@ impl DnsQueryRaw {
     }
 }
 
+/// Composite key for the Tappa 7 `PROTECTED_INODES` BPF map.
+///
+/// Userland keys come from `stat(2)` (`st_dev`, `st_ino`); the eBPF
+/// LSM hooks rebuild the same pair from `inode->i_sb->s_dev` and
+/// `inode->i_ino`. We use `u64` for `dev` on both sides even though
+/// the kernel `dev_t` is 32 bits — the wider type guarantees the
+/// BPF map's key blob is naturally 8-aligned with no implicit pad.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct InodeKey {
+    pub dev: u64,
+    pub ino: u64,
+}
+
 // Tappa 7 filesystem-protection denial codes. The eBPF inode hooks
 // write one of these into `FsProtectDenialRaw.operation` when they
 // return `-EPERM`. Userland inflates the byte into the typed
