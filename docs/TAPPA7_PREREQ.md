@@ -186,3 +186,71 @@ Tempo stimato Tappa 7 sviluppo: 2-3 settimane (da ROADMAP.md).
   Sviluppo e test Tappa 7 = su server Hetzner o VM KVM locale.
 - Phase A Reasoning training in corso su PC fisso non
   interferisce con lavoro server (hardware separato).
+
+---
+
+## UPDATE 12 maggio 2026 — 15:15 UTC — IMPLEMENTATION + LIVE TEST
+
+### Implementation (via Claude Code, autopilot mode)
+
+Commits on `main` (already pushed to origin):
+
+- `9396e26` — `feat(agent-ebpf): task_kill.rs LSM hook denies SIGKILL/SIGTERM`
+- `ed1e3c3` — `feat(agent-ebpf): ptrace_check.rs LSM hook denies ptrace`
+- `1dcd0dd` — `feat(agent): userland LSM loader (anti_tamper module)`
+
+Build verification: 258 tests passing, BTF section present in
+agent-ebpf ELF, cargo clippy clean.
+
+### Live test on northnarrow-dev-01
+
+Agent launched as root via:
+sudo nohup ./target/release/northnarrow-agent --no-ade > /tmp/nn-agent.log 2>&1 &
+
+Log confirmed at launch:
+INFO anti-tamper: agent PID registered with kernel agent_pid=14112 map="PROTECTED_PID"
+INFO anti-tamper: LSM hook attached (denies SIGKILL/SIGTERM to agent) program="task_kill"
+INFO anti-tamper: LSM hook attached (denies ptrace to agent) program="ptrace_access_check"
+
+### Test results
+
+| # | Test | Command | Expected | Actual | Verdict |
+|---|------|---------|----------|--------|---------|
+| 1 | SIGKILL | `sudo kill -9 14112` | denied | `kill: Operation not permitted`, agent Rl | PASS |
+| 2 | SIGTERM | `sudo kill -15 14112` | denied | `kill: Operation not permitted`, agent Rl | PASS |
+| 3 | PTRACE | `sudo gdb -p 14112` | denied | `Could not attach to process`, `ptrace: Inappropriate ioctl` | PASS |
+| 4 | SIGQUIT | `sudo kill -3 14112` | allowed | exit 0, agent terminated cleanly | PASS |
+
+### Known issues (non-blocking)
+
+- `SIGINT` (signal 2) and `SIGHUP` (signal 1) not handled by
+  userland agent (tokio `signal::ctrl_c` doesn't catch
+  `sudo kill -2`). Workaround: use `SIGQUIT` for shutdown.
+  Fix scheduled with subsequent Tappa 7 tasks.
+
+### Conclusion
+
+Anti-tamper layer of Tappa 7 (task_kill + ptrace_access_check)
+is VERIFIED FUNCTIONAL on production-grade kernel:
+
+- Root cannot kill the agent with SIGKILL or SIGTERM.
+- Root cannot attach a debugger to the agent.
+- Agent remains responsive to graceful shutdown (SIGQUIT).
+- LSM hooks correctly filter only the targeted signals
+  (no over-blocking).
+
+Differentiator vs CrowdStrike Falcon: CrowdStrike's userspace
+agent on Linux can be killed by root via standard signals.
+NorthNarrow agent on this server, with Tappa 7 hooks active,
+cannot. Verified empirically 12 May 2026 15:14 UTC.
+
+### Remaining Tappa 7 work
+
+- Task 5: filesystem protection `/var/lib/northnarrow/`
+  (chattr +i + LSM inode hooks).
+- Task 6: secondary watchdog process.
+- Bug fix: SIGINT/SIGHUP handler in agent userland.
+- Optional: migrate Tappe 1-4 from tracepoint to LSM hooks
+  now that BTF emission works.
+
+Target completion: settimana lunedì 19 maggio 2026.
