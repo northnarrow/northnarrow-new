@@ -23,6 +23,8 @@
 //! - The map write happens *before* the attach calls so any time
 //!   window in which the hook fires sees a valid `tgid`, never `0`.
 
+pub mod filesystem;
+
 use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{Array, MapData},
@@ -100,6 +102,15 @@ pub fn attach(ebpf: &mut Ebpf, agent_pid: u32) -> Result<()> {
         ),
     }
 
+    // Tappa 7 task 5: directory + inode protection. Failure to
+    // bootstrap (no /var/lib, read-only rootfs, permission denied
+    // even as root) is warn-and-continue: process-level anti-tamper
+    // already attached above, so the agent isn't worthless without
+    // FS protection.
+    if let Err(e) = filesystem::attach(ebpf, &btf) {
+        warn!(error = %e, "anti-tamper FS: bootstrap failed, continuing without FS protection");
+    }
+
     Ok(())
 }
 
@@ -115,7 +126,7 @@ fn write_protected_pid(ebpf: &mut Ebpf, agent_pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn attach_lsm(
+pub(crate) fn attach_lsm(
     ebpf: &mut Ebpf,
     program_name: &str,
     hook_name: &str,
