@@ -39,7 +39,8 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 
-use crate::task_kill::{PROTECTED_PID, TASK_STRUCT_TGID_OFFSET};
+use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
+use crate::task_kill::PROTECTED_PID;
 
 /// Linux `EPERM` value; LSM hooks return `-errno` to deny.
 const EPERM: c_int = 1;

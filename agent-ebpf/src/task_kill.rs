@@ -31,21 +31,7 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 
-// ---------------------------------------------------------------------------
-// Kernel struct offsets.
-//
-// `struct task_struct.tgid` byte offset, captured from
-// `/sys/kernel/btf/vmlinux` on Ubuntu 24.04.4 / Linux 6.8.0-111-generic
-// (2026-05-12): `bits_offset=19936` → 2492 bytes. The thread-group id
-// is what userland calls "PID" — `getpid(2)` returns `tgid`, while the
-// kernel's `task->pid` is the per-thread id. We compare against `tgid`.
-//
-// aya-ebpf 0.1 does not emit CO-RE field relocations from Rust struct
-// definitions, so this constant is brittle across kernel rebuilds. The
-// userland loader validates it at boot by re-reading the kernel BTF
-// (Tappa 7 task 4 / `agent::anti_tamper`) before attaching the hook.
-// ---------------------------------------------------------------------------
-pub(crate) const TASK_STRUCT_TGID_OFFSET: usize = 2492;
+use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
 
 const SIGKILL: c_int = 9;
 const SIGTERM: c_int = 15;
