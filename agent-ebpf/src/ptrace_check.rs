@@ -65,12 +65,11 @@ pub fn ptrace_access_check(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
-    // LSM-chain hygiene: if a prior hook on the chain already
-    // produced a non-zero verdict, propagate it unchanged.
-    let prev_retval: c_int = ctx.arg(2);
-    if prev_retval != 0 {
-        return prev_retval;
-    }
+    // No prev-retval read — see task_kill.rs comment for rationale.
+    // Short version: kernel call_int_hook short-circuits on the first
+    // non-zero LSM verdict, so we are only invoked when prev==0, and
+    // aya 0.13's arg(N) read of the phony retval is unreliable on
+    // Ubuntu 6.8's BPF-LSM trampoline.
 
     let protected = match PROTECTED_PID.get(0) {
         Some(p) => *p,

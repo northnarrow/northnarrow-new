@@ -31,12 +31,35 @@ use aya_ebpf::{
     cty::{c_int, c_uint, c_void},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_printk, bpf_trace_vprintk,
     },
     macros::{lsm, map},
     maps::{Array, HashMap, RingBuf},
     programs::LsmContext,
 };
+
+/// Trustworthy single-u64 printk that uses `bpf_trace_vprintk`
+/// (helper #177) instead of aya 0.13's `bpf_printk!` macro.
+///
+/// The macro's 1-3-args path transmutes helper #6 to a Rust variadic
+/// fn and passes `PrintkArg` aggregates by value. The BPF backend
+/// lowers that as pass-by-pointer, so the kernel sees a STACK
+/// POINTER instead of our value (verified in disassembly: r3 = &slot,
+/// not r3 = value). The vprintk path takes an explicit
+/// `data_ptr + data_len` so there's no variadic ambiguity.
+///
+/// Diagnostic-only; remove or gate behind a feature once Tappa 7
+/// task 5 is verified working.
+#[inline(always)]
+unsafe fn nn_printk_u64(fmt: &[u8], value: u64) {
+    let data: [u64; 1] = [value];
+    bpf_trace_vprintk(
+        fmt.as_ptr() as *const _,
+        fmt.len() as u32,
+        data.as_ptr() as *const _,
+        core::mem::size_of_val(&data) as u32,
+    );
+}
 use northnarrow_common::wire::{
     FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
     FS_OP_UNLINK,
@@ -179,14 +202,29 @@ fn emit_denial(operation: u8, key: InodeKey) {
 unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
     let key = match inode_key(target) {
         Some(k) => k,
-        None => return false,
+        None => {
+            nn_printk_u64(b"nn-diag: inode_key=None op=%lu", operation as u64);
+            return false;
+        }
     };
+    // The 1-3 args path of aya 0.13's bpf_printk! macro passes
+    // PrintkArg structs by reference (verified in BPF disasm: r3
+    // ends up as a stack pointer, not the value). Use nn_printk_u64
+    // which goes through bpf_trace_vprintk instead — that path
+    // takes an explicit buffer + length and correctly forwards
+    // values.
+    nn_printk_u64(b"nn-diag: deny_if op=%lu", operation as u64);
+    nn_printk_u64(b"nn-diag: deny_if dev=%lu", key.dev);
+    nn_printk_u64(b"nn-diag: deny_if ino=%lu", key.ino);
     if !is_protected(&key) {
+        nn_printk_u64(b"nn-diag: MISS op=%lu", operation as u64);
         return false;
     }
     if override_active() {
+        nn_printk_u64(b"nn-diag: MATCH-override op=%lu", operation as u64);
         return false;
     }
+    nn_printk_u64(b"nn-diag: MATCH-EPERM op=%lu", operation as u64);
     emit_denial(operation, key);
     true
 }
@@ -202,10 +240,10 @@ pub fn inode_unlink(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
-    let prev: c_int = ctx.arg(2);
-    if prev != 0 {
-        return prev;
-    }
+    // No prev-retval read — see task_kill.rs for rationale (kernel
+    // call_int_hook short-circuits, aya 0.13's phony-retval slot is
+    // unreliable on Ubuntu 6.8 trampoline).
+    //
     // arg(0) = parent dir inode, arg(1) = target dentry. Block if
     // either the parent dir or the target inode itself is in the
     // protected set — that covers both "rm somefile inside dir" and
@@ -230,10 +268,7 @@ pub fn inode_rmdir(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
-    let prev: c_int = ctx.arg(2);
-    if prev != 0 {
-        return prev;
-    }
+    // No prev-retval read — see task_kill.rs.
     let parent: *const c_void = ctx.arg(0);
     if deny_if_protected(FS_OP_RMDIR, parent) {
         return -EPERM;
@@ -249,17 +284,21 @@ unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
 
 #[lsm(hook = "inode_rename")]
 pub fn inode_rename(ctx: LsmContext) -> i32 {
+    // Unconditional entry marker — fires the instant the kernel
+    // dispatches this BPF program, BEFORE any ctx.arg() access or
+    // verifier-visible logic. Used to disambiguate "kernel called
+    // security_inode_rename but our BPF prog didn't run" vs
+    // "our prog ran but its logic didn't match" during 2026-05-12
+    // Tappa 7 task 5 diagnosis.
+    unsafe { bpf_printk!(b"nn-diag-rename-body fired") };
     unsafe { try_inode_rename(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
     // Kernel signature: (old_dir, old_dentry, new_dir, new_dentry).
-    // Aya appends prev-retval at arg(4).
-    let prev: c_int = ctx.arg(4);
-    if prev != 0 {
-        return prev;
-    }
+    // No prev-retval read — see task_kill.rs for rationale.
+    nn_printk_u64(b"nn-diag: ENTER inode_rename", 0);
 
     let old_dir: *const c_void = ctx.arg(0);
     if deny_if_protected(FS_OP_RENAME, old_dir) {
@@ -292,17 +331,11 @@ pub fn inode_setattr(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
-    // Kernel signature on Ubuntu 6.8 (verified against
-    // /sys/kernel/btf/vmlinux): vlen=2, (dentry, iattr). Mainline
-    // 6.3+ prepended a `struct mnt_idmap *` for idmapped mounts and
-    // the hook became (mnt_idmap, dentry, iattr); Ubuntu's 6.8
-    // backport kept the older 2-arg form. Aya appends prev-retval
-    // as the final arg, so it lives at arg(2) here, not arg(3).
-    // Using arg(3) made the verifier reject the program at load.
-    let prev: c_int = ctx.arg(2);
-    if prev != 0 {
-        return prev;
-    }
+    // Kernel signature on Ubuntu 6.8: vlen=2, (dentry, iattr) —
+    // verified against /sys/kernel/btf/vmlinux. Mainline 6.3+
+    // prepended a `struct mnt_idmap *`. We previously read
+    // ctx.arg(2) as the aya "phony retval" but per task_kill.rs
+    // rationale we no longer trust that slot, so the read is gone.
     let dentry: *const c_void = ctx.arg(0);
     if let Some(target_inode) = inode_from_dentry(dentry) {
         if deny_if_protected(FS_OP_SETATTR, target_inode) {
@@ -314,23 +347,32 @@ unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
 
 #[lsm(hook = "file_ioctl")]
 pub fn file_ioctl(ctx: LsmContext) -> i32 {
+    // Same diagnostic marker as inode_rename — unconditional, top
+    // of body, no arg access yet. If the kernel calls
+    // security_file_ioctl but this line never appears in
+    // trace_pipe, our BPF program is registered to the wrong
+    // attach point.
+    unsafe { bpf_printk!(b"nn-diag-ioctl-body fired") };
     unsafe { try_file_ioctl(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (file, cmd, arg). Prev-retval at arg(3).
-    let prev: c_int = ctx.arg(3);
-    if prev != 0 {
-        return prev;
-    }
+    // Kernel signature: (file, cmd, arg). No prev-retval read —
+    // this is exactly where aya's phony-retval convention bit us
+    // in the 2026-05-12 diagnosis: ctx.arg(3) consistently returned
+    // non-zero garbage on Ubuntu 6.8's trampoline, so every chattr
+    // ioctl early-returned before reaching the cmd filter. See
+    // task_kill.rs for the broader rationale.
 
     // Fast path: this hook fires for EVERY ioctl on EVERY fd.
     // Filter on cmd before touching any kernel struct.
     let cmd: c_uint = ctx.arg(1);
+    nn_printk_u64(b"nn-diag: ENTER file_ioctl cmd=0x%lx", cmd as u64);
     if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS {
         return 0;
     }
+    nn_printk_u64(b"nn-diag: file_ioctl matched chattr cmd=0x%lx", cmd as u64);
 
     let file: *const c_void = ctx.arg(0);
     if file.is_null() {

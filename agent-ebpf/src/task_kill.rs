@@ -60,12 +60,14 @@ pub fn task_kill(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
-    // LSM-chain hygiene: if a prior hook on the chain already
-    // produced a non-zero verdict, propagate it unchanged.
-    let prev_retval: c_int = ctx.arg(4);
-    if prev_retval != 0 {
-        return prev_retval;
-    }
+    // No prev-retval read on this kernel. Aya 0.13 documents a
+    // "phony retval at arg(N)" convention, but on Ubuntu 6.8's
+    // BPF-LSM trampoline that slot is not reliably zero-initialised
+    // — file_ioctl was silently early-returning because of garbage
+    // at arg(3) (see 2026-05-12 diagnosis). The kernel's
+    // call_int_hook macro short-circuits the LSM chain on the first
+    // non-zero verdict anyway, so we are only ever invoked when all
+    // prior LSMs returned 0; the prev-retval read is dead code.
 
     // We only police the two signals that can terminate a daemon
     // without coordination. Everything else (SIGCHLD, SIGWINCH,
