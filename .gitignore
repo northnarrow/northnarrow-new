@@ -31,3 +31,8 @@ tarpaulin-report.html
 *.bak
 *.tmp
 .claude/
+
+# Backup files
+*.bak
+*.bak2
+*.bak.*
