@@ -9,6 +9,7 @@
 //!   feeding ADE (Sub-tappa 6.7).
 
 pub mod ade;
+pub mod anti_tamper;
 pub mod correlation;
 pub mod decision;
 pub mod posture;

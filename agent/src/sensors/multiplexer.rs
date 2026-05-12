@@ -31,7 +31,7 @@ const CHANNEL_CAPACITY: usize = 4096;
 /// Owns the loaded eBPF object and every attached link. Dropping the
 /// multiplexer detaches everything and aborts the pump tasks.
 pub struct SensorMultiplexer {
-    _ebpf: Ebpf,
+    ebpf: Ebpf,
     pumps: Vec<JoinHandle<()>>,
     rx: mpsc::Receiver<Event>,
 }
@@ -94,17 +94,22 @@ impl SensorMultiplexer {
             spawn_pump::<DnsQueryRaw>("dns_query", dns_query_rb, tx),
         ];
 
-        Ok(Self {
-            _ebpf: ebpf,
-            pumps,
-            rx,
-        })
+        Ok(Self { ebpf, pumps, rx })
     }
 
     /// Drain the next event. Returns `None` when every pump task has
     /// exited (which only happens at shutdown).
     pub async fn next_event(&mut self) -> Option<Event> {
         self.rx.recv().await
+    }
+
+    /// Wire up the Tappa 7 anti-tamper LSM hooks: write the agent's
+    /// own PID into `PROTECTED_PID` and attach `task_kill` +
+    /// `ptrace_access_check`. Lives on the multiplexer because it
+    /// owns the only [`Ebpf`] instance — see
+    /// [`crate::anti_tamper`] for the rationale.
+    pub fn attach_anti_tamper(&mut self, agent_pid: u32) -> Result<()> {
+        crate::anti_tamper::attach(&mut self.ebpf, agent_pid)
     }
 }
 

@@ -92,6 +92,15 @@ async fn main() -> Result<()> {
         "sensor multiplexer attached"
     );
 
+    // Tappa 7: turn ourselves opaque to kill(2) and ptrace(2) before
+    // anything spawns child tasks or holds resources we'd hate to
+    // leak. Per-hook failures are logged WARN inside the call and
+    // tolerated so the agent still runs on kernels without BPF-LSM.
+    let agent_pid = std::process::id();
+    if let Err(e) = sensor.attach_anti_tamper(agent_pid) {
+        warn!(error = %e, agent_pid, "anti-tamper setup failed");
+    }
+
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
     #[cfg(not(feature = "demo-tappa5"))]
