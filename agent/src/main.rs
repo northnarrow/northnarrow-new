@@ -33,7 +33,7 @@ use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
-use tokio::signal;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -183,8 +183,23 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+    // Install the three shutdown signals up front, before the loop.
+    // Re-creating the future inside `select!` every iteration (the
+    // old `signal::ctrl_c()` shorthand) re-runs handler registration
+    // each tick and interacts badly with `SIG_IGN` inherited from
+    // `bash &` + `nohup` (live test 2026-05-12 found SIGINT and
+    // SIGHUP silently dropped; only SIGQUIT brought the agent down).
+    // A pre-registered `Signal` stream is the documented robust path.
+    //
+    // SIGTERM is normally caught by the Tappa 7 LSM hook before
+    // userland ever sees it; the handler is here for builds running
+    // without anti-tamper (kernels lacking `bpf` in their LSM chain).
+    let mut sigint = signal(SignalKind::interrupt())
+        .context("installing SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate())
         .context("installing SIGTERM handler")?;
+    let mut sighup = signal(SignalKind::hangup())
+        .context("installing SIGHUP handler")?;
 
     loop {
         tokio::select! {
@@ -203,12 +218,16 @@ async fn main() -> Result<()> {
                     break;
                 }
             },
-            _ = signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 info!("SIGINT received; shutting down");
                 break;
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received; shutting down");
+                break;
+            }
+            _ = sighup.recv() => {
+                info!("SIGHUP received; shutting down");
                 break;
             }
         }
