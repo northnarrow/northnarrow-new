@@ -5,10 +5,12 @@ target = "bpfel-unknown-none"
 build-std = ["core"]
 
 [target.bpfel-unknown-none]
-# `link-arg=--btf` tells bpf-linker to emit a `.BTF` section. Aya
-# 0.13's loader hard-requires BTF info to map programs/maps; without
-# it `Object::parse` fails with "error parsing ELF data".
+# `-C debuginfo=2` is REQUIRED for bpf-linker to emit BTF
+# (without DWARF debug info, bpf-linker cannot convert to BTF).
+# `-C link-arg=--btf` tells bpf-linker to emit .BTF section.
+# Aya 0.13's LSM loader hard-requires BTF info.
 rustflags = [
     "-C", "panic=abort",
+    "-C", "debuginfo=2",
     "-C", "link-arg=--btf",
 ]

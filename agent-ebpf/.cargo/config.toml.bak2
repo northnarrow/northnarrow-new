@@ -1,0 +1,14 @@
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+# `link-arg=--btf` tells bpf-linker to emit a `.BTF` section. Aya
+# 0.13's loader hard-requires BTF info to map programs/maps; without
+# it `Object::parse` fails with "error parsing ELF data".
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "link-arg=--btf",
+]

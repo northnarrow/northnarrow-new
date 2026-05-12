@@ -2,6 +2,6 @@
 # is tier-3 and ships no prebuilt artifacts; we build core/alloc from
 # source via -Zbuild-std. Userland (parent workspace) stays on stable.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2025-12-01"
 components = ["rust-src", "rustfmt", "clippy"]
 profile = "minimal"
