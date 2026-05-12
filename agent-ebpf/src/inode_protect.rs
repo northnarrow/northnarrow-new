@@ -292,13 +292,18 @@ pub fn inode_setattr(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (mnt_idmap, dentry, iattr). Prev-retval at
-    // arg(3).
-    let prev: c_int = ctx.arg(3);
+    // Kernel signature on Ubuntu 6.8 (verified against
+    // /sys/kernel/btf/vmlinux): vlen=2, (dentry, iattr). Mainline
+    // 6.3+ prepended a `struct mnt_idmap *` for idmapped mounts and
+    // the hook became (mnt_idmap, dentry, iattr); Ubuntu's 6.8
+    // backport kept the older 2-arg form. Aya appends prev-retval
+    // as the final arg, so it lives at arg(2) here, not arg(3).
+    // Using arg(3) made the verifier reject the program at load.
+    let prev: c_int = ctx.arg(2);
     if prev != 0 {
         return prev;
     }
-    let dentry: *const c_void = ctx.arg(1);
+    let dentry: *const c_void = ctx.arg(0);
     if let Some(target_inode) = inode_from_dentry(dentry) {
         if deny_if_protected(FS_OP_SETATTR, target_inode) {
             return -EPERM;
