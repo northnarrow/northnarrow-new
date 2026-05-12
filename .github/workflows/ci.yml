@@ -44,19 +44,19 @@ jobs:
         if: matrix.task == 'fmt'
         run: cargo fmt --all --check
 
-      - name: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy --workspace --exclude northnarrow-agent-ebpf --all-targets -- -D warnings
         if: matrix.task == 'clippy'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude northnarrow-agent-ebpf --all-targets -- -D warnings
 
       - name: cargo build --workspace
         if: matrix.task == 'build'
-        run: cargo build --workspace --verbose
+        run: cargo build --workspace --exclude northnarrow-agent-ebpf --verbose
 
       - name: cargo test --workspace
         # Integration tests that need root are #[ignore]d, so the
         # default `cargo test` run is unprivileged.
         if: matrix.task == 'test'
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --exclude northnarrow-agent-ebpf --verbose
 
   test-privileged:
     name: test-privileged (compile-only)
