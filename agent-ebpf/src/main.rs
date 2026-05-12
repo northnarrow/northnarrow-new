@@ -19,6 +19,7 @@
 mod dns_query;
 mod exec_check;
 mod file_open;
+mod task_kill;
 mod tcp_connect;
 
 use aya_ebpf::{
