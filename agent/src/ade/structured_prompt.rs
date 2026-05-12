@@ -161,6 +161,7 @@ fn event_kind_label(e: &Event) -> &'static str {
         Event::ExecCheck { .. } => "exec_check",
         Event::TcpConnect { .. } => "tcp_connect",
         Event::DnsQuery { .. } => "dns_query",
+        Event::FsProtectDenial { .. } => "fs_protect_denial",
     }
 }
 
@@ -170,7 +171,8 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
         | Event::FileOpen { pid, uid, .. }
         | Event::ExecCheck { pid, uid, .. }
         | Event::TcpConnect { pid, uid, .. }
-        | Event::DnsQuery { pid, uid, .. } => (*pid, *uid),
+        | Event::DnsQuery { pid, uid, .. }
+        | Event::FsProtectDenial { pid, uid, .. } => (*pid, *uid),
     };
     buf.push_str(&format!("pid: {pid}\nuid: {uid}\n"));
 }

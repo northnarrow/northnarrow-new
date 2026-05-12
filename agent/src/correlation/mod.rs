@@ -121,7 +121,8 @@ fn event_timestamp_ns(e: &Event) -> u64 {
         | Event::FileOpen { timestamp_ns, .. }
         | Event::ExecCheck { timestamp_ns, .. }
         | Event::TcpConnect { timestamp_ns, .. }
-        | Event::DnsQuery { timestamp_ns, .. } => *timestamp_ns,
+        | Event::DnsQuery { timestamp_ns, .. }
+        | Event::FsProtectDenial { timestamp_ns, .. } => *timestamp_ns,
     }
 }
 
@@ -140,7 +141,9 @@ fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
             ..
         } => (*pid, Some(*ppid), Some(filename.as_str())),
         Event::FileOpen { pid, filename, .. } => (*pid, None, Some(filename.as_str())),
-        Event::TcpConnect { pid, .. } | Event::DnsQuery { pid, .. } => (*pid, None, None),
+        Event::TcpConnect { pid, .. }
+        | Event::DnsQuery { pid, .. }
+        | Event::FsProtectDenial { pid, .. } => (*pid, None, None),
     }
 }
 

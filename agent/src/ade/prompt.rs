@@ -177,6 +177,18 @@ pub(crate) fn format_event_line(event: &Event) -> String {
         } => format!(
             "- dns_query pid={pid} uid={uid} comm={comm} qname={query_name} qtype={query_type}"
         ),
+        Event::FsProtectDenial {
+            pid,
+            uid,
+            comm,
+            target_dev,
+            target_ino,
+            operation,
+            ..
+        } => format!(
+            "- fs_protect_denial pid={pid} uid={uid} comm={comm} op={operation} \
+             dev={target_dev} ino={target_ino}"
+        ),
     }
 }
 

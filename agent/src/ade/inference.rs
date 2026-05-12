@@ -255,6 +255,12 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             pid_for_pkg = *pid;
             filename_for_pkg = comm.clone();
         }
+        // FsProtectDenial is short-circuited before ADE in main.rs.
+        // Unreachable in practice; kept for exhaustiveness.
+        Event::FsProtectDenial { pid, operation, .. } => {
+            pid_for_pkg = *pid;
+            filename_for_pkg = format!("fs_protect_denial:{operation}");
+        }
     }
 
     let metadata = AdeMetadata {

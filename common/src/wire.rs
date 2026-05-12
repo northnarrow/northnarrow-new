@@ -203,6 +203,51 @@ impl DnsQueryRaw {
     }
 }
 
+// Tappa 7 filesystem-protection denial codes. The eBPF inode hooks
+// write one of these into `FsProtectDenialRaw.operation` when they
+// return `-EPERM`. Userland inflates the byte into the typed
+// `model::FsProtectOperation`.
+pub const FS_OP_UNLINK: u8 = 1;
+pub const FS_OP_RMDIR: u8 = 2;
+pub const FS_OP_RENAME: u8 = 3;
+pub const FS_OP_SETATTR: u8 = 4;
+pub const FS_OP_IOCTL: u8 = 5;
+
+/// Audit record emitted whenever a Tappa 7 inode-protection LSM hook
+/// returns `-EPERM`. The denial is the security event — userland
+/// raises a WARN and feeds the agent's posture machine.
+///
+/// Field order chosen for natural u64 alignment with no implicit
+/// padding gaps before `_pad`: 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 = 56.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FsProtectDenialRaw {
+    pub timestamp_ns: u64,
+    pub target_dev: u64,
+    pub target_ino: u64,
+    pub attacker_pid: u32,
+    pub attacker_uid: u32,
+    pub attacker_comm: [u8; TASK_COMM_LEN],
+    pub operation: u8,
+    pub _pad: [u8; 7],
+}
+
+impl FsProtectDenialRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            target_dev: 0,
+            target_ino: 0,
+            attacker_pid: 0,
+            attacker_uid: 0,
+            attacker_comm: [0u8; TASK_COMM_LEN],
+            operation: 0,
+            _pad: [0u8; 7],
+        }
+    }
+}
+
 /// Decode a fixed-size, possibly NUL-terminated byte buffer into a
 /// borrowed `&str`, stopping at the first NUL or at the end of the
 /// buffer. Invalid UTF-8 is replaced lossily by the caller.
@@ -251,6 +296,13 @@ mod tests {
         assert_eq!(restored.comm, original.comm);
         assert_eq!(restored.filename, original.filename);
         assert_eq!(restored.timestamp_ns, original.timestamp_ns);
+    }
+
+    #[test]
+    fn fs_protect_denial_raw_layout_is_stable() {
+        // 8+8+8+4+4+16+1+7 = 56, aligned to 8.
+        assert_eq!(size_of::<FsProtectDenialRaw>(), 56);
+        assert_eq!(align_of::<FsProtectDenialRaw>(), 8);
     }
 
     #[test]

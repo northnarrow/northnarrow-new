@@ -149,7 +149,8 @@ fn pid_of(e: &Event) -> u32 {
         | Event::FileOpen { pid, .. }
         | Event::ExecCheck { pid, .. }
         | Event::TcpConnect { pid, .. }
-        | Event::DnsQuery { pid, .. } => *pid,
+        | Event::DnsQuery { pid, .. }
+        | Event::FsProtectDenial { pid, .. } => *pid,
     }
 }
 

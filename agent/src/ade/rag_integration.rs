@@ -42,6 +42,9 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
         Event::DnsQuery {
             comm, query_name, ..
         } => format!("dns query from {comm} to {query_name}"),
+        Event::FsProtectDenial {
+            comm, operation, ..
+        } => format!("anti-tamper denial of {operation} by {comm}"),
     }
 }
 

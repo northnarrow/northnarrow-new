@@ -330,6 +330,25 @@ async fn process_event(
                 "dns_query"
             )
         }
+        // Tappa 7: kernel-side LSM hook denied a tamper attempt on
+        // protected state. Chunk 5 will raise the posture machine
+        // here; for now we just log loudly so the event isn't lost.
+        Event::FsProtectDenial {
+            pid,
+            uid,
+            comm,
+            target_dev,
+            target_ino,
+            operation,
+            ..
+        } => {
+            warn!(
+                pid, uid, comm = %comm,
+                op = %operation,
+                target_dev, target_ino,
+                "ANTI-TAMPER DENIAL"
+            );
+        }
     }
 
     if let Some(verdict) = engine.evaluate(&event) {

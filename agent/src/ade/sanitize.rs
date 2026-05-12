@@ -402,6 +402,13 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
         Event::DnsQuery {
             comm, query_name, ..
         } => (String::new(), comm.clone(), query_name.clone()),
+        Event::FsProtectDenial {
+            comm, operation, ..
+        } => (
+            format!("fs_protect_denial:{operation}"),
+            comm.clone(),
+            String::new(),
+        ),
     }
 }
 
@@ -415,6 +422,7 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
         Event::DnsQuery {
             comm, query_name, ..
         } => vec![comm.clone(), query_name.clone()],
+        Event::FsProtectDenial { comm, .. } => vec![comm.clone()],
     }
 }
 

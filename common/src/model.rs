@@ -9,7 +9,8 @@ use alloc::string::String;
 use serde::{Deserialize, Serialize};
 
 use crate::wire::{
-    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
+    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
+    ADDR_LEN, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_UNLINK,
 };
 
 /// Canonical event emitted by a sensor.
@@ -71,6 +72,73 @@ pub enum Event {
         family: u8,
         timestamp_ns: u64,
     },
+    /// Tappa 7 inode-protection LSM hook denied a modification of a
+    /// protected filesystem object. By construction this means
+    /// someone (often root) attempted to delete, rename, chmod,
+    /// chown, or `chattr` the agent's own state directory.
+    FsProtectDenial {
+        pid: u32,
+        uid: u32,
+        comm: String,
+        target_dev: u64,
+        target_ino: u64,
+        operation: FsProtectOperation,
+        timestamp_ns: u64,
+    },
+}
+
+/// Which inode operation the LSM hook denied. Wire-side these are
+/// the `FS_OP_*` byte constants in [`crate::wire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FsProtectOperation {
+    /// `unlink(2)` — `rm` of a file inside or pointing at the
+    /// protected set.
+    Unlink,
+    /// `rmdir(2)` — removal of a protected directory.
+    Rmdir,
+    /// `rename(2)` / `renameat2(2)` involving a protected inode on
+    /// either side.
+    Rename,
+    /// `chmod` / `chown` / `truncate` via `notify_change`.
+    Setattr,
+    /// `ioctl(FS_IOC_SETFLAGS, ...)` — the `chattr -i` defense.
+    Ioctl,
+    /// Wire byte the agent does not recognise (forward-compatible
+    /// safety net).
+    Unknown(u8),
+}
+
+impl FsProtectOperation {
+    pub fn from_wire(byte: u8) -> Self {
+        match byte {
+            FS_OP_UNLINK => Self::Unlink,
+            FS_OP_RMDIR => Self::Rmdir,
+            FS_OP_RENAME => Self::Rename,
+            FS_OP_SETATTR => Self::Setattr,
+            FS_OP_IOCTL => Self::Ioctl,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unlink => "unlink",
+            Self::Rmdir => "rmdir",
+            Self::Rename => "rename",
+            Self::Setattr => "setattr",
+            Self::Ioctl => "ioctl",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl core::fmt::Display for FsProtectOperation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown(b) => write!(f, "unknown({b})"),
+            other => f.write_str(other.as_str()),
+        }
+    }
 }
 
 impl From<&ProcessSpawnRaw> for Event {
@@ -125,6 +193,20 @@ impl From<&TcpConnectRaw> for Event {
             src_port: raw.src_port,
             dst_addr: raw.dst_addr,
             dst_port: raw.dst_port,
+            timestamp_ns: raw.timestamp_ns,
+        }
+    }
+}
+
+impl From<&FsProtectDenialRaw> for Event {
+    fn from(raw: &FsProtectDenialRaw) -> Self {
+        Event::FsProtectDenial {
+            pid: raw.attacker_pid,
+            uid: raw.attacker_uid,
+            comm: crate::wire::cstr_lossy(&raw.attacker_comm).into_owned(),
+            target_dev: raw.target_dev,
+            target_ino: raw.target_ino,
+            operation: FsProtectOperation::from_wire(raw.operation),
             timestamp_ns: raw.timestamp_ns,
         }
     }
