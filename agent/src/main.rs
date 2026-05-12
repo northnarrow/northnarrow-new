@@ -331,8 +331,10 @@ async fn process_event(
             )
         }
         // Tappa 7: kernel-side LSM hook denied a tamper attempt on
-        // protected state. Chunk 5 will raise the posture machine
-        // here; for now we just log loudly so the event isn't lost.
+        // protected state. The posture machine observed the event
+        // at the top of this function and will route it through the
+        // ConfirmedIntrusion trigger (anti-tamper denial = strongest
+        // possible posture signal, ENGAGED → COMBAT).
         Event::FsProtectDenial {
             pid,
             uid,
@@ -348,6 +350,10 @@ async fn process_event(
                 target_dev, target_ino,
                 "ANTI-TAMPER DENIAL"
             );
+            // Short-circuit: a kernel deny is not something the
+            // rule engine or ADE LLM should re-evaluate. The
+            // posture trigger above is the response; we are done.
+            return;
         }
     }
 

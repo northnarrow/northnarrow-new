@@ -15,7 +15,9 @@ use aya::{
     Ebpf, EbpfLoader,
 };
 use bytemuck::Pod;
-use common::wire::{DnsQueryRaw, ExecCheckRaw, FileOpenRaw, ProcessSpawnRaw, TcpConnectRaw};
+use common::wire::{
+    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
+};
 use common::Event;
 use tokio::{io::unix::AsyncFd, sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, warn};
@@ -84,6 +86,7 @@ impl SensorMultiplexer {
         let exec_check_rb = take_ringbuf(&mut ebpf, "EXEC_CHECK_EVENTS")?;
         let tcp_connect_rb = take_ringbuf(&mut ebpf, "TCP_CONNECT_EVENTS")?;
         let dns_query_rb = take_ringbuf(&mut ebpf, "DNS_QUERY_EVENTS")?;
+        let fs_protect_rb = take_ringbuf(&mut ebpf, "FS_PROTECT_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
         let pumps = vec![
@@ -91,7 +94,8 @@ impl SensorMultiplexer {
             spawn_pump::<FileOpenRaw>("file_open", file_open_rb, tx.clone()),
             spawn_pump::<ExecCheckRaw>("exec_check", exec_check_rb, tx.clone()),
             spawn_pump::<TcpConnectRaw>("tcp_connect", tcp_connect_rb, tx.clone()),
-            spawn_pump::<DnsQueryRaw>("dns_query", dns_query_rb, tx),
+            spawn_pump::<DnsQueryRaw>("dns_query", dns_query_rb, tx.clone()),
+            spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx),
         ];
 
         Ok(Self { ebpf, pumps, rx })

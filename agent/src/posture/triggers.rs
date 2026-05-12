@@ -323,6 +323,12 @@ fn critical_file_modification(focal: &Event) -> bool {
 }
 
 fn confirmed_intrusion(focal: &Event, recent: &[Event]) -> bool {
+    // Tappa 7: a denied FS-tamper attempt is, by definition, a
+    // confirmed intrusion — root tried to disable or destroy agent
+    // state. Single event raises the posture all the way to COMBAT.
+    if let Event::FsProtectDenial { .. } = focal {
+        return true;
+    }
     if let Event::ProcessSpawn { filename, .. } | Event::ExecCheck { filename, .. } = focal {
         if filename.starts_with("/tmp/") || filename.starts_with("/dev/shm/") {
             return true;
@@ -650,6 +656,29 @@ mod tests {
         let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    #[test]
+    fn confirmed_intrusion_fires_on_any_fs_protect_denial() {
+        // Tappa 7: a kernel-side denial of root's tamper attempt is
+        // by definition a confirmed intrusion — push posture all
+        // the way to COMBAT on a single event.
+        let det = TriggerDetector::new();
+        let focal = Event::FsProtectDenial {
+            pid: 9999,
+            uid: 0,
+            comm: "rm".into(),
+            target_dev: 64_770,
+            target_ino: 12345,
+            operation: common::FsProtectOperation::Unlink,
+            timestamp_ns: 1,
+        };
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "expected ConfirmedIntrusion, got {:?}",
+            hits
+        );
     }
 
     #[test]
