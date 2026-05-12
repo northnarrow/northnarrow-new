@@ -19,6 +19,7 @@
 mod dns_query;
 mod exec_check;
 mod file_open;
+mod ptrace_check;
 mod task_kill;
 mod tcp_connect;
 

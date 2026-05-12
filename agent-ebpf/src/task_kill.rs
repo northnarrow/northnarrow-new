@@ -45,7 +45,7 @@ use aya_ebpf::{
 // userland loader validates it at boot by re-reading the kernel BTF
 // (Tappa 7 task 4 / `agent::anti_tamper`) before attaching the hook.
 // ---------------------------------------------------------------------------
-const TASK_STRUCT_TGID_OFFSET: usize = 2492;
+pub(crate) const TASK_STRUCT_TGID_OFFSET: usize = 2492;
 
 const SIGKILL: c_int = 9;
 const SIGTERM: c_int = 15;
