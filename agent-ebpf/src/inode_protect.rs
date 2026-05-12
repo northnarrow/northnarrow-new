@@ -200,31 +200,31 @@ fn emit_denial(operation: u8, key: InodeKey) {
 /// be blocked; emits the audit record as a side effect.
 #[inline(always)]
 unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
+    // 2026-05-12 diagnostic: zero-arg bpf_printk! markers in place of
+    // nn_printk_u64. Suspected aya 0.13 bpf_trace_vprintk binding
+    // silently drops output on Ubuntu 6.8's BPF-LSM trampoline (see
+    // docs/TAPPA7_TASK5_DEEP_DEBUG.md §2 hypothesis B). If these
+    // markers fire but the nn_printk_u64 ones in try_inode_rename /
+    // try_file_ioctl do not, B is confirmed and we rip the helper out.
+    bpf_printk!(b"nn-diag-REACHED-deny-if");
+    let _ = operation;
     let key = match inode_key(target) {
         Some(k) => k,
         None => {
-            nn_printk_u64(b"nn-diag: inode_key=None op=%lu", operation as u64);
+            bpf_printk!(b"nn-diag-REACHED-key-none");
             return false;
         }
     };
-    // The 1-3 args path of aya 0.13's bpf_printk! macro passes
-    // PrintkArg structs by reference (verified in BPF disasm: r3
-    // ends up as a stack pointer, not the value). Use nn_printk_u64
-    // which goes through bpf_trace_vprintk instead — that path
-    // takes an explicit buffer + length and correctly forwards
-    // values.
-    nn_printk_u64(b"nn-diag: deny_if op=%lu", operation as u64);
-    nn_printk_u64(b"nn-diag: deny_if dev=%lu", key.dev);
-    nn_printk_u64(b"nn-diag: deny_if ino=%lu", key.ino);
+    bpf_printk!(b"nn-diag-REACHED-key-ok");
     if !is_protected(&key) {
-        nn_printk_u64(b"nn-diag: MISS op=%lu", operation as u64);
+        bpf_printk!(b"nn-diag-REACHED-MISS");
         return false;
     }
     if override_active() {
-        nn_printk_u64(b"nn-diag: MATCH-override op=%lu", operation as u64);
+        bpf_printk!(b"nn-diag-REACHED-OVERRIDE");
         return false;
     }
-    nn_printk_u64(b"nn-diag: MATCH-EPERM op=%lu", operation as u64);
+    bpf_printk!(b"nn-diag-REACHED-MATCH");
     emit_denial(operation, key);
     true
 }
@@ -235,6 +235,11 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
 
 #[lsm(hook = "inode_unlink")]
 pub fn inode_unlink(ctx: LsmContext) -> i32 {
+    // Unconditional body marker — same role as inode_rename / file_ioctl
+    // (see docs/TAPPA7_TASK5_DEEP_DEBUG.md). If `rm` runs and this
+    // line never lands in trace_pipe, the kernel is not dispatching
+    // security_inode_unlink to our BPF program at all.
+    unsafe { bpf_printk!(b"nn-diag-unlink-body fired") };
     unsafe { try_inode_unlink(&ctx) }
 }
 
@@ -263,6 +268,7 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
 
 #[lsm(hook = "inode_rmdir")]
 pub fn inode_rmdir(ctx: LsmContext) -> i32 {
+    unsafe { bpf_printk!(b"nn-diag-rmdir-body fired") };
     unsafe { try_inode_rmdir(&ctx) }
 }
 
@@ -326,6 +332,10 @@ unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
 
 #[lsm(hook = "inode_setattr")]
 pub fn inode_setattr(ctx: LsmContext) -> i32 {
+    // Body marker covers chmod / chown / truncate paths. `touch` on
+    // an existing file routes through notify_change → security_inode_setattr
+    // so we expect this marker for `touch existingfile` too.
+    unsafe { bpf_printk!(b"nn-diag-setattr-body fired") };
     unsafe { try_inode_setattr(&ctx) }
 }
 
