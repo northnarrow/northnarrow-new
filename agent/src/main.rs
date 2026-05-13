@@ -130,8 +130,16 @@ async fn main() -> Result<()> {
     // anything spawns child tasks or holds resources we'd hate to
     // leak. Per-hook failures are logged WARN inside the call and
     // tolerated so the agent still runs on kernels without BPF-LSM.
+    //
+    // The PID set + allowed-comm set are scoped to the agent for now;
+    // Tappa 7 task 6 commit #4 will widen both to include the
+    // watchdog (PID read from /run/northnarrow/watchdog.pid).
     let agent_pid = std::process::id();
-    if let Err(e) = sensor.attach_anti_tamper(agent_pid) {
+    let agent_comm = northnarrow_agent::anti_tamper::read_self_comm()
+        .context("reading own /proc/self/comm for anti-tamper allowed-comm set")?;
+    let mut allowed_comms = std::collections::HashSet::new();
+    allowed_comms.insert(agent_comm);
+    if let Err(e) = sensor.attach_anti_tamper(&[agent_pid], &allowed_comms) {
         warn!(error = %e, agent_pid, "anti-tamper setup failed");
     }
 

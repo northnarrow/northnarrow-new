@@ -40,7 +40,7 @@ use aya_ebpf::{
 };
 
 use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
-use crate::task_kill::PROTECTED_PID;
+use crate::task_kill::PROTECTED_PIDS;
 
 /// Linux `EPERM` value; LSM hooks return `-errno` to deny.
 const EPERM: c_int = 1;
@@ -71,14 +71,6 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // aya 0.13's arg(N) read of the phony retval is unreliable on
     // Ubuntu 6.8's BPF-LSM trampoline.
 
-    let protected = match PROTECTED_PID.get(0) {
-        Some(p) => *p,
-        None => return 0,
-    };
-    if protected == 0 {
-        return 0;
-    }
-
     let target: *const c_void = ctx.arg(0);
     if target.is_null() {
         return 0;
@@ -96,7 +88,10 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
         Err(_) => return 0,
     };
 
-    if target_tgid != protected {
+    // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
+    // hash map (see task_kill.rs for the rationale on the Tappa 7
+    // task 6 single-PID → hash-set migration).
+    if PROTECTED_PIDS.get(&target_tgid).is_none() {
         return 0;
     }
 

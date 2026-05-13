@@ -2,8 +2,11 @@
 //!
 //! Tappa 7 (ROADMAP.md): the agent must survive `SIGKILL`/`SIGTERM`
 //! from any sender, including `root`. The kernel-mode policy is
-//! enforced here by returning `-EPERM` when the target `tgid`
-//! matches the userland-registered protected PID.
+//! enforced here by returning `-EPERM` when the target `tgid` is
+//! present in the [`PROTECTED_PIDS`] map. Task 6 (Tappa 7) widened
+//! the map from a single-slot `Array<u32>` to a `HashMap<u32, u8>`
+//! so the agent AND the watchdog can both be protected from one
+//! lookup.
 //!
 //! Kernel hook signature (`linux/lsm_hook_defs.h`):
 //! ```c
@@ -27,7 +30,7 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::bpf_probe_read_kernel,
     macros::{lsm, map},
-    maps::Array,
+    maps::{Array, HashMap},
     programs::LsmContext,
 };
 
@@ -39,11 +42,20 @@ const SIGTERM: c_int = 15;
 /// Linux `EPERM` value; LSM hooks return `-errno` to deny.
 const EPERM: c_int = 1;
 
-/// Slot 0 holds the agent's `tgid`. `0` means "not registered yet",
-/// which fails open during the brief window between agent startup
-/// and userland populating the map.
+/// PIDs the userland loader has registered for protection. Multi-PID
+/// support (Tappa 7 task 6) replaces the prior `PROTECTED_PID:
+/// Array<u32>` (single slot) so the agent AND the watchdog can both
+/// be protected from the same hook with one bpf_map_lookup_elem.
+///
+/// Value is unused — presence is the signal — kept as `u8` to keep
+/// each map node tiny. `max_entries = 16` is generous headroom for
+/// V1 (agent + watchdog + room for future nn-config-daemon, Tappa 9);
+/// real-world occupancy is 2 entries.
+///
+/// `0` is NOT a valid PID, so an empty map fails open (no protection)
+/// rather than denying every kill on the host.
 #[map]
-pub static PROTECTED_PID: Array<u32> = Array::with_max_entries(1, 0);
+pub static PROTECTED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 
 /// Tappa 8 stub: Ed25519-signed override capability. Slot 0 holds a
 /// monotonic token; a non-zero value means "current admin-signed
@@ -78,14 +90,6 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
-    let protected = match PROTECTED_PID.get(0) {
-        Some(p) => *p,
-        None => return 0,
-    };
-    if protected == 0 {
-        return 0;
-    }
-
     let target: *const c_void = ctx.arg(0);
     if target.is_null() {
         return 0;
@@ -101,7 +105,14 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         Err(_) => return 0,
     };
 
-    if target_tgid != protected {
+    // Multi-PID lookup. `HashMap::get` in aya-ebpf returns a raw
+    // pointer to the value; we only care about presence, so the
+    // is_some() check collapses to a single bpf_map_lookup_elem
+    // call. Marked unsafe because the returned reference can be
+    // invalidated if the map mutates concurrently — we don't deref
+    // it, so the invalidation window is irrelevant here.
+    let is_protected = PROTECTED_PIDS.get(&target_tgid).is_some();
+    if !is_protected {
         return 0;
     }
 

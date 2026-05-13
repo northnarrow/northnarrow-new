@@ -107,13 +107,21 @@ impl SensorMultiplexer {
         self.rx.recv().await
     }
 
-    /// Wire up the Tappa 7 anti-tamper LSM hooks: write the agent's
-    /// own PID into `PROTECTED_PID` and attach `task_kill` +
+    /// Wire up the Tappa 7 anti-tamper LSM hooks: register the
+    /// given PID set in `PROTECTED_PIDS` and attach `task_kill` +
     /// `ptrace_access_check`. Lives on the multiplexer because it
     /// owns the only [`Ebpf`] instance — see
     /// [`crate::anti_tamper`] for the rationale.
-    pub fn attach_anti_tamper(&mut self, agent_pid: u32) -> Result<()> {
-        crate::anti_tamper::attach(&mut self.ebpf, agent_pid)
+    ///
+    /// `pids` is a slice (not a single PID) so the watchdog can be
+    /// registered alongside the agent in the same call once Tappa 7
+    /// task 6 commits #3-4 land.
+    pub fn attach_anti_tamper(
+        &mut self,
+        pids: &[u32],
+        allowed_comms: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        crate::anti_tamper::attach(&mut self.ebpf, pids, allowed_comms)
     }
 }
 
