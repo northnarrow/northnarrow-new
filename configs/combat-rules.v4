@@ -1,0 +1,22 @@
+# NorthNarrow COMBAT-state iptables ruleset (Tappa 7 task 7 / Tappa 8).
+#
+# Loaded by NetworkIsolator::engage() via `iptables-restore`. On
+# COMBAT entry the agent drops the host from the network entirely:
+# every packet on INPUT, OUTPUT, and FORWARD is dropped except
+# loopback. There is intentionally NO management-port carve-out;
+# recovery requires physical access plus an Ed25519-signed admin
+# unlock (see agent/src/anti_tamper/admin_auth.rs).
+#
+# `iptables-restore` flushes the filter table by default before
+# applying these rules, so any previously installed user rules are
+# replaced atomically.
+
+*filter
+:NORTHNARROW_COMBAT - [0:0]
+-A INPUT -j NORTHNARROW_COMBAT
+-A OUTPUT -j NORTHNARROW_COMBAT
+-A FORWARD -j NORTHNARROW_COMBAT
+-A NORTHNARROW_COMBAT -i lo -j RETURN
+-A NORTHNARROW_COMBAT -o lo -j RETURN
+-A NORTHNARROW_COMBAT -j DROP
+COMMIT

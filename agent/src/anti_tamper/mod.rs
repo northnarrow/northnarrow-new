@@ -24,6 +24,7 @@
 //!   window in which the hook fires sees a valid `tgid`, never `0`.
 
 pub mod filesystem;
+pub mod network_isolate;
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
