@@ -263,6 +263,13 @@ impl FsProtectDenialRaw {
     }
 }
 
+/// nn-admin ↔ agent protocol carried over the Unix socket at
+/// `/run/northnarrow/admin.sock`. Std-only because the agent is the
+/// only consumer and `StatusResponse` references `PostureKind` which
+/// lives behind `#[cfg(feature = "std")]` at the crate root.
+#[cfg(feature = "std")]
+pub mod admin_protocol;
+
 /// Decode a fixed-size, possibly NUL-terminated byte buffer into a
 /// borrowed `&str`, stopping at the first NUL or at the end of the
 /// buffer. Invalid UTF-8 is replaced lossily by the caller.

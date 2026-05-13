@@ -17,11 +17,20 @@ default = ["std"]
 # `std` enables the userland-rich types (Event, Verdict, ResponseAction)
 # and bytemuck Pod derives. Disable it from the eBPF crate, which only
 # needs the raw wire types.
-std = ["dep:serde", "dep:bytemuck"]
+std = ["dep:serde", "dep:bytemuck", "dep:postcard", "dep:serde-big-array"]
+# Opt-in for the nn-admin debug surface (DebugForcePosture variant in
+# the admin protocol). Off by default; production builds never see it.
+# The agent crate forwards its own `debug-trigger` feature here.
+debug-trigger = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 bytemuck = { version = "1", default-features = false, features = ["derive", "min_const_generics"], optional = true }
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
+# Serde's auto-derive supports `[T; N]` only up to N=32 in stable;
+# UnlockRequest carries an Ed25519 sig as `[u8; 64]`. serde-big-array
+# unblocks the larger sizes without us hand-rolling Deserialize.
+serde-big-array = { version = "0.5", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
