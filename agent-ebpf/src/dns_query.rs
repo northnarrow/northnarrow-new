@@ -18,8 +18,8 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel,
     },
     macros::{kprobe, map},
     maps::RingBuf,
@@ -78,11 +78,12 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
     }
 
     // Read msg_name pointer + msg_namelen.
-    let name_ptr: *const u8 =
-        match unsafe { bpf_probe_read_kernel::<*const u8>(msg_ptr.add(MSGHDR_NAME_OFFSET) as *const _) } {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
+    let name_ptr: *const u8 = match unsafe {
+        bpf_probe_read_kernel::<*const u8>(msg_ptr.add(MSGHDR_NAME_OFFSET) as *const _)
+    } {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
     if name_ptr.is_null() {
         return Ok(());
     }
@@ -105,9 +106,8 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    let port_be: u16 = match unsafe {
-        bpf_probe_read_kernel::<u16>(name_ptr.add(2) as *const u16)
-    } {
+    let port_be: u16 = match unsafe { bpf_probe_read_kernel::<u16>(name_ptr.add(2) as *const u16) }
+    {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
@@ -121,12 +121,12 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
     match family {
         AF_INET => {
             raw_family = 2u8;
-            let sa: SockaddrIn = match unsafe {
-                bpf_probe_read_kernel::<SockaddrIn>(name_ptr as *const SockaddrIn)
-            } {
-                Ok(v) => v,
-                Err(_) => return Ok(()),
-            };
+            let sa: SockaddrIn =
+                match unsafe { bpf_probe_read_kernel::<SockaddrIn>(name_ptr as *const SockaddrIn) }
+                {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()),
+                };
             let bytes = sa.sin_addr.to_ne_bytes();
             let mut i = 0usize;
             while i < 4 {

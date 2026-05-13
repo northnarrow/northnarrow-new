@@ -13,8 +13,8 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel,
     },
     macros::{kprobe, map},
     maps::RingBuf,
@@ -30,8 +30,8 @@ static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[derive(Copy, Clone)]
 struct SockaddrIn {
     sin_family: u16,
-    sin_port: u16,   // network byte order
-    sin_addr: u32,   // network byte order
+    sin_port: u16, // network byte order
+    sin_addr: u32, // network byte order
     sin_zero: [u8; 8],
 }
 

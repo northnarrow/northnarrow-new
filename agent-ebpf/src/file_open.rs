@@ -12,8 +12,8 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
     maps::RingBuf,
@@ -82,10 +82,8 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i64> {
     // filename — read from user memory.
     if filename_ptr != 0 {
         unsafe {
-            let dst = core::slice::from_raw_parts_mut(
-                (*raw_ptr).filename.as_mut_ptr(),
-                FILENAME_LEN,
-            );
+            let dst =
+                core::slice::from_raw_parts_mut((*raw_ptr).filename.as_mut_ptr(), FILENAME_LEN);
             let _ = bpf_probe_read_user_str_bytes(filename_ptr as *const u8, dst);
         }
     }

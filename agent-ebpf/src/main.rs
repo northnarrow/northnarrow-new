@@ -27,8 +27,8 @@ mod tcp_connect;
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel_buf,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel_buf,
     },
     macros::{map, tracepoint},
     maps::{PerCpuArray, RingBuf},
@@ -140,9 +140,8 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
         let base = ctx.as_ptr() as *const u8;
         let src = unsafe { base.add(f_off) };
         let mut tmp: MaybeUninit<[u8; FILENAME_LEN]> = MaybeUninit::uninit();
-        let dst_slice = unsafe {
-            core::slice::from_raw_parts_mut(tmp.as_mut_ptr() as *mut u8, FILENAME_LEN)
-        };
+        let dst_slice =
+            unsafe { core::slice::from_raw_parts_mut(tmp.as_mut_ptr() as *mut u8, FILENAME_LEN) };
         // Read the actual length we computed; fall back to nothing on err.
         let _ = unsafe { bpf_probe_read_kernel_buf(src, &mut dst_slice[..f_len]) };
         unsafe {

@@ -30,8 +30,8 @@
 use aya_ebpf::{
     cty::{c_int, c_uint, c_void},
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_printk,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_printk, bpf_probe_read_kernel,
     },
     macros::{lsm, map},
     maps::{Array, HashMap, RingBuf},
