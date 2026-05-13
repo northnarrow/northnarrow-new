@@ -12,6 +12,10 @@ description = "NorthNarrow agent daemon (Linux-first, 100% Rust XDR sensor + res
 name = "northnarrow-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "nn-admin"
+path = "src/bin/nn_admin.rs"
+
 [lib]
 name = "northnarrow_agent"
 path = "src/lib.rs"
@@ -23,6 +27,10 @@ default = []
 # FullNetworkIsolation, Quarantine, ThrottleProcess) by filename
 # suffix. NEVER enable in production builds.
 demo-tappa5 = []
+# Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
+# the agent-side handler that consumes it. Used by the integration
+# test harness; never enabled in production builds.
+debug-trigger = ["common/debug-trigger"]
 
 [dependencies]
 common = { workspace = true }

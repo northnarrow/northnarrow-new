@@ -57,6 +57,13 @@ pub enum UnlockResult {
     RateLimited { retry_after_secs: u32 },
 }
 
+/// Trigger payload for "issue me a fresh challenge nonce". Empty
+/// today; reserved as a struct so future fields (client version,
+/// requested key fingerprint) can be added without an AdminMessage
+/// variant bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ChallengeRequest {}
+
 /// `status` query payload. Empty today; reserved as a struct (not a
 /// unit variant) so future read-only fields can be added without an
 /// AdminMessage variant bump.
@@ -96,7 +103,7 @@ pub enum DebugForcePosture {
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
     /// "Mint me a fresh nonce." Triggers [`Challenge`] reply.
-    ChallengeRequest,
+    ChallengeRequest(ChallengeRequest),
     /// "Here is my Ed25519 sig over the last nonce." Triggers
     /// [`UnlockResult`] reply.
     Unlock(UnlockRequest),
@@ -236,7 +243,7 @@ mod tests {
 
     #[test]
     fn roundtrip_challenge_request() {
-        roundtrip(AdminMessage::ChallengeRequest);
+        roundtrip(AdminMessage::ChallengeRequest(ChallengeRequest {}));
     }
 
     #[test]
@@ -347,14 +354,14 @@ mod tests {
     fn decode_consumes_exactly_one_frame_when_buffer_has_extra() {
         // Concat two frames in one buffer; decode_frame must return
         // only the first and report the right consumed-bytes count.
-        let a = encode_frame(&AdminMessage::ChallengeRequest).unwrap();
+        let a = encode_frame(&AdminMessage::ChallengeRequest(ChallengeRequest {})).unwrap();
         let b = encode_frame(&AdminMessage::Status(StatusRequest {})).unwrap();
         let mut joined = Vec::new();
         joined.extend_from_slice(&a);
         joined.extend_from_slice(&b);
 
         let (first, n1) = decode_frame(&joined).unwrap().unwrap();
-        assert_eq!(first, AdminMessage::ChallengeRequest);
+        assert_eq!(first, AdminMessage::ChallengeRequest(ChallengeRequest {}));
         assert_eq!(n1, a.len());
 
         let (second, n2) = decode_frame(&joined[n1..]).unwrap().unwrap();
@@ -385,7 +392,7 @@ mod tests {
         // exhaustiveness and the test would fail to compile.
         fn _exhaust(m: AdminMessage) {
             match m {
-                AdminMessage::ChallengeRequest
+                AdminMessage::ChallengeRequest(_)
                 | AdminMessage::Unlock(_)
                 | AdminMessage::Status(_)
                 | AdminMessage::Challenge(_)
