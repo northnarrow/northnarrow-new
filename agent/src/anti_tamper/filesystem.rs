@@ -96,14 +96,15 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
     );
 
     // Step 2: register inode in the BPF map BEFORE attaching hooks.
+    let st_dev = meta.dev();
     let key = InodeKey {
-        dev: meta.dev(),
+        dev: stat_dev_to_kernel_dev(st_dev),
         ino: meta.ino(),
     };
     register_inode(ebpf, &key)?;
     info!(
         path = %dir.display(),
-        dev = key.dev, ino = key.ino,
+        st_dev = st_dev, kernel_dev = key.dev, ino = key.ino,
         "anti-tamper FS: directory inode registered in {PROTECTED_INODES_MAP}"
     );
 
@@ -167,6 +168,24 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Convert the userland-encoded `dev_t` returned by `stat(2)` /
+/// `MetadataExt::dev()` back into the kernel-internal `MKDEV` form
+/// that `inode->i_sb->s_dev` actually holds.
+///
+/// Why: the kernel stores `super_block.s_dev = MKDEV(major, minor) =
+/// (major << 20) | minor`, but `stat(2)` runs that value through
+/// `new_encode_dev()` before stamping it into `kstat.dev`, giving
+/// `(minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)`. For
+/// `/dev/sda2` (major=8, minor=2) those are `0x800002` and `0x802`
+/// respectively. The eBPF inode-protection hooks read the raw
+/// `s_dev` directly, so the BPF map key MUST be in the kernel form.
+/// See docs/TAPPA7_TASK5_DEEP_DEBUG.md §7 for the full diagnosis.
+fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
+    let major = libc::major(st_dev) as u64;
+    let minor = libc::minor(st_dev) as u64;
+    (major << 20) | minor
+}
+
 fn register_inode(ebpf: &mut Ebpf, key: &InodeKey) -> Result<()> {
     let map = ebpf
         .map_mut(PROTECTED_INODES_MAP)
@@ -217,3 +236,26 @@ fn chattr_immutable_add(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_dev_to_kernel_dev_sda2() {
+        // /dev/sda2 → major=8, minor=2.
+        // stat(2) returns the new_encode_dev form 0x802.
+        // Kernel-internal MKDEV form is (8 << 20) | 2 = 0x800002.
+        assert_eq!(stat_dev_to_kernel_dev(0x802), 0x800002);
+    }
+
+    #[test]
+    fn stat_dev_to_kernel_dev_high_minor() {
+        // major=8, minor=257 (high-minor case so the encoded form's
+        // ((minor & ~0xff) << 12) branch is non-zero).
+        // new_encode_dev = (257 & 0xff) | (8 << 8) | ((257 & ~0xff) << 12)
+        //                = 1 | 0x800 | (0x100 << 12)
+        //                = 0x100801
+        // MKDEV = (8 << 20) | 257 = 0x800101
+        assert_eq!(stat_dev_to_kernel_dev(0x100801), 0x800101);
+    }
+}

@@ -246,3 +246,258 @@ message. Three categories of evidence we need:
 
 After results: update §0 with the new table, §4 with the resolved
 bugs, §5/§6 with the next question.
+
+---
+
+## 7. Iteration 3 root cause — `dev_t` encoding mismatch (2026-05-13)
+
+After iteration 2 the markers say:
+
+- `setattr-body` fires → kernel dispatches the LSM prog ✓
+- `setattr-pre-deny` fires → ctx.arg(0) → inode_from_dentry returns Some ✓
+- `REACHED-deny-if` fires → into `deny_if_protected` ✓
+- `REACHED-key-ok` fires → `inode_key()` returns Some(InodeKey) ✓
+- `REACHED-MISS` fires → `PROTECTED_INODES.get(&key)` returns None ✗
+
+So the hook runs, the key is constructed, but the lookup misses despite
+`bpftool map dump name PROTECTED_INODES` showing the "right" key.
+
+### 7.1 The empirical clue
+
+User reported, from `stat /var/lib/northnarrow`:
+- `dev = 2050` (decimal) = `0x802`
+- `ino = 1835009` = `0x1c0001`
+
+Map dump:
+```
+key: 02 08 00 00 00 00 00 00  01 00 1c 00 00 00 00 00
+     └─ dev u64 LE = 0x802 ──┘ └─ ino u64 LE = 0x1c0001 ─┘
+```
+
+So userland inserted dev=`0x802`. That is the value returned by
+`std::os::unix::fs::MetadataExt::dev()`, which is `statx().stx_dev_major/minor`
+recombined → equivalent to glibc `st_dev`.
+
+### 7.2 What value does eBPF actually read?
+
+`/var/lib/northnarrow` lives on `/dev/sda2`. `/sys/dev/block/` shows
+`8:2 → sda2`, so **major=8, minor=2**.
+
+The kernel stores `super_block.s_dev` as **`dev_t` in kernel-internal
+form** — the result of `MKDEV(major, minor)`:
+
+```
+#define MINORBITS 20
+#define MKDEV(ma, mi) (((ma) << MINORBITS) | (mi))
+```
+
+So `s_dev = (8 << 20) | 2 = 0x800002 = 8388610`.
+
+Userland `stat(2)` does NOT return this raw value. The kernel runs it
+through `new_encode_dev(dev_t)` before stamping `kstat.dev`:
+
+```c
+static __always_inline u32 new_encode_dev(dev_t dev) {
+    unsigned major = MAJOR(dev);            // 8
+    unsigned minor = MINOR(dev);            // 2
+    return (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12);
+    //   = 2          | 0x800       | 0
+    //   = 0x802
+}
+```
+
+So:
+
+| Source                                            | dev value   | hex       |
+|---------------------------------------------------|-------------|-----------|
+| Userland `metadata.dev()` (statx-encoded)         | 2050        | `0x802`   |
+| Kernel raw `inode->i_sb->s_dev` (MKDEV form)      | 8388610     | `0x800002`|
+
+The eBPF code at `agent-ebpf/src/inode_protect.rs:136-145` reads the
+raw `s_dev` (MKDEV form) directly:
+
+```rust
+let dev_slot = (sb_ptr as *const u8).add(SUPER_BLOCK_S_DEV_OFFSET) as *const u32;
+let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;   // → 0x800002
+...
+Some(InodeKey { dev: dev as u64, ino })                    // → dev=0x800002
+```
+
+But userland at `agent/src/anti_tamper/filesystem.rs:99-103` inserts the
+encoded form:
+
+```rust
+let key = InodeKey {
+    dev: meta.dev(),   // → 2050 = 0x802  (encoded)
+    ino: meta.ino(),
+};
+register_inode(ebpf, &key)?;
+```
+
+Map key bytes from each side:
+
+- Userland writes:  `02 08 00 00 00 00 00 00 …`
+- eBPF looks up:    `02 00 80 00 00 00 00 00 …`
+
+The HashMap is a `memcmp` of 16-byte blobs. These will *never* match.
+Hence permanent `REACHED-MISS`. The `ino` is identical on both sides,
+so it's purely the dev half that breaks the comparison.
+
+This is consistent with every piece of observed evidence:
+
+- `bpftool map dump` shows the encoded form because that's literally
+  what userland wrote (bpftool only displays bytes; it has no opinion
+  about `dev_t` encoding).
+- All five LSM hooks behave identically (`MISS` on every protected-dir
+  attack) because every hook routes through the same `inode_key()`
+  helper, which has the same bug for all of them.
+- It only became visible in iteration 3 because earlier iterations
+  never reached `is_protected()` at all (broken printk, then broken
+  prev-retval, then missing body markers).
+
+### 7.3 Why this didn't show up in any layout test
+
+`common/src/wire.rs::InodeKey` is `#[repr(C)]` over two `u64`s — 16
+bytes, no padding, identical layout in eBPF and userland. The tests
+in `common/src/wire.rs` only verify *struct layout*, not *value
+semantics* — and the bug is a semantic mismatch (which u32→u64
+transform to use), not a layout one.
+
+### 7.4 Aya `HashMap` key comparison — not the bug
+
+Briefly considered as a suspect; ruled out. Aya's `HashMap::insert`
+delegates to `bpf(BPF_MAP_UPDATE_ELEM, …)` with `&key` as a byte
+blob, and `HashMap::get` (eBPF side) hashes/compares the same byte
+blob. For two `#[repr(C)] { u64, u64 }` keys with no padding gaps,
+the byte blob is exactly `[dev.to_ne_bytes(); ino.to_ne_bytes()]` on
+both sides. The comparison is well-defined; the *inputs* are wrong.
+
+---
+
+## 8. Proposed fix
+
+**Convert in userland, leave eBPF alone.**
+
+The kernel-internal `s_dev` is the cheapest thing the eBPF hot path
+can read (one `bpf_probe_read_kernel::<u32>`). Doing `new_encode_dev`
+bit-math inside every LSM hook would mean four extra instructions
+per inode op for no benefit. The userland conversion runs once at
+startup.
+
+### 8.1 Code change
+
+`agent/src/anti_tamper/filesystem.rs:99-103`:
+
+```rust
+// BEFORE
+let key = InodeKey {
+    dev: meta.dev(),
+    ino: meta.ino(),
+};
+
+// AFTER
+let st_dev = meta.dev();
+let major = unsafe { libc::major(st_dev) } as u64;
+let minor = unsafe { libc::minor(st_dev) } as u64;
+let key = InodeKey {
+    // Kernel-internal MKDEV form — matches `inode->i_sb->s_dev` as
+    // read by the eBPF inode_key() helper. `meta.dev()` returns the
+    // userland-encoded form (`new_encode_dev`) which is NOT what the
+    // kernel stores in super_block.s_dev. See docs/TAPPA7_TASK5_DEEP_DEBUG.md §7.
+    dev: (major << 20) | minor,
+    ino: meta.ino(),
+};
+```
+
+Note: `libc::major` / `libc::minor` are `unsafe fn` in some libc
+versions; the `unsafe` block is required.
+
+A small helper deserves its own function for testability:
+
+```rust
+/// Convert the userland-encoded `dev_t` returned by `stat(2)` /
+/// `MetadataExt::dev()` back into the kernel-internal `MKDEV` form
+/// that `inode->i_sb->s_dev` actually holds. See
+/// docs/TAPPA7_TASK5_DEEP_DEBUG.md §7 for the encoding mismatch this
+/// resolves.
+fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
+    // SAFETY: libc::major/minor are pure bit-math on the argument
+    // with no side effects; called `unsafe` only because the C
+    // prototypes are defined in <sys/sysmacros.h> as macros that
+    // libc-rs exposes as `unsafe fn`.
+    let major = unsafe { libc::major(st_dev) } as u64;
+    let minor = unsafe { libc::minor(st_dev) } as u64;
+    (major << 20) | minor
+}
+```
+
+Then `register_inode` builds:
+
+```rust
+let key = InodeKey {
+    dev: stat_dev_to_kernel_dev(meta.dev()),
+    ino: meta.ino(),
+};
+```
+
+The `info!` log line should keep printing the raw `meta.dev()` so the
+human-readable value still matches what `stat /var/lib/northnarrow`
+shows; add the kernel-internal form alongside it:
+
+```rust
+info!(
+    path = %dir.display(),
+    st_dev = meta.dev(),
+    kernel_dev = key.dev,
+    ino = key.ino,
+    "anti-tamper FS: directory inode registered in {PROTECTED_INODES_MAP}"
+);
+```
+
+### 8.2 Optional belt-and-braces: layout/value test
+
+Add to `common/src/wire.rs` (or to the agent crate, since libc lives
+there):
+
+```rust
+#[test]
+fn inode_key_dev_matches_mkdev_for_sda2() {
+    // /dev/sda2 → major=8 minor=2.
+    // statx() / stat() returns the encoded form 0x802.
+    // Kernel-internal MKDEV form is 0x800002.
+    // Our converter must take 0x802 → 0x800002.
+    assert_eq!(super::stat_dev_to_kernel_dev(0x802), 0x800002);
+}
+```
+
+### 8.3 Verification plan
+
+1. Apply patch, rebuild agent + ebpf, restart agent.
+2. `bpftool map dump name PROTECTED_INODES` — expect key bytes
+   `02 00 80 00 00 00 00 00 01 00 1c 00 00 00 00 00`
+   (dev=0x800002, ino=0x1c0001).
+3. Drop the immutable bit via the kernel-6.8 chattr gap, then run
+   the failing case from §0:
+   ```
+   chmod 0777 /var/lib/northnarrow
+   ```
+   Expect:
+   - rc = 1 (EPERM)
+   - directory mode stays 0700
+   - `trace_pipe` shows `…REACHED-MATCH` (not `…REACHED-MISS`)
+   - audit ringbuffer emits an `FsProtectDenialRaw{operation=4}` record
+4. Re-run the full attack matrix from §0. All five rows should flip
+   from "attacker wins" to "blocked".
+
+If step 2 still shows the wrong bytes, the converter is wrong — most
+likely `libc::major` / `libc::minor` returning sign-extended values;
+print `major/minor` from the agent startup log to confirm.
+
+If step 3 still shows `…REACHED-MISS` even after the key bytes match,
+there is a *second* bug (very unlikely given the byte-perfect map
+contents this fix produces), and we'd next compare the BPF-side key
+blob via a `bpf_printk!` of `key.dev` after constructing it. We
+intentionally don't add that print pre-emptively to keep the hot
+path clean.
+
+
