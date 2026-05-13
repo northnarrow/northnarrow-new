@@ -49,8 +49,7 @@ const PTRACE_HOOK: &str = "ptrace_access_check";
 /// either LSM hook is logged and tolerated so the agent can still
 /// run on kernels without BPF-LSM in the boot `lsm=` chain.
 pub fn attach(ebpf: &mut Ebpf, agent_pid: u32) -> Result<()> {
-    write_protected_pid(ebpf, agent_pid)
-        .context("populating PROTECTED_PID before LSM attach")?;
+    write_protected_pid(ebpf, agent_pid).context("populating PROTECTED_PID before LSM attach")?;
     info!(
         agent_pid,
         map = PROTECTED_PID_MAP,

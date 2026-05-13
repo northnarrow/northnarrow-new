@@ -194,12 +194,9 @@ async fn main() -> Result<()> {
     // SIGTERM is normally caught by the Tappa 7 LSM hook before
     // userland ever sees it; the handler is here for builds running
     // without anti-tamper (kernels lacking `bpf` in their LSM chain).
-    let mut sigint = signal(SignalKind::interrupt())
-        .context("installing SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate())
-        .context("installing SIGTERM handler")?;
-    let mut sighup = signal(SignalKind::hangup())
-        .context("installing SIGHUP handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
 
     loop {
         tokio::select! {

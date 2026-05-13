@@ -135,7 +135,11 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
 
 fn ensure_state_dir(dir: &Path) -> Result<()> {
     // Try to create; tolerate AlreadyExists (idempotent startup).
-    match DirBuilder::new().mode(STATE_DIR_MODE).recursive(true).create(dir) {
+    match DirBuilder::new()
+        .mode(STATE_DIR_MODE)
+        .recursive(true)
+        .create(dir)
+    {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(anyhow!(e).context(format!("mkdir {}", dir.display()))),
@@ -143,8 +147,8 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
 
     // Re-assert ownership + mode unconditionally so a slack umask
     // or a previous-version run with wider perms doesn't persist.
-    let meta = std::fs::metadata(dir)
-        .with_context(|| format!("stat {} after mkdir", dir.display()))?;
+    let meta =
+        std::fs::metadata(dir).with_context(|| format!("stat {} after mkdir", dir.display()))?;
     if !meta.is_dir() {
         return Err(anyhow!("{} exists and is not a directory", dir.display()));
     }
@@ -191,11 +195,13 @@ fn register_inode(ebpf: &mut Ebpf, key: &InodeKey) -> Result<()> {
         .map_mut(PROTECTED_INODES_MAP)
         .ok_or_else(|| anyhow!("map {PROTECTED_INODES_MAP} missing from eBPF object"))?;
     let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
-        .with_context(|| {
-            format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>")
-        })?;
-    map.insert(AyaInodeKey(*key), 1u8, 0)
-        .with_context(|| format!("inserting (dev={}, ino={}) into {PROTECTED_INODES_MAP}", key.dev, key.ino))?;
+        .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
+    map.insert(AyaInodeKey(*key), 1u8, 0).with_context(|| {
+        format!(
+            "inserting (dev={}, ino={}) into {PROTECTED_INODES_MAP}",
+            key.dev, key.ino
+        )
+    })?;
     Ok(())
 }
 
