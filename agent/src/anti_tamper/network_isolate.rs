@@ -139,11 +139,13 @@ impl NetworkIsolator {
     /// tolerates "rule does not exist" / "no chain by that name"
     /// stderr so calling `release()` on an already-released
     /// isolator is a no-op rather than an error.
-    #[allow(
-        dead_code,
-        reason = "production caller is admin_auth.verify_unlock → release (commit #6)"
-    )]
-    pub(crate) fn release(&self, _: UnlockToken) -> Result<()> {
+    /// Promoted from `pub(crate)` in commit #2 to `pub` here so the
+    /// binary crate (`main.rs`) can construct the
+    /// `combat_release_hook` closure. The capability invariant is
+    /// unchanged: `release` requires an [`UnlockToken`] by value and
+    /// `mint_unlock_token` is still `pub(in crate::anti_tamper)`,
+    /// so no external caller can fabricate a token to slip past this.
+    pub fn release(&self, _: UnlockToken) -> Result<()> {
         for base in ["INPUT", "OUTPUT", "FORWARD"] {
             run_iptables_idempotent(&self.iptables_bin, &["-D", base, "-j", COMBAT_CHAIN])
                 .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;

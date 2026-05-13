@@ -42,11 +42,13 @@ mod tests;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use common::ade_types::AdeVerdict;
 use common::posture_types::{PostureKind, PostureTransition, TriggerType};
 use common::Event;
+
+use crate::anti_tamper::network_isolate::UnlockToken;
 
 pub use state::PostureState;
 pub use triggers::TriggerDetector;
@@ -69,18 +71,37 @@ pub struct PostureMachine {
 /// COMBAT edge. The agent's `main.rs` wires this to
 /// `NetworkIsolator::engage`. Stored as `Arc<dyn Fn() + Send +
 /// Sync>` so the machine itself can stay `Clone + Send + Sync`.
-pub type CombatHook = Arc<dyn Fn() + Send + Sync>;
+pub type CombatEntryHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Hook invoked when the admin successfully releases COMBAT via
+/// [`PostureMachine::admin_release_combat_with_token`]. Receives the
+/// validated [`UnlockToken`] by value so the implementation can pass
+/// it straight into `NetworkIsolator::release`.
+///
+/// Fires AFTER the posture state transition and AFTER the write
+/// lock is dropped — keep that contract so the hook is free to
+/// shell out to `iptables` (which can take tens of ms) without
+/// blocking other observers.
+pub type CombatReleaseHook = Arc<dyn Fn(UnlockToken) + Send + Sync>;
+
+/// Pre-#6 alias retained so any in-flight references keep building.
+pub type CombatHook = CombatEntryHook;
 
 struct Inner {
     state: RwLock<PostureState>,
     transitions: RwLock<Vec<PostureTransition>>,
     triggers: TriggerDetector,
-    combat_hook: Option<CombatHook>,
+    combat_entry_hook: Option<CombatEntryHook>,
+    combat_release_hook: Option<CombatReleaseHook>,
+    /// Monotonic timestamp of the most recent successful admin
+    /// release. `None` if no admin action has occurred since boot.
+    /// Read by `StatusResponse` via [`PostureMachine::last_admin_action_secs_ago`].
+    last_admin_action: Mutex<Option<Instant>>,
 }
 
 impl PostureMachine {
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(None, None)
     }
 
     /// Build a machine that fires `hook` whenever a transition crosses
@@ -93,17 +114,34 @@ impl PostureMachine {
     /// machine is already in Combat when another trigger fires, the
     /// hook is NOT re-invoked. The wiring in `observe()` checks
     /// `before.kind() != Combat && after.kind() == Combat`.
-    pub fn new_with_combat_hook(hook: CombatHook) -> Self {
-        Self::build(Some(hook))
+    pub fn new_with_combat_hook(hook: CombatEntryHook) -> Self {
+        Self::build(Some(hook), None)
     }
 
-    fn build(combat_hook: Option<CombatHook>) -> Self {
+    /// Build a machine that fires both an entry hook (on the
+    /// non-Combat → Combat edge) and a release hook (during
+    /// [`Self::admin_release_combat_with_token`]). The release hook
+    /// receives the validated [`UnlockToken`] by value.
+    ///
+    /// This is the production constructor — `main.rs` uses it to
+    /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
+    /// to the posture state machine in one place.
+    pub fn new_with_hooks(entry: CombatEntryHook, release: CombatReleaseHook) -> Self {
+        Self::build(Some(entry), Some(release))
+    }
+
+    fn build(
+        combat_entry_hook: Option<CombatEntryHook>,
+        combat_release_hook: Option<CombatReleaseHook>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
                 triggers: TriggerDetector::new(),
-                combat_hook,
+                combat_entry_hook,
+                combat_release_hook,
+                last_admin_action: Mutex::new(None),
             }),
         }
     }
@@ -160,7 +198,7 @@ impl PostureMachine {
             // network isolation (which would be a redundant shell-out
             // and could mask audit signal).
             if before != PostureKind::Combat && after == PostureKind::Combat {
-                if let Some(hook) = self.inner.combat_hook.as_ref() {
+                if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
                     hook();
                 }
             }
@@ -196,16 +234,17 @@ impl PostureMachine {
         Some(next)
     }
 
-    /// Force a down-transition from `Combat`. Sub-tappa 6.5 ships a
-    /// boolean stub (`admin_authorized`). Tappa 8 replaces it with
-    /// an Ed25519 verifier.
-    ///
-    /// Returns:
-    /// - `Ok(new_state)` on success (always `Engaged`).
-    /// - `Err(AdminReleaseError::NotInCombat)` if posture is not
-    ///   `Combat`.
-    /// - `Err(AdminReleaseError::Unauthorized)` if the boolean is
-    ///   `false`.
+    /// Force a down-transition from `Combat`. Sub-tappa 6.5 stub
+    /// kept around so `agent/examples/posture_demo.rs` and the older
+    /// unit tests keep building; production code uses
+    /// [`Self::admin_release_combat_with_token`], wired from
+    /// `AdminAuth::verify_unlock` in `main.rs`.
+    // NOTE: this bool stub is the Sub-tappa 6.5 placeholder.
+    // Production code uses `admin_release_combat_with_token`. We
+    // intentionally do NOT add a `#[deprecated]` attribute today —
+    // the legacy callers (the demo binary + several posture tests)
+    // need to be migrated first; doing both in one commit would blow
+    // up the diff. Migration tracked as a follow-up cleanup.
     pub fn admin_release_combat(
         &self,
         admin_authorized: bool,
@@ -232,6 +271,109 @@ impl PostureMachine {
             "admin override".into(),
         );
         Ok(next)
+    }
+
+    /// Production path out of Combat — invoked from the agent's
+    /// admin socket handler after `AdminAuth::verify_unlock` returns
+    /// a token. Drops the posture down to `Alerted` (NOT `Engaged`
+    /// like the legacy bool stub), then fires the combat-release
+    /// hook with the consumed token so `NetworkIsolator::release`
+    /// can tear down the iptables ruleset.
+    ///
+    /// Idempotent w.r.t. "already out of Combat" only at the socket
+    /// layer — this method itself errors with `NotInCombat` if the
+    /// state isn't Combat, leaving caller-side policy to map that to
+    /// `UnlockResult::Success`.
+    ///
+    /// On success records `Instant::now()` in `last_admin_action`,
+    /// surfaced via [`Self::last_admin_action_secs_ago`] for the
+    /// `nn-admin status` response.
+    pub fn admin_release_combat_with_token(
+        &self,
+        token: UnlockToken,
+    ) -> Result<PostureState, AdminReleaseError> {
+        let now = Instant::now();
+        let mut guard = self.inner.state.write();
+        if !matches!(*guard, PostureState::Combat { .. }) {
+            return Err(AdminReleaseError::NotInCombat);
+        }
+        let next = PostureState::Alerted {
+            since: now,
+            last_trigger: now,
+        };
+        *guard = next.clone();
+        drop(guard);
+        *self.inner.last_admin_action.lock() = Some(now);
+        self.log_transition(
+            PostureKind::Combat,
+            PostureKind::Alerted,
+            None,
+            "admin token release".into(),
+        );
+
+        // Hook runs *after* state mutation + lock drop + log so it
+        // can shell out to iptables without blocking other observers.
+        if let Some(hook) = self.inner.combat_release_hook.as_ref() {
+            hook(token);
+        }
+        // In the no-hook configuration the token falls out of scope
+        // here; UnlockToken has no Drop impl, so the explicit
+        // `drop()` clippy nagged about was a no-op anyway. The
+        // capability invariant is intact because the token's
+        // *constructor* is what's visibility-gated.
+        Ok(next)
+    }
+
+    /// Seconds since the last successful admin release, or `None` if
+    /// no admin action has occurred since the agent booted.
+    pub fn last_admin_action_secs_ago(&self) -> Option<u64> {
+        self.inner
+            .last_admin_action
+            .lock()
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    /// Test-only hatch used by the `nn-admin debug --force-posture`
+    /// integration scenario. Bypasses every trigger and decay rule
+    /// to slam the state machine to `target`. Only compiled when
+    /// the `debug-trigger` Cargo feature is on; refusing to build it
+    /// in production prevents accidental misuse.
+    #[cfg(feature = "debug-trigger")]
+    pub fn force_state_for_test(&self, target: PostureKind) {
+        let now = Instant::now();
+        let mut guard = self.inner.state.write();
+        let before = guard.kind();
+        let next = match target {
+            PostureKind::Observing => PostureState::Observing,
+            PostureKind::Alerted => PostureState::Alerted {
+                since: now,
+                last_trigger: now,
+            },
+            PostureKind::Engaged => PostureState::Engaged {
+                since: now,
+                last_trigger: now,
+            },
+            PostureKind::Combat => PostureState::Combat {
+                since: now,
+                locked: true,
+            },
+        };
+        *guard = next;
+        drop(guard);
+        let after = target;
+        if before != after {
+            self.log_transition(
+                before,
+                after,
+                None,
+                "debug-trigger force_state_for_test".into(),
+            );
+            if before != PostureKind::Combat && after == PostureKind::Combat {
+                if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
+                    hook();
+                }
+            }
+        }
     }
 
     /// Snapshot of the most recent transitions (oldest first, capped).

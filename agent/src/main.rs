@@ -28,9 +28,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::Event;
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
+use northnarrow_agent::admin_socket;
+use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
+use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
-use northnarrow_agent::posture::PostureMachine;
+use northnarrow_agent::posture::{CombatEntryHook, CombatReleaseHook, PostureMachine};
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal::unix::{signal, SignalKind};
@@ -65,6 +68,37 @@ struct Cli {
     /// Setting `RAYON_NUM_THREADS` in the environment takes priority.
     #[arg(long = "ade-threads", value_name = "N")]
     ade_threads: Option<usize>,
+
+    /// Path to the iptables ruleset NetworkIsolator applies on
+    /// COMBAT entry. Production install: /etc/northnarrow/combat-rules.v4.
+    /// Repo dev path: configs/combat-rules.v4.
+    #[arg(
+        long = "combat-rules",
+        value_name = "PATH",
+        default_value = "/etc/northnarrow/combat-rules.v4"
+    )]
+    combat_rules: PathBuf,
+
+    /// Path to the admin pubkey file. If the file is missing, the
+    /// admin socket is not started (the agent still runs, posture
+    /// state still moves into Combat on intrusion, network isolation
+    /// still engages — but there is no way to release without an
+    /// admin pub key, so operators must reboot to clear COMBAT).
+    #[arg(
+        long = "admin-pub",
+        value_name = "PATH",
+        default_value = "/etc/northnarrow/admin.pub"
+    )]
+    admin_pub: PathBuf,
+
+    /// Unix-socket path nn-admin connects to. Removed on startup if
+    /// it already exists (stale file from prior unclean shutdown).
+    #[arg(
+        long = "admin-socket",
+        value_name = "PATH",
+        default_value = "/run/northnarrow/admin.sock"
+    )]
+    admin_socket: PathBuf,
 }
 
 #[tokio::main]
@@ -164,8 +198,75 @@ async fn main() -> Result<()> {
     let correlation = CorrelationBuffer::with_default_capacity();
     let host = HostContext::discover();
 
-    let posture = PostureMachine::new();
+    // Tappa 7 task 7 / Tappa 8: anti-tamper response pipeline. The
+    // NetworkIsolator owns the iptables shell-out; engage runs on
+    // any non-Combat → Combat edge, release only fires for an
+    // Ed25519-verified admin unlock (capability gated via
+    // UnlockToken). If the ruleset is missing we WARN-and-continue
+    // with no isolator, so the agent still boots in dev environments
+    // without /etc/northnarrow/ provisioned.
+    let isolator = match NetworkIsolator::new(cli.combat_rules.clone()) {
+        Ok(i) => Some(Arc::new(i)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %cli.combat_rules.display(),
+                "combat ruleset missing; COMBAT entry will not engage network isolation"
+            );
+            None
+        }
+    };
+
+    let posture = if let Some(iso) = isolator.as_ref() {
+        let iso_engage = Arc::clone(iso);
+        let iso_release = Arc::clone(iso);
+        let engage_hook: CombatEntryHook = Arc::new(move || {
+            if let Err(e) = iso_engage.engage() {
+                tracing::error!(error = %e, "COMBAT engage failed; agent continues in degraded mode");
+            }
+        });
+        let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
+            if let Err(e) = iso_release.release(token) {
+                tracing::error!(
+                    error = %e,
+                    "admin release failed; iptables state may need manual cleanup"
+                );
+            }
+        });
+        PostureMachine::new_with_hooks(engage_hook, release_hook)
+    } else {
+        PostureMachine::new()
+    };
     info!("posture state machine initialized (state: OBSERVING)");
+
+    // Optional admin socket: only spawned if admin pubkey config
+    // is present. Missing config = no unlock path; the agent still
+    // runs but COMBAT can only be cleared by reboot.
+    if let Some(iso) = isolator.as_ref() {
+        match AdminAuth::load(&cli.admin_pub) {
+            Ok(auth) => {
+                let auth = Arc::new(auth);
+                let posture_clone = posture.clone();
+                let iso_clone = Arc::clone(iso);
+                let socket_path = cli.admin_socket.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        admin_socket::serve(socket_path, auth, Arc::new(posture_clone), iso_clone)
+                            .await
+                    {
+                        warn!(error = %e, "admin socket serve loop exited");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %cli.admin_pub.display(),
+                    "admin pub key file missing or invalid; admin socket disabled"
+                );
+            }
+        }
+    }
 
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
     // idle, ENGAGED→ALERTED after 24h idle). COMBAT never decays
@@ -245,6 +346,13 @@ async fn main() -> Result<()> {
             "ADE shutdown stats"
         );
     }
+
+    // Best-effort socket cleanup so a future agent process can bind
+    // without first encountering a stale file. The accept loop is
+    // about to be torn down with the runtime, so this race is between
+    // tokio's drop-of-the-listener and our unlink — either order
+    // leaves the filesystem clean.
+    admin_socket::unlink_socket(&cli.admin_socket);
 
     info!("NorthNarrow agent stopped.");
     Ok(())

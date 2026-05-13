@@ -10,6 +10,7 @@
 
 pub mod ade;
 pub mod admin_cli;
+pub mod admin_socket;
 pub mod anti_tamper;
 pub mod correlation;
 pub mod decision;

@@ -340,3 +340,77 @@ fn default_new_has_no_combat_hook() {
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
+
+// ─── admin_release_combat_with_token (Tappa 7 task 7 / Tappa 8) ─────
+
+#[test]
+fn admin_release_with_token_transitions_combat_to_alerted() {
+    let m = PostureMachine::new();
+    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    m.observe(&intrusion, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let new_state = m
+        .admin_release_combat_with_token(token)
+        .expect("token release should succeed from Combat");
+    assert_eq!(new_state.kind(), PostureKind::Alerted);
+    assert_eq!(m.current_kind(), PostureKind::Alerted);
+    // last_admin_action populated.
+    assert!(m.last_admin_action_secs_ago().is_some());
+}
+
+#[test]
+fn admin_release_with_token_fails_when_not_in_combat() {
+    let m = PostureMachine::new();
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let err = m.admin_release_combat_with_token(token).unwrap_err();
+    assert_eq!(err, super::AdminReleaseError::NotInCombat);
+    // last_admin_action stays None — failed releases must not stamp it.
+    assert!(m.last_admin_action_secs_ago().is_none());
+}
+
+#[test]
+fn release_hook_fires_with_token_on_successful_release() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&count);
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+        // The token is consumed by-value into the closure body —
+        // dropping it here exercises the production ownership flow.
+        c2.fetch_add(1, Ordering::SeqCst);
+    });
+    let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
+    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    m.observe(&intrusion, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let _ = m.admin_release_combat_with_token(token).unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn release_hook_does_not_fire_on_not_in_combat() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&count);
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+        c2.fetch_add(1, Ordering::SeqCst);
+    });
+    let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
+    // Never entered Combat — release must reject + leave hook untouched.
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    assert!(m.admin_release_combat_with_token(token).is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn last_admin_action_secs_ago_returns_none_before_release() {
+    let m = PostureMachine::new();
+    assert!(m.last_admin_action_secs_ago().is_none());
+}

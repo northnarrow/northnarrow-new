@@ -27,6 +27,16 @@ pub mod admin_auth;
 pub mod filesystem;
 pub mod network_isolate;
 
+/// Test-only mint of an [`network_isolate::UnlockToken`] for unit
+/// tests that exercise code paths consuming the capability (e.g.
+/// `posture::admin_release_combat_with_token`). The production
+/// capability invariant is unaffected — this helper is only
+/// compiled under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
+    network_isolate::mint_unlock_token()
+}
+
 use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{Array, MapData},
