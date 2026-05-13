@@ -23,6 +23,7 @@
 //! - The map write happens *before* the attach calls so any time
 //!   window in which the hook fires sees a valid `tgid`, never `0`.
 
+pub mod admin_auth;
 pub mod filesystem;
 pub mod network_isolate;
 

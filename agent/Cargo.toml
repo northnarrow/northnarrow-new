@@ -68,6 +68,12 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # untrusted strings inside the structured prompt).
 base64 = "0.22"
 
+# Tappa 7 task 7 / Tappa 8: nn-admin Ed25519 challenge-response.
+# `std` keeps the regular SignatureError type (no_std mode pares it
+# down); `rand_core` lets us feed rand 0.8's OsRng into key generation.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+hex = "0.4"
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
