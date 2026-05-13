@@ -1,0 +1,21 @@
+[package]
+name = "northnarrow-antitamper-bpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared anti-tamper eBPF pin/reuse + PID-set management used by both northnarrow-agent and northnarrow-watchdog. Keeps aya contained to this crate so the watchdog binary stays lean."
+
+[lib]
+name = "northnarrow_antitamper_bpf"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+aya = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

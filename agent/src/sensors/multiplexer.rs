@@ -36,6 +36,12 @@ pub struct SensorMultiplexer {
     ebpf: Ebpf,
     pumps: Vec<JoinHandle<()>>,
     rx: mpsc::Receiver<Event>,
+    /// Anti-tamper handle. Created during `start()` (same place as
+    /// the loader configuration) so the bpffs root and map_pin_path
+    /// agree by construction. Threaded through `attach_anti_tamper`
+    /// at boot; the watchdog will also clone it (commit #3) for the
+    /// SIGCHLD `evict_pid` path.
+    antitamper: antitamper_bpf::AntiTamper,
 }
 
 impl SensorMultiplexer {
@@ -50,8 +56,24 @@ impl SensorMultiplexer {
             );
         }
 
-        let mut ebpf = EbpfLoader::new()
-            .btf(None)
+        // Tappa 7 task 6 commit #2: tell aya to pin every map in
+        // the object to `/sys/fs/bpf/northnarrow/<MAP_NAME>` AND to
+        // auto-reuse any pin that already exists. This is the
+        // built-in load-or-create path; no manual map-pin code on
+        // our side. The bpffs root is created by `AntiTamper::new`
+        // if missing, so the parent directory always exists when
+        // aya goes to write the pin file.
+        let antitamper = antitamper_bpf::AntiTamper::new(antitamper_bpf::DEFAULT_BPFFS_ROOT.into())
+            .with_context(|| {
+                format!(
+                    "preparing bpffs root {}",
+                    antitamper_bpf::DEFAULT_BPFFS_ROOT
+                )
+            })?;
+        let mut loader = EbpfLoader::new();
+        loader.btf(None);
+        antitamper.configure_loader(&mut loader);
+        let mut ebpf = loader
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
 
@@ -98,7 +120,12 @@ impl SensorMultiplexer {
             spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx),
         ];
 
-        Ok(Self { ebpf, pumps, rx })
+        Ok(Self {
+            ebpf,
+            pumps,
+            rx,
+            antitamper,
+        })
     }
 
     /// Drain the next event. Returns `None` when every pump task has
@@ -121,7 +148,14 @@ impl SensorMultiplexer {
         pids: &[u32],
         allowed_comms: &std::collections::HashSet<String>,
     ) -> Result<()> {
-        crate::anti_tamper::attach(&mut self.ebpf, pids, allowed_comms)
+        crate::anti_tamper::attach(&mut self.ebpf, &self.antitamper, pids, allowed_comms)
+    }
+
+    /// Borrow the anti-tamper handle so external callers (e.g. the
+    /// future watchdog crate in commit #3) can issue the
+    /// SIGCHLD-side `evict_pid` against the same bpffs root.
+    pub fn antitamper(&self) -> &antitamper_bpf::AntiTamper {
+        &self.antitamper
     }
 }
 

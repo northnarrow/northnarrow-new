@@ -52,37 +52,32 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 
 use std::collections::HashSet;
 
-use anyhow::{anyhow, Context, Result};
-use aya::{
-    maps::{HashMap as AyaHashMap, MapData},
-    programs::Lsm,
-    Btf, Ebpf,
-};
+use anyhow::{Context, Result};
+use aya::{Btf, Ebpf};
 use tracing::{info, warn};
 
-/// Names mirroring `#[map]` / `#[lsm(hook = "…")]` declarations in
-/// `agent-ebpf/src/{task_kill,ptrace_check}.rs`. Kept here as
-/// constants because aya looks them up by string at runtime.
-const PROTECTED_PIDS_MAP: &str = "PROTECTED_PIDS";
-const TASK_KILL_PROGRAM: &str = "task_kill";
-const TASK_KILL_HOOK: &str = "task_kill";
-const PTRACE_PROGRAM: &str = "ptrace_access_check";
-const PTRACE_HOOK: &str = "ptrace_access_check";
+// Re-export the helpers the binary crate (main.rs) reaches for.
+// The actual logic lives in northnarrow-antitamper-bpf so the
+// watchdog can share it without pulling in agent's full library.
+pub use antitamper_bpf::{read_proc_comm, read_self_comm, AntiTamper, HookAttachOutcome};
 
-/// Populate `PROTECTED_PIDS` and attach the two Tappa 7 LSM hooks.
+/// Run the full anti-tamper bootstrap against an already-loaded
+/// [`Ebpf`] instance (the multiplexer is responsible for invoking
+/// `AntiTamper::configure_loader(&mut loader)` BEFORE
+/// `loader.load()` so map_pin_path takes effect; this function does
+/// the post-load PID + LSM-link work).
 ///
-/// A failure populating the map is fatal: the hooks would otherwise
-/// fail open and we'd silently lose anti-tamper. Failure attaching
-/// either LSM hook is logged and tolerated so the agent can still
-/// run on kernels without BPF-LSM in the boot `lsm=` chain.
-///
-/// `pids` is a slice so callers can register multiple PIDs in one
-/// call (Tappa 7 task 6: agent + watchdog). Stale entries from a
-/// prior pinned-map load are evicted first — every entry whose PID
-/// is dead or whose `/proc/<pid>/comm` is not in `allowed_comms`
-/// is removed before `pids` is inserted.
-pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) -> Result<()> {
-    match evict_stale_pids(ebpf, allowed_comms) {
+/// Order: evict stale PIDs → register fresh PIDs → pin-or-attach
+/// all 7 LSM hooks → filesystem bootstrap (Tappa 7 task 5). Per-hook
+/// failures are logged WARN and tolerated so the agent still runs
+/// on kernels without BPF-LSM.
+pub fn attach(
+    ebpf: &mut Ebpf,
+    antitamper: &AntiTamper,
+    pids: &[u32],
+    allowed_comms: &HashSet<String>,
+) -> Result<()> {
+    match antitamper.evict_stale_pids(ebpf, allowed_comms) {
         Ok(0) => {}
         Ok(n) => info!(
             evicted = n,
@@ -94,18 +89,14 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
              will be overwritten by the registration step)"
         ),
     }
-    register_protected_pids(ebpf, pids).context("populating PROTECTED_PIDS before LSM attach")?;
-    info!(
-        pids = ?pids,
-        map = PROTECTED_PIDS_MAP,
-        "anti-tamper: PIDs registered with kernel"
-    );
+    antitamper
+        .register_pids(ebpf, pids)
+        .context("populating PROTECTED_PIDS before LSM attach")?;
 
     // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
-    // loader resolves `bpf_lsm_<hook>` against it to set the
-    // `attach_btf_id` the kernel expects. If we can't read vmlinux
-    // BTF, neither hook can attach — log once and skip both rather
-    // than warning twice for the same root cause.
+    // loader resolves `bpf_lsm_<hook>` against it. If we can't read
+    // vmlinux BTF, no hook can attach — log once and skip the whole
+    // batch rather than warning N times for the same root cause.
     let btf = match Btf::from_sys_fs() {
         Ok(b) => b,
         Err(e) => {
@@ -118,144 +109,45 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
         }
     };
 
-    match attach_lsm(ebpf, TASK_KILL_PROGRAM, TASK_KILL_HOOK, &btf) {
-        Ok(()) => info!(
-            program = TASK_KILL_PROGRAM,
-            hook = TASK_KILL_HOOK,
-            "anti-tamper: LSM hook attached (denies SIGKILL/SIGTERM to agent)"
-        ),
-        Err(e) => warn!(
-            program = TASK_KILL_PROGRAM,
-            hook = TASK_KILL_HOOK,
-            error = %e,
-            "anti-tamper: LSM hook attach FAILED — agent killable by root"
-        ),
+    let mut reused = 0usize;
+    let mut fresh = 0usize;
+    let mut failed = 0usize;
+    for (hook, res) in antitamper.pin_or_attach_lsm_hooks(ebpf, &btf) {
+        match res {
+            Ok(HookAttachOutcome::ReusedPin) => {
+                reused += 1;
+                info!(hook, "anti-tamper: reused pinned LSM link");
+            }
+            Ok(HookAttachOutcome::FreshlyAttached) => {
+                fresh += 1;
+                info!(hook, "anti-tamper: LSM hook freshly attached + pinned");
+            }
+            Err(e) => {
+                failed += 1;
+                warn!(
+                    hook, error = %e,
+                    "anti-tamper: LSM hook attach FAILED — coverage degraded"
+                );
+            }
+        }
     }
+    info!(
+        reused,
+        fresh, failed, "anti-tamper: LSM hook attach summary"
+    );
 
-    match attach_lsm(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf) {
-        Ok(()) => info!(
-            program = PTRACE_PROGRAM,
-            hook = PTRACE_HOOK,
-            "anti-tamper: LSM hook attached (denies ptrace to agent)"
-        ),
-        Err(e) => warn!(
-            program = PTRACE_PROGRAM,
-            hook = PTRACE_HOOK,
-            error = %e,
-            "anti-tamper: LSM hook attach FAILED — agent inspectable by root"
-        ),
-    }
-
-    // Tappa 7 task 5: directory + inode protection. Failure to
-    // bootstrap (no /var/lib, read-only rootfs, permission denied
-    // even as root) is warn-and-continue: process-level anti-tamper
-    // already attached above, so the agent isn't worthless without
-    // FS protection.
+    // Tappa 7 task 5: directory + inode bootstrap. Filesystem
+    // protection's LSM hooks (5 of the 7) are already attached by
+    // pin_or_attach_lsm_hooks above; this call still runs the
+    // mkdir + chattr +i + PROTECTED_INODES registration for
+    // `/var/lib/northnarrow/`.
     if let Err(e) = filesystem::attach(ebpf, &btf) {
-        warn!(error = %e, "anti-tamper FS: bootstrap failed, continuing without FS protection");
+        warn!(
+            error = %e,
+            "anti-tamper FS: bootstrap failed (LSM hooks remain attached and pinned)"
+        );
     }
 
-    Ok(())
-}
-
-/// Insert each PID into `PROTECTED_PIDS`. `BPF_ANY` upsert
-/// semantics: an entry that already exists is overwritten, so
-/// re-registering the same PID after an eviction race is fine.
-fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
-    let map = ebpf
-        .map_mut(PROTECTED_PIDS_MAP)
-        .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP} missing from eBPF object"))?;
-    let mut hm: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)
-        .with_context(|| format!("{PROTECTED_PIDS_MAP} is not a HashMap<u32, u8>"))?;
-    for &pid in pids {
-        hm.insert(pid, 1u8, 0)
-            .with_context(|| format!("inserting PID {pid} into {PROTECTED_PIDS_MAP}"))?;
-    }
-    Ok(())
-}
-
-/// Walk every PID currently in `PROTECTED_PIDS`. Evict any entry
-/// whose PID is dead OR whose `/proc/<pid>/comm` is not in
-/// `allowed_comms`. Returns the number of entries removed.
-///
-/// This is a no-op on a freshly-loaded eBPF object (the map is
-/// empty); it becomes load-bearing once Tappa 7 task 6 commit #2
-/// pins the map to bpffs, at which point a restarted agent inherits
-/// the prior generation's entries and must clean up stale ones
-/// before the new PIDs take effect.
-fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<usize> {
-    let map = ebpf
-        .map_mut(PROTECTED_PIDS_MAP)
-        .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP} missing from eBPF object"))?;
-    let mut hm: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)
-        .with_context(|| format!("{PROTECTED_PIDS_MAP} is not a HashMap<u32, u8>"))?;
-
-    // Materialise the key set up-front; aya's `keys()` iterator
-    // holds a borrow of the map, and we need `&mut hm` to call
-    // `remove()`.
-    let existing: Vec<u32> = hm.keys().filter_map(Result::ok).collect();
-    let mut evicted = 0usize;
-    for pid in existing {
-        let alive_and_matching = match read_proc_comm(pid) {
-            Some(comm) => allowed_comms.contains(&comm),
-            None => false,
-        };
-        if alive_and_matching {
-            continue;
-        }
-        match hm.remove(&pid) {
-            Ok(()) => evicted += 1,
-            Err(e) => warn!(
-                pid, error = %e,
-                "anti-tamper: failed to evict stale PID (continuing)"
-            ),
-        }
-    }
-    Ok(evicted)
-}
-
-/// Read `/proc/self/comm` and return it as an owned `String` with
-/// the trailing newline stripped. Returns an error if the file is
-/// missing or unreadable — both shouldn't happen for our own PID.
-pub fn read_self_comm() -> Result<String> {
-    let raw = std::fs::read_to_string("/proc/self/comm").context("reading /proc/self/comm")?;
-    Ok(raw.trim_end_matches('\n').to_string())
-}
-
-/// Read `/proc/<pid>/comm` and return it as an owned `String`.
-/// Returns `None` if the file does not exist (process gone) or
-/// cannot be read for any other reason — callers treat both
-/// outcomes as "this PID is no longer ours."
-///
-/// `comm` is the kernel-stamped 15-char-plus-NUL `TASK_COMM_LEN`
-/// field, set on exec and updatable via `prctl(PR_SET_NAME)`. We
-/// use it rather than `cmdline` because comm is the value the
-/// kernel itself uses internally; cmdline can be rewritten via
-/// `/proc/self/cmdline` write from userland. Neither defeats a
-/// motivated attacker — comm is a sanity check for PID recycling
-/// race, not a security primitive.
-pub fn read_proc_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/comm");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim_end_matches('\n').to_string())
-}
-
-pub(crate) fn attach_lsm(
-    ebpf: &mut Ebpf,
-    program_name: &str,
-    hook_name: &str,
-    btf: &Btf,
-) -> Result<()> {
-    let prog: &mut Lsm = ebpf
-        .program_mut(program_name)
-        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
-        .try_into()
-        .with_context(|| format!("program {program_name} is not an LSM program"))?;
-    prog.load(hook_name, btf)
-        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
-    prog.attach()
-        .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
     Ok(())
 }
 

@@ -69,18 +69,14 @@ const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
 const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
 const FS_IMMUTABLE_FL: libc::c_long = 0x0000_0010;
 
-/// The five LSM programs from `agent-ebpf/src/inode_protect.rs`.
-/// First field is the program name in the ELF, second is the LSM
-/// hook name the kernel exposes as `bpf_lsm_<hook>` in vmlinux BTF.
-const LSM_PROGRAMS: &[(&str, &str)] = &[
-    ("inode_unlink", "inode_unlink"),
-    ("inode_rmdir", "inode_rmdir"),
-    ("inode_rename", "inode_rename"),
-    ("inode_setattr", "inode_setattr"),
-    ("file_ioctl", "file_ioctl"),
-];
+// Tappa 7 task 6 commit #2 moved the 5 inode/file_ioctl LSM hooks
+// into the unified `AntiTamper::pin_or_attach_lsm_hooks` path in
+// `northnarrow-antitamper-bpf`, so `filesystem::attach` is now only
+// responsible for the userland-state half (mkdir, chattr +i, and
+// PROTECTED_INODES population). The `Btf` parameter is dropped
+// because we no longer call `super::attach_lsm` here.
 
-pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
+pub(crate) fn attach(ebpf: &mut Ebpf, _btf: &Btf) -> Result<()> {
     let dir = Path::new(STATE_DIR);
 
     // Step 1: ensure dir exists, mode 0700, root-owned.
@@ -95,7 +91,10 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
         "anti-tamper FS: state directory ready"
     );
 
-    // Step 2: register inode in the BPF map BEFORE attaching hooks.
+    // Step 2: register inode in the BPF map. The LSM hooks that
+    // consult PROTECTED_INODES were attached centrally by
+    // `AntiTamper::pin_or_attach_lsm_hooks` before this function ran,
+    // so the new entry takes effect immediately on next syscall.
     let st_dev = meta.dev();
     let key = InodeKey {
         dev: stat_dev_to_kernel_dev(st_dev),
@@ -117,17 +116,6 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
             "anti-tamper FS: chattr +i failed — LSM still protects, but the kernel \
              immutable check is unavailable"
         ),
-    }
-
-    // Step 4: attach the five LSM programs.
-    for (program, hook) in LSM_PROGRAMS {
-        match super::attach_lsm(ebpf, program, hook, btf) {
-            Ok(()) => info!(program, hook, "anti-tamper FS: LSM hook attached"),
-            Err(e) => warn!(
-                program, hook, error = %e,
-                "anti-tamper FS: LSM hook attach FAILED"
-            ),
-        }
     }
 
     Ok(())

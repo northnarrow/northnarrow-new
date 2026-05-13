@@ -1374,6 +1374,7 @@ dependencies = [
  "hkdf",
  "libc",
  "nix",
+ "northnarrow-antitamper-bpf",
  "northnarrow-common",
  "num_cpus",
  "parking_lot",
@@ -1389,6 +1390,16 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "northnarrow-antitamper-bpf"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "aya",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

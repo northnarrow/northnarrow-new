@@ -40,6 +40,7 @@ test-privileged = []
 
 [dependencies]
 common = { workspace = true }
+antitamper-bpf = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
