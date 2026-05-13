@@ -280,3 +280,63 @@ fn transition_log_caps_at_bound() {
     // Final state must be ENGAGED (last operation was admin release).
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 }
+
+#[test]
+fn combat_hook_fires_on_first_combat_entry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&count);
+    let m = PostureMachine::new_with_combat_hook(Arc::new(move || {
+        c2.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // Reconnaissance only takes us to ALERTED — hook must not fire.
+    let recon_recent = vec![
+        tcp_v4(42, [127, 0, 0, 1], 22, 100),
+        tcp_v4(42, [127, 0, 0, 1], 80, 200),
+    ];
+    let recon_focal = tcp_v4(42, [127, 0, 0, 1], 443, 300);
+    m.observe(&recon_focal, &recon_recent);
+    assert_eq!(m.current_kind(), PostureKind::Alerted);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+
+    // ConfirmedIntrusion crosses into COMBAT — hook fires exactly once.
+    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    m.observe(&intrusion, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn combat_hook_does_not_refire_while_already_in_combat() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&count);
+    let m = PostureMachine::new_with_combat_hook(Arc::new(move || {
+        c2.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    m.observe(&intrusion, &[]);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // A second intrusion event while already in COMBAT must not
+    // re-engage isolation — apply_trigger short-circuits and observe
+    // returns None, so the upward-edge check never fires the hook.
+    let again = spawn(101, 1, "evil2", "/tmp/payload2", 600);
+    let result = m.observe(&again, &[]);
+    assert!(result.is_none(), "no transition expected while in COMBAT");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn default_new_has_no_combat_hook() {
+    // Smoke test: PostureMachine::new() still constructs a working
+    // machine that can reach COMBAT without panicking. Older tests
+    // implicitly rely on this; making it an explicit assertion
+    // protects against accidental hook-required regressions.
+    let m = PostureMachine::new();
+    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    m.observe(&intrusion, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}

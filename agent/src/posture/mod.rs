@@ -65,19 +65,45 @@ pub struct PostureMachine {
     inner: Arc<Inner>,
 }
 
+/// Hook invoked exactly once per Observing/Alerted/Engaged →
+/// COMBAT edge. The agent's `main.rs` wires this to
+/// `NetworkIsolator::engage`. Stored as `Arc<dyn Fn() + Send +
+/// Sync>` so the machine itself can stay `Clone + Send + Sync`.
+pub type CombatHook = Arc<dyn Fn() + Send + Sync>;
+
 struct Inner {
     state: RwLock<PostureState>,
     transitions: RwLock<Vec<PostureTransition>>,
     triggers: TriggerDetector,
+    combat_hook: Option<CombatHook>,
 }
 
 impl PostureMachine {
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Build a machine that fires `hook` whenever a transition crosses
+    /// into [`PostureKind::Combat`] from any non-Combat state. The
+    /// hook runs *after* the state mutation, with no lock held, so
+    /// it is free to do blocking I/O (the production hook shells out
+    /// to `iptables-restore`, which can take tens of milliseconds).
+    ///
+    /// The hook fires exactly once per upward edge into Combat; if the
+    /// machine is already in Combat when another trigger fires, the
+    /// hook is NOT re-invoked. The wiring in `observe()` checks
+    /// `before.kind() != Combat && after.kind() == Combat`.
+    pub fn new_with_combat_hook(hook: CombatHook) -> Self {
+        Self::build(Some(hook))
+    }
+
+    fn build(combat_hook: Option<CombatHook>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
                 triggers: TriggerDetector::new(),
+                combat_hook,
             }),
         }
     }
@@ -128,6 +154,16 @@ impl PostureMachine {
 
         if after != before {
             self.log_transition(before, after, firing, describe_triggers(&hits));
+            // Combat-entry edge — fire the hook exactly once per
+            // upward crossing. We deliberately check `before` so a
+            // re-trigger while already in Combat does NOT re-engage
+            // network isolation (which would be a redundant shell-out
+            // and could mask audit signal).
+            if before != PostureKind::Combat && after == PostureKind::Combat {
+                if let Some(hook) = self.inner.combat_hook.as_ref() {
+                    hook();
+                }
+            }
             Some(current)
         } else {
             None
