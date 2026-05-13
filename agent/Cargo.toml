@@ -31,6 +31,12 @@ demo-tappa5 = []
 # the agent-side handler that consumes it. Used by the integration
 # test harness; never enabled in production builds.
 debug-trigger = ["common/debug-trigger"]
+# Gates `agent/tests/privileged_e2e.rs` — full end-to-end scenarios
+# that spawn the agent + nn-admin subprocesses and verify the
+# iptables ruleset against a live kernel. Requires root and a
+# working iptables binary; CI compiles but does not execute these.
+# See docs/integration-test-runbook.md for the manual run path.
+test-privileged = []
 
 [dependencies]
 common = { workspace = true }

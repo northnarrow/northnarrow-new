@@ -280,6 +280,25 @@ impl PostureMachine {
     /// hook with the consumed token so `NetworkIsolator::release`
     /// can tear down the iptables ruleset.
     ///
+    /// ## Target-state rationale (Alerted, not Engaged)
+    ///
+    /// A legitimate admin unlock means *"threat acknowledged,
+    /// network restored"* — it does NOT mean *"incident over."*
+    /// The operator just told us they're in the loop; the right
+    /// posture after that signal is still elevated (Alerted)
+    /// because there is no semantic basis to assume the broader
+    /// threat is gone. If the host was actively compromised when
+    /// COMBAT engaged, the attacker's foothold is unchanged by
+    /// the admin's signature — we just stopped quarantining the
+    /// network. Alerted preserves heightened sensitivity to
+    /// subsequent triggers.
+    ///
+    /// The legacy `admin_release_combat` bool stub returns to
+    /// Engaged instead, for state-machine-exercise reasons that
+    /// predate the Tappa 7/8 work. That stub is `#[cfg(test)]`-
+    /// shaped (its only callers are the demo example and unit
+    /// tests); the asymmetry is intentional and deliberate.
+    ///
     /// Idempotent w.r.t. "already out of Combat" only at the socket
     /// layer — this method itself errors with `NotInCombat` if the
     /// state isn't Combat, leaving caller-side policy to map that to

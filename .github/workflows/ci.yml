@@ -87,6 +87,14 @@ jobs:
       - name: Compile workspace tests (including ignored)
         run: cargo test --workspace --no-run --verbose
 
+      # Tappa 7 task 7 / Tappa 8: agent/tests/privileged_e2e.rs is gated
+      # behind --features test-privileged. Running it needs root +
+      # iptables (see docs/integration-test-runbook.md), so CI compiles
+      # without executing — same bit-rot guard pattern as the rest of
+      # this job.
+      - name: Compile privileged_e2e module (test-privileged)
+        run: cargo test --workspace --no-run --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger --verbose
+
   ade-build:
     # Tappa 6 — verifies the ADE module compiles cleanly without
     # ever pulling a GGUF model or any C++ dependency. The default
