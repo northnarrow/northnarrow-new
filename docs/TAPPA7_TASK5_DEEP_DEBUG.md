@@ -501,3 +501,50 @@ intentionally don't add that print pre-emptively to keep the hot
 path clean.
 
 
+
+---
+
+## Resolution: dev_t encoding fix (8ff04c7, 2026-05-13)
+
+### Root cause
+
+Userland and kernel use different encodings for `dev_t` device identifiers:
+
+- **Userland (`stat(2)`):** `meta.dev()` returns `new_encode_dev(MKDEV(major, minor))` — legacy compact form. For `/var/lib/northnarrow` on `/dev/sda2`: `MKDEV(8, 2) → 0x802 = 2050`.
+- **Kernel (`super_block->s_dev`):** BPF-LSM hooks read `MKDEV(major, minor) = (major << 20) | minor`. Same device: `0x800002 = 8388610`.
+
+The agent inserted PROTECTED_INODES keys using `meta.dev()` (stat form), while LSM hooks looked them up via `s_dev` (kernel form). The HashMap byte-compare failed silently: key `02 08 ...` ≠ stored `02 00 80 ...`. Every protected access produced `REACHED-MISS` in trace_pipe (32× MISS in iter2 pre-fix run).
+
+This silently affected **all five FS hooks**: `inode_unlink`, `inode_rmdir`, `inode_rename`, `inode_setattr`, and `file_ioctl`. The previously documented "chattr bypass" was a symptom of the same root cause, not a Linux 6.8 LSM gap.
+
+### Fix
+
+`agent/src/anti_tamper/filesystem.rs`: new `stat_dev_to_kernel_dev()` helper converts userland-encoded `dev_t` to kernel MKDEV form before insertion. Startup log now prints both `st_dev` and `kernel_dev` for sanity-checking the conversion.
+
+Unit tests:
+- `stat_dev_to_kernel_dev_sda2` (0x802 → 0x800002)
+- `stat_dev_to_kernel_dev_high_minor` (0x100801 → 0x800101)
+
+### Live verification (2026-05-13, kernel 6.8.0-111-generic)
+
+Startup log:
+anti-tamper FS: directory inode registered in PROTECTED_INODES path=/var/lib/northnarrow st_dev=2050 kernel_dev=8388610 ino=1835288
+
+`bpftool prog show | grep -c lsm` → **7** (task_kill + ptrace + 5 fs hooks).
+
+Attack matrix:
+
+| Attack | RC | LSM hook | Result |
+|---|---|---|---|
+| `chmod 0777 /var/lib/northnarrow` | 1 (EPERM) | `inode_setattr` | DENIED |
+| `touch /var/lib/northnarrow/canary` | 1 (EPERM) | `inode_setattr` | DENIED |
+| `mv /var/lib/northnarrow /var/lib/northnarrow.attk` | 1 (EPERM) | `inode_rename` | DENIED |
+| `rm -rf /var/lib/northnarrow` | 1 (EPERM) | `inode_rmdir` | DENIED |
+| `chattr -i /var/lib/northnarrow` | 1 (EPERM) | `file_ioctl` (FS_IOC_SETFLAGS) | DENIED |
+| `kill -TERM <agent_pid>` (reverse) | 1 (EPERM) | `task_kill` | DENIED |
+
+**Zero residual bypasses on the tested attack surface.** The "Known bypass: chattr on Linux 6.8" entry is marked RESOLVED — it was caused by the same dev_t mismatch, not a kernel LSM gap.
+
+### Files modified
+- `agent/src/anti_tamper/filesystem.rs` — `stat_dev_to_kernel_dev()` helper + updated startup log line
+
