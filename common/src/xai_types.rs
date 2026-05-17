@@ -49,14 +49,15 @@ pub const XAI_SCHEMA_VERSION: &str = "1.0.0";
 /// Fail-closed XAI compute ceiling, in milliseconds (gating question Q2:
 /// FIXED, deliberately NOT derived from `AdeConfig.timeout`).
 ///
-/// Rationale: synthesis is hard-capped at ≤5 rules / 60 s; coarse-to-fine
-/// + bounded-K is ~16–19 model inferences worst case at ~5 s/inference on
-/// the 8B-Q4_K_M CPU path ⇒ ~80–95 s. 90 s is that envelope plus margin.
-/// Exceeding it returns `XaiUnavailable` ⇒ synthesis refuses the rule
-/// (regulatory fail-closed — an unexplained rule must never deploy).
-/// Deriving this from another config would create hidden coupling that
-/// harms regulatory predictability. Future changes: a dedicated commit
-/// with a written rationale, never a runtime computation.
+/// Rationale: synthesis is hard-capped at ≤5 rules / 60 s; the
+/// coarse-to-fine bounded-K path is ~16–19 model inferences worst case
+/// at ~5 s/inference on the 8B-Q4_K_M CPU path ⇒ ~80–95 s. 90 s is that
+/// envelope plus margin. Exceeding it returns `XaiUnavailable` ⇒
+/// synthesis refuses the rule (regulatory fail-closed — an unexplained
+/// rule must never deploy). Deriving this from another config would
+/// create hidden coupling that harms regulatory predictability. Future
+/// changes: a dedicated commit with a written rationale, never a
+/// runtime computation.
 pub const XAI_BUDGET_MS: u64 = 90_000;
 
 /// Domain-separation prefix for [`XaiEvidenceChain::canonical_bytes`]. A
