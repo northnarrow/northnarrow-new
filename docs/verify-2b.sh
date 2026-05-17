@@ -22,14 +22,22 @@
 #   isolated, post-reboot verify box.
 #
 # ── Agent stop signal (source-verified) ─────────────────────────────
-#   The agent's tokio select handles SIGINT/SIGTERM/SIGHUP gracefully
-#   (agent/src/main.rs:306-338). SIGTERM is *blocked by the LSM hook
-#   under test*; SIGHUP is documented as unreliably delivered. SIGINT
-#   is NOT blocked by the hook (task_kill denies only SIGKILL/SIGTERM)
-#   and drives the graceful-shutdown arm — so SIGINT is the clean,
-#   deterministic stop. SIGQUIT (no handler ⇒ default terminate) is
-#   the hard fallback. We poll liveness with `sudo kill -0` and never
-#   assume a single signal worked.
+#   SIGKILL and SIGTERM are *blocked by the LSM hook under test* — the
+#   protected agent cannot be stopped with either. Of the deliverable
+#   signals (agent/src/main.rs:306-338): SIGINT drives the tokio
+#   graceful-shutdown arm (works, but runs full eBPF/ADE teardown, so
+#   termination latency is unbounded); SIGHUP is documented as
+#   unreliably delivered; SIGQUIT has *no handler* ⇒ kernel default
+#   action = immediate terminate, and is not hook-blocked. SIGQUIT is
+#   therefore the deterministic, immediate stop and is exactly what
+#   the proven AgentGuard pattern in privileged_map_pin.rs uses. It is
+#   also the semantically stronger test: 2b's pin-survival defends
+#   against an attacker *abruptly* killing the agent, so verifying the
+#   gap under an abrupt SIGQUIT models the real threat better than a
+#   graceful SIGINT would. We send SIGQUIT, poll liveness with
+#   `sudo kill -0`, and on timeout dump process diagnostics — a
+#   SIGQUIT that "fails" means the resolved PID is wrong (it cannot
+#   mean SIGQUIT was ineffective), which the diagnostics expose.
 set -u
 
 ROOT=/sys/fs/bpf/northnarrow
@@ -38,7 +46,7 @@ AGENT_BIN=${AGENT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/northnar
 RULES_SRC=${RULES_SRC:-$(cd "$(dirname "$0")/.." && pwd)/configs/combat-rules.v4}
 EXPECTED_HOOKS=7
 ATTACH_TIMEOUT=20      # seconds
-STOP_TIMEOUT=15        # seconds
+STOP_TIMEOUT=30        # seconds (safety margin; SIGQUIT is immediate)
 WORK=$(mktemp -d)
 
 PASS=0
@@ -50,7 +58,10 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 ok()    { green "PASS: $*"; PASS=$((PASS + 1)); }
 bad()   { red   "FAIL: $*"; FAIL=$((FAIL + 1)); }
-note()  { printf '---- %s\n' "$*"; }
+# `printf '---- …'` makes bash's printf parse the leading dashes as
+# options ("printf: --: invalid option"); echo of a dash-prefixed
+# string containing spaces/letters is printed literally and is safe.
+note()  { echo "---- $*"; }
 
 # ── bash-bug fix #1: `grep -c X f || echo 0` emits "0\n0" and breaks
 # arithmetic. `grep -c` already prints a lone count (0 when none) and
@@ -90,7 +101,9 @@ cleanup() {
   done
   for a in "${AGENTS[@]}"; do
     [ -n "$a" ] || continue
-    alive "$a" && sudo kill -INT "$a" >/dev/null 2>&1
+    # SIGQUIT: deterministic best-effort reap (SIGINT can hang on
+    # the agent's graceful-shutdown teardown; cleanup must not block).
+    alive "$a" && sudo kill -QUIT "$a" >/dev/null 2>&1
   done
   rm -rf "$WORK"
 }
@@ -133,12 +146,22 @@ spawn_agent() { # spawn_agent <tag>
     --admin-pub "$td/admin.pub" \
     --admin-socket "$td/admin.sock" \
     --no-ade >"$td/agent.log" 2>&1 &
-  local shpid=$!
-  # The real agent is the sudo child; resolve it.
+  local shpid=$!   # PID of the `sudo` wrapper, not the agent
+  # The agent is sudo's child. Primary: child of sudo whose cmdline
+  # matches the binary. Fallback: any direct child of sudo (the agent
+  # is sudo's only child) — NOT `pgrep -f` (sudo's own argv contains
+  # the binary path, so an unscoped match also hits the wrapper).
   sleep 0.3
   local apid
   apid=$(pgrep -P "$shpid" -f "$AGENT_BIN" | head -1)
-  [ -n "$apid" ] || apid=$(pgrep -f "$AGENT_BIN" | tail -1)
+  [ -n "$apid" ] || apid=$(pgrep -P "$shpid" | head -1)
+  # Runtime diagnostic to stderr (NOT stdout — stdout is captured as
+  # the PID by `$(spawn_agent …)`). Confirms apid is the agent, not
+  # the sudo wrapper, before stop_agent depends on it.
+  {
+    note "spawn_agent[$tag]: shpid=$shpid apid=$apid cmdline='$(
+      sudo cat /proc/"$apid"/cmdline 2>/dev/null | tr '\0' ' ')'"
+  } >&2
   # NB: caller must `AGENTS+=("$pid")` — doing it here would mutate a
   # command-substitution subshell, leaving the trap's array empty.
   echo "$apid"
@@ -146,29 +169,46 @@ spawn_agent() { # spawn_agent <tag>
 
 wait_for_full_attach() { # wait_for_full_attach <agent.log>
   local log=$1 deadline=$((SECONDS + ATTACH_TIMEOUT))
+  # Strict gate: each hook runs load → attach → pin_prog → pin_link
+  # sequentially, so prog/link PIN FILES lag the kernel program by a
+  # ~200ms window. Waiting only on `lsm_prog_count` lets the caller
+  # sample pin counts mid-window and see 6/7. Require all three —
+  # 7 progs loaded AND 7 prog_ pins AND 7 link_ pins — to close the
+  # race (same load-vs-pin race the Rust test's
+  # `wait_for_full_lsm_attach` already guards).
   while [ $SECONDS -lt $deadline ]; do
-    if sudo test -e "$PIN" && [ "$(lsm_prog_count)" -ge "$EXPECTED_HOOKS" ]; then
+    if sudo test -e "$PIN" \
+       && [ "$(lsm_prog_count)" -ge "$EXPECTED_HOOKS" ] \
+       && [ "$(count_pins prog_)" -ge "$EXPECTED_HOOKS" ] \
+       && [ "$(count_pins link_)" -ge "$EXPECTED_HOOKS" ]; then
       return 0
     fi
     sleep 0.2
   done
   red "timeout: full LSM attach not reached in ${ATTACH_TIMEOUT}s"
+  note "state: progs=$(lsm_prog_count) prog_pins=$(count_pins prog_) link_pins=$(count_pins link_)"
   note "agent.log tail:"; tail -15 "$log"
   return 1
 }
 
 stop_agent() { # stop_agent <pid>
+  # SIGQUIT primary: no handler ⇒ kernel default action terminates
+  # immediately, not hook-blocked — matches the proven AgentGuard
+  # pattern and models abrupt-kill (the threat 2b defends). A
+  # SIGQUIT that doesn't land in STOP_TIMEOUT means the PID is wrong,
+  # not that SIGQUIT failed — so we dump diagnostics instead of
+  # escalating to SIGKILL/SIGTERM (both hook-blocked anyway).
   local p=$1 deadline=$((SECONDS + STOP_TIMEOUT))
-  sudo kill -INT "$p" 2>/dev/null
+  sudo kill -QUIT "$p" 2>/dev/null
   while [ $SECONDS -lt $deadline ]; do
     alive "$p" || return 0
     sleep 0.2
   done
-  note "SIGINT did not stop $p in ${STOP_TIMEOUT}s; SIGQUIT fallback"
-  sudo kill -QUIT "$p" 2>/dev/null
-  sleep 1
-  alive "$p" && { red "agent $p will not die"; return 1; }
-  return 0
+  note "SIGQUIT did not stop $p in ${STOP_TIMEOUT}s"
+  note "process state: $(sudo grep -E '^(Name|State|PPid):' /proc/"$p"/status 2>/dev/null | tr '\n' ' ')"
+  note "cmdline: $(sudo cat /proc/"$p"/cmdline 2>/dev/null | tr '\0' ' ')"
+  red "agent $p will not die"
+  return 1
 }
 
 count_pins() { # count_pins <prefix>
@@ -203,7 +243,7 @@ reuse=$(count_in 'reused pinned LSM link' "$A1_LOG")
   || bad "boot1: unexpected 'reused' lines=$reuse"
 
 # ===== Stop boot 1 → enter the GAP =================================
-note "Stopping boot 1 (SIGINT — graceful, hook-permitted) → GAP open"
+note "Stopping boot 1 (SIGQUIT — immediate, models abrupt kill) → GAP open"
 stop_agent "$A1" || exit 1
 
 # ----- structural gap proof: kernel objects survive with NO agent --
@@ -272,7 +312,7 @@ if [ "$RC_KILL" -ne 0 ] && grep -qi 'not permitted' "$WORK/a2.err"; then
 else
   bad "steady-state: kill -9 agent2 rc=$RC_KILL err='$(cat "$WORK/a2.err")'"
 fi
-note "stopping boot 2 (SIGINT)"
+note "stopping boot 2 (SIGQUIT)"
 stop_agent "$A2" || true
 
 # ===== DEFERRED: stale-pin recovery path ===========================
