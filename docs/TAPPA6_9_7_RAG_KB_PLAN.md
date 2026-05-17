@@ -1,6 +1,13 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ DELIVERED (P5 pending owner gate).**
+Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ DELIVERED (P6 pending owner gate).**
+P6: bench/golden/e2e validation over the real 964-doc corpus —
+`retrieve` p95 **2.2 ms** (≤50 ms), cold open **707 ms** (≤5 s),
+golden **22/24 = 91.7 %** (≥90 %; 2 documented cross-source
+`want_sigma` misses), `kb_index_hash` reproduced byte-identical to the
+P2 anchor, e2e format matches the frozen P5 contract. clippy 0/0; no
+regressions. (Earlier P2–P5 status follows.)
+Prior — **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ DELIVERED (P5 pending owner gate).**
 P5: env-driven RAG canary (`NN_ADE_RAG_ENABLED` default OFF + graceful
 fallback) wired at the single main.rs `AdeEngine::new`; Q4(a) RULED
 freeze-as-contract — `format_rag_block` byte-frozen as the Phase-C
@@ -798,9 +805,30 @@ the bench records evaluate-with-RAG vs without.
   +6 tests (4 `rag::canary` env/3-state, format snapshot, with_rag
   splice) + the P4 canary-parity (rag:None). clippy 0/0; rag:: 39+1;
   ade:: 109+2. → owner gate.
-- **P6 — bench + golden**: latency p50/p95 (`NN_RAG_BENCH_N`), 20–30
-  golden cases, `kb_index_hash` stability; re-confirm the P5 Phase-C
-  format alignment holds end-to-end. → owner gate.
+- **P6 — bench + golden** — ✅ **DELIVERED (this commit) — pending
+  owner gate audit.** `agent/src/rag/bench.rs`: latency harness
+  (`NN_RAG_BENCH_N`, default 1000) + 24-case golden suite + e2e
+  format re-confirm; heavy runs `#[ignore]` (real-corpus pattern).
+  **Results over the real 964-doc corpus (n=6000 retrieves):**
+  - Latency: cold `open_index` **707 ms** (≤ 5 s ✅); `retrieve`
+    **p50 1.6 ms / p95 2.2 ms / p99 2.4 ms** (≤ 50 ms ✅, ~23× margin);
+    RSS Δ ≈ 50 MiB (tantivy mmap, reasonable).
+  - Golden: **22/24 = 91.7 %** (≥ 90 % ✅). The 2 misses are the
+    `want_sigma` half of two cross-source cases ("powershell
+    credential dump lsass", "scripting interpreter powershell abuse")
+    — the exact ATT&CK ids *were* retrieved; no Linux-Sigma rule
+    co-ranked top-10 for these Windows-flavoured credential phrasings
+    (the Sigma corpus is the Linux subset; LOLBAS dropped). Documented
+    future-improvement, consistent with the §10 coverage-gap row — not
+    a defect; corpus-quality, post-beta hybrid/GTFOBins addresses it.
+  - `kb_index_hash`: an independent P6 re-run of `cargo xtask rag-kb`
+    reproduced `4d335aed…6cd5fd98` **byte-identical** to the
+    P2-committed anchor (full-pipeline reproducibility ✓; tamper-
+    sensitivity is the committed P2 unit byte-lock).
+  - e2e Phase-C format: real retrieval → `format_rag_block` matches
+    the frozen P5 contract shape ✓.
+  Release-gate alignment: satisfies §13 checklist #3 (latency) and the
+  golden-determinism precondition. → owner gate.
 - **P7 — docs closeout**: ADE_DOCTRINE + XDR_ROADMAP annotation;
   Art-13 dossier documents the **two-artifact model** (signed XAI
   chain + the separate hash-chained RAG log) and **references the
