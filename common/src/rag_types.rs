@@ -85,9 +85,17 @@ pub struct KbDocument {
 /// A retrieval result: one [`KbDocument`] plus its similarity score
 /// against the query.
 ///
-/// `similarity` is cosine similarity on normalized vectors and lies in
-/// `[-1.0, 1.0]`; in practice the seed KB uses non-negative bag-of-grams
-/// embeddings so values are in `[0.0, 1.0]`.
+/// `similarity` semantics depend on the active `RagEngine` backend;
+/// the field, type and range (`[0.0, 1.0]`) are stable either way
+/// (no struct change — C2/CLI deserialize charter):
+/// * **6.7 embedding path** — cosine similarity on L2-normalized
+///   vectors (theoretically `[-1.0, 1.0]`; the bag-of-grams seed is
+///   non-negative so in practice `[0.0, 1.0]`).
+/// * **6.9.7 BM25 path** — the raw BM25 score (unbounded ≥ 0)
+///   **normalised within the result**: `score / max_score_in_result`,
+///   so the top hit is exactly `1.0` and the rest are proportionally
+///   lower (plan §3.4(a)). It is a *within-result* ranking signal,
+///   not an absolute cross-query magnitude.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RagDocument {
     pub id: String,

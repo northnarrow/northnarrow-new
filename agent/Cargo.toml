@@ -102,8 +102,11 @@ hex = "0.4"
 # (mmap = memmap2 on-disk index; lz4-compression = lz4_flex store) keeps
 # zstd-sys out of the tree (verified via `cargo tree`). Do NOT re-enable
 # default features or add `zstd-compression`/`columnar-zstd-compression`.
-# 0.26.1 is GA as of P3 but a bump stays deliberate (see verbatim above).
-tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "stopwords", "lz4-compression"] }
+# `stopwords` dropped in P4 (audit F-P3-2): the nn_sec analyzer does not
+# use a stop-word filter — verified the full rag suite green without it
+# (minimal surface). 0.26.1 is GA as of P3 but a bump stays deliberate
+# (see verbatim above).
+tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "lz4-compression"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

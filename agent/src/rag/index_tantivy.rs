@@ -15,6 +15,7 @@
 //! -source-change, and golden retrieval fixtures. Wiring this behind
 //! `RagEngine::retrieve` / a canary flag is P4/P5 — NOT here.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -386,17 +387,38 @@ pub fn open_or_build(records: &[CanonLine], dir: &Path) -> Result<Index> {
 
 // ── BM25 retrieval (P3 golden harness; P4 wraps it in RagEngine) ───────
 
+/// One BM25 hit with the stored fields needed to build a
+/// `common::rag_types::RagDocument` (P4 maps these without re-querying).
+#[derive(Debug, Clone)]
+pub struct Bm25Hit {
+    pub score: f32,
+    pub id: String,
+    pub category: String,
+    pub title: String,
+    pub content: String,
+}
+
 /// BM25 top-`k` over `title`/`content`/`author`. The query is analysed
 /// with the SAME R3 analyzer (no `QueryParser` syntax pitfalls with
-/// `/ : .`), then OR-combined as per-field `TermQuery`s — tantivy's
-/// default similarity is BM25, so `TopDocs` is BM25-ranked. Returns
-/// `(score, id)` best-first.
-pub fn bm25_search(index: &Index, query: &str, k: usize) -> Result<Vec<(f32, String)>> {
+/// `/ : .`), OR-combined as per-field `TermQuery`s — tantivy's default
+/// similarity is BM25, so `TopDocs` is BM25-ranked.
+///
+/// **R1 tie-break (plan §12.1):** `TopDocs` breaks score ties by
+/// internal segment/DocId order, which is not stable across rebuilds.
+/// We re-sort the collected hits by **score descending, then `id`
+/// ascending** so equal-score retrieval is deterministic (DocId order
+/// ≈ id order here anyway — `build_index` inserts id-sorted — but the
+/// explicit re-sort is the contract).
+pub fn bm25_query(index: &Index, query: &str, k: usize) -> Result<Vec<Bm25Hit>> {
     let schema = index.schema();
-    let id_f = schema.get_field("id").unwrap();
-    let title_f = schema.get_field("title").unwrap();
-    let content_f = schema.get_field("content").unwrap();
-    let author_f = schema.get_field("author").unwrap();
+    let get = |n: &str| schema.get_field(n).unwrap();
+    let (id_f, cat_f, title_f, content_f, author_f) = (
+        get("id"),
+        get("category"),
+        get("title"),
+        get("content"),
+        get("author"),
+    );
 
     let terms = analyze(query);
     if terms.is_empty() {
@@ -420,17 +442,40 @@ pub fn bm25_search(index: &Index, query: &str, k: usize) -> Result<Vec<(f32, Str
     let hits = searcher
         .search(&query, &TopDocs::with_limit(k))
         .context("search")?;
+    let txt = |doc: &TantivyDocument, f: Field| -> String {
+        doc.get_first(f)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
     let mut out = Vec::with_capacity(hits.len());
     for (score, addr) in hits {
         let doc: TantivyDocument = searcher.doc(addr).context("fetch doc")?;
-        let id = doc
-            .get_first(id_f)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        out.push((score, id));
+        out.push(Bm25Hit {
+            score,
+            id: txt(&doc, id_f),
+            category: txt(&doc, cat_f),
+            title: txt(&doc, title_f),
+            content: txt(&doc, content_f),
+        });
     }
+    // R1: deterministic order — score desc, id asc.
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(out)
+}
+
+/// `(score, id)` projection of [`bm25_query`] — the P3 golden harness
+/// keeps using this; P4's `RagEngine` uses the richer [`bm25_query`].
+pub fn bm25_search(index: &Index, query: &str, k: usize) -> Result<Vec<(f32, String)>> {
+    Ok(bm25_query(index, query, k)?
+        .into_iter()
+        .map(|h| (h.score, h.id))
+        .collect())
 }
 
 #[cfg(test)]
@@ -525,6 +570,25 @@ mod tests {
         assert!(top("process injection").contains(&"attack:T1055".to_string()));
         // Author field is queryable ("rules by Florian Roth").
         assert!(top("Florian Roth").contains(&"sigma:shadow-1".to_string()));
+    }
+
+    #[test]
+    fn r1_tie_break_is_id_ascending_for_equal_scores() {
+        // Identical content+title ⇒ identical BM25 (tf/idf/fieldnorm)
+        // ⇒ a score tie; R1 must order by id ascending, deterministically.
+        let dir = tempfile::tempdir().unwrap();
+        let same = "process injection technique";
+        let recs = vec![
+            rec("z-dup", same, same, None),
+            rec("a-dup", same, same, None),
+            rec("m-dup", same, same, None),
+        ];
+        let idx = open_or_build(&recs, dir.path()).unwrap();
+        let hits = bm25_query(&idx, "process injection technique", 10).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["a-dup", "m-dup", "z-dup"], "R1 tie-break must be id-asc");
+        // Scores genuinely tied.
+        assert!((hits[0].score - hits[2].score).abs() < 1e-6, "scores must tie");
     }
 
     #[test]

@@ -1,6 +1,13 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 frozen · P2 ✅ + P3 ✅ DELIVERED (P3 pending owner gate).**
+Status: **P1.5 frozen · P2 ✅ P3 ✅ P4 ✅ DELIVERED (P4 pending owner gate).**
+P4: `RagEngine::open_index` BM25 swap behind the byte-stable
+`retrieve`/`RagQuery`/`RagResult` API (Backend enum; 6.7 embedding
+retained); R1 `(-score,id-asc)` tie-break; §3.4(a) within-result
+normalisation + post-norm `min_similarity` floor; 6.7 canary-parity
+test (`rag:None`⇒pre-6.7); F-P3-1/F-P3-2 folded; clippy 0/0; rag:: 35
++1. (Earlier P2/P3 status follows.)
+Prior — **P1.5 frozen · P2 ✅ + P3 ✅ DELIVERED (P3 pending owner gate).**
 P3: `agent/src/rag/index_tantivy.rs` — 8-field tantivy schema + R3
 `nn_sec` security-token analyzer + persist/rebuild-on-change; `tantivy
 =0.25.0 default-features=false` (🚩 charter: default `zstd-sys` C-FFI
@@ -246,6 +253,20 @@ as cosine ∈ [0,1]. BM25 is unbounded ≥ 0. Options:
 Conservative no-match (sovereign constraint, Phase-C input):
 `min_score` floor ⇒ **empty `RagResult`** (the 6.7 `is_empty()` path is
 already handled conservatively downstream — preserve it).
+
+**AS BUILT (P4, `agent/src/rag/retrieval.rs::retrieve_bm25`):** Q4=(a)
+ruled — `similarity = score / max_score_in_result` (top hit = exactly
+`1.0`, rest proportional); empty result skips normalisation. The
+`min_similarity` floor (the existing `RagQuery` field — kept verbatim
+for API stability; "min_score" in spec prose = this field) is applied
+**after** normalisation, on the [0,1] scale; all-below-floor ⇒ empty
+`RagResult` (6.7 conservative contract preserved). A BM25 query error
+also yields an empty `RagResult` (the infallible `retrieve` contract
+is kept — no `Result` in the signature). `common/src/rag_types.rs`
+doc-comment updated (DOC ONLY — no struct change; C2/CLI charter).
+Ordering is R1 (`(-score, id-asc)`, from `bm25_query`) so equal-score
+retrieval is deterministic. `query_embedding_ms = 0` on this path
+(reserved for the §7 hybrid).
 
 ---
 
@@ -590,6 +611,20 @@ agent/src/rag/store.rs           // 6.7 — retained, dormant
 common/src/rag_types.rs          // doc-comment fix only (3.4a) — NO shape change
 docs/TAPPA6_9_7_RAG_KB_PLAN.md   // this doc
 ```
+**AS BUILT (P2–P4) — deviations from the sketch above (documented):**
+- No `agent/src/rag/kb_dump.rs`: the canonical-dump model + the
+  `kb_index_hash` (§3.1.1) live in **`xtask/src/rag_kb.rs`** (the P2
+  acquisition tool — that is where canonicalisation happens); the
+  agent only *parses* a canonical JSONL line, via
+  `index_tantivy::CanonLine::from_json` (serde_json::Value, no serde
+  derive — avoided an agent Cargo.toml dep change).
+- `xtask/ (new subcommand)` realised as `cargo xtask rag-kb`
+  (build-time fetch | `--mirror` install).
+- `retrieval.rs` (P4): `RagEngine` is now a `Backend` enum —
+  `with_seed` ⇒ legacy 6.7 embedding; `open_index` ⇒ 6.9.7 BM25;
+  `retrieve`/`RagQuery`/`RagResult` byte-stable (the §0 swap). The
+  6.7 embedder/store stay dormant for the §7 hybrid.
+
 **Placement decision (§12 Q6):** keep `agent/src/rag/` (sibling of
 `ade/`, exactly where 6.7 put it and where `with_rag` already wires).
 Promoting it is unnecessary churn — recommend KEEP.
@@ -700,10 +735,20 @@ the bench records evaluate-with-RAG vs without.
   fingerprint / rebuild) + 1 `#[ignore]` real-corpus smoke (964 recs,
   all 5 owner golden queries pass). clippy 0/0; bump-if-verified:
   0.26.1 is GA but stays a deliberate future commit (Q1). → owner gate.
-- **P4 — BM25 retrieval**: `RagEngine::open_index` + BM25 + R1
-  `(-bm25,id)` tie-break + §3.4(a) normalised similarity, **keeping
-  `retrieve()` API byte-stable**. Determinism + golden tests.
-  → owner gate (retrieval-correctness audit).
+- **P4 — BM25 retrieval** — ✅ **DELIVERED (this commit) — pending
+  owner gate audit.** `RagEngine` → `Backend` enum;
+  `RagEngine::open_index(jsonl_dir,index_dir)` (loads P2 JSONL + 6.7
+  seed → `open_or_build`); `retrieve`/`RagQuery`/`RagResult`
+  **byte-stable** (C2/CLI charter — no `common` struct change, doc
+  only). R1 `(-score,id-asc)` tie-break; §3.4(a) within-result
+  normalisation (top=1.0); `min_similarity` floor post-normalisation;
+  conservative empty on error/no-match (infallible `retrieve` kept);
+  `query_embedding_ms=0`. 6.7 embedding path retained for `with_seed`.
+  +3 rag tests (tie-break, normalised open_index, post-norm floor) +
+  the **6.7 canary-parity test** (`rag:None` ⇒ no RAG block ⇒ pre-6.7
+  prompt — §13 checklist #1). F-P3-1 (mod.rs doc) + F-P3-2 (`stopwords`
+  dropped, verified) folded. clippy 0/0; rag:: 35+1; xai/xtask
+  unaffected. → owner gate (retrieval-correctness audit).
 - **P5 — ADE canary integration** (§5/Q7 RULED Option A ⇒ unblocked;
   zero `xai_types`/`xai` changes; NO hash-chained log here — that is a
   Tappa 13 follow-on per §5.1): wire the *existing* `with_rag` behind

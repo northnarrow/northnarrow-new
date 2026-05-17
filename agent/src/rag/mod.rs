@@ -24,12 +24,25 @@
 //! a `=== RELEVANT CYBERSEC KNOWLEDGE ===` block surfacing the top-k
 //! retrievals.
 //!
-//! ## Future deltas (Sub-tappa 6.7+)
+//! ## Sub-tappa 6.9.7 — production path (CURRENT)
 //!
-//! - Real candle-loaded bge-small embedder.
-//! - Persistent on-disk store (LanceDB once its dependency footprint
-//!   is acceptable; otherwise a custom Arrow-flavoured layout).
-//! - Live ingestion from MITRE GitHub, Sigma, LOLBAS.
+//! 6.7's 30-doc hashed-n-gram embedding store is the **legacy /
+//! transition** path. The production path is the deterministic BM25
+//! index ([`index_tantivy`]) over the pinned canonical KB (MITRE
+//! ATT&CK v18.1 + SigmaHQ Linux, acquired by `cargo xtask rag-kb`)
+//! **plus** the retained 6.7 [`kb_seed`] notes. The swap is behind the
+//! unchanged [`RagEngine`] / [`RagQuery`] / `RagResult` API (plan §0):
+//! [`RagEngine::with_seed`] = legacy embedding; [`RagEngine::open_index`]
+//! = BM25. `rag: None` still reproduces pre-6.7 behaviour byte-for-byte
+//! (canary-parity guarantee).
+//!
+//! ## Future deltas
+//!
+//! - §7 hybrid seam: re-introduce a candle bge-small embedding
+//!   re-rank *over* BM25 candidates (the embedder/store stay dormant,
+//!   `RagResult.query_embedding_ms` reserved for it).
+//! - LOLBAS is intentionally absent (GPL-3.0 — plan §4.2.3); GTFOBins
+//!   is a post-beta corpus-extension research task.
 
 pub mod embedder;
 pub mod index_tantivy;
@@ -39,8 +52,8 @@ pub mod store;
 
 pub use embedder::{cosine_similarity, RagEmbedder};
 pub use index_tantivy::{
-    analyze, bm25_search, build_index, load_records, open_or_build, source_fingerprint, CanonLine,
-    SEC_ANALYZER,
+    analyze, bm25_query, bm25_search, build_index, load_records, open_or_build,
+    source_fingerprint, Bm25Hit, CanonLine, SEC_ANALYZER,
 };
 pub use retrieval::{RagEngine, RagQuery, DEFAULT_MIN_SIMILARITY, DEFAULT_TOP_K};
 pub use store::{RagStore, StoreHit};

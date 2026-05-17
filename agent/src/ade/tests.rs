@@ -506,3 +506,46 @@ async fn evaluate_produces_identical_verdict_with_or_without_streaming() {
     );
     assert_eq!(va.recommended_action.action, vb.recommended_action.action);
 }
+
+/// Tappa 6.9.7 P4 item 6 / §13 canary-default-flip checklist #1 —
+/// **6.7 canary-parity guarantee.** With no `RagEngine` wired
+/// (`rag: None`, the `new_with_backend` default), the assembled prompt
+/// MUST NOT contain the RAG block: the prompt-build path is then
+/// byte-identical to pre-6.7. This is what guarantees every XAI
+/// evidence chain produced WITHOUT RAG stays reproducible by an
+/// auditor running RAG-off. (RAG-on splices a
+/// `=== RELEVANT CYBERSEC KNOWLEDGE ... ===` block — see
+/// `ade::rag_integration::format_rag_block`.)
+#[tokio::test]
+async fn rag_none_prompt_is_byte_identical_to_pre_6_7() {
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let cfg = cfg_with(prompt.path(), model.path());
+    // new_with_backend ⇒ rag: None (no with_rag) — the pre-6.7 path.
+    let engine = AdeEngine::new_with_backend(cfg, Arc::new(MockBackend::new()))
+        .await
+        .unwrap();
+    let event = Event::ProcessSpawn {
+        pid: 4242,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "xmrig".into(),
+        filename: "/tmp/x".into(),
+        timestamp_ns: 0,
+    };
+    let ctx = EventContext {
+        recent_events: vec![],
+        host_context: HostContext::discover(),
+    };
+    let assembled = engine
+        .assembled_prompt(&event, &ctx)
+        .expect("a prompt is produced (no high-injection short-circuit)");
+    assert!(
+        !assembled.contains("RELEVANT CYBERSEC KNOWLEDGE"),
+        "rag:None must NOT splice the RAG block — pre-6.7 parity broken"
+    );
+    // And the decision path is unaffected (deterministic MockBackend).
+    let v = engine.evaluate(&event, &ctx).await.unwrap();
+    assert_eq!(v.verdict, AdeAction::Kill);
+}
