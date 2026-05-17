@@ -32,11 +32,16 @@
 //! - Live ingestion from MITRE GitHub, Sigma, LOLBAS.
 
 pub mod embedder;
+pub mod index_tantivy;
 pub mod kb_seed;
 pub mod retrieval;
 pub mod store;
 
 pub use embedder::{cosine_similarity, RagEmbedder};
+pub use index_tantivy::{
+    analyze, bm25_search, build_index, load_records, open_or_build, source_fingerprint, CanonLine,
+    SEC_ANALYZER,
+};
 pub use retrieval::{RagEngine, RagQuery, DEFAULT_MIN_SIMILARITY, DEFAULT_TOP_K};
 pub use store::{RagStore, StoreHit};
 

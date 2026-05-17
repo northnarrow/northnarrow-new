@@ -1,6 +1,13 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 frozen + ✅ P2 DELIVERED (pending owner gate audit).**
+Status: **P1.5 frozen · P2 ✅ + P3 ✅ DELIVERED (P3 pending owner gate).**
+P3: `agent/src/rag/index_tantivy.rs` — 8-field tantivy schema + R3
+`nn_sec` security-token analyzer + persist/rebuild-on-change; `tantivy
+=0.25.0 default-features=false` (🚩 charter: default `zstd-sys` C-FFI
+excluded — see §3.2/agent Cargo.toml note); clippy 0/0; 5 hermetic
+tests + real-corpus smoke (964 recs) all green. (Original P2 status
+line follows.)
+Prior — **P1.5 frozen + ✅ P2 DELIVERED (pending owner gate audit).**
 All owner verbatim folded (§5.1/§12.1/§4.2.2/§13/§4.2.3/§10-row) +
 the 8-key-schema ruling (§4.1/§4.2/§3.1.1, folded into the P2 commit
 per owner instruction — no separate P1.6). **P2 shipped:** `cargo
@@ -179,16 +186,45 @@ kb_index_hash = lower_hex(sha256(preimage))   # 64 hex chars
 A P2 unit test locks this with fixture digests (tamper-sensitive, like
 `canonical_bytes_byte_locked_for_sample`).
 
-### 3.2 Index schema (tantivy fields)
-Proposed document schema (maps onto the existing 5 `KbCategory`):
-`id` (STRING, stored, indexed-raw) · `category` (STRING/facet, stored) ·
-`title` (TEXT, stored) · `content` (TEXT, stored) ·
-`source_ref` (STRING, stored — e.g. `attack:T1059.001`,
-`sigma:<rule-id>`, `lolbas:<bin>`) · `severity`/`platform` (STRING,
-stored, optional). Tokeniser: default `en` + lowercase; **no
-stemming/stopwords by default** (R3, confirm — security tokens like
-`xmrig`, `T1059.001`, `/etc/passwd` must survive intact; a custom
-analyzer that keeps dotted/slashed identifiers is likely needed).
+### 3.2 Index schema (tantivy fields) — AS BUILT (P3, `agent/src/rag/index_tantivy.rs`)
+
+8-field schema, one field per canonical-record key (the 8-key ruling):
+- `title`, `content`, `author` — **TEXT**, R3 analyzer (`nn_sec`),
+  `WithFreqsAndPositions`, stored. `author` is analysed text so
+  "rules by Florian Roth" queries work.
+- `id`, `category`, `source_ref`, `severity`, `platform` — **STRING**
+  (raw, exact-match), stored.
+
+**Deviations from the original proposal (documented per P3 item 6):**
+1. `author` added (8th field) — the 8-key ruling.
+2. `category` is **STRING** (raw, stored), not a facet — exact-match is
+   all that's needed; simpler, no facet machinery. (Maps onto the 5
+   `KbCategory` strings verbatim.)
+3. **R3 analyzer = `nn_sec`** (custom `Tokenizer` + `LowerCaser`), NOT
+   the stock `en` tokenizer. Token rule: a token is a maximal run of
+   `alphanumeric | . / - _ :`; everything else splits; leading
+   `([{"'` and trailing `.,;:!?)]}"'` are trimmed (sentence
+   punctuation) while *internal* `. / - _` are kept. This keeps
+   `T1059.001`, `/etc/shadow`, `cmd.exe`, `192.168.1.1`,
+   `CVE-2024-1234`, `v18.1`, long hex whole; prose still splits on
+   whitespace. Applied identically index- and query-side.
+4. Retrieval is an analyzer-applied `BooleanQuery` of per-field
+   `TermQuery` (tantivy default similarity = BM25), **not**
+   `QueryParser` — avoids `QueryParser` syntax pitfalls with `/ : .`
+   in security identifiers, and exercises R3 on the query side too.
+5. Charter: `tantivy` `default-features=false` — the default
+   `columnar-zstd-compression` pulls `zstd-sys` (C-FFI), forbidden;
+   pure-Rust `mmap`+`lz4-compression` used (verified `cargo tree`).
+6. On-disk persistence (MmapDirectory) + a source fingerprint marker
+   (`NN-RAG-KB-INDEX-SRC-v1`, dedup-by-id, order-independent) drives
+   lazy **rebuild-on-source-change**; the 6.7 `kb_seed` notes are
+   ingested alongside the P2 JSONL dumps. (The 6.7 seed retains an
+   in-repo curated `lolbas_certutil`-style note — that is the
+   repo-licensed seed, NOT the dropped GPL-3.0 LOLBAS upstream.)
+
+Validated end-to-end: real-corpus smoke over 964 records (691 ATT&CK
+v18.1 + 243 Sigma Linux + 30 seed) — the owner's 5 golden queries all
+return strong cross-source hits.
 
 ### 3.3 Query construction
 Reuse the existing `ade::rag_integration::build_rag_query_from_event`
@@ -653,12 +689,17 @@ the bench records evaluate-with-RAG vs without.
   7. `kb_index_hash` per §3.1.1 implemented + byte-lock test.
   Plus: R4 license-permits-shipping verified (else mode-4 install-only).
   Atomic commit. → **owner gate audit, then P3.**
-- **P3 — tantivy index build** (needs Q1 tantivy version pinned).
-  Schema §3.2; **R3 custom analyzer DESIGN + golden test fixtures
-  proving the owner's security tokens survive tokenisation:
-  `T1059.001`, `/etc/shadow`, `xmrig`, `certutil`, base64-blob, dotted/
-  slashed identifiers** (explicit owner P3 requirement). Persist +
-  lazy `open`. → owner gate.
+- **P3 — tantivy index build** — ✅ **DELIVERED (this commit) —
+  pending owner gate audit.** `agent/src/rag/index_tantivy.rs`:
+  8-field schema (§3.2 as-built), R3 `nn_sec` analyzer (security
+  tokens survive — tested), `tantivy =0.25.0`
+  `default-features=false` (🚩 charter: default pulls `zstd-sys`
+  C-FFI — excluded; pure-Rust `mmap`+`lz4`), MmapDirectory persist +
+  fingerprint rebuild-on-change, ingests P2 JSONL + 6.7 seed. 5
+  hermetic tests (analyzer / golden previews / persistence /
+  fingerprint / rebuild) + 1 `#[ignore]` real-corpus smoke (964 recs,
+  all 5 owner golden queries pass). clippy 0/0; bump-if-verified:
+  0.26.1 is GA but stays a deliberate future commit (Q1). → owner gate.
 - **P4 — BM25 retrieval**: `RagEngine::open_index` + BM25 + R1
   `(-bm25,id)` tie-break + §3.4(a) normalised similarity, **keeping
   `retrieve()` API byte-stable**. Determinism + golden tests.
