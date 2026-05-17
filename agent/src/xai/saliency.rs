@@ -259,7 +259,12 @@ fn budget_check<C: Clock>(
     }
 }
 
-fn degraded_reason(coarse: &[Region], tail: Option<(Region, u32, u32)>) -> String {
+/// Deterministic, exhaustive partial-fidelity reason (signed via
+/// `XaiStatus::Degraded`). Every coarse region AND every bounded-K tail
+/// is listed: with a low `max_units` config more than one region can
+/// overflow (e.g. focal's ≤9 fields and correlated both at K=3), and the
+/// Article-13 dossier must name each, not just the last (F1).
+fn degraded_reason(coarse: &[Region], tails: &[(Region, u32, u32)]) -> String {
     let mut s = String::from("partial fidelity: ");
     if !coarse.is_empty() {
         let names: Vec<&str> = coarse.iter().map(|r| region_word(*r)).collect();
@@ -268,13 +273,13 @@ fn degraded_reason(coarse: &[Region], tail: Option<(Region, u32, u32)>) -> Strin
             names.join(", ")
         ));
     }
-    if let Some((r, n, total)) = tail {
-        if !coarse.is_empty() {
+    for (i, (r, n, total)) in tails.iter().enumerate() {
+        if !coarse.is_empty() || i > 0 {
             s.push_str("; ");
         }
         s.push_str(&format!(
             "bounded-K tail in {} ({} of {} units aggregated)",
-            region_word(r),
+            region_word(*r),
             n,
             total
         ));
@@ -362,7 +367,7 @@ pub async fn explain_saliency_with_clock<P: DecisionProbe, C: Clock>(
 
     // ── Stage B ──
     let mut coarse_regions: Vec<Region> = Vec::new();
-    let mut tail_note: Option<(Region, u32, u32)> = None;
+    let mut tail_notes: Vec<(Region, u32, u32)> = Vec::new();
     for (r, rd, rs) in &region_delta {
         let mut region_units: Vec<&PerturbableUnit> =
             units.iter().filter(|u| u.region == *r).collect();
@@ -436,7 +441,7 @@ pub async fn explain_saliency_with_clock<P: DecisionProbe, C: Clock>(
                 delta: d,
                 attention_score: None,
             });
-            tail_note = Some((*r, n, region_units.len() as u32));
+            tail_notes.push((*r, n, region_units.len() as u32));
         }
     }
 
@@ -461,7 +466,7 @@ pub async fn explain_saliency_with_clock<P: DecisionProbe, C: Clock>(
     let status = if fine == total_units {
         XaiStatus::Complete
     } else {
-        XaiStatus::Degraded(degraded_reason(&coarse_regions, tail_note))
+        XaiStatus::Degraded(degraded_reason(&coarse_regions, &tail_notes))
     };
 
     Ok(SaliencyRun {
@@ -624,6 +629,30 @@ mod tests {
             _c: &EventContext,
         ) -> Result<AdeVerdict, XaiProbeError> {
             Ok(verdict(AdeAction::Monitor, AdeSeverity::Low, 0.5))
+        }
+    }
+
+    /// Two independent causes (focal `comm == "miner"` and a recent c2
+    /// DNS). Occluding either region alone still moves the verdict
+    /// (Kill→Alert), so BOTH regions refine — and with a low `max_units`
+    /// both can overflow, exercising the multi-tail reason (F1).
+    struct MultiCauseProbe;
+    impl DecisionProbe for MultiCauseProbe {
+        async fn probe(
+            &self,
+            focal: &Event,
+            ctx: &EventContext,
+        ) -> Result<AdeVerdict, XaiProbeError> {
+            let focal_bad =
+                matches!(focal, Event::ProcessSpawn { comm, .. } if comm == "miner");
+            let corr_bad = ctx.recent_events.iter().any(|e| {
+                matches!(e, Event::DnsQuery { query_name, .. } if query_name.contains("c2.evil"))
+            });
+            Ok(match u8::from(focal_bad) + u8::from(corr_bad) {
+                2 => verdict(AdeAction::Kill, AdeSeverity::Critical, 0.95),
+                1 => verdict(AdeAction::Alert, AdeSeverity::Medium, 0.60),
+                _ => verdict(AdeAction::Allow, AdeSeverity::None, 0.10),
+            })
         }
     }
 
@@ -955,6 +984,45 @@ mod tests {
                      in correlated (1 of 3 units aggregated)"
                 );
             }
+            XaiStatus::Complete => panic!("expected Degraded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_region_overflow_lists_every_tail_in_reason() {
+        // F1 regression: focal (7 fields) AND correlated (5 events) both
+        // overflow K=3 and both refine ⇒ the reason must name BOTH tails.
+        let recent = vec![
+            dns("ok0"),
+            dns("login.c2.evil.net"),
+            dns("ok2"),
+            dns("ok3"),
+            dns("ok4"),
+        ];
+        let cfg = SaliencyConfig {
+            max_units: 3,
+            ..Default::default()
+        };
+        let run = explain_saliency(&cfg, &ps("miner"), &ctx(recent), &MultiCauseProbe)
+            .await
+            .unwrap();
+
+        assert!(run
+            .saliency_map
+            .iter()
+            .any(|e| e.unit_id == "tail:focal:N=4" && e.refinement == Refinement::Coarse));
+        assert!(run
+            .saliency_map
+            .iter()
+            .any(|e| e.unit_id == "tail:correlated:N=2" && e.refinement == Refinement::Coarse));
+        match run.status {
+            XaiStatus::Degraded(reason) => assert_eq!(
+                reason,
+                "partial fidelity: region(s) [host] at block granularity \
+                 (below refine threshold); bounded-K tail in focal \
+                 (4 of 7 units aggregated); bounded-K tail in correlated \
+                 (2 of 5 units aggregated)"
+            ),
             XaiStatus::Complete => panic!("expected Degraded"),
         }
     }
