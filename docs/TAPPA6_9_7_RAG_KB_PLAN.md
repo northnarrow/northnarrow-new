@@ -1,16 +1,19 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.1 — owner rulings folded in; STILL BLOCKED on 4 items.**
-RULED (this revision): Q3 (no IoC), Q4=(a), Q5=both modes, Q8
-(NOTICES/LICENSES attribution), Q9→new §13. **STILL BLOCKING P2+
-(escalated):** (i) **§5 / Q7 Article-13 schema ruling — NOT addressed
-in the P2-conditions message; remains the original BLOCKING item**;
-(ii) Q1 — exact `tantivy` version to pin; (iii) Q2 — exact corpus pins
-(ATT&CK release tag, Sigma commit, LOLBAS commit) — P2 cannot pin
-sources without these; (iv) §13 — the owner referenced "the 8-point
-checklist from my Q9 ruling" but the 8 points were **not included**;
-§13 below is a CC DRAFT pending the owner's actual list.
-Author: Claude (staff-eng) · Created 2026-05-17 · Rev P1.1 ·
+Status: **P1.2 — all four rulings folded; P2 GREENLIT.** RULED: §5/Q7 =
+**Option A** (§5.1); Q1 = `tantivy =0.25.0` (+bump-if-verified clause,
+§12.1); Q2 = ATT&CK **v18.1** + Sigma/LOLBAS **HEAD@P2**; plus the P1.1
+rulings (Q3 no-IoC, Q4a, Q5 both modes, Q8 NOTICES/LICENSES).
+**P2 commit is HARD-GATED on Q8/R4 license verification** (owner: any
+MITRE-ToU / Sigma-DRL-1.1 / LOLBAS-MIT incompatibility with
+ship-with-agent ⇒ FLAG before P2 commit ⇒ re-rule Q5 → install-only).
+⚠️ **Recurring transmission gap (3rd turn):** the owner's "verbatim"
+artifacts — §5 5-point rationale, the Cargo.toml comment template, the
+provenance JSON template, and the §13 8-point checklist — were
+*described but not included*. CC has rendered each faithfully to the
+owner's stated structure and **flagged each as CC-authored-to-spec,
+not owner-verbatim**; §13 stays a CC DRAFT (non-blocking for P2).
+Author: Claude (staff-eng) · Created 2026-05-17 · Rev P1.2 ·
 Branch: `tappa-6.9.7-rag-kb-plan`.
 Driver: pulled pre-beta so **Phase C (RAG-trust calibration training)**
 can run pre-beta alongside Phase B — epistemic resilience + EU AI Act
@@ -246,17 +249,20 @@ binary format. Rules:
 
 ---
 
-## 5. ⚠️ Article-13 compatibility — SCHEMA QUESTION (RULING STILL OUTSTANDING)
+## 5. Article-13 compatibility — RULED: **Option A** (owner, P1.2)
 
-> **ESCALATED:** the P2-conditions message ruled Q3/Q4/Q5/Q8/Q9 but did
-> **not** address this. It was flagged BLOCKING in P1 and remains so.
-> P2 (acquisition/dump/`kb_index_hash`) can proceed once Q1/Q2 are
-> given **regardless** of this ruling — but **P5 (ADE wiring) and P7
-> (Art-13 artifact) are hard-blocked until Option A or B is chosen**,
-> because the choice decides whether retrieval provenance lives in a
-> separate unsigned RAG log (A) or mutates the closed XAI 1.0.0 schema
-> (B, tripping the 6.9-closure standing trigger #1). Recommendation
-> unchanged: **Option A**.
+> **RULED = Option A** — rely on `prompt_sha256`; XAI stays frozen at
+> 1.0.0; retrieval provenance lives in a *separate, hash-chained,
+> unsigned* RAG retrieval log. Unblocks P5/P7.
+>
+> ⚠️ **Verbatim-text gap (flagged):** the owner directed "add the
+> 5-point ruling rationale verbatim" but the verbatim text was **not
+> transmitted** with the ruling — only the five pillar *labels*
+> (cryptographic completeness · standing trigger · separate
+> hash-chained log design · methodological tradeoff · V2.0+ future
+> path). §5.1 below is **CC's faithful rendering of each named
+> pillar**, to be replaced if the owner has specific wording. The
+> *decision* (Option A) is unambiguous and is treated as final.
 
 **Question (verbatim from the assignment):** add a
 `retrieved_snippets_sha256` field to the XAI chain, *or* rely on the
@@ -288,8 +294,43 @@ existing `prompt_sha256`?
   re-derives the P1.1 byte-lock, needs migration notes — a deliberate
   breaking change to a *closed, shipped* regulatory artifact.
 
-**No implementation of either until the owner rules.** (Defaulting to A
-in the plan only as the recommendation; not code.)
+### 5.1 Ruling rationale — Option A (5 pillars; CC rendering, verbatim pending)
+
+1. **Cryptographic completeness.** 6.9 P4's `assembled_prompt` already
+   splices the RAG block, so `XaiInputSnapshot.prompt_sha256` *already*
+   binds every retrieved snippet under the existing Ed25519 signature.
+   Integrity and tamper-evidence of the retrievals are therefore
+   *already complete* — Option B would add no integrity, only
+   separability, at schema-mutation cost.
+2. **Standing trigger.** The 6.9-closure standing audit trigger #1
+   mandates that any `XAI_SCHEMA_VERSION` change be a deliberate
+   breaking commit. Option A *honours it by not tripping it*: the
+   closed, shipped XAI 1.0.0 regulatory artifact stays byte-frozen
+   (no `canonical_bytes` touch, no P1.1 byte-lock re-derivation).
+3. **Separate hash-chained log design.** Retrieval provenance lives in
+   a dedicated **append-only, hash-chained** RAG retrieval log: each
+   entry = `{ts, ade_trace_id, kb_index_hash, retrieved:[{id,score}],
+   prev_entry_sha256}` with `entry_sha256` chaining the previous entry
+   (tamper-evident without signing, sovereign-local). It references the
+   XAI chain by `ade_trace_id`, giving separable, independently
+   auditable retrieval provenance *outside* the signed schema.
+4. **Methodological tradeoff (accepted).** Option A trades the
+   "single signed artifact contains everything" story for schema
+   stability + provenance completeness. Accepted: the hash-chain gives
+   tamper-evidence; the FK cross-links the two artifacts; the
+   regulatory dossier (§7/P7) documents the two-artifact model
+   explicitly so an auditor follows `ade_trace_id` between them.
+5. **V2.0+ future path.** Option B is not rejected forever — it is
+   deferred to the *next deliberate XAI schema major* (a V2.0+ that
+   already pays the standing-trigger cost for other reasons), at which
+   point `retrieved_snippets_sha256` + `kb_index_hash` fold into
+   `XaiInputSnapshot` natively. The hash-chained log is forward
+   -compatible with that migration (same fields).
+
+**Consequence for phases:** P5 wires the hash-chained log alongside the
+existing `with_rag` path; P7's Art-13 closeout documents the
+two-artifact model. XAI 1.0.0 is **not** touched (Option B's schema
+mutation is explicitly NOT done).
 
 ---
 
@@ -424,15 +465,23 @@ iteration pattern the owner endorsed). `clippy --workspace
 
 ## 12. Gating questions — RULINGS REQUESTED (blocking, like 6.9 §12)
 
-**STILL OWED BY OWNER (P2+ blocked):**
-- **Q1 — engine/version:** `tantivy` accepted in principle; **exact
-  version to pin still owed** (needed at P3, not P2).
-- **Q2 — corpus pins:** **exact ATT&CK release tag + Sigma commit +
-  LOLBAS commit still owed — P2 cannot start without these.**
-- **Q7 / §5 — Article-13 schema:** **STILL UNRULED** (not addressed in
-  the P2-conditions msg). Option A *(rec)* vs B. Hard-blocks P5/P7.
-- **§13 8-point checklist:** owner referenced "my Q9 ruling" 8 points
-  but did **not** include them; §13 is a CC DRAFT pending the list.
+**RULED in P1.2 (all four):**
+- **Q1 — engine/version:** RULED = `tantivy = "=0.25.0"` (exact pin).
+  Bump-if-verified clause: may move to `=0.26.0` *only* after a
+  deliberate determinism re-verification (golden + `kb_index_hash`
+  unchanged) in its own commit. Cargo.toml comment = §12.1 (CC-authored
+  to the owner's stated rule; the "template included" was not
+  transmitted).
+- **Q2 — corpus pins:** RULED = MITRE **ATT&CK v18.1** (fixed tag);
+  **Sigma & LOLBAS = repo HEAD captured at P2 acquisition time**, the
+  exact commit recorded into the provenance sidecar (§4.1). Provenance
+  template = the §4.1 schema (the owner's "template included" was not
+  transmitted; the already-specified §4.1 sidecar schema is used).
+- **Q7 / §5 — Article-13:** RULED = **Option A** (§5/§5.1).
+- **§13 — canary checklist:** ⚠️ **owner-authoritative 8 points STILL
+  not transmitted** (3rd consecutive turn the verbatim list/templates
+  were described but not included). §13 remains a clearly-marked CC
+  DRAFT; it governs a *later* tappa and does **not** block P2.
 
 **RULED (folded into this revision):**
 - **Q3 — IoC feeds:** RULED = none in V1 (condition 6).
@@ -452,16 +501,33 @@ iteration pattern the owner endorsed). `clippy --workspace
   security-token-preserving analyzer (P3 golden fixtures mandated by
   owner); R4 license verification before P2 ships.
 
+### 12.1 `tantivy` pin — Cargo.toml comment (CC-authored to the Q1 rule)
+
+The owner's "comment template included" was not transmitted; this is
+CC's rendering of the stated rule (exact pin + bump-if-verified):
+
+```toml
+# Tappa 6.9.7 RAG: tantivy is EXACT-pinned. BM25 scoring + segment
+# codec must be byte-stable for deterministic retrieval + a stable
+# kb_index_hash (Art-13). A version move (e.g. =0.26.0) is allowed
+# ONLY in a dedicated commit that re-verifies: golden retrieval green
+# AND kb_index_hash unchanged AND the P3 analyzer golden tokens still
+# survive. Never a passive `^`/`~` range.
+tantivy = "=0.25.0"
+```
+
 ---
 
 ## 13. Canary default-flip criteria (Q9) — ⚠️ CC DRAFT, NOT the owner's ruling
 
-> **GAP FLAGGED:** the P2-conditions message said *"include the 8-point
-> checklist from my Q9 ruling"* but the 8 points were **not in the
-> message**. To avoid fabricating-then-attributing a ruling, the list
-> below is a **CC-proposed draft** for the owner to replace/confirm. The
-> flip itself is a *later tappa*, not 6.9.7 — 6.9.7 only ships the
-> canary OFF by default and the measurement harness.
+> **GAP FLAGGED (3rd consecutive turn).** "Include the 8-point
+> checklist from my Q9 ruling" — the 8 points were **not in the
+> message** (same pattern as the §13 list last turn and the §5/Q1/Q2
+> "verbatim/templates" this turn). To avoid fabricating-then
+> -attributing a ruling, the list below is a **CC-proposed draft** for
+> the owner to replace/confirm. Non-blocking for P2: the flip is a
+> *later tappa*; 6.9.7 only ships the canary OFF by default + the
+> measurement harness.
 
 `NN_ADE_RAG_ENABLED` flips to default-on only when ALL hold (draft):
 
@@ -484,6 +550,9 @@ iteration pattern the owner endorsed). `clippy --workspace
 
 ---
 
-*Plan of record once approved. P2 needs Q2 (pins) + Q8/R4 (license OK);
-P3 needs Q1 (tantivy version); P5/P7 need §5/Q7. No P2+ code until those
-are ruled. §13 awaits the owner's actual 8-point list.*
+*Plan of record (P1.2). All gating rulings folded — **P2 is GREENLIT**.
+The only P2-commit gate is Q8/R4 license verification (BLOCKING:
+incompatibility ⇒ FLAG before commit ⇒ re-rule Q5 → install-only).
+§13's owner-authoritative 8-point list is still pending but is
+non-blocking for P2. Subsequent phases: atomic commit + owner gate +
+clippy 0/0 + tests green; no multi-phase mega-commits.*
