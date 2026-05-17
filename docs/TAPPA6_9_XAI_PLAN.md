@@ -1,7 +1,12 @@
 # Tappa 6.9 — XAI Saliency Mapping — Implementation Plan
 
-Status: **REVIEWED & LOCKED — P0.1** (4 gating questions RESOLVED §12; refinements
-R1–R4 applied; R5 scoped as separate P6). P1 may begin.
+Status: **SHIPPED — P0…P5 complete** (2026-05-17). Phase ledger: P0
+`5a7e45b` · P0.1 `b23b072` · P1 `a5963b7` · P2 `0865133` · P3 `54ea836`
+· P4 `1cde064` · P5 `eeec43f`+closeout. Article-13 conformance dossier:
+`docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md`. **P6 (golden saliency
+regression fixtures, R5) is deferred — a separate later phase.** The
+text below is the as-built plan of record (4 gating questions RESOLVED
+§12; refinements R1–R4 applied; R5 scoped as the deferred P6).
 Author: Claude (staff-eng) · Created 2026-05-17 · P0 anchor commit: see `git log -- docs/TAPPA6_9_XAI_PLAN.md` (5a7e45b)
 Driver: EU AI Act Art. 13, pre-beta blocker.
 Locked decisions: saliency = **Hybrid (perturbation canonical now, attention seam later)**; approach = plan-first.

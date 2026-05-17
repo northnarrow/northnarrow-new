@@ -18,7 +18,7 @@ Both tappe map to the ADE Doctrine framework defined in `docs/ADE_DOCTRINE.md` �
 **Prerequisites** (non-negotiable):
 
 - Tappa 14.4.5 (Digital Twin Shadow Mode) — Battle-Time Synthesis without Digital Twin validation is unacceptable risk.
-- Tappa 6.9 (XAI Saliency Mapping) — required for the forensic chain on every synthesized rule.
+- Tappa 6.9 (XAI Saliency Mapping) — required for the forensic chain on every synthesized rule. **✅ SHIPPED** (commits `5a7e45b..eeec43f`+P5 closeout). The standalone XAI capability + Article-13 evidence chain are complete and verifiable; EU AI Act Article 13 conformance: **✅ SHIPPED** (dossier: `docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md`). P6 (golden saliency regression fixtures) is a deferred separate phase — does not block this prerequisite. (This roadmap file is the Tappa 10.5 spec and carries no per-tappa status board; status annotated inline here.)
 - Tappa 10 (Detection rules engine) — synthesized rules emit into this engine.
 - Tappa 13 (Backend SaaS) — for cross-tenant correlation of synthesis triggers (telemetry to security operations console).
 

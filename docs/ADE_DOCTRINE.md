@@ -186,6 +186,33 @@ The doctrine aligns with EU AI Act Article 13 (transparency and explainability) 
 
 **GDPR**: data processing is EU-sovereign (Tappa 13). Customer telemetry never leaves jurisdiction. The deception layer's canary artifacts are designed to be GDPR-neutral (no personal data, no PII bait).
 
+### Tappa 6.9 — XAI Saliency (Article 13 evidence chain) — SHIPPED
+
+The Article 13 commitment above is now realised as a concrete,
+verifiable artifact. Plan of record: `docs/TAPPA6_9_XAI_PLAN.md`;
+regulatory dossier: `docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md` (the
+clause-by-clause hand-off, with implementation `file:symbol` and the
+test that locks each). Standalone capability — its consumer (Phase 4
+Battle-Time Synthesis, Tappa 10.5) is not yet built.
+
+Phase ledger: P0 `5a7e45b` · P0.1 `b23b072` · P1 `a5963b7` · P2
+`0865133` · P3 `54ea836` · P4 `1cde064` · P5 `eeec43f`+closeout.
+**P6 (golden saliency regression fixtures) is deferred — a separate
+later phase, tracked, not shipped.**
+
+**Production contract (loud, non-negotiable).** The XAI path MUST run a
+*dedicated* `AdeEngine` built through
+`xai::engine::deterministic_ade_config` (temperature 0 ⇒ greedy, single
+-thread) — production sampling may differ and must never be perturbed.
+Determinism is a *construction* contract: `XaiEngine` consumes ADE via
+the `evaluate` seam only and cannot enforce it at call time. The chain
+records the exact decoding settings so an auditor reproduces the
+saliency map bit-for-bit. Deployment cost: ≈ +16 GB for the second
+Foundation-Sec-8B Q4_K_M instance, **lazy-loaded on first XAI
+invocation** (synthesis is COMBAT-only/rare ⇒ steady-state cost zero).
+Fail-closed is absolute: no XAI ⇒ no synthesis (`XaiUnavailable` is a
+hard stop, never a partial chain).
+
 ---
 
 ## Conclusion
