@@ -1,15 +1,16 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.4 — all 4 owner verbatim artifacts folded; P2 BLOCKED on
-ONE decision (LOLBAS).** §5.1 (ARTIFACT 1), §12.1 (ARTIFACT 2), §4.2.2
-(ARTIFACT 3), §13 (ARTIFACT 4) inserted verbatim — no CC placeholders
-remain. **🛑 P2 still blocked solely on the LOLBAS Q2/Q5 re-ruling**
-(Q8/R4 verification proved LOLBAS = GPL-3.0, incompatible with
-proprietary ship-with-agent — P1's "MIT" was a verified error; CC rec:
-DROP LOLBAS from V1, §4.2). Non-blocking flag: §4.2.2's verbatim example
-names the MITRE repo `mitre-attack/attack-stix-data@v18.1`, not the
-legacy `mitre/cti@ATT&CK-v18.1` CC verified — MITRE license re-verified
-against the owner-named repo at P2. MITRE/Sigma otherwise clear. (Prior
+Status: **P1.5 — fully ruled; ✅ P2 GREENLIT.** All owner verbatim
+artifacts folded: §5.1 (A1), §12.1 (A2), §4.2.2 (A3), §13 (A4), and
+**§4.2.3 + §10-row (LOLBAS drop ruling, this turn)**. No CC
+placeholders, no open blockers. **V1 corpus = MITRE ATT&CK Enterprise
+v18.1 + SigmaHQ Sigma (HEAD@P2, Linux subset) + 6.7 in-repo notes;
+LOLBAS DROPPED (GPL-3.0, §4.2.3) — not fetched/indexed/referenced.**
+One non-blocking P2-internal item: §4.2.2's authoritative example names
+the MITRE repo `mitre-attack/attack-stix-data@v18.1` (not the legacy
+`mitre/cti` CC verified in P1.3) — the MITRE license is re-verified
+against that repo *during* P2 (same ATT&CK ToU expected; the owner's
+standing "flag if incompat before P2 commit" still applies). (Prior
 P1.2 status follows.)
 
 Prior — P1.2: all four rulings folded; P2 was greenlit pre-verification. RULED: §5/Q7 =
@@ -257,25 +258,64 @@ binary format. Rules:
 |---|---|---|---|
 | MITRE ATT&CK | tag `ATT&CK-v18.1` = `605ed54…`, peeled commit `421deac…` | ATT&CK® Terms of Use (`mitre/cti/LICENSE.txt`, 2311 B, fetched verbatim) | ✅ OK with the required ATT&CK attribution string in `NOTICES.md` |
 | Sigma | HEAD@P2 `df5c6a6e…` | **DRL 1.1 lives in a SEPARATE repo** `SigmaHQ/Detection-Rule-License` (sigma-repo root `LICENSE` is only an index pointing there). DRL 1.1 = MIT-like ("deal in the Rules without restriction… distribute, sublicense, sell") **subject to retaining author attribution** | ✅ OK — must fetch DRL from `SigmaHQ/Detection-Rule-License`, retain per-rule `author` attribution (distillation = "modified form" ⇒ attribution mandatory) |
-| LOLBAS | HEAD@P2 `fe42806…` | **GPL-3.0** — `NOTICE.md` @pin states verbatim *"The LOLBAS Project is licensed under GPL 3.0"*; full GPLv3 `LICENSE` (35 149 B) confirmed. **No data/code carve-out — the whole project incl. the YAML entries.** | 🛑 **INCOMPATIBLE with proprietary ship-with-agent (copyleft).** P1's "LOLBAS = MIT" was WRONG. |
+| ~~LOLBAS~~ | n/a | **GPL-3.0** (verified `NOTICE.md`@pin + 35 149 B GPLv3 `LICENSE`) | 🚫 **DROPPED from V1 — RULED §4.2.3.** Not fetched/canonicalised/indexed/referenced. P1's "LOLBAS=MIT" was a verified error; the Q8/R4 gate worked. |
 
-**LOLBAS remediation — owner ruling required (re-rule of Q2/Q5 for
-LOLBAS only):**
-- **(a) DROP LOLBAS from the V1 corpus — RECOMMENDED.** MITRE ATT&CK +
-  Sigma are the high-value sovereign corpus; the agent is **Linux-first**
-  and LOLBAS is Windows-binary-centric, so its pre-beta marginal value
-  is low. Cleanest; zero copyleft exposure; revisit post-beta with legal.
-- (b) install-from-mirror for LOLBAS only — note: GPLv3 reciprocity
-  attaches to *distribution* and *derivative works*; a mirror is still
-  distribution and the distilled entries may be a derivative. Does **not
-  reliably cure** copyleft without a legal determination.
-- (c) use only non-copyrightable bare facts (binary names) — thin value,
-  legal-grey; not recommended.
-- (d) accept GPLv3 obligations for the LOLBAS slice — unacceptable for a
-  commercial agent.
+**LOLBAS — RULED: dropped from V1 (owner, §4.2.3 below).** The Q2/Q5
+re-ruling is made; the option analysis (drop / mirror / bare-facts /
+accept-GPL) is resolved to **drop**. P2 proceeds with **MITRE ATT&CK
+v18.1 + Sigma + the 6.7 in-repo notes ONLY**; LOLBAS is not fetched,
+canonicalised, indexed, or referenced in any artifact.
 
-Until ruled, **P2 proceeds (if at all) with MITRE + Sigma ONLY**; no
-LOLBAS acquisition/commit.
+<<<VERBATIM — Owner: Fortunato Milani via Claude Opus 4.7, 2026-05-17>>>
+
+### §4.2.3 — LOLBAS drop ruling (Q2/Q5 re-ruling, post-P1.3 verification)
+
+RULED: drop LOLBAS from the V1 corpus.
+
+Trigger: P1.3 license verification proved LOLBAS-Project is licensed
+under GPL-3.0, not MIT as the P1 plan asserted. The P1 assertion was
+verified-and-disproved by the Q8/R4 blocking gate — the gate worked
+as designed.
+
+V1 corpus is therefore:
+  - MITRE ATT&CK Enterprise v18.1
+  - SigmaHQ sigma rules (HEAD@P2, Linux subset)
+  - Tappa 6.7 in-repo curated notes (rag/kb_seed.rs, retained)
+
+LOLBAS is NOT fetched, NOT canonicalised, NOT indexed by the V1
+xtask. No LOLBAS files appear in NOTICES.md, LICENSES/, or
+docs/kb-sources/.
+
+Rationale:
+1. NorthNarrow agent ships proprietary closed-source (ADE_DOCTRINE).
+   GPL-3.0 copyleft is incompatible with this distribution model.
+   Distillation of LOLBAS entries into a canonical dump is arguably
+   derivative work — accepting GPL-3.0 would force the entire agent
+   under GPL-3.0 via linkage/distribution, killing the commercial
+   business.
+2. Install-from-mirror (the original Q5 fallback) does not cleanly
+   cure copyleft: a customer mirror is still a distribution channel,
+   and distilled entries remain derivative. Mirror+legal sign-off
+   (option b from P1.4 §4.2) is not pursued for V1 due to legal
+   delay risk against beta timeline.
+3. Bare-facts-only extraction (option c) is rejected because BM25
+   retrieval requires description text for term matching; pure
+   technique-ID extraction has no semantic value for the retrieval
+   layer and would not serve Phase C training.
+4. The agent is Linux-first (Windows agent deferred to Tappe 11-12,
+   memory 12). LOLBAS is Windows-centric (cmd.exe, certutil.exe,
+   mshta, etc.). Coverage loss for the pre-beta Linux-focused
+   product is acceptable: ATT&CK technique coverage and Sigma Linux
+   rules carry the V1 detection vocabulary.
+
+Future research task (NOT 6.9.7 scope, NOT scheduled):
+GTFOBins (https://gtfobins.github.io/) is the Linux equivalent of
+LOLBAS and a natural corpus addition for OS-binary-abuse patterns.
+License verification required before any adoption. Tracked as a
+post-beta corpus extension consideration, not as a 6.9.7 deliverable
+and not as a beta-launch dependency.
+
+<<<END VERBATIM>>>
 
 ### 4.2.1 Attribution & licensing requirements (Q8, conditions 1–3)
 
@@ -562,16 +602,21 @@ the bench records evaluate-with-RAG vs without.
 | Security identifiers lost to tokeniser | R3 custom analyzer preserving dotted/slashed/`T####` tokens; golden tests guard it |
 | RAG perturbs XAI determinism | canary-off parity is a release gate; RAG is itself deterministic so RAG-on is still reproducible |
 | Scope creep into Phase C | Phase C is explicitly out (§1); 6.9.7 ends at "production-equivalent retrieval signal exists + golden-locked" |
+| Corpus coverage gap on OS-binary-abuse patterns (LOLBAS dropped due to GPL-3.0) | V1 acceptable: ATT&CK techniques cover execution/persistence/defense-evasion semantics; Sigma Linux rules cover binary-abuse detection. GTFOBins evaluation flagged as post-beta separate research task. Watched as a recall-gap in golden retrieval tests; if specific eBPF event classes (e.g. abusive use of standard Linux utilities) fail to retrieve useful snippets in P6 golden suite, the gap is documented as a known limitation rather than papered over. |
+
+*(The LOLBAS-coverage-gap row above is owner-verbatim, ARTIFACT §10, 2026-05-17.)*
 
 ## 11. Phased delivery (plan-first; owner gate between phases, as 6.9)
 
-- **P1 — this doc** (rev **P1.3**). Rulings folded; Q8/R4 verified.
-  *(current)*
-- **P2 — KB acquisition pipeline** (xtask) — 🛑 **BLOCKED:** Q8/R4
-  found LOLBAS = GPL-3.0 (§4.2); awaiting the owner's LOLBAS Q2/Q5
-  re-ruling. Once ruled, **V1 corpus = MITRE ATT&CK v18.1 + Sigma +
-  in-repo notes (NO LOLBAS)**. Commit acceptance = ALL of (owner
-  conditions 1–7, verbatim):
+- **P1 — this doc** (rev **P1.5**). Fully ruled; Q8/R4 verified;
+  LOLBAS dropped (§4.2.3). *(complete)*
+- **P2 — KB acquisition pipeline** (xtask) — ✅ **GREENLIT.**
+  **V1 corpus = MITRE ATT&CK Enterprise v18.1
+  (`mitre-attack/attack-stix-data@v18.1`, §4.2.2) + SigmaHQ Sigma
+  (HEAD@P2, Linux subset) + 6.7 in-repo notes. NO LOLBAS.** During P2
+  the MITRE license is re-verified against `attack-stix-data` (flag
+  before commit if it differs from the ATT&CK ToU). Commit acceptance
+  = ALL of (owner conditions 1–7, verbatim):
   1. `NOTICES.md` with per-source attribution (Q8).
   2. `LICENSES/` populated with verbatim license files.
   3. Each source documents: canonical upstream URL · specific pin
@@ -629,21 +674,18 @@ iteration pattern the owner endorsed). `clippy --workspace
   unchanged) in its own commit. Cargo.toml comment = §12.1 (CC-authored
   to the owner's stated rule; the "template included" was not
   transmitted).
-- **Q2 — corpus pins:** RULED = MITRE **ATT&CK v18.1** (✅ tag verified
-  `605ed54…`/peeled `421deac…`); **Sigma HEAD@P2 `df5c6a6e…` captured**.
-  **LOLBAS pin `fe42806…` captured but LOLBAS is REMOVED** (GPL-3.0,
-  §4.2) — needs a Q2/Q5 re-ruling. Provenance template = the §4.1
-  schema (owner's "template included" not transmitted).
-- **Q8 / R4 — VERIFIED (P1.3), the BLOCKING gate, result:** MITRE
-  ATT&CK v18.1 ✅ ship-OK (+attribution); Sigma DRL-1.1 ✅ ship-OK
-  (+author attribution; DRL text is in the **separate**
-  `SigmaHQ/Detection-Rule-License` repo — plan path corrected);
-  **LOLBAS 🛑 GPL-3.0 — incompatible with proprietary ship-with-agent.
-  P1's "LOLBAS=MIT" was a verified error.** Per the owner's
-  pre-authorised path: **FLAGGED before P2 commit; P2 BLOCKED until
-  the LOLBAS Q2/Q5 re-ruling.** Recommendation: **drop LOLBAS from V1**
-  (Linux-first agent ⇒ low Windows-LOLBAS value pre-beta; zero copyleft
-  exposure); install-from-mirror does NOT reliably cure GPLv3 copyleft.
+- **Q2 — corpus pins:** RULED. MITRE **ATT&CK Enterprise v18.1** via
+  `mitre-attack/attack-stix-data@v18.1` (§4.2.2; re-verify license vs
+  that repo during P2). **Sigma HEAD@P2 `df5c6a6e…` (Linux subset).**
+  **LOLBAS DROPPED — §4.2.3 (Q2/Q5 re-ruling complete).** Provenance
+  schema = §4.2.2 (owner verbatim).
+- **Q8 / R4 — VERIFIED (P1.3) + RESOLVED (P1.5):** MITRE ATT&CK ✅
+  ship-OK (+attribution; re-verify on `attack-stix-data` at P2); Sigma
+  DRL-1.1 ✅ ship-OK (+author attribution; DRL text in the **separate**
+  `SigmaHQ/Detection-Rule-License` repo — plan path corrected); **LOLBAS
+  = GPL-3.0 ⇒ DROPPED (§4.2.3).** The blocking gate worked exactly as
+  designed (caught P1's wrong "LOLBAS=MIT"). No incompatibility remains
+  in the V1 corpus.
 - **Q7 / §5 — Article-13:** RULED = **Option A** (§5/§5.1).
 - **§13 — canary checklist:** ⚠️ **owner-authoritative 8 points STILL
   not transmitted** (3rd consecutive turn the verbatim list/templates
@@ -654,18 +696,15 @@ iteration pattern the owner endorsed). `clippy --workspace
 - **Q3 — IoC feeds:** RULED = none in V1 (condition 6).
 - **Q4 — `similarity` field:** RULED = (a) reuse + normalised BM25 +
   doc-comment fix; no `common` shape change.
-- **Q5 — KB packaging:** RULED = **both** modes (condition 4). ⚠️ Note
-  from Q8/R4: the install-from-mirror mode does **not** cure GPL-3.0
-  copyleft for LOLBAS (mirror = distribution; distilled entries may be
-  derivative) — so the owner's pre-stated "re-rule Q5 → install-only"
-  remedy is, for GPLv3 specifically, insufficient without legal sign-off;
-  hence the §4.2 recommendation to **drop LOLBAS** rather than mirror it.
+- **Q5 — KB packaging:** RULED = **both** modes (condition 4). The
+  GPL-3.0/LOLBAS interaction is now moot — §4.2.3 drops LOLBAS rather
+  than mirroring it (install-from-mirror does not cure copyleft).
 - **Q6 — module placement:** keep `agent/src/rag/` (uncontested;
   treated as accepted — owner object if not).
 - **Q8 — licenses/attribution:** RULED requirements stand
   (`NOTICES.md` + `LICENSES/` + provenance, conditions 1–3). **R4
-  verification EXECUTED (P1.3): MITRE ✅ / Sigma ✅ / LOLBAS 🛑 GPL-3.0
-  — P2 BLOCKED, see §4.2 + Q2/Q8 above.**
+  verification EXECUTED (P1.3) + RESOLVED (P1.5): MITRE ✅ / Sigma ✅ /
+  LOLBAS dropped (§4.2.3). No incompatibility remains; P2 GREENLIT.**
 - **Q9 — canary default-flip:** RULED to exist as **§13** (content
   pending owner's 8 points).
 - **Refinements (all accepted into the plan):** R1 stable tie-break
@@ -759,15 +798,13 @@ similar). The flip cannot be merged unless every point passes.
 
 ---
 
-*Plan of record (**P1.4**). All four owner verbatim artifacts folded
-(§5.1, §12.1, §4.2.2, §13) — no CC placeholders remain; the recurring
-verbatim-gap is CLOSED. **🛑 P2 remains BLOCKED on exactly ONE owner
-decision: the LOLBAS Q2/Q5 re-ruling** (verification proved LOLBAS =
-GPL-3.0; CC recommends **drop LOLBAS from V1**). Second, non-blocking
-flag: the owner's authoritative provenance example (§4.2.2) names the
-MITRE repo `mitre-attack/attack-stix-data@v18.1`, NOT the legacy
-`mitre/cti@ATT&CK-v18.1` CC verified in P1.3 — **the MITRE license must
-be re-verified against `attack-stix-data` at P2** (same ATT&CK ToU
-expected, but not assumed). MITRE & Sigma otherwise clear. No P2
-code/commit until the LOLBAS ruling. Subsequent phases: atomic commit
-+ owner gate + clippy 0/0 + tests green; no multi-phase mega-commits.*
+*Plan of record (**P1.5 — FROZEN; P1 complete**). All owner verbatim
+artifacts folded (§5.1, §12.1, §4.2.2, §13, §4.2.3, §10-row) — no CC
+placeholders, no open rulings. **✅ P2 GREENLIT.** V1 corpus = MITRE
+ATT&CK Enterprise v18.1 (`mitre-attack/attack-stix-data@v18.1`) +
+SigmaHQ Sigma (HEAD@P2, Linux subset) + 6.7 in-repo notes; **LOLBAS
+dropped (GPL-3.0, §4.2.3)**. One P2-internal acceptance step (not a
+pre-P2 blocker): re-verify the MITRE license against
+`attack-stix-data@v18.1` and FLAG before the P2 commit if it differs
+from the ATT&CK ToU. Subsequent phases: atomic commit + owner gate +
+clippy 0/0 + tests green; no multi-phase mega-commits.*
