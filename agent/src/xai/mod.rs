@@ -14,12 +14,23 @@
 //!   seam plus offline verification ([`evidence`]). `common` stays
 //!   dependency-light; the curve math lives here, exactly as
 //!   `anti_tamper::admin_auth` owns it for the admin protocol.
-//! - **P2+** — `occlusion`, `saliency` (coarse-to-fine + bounded-K +
-//!   `tail`), `source` (perturbation now / attention seam later) and the
-//!   `XaiEngine::explain` public entrypoint with the fail-closed
-//!   `XaiUnavailable` guardrail. Not in this commit (the schema is
-//!   owner-audited before P2 begins).
+//! - **P2 (this commit)** — `occlusion` (perturbable-unit taxonomy +
+//!   the Drop/AnonymiseInPlace operator) and `source` (the
+//!   `DecisionProbe` seam, decision-delta scoring, `PerturbationSource`,
+//!   and the `SaliencySource` hybrid seam). Flat per-unit scoring +
+//!   deterministic causal faithfulness oracle.
+//! - **P3+** — `saliency` (coarse-to-fine + `region_refine_threshold` +
+//!   bounded-K + `tail` + fail-closed budget) and the
+//!   `XaiEngine::explain` public entrypoint with the `XaiUnavailable`
+//!   guardrail. Not in this commit (owner audits the occlusion algorithm
+//!   + scoring before P3).
 
 pub mod evidence;
+pub mod occlusion;
+pub mod source;
 
 pub use evidence::{verify_evidence, Ed25519EvidenceSigner, XaiVerifyError};
+pub use source::{
+    composite, decision_delta, DecisionProbe, PerturbationSource, SaliencySource, UnitScore,
+    XaiProbeError, XaiSourceError, DEFAULT_WEIGHTS,
+};
