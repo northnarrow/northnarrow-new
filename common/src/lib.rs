@@ -36,3 +36,7 @@ pub mod posture_types;
 /// RAG knowledge-base types (Sub-tappa 6.7).
 #[cfg(feature = "std")]
 pub mod rag_types;
+
+/// XAI Saliency Mapping forensic evidence schema (Tappa 6.9, v1.0.0).
+#[cfg(feature = "std")]
+pub mod xai_types;
