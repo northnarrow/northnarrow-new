@@ -14,6 +14,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+mod rag_kb;
+
 const EBPF_TARGET: &str = "bpfel-unknown-none";
 const EBPF_PACKAGE: &str = "northnarrow-agent-ebpf";
 const AGENT_PACKAGE: &str = "northnarrow-agent";
@@ -66,6 +68,20 @@ enum Cmd {
     /// engine, dump verdicts + p50/p95/p99 latency. Does not need
     /// root, eBPF, or a real GGUF — uses MockBackend.
     AdeDemo,
+    /// Tappa 6.9.7 P2: acquire + canonicalise the RAG knowledge base
+    /// (MITRE ATT&CK v18.1 + SigmaHQ Linux rules) from pinned refs,
+    /// emit canonical JSONL dumps, per-source provenance, LICENSES/
+    /// and NOTICES.md. Build-time (fetch) or install-time (--mirror).
+    RagKb {
+        /// Install-time mode: read the pinned source artifacts from a
+        /// local customer-controlled mirror dir instead of fetching
+        /// upstream. Same canonicalisation + hashes either way.
+        #[arg(long)]
+        mirror: Option<PathBuf>,
+        /// Output dir for the (gitignored) canonical JSONL dumps.
+        #[arg(long, default_value = "target/kb")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -103,6 +119,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
         Cmd::AdeDemo => ade_demo()?,
+        Cmd::RagKb { mirror, out } => {
+            let root = repo_root()?;
+            rag_kb::build(&root, mirror.as_deref(), &out)?;
+        }
     }
     Ok(())
 }

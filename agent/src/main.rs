@@ -233,6 +233,13 @@ async fn main() -> Result<()> {
                     timeout_s = engine.config().timeout.as_secs(),
                     "ADE engine ready"
                 );
+                // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
+                // graceful no-RAG fallback). Uses the existing 6.7
+                // `with_rag` seam; logging is inside `open_index_from_env`.
+                let engine = match northnarrow_agent::rag::open_index_from_env() {
+                    Some(rag) => engine.with_rag(Arc::new(rag)),
+                    None => engine,
+                };
                 Some(Arc::new(engine))
             }
             Err(e) => {

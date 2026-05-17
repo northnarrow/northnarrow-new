@@ -1,0 +1,17 @@
+{
+  "domain": "NN-RAG-KB-CANON-v1",
+  "kb_index_hash": "4d335aed6eec26e150b488f94bb36f65f2784b6221e1b51dede6fce63cd5fd98",
+  "note": "LOLBAS excluded (GPL-3.0, plan §4.2.3). 6.7 in-repo notes merged at index build (P3/P4), not acquired here.",
+  "sources": [
+    {
+      "canonical_dump_sha256": "c5bfbb28203657cb79de2390163a0cc825f871a3303bff966e25a8d5d1f76f7b",
+      "pin": "v18.1",
+      "source": "mitre-attack-stix-data"
+    },
+    {
+      "canonical_dump_sha256": "34c7707d2e1a3195e4de0af7c9da3a3579b945c5e870ebb5dd3c749ba7af9d67",
+      "pin": "master",
+      "source": "sigma-hq-rules"
+    }
+  ]
+}

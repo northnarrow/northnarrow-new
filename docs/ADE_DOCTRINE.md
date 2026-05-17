@@ -213,6 +213,38 @@ invocation** (synthesis is COMBAT-only/rare ⇒ steady-state cost zero).
 Fail-closed is absolute: no XAI ⇒ no synthesis (`XaiUnavailable` is a
 hard stop, never a partial chain).
 
+### Tappa 6.9.7 — RAG-Local Knowledge Base — SHIPPED
+
+A sovereign, deterministic retrieval layer that biases ADE verdicts
+toward curated evidence. Plan of record:
+`docs/TAPPA6_9_7_RAG_KB_PLAN.md` (delivered 2026-05-17).
+
+- **Architecture.** `tantivy` BM25 (pinned `=0.25.0`,
+  `default-features=false` — no `zstd-sys` C-FFI; the 100%-Rust/no-FFI
+  charter holds) over a canonical KB: pinned **MITRE ATT&CK v18.1** +
+  **SigmaHQ Linux** rules + the 6.7 `kb_seed` notes. An R3
+  security-token analyzer keeps identifiers (`T1059.001`,
+  `/etc/shadow`, `cmd.exe`, `CVE-…`) intact.
+- **Sovereign.** The agent never fetches at runtime; the KB is
+  acquired build/release-time (or from a customer mirror) by
+  `cargo xtask rag-kb`. `kb_index_hash` is byte-stable and reproduced
+  identically across independent rebuilds (auditable provenance in
+  `docs/kb-sources/`). LOLBAS is excluded (GPL-3.0 — incompatible with
+  proprietary distribution).
+- **Integration.** Behind the byte-stable `RagEngine::retrieve`
+  (C2/CLI deserialize charter — plan §0 mechanism swap, §3.4
+  within-result normalisation); canary-gated via `NN_ADE_RAG_ENABLED`
+  (default **OFF**, beta-safe — §13 default-flip checklist). `rag:None`
+  is byte-identical to pre-6.7 (protects RAG-off XAI determinism).
+- **Article 13.** The RAG block is part of the assembled prompt, so it
+  is already bound by the signed `prompt_sha256` (XAI 1.0.0 schema
+  untouched — plan §5 Option A); the separate hash-chained RAG
+  retrieval log is a Tappa 13 follow-on.
+- **Operational metrics** (real 964-doc corpus): `retrieve` p95
+  **2.2 ms** (≤ 50 ms budget, ~23× margin), cold `open_index`
+  **707 ms** (≤ 5 s). Golden suite 22/24 (cross-source Sigma
+  co-retrieval gap documented — post-beta hybrid re-rank / GTFOBins).
+
 ---
 
 ## Conclusion

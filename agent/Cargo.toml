@@ -87,6 +87,26 @@ base64 = "0.22"
 # down); `rand_core` lets us feed rand 0.8's OsRng into key generation.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 hex = "0.4"
+# <<<VERBATIM — Owner ruling §12.1, 2026-05-17>>>
+# Tappa 6.9.7: tantivy is pinned exact-version to ensure deterministic
+# BM25 scoring across rebuilds. A version bump invalidates the golden
+# retrieval test suite and the KB index format compatibility, so it is
+# a deliberate commit with golden-test refresh and KB rebuild, never a
+# silent cargo update. Bump-if-verified path: 0.26.0 may be adopted if
+# `cargo search tantivy` confirms GA (not RC) AND no breaking BM25
+# scoring changes vs 0.25.x are noted in the changelog.
+# <<<END VERBATIM>>>
+# CHARTER NOTE (P3, 2026-05-17): default-features=false is MANDATORY —
+# tantivy's default `columnar-zstd-compression` pulls `zstd-sys` (C FFI),
+# which violates the 100%-Rust/no-FFI charter. The pure-Rust set below
+# (mmap = memmap2 on-disk index; lz4-compression = lz4_flex store) keeps
+# zstd-sys out of the tree (verified via `cargo tree`). Do NOT re-enable
+# default features or add `zstd-compression`/`columnar-zstd-compression`.
+# `stopwords` dropped in P4 (audit F-P3-2): the nn_sec analyzer does not
+# use a stop-word filter — verified the full rag suite green without it
+# (minimal surface). 0.26.1 is GA as of P3 but a bump stays deliberate
+# (see verbatim above).
+tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "lz4-compression"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
