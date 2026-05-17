@@ -66,6 +66,15 @@ use std::time::{Duration, Instant};
 use northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT;
 
 const PIN_APPEAR_TIMEOUT: Duration = Duration::from_secs(20);
+/// Aya's `Ebpf::load_from_bytes` only *creates* maps (which is when
+/// the `PROTECTED_PIDS` pin file appears); each LSM program is loaded
+/// into the kernel and attached afterwards by per-hook
+/// `program.load()` + `attach()` calls. The pin-file gate therefore
+/// races the prog-load step, so we additionally poll until an LSM
+/// program is actually bound to the pinned map. 20s is generous
+/// headroom over the typical sub-200ms attach (slow/cold CI), and a
+/// genuine non-attach within 20s is itself a failure worth surfacing.
+const LSM_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POST_EXIT_SETTLE: Duration = Duration::from_millis(500);
 
@@ -326,6 +335,30 @@ fn find_lsm_prog_using_map(map_id: u64) -> Result<ProgInfo, String> {
     ))
 }
 
+/// Readiness gate bridging the pin-file gate and the `map_ids`
+/// assertion: poll [`find_lsm_prog_using_map`] until an LSM program
+/// is bound to the pinned map, or time out. Closes the race where
+/// the `PROTECTED_PIDS` pin appears at map-create time
+/// (`Ebpf::load_from_bytes`) but no program is in the kernel yet
+/// (per-hook `program.load()` + `attach()` run afterwards). Mirrors
+/// the deadline/poll shape of [`wait_for_pin`] and
+/// `privileged_e2e::wait_for_socket`.
+fn wait_for_lsm_attach(map_id: u64) -> Result<(), String> {
+    let deadline = Instant::now() + LSM_ATTACH_TIMEOUT;
+    let mut last_err = String::new();
+    while Instant::now() < deadline {
+        match find_lsm_prog_using_map(map_id) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    Err(format!(
+        "timeout waiting for any LSM prog bound to map_id {map_id} \
+         after {LSM_ATTACH_TIMEOUT:?}. Last lookup error: {last_err}"
+    ))
+}
+
 /// Best-effort recursive removal of the pin root. See the module
 /// "Destructive precondition" note.
 fn purge_pin_root() {
@@ -357,7 +390,7 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
     wait_for_pin(&pin);
 
     let id1 = pinned_map_id(&pin);
-    find_lsm_prog_using_map(id1).unwrap_or_else(|e| {
+    wait_for_lsm_attach(id1).unwrap_or_else(|e| {
         panic!(
             "boot-1: no anti-tamper LSM hook is bound to the pinned \
              PROTECTED_PIDS id {id1} — relocation/binding broken.\n{e}"
@@ -387,7 +420,7 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
          pinned one — split brain NOT closed"
     );
 
-    find_lsm_prog_using_map(id2).unwrap_or_else(|e| {
+    wait_for_lsm_attach(id2).unwrap_or_else(|e| {
         panic!(
             "boot-2: no anti-tamper LSM hook is bound to the reused \
              pinned id {id2} — restarted agent is split-brained off \
