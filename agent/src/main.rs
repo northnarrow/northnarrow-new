@@ -99,6 +99,22 @@ struct Cli {
         default_value = "/run/northnarrow/admin.sock"
     )]
     admin_socket: PathBuf,
+
+    /// Optional PID file path. After all anti-tamper LSM hooks are
+    /// attached and pinned (the same synchronisation point at which
+    /// the "decision engine ready" line is logged), the agent's PID
+    /// is written to this path atomically (sibling tempfile + rename,
+    /// so a reader never observes a half-written or empty file). On
+    /// graceful shutdown the file is removed. Intended for
+    /// verification harnesses and process supervisors: the file's
+    /// EXISTENCE is itself the readiness signal (it cannot appear
+    /// before every hook is live). A stale file from a previous
+    /// crashed run is OVERWRITTEN, not respected — so readers must
+    /// confirm /proc/<pid> before trusting the contents. Omitting
+    /// the flag (the production default) is a no-op: behaviour is
+    /// exactly as before, no PID file is touched.
+    #[arg(long = "pid-file", value_name = "PATH")]
+    pid_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -152,6 +168,29 @@ async fn main() -> Result<()> {
         demo_tappa5 = cfg!(feature = "demo-tappa5"),
         "decision engine ready"
     );
+
+    // Tappa 7 task 6 #2b-verify: optional PID file. `attach_anti_tamper`
+    // above is fully synchronous (anti_tamper::attach attempts AND pins
+    // every LSM hook before it returns — agent/src/anti_tamper/mod.rs),
+    // and the "decision engine ready" line has now flushed, so the
+    // file's *existence* is a sound readiness gate: anything that sees
+    // it knows every hook is attached and self-protection is live.
+    //
+    // The agent writing its OWN pid is immune to the failure class that
+    // sank three external-resolution strategies in docs/verify-2b.sh
+    // (989c292 pgrep -P / -x, 6e746c6 /proc/*/exe diff): the sudo+exec
+    // process-tree race, TASK_COMM_LEN comm truncation, and pgrep
+    // quirks. A write failure here is FATAL by design — a harness or
+    // supervisor that asked for a PID file cannot proceed without it,
+    // and silently degrading would resurrect exactly the "agent is
+    // alive but the watcher can't find it" bug this flag exists to
+    // kill. Production never passes --pid-file, so this is inert there.
+    if let Some(pid_file) = cli.pid_file.as_deref() {
+        write_pid_file(pid_file)
+            .with_context(|| format!("writing --pid-file {}", pid_file.display()))?;
+    } else {
+        debug!("no --pid-file provided; PID file write skipped (production default)");
+    }
 
     let executor = Executor::new();
     info!(
@@ -353,6 +392,34 @@ async fn main() -> Result<()> {
             p99_ms = snap.p99_latency_ms,
             "ADE shutdown stats"
         );
+    }
+
+    // Tappa 7 task 6 #2b-verify: remove our PID file on GRACEFUL
+    // shutdown only, so a supervisor/harness reads "file gone =>
+    // agent exited cleanly". A crash (panic / SIGKILL — neither
+    // reaches here) deliberately leaves it STALE; that is why readers
+    // must confirm /proc/<pid> is alive (and is the agent binary)
+    // before trusting the contents. Removal failure is logged loudly,
+    // never swallowed, but is non-fatal — we are already shutting down.
+    if let Some(pid_file) = cli.pid_file.as_deref() {
+        match std::fs::remove_file(pid_file) {
+            Ok(()) => info!(
+                target: "anti-tamper",
+                path = %pid_file.display(),
+                "pid_file removed on graceful shutdown"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => debug!(
+                target: "anti-tamper",
+                path = %pid_file.display(),
+                "pid_file already absent at shutdown (nothing to remove)"
+            ),
+            Err(e) => warn!(
+                target: "anti-tamper",
+                path = %pid_file.display(),
+                error = %e,
+                "pid_file removal failed on shutdown (left stale)"
+            ),
+        }
     }
 
     // Best-effort socket cleanup so a future agent process can bind
@@ -596,6 +663,61 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
     } else {
         format!("family={family}")
     }
+}
+
+/// Atomically publish the current PID to `path` (Tappa 7 task 6
+/// #2b-verify). A sibling tempfile is written then `rename(2)`d over
+/// the target, so the rename is a same-filesystem atomic swap and a
+/// concurrent reader observes either the old file or the complete new
+/// one — never a truncated or empty file. The tempfile name carries
+/// the PID so two agents misconfigured onto one path cannot corrupt
+/// each other's tempfile mid-write. Every error is contextualised and
+/// propagated (never swallowed) so the caller can make it fatal and a
+/// failing harness can pinpoint which syscall failed.
+fn write_pid_file(path: &std::path::Path) -> Result<()> {
+    let pid = std::process::id();
+
+    // The tempfile MUST live in the target's directory (same
+    // filesystem) for rename(2) to be atomic — derive it from the
+    // target, never from /tmp. `with_file_name` preserves the parent.
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut t = name.to_os_string();
+            t.push(format!(".tmp.{pid}"));
+            path.with_file_name(t)
+        }
+        None => anyhow::bail!(
+            "--pid-file path has no file-name component: {}",
+            path.display()
+        ),
+    };
+
+    // `fs::write` create+truncate+write+close in one shot. If the
+    // parent directory is missing this fails NotFound here, at
+    // startup, loudly — which is the intended behaviour for a
+    // misconfigured --pid-file path.
+    std::fs::write(&tmp, format!("{pid}\n"))
+        .with_context(|| format!("writing PID tempfile {}", tmp.display()))?;
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Don't litter a half-finished tempfile on rename failure.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "atomically renaming PID file {} -> {}",
+                tmp.display(),
+                path.display()
+            )
+        });
+    }
+
+    info!(
+        target: "anti-tamper",
+        path = %path.display(),
+        pid,
+        "pid_file written (atomic tempfile+rename; existence == post-attach readiness gate)"
+    );
+    Ok(())
 }
 
 /// Raise `RLIMIT_MEMLOCK` to infinity so older kernels accept large

@@ -137,10 +137,14 @@ EXPECTED_HOOKS=0   # discovered at boot1 attach; 0 until then
 
 SENTINELS=()       # helper PIDs (sleep) to reap
 AGENTS=()          # agent PIDs to stop on exit
+AGENT_PID=""       # spawn_agent's out-param (set in the PARENT shell;
+                   # spawn_agent is NOT called via $(...) any more so
+                   # its record_spawn appends survive — see spawn_agent)
 
 # Verdict accumulators (parallel arrays — bash has no struct).
 A_NAME=(); A_STAT=(); A_EVID=(); A_DUR=()
 S_SIG=(); S_PID=(); S_RC=(); S_OUT=()
+SP_TAG=(); SP_SHPID=(); SP_PIDFILE=(); SP_PID=(); SP_METHOD=(); SP_DUR=()
 declare -A BPFFS_SNAP=()
 declare -A LSM_SNAP=()
 
@@ -192,6 +196,14 @@ skip() { record_assertion "$1" SKIP "$2" "${3:-}"; }
 
 # record_signal <signal> <pid> <rc> <outcome>
 record_signal() { S_SIG+=("$1"); S_PID+=("$2"); S_RC+=("$3"); S_OUT+=("$4"); }
+
+# record_spawn <tag> <shpid> <pid_file> <resolved_pid|0> <method> <dur_ms>
+# resolved_pid/shpid are emitted as JSON numbers, so callers MUST pass
+# a bare integer (0 when unresolved), never an empty string.
+record_spawn() {
+  SP_TAG+=("$1"); SP_SHPID+=("$2"); SP_PIDFILE+=("$3")
+  SP_PID+=("$4"); SP_METHOD+=("$5"); SP_DUR+=("$6")
+}
 
 # ── primitives ──────────────────────────────────────────────────────
 
@@ -442,8 +454,22 @@ write_verdict() { # write_verdict <exit_code>
     done
     [ -n "$sep" ] && printf '\n  ' ; printf '],\n'
 
-    printf '  "log_paths": {"boot1_agent_log":"%s","boot2_agent_log":"%s","harness_stdout":"%s","harness_stderr":"%s"},\n' \
+    # Fourth-and-final PID-resolution audit trail: one entry per
+    # spawn_agent call (success OR failure), so a RED run shows which
+    # boot could not produce its pid_file and how long it waited.
+    printf '  "spawn_attempts": ['
+    sep=''
+    for i in "${!SP_TAG[@]}"; do
+      printf '%s\n    {"tag":"%s","shpid":%s,"pid_file":"%s","resolved_pid":%s,"resolution_method":"%s","resolution_duration_ms":%s}' \
+        "$sep" "$(jstr "${SP_TAG[$i]}")" "${SP_SHPID[$i]:-0}" "$(jstr "${SP_PIDFILE[$i]}")" \
+        "${SP_PID[$i]:-0}" "$(jstr "${SP_METHOD[$i]}")" "${SP_DUR[$i]:-0}"
+      sep=','
+    done
+    [ -n "$sep" ] && printf '\n  ' ; printf '],\n'
+
+    printf '  "log_paths": {"boot1_agent_log":"%s","boot2_agent_log":"%s","boot1_pid_file":"%s","boot2_pid_file":"%s","harness_stdout":"%s","harness_stderr":"%s"},\n' \
       "$(jstr "$WORK/boot1/agent.log")" "$(jstr "$WORK/boot2/agent.log")" \
+      "$(jstr "$WORK/boot1/agent.pid")" "$(jstr "$WORK/boot2/agent.pid")" \
       "$(jstr "$HARNESS_OUT")" "$(jstr "$HARNESS_ERR")"
 
     printf '  "bpffs_snapshots": {'
@@ -487,6 +513,12 @@ cleanup() {
 
   snapshot_bpffs at_end 2>/dev/null
   snapshot_lsm   at_end 2>/dev/null
+  # Defensive: a crashed agent leaves its pid_file STALE by design and
+  # root-owned (written via sudo). Remove the known per-boot files
+  # explicitly with sudo before the unprivileged $WORK teardown, so
+  # nothing is left behind even if the agent never reached its own
+  # graceful-shutdown removal.
+  sudo rm -f "$WORK/boot1/agent.pid" "$WORK/boot2/agent.pid" 2>/dev/null || true
   rm -rf "$WORK" 2>/dev/null
 
   write_verdict "$rc"
@@ -576,40 +608,138 @@ pre_flight_cleanup() {
 }
 
 # ── spawn ───────────────────────────────────────────────────────────
-# Audit/bugs #3,#4: never PID-resolve via the sudo wrapper. We diff
-# the exe-verified PID set before/after spawn and take the NEW member
-# — impervious to comm truncation, the sudo double-fork, binary
-# rename, and Tappa-9.5 honeypot comm collisions.
-spawn_agent() { # spawn_agent <tag> ; echoes PID on stdout
-  local tag=$1 td="$WORK/$1" before after newpid deadline
+# PID RESOLUTION — fourth and FINAL design. Read this whole block
+# before touching spawn_agent. The agent is launched as
+# `sudo "$AGENT_BIN" … &`: sudo forks a monitor and exec(2)s the real
+# agent, so the backgrounded job ($!) is ALWAYS the sudo wrapper, never
+# the agent. Three external-observation strategies all failed to bridge
+# that gap against the sudo→exec timing/process-tree race:
+#
+#   989c292      pgrep -P "$shpid" -f "$AGENT_BIN"  → matched the sudo
+#                WRAPPER (the agent path is a literal arg in sudo's
+#                argv, so -f saw it on the wrong process).
+#   989c292 fu.  pgrep -x <comm>                    → empty: the kernel
+#                stamps comm at TASK_COMM_LEN-1 = 15 chars and
+#                "northnarrow-agent" is 17, so -x never matched.
+#   6e746c6      diff the exe-realpath /proc/*/exe set before/after
+#                spawn → RED: the scan samples /proc before the wrapper
+#                has finished exec'ing into the agent, the "new" member
+#                is empty, and on a busy box the full sweep also blew
+#                the resolve budget on thousands of sudo readlinks.
+#
+# Root cause is FUNDAMENTAL, not a tuning bug: any *external* observer
+# must guess WHEN the post-sudo exec has produced the real agent and
+# necessarily races it.
+#
+# FINAL design — the agent reports ITSELF. We pass --pid-file; the
+# agent (agent/src/main.rs `write_pid_file`) writes "<pid>\n" via
+# tempfile+rename AFTER every LSM hook is attached+pinned and the
+# "decision engine ready" line has flushed. Guarantees:
+#
+#   * No process-tree / comm / pgrep / exec-timing assumption — the
+#     agent names itself, exactly once, exactly when it is ready.
+#   * EXISTENCE is the readiness gate. The write is strictly after
+#     anti_tamper::attach() returns (it is synchronous — it attaches
+#     AND pins every hook before returning), so the file cannot appear
+#     before self-protection is live. It is the same sync point
+#     wait_for_attached() gates on ("decision engine ready"), so the
+#     two readiness mechanisms reinforce rather than race each other.
+#   * rename(2) is atomic ⇒ a reader sees a complete PID or no file,
+#     never a truncated/empty one.
+#   * A crash (panic / SIGKILL) leaves the file STALE by design — so
+#     we NEVER trust the contents without confirming /proc/<pid> is
+#     alive AND its exe realpath IS the agent binary. That single
+#     check also rejects an impostor (Tappa-9.5 honeypot) and a
+#     stale-file PID that the kernel has since recycled to something
+#     else.
+#
+# This is the battle-tested systemd/nginx/postgres/dockerd pidfile
+# pattern. There is no PID-resolution-specific failure mode left.
+#
+# NOTE: spawn_agent is deliberately NOT invoked via `$(...)`. It runs
+# in the PARENT shell and returns the PID through the global AGENT_PID
+# (return 0 ok / 1 fail) so its record_spawn append lands in the real
+# verdict arrays — a command-substitution subshell would discard it.
+spawn_agent() { # spawn_agent <tag> ; sets AGENT_PID, returns 0|1
+  local tag=$1 td="$WORK/$1" pid_file shpid apid exe start dur
+  AGENT_PID=""
   mkdir -p "$td"
   cp "$RULES_SRC" "$td/combat-rules.v4"
-  before=$(resolve_agent_pids | tr '\n' '|')
+  pid_file="$td/agent.pid"
+  # $td is a fresh mktemp -d subdir so this can't pre-exist, but a
+  # stale file here would break the existence==readiness invariant —
+  # clear it unconditionally (root-owned if an earlier agent crashed).
+  sudo rm -f "$pid_file" 2>/dev/null || true
+
+  note "spawn_agent[$tag]: launching agent"
+  note "  cmd: sudo $AGENT_BIN --combat-rules $td/combat-rules.v4 --admin-pub $td/admin.pub --admin-socket $td/admin.sock --pid-file $pid_file --no-ade"
+  start=$(now_ms)
   sudo "$AGENT_BIN" \
     --combat-rules "$td/combat-rules.v4" \
-    --admin-pub   "$td/admin.pub" \
+    --admin-pub    "$td/admin.pub" \
     --admin-socket "$td/admin.sock" \
+    --pid-file     "$pid_file" \
     --no-ade >"$td/agent.log" 2>&1 &
-  local shpid=$!   # the `sudo` wrapper PID, never the agent
-  deadline=$(( SECONDS + 10 ))
-  newpid=""
+  shpid=$!   # the `sudo` wrapper PID, NEVER the agent — see header
+  note "  shpid (sudo wrapper): $shpid"
+  note "  pid_file: $pid_file"
+  note "spawn_agent[$tag]: polling for pid_file (timeout ${ATTACH_TIMEOUT}s)"
+
+  apid=""
+  local deadline=$(( SECONDS + ATTACH_TIMEOUT ))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    while read -r cand; do
-      [ -n "$cand" ] || continue
-      case "|$before|" in *"|$cand|"*) : ;; *) newpid=$cand ;; esac
-    done < <(resolve_agent_pids)
-    [ -n "$newpid" ] && break
-    # Fail fast if the sudo wrapper already died (bad flags, EACCES).
-    kill -0 "$shpid" 2>/dev/null || { [ -n "$newpid" ] || break; }
+    if sudo test -f "$pid_file" 2>/dev/null; then
+      apid=$(sudo cat "$pid_file" 2>/dev/null | tr -d '[:space:]')
+      if [[ "$apid" =~ ^[0-9]+$ ]] && sudo test -d "/proc/$apid" 2>/dev/null; then
+        # Impostor / recycled-PID guard: the live process at $apid must
+        # actually BE the agent binary. Rejects a crashed-agent stale
+        # file whose PID the kernel reassigned to an unrelated process.
+        exe=$(sudo readlink -f "/proc/$apid/exe" 2>/dev/null || true)
+        if [ "$exe" = "$AGENT_REAL" ]; then
+          break
+        fi
+        note "spawn_agent[$tag]: pid_file says $apid but /proc/$apid/exe='$exe' != '$AGENT_REAL' (stale+recycled?) — keep polling"
+      fi
+      apid=""   # absent / partial / non-numeric / impostor — keep polling
+    fi
+    # Fail fast: if the sudo wrapper is gone AND no pid_file yet, the
+    # agent never came up (bad flags, EACCES, or main.rs failing loudly
+    # on a missing --pid-file parent). `alive` probes via sudo because
+    # a non-root `kill -0` on the root sudo process returns EPERM and
+    # would look falsely dead.
+    if ! alive "$shpid" && ! sudo test -f "$pid_file" 2>/dev/null; then
+      note "spawn_agent[$tag]: sudo wrapper $shpid exited before any pid_file appeared — aborting poll"
+      break
+    fi
     sleep "$POLL"
   done
-  {
-    note "spawn_agent[$tag]: shpid=$shpid agent_pid=${newpid:-<unresolved>}"
-    proc_diag "$newpid" "spawn_agent[$tag]"
-    [ -z "$newpid" ] && note "spawn_agent[$tag]: agent.log tail:" \
-      && tail -n 15 "$td/agent.log" >&2 2>/dev/null
-  } >&2
-  printf '%s' "$newpid"   # caller MUST AGENTS+=("$pid") (subshell-safe)
+  dur=$(( $(now_ms) - start ))
+
+  if [ -z "$apid" ]; then
+    note "spawn_agent[$tag]: pid_file '$pid_file' never appeared with valid contents within ${ATTACH_TIMEOUT}s (waited ${dur}ms)"
+    note "  shpid=$shpid alive=$(alive "$shpid" && echo yes || echo no)"
+    note "  agent.log tail:"; tail -n 30 "$td/agent.log" >&2 2>/dev/null
+    note "  process tree around shpid:"
+    # pipefail is OFF, so `pstree|head` always exits 0 and a `||ps`
+    # fallback would never fire when pstree (pkg psmisc) is absent on
+    # a minimal box — pick the available tool explicitly instead.
+    if command -v pstree >/dev/null 2>&1; then
+      pstree -p "$shpid" 2>/dev/null | head -20 >&2 || true
+    else
+      ps -o pid,ppid,stat,comm -g "$shpid" 2>/dev/null | head -20 >&2 || true
+    fi
+    record_spawn "$tag" "$shpid" "$pid_file" 0 "pid-file" "$dur"
+    return 1
+  fi
+
+  AGENT_PID=$apid
+  record_spawn "$tag" "$shpid" "$pid_file" "$apid" "pid-file" "$dur"
+  note "spawn_agent[$tag]: pid_file appeared, contents='$apid', /proc/$apid exists, exe == agent"
+  note "spawn_agent[$tag]: agent PID resolved → $apid (${dur}ms via pid-file)"
+  note "spawn_agent[$tag]: agent.log first attach line:"
+  grep -m1 'LSM hook' "$td/agent.log" 2>/dev/null | sed 's/^/    /' >&2 || true
+  note "spawn_agent[$tag]: ready"
+  return 0
 }
 
 # ── attach gate ─────────────────────────────────────────────────────
@@ -664,9 +794,9 @@ purge_bpffs_safe || die 1 "could not purge $ROOT — an agent is still holding i
 
 # ===== Boot 1 — FRESH attach path ==================================
 note "Boot 1: spawn agent (expect fresh attach + pin of all hooks)"
-A1=$(spawn_agent boot1); AGENTS+=("$A1")
+spawn_agent boot1 || die 1 "boot1: could not resolve agent PID via pid-file (see $WORK/boot1/agent.log)"
+A1=$AGENT_PID; AGENTS+=("$A1")
 A1_LOG="$WORK/boot1/agent.log"
-[ -n "$A1" ] || die 1 "boot1: could not resolve agent PID (see $A1_LOG)"
 ts=$(now_ms)
 if wait_for_attached boot1 "$A1_LOG"; then
   EXPECTED_HOOKS=$DISCOVERED_HOOKS
@@ -755,9 +885,9 @@ reap_sentinel "$SENT"
 
 # ===== Boot 2 — REUSE path =========================================
 note "Boot 2: spawn agent (expect REUSE of every pinned link)"
-A2=$(spawn_agent boot2); AGENTS+=("$A2")
+spawn_agent boot2 || die 1 "boot2: could not resolve agent PID via pid-file (see $WORK/boot2/agent.log)"
+A2=$AGENT_PID; AGENTS+=("$A2")
 A2_LOG="$WORK/boot2/agent.log"
-[ -n "$A2" ] || die 1 "boot2: could not resolve agent PID (see $A2_LOG)"
 ts=$(now_ms)
 if wait_for_attached boot2 "$A2_LOG"; then
   ok "boot2:attach" "agent re-attached; $DISCOVERED_HOOKS dispositions logged" "$ts"
