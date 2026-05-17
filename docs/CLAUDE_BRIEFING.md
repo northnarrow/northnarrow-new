@@ -93,7 +93,7 @@ Documentato in `VISION.md` repo. NESSUN ridimensionamento ammesso. Assistente ch
 - Tappa 6.9.5: Surgical fine-tune
   - **Phase A Strict Formatter: ✅ DONE 13 maggio (100% validation 1000/1000)**
   - Phase B eBPF Dialect: TODO
-  - Phase C RAG Trust: deferred post-beta, **spec documentata**
+  - Phase C RAG Trust: PROMOTED pre-beta (17 May 2026 ruling); dataset generation pending post-Tappa-6.9.7; will conform to frozen format_rag_block contract per Q4(a) ruling
   - Phase D DPO Posture Alignment: deferred post-beta, **spec documentata** (con bug fix esplicito noto)
 
 ### FASE 3: Anti-Tamper (Tappa 7-8) — IN PROGRESS
@@ -424,7 +424,7 @@ sudo kill -QUIT <pid>
 ### Deferred con spec (NON dimenticare)
 - Tappa 6.3 distillation Foundation-Sec → Qwen 3B (post-beta, scope 1-2 sett)
 - Tappa 6.7 cold start fallback (può anticipare se 6.8.1 GGUF chiude, scope ore)
-- Tappa 6.9.5 Phase C RAG Trust (post-beta, scope 1 sett)
+- Tappa 6.9.5 Phase C RAG Trust (PRE-BETA, scope 3-5 days as part of Phase B+C training cycle post-6.9.7)
 - Tappa 6.9.5 Phase D Posture Alignment DPO (post-beta, scope 1 sett + bug fix)
 
 Riferimento: `docs/specs/PHASE_2_DEFERRED_TAPPE.md`

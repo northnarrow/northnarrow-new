@@ -144,3 +144,47 @@ fields (hostname, host_id, paths). Posture:
 | P4 | `1cde064` | `XaiEngine::explain` + chain assembly/signing + `environment_hash` + candle bench |
 | P5 | `eeec43f` + this commit | audit-finding closeout + this dossier |
 | P6 | — | golden regression fixtures — **deferred** (separate phase) |
+
+---
+
+## 8. Two-artifact traceability model (added Tappa 6.9.7 P7)
+
+Tappa 6.9.7 wired a local RAG knowledge base into the ADE prompt. The
+Article-13 traceability story is therefore **two artifacts**, by
+deliberate design (plan §5 Option A — `XAI_SCHEMA_VERSION` stays
+1.0.0, no schema mutation):
+
+**(a) Signed XAI evidence chain — 6.9, IMPLEMENTED.** Answers *"what
+did the AI explain, and why"*. Ed25519-signed; `prompt_sha256` binds
+the **entire assembled prompt**, which — when RAG is enabled —
+*includes* the `=== RELEVANT CYBERSEC KNOWLEDGE ===` block verbatim.
+So every retrieved snippet that influenced a verdict is already
+cryptographically committed. Consequence (intentional, not a
+regression): a RAG-on chain is only reproducible RAG-on with the same
+`kb_index_hash`; the `rag:None` canary path keeps every RAG-off chain
+reproducible. Art. 13 §3(c) "what was explained" is fully covered here.
+
+**(b) Hash-chained RAG retrieval log — Tappa 13 SaaS Backend
+follow-on, NOT YET BUILT.** Answers *"what context was retrieved at
+decision time, at what granularity"*: a separate, unsigned,
+append-only hash-chained log of `{ade_trace_id, kb_index_hash,
+retrieved doc ids + scores, prev_entry_sha256}`. It gives per-query
+retrieval provenance *separable* from the signed prompt without
+mutating the closed XAI schema. Scope/justification: plan §5.1
+(explicitly a Tappa 13 deliverable; the §5.1 5-pillar ruling stands).
+Until it ships, retrieval provenance is the in-repo `kb_index_hash`
+anchor (`docs/kb-sources/`, byte-reproducible) plus the signed
+prompt's transitive binding of the RAG block.
+
+Net Art. 13 §3(c): the signed chain carries *"what the AI explained"*;
+the (future) hash-chained log carries *"what context was retrieved"* —
+cross-linked by `ade_trace_id`.
+
+## 9. Change log
+
+- **2026-05-17 — initial (Tappa 6.9 P0→P5).** §1–§7 above.
+- **2026-05-17 (Tappa 6.9.7 P7).** RAG-local-KB integration
+  documented; §8 two-artifact traceability model defined (Option A
+  frozen — XAI 1.0.0 untouched; hash-chained RAG log scoped to
+  Tappa 13 per plan §5.1). No change to the §2 conformance matrix or
+  the §3 reproducibility basis.

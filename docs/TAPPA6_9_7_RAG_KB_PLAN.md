@@ -1,6 +1,13 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ DELIVERED (P6 pending owner gate).**
+Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ P7✅ COMPLETE — branch ready for merge to main.**
+P7: docs closeout (docs-only — no code/tests/Cargo; clippy 0/0 and the
+test suite trivially unchanged, no Rust touched). ADE_DOCTRINE +
+XDR_ROADMAP + Art-13 dossier (two-artifact model) annotated;
+CLAUDE_BRIEFING lines 96/427 Phase-C drift reconciled (minimal-touch);
+plan §11 + this header folded; final AS-BUILT closure recorded at the
+end of this plan. (Earlier P2–P6 status follows.)
+Prior — **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ DELIVERED (P6 pending owner gate).**
 P6: bench/golden/e2e validation over the real 964-doc corpus —
 `retrieve` p95 **2.2 ms** (≤50 ms), cold open **707 ms** (≤5 s),
 golden **22/24 = 91.7 %** (≥90 %; 2 documented cross-source
@@ -829,12 +836,21 @@ the bench records evaluate-with-RAG vs without.
     the frozen P5 contract shape ✓.
   Release-gate alignment: satisfies §13 checklist #3 (latency) and the
   golden-determinism precondition. → owner gate.
-- **P7 — docs closeout**: ADE_DOCTRINE + XDR_ROADMAP annotation;
-  Art-13 dossier documents the **two-artifact model** (signed XAI
-  chain + the separate hash-chained RAG log) and **references the
-  hash-chained RAG retrieval log as a Tappa 13 Backend-SaaS
-  follow-on** (per §5.1 — NOT built in 6.9.7); memory closure. (No
-  XAI schema artifact — Option A ruled; Option B is the V2.0+ path.)
+- **P7 — docs closeout** — ✅ **DELIVERED (this commit) — pending
+  owner final audit → ship.** Docs-only (no code/tests/Cargo).
+  Touched: `ADE_DOCTRINE.md` (new "Tappa 6.9.7 — RAG-Local Knowledge
+  Base — SHIPPED" section w/ operational metrics); `XDR_ROADMAP_TAPPE
+  _NEW.md` (6.9.7 ✅ DELIVERED + V1.0 cross-refs + Phase-C pre-beta
+  status; inline, no per-tappa board); `TAPPA6_9_ARTICLE_13
+  _COMPLIANCE.md` (§8 two-artifact traceability model + §9 change
+  log — signed XAI chain = "what explained"; hash-chained RAG log =
+  "what retrieved", a **Tappa 13** follow-on per §5.1; XAI 1.0.0
+  untouched); `CLAUDE_BRIEFING.md` (lines 96/427 reconciled
+  minimal-touch — the P5 repo↔memory Phase-C drift RESOLVED). Aux
+  RAG-staleness scan: `IDEAS`/`PERFORMANCE_HARDWARE` are context not
+  status, README has no RAG mention — none touched (minimal scope).
+  Plan §11 + header folded. **Branch ready for merge to main after
+  this audit.**
 
 Each phase: atomic commit, push, notify, STOP at the gate (the 6.9
 iteration pattern the owner endorsed). `clippy --workspace
@@ -983,3 +999,68 @@ pre-P2 blocker): re-verify the MITRE license against
 `attack-stix-data@v18.1` and FLAG before the P2 commit if it differs
 from the ATT&CK ToU. Subsequent phases: atomic commit + owner gate +
 clippy 0/0 + tests green; no multi-phase mega-commits.*
+
+---
+
+## AS-BUILT — Tappa 6.9.7 closure (P7, 2026-05-17)
+
+**Status: P1→P7 COMPLETE. Branch `tappa-6.9.7-rag-kb-plan` ready for
+merge to `main`.** Recorded against the P7 docs-closeout commit; supersedes
+the P1.5-era plan-of-record note above.
+
+**What shipped (AS-BUILT, vs plan of record):**
+
+- **P2** — sovereign KB acquisition (`cargo xtask rag-kb`): MITRE
+  ATT&CK Enterprise **v18.1** (691 techniques) + SigmaHQ Linux (243
+  rules) + 6.7 in-repo `kb_seed`; LOLBAS **dropped** (GPL-3.0, §4.2.3);
+  MITRE ATT&CK ToU re-verified on `attack-stix-data@v18.1` (commercial
+  grant — no incompat). Provenance anchored in `docs/kb-sources/`.
+- **P3** — `tantivy =0.25.0 default-features=false` (no `zstd-sys`
+  C-FFI — 100%-Rust/no-FFI charter held); 8-field schema + R3 `nn_sec`
+  security-token analyzer; persist + rebuild-on-change.
+- **P4** — BM25 `RagEngine::open_index` swapped **behind the
+  byte-stable `retrieve`/`RagQuery`/`RagResult` API** (plan §0
+  mechanism swap); R1 `(-score,id-asc)` tie-break; §3.4(a)
+  within-result normalisation + post-norm `min_similarity` floor;
+  `rag:None` byte-identical to pre-6.7 (XAI-determinism protected).
+- **P5** — env canary `NN_ADE_RAG_ENABLED` (default **OFF**,
+  beta-safe; graceful fallback) at the single `AdeEngine::new`;
+  Q4(a) **`format_rag_block` byte-frozen** as the Phase-C training
+  contract; XAI 1.0.0 schema untouched.
+- **P6** — real 964-doc corpus: `retrieve` p95 **2.2 ms** (≤50 ms,
+  ~23× margin), cold `open_index` **707 ms** (≤5 s), golden
+  **22/24 = 91.7 %** (≥90 %; the 2 misses are documented §10
+  cross-source `want_sigma` co-retrieval coverage gaps, not gamed),
+  `kb_index_hash` reproduced byte-identical to the P2 anchor, e2e
+  matches the frozen P5 contract. clippy 0/0; no regressions.
+- **P7** — docs closeout (this commit, docs-only): ADE_DOCTRINE
+  "RAG-Local Knowledge Base — SHIPPED" section w/ operational metrics;
+  XDR_ROADMAP 6.9.7 ✅ DELIVERED + V1.0 cross-refs; Art-13 dossier §8
+  two-artifact traceability model + §9 change log; CLAUDE_BRIEFING
+  lines 96/427 reconciled (the P5-flagged repo↔memory Phase-C drift
+  **RESOLVED**); plan §11 + header folded. Aux RAG-staleness scan:
+  no stale status statement in `docs/*.md` (PERFORMANCE_HARDWARE /
+  IDEAS mentions are context; README has no RAG mention) — none
+  touched (minimal scope). No code/test/Cargo changes.
+
+**Sovereign + Article-13 posture (AS-BUILT):** 100% local KB, zero
+external fetch at agent runtime; `kb_index_hash` byte-reproducible
+(auditable provenance). Article-13 traceability is the **two-artifact
+model** (dossier §8): the signed XAI 1.0.0 chain binds the RAG block
+transitively via `prompt_sha256` (Option A frozen — §5); the separate
+hash-chained RAG retrieval log is a **Tappa 13** SaaS-Backend follow-on
+(§5.1, NOT built in 6.9.7).
+
+**V1.0 forward work (not in 6.9.7):** hybrid candle bge-small re-rank
+over BM25 candidates (§7); GTFOBins corpus extension (§4.2.3,
+post-beta); the hash-chained RAG retrieval log (Tappa 13, §5.1).
+
+**Merge declaration:** P1.5 frozen; P2–P7 delivered; owner gates
+passed P2–P6; P6 audit PASS (zero findings); P7 docs-only with no
+code/test/Cargo/clippy delta. Pending only the P7 owner audit gate,
+after which `tappa-6.9.7-rag-kb-plan` merges to `main`, Tappa 6.9.7
+**SHIPS**, and the Phase B+C training cycle (3–5 days) begins —
+training against the byte-frozen `format_rag_block` (Q4(a)). Tappa
+6.9.5 Phase C is **PROMOTED pre-beta** (17 May 2026 ruling); its
+dataset is generated post-6.9.7 and will conform to the frozen
+contract.
