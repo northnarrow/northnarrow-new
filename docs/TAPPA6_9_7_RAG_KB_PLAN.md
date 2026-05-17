@@ -1,9 +1,17 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **DRAFT — awaiting owner review** (gating questions §12 + the
-Article-13 schema ruling §5 are BLOCKING; no P2+ code until ruled).
-Author: Claude (staff-eng) · Created 2026-05-17 · Branch:
-`tappa-6.9.7-rag-kb-plan`.
+Status: **P1.1 — owner rulings folded in; STILL BLOCKED on 4 items.**
+RULED (this revision): Q3 (no IoC), Q4=(a), Q5=both modes, Q8
+(NOTICES/LICENSES attribution), Q9→new §13. **STILL BLOCKING P2+
+(escalated):** (i) **§5 / Q7 Article-13 schema ruling — NOT addressed
+in the P2-conditions message; remains the original BLOCKING item**;
+(ii) Q1 — exact `tantivy` version to pin; (iii) Q2 — exact corpus pins
+(ATT&CK release tag, Sigma commit, LOLBAS commit) — P2 cannot pin
+sources without these; (iv) §13 — the owner referenced "the 8-point
+checklist from my Q9 ruling" but the 8 points were **not included**;
+§13 below is a CC DRAFT pending the owner's actual list.
+Author: Claude (staff-eng) · Created 2026-05-17 · Rev P1.1 ·
+Branch: `tappa-6.9.7-rag-kb-plan`.
 Driver: pulled pre-beta so **Phase C (RAG-trust calibration training)**
 can run pre-beta alongside Phase B — epistemic resilience + EU AI Act
 Art. 13(3)(b)(ii) robustness. Sovereign-principle play (ADE_DOCTRINE
@@ -97,10 +105,55 @@ Same query + same KB index ⇒ **identical ranked top-K**, always.
   `DocId`/segment order (which can shift on rebuild). The retrieval
   layer sorts `(-bm25, id)`.
 - **Index reproducibility:** same pinned source snapshots + same
-  tantivy version + same analyzer config ⇒ byte-reproducible index, or
-  at minimum a stable **KB index hash** = `sha256` over the
-  *canonicalised source dump* (not the tantivy segment bytes, which may
-  embed timestamps — R2, confirm). The hash is the auditable identity.
+  tantivy version + same analyzer config ⇒ stable **KB index hash**
+  taken over the *canonicalised source dump* (NOT tantivy segment
+  bytes, which embed build timestamps/segment UUIDs — R2, confirmed by
+  condition 7). The hash is the auditable KB identity, referenced by
+  Article-13 provenance (§5).
+
+#### 3.1.1 KB index hash — normative spec (condition 7)
+
+The canonical dump (§4.1) is the single hashed preimage. The hash is
+domain-separated and order-deterministic:
+
+```text
+kb_index_hash = lower_hex(sha256(
+    b"NN-RAG-KB-CANON-v1\0"                         ||  # domain sep (versioned)
+    u32_be(num_sources) ||
+    for each source in SORTED(source_id):                # lexicographic by source_id
+        u32_be(len(source_id))   || source_id_utf8   ||  # "attack" | "sigma" | "lolbas" | ...
+        u32_be(len(upstream_url))|| upstream_url_utf8 ||
+        u32_be(len(pin))         || pin_utf8          ||  # commit hash / release tag
+        sha256(canonical_source_dump_bytes)               # 32 raw bytes; dump = §4.1 format
+))
+```
+
+Fixed 32-byte digests + u32-BE length prefixes on every variable field
+⇒ unambiguous preimage (the same discipline as the 6.9
+`environment_hash`, audit F3). The `-v1` domain tag versions the hash
+encoding; a layout change is a deliberate bump (mirrors XAI
+`CANON_DOMAIN`).
+
+Worked example (3 sources, illustrative digests):
+
+```text
+sources (sorted): attack, lolbas, sigma
+  attack: url=https://github.com/mitre/cti pin=ATTACK-vXX
+          sha256(dump)=aa..aa (32B)
+  lolbas: url=https://github.com/LOLBAS-Project/LOLBAS pin=<commit>
+          sha256(dump)=bb..bb
+  sigma:  url=https://github.com/SigmaHQ/sigma pin=<commit>
+          sha256(dump)=cc..cc
+preimage = "NN-RAG-KB-CANON-v1\0" || u32_be(3)
+         || u32_be(6)||"attack" || u32_be(31)||"https://github.com/mitre/cti"
+            || u32_be(10)||"ATTACK-vXX" || aa..aa
+         || u32_be(6)||"lolbas" || ... || bb..bb
+         || u32_be(5)||"sigma"  || ... || cc..cc
+kb_index_hash = lower_hex(sha256(preimage))   # 64 hex chars
+```
+
+A P2 unit test locks this with fixture digests (tamper-sensitive, like
+`canonical_bytes_byte_locked_for_sample`).
 
 ### 3.2 Index schema (tantivy fields)
 Proposed document schema (maps onto the existing 5 `KbCategory`):
@@ -136,29 +189,74 @@ already handled conservatively downstream — preserve it).
 
 ---
 
-## 4. KB content sources (pinned snapshots; proposals — §12 Q2/Q3)
+## 4. KB content sources — RULED (Q3, Q4a, Q5, Q8)
 
 All **pinned to an immutable ref**, SHA-256 per source, mapped into the
-existing `KbCategory`. Sovereign: fetched by xtask at *build/release*
-time from the upstream (or a customer-controlled mirror at install —
-§12 Q5), never by the agent at runtime.
+existing `KbCategory`. Sovereign: acquired by `xtask` at build/release
+time from upstream, OR at install from a customer-controlled mirror —
+**both modes (Q5 RULED = both; condition 4)**, never by the agent at
+runtime. `RagDocument.similarity` reused with normalised BM25 + a
+doc-comment fix (**Q4 RULED = (a)**); no `common` schema shape change.
 
-| Source | Pin | → KbCategory | Distilled fields | License (VERIFY — R4/risk) |
+| Source | Pin (⚠ owner to specify — Q2) | → KbCategory | Distilled fields | License |
 |---|---|---|---|---|
-| MITRE ATT&CK Enterprise STIX 2.1 (`mitre/cti`) | a tagged ATT&CK release | `MitreTechnique` | technique id, name, description, platforms, data-sources | MITRE ATT&CK Terms of Use (attribution) |
-| SigmaHQ `sigma` (`rules/linux/**`, `rules/**/builtin` subset) | a pinned commit | `SigmaRule` | rule id, title, logsource, distilled detection summary (NOT raw YAML) | Detection Rule License (DRL 1.1) |
-| LOLBAS-Project | a pinned commit | `Lolbas` | binary, description, sample command, ATT&CK mapping | MIT |
-| (existing 6.7 curated Linux/tooling notes) | in-repo | `LinuxPattern`,`ThreatTool` | keep as-is, re-indexed | in-repo |
-| **IoC feeds** | — | — | **DEFERRED in V1** (Q3): volatile feeds break determinism/immutability; conflict with the audit story. Options: (i) none in V1 *(recommended)*; (ii) pinned curated snapshot w/ explicit staleness caveat; (iii) customer-mirror at install (sovereign seam, later). | — |
+| MITRE ATT&CK Enterprise STIX 2.1 (`github.com/mitre/cti`) | release tag — **Q2 owner pick** | `MitreTechnique` | technique id, name, description, platforms, data-sources | MITRE ATT&CK Terms of Use (attribution req.) |
+| SigmaHQ `sigma` (`rules/linux/**`, builtin subset) | commit — **Q2 owner pick** | `SigmaRule` | rule id, title, logsource, distilled detection summary (NOT raw YAML) | Detection Rule License 1.1 |
+| LOLBAS-Project | commit — **Q2 owner pick** | `Lolbas` | binary, description, sample command, ATT&CK mapping | MIT |
+| existing 6.7 curated notes (in-repo) | repo HEAD | `LinuxPattern`,`ThreatTool` | kept, re-indexed | in-repo |
+| **IoC feeds** | — | — | **EXCLUDED in V1 — Q3 RULED, condition 6.** No IoC source ships in 6.9.7. The install-from-mirror seam (Q5) is the future path if/when IoCs are revisited. | — |
 
-Acquisition output: a **canonical JSON dump** (one stable schema,
-sorted keys, LF) per source → the input the tantivy index is built
-from and the input the KB index hash is taken over (decouples
-provenance from tantivy's binary format).
+> **Q2 still owner-blocking:** P2 *cannot* pin sources without the
+> exact ATT&CK release tag + Sigma/LOLBAS commits. Pinning is the whole
+> determinism story — CC will not pick arbitrary refs.
+
+### 4.1 Canonical dump format (condition 5)
+
+One stable schema per source; the dump is the hashed preimage (§3.1.1)
+and the tantivy build input — decoupling provenance from tantivy's
+binary format. Rules:
+
+- **Encoding:** UTF-8, `\n` (LF) line endings, **no trailing
+  whitespace**, file ends with a single `\n`.
+- **Structure:** one JSON object per line (**JSONL**), one line per KB
+  document, lines **sorted by `id` ascending** (byte order).
+- **Per-line object:** keys **lexicographically sorted**, compact
+  (no insignificant whitespace), schema:
+  `{"category","content","id","platform","severity","source_ref","title"}`
+  (string fields; absent optionals serialised as `""`, never omitted —
+  keeps the line schema fixed for the hash).
+- **Per-source provenance sidecar** `<<source>>.provenance.json`:
+  `{"acquired_utc","canonical_dump_sha256","pin","source_id","upstream_url"}`
+  (sorted keys). `canonical_dump_sha256` = `sha256` of the JSONL bytes;
+  it feeds §3.1.1.
+
+### 4.2 Attribution & licensing (Q8 RULED — conditions 1–3)
+
+- **`NOTICES.md`** (repo root): per-source attribution block —
+  source name, upstream URL, pin, license name, required attribution
+  text (esp. MITRE ATT&CK ToU, Sigma DRL-1.1 notice).
+- **`LICENSES/`**: verbatim license file per source
+  (`LICENSES/MITRE_ATTACK_TERMS.txt`, `LICENSES/SIGMA_DRL-1.1.txt`,
+  `LICENSES/LOLBAS_MIT.txt`).
+- **Documented per source** (conditions 3): canonical upstream URL,
+  specific pin (commit/tag), acquisition date (UTC), SHA-256 of the
+  canonical dump — all live in the `.provenance.json` sidecars AND are
+  summarised in `NOTICES.md`. R4 license-permits-shipping verification
+  is a P2 acceptance gate (§11).
 
 ---
 
-## 5. ⚠️ Article-13 compatibility — SCHEMA QUESTION (BLOCKING owner ruling)
+## 5. ⚠️ Article-13 compatibility — SCHEMA QUESTION (RULING STILL OUTSTANDING)
+
+> **ESCALATED:** the P2-conditions message ruled Q3/Q4/Q5/Q8/Q9 but did
+> **not** address this. It was flagged BLOCKING in P1 and remains so.
+> P2 (acquisition/dump/`kb_index_hash`) can proceed once Q1/Q2 are
+> given **regardless** of this ruling — but **P5 (ADE wiring) and P7
+> (Art-13 artifact) are hard-blocked until Option A or B is chosen**,
+> because the choice decides whether retrieval provenance lives in a
+> separate unsigned RAG log (A) or mutates the closed XAI 1.0.0 schema
+> (B, tripping the 6.9-closure standing trigger #1). Recommendation
+> unchanged: **Option A**.
 
 **Question (verbatim from the assignment):** add a
 `retrieved_snippets_sha256` field to the XAI chain, *or* rely on the
@@ -277,21 +375,48 @@ the bench records evaluate-with-RAG vs without.
 
 ## 11. Phased delivery (plan-first; owner gate between phases, as 6.9)
 
-- **P1 — this doc.** Owner reviews; rules §5 + §12. *(current)*
-- **P2 — KB acquisition pipeline** (xtask): pinned fetch → canonical
-  JSON dump → per-source SHA-256 + KB index hash. Atomic commit.
-  → owner gate.
-- **P3 — tantivy index build**: schema (§3.2), analyzer (R3), persist,
+- **P1 — this doc** (rev P1.1). Owner reviews; still owes Q1, Q2,
+  §5/Q7, and the §13 8-point list. *(current)*
+- **P2 — KB acquisition pipeline** (xtask). **Unblock requires Q1 N/A
+  (P2 is pre-tantivy) but Q2 exact pins + Q8 license-OK.** Commit
+  acceptance = ALL of (owner conditions 1–7, verbatim):
+  1. `NOTICES.md` with per-source attribution (Q8).
+  2. `LICENSES/` populated with verbatim license files.
+  3. Each source documents: canonical upstream URL · specific pin
+     (commit/tag) · acquisition date (UTC) · SHA-256 of the
+     canonical dump (in `.provenance.json` + `NOTICES.md`).
+  4. xtask supports BOTH build-time acquisition (default,
+     ship-with-agent) AND install-time acquisition (customer-mirror,
+     future seam).
+  5. canonical dump format documented + implemented per §4.1
+     (JSONL, sorted lines by id, sorted keys, LF).
+  6. NO IoC sources (Q3).
+  7. `kb_index_hash` per §3.1.1 implemented + byte-lock test.
+  Plus: R4 license-permits-shipping verified (else mode-4 install-only).
+  Atomic commit. → **owner gate audit, then P3.**
+- **P3 — tantivy index build** (needs Q1 tantivy version pinned).
+  Schema §3.2; **R3 custom analyzer DESIGN + golden test fixtures
+  proving the owner's security tokens survive tokenisation:
+  `T1059.001`, `/etc/shadow`, `xmrig`, `certutil`, base64-blob, dotted/
+  slashed identifiers** (explicit owner P3 requirement). Persist +
   lazy `open`. → owner gate.
-- **P4 — BM25 retrieval**: `RagEngine::open_index` + BM25 search +
-  R1 tie-break + 3.4 scoring, *keeping `retrieve()` API*. Determinism
-  + golden tests. → owner gate (audit retrieval correctness).
-- **P5 — ADE canary integration**: wire existing `with_rag` behind
-  `NN_ADE_RAG_ENABLED`; canary-off parity gate. → owner gate.
-- **P6 — bench + golden**: latency p50/p95, 20–30 golden cases,
-  index-hash stability. → owner gate.
+- **P4 — BM25 retrieval**: `RagEngine::open_index` + BM25 + R1
+  `(-bm25,id)` tie-break + §3.4(a) normalised similarity, **keeping
+  `retrieve()` API byte-stable**. Determinism + golden tests.
+  → owner gate (retrieval-correctness audit).
+- **P5 — ADE canary integration** (hard-blocked by §5/Q7): wire the
+  *existing* `with_rag` behind `NN_ADE_RAG_ENABLED`; canary-off parity
+  is a release gate. **Q4(a) verification step (owner-mandated):**
+  confirm production `format_rag_block` output matches the
+  **already-generated Forge v2 Phase-C dataset (5K examples)** format.
+  On misalignment: **FLAG before training**, then either adjust
+  `format_rag_block` to match the dataset OR regenerate the dataset
+  with the corrected format (owner decides which). → owner gate.
+- **P6 — bench + golden**: latency p50/p95 (`NN_RAG_BENCH_N`), 20–30
+  golden cases, `kb_index_hash` stability; re-confirm the P5 Phase-C
+  format alignment holds end-to-end. → owner gate.
 - **P7 — docs closeout**: ADE_DOCTRINE + XDR_ROADMAP annotation; the
-  §5 Art-13 artifact *iff* the ruling requires it; memory closure.
+  §5 Art-13 artifact *iff* Option B is ruled; memory closure.
 
 Each phase: atomic commit, push, notify, STOP at the gate (the 6.9
 iteration pattern the owner endorsed). `clippy --workspace
@@ -299,28 +424,66 @@ iteration pattern the owner endorsed). `clippy --workspace
 
 ## 12. Gating questions — RULINGS REQUESTED (blocking, like 6.9 §12)
 
-- **Q1 — engine:** confirm `tantivy` (pin which version?) vs any
-  alternative. *(rec: tantivy, latest stable, pinned)*
-- **Q2 — corpus set:** MITRE ATT&CK + Sigma + LOLBAS as proposed? Which
-  exact pins (ATT&CK release tag, Sigma/LOLBAS commit)?
-- **Q3 — IoC feeds:** V1 = none *(rec)* / pinned-snapshot / mirror-seam?
-- **Q4 — `similarity` field:** (a) reuse w/ normalised BM25 + doc-fix
-  *(rec)* vs (b) add `bm25_raw` to the `common` schema.
-- **Q5 — KB packaging:** ship pre-built index *with* the agent vs build
-  at install from a customer-controlled mirror (sovereign; depends on
-  index size from P3 + Q2 licenses).
-- **Q6 — module placement:** keep `agent/src/rag/` *(rec)* vs promote.
-- **Q7 — Article-13 (§5):** Option A (rely on `prompt_sha256`, XAI
-  frozen, separate unsigned RAG log) *(rec)* vs Option B (extend
-  `XaiInputSnapshot`, bump `XAI_SCHEMA_VERSION`).
-- **Q8 — corpus licenses (R4):** confirm MITRE ToU / Sigma DRL-1.1 /
-  LOLBAS-MIT permit shipping-with-agent; else mandate install-from-mirror.
-- **Q9 — canary default-flip criteria:** what A/B evidence flips
-  `NN_ADE_RAG_ENABLED` to default-on (a later tappa, not 6.9.7)?
-- **Refinements proposed:** R1 stable tie-break `(-bm25,id)`; R2 KB
-  index hash over canonical dump (not segment bytes); R3 security-token
-  -preserving analyzer; R4 license verification before P2 ships.
+**STILL OWED BY OWNER (P2+ blocked):**
+- **Q1 — engine/version:** `tantivy` accepted in principle; **exact
+  version to pin still owed** (needed at P3, not P2).
+- **Q2 — corpus pins:** **exact ATT&CK release tag + Sigma commit +
+  LOLBAS commit still owed — P2 cannot start without these.**
+- **Q7 / §5 — Article-13 schema:** **STILL UNRULED** (not addressed in
+  the P2-conditions msg). Option A *(rec)* vs B. Hard-blocks P5/P7.
+- **§13 8-point checklist:** owner referenced "my Q9 ruling" 8 points
+  but did **not** include them; §13 is a CC DRAFT pending the list.
+
+**RULED (folded into this revision):**
+- **Q3 — IoC feeds:** RULED = none in V1 (condition 6).
+- **Q4 — `similarity` field:** RULED = (a) reuse + normalised BM25 +
+  doc-comment fix; no `common` shape change.
+- **Q5 — KB packaging:** RULED = **both** modes (condition 4) — xtask
+  build-time (default) + install-time mirror seam.
+- **Q6 — module placement:** keep `agent/src/rag/` (uncontested;
+  treated as accepted — owner object if not).
+- **Q8 — licenses/attribution:** RULED = ship with `NOTICES.md` +
+  `LICENSES/` + per-source provenance (conditions 1–3); R4
+  license-permits-shipping is a P2 acceptance gate.
+- **Q9 — canary default-flip:** RULED to exist as **§13** (content
+  pending owner's 8 points).
+- **Refinements (all accepted into the plan):** R1 stable tie-break
+  `(-bm25,id)`; R2 `kb_index_hash` over canonical dump (§3.1.1); R3
+  security-token-preserving analyzer (P3 golden fixtures mandated by
+  owner); R4 license verification before P2 ships.
 
 ---
 
-*Plan of record once approved. No P2+ code until §5 + §12 are ruled.*
+## 13. Canary default-flip criteria (Q9) — ⚠️ CC DRAFT, NOT the owner's ruling
+
+> **GAP FLAGGED:** the P2-conditions message said *"include the 8-point
+> checklist from my Q9 ruling"* but the 8 points were **not in the
+> message**. To avoid fabricating-then-attributing a ruling, the list
+> below is a **CC-proposed draft** for the owner to replace/confirm. The
+> flip itself is a *later tappa*, not 6.9.7 — 6.9.7 only ships the
+> canary OFF by default and the measurement harness.
+
+`NN_ADE_RAG_ENABLED` flips to default-on only when ALL hold (draft):
+
+1. **Retrieval determinism locked** — golden retrieval + tie-break
+   tests green; `kb_index_hash` byte-locked.
+2. **Latency** — RAG-on ADE `evaluate` p95 within the XAI R-P3.2
+   budget; retrieval p95 ≤ 50 ms (constraint 3).
+3. **Phase-C alignment proven** — production `format_rag_block` ==
+   the Phase-C training format (the P5/P6 verification passed).
+4. **Quality A/B** — RAG-on verdict accuracy ≥ RAG-off on the eBPF
+   golden set, no regression on the no-match-conservative cases.
+5. **No-match safety** — below-floor queries yield empty `RagResult`
+   and never degrade a RAG-off verdict.
+6. **Canary-off parity** — with the flag unset, ADE output is
+   byte-identical to pre-6.7 (release gate, every phase).
+7. **Provenance** — the §5 Art-13 ruling (A or B) is implemented and
+   retrieval provenance is auditable (`kb_index_hash` reachable).
+8. **Licensing clear** — `NOTICES.md`/`LICENSES/` complete; R4
+   shipping-permission verified for every pinned source.
+
+---
+
+*Plan of record once approved. P2 needs Q2 (pins) + Q8/R4 (license OK);
+P3 needs Q1 (tantivy version); P5/P7 need §5/Q7. No P2+ code until those
+are ruled. §13 awaits the owner's actual 8-point list.*
