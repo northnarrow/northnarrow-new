@@ -147,14 +147,24 @@ spawn_agent() { # spawn_agent <tag>
     --admin-socket "$td/admin.sock" \
     --no-ade >"$td/agent.log" 2>&1 &
   local shpid=$!   # PID of the `sudo` wrapper, not the agent
-  # The agent is sudo's child. Primary: child of sudo whose cmdline
-  # matches the binary. Fallback: any direct child of sudo (the agent
-  # is sudo's only child) — NOT `pgrep -f` (sudo's own argv contains
-  # the binary path, so an unscoped match also hits the wrapper).
-  sleep 0.3
-  local apid
-  apid=$(pgrep -P "$shpid" -f "$AGENT_BIN" | head -1)
-  [ -n "$apid" ] || apid=$(pgrep -P "$shpid" | head -1)
+  # pgrep -x matches comm (binary basename post-exec). sudo's comm is
+  # "sudo" — won't match. Only the real agent (after sudo execs it)
+  # has comm="northnarrow-agent". This sidesteps the double-fork sudo
+  # wrapper entirely: modern Ubuntu sudo forks orig -> monitor ->
+  # agent, so `pgrep -P "$shpid"` / cmdline matching latch onto the
+  # sudo monitor (its argv contains $AGENT_BIN) which does NOT
+  # propagate SIGQUIT to the agent — hence the prior 30s stop timeout.
+  local apid agent_comm deadline
+  agent_comm=$(basename "$AGENT_BIN")   # "northnarrow-agent"
+  # 5s deadline + 0.2s poll covers the race where pgrep runs before
+  # sudo has finished exec'ing the agent. `tail -1` picks the newest
+  # match if a stale process lingers (defensive; clean box has one).
+  deadline=$((SECONDS + 5))
+  while [ $SECONDS -lt $deadline ]; do
+    apid=$(pgrep -x "$agent_comm" 2>/dev/null | tail -1)
+    [ -n "$apid" ] && break
+    sleep 0.2
+  done
   # Runtime diagnostic to stderr (NOT stdout — stdout is captured as
   # the PID by `$(spawn_agent …)`). Confirms apid is the agent, not
   # the sudo wrapper, before stop_agent depends on it.
