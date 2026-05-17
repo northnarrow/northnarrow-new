@@ -53,12 +53,15 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 use std::collections::HashSet;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
     maps::{HashMap as AyaHashMap, MapData},
-    programs::Lsm,
+    programs::{
+        links::{FdLink, PinnedLink},
+        Lsm,
+    },
     Btf, Ebpf,
 };
 use tracing::{info, warn};
@@ -232,32 +235,34 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
         }
     };
 
-    match attach_lsm(ebpf, TASK_KILL_PROGRAM, TASK_KILL_HOOK, &btf) {
-        Ok(()) => info!(
-            program = TASK_KILL_PROGRAM,
-            hook = TASK_KILL_HOOK,
-            "anti-tamper: LSM hook attached (denies SIGKILL/SIGTERM to agent)"
-        ),
-        Err(e) => warn!(
+    // Commit #2b: the bpffs root that holds the prog/link pins. Same
+    // root the multiplexer handed to `map_pin_path`; `prepare_pin_root`
+    // is idempotent (dir already created) and silent on the happy
+    // path, so re-deriving it here keeps the change inside
+    // `anti_tamper/` without threading a new param through the
+    // multiplexer. `None` (no bpffs) ⇒ transient attach, no
+    // persistence — `attach_lsm` handles the degrade + log.
+    let pin_root = prepare_pin_root();
+
+    // On success `attach_lsm` logs the disposition (reused / freshly
+    // attached / purged-then-attached) itself — the call sites only
+    // escalate the *failure* case with its operator-facing severity.
+    if let Err(e) = attach_lsm(ebpf, TASK_KILL_PROGRAM, TASK_KILL_HOOK, &btf, pin_root) {
+        warn!(
             program = TASK_KILL_PROGRAM,
             hook = TASK_KILL_HOOK,
             error = %e,
             "anti-tamper: LSM hook attach FAILED — agent killable by root"
-        ),
+        );
     }
 
-    match attach_lsm(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf) {
-        Ok(()) => info!(
-            program = PTRACE_PROGRAM,
-            hook = PTRACE_HOOK,
-            "anti-tamper: LSM hook attached (denies ptrace to agent)"
-        ),
-        Err(e) => warn!(
+    if let Err(e) = attach_lsm(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
+        warn!(
             program = PTRACE_PROGRAM,
             hook = PTRACE_HOOK,
             error = %e,
             "anti-tamper: LSM hook attach FAILED — agent inspectable by root"
-        ),
+        );
     }
 
     // Tappa 7 task 5: directory + inode protection. Failure to
@@ -265,7 +270,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     // even as root) is warn-and-continue: process-level anti-tamper
     // already attached above, so the agent isn't worthless without
     // FS protection.
-    if let Err(e) = filesystem::attach(ebpf, &btf) {
+    if let Err(e) = filesystem::attach(ebpf, &btf, pin_root) {
         warn!(error = %e, "anti-tamper FS: bootstrap failed, continuing without FS protection");
     }
 
@@ -355,7 +360,95 @@ pub fn read_proc_comm(pid: u32) -> Option<String> {
         .map(|s| s.trim_end_matches('\n').to_string())
 }
 
-pub(crate) fn attach_lsm(
+/// bpffs pin paths for one LSM hook. Commit #2b keeps the path key
+/// the **human-readable hook name** (`task_kill`,
+/// `ptrace_access_check`, …) so an operator listing
+/// [`DEFAULT_BPFFS_ROOT`] sees self-describing names. The kernel
+/// truncates aya's program *name* (the Rust fn symbol) to 15 chars,
+/// so e.g. `bpftool prog show name` reports `ptrace_access_c` — that
+/// truncation is a *verification-harness* concern only; nothing here
+/// or in `bpf_get_object` cares about the kernel prog name.
+///
+/// Two **separate** pins per hook, both required:
+/// - `prog_<hook>` keeps the kernel *program* object loaded.
+/// - `link_<hook>` keeps the *attachment* live — this is the one
+///   that makes the hook keep **firing** across the agent
+///   death→respawn gap. A pinned program with no pinned link is a
+///   loaded-but-inert program; the link pin is the survivability
+///   primitive (see `aya` `programs/links.rs` `FdLink::pin` /
+///   `PinnedLink::from_pin`).
+fn lsm_pin_paths(root: &Path, hook_name: &str) -> (PathBuf, PathBuf) {
+    (
+        root.join(format!("prog_{hook_name}")),
+        root.join(format!("link_{hook_name}")),
+    )
+}
+
+/// Best-effort unlink of a stale/crashed-state pin. A leftover pin
+/// file whose backing kernel object is gone (or is corrupt on disk)
+/// must never wedge agent startup: we remove it and fall through to
+/// a fresh attach. `NotFound` is success (already gone).
+fn purge_stale_pin(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            error = %e, path = %path.display(),
+            "anti-tamper: could not unlink stale pin (continuing to fresh attach)"
+        ),
+    }
+}
+
+/// Load → attach → pin-program → take-link → pin-link for one hook.
+/// On success the kernel holds: the program (pinned at `prog_path`)
+/// and its LSM attachment (pinned at `link_path`). The `PinnedLink`
+/// is intentionally dropped at end of scope — that closes only the
+/// agent's dup fd; the bpffs pin file retains the kernel reference,
+/// so the hook keeps firing after this process exits. That is the
+/// entire point of commit #2b.
+fn fresh_attach_and_pin(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    hook_name: &str,
+    btf: &Btf,
+    prog_path: &Path,
+    link_path: &Path,
+) -> Result<()> {
+    let prog: &mut Lsm = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program_name} is not an LSM program"))?;
+    prog.load(hook_name, btf)
+        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
+    let link_id = prog
+        .attach()
+        .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
+    prog.pin(prog_path).with_context(|| {
+        format!(
+            "pinning LSM program `{program_name}` to {}",
+            prog_path.display()
+        )
+    })?;
+    // `take_link` removes the link from the program's `LinkMap` so it
+    // is NOT detached when `Ebpf` drops at agent exit; we then own it
+    // and hand ownership to the bpffs pin.
+    let link = prog
+        .take_link(link_id)
+        .with_context(|| format!("taking ownership of `{hook_name}` LSM link for pinning"))?;
+    let fd_link: FdLink = link.into();
+    let _pinned: PinnedLink = fd_link
+        .pin(link_path)
+        .with_context(|| format!("pinning LSM link `{hook_name}` to {}", link_path.display()))?;
+    Ok(())
+}
+
+/// Transient attach (pre-#2b behaviour) used only when bpffs is
+/// unavailable: the hook works for *this* boot but is detached on
+/// agent exit. Mirrors the "degrade, keep telemetry" stance the rest
+/// of anti-tamper takes — no bpffs ⇒ no cross-restart persistence,
+/// but the agent still defends itself while it is alive.
+fn attach_transient(
     ebpf: &mut Ebpf,
     program_name: &str,
     hook_name: &str,
@@ -370,6 +463,94 @@ pub(crate) fn attach_lsm(
         .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
     prog.attach()
         .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
+    Ok(())
+}
+
+/// Attach an LSM hook with cross-restart persistence (#2b), or reuse
+/// the prior boot's still-firing kernel hook if its link pin is
+/// present and valid.
+///
+/// Per hook, given a usable bpffs `pin_root`:
+/// - `link_<hook>` exists and re-opens (`PinnedLink::from_pin`) ⇒
+///   the prior boot's hook never stopped firing (the pin held it
+///   across the death→respawn gap). Validate and return; the program
+///   for this boot is left unloaded. Log: *reused pinned LSM link*.
+/// - `link_<hook>` exists but `from_pin` fails (object gone / pin
+///   corrupt) ⇒ purge both stale pins, then fresh attach+pin. Log:
+///   *purged stale pin and freshly attached*.
+/// - no `link_<hook>` ⇒ fresh attach+pin. Log: *freshly attached +
+///   pinned*.
+///
+/// `pin_root == None` (no bpffs) ⇒ [`attach_transient`]: works this
+/// boot, no persistence. The three success log messages are stable
+/// strings the #2b verification harness greps.
+pub(crate) fn attach_lsm(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    hook_name: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<()> {
+    let Some(root) = pin_root else {
+        attach_transient(ebpf, program_name, hook_name, btf)?;
+        warn!(
+            hook = hook_name,
+            "anti-tamper: LSM hook attached WITHOUT pin (no bpffs) — will \
+             NOT survive agent restart"
+        );
+        return Ok(());
+    };
+
+    let (prog_path, link_path) = lsm_pin_paths(root, hook_name);
+
+    if link_path.exists() {
+        match PinnedLink::from_pin(&link_path) {
+            Ok(pinned) => {
+                // Dropping `pinned` closes only our dup fd; the bpffs
+                // pin file keeps the kernel link (hook) alive. Do NOT
+                // touch the program — the prior boot's is still live
+                // and bound to the (2a-pinned) PROTECTED_PIDS map.
+                drop(pinned);
+                info!(
+                    hook = hook_name,
+                    link_pin = %link_path.display(),
+                    "anti-tamper: reused pinned LSM link"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    hook = hook_name, error = %e,
+                    link_pin = %link_path.display(),
+                    "anti-tamper: pinned LSM link stale/corrupt — purging \
+                     and re-attaching"
+                );
+                purge_stale_pin(&link_path);
+                purge_stale_pin(&prog_path);
+                fresh_attach_and_pin(
+                    ebpf,
+                    program_name,
+                    hook_name,
+                    btf,
+                    &prog_path,
+                    &link_path,
+                )?;
+                info!(
+                    hook = hook_name,
+                    "anti-tamper: purged stale pin and freshly attached"
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    fresh_attach_and_pin(ebpf, program_name, hook_name, btf, &prog_path, &link_path)?;
+    info!(
+        hook = hook_name,
+        prog_pin = %prog_path.display(),
+        link_pin = %link_path.display(),
+        "anti-tamper: LSM hook freshly attached + pinned"
+    );
     Ok(())
 }
 

@@ -80,7 +80,7 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("file_ioctl", "file_ioctl"),
 ];
 
-pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
+pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Result<()> {
     let dir = Path::new(STATE_DIR);
 
     // Step 1: ensure dir exists, mode 0700, root-owned.
@@ -119,14 +119,15 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
         ),
     }
 
-    // Step 4: attach the five LSM programs.
+    // Step 4: attach (or reuse the prior boot's still-firing) five
+    // LSM hooks. `attach_lsm` logs the per-hook disposition; we only
+    // escalate failures here.
     for (program, hook) in LSM_PROGRAMS {
-        match super::attach_lsm(ebpf, program, hook, btf) {
-            Ok(()) => info!(program, hook, "anti-tamper FS: LSM hook attached"),
-            Err(e) => warn!(
+        if let Err(e) = super::attach_lsm(ebpf, program, hook, btf, pin_root) {
+            warn!(
                 program, hook, error = %e,
                 "anti-tamper FS: LSM hook attach FAILED"
-            ),
+            );
         }
     }
 
