@@ -24,16 +24,25 @@
 //!   subset-occluded `tail`), the R-P3.1 cost preflight, the R-P3.2 cost
 //!   ledger, and the two-tier fail-closed [`saliency::XaiUnavailable`]
 //!   budget with its synthesis-refuses guardrail contract test.
-//! - **P4+** — the `XaiEngine::explain` public entrypoint + evidence
-//!   assembly/signing + `environment_hash` compute + the candle bench.
-//!   Not in this commit (owner audits the P3 driver + budget enforcement
-//!   before P4).
+//! - **P4 (this commit)** — `engine`: the `XaiEngine::explain` public
+//!   entrypoint + Article-13 chain assembly/signing, the
+//!   `AdeEngine`→`DecisionProbe` adapter, `deterministic_ade_config`
+//!   (R1 contract), the cached deployment `environment_hash`, and the
+//!   opt-in `#[ignore]` candle latency bench (R-P3.2 instrument). One
+//!   read-only ADE-surface addition: `AdeEngine::assembled_prompt`.
+//! - **P5** — docs/audit closeout (stale `inference.rs` doc-fix,
+//!   `ADE_DOCTRINE` cross-ref, final Art. 13 pass). Not in this commit.
 
+pub mod engine;
 pub mod evidence;
 pub mod occlusion;
 pub mod saliency;
 pub mod source;
 
+pub use engine::{
+    compute_environment_hash, deterministic_ade_config, deterministic_inference_settings, AdeProbe,
+    EnvironmentInputs, XaiEngine, XAI_DETERMINISTIC_SEED,
+};
 pub use evidence::{verify_evidence, Ed25519EvidenceSigner, XaiVerifyError};
 pub use saliency::{
     explain_saliency, explain_saliency_with_clock, Clock, MonotonicClock, SaliencyConfig,

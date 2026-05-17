@@ -356,6 +356,38 @@ impl AdeEngine {
         }
     }
 
+    /// Read-only forensic seam (Tappa 6.9 XAI / EU AI Act Art. 13): the
+    /// exact assembled model prompt `evaluate` would send the backend
+    /// for `(event, context)` — WITHOUT running inference and WITHOUT
+    /// any state change. It shares evaluate's
+    /// sanitize→structured-prompt→chat-template path verbatim, so the
+    /// `XaiInputSnapshot.prompt_sha256` binds the literal prompt. ADE
+    /// behaviour is byte-identical whether or not this is ever called
+    /// (it is invoked only by `XaiEngine`). Returns `None` when the
+    /// sanitiser would short-circuit `evaluate` to an injection
+    /// Escalate — in that path no prompt is ever produced.
+    pub fn assembled_prompt(&self, event: &Event, context: &EventContext) -> Option<String> {
+        let sanitized = sanitize::sanitize_event_for_ade(event);
+        if sanitized.injection_score >= HIGH_INJECTION_SCORE_REJECT {
+            return None;
+        }
+        let rag_result: Option<RagResult> = self.inner.rag.as_ref().map(|rag| {
+            let query_text = build_rag_query_from_event(event);
+            rag.retrieve(RagQuery::new(&query_text))
+        });
+        let parts = structured_prompt::build_structured_prompt_with_rag(
+            &self.inner.system_prompt,
+            &self.inner.config,
+            &sanitized,
+            context,
+            rag_result.as_ref(),
+        );
+        Some(match self.inner.backend.chat_template() {
+            inference::ChatTemplate::Llama3 => parts.into_llama3_chat(),
+            inference::ChatTemplate::Plain => parts.into_plain_text(),
+        })
+    }
+
     fn escalate_meta(&self, latency_ms: u64) -> EscalateMeta<'_> {
         EscalateMeta {
             model_id: self.inner.backend.model_id(),
