@@ -51,6 +51,9 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 }
 
 use std::collections::HashSet;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
@@ -59,6 +62,117 @@ use aya::{
     Btf, Ebpf,
 };
 use tracing::{info, warn};
+
+/// Single bpffs directory holding every pinned anti-tamper object.
+/// Commit #2 pins the six anti-tamper maps here; commit #2b adds the
+/// seven LSM programs + links. One self-contained namespace lets the
+/// watchdog and `nn-admin` enumerate the pinned set by listing it,
+/// and keeps `EbpfLoader::map_pin_path` (maps) and the future
+/// `FdLink::pin` (links) sharing one root.
+pub const DEFAULT_BPFFS_ROOT: &str = "/sys/fs/bpf/northnarrow";
+
+/// `statfs(2)` magic for a BPF filesystem mount (`uapi/linux/magic.h`
+/// `BPF_FS_MAGIC`). Used to fail *soft* with an actionable message
+/// when `/sys/fs/bpf` isn't a bpffs mount, rather than letting aya
+/// surface an opaque `BPF_OBJ_PIN` errno from deep inside `load()`.
+const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+
+/// Mode for [`DEFAULT_BPFFS_ROOT`]. `0700`: only root may list or
+/// unlink the pins. This matters beyond hygiene — in commit #2b an
+/// unprivileged `unlink` of a pinned *link* would detach a live LSM
+/// hook, and even in commit #2 unlinking a pinned *map* re-opens the
+/// split-brain on the next agent restart.
+const PIN_ROOT_MODE: u32 = 0o700;
+
+// TODO(Tappa 8): the three override arrays — KILL_OVERRIDE,
+// PTRACE_OVERRIDE, FS_PROTECT_OVERRIDE — are now `pinned` by-name
+// (commit #2), so slot 0 now SURVIVES an agent restart. They are
+// shipped empty and never written in Tappa 7, so this is inert
+// today. When Tappa 8 wires the Ed25519 verifier that writes a
+// capability token into slot 0, it MUST zero that slot on agent
+// boot (`MapData::insert(0, &0, 0)`) before trusting it, or a
+// pre-restart grant would silently outlive its window. No zeroing
+// is added here in commit #2: it would be dead code with no
+// Tappa-7 caller and is out of this commit's scope.
+
+/// Prepare the bpffs pin directory and return the path to hand to
+/// [`aya::EbpfLoader::map_pin_path`]. Returns `None` when bpffs is
+/// unavailable: the caller then loads the eBPF object WITHOUT
+/// pinning so the sensor half of the agent still runs (anti-tamper
+/// cross-restart persistence is forfeited until the host gains a
+/// bpffs mount). This mirrors the warn-and-continue stance the rest
+/// of anti-tamper takes — losing persistence must not cost the
+/// operator their telemetry.
+pub fn prepare_pin_root() -> Option<&'static Path> {
+    let root = Path::new(DEFAULT_BPFFS_ROOT);
+    let mount = root.parent().unwrap_or_else(|| Path::new("/sys/fs/bpf"));
+
+    if !is_bpffs(mount) {
+        warn!(
+            path = %mount.display(),
+            "anti-tamper: {} is not a bpffs mount — anti-tamper maps will NOT \
+             persist across restart (split-brain risk on respawn). Mount it: \
+             `mount -t bpf bpf /sys/fs/bpf`. Continuing with sensors only.",
+            mount.display()
+        );
+        return None;
+    }
+
+    match std::fs::DirBuilder::new()
+        .mode(PIN_ROOT_MODE)
+        .recursive(true)
+        .create(root)
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            warn!(
+                error = %e, path = %root.display(),
+                "anti-tamper: could not create bpffs pin dir — continuing \
+                 unpinned (sensors only, no anti-tamper persistence)"
+            );
+            return None;
+        }
+    }
+
+    // Re-assert mode unconditionally: a pre-existing dir from an
+    // older build (or a loosened one) must not keep wider perms.
+    // No chown — bpffs inodes are kernel-owned root:root and we
+    // already required root to get this far.
+    if let Ok(meta) = std::fs::metadata(root) {
+        if (meta.permissions().mode() & 0o7777) != PIN_ROOT_MODE {
+            if let Err(e) =
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(PIN_ROOT_MODE))
+            {
+                warn!(
+                    error = %e, path = %root.display(),
+                    "anti-tamper: could not chmod 0700 the bpffs pin dir \
+                     (pins still created; dir perms wider than intended)"
+                );
+            }
+        }
+    }
+
+    Some(root)
+}
+
+/// `true` iff `p` resides on a bpffs mount. A `statfs` failure or a
+/// non-bpffs magic both return `false` — the caller treats either as
+/// "pinning unavailable" and degrades gracefully.
+fn is_bpffs(p: &Path) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated path; `s` is a
+    // fully-owned `statfs` out-param the kernel initialises on
+    // success. We only read `f_type` and only when the call
+    // returned 0.
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut s) } != 0 {
+        return false;
+    }
+    s.f_type as i64 == BPF_FS_MAGIC
+}
 
 /// Names mirroring `#[map]` / `#[lsm(hook = "…")]` declarations in
 /// `agent-ebpf/src/{task_kill,ptrace_check}.rs`. Kept here as

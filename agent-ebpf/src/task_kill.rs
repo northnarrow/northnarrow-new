@@ -54,16 +54,29 @@ const EPERM: c_int = 1;
 ///
 /// `0` is NOT a valid PID, so an empty map fails open (no protection)
 /// rather than denying every kill on the host.
+///
+/// `HashMap::pinned` (Tappa 7 task 6 commit #2) emits
+/// `LIBBPF_PIN_BY_NAME`. Aya only consults `EbpfLoader::map_pin_path`
+/// for maps carrying that flag (`aya-0.13.1` `bpf.rs:494`); a plain
+/// `with_max_entries` declaration is created fresh on every load,
+/// which split-brained the pinned LSM hook off a stale map. Pinned,
+/// a restarted agent reuses the SAME kernel map object via
+/// `bpf_get_object`, keeping the hook's map binding intact.
 #[map]
-pub static PROTECTED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
+pub static PROTECTED_PIDS: HashMap<u32, u8> = HashMap::pinned(16, 0);
 
 /// Tappa 8 stub: Ed25519-signed override capability. Slot 0 holds a
 /// monotonic token; a non-zero value means "current admin-signed
 /// kill request is in flight and may bypass the deny". In the
 /// Tappa 7 ELF the map is shipped empty and never written by the
 /// agent — that is the entire point of "anti-tamper Linux".
+///
+/// Pinned by-name alongside `PROTECTED_PIDS` so the pinned hook and
+/// userland share one kernel object. Tappa-8 caveat: a pinned
+/// override slot now PERSISTS across agent restart; Tappa 8 must
+/// zero slot 0 on boot before trusting it (see commit message).
 #[map]
-pub static KILL_OVERRIDE: Array<u32> = Array::with_max_entries(1, 0);
+pub static KILL_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 
 #[lsm(hook = "task_kill")]
 pub fn task_kill(ctx: LsmContext) -> i32 {

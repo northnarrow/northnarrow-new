@@ -89,21 +89,30 @@ const FS_IOC_FSGETXATTR: c_uint = 0x801c_581f;
 /// 1024 entries; the Tappa 7 build only registers
 /// `/var/lib/northnarrow/` (one entry). Value is unused (presence is
 /// the signal); kept as `u8` to keep the map node tiny.
+///
+/// By-name pinned (Tappa 7 task 6 #2): the pinned `inode_*` hooks
+/// must read the same kernel map a restarted agent re-registers
+/// into. See `task_kill::PROTECTED_PIDS` for the full rationale.
 #[map]
-pub static PROTECTED_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(1024, 0);
+pub static PROTECTED_INODES: HashMap<InodeKey, u8> = HashMap::pinned(1024, 0);
 
 /// Tappa 8 stub: Ed25519-signed override capability for FS
 /// modification. Non-zero slot 0 = active admin grant, hooks
-/// pass-through. Empty in Tappa 7.
+/// pass-through. Empty in Tappa 7. Pinned by-name; Tappa-8 caveat:
+/// slot 0 persists across restart and must be zeroed on boot.
 #[map]
-pub static FS_PROTECT_OVERRIDE: Array<u32> = Array::with_max_entries(1, 0);
+pub static FS_PROTECT_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 
 /// Audit ringbuffer for denials. 64 KiB ≈ ~1100
 /// [`FsProtectDenialRaw`] (56 B each). Denials are by definition
 /// rare; if userland is asleep when a burst hits, losing the record
 /// is acceptable — the kernel-side deny still fires.
+///
+/// Pinned by-name: the pinned `inode_*` hooks write here, so a
+/// restarted agent must drain the SAME kernel ringbuf rather than a
+/// fresh one (same split-brain class as `PROTECTED_INODES`).
 #[map]
-pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::pinned(64 * 1024, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers — common pointer-chase logic for every hook.

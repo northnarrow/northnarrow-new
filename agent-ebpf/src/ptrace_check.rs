@@ -55,8 +55,11 @@ const EPERM: c_int = 1;
 /// "kill the agent" and signing off "let me read agent memory" are
 /// independent capabilities and Tappa 8 should be able to grant
 /// one without the other.
+///
+/// Pinned by-name alongside `PROTECTED_PIDS`. Tappa-8 caveat: slot 0
+/// persists across agent restart and must be zeroed on boot.
 #[map]
-pub static PTRACE_OVERRIDE: Array<u32> = Array::with_max_entries(1, 0);
+pub static PTRACE_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 
 #[lsm(hook = "ptrace_access_check")]
 pub fn ptrace_access_check(ctx: LsmContext) -> i32 {

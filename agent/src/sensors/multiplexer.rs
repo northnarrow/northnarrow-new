@@ -50,8 +50,25 @@ impl SensorMultiplexer {
             );
         }
 
-        let mut ebpf = EbpfLoader::new()
-            .btf(None)
+        // Tappa 7 task 6 commit #2: pin the six anti-tamper maps
+        // by-name to bpffs so a restarted agent reuses the SAME
+        // kernel map objects the pinned LSM hooks reference (closes
+        // the split-brain regression). `prepare_pin_root` returns
+        // `None` on a host without bpffs; we then load unpinned so
+        // sensors still run. Only maps declared `#[map]` with a
+        // `::pinned(..)` constructor are affected — the five sensor
+        // ringbufs stay process-local by design.
+        let pin_root = crate::anti_tamper::prepare_pin_root();
+        let mut loader = EbpfLoader::new();
+        loader.btf(None);
+        if let Some(root) = pin_root {
+            loader.map_pin_path(root);
+            debug!(
+                path = %root.display(),
+                "anti-tamper: anti-tamper maps will be by-name pinned to bpffs"
+            );
+        }
+        let mut ebpf = loader
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
 
