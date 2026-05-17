@@ -83,9 +83,36 @@ pub struct XaiEvidenceChain {
     pub model: XaiModelRef,
     pub method: XaiMethod,
     pub input_snapshot: XaiInputSnapshot,
+    /// Deployment identity hash. Computed at AdeEngine init and cached;
+    /// embedded into every chain produced under this binary+model+rules+host.
+    ///
+    /// ```text
+    /// environment_hash = lower_hex(sha256(
+    ///     agent_binary_sha256_bytes ||
+    ///     model_file_sha256_bytes ||
+    ///     combat_rules_sha256_bytes ||
+    ///     hostname_canonical_utf8 ||      // `hostname --fqdn` w/ hostname fallback
+    ///     agent_build_commit_sha_utf8     // BUILD_SHA env at compile time
+    /// ))
+    /// ```
+    ///
+    /// 64 lower-case hex chars. Forward-compat: Tappa 14.x TEE attestation
+    /// may evolve the inputs while preserving this field name; schema
+    /// versioning handles the transition.
     pub environment_hash: String,
     pub baseline_verdict: XaiBaselineVerdict,
     pub saliency_map: Vec<SaliencyEntry>,
+    /// Honesty field: fraction of perturbable units explained at unit
+    /// granularity. Computed as:
+    ///
+    /// ```text
+    /// saliency_coverage = units_with_refinement_eq_fine / units_total
+    /// ```
+    ///
+    /// Range [0.0, 1.0]. A value < 1.0 means some regions were reported at
+    /// block granularity (refinement: coarse) due to coarse-to-fine pruning
+    /// or bounded-K capping with tail aggregation. The auditor MUST never
+    /// assume finer attribution than this fraction admits.
     pub saliency_coverage: f64,
     pub status: XaiStatus,
     /// Ed25519 over `canonical_bytes()`. Structurally separate so it can
@@ -564,6 +591,32 @@ mod tests {
         let mut e = sample();
         e.status = XaiStatus::Degraded("budget exceeded".to_string());
         assert_ne!(base, e.canonical_bytes());
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| alloc::format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn canonical_bytes_byte_locked_for_sample() {
+        // Audit anchor: any accidental change to canonical_bytes (field
+        // addition, encoding tweak, enum-tag change) flips this hash and
+        // fails CI, forcing a DELIBERATE CANON_DOMAIN version bump plus a
+        // rationale entry in the commit body. Complementary to
+        // `canonical_bytes_are_tamper_sensitive` (which catches changes in
+        // field *values*, not in the encoding *algorithm*). The sample()
+        // fixture is fully deterministic and all f64 literals have
+        // platform-independent IEEE-754 bit patterns, so this constant is
+        // stable across hosts/toolchains.
+        use sha2::{Digest, Sha256};
+        let bytes = sample().canonical_bytes();
+        let hash = lower_hex(Sha256::digest(&bytes).as_slice());
+        assert_eq!(
+            hash,
+            "3514e399ef2ca32bd0bf078dd565b14d8e966330c3738e93b993dfc1835a88e6",
+            "canonical encoding drifted — if intentional, bump CANON_DOMAIN \
+             and update this lock with a rationale in the commit body"
+        );
     }
 
     #[test]

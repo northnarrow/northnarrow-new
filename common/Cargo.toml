@@ -34,3 +34,8 @@ serde-big-array = { version = "0.5", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+# Test-only: the canonical_bytes byte-lock regression anchor
+# (xai_types). NOT a runtime dep — the dependency-light charter governs
+# the shipped eBPF/CLI/C2 surface, not `cargo test`. Pinned to the same
+# 0.10 the agent already uses for environment_hash at runtime.
+sha2 = "0.10"
