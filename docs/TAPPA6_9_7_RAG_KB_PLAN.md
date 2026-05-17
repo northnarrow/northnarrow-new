@@ -1,15 +1,16 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.3 — 🛑 P2 BLOCKED by Q8/R4 verification.** Q8/R4 ran
-against the exact pinned refs (the owner's hard gate) and found:
-MITRE ATT&CK v18.1 ✅, Sigma DRL-1.1 ✅ (DRL is in a *separate* repo —
-correction), **LOLBAS = GPL-3.0 🛑 incompatible with proprietary
-ship-with-agent** (P1's "LOLBAS = MIT" was WRONG — caught by
-verification). Per the owner's pre-authorised path this **FLAGS before
-the P2 commit**; LOLBAS needs a Q2/Q5 re-ruling (recommend: DROP LOLBAS
-from V1 — see §4.2). **P2 may proceed with MITRE + Sigma ONLY once that
-is ruled; no P2 code/commit until then.** Verified pins recorded in
-§4.2. (Prior P1.2 status follows.)
+Status: **P1.4 — all 4 owner verbatim artifacts folded; P2 BLOCKED on
+ONE decision (LOLBAS).** §5.1 (ARTIFACT 1), §12.1 (ARTIFACT 2), §4.2.2
+(ARTIFACT 3), §13 (ARTIFACT 4) inserted verbatim — no CC placeholders
+remain. **🛑 P2 still blocked solely on the LOLBAS Q2/Q5 re-ruling**
+(Q8/R4 verification proved LOLBAS = GPL-3.0, incompatible with
+proprietary ship-with-agent — P1's "MIT" was a verified error; CC rec:
+DROP LOLBAS from V1, §4.2). Non-blocking flag: §4.2.2's verbatim example
+names the MITRE repo `mitre-attack/attack-stix-data@v18.1`, not the
+legacy `mitre/cti@ATT&CK-v18.1` CC verified — MITRE license re-verified
+against the owner-named repo at P2. MITRE/Sigma otherwise clear. (Prior
+P1.2 status follows.)
 
 Prior — P1.2: all four rulings folded; P2 was greenlit pre-verification. RULED: §5/Q7 =
 **Option A** (§5.1); Q1 = `tantivy =0.25.0` (+bump-if-verified clause,
@@ -239,10 +240,12 @@ binary format. Rules:
   `{"category","content","id","platform","severity","source_ref","title"}`
   (string fields; absent optionals serialised as `""`, never omitted —
   keeps the line schema fixed for the hash).
-- **Per-source provenance sidecar** `<<source>>.provenance.json`:
-  `{"acquired_utc","canonical_dump_sha256","pin","source_id","upstream_url"}`
-  (sorted keys). `canonical_dump_sha256` = `sha256` of the JSONL bytes;
-  it feeds §3.1.1.
+- **Per-source provenance sidecar:** schema is **§4.2.2 (owner
+  verbatim, ARTIFACT 3)** — authoritative; it supersedes the ad-hoc
+  field list earlier drafts used. `canonical_dump_sha256` = `sha256`
+  of the JSONL bytes; it feeds §3.1.1. The §3.1.1 `kb_index_hash`
+  preimage field labels are aligned to the §4.2.2 names
+  (`source` sort key; `url`, `pin`, `canonical_dump_sha256`).
 
 ### 4.2 Attribution & licensing — Q8/R4 VERIFICATION RESULT (P1.3, 2026-05-17)
 
@@ -289,22 +292,100 @@ LOLBAS acquisition/commit.
   summarised in `NOTICES.md`. R4 license-permits-shipping verification
   is a P2 acceptance gate (§11).
 
+### 4.2.2 Provenance sidecar schema — owner verbatim (ARTIFACT 3, §12.2)
+
+Mandatory P2 deliverable; one per included corpus source, stored at
+`docs/kb-sources/<source>/`.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "<<<VERBATIM — Owner ruling §12.2, 2026-05-17>>> Per-corpus-source provenance sidecar, mandatory P2 deliverable per Tappa 6.9.7 plan §4.2. Stored next to each canonical JSONL dump in docs/kb-sources/<source>/.",
+  "type": "object",
+  "required": ["source", "url", "pin", "commit_sha", "acquired_at_utc", "canonical_dump_sha256", "license", "license_file"],
+  "properties": {
+    "source": {
+      "type": "string",
+      "description": "Canonical source identifier, e.g. 'mitre-attack-stix-data', 'sigma-hq-rules'.",
+      "examples": ["mitre-attack-stix-data", "sigma-hq-rules"]
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Upstream canonical repository URL."
+    },
+    "pin": {
+      "type": "string",
+      "description": "The pin form: release tag (e.g. 'v18.1') or branch name (e.g. 'master')."
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full git commit SHA-1 of the pinned ref at acquisition time. Captured by xtask via `git rev-parse HEAD`."
+    },
+    "acquired_at_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 UTC timestamp of acquisition."
+    },
+    "canonical_dump_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the canonical JSONL dump (sorted lines by id, sorted keys, LF). The input to the KB index hash."
+    },
+    "license": {
+      "type": "string",
+      "description": "License name + SPDX identifier if applicable, e.g. 'MITRE ATT&CK Terms of Use', 'DRL-1.1', 'MIT'."
+    },
+    "license_file": {
+      "type": "string",
+      "description": "Relative path within the repo to the verbatim LICENSE file copy, e.g. 'LICENSES/MITRE_ATTACK_ToU.md'."
+    }
+  }
+}
+```
+
+Example instance (owner verbatim):
+
+```json
+{
+  "$comment": "<<<VERBATIM — example instance, 2026-05-17>>>",
+  "source": "mitre-attack-stix-data",
+  "url": "https://github.com/mitre-attack/attack-stix-data",
+  "pin": "v18.1",
+  "commit_sha": "605ed54...",
+  "acquired_at_utc": "2026-05-XX T XX:XX:XX Z",
+  "canonical_dump_sha256": "<filled by xtask>",
+  "license": "MITRE ATT&CK Terms of Use",
+  "license_file": "LICENSES/MITRE_ATTACK_ToU.md"
+}
+```
+
+> ⚠️ **CC reconciliation flag (NOT overriding the verbatim):** the
+> verbatim example names the MITRE source repo as
+> **`github.com/mitre-attack/attack-stix-data`** with `pin: "v18.1"`.
+> CC's P1.3 Q8/R4 verification was run against the *legacy*
+> **`github.com/mitre/cti`** (tag `ATT&CK-v18.1`, commit `605ed54…`).
+> These are two different MITRE repos; `attack-stix-data` is the
+> current STIX-2.1 home and matches the owner's intent. **At P2 the
+> pipeline targets `mitre-attack/attack-stix-data@v18.1` and the
+> MITRE license must be RE-VERIFIED against THAT repo** (the legacy
+> `mitre/cti` ToU result does not automatically transfer). The §4
+> source table will be reconciled to the owner-specified repo at P2.
+> `commit_sha "605ed54..."` in the example is the `mitre/cti`
+> v18.1 SHA; the `attack-stix-data` v18.1 SHA is captured at P2.
+
 ---
 
 ## 5. Article-13 compatibility — RULED: **Option A** (owner, P1.2)
 
 > **RULED = Option A** — rely on `prompt_sha256`; XAI stays frozen at
-> 1.0.0; retrieval provenance lives in a *separate, hash-chained,
-> unsigned* RAG retrieval log. Unblocks P5/P7.
->
-> ⚠️ **Verbatim-text gap (flagged):** the owner directed "add the
-> 5-point ruling rationale verbatim" but the verbatim text was **not
-> transmitted** with the ruling — only the five pillar *labels*
-> (cryptographic completeness · standing trigger · separate
-> hash-chained log design · methodological tradeoff · V2.0+ future
-> path). §5.1 below is **CC's faithful rendering of each named
-> pillar**, to be replaced if the owner has specific wording. The
-> *decision* (Option A) is unambiguous and is treated as final.
+> 1.0.0. ✅ **P1.4: the owner's verbatim §5.1 rationale is now folded
+> (ARTIFACT 1)** — the prior CC rendering is replaced. Per the verbatim
+> ruling the hash-chained RAG log is **OUT of 6.9.7 scope** (a Tappa 13
+> Backend-SaaS follow-on); 6.9.7 makes **zero changes to
+> `common/src/xai_types.rs` or `agent/src/xai/`**. §11 P5/P7 updated to
+> match.
 
 **Question (verbatim from the assignment):** add a
 `retrieved_snippets_sha256` field to the XAI chain, *or* rely on the
@@ -336,43 +417,69 @@ existing `prompt_sha256`?
   re-derives the P1.1 byte-lock, needs migration notes — a deliberate
   breaking change to a *closed, shipped* regulatory artifact.
 
-### 5.1 Ruling rationale — Option A (5 pillars; CC rendering, verbatim pending)
+<<<VERBATIM — Owner: Fortunato Milani via Claude Opus 4.7, 2026-05-17>>>
 
-1. **Cryptographic completeness.** 6.9 P4's `assembled_prompt` already
-   splices the RAG block, so `XaiInputSnapshot.prompt_sha256` *already*
-   binds every retrieved snippet under the existing Ed25519 signature.
-   Integrity and tamper-evidence of the retrievals are therefore
-   *already complete* — Option B would add no integrity, only
-   separability, at schema-mutation cost.
-2. **Standing trigger.** The 6.9-closure standing audit trigger #1
-   mandates that any `XAI_SCHEMA_VERSION` change be a deliberate
-   breaking commit. Option A *honours it by not tripping it*: the
-   closed, shipped XAI 1.0.0 regulatory artifact stays byte-frozen
-   (no `canonical_bytes` touch, no P1.1 byte-lock re-derivation).
-3. **Separate hash-chained log design.** Retrieval provenance lives in
-   a dedicated **append-only, hash-chained** RAG retrieval log: each
-   entry = `{ts, ade_trace_id, kb_index_hash, retrieved:[{id,score}],
-   prev_entry_sha256}` with `entry_sha256` chaining the previous entry
-   (tamper-evident without signing, sovereign-local). It references the
-   XAI chain by `ade_trace_id`, giving separable, independently
-   auditable retrieval provenance *outside* the signed schema.
-4. **Methodological tradeoff (accepted).** Option A trades the
-   "single signed artifact contains everything" story for schema
-   stability + provenance completeness. Accepted: the hash-chain gives
-   tamper-evidence; the FK cross-links the two artifacts; the
-   regulatory dossier (§7/P7) documents the two-artifact model
-   explicitly so an auditor follows `ade_trace_id` between them.
-5. **V2.0+ future path.** Option B is not rejected forever — it is
-   deferred to the *next deliberate XAI schema major* (a V2.0+ that
-   already pays the standing-trigger cost for other reasons), at which
-   point `retrieved_snippets_sha256` + `kb_index_hash` fold into
-   `XaiInputSnapshot` natively. The hash-chained log is forward
-   -compatible with that migration (same fields).
+### §5.1 — Ruling rationale (Option A: XAI 1.0.0 frozen)
 
-**Consequence for phases:** P5 wires the hash-chained log alongside the
-existing `with_rag` path; P7's Art-13 closeout documents the
-two-artifact model. XAI 1.0.0 is **not** touched (Option B's schema
-mutation is explicitly NOT done).
+RULED: rely on `XaiInputSnapshot.prompt_sha256` for retrieval
+provenance. XAI_SCHEMA_VERSION remains 1.0.0. No bump.
+
+Five pillars of the rationale:
+
+1. **Cryptographic completeness already exists.** `prompt_sha256`
+   (introduced in 6.9 P4) binds the entire assembled prompt
+   including the `=== RELEVANT CYBERSEC KNOWLEDGE ===` block produced
+   by 6.7's `format_rag_block`. Every RAG snippet that influences the
+   verdict is already cryptographically committed via the prompt
+   hash. Adding `retrieved_snippets_sha256` would be redundant to
+   this binding.
+
+2. **Standing audit trigger #1 (6.9 closure) preserved.** The trigger
+   established at Tappa 6.9 closure (HEAD 1726ace) requires that any
+   `XAI_SCHEMA_VERSION` change be a deliberate breaking commit with
+   migration notes. Bumping the schema in the very next tappa for
+   provenance already covered by `prompt_sha256` is exactly the
+   churn the trigger exists to prevent.
+
+3. **Retrieval provenance lives in a separate hash-chained RAG log.**
+   Design (NOT scope of 6.9.7 — flagged as Tappa 13 Backend SaaS
+   follow-on): each log entry contains `ade_trace_id` (cross-key to
+   signed XAI chain), `kb_index_hash`, retrieved doc ids + BM25
+   scores, and `prev_entry_sha256` (Merkle chain integrity).
+   Reproducibility cross-check: an auditor recomputes
+   `assembled_prompt` from `XaiInputSnapshot` against the agent at
+   recorded `environment_hash`, hashes it, verifies equals
+   `prompt_sha256` — any tampering with the unsigned log produces a
+   hash mismatch.
+
+4. **Methodological tradeoff (acknowledged).** The XAI `saliency_map`
+   does NOT enumerate retrieved snippets as perturbable units. If a
+   snippet is the decisive cause, attribution flows transitively:
+   occluding an input that drove the RAG query also removes that
+   snippet from the prompt. This captures functional causality but
+   not snippet-level granularity. Acceptable for beta because (a)
+   `prompt_sha256` + `assembled_prompt` reproducibility permits
+   snippet-level deepdive off-chain; (b) Phase C training increases
+   the model's principled use of retrievals but doesn't require
+   schema-level attribution; (c) snippet-level perturbation would be
+   a new `Region::Knowledge` in the occlusion taxonomy — V2.0+
+   architectural extension, not beta scope.
+
+5. **Future path (V2.0+, NOT 6.9.7 scope).** If post-beta empirical
+   audit data demonstrates transitive attribution is insufficient,
+   the defined breaking-change path is: new `Region::Knowledge` enum
+   variant + `UnitAddr::RetrievedSnippet(snippet_id)` in occlusion
+   taxonomy + deliberate `XAI_SCHEMA_VERSION` bump to 2.0.0 +
+   migration notes + `canonical_bytes` update + P1.1 byte-lock
+   re-derivation. This is the defined breaking-change path, not a
+   stealth-bump.
+
+Implementation impact on 6.9.7: zero changes to
+`common/src/xai_types.rs` or `agent/src/xai/`. The hash-chained RAG
+retrieval log is a Tappa 13 deliverable referenced in P7 docs
+closeout as a follow-on.
+
+<<<END VERBATIM>>>
 
 ---
 
@@ -489,9 +596,11 @@ the bench records evaluate-with-RAG vs without.
   `(-bm25,id)` tie-break + §3.4(a) normalised similarity, **keeping
   `retrieve()` API byte-stable**. Determinism + golden tests.
   → owner gate (retrieval-correctness audit).
-- **P5 — ADE canary integration** (hard-blocked by §5/Q7): wire the
-  *existing* `with_rag` behind `NN_ADE_RAG_ENABLED`; canary-off parity
-  is a release gate. **Q4(a) verification step (owner-mandated):**
+- **P5 — ADE canary integration** (§5/Q7 RULED Option A ⇒ unblocked;
+  zero `xai_types`/`xai` changes; NO hash-chained log here — that is a
+  Tappa 13 follow-on per §5.1): wire the *existing* `with_rag` behind
+  `NN_ADE_RAG_ENABLED`; canary-off parity is a release gate.
+  **Q4(a) verification step (owner-mandated):**
   confirm production `format_rag_block` output matches the
   **already-generated Forge v2 Phase-C dataset (5K examples)** format.
   On misalignment: **FLAG before training**, then either adjust
@@ -500,8 +609,12 @@ the bench records evaluate-with-RAG vs without.
 - **P6 — bench + golden**: latency p50/p95 (`NN_RAG_BENCH_N`), 20–30
   golden cases, `kb_index_hash` stability; re-confirm the P5 Phase-C
   format alignment holds end-to-end. → owner gate.
-- **P7 — docs closeout**: ADE_DOCTRINE + XDR_ROADMAP annotation; the
-  §5 Art-13 artifact *iff* Option B is ruled; memory closure.
+- **P7 — docs closeout**: ADE_DOCTRINE + XDR_ROADMAP annotation;
+  Art-13 dossier documents the **two-artifact model** (signed XAI
+  chain + the separate hash-chained RAG log) and **references the
+  hash-chained RAG retrieval log as a Tappa 13 Backend-SaaS
+  follow-on** (per §5.1 — NOT built in 6.9.7); memory closure. (No
+  XAI schema artifact — Option A ruled; Option B is the V2.0+ path.)
 
 Each phase: atomic commit, push, notify, STOP at the gate (the 6.9
 iteration pattern the owner endorsed). `clippy --workspace
@@ -560,63 +673,101 @@ iteration pattern the owner endorsed). `clippy --workspace
   security-token-preserving analyzer (P3 golden fixtures mandated by
   owner); R4 license verification before P2 ships.
 
-### 12.1 `tantivy` pin — Cargo.toml comment (CC-authored to the Q1 rule)
+### 12.1 `tantivy` pin — Cargo.toml comment (owner verbatim, ARTIFACT 2, P1.4)
 
-The owner's "comment template included" was not transmitted; this is
-CC's rendering of the stated rule (exact pin + bump-if-verified):
+Insert this verbatim where the `tantivy` dependency is added (P3):
 
 ```toml
-# Tappa 6.9.7 RAG: tantivy is EXACT-pinned. BM25 scoring + segment
-# codec must be byte-stable for deterministic retrieval + a stable
-# kb_index_hash (Art-13). A version move (e.g. =0.26.0) is allowed
-# ONLY in a dedicated commit that re-verifies: golden retrieval green
-# AND kb_index_hash unchanged AND the P3 analyzer golden tokens still
-# survive. Never a passive `^`/`~` range.
+# <<<VERBATIM — Owner ruling §12.1, 2026-05-17>>>
+# Tappa 6.9.7: tantivy is pinned exact-version to ensure deterministic
+# BM25 scoring across rebuilds. A version bump invalidates the golden
+# retrieval test suite and the KB index format compatibility, so it is
+# a deliberate commit with golden-test refresh and KB rebuild, never a
+# silent cargo update. Bump-if-verified path: 0.26.0 may be adopted if
+# `cargo search tantivy` confirms GA (not RC) AND no breaking BM25
+# scoring changes vs 0.25.x are noted in the changelog.
 tantivy = "=0.25.0"
+# <<<END VERBATIM>>>
 ```
 
 ---
 
-## 13. Canary default-flip criteria (Q9) — ⚠️ CC DRAFT, NOT the owner's ruling
+<<<VERBATIM — Owner: Fortunato Milani via Claude Opus 4.7, 2026-05-17>>>
 
-> **GAP FLAGGED (3rd consecutive turn).** "Include the 8-point
-> checklist from my Q9 ruling" — the 8 points were **not in the
-> message** (same pattern as the §13 list last turn and the §5/Q1/Q2
-> "verbatim/templates" this turn). To avoid fabricating-then
-> -attributing a ruling, the list below is a **CC-proposed draft** for
-> the owner to replace/confirm. Non-blocking for P2: the flip is a
-> *later tappa*; 6.9.7 only ships the canary OFF by default + the
-> measurement harness.
+## §13 — Canary default-flip checklist (8 points)
 
-`NN_ADE_RAG_ENABLED` flips to default-on only when ALL hold (draft):
+The default value of `NN_ADE_RAG_ENABLED` will be flipped from `0`
+(off) to `1` (on) in a future deliberate commit, AFTER Tappa 6.9.7
+ships and AFTER the Phase B + Phase C training tappa completes. The
+flip is NOT part of 6.9.7 scope.
 
-1. **Retrieval determinism locked** — golden retrieval + tie-break
-   tests green; `kb_index_hash` byte-locked.
-2. **Latency** — RAG-on ADE `evaluate` p95 within the XAI R-P3.2
-   budget; retrieval p95 ≤ 50 ms (constraint 3).
-3. **Phase-C alignment proven** — production `format_rag_block` ==
-   the Phase-C training format (the P5/P6 verification passed).
-4. **Quality A/B** — RAG-on verdict accuracy ≥ RAG-off on the eBPF
-   golden set, no regression on the no-match-conservative cases.
-5. **No-match safety** — below-floor queries yield empty `RagResult`
-   and never degrade a RAG-off verdict.
-6. **Canary-off parity** — with the flag unset, ADE output is
-   byte-identical to pre-6.7 (release gate, every phase).
-7. **Provenance** — the §5 Art-13 ruling (A or B) is implemented and
-   retrieval provenance is auditable (`kb_index_hash` reachable).
-8. **Licensing clear** — `NOTICES.md`/`LICENSES/` complete; R4
-   shipping-permission verified for every pinned source.
+The flip commit body MUST cite all 8 of the following points with a
+verification reference (test name, log file, doc commit SHA, or
+similar). The flip cannot be merged unless every point passes.
+
+1. **Canary parity test passing.** `NN_ADE_RAG_ENABLED` unset (RAG
+   off) produces ADE output byte-identical to pre-6.7 baseline. The
+   6.7 invariant `rag: None ⇒ byte-identical to pre-6.7` is verified
+   structurally and via a regression test. This protects retroactive
+   XAI determinism: every XAI evidence chain generated before the
+   flip remains reproducible by an auditor running RAG-off.
+
+2. **Phase B + Phase C LoRA trained and validated.** The fine-tuned
+   model has been trained on the SAME RAG retrieval signal that
+   production will produce, as verified by the P5/P6 Forge-v2
+   `format_rag_block` alignment check. The validation suite
+   demonstrates that the trained model uses RAG retrievals more
+   discriminately than the untrained baseline.
+
+3. **Latency budget met.** `evaluate-with-RAG` p95 ≤ XAI_BUDGET_MS
+   (90s) with documented headroom; RAG retrieval p95 ≤ 50 ms
+   (constraint 3 of §1). Measurements recorded with provenance per
+   the R-P3.2 ledger discipline (host, date, KB index hash, sample
+   count, percentile values).
+
+4. **Golden retrieval suite passing.** The 20-30 known eBPF event
+   scenarios documented in §8 produce the expected top-snippet doc
+   ids deterministically. The R3 security-token-preserving analyzer
+   correctly handles every golden case including T1059.001,
+   /etc/shadow, xmrig, certutil, and the other tokens specified in
+   the analyzer test fixtures.
+
+5. **Customer-mode integration smoke test passing.** End-to-end
+   deployment scenario tested on staging: agent boot → KB index
+   lazy-load → RAG canary enabled → ADE evaluate → XAI explain →
+   signed evidence chain produced → offline verify succeeds. No
+   regression detected in any layer.
+
+6. **24-hour soak test passing on staging.** Canary on, realistic
+   event load. No memory leaks, no file descriptor leaks, no latency
+   drift outside p95 envelope, no index corruption. Soak log
+   reviewed and approved.
+
+7. **XAI evidence chain integrity preserved.** RAG-on chains verify
+   correctly via Ed25519. `prompt_sha256` is reconstructible by
+   recomputing `assembled_prompt` from `XaiInputSnapshot` against the
+   agent built at recorded `environment_hash`. The end-to-end
+   audit-reproducibility property holds with RAG enabled.
+
+8. **Article 13 dossier update committed.** `docs/TAPPA6_9_ARTICLE_
+   13_COMPLIANCE.md` §3 (reproducibility) is extended to explicitly
+   cover RAG retrieval determinism (BM25 over a pinned KB index
+   produces identical top-K). §5 (deployment posture) is amended for
+   the canary-on default state. The commit SHA is recorded.
+
+<<<END VERBATIM>>>
 
 ---
 
-*Plan of record (**P1.3**). All gating rulings folded; Q8/R4 verified.
-**🛑 P2 is BLOCKED:** verification found **LOLBAS = GPL-3.0**
-(incompatible with proprietary ship-with-agent — P1's "MIT" was wrong),
-so per the owner's pre-authorised path this is FLAGGED before the P2
-commit and awaits a LOLBAS Q2/Q5 re-ruling (CC recommends **drop LOLBAS
-from V1**; install-from-mirror does not reliably cure GPLv3). MITRE
-ATT&CK v18.1 ✅ and Sigma DRL-1.1 ✅ are clear. No P2 code/commit until
-the LOLBAS ruling. Also still pending (non-blocking): the §13
-owner-authoritative 8-point list (3rd turn referenced-but-not-sent).
-Subsequent phases: atomic commit + owner gate + clippy 0/0 + tests
-green; no multi-phase mega-commits.*
+*Plan of record (**P1.4**). All four owner verbatim artifacts folded
+(§5.1, §12.1, §4.2.2, §13) — no CC placeholders remain; the recurring
+verbatim-gap is CLOSED. **🛑 P2 remains BLOCKED on exactly ONE owner
+decision: the LOLBAS Q2/Q5 re-ruling** (verification proved LOLBAS =
+GPL-3.0; CC recommends **drop LOLBAS from V1**). Second, non-blocking
+flag: the owner's authoritative provenance example (§4.2.2) names the
+MITRE repo `mitre-attack/attack-stix-data@v18.1`, NOT the legacy
+`mitre/cti@ATT&CK-v18.1` CC verified in P1.3 — **the MITRE license must
+be re-verified against `attack-stix-data` at P2** (same ATT&CK ToU
+expected, but not assumed). MITRE & Sigma otherwise clear. No P2
+code/commit until the LOLBAS ruling. Subsequent phases: atomic commit
++ owner gate + clippy 0/0 + tests green; no multi-phase mega-commits.*
