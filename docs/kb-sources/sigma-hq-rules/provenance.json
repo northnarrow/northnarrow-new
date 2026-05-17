@@ -1,0 +1,10 @@
+{
+  "source": "sigma-hq-rules",
+  "url": "https://github.com/SigmaHQ/sigma",
+  "pin": "master",
+  "commit_sha": "df5c6a6ecc149e05cb4dea306012668fb2ae5a12",
+  "acquired_at_utc": "2026-05-17T18:36:25.294582068+00:00",
+  "canonical_dump_sha256": "34c7707d2e1a3195e4de0af7c9da3a3579b945c5e870ebb5dd3c749ba7af9d67",
+  "license": "DRL-1.1",
+  "license_file": "LICENSES/SIGMA_DRL-1.1.md"
+}

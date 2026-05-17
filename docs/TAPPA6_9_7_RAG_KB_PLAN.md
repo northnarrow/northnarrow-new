@@ -1,17 +1,18 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 — fully ruled; ✅ P2 GREENLIT.** All owner verbatim
-artifacts folded: §5.1 (A1), §12.1 (A2), §4.2.2 (A3), §13 (A4), and
-**§4.2.3 + §10-row (LOLBAS drop ruling, this turn)**. No CC
-placeholders, no open blockers. **V1 corpus = MITRE ATT&CK Enterprise
-v18.1 + SigmaHQ Sigma (HEAD@P2, Linux subset) + 6.7 in-repo notes;
-LOLBAS DROPPED (GPL-3.0, §4.2.3) — not fetched/indexed/referenced.**
-One non-blocking P2-internal item: §4.2.2's authoritative example names
-the MITRE repo `mitre-attack/attack-stix-data@v18.1` (not the legacy
-`mitre/cti` CC verified in P1.3) — the MITRE license is re-verified
-against that repo *during* P2 (same ATT&CK ToU expected; the owner's
-standing "flag if incompat before P2 commit" still applies). (Prior
-P1.2 status follows.)
+Status: **P1.5 frozen + ✅ P2 DELIVERED (pending owner gate audit).**
+All owner verbatim folded (§5.1/§12.1/§4.2.2/§13/§4.2.3/§10-row) +
+the 8-key-schema ruling (§4.1/§4.2/§3.1.1, folded into the P2 commit
+per owner instruction — no separate P1.6). **P2 shipped:** `cargo
+xtask rag-kb` acquired **691 ATT&CK v18.1 techniques + 243 Sigma Linux
+rules**; R4 MITRE re-verification on `attack-stix-data@v18.1` PASSED
+(ATT&CK ToU commercial-use grant — no incompat flag); clippy 0/0
+workspace; xtask tests 4/4; `kb_index_hash 4d335aed…`. Bulky JSONL
+dumps gitignored (`/target/kb`); auditable anchor (provenance +
+`kb_index.json` + `LICENSES/` + `NOTICES.md`) committed. **V1 corpus =
+MITRE ATT&CK Enterprise v18.1 + SigmaHQ Sigma (Linux subset) + 6.7
+in-repo notes; LOLBAS DROPPED (GPL-3.0, §4.2.3).** (Prior P1.2 status
+follows.)
 
 Prior — P1.2: all four rulings folded; P2 was greenlit pre-verification. RULED: §5/Q7 =
 **Option A** (§5.1); Q1 = `tantivy =0.25.0` (+bump-if-verified clause,
@@ -129,6 +130,13 @@ Same query + same KB index ⇒ **identical ranked top-K**, always.
 
 #### 3.1.1 KB index hash — normative spec (condition 7)
 
+> **8-key schema confirmation (P2):** the §4.1 7→8 key change does NOT
+> affect this spec. The preimage consumes the canonical-dump *bytes*
+> (`sha256(canonical_source_dump_bytes)`); 8 vs 7 keys only changes
+> each line's content, not the JSONL format or this length-prefixed
+> structure. Implemented + byte-locked in `xtask/src/rag_kb.rs`
+> (`kb_index_hash_is_byte_locked_and_tamper_sensitive`).
+
 The canonical dump (§4.1) is the single hashed preimage. The hash is
 domain-separated and order-deterministic:
 
@@ -236,11 +244,22 @@ binary format. Rules:
   whitespace**, file ends with a single `\n`.
 - **Structure:** one JSON object per line (**JSONL**), one line per KB
   document, lines **sorted by `id` ascending** (byte order).
-- **Per-line object:** keys **lexicographically sorted**, compact
-  (no insignificant whitespace), schema:
-  `{"category","content","id","platform","severity","source_ref","title"}`
-  (string fields; absent optionals serialised as `""`, never omitted —
-  keeps the line schema fixed for the hash).
+- **Per-line object (8-key schema — owner ruling 2026-05-17, was 7):**
+  keys **lexicographically sorted**, compact (no insignificant
+  whitespace), alphabetical key order:
+  `{"author","category","content","id","platform","severity","source_ref","title"}`.
+  `author` is `Vec<String>` **or `null`**, **always present** (never
+  omitted) so every line has an identical key set — maximal hash
+  determinism. The other seven are strings; absent optionals serialised
+  as `""`, never omitted. **Motivation for the 8th key:** DRL-1.1
+  modified-form attribution requires per-rule author retention *in the
+  canonical record* (§4.2 Sigma row); a structured `author` field
+  (vs. embedding in `content`) keeps it one-glance auditable, leaves
+  BM25 scoring undistorted, and future-proofs the schema. The 7→8 bump
+  is zero-cost: no canonical dump existed yet (no hash to invalidate,
+  no shipped artifact to migrate). Per-source `author` population:
+  Sigma = parsed `author` (comma/sequence split, trimmed); MITRE =
+  `null` (wholesale attribution via `NOTICES.md`); 6.7 notes = `null`.
 - **Per-source provenance sidecar:** schema is **§4.2.2 (owner
   verbatim, ARTIFACT 3)** — authoritative; it supersedes the ad-hoc
   field list earlier drafts used. `canonical_dump_sha256` = `sha256`
@@ -257,7 +276,7 @@ binary format. Rules:
 | Source | Pinned ref captured | Real license @pin | Ship-with-agent verdict |
 |---|---|---|---|
 | MITRE ATT&CK | tag `ATT&CK-v18.1` = `605ed54…`, peeled commit `421deac…` | ATT&CK® Terms of Use (`mitre/cti/LICENSE.txt`, 2311 B, fetched verbatim) | ✅ OK with the required ATT&CK attribution string in `NOTICES.md` |
-| Sigma | HEAD@P2 `df5c6a6e…` | **DRL 1.1 lives in a SEPARATE repo** `SigmaHQ/Detection-Rule-License` (sigma-repo root `LICENSE` is only an index pointing there). DRL 1.1 = MIT-like ("deal in the Rules without restriction… distribute, sublicense, sell") **subject to retaining author attribution** | ✅ OK — must fetch DRL from `SigmaHQ/Detection-Rule-License`, retain per-rule `author` attribution (distillation = "modified form" ⇒ attribution mandatory) |
+| Sigma | HEAD@P2 `df5c6a6e…` | **DRL 1.1 lives in a SEPARATE repo** `SigmaHQ/Detection-Rule-License` (sigma-repo root `LICENSE` is only an index pointing there). DRL 1.1 = MIT-like ("deal in the Rules without restriction… distribute, sublicense, sell") **subject to retaining author attribution** | ✅ OK — DRL fetched from `SigmaHQ/Detection-Rule-License`. **Per-rule author preservation is in the canonical line's dedicated `author` field (§4.1, 8-key schema), NOT embedded in `content` text** (distillation = DRL "modified form" ⇒ structured attribution mandatory); `NOTICES.md` additionally aggregates the corpus-wide author set for discoverability |
 | ~~LOLBAS~~ | n/a | **GPL-3.0** (verified `NOTICE.md`@pin + 35 149 B GPLv3 `LICENSE`) | 🚫 **DROPPED from V1 — RULED §4.2.3.** Not fetched/canonicalised/indexed/referenced. P1's "LOLBAS=MIT" was a verified error; the Q8/R4 gate worked. |
 
 **LOLBAS — RULED: dropped from V1 (owner, §4.2.3 below).** The Q2/Q5
@@ -610,12 +629,15 @@ the bench records evaluate-with-RAG vs without.
 
 - **P1 — this doc** (rev **P1.5**). Fully ruled; Q8/R4 verified;
   LOLBAS dropped (§4.2.3). *(complete)*
-- **P2 — KB acquisition pipeline** (xtask) — ✅ **GREENLIT.**
-  **V1 corpus = MITRE ATT&CK Enterprise v18.1
-  (`mitre-attack/attack-stix-data@v18.1`, §4.2.2) + SigmaHQ Sigma
-  (HEAD@P2, Linux subset) + 6.7 in-repo notes. NO LOLBAS.** During P2
-  the MITRE license is re-verified against `attack-stix-data` (flag
-  before commit if it differs from the ATT&CK ToU). Commit acceptance
+- **P2 — KB acquisition pipeline** (xtask) — ✅ **DELIVERED (this
+  commit) — pending owner gate audit.** `cargo xtask rag-kb`
+  (build/fetch + `--mirror` install modes); live run produced **691
+  ATT&CK v18.1 techniques + 243 Sigma Linux rules**; R4 MITRE
+  re-verification on `attack-stix-data@v18.1` **PASSED** (ATT&CK ToU,
+  commercial-use grant — no flag). `kb_index_hash` =
+  `4d335aed…cd5fd98`. **V1 corpus = MITRE ATT&CK Enterprise v18.1 +
+  SigmaHQ Sigma (Linux subset) + 6.7 in-repo notes. NO LOLBAS.**
+  Commit acceptance
   = ALL of (owner conditions 1–7, verbatim):
   1. `NOTICES.md` with per-source attribution (Q8).
   2. `LICENSES/` populated with verbatim license files.
