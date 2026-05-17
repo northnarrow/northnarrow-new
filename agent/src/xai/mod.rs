@@ -19,17 +19,26 @@
 //!   `DecisionProbe` seam, decision-delta scoring, `PerturbationSource`,
 //!   and the `SaliencySource` hybrid seam). Flat per-unit scoring +
 //!   deterministic causal faithfulness oracle.
-//! - **P3+** — `saliency` (coarse-to-fine + `region_refine_threshold` +
-//!   bounded-K + `tail` + fail-closed budget) and the
-//!   `XaiEngine::explain` public entrypoint with the `XaiUnavailable`
-//!   guardrail. Not in this commit (owner audits the occlusion algorithm
-//!   + scoring before P3).
+//! - **P3 (this commit)** — `saliency`: the coarse-to-fine driver
+//!   (Stage-A region occlusion, `region_refine_threshold`, bounded-K +
+//!   subset-occluded `tail`), the R-P3.1 cost preflight, the R-P3.2 cost
+//!   ledger, and the two-tier fail-closed [`saliency::XaiUnavailable`]
+//!   budget with its synthesis-refuses guardrail contract test.
+//! - **P4+** — the `XaiEngine::explain` public entrypoint + evidence
+//!   assembly/signing + `environment_hash` compute + the candle bench.
+//!   Not in this commit (owner audits the P3 driver + budget enforcement
+//!   before P4).
 
 pub mod evidence;
 pub mod occlusion;
+pub mod saliency;
 pub mod source;
 
 pub use evidence::{verify_evidence, Ed25519EvidenceSigner, XaiVerifyError};
+pub use saliency::{
+    explain_saliency, explain_saliency_with_clock, Clock, MonotonicClock, SaliencyConfig,
+    SaliencyRun, XaiUnavailable,
+};
 pub use source::{
     composite, decision_delta, DecisionProbe, PerturbationSource, SaliencySource, UnitScore,
     XaiProbeError, XaiSourceError, DEFAULT_WEIGHTS,

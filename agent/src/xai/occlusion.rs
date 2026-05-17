@@ -347,6 +347,60 @@ pub fn occlude(
     }
 }
 
+/// Return a neutralised `(focal, context)` clone with **every** unit in
+/// `addrs` occluded together in one shot — the multi-unit generalisation
+/// of [`occlude`]. The P3 coarse-to-fine driver uses it for exactly two
+/// things, both single-inference by construction:
+/// * **Stage-A region-block** occlusion — pass every [`UnitAddr`] of one
+///   [`Region`] to measure that region's aggregate decision delta.
+/// * the bounded-K **`tail`** — pass all overflow units to occlude them
+///   together ("what if NONE of these had happened"). This is the
+///   directly-measurable counterfactual mandated by plan §3.4-R4; it is
+///   deliberately NOT a sum or average of per-unit deltas (those would be
+///   fabricated attribution — redundant causes would be double-counted or
+///   cancel, as `occlude_units_*` tests demonstrate).
+///
+/// Correlated `Drop` removals are coalesced and applied highest-index
+/// first so earlier indices stay valid. Focal/host neutralisation is an
+/// idempotent scalar sentinel, so unit order is irrelevant. The original
+/// inputs are never mutated.
+pub fn occlude_units(
+    focal: &Event,
+    ctx: &EventContext,
+    addrs: &[UnitAddr],
+    mode: OcclusionMode,
+) -> (Event, EventContext) {
+    let mut f = focal.clone();
+    let mut c = ctx.clone();
+    let mut drop_idx: Vec<usize> = Vec::new();
+    for a in addrs {
+        match a {
+            UnitAddr::Focal(field) => neutralise_focal_field(&mut f, *field),
+            UnitAddr::Host(h) => neutralise_host_field(&mut c.host_context, *h),
+            UnitAddr::Correlated(i) => match mode {
+                OcclusionMode::Drop => drop_idx.push(*i),
+                OcclusionMode::AnonymiseInPlace => {
+                    if *i < c.recent_events.len() {
+                        c.recent_events[*i] = anonymised_clone(&c.recent_events[*i]);
+                    }
+                }
+            },
+        }
+    }
+    if !drop_idx.is_empty() {
+        drop_idx.sort_unstable();
+        drop_idx.dedup();
+        // Highest-first: removing a later index never shifts an earlier
+        // still-to-remove index.
+        for &i in drop_idx.iter().rev() {
+            if i < c.recent_events.len() {
+                c.recent_events.remove(i);
+            }
+        }
+    }
+    (f, c)
+}
+
 const ZERO_ADDR: [u8; ADDR_LEN] = [0u8; ADDR_LEN];
 
 /// Replace one focal field with a typed neutral sentinel. Fields a
@@ -610,5 +664,69 @@ mod tests {
         );
         assert!(c2.host_context.hostname.is_empty());
         assert_eq!(c2.host_context.kernel_version, "6.8");
+    }
+
+    #[test]
+    fn occlude_units_drops_multiple_correlated_index_safe() {
+        // Indices 1 and 3 must both go even though removing one shifts
+        // the rest — the highest-first removal contract.
+        let c = ctx(vec![dns("a"), dns("c2.evil.1"), dns("b"), dns("c2.evil.2")]);
+        let (_, c2) = occlude_units(
+            &ps(),
+            &c,
+            &[UnitAddr::Correlated(1), UnitAddr::Correlated(3)],
+            OcclusionMode::Drop,
+        );
+        assert_eq!(c2.recent_events.len(), 2);
+        assert!(!c2.recent_events.iter().any(|e| matches!(
+            e, Event::DnsQuery { query_name, .. } if query_name.contains("c2.evil")
+        )));
+    }
+
+    #[test]
+    fn occlude_units_region_block_focal_clears_every_field() {
+        let units = enumerate(&ps(), &ctx(vec![]));
+        let addrs: Vec<UnitAddr> = units
+            .iter()
+            .filter(|u| u.region == Region::Focal)
+            .map(|u| u.addr.clone())
+            .collect();
+        let (f, _) = occlude_units(&ps(), &ctx(vec![]), &addrs, OcclusionMode::Drop);
+        match f {
+            Event::ProcessSpawn {
+                pid,
+                comm,
+                filename,
+                timestamp_ns,
+                ..
+            } => {
+                assert!(comm.is_empty() && filename.is_empty());
+                assert_eq!(pid, 0);
+                assert_eq!(timestamp_ns, 0);
+            }
+            _ => panic!("variant changed"),
+        }
+    }
+
+    #[test]
+    fn occlude_units_mixed_focal_and_host_are_both_applied() {
+        let (f, c2) = occlude_units(
+            &ps(),
+            &ctx(vec![]),
+            &[
+                UnitAddr::Focal(FocalField::Comm),
+                UnitAddr::Host(HostField::Hostname),
+            ],
+            OcclusionMode::Drop,
+        );
+        match f {
+            Event::ProcessSpawn { comm, filename, .. } => {
+                assert!(comm.is_empty());
+                assert_eq!(filename, "/tmp/x", "untargeted focal field intact");
+            }
+            _ => panic!("variant changed"),
+        }
+        assert!(c2.host_context.hostname.is_empty());
+        assert_eq!(c2.host_context.kernel_version, "6.8", "untargeted host intact");
     }
 }
