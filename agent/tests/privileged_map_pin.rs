@@ -17,21 +17,24 @@
 //!
 //! 1. Boot the real agent; it pins `PROTECTED_PIDS` to
 //!    `<DEFAULT_BPFFS_ROOT>/PROTECTED_PIDS`. Record its kernel map
-//!    id and assert the live `task_kill` LSM program is bound to
-//!    that id (`bpftool prog show … map_ids`).
+//!    id and assert a live anti-tamper LSM program is bound to that
+//!    id (`bpftool prog show … map_ids`).
 //! 2. Stop the agent (SIGQUIT — SIGKILL/SIGTERM are denied by the
 //!    very hook under test). Assert the pin **survives process
 //!    exit** — direct evidence the kernel object outlived the agent.
 //! 3. Restart the agent. Assert the pinned map id is **unchanged**
 //!    (same kernel object reused via `bpf_get_object`, not a fresh
-//!    one) and that the *new* boot's `task_kill` program is bound to
-//!    that same id. Equal ids ⇒ split brain closed.
+//!    one) and that the *new* boot's LSM hooks are bound to that
+//!    same id. Equal ids ⇒ split brain closed.
 //!
 //! In commit #2 the LSM **programs/links are not yet pinned** (that
-//! is commit #2b); the `task_kill` program is therefore located by
-//! name while the agent is alive, not via a pinned prog path. The
-//! pinned-program form of step-1/3's `map_ids` assertion is
-//! deferred to commit #2b's harness.
+//! is commit #2b), so the in-kernel LSM hook is located while the
+//! agent is alive by scanning loaded programs for the one whose
+//! `map_ids` references the pinned `PROTECTED_PIDS` object — *not*
+//! by program name (aya names programs after the truncated Rust fn
+//! symbol, not the `#[lsm]` hook, so a name lookup is brittle; see
+//! `find_lsm_prog_using_map`). The pinned-program form of step-1/3's
+//! assertion is deferred to commit #2b's harness.
 //!
 //! ## Requirements (Hetzner verify box only)
 //!
@@ -181,34 +184,146 @@ fn pinned_map_id(pin: &Path) -> u64 {
         .unwrap_or_else(|| panic!("could not parse map id from bpftool output: {stdout:?}"))
 }
 
-/// `map_ids` of the live `task_kill` LSM program, via
-/// `bpftool prog show name task_kill`. The block contains a
-/// `map_ids 189,190` token; we return the parsed list. Panics if no
-/// such program is loaded (agent not up, or hook attach failed).
-fn task_kill_map_ids() -> Vec<u64> {
+/// One `bpftool prog show` record, reduced to the fields this test
+/// reasons about. `name` is captured for diagnostics **only** — it
+/// is deliberately never matched on (see `find_lsm_prog_using_map`).
+#[derive(Debug)]
+struct ProgInfo {
+    id: u64,
+    prog_type: String,
+    name: Option<String>,
+    map_ids: Vec<u64>,
+}
+
+/// Full `bpftool prog show` (every loaded program, plain text). We do
+/// **not** pass `--json`: parsing JSON would mean a new dev-dependency
+/// (`serde_json` is a normal dep of the crate, not reachable from an
+/// integration-test crate), and the module contract above is to stay
+/// dev-dependency-free. The plain-text record grammar is stable and
+/// trivially block-parseable, so it carries the same information.
+fn bpftool_prog_show_all() -> Result<String, String> {
     let out = Command::new("bpftool")
-        .args(["prog", "show", "name", "task_kill"])
+        .args(["prog", "show"])
         .output()
-        .expect("spawn `bpftool prog show name task_kill`");
-    assert!(
-        out.status.success(),
-        "bpftool prog show name task_kill failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.trim().is_empty(),
-        "no `task_kill` program loaded — agent down or LSM attach failed"
-    );
-    let toks: Vec<&str> = stdout.split_whitespace().collect();
-    let i = toks
-        .iter()
-        .position(|&t| t == "map_ids")
-        .unwrap_or_else(|| panic!("no `map_ids` field in bpftool prog output: {stdout:?}"));
-    toks[i + 1]
-        .split(',')
-        .filter_map(|t| t.trim().parse::<u64>().ok())
-        .collect()
+        .map_err(|e| format!("spawn `bpftool prog show`: {e} — is bpftool on PATH?"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`bpftool prog show` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Block-parse `bpftool prog show` plain text. A record starts at a
+/// line whose first token is `<id>:`; its `prog_type` is the next
+/// token; continuation lines (anything until the next header) may
+/// carry a `map_ids a,b,c` token and an optional `name <n>`.
+fn parse_progs(text: &str) -> Vec<ProgInfo> {
+    let mut progs = Vec::new();
+    let mut cur: Option<ProgInfo> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let toks: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(&first) = toks.first() else { continue };
+
+        // Header line? `<id>:` then the program type.
+        if let Some(id_str) = first.strip_suffix(':') {
+            if let Ok(id) = id_str.parse::<u64>() {
+                if let Some(p) = cur.take() {
+                    progs.push(p);
+                }
+                let prog_type = toks.get(1).copied().unwrap_or_default().to_string();
+                let name = toks
+                    .iter()
+                    .position(|&t| t == "name")
+                    .and_then(|i| toks.get(i + 1))
+                    .map(|s| s.to_string());
+                cur = Some(ProgInfo {
+                    id,
+                    prog_type,
+                    name,
+                    map_ids: Vec::new(),
+                });
+                continue;
+            }
+        }
+
+        // Continuation line of the current record: harvest map_ids.
+        if let Some(p) = cur.as_mut() {
+            if let Some(i) = toks.iter().position(|&t| t == "map_ids") {
+                if let Some(list) = toks.get(i + 1) {
+                    p.map_ids = list
+                        .split(',')
+                        .filter_map(|t| t.trim().parse::<u64>().ok())
+                        .collect();
+                }
+            }
+        }
+    }
+    if let Some(p) = cur.take() {
+        progs.push(p);
+    }
+    progs
+}
+
+/// Locate the loaded **LSM** program bound to the pinned
+/// `PROTECTED_PIDS` kernel object, identified by that object's map
+/// **id** (`map_id`, as returned by [`pinned_map_id`]).
+///
+/// Why by map id and not by program name: aya derives the kernel
+/// program name from the Rust function symbol, truncated to
+/// `BPF_OBJ_NAME_LEN-1` = 15 bytes — *not* from the `#[lsm(hook =
+/// …)]` attach point. `bpftool prog show name <X>` therefore can't
+/// be driven from the hook name, and hard-coding the truncated
+/// symbol is brittle (it silently rots if anyone renames the eBPF
+/// fn). Matching on `type == lsm` + `map_ids ∋ map_id` needs neither:
+/// it asks exactly the question the §4 invariant cares about — *is
+/// some in-kernel LSM hook actually wired to the pinned object?* —
+/// and is the genuine split-brain discriminator: a freshly-created
+/// (un-pinned) map would carry a different id, so a split-brained
+/// boot yields **no** match and the lookup fails loudly.
+///
+/// `PROTECTED_PIDS` is shared by three LSM hooks (`task_kill`,
+/// `ptrace_access_check`, and the `inode_*`/`file_ioctl` family);
+/// any one of them referencing the pinned id proves the binding, so
+/// the first match is returned.
+fn find_lsm_prog_using_map(map_id: u64) -> Result<ProgInfo, String> {
+    let text = bpftool_prog_show_all()?;
+    let progs = parse_progs(&text);
+
+    if let Some(p) = progs
+        .into_iter()
+        .find(|p| p.prog_type == "lsm" && p.map_ids.contains(&map_id))
+    {
+        return Ok(p);
+    }
+
+    // Re-parse for an actionable diagnostic: which LSM programs *are*
+    // loaded, and what maps do they point at?
+    let lsm: Vec<String> = parse_progs(&text)
+        .into_iter()
+        .filter(|p| p.prog_type == "lsm")
+        .map(|p| {
+            format!(
+                "  id={} name={:?} map_ids={:?}",
+                p.id, p.name, p.map_ids
+            )
+        })
+        .collect();
+    Err(format!(
+        "no loaded LSM program references pinned PROTECTED_PIDS id \
+         {map_id}. Either no anti-tamper hook attached (agent down / \
+         BPF-LSM not in lsm= chain) or the agent created a FRESH map \
+         instead of reusing the pinned one (split brain). LSM programs \
+         currently loaded:\n{}",
+        if lsm.is_empty() {
+            "  <none>".to_string()
+        } else {
+            lsm.join("\n")
+        }
+    ))
 }
 
 /// Best-effort recursive removal of the pin root. See the module
@@ -242,12 +357,12 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
     wait_for_pin(&pin);
 
     let id1 = pinned_map_id(&pin);
-    let prog_maps1 = task_kill_map_ids();
-    assert!(
-        prog_maps1.contains(&id1),
-        "boot-1 task_kill program {prog_maps1:?} is NOT bound to the \
-         pinned PROTECTED_PIDS id {id1} — relocation/binding broken"
-    );
+    find_lsm_prog_using_map(id1).unwrap_or_else(|e| {
+        panic!(
+            "boot-1: no anti-tamper LSM hook is bound to the pinned \
+             PROTECTED_PIDS id {id1} — relocation/binding broken.\n{e}"
+        )
+    });
 
     // ---- Stop boot 1; the pinned map must outlive the process. --
     agent1.stop();
@@ -272,13 +387,13 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
          pinned one — split brain NOT closed"
     );
 
-    let prog_maps2 = task_kill_map_ids();
-    assert!(
-        prog_maps2.contains(&id2),
-        "boot-2 task_kill program {prog_maps2:?} is NOT bound to the \
-         reused pinned id {id2} — restarted agent is split-brained \
-         off its own protection map"
-    );
+    find_lsm_prog_using_map(id2).unwrap_or_else(|e| {
+        panic!(
+            "boot-2: no anti-tamper LSM hook is bound to the reused \
+             pinned id {id2} — restarted agent is split-brained off \
+             its own protection map.\n{e}"
+        )
+    });
 
     agent2.stop();
     // Leave the pin in place: the verify protocol's subsequent
