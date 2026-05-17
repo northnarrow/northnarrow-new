@@ -48,6 +48,15 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
     }
 }
 
+/// # Phase-C training contract (Tappa 6.9.7 P5, frozen 2026-05-17)
+///
+/// The byte-stable output of this function is THE CONTRACT that
+/// Phase-C RAG-trust training data MUST conform to. The
+/// format_rag_block_byte_stable_phase_c_contract regression test
+/// locks the format. Any change here is a deliberate breaking
+/// commit requiring Phase-C dataset regeneration (Tappa 6.9.5 /
+/// post-6.9.7 training cycle). Do NOT modify lightly.
+///
 /// Render the RAG context as a TRUSTED block for the structured
 /// prompt. Returns `None` when the result is empty so the caller
 /// can skip the section entirely (no empty headers in the prompt).

@@ -44,12 +44,14 @@
 //! - LOLBAS is intentionally absent (GPL-3.0 — plan §4.2.3); GTFOBins
 //!   is a post-beta corpus-extension research task.
 
+pub mod canary;
 pub mod embedder;
 pub mod index_tantivy;
 pub mod kb_seed;
 pub mod retrieval;
 pub mod store;
 
+pub use canary::{env_rag_enabled, env_truthy, open_index_from_env, rag_canary};
 pub use embedder::{cosine_similarity, RagEmbedder};
 pub use index_tantivy::{
     analyze, bm25_query, bm25_search, build_index, load_records, open_or_build,

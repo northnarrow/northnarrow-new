@@ -1,6 +1,14 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 frozen · P2 ✅ P3 ✅ P4 ✅ DELIVERED (P4 pending owner gate).**
+Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ DELIVERED (P5 pending owner gate).**
+P5: env-driven RAG canary (`NN_ADE_RAG_ENABLED` default OFF + graceful
+fallback) wired at the single main.rs `AdeEngine::new`; Q4(a) RULED
+freeze-as-contract — `format_rag_block` byte-frozen as the Phase-C
+contract (production = source of truth; repo↔memory Phase-C drift
+tracked for P7, briefing untouched); XAI invariant held (no
+xai_types/xai changes); clippy 0/0; rag 39+1, ade 109+2. (Earlier
+P2–P4 status follows.)
+Prior — **P1.5 frozen · P2 ✅ P3 ✅ P4 ✅ DELIVERED (P4 pending owner gate).**
 P4: `RagEngine::open_index` BM25 swap behind the byte-stable
 `retrieve`/`RagQuery`/`RagResult` API (Backend enum; 6.7 embedding
 retained); R1 `(-score,id-asc)` tie-break; §3.4(a) within-result
@@ -597,6 +605,30 @@ closeout as a follow-on.
 
 <<<END VERBATIM>>>
 
+### 5.2 AS BUILT (P5) — Option A confirmed + Q4(a) format freeze
+
+- **Option A confirmed AS-BUILT.** P5 makes **zero** changes to
+  `common/src/xai_types.rs` or `agent/src/xai/*` (XAI 1.0.0 schema
+  untouched). The RAG block is part of the assembled prompt, so it is
+  already bound by `XaiInputSnapshot.prompt_sha256` (the Ed25519
+  signature from 6.9 P4). Consequence (by design, NOT a regression):
+  a RAG-**on** evidence chain can only be reproduced by an auditor
+  running RAG-**on** with the same `kb_index_hash`; a RAG-off auditor
+  cannot — the RAG block IS part of the prompt being explained. The
+  `rag:None` canary-parity path keeps every RAG-off chain reproducible.
+- **§5.1 follow-on unchanged:** the hash-chained RAG retrieval log
+  stays a Tappa 13 deliverable — explicitly NOT built in P5.
+- **Q4(a) RULED = freeze-as-contract (owner, 2026-05-17).** The
+  Phase-C dataset is not in-repo and the briefing has Phase C as
+  deferred/spec-only (repo↔memory drift caught — tracked for P7 docs
+  reconciliation, briefing NOT touched in P5). Production
+  `format_rag_block` IS the source of truth: its byte-stable output is
+  frozen by `format_rag_block_byte_stable_phase_c_contract` +
+  documented as the contract in a doc-comment above the fn. **Future
+  Phase-C (Tappa 6.9.5 / the post-6.9.7 Phase-B+C training cycle) is
+  generated to conform to production — not vice versa.** No byte-diff
+  against nonexistent/stale Colab data; `format_rag_block` unmodified.
+
 ---
 
 ## 6. Module / file layout & integration
@@ -749,16 +781,23 @@ the bench records evaluate-with-RAG vs without.
   prompt — §13 checklist #1). F-P3-1 (mod.rs doc) + F-P3-2 (`stopwords`
   dropped, verified) folded. clippy 0/0; rag:: 35+1; xai/xtask
   unaffected. → owner gate (retrieval-correctness audit).
-- **P5 — ADE canary integration** (§5/Q7 RULED Option A ⇒ unblocked;
-  zero `xai_types`/`xai` changes; NO hash-chained log here — that is a
-  Tappa 13 follow-on per §5.1): wire the *existing* `with_rag` behind
-  `NN_ADE_RAG_ENABLED`; canary-off parity is a release gate.
-  **Q4(a) verification step (owner-mandated):**
-  confirm production `format_rag_block` output matches the
-  **already-generated Forge v2 Phase-C dataset (5K examples)** format.
-  On misalignment: **FLAG before training**, then either adjust
-  `format_rag_block` to match the dataset OR regenerate the dataset
-  with the corrected format (owner decides which). → owner gate.
+- **P5 — ADE canary integration** — ✅ **DELIVERED (this commit) —
+  pending owner gate audit.** `rag::canary` (pure `rag_canary` core +
+  `open_index_from_env` glue) wired into the single `main.rs`
+  `AdeEngine::new` site behind `NN_ADE_RAG_ENABLED` (default OFF,
+  beta-safe) / `NN_ADE_RAG_JSONL_DIR` / `NN_ADE_RAG_INDEX_DIR`;
+  graceful no-RAG fallback on open_index failure (canary parity
+  preserved); `tracing::info`/`warn` at each branch. **Q4(a) RULED
+  freeze-as-contract** (§5.2): `format_rag_block` byte-frozen by
+  `format_rag_block_byte_stable_phase_c_contract` + contract
+  doc-comment; production is the source of truth, future Phase-C
+  conforms to it (no byte-diff vs nonexistent data; the repo↔memory
+  Phase-C drift is tracked for P7 — briefing NOT touched). **XAI
+  invariant held:** zero `xai_types`/`xai/*` changes (xai:: 33+1
+  unaffected); RAG-on chains need RAG-on reproduction *by design*.
+  +6 tests (4 `rag::canary` env/3-state, format snapshot, with_rag
+  splice) + the P4 canary-parity (rag:None). clippy 0/0; rag:: 39+1;
+  ade:: 109+2. → owner gate.
 - **P6 — bench + golden**: latency p50/p95 (`NN_RAG_BENCH_N`), 20–30
   golden cases, `kb_index_hash` stability; re-confirm the P5 Phase-C
   format alignment holds end-to-end. → owner gate.
