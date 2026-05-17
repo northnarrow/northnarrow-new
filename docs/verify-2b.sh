@@ -674,6 +674,11 @@ spawn_agent() { # spawn_agent <tag> ; sets AGENT_PID, returns 0|1
   note "spawn_agent[$tag]: launching agent"
   note "  cmd: sudo $AGENT_BIN --combat-rules $td/combat-rules.v4 --admin-pub $td/admin.pub --admin-socket $td/admin.sock --pid-file $pid_file --no-ade"
   start=$(now_ms)
+  # shellcheck disable=SC2024  # the redirect is DELIBERATELY shell-side
+  # (not `sudo tee`): it makes agent.log HARNESS-USER-owned so the later
+  # UNPRIVILEGED `tail`/`grep` diagnostic reads work without sudo. The
+  # agent's pid_file (root-owned) is read via `sudo cat` precisely
+  # because it, unlike this log, is written by the privileged process.
   sudo "$AGENT_BIN" \
     --combat-rules "$td/combat-rules.v4" \
     --admin-pub    "$td/admin.pub" \
