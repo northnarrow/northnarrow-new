@@ -42,6 +42,15 @@ use common::Event;
 use super::error::AdeError;
 use super::inference::{ChatTemplate, InferenceBackend, StreamControl};
 
+/// The fixed `LogitsProcessor` seed for the candle decode path. Greedy
+/// decoding (`Sampling::ArgMax`, `temperature == 0`) ignores it, but the
+/// XAI Article-13 path records it verbatim for reproducibility under any
+/// future sampling method. It lives here — the single source of truth —
+/// and `xai::engine::XAI_DETERMINISTIC_SEED` is *derived* from it; the
+/// dependency points xai → ade, never the reverse (ADE stays unaware of
+/// XAI, the layering contract held throughout Tappa 6.9).
+pub const CANDLE_LOGITS_SEED: u64 = 0x00C0_FFEE;
+
 /// Soft cap on output tokens — keeps generation time bounded even if
 /// the caller asks for more than the engine can deliver in 15 s.
 const MAX_OUTPUT_TOKENS_HARD_CAP: usize = 2048;
@@ -244,7 +253,7 @@ impl CandleBackend {
                 temperature: temperature as f64,
             }
         };
-        let mut logits_processor = LogitsProcessor::from_sampling(0xC0FFEE, sampling);
+        let mut logits_processor = LogitsProcessor::from_sampling(CANDLE_LOGITS_SEED, sampling);
 
         let mut all_tokens: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + max_tokens);
         all_tokens.extend_from_slice(&prompt_tokens);

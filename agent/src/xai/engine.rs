@@ -44,10 +44,12 @@ use crate::xai::saliency::{explain_saliency, SaliencyConfig, XaiUnavailable};
 use crate::xai::source::{DecisionProbe, XaiProbeError};
 use common::xai_types::EvidenceSigner;
 
-/// The fixed candle `LogitsProcessor` seed (`backend_candle.rs`, the
-/// `0xC0FFEE` literal). Greedy ArgMax decoding ignores it, but R1
-/// records it verbatim so a future sampling method stays reproducible.
-pub const XAI_DETERMINISTIC_SEED: u64 = 0x00C0_FFEE;
+/// The fixed candle decode seed, recorded verbatim into every chain's
+/// `method.inference_settings.seed` for R1 reproducibility (greedy
+/// ArgMax ignores it today). Single-sourced from
+/// [`crate::ade::backend_candle::CANDLE_LOGITS_SEED`] — provably the
+/// value the inference path uses, never a re-typed literal (audit F2).
+pub const XAI_DETERMINISTIC_SEED: u64 = crate::ade::backend_candle::CANDLE_LOGITS_SEED;
 
 /// Force an [`AdeConfig`] onto the R1 bit-reproducible path: greedy
 /// decoding (`temperature = 0` ⇒ candle `Sampling::ArgMax`), no
@@ -137,18 +139,39 @@ fn canonical_hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// `lower_hex(sha256( agent_binary_sha256 || model_file_sha256 ||
-/// combat_rules_sha256 || hostname_utf8 || build_commit_sha_utf8 ))`,
-/// exactly the D1 spec in `common::xai_types`. Computed once at
-/// [`XaiEngine::new`] and cached into every chain.
+/// `lower_hex(sha256(preimage))` exactly per the D1 spec in
+/// `common::xai_types`. The preimage is:
+///
+/// ```text
+/// agent_binary_sha256          (32 bytes, fixed)
+/// model_file_sha256            (32 bytes, fixed)
+/// combat_rules_sha256          (32 bytes, fixed)
+/// u32_be(hostname.len()) || hostname_utf8
+/// u32_be(build_sha.len()) || build_sha_utf8
+/// ```
+///
+/// F3 (audit) — chose option (a)'s mechanism *without* its schema bump:
+/// the three leading digests are self-delimiting (fixed 32 B), and the
+/// two trailing variable fields are u32-BE length-prefixed so the
+/// preimage is unambiguous by construction — the residual
+/// hostname‖build_sha boundary collision is *eliminated*, not merely
+/// documented as accepted risk (option b). No `XAI_SCHEMA_VERSION` bump:
+/// `environment_hash` is a plain `String` field, this preimage is not
+/// part of the JSON schema, and no chains are shipped, so 1.0.0 ships
+/// unchanged. Computed once at [`XaiEngine::new`], cached into every
+/// chain.
 pub fn compute_environment_hash(env: &EnvironmentInputs) -> std::io::Result<String> {
     let agent_binary = std::env::current_exe()?;
     let mut h = Sha256::new();
     h.update(sha256_file(&agent_binary)?);
     h.update(sha256_file(&env.model_path)?);
     h.update(sha256_file(&env.combat_rules_path)?);
-    h.update(canonical_hostname().as_bytes());
-    h.update(env!("BUILD_SHA").as_bytes());
+    let hostname = canonical_hostname();
+    h.update((hostname.len() as u32).to_be_bytes());
+    h.update(hostname.as_bytes());
+    let build_sha = env!("BUILD_SHA");
+    h.update((build_sha.len() as u32).to_be_bytes());
+    h.update(build_sha.as_bytes());
     Ok(hex::encode(h.finalize()))
 }
 
@@ -465,8 +488,15 @@ mod tests {
             host_context: HostContext::discover(),
         };
 
-        let mut samples = Vec::new();
-        for _ in 0..7 {
+        // F6 (audit): sample count via NN_XAI_BENCH_N (default 30) so
+        // p50/p95 are statistically meaningful, not n=7 thin.
+        let n: usize = std::env::var("NN_XAI_BENCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(30);
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
             let t = std::time::Instant::now();
             engine.evaluate(&focal, &ctx).await.unwrap();
             samples.push(t.elapsed().as_millis() as u64);

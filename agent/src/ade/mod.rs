@@ -6,9 +6,10 @@
 //!
 //! 1. Builds a structured prompt from the focal event + the most
 //!    recent correlated events + host context.
-//! 2. Hands the prompt to an [`InferenceBackend`] (in Tappa 6 the
-//!    only shipped impl is [`MockBackend`]; see
-//!    `inference.rs` for the rationale).
+//! 2. Hands the prompt to an [`InferenceBackend`] — the real candle
+//!    Llama-3.1 backend ([`backend_candle`]) is the default since
+//!    Sub-tappa 6.1; [`MockBackend`] is the CI / load-failure
+//!    fallback (see `inference.rs`).
 //! 3. Parses the output through [`VerdictParser`] (14 schema rules).
 //! 4. On parse failure, synthesises an Escalate Tier1 verdict via
 //!    [`escalate::transform_to_escalate`] so the agent always has a

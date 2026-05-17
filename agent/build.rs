@@ -42,7 +42,11 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=BUILD_SHA={build_sha}");
+    // `.git/HEAD` covers branch switches / detached HEAD; the refs dir
+    // covers a commit on the current branch (HEAD then still points at
+    // the same ref file) so BUILD_SHA re-evaluates on every commit (F4).
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads/");
 
     if ebpf_artifact.is_file() {
         fs::copy(&ebpf_artifact, &dst).expect("copy eBPF object into OUT_DIR");

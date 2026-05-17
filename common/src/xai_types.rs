@@ -89,13 +89,26 @@ pub struct XaiEvidenceChain {
     ///
     /// ```text
     /// environment_hash = lower_hex(sha256(
-    ///     agent_binary_sha256_bytes ||
-    ///     model_file_sha256_bytes ||
-    ///     combat_rules_sha256_bytes ||
-    ///     hostname_canonical_utf8 ||      // `hostname --fqdn` w/ hostname fallback
-    ///     agent_build_commit_sha_utf8     // BUILD_SHA env at compile time
+    ///     agent_binary_sha256_bytes ||                       // 32 B, fixed
+    ///     model_file_sha256_bytes   ||                       // 32 B, fixed
+    ///     combat_rules_sha256_bytes ||                       // 32 B, fixed
+    ///     u32_be(hostname.len())  || hostname_canonical_utf8 ||
+    ///     u32_be(build_sha.len()) || agent_build_commit_sha_utf8
     /// ))
     /// ```
+    ///
+    /// `hostname_canonical` is the trimmed `/proc/sys/kernel/hostname`
+    /// (the agent-wide canonical source, matching `HostContext`; the
+    /// procfs read is authoritative — not an `hostname --fqdn` shell-out
+    /// — so the deployment-identity hash agrees with the rest of the
+    /// agent's host identity), with a fixed `"unknown"` fallback.
+    /// `build_sha` is the compile-time `BUILD_SHA` env (git `HEAD`, or
+    /// `"unknown"` for non-git builds). The three leading digests are
+    /// self-delimiting (fixed 32 B); the two trailing variable fields
+    /// are u32-BE length-prefixed, so the preimage is unambiguous by
+    /// construction (no boundary-collision). This preimage is **not**
+    /// part of the JSON schema — evolving it needs no
+    /// [`XAI_SCHEMA_VERSION`] bump (this is a plain `String` field).
     ///
     /// 64 lower-case hex chars. Forward-compat: Tappa 14.x TEE attestation
     /// may evolve the inputs while preserving this field name; schema

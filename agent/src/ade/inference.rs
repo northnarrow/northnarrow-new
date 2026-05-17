@@ -2,35 +2,23 @@
 //!
 //! ## Why an abstraction
 //!
-//! Tappa 6 ships with a `MockBackend` that produces deterministic,
-//! schema-valid outputs regardless of input. This keeps CI fast
-//! (no GGUF dependency, no FFI) and lets the rest of the ADE pipeline
-//! — parser, escalate, stats, wiring — be exercised end-to-end on
-//! every push.
+//! The trait lets the real LLM and a deterministic stub share one
+//! call path. `MockBackend` produces deterministic, schema-valid
+//! outputs regardless of input, keeping CI fast (no GGUF, no FFI) and
+//! letting parser / escalate / stats / wiring be exercised end-to-end
+//! on every push.
 //!
-//! ## Why no real LLM backend ships in Tappa 6
+//! ## Which backend ships (current state)
 //!
-//! The founder-supplied model is `gemma-4-E4B-it-Q4_K_M.gguf`
-//! (Unsloth quant of `google/gemma-4-E4B-it`). The GGUF metadata
-//! advertises:
-//!
-//! - `general.architecture = "gemma4"`
-//! - 42 layers, sliding-window 512, GQA 8:2, `shared_kv_layers=18`,
-//!   final-logit soft-capping
-//!
-//! As of May 2026 the Rust-native inference engines ship the
-//! following Gemma support:
-//!
-//! - `candle-transformers 0.7+` → gemma, gemma2, gemma3 (NOT gemma4)
-//! - `mistral.rs 0.3` → gemma3n (uncertain, untested with this GGUF)
-//! - `llama-cpp-2` → full gemma4 support, but pulls a C++ build
-//!   dependency that contradicts the "100% Rust" charter.
-//!
-//! Rather than rush an unstable native port, Tappa 6 closes with
-//! `MockBackend` as the default and a clear extension surface
-//! ([`InferenceBackend`]) for adding a real backend in a follow-up
-//! sub-tappa once one of the Rust engines covers the architecture.
-//! See `docs/ADE_BACKEND_NOTES.md` for the migration plan.
+//! Since **Sub-tappa 6.1** the default is the real candle Llama-3.1
+//! backend ([`super::backend_candle`], Foundation-Sec-8B-Reasoning
+//! Q4_K_M GGUF) — see that module's header for the authoritative
+//! rationale (the earlier gemma4 blocker is historical: the model
+//! choice moved to a Llama-3.1-architecture model with native candle
+//! support). [`MockBackend`] is now the CI / load-failure fallback
+//! only, NOT the production default. `build_default_backend` in
+//! [`super`] selects candle and falls back to the mock if the GGUF
+//! cannot be loaded.
 
 use std::path::{Path, PathBuf};
 
