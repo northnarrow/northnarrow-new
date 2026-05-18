@@ -1,6 +1,13 @@
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
-Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ P7✅ COMPLETE — branch ready for merge to main.**
+Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ P7✅ COMPLETE (merged `75855c6`) · P5.1✅ DELIVERED (Tappa 6.9.7.1 amendment — pending owner gate).**
+P5.1 (2026-05-19): AMENDS the P5 Q4(a) freeze — `format_rag_block`
+flipped to the compact `RAG_CONTEXT:` format the off-repo Phase
+A/B/C/D datasets actually use (the freeze rested on a now-invalidated
+"no Phase-C dataset" assumption). Deterministic Sigma severity
+recovery from `content`; byte-lock renamed `..._phase_abcd_contract`.
+Charter/scope invariants held; `Option<String>` kept (reconciled).
+See §5.2.1 + §11. (Earlier P2–P7 status follows.)
 P7: docs closeout (docs-only — no code/tests/Cargo; clippy 0/0 and the
 test suite trivially unchanged, no Rust touched). ADE_DOCTRINE +
 XDR_ROADMAP + Art-13 dossier (two-artifact model) annotated;
@@ -643,6 +650,48 @@ closeout as a follow-on.
   generated to conform to production — not vice versa.** No byte-diff
   against nonexistent/stale Colab data; `format_rag_block` unmodified.
 
+### 5.2.1 AMENDED (P5.1, Tappa 6.9.7.1, 2026-05-19) — contract flip
+
+- **Q4(a) assumption INVALIDATED.** P5 froze the verbose structured
+  block under the (mistaken) belief no Phase-C dataset existed. The
+  2026-05-19 dataset inventory corrected this: Phase B (30K), C (5K),
+  D (2K) exist off-repo (PC Fisso Downloads, ~37K) and are coherent
+  with the already-trained Phase A (50K, 100% PASS) on the **compact
+  `RAG_CONTEXT:\n<summary>` natural-language format**. Empirical ground
+  truth: the Forge v2 generator templates (`forge_v2.py:804 + 919 +
+  987`). Production must conform to training data, not vice versa
+  (regenerating 37K examples = negative ROI).
+- **AS-BUILT P5.1.** `format_rag_block` rewritten to emit
+  `RAG_CONTEXT:\n<line per doc>\n\n`: `Sigma Intel ({sev} severity):
+  {title}.` for SigmaRule (severity deterministically recovered from
+  the `Level:`/`Severity:` standalone line the P2 builder appends —
+  `xtask/src/rag_kb.rs:317-321` — typed `SigmaSeverity`; graceful
+  title-only fallback, zero false positives), `Intel: {title}.` for
+  the other four `KbCategory` variants. Top-K → one line per doc
+  (Option B; multi-line is OOD vs single-line training but canary
+  defaults OFF + pre-beta validation pre-flip mitigates).
+- **Phase C is orthogonal by design.** Phase C (customer-context
+  whitelisting / RAG-trust resilience training) uses a pattern
+  production retrieval does not emit — intentional resilience framing,
+  NOT a format mismatch; it does not constrain this contract.
+- **Charter / scope held.** Zero `xai_types`/`xai/*` touches;
+  `RagDocument` schema unchanged (severity recovered from `content`,
+  never a new field — any propagation would be a separate 6.9.7.2);
+  no new deps; canary OFF default + `rag:None` byte-identical
+  preserved. **`Option<String>` signature deliberately kept** (the
+  FINAL "return `String::new()`" wording reconciled to `None`-for-
+  empty: it preserves the original brief's "existing empty-result
+  behavior preserved", the no-new-public-API invariant, and the
+  `.expect("…⇒ Some")` call sites in `tests.rs`/`bench.rs` — flagged
+  at the owner gate).
+- Byte-lock test renamed `format_rag_block_byte_stable_phase_c
+  _contract` → `..._phase_abcd_contract`; `bench.rs` e2e + the P5
+  `with_rag_splices_block_into_assembled_prompt` splice test re-pointed
+  to the compact contract (the two non-enumerated old-format call
+  sites — flagged). clippy 0/0; all P5.1 tests green (the unrelated
+  pre-existing `admin_socket::server_recreates_stale_socket_on_startup`
+  flaky is out of scope — fails identically on clean `75855c6`).
+
 ---
 
 ## 6. Module / file layout & integration
@@ -851,6 +900,23 @@ the bench records evaluate-with-RAG vs without.
   status, README has no RAG mention — none touched (minimal scope).
   Plan §11 + header folded. **Branch ready for merge to main after
   this audit.**
+- **P5.1 — format contract amendment (Tappa 6.9.7.1)** — ✅
+  **DELIVERED — pending owner gate audit.** AMENDS the P5 Q4(a)
+  freeze (§5.2.1): `format_rag_block` flipped from the verbose
+  structured block to the compact `RAG_CONTEXT:\n<summary>\n\n`
+  format the off-repo Phase A/B/C/D datasets (~37K, Forge v2
+  `forge_v2.py:804/919/987`) actually use. Deterministic Sigma
+  severity recovery from `content` (`SigmaSeverity` enum + `Level:`/
+  `Severity:` whole-line parse per `rag_kb.rs:317-321`; title-only
+  fallback). Edits: `rag_integration.rs` (fn + doc-comment + in-file
+  unit tests inc. 6 new `extract_sigma_severity` cases), `ade/tests.rs`
+  (byte-lock renamed `..._phase_abcd_contract` + new fallback test +
+  P5 splice test re-pointed), `rag/bench.rs` (e2e re-pointed),
+  `CLAUDE_BRIEFING.md`, this plan (§5.2.1 + §11 + header). XAI/
+  `RagDocument`/deps/canary-OFF/`rag:None` invariants held;
+  `Option<String>` signature kept (reconciled — see §5.2.1). clippy
+  0/0; P5.1 tests green (pre-existing unrelated `admin_socket` flaky
+  excluded). → owner gate.
 
 Each phase: atomic commit, push, notify, STOP at the gate (the 6.9
 iteration pattern the owner endorsed). `clippy --workspace

@@ -277,10 +277,11 @@ mod tests {
         );
     }
 
-    /// End-to-end Phase-C format re-confirm: real retrieval → the
-    /// frozen `format_rag_block` shape (structural, content is
-    /// corpus-dependent so not byte-exact — that is the P5 hermetic
-    /// snapshot's job).
+    /// End-to-end Phase-A/B/C/D format re-confirm (Tappa 6.9.7.1 P5.1):
+    /// real retrieval → the compact `RAG_CONTEXT:` shape. Content is
+    /// corpus-dependent so this is structural, not byte-exact — the
+    /// byte-exact lock is the hermetic
+    /// `format_rag_block_byte_stable_phase_abcd_contract` snapshot.
     #[test]
     #[ignore = "needs target/kb (cargo xtask rag-kb)"]
     fn end_to_end_format_rag_block_real_corpus() {
@@ -293,12 +294,19 @@ mod tests {
         });
         assert!(!r.documents.is_empty(), "expected real hits");
         let block = crate::ade::format_rag_block(&r).expect("non-empty ⇒ Some");
-        assert!(block.starts_with("=== RELEVANT CYBERSEC KNOWLEDGE (retrieved from local KB, trusted) ===\n"));
-        assert!(block.trim_end().ends_with("=== END RELEVANT KNOWLEDGE ==="));
+        assert!(block.starts_with("RAG_CONTEXT:\n"));
+        assert!(block.ends_with("\n\n"));
         for d in &r.documents {
-            assert!(block.contains(&format!("Id: {}", d.id)));
-            assert!(block.contains(&format!("Category: {}", d.category)));
-            assert!(block.contains(&format!("Similarity: {:.2}", d.similarity)));
+            // `clean_title` only trims trailing whitespace/'.', so the
+            // normalised title core is always a substring (KB titles
+            // carry no trailing period — corpus-independent check).
+            let core = d.title.trim().trim_end_matches('.').trim_end();
+            assert!(block.contains(core), "missing title {:?}", d.title);
         }
+        // The retired P5 verbose markers must be fully gone.
+        assert!(!block.contains("=== RELEVANT"));
+        assert!(!block.contains("=== END RELEVANT"));
+        assert!(!block.contains("Similarity:"));
+        assert!(!block.contains("Category:"));
     }
 }

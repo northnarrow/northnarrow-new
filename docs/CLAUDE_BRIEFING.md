@@ -92,9 +92,10 @@ Documentato in `VISION.md` repo. NESSUN ridimensionamento ammesso. Assistente ch
 - Tappa 6.9: XAI Saliency Mapping (**CRITICAL pre-beta blocker**, AI Act EU mandate)
 - Tappa 6.9.5: Surgical fine-tune
   - **Phase A Strict Formatter: ✅ DONE 13 maggio (100% validation 1000/1000)**
-  - Phase B eBPF Dialect: TODO
-  - Phase C RAG Trust: PROMOTED pre-beta (17 May 2026 ruling); dataset generation pending post-Tappa-6.9.7; will conform to frozen format_rag_block contract per Q4(a) ruling
-  - Phase D DPO Posture Alignment: deferred post-beta, **spec documentata** (con bug fix esplicito noto)
+  - Phase B eBPF Dialect (30K): dataset confirmed in PC Fisso Downloads (off-repo); format contract aligned via Tappa 6.9.7.1 P5.1; ready for training cycle 2026-05-20+
+  - Phase C RAG Trust (5K): PROMOTED pre-beta (17 May 2026 ruling); dataset confirmed in PC Fisso Downloads (off-repo); format contract aligned to the compact `RAG_CONTEXT:` `format_rag_block` via Tappa 6.9.7.1 P5.1 (AMENDS the Q4(a) freeze — see RAG plan §5.2.1); ready for training cycle 2026-05-20+
+  - Phase D DPO Posture Alignment (2K): dataset confirmed in PC Fisso Downloads (off-repo), format aligned via P5.1, ready for training cycle 2026-05-20+; **spec documentata** (con bug fix esplicito noto), deferred post-beta
+  - (Phase B+C+D = ~37K off-repo, coherent with the already-trained Phase A on the compact format — empirical ground truth: Forge v2 `forge_v2.py:804/919/987`)
 
 ### FASE 3: Anti-Tamper (Tappa 7-8) — IN PROGRESS
 - **Tappa 7: Anti-tamper LSM + Emergency Network Isolation**
