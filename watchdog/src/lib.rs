@@ -96,6 +96,18 @@ pub struct Cli {
     /// layer-2 evict path; W2 stores the flag but doesn't use it.
     #[arg(long = "bpffs-root", value_name = "PATH", default_value = DEFAULT_BPFFS_ROOT)]
     pub bpffs_root: PathBuf,
+    /// Optional explicit path to the agent binary. When omitted,
+    /// the watchdog reads `/proc/<agent_pid>/exe` to discover it
+    /// at boot. Provided as an escape hatch for environments where
+    /// the agent's `ptrace_access_check` LSM hook is active and the
+    /// watchdog's PID is not yet in PROTECTED_PIDS at boot — the
+    /// agent's mutual-protection insertion (via the W6 watchdog
+    /// pidfile poll) races with the watchdog's own boot, so the
+    /// `/proc/<pid>/exe` readlink can fail with EPERM during the
+    /// race window. Production systemd units pass this explicitly
+    /// to skip the race entirely.
+    #[arg(long = "agent-bin", value_name = "PATH")]
+    pub agent_bin: Option<PathBuf>,
 }
 
 /// Apply the W2 process-hardening prctls per design §7.4:

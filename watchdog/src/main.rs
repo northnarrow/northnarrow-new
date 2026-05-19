@@ -101,7 +101,14 @@ async fn run(cli: Cli) -> Result<()> {
         .context("opening initial agent pidfd")?;
     let mut agent_pid = read_pid_from_file(&cli.agent_pidfile)
         .context("re-reading agent PID for layer-2 evict context")?;
-    let agent_argv = derive_agent_argv(agent_pid, &cli.agent_pidfile)?;
+    let agent_argv = match cli.agent_bin.as_deref() {
+        Some(bin) => vec![
+            bin.to_string_lossy().into_owned(),
+            "--pid-file".to_string(),
+            cli.agent_pidfile.to_string_lossy().into_owned(),
+        ],
+        None => derive_agent_argv(agent_pid, &cli.agent_pidfile)?,
+    };
 
     let own_pid = std::process::id();
     write_pidfile_atomic(&cli.pidfile, own_pid)
