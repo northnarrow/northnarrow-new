@@ -90,6 +90,17 @@ pub enum AdminAuthError {
         key_fingerprint: String,
         required_role: Role,
     },
+    /// Quorum verify (Tappa 8 A6, design §3.3) collected fewer
+    /// distinct valid signatures than the operation requires.
+    /// `provided` counts only signatures that matched a loaded
+    /// admin pubkey AND came from a distinct key from any
+    /// previously matched signature in the same submission.
+    /// `required` mirrors the design §6.6 wire variant's
+    /// `required` field. This error does **not** increment the
+    /// rate-limit counter — a quorum shortfall is operator UX
+    /// (a co-signer hasn't replied yet), not an attack signal.
+    #[error("quorum not met: {provided} distinct valid signatures (need {required})")]
+    QuorumNotMet { required: u8, provided: u8 },
 }
 
 /// One loaded admin pubkey plus its parsed role allowlist. Stored
@@ -357,6 +368,170 @@ impl AdminAuth {
                 Err(AdminAuthError::InvalidSignature)
             }
         }
+    }
+
+    /// Verify a multi-signature **quorum** submission against the
+    /// outstanding nonce. Each signature in `signatures` is verified
+    /// independently; the agent tallies **distinct** matched pubkey
+    /// indices (per design §3.3, two signatures from the same key
+    /// count as one) and accepts the submission iff:
+    /// - at least `min_distinct` distinct keys verified, AND
+    /// - each role in `role_requirements` is carried by at least
+    ///   one of the matched keys ([`Role::All`] satisfies any
+    ///   required role).
+    ///
+    /// Failure-mode mapping (matches the design §6.6 wire variants
+    /// A7 will introduce):
+    /// - `signatures.is_empty()` OR `0 < matched < min_distinct`
+    ///   → [`AdminAuthError::QuorumNotMet`] (no rate-limit hit —
+    ///   a quorum shortfall is operator UX, not an attack signal).
+    /// - non-empty `signatures` with zero valid matches →
+    ///   [`AdminAuthError::InvalidSignature`] (rate-limit hit —
+    ///   the only way to land here is to submit signatures that
+    ///   verify under no loaded pubkey, which is an attack
+    ///   indicator).
+    /// - `min_distinct` keys matched but no matched key carries a
+    ///   required role → [`AdminAuthError::RoleDenied`]
+    ///   (no rate-limit hit — same rationale as A5).
+    /// - all checks pass → [`UnlockToken`] is minted; the nonce
+    ///   was consumed at the top of this method (single-use,
+    ///   regardless of outcome).
+    ///
+    /// **Constant-time iteration property:** for each submitted
+    /// signature, the inner per-key loop does NOT short-circuit on
+    /// match (same property as [`Self::verify_with_role`]). The
+    /// outer per-signature loop iterates every submitted signature
+    /// regardless of how many have already matched — so the total
+    /// verification cost is `O(signatures × pub_keys)` regardless
+    /// of which sigs verify or in which order.
+    ///
+    /// **Forward note (A7):** signatures here are over the raw
+    /// 32-byte outstanding nonce, mirroring [`Self::verify_with_role`].
+    /// A7 will introduce wire variants (`ShutdownRequest`, etc.)
+    /// that carry a [`SignedPayload`](common::wire::admin_signed_payload::SignedPayload)
+    /// and signatures over its
+    /// [`signing_digest`](common::wire::admin_signed_payload::signing_digest);
+    /// the quorum-verify machinery here stays unchanged — only the
+    /// caller-supplied "message to verify against" swaps from
+    /// `nonce[..]` to `signing_digest(payload)[..]`. That refactor
+    /// can be a pure parameter swap because both shapes produce a
+    /// fixed-size byte slice over which `verify_strict` operates.
+    pub fn verify_quorum(
+        &self,
+        signatures: &[[u8; 64]],
+        min_distinct: u8,
+        role_requirements: &[Role],
+    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+        debug_assert!(
+            min_distinct >= 1,
+            "verify_quorum: min_distinct must be >= 1 (got {min_distinct}); \
+             0 would mint a token with no signature"
+        );
+
+        let nonce = match self.pending_challenge.lock().take() {
+            Some(n) => n,
+            None => {
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "no_pending_challenge",
+                    "admin quorum verify with no outstanding challenge"
+                );
+                return Err(AdminAuthError::NoPendingChallenge);
+            }
+        };
+
+        // Tally distinct matched pubkey indices across every
+        // submitted signature.
+        let mut matched: Vec<usize> = Vec::new();
+        for sig_bytes in signatures {
+            let sig = Signature::from_bytes(sig_bytes);
+            let mut this_match: Option<usize> = None;
+            for (idx, entry) in self.pub_keys.iter().enumerate() {
+                if entry.key.verify_strict(&nonce, &sig).is_ok() {
+                    this_match = Some(idx);
+                    // intentionally no break — preserve constant-time
+                }
+            }
+            if let Some(idx) = this_match {
+                if !matched.contains(&idx) {
+                    matched.push(idx);
+                }
+            }
+        }
+
+        // Zero matches + non-empty submission = attack signal. Zero
+        // matches + empty submission = operator UX (no rate-limit).
+        if matched.is_empty() && !signatures.is_empty() {
+            self.failure_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_failure.lock() = Some(Instant::now());
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "invalid_sig",
+                submitted = signatures.len(),
+                "admin quorum verify: zero valid signatures in non-empty submission"
+            );
+            return Err(AdminAuthError::InvalidSignature);
+        }
+
+        // Cap at u8::MAX — a realistic admin install ships with
+        // single-digit admin keys, so this saturating cast never
+        // bites in practice.
+        let distinct: u8 = matched.len().min(u8::MAX as usize) as u8;
+        if distinct < min_distinct {
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "quorum_not_met",
+                required = min_distinct,
+                provided = distinct,
+                "admin quorum verify: insufficient distinct valid signatures"
+            );
+            return Err(AdminAuthError::QuorumNotMet {
+                required: min_distinct,
+                provided: distinct,
+            });
+        }
+
+        // Role check: every required role must be carried by AT
+        // LEAST ONE matched key. Order of role_requirements is
+        // irrelevant — the loop short-circuits on the first
+        // missing role and returns its fingerprint; tests assert
+        // this is the FIRST missing role, locked semantics.
+        for &required in role_requirements {
+            let satisfied = matched
+                .iter()
+                .any(|&idx| self.pub_keys[idx].authorizes(required));
+            if !satisfied {
+                // Surface the first matched key's fingerprint —
+                // it's the most useful audit-log breadcrumb when
+                // the operator sees "RoleDenied: which key?"
+                let fp = fingerprint(&self.pub_keys[matched[0]].key);
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "role_denied",
+                    required_role = ?required,
+                    matched_count = distinct,
+                    first_matched_fingerprint = %fp,
+                    "admin quorum verify: required role not carried by any matched key"
+                );
+                return Err(AdminAuthError::RoleDenied {
+                    key_fingerprint: fp,
+                    required_role: required,
+                });
+            }
+        }
+
+        // All checks pass — mint the token. Reset failure state on
+        // success (consistent with verify_with_role).
+        self.failure_count.store(0, Ordering::SeqCst);
+        *self.last_failure.lock() = None;
+        info!(
+            target: "anti_tamper.admin_auth.verify_success",
+            distinct,
+            required = min_distinct,
+            role_count = role_requirements.len(),
+            "admin quorum verified, unlock token minted"
+        );
+        Ok(mint_unlock_token())
     }
 
     /// Inspect rate-limit state and reset the counter when the
@@ -1232,5 +1407,231 @@ mod tests {
         let _token = auth
             .verify_unlock(&sig)
             .expect("pre-A5 admin.pub must continue to authorise unlock");
+    }
+
+    // ── A6: k-of-n quorum verify (§3.3) ────────────────────────────
+
+    /// Build an AdminAuth with N keys, each carrying the provided
+    /// roles. Returns the auth + the signing keys (in the same
+    /// order as their entries) so tests can mint signatures for
+    /// specific keys deterministically.
+    fn build_auth_with_keyed_roles(
+        per_key_roles: &[Vec<Role>],
+    ) -> (AdminAuth, Vec<SigningKey>) {
+        let mut entries = Vec::with_capacity(per_key_roles.len());
+        let mut signers = Vec::with_capacity(per_key_roles.len());
+        for roles in per_key_roles {
+            let (signing, verifying) = make_keypair();
+            entries.push(KeyEntry {
+                key: verifying,
+                roles: roles.clone(),
+            });
+            signers.push(signing);
+        }
+        let auth = AdminAuth::build_entries(entries, DEFAULT_RATE_LIMIT_WINDOW);
+        (auth, signers)
+    }
+
+    /// Required A6 test 1 (success path): two signatures from two
+    /// distinct admin keys, both with the required role, meet a
+    /// 2-of-N quorum and mint a token.
+    #[test]
+    fn verify_quorum_succeeds_with_two_distinct_keys_carrying_required_role() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::Shutdown, Role::Unlock],
+            vec![Role::Shutdown, Role::AuditRead],
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        let sigs = [
+            signers[0].sign(&nonce).to_bytes(),
+            signers[1].sign(&nonce).to_bytes(),
+        ];
+        auth.verify_quorum(&sigs, 2, &[Role::Shutdown])
+            .expect("2-of-N with role met must succeed");
+    }
+
+    /// Required A6 test 2 (insufficient distinct): one valid
+    /// signature when min_distinct = 2 surfaces QuorumNotMet
+    /// carrying { required: 2, provided: 1 } — does NOT trip
+    /// rate-limit (a co-signer simply hasn't replied yet).
+    #[test]
+    fn verify_quorum_rejects_insufficient_distinct_signatures_without_rate_limit() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::Shutdown],
+            vec![Role::Shutdown],
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        let sigs = [signers[0].sign(&nonce).to_bytes()];
+        match auth.verify_quorum(&sigs, 2, &[Role::Shutdown]) {
+            Err(AdminAuthError::QuorumNotMet { required, provided }) => {
+                assert_eq!(required, 2);
+                assert_eq!(provided, 1);
+            }
+            other => panic!("expected QuorumNotMet{{2,1}}, got {other:?}"),
+        }
+        // Rate-limit counter MUST stay at zero — operator UX
+        // event, not attack signal.
+        assert_eq!(
+            auth.failure_count.load(Ordering::SeqCst),
+            0,
+            "QuorumNotMet must not count toward rate-limit"
+        );
+    }
+
+    /// Required A6 test 3 (distinct-key tally): two signatures
+    /// from the SAME key count as one distinct match. A 2-of-N
+    /// quorum cannot be satisfied by one operator submitting two
+    /// copies of their own signature.
+    #[test]
+    fn verify_quorum_tallies_distinct_keys_not_signatures() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::Shutdown],
+            vec![Role::Shutdown],
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        // Same signing key, twice.
+        let sig0: [u8; 64] = signers[0].sign(&nonce).to_bytes();
+        let sigs = [sig0, sig0];
+        match auth.verify_quorum(&sigs, 2, &[Role::Shutdown]) {
+            Err(AdminAuthError::QuorumNotMet { required, provided }) => {
+                assert_eq!(required, 2);
+                assert_eq!(
+                    provided, 1,
+                    "two sigs from one key must tally as 1 distinct"
+                );
+            }
+            other => panic!("expected QuorumNotMet{{2,1}}, got {other:?}"),
+        }
+    }
+
+    /// Required A6 test 4 (role-requirement satisfied by one
+    /// signer): the role requirement is per-quorum, not per-signer.
+    /// One key carries `RotateKeys`, the second carries only
+    /// `Unlock` — but the 2-of-N submission with `[RotateKeys]`
+    /// required succeeds because AT LEAST ONE matched key has it.
+    #[test]
+    fn verify_quorum_role_requirement_satisfied_by_any_one_matched_key() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::RotateKeys, Role::Unlock], // the rotate-keys-bearing co-signer
+            vec![Role::Unlock],                   // the "any second admin" co-signer
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        let sigs = [
+            signers[0].sign(&nonce).to_bytes(),
+            signers[1].sign(&nonce).to_bytes(),
+        ];
+        auth.verify_quorum(&sigs, 2, &[Role::RotateKeys])
+            .expect("rotate-keys carried by one of two matched keys must satisfy");
+    }
+
+    /// Required A6 test 5 (role-requirement NOT met): two valid
+    /// signatures from distinct keys, but neither key carries the
+    /// required role. Surfaces RoleDenied (not QuorumNotMet) so
+    /// the operator's UX hint is "wrong key, not too few keys."
+    #[test]
+    fn verify_quorum_returns_role_denied_when_no_matched_key_carries_required_role() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::Unlock, Role::AuditRead],
+            vec![Role::Unlock, Role::AuditRead],
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        let sigs = [
+            signers[0].sign(&nonce).to_bytes(),
+            signers[1].sign(&nonce).to_bytes(),
+        ];
+        match auth.verify_quorum(&sigs, 2, &[Role::Shutdown]) {
+            Err(AdminAuthError::RoleDenied { required_role, .. }) => {
+                assert_eq!(required_role, Role::Shutdown);
+            }
+            other => panic!("expected RoleDenied(Shutdown), got {other:?}"),
+        }
+        // RoleDenied also must not trip the rate-limit counter —
+        // legit operator with the wrong key, not attack.
+        assert_eq!(auth.failure_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Required A6 test 6 (counts only valid signatures): a
+    /// submission mixing valid and garbage signatures counts only
+    /// the validly-matching ones toward quorum. A 2-of-N quorum
+    /// with one valid + one garbage sig fails as QuorumNotMet
+    /// (provided=1), NOT as InvalidSignature.
+    #[test]
+    fn verify_quorum_counts_only_valid_matching_signatures() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::Shutdown],
+            vec![Role::Shutdown],
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        let valid: [u8; 64] = signers[0].sign(&nonce).to_bytes();
+        let garbage: [u8; 64] = [0u8; 64];
+        let sigs = [valid, garbage];
+        match auth.verify_quorum(&sigs, 2, &[Role::Shutdown]) {
+            Err(AdminAuthError::QuorumNotMet { required, provided }) => {
+                assert_eq!(required, 2);
+                assert_eq!(provided, 1);
+            }
+            other => panic!("expected QuorumNotMet{{2,1}}, got {other:?}"),
+        }
+        // Submission HAD a garbage sig but ALSO had a valid one
+        // — so it's not an "all-invalid" attack signal. Rate-limit
+        // counter must stay zero.
+        assert_eq!(auth.failure_count.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Supplementary A6 tests ─────────────────────────────────────
+
+    /// A non-empty submission whose every signature is garbage
+    /// IS an attack signal — InvalidSignature surfaces and the
+    /// rate-limit counter increments.
+    #[test]
+    fn verify_quorum_all_garbage_signatures_trips_rate_limit() {
+        let (auth, _) = build_auth_with_keyed_roles(&[vec![Role::Shutdown]]);
+        let _nonce = auth.issue_challenge().unwrap();
+        let sigs = [[0u8; 64], [1u8; 64]];
+        match auth.verify_quorum(&sigs, 1, &[]) {
+            Err(AdminAuthError::InvalidSignature) => {}
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+        assert_eq!(
+            auth.failure_count.load(Ordering::SeqCst),
+            1,
+            "all-garbage submission must count toward rate-limit"
+        );
+    }
+
+    /// An empty signature submission surfaces QuorumNotMet (NOT
+    /// InvalidSignature) and does NOT trip the rate-limit
+    /// counter — a no-op submission can't be an attack.
+    #[test]
+    fn verify_quorum_rejects_empty_submission_as_quorum_not_met_no_rate_limit() {
+        let (auth, _) = build_auth_with_keyed_roles(&[vec![Role::Shutdown]]);
+        let _nonce = auth.issue_challenge().unwrap();
+        match auth.verify_quorum(&[], 2, &[Role::Shutdown]) {
+            Err(AdminAuthError::QuorumNotMet { required, provided }) => {
+                assert_eq!(required, 2);
+                assert_eq!(provided, 0);
+            }
+            other => panic!("expected QuorumNotMet{{2,0}}, got {other:?}"),
+        }
+        assert_eq!(auth.failure_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// [`Role::All`] satisfies any required role in a quorum
+    /// check — same semantics as single-key verify_with_role.
+    /// Useful for break-glass operators whose key holds `all`.
+    #[test]
+    fn verify_quorum_role_all_satisfies_any_required_role() {
+        let (auth, signers) = build_auth_with_keyed_roles(&[
+            vec![Role::All],
+            vec![Role::Unlock],
+        ]);
+        let nonce = auth.issue_challenge().unwrap();
+        let sigs = [
+            signers[0].sign(&nonce).to_bytes(),
+            signers[1].sign(&nonce).to_bytes(),
+        ];
+        // Required role is RotateKeys — only the All-key satisfies.
+        auth.verify_quorum(&sigs, 2, &[Role::RotateKeys])
+            .expect("Role::All must satisfy RotateKeys role requirement");
     }
 }
