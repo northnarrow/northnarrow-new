@@ -685,3 +685,94 @@ fn stuck_recovery_kills_sigint_ignoring_subprocess_via_real_bpf() {
         "sleeper {sleeper_pid} should be evicted from PROTECTED_PIDS: {pids:?}"
     );
 }
+
+// ── Test 4: PHASE_D_002 ptrace_access_check caller-side exemption ──
+
+/// **PHASE_D_002 verification:** ptrace_access_check exempts
+/// callers whose own tgid is in PROTECTED_PIDS (mutual whitelist,
+/// symmetric to W6's target-side protection). Reads
+/// `/proc/<agent_pid>/exe` from the test process — which goes
+/// through `proc_pid_readlink` → `ptrace_may_access` →
+/// `security_ptrace_access_check` → the agent's BPF program. The
+/// readlink must succeed when the caller (test pid) is in
+/// PROTECTED_PIDS, and fail with EPERM when it isn't.
+///
+/// This is the BPF-side proof that the W8 `--agent-bin` flag is
+/// no longer load-bearing for *correctness* — only kept as
+/// defense-in-depth + a clean operator override.
+#[test]
+fn ptrace_access_check_exempts_caller_in_protected_pids() {
+    let mut fx = E2eFixture::setup();
+    let agent_pid = fx.spawn_agent();
+    let test_pid = std::process::id();
+
+    // Baseline: caller (this test process) NOT in PROTECTED_PIDS.
+    // readlink /proc/<agent_pid>/exe must fail because the agent
+    // is in PROTECTED_PIDS and the BPF hook denies any unprotected
+    // caller. The kernel surface errno can be either EPERM (1, the
+    // LSM verdict directly) or EACCES (13, when an earlier
+    // `inode_permission` check on the /proc/<pid>/exe symlink
+    // trips before the LSM hook); both indicate "denied".
+    let exe_path = format!("/proc/{agent_pid}/exe");
+    let baseline = std::fs::read_link(&exe_path);
+    assert!(
+        baseline.is_err(),
+        "PROTECTED_PIDS-target readlink should fail for unprotected caller; \
+         got {baseline:?} (PHASE_D_002 baseline)"
+    );
+    let baseline_errno = baseline.unwrap_err().raw_os_error();
+    assert!(
+        matches!(baseline_errno, Some(1) | Some(13)),
+        "expected EPERM (1) or EACCES (13), got errno={baseline_errno:?}"
+    );
+
+    // Insert the test process's tgid into PROTECTED_PIDS via
+    // bpftool. Key is little-endian u32. Now the test process is
+    // a "protected" caller and the BPF program's PHASE_D_002
+    // mutual-whitelist branch should allow the readlink through.
+    let key_bytes = format!(
+        "{} {} {} {}",
+        test_pid & 0xFF,
+        (test_pid >> 8) & 0xFF,
+        (test_pid >> 16) & 0xFF,
+        (test_pid >> 24) & 0xFF,
+    );
+    let status = Command::new("sudo")
+        .arg("bpftool")
+        .arg("map")
+        .arg("update")
+        .arg("pinned")
+        .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
+        .arg("key")
+        .args(key_bytes.split_whitespace())
+        .arg("value")
+        .arg("1")
+        .status()
+        .expect("spawn bpftool map update");
+    assert!(
+        status.success(),
+        "bpftool map update for test pid {test_pid} failed"
+    );
+
+    // Same readlink, same target — must now succeed because the
+    // caller (test_pid) is in PROTECTED_PIDS. If this still EPERMs,
+    // the PHASE_D_002 BPF caller-exemption is broken.
+    let post = std::fs::read_link(&exe_path);
+    // Evict the test pid before any panic so a failed assert
+    // doesn't leave a stray protected PID across the fixture
+    // teardown.
+    let _ = Command::new("sudo")
+        .arg("bpftool")
+        .arg("map")
+        .arg("delete")
+        .arg("pinned")
+        .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
+        .arg("key")
+        .args(key_bytes.split_whitespace())
+        .status();
+    assert!(
+        post.is_ok(),
+        "ptrace_access_check should EXEMPT caller in PROTECTED_PIDS, but readlink \
+         /proc/{agent_pid}/exe returned {post:?} (PHASE_D_002 regression)"
+    );
+}

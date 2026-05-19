@@ -33,7 +33,7 @@
 
 use aya_ebpf::{
     cty::{c_int, c_void},
-    helpers::bpf_probe_read_kernel,
+    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel},
     macros::{lsm, map},
     maps::Array,
     programs::LsmContext,
@@ -95,6 +95,25 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // hash map (see task_kill.rs for the rationale on the Tappa 7
     // task 6 single-PID → hash-set migration).
     if PROTECTED_PIDS.get(&target_tgid).is_none() {
+        return 0;
+    }
+
+    // PHASE_D_002: caller-side mutual whitelist. If the CALLER's
+    // tgid is itself in PROTECTED_PIDS, allow the ptrace_access —
+    // this is the symmetric counterpart to W6's mutual PID
+    // protection: agent and watchdog are both in PROTECTED_PIDS
+    // and must therefore be able to read each other's /proc
+    // interfaces (the watchdog reads /proc/<agent_pid>/exe to
+    // reconstruct argv for respawn; the agent may in future read
+    // /proc/<watchdog_pid>/status for stuck-detection symmetry).
+    // Defends against unrelated root processes reading the agent's
+    // memory while allowing the in-family supervisor relationship.
+    //
+    // `bpf_get_current_pid_tgid` returns `(tgid << 32) | pid`; we
+    // want the tgid (upper 32 bits) to match the task_kill hook's
+    // semantics (which checks target *tgid*, not pid).
+    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if PROTECTED_PIDS.get(&caller_tgid).is_some() {
         return 0;
     }
 
