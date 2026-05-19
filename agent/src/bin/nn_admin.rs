@@ -33,12 +33,15 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
-    run_force_posture, run_init, run_shutdown, run_status, run_unlock, run_verify_keys,
+    load_audit_pubkey, run_audit_read, run_audit_verify, run_force_posture, run_init,
+    run_shutdown, run_status, run_unlock, run_verify_keys, AuditVerifyOutcome,
     ForcePostureOutcome, ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
 const DEFAULT_PUB_PATH: &str = "/etc/northnarrow/admin.pub";
+const DEFAULT_AUDIT_LOG_PATH: &str = "/etc/northnarrow/audit.log";
+const DEFAULT_SIGNING_KEY_PATH: &str = "/etc/northnarrow/agent.sig.key";
 /// Default path of the per-install agent UUID. Must match
 /// `Cli::agent_id_file` in `agent/src/main.rs` so nn-admin and the
 /// agent read the same on-disk source of truth (design §6.5).
@@ -186,6 +189,21 @@ enum Cmd {
         socket: PathBuf,
     },
 
+    /// Tappa 8 A12 — read or verify the tamper-evident audit log
+    /// (design §9). Two subcommands: `read` streams entries from
+    /// the on-disk JSONL log, `verify` runs the SHA-256 hash
+    /// chain + per-entry Ed25519 signature recomputation through
+    /// `northnarrow_agent::audit::verify_chain`.
+    ///
+    /// `audit verify` exits 8 (per design §5.3) on a broken chain,
+    /// 0 on success — distinct from the other admin commands so
+    /// CI can act on chain integrity specifically. An empty /
+    /// missing log file is "0 entries, success" (not an error).
+    Audit {
+        #[command(subcommand)]
+        sub: AuditCmd,
+    },
+
     /// Debug-only: force the agent's posture state machine into a
     /// chosen state. Only compiled when the `debug-trigger` Cargo
     /// feature is on.
@@ -193,6 +211,55 @@ enum Cmd {
     Debug {
         #[command(subcommand)]
         sub: DebugCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCmd {
+    /// Stream the audit log to stdout, optionally filtered by
+    /// timestamp. Default output is a compact human-readable
+    /// summary; `--json` emits one canonical JSON object per line
+    /// (matches the on-disk JSONL exactly).
+    Read {
+        /// Path to the audit log file (default
+        /// /etc/northnarrow/audit.log).
+        #[arg(long, default_value = DEFAULT_AUDIT_LOG_PATH)]
+        path: PathBuf,
+        /// Optional ISO-8601 / RFC-3339 timestamp threshold;
+        /// entries whose `ts` is lexicographically `>=` this
+        /// value are kept (the field's fixed-width format makes
+        /// string comparison equivalent to instant comparison).
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit one canonical JSON object per line instead of
+        /// the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replay the chain in `--from <path>` through
+    /// [`northnarrow_agent::audit::verify_chain`]. Loads the
+    /// verifying key either from `--agent-pubkey <hex>` (off-host
+    /// verification with the pubkey conveyed out-of-band) or from
+    /// the local `--agent-sig-key <path>` (default
+    /// /etc/northnarrow/agent.sig.key — zero-config on the agent
+    /// host, requires sudo to read the mode-0400 file).
+    Verify {
+        /// Path to a JSONL chain file (export from `audit read
+        /// --json` or the on-disk log itself).
+        #[arg(long)]
+        from: PathBuf,
+        /// Explicit 64-hex-char Ed25519 pubkey of the agent's
+        /// audit signing key. Set this when running off-host
+        /// (the auditor doesn't have access to the agent's
+        /// `agent.sig.key`).
+        #[arg(long = "agent-pubkey")]
+        agent_pubkey: Option<String>,
+        /// Local signing-key file the verifier derives the
+        /// pubkey from when `--agent-pubkey` is not given. Mode
+        /// 0400 — usually requires sudo.
+        #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
+        agent_sig_key: PathBuf,
     },
 }
 
@@ -324,6 +391,52 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::Audit {
+            sub: AuditCmd::Read { path, since, json },
+        } => match run_audit_read(&path, since.as_deref(), json) {
+            Ok(n) => {
+                // Summary goes to stderr so `audit read --json |
+                // jq` keeps a clean JSONL stream on stdout. Match
+                // the `audit: ...` prefix convention from §5.3.
+                eprintln!("audit: {n} entries read from {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("audit: {e:#}");
+                ExitCode::from(1)
+            }
+        },
+        Cmd::Audit {
+            sub:
+                AuditCmd::Verify {
+                    from,
+                    agent_pubkey,
+                    agent_sig_key,
+                },
+        } => match load_audit_pubkey(agent_pubkey.as_deref(), &agent_sig_key) {
+            Ok(pubkey) => match run_audit_verify(&from, &pubkey) {
+                Ok(AuditVerifyOutcome::Success { entries }) => {
+                    println!(
+                        "audit: {entries} entries, hash chain intact, all sigs valid"
+                    );
+                    ExitCode::SUCCESS
+                }
+                Ok(AuditVerifyOutcome::ChainBroken(err)) => {
+                    eprintln!("audit: chain broken — {err}");
+                    // Exit code 8 per design §5.3: "audit
+                    // verification failed (hash chain broken)".
+                    ExitCode::from(8)
+                }
+                Err(e) => {
+                    eprintln!("audit: {e:#}");
+                    ExitCode::from(1)
+                }
+            },
+            Err(e) => {
+                eprintln!("audit: {e:#}");
+                ExitCode::from(1)
+            }
+        },
         #[cfg(feature = "debug-trigger")]
         Cmd::Debug {
             sub: DebugCmd::ForcePosture { state, socket },
