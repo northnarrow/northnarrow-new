@@ -266,12 +266,36 @@ audit log so verification reuses `audit::verify_chain` logic.
   "uid": 0,
   "gid": 0,
   "size_bytes": 980728,
+  "is_symlink": false,
   "agent_id": "1f8a...",
   "prev_hash": "abc...",
   "entry_hash": "def...",
   "agent_sig": "..."
 }
 ```
+
+**Q1 resolution — `is_symlink: bool` field (NEW, `#[serde(default)]`
+for forward-compat).** When a watched path is itself a symlink, the
+baseline computer emits **TWO** `BaselineEntry` rows:
+
+- One with `is_symlink: true`, whose `sha256` is the SHA-256 of the
+  target *string* (the bytes `readlink(2)` returns) concatenated
+  with the `lstat` metadata struct. Catches "symlink target swap"
+  attacks where the attacker changes where the link points.
+- One with `is_symlink: false`, whose `sha256` is the SHA-256 of
+  the resolved target *content*. Catches "modify the file the
+  symlink resolves to" attacks.
+
+Auto-resolution depth is **capped at 1 hop** — if a watched symlink
+points at another symlink, only the immediate target is auto-added;
+deeper rebinds (e.g., Debian's `/etc/alternatives/*` chain) rely on
+the target's normal watch entry firing NN-L-FIM-001 if it's also
+in the watched-paths list.
+
+The `#[serde(default)]` attribute means pre-resolution
+`fim_baseline.jsonl` rows lacking the field deserialise to
+`is_symlink: false` automatically — V1.0 ships the field, but
+upgrades from a hypothetical pre-resolution chain stay verifiable.
 
 ### 4.3 `RuleMatch` (decision-engine verdict)
 
@@ -310,8 +334,11 @@ Each program:
 
 ### 5.2 Resource budget
 
-- `WATCHED_PATHS` capacity: 4096 entries (well above the 100-path
-  V1.0 baseline; headroom for future operator expansion).
+- `WATCHED_PATHS` capacity: **8192 entries** (bumped from the
+  initial 4096 estimate per Q1 + Q3 + Q7 resolutions —
+  ~100 curated base + ~10 Q1 symlink-target rows + headroom
+  for Q7's per-deployment `add:` lists + Q3's V1.1 recursive
+  watch opt-in).
 - `FS_FIM_EVENTS` ringbuf: 256 KiB (~3600 events at 72 B each).
   Higher than Tappa 7 task 5's deny ringbuf because drift events
   are bursty (a yum/apt upgrade can generate dozens in a second).
@@ -371,6 +398,62 @@ under `/var/lib/northnarrow/`:
 Same LSM caller-side exemption (PROTECTED_PIDS) means the agent can
 append while every other root caller is denied.
 
+### 6.5 Drift rate-limiting (Q4 resolution)
+
+Storm protection between the drain loop's `Event::Fim` emit
+and the decision engine, implemented as a **hierarchical
+token-bucket per rule**:
+
+| Severity tier | Default rate | Configurable |
+|---|---|---|
+| Critical | **NO LIMIT** | No — tampering with the cap itself would defeat the protection |
+| High | 50 events / minute / rule | Yes (`fim.rate_limit.high_per_min` in `/etc/northnarrow/config.toml`) |
+| Medium | 100 events / minute / rule | Yes (`fim.rate_limit.medium_per_min`) |
+
+When a rule's bucket is exhausted, the drain loop:
+
+1. **Always appends the `FimDriftEntry` to `fim_drift.jsonl`** —
+   evidence preservation is non-negotiable. The chain captures
+   every kernel-observed drift regardless of bucket state.
+2. **Sets `decision_engine_skipped: true`** on the persisted
+   entry. NEW schema field, `#[serde(default)]` for forward-
+   compat (older rows deserialise to `false` automatically).
+3. **Skips the `Event::Fim` emission** to the decision engine
+   for the suppressed event.
+4. **Logs once per bucket-exhaustion window**:
+   `WARN fim: drift rate-limit hit (M events suppressed for
+   rule R, window resets at T)`.
+
+`nn-admin fim status` surfaces the current bucket state
+(`<rule>: 47/50 tokens remaining, window resets in 23s`) so
+operators can see throttling as it happens.
+
+**Rationale for per-rule buckets:** a yum-upgrade flood of
+Medium-severity drift on `/usr/local/bin/` should NOT starve
+Critical-severity tokens for `/usr/sbin/sshd`. Per-rule
+isolation means an attacker can't exhaust the Critical bucket
+by flooding low-severity paths.
+
+**Rationale for Critical-uncapped:** every Critical event is
+either a documented evasion technique (Q2 hardlink-create on
+SUID) or a system-binary tamper. Throttling them would defeat
+the security property they're enforcing. Acceptable because
+the *deterministic* rule path (kill + posture transition) is
+also untouched — even if ADE batching (Q9) kicks in, the
+agent still fires the local response.
+
+`FimDriftEntry` schema addition:
+
+```json
+{
+  // ... existing fields per §4.1 + chain integrity ...
+  "decision_engine_skipped": false,  // NEW, Q4 resolution
+  "skip_reason": null                 // NEW; populated to
+                                      // "rate_limit:rule_<R>"
+                                      // when skipped=true
+}
+```
+
 ---
 
 ## 7. Detection rules — NN-L-FIM-001 through NN-L-FIM-009
@@ -398,6 +481,26 @@ inspects `Event::Fim(FimEvent)`, checks the path against the rule's
 allow/deny set, and returns a `VerdictRecord` carrying the
 severity + action + reasoning string.
 
+**Cross-cutting rule note (Q2 + Q4 lock-in):** every `Critical`-
+severity rule above is **never throttled by §6.5's drift rate
+limiter**. NN-L-FIM-001, NN-L-FIM-002, and NN-L-FIM-008 fire on
+every kernel-observed event regardless of bucket state — the
+events they catch (system-binary tamper, SUID-hardlink-evasion,
+kernel module modification) are documented evasion techniques and
+must not be suppressible. High / Medium tiers DO honour their
+buckets per §6.5.
+
+**NN-L-FIM-002 hardlink semantics (Q2 resolution):** the rule
+fires on EITHER `Created` op (new file with SUID bit) OR `Linked`
+op (new hardlink to an existing SUID-root inode). For the
+hardlink case the *new link path* is what matters — Critical
+severity when that path is under `/tmp/*`, `/var/tmp/*`,
+`/dev/shm/*`, or `/home/*` (user-writable directories). Callers
+in `PROTECTED_PIDS` are exempted (PHASE_D_002 caller-side
+pattern); operator-tunable allowlist of package-manager
+basenames (`dpkg`, `rpm`, `docker`) skips legitimate hardlink
+workflows.
+
 ---
 
 ## 8. ADE handoff
@@ -417,6 +520,31 @@ asked to:
 `severity = High` / `Medium` events stay in the deterministic-rule
 path — same gate the rest of Tappa 6 uses to avoid LLM cost on
 low-severity events.
+
+### 8.1 ADE prompt cost ceiling (Q9 resolution) — TIERED CAP
+
+Production LLM budget protection without sacrificing signal
+density during multi-event incidents. **Two-tier cap:**
+
+- **10 individual ADE prompts / minute** — one per Critical
+  `FimEvent` until the cap. Each prompt carries the full event
+  context for fine-grained LLM analysis.
+- **1 batched overflow prompt / minute** — fired when the
+  individual cap is exhausted. Carries the full list of
+  suppressed `FimEvent` JSON objects in a single prompt context
+  so the LLM still sees signal density without N separate API
+  calls. Upper bound: **11 ADE calls / minute** total.
+
+The DETERMINISTIC rule path (kill + posture transition) is
+**never throttled by the ADE cap** — it fires on every Critical
+event regardless of whether ADE saw the event individually or
+in the batch. ADE is enrichment, not a gate.
+
+`fim.ade.individual_cap_per_min` (default 10) and
+`fim.ade.batched_overflow_per_min` (default 1) are runtime-
+tuneable in `/etc/northnarrow/config.toml`. Setting overflow to
+0 disables the batched tier — useful for cost-sensitive
+deployments that prefer the simple cap.
 
 ---
 
@@ -521,71 +649,216 @@ feature.
 
 ---
 
-## 13. RFC items / open questions for owner ruling
+## 13. RFC resolutions
 
-1. **Q1 — Symlink baseline policy.** Baseline the target (current
-   recommendation) OR the link itself OR both? Targeting follows
-   the principle of least surprise (a `cp -L`-style operator
-   mental model) but means a malicious target-swap on a symlinked
-   binary path goes undetected until the next baseline. Owner
-   preference?
-2. **Q2 — Hardlink detection semantics.** A new hardlink to a
-   watched file doesn't change the watched inode's content — it
-   just creates a SECOND path pointing at the same data. Should
-   NN-L-FIM-002 flag this as "new SUID binary appeared" if the
-   new link is a SUID-root file? Recommendation: yes, surface via
-   `fim_link_observe`; rule decides.
-3. **Q3 — Recursive watch directories.** A naive recursive watch of
-   `/usr/bin/` would register ~3000 inodes — well under the 4096
-   `WATCHED_PATHS` capacity but still chatty. V1.0 ships a curated
-   ~100-path list (system binaries by-name + critical configs).
-   V1.1 could add wildcard recursion under operator opt-in. Owner
-   ruling: confirm the V1.0 curated approach.
-4. **Q4 — Drift event rate-limiting.** A `yum upgrade` can drift
-   dozens of paths in a few seconds. Should the drain emit one
-   `Event::Fim` per drift (current spec) OR batch into one event
-   per N drifts within a sliding window? Recommendation:
-   per-drift (simplest semantics; the decision engine + ADE batch
-   already if they're slow consumers).
-5. **Q5 — Baseline-on-install vs first-boot.** Should
-   `deploy/install.sh` compute the initial baseline (operator gets
-   a populated DB on first agent run) OR should the agent's first
-   boot compute it (faster install, slower first-boot)? Tradeoff:
-   install.sh would need to ship the SHA-256 helper without the
-   agent binary AND would block the install on a 200ms walk.
-   Recommendation: first-boot, log "computing initial baseline
-   (one-time, ~200ms)" so operators know what they're seeing.
-6. **Q6 — Drift report quorum.** Should `nn-admin fim report
-   --acknowledge` (mark drift events as operator-acknowledged in
-   the DB) require a quorum like `shutdown`? Recommendation: no
-   — acknowledgement is an operator-UX hint, not an authorisation
-   gate; single-sig with the `fim-manage` role.
-7. **Q7 — fim-paths.local conflict resolution.** Default
-   `fim-paths.v1` ships with the V1.0 curated list. Operator
-   override at `/etc/northnarrow/fim-paths.local` is ADDITIVE
-   only (the design line) — what if the operator wants to REMOVE a
-   default path (e.g., `/usr/sbin/sshd` because they don't run
-   sshd)? Recommendation: V1.0 keeps additive-only; V1.1
-   introduces a `disable:` list in the local file.
-8. **Q8 — Baseline rotation / pruning policy.** `fim_baseline.jsonl`
-   grows monotonically. After 5 years of yearly OS upgrades a
-   single agent could have ~500 entries per watched binary
-   (multiple rebaselines on each upgrade). When/how to prune?
-   Recommendation: V1.0 keeps the full chain (audit value);
-   V1.1 introduces a signed `fim-rotate` op that exports +
-   truncates with chain-of-chains continuation (same shape as
-   audit-rotate in Tappa 8's §14 Q9).
-9. **Q9 — ADE prompt cost ceiling.** Critical FIM events route to
-   ADE (§8). One LLM call per critical event could be costly under
-   an active intrusion. Cap at N calls per minute? Recommendation:
-   cap at 10/min via the existing ADE rate-limit knob; events
-   beyond the cap are still emitted to the deterministic-rule path
-   (which already fires the kill + posture transition).
-10. **Q10 — Tappa-13 backend mirror.** Should the agent stream
-    `fim_drift.jsonl` appends to the backend in addition to the
-    local file (parallel to Tappa 8 §14 Q10's audit-log mirror)?
-    Tappa-13 design concern; deferred. Local file + signed
-    `nn-admin fim report --json` export is V1.0.
+All 10 RFC items resolved 2026-05-19 (owner-accepted engineering
+recommendations). C1 implementation now unblocked. Each block
+below: **Decision**, **Rationale**, **Implementation note**
+(where in this doc / commit plan the decision manifests),
+**Reversibility cost**.
+
+### Q1 — Symlink baseline policy
+
+- **Decision:** baseline BOTH the symlink (its target string +
+  lstat metadata) AND auto-resolve to baseline the resolved
+  target's content as a SECOND entry. Auto-resolution depth
+  capped at 1 hop.
+- **Rationale:** security-deep question; coverage > operator
+  surprise. Cost is small (~10 extra rows for symlinks in the
+  V1.0 curated list). One operator decision (path in
+  fim-paths) → both attack vectors covered without operator
+  having to think.
+- **Implementation note:** §4.2 `BaselineEntry.is_symlink: bool`
+  schema field (`#[serde(default)]` for forward-compat) +
+  C3 `baseline.rs` emits two entries per symlinked watched path.
+- **Reversibility:** medium — schema field commits to disk;
+  flipping policy means an operator-driven rebaseline pass.
+  Acceptable because the field is additive from day one.
+
+### Q2 — Hardlink detection semantics
+
+- **Decision:** YES — NN-L-FIM-002 fires on hardlink creation
+  when the new link points at a SUID-root file from a user-
+  writable directory (`/tmp/*`, `/var/tmp/*`, `/dev/shm/*`,
+  `/home/*`). Surfaced via `fim_link_observe`; rule decides
+  based on the new link path (not the source path).
+- **Rationale:** documented evasion technique. Cost is one extra
+  rule check per hardlink syscall — negligible. Caller
+  exemption via `PROTECTED_PIDS` + operator-tunable package-
+  manager allowlist (`dpkg`, `rpm`, `docker`) handles
+  legitimate workflows.
+- **Implementation note:** §7 rule-table footer + C2
+  `fim_link_observe` BPF program + C5 NN-L-FIM-002 rule logic.
+- **Reversibility:** easy (rule logic only; no schema or wire
+  impact).
+
+### Q3 — Recursive watch directories
+
+- **Decision:** CONFIRM V1.0 CURATED ~100-path list. V1.1 adds
+  recursive opt-in via `recurse: true` in `fim-paths.local`
+  per-entry. `WATCHED_PATHS` map capacity bumped from 4096 →
+  **8192** in V1.0 (cheap insurance for Q1 + Q7 cross-cutting
+  additions).
+- **Rationale:** perf-coverage tradeoff weighs toward
+  predictability. A `yum upgrade` of `glibc` generates ~5-10
+  drift events with the curated list vs ~50-100 with
+  recursive `/usr/bin/`. The 10× difference matters during
+  active-intrusion conditions when every other system is
+  noisy.
+- **Implementation note:** §5.2 capacity bump + C7
+  `fim-paths.v1` ships the curated list; V1.1 adds the
+  recursion logic to C2's WATCHED_PATHS populator.
+- **Reversibility:** easy (no schema change; V1.1 recursion
+  only adds the populator logic).
+
+### Q4 — Drift event rate-limiting
+
+- **Decision:** PER-DRIFT to audit chain (always — evidence
+  preservation is non-negotiable) + HIERARCHICAL TOKEN-BUCKET
+  per rule on `Event::Fim` emission to the decision engine.
+  Defaults: 100/min Medium, 50/min High, **NO LIMIT
+  Critical**. Suppressed events get
+  `decision_engine_skipped: true` on the persisted entry.
+- **Rationale:** most consequential rate-limit decision —
+  needs to protect the decision pipeline from upgrade noise
+  WITHOUT giving an attacker a suppression window for
+  Critical events. Per-rule buckets prevent low-severity
+  flooding from starving Critical tokens. Mirrors Tappa 7
+  task_kill's 5-in-60s tamper ceiling pattern.
+- **Implementation note:** §6.5 NEW subsection + §7 rule-
+  table footer (Critical-uncapped lock-in) + C4 drain loop
+  implements the bucket between diff and emit; C5 rules
+  declare their severity tier so the bucket allocator knows
+  which to pick.
+- **Reversibility:** medium — `decision_engine_skipped: true`
+  schema field commits to disk; bucket parameters are
+  runtime-tuneable. Schema additive from day one.
+
+### Q5 — Baseline-on-install vs first-boot
+
+- **Decision:** FIRST-BOOT baseline. Document the TOFU (trust-
+  on-first-use) assumption explicitly in
+  `docs/operator/TAPPA9_FIM_TRUST_MODEL.md`. V1.1 adds
+  `nn-admin fim seed-from-file <known-good-shas.txt>` so
+  paranoid customers can OOB-distribute a trusted manifest.
+- **Rationale:** UX-simplicity rule applies. Install-time
+  baseline forces shipping a SHA-256 helper without the
+  agent binary, adds a 200ms install block, and STILL
+  doesn't solve "system might already be compromised"
+  honestly. First-boot + explicit TOFU disclosure is the
+  honest tradeoff.
+- **Implementation note:** C3 baseline auto-runs on first
+  boot when `fim_baseline.jsonl` is empty; C7 ships the
+  operator TOFU trust-model doc.
+- **Reversibility:** easy (operators can manually run
+  `nn-admin fim rebaseline-all` post-install at any time;
+  V1.1 `seed-from-file` is additive).
+
+### Q6 — Drift report acknowledge quorum
+
+- **Decision:** NO QUORUM — single-sig with `fim-manage`
+  role. Audit chain records the acknowledgement (who, when,
+  which event hashes) for later attribution.
+- **Rationale:** workflow gates are single-sig; security-
+  affecting ops are quorum. Acknowledging is a workflow
+  gate ("operator saw this"), not an authorisation gate
+  (doesn't unlock any new capability). The audit chain
+  provides retrospective accountability without operational
+  friction.
+- **Implementation note:** C6 `nn-admin fim report
+  --acknowledge` invokes the existing 1-of-N
+  `verify_signed_payload_quorum(min_distinct=1)` with
+  `Role::FimManage`.
+- **Reversibility:** easy (add `--require-quorum` later;
+  existing acks remain valid).
+
+### Q7 — fim-paths.local conflict resolution
+
+- **Decision:** V1.0 supports BOTH `add:` AND `disable:`
+  lists in `/etc/northnarrow/fim-paths.local` (override
+  original design rec). Disabled-default paths log `WARN
+  fim: default path <P> disabled by operator config` at
+  every agent boot. Disabling a path requires `fim-manage`
+  role.
+- **Rationale:** the additive-only constraint forces operators
+  into baseline-noise workarounds for unused services. Cost
+  is one extra YAML field + one boot-log line. Boot-time
+  WARN ensures operators can't silently hide a regression.
+- **Implementation note:** §10 deploy + C7 `fim-paths.local`
+  parser + boot-time WARN; C6 `nn-admin fim status
+  --show-disabled` surfaces the disabled set.
+- **Reversibility:** easy (additive-only is a strict subset
+  of "add + disable" — V1.1 could drop `disable:` with
+  operator migration if it proves misused).
+
+### Q8 — Baseline rotation / pruning policy
+
+- **Decision:** V1.0 KEEPS FULL CHAIN. V1.1 ships signed
+  `fim-rotate` op with chain-of-chains continuation (same
+  shape as Tappa 8 §14 Q9 audit-rotate).
+- **Rationale:** a 500-entry chain is ~100KB on disk —
+  trivial. Audit value of the full chain (compliance, post-
+  incident forensics) > storage savings. Pruning policy
+  belongs in V1.1 once we have customer feedback on actual
+  growth rates.
+- **Implementation note:** no V1.0 implementation work;
+  documented as deferred follow-up.
+- **Reversibility:** easy (V1.1 rotate is additive; un-
+  rotated chains stay verifiable forever).
+
+### Q9 — ADE prompt cost ceiling
+
+- **Decision:** TIERED CAP — 10 individual ADE prompts /
+  min + 1 batched overflow prompt / min summarising
+  suppressed events. Total upper bound: **11 ADE calls /
+  minute**. Deterministic-rule path is NEVER throttled by
+  the ADE cap.
+- **Rationale:** override original simple-cap rec by adding
+  the batched-overflow tier. 10/min works in steady state
+  but a multi-stage attack with 50 critical events in 30s
+  would lose 40 events of LLM context. Batching preserves
+  signal density at one extra API call/minute.
+- **Implementation note:** §8.1 + C9 (optional) ADE
+  integration; if C9 ships, the rate-limit knob lives in
+  `agent/src/ade/rate_limit.rs` alongside the existing
+  Tappa 6 ADE-rate-limit knob.
+- **Reversibility:** easy (runtime-tuneable; batched-
+  overflow disabled by setting overflow cap to 0).
+
+### Q10 — Tappa-13 backend mirror
+
+- **Decision:** DEFER TO TAPPA 13. V1.0 local
+  `fim_drift.jsonl` + signed `nn-admin fim report --json`
+  export is the audit-grade primitive; remote mirroring is
+  an additive future feature.
+- **Rationale:** mirroring requires backend-SaaS
+  architecture decisions out of Tappa 9 scope. The on-disk
+  format Tappa 9 ships IS the streaming protocol Tappa 13
+  will consume.
+- **Implementation note:** no V1.0 implementation work.
+- **Reversibility:** easy (additive future feature; no V1.0
+  commitment to preclude).
+
+### Cross-cutting consistency (lock-ins captured above)
+
+1. **Q1 (both) + Q3 (curated) compound on `WATCHED_PATHS`
+   size** → §5.2 capacity bumped to 8192.
+2. **Q2 (hardlink → Critical) + Q4 (Critical uncapped)** →
+   §7 rule-table footer documents the never-throttled
+   coupling explicitly.
+3. **Q5 (TOFU) + Q7 (disable list)** both expose operator-
+   trust assumptions → single
+   `docs/operator/TAPPA9_FIM_TRUST_MODEL.md` covers both;
+   referenced from C7's deploy work.
+4. **Q6 (no-quorum ack) + Q8 (signed fim-rotate)** →
+   workflow gates are single-sig, security-affecting ops are
+   quorum. Principle recorded as the consistent role-
+   allocation policy.
+5. **Q4 (audit chain captures all) + Q10 (defer backend
+   mirror)** → local file is the source of truth for
+   everything (including throttled-but-recorded events);
+   Tappa 13 backend mirror inherits that property by
+   construction.
 
 ---
 
