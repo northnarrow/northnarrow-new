@@ -770,6 +770,13 @@ impl AdminAuth {
     ///     now,
     /// )?;
     /// ```
+    /// PHASE_D_004: the success arm returns `(UnlockToken,
+    /// Vec<String>)` where the `Vec` is the 8-hex-char
+    /// fingerprints of every matched key, primary first by index
+    /// order in `admin.pub`. The dispatch layer threads these
+    /// into the audit log's `key_fp` / `cosigner_fps` fields so
+    /// the chain records WHICH operator(s) authorised each
+    /// signed action.
     pub fn verify_signed_payload_quorum(
         &self,
         payload: &SignedPayload,
@@ -778,7 +785,7 @@ impl AdminAuth {
         role_requirements: &[Role],
         expected_op: admin_signed_payload::OperationCode,
         server_now_unix_secs: u64,
-    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+    ) -> std::result::Result<(UnlockToken, Vec<String>), AdminAuthError> {
         debug_assert!(
             min_distinct >= 1,
             "verify_signed_payload_quorum: min_distinct must be >= 1 \
@@ -953,6 +960,13 @@ impl AdminAuth {
         // All checks pass.
         self.failure_count.store(0, Ordering::SeqCst);
         *self.last_failure.lock() = None;
+        // PHASE_D_004: collect the matched-key fingerprints (in
+        // matched-order, which is admin.pub index-order via the
+        // per-sig scan above) for the audit log.
+        let matched_fps: Vec<String> = matched
+            .iter()
+            .map(|&idx| fingerprint(&pub_keys[idx].key))
+            .collect();
         info!(
             target: "anti_tamper.admin_auth.verify_success",
             op = ?expected_op,
@@ -961,7 +975,7 @@ impl AdminAuth {
             role_count = role_requirements.len(),
             "signed-payload quorum verified, unlock token minted"
         );
-        Ok(mint_unlock_token())
+        Ok((mint_unlock_token(), matched_fps))
     }
 
     /// Inspect rate-limit state and reset the counter when the
@@ -2378,5 +2392,80 @@ mod tests {
         // against the original key.
         let snap = auth.key_fingerprints_snapshot();
         assert_eq!(snap.len(), 1);
+    }
+
+    // ── PHASE_D_004 — verify_signed_payload_quorum returns fps ────
+
+    /// PHASE_D_004 surface test: on success, verify returns
+    /// the matched-key fingerprints in admin.pub index-order.
+    /// 2-of-N quorum with two distinct signing keys → two
+    /// distinct fingerprints in the returned Vec, primary
+    /// signer first. The audit-log dispatch layer relies on
+    /// this ordering for its `key_fp` / `cosigner_fps` split.
+    #[test]
+    fn verify_signed_payload_quorum_returns_matched_fingerprints() {
+        use common::wire::admin_signed_payload::{
+            sign as sign_payload, signing_digest, OperationCode, SignedPayload,
+        };
+        // Build a 2-of-N auth with both keys carrying Shutdown
+        // role + a stable agent_id we can pass to the payload.
+        let agent_id = [0x77; 16];
+        let signers: Vec<SigningKey> =
+            (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let entries: Vec<KeyEntry> = signers
+            .iter()
+            .map(|s| KeyEntry {
+                key: s.verifying_key(),
+                roles: vec![Role::Shutdown],
+            })
+            .collect();
+        let auth = AdminAuth::build_entries_with_agent_id(
+            entries,
+            DEFAULT_RATE_LIMIT_WINDOW,
+            agent_id,
+        );
+        let nonce = auth.issue_challenge().unwrap();
+        let payload =
+            SignedPayload::new_shutdown(nonce, 1_700_000_000, agent_id, 10);
+        // Sanity: signing_digest is non-empty.
+        let _ = signing_digest(&payload).expect("digest");
+        let sigs: Vec<[u8; 64]> = signers
+            .iter()
+            .map(|s| sign_payload(&payload, s).expect("sign"))
+            .collect();
+
+        let (_token, fps) = auth
+            .verify_signed_payload_quorum(
+                &payload,
+                &sigs,
+                2,
+                &[Role::Shutdown],
+                OperationCode::Shutdown,
+                1_700_000_000,
+            )
+            .expect("verify must succeed");
+        // Two distinct 8-hex fingerprints.
+        assert_eq!(fps.len(), 2, "expected 2 matched fps, got {fps:?}");
+        assert_ne!(fps[0], fps[1], "fps must be distinct: {fps:?}");
+        for fp in &fps {
+            assert_eq!(fp.len(), 8, "fp must be 8 hex chars: {fp}");
+            assert!(
+                fp.chars().all(|c| c.is_ascii_hexdigit()),
+                "fp must be hex: {fp}"
+            );
+        }
+        // The fingerprints match the two installed pubkeys
+        // (order-independent — verify reports in admin.pub
+        // index-order, which equals signer-vec order here).
+        let expected: Vec<String> = signers
+            .iter()
+            .map(|s| fingerprint(&s.verifying_key()))
+            .collect();
+        for fp in &fps {
+            assert!(
+                expected.contains(fp),
+                "fp {fp} not in expected set {expected:?}"
+            );
+        }
     }
 }

@@ -255,8 +255,17 @@ async fn handle_connection(
             Some(m) => m,
             None => return Ok(()),
         };
-        let reply = dispatch(msg.clone(), auth, posture, isolator, marker_path, shutdown_signal);
-        emit_audit_for(&msg, &reply, &client, audit_log);
+        let mut matched_fps: Vec<String> = Vec::new();
+        let reply = dispatch(
+            msg.clone(),
+            auth,
+            posture,
+            isolator,
+            marker_path,
+            shutdown_signal,
+            &mut matched_fps,
+        );
+        emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
         write_frame(&mut stream, &reply).await?;
     }
 }
@@ -346,11 +355,16 @@ fn peer_creds(stream: &UnixStream) -> AuditClient {
 /// plus continue: the operator's authorised action MUST succeed
 /// even if the audit log is temporarily unwritable (design §9
 /// states "the entry is the receipt; the action is the action").
+// PHASE_D_004: `matched_fps` is the dispatch_* fns' `fps_out`
+// values — empty for the legacy `Unlock` path (still goes
+// through the non-payload verify) and for failure paths;
+// populated for successful signed-payload ops.
 fn emit_audit_for(
     msg: &AdminMessage,
     reply: &AdminMessage,
     client: &AuditClient,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    matched_fps: &[String],
 ) {
     let Some(audit_log) = audit_log else {
         return;
@@ -420,16 +434,24 @@ fn emit_audit_for(
         // out-of-spec and already logged; no audit row.
         _ => return,
     };
+    // PHASE_D_004: split matched_fps into primary + cosigners.
+    // matched_fps is in admin.pub index-order — the first slot
+    // is the canonical "key_fp" (primary signer), the rest are
+    // cosigners. Empty matched_fps (legacy Unlock path / failure
+    // paths) falls back to empty strings — the same shape B5
+    // shipped, so audit-verify of an existing chain still parses.
+    let (key_fp, cosigner_fps): (String, Vec<String>) = if matched_fps.is_empty() {
+        (String::new(), vec![String::new(); cosigner_count])
+    } else {
+        let mut iter = matched_fps.iter().cloned();
+        let primary = iter.next().unwrap_or_default();
+        (primary, iter.collect())
+    };
     let draft = AuditEntryDraft {
         op: op.to_string(),
         extra,
-        // B5 ships the audit emission path with key_fp omitted —
-        // verify_signed_payload_quorum doesn't currently return
-        // the matched key's fingerprint. PHASE_D_004 follow-up
-        // threads it through so this field carries the real
-        // signer fingerprint.
-        key_fp: String::new(),
-        cosigner_fps: vec![String::new(); cosigner_count],
+        key_fp,
+        cosigner_fps,
         result,
         client_pid: client.pid,
         client_uid: client.uid,
@@ -497,6 +519,7 @@ fn dispatch(
     isolator: &NetworkIsolator,
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
+    fps_out: &mut Vec<String>,
 ) -> AdminMessage {
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
@@ -597,19 +620,20 @@ fn dispatch(
                 auth,
                 marker_path,
                 shutdown_signal,
+                fps_out,
             ))
         }
 
         AdminMessage::ForcePostureRequest(req) => {
-            AdminMessage::ForcePostureResult(dispatch_force_posture(req, auth, posture))
+            AdminMessage::ForcePostureResult(dispatch_force_posture(req, auth, posture, fps_out))
         }
 
         AdminMessage::RotateKeysAddRequest(req) => {
-            AdminMessage::RotateKeysAddResult(dispatch_rotate_keys_add(req, auth))
+            AdminMessage::RotateKeysAddResult(dispatch_rotate_keys_add(req, auth, fps_out))
         }
 
         AdminMessage::RotateKeysRevokeRequest(req) => {
-            AdminMessage::RotateKeysRevokeResult(dispatch_rotate_keys_revoke(req, auth))
+            AdminMessage::RotateKeysRevokeResult(dispatch_rotate_keys_revoke(req, auth, fps_out))
         }
 
         // Server-only variants — clients sending these are speaking
@@ -671,11 +695,17 @@ fn dispatch(
 /// the cross-component contract is "marker on disk = the agent
 /// authorised this exit"; production E2E will be exercised once
 /// A8 lands the main-loop integration.
+// PHASE_D_004: `fps_out` is an out-parameter populated on the
+// success path with the 8-hex-char fingerprints of every
+// matched signer. dispatch() reads this for emit_audit_for
+// so the audit chain records WHICH operators authorised each
+// signed action.
 fn dispatch_shutdown(
     req: ShutdownRequest,
     auth: &AdminAuth,
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
+    fps_out: &mut Vec<String>,
 ) -> AdminResult {
     // Per §10.3 step 1: quorum verify (2-of-N including ≥1
     // Role::Shutdown). The integrated verify path
@@ -695,8 +725,8 @@ fn dispatch_shutdown(
         server_now,
     );
 
-    let _token = match verify_outcome {
-        Ok(token) => token,
+    let (_token, matched_fps) = match verify_outcome {
+        Ok(t) => t,
         Err(AdminAuthError::NoPendingChallenge) => return AdminResult::NoPendingChallenge,
         Err(AdminAuthError::NonceMismatch) => return AdminResult::InvalidSignature,
         Err(AdminAuthError::UnknownOperation { .. }) => return AdminResult::UnknownOperation,
@@ -723,6 +753,7 @@ fn dispatch_shutdown(
             return AdminResult::InvalidSignature;
         }
     };
+    *fps_out = matched_fps;
 
     // Per §10.3 step 2: build the marker. entry_hash is the
     // SHA-256 over signing_digest(payload) — a stable opaque
@@ -812,6 +843,7 @@ fn dispatch_force_posture(
     req: ForcePostureRequest,
     auth: &AdminAuth,
     posture: &PostureMachine,
+    fps_out: &mut Vec<String>,
 ) -> AdminResult {
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -825,8 +857,8 @@ fn dispatch_force_posture(
         server_now,
     );
 
-    let token = match verify_outcome {
-        Ok(token) => token,
+    let (token, matched_fps) = match verify_outcome {
+        Ok(t) => t,
         Err(AdminAuthError::NoPendingChallenge) => return AdminResult::NoPendingChallenge,
         Err(AdminAuthError::NonceMismatch) => return AdminResult::InvalidSignature,
         Err(AdminAuthError::UnknownOperation { .. }) => return AdminResult::UnknownOperation,
@@ -853,6 +885,7 @@ fn dispatch_force_posture(
             return AdminResult::InvalidSignature;
         }
     };
+    *fps_out = matched_fps;
 
     // Extract the target from the verified payload. The op/extra
     // invariant inside verify_signed_payload_quorum already
@@ -910,11 +943,15 @@ fn dispatch_force_posture(
 /// that go through `build_*` don't, and trying to rotate keys
 /// against an in-memory-only auth surfaces as a clear log line
 /// + `AdminResult::UnknownOperation`.
-fn dispatch_rotate_keys_add(req: RotateKeysAddRequest, auth: &AdminAuth) -> AdminResult {
+fn dispatch_rotate_keys_add(
+    req: RotateKeysAddRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> AdminResult {
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
 
-    let _token = match auth.verify_signed_payload_quorum(
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
         &req.payload,
         &sigs,
         2, // 2-of-N per §3.3
@@ -925,6 +962,7 @@ fn dispatch_rotate_keys_add(req: RotateKeysAddRequest, auth: &AdminAuth) -> Admi
         Ok(t) => t,
         Err(e) => return map_admin_auth_error(e, "rotate-keys-add"),
     };
+    *fps_out = matched_fps;
 
     let (new_pubkey_bytes, roles) = match &req.payload.extra {
         OperationExtra::RotateKeysAdd(extra) => (extra.new_pubkey, extra.roles.clone()),
@@ -995,11 +1033,15 @@ fn dispatch_rotate_keys_add(req: RotateKeysAddRequest, auth: &AdminAuth) -> Admi
 /// LAST remaining key — that would soft-brick the agent
 /// (`AdminResult::InvalidSignature` rather than a dedicated
 /// variant; the operator-facing detail is in the agent's own log).
-fn dispatch_rotate_keys_revoke(req: RotateKeysRevokeRequest, auth: &AdminAuth) -> AdminResult {
+fn dispatch_rotate_keys_revoke(
+    req: RotateKeysRevokeRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> AdminResult {
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
 
-    let _token = match auth.verify_signed_payload_quorum(
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
         &req.payload,
         &sigs,
         2, // 2-of-N per §3.3
@@ -1010,6 +1052,7 @@ fn dispatch_rotate_keys_revoke(req: RotateKeysRevokeRequest, auth: &AdminAuth) -
         Ok(t) => t,
         Err(e) => return map_admin_auth_error(e, "rotate-keys-revoke"),
     };
+    *fps_out = matched_fps;
 
     let target_fp = match &req.payload.extra {
         OperationExtra::RotateKeysRevoke(extra) => extra.fingerprint,
@@ -1769,7 +1812,7 @@ mod tests {
             },
         );
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit));
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "unlock");
@@ -1800,7 +1843,7 @@ mod tests {
             ],
         });
         let reply = AdminMessage::ShutdownResult(AdminResult::Success);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit));
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "shutdown");
@@ -1833,7 +1876,7 @@ mod tests {
             signatures: vec![KeyedSignature { signature: [0; 64] }],
         });
         let reply = AdminMessage::ForcePostureResult(AdminResult::RoleDenied);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit));
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "force_posture");
@@ -1864,6 +1907,7 @@ mod tests {
             &challenge_reply,
             &fake_client(),
             Some(&audit),
+            &[],
         );
         // Non-auditable: Status request.
         let status_req = AdminMessage::Status(StatusRequest {});
@@ -1872,7 +1916,7 @@ mod tests {
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
         });
-        emit_audit_for(&status_req, &status_reply, &fake_client(), Some(&audit));
+        emit_audit_for(&status_req, &status_reply, &fake_client(), Some(&audit), &[]);
 
         let after_skips = read_audit_entries(&log_path);
         assert_eq!(
@@ -1893,11 +1937,16 @@ mod tests {
             payload: payload_a,
             signatures: vec![KeyedSignature { signature: [0; 64] }],
         });
+        // PHASE_D_004: pass non-empty matched_fps to exercise
+        // the new fingerprint-threading path. Two distinct
+        // fps for the two ops so the chain test below can
+        // assert non-empty + distinct values per row.
         emit_audit_for(
             &req_a,
             &AdminMessage::RotateKeysAddResult(AdminResult::Success),
             &fake_client(),
             Some(&audit),
+            &["aaaaaaaa".to_string(), "bbbbbbbb".to_string()],
         );
 
         let payload_b = SignedPayload::new_rotate_keys_add(
@@ -1916,6 +1965,7 @@ mod tests {
             &AdminMessage::RotateKeysAddResult(AdminResult::Success),
             &fake_client(),
             Some(&audit),
+            &["cccccccc".to_string(), "dddddddd".to_string()],
         );
 
         let entries = read_audit_entries(&log_path);
@@ -1929,5 +1979,37 @@ mod tests {
         );
         // The two new_key_fp values differ (different new_pubkey).
         assert_ne!(entries[0].extra, entries[1].extra);
+        // PHASE_D_004: fingerprints now flow through. First
+        // emission's key_fp = "aaaaaaaa" + cosigner_fps = ["bbbbbbbb"];
+        // second = "cccccccc" + ["dddddddd"].
+        assert_eq!(entries[0].key_fp, "aaaaaaaa");
+        assert_eq!(entries[0].cosigner_fps, vec!["bbbbbbbb".to_string()]);
+        assert_eq!(entries[1].key_fp, "cccccccc");
+        assert_eq!(entries[1].cosigner_fps, vec!["dddddddd".to_string()]);
+    }
+
+    // ── PHASE_D_004 — fingerprint-threading focused test ──────────
+
+    /// PHASE_D_004 dispatch-level proof: when an empty
+    /// `matched_fps` slice is passed (B5 backwards-compat / the
+    /// legacy Unlock path), the audit row gets empty strings —
+    /// same shape B5 originally shipped. Guards against an
+    /// accidental "always populate from fps" regression that
+    /// would break the legacy path.
+    #[test]
+    fn audit_empty_matched_fps_preserves_b5_empty_string_shape() {
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let req = AdminMessage::Unlock(
+            common::wire::admin_protocol::UnlockRequest {
+                signature: [0; 64],
+            },
+        );
+        let reply = AdminMessage::UnlockResult(UnlockResult::Success);
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key_fp, "");
+        assert!(entries[0].cosigner_fps.iter().all(String::is_empty));
     }
 }
