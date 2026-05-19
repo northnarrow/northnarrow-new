@@ -56,6 +56,31 @@ use tracing::{info, warn};
 /// log). Hard-coded for now; promotable to config when Tappa 9 lands.
 pub const STATE_DIR: &str = "/var/lib/northnarrow";
 
+/// Config directory holding admin-controlled secrets + agent
+/// identity files. Tappa 8 A14 (B4) widens PROTECTED_INODES to
+/// cover this directory's contents so an attacker with root
+/// can't tamper with `admin.pub` / `agent_id` / `audit.log` /
+/// `agent.sig.key` between agent restarts. The directory itself
+/// is not registered (operators legitimately add new files
+/// here — e.g., dropping a fresh pubkey for `rotate-keys add`);
+/// only the individual files are.
+pub const CONFIG_DIR: &str = "/etc/northnarrow";
+
+/// The four files inside [`CONFIG_DIR`] that Tappa 8 A14 brings
+/// under PROTECTED_INODES. Order is the operator-visible audit
+/// order — A14's tests assert it for stability.
+///
+/// - `admin.pub`: operator-provided. The W6 admin key allowlist.
+/// - `agent_id`: agent-bootstrapped per design §6.5.
+/// - `audit.log`: agent-appended per design §9 / commit B1.
+/// - `agent.sig.key`: agent-bootstrapped per commit B1 (mode 0400).
+pub const ETC_PROTECTED_FILES: &[&str] = &[
+    "admin.pub",
+    "agent_id",
+    "audit.log",
+    "agent.sig.key",
+];
+
 /// Permission bits applied at create time and re-asserted on every
 /// startup (defends against an admin loosening perms while the
 /// agent is offline).
@@ -119,6 +144,22 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
         ),
     }
 
+    // Step 3.5 (Tappa 8 A14 / B4): register the four
+    // /etc/northnarrow/ files in PROTECTED_INODES so the LSM
+    // hooks defend them too. Lenient: files that don't exist
+    // yet (audit.log on first install before any admin op, or
+    // agent.sig.key on a pre-B1 deploy) are skipped with a
+    // warn. The caller-side PROTECTED_PIDS exemption in the
+    // BPF program (also A14) keeps the agent's own A13
+    // rotate-keys atomic rewrite from being self-denied.
+    if let Err(e) = register_etc_files(ebpf, Path::new(CONFIG_DIR)) {
+        warn!(
+            error = %e,
+            "anti-tamper FS: /etc/northnarrow file registration failed — \
+             config files defended only by POSIX perms this boot"
+        );
+    }
+
     // Step 4: attach (or reuse the prior boot's still-firing) five
     // LSM hooks. `attach_lsm` logs the per-hook disposition; we only
     // escalate failures here.
@@ -131,6 +172,104 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
         }
     }
 
+    Ok(())
+}
+
+/// Tappa 8 A14 (B4): register each of the four [`ETC_PROTECTED_FILES`]
+/// in `PROTECTED_INODES` so the same LSM hooks that defend
+/// `/var/lib/northnarrow` also defend admin.pub / agent_id /
+/// audit.log / agent.sig.key. Missing files are skipped with a
+/// warn (a fresh install before the first admin op has no
+/// audit.log; a pre-B1 deploy has no agent.sig.key); present
+/// files are registered before the LSM hooks attach so the
+/// kernel never sees an unprotected window.
+///
+/// Returns the number of files actually registered, for the
+/// info-log line.
+pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usize> {
+    let mut registered = 0usize;
+    for name in ETC_PROTECTED_FILES {
+        let path = etc_dir.join(name);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    path = %path.display(),
+                    "anti-tamper FS: skip register_etc_files entry — file missing \
+                     (will be unprotected until next agent restart with the file present)"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "anti-tamper FS: stat failed for register_etc_files entry"
+                );
+                continue;
+            }
+        };
+        let key = InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        };
+        register_inode(ebpf, &key).with_context(|| {
+            format!("registering {} in {PROTECTED_INODES_MAP}", path.display())
+        })?;
+        info!(
+            path = %path.display(),
+            kernel_dev = key.dev,
+            ino = key.ino,
+            "anti-tamper FS: /etc/northnarrow file registered in {PROTECTED_INODES_MAP}"
+        );
+        registered += 1;
+    }
+    info!(
+        etc_dir = %etc_dir.display(),
+        registered,
+        total = ETC_PROTECTED_FILES.len(),
+        "anti-tamper FS: /etc/northnarrow file registration complete"
+    );
+    Ok(registered)
+}
+
+/// Tappa 8 A14 (B4): bootstrap an empty audit.log file if it
+/// doesn't exist yet, so PROTECTED_INODES has an inode to
+/// register at attach time. Idempotent: a present file is
+/// untouched. Atomicity isn't critical here — the file is
+/// 0 bytes either way; the worst race is a concurrent agent
+/// starting up and observing a non-existent path moments
+/// before we create it.
+pub fn bootstrap_audit_log(audit_log_path: &Path) -> Result<()> {
+    if audit_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = audit_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(0o755)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| {
+                    format!("creating audit-log parent dir {}", parent.display())
+                })?;
+        }
+    }
+    // 0644 matches the rest of /etc/northnarrow/ layout (design
+    // §6.5: world-readable, root-only writable + LSM-enforced
+    // append-only). Empty file body — first append writes the
+    // genesis entry.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(audit_log_path)
+        .with_context(|| format!("creating audit log {}", audit_log_path.display()))?;
+    info!(
+        path = %audit_log_path.display(),
+        "anti-tamper FS: audit log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
     Ok(())
 }
 
@@ -246,6 +385,7 @@ fn chattr_immutable_add(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn stat_dev_to_kernel_dev_sda2() {
@@ -264,5 +404,114 @@ mod tests {
         //                = 0x100801
         // MKDEV = (8 << 20) | 257 = 0x800101
         assert_eq!(stat_dev_to_kernel_dev(0x100801), 0x800101);
+    }
+
+    // ── Tappa 8 A14 (B4) — /etc/northnarrow registration tests ─────
+
+    /// A14 test #1: `ETC_PROTECTED_FILES` is a stable, ordered
+    /// list of the four file basenames. The ordering matters
+    /// for the operator-visible audit-log entries the next
+    /// commit will append, so anchor it explicitly here. Tests
+    /// 2-6 use this list to drive temp-dir fixtures.
+    #[test]
+    fn etc_protected_files_lists_the_four_design_files() {
+        assert_eq!(
+            ETC_PROTECTED_FILES,
+            &["admin.pub", "agent_id", "audit.log", "agent.sig.key"],
+            "design §9 / commit A14 specifies these four files exactly"
+        );
+        assert_eq!(CONFIG_DIR, "/etc/northnarrow");
+    }
+
+    /// A14 test #2: `bootstrap_audit_log` creates a zero-byte
+    /// file at the given path when it doesn't exist, with mode
+    /// 0644 so the LSM-protected world-readable contract holds.
+    #[test]
+    fn bootstrap_audit_log_creates_zero_byte_file_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("audit.log");
+        assert!(!log_path.exists());
+        bootstrap_audit_log(&log_path).expect("bootstrap missing log");
+        assert!(log_path.exists());
+        let meta = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    /// A14 test #3: `bootstrap_audit_log` is idempotent — a
+    /// second call on an existing file is a no-op and does NOT
+    /// truncate (so prior audit entries survive an agent
+    /// restart that calls bootstrap defensively at boot).
+    #[test]
+    fn bootstrap_audit_log_is_idempotent_and_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("audit.log");
+        bootstrap_audit_log(&log_path).expect("first bootstrap");
+        std::fs::write(&log_path, b"existing entry line\n").unwrap();
+        bootstrap_audit_log(&log_path).expect("second bootstrap");
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            body, "existing entry line\n",
+            "second bootstrap must NOT truncate"
+        );
+    }
+
+    /// A14 test #4: `bootstrap_audit_log` creates the parent
+    /// directory at mode 0755 if it doesn't yet exist
+    /// (handles a fresh /etc/northnarrow/ install where the
+    /// operator hasn't created the directory manually).
+    #[test]
+    fn bootstrap_audit_log_creates_parent_dir_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("etc/northnarrow");
+        let log_path = nested.join("audit.log");
+        assert!(!nested.exists());
+        bootstrap_audit_log(&log_path).expect("bootstrap into missing dir");
+        assert!(log_path.exists());
+        let dir_meta = std::fs::metadata(&nested).unwrap();
+        assert!(dir_meta.is_dir());
+        assert_eq!(
+            dir_meta.permissions().mode() & 0o777,
+            0o755,
+            "parent dir must be mode 0755 for design §6.5 layout"
+        );
+    }
+
+    /// A14 test #5: the ETC_PROTECTED_FILES list does NOT
+    /// include any path-traversal components. Defends against
+    /// a future operator-editable config where one of these
+    /// names becomes `../something` and the join with
+    /// CONFIG_DIR escapes to an unrelated inode.
+    #[test]
+    fn etc_protected_files_have_no_path_traversal() {
+        for name in ETC_PROTECTED_FILES {
+            assert!(
+                !name.contains('/'),
+                "{name} must be a bare basename — no '/'"
+            );
+            assert!(
+                !name.contains(".."),
+                "{name} must not contain '..' (path traversal defence)"
+            );
+            assert!(
+                !name.is_empty(),
+                "ETC_PROTECTED_FILES entries must be non-empty"
+            );
+        }
+    }
+
+    /// A14 test #6: ETC_PROTECTED_FILES entries are unique —
+    /// no duplicate names would silently register the same
+    /// inode twice (idempotent in the map, but bumps the
+    /// "registered N of total" log line incorrectly).
+    #[test]
+    fn etc_protected_files_are_unique() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for name in ETC_PROTECTED_FILES {
+            assert!(
+                seen.insert(name),
+                "duplicate entry {name} in ETC_PROTECTED_FILES"
+            );
+        }
     }
 }

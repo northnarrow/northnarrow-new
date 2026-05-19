@@ -231,6 +231,20 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
         bpf_printk!(b"nn-diag-REACHED-OVERRIDE");
         return false;
     }
+    // Tappa 8 A14 (B4): caller-side mutual whitelist. If the
+    // CALLER's tgid is in `task_kill::PROTECTED_PIDS`, allow the
+    // operation — same symmetric exemption PHASE_D_002 added to
+    // ptrace_access_check. The agent and watchdog are both
+    // inserted into PROTECTED_PIDS by W6, so this naturally
+    // exempts the agent's own A13 rotate-keys atomic rewrite +
+    // every other in-family FS-mutation path (audit log
+    // append, agent.sig.key rotation on re-install, etc.)
+    // while denying every unrelated root caller.
+    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if crate::task_kill::PROTECTED_PIDS.get(&caller_tgid).is_some() {
+        bpf_printk!(b"nn-diag-REACHED-CALLER-EXEMPT");
+        return false;
+    }
     bpf_printk!(b"nn-diag-REACHED-MATCH");
     emit_denial(operation, key);
     true

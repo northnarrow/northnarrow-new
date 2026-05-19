@@ -167,6 +167,48 @@ async fn main() -> Result<()> {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
 
+    // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
+    // BEFORE the sensor multiplexer attaches the LSM hooks, so the
+    // hooks see their inodes in PROTECTED_INODES the moment they
+    // fire. agent_id + signing key bootstraps were previously done
+    // post-attach (line ~360); moved here so the LSM-protected
+    // window starts at boot rather than at "first signed admin op".
+    // audit.log is created as a zero-byte placeholder if absent
+    // (first append writes the genesis entry).
+    if let Err(e) = northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+        std::path::Path::new(
+            northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
+        ),
+    ) {
+        warn!(
+            error = %e,
+            "agent signing key bootstrap failed pre-attach — audit log will be \
+             unsigned this boot"
+        );
+    }
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_audit_log(
+        std::path::Path::new(northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH),
+    ) {
+        warn!(
+            error = %e,
+            "audit log bootstrap failed pre-attach — file will be lazily created \
+             on first append (and protected only from agent restart onwards)"
+        );
+    }
+    // agent_id bootstrap moved up from line ~360 so its inode is
+    // present in PROTECTED_INODES from boot. The post-attach
+    // re-read at line ~360 stays for the SignedPayload wiring path
+    // (it just sees the same value we minted here).
+    let _ = agent_id::load_or_bootstrap(&cli.agent_id_file).map_err(|e| {
+        warn!(
+            error = %e,
+            path = %cli.agent_id_file.display(),
+            "pre-attach agent_id bootstrap failed — post-attach re-read will \
+             surface the same error and fall back to zero UUID"
+        );
+        e
+    });
+
     let mut sensor = SensorMultiplexer::start()
         .await
         .context("starting the sensor multiplexer")?;
