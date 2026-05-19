@@ -467,6 +467,180 @@ pub fn run_verify_keys(path: &Path) -> Result<VerifyKeysOutcome> {
     Ok(VerifyKeysOutcome { fingerprints })
 }
 
+// ── Tappa 8 A12 — audit read / audit verify ─────────────────────────
+
+/// Outcome of `nn-admin audit verify`. Mapped to exit codes in
+/// the binary (Success=0, ChainBroken=8 per design §5.3).
+#[derive(Debug)]
+pub enum AuditVerifyOutcome {
+    /// Chain verified end-to-end. `entries` is the count walked
+    /// (printed to the operator so they know how much they
+    /// audited).
+    Success { entries: usize },
+    /// Chain failed at the carried index. The typed
+    /// [`crate::audit::AuditVerifyError`] is preserved so the
+    /// caller can print the specific failure mode (prev_hash
+    /// mismatch, entry_hash mismatch, signature invalid,
+    /// malformed field). Exit code 8.
+    ChainBroken(crate::audit::AuditVerifyError),
+}
+
+/// `nn-admin audit read` — stream the audit log to stdout. Reads
+/// the on-disk JSONL log at `log_path` (default
+/// `/etc/northnarrow/audit.log`), optionally filtered by `since`
+/// (ISO-8601 timestamp string; entries whose `ts` is
+/// lexicographically `>=` are kept — RFC-3339 ISO strings sort
+/// the same way as the underlying instants because the format
+/// is fixed-width).
+///
+/// Output is one entry per line:
+/// - **Human (default)**: a tabular `ts op key_fp result` line
+///   plus the full JSON dump beside it. Compact enough for a
+///   `less`-style scroll, complete enough for an operator to
+///   not need a second tool.
+/// - **JSON (`json=true`)**: one canonical JSON object per
+///   line. Matches the on-disk JSONL exactly; the field set
+///   round-trips with [`crate::audit::AuditEntry`].
+///
+/// Returns the number of entries written so the binary can print
+/// `audit: N entries read`.
+pub fn run_audit_read(log_path: &Path, since: Option<&str>, json: bool) -> Result<usize> {
+    use std::io::{BufRead, BufReader, Write};
+    let f = match std::fs::OpenOptions::new().read(true).open(log_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Empty/absent log is a valid state (fresh install,
+            // no admin ops yet). Print nothing, return 0 — the
+            // binary's summary line communicates the count.
+            return Ok(0);
+        }
+        Err(e) => return Err(anyhow!(e).context(format!("opening {}", log_path.display()))),
+    };
+    let reader = BufReader::new(f);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut count = 0usize;
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading line {} of {}", idx + 1, log_path.display()))?;
+        if line.is_empty() {
+            continue;
+        }
+        let entry: crate::audit::AuditEntry = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parsing audit-log line {} of {} as JSON",
+                idx + 1,
+                log_path.display()
+            )
+        })?;
+        if let Some(threshold) = since {
+            if entry.ts.as_str() < threshold {
+                continue;
+            }
+        }
+        if json {
+            // Re-serialise to canonical form (drops any extra
+            // whitespace the file might have, normalises field
+            // order to the struct order).
+            let canonical = serde_json::to_string(&entry)
+                .map_err(|e| anyhow!("re-serialising audit entry: {e}"))?;
+            writeln!(out, "{canonical}").context("writing stdout")?;
+        } else {
+            // Human-friendly compact summary; entry.result may be
+            // long ("failure: …") so we don't pad it.
+            writeln!(
+                out,
+                "{} {:<16} {} {} {}",
+                entry.ts, entry.op, entry.key_fp, entry.result, entry.entry_hash
+            )
+            .context("writing stdout")?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// `nn-admin audit verify` — replay the chain in `from_path`
+/// through [`crate::audit::verify_chain`] using `pubkey`.
+/// Returns [`AuditVerifyOutcome::Success`] with the entry count
+/// or [`AuditVerifyOutcome::ChainBroken`] carrying the typed
+/// failure.
+///
+/// An empty / missing file is `Success { entries: 0 }` — there's
+/// nothing to verify and that is not an error condition; the
+/// exit-8 contract per §5.3 is reserved for an *actually-broken*
+/// chain.
+pub fn run_audit_verify(from_path: &Path, pubkey: &VerifyingKey) -> Result<AuditVerifyOutcome> {
+    use std::io::{BufRead, BufReader};
+    let f = match std::fs::OpenOptions::new().read(true).open(from_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AuditVerifyOutcome::Success { entries: 0 });
+        }
+        Err(e) => return Err(anyhow!(e).context(format!("opening {}", from_path.display()))),
+    };
+    let reader = BufReader::new(f);
+    let mut entries: Vec<crate::audit::AuditEntry> = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| {
+            format!("reading line {} of {}", idx + 1, from_path.display())
+        })?;
+        if line.is_empty() {
+            continue;
+        }
+        let entry: crate::audit::AuditEntry = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parsing audit-log line {} of {} as JSON",
+                idx + 1,
+                from_path.display()
+            )
+        })?;
+        entries.push(entry);
+    }
+    match crate::audit::verify_chain(&entries, pubkey) {
+        Ok(()) => Ok(AuditVerifyOutcome::Success {
+            entries: entries.len(),
+        }),
+        Err(e) => Ok(AuditVerifyOutcome::ChainBroken(e)),
+    }
+}
+
+/// Load an agent verifying key for `audit verify`. Prefers an
+/// explicit `--agent-pubkey <hex>` (32 bytes / 64 hex chars,
+/// optionally trailing newline) when present; otherwise reads
+/// the local signing-key file at `key_path` and derives the
+/// public half. The latter is the zero-config path on the
+/// agent host (operator runs `sudo nn-admin audit verify
+/// --from /etc/northnarrow/audit.log`); the former is the
+/// off-host path (auditor receives the pubkey hex via an
+/// out-of-band channel).
+pub fn load_audit_pubkey(
+    explicit_hex: Option<&str>,
+    key_path: &Path,
+) -> Result<VerifyingKey> {
+    if let Some(hex_str) = explicit_hex {
+        let trimmed = hex_str.trim();
+        if trimmed.len() != 64 {
+            bail!(
+                "--agent-pubkey must be 64 hex chars (got {})",
+                trimmed.len()
+            );
+        }
+        let bytes = hex::decode(trimmed)
+            .map_err(|e| anyhow!("--agent-pubkey is not valid hex: {e}"))?;
+        let arr: [u8; 32] = bytes.try_into().expect("hex pre-validated to 32 bytes");
+        return VerifyingKey::from_bytes(&arr)
+            .map_err(|e| anyhow!("--agent-pubkey is not a valid Ed25519 pubkey: {e}"));
+    }
+    let key = crate::audit::AgentSigningKey::load_or_bootstrap(key_path).with_context(|| {
+        format!(
+            "deriving agent pubkey from signing key file {}; pass --agent-pubkey \
+             <hex> when verifying off-host",
+            key_path.display()
+        )
+    })?;
+    Ok(key.verifying_key())
+}
+
 /// Debug-only: send a `DebugForcePosture` request. Only available
 /// when both this crate and `common` are built with the
 /// `debug-trigger` Cargo feature.
@@ -1088,6 +1262,156 @@ mod tests {
         assert!(
             s.contains("300"),
             "error must mention the 300 s design cap, got: {s}"
+        );
+    }
+
+    // ── Tappa 8 A12 — audit read / verify tests (5) ────────────────
+
+    /// Builder helper: bootstrap a fresh agent signing key in `dir`,
+    /// open an AuditLog at `dir/audit.log`, append `n` sample
+    /// entries. Returns (key_path, log_path, pubkey, the entries).
+    fn build_audit_log(
+        dir: &TempDir,
+        n: usize,
+    ) -> (PathBuf, PathBuf, VerifyingKey, Vec<crate::audit::AuditEntry>) {
+        let key_path = dir.path().join("agent.sig.key");
+        let log_path = dir.path().join("audit.log");
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pubkey = key.verifying_key();
+        let mut log = crate::audit::AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        let mut entries = Vec::new();
+        for i in 0..n {
+            let draft = crate::audit::AuditEntryDraft {
+                op: format!("test_op_{i}"),
+                extra: serde_json::json!({ "seq": i }),
+                key_fp: format!("{i:08x}"),
+                cosigner_fps: vec![],
+                result: "success".to_string(),
+                client_pid: 1000 + i as u32,
+                client_uid: 0,
+                client_comm: "nn-admin".to_string(),
+            };
+            entries.push(log.append(draft).unwrap());
+        }
+        (key_path, log_path, pubkey, entries)
+    }
+
+    // ── Test 1 (A12 #1): read on a missing log returns 0 with no
+    //                    spurious error (fresh install state).
+    #[test]
+    fn audit_read_missing_log_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let nowhere = dir.path().join("does-not-exist.jsonl");
+        let n = run_audit_read(&nowhere, None, false).expect("missing log is not an error");
+        assert_eq!(n, 0);
+    }
+
+    // ── Test 2 (A12 #2): read with --since filter drops entries
+    //                    strictly older than the threshold.
+    #[test]
+    fn audit_read_since_filter_drops_older_entries() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, log_path, _pubkey, entries) = build_audit_log(&dir, 3);
+        // since == third entry's ts → exactly one kept (>=, not >);
+        // entries[2] passes, entries[0..=1] are dropped.
+        let threshold = entries[2].ts.clone();
+        let n = run_audit_read(&log_path, Some(&threshold), true).unwrap();
+        assert_eq!(
+            n, 1,
+            "since-threshold equal to entries[2].ts should keep exactly entries[2]"
+        );
+        // since == "9999-..." → all dropped.
+        let n_none = run_audit_read(&log_path, Some("9999-99-99T99:99:99Z"), true).unwrap();
+        assert_eq!(n_none, 0);
+        // since == "0001-..." → all kept.
+        let n_all = run_audit_read(&log_path, Some("0001-01-01T00:00:00Z"), true).unwrap();
+        assert_eq!(n_all, 3);
+    }
+
+    // ── Test 3 (A12 #3): verify on an intact chain returns
+    //                    Success(count).
+    #[test]
+    fn audit_verify_intact_chain_returns_success() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, log_path, pubkey, _) = build_audit_log(&dir, 4);
+        let outcome = run_audit_verify(&log_path, &pubkey).unwrap();
+        match outcome {
+            AuditVerifyOutcome::Success { entries } => assert_eq!(entries, 4),
+            AuditVerifyOutcome::ChainBroken(e) => {
+                panic!("intact chain reported broken: {e:?}");
+            }
+        }
+    }
+
+    // ── Test 4 (A12 #4): verify on a tampered chain returns
+    //                    ChainBroken with the typed error.
+    #[test]
+    fn audit_verify_tampered_chain_reports_broken() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, log_path, pubkey, _) = build_audit_log(&dir, 2);
+        // Rewrite the log: flip the first entry's `result` field
+        // post-write — exactly the attack verify_chain catches via
+        // EntryHashMismatch.
+        let raw = std::fs::read_to_string(&log_path).unwrap();
+        let mut lines: Vec<crate::audit::AuditEntry> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        lines[0].result = "failure: someone-rewrote-this".to_string();
+        let mut new_body = String::new();
+        for l in &lines {
+            new_body.push_str(&serde_json::to_string(l).unwrap());
+            new_body.push('\n');
+        }
+        std::fs::write(&log_path, new_body).unwrap();
+
+        let outcome = run_audit_verify(&log_path, &pubkey).unwrap();
+        match outcome {
+            AuditVerifyOutcome::ChainBroken(crate::audit::AuditVerifyError::EntryHashMismatch {
+                idx: 0,
+                ..
+            }) => {} // expected
+            other => panic!("expected EntryHashMismatch on entry 0; got: {other:?}"),
+        }
+    }
+
+    // ── Test 5 (A12 #5): load_audit_pubkey accepts explicit
+    //                    --agent-pubkey hex AND falls back to the
+    //                    local signing-key file (zero-config path).
+    #[test]
+    fn load_audit_pubkey_explicit_hex_overrides_file_fallback() {
+        let dir = TempDir::new().unwrap();
+        // 1) Fresh signing key in the tempdir; pubkey from file
+        //    matches the one load_audit_pubkey derives.
+        let key_path = dir.path().join("agent.sig.key");
+        let on_disk_key =
+            crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let on_disk_pub = on_disk_key.verifying_key();
+        let derived = load_audit_pubkey(None, &key_path).expect("file fallback");
+        assert_eq!(derived.to_bytes(), on_disk_pub.to_bytes());
+
+        // 2) Explicit hex overrides — synthesise a DIFFERENT key,
+        //    pass its hex pubkey; load_audit_pubkey must return the
+        //    explicit one, NOT the on-disk one. Proves the
+        //    explicit-hex path is wired.
+        let other = SigningKey::generate(&mut OsRng);
+        let other_pub_hex = hex::encode(other.verifying_key().to_bytes());
+        let from_hex =
+            load_audit_pubkey(Some(&other_pub_hex), &key_path).expect("explicit hex");
+        assert_eq!(from_hex.to_bytes(), other.verifying_key().to_bytes());
+        assert_ne!(
+            from_hex.to_bytes(),
+            on_disk_pub.to_bytes(),
+            "explicit hex must NOT silently fall back to the file pubkey"
+        );
+
+        // 3) Bad-length hex is rejected with an actionable error.
+        let too_short = "deadbeef".repeat(7); // 56 chars, not 64
+        let err = load_audit_pubkey(Some(&too_short), &key_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("64 hex chars"),
+            "error must mention the 64-hex-char shape; got: {msg}"
         );
     }
 }
