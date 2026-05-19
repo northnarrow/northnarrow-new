@@ -47,6 +47,10 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
         Event::FsProtectDenial {
             comm, operation, ..
         } => format!("anti-tamper denial of {operation} by {comm}"),
+        // Tappa 9 (C4): FIM drift RAG query — keep short, focus
+        // on path + op (the most-grep-able tokens for sigma-rule
+        // search). Doesn't reach RAG in V1.0.
+        Event::Fim(fe) => format!("fim drift {} op {:?}", fe.path, fe.op),
     }
 }
 

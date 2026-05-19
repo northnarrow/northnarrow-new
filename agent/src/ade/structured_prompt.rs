@@ -162,6 +162,9 @@ fn event_kind_label(e: &Event) -> &'static str {
         Event::TcpConnect { .. } => "tcp_connect",
         Event::DnsQuery { .. } => "dns_query",
         Event::FsProtectDenial { .. } => "fs_protect_denial",
+        // Tappa 9 (C4): FIM event label. Doesn't appear in the
+        // ADE structured prompt in V1.0.
+        Event::Fim(_) => "fim_drift",
     }
 }
 
@@ -173,6 +176,8 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
         | Event::TcpConnect { pid, uid, .. }
         | Event::DnsQuery { pid, uid, .. }
         | Event::FsProtectDenial { pid, uid, .. } => (*pid, *uid),
+        // Tappa 9 (C4): FIM modifier triple.
+        Event::Fim(fe) => (fe.modifier_pid, fe.modifier_uid),
     };
     buf.push_str(&format!("pid: {pid}\nuid: {uid}\n"));
 }

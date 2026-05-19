@@ -85,6 +85,12 @@ pub enum Event {
         operation: FsProtectOperation,
         timestamp_ns: u64,
     },
+    /// Tappa 9 (C4) — file-integrity drift detected by the
+    /// observe-only FIM LSM hooks. The drain loop has already
+    /// re-hashed the target + diffed against the baseline DB;
+    /// emission here means the file actually changed. C5 rule
+    /// matchers consume this variant.
+    Fim(crate::wire::FimEvent),
 }
 
 /// Which inode operation the LSM hook denied. Wire-side these are

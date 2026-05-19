@@ -189,6 +189,12 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             "- fs_protect_denial pid={pid} uid={uid} comm={comm} op={operation} \
              dev={target_dev} ino={target_ino}"
         ),
+        // Tappa 9 (C4): FIM drift one-liner. Doesn't appear in
+        // the ADE prompt in V1.0 — C9 may wire it later.
+        Event::Fim(fe) => format!(
+            "- fim_drift path={} op={:?} modifier_pid={} modifier_comm={}",
+            fe.path, fe.op, fe.modifier_pid, fe.modifier_comm
+        ),
     }
 }
 
