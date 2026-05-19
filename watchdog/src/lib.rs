@@ -25,15 +25,19 @@
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
 use std::collections::VecDeque;
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use antitamper_bpf::ProtectedPidsHandle;
+use common::wire::admin_protocol::{
+    decode_frame, encode_frame, AdminMessage, StatusRequest, MAX_FRAME_BODY,
+};
 use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::UnixStream;
 use tracing::{debug, error, info, warn};
 
 /// Default CLI values mirror the design §10.2 systemd unit file
@@ -776,11 +780,304 @@ pub fn log_tamper_suspected(attempts_in_window: u8, window: Duration) {
     );
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Watchdog W5 — STATUS-ping secondary stuck detection +
+// stuck-agent SIGINT recovery (design §3.3-4 + §4.1 + §12 row W5)
+// ────────────────────────────────────────────────────────────────────
+
+/// Interval between STATUS pings — every 30 s per design §4.
+/// Balances detection latency for "stuck" agents against
+/// socket-load noise (the agent's own tracing heartbeat fires
+/// at 60 s, so 30 s gives ≤ 1-cycle skew detection).
+pub const STATUS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Per-ping reply timeout — 2 s per design §4. Conservative cap
+/// on healthy reply (the admin socket handler runs on the
+/// agent's tokio runtime; under steady state replies are
+/// sub-100 ms). 2 s tolerates pathological GC pauses,
+/// page-fault storms, brief schedlatency.
+pub const STATUS_PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per §4: two consecutive timeouts in a row promote "stuck"
+/// to "dead" and trigger the recovery path. One timeout could
+/// be a CPU steal spike or runaway ADE inference; two in a row
+/// (60 s gap with the 30 s interval) is strong evidence the
+/// agent's main loop is not making progress.
+pub const STATUS_PING_CONSECUTIVE_TIMEOUT_THRESHOLD: u8 = 2;
+
+/// Per §4.1 recovery sequence: after SIGINT, wait this long
+/// for graceful exit before escalating to evict + SIGKILL.
+/// Matches `docs/verify-2b.sh` `HARDKILL_GRACE`.
+pub const STUCK_RECOVERY_HARDKILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Outcome of one STATUS-ping tracker tick — pure value for
+/// unit testing the timeout state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingOutcome {
+    /// Reply received within the timeout window. Counter reset.
+    Ok,
+    /// First timeout in a row — log WARN, continue (per §4.1
+    /// "STATUS reply timeout × 1 only → log WARN, continue").
+    TimeoutOnce,
+    /// Threshold reached (default 2 consecutive). Caller should
+    /// kick off the stuck-recovery sequence
+    /// ([`stuck_recovery`]).
+    StuckDetected,
+}
+
+/// Sliding-counter state machine that tracks consecutive
+/// STATUS-ping timeouts. Reset on any successful ping. Threshold
+/// configurable for tests so we don't have to hardcode 2 in
+/// every assertion.
+#[derive(Debug, Clone)]
+pub struct StatusPingTracker {
+    consecutive_timeouts: u8,
+    threshold: u8,
+}
+
+impl StatusPingTracker {
+    /// Production constructor — threshold = 2 per design §4.
+    pub fn new() -> Self {
+        Self::with_threshold(STATUS_PING_CONSECUTIVE_TIMEOUT_THRESHOLD)
+    }
+
+    /// Test-friendly knob (and forward-compat for a future
+    /// hardening tappa that tightens the threshold to 1).
+    pub fn with_threshold(threshold: u8) -> Self {
+        Self {
+            consecutive_timeouts: 0,
+            threshold,
+        }
+    }
+
+    /// Record a successful ping. Resets the counter; returns
+    /// [`PingOutcome::Ok`].
+    pub fn record_ok(&mut self) -> PingOutcome {
+        self.consecutive_timeouts = 0;
+        PingOutcome::Ok
+    }
+
+    /// Record a ping failure (reply timeout OR transport error
+    /// — both are "agent not responding" from the watchdog's
+    /// perspective). Returns [`PingOutcome::TimeoutOnce`] for
+    /// the first failure in a row, [`PingOutcome::StuckDetected`]
+    /// when the threshold is met.
+    pub fn record_timeout(&mut self) -> PingOutcome {
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        if self.consecutive_timeouts >= self.threshold {
+            PingOutcome::StuckDetected
+        } else {
+            PingOutcome::TimeoutOnce
+        }
+    }
+
+    /// Reset the counter (e.g., after a stuck-recovery cycle so
+    /// the new respawned agent gets a fresh ping budget).
+    pub fn reset(&mut self) {
+        self.consecutive_timeouts = 0;
+    }
+
+    /// Snapshot of the consecutive-timeout counter. Used by log
+    /// lines + tests.
+    pub fn consecutive_timeouts(&self) -> u8 {
+        self.consecutive_timeouts
+    }
+}
+
+impl Default for StatusPingTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Send one STATUS frame over the agent's admin socket and
+/// await the reply. Returns `Ok(())` on a well-formed
+/// [`AdminMessage::StatusResponse`]; returns `Err` on any of:
+/// - socket connect failure (agent down / restart in progress)
+/// - frame write timeout
+/// - reply read timeout (the design's "STATUS reply timeout"
+///   case — what triggers the `record_timeout` call)
+/// - decode failure
+///
+/// Per design §3.3 the watchdog inspects only **reply latency**,
+/// not contents. The match against `StatusResponse` is purely
+/// for protocol-shape validation — content fields are ignored.
+pub async fn ping_agent_status(socket_path: &Path, timeout: Duration) -> Result<()> {
+    let fut = async {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("connect {}", socket_path.display()))?;
+
+        let req = AdminMessage::Status(StatusRequest {});
+        let bytes = encode_frame(&req).map_err(|e| anyhow!("encode_frame: {e}"))?;
+        stream
+            .write_all(&bytes)
+            .await
+            .context("writing STATUS request frame")?;
+
+        // Read length-prefixed reply frame: 4-byte big-endian
+        // length + body. Length cap mirrors the agent-side
+        // MAX_FRAME_BODY so a malicious peer can't ask us to
+        // allocate gigabytes.
+        let mut header = [0u8; 4];
+        stream
+            .read_exact(&mut header)
+            .await
+            .context("reading reply frame header")?;
+        let body_len = u32::from_be_bytes(header) as usize;
+        if body_len > MAX_FRAME_BODY {
+            return Err(anyhow!(
+                "reply body length {body_len} exceeds MAX_FRAME_BODY {MAX_FRAME_BODY}"
+            ));
+        }
+        let mut body = vec![0u8; body_len];
+        stream
+            .read_exact(&mut body)
+            .await
+            .context("reading reply frame body")?;
+
+        let mut full = Vec::with_capacity(4 + body_len);
+        full.extend_from_slice(&header);
+        full.extend_from_slice(&body);
+        let (msg, _consumed) = decode_frame(&full)
+            .map_err(|e| anyhow!("decode_frame: {e}"))?
+            .ok_or_else(|| anyhow!("decode_frame returned None on full buffer"))?;
+        if !matches!(msg, AdminMessage::StatusResponse(_)) {
+            return Err(anyhow!(
+                "unexpected reply variant (wanted StatusResponse): {msg:?}"
+            ));
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(anyhow!(
+            "STATUS ping timed out after {:?} (socket {})",
+            timeout,
+            socket_path.display()
+        )),
+    }
+}
+
+/// Stuck-agent recovery sequence per design §4.1:
+///
+/// 1. `kill(agent_pid, SIGINT)` — the only hook-passing stop
+///    (the agent's Tappa 7 LSM task_kill hook only denies
+///    SIGKILL + SIGTERM; SIGINT passes through and the agent
+///    re-armed it explicitly for graceful shutdown per
+///    `docs/verify-2b.sh:48-51`).
+/// 2. Wait `hardkill_grace` OR pidfd POLLIN, whichever first.
+///    POLLIN → agent died gracefully, restart path takes over.
+///    Timeout → agent is wedged past SIGINT response; escalate.
+/// 3. `ProtectedPidsHandle::evict(agent_pid)` — race-free
+///    hard-kill recipe from `docs/verify-2b.sh:57-63`. Without
+///    this, the LSM task_kill hook would deny the subsequent
+///    SIGKILL.
+/// 4. `kill(agent_pid, SIGKILL)`.
+/// 5. Wait for pidfd POLLIN — the kernel reaps the agent.
+///
+/// Returns Ok when the agent is confirmed dead (pidfd POLLIN
+/// observed) so the W4 caller's restart loop can proceed
+/// directly to backoff + spawn. Opens its own fresh pidfd
+/// inside (cheap; kernel ref-counts the task struct) so the
+/// W4 main loop's `OwnedFd` ownership stays clean.
+pub async fn stuck_recovery(
+    agent_pid: u32,
+    bpffs_root: &Path,
+    hardkill_grace: Duration,
+) -> Result<()> {
+    let raw = pidfd_open(agent_pid)
+        .with_context(|| format!("pidfd_open({agent_pid}) for stuck recovery"))?;
+    // SAFETY: pidfd_open returned this fd to us; we own it.
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    let async_fd = AsyncFd::with_interest(owned, Interest::READABLE)
+        .context("registering pidfd with AsyncFd for stuck recovery")?;
+
+    // 1. SIGINT.
+    info!(
+        target: "watchdog.stuck_recovery",
+        agent_pid,
+        "stuck recovery: sending SIGINT (hook-passing graceful stop)"
+    );
+    // SAFETY: kill(2) with a known PID + standard signal is a
+    // trivial syscall.
+    let r = unsafe { libc::kill(agent_pid as libc::pid_t, libc::SIGINT) };
+    if r != 0 {
+        return Err(anyhow!(
+            "kill(SIGINT, pid={agent_pid}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // 2. Wait grace OR pidfd POLLIN.
+    let gracefully_dead = tokio::select! {
+        guard = async_fd.readable() => {
+            // POLLIN observed — agent died after SIGINT.
+            drop(guard);
+            true
+        }
+        _ = tokio::time::sleep(hardkill_grace) => false,
+    };
+
+    if gracefully_dead {
+        info!(
+            target: "watchdog.stuck_recovery",
+            agent_pid,
+            "agent died gracefully after SIGINT — restart path takes over"
+        );
+        return Ok(());
+    }
+
+    // 3-4. Escalate: evict + SIGKILL.
+    warn!(
+        target: "watchdog.stuck_recovery",
+        agent_pid,
+        grace_secs = hardkill_grace.as_secs(),
+        "agent did not exit within grace — escalating to evict + SIGKILL"
+    );
+    // Best-effort evict; even on Err we proceed to SIGKILL (the
+    // worst case is the kernel rejects the kill with EPERM and
+    // we surface the error to the caller, who'll log + retry).
+    if let Err(e) = ProtectedPidsHandle::open(bpffs_root)
+        .and_then(|mut h| h.evict(agent_pid))
+    {
+        warn!(
+            target: "watchdog.stuck_recovery",
+            error = %e,
+            agent_pid,
+            bpffs_root = %bpffs_root.display(),
+            "PROTECTED_PIDS evict failed before SIGKILL — kill may EPERM"
+        );
+    }
+    // SAFETY: same as above.
+    let r = unsafe { libc::kill(agent_pid as libc::pid_t, libc::SIGKILL) };
+    if r != 0 {
+        return Err(anyhow!(
+            "kill(SIGKILL, pid={agent_pid}) after evict failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // 5. Wait for kernel reap.
+    let guard = async_fd
+        .readable()
+        .await
+        .context("awaiting post-SIGKILL pidfd POLLIN")?;
+    drop(guard);
+    info!(
+        target: "watchdog.stuck_recovery",
+        agent_pid,
+        "agent hard-killed after evict + SIGKILL — restart path takes over"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::os::fd::FromRawFd;
     use tempfile::TempDir;
 
     /// Required W2 test 1 — CLI parse. Asserts every flag the
@@ -1365,5 +1662,150 @@ mod tests {
         );
 
         let _ = child.wait();
+    }
+
+    // ── Watchdog W5: STATUS-ping tracker + ping client ─────────────
+
+    /// Required W5 test 1: a successful ping resets the
+    /// counter — the next timeout starts a fresh streak, not a
+    /// resumption of an earlier one. Anchors the
+    /// "isolated transient + recovery" contract.
+    #[test]
+    fn status_ping_tracker_record_ok_resets_counter() {
+        let mut tracker = StatusPingTracker::new();
+        // One timeout → counter = 1.
+        assert_eq!(tracker.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(tracker.consecutive_timeouts(), 1);
+        // Ok → reset to 0.
+        assert_eq!(tracker.record_ok(), PingOutcome::Ok);
+        assert_eq!(tracker.consecutive_timeouts(), 0);
+        // Another timeout starts a fresh streak.
+        assert_eq!(tracker.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(tracker.consecutive_timeouts(), 1);
+    }
+
+    /// Required W5 test 2: a single timeout returns
+    /// `TimeoutOnce` — caller logs WARN and continues. The
+    /// stuck-recovery sequence is NOT triggered on one
+    /// transient.
+    #[test]
+    fn status_ping_tracker_single_timeout_returns_timeout_once() {
+        let mut tracker = StatusPingTracker::new();
+        let outcome = tracker.record_timeout();
+        assert_eq!(outcome, PingOutcome::TimeoutOnce);
+        assert_eq!(tracker.consecutive_timeouts(), 1);
+    }
+
+    /// Required W5 test 3: two consecutive timeouts return
+    /// `StuckDetected`. This is the design §4 trigger for the
+    /// SIGINT recovery sequence — locks the threshold against
+    /// a future "let's tune to 3" silent change.
+    #[test]
+    fn status_ping_tracker_two_consecutive_timeouts_returns_stuck_detected() {
+        let mut tracker = StatusPingTracker::new();
+        assert_eq!(tracker.record_timeout(), PingOutcome::TimeoutOnce);
+        let outcome = tracker.record_timeout();
+        assert_eq!(outcome, PingOutcome::StuckDetected);
+        assert_eq!(tracker.consecutive_timeouts(), 2);
+    }
+
+    /// Required W5 test 4: custom threshold for forward-compat
+    /// (a hardening tappa tightening to 1 OR loosening to 3
+    /// uses the same machinery). With threshold=3, two
+    /// timeouts give TimeoutOnce; the third gives
+    /// StuckDetected.
+    #[test]
+    fn status_ping_tracker_with_threshold_3_triggers_on_third_timeout() {
+        let mut tracker = StatusPingTracker::with_threshold(3);
+        assert_eq!(tracker.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(tracker.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(tracker.record_timeout(), PingOutcome::StuckDetected);
+        assert_eq!(tracker.consecutive_timeouts(), 3);
+    }
+
+    // ── Supplementary W5 tests ─────────────────────────────────────
+
+    /// Reset method actually zeros the counter — used by the
+    /// main loop after a stuck-recovery cycle to give the new
+    /// respawned agent a fresh ping budget.
+    #[test]
+    fn status_ping_tracker_reset_zeros_counter() {
+        let mut tracker = StatusPingTracker::new();
+        let _ = tracker.record_timeout();
+        let _ = tracker.record_timeout();
+        // At threshold — but reset clears.
+        tracker.reset();
+        assert_eq!(tracker.consecutive_timeouts(), 0);
+        // Next timeout is the first of a new streak.
+        assert_eq!(tracker.record_timeout(), PingOutcome::TimeoutOnce);
+    }
+
+    /// `ping_agent_status` against a non-existent socket
+    /// surfaces a clear Err quickly (UnixStream::connect
+    /// returns ENOENT/ECONNREFUSED before the timeout window
+    /// elapses). Anchors the "socket missing = treated as
+    /// timeout" contract — what the agent-restart-in-progress
+    /// race produces.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ping_agent_status_fails_quickly_on_missing_socket() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("never_bound.sock");
+        let start = Instant::now();
+        let result =
+            ping_agent_status(&socket, Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "missing socket must error");
+        // Connect fail is near-instant; well under the 5 s
+        // budget. 500 ms gives generous CI slack.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "connect-fail should be near-instant: {elapsed:?}"
+        );
+    }
+
+    /// `ping_agent_status` returns Ok when a mock server
+    /// answers with a well-formed `StatusResponse`. Proves the
+    /// full request → encode → write → read → decode pipeline
+    /// works end-to-end against the common wire types without
+    /// needing a real agent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ping_agent_status_round_trips_through_mock_server() {
+        use common::posture_types::PostureKind;
+        use common::wire::admin_protocol::StatusResponse;
+
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("mock.sock");
+
+        // Mock server: accept once, read one frame, send one
+        // StatusResponse, close.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            // Drain the request frame (we don't care about its
+            // bytes — the contract is "client sends Status,
+            // server replies StatusResponse").
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await.expect("read hdr");
+            let body_len = u32::from_be_bytes(header) as usize;
+            let mut body = vec![0u8; body_len];
+            stream.read_exact(&mut body).await.expect("read body");
+            // Reply.
+            let reply = AdminMessage::StatusResponse(StatusResponse {
+                posture: PostureKind::Observing,
+                network_isolation_engaged: false,
+                last_admin_action_secs_ago: None,
+            });
+            let bytes = encode_frame(&reply).expect("encode reply");
+            stream.write_all(&bytes).await.expect("write reply");
+        });
+
+        // Give the listener a tick to be ready.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        ping_agent_status(&socket, Duration::from_secs(2))
+            .await
+            .expect("ping must succeed against mock server");
+
+        mock.await.expect("mock task");
     }
 }
