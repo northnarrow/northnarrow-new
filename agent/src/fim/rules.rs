@@ -601,6 +601,180 @@ impl Rule for NnLFim010RansomwareExtensionRename {
     }
 }
 
+// ── NN-L-FIM-011..014 — cloud credentials read (C5.3) ─────────────
+
+/// Substring fragments that identify cloud-credential file
+/// paths for the four NN-L-FIM-011..014 rules. Match policy is
+/// `path.contains(<fragment>)` — substring rather than prefix
+/// so both `/home/<user>/.aws/credentials` AND
+/// `/root/.aws/credentials` match the same `/.aws/` fragment.
+/// Curated, not exhaustive; operators extend via future
+/// `fim-cred-paths.local` (V1.1).
+const AWS_CRED_FRAGMENTS: &[&str] = &["/.aws/credentials", "/.aws/config"];
+const AZURE_CRED_FRAGMENTS: &[&str] = &["/.azure/"];
+const GCP_CRED_FRAGMENTS: &[&str] = &[
+    "/.config/gcloud/credentials.db",
+    "/.config/gcloud/legacy_credentials/",
+    "/.config/gcloud/access_tokens.db",
+    "/.config/gcloud/application_default_credentials.json",
+];
+const DOCKER_CRED_FRAGMENTS: &[&str] =
+    &["/.docker/config.json", "/var/lib/docker/credentials.json"];
+
+/// Process basenames that legitimately read the cloud-cred
+/// files for each family. Comm field is `TASK_COMM_LEN`
+/// (15 chars + NUL) so all entries fit without truncation.
+/// Operator-tunable in a future V1.1 commit; the V1.0 list
+/// covers the most-common official CLIs per cloud.
+const AWS_CLI_COMMS: &[&str] = &["aws", "aws-cli"];
+const AZURE_CLI_COMMS: &[&str] = &["az"];
+const GCP_CLI_COMMS: &[&str] = &["gcloud", "gsutil", "bq"];
+const DOCKER_CLI_COMMS: &[&str] = &["docker", "dockerd", "containerd"];
+
+/// Common shape for the 4 cred-read rules — every rule
+/// follows the same `FimOp::Opened` + path-fragment +
+/// CLI-comm-exempt pattern. Extracted into a single helper so
+/// each rule body stays a 1-line config block.
+fn evaluate_cred_read(
+    rule: &dyn Rule,
+    event: &Event,
+    path_fragments: &[&str],
+    legit_cli_comms: &[&str],
+    reasoning: &str,
+) -> Option<Verdict> {
+    let fe = as_fim(event)?;
+    if fe.op != FimOp::Opened {
+        return None;
+    }
+    if !path_fragments.iter().any(|f| fe.path.contains(f)) {
+        return None;
+    }
+    // FP guard: the legitimate CLI for this cloud reading its
+    // own creds is the dominant traffic pattern. Skip when the
+    // modifier_comm matches. The audit chain still captures
+    // the event regardless (decision_engine_skipped path in C4
+    // does not apply here — we drop the verdict outright at
+    // the rule layer so the engine doesn't kill the legit CLI).
+    if legit_cli_comms.iter().any(|c| fe.modifier_comm == *c) {
+        return None;
+    }
+    Some(fim_verdict(
+        rule,
+        fe,
+        ResponseAction::KillProcess,
+        Severity::High,
+        reasoning,
+    ))
+}
+
+/// NN-L-FIM-011 — AWS credentials read by a non-CLI process.
+/// MITRE T1552.001 (Unsecured Credentials: Credentials In Files).
+pub struct NnLFim011AwsCredsRead;
+
+impl Rule for NnLFim011AwsCredsRead {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-011_AwsCredsRead"
+    }
+    fn name(&self) -> &'static str {
+        "AWS credentials read by non-CLI process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_read(
+            self,
+            event,
+            AWS_CRED_FRAGMENTS,
+            AWS_CLI_COMMS,
+            "AWS credentials read by a process other than aws-cli — \
+             MITRE T1552.001 indicator",
+        )
+    }
+}
+
+/// NN-L-FIM-012 — Azure credentials read by a non-CLI process.
+/// MITRE T1552.001.
+pub struct NnLFim012AzureCredsRead;
+
+impl Rule for NnLFim012AzureCredsRead {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-012_AzureCredsRead"
+    }
+    fn name(&self) -> &'static str {
+        "Azure credentials read by non-CLI process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_read(
+            self,
+            event,
+            AZURE_CRED_FRAGMENTS,
+            AZURE_CLI_COMMS,
+            "Azure credentials read by a process other than az — \
+             MITRE T1552.001 indicator",
+        )
+    }
+}
+
+/// NN-L-FIM-013 — GCP credentials read by a non-CLI process.
+/// MITRE T1552.001. Covers both the modern credentials.db and
+/// the legacy `legacy_credentials/` directory layout.
+pub struct NnLFim013GcpCredsRead;
+
+impl Rule for NnLFim013GcpCredsRead {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-013_GcpCredsRead"
+    }
+    fn name(&self) -> &'static str {
+        "GCP credentials read by non-CLI process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_read(
+            self,
+            event,
+            GCP_CRED_FRAGMENTS,
+            GCP_CLI_COMMS,
+            "GCP credentials read by a process other than gcloud/gsutil/bq — \
+             MITRE T1552.001 indicator",
+        )
+    }
+}
+
+/// NN-L-FIM-014 — Docker registry credentials read by a
+/// non-CLI process. MITRE T1552.001. Reads of the config.json
+/// (operator-side) or /var/lib/docker/credentials.json (daemon-
+/// side) by anything other than `docker`/`dockerd`/`containerd`
+/// is a strong credential-theft indicator.
+pub struct NnLFim014DockerCredsRead;
+
+impl Rule for NnLFim014DockerCredsRead {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-014_DockerCredsRead"
+    }
+    fn name(&self) -> &'static str {
+        "Docker registry credentials read by non-CLI process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_read(
+            self,
+            event,
+            DOCKER_CRED_FRAGMENTS,
+            DOCKER_CLI_COMMS,
+            "Docker registry creds read by a process other than docker/dockerd/containerd — \
+             MITRE T1552.001 indicator",
+        )
+    }
+}
+
 // ── public builder ─────────────────────────────────────────────────
 
 /// Build the FIM rules in evaluation order. The agent's
@@ -628,6 +802,14 @@ pub fn fim_rules() -> Vec<Box<dyn Rule>> {
         Box::new(NnLFim005LogTruncated),
         Box::new(NnLFim007CronDropInCreated),
         Box::new(NnLFim009SystemdUnitDropped),
+        // C5.3 — cloud credential read family. Same High
+        // tier as the rest of the credential-access bucket
+        // (NN-L-FIM-003 sensitive config / NN-L-FIM-004
+        // authorized_keys).
+        Box::new(NnLFim011AwsCredsRead),
+        Box::new(NnLFim012AzureCredsRead),
+        Box::new(NnLFim013GcpCredsRead),
+        Box::new(NnLFim014DockerCredsRead),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
     ]
@@ -1047,5 +1229,196 @@ mod tests {
                 "RANSOMWARE_EXTENSIONS entry {ext:?} must start with '.'"
             );
         }
+    }
+
+    // ── C5.3 — cloud credential read family helpers ─────────────
+
+    fn fim_event_with_comm(op: FimOp, path: &str, comm: &str) -> Event {
+        Event::Fim(FimEvent {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            path: path.to_string(),
+            op,
+            new_sha256: Some([0xAA; 32]),
+            baseline_sha256: Some([0xBB; 32]),
+            modifier_exe: None,
+            modifier_pid: 42,
+            modifier_uid: 0,
+            modifier_comm: comm.to_string(),
+        })
+    }
+
+    // ── NN-L-FIM-011 (AWS) ──────────────────────────────────────
+
+    #[test]
+    fn fim011_fires_on_aws_cred_read_by_unknown_process() {
+        let r = NnLFim011AwsCredsRead;
+        for path in &[
+            "/root/.aws/credentials",
+            "/root/.aws/config",
+            "/home/alice/.aws/credentials",
+            "/home/bob/.aws/config",
+        ] {
+            let v = r
+                .evaluate(&fim_event_with_comm(FimOp::Opened, path, "evil"))
+                .unwrap_or_else(|| panic!("expected fire on {path}"));
+            assert_eq!(v.severity, Severity::High);
+            assert_eq!(v.action, ResponseAction::KillProcess);
+            assert_eq!(v.category, "fim_credential_access");
+        }
+    }
+
+    #[test]
+    fn fim011_does_not_fire_on_aws_cli_reading_own_creds() {
+        let r = NnLFim011AwsCredsRead;
+        for comm in &["aws", "aws-cli"] {
+            assert!(
+                r.evaluate(&fim_event_with_comm(
+                    FimOp::Opened,
+                    "/root/.aws/credentials",
+                    comm
+                ))
+                .is_none(),
+                "legit {comm} reading its own creds must not fire"
+            );
+        }
+    }
+
+    #[test]
+    fn fim011_does_not_fire_on_non_opened_op_or_non_aws_path() {
+        let r = NnLFim011AwsCredsRead;
+        // Modified op of AWS creds is interesting (rare, but
+        // covered by other rules); 011 is Opened-only.
+        assert!(r
+            .evaluate(&fim_event_with_comm(
+                FimOp::Modified,
+                "/root/.aws/credentials",
+                "evil"
+            ))
+            .is_none());
+        // Random path with "aws" in it — must NOT match the
+        // /.aws/ fragment pattern.
+        assert!(r
+            .evaluate(&fim_event_with_comm(
+                FimOp::Opened,
+                "/etc/aws-cli/something",
+                "evil"
+            ))
+            .is_none());
+    }
+
+    // ── NN-L-FIM-012 (Azure) ────────────────────────────────────
+
+    #[test]
+    fn fim012_fires_on_azure_cred_read_by_unknown_process() {
+        let r = NnLFim012AzureCredsRead;
+        for path in &[
+            "/root/.azure/azureProfile.json",
+            "/home/alice/.azure/accessTokens.json",
+        ] {
+            let v = r
+                .evaluate(&fim_event_with_comm(FimOp::Opened, path, "evil"))
+                .unwrap_or_else(|| panic!("expected fire on {path}"));
+            assert_eq!(v.severity, Severity::High);
+        }
+    }
+
+    #[test]
+    fn fim012_does_not_fire_on_az_cli_reading_own_creds() {
+        let r = NnLFim012AzureCredsRead;
+        assert!(r
+            .evaluate(&fim_event_with_comm(
+                FimOp::Opened,
+                "/root/.azure/azureProfile.json",
+                "az"
+            ))
+            .is_none());
+    }
+
+    // ── NN-L-FIM-013 (GCP) ──────────────────────────────────────
+
+    #[test]
+    fn fim013_fires_on_gcp_cred_read_by_unknown_process() {
+        let r = NnLFim013GcpCredsRead;
+        for path in &[
+            "/root/.config/gcloud/credentials.db",
+            "/root/.config/gcloud/access_tokens.db",
+            "/home/alice/.config/gcloud/application_default_credentials.json",
+            "/home/alice/.config/gcloud/legacy_credentials/u@example.com/adc.json",
+        ] {
+            let v = r
+                .evaluate(&fim_event_with_comm(FimOp::Opened, path, "evil"))
+                .unwrap_or_else(|| panic!("expected fire on {path}"));
+            assert_eq!(v.severity, Severity::High);
+        }
+    }
+
+    #[test]
+    fn fim013_does_not_fire_on_gcloud_or_gsutil_or_bq() {
+        let r = NnLFim013GcpCredsRead;
+        for comm in &["gcloud", "gsutil", "bq"] {
+            assert!(
+                r.evaluate(&fim_event_with_comm(
+                    FimOp::Opened,
+                    "/root/.config/gcloud/credentials.db",
+                    comm
+                ))
+                .is_none(),
+                "legit {comm} reading its own creds must not fire"
+            );
+        }
+    }
+
+    // ── NN-L-FIM-014 (Docker) ───────────────────────────────────
+
+    #[test]
+    fn fim014_fires_on_docker_cred_read_by_unknown_process() {
+        let r = NnLFim014DockerCredsRead;
+        for path in &[
+            "/root/.docker/config.json",
+            "/home/alice/.docker/config.json",
+            "/var/lib/docker/credentials.json",
+        ] {
+            let v = r
+                .evaluate(&fim_event_with_comm(FimOp::Opened, path, "evil"))
+                .unwrap_or_else(|| panic!("expected fire on {path}"));
+            assert_eq!(v.severity, Severity::High);
+        }
+    }
+
+    #[test]
+    fn fim014_does_not_fire_on_docker_daemon_or_containerd() {
+        let r = NnLFim014DockerCredsRead;
+        for comm in &["docker", "dockerd", "containerd"] {
+            assert!(
+                r.evaluate(&fim_event_with_comm(
+                    FimOp::Opened,
+                    "/root/.docker/config.json",
+                    comm
+                ))
+                .is_none(),
+                "legit {comm} reading its own creds must not fire"
+            );
+        }
+    }
+
+    // ── C5.3 cross-cutting invariants ───────────────────────────
+
+    #[test]
+    fn cred_read_rules_share_credential_access_category() {
+        for r in [
+            NnLFim011AwsCredsRead.category(),
+            NnLFim012AzureCredsRead.category(),
+            NnLFim013GcpCredsRead.category(),
+            NnLFim014DockerCredsRead.category(),
+        ] {
+            assert_eq!(r, "fim_credential_access");
+        }
+    }
+
+    #[test]
+    fn cred_read_rules_in_builder_at_14_total_rules() {
+        // C5 shipped 9, C5.1 added 1, C5.3 adds 4 → 14 total.
+        let n = fim_rules().len();
+        assert_eq!(n, 14, "expected 14 FIM rules post-C5.3, got {n}");
     }
 }
