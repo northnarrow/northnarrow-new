@@ -4,18 +4,29 @@
 //! sign a server-issued challenge with their Ed25519 private key.
 //! [`AdminAuth`] handles the server side of that exchange:
 //!
-//! 1. Load N admin pubkeys from `/etc/northnarrow/admin.pub`
-//!    (one hex-encoded 32-byte key per line, `#` comments allowed).
+//! 1. Load N admin pubkeys from `/etc/northnarrow/admin.pub`. Each
+//!    line is `<hex64-pubkey> [<role,role,...>]` (Tappa 8 A5); the
+//!    optional role token controls which Tappa 8 operations the key
+//!    authorises. A pubkey-only line gets the default allowlist
+//!    [`Role::Unlock`] + [`Role::AuditRead`] — backward-compatible
+//!    with every admin.pub file written before A5.
 //! 2. Mint a 32-byte cryptographic nonce on demand
 //!    ([`AdminAuth::issue_challenge`]).
 //! 3. Verify a 64-byte Ed25519 signature over that nonce against
-//!    every loaded pubkey ([`AdminAuth::verify_unlock`]).
+//!    every loaded pubkey AND check the matched key's role
+//!    allowlist against the operation being authorised
+//!    ([`AdminAuth::verify_with_role`]; the legacy
+//!    [`AdminAuth::verify_unlock`] is a thin wrapper that requires
+//!    [`Role::Unlock`] for backward-compat).
 //! 4. On success, mint an [`UnlockToken`] via the capability gate in
-//!    `network_isolate.rs`. On failure, increment a rate-limit
-//!    counter; three failures inside a 5-minute window block
-//!    further challenge issuance.
+//!    `network_isolate.rs`. On invalid-signature failure, increment
+//!    a rate-limit counter; three failures inside a 5-minute window
+//!    block further challenge issuance. Role-mismatch failures
+//!    deliberately do **not** trip the rate limiter — a legitimate
+//!    operator using a correctly-signed key with an insufficient
+//!    role is a configuration error, not an attack signal.
 //!
-//! The nonce is single-use — it is consumed inside `verify_unlock`
+//! The nonce is single-use — it is consumed inside the verify path
 //! regardless of outcome. A failed attempt forces the attacker to
 //! request a fresh challenge AND to incur a rate-limit hit.
 
@@ -24,10 +35,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use common::wire::admin_signed_payload::Role;
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -46,9 +59,19 @@ pub const RATE_LIMIT_THRESHOLD: u32 = 3;
 /// Hex length of an Ed25519 pubkey (32 bytes × 2 nibbles).
 const PUBKEY_HEX_LEN: usize = 64;
 
-/// Reasons [`AdminAuth::issue_challenge`] / [`AdminAuth::verify_unlock`]
+/// Default role allowlist applied to admin.pub lines that omit the
+/// role token. `unlock` is the legacy-compat baseline (every key
+/// could perform unlock before A5); `audit-read` is the safe
+/// read-only complement per design §3.2 ("on-call minimum").
+fn default_roles() -> Vec<Role> {
+    vec![Role::Unlock, Role::AuditRead]
+}
+
+/// Reasons [`AdminAuth::issue_challenge`] / [`AdminAuth::verify_with_role`]
 /// can refuse, carrying the user-facing detail needed to translate
-/// into an [`UnlockResult`](common::wire::admin_protocol::UnlockResult).
+/// into an [`UnlockResult`](common::wire::admin_protocol::UnlockResult)
+/// or the broader Tappa 8 [`AdminResult`](docs/design/TAPPA8_…)
+/// shape (design §6.6).
 #[derive(Debug, Error)]
 pub enum AdminAuthError {
     #[error("rate limited: retry after {retry_after_secs}s")]
@@ -57,13 +80,48 @@ pub enum AdminAuthError {
     NoPendingChallenge,
     #[error("invalid signature")]
     InvalidSignature,
+    /// Signature verifies under one of the loaded pubkeys, but that
+    /// key's role allowlist does not include the operation's
+    /// required role. The 8-hex-char fingerprint identifies which
+    /// key — the audit log records it so an operator can find the
+    /// misconfigured admin.pub line.
+    #[error("admin key {key_fingerprint} not authorised for {required_role:?}")]
+    RoleDenied {
+        key_fingerprint: String,
+        required_role: Role,
+    },
+}
+
+/// One loaded admin pubkey plus its parsed role allowlist. Stored
+/// inside [`AdminAuth`]; the type is intentionally crate-private
+/// because the only legitimate construction path is
+/// [`AdminAuth::load`] (line parser) or the test-only `build`
+/// helper (defaults the roles to [`default_roles`]).
+#[derive(Debug, Clone)]
+struct KeyEntry {
+    key: VerifyingKey,
+    roles: Vec<Role>,
+}
+
+impl KeyEntry {
+    /// `true` iff the key may authorise an operation whose required
+    /// role is `required`. [`Role::All`] is the break-glass
+    /// super-role and unconditionally satisfies any required role
+    /// (design §3.2 "break-glass key (kept offline)" pattern).
+    fn authorizes(&self, required: Role) -> bool {
+        self.roles
+            .iter()
+            .any(|r| *r == required || *r == Role::All)
+    }
 }
 
 /// Server-side admin authenticator.
 ///
 /// `pub_keys` is read-only after construction so we never need a
 /// lock for verification — only the nonce slot, the failure counter,
-/// and the last-failure timestamp are mutable.
+/// and the last-failure timestamp are mutable. Each entry pairs a
+/// verifying key with the operations its operator is authorised to
+/// trigger ([`Role`] enum from [`common::wire::admin_signed_payload`]).
 ///
 /// The `rate_limit_window` field is the one deviation from the
 /// spec's struct layout: tests need to override the 5-minute
@@ -72,7 +130,7 @@ pub enum AdminAuthError {
 /// which pins the field to [`DEFAULT_RATE_LIMIT_WINDOW`].
 #[derive(Debug)]
 pub struct AdminAuth {
-    pub_keys: Vec<VerifyingKey>,
+    pub_keys: Vec<KeyEntry>,
     pending_challenge: Mutex<Option<[u8; 32]>>,
     failure_count: AtomicU32,
     last_failure: Mutex<Option<Instant>>,
@@ -80,10 +138,17 @@ pub struct AdminAuth {
 }
 
 impl AdminAuth {
-    /// Parse `config_path` — one hex-encoded pubkey per line, `#`
-    /// comments, blank lines OK — and build an authenticator. At
-    /// least one valid key is required; an empty file is a startup
-    /// error, not a "anybody can unlock" silent-default.
+    /// Parse `config_path` — one line per admin key, format
+    /// `<hex64-pubkey> [<role,role,...>]`. Blank lines and lines
+    /// starting with `#` are skipped. At least one valid key is
+    /// required; an empty file is a startup error, not a
+    /// "anybody can unlock" silent-default.
+    ///
+    /// Tappa 8 A5: lines without a role token get the
+    /// [`default_roles`] allowlist (`unlock,audit-read`), which
+    /// preserves the behaviour of every admin.pub written before
+    /// A5 — those pubkey-only lines authorise unlock exactly as
+    /// they did pre-A5.
     pub fn load(config_path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
@@ -95,28 +160,10 @@ impl AdminAuth {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if line.len() != PUBKEY_HEX_LEN {
-                return Err(anyhow!(
-                    "{}:{}: pub key must be {} hex chars (got {})",
-                    config_path.display(),
-                    line_no,
-                    PUBKEY_HEX_LEN,
-                    line.len()
-                ));
-            }
-            let raw_bytes = hex::decode(line)
-                .map_err(|e| anyhow!("{}:{}: invalid hex ({e})", config_path.display(), line_no))?;
-            let key_bytes: [u8; 32] = raw_bytes
-                .try_into()
-                .expect("hex decode length pre-validated to 64 chars");
-            let vk = VerifyingKey::from_bytes(&key_bytes).map_err(|e| {
-                anyhow!(
-                    "{}:{}: not a valid Ed25519 pubkey ({e})",
-                    config_path.display(),
-                    line_no
-                )
+            let entry = parse_admin_line(line).map_err(|e| {
+                anyhow!("{}:{}: {e}", config_path.display(), line_no)
             })?;
-            pub_keys.push(vk);
+            pub_keys.push(entry);
         }
 
         if pub_keys.is_empty() {
@@ -126,10 +173,32 @@ impl AdminAuth {
             ));
         }
 
-        Ok(Self::build(pub_keys, DEFAULT_RATE_LIMIT_WINDOW))
+        Ok(Self::build_entries(pub_keys, DEFAULT_RATE_LIMIT_WINDOW))
     }
 
+    /// Wrap pre-existing verifying keys in the [`default_roles`]
+    /// allowlist and build an authenticator. Kept for test
+    /// ergonomics — production callers go through [`Self::load`]
+    /// (which parses roles per-line and calls
+    /// [`Self::build_entries`] directly) so the line parser is
+    /// exercised end-to-end. The signature is stable across A5 so
+    /// every pre-A5 test still compiles.
+    #[cfg(test)]
     fn build(pub_keys: Vec<VerifyingKey>, rate_limit_window: Duration) -> Self {
+        let entries = pub_keys
+            .into_iter()
+            .map(|key| KeyEntry {
+                key,
+                roles: default_roles(),
+            })
+            .collect();
+        Self::build_entries(entries, rate_limit_window)
+    }
+
+    /// Lower-level builder consumed by [`Self::load`] (which has
+    /// already parsed roles per-line) and by tests that want to
+    /// pin custom role allowlists per key.
+    fn build_entries(pub_keys: Vec<KeyEntry>, rate_limit_window: Duration) -> Self {
         Self {
             pub_keys,
             pending_challenge: Mutex::new(None),
@@ -174,16 +243,48 @@ impl AdminAuth {
         Ok(nonce)
     }
 
-    /// Verify `signature` against the outstanding nonce. On success,
-    /// mint an [`UnlockToken`]; on failure, increment the rate-limit
-    /// counter so repeated probing eventually trips the gate.
+    /// Verify `signature` against the outstanding nonce, requiring
+    /// the matched key to authorise [`Role::Unlock`]. Thin wrapper
+    /// over [`Self::verify_with_role`]; preserved as a separate
+    /// method so the legacy COMBAT-release call path (admin_socket
+    /// dispatcher, pre-A7) compiles unchanged.
     ///
-    /// The nonce is consumed unconditionally — even a failed verify
-    /// invalidates it. That forces an attacker who guessed wrong to
-    /// roundtrip another challenge AND eat a rate-limit hit.
+    /// Every admin.pub line — including pubkey-only lines from
+    /// before A5 — has [`Role::Unlock`] in its allowlist by
+    /// default, so this method's behaviour is byte-identical to
+    /// the pre-A5 implementation for every legacy admin.pub.
     pub fn verify_unlock(
         &self,
         signature: &[u8; 64],
+    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+        self.verify_with_role(signature, Role::Unlock)
+    }
+
+    /// Verify `signature` against the outstanding nonce AND check
+    /// that the matched key's role allowlist includes
+    /// `required_role` (or [`Role::All`], the break-glass
+    /// super-role). On success, mint an [`UnlockToken`]; on
+    /// invalid-signature failure, increment the rate-limit
+    /// counter; on role-mismatch, return [`AdminAuthError::RoleDenied`]
+    /// **without** incrementing rate limit (legit operator picked
+    /// the wrong key, not an attack signal).
+    ///
+    /// The nonce is consumed unconditionally — even a failed
+    /// verify invalidates it. That forces an attacker who guessed
+    /// wrong to roundtrip another challenge AND eat a rate-limit
+    /// hit.
+    ///
+    /// Constant-time iteration is preserved across the per-key
+    /// signature scan: the loop does NOT short-circuit on the
+    /// first match, so per-attempt cost depends on the number of
+    /// installed keys but not on which key matched (or whether
+    /// any matched at all). Role lookup happens once after the
+    /// loop on the matched index — that's an O(1) check on a
+    /// short Vec, no side-channel relative to key position.
+    pub fn verify_with_role(
+        &self,
+        signature: &[u8; 64],
+        required_role: Role,
     ) -> std::result::Result<UnlockToken, AdminAuthError> {
         let nonce = match self.pending_challenge.lock().take() {
             Some(n) => n,
@@ -199,35 +300,62 @@ impl AdminAuth {
 
         let sig = Signature::from_bytes(signature);
 
-        // Verify against every loaded pubkey without short-circuiting.
-        // ed25519-dalek's `verify_strict` is itself constant-time;
-        // this loop keeps the per-attempt cost dependent on the
-        // number of installed keys but NOT on which key matched,
-        // closing a minor side-channel on key rotation.
-        let mut ok = false;
-        for key in &self.pub_keys {
-            if key.verify_strict(&nonce, &sig).is_ok() {
-                ok = true;
+        // Constant-time across keys (no short-circuit) — record
+        // the matched index so we can check the matched key's
+        // role allowlist after the loop. ed25519-dalek's
+        // `verify_strict` is itself constant-time.
+        let mut matched_idx: Option<usize> = None;
+        for (idx, entry) in self.pub_keys.iter().enumerate() {
+            if entry.key.verify_strict(&nonce, &sig).is_ok() {
+                matched_idx = Some(idx);
+                // intentionally NOT `break` — preserve constant-time iteration
             }
         }
 
-        if ok {
-            self.failure_count.store(0, Ordering::SeqCst);
-            *self.last_failure.lock() = None;
-            info!(
-                target: "anti_tamper.admin_auth.verify_success",
-                "admin signature verified, unlock token minted"
-            );
-            Ok(mint_unlock_token())
-        } else {
-            self.failure_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_failure.lock() = Some(Instant::now());
-            warn!(
-                target: "anti_tamper.admin_auth.verify_failure",
-                reason = "invalid_sig",
-                "admin signature verification failed"
-            );
-            Err(AdminAuthError::InvalidSignature)
+        match matched_idx {
+            Some(idx) => {
+                let entry = &self.pub_keys[idx];
+                if entry.authorizes(required_role) {
+                    self.failure_count.store(0, Ordering::SeqCst);
+                    *self.last_failure.lock() = None;
+                    info!(
+                        target: "anti_tamper.admin_auth.verify_success",
+                        key_fingerprint = %fingerprint(&entry.key),
+                        required_role = ?required_role,
+                        "admin signature verified, unlock token minted"
+                    );
+                    Ok(mint_unlock_token())
+                } else {
+                    // Role mismatch — do NOT increment failure
+                    // counter. A correctly-signed but
+                    // under-privileged request is a config
+                    // mistake by a legitimate operator, not an
+                    // attack signal; counting it would lock the
+                    // operator out under rate-limit.
+                    let fp = fingerprint(&entry.key);
+                    warn!(
+                        target: "anti_tamper.admin_auth.verify_failure",
+                        reason = "role_denied",
+                        key_fingerprint = %fp,
+                        required_role = ?required_role,
+                        "admin signature verified but key not authorised for operation"
+                    );
+                    Err(AdminAuthError::RoleDenied {
+                        key_fingerprint: fp,
+                        required_role,
+                    })
+                }
+            }
+            None => {
+                self.failure_count.fetch_add(1, Ordering::SeqCst);
+                *self.last_failure.lock() = Some(Instant::now());
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "invalid_sig",
+                    "admin signature verification failed"
+                );
+                Err(AdminAuthError::InvalidSignature)
+            }
         }
     }
 
@@ -255,6 +383,109 @@ impl AdminAuth {
             Some(_) => None,
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tappa 8 sub-sprint A commit A5 — admin.pub role allowlist parser
+// (§3.2). Helpers consumed by AdminAuth::load above.
+// ────────────────────────────────────────────────────────────────────
+
+/// Parse one already-trimmed, non-comment, non-blank admin.pub
+/// line into a [`KeyEntry`]. Whitespace-tokenised: the first token
+/// is the hex pubkey, the optional second token is the
+/// comma-separated role list. A third+ token is an error (catches
+/// the common operator mistake of forgetting the comma between
+/// roles, e.g. `<hex>  unlock audit-read`).
+fn parse_admin_line(line: &str) -> Result<KeyEntry> {
+    let mut parts = line.split_whitespace();
+    let hex_token = parts.next().ok_or_else(|| {
+        // split_whitespace on a non-empty trimmed input always
+        // yields at least one item, so this is structurally
+        // unreachable; we name the error anyway because
+        // unwrap()-in-the-load-loop would be a worse failure mode.
+        anyhow!("line is empty after trimming (should have been skipped)")
+    })?;
+    if hex_token.len() != PUBKEY_HEX_LEN {
+        return Err(anyhow!(
+            "pub key must be {PUBKEY_HEX_LEN} hex chars (got {})",
+            hex_token.len()
+        ));
+    }
+    let raw_bytes =
+        hex::decode(hex_token).map_err(|e| anyhow!("invalid hex: {e}"))?;
+    let key_bytes: [u8; 32] = raw_bytes
+        .try_into()
+        .expect("hex decode length pre-validated to 64 chars");
+    let key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| anyhow!("not a valid Ed25519 pubkey: {e}"))?;
+
+    let roles = match parts.next() {
+        None => default_roles(),
+        Some(role_list) => parse_role_list(role_list)?,
+    };
+    if parts.next().is_some() {
+        return Err(anyhow!(
+            "unexpected token after role list — roles must be \
+             comma-separated within a single token (no spaces)"
+        ));
+    }
+    Ok(KeyEntry { key, roles })
+}
+
+/// Parse a comma-separated role list (e.g. `"unlock,audit-read"`)
+/// into a [`Vec<Role>`]. Empty list / single trailing comma / leading
+/// comma are all errors — the canonical writer emits a tight list.
+/// Duplicate roles inside the list are deduped before returning via
+/// linear scan (the list is at most 6 elements long, smaller than
+/// any reasonable hash table overhead).
+fn parse_role_list(s: &str) -> Result<Vec<Role>> {
+    if s.is_empty() {
+        return Err(anyhow!("role list is empty"));
+    }
+    let mut out: Vec<Role> = Vec::new();
+    for token in s.split(',') {
+        if token.is_empty() {
+            return Err(anyhow!(
+                "role list has empty entry (leading/trailing/double comma)"
+            ));
+        }
+        let role = parse_role_keyword(token)?;
+        if !out.contains(&role) {
+            out.push(role);
+        }
+    }
+    Ok(out)
+}
+
+/// Map one role keyword to its [`Role`]. Keywords mirror the
+/// design §3.2 list verbatim — case-sensitive lowercase. The
+/// `all` keyword maps to [`Role::All`], which authorises every
+/// operation (break-glass).
+fn parse_role_keyword(s: &str) -> Result<Role> {
+    match s {
+        "unlock" => Ok(Role::Unlock),
+        "shutdown" => Ok(Role::Shutdown),
+        "force-posture" => Ok(Role::ForcePosture),
+        "rotate-keys" => Ok(Role::RotateKeys),
+        "audit-read" => Ok(Role::AuditRead),
+        "all" => Ok(Role::All),
+        other => Err(anyhow!(
+            "unknown role `{other}` — expected one of: \
+             unlock, shutdown, force-posture, rotate-keys, audit-read, all"
+        )),
+    }
+}
+
+/// 8-hex-char pubkey fingerprint: first 4 bytes of SHA-256 over the
+/// raw pubkey. Same convention as `nn-admin verify-keys` output and
+/// `admin_cli::pubkey_fingerprint` — duplicated here rather than
+/// imported so admin_auth stays free of an admin_cli dependency.
+/// Used in log/audit context (`RoleDenied` carries this).
+fn fingerprint(vk: &VerifyingKey) -> String {
+    let mut h = Sha256::new();
+    h.update(vk.to_bytes());
+    let digest = h.finalize();
+    hex::encode(&digest[..4])
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -787,5 +1018,219 @@ mod tests {
             MAX_TIMESTAMP_SKEW_SECS, 60,
             "design §6.4 layer 2 mandates ±60s — change requires a roadmap update"
         );
+    }
+
+    // ── A5: per-key role allowlist (§3.2) ──────────────────────────
+
+    /// Required A5 test (parse + default): a pubkey-only admin.pub
+    /// line (no role token) gets the [`default_roles`] allowlist,
+    /// guaranteeing backward compat for every admin.pub written
+    /// before A5.
+    #[test]
+    fn load_parses_pubkey_only_assigns_default_roles() {
+        let (_, vk) = make_keypair();
+        let f = write_config(&[&hex::encode(vk.to_bytes())]);
+        let auth = AdminAuth::load(f.path()).expect("load");
+        assert_eq!(auth.pub_keys.len(), 1);
+        let entry = &auth.pub_keys[0];
+        assert_eq!(entry.roles, default_roles());
+        assert_eq!(entry.roles, vec![Role::Unlock, Role::AuditRead]);
+    }
+
+    /// Required A5 test (parse + single role): a single-role line
+    /// extracts exactly that one role — no surprise additions, no
+    /// default-roles fallback.
+    #[test]
+    fn load_parses_pubkey_with_single_role() {
+        let (_, vk) = make_keypair();
+        let line = format!("{} shutdown", hex::encode(vk.to_bytes()));
+        let f = write_config(&[&line]);
+        let auth = AdminAuth::load(f.path()).expect("load");
+        assert_eq!(auth.pub_keys[0].roles, vec![Role::Shutdown]);
+    }
+
+    /// Required A5 test (parse + multi-role): comma-separated role
+    /// list preserves order and dedupes duplicates.
+    #[test]
+    fn load_parses_pubkey_with_multi_role_list() {
+        let (_, vk) = make_keypair();
+        let line = format!(
+            "{} unlock,shutdown,audit-read,unlock",
+            hex::encode(vk.to_bytes())
+        );
+        let f = write_config(&[&line]);
+        let auth = AdminAuth::load(f.path()).expect("load");
+        // Duplicate `unlock` is collapsed; order of first
+        // appearance is preserved.
+        assert_eq!(
+            auth.pub_keys[0].roles,
+            vec![Role::Unlock, Role::Shutdown, Role::AuditRead]
+        );
+    }
+
+    /// Required A5 test (each role): every role keyword from the
+    /// §3.2 list parses to its expected [`Role`] discriminant —
+    /// including the non-contiguous `all = 255` super-role.
+    #[test]
+    fn load_parses_every_role_keyword_in_design_spec_3_2() {
+        let cases = [
+            ("unlock", Role::Unlock),
+            ("shutdown", Role::Shutdown),
+            ("force-posture", Role::ForcePosture),
+            ("rotate-keys", Role::RotateKeys),
+            ("audit-read", Role::AuditRead),
+            ("all", Role::All),
+        ];
+        for (keyword, expected) in cases {
+            let (_, vk) = make_keypair();
+            let line = format!("{} {keyword}", hex::encode(vk.to_bytes()));
+            let f = write_config(&[&line]);
+            let auth = AdminAuth::load(f.path())
+                .unwrap_or_else(|e| panic!("load failed for `{keyword}`: {e}"));
+            assert_eq!(
+                auth.pub_keys[0].roles,
+                vec![expected],
+                "keyword `{keyword}` should map to {expected:?}"
+            );
+        }
+    }
+
+    /// Required A5 test (malformed - unknown role): a typo'd role
+    /// keyword surfaces a parse error with the line number and the
+    /// bad token, not a silent fallback to default roles (which
+    /// would mask an operator misconfiguration).
+    #[test]
+    fn load_rejects_unknown_role_keyword_with_line_number() {
+        let (_, vk) = make_keypair();
+        let line = format!("{} unlock,doesnotexist", hex::encode(vk.to_bytes()));
+        let f = write_config(&["# header", &line]);
+        let err = AdminAuth::load(f.path()).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains(":2:"),
+            "error should reference line 2, got: {s}"
+        );
+        assert!(
+            s.contains("doesnotexist"),
+            "error should mention the bad role, got: {s}"
+        );
+    }
+
+    /// Required A5 test (malformed - separator): the common
+    /// operator typo of using spaces instead of commas between
+    /// roles surfaces as an explicit "third token" error rather
+    /// than silently using only the first role.
+    #[test]
+    fn load_rejects_space_separated_roles_with_actionable_message() {
+        let (_, vk) = make_keypair();
+        // "unlock audit-read" is two tokens, not one role list.
+        let line = format!("{} unlock audit-read", hex::encode(vk.to_bytes()));
+        let f = write_config(&[&line]);
+        let err = AdminAuth::load(f.path()).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("comma-separated"),
+            "error should explain the comma requirement, got: {s}"
+        );
+    }
+
+    /// Required A5 test (verify role-match): a key whose
+    /// allowlist contains the required role successfully authorises
+    /// the operation. Uses `Role::AuditRead` because the default
+    /// allowlist includes it — this also documents that
+    /// `verify_with_role` works for non-Unlock roles.
+    #[test]
+    fn verify_with_role_succeeds_when_key_authorises_required_role() {
+        let (signing, vk) = make_keypair();
+        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let nonce = auth.issue_challenge().unwrap();
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        // Default roles include AuditRead, so this must succeed.
+        let _ = auth
+            .verify_with_role(&sig, Role::AuditRead)
+            .expect("default roles include AuditRead — should succeed");
+    }
+
+    /// Required A5 test (verify role-mismatch): a correctly-signed
+    /// request whose required role is NOT in the matched key's
+    /// allowlist returns [`AdminAuthError::RoleDenied`] carrying
+    /// the matched key's fingerprint AND the required role —
+    /// audit-log-ready.
+    #[test]
+    fn verify_with_role_returns_role_denied_when_key_lacks_role() {
+        let (signing, vk) = make_keypair();
+        // Default roles are {Unlock, AuditRead} — they do NOT
+        // include Shutdown. A correctly-signed Shutdown request
+        // must surface RoleDenied, not InvalidSignature.
+        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let nonce = auth.issue_challenge().unwrap();
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        let err = auth.verify_with_role(&sig, Role::Shutdown).unwrap_err();
+        match err {
+            AdminAuthError::RoleDenied {
+                key_fingerprint,
+                required_role,
+            } => {
+                assert_eq!(required_role, Role::Shutdown);
+                assert_eq!(
+                    key_fingerprint.len(),
+                    8,
+                    "fingerprint should be 8 hex chars (SHA-256 prefix)"
+                );
+                assert_eq!(key_fingerprint, fingerprint(&vk));
+            }
+            other => panic!("expected RoleDenied, got {other:?}"),
+        }
+        // Rate-limit counter MUST NOT have been incremented: the
+        // request was a config error, not an attack signal.
+        assert_eq!(
+            auth.failure_count.load(Ordering::SeqCst),
+            0,
+            "RoleDenied must not count toward rate-limit"
+        );
+    }
+
+    // ── Supplementary A5 tests ─────────────────────────────────────
+
+    /// [`Role::All`] is the break-glass super-role — a key whose
+    /// allowlist contains `all` authorises every required role
+    /// without exception. Locks the design §3.2 contract against
+    /// a future regression that adds an "all except X" carve-out.
+    #[test]
+    fn role_all_authorises_every_required_role() {
+        let (signing, vk) = make_keypair();
+        let entry = KeyEntry {
+            key: vk,
+            roles: vec![Role::All],
+        };
+        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        for role in [
+            Role::Unlock,
+            Role::Shutdown,
+            Role::ForcePosture,
+            Role::RotateKeys,
+            Role::AuditRead,
+        ] {
+            let nonce = auth.issue_challenge().unwrap();
+            let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+            auth.verify_with_role(&sig, role)
+                .unwrap_or_else(|e| panic!("Role::All should authorise {role:?}: {e:?}"));
+        }
+    }
+
+    /// The pre-A5 [`AdminAuth::verify_unlock`] entry point is now
+    /// a wrapper around `verify_with_role(sig, Role::Unlock)` and
+    /// behaves byte-identically for every legacy admin.pub line
+    /// (default roles include Unlock). Anchor for the backward-
+    /// compat guarantee called out in `verify_unlock`'s doc-comment.
+    #[test]
+    fn verify_unlock_is_backward_compatible_with_pre_a5_admin_pub() {
+        let (signing, vk) = make_keypair();
+        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let nonce = auth.issue_challenge().unwrap();
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        let _token = auth
+            .verify_unlock(&sig)
+            .expect("pre-A5 admin.pub must continue to authorise unlock");
     }
 }
