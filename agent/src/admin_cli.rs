@@ -28,9 +28,12 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, ChallengeRequest, StatusRequest, UnlockRequest,
-    UnlockResult,
+    decode_frame, encode_frame, AdminMessage, AdminResult, ChallengeRequest, KeyedSignature,
+    ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
 };
+use common::wire::admin_signed_payload::{sign, SignedPayload};
+
+use crate::agent_id::{self, AGENT_ID_LEN};
 
 // ── public outcome types ────────────────────────────────────────────
 
@@ -43,6 +46,35 @@ pub enum UnlockOutcome {
     InvalidSignature,
     NoPendingChallenge,
     RateLimited { retry_after_secs: u32 },
+}
+
+/// Result of `nn-admin shutdown` (Tappa 8 A9, design §5.1 + §10).
+/// Mapped to the binary's exit codes per the design §5.3 contract:
+/// - Success=0 (clean acknowledgement; the agent will exit and the
+///   watchdog will stand down)
+/// - InvalidSignature=2 (legacy code; also catches the rare
+///   misconfigured admin.pub line case)
+/// - NoPendingChallenge=3 (server state out of sync — retry)
+/// - RateLimited=4 (server-side throttle hit)
+/// - Transport=5 (covers TimestampSkew / AgentIdMismatch /
+///   UnknownOperation / ProtocolVersionUnsupported — all are
+///   environment / config / version-mismatch issues the operator
+///   must investigate before retrying)
+/// - QuorumNotMet=6 (NEW per design §5.3 — too few distinct sigs)
+/// - RoleDenied=7 (NEW per design §5.3 — keys present but lack
+///   the `shutdown` role; check admin.pub)
+#[derive(Debug)]
+pub enum ShutdownOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
 }
 
 #[derive(Debug)]
@@ -161,6 +193,131 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         posture: resp.posture,
         network_isolation_engaged: resp.network_isolation_engaged,
         last_admin_action_secs_ago: resp.last_admin_action_secs_ago,
+    })
+}
+
+/// Tappa 8 A9 — full signed-shutdown CLI flow.
+///
+/// Wire path (design §10):
+/// 1. Connect to `socket`.
+/// 2. Send a `ChallengeRequest`; receive a `Challenge { nonce }`.
+/// 3. Read `agent_id` from the local `agent_id_path` — the same
+///    file the agent's `main.rs` reads at startup
+///    (`/etc/northnarrow/agent_id` per design §6.5). nn-admin is
+///    typically run on the same host (or through an SSH-forwarded
+///    socket per §8.1), so a local read is the source of truth.
+/// 4. Build a [`SignedPayload`] for `OperationCode::Shutdown` with
+///    the nonce, current wall-clock ts, agent_id, and the
+///    operator's `grace_secs`.
+/// 5. Sign the payload with BOTH private keys (one nonce signed
+///    by both — the simpler per-§13 A9 row resolution).
+/// 6. Submit one `ShutdownRequest` carrying both signatures.
+/// 7. Parse the `ShutdownResult(AdminResult)` reply into a typed
+///    [`ShutdownOutcome`] for the binary to map to an exit code.
+///
+/// Both keys are REQUIRED — the agent's quorum verify (A6+A7)
+/// requires `min_distinct >= 2` for shutdown. Passing the same
+/// key as both `key` and `cosign_key` will fail server-side with
+/// `QuorumNotMet { required: 2, provided: 1 }` (the server tallies
+/// distinct fingerprints).
+///
+/// `grace_secs` is clamped to the design §10.2 maximum of 300 (5
+/// min). A value larger than the cap is rejected at parse time
+/// rather than silently truncated.
+pub fn run_shutdown(
+    socket: &Path,
+    key_path: &Path,
+    cosign_key_path: &Path,
+    agent_id_path: &Path,
+    grace_secs: u32,
+) -> Result<ShutdownOutcome> {
+    const MAX_GRACE_SECS: u32 = 300;
+    if grace_secs > MAX_GRACE_SECS {
+        bail!(
+            "grace_secs {grace_secs} exceeds design §10.2 cap of {MAX_GRACE_SECS}"
+        );
+    }
+
+    // Read both keys + the agent_id BEFORE opening the socket so a
+    // typo'd path fails fast instead of holding the agent's
+    // dispatcher connection while we error.
+    let signing_a = read_priv_key(key_path)?;
+    let signing_b = read_priv_key(cosign_key_path)?;
+    let agent_id_arr =
+        agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+            format!(
+                "reading agent_id at {} (nn-admin must run on the agent host \
+                 or have the file copied / SSH-forwarded — design §6.5)",
+                agent_id_path.display()
+            )
+        })?;
+    // Compile-time guarantee that the wire shape matches the file
+    // shape — if a future hardening tappa changes either width the
+    // build breaks before we ship a mismatched signer.
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected server reply to ChallengeRequest: {other:?}"),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let payload =
+        SignedPayload::new_shutdown(nonce, now, agent_id_arr, grace_secs);
+    let sig_a: [u8; 64] = sign(&payload, &signing_a)
+        .map_err(|e| anyhow!("signing payload with primary key: {e}"))?;
+    let sig_b: [u8; 64] = sign(&payload, &signing_b)
+        .map_err(|e| anyhow!("signing payload with cosign key: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::ShutdownRequest(ShutdownRequest {
+            payload,
+            signatures: vec![
+                KeyedSignature { signature: sig_a },
+                KeyedSignature { signature: sig_b },
+            ],
+        }),
+    )?;
+
+    let result = match read_frame(&mut stream)? {
+        AdminMessage::ShutdownResult(r) => r,
+        other => bail!("unexpected server reply to ShutdownRequest: {other:?}"),
+    };
+
+    Ok(match result {
+        AdminResult::Success => ShutdownOutcome::Success,
+        AdminResult::InvalidSignature => ShutdownOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => ShutdownOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            ShutdownOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            ShutdownOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => ShutdownOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => ShutdownOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => ShutdownOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => ShutdownOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            ShutdownOutcome::ProtocolVersionUnsupported { server_version }
+        }
     })
 }
 
@@ -588,5 +745,233 @@ mod tests {
         // Differs for a different key, with overwhelming probability.
         let other = SigningKey::generate(&mut OsRng).verifying_key();
         assert_ne!(pubkey_fingerprint(&other), a);
+    }
+
+    // ── A9: nn-admin shutdown — mock-server tests ──────────────────
+
+    use common::wire::admin_protocol::AdminResult;
+    use common::wire::admin_signed_payload::verify;
+
+    /// Write a 16-byte agent_id to a tempdir file in the canonical
+    /// format. Returns both the path and the raw bytes so the test
+    /// can verify the client signed with the expected value.
+    fn write_agent_id_file(dir: &TempDir, raw: &[u8; 16]) -> PathBuf {
+        let p = dir.path().join("agent_id");
+        std::fs::write(&p, format!("{}\n", hex::encode(raw))).unwrap();
+        p
+    }
+
+    /// Run `mock_server_fn` in a thread bound to `socket_path`,
+    /// while `client_fn` runs in the foreground. Joins the server
+    /// thread at the end so any server-side panic is surfaced.
+    fn run_with_mock_server<S, C, R>(
+        socket_path: &Path,
+        mock_server_fn: S,
+        client_fn: C,
+    ) -> R
+    where
+        S: FnOnce(&mut UnixStream) + Send + 'static,
+        C: FnOnce() -> R,
+    {
+        let server = spawn_mock_server(socket_path, mock_server_fn);
+        let out = client_fn();
+        server.join().expect("mock server panicked");
+        out
+    }
+
+    /// Required A9 test 1 (happy path): a 2-of-N submission with
+    /// distinct valid keys + Shutdown role + matching agent_id + in-
+    /// window ts must round-trip to ShutdownOutcome::Success. Also
+    /// proves the client actually signs the SignedPayload (the
+    /// mock server verifies BOTH sigs against the served nonce-
+    /// bound digest).
+    #[test]
+    fn cli_shutdown_happy_path_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_a = dir.path().join("admin_a.key");
+        let priv_b = dir.path().join("admin_b.key");
+        let signing_a = SigningKey::generate(&mut OsRng);
+        let signing_b = SigningKey::generate(&mut OsRng);
+        std::fs::write(&priv_a, format!("{}\n", hex::encode(signing_a.to_bytes()))).unwrap();
+        std::fs::write(&priv_b, format!("{}\n", hex::encode(signing_b.to_bytes()))).unwrap();
+        let agent_id: [u8; 16] = [0x9Au8; 16];
+        let agent_id_path = write_agent_id_file(&dir, &agent_id);
+
+        let vk_a = signing_a.verifying_key();
+        let vk_b = signing_b.verifying_key();
+        let socket_for_client = socket.clone();
+        let nonce = [0x33u8; 32];
+
+        let outcome = run_with_mock_server(
+            &socket,
+            move |stream| {
+                // Step 1: server replies with a fixed nonce.
+                match server_read_frame(stream) {
+                    AdminMessage::ChallengeRequest(_) => {}
+                    other => panic!("expected ChallengeRequest, got {other:?}"),
+                }
+                server_write_frame(
+                    stream,
+                    &AdminMessage::Challenge(
+                        common::wire::admin_protocol::Challenge { nonce },
+                    ),
+                );
+
+                // Step 2: server receives ShutdownRequest, verifies
+                // both signatures actually verify under the served
+                // nonce + agent_id binding.
+                let req = match server_read_frame(stream) {
+                    AdminMessage::ShutdownRequest(r) => r,
+                    other => panic!("expected ShutdownRequest, got {other:?}"),
+                };
+                assert_eq!(req.payload.nonce, nonce, "payload.nonce must echo served nonce");
+                assert_eq!(req.payload.agent_id, agent_id, "payload.agent_id must match the file");
+                assert_eq!(req.signatures.len(), 2, "exactly 2 sigs in quorum");
+                // Both sigs verify against the SAME payload — the
+                // design's "one nonce signed by both" resolution.
+                verify(&req.payload, &req.signatures[0].signature, &vk_a)
+                    .expect("sig_a must verify under key A");
+                verify(&req.payload, &req.signatures[1].signature, &vk_b)
+                    .expect("sig_b must verify under key B");
+
+                // Step 3: server replies Success.
+                server_write_frame(
+                    stream,
+                    &AdminMessage::ShutdownResult(AdminResult::Success),
+                );
+            },
+            || run_shutdown(&socket_for_client, &priv_a, &priv_b, &agent_id_path, 30),
+        );
+
+        let outcome = outcome.expect("client should not error");
+        assert!(matches!(outcome, ShutdownOutcome::Success));
+    }
+
+    /// Required A9 test 2 (server quorum-not-met → client outcome):
+    /// the server replies QuorumNotMet { required: 2, provided: 1 };
+    /// the client maps it to ShutdownOutcome::QuorumNotMet with the
+    /// counts preserved.
+    #[test]
+    fn cli_shutdown_propagates_quorum_not_met() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_a = dir.path().join("admin_a.key");
+        let priv_b = dir.path().join("admin_b.key");
+        let signing_a = SigningKey::generate(&mut OsRng);
+        let signing_b = SigningKey::generate(&mut OsRng);
+        std::fs::write(&priv_a, format!("{}\n", hex::encode(signing_a.to_bytes()))).unwrap();
+        std::fs::write(&priv_b, format!("{}\n", hex::encode(signing_b.to_bytes()))).unwrap();
+        let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
+
+        let socket_for_client = socket.clone();
+        let outcome = run_with_mock_server(
+            &socket,
+            move |stream| {
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::Challenge(
+                        common::wire::admin_protocol::Challenge { nonce: [0u8; 32] },
+                    ),
+                );
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::ShutdownResult(AdminResult::QuorumNotMet {
+                        required: 2,
+                        provided: 1,
+                    }),
+                );
+            },
+            || run_shutdown(&socket_for_client, &priv_a, &priv_b, &agent_id_path, 30),
+        )
+        .expect("client should not error");
+        match outcome {
+            ShutdownOutcome::QuorumNotMet { required, provided } => {
+                assert_eq!(required, 2);
+                assert_eq!(provided, 1);
+            }
+            other => panic!("expected QuorumNotMet{{2,1}}, got {other:?}"),
+        }
+    }
+
+    /// Required A9 test 3 (server role-denied → client outcome):
+    /// the operator's keys verified but neither carries the
+    /// `shutdown` role in admin.pub. Client surfaces RoleDenied.
+    #[test]
+    fn cli_shutdown_propagates_role_denied() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_a = dir.path().join("admin_a.key");
+        let priv_b = dir.path().join("admin_b.key");
+        let signing_a = SigningKey::generate(&mut OsRng);
+        let signing_b = SigningKey::generate(&mut OsRng);
+        std::fs::write(&priv_a, format!("{}\n", hex::encode(signing_a.to_bytes()))).unwrap();
+        std::fs::write(&priv_b, format!("{}\n", hex::encode(signing_b.to_bytes()))).unwrap();
+        let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
+
+        let socket_for_client = socket.clone();
+        let outcome = run_with_mock_server(
+            &socket,
+            move |stream| {
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::Challenge(
+                        common::wire::admin_protocol::Challenge { nonce: [0u8; 32] },
+                    ),
+                );
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::ShutdownResult(AdminResult::RoleDenied),
+                );
+            },
+            || run_shutdown(&socket_for_client, &priv_a, &priv_b, &agent_id_path, 30),
+        )
+        .expect("client should not error");
+        assert!(matches!(outcome, ShutdownOutcome::RoleDenied));
+    }
+
+    /// Required A9 test 4 (client-side input validation):
+    /// grace_secs over the design §10.2 cap of 300 is rejected
+    /// before any socket I/O — surfaces an anyhow Err with a
+    /// message mentioning the cap. This is the only "client
+    /// rejects the operator's request before talking to the
+    /// server" path; every other client-side error wraps a
+    /// server-side AdminResult.
+    #[test]
+    fn cli_shutdown_rejects_grace_over_cap_without_socket_io() {
+        let dir = TempDir::new().unwrap();
+        // Real files but a NON-EXISTENT socket: proves we didn't
+        // try to connect (would have errored with "connection
+        // refused" not "grace_secs ...").
+        let priv_a = dir.path().join("admin_a.key");
+        let priv_b = dir.path().join("admin_b.key");
+        std::fs::write(
+            &priv_a,
+            format!("{}\n", hex::encode(SigningKey::generate(&mut OsRng).to_bytes())),
+        )
+        .unwrap();
+        std::fs::write(
+            &priv_b,
+            format!("{}\n", hex::encode(SigningKey::generate(&mut OsRng).to_bytes())),
+        )
+        .unwrap();
+        let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
+        let socket = dir.path().join("never_bound.sock");
+
+        let err = run_shutdown(&socket, &priv_a, &priv_b, &agent_id_path, 9999)
+            .unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("grace_secs"),
+            "error must mention grace_secs cap, got: {s}"
+        );
+        assert!(
+            s.contains("300"),
+            "error must mention the 300 s design cap, got: {s}"
+        );
     }
 }

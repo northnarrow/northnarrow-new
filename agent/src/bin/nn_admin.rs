@@ -8,10 +8,18 @@
 //! Exit codes (stable contract; do not renumber):
 //! - 0  success
 //! - 1  generic startup failure (bad args, file I/O, missing keys)
-//! - 2  unlock: server rejected the signature
-//! - 3  unlock: server reports no pending challenge
-//! - 4  unlock: rate-limited (retry_after_secs printed)
-//! - 5  unlock or status: transport / protocol failure
+//! - 2  unlock/shutdown: server rejected the signature
+//! - 3  unlock/shutdown: server reports no pending challenge
+//! - 4  unlock/shutdown: rate-limited (retry_after_secs printed)
+//! - 5  unlock/shutdown/status: transport / protocol failure
+//!   (Tappa 8 A9 also folds TimestampSkew, AgentIdMismatch,
+//!   UnknownOperation, ProtocolVersionUnsupported here — all
+//!   "operator must investigate environment / config / version
+//!   mismatch before retrying" failures)
+//! - 6  shutdown: quorum not met (too few distinct valid sigs)
+//!   (NEW in Tappa 8 A9 per design §5.3)
+//! - 7  shutdown: role check failed (key valid but lacks `shutdown`)
+//!   (NEW in Tappa 8 A9 per design §5.3)
 //!
 //! Air-gapped split flow (`unlock --request-only` writing a
 //! challenge file, plus a separate `nn-admin sign` offline) is on
@@ -25,12 +33,19 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
-    run_init, run_status, run_unlock, run_verify_keys, StatusOutcome, UnlockOutcome,
-    VerifyKeysOutcome,
+    run_init, run_shutdown, run_status, run_unlock, run_verify_keys, ShutdownOutcome,
+    StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
 const DEFAULT_PUB_PATH: &str = "/etc/northnarrow/admin.pub";
+/// Default path of the per-install agent UUID. Must match
+/// `Cli::agent_id_file` in `agent/src/main.rs` so nn-admin and the
+/// agent read the same on-disk source of truth (design §6.5).
+const DEFAULT_AGENT_ID_PATH: &str = "/etc/northnarrow/agent_id";
+/// Operator-chosen default per design §10.2 — 30 s is the typical
+/// "drain in-flight work" window before the watchdog deadline.
+const DEFAULT_GRACE_SECS: u32 = 30;
 
 #[derive(Parser, Debug)]
 #[command(name = "nn-admin", version, about = "NorthNarrow admin CLI")]
@@ -91,6 +106,52 @@ enum Cmd {
     VerifyKeys {
         #[arg(long, default_value = DEFAULT_PUB_PATH)]
         path: PathBuf,
+    },
+
+    /// Tappa 8 A9 — signed agent shutdown (design §10).
+    ///
+    /// Submits a 2-of-N quorum-signed shutdown request. The agent
+    /// verifies through every Tappa 8 layer (nonce binding,
+    /// timestamp skew, agent_id binding, signature verify,
+    /// distinct-key tally, role check), atomically writes the
+    /// watchdog's shutdown-authorisation marker, replies Success,
+    /// then exits cleanly. The watchdog (when present) reads the
+    /// marker on the agent's pidfd POLLIN and stands down rather
+    /// than respawning.
+    ///
+    /// BOTH keys are required — the quorum requires two distinct
+    /// admin keys, each with the `shutdown` role (per admin.pub
+    /// allowlist). Same key for both args fails server-side as
+    /// QuorumNotMet { required: 2, provided: 1 } because the
+    /// server tallies distinct fingerprints. The `--agent-id-file`
+    /// path defaults to the design's canonical location; override
+    /// only if `nn-admin` is run on a host where the file lives
+    /// elsewhere (e.g., SSH-forwarded socket with a separate
+    /// copy of the file).
+    Shutdown {
+        /// Path to the operator's primary admin private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// Path to a second, DISTINCT admin private key
+        /// (co-signer). The quorum verify requires distinct
+        /// fingerprints — passing the same key as both arms
+        /// will be rejected by the agent.
+        #[arg(long = "cosign-key")]
+        cosign_key: PathBuf,
+        /// Path to the agent's per-install UUID file (design §6.5).
+        /// nn-admin reads this to bind the signed payload to the
+        /// specific agent install — a captured signature from
+        /// agent-A cannot be replayed against agent-B.
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        /// Grace period (seconds) the operator gives the agent
+        /// to drain in-flight work before the watchdog's
+        /// stand-down deadline expires. Capped at 300 s per
+        /// design §10.2.
+        #[arg(long = "grace-secs", default_value_t = DEFAULT_GRACE_SECS)]
+        grace_secs: u32,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 
     /// Debug-only: force the agent's posture state machine into a
@@ -168,6 +229,27 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Cmd::Shutdown {
+            key,
+            cosign_key,
+            agent_id_file,
+            grace_secs,
+            socket,
+        } => match run_shutdown(&socket, &key, &cosign_key, &agent_id_file, grace_secs) {
+            Ok(outcome) => exit_from_shutdown(outcome, grace_secs),
+            Err(e) => {
+                // Startup-class failures (file I/O on key/agent_id,
+                // grace_secs over cap, transport failure) all land
+                // here from `run_shutdown`'s anyhow Err. Map to
+                // exit 5 (transport) since that's the "operator
+                // must investigate" exit — `1` is reserved for
+                // generic startup failure and we want shutdown
+                // failures to be distinguishable from "couldn't
+                // even launch nn-admin."
+                eprintln!("shutdown: {e:#}");
+                ExitCode::from(5)
+            }
+        },
         #[cfg(feature = "debug-trigger")]
         Cmd::Debug {
             sub: DebugCmd::ForcePosture { state, socket },
@@ -211,6 +293,159 @@ fn exit_from_anyhow(r: anyhow::Result<()>) -> ExitCode {
         Err(e) => {
             eprintln!("{e:#}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn exit_from_shutdown(outcome: ShutdownOutcome, grace_secs: u32) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        ShutdownOutcome::Success => {
+            // Two-line UX per design §10.5: collect-confirmation
+            // then ack-confirmation. The fingerprint roll-up
+            // ("8a1c2f3e+7b5d4ce0") shown in the design is the
+            // agent's audit-log job (A11+) — we don't have the
+            // matched fingerprints client-side here.
+            println!(
+                "{}",
+                colorize(
+                    "shutdown: 2 signatures collected; quorum met",
+                    "32",
+                    tty
+                )
+            );
+            println!(
+                "{}",
+                colorize(
+                    &format!(
+                        "shutdown: agent acknowledged (grace {grace_secs}s); \
+                         watchdog will stand down on next pidfd POLLIN"
+                    ),
+                    "32",
+                    tty
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        ShutdownOutcome::InvalidSignature => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "shutdown: invalid signature (key not in admin.pub, or wrong bytes)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(2)
+        }
+        ShutdownOutcome::NoPendingChallenge => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "shutdown: no pending challenge (server state out of sync — retry)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(3)
+        }
+        ShutdownOutcome::RateLimited { retry_after_secs } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "shutdown: rate limited; retry after {retry_after_secs}s"
+                    ),
+                    "33",
+                    tty
+                )
+            );
+            ExitCode::from(4)
+        }
+        ShutdownOutcome::QuorumNotMet { required, provided } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "shutdown: quorum not met ({provided}/{required} distinct \
+                         valid signatures). Co-signer key may be wrong, the same \
+                         key may have been passed to --key and --cosign-key, or \
+                         the second sig may not verify."
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(6)
+        }
+        ShutdownOutcome::RoleDenied => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "shutdown: role denied (one of the keys verified but lacks \
+                     the `shutdown` role in admin.pub — check the line's role list)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(7)
+        }
+        ShutdownOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "shutdown: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s). \
+                         NTP-sync this host and the agent host, then retry."
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
+        }
+        ShutdownOutcome::AgentIdMismatch => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "shutdown: agent_id mismatch (the --agent-id-file content \
+                     doesn't match the agent's bootstrapped UUID — check the \
+                     path, or copy the file from the agent host).",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
+        }
+        ShutdownOutcome::UnknownOperation => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "shutdown: unknown operation (protocol misuse — likely a \
+                     version mismatch between nn-admin and the agent)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
+        }
+        ShutdownOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "shutdown: protocol version unsupported (server speaks \
+                         up to v{server_version}; nn-admin is newer — downgrade \
+                         nn-admin or upgrade the agent)"
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
         }
     }
 }
