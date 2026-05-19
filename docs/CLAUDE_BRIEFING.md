@@ -105,8 +105,40 @@ Documentato in `VISION.md` repo. NESSUN ridimensionamento ammesso. Assistente ch
   - Task 4 (Userland LSM loader): ✅
   - **Task 5 (Filesystem protection, 5 LSM hooks): ✅ COMPLETED 13 maggio** (HEAD `8ff04c7` fix + `c33d089` doc, attack matrix tutta DENIED incluso chattr)
   - Task 6 (Watchdog secondary process): TODO
-  - Task 7 (Emergency Network Isolation autonomous via COMBAT): TODO
+  - **Task 7 (Emergency Network Isolation autonomous via COMBAT): PARTIAL — code-complete, integration test self-kills via R009 from `/home/*` paths (see "Task 7 known issue (2026-05-19)" below and `docs/issues/ISSUE_001_eni_test_r009_selfkill.md`). NOT SHIPPED.**
 - Tappa 8: Ed25519 challenge-response auth admin override: TODO
+
+#### Task 7 known issue (2026-05-19)
+
+Live-verify of `e2e_force_combat_then_unlock_via_cli` (Ubuntu Server VM,
+kernel `6.8.0-117-generic`, HEAD `1bb1f1f`, build `--features
+test-privileged,debug-trigger`) panics at `agent/tests/privileged_e2e.rs:177`
+with `debug force-posture failed: stderr=""`. Root cause: the test spawns
+`nn-admin` from `CARGO_BIN_EXE_nn-admin` which resolves to
+`<repo>/target/release/nn-admin` under `/home/<user>/...`; the production
+rule `R009_RootExecFromUserPath`
+(`agent/src/decision/rules/r009_root_exec_from_user_path.rs:8`) matches
+on `uid == 0` + `/home/` prefix and issues `ResponseAction::KillProcess`
+~47 μs after spawn, before `nn-admin` can transmit the force-posture
+command. The ENI implementation (`NetworkIsolator`,
+`configs/combat-rules.v4`, Ed25519 `UnlockToken`, posture state machine,
+admin socket) is correct; only the integration test harness is blocked.
+
+Three remediation paths were considered and deferred to a separate
+workstream:
+
+- **A.** Test fixture copies binaries to `/usr/local/bin/` before spawn
+  (~1 h, no production-code change).
+- **B.** Agent `--decision-rules-allowlist` / `--decision-rules-deny`
+  flag behind a test-only feature gate (~3–4 h plus design review;
+  introduces a rule-disable footgun surface).
+- **C.** R009 parent-PID / Ed25519-signature exemption for admin
+  tooling (~1 week; properly Tappa 8/9 admin-trust scope).
+
+Full reproducer, evidence table, and remediation analysis:
+`docs/issues/ISSUE_001_eni_test_r009_selfkill.md`. No production code
+changes have been made for this finding — Task 7 is marked PARTIAL
+pending owner decision on remediation path.
 
 ### FASE 4-7: come da `docs/XDR_ROADMAP.md`
 - FASE 4 Deception + Hardening (Tappa 9.5 canary, Tappa 10 sandbox)
