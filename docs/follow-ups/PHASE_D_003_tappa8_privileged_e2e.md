@@ -1,6 +1,14 @@
 # PHASE_D_003 — Tappa 8 privileged e2e (deferred from A15)
 
-**Status:** OPEN — deferred from B5 (Tappa 8 closing commit).
+**Status:** RESOLVED 2026-05-19 — shipped on branch
+`phase-d-003-tappa8-priv-e2e`. The three design-A15 privileged
+round-trip tests are now live in `agent/tests/privileged_e2e.rs`
+gated under `--features test-privileged`; `install_to_priv_bin`
++ RAII `InstalledBin` was ported from the watchdog harness;
+three new agent CLI flags (`--signing-key-file`,
+`--audit-log-file`, `--shutdown-marker-file`) let tests
+override the hard-coded `/etc/northnarrow/` and `/run/northnarrow/`
+paths per-test-tempdir. 3/3 PASS on Hetzner in 5.91s.
 **Filed:** 2026-05-19 alongside B5 (`feat(admin_socket): Tappa 8
 sub-sprint B B5 (A15) — wire AuditLog::append into every signed
 admin dispatch + SO_PEERCRED client capture`).
