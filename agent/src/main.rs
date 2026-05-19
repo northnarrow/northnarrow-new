@@ -133,6 +133,41 @@ struct Cli {
     )]
     admin_socket: PathBuf,
 
+    /// PHASE_D_003: configurable path of the agent's audit
+    /// signing key (Tappa 8 B1). Default mirrors the design's
+    /// canonical location. Tests override this to a per-test
+    /// tempdir so each test run gets a fresh key without
+    /// mutating the host's /etc/northnarrow/ state.
+    #[arg(
+        long = "signing-key-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
+    )]
+    signing_key_file: PathBuf,
+
+    /// PHASE_D_003: configurable path of the agent's audit
+    /// log (Tappa 8 B1 + B5). Default mirrors the design's
+    /// canonical location.
+    #[arg(
+        long = "audit-log-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH,
+    )]
+    audit_log_file: PathBuf,
+
+    /// PHASE_D_003: configurable path of the
+    /// shutdown-authorisation marker (Tappa 8 A8). Default is
+    /// the design's canonical
+    /// `/run/northnarrow/agent.shutdown_authorised`. Tests use
+    /// a per-test tempdir so the watchdog can be mocked or
+    /// skipped without colliding with a real install.
+    #[arg(
+        long = "shutdown-marker-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::shutdown_marker::DEFAULT_MARKER_PATH,
+    )]
+    shutdown_marker_file: PathBuf,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -176,21 +211,21 @@ async fn main() -> Result<()> {
     // audit.log is created as a zero-byte placeholder if absent
     // (first append writes the genesis entry).
     if let Err(e) = northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-        std::path::Path::new(
-            northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
-        ),
+        &cli.signing_key_file,
     ) {
         warn!(
             error = %e,
+            path = %cli.signing_key_file.display(),
             "agent signing key bootstrap failed pre-attach — audit log will be \
              unsigned this boot"
         );
     }
     if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_audit_log(
-        std::path::Path::new(northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH),
+        &cli.audit_log_file,
     ) {
         warn!(
             error = %e,
+            path = %cli.audit_log_file.display(),
             "audit log bootstrap failed pre-attach — file will be lazily created \
              on first append (and protected only from agent restart onwards)"
         );
@@ -447,16 +482,14 @@ async fn main() -> Result<()> {
                 // SigningKey rather than wrap the pre-attach
                 // bootstrap result. agent_id is whatever the
                 // pre-attach call minted.
+                let signing_key_path = cli.signing_key_file.clone();
+                let audit_log_path = cli.audit_log_file.clone();
                 let audit_log = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-                    std::path::Path::new(
-                        northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
-                    ),
+                    &signing_key_path,
                 ) {
                     Ok(key) => {
                         match northnarrow_agent::audit::AuditLog::open(
-                            std::path::Path::new(
-                                northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH,
-                            ),
+                            &audit_log_path,
                             key,
                             agent_id,
                         ) {
@@ -482,15 +515,14 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+                let marker_path = cli.shutdown_marker_file.clone();
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
                         auth,
                         Arc::new(posture_clone),
                         iso_clone,
-                        PathBuf::from(
-                            northnarrow_agent::shutdown_marker::DEFAULT_MARKER_PATH,
-                        ),
+                        marker_path,
                         Some(signal_for_serve),
                         audit_log,
                     )
