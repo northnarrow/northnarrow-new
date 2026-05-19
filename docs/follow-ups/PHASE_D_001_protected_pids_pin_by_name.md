@@ -1,9 +1,19 @@
 # PHASE_D_001 — agent doesn't pin PROTECTED_PIDS by name
 
+**Status:** RESOLVED 2026-05-19 (fixed in `agent/src/anti_tamper/mod.rs::attach`).
 **Discovered:** Tappa 7 task 6 W8 (privileged_e2e bring-up, 2026-05-19).
 **Severity:** ARCHITECTURAL — watchdog's W3 layer-2 evict is unreachable in production.
 **Blast radius:** All three W8 privileged tests are blocked. Production
 watchdog respawn loop will fail at `ProtectedPidsHandle::open(bpffs_root)`.
+
+## Resolution
+
+`agent/src/anti_tamper/mod.rs::attach` now explicitly pins the map via
+`ebpf.map_mut(PROTECTED_PIDS_MAP_NAME)?.pin(<bpffs_root>/PROTECTED_PIDS)?`
+right after `register_protected_pids`. The pattern mirrors the W1
+`attach_lsm` idiom: `purge_stale_pin` + `pin` so a leftover pin from
+a prior wedged boot can never wedge the new boot. All three W8
+privileged tests now pass on Hetzner (`3 passed; 0 failed` in 12.79s).
 
 ## Symptom
 

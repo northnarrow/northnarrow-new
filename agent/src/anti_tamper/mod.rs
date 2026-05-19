@@ -200,6 +200,37 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
         "anti-tamper: PIDs registered with kernel"
     );
 
+    // PHASE_D_001: pin PROTECTED_PIDS by name to bpffs. The eBPF
+    // source declares `HashMap::pinned(16, 0)` and the loader
+    // calls `map_pin_path(root)`, which is documented to handle
+    // by-name pinning automatically — empirically on aya 0.13.1 +
+    // kernel 6.8 it does not, leaving the watchdog's
+    // `ProtectedPidsHandle::open(bpffs_root)` unable to find the
+    // map. Explicit pin here closes the gap. purge_stale_pin +
+    // pin mirrors the W1 attach_lsm idiom: a leftover pin from a
+    // prior wedged boot may point at a dead kernel map, so we
+    // always re-pin against the live map this boot loaded.
+    if let Some(root) = prepare_pin_root() {
+        let map_pin_path = root.join(PROTECTED_PIDS_MAP_NAME);
+        purge_stale_pin(&map_pin_path);
+        ebpf.map_mut(PROTECTED_PIDS_MAP_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!("map {PROTECTED_PIDS_MAP_NAME} missing from eBPF object")
+            })?
+            .pin(&map_pin_path)
+            .with_context(|| {
+                format!(
+                    "pinning {PROTECTED_PIDS_MAP_NAME} to {}",
+                    map_pin_path.display()
+                )
+            })?;
+        info!(
+            map = PROTECTED_PIDS_MAP_NAME,
+            map_pin = %map_pin_path.display(),
+            "anti-tamper: PROTECTED_PIDS pinned by-name to bpffs (PHASE_D_001)"
+        );
+    }
+
     // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
     // loader resolves `bpf_lsm_<hook>` against it to set the
     // `attach_btf_id` the kernel expects. If we can't read vmlinux
