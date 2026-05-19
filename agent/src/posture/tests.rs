@@ -414,3 +414,128 @@ fn last_admin_action_secs_ago_returns_none_before_release() {
     let m = PostureMachine::new();
     assert!(m.last_admin_action_secs_ago().is_none());
 }
+
+// ─── admin_force_state_with_token (Tappa 8 A10, §12.2) ──────────────
+
+/// Required A10 test 1: any → any transition works under the
+/// capability gate. Exercises every starting state via the
+/// debug-trigger force_state_for_test setter to set the initial
+/// state without going through observe(), then forces to each of
+/// the 4 target states and asserts the resulting kind.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn admin_force_state_with_token_any_to_any() {
+    use PostureKind::*;
+    for from in [Observing, Alerted, Engaged, Combat] {
+        for to in [Observing, Alerted, Engaged, Combat] {
+            let m = PostureMachine::new();
+            m.force_state_for_test(from);
+            assert_eq!(m.current_kind(), from);
+            let token = crate::anti_tamper::_test_mint_unlock_token();
+            let next = m
+                .admin_force_state_with_token(token, to)
+                .expect("any-to-any allowed");
+            assert_eq!(next.kind(), to);
+            assert_eq!(m.current_kind(), to);
+        }
+    }
+}
+
+/// Required A10 test 2: non-COMBAT → COMBAT fires the
+/// `combat_entry_hook` (iptables engage per §12.2). Sets up a
+/// counter-incrementing hook so the test directly observes
+/// firing rather than relying on side-effects elsewhere.
+#[test]
+fn admin_force_state_with_token_non_combat_to_combat_fires_entry_hook() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let counter = Arc::new(AtomicU32::new(0));
+    let c = Arc::clone(&counter);
+    let entry_hook: super::CombatEntryHook = Arc::new(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+    let m = PostureMachine::new_with_combat_hook(entry_hook);
+    // Starts in Observing (PostureMachine::new() default).
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let _ = m
+        .admin_force_state_with_token(token, PostureKind::Combat)
+        .expect("Observing → Combat allowed");
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "combat_entry_hook should fire exactly once on non-Combat → Combat"
+    );
+}
+
+/// Required A10 test 3: COMBAT → non-COMBAT fires the
+/// `combat_release_hook` AND consumes the token (the hook closure
+/// receives it by value).
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let counter = Arc::new(AtomicU32::new(0));
+    let c = Arc::clone(&counter);
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+    // Build a PostureMachine with both hooks present so the
+    // combat-entry path also works for state setup.
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
+    m.force_state_for_test(PostureKind::Combat);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let _ = m
+        .admin_force_state_with_token(token, PostureKind::Observing)
+        .expect("Combat → Observing allowed");
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "combat_release_hook should fire exactly once on Combat → non-Combat"
+    );
+}
+
+/// Required A10 test 4: same-state transition is a no-op — no
+/// `last_admin_action` timestamp recorded, no log transition
+/// added, no hook fires. Anchors the §12.2 design contract that
+/// idempotent forces don't pollute the audit log.
+#[test]
+fn admin_force_state_with_token_same_state_is_noop() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let counter = Arc::new(AtomicU32::new(0));
+    let c = Arc::clone(&counter);
+    let entry_hook: super::CombatEntryHook = Arc::new(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+    let m = PostureMachine::new_with_combat_hook(entry_hook);
+    // Starts in Observing. Force to Observing.
+    let transitions_before = m.transition_log().len();
+    let last_action_before = m.last_admin_action_secs_ago();
+    assert!(last_action_before.is_none(), "no admin action yet");
+
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let _ = m
+        .admin_force_state_with_token(token, PostureKind::Observing)
+        .expect("idempotent same-state allowed");
+
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+    assert_eq!(
+        m.transition_log().len(),
+        transitions_before,
+        "same-state force must not log a transition"
+    );
+    assert!(
+        m.last_admin_action_secs_ago().is_none(),
+        "same-state force must not record last_admin_action"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "no hook should fire on same-state transition"
+    );
+}

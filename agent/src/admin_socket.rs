@@ -26,10 +26,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, ShutdownRequest,
-    StatusResponse, UnlockResult, MAX_FRAME_BODY,
+    decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, ForcePostureRequest,
+    ShutdownRequest, StatusResponse, UnlockResult, MAX_FRAME_BODY,
 };
-use common::wire::admin_signed_payload::{OperationCode, Role};
+use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
@@ -339,13 +339,18 @@ fn dispatch(
             ))
         }
 
+        AdminMessage::ForcePostureRequest(req) => {
+            AdminMessage::ForcePostureResult(dispatch_force_posture(req, auth, posture))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
         AdminMessage::Challenge(_)
         | AdminMessage::UnlockResult(_)
         | AdminMessage::StatusResponse(_)
-        | AdminMessage::ShutdownResult(_) => {
+        | AdminMessage::ShutdownResult(_)
+        | AdminMessage::ForcePostureResult(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -512,6 +517,115 @@ fn dispatch_shutdown(
     }
 
     AdminResult::Success
+}
+
+/// Tappa 8 A10 — handle one [`ForcePostureRequest`] (design §4 +
+/// §12.2). Distinct from the existing `cfg(debug-trigger)`
+/// `DebugForcePosture` arm: that one bypasses every authentication
+/// layer for integration testing; this one runs the full Tappa-8
+/// verify path AND honours the role allowlist.
+///
+/// Quorum semantics: 1-of-N per §3.3 (unlike shutdown's 2-of-N).
+/// Required role: [`Role::ForcePosture`]. Expected op tag:
+/// [`OperationCode::ForcePosture`]. The signed payload's `extra`
+/// MUST be [`OperationExtra::ForcePosture { target }`]; any other
+/// extra variant trips the op/extra invariant check inside
+/// [`crate::anti_tamper::admin_auth::AdminAuth::verify_signed_payload_quorum`]
+/// (Tappa 8 A7) and surfaces as `UnknownOperation` on the wire.
+///
+/// On verify success, mutates the posture machine to the requested
+/// target via [`PostureMachine::admin_force_state_with_token`]
+/// (Tappa 8 A10), which fires the COMBAT entry/release hooks per
+/// §12.2 if the direction crosses the COMBAT boundary.
+fn dispatch_force_posture(
+    req: ForcePostureRequest,
+    auth: &AdminAuth,
+    posture: &PostureMachine,
+) -> AdminResult {
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let verify_outcome = auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1, // 1-of-N per §3.3
+        &[Role::ForcePosture],
+        OperationCode::ForcePosture,
+        server_now,
+    );
+
+    let token = match verify_outcome {
+        Ok(token) => token,
+        Err(AdminAuthError::NoPendingChallenge) => return AdminResult::NoPendingChallenge,
+        Err(AdminAuthError::NonceMismatch) => return AdminResult::InvalidSignature,
+        Err(AdminAuthError::UnknownOperation { .. }) => return AdminResult::UnknownOperation,
+        Err(AdminAuthError::AgentIdMismatch) => return AdminResult::AgentIdMismatch,
+        Err(AdminAuthError::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        }) => {
+            return AdminResult::TimestampSkew {
+                server_ts,
+                max_skew_secs,
+            };
+        }
+        Err(AdminAuthError::InvalidSignature) => return AdminResult::InvalidSignature,
+        Err(AdminAuthError::QuorumNotMet { required, provided }) => {
+            return AdminResult::QuorumNotMet { required, provided };
+        }
+        Err(AdminAuthError::RoleDenied { .. }) => return AdminResult::RoleDenied,
+        Err(AdminAuthError::RateLimited { retry_after_secs }) => {
+            return AdminResult::RateLimited { retry_after_secs };
+        }
+        Err(AdminAuthError::PayloadVerify(e)) => {
+            warn!(error = ?e, "force-posture payload verify failed at common layer");
+            return AdminResult::InvalidSignature;
+        }
+    };
+
+    // Extract the target from the verified payload. The op/extra
+    // invariant inside verify_signed_payload_quorum already
+    // guarantees this is the ForcePosture variant — but a
+    // belt-and-suspenders match keeps the compiler exhaustive and
+    // surfaces a clear UnknownOperation if a future refactor ever
+    // breaks the invariant.
+    let target = match &req.payload.extra {
+        OperationExtra::ForcePosture(extra) => extra.target,
+        other => {
+            warn!(
+                extra = ?other,
+                "force-posture payload extra is not ForcePosture variant — \
+                 op/extra invariant breach"
+            );
+            return AdminResult::UnknownOperation;
+        }
+    };
+
+    // Drive the posture mutation through the capability-gated path.
+    // `admin_force_state_with_token` consumes the token, fires
+    // hooks per §12.2, and returns the post-transition state.
+    // Today the method's signature is infallible (no error variant
+    // produced — any → any is allowed) but we map any future error
+    // shape to InvalidSignature defensively.
+    match posture.admin_force_state_with_token(token, target) {
+        Ok(state) => {
+            info!(
+                target: "admin.force_posture",
+                from = ?state.kind(),
+                to = ?target,
+                "production force-posture applied"
+            );
+            AdminResult::Success
+        }
+        Err(e) => {
+            warn!(
+                error = ?e,
+                target = ?target,
+                "admin_force_state_with_token errored unexpectedly"
+            );
+            AdminResult::InvalidSignature
+        }
+    }
 }
 
 async fn read_frame(stream: &mut UnixStream) -> Result<Option<AdminMessage>> {

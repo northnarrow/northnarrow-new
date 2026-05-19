@@ -33,8 +33,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
-    run_init, run_shutdown, run_status, run_unlock, run_verify_keys, ShutdownOutcome,
-    StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
+    run_force_posture, run_init, run_shutdown, run_status, run_unlock, run_verify_keys,
+    ForcePostureOutcome, ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -154,6 +154,38 @@ enum Cmd {
         socket: PathBuf,
     },
 
+    /// Tappa 8 A10 — production signed force-posture (design
+    /// §4 + §12.2).
+    ///
+    /// Drives the agent's posture state machine to `target` via
+    /// the full Tappa 8 verify path (nonce binding, timestamp
+    /// skew, agent_id binding, signature verify, role check).
+    /// 1-of-N quorum — only `--key` is required. The admin.pub
+    /// line for that key MUST include the `force-posture` role.
+    ///
+    /// NOT the preferred path out of COMBAT. `nn-admin unlock`
+    /// carries clearer audit semantics ("admin acknowledged
+    /// COMBAT release") than a force-posture COMBAT → anything;
+    /// use unlock when releasing COMBAT.
+    ///
+    /// Distinct from `nn-admin debug force-posture` (the
+    /// integration-test path gated by the `debug-trigger` Cargo
+    /// feature). Both subcommands stay; production uses this one.
+    ForcePosture {
+        /// Target posture state.
+        #[arg(value_enum)]
+        target: ForcePostureTargetArg,
+        /// Path to the operator's admin private key (role
+        /// `force-posture` required in admin.pub).
+        #[arg(long)]
+        key: PathBuf,
+        /// Path to the agent's per-install UUID file (design §6.5).
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
     /// Debug-only: force the agent's posture state machine into a
     /// chosen state. Only compiled when the `debug-trigger` Cargo
     /// feature is on.
@@ -193,6 +225,29 @@ impl From<DebugStateArg> for common::wire::admin_protocol::DebugForcePosture {
             DebugStateArg::Alerted => Alerted,
             DebugStateArg::Engaged => Engaged,
             DebugStateArg::Combat => Combat,
+        }
+    }
+}
+
+/// Production force-posture target enum (Tappa 8 A10). Always
+/// compiled (NOT feature-gated like [`DebugStateArg`]) because
+/// production force-posture is a first-class operator command.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ForcePostureTargetArg {
+    Observing,
+    Alerted,
+    Engaged,
+    Combat,
+}
+
+impl From<ForcePostureTargetArg> for common::posture_types::PostureKind {
+    fn from(t: ForcePostureTargetArg) -> Self {
+        use common::posture_types::PostureKind::*;
+        match t {
+            ForcePostureTargetArg::Observing => Observing,
+            ForcePostureTargetArg::Alerted => Alerted,
+            ForcePostureTargetArg::Engaged => Engaged,
+            ForcePostureTargetArg::Combat => Combat,
         }
     }
 }
@@ -250,6 +305,25 @@ fn main() -> ExitCode {
                 ExitCode::from(5)
             }
         },
+        Cmd::ForcePosture {
+            target,
+            key,
+            agent_id_file,
+            socket,
+        } => {
+            let target_kind = target.into();
+            match run_force_posture(&socket, &key, &agent_id_file, target_kind) {
+                Ok(outcome) => exit_from_force_posture(outcome, target_kind),
+                Err(e) => {
+                    // Same exit-5 rationale as Shutdown: startup-
+                    // class errors are operator-investigation,
+                    // distinguishable from exit 1 (clap parse
+                    // failure / didn't even launch).
+                    eprintln!("force-posture: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
         #[cfg(feature = "debug-trigger")]
         Cmd::Debug {
             sub: DebugCmd::ForcePosture { state, socket },
@@ -293,6 +367,148 @@ fn exit_from_anyhow(r: anyhow::Result<()>) -> ExitCode {
         Err(e) => {
             eprintln!("{e:#}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn exit_from_force_posture(
+    outcome: ForcePostureOutcome,
+    target: common::posture_types::PostureKind,
+) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        ForcePostureOutcome::Success => {
+            println!(
+                "{}",
+                colorize(
+                    &format!("force-posture: agent posture set to {target:?}"),
+                    "32",
+                    tty
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        ForcePostureOutcome::InvalidSignature => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "force-posture: invalid signature (key not in admin.pub, or wrong bytes)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(2)
+        }
+        ForcePostureOutcome::NoPendingChallenge => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "force-posture: no pending challenge (server state out of sync — retry)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(3)
+        }
+        ForcePostureOutcome::RateLimited { retry_after_secs } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "force-posture: rate limited; retry after {retry_after_secs}s"
+                    ),
+                    "33",
+                    tty
+                )
+            );
+            ExitCode::from(4)
+        }
+        ForcePostureOutcome::QuorumNotMet { required, provided } => {
+            // For force-posture, required is always 1 (1-of-N
+            // quorum). Hitting QuorumNotMet here means the single
+            // sig didn't verify under any pubkey — same operator
+            // hint as InvalidSignature, but distinct exit code so
+            // automation can tell them apart.
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "force-posture: quorum not met ({provided}/{required}). \
+                         The submitted key doesn't match any line in admin.pub."
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(6)
+        }
+        ForcePostureOutcome::RoleDenied => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "force-posture: role denied (key verified but lacks the \
+                     `force-posture` role in admin.pub — add it to the line's \
+                     role list, e.g. `<hex>  force-posture,unlock`)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(7)
+        }
+        ForcePostureOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "force-posture: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s). \
+                         NTP-sync this host and the agent host, then retry."
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
+        }
+        ForcePostureOutcome::AgentIdMismatch => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "force-posture: agent_id mismatch (the --agent-id-file \
+                     content doesn't match the agent's bootstrapped UUID).",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
+        }
+        ForcePostureOutcome::UnknownOperation => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "force-posture: unknown operation (protocol misuse — \
+                     likely a version mismatch between nn-admin and the agent)",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
+        }
+        ForcePostureOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "force-posture: protocol version unsupported (server \
+                         speaks up to v{server_version}; nn-admin is newer)"
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
         }
     }
 }
