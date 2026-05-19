@@ -21,7 +21,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -254,6 +254,113 @@ impl AdminAuth {
             }
             Some(_) => None,
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tappa 8 sub-sprint A commit A4 — timestamp skew check (§6.4 layer 2)
+// ────────────────────────────────────────────────────────────────────
+
+/// Maximum allowed difference, in seconds, between the client's
+/// `SignedPayload.ts` field and the server's wall-clock. ±60 s per
+/// design §6.4 layer 2 — wide enough to tolerate non-NTP-synced
+/// hosts and brief network latency, narrow enough that a captured
+/// signature with an unaltered `ts` cannot be replayed minutes
+/// later. A future hardening tappa could tighten this to ±10 s
+/// once every customer deploys NTP; for V1.0 the operator-friendly
+/// width wins.
+pub const MAX_TIMESTAMP_SKEW_SECS: u32 = 60;
+
+/// Returned by [`check_timestamp_skew`] when the client's `ts` is
+/// outside the ± [`MAX_TIMESTAMP_SKEW_SECS`] window. Mirrors the
+/// design §6.6 `AdminResult::TimestampSkew { server_ts,
+/// max_skew_secs }` wire variant — `server_ts` lets the client
+/// re-NTP-sync and retry without having to guess the server's
+/// clock.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TimestampSkewError {
+    #[error(
+        "timestamp outside ±{max_skew_secs}s window (server_ts={server_ts})"
+    )]
+    OutOfWindow { server_ts: u64, max_skew_secs: u32 },
+}
+
+/// Source of "now" for the timestamp skew check. Abstracted as a
+/// trait so unit tests inject a deterministic value via
+/// [`FixedClock`] without `unsafe` or thread-local time-mocking.
+///
+/// **Monotonic-aware note** (design §13 row A4): the skew check
+/// compares two **wall clocks** — the client's `SignedPayload.ts`
+/// and the server's `SystemTime::now()` — because the comparison
+/// is cross-host. `CLOCK_MONOTONIC` is wrong here: it cannot be
+/// compared across machines. The trait exists so test code (which
+/// must be deterministic) and production code (which must read the
+/// real wall clock) can both ride one verify path.
+pub trait Clock: Send + Sync {
+    /// Seconds since the Unix epoch as a `u64`. The skew check is
+    /// integer-only on seconds; sub-second precision is irrelevant
+    /// at the ±60 s window scale.
+    fn now_unix_secs(&self) -> u64;
+}
+
+/// Production [`Clock`] backed by `SystemTime::now()` →
+/// `CLOCK_REALTIME` on Linux. Wall-clock-based and therefore
+/// subject to NTP step + manual operator adjustment; that exposure
+/// is documented in §6.4 layer 2 ("server rejects `ts` outside a
+/// ± 60 s window relative to its own clock") and is bounded by the
+/// nonce single-use property (layer 1) and the agent_id binding
+/// (layer 3, A3/A7).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix_secs(&self) -> u64 {
+        // Pre-1970 system time is impossible in any production
+        // deployment; default to 0 if a misconfigured host
+        // surfaces one — the skew check will then reject every
+        // valid client timestamp until the operator fixes the
+        // clock, which is the desired fail-closed behaviour.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
+/// Pure timestamp-skew predicate. The caller supplies both
+/// timestamps and the window width; this function does no I/O and
+/// no clock-reading. Designed so the wiring site in A7's verify
+/// path looks like
+///
+/// ```ignore
+/// check_timestamp_skew(
+///     payload.ts,
+///     clock.now_unix_secs(),
+///     MAX_TIMESTAMP_SKEW_SECS,
+/// )?;
+/// ```
+///
+/// and is trivially test-injectable via [`FixedClock`].
+///
+/// Boundary semantics: a difference **equal to** `max_skew_secs`
+/// is accepted (`<=` check); one second past is rejected. Locked
+/// in the `accepts_exact_boundary_seconds` test.
+pub fn check_timestamp_skew(
+    client_ts: u64,
+    server_ts: u64,
+    max_skew_secs: u32,
+) -> Result<(), TimestampSkewError> {
+    // `abs_diff` is the unsigned-safe absolute difference; it
+    // never underflows even when client_ts < server_ts by a wide
+    // margin (e.g. client at 0 from a botched bootstrap).
+    let diff = client_ts.abs_diff(server_ts);
+    if diff > u64::from(max_skew_secs) {
+        Err(TimestampSkewError::OutOfWindow {
+            server_ts,
+            max_skew_secs,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -513,5 +620,172 @@ mod tests {
         }
         // 3rd failure trips the gate, but 1+2 should not.
         assert!(auth.issue_challenge().is_ok());
+    }
+
+    // ── A4: timestamp skew check (§6.4 layer 2) ────────────────────
+
+    /// Deterministic [`Clock`] for skew tests. Lets one helper
+    /// produce repeatable "now" values without coupling to wall
+    /// time. Lives in the test module — production callers use
+    /// [`SystemClock`].
+    #[derive(Debug, Clone, Copy)]
+    struct FixedClock(u64);
+    impl Clock for FixedClock {
+        fn now_unix_secs(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// Required A4 test 1 ("in-window"): client and server
+    /// timestamps that are equal — and ones that differ by any
+    /// amount up to and including the cap — must verify Ok.
+    /// Includes the symmetric past/future variants explicitly so a
+    /// regression that accidentally inverts the sign of `diff`
+    /// would still fail this test.
+    #[test]
+    fn check_timestamp_skew_accepts_in_window_offsets() {
+        let server = FixedClock(1_710_000_000);
+        // Exact match.
+        check_timestamp_skew(server.now_unix_secs(), server.now_unix_secs(), MAX_TIMESTAMP_SKEW_SECS)
+            .expect("equal timestamps are in-window");
+        // Client one second in the future.
+        check_timestamp_skew(
+            server.now_unix_secs() + 1,
+            server.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect("client +1s is in-window");
+        // Client one second in the past.
+        check_timestamp_skew(
+            server.now_unix_secs() - 1,
+            server.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect("client -1s is in-window");
+        // Mid-window (±30 s).
+        check_timestamp_skew(
+            server.now_unix_secs() + 30,
+            server.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect("client +30s is in-window");
+        check_timestamp_skew(
+            server.now_unix_secs() - 30,
+            server.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect("client -30s is in-window");
+    }
+
+    /// Required A4 test 2 ("future-skew"): a client timestamp more
+    /// than [`MAX_TIMESTAMP_SKEW_SECS`] in the future must surface
+    /// `OutOfWindow` carrying the server's `ts` and the window width
+    /// so the client can re-NTP-sync and retry.
+    #[test]
+    fn check_timestamp_skew_rejects_future_skew_beyond_cap() {
+        let server_now = 1_710_000_000u64;
+        let client_ts = server_now + u64::from(MAX_TIMESTAMP_SKEW_SECS) + 1; // one second past cap
+        match check_timestamp_skew(client_ts, server_now, MAX_TIMESTAMP_SKEW_SECS) {
+            Err(TimestampSkewError::OutOfWindow { server_ts, max_skew_secs }) => {
+                assert_eq!(server_ts, server_now);
+                assert_eq!(max_skew_secs, MAX_TIMESTAMP_SKEW_SECS);
+            }
+            other => panic!("expected OutOfWindow, got {other:?}"),
+        }
+        // Far-future stress: should still be OutOfWindow, not panic.
+        check_timestamp_skew(server_now + 86_400, server_now, MAX_TIMESTAMP_SKEW_SECS)
+            .expect_err("client one day ahead must reject");
+    }
+
+    /// Required A4 test 3 ("past-skew"): symmetric to test 2 —
+    /// far-past client timestamps reject identically. Important
+    /// because a captured-and-stored signature from yesterday's
+    /// session would hit exactly this case.
+    #[test]
+    fn check_timestamp_skew_rejects_past_skew_beyond_cap() {
+        let server_now = 1_710_000_000u64;
+        let client_ts = server_now - u64::from(MAX_TIMESTAMP_SKEW_SECS) - 1;
+        match check_timestamp_skew(client_ts, server_now, MAX_TIMESTAMP_SKEW_SECS) {
+            Err(TimestampSkewError::OutOfWindow { server_ts, max_skew_secs }) => {
+                assert_eq!(server_ts, server_now);
+                assert_eq!(max_skew_secs, MAX_TIMESTAMP_SKEW_SECS);
+            }
+            other => panic!("expected OutOfWindow, got {other:?}"),
+        }
+        // Far-past stress: client timestamp at zero (bootstrapped
+        // host with no RTC) must reject, not silently accept.
+        check_timestamp_skew(0, server_now, MAX_TIMESTAMP_SKEW_SECS)
+            .expect_err("client_ts = 0 must reject when server is in 2026");
+    }
+
+    /// Required A4 test 4 ("exact-boundary"): a difference of
+    /// exactly [`MAX_TIMESTAMP_SKEW_SECS`] is accepted (`<=`);
+    /// one second further is rejected. Locks the boundary
+    /// semantics against a future `>` vs `>=` swap.
+    #[test]
+    fn check_timestamp_skew_exact_boundary_inclusive() {
+        let server_now = 1_710_000_000u64;
+        let cap = u64::from(MAX_TIMESTAMP_SKEW_SECS);
+
+        // Future side: exactly +cap is in, +cap+1 is out.
+        check_timestamp_skew(server_now + cap, server_now, MAX_TIMESTAMP_SKEW_SECS)
+            .expect("exactly +cap must be in-window");
+        check_timestamp_skew(server_now + cap + 1, server_now, MAX_TIMESTAMP_SKEW_SECS)
+            .expect_err("cap+1 must reject");
+
+        // Past side: exactly -cap is in, -cap-1 is out.
+        check_timestamp_skew(server_now - cap, server_now, MAX_TIMESTAMP_SKEW_SECS)
+            .expect("exactly -cap must be in-window");
+        check_timestamp_skew(server_now - cap - 1, server_now, MAX_TIMESTAMP_SKEW_SECS)
+            .expect_err("-cap-1 must reject");
+    }
+
+    // ── Supplementary tests ────────────────────────────────────────
+
+    /// `SystemClock` returns a value that is plausibly recent
+    /// (post-2025, pre-2100). Smoke test that the production
+    /// clock impl is wired to the wall clock, not stubbed to 0.
+    #[test]
+    fn system_clock_returns_plausible_unix_seconds() {
+        let now = SystemClock.now_unix_secs();
+        const Y2025: u64 = 1_735_689_600; // 2025-01-01 UTC
+        const Y2100: u64 = 4_102_444_800; // 2100-01-01 UTC
+        assert!(
+            now > Y2025 && now < Y2100,
+            "SystemClock returned implausible timestamp: {now}"
+        );
+    }
+
+    /// The `Clock` trait abstraction is the test-injection seam.
+    /// Demonstrate that a [`FixedClock`] can be swapped in for
+    /// `SystemClock` and produces deterministic skew outcomes —
+    /// this is the pattern A7's verify path will use when it
+    /// finally consumes a `SignedPayload.ts`.
+    #[test]
+    fn fixed_clock_drives_skew_check_deterministically() {
+        let clock = FixedClock(1_710_000_000);
+        // In-window: client matches the fixed server time.
+        check_timestamp_skew(clock.now_unix_secs(), clock.now_unix_secs(), MAX_TIMESTAMP_SKEW_SECS)
+            .expect("FixedClock baseline");
+        // Out-of-window: future skew at the same fixed server time.
+        check_timestamp_skew(
+            clock.now_unix_secs() + 1_000,
+            clock.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect_err("FixedClock far-future");
+    }
+
+    /// The default cap is exactly 60 seconds per design §6.4
+    /// layer 2 — a future relaxation to 120 s or tightening to
+    /// 10 s is an intentional product decision, not a casual
+    /// constant tweak. Locked here to make any change visible
+    /// in the diff.
+    #[test]
+    fn max_timestamp_skew_constant_matches_design_spec() {
+        assert_eq!(
+            MAX_TIMESTAMP_SKEW_SECS, 60,
+            "design §6.4 layer 2 mandates ±60s — change requires a roadmap update"
+        );
     }
 }
