@@ -504,19 +504,121 @@ impl Rule for NnLFim009SystemdUnitDropped {
     }
 }
 
+// ── NN-L-FIM-010 — ransomware extension rename (C5.1) ──────────────
+
+/// Curated list of file extensions strongly indicative of
+/// ransomware-driven file rename (the classic "encrypt + rename
+/// to a marker extension" loop). Port of the legacy M14.4
+/// NN-L-FIM-001 rule into the new C5 architecture.
+///
+/// MUST stay extension-only (e.g. `.locked`, never `.lock`) so
+/// legitimate `.lock` PID files in `/var/run/`, `/run/`, `/tmp/`
+/// don't match. Match policy is `ends_with(".<ext>")` (the leading
+/// dot is part of the check) so a file literally named "locked"
+/// or "encrypted" doesn't false-positive either.
+///
+/// Curated, not exhaustive — operators with a known ransomware
+/// strain in their threat model add to this list via a future
+/// `fim-ransomware-extensions.local` override (V1.1). The V1.0
+/// list covers the most-prevalent strains seen in EDR
+/// telemetry per the legacy M14.4 commit + recent IR reports.
+const RANSOMWARE_EXTENSIONS: &[&str] = &[
+    // Generic ransomware markers (most-common file extensions
+    // after the encrypt loop).
+    ".crypted",
+    ".locked",
+    ".encrypted",
+    ".crypto",
+    ".crypt",
+    ".vault",
+    ".crinf",
+    ".ezz",
+    ".exx",
+    ".xyz",
+    ".ttt",
+    ".micro",
+    ".xxx",
+    // Strain-specific markers (named-attribution).
+    ".ryk",       // Ryuk
+    ".wannacry",  // WannaCry
+    ".wcry",      // WannaCry (alt)
+    ".conti",     // Conti
+    ".lockbit",   // LockBit
+    ".blackcat",  // ALPHV/BlackCat
+];
+
+/// Ransomware extension rename per legacy M14.4 NN-L-FIM-001,
+/// restored into the C5 architecture as NN-L-FIM-010.
+///
+/// Detection: `FimOp::Renamed` event whose path ends with one
+/// of the [`RANSOMWARE_EXTENSIONS`]. Critical severity (MITRE
+/// T1486 Data Encrypted for Impact); response is
+/// `KillProcessTree` of the modifier — the ransomware loop is
+/// running and we want to stop it before it traverses more of
+/// the filesystem. Never throttled by §6.5 rate limiter per
+/// Q4 lock-in (Critical tier).
+///
+/// **False-positive guards (asserted in tests):**
+/// - `.lock` PID files in `/var/run/`, `/run/`, `/tmp/` — NOT
+///   in the extension list (we match `.locked` not `.lock`).
+/// - `.tmp`, `.bak`, `.swp`, `.swo`, `.bup` — editor + admin
+///   convention; never in the list.
+/// - Caller in `PROTECTED_PIDS` — already filtered by the C2
+///   BPF program's `should_emit` (PHASE_D_002-symmetric
+///   `caller_is_in_family` check); FIM events that reach the
+///   rule layer have already been screened.
+pub struct NnLFim010RansomwareExtensionRename;
+
+impl Rule for NnLFim010RansomwareExtensionRename {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-010_RansomwareExtensionRename"
+    }
+    fn name(&self) -> &'static str {
+        "Ransomware extension rename"
+    }
+    fn category(&self) -> &'static str {
+        "fim_impact_ransomware"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if fe.op != FimOp::Renamed {
+            return None;
+        }
+        if !RANSOMWARE_EXTENSIONS
+            .iter()
+            .any(|ext| fe.path.ends_with(ext))
+        {
+            return None;
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            "Ransomware extension rename — MITRE T1486 (Data Encrypted for Impact); \
+             kill the modifier tree to halt the encrypt loop",
+        ))
+    }
+}
+
 // ── public builder ─────────────────────────────────────────────────
 
-/// Build the 9 NN-L-FIM-* rules in evaluation order. The
-/// agent's `decision::Engine` evaluates these alongside the
-/// existing R001..R012 rules; FIM rules are early in the list
-/// so a FIM hit short-circuits the process-event scan
-/// (process-event rules return `None` on `Event::Fim` anyway,
-/// so order is correctness-neutral — early is a perf hint
-/// only).
+/// Build the FIM rules in evaluation order. The agent's
+/// `decision::Engine` evaluates these alongside the existing
+/// R001..R012 rules; FIM rules are early in the list so a FIM
+/// hit short-circuits the process-event scan (process-event
+/// rules return `None` on `Event::Fim` anyway, so order is
+/// correctness-neutral — early is a perf hint only).
+///
+/// C5.1 added NN-L-FIM-010 (ransomware extension rename) at
+/// the front of the Critical tier — ransomware is the
+/// canonical kill-the-tree-immediately signal so it gets first
+/// pass.
 pub fn fim_rules() -> Vec<Box<dyn Rule>> {
     vec![
         // Critical first — fire on the worst-case signals
-        // before any Medium rule has a chance to match.
+        // before any High/Medium rule has a chance to match.
+        Box::new(NnLFim010RansomwareExtensionRename),
         Box::new(NnLFim001SystemBinaryModified),
         Box::new(NnLFim002NewSuidBinary),
         Box::new(NnLFim008KernelModuleModified),
@@ -805,13 +907,17 @@ mod tests {
     // ── builder hygiene ─────────────────────────────────────────
 
     #[test]
-    fn fim_rules_builder_returns_nine_distinct_rules() {
+    fn fim_rules_builder_returns_distinct_rules() {
         let rules = fim_rules();
-        assert_eq!(rules.len(), 9);
+        // C5.1 grew the set from 9 → 10 with the
+        // NN-L-FIM-010 ransomware-extension rule. Count
+        // assertion lifted from a literal 9 to "matches the
+        // built set" + the distinct-IDs guard.
+        let n = rules.len();
+        assert!(n >= 10, "expected at least 10 FIM rules, got {n}");
         let ids: std::collections::HashSet<&str> =
             rules.iter().map(|r| r.id()).collect();
-        assert_eq!(ids.len(), 9, "rule IDs must be unique");
-        // Each ID is the canonical NN-L-FIM-NNN prefix.
+        assert_eq!(ids.len(), n, "rule IDs must be unique");
         for id in &ids {
             assert!(
                 id.starts_with("NN-L-FIM-"),
@@ -821,18 +927,13 @@ mod tests {
     }
 
     /// Critical rules are NEVER throttled by §6.5 — encoded as
-    /// "rule 001, 002, 008 produce Severity::Critical". The
-    /// C4 `DriftRateLimiter::try_consume(Critical) → Ok(())`
-    /// invariant + this severity assertion together enforce
-    /// the Q4 lock-in across the drain → rule boundary.
+    /// "rule 001, 002, 008, 010 produce Severity::Critical".
+    /// The C4 `DriftRateLimiter::try_consume(Critical) → Ok(())`
+    /// invariant + this severity assertion together enforce the
+    /// Q4 lock-in across the drain → rule boundary. C5.1 added
+    /// NN-L-FIM-010 (ransomware) to the Critical roster.
     #[test]
     fn critical_rules_lock_in_severity() {
-        let critical_rules = [
-            NnLFim001SystemBinaryModified.id(),
-            NnLFim002NewSuidBinary.id(),
-            NnLFim008KernelModuleModified.id(),
-        ];
-        assert_eq!(critical_rules.len(), 3);
         // Smoke: each fires at Critical on its canonical input.
         let events = [
             (
@@ -854,10 +955,97 @@ mod tests {
                 )),
                 Severity::Critical,
             ),
+            (
+                NnLFim010RansomwareExtensionRename
+                    .evaluate(&fim_event(FimOp::Renamed, "/home/u/photo.jpg.locked")),
+                Severity::Critical,
+            ),
         ];
         for (verdict, expected_severity) in events {
             let v = verdict.expect("expected fire");
             assert_eq!(v.severity, expected_severity);
+        }
+    }
+
+    // ── NN-L-FIM-010 (C5.1) ─────────────────────────────────────
+
+    #[test]
+    fn fim010_fires_on_renamed_to_ransomware_extension() {
+        let r = NnLFim010RansomwareExtensionRename;
+        for path in &[
+            "/home/u/photo.jpg.locked",
+            "/home/u/doc.txt.encrypted",
+            "/srv/backup/db.sql.crypted",
+            "/var/data/payroll.xlsx.wcry",
+            "/home/u/code.py.lockbit",
+            "/etc/foo.conti",
+            "/tmp/.x.blackcat",
+        ] {
+            let v = r
+                .evaluate(&fim_event(FimOp::Renamed, path))
+                .unwrap_or_else(|| panic!("expected fire on {path}"));
+            assert_eq!(v.severity, Severity::Critical);
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
+            assert!(v.rule_id.contains("NN-L-FIM-010"));
+        }
+    }
+
+    #[test]
+    fn fim010_does_not_fire_on_legitimate_lock_or_temp_extensions() {
+        let r = NnLFim010RansomwareExtensionRename;
+        // PID lock files in /var/run/, /run/, /tmp/ use .lock
+        // (singular) — the rule matches .locked only. Asserted
+        // false-positive guard.
+        for path in &[
+            "/var/run/sshd.lock",
+            "/run/dbus.lock",
+            "/tmp/build.lock",
+            // Editor + admin convention extensions.
+            "/home/u/doc.txt.tmp",
+            "/etc/passwd.bak",
+            "/home/u/.vimrc.swp",
+            "/home/u/.vimrc.swo",
+            // No ext at all — bare-named file matching one of
+            // the markers as the WHOLE name must NOT fire
+            // (extension is the leading-dot pattern).
+            "/home/u/locked",
+            "/home/u/encrypted",
+            "/home/u/conti",
+        ] {
+            assert!(
+                r.evaluate(&fim_event(FimOp::Renamed, path)).is_none(),
+                "false-positive on {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn fim010_does_not_fire_on_non_rename_ops() {
+        let r = NnLFim010RansomwareExtensionRename;
+        let path = "/home/u/photo.jpg.locked";
+        // Created / Modified / Deleted / Linked of a
+        // ransomware-extension file are caught (or not) by
+        // OTHER rules — NN-L-FIM-010 is specifically the
+        // *rename to* signal that proves the encrypt loop is
+        // running.
+        assert!(r.evaluate(&fim_event(FimOp::Created, path)).is_none());
+        assert!(r.evaluate(&fim_event(FimOp::Modified, path)).is_none());
+        assert!(r.evaluate(&fim_event(FimOp::Deleted, path)).is_none());
+        assert!(r.evaluate(&fim_event(FimOp::Linked, path)).is_none());
+    }
+
+    #[test]
+    fn fim010_extension_list_uses_leading_dot() {
+        // Curated invariant: every RANSOMWARE_EXTENSIONS entry
+        // starts with '.' so partial-substring matches on file
+        // bodies named "locked" / "encrypted" / etc. don't
+        // false-positive (asserted in
+        // `fim010_does_not_fire_on_legitimate_lock_or_temp_extensions`).
+        for ext in RANSOMWARE_EXTENSIONS {
+            assert!(
+                ext.starts_with('.'),
+                "RANSOMWARE_EXTENSIONS entry {ext:?} must start with '.'"
+            );
         }
     }
 }
