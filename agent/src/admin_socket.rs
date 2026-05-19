@@ -37,6 +37,55 @@ use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::posture::{AdminReleaseError, PostureMachine};
 use crate::shutdown_marker::{self, ShutdownMarker, DEFAULT_MARKER_PATH};
 
+use tokio::sync::Notify;
+
+/// Cross-task signal that an admin-authorised shutdown has been
+/// accepted by the dispatcher. Tappa 8 A8 wires this between the
+/// admin-socket dispatcher (which writes the on-disk marker for
+/// the watchdog AND fires this signal for the in-process main
+/// loop) and `main.rs`'s tokio select loop (which awaits this
+/// signal and breaks the loop on fire).
+///
+/// Holds an [`Arc<Notify>`] so a single-producer / single-consumer
+/// fire-once pattern is natural: dispatcher calls [`Self::fire`]
+/// after a successful marker write; main loop calls [`Self::wait`]
+/// in its select. Re-firing the signal is a no-op once a waiter
+/// has already observed it (the underlying [`Notify`] is one-shot
+/// per `notified()` future).
+///
+/// Cloning is cheap (Arc bump) so production main.rs hands a
+/// clone to [`serve_with_marker_path`] while keeping its own
+/// clone for the select arm.
+#[derive(Debug, Clone, Default)]
+pub struct ShutdownSignal {
+    inner: Arc<Notify>,
+}
+
+impl ShutdownSignal {
+    /// Build a fresh signal. The Arc bump on [`Self::clone`] is
+    /// the canonical way to share one signal between producer
+    /// (dispatcher) and consumer (main loop).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wake exactly one waiter on [`Self::wait`]. Safe to call
+    /// before any waiter exists — `Notify::notify_one` is
+    /// "permitted" semantics: the next `notified()` future
+    /// returns immediately. Idempotent fires past the first are
+    /// coalesced (we only fire once per shutdown anyway).
+    pub fn fire(&self) {
+        self.inner.notify_one();
+    }
+
+    /// Suspend until [`Self::fire`] has been (or already was)
+    /// called. Used by main.rs's tokio select loop as a fourth
+    /// arm alongside the three signal handlers.
+    pub async fn wait(&self) {
+        self.inner.notified().await;
+    }
+}
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
 /// agent's main loop is expected to also exit on the same condition.
@@ -54,12 +103,16 @@ pub async fn serve(
     // The shutdown-marker path is fixed per design §10.3 in
     // production. `serve_with_marker_path` lets tests substitute
     // a tempdir path; production serve() pins the canonical one.
+    // Legacy `serve` callers (those that predate A8's
+    // ShutdownSignal) get None — the dispatcher still writes the
+    // marker, the in-process exit signal is just not delivered.
     serve_with_marker_path(
         socket_path,
         auth,
         posture,
         isolator,
         PathBuf::from(DEFAULT_MARKER_PATH),
+        None,
     )
     .await
 }
@@ -67,13 +120,19 @@ pub async fn serve(
 /// Test-injectable variant of [`serve`] that lets the caller
 /// substitute the shutdown-marker file path (so unit tests can
 /// land the marker in a tempdir instead of `/run/northnarrow/`,
-/// which requires root and is process-global).
+/// which requires root and is process-global) AND optionally pass
+/// a [`ShutdownSignal`] — when present, the dispatcher fires it
+/// after a successful marker write so the agent's main loop can
+/// break and exit cleanly (Tappa 8 A8). When `None`, the
+/// dispatcher still writes the marker but no in-process signal is
+/// delivered (legacy + test callers that don't care).
 pub async fn serve_with_marker_path(
     socket_path: PathBuf,
     auth: Arc<AdminAuth>,
     posture: Arc<PostureMachine>,
     isolator: Arc<NetworkIsolator>,
     marker_path: PathBuf,
+    shutdown_signal: Option<ShutdownSignal>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -106,9 +165,17 @@ pub async fn serve_with_marker_path(
         let posture = Arc::clone(&posture);
         let isolator = Arc::clone(&isolator);
         let marker_path = marker_path.clone();
+        let shutdown_signal = shutdown_signal.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, &auth, &posture, &isolator, &marker_path).await
+            if let Err(e) = handle_connection(
+                stream,
+                &auth,
+                &posture,
+                &isolator,
+                &marker_path,
+                shutdown_signal.as_ref(),
+            )
+            .await
             {
                 warn!(error = ?e, "admin connection handler errored");
             }
@@ -136,13 +203,14 @@ async fn handle_connection(
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     marker_path: &Path,
+    shutdown_signal: Option<&ShutdownSignal>,
 ) -> Result<()> {
     loop {
         let msg = match read_frame(&mut stream).await? {
             Some(m) => m,
             None => return Ok(()),
         };
-        let reply = dispatch(msg, auth, posture, isolator, marker_path);
+        let reply = dispatch(msg, auth, posture, isolator, marker_path, shutdown_signal);
         write_frame(&mut stream, &reply).await?;
     }
 }
@@ -167,6 +235,7 @@ fn dispatch(
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     marker_path: &Path,
+    shutdown_signal: Option<&ShutdownSignal>,
 ) -> AdminMessage {
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
@@ -262,7 +331,12 @@ fn dispatch(
         }),
 
         AdminMessage::ShutdownRequest(req) => {
-            AdminMessage::ShutdownResult(dispatch_shutdown(req, auth, marker_path))
+            AdminMessage::ShutdownResult(dispatch_shutdown(
+                req,
+                auth,
+                marker_path,
+                shutdown_signal,
+            ))
         }
 
         // Server-only variants — clients sending these are speaking
@@ -325,6 +399,7 @@ fn dispatch_shutdown(
     req: ShutdownRequest,
     auth: &AdminAuth,
     marker_path: &Path,
+    shutdown_signal: Option<&ShutdownSignal>,
 ) -> AdminResult {
     // Per §10.3 step 1: quorum verify (2-of-N including ≥1
     // Role::Shutdown). The integrated verify path
@@ -423,6 +498,18 @@ fn dispatch_shutdown(
         marker_path = %marker_path.display(),
         "shutdown authorised — marker written, watchdog will stand down on next pidfd POLLIN"
     );
+
+    // Tappa 8 A8: signal the agent's main loop that an
+    // admin-authorised shutdown has begun. The marker is already on
+    // disk (the watchdog's cross-component contract) BEFORE we fire
+    // here, so the ordering is: disk → in-process signal → wire
+    // reply. If the signal is `None` (legacy `serve()` callers or
+    // tests that aren't exercising the exit path), we still wrote
+    // the marker — the contract with the watchdog is intact, only
+    // the in-process exit is uninstrumented.
+    if let Some(sig) = shutdown_signal {
+        sig.fire();
+    }
 
     AdminResult::Success
 }
@@ -749,7 +836,7 @@ mod tests {
         let marker_c = marker_path.clone();
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
-                socket_c, auth_c, posture_c, isolator_c, marker_c,
+                socket_c, auth_c, posture_c, isolator_c, marker_c, None,
             )
             .await;
         });
@@ -873,5 +960,174 @@ mod tests {
 
         task.abort();
         result.expect("test panic");
+    }
+
+    // ── A8: shutdown-signal abstraction + integration ──────────────
+
+    /// Required A8 test (signal abstraction): a freshly-fired
+    /// signal wakes a waiter that started suspended BEFORE the
+    /// fire. Standard Notify-semantics anchor — proves the
+    /// abstraction is correct on the "consumer started first"
+    /// path that production main.rs follows.
+    #[tokio::test]
+    async fn shutdown_signal_wakes_waiter_started_before_fire() {
+        let signal = ShutdownSignal::new();
+        let consumer = signal.clone();
+        let waiter = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), consumer.wait())
+                .await
+                .expect("wait must complete within 2s after fire")
+        });
+        // Brief sleep ensures the waiter is parked inside
+        // `notified()` before we fire — exercises the
+        // "wake an already-suspended waiter" path.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        signal.fire();
+        waiter.await.expect("waiter task");
+    }
+
+    /// Required A8 test (signal abstraction): fire-then-wait —
+    /// `Notify::notify_one` is permitted-semantics, so a waiter
+    /// that suspends AFTER the fire still returns immediately.
+    /// This is the path the integration test below exercises
+    /// (the dispatcher fires before the client returns from
+    /// `connect()`, but main.rs may not yet be parked in its
+    /// select loop).
+    #[tokio::test]
+    async fn shutdown_signal_wakes_waiter_started_after_fire() {
+        let signal = ShutdownSignal::new();
+        signal.fire();
+        tokio::time::timeout(Duration::from_secs(2), signal.wait())
+            .await
+            .expect("wait after fire must complete immediately");
+    }
+
+    /// Required A8 test (signal abstraction): two clones of the
+    /// same signal observe the SAME fire — the underlying Arc
+    /// guarantees the production "main.rs holds one Arc + serve
+    /// holds the other" topology is correct.
+    #[tokio::test]
+    async fn shutdown_signal_clones_share_one_arc() {
+        let signal_a = ShutdownSignal::new();
+        let signal_b = signal_a.clone();
+        signal_a.fire();
+        tokio::time::timeout(Duration::from_secs(2), signal_b.wait())
+            .await
+            .expect("fire on clone A wakes wait on clone B");
+    }
+
+    /// Required A8 integration test: a full ShutdownRequest →
+    /// marker write → signal fire round-trip. Builds on the A7
+    /// e2e infrastructure; the assertion that's new in A8 is
+    /// that the signal fires (via `wait()` completing within a
+    /// bounded budget) AFTER the dispatcher replies Success.
+    #[tokio::test]
+    async fn shutdown_request_fires_in_process_shutdown_signal() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let marker_path = dir.path().join("agent.shutdown_authorised");
+        let pub_path = dir.path().join("admin.pub");
+        let rules = rules_path();
+
+        let signing_a = SigningKey::generate(&mut OsRng);
+        let signing_b = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &pub_path,
+            format!(
+                "{} shutdown,unlock\n{} shutdown,unlock\n",
+                hex::encode(signing_a.verifying_key().to_bytes()),
+                hex::encode(signing_b.verifying_key().to_bytes()),
+            ),
+        )
+        .unwrap();
+
+        let agent_id: [u8; 16] = [0xA8u8; 16];
+        let auth = Arc::new(
+            AdminAuth::load_with_agent_id(&pub_path, agent_id).expect("load"),
+        );
+        let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
+        let posture = Arc::new(PostureMachine::new());
+
+        // A8: build the shutdown signal, hand a clone to serve.
+        let signal = ShutdownSignal::new();
+        let signal_for_serve = signal.clone();
+
+        let auth_c = Arc::clone(&auth);
+        let posture_c = Arc::clone(&posture);
+        let isolator_c = Arc::clone(&isolator);
+        let socket_c = socket.clone();
+        let marker_c = marker_path.clone();
+        let task = tokio::spawn(async move {
+            let _ = serve_with_marker_path(
+                socket_c,
+                auth_c,
+                posture_c,
+                isolator_c,
+                marker_c,
+                Some(signal_for_serve),
+            )
+            .await;
+        });
+
+        // Wait for socket bind.
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Client thread submits a valid ShutdownRequest.
+        let socket_c = socket.clone();
+        let agent_id_c = agent_id;
+        tokio::task::spawn_blocking(move || {
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket_c).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+            sync_write_frame(
+                &mut stream,
+                &AdminMessage::ChallengeRequest(
+                    common::wire::admin_protocol::ChallengeRequest {},
+                ),
+            );
+            let nonce = match sync_read_frame(&mut stream) {
+                AdminMessage::Challenge(c) => c.nonce,
+                other => panic!("expected Challenge, got {other:?}"),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let payload = SignedPayload::new_shutdown(nonce, now, agent_id_c, 30);
+            let sig_a: [u8; 64] = sign(&payload, &signing_a).expect("sign a");
+            let sig_b: [u8; 64] = sign(&payload, &signing_b).expect("sign b");
+            sync_write_frame(
+                &mut stream,
+                &AdminMessage::ShutdownRequest(ShutdownRequest {
+                    payload,
+                    signatures: vec![
+                        KeyedSignature { signature: sig_a },
+                        KeyedSignature { signature: sig_b },
+                    ],
+                }),
+            );
+            let reply = sync_read_frame(&mut stream);
+            assert!(
+                matches!(reply, AdminMessage::ShutdownResult(AdminResult::Success)),
+                "expected ShutdownResult(Success), got {reply:?}"
+            );
+        })
+        .await
+        .expect("client task");
+
+        // The signal MUST have fired by the time the dispatcher
+        // returned Success (it fires immediately after the marker
+        // write, before the reply is sent). 2 s upper bound on the
+        // wait is generous — in practice this returns in < 1 ms.
+        tokio::time::timeout(Duration::from_secs(2), signal.wait())
+            .await
+            .expect("shutdown signal must fire within 2s of Success");
+
+        task.abort();
     }
 }

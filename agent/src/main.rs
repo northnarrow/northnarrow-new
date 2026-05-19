@@ -28,7 +28,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::Event;
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
-use northnarrow_agent::admin_socket;
+use northnarrow_agent::admin_socket::{self, ShutdownSignal};
+use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
@@ -90,6 +91,21 @@ struct Cli {
         default_value = "/etc/northnarrow/admin.pub"
     )]
     admin_pub: PathBuf,
+
+    /// Tappa 8 A3 + A8: per-install agent identity file. The agent
+    /// reads (or, on first boot, mints) a 16-byte UUID at this
+    /// path; the UUID becomes the third anti-replay layer for the
+    /// signed-payload pipeline (design §6.4 layer 3) — a captured
+    /// admin signature from one agent install cannot be replayed
+    /// against another. Persisted as 32 hex chars + newline at
+    /// mode 0644 per design §6.5. Default path mirrors the design
+    /// spec; override only for testing or unusual install layouts.
+    #[arg(
+        long = "agent-id-file",
+        value_name = "PATH",
+        default_value = "/etc/northnarrow/agent_id"
+    )]
+    agent_id_file: PathBuf,
 
     /// Unix-socket path nn-admin connects to. Removed on startup if
     /// it already exists (stale file from prior unclean shutdown).
@@ -293,20 +309,67 @@ async fn main() -> Result<()> {
     };
     info!("posture state machine initialized (state: OBSERVING)");
 
+    // Tappa 8 A3 + A8: bootstrap (or read) the per-install agent
+    // UUID. The value becomes the third anti-replay layer for the
+    // signed-payload verify path (design §6.4 layer 3, plumbed in
+    // commit A7 via `verify_signed_payload_quorum`). A failure
+    // here is non-fatal: the agent falls back to a zero UUID,
+    // which means signed-payload submissions whose `agent_id`
+    // field is `[0; 16]` will still verify but every other
+    // submission will fail `AgentIdMismatch`. We log loudly so
+    // the operator sees the bootstrap problem; the legacy
+    // unlock/force-posture/status paths are unaffected because
+    // they don't touch agent_id.
+    let agent_id = match agent_id::load_or_bootstrap(&cli.agent_id_file) {
+        Ok(id) => {
+            info!(
+                target: "agent_id",
+                path = %cli.agent_id_file.display(),
+                "agent_id ready"
+            );
+            id
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %cli.agent_id_file.display(),
+                "agent_id bootstrap failed; falling back to zero UUID — \
+                 signed-payload admin operations will reject all clients"
+            );
+            [0u8; 16]
+        }
+    };
+
+    // Tappa 8 A8: shutdown signal — the dispatcher fires it on a
+    // successfully-verified `ShutdownRequest` so this main loop
+    // can break and the agent can exit cleanly. The same Arc is
+    // cloned into `serve_with_marker_path` (Some(...)) and kept
+    // here for the select-arm `wait()`.
+    let shutdown_signal = ShutdownSignal::new();
+
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
     // runs but COMBAT can only be cleared by reboot.
     if let Some(iso) = isolator.as_ref() {
-        match AdminAuth::load(&cli.admin_pub) {
+        match AdminAuth::load_with_agent_id(&cli.admin_pub, agent_id) {
             Ok(auth) => {
                 let auth = Arc::new(auth);
                 let posture_clone = posture.clone();
                 let iso_clone = Arc::clone(iso);
                 let socket_path = cli.admin_socket.clone();
+                let signal_for_serve = shutdown_signal.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        admin_socket::serve(socket_path, auth, Arc::new(posture_clone), iso_clone)
-                            .await
+                    if let Err(e) = admin_socket::serve_with_marker_path(
+                        socket_path,
+                        auth,
+                        Arc::new(posture_clone),
+                        iso_clone,
+                        PathBuf::from(
+                            northnarrow_agent::shutdown_marker::DEFAULT_MARKER_PATH,
+                        ),
+                        Some(signal_for_serve),
+                    )
+                    .await
                     {
                         warn!(error = %e, "admin socket serve loop exited");
                     }
@@ -380,6 +443,34 @@ async fn main() -> Result<()> {
             }
             _ = sighup.recv() => {
                 info!("SIGHUP received; shutting down");
+                break;
+            }
+            // Tappa 8 A8: admin-authorised graceful shutdown. The
+            // dispatcher has already (a) verified the
+            // ShutdownRequest quorum, (b) written the on-disk
+            // marker the watchdog will honour, and (c) replied
+            // Success to the client BEFORE firing this signal.
+            // Breaking the loop runs the existing shutdown
+            // sequence (ADE stats, pid_file removal, admin socket
+            // unlink), then main() returns Ok(()) and the
+            // process exits 0.
+            //
+            // Design note (§10.3 step 4): we deliberately do NOT
+            // release the COMBAT iptables ruleset here. "Shutdown
+            // of the agent is orthogonal to network state" — the
+            // operator's intent is to stop the agent, not to
+            // declare the threat over. The next agent boot
+            // inherits the existing iptables state and reports
+            // COMBAT in `status`; the operator clears it with a
+            // separate `nn-admin unlock` after restart if they
+            // want.
+            _ = shutdown_signal.wait() => {
+                info!(
+                    target: "admin.shutdown",
+                    "admin-authorised shutdown signal received; \
+                     beginning graceful exit (COMBAT state preserved \
+                     across restart per design §10.3 step 4)"
+                );
                 break;
             }
         }
