@@ -46,12 +46,14 @@
 //! `crate::anti_tamper::read_self_comm`, …) compile byte-identically.
 //! This is the "zero functional changes" contract from ISSUE_002.
 
+use std::borrow::{Borrow, BorrowMut};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
+    maps::{HashMap as AyaHashMap, Map as AyaMap, MapData},
     programs::{
         links::{FdLink, PinnedLink},
         Lsm,
@@ -59,6 +61,13 @@ use aya::{
     Btf, Ebpf,
 };
 use tracing::{info, warn};
+
+/// Name of the pinned `PROTECTED_PIDS` map (mirrors the
+/// `#[map]` declaration in `agent-ebpf/src/task_kill.rs`). The
+/// agent's eBPF object pins this map under [`DEFAULT_BPFFS_ROOT`]
+/// via `EbpfLoader::map_pin_path`, and the watchdog opens it by
+/// joining this name onto the bpffs root.
+pub const PROTECTED_PIDS_MAP_NAME: &str = "PROTECTED_PIDS";
 
 /// Single bpffs directory holding every pinned anti-tamper object.
 /// Pre-extraction commit history (Tappa 7 task 6 #2 / #2b) pinned the
@@ -382,6 +391,195 @@ pub fn attach_lsm(
     Ok(())
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Tappa 7 task 6 Watchdog W1 — ProtectedPidsHandle (design §6.3)
+// ────────────────────────────────────────────────────────────────────
+
+/// Typed handle to the pinned `PROTECTED_PIDS` BPF map, the
+/// kernel-side source of truth for which PIDs the agent's
+/// `task_kill` + `ptrace_access_check` LSM hooks treat as
+/// "untouchable by root".
+///
+/// Two construction paths cover the two consumer shapes:
+/// - [`Self::open`] opens the map by **bpffs path**
+///   (`MapData::from_pin`). No `Ebpf` instance, no aya loader, no
+///   eBPF object load — just a path string. This is the
+///   **watchdog**-facing API per design §6.3: the watchdog binary
+///   never loads any program, but needs to delete the agent's PID
+///   from the map on agent death (the layer-2 recycled-PID race
+///   close).
+/// - [`Self::from_ebpf`] borrows the already-loaded `MapData`
+///   from an existing `Ebpf` instance. This is the
+///   **agent**-facing API: the agent has already loaded its eBPF
+///   object (which contains `PROTECTED_PIDS`); reusing that
+///   in-process `MapData` avoids opening a second userspace fd on
+///   the same kernel map AND supports the no-bpffs degraded path
+///   where the map is loaded but not pinned.
+///
+/// Both constructors yield the same surface
+/// (`insert`/`evict`/`contains`/`pids`); the generic storage
+/// parameter [`T`] hides the differing aya borrow shapes from
+/// callers.
+#[derive(Debug)]
+pub struct ProtectedPidsHandle<T = MapData> {
+    map: AyaHashMap<T, u32, u8>,
+}
+
+impl ProtectedPidsHandle<MapData> {
+    /// Watchdog-facing constructor. Opens the pinned
+    /// `PROTECTED_PIDS` map at
+    /// `<bpffs_root>/PROTECTED_PIDS` (default
+    /// `/sys/fs/bpf/northnarrow/PROTECTED_PIDS`). Fails if the
+    /// pin file is missing (no agent has loaded a pinned map at
+    /// this bpffs yet) or if the file exists but is not a valid
+    /// pinned BPF map of shape `HashMap<u32, u8>`.
+    ///
+    /// The returned handle owns its `MapData` (a fresh userspace
+    /// fd on the kernel map); dropping the handle drops the fd
+    /// but leaves the pinned kernel object intact — the bpffs
+    /// pin is the persistence mechanism, the userspace handle is
+    /// just a window onto it.
+    pub fn open(bpffs_root: &Path) -> Result<Self> {
+        let pin_path = bpffs_root.join(PROTECTED_PIDS_MAP_NAME);
+        let map_data = MapData::from_pin(&pin_path).with_context(|| {
+            format!(
+                "opening pinned {} at {}",
+                PROTECTED_PIDS_MAP_NAME,
+                pin_path.display()
+            )
+        })?;
+        // aya's `HashMap::try_from` accepts the `Map` enum (not
+        // `MapData` directly), so wrap the freshly-opened
+        // `MapData` in `Map::HashMap` before the cast. The
+        // resulting handle owns the `Map::HashMap(_)` storage
+        // — a single `MapData` worth of state, just wrapped.
+        let map = AyaMap::HashMap(map_data);
+        let map = AyaHashMap::try_from(map).with_context(|| {
+            format!(
+                "{} is not a HashMap<u32, u8>",
+                PROTECTED_PIDS_MAP_NAME
+            )
+        })?;
+        Ok(Self { map })
+    }
+}
+
+impl<'a> ProtectedPidsHandle<&'a mut MapData> {
+    /// Agent-facing constructor. Borrows the
+    /// already-loaded `PROTECTED_PIDS` map from an existing
+    /// `Ebpf` instance. Works regardless of whether the map is
+    /// pinned (which matters for the no-bpffs degraded path the
+    /// agent supports). Fails if the eBPF object doesn't contain
+    /// a map named [`PROTECTED_PIDS_MAP_NAME`] or if the map's
+    /// key/value types don't match `HashMap<u32, u8>`.
+    pub fn from_ebpf(ebpf: &'a mut Ebpf) -> Result<Self> {
+        let map = ebpf.map_mut(PROTECTED_PIDS_MAP_NAME).ok_or_else(|| {
+            anyhow!("map {PROTECTED_PIDS_MAP_NAME} missing from eBPF object")
+        })?;
+        let map = AyaHashMap::try_from(map).with_context(|| {
+            format!("{PROTECTED_PIDS_MAP_NAME} is not a HashMap<u32, u8>")
+        })?;
+        Ok(Self { map })
+    }
+}
+
+// Write-side methods require BorrowMut<MapData>. Both Open
+// (`MapData` owned) and FromEbpf (`&mut MapData` borrowed)
+// satisfy this — owned types impl BorrowMut for themselves.
+impl<T> ProtectedPidsHandle<T>
+where
+    T: BorrowMut<MapData>,
+{
+    /// Insert `pid` into `PROTECTED_PIDS`. `BPF_ANY` upsert
+    /// semantics: an entry that already exists is overwritten,
+    /// so re-inserting the same PID after an eviction race is
+    /// fine. Value is always `1u8`; the map's value type is
+    /// `u8` rather than `()` to align with the aya HashMap API.
+    pub fn insert(&mut self, pid: u32) -> Result<()> {
+        self.map
+            .insert(pid, 1u8, 0)
+            .with_context(|| {
+                format!("inserting PID {pid} into {PROTECTED_PIDS_MAP_NAME}")
+            })?;
+        Ok(())
+    }
+
+    /// Remove `pid` from `PROTECTED_PIDS`. Returns Ok if the PID
+    /// was present and removed, OR if it was already absent
+    /// (idempotent eviction — the watchdog's pidfd-driven death
+    /// detection may race against the agent's own
+    /// `evict_stale_pids` at startup, and either order is fine).
+    /// Other errors (e.g. kernel rejecting the syscall) propagate.
+    pub fn evict(&mut self, pid: u32) -> Result<()> {
+        match self.map.remove(&pid) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // aya 0.13 surfaces "key not found" via a
+                // SyscallError carrying io_error == NotFound.
+                // Treat that as idempotent success.
+                if is_not_found_err(&e) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("evicting PID {pid} from {PROTECTED_PIDS_MAP_NAME}")
+                    })
+                }
+            }
+        }
+    }
+}
+
+// Read-side methods only need Borrow<MapData>.
+impl<T> ProtectedPidsHandle<T>
+where
+    T: Borrow<MapData>,
+{
+    /// `true` if `pid` is currently in the map. Any aya error
+    /// other than "key not found" propagates so callers can
+    /// distinguish "definitely absent" from "lookup failed."
+    pub fn contains(&self, pid: u32) -> Result<bool> {
+        match self.map.get(&pid, 0) {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if is_not_found_err(&e) {
+                    Ok(false)
+                } else {
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("looking up PID {pid} in {PROTECTED_PIDS_MAP_NAME}")
+                    })
+                }
+            }
+        }
+    }
+
+    /// Snapshot of every PID currently in the map. Materialised
+    /// into a `Vec` up front because aya's `keys()` iterator
+    /// holds a borrow on the map, and the agent's
+    /// `evict_stale_pids` walk needs to call [`Self::evict`]
+    /// (which needs `&mut`) for each stale entry. Returning a
+    /// `Vec` also matches the watchdog's diagnostic use cases
+    /// (dump the protected set to a log line).
+    pub fn pids(&self) -> Result<Vec<u32>> {
+        Ok(self.map.keys().filter_map(Result::ok).collect())
+    }
+}
+
+/// Helper: does this aya `MapError` represent "key not found"?
+/// aya 0.13 surfaces `ENOENT` from the kernel BPF syscalls
+/// through `MapError::SyscallError { io_error, .. }` where
+/// `io_error.kind() == NotFound`. Centralised here so both
+/// `evict` and `contains` share one check and a future aya
+/// upgrade (e.g. an explicit `KeyNotFound` variant) only has
+/// one site to update.
+fn is_not_found_err(e: &aya::maps::MapError) -> bool {
+    match e {
+        aya::maps::MapError::SyscallError(syscall_err) => {
+            syscall_err.io_error.kind() == std::io::ErrorKind::NotFound
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +644,111 @@ mod tests {
         assert!(f.exists());
         purge_stale_pin(&f);
         assert!(!f.exists(), "purge_stale_pin should unlink a regular file");
+    }
+
+    // ── Watchdog W1: ProtectedPidsHandle (design §6.3, §12 row W1)
+    //
+    // Full insert/evict/contains/pids round-trips on a real BPF
+    // map require root + a kernel with `bpf` in the boot lsm=
+    // chain — exercised by `agent/tests/privileged_e2e.rs` today
+    // and by the future W8 watchdog privileged e2e test. The
+    // unit tests below cover everything that's testable WITHOUT
+    // root: error paths (file missing, wrong kind), pin-path
+    // construction, and a compile-time guard that both
+    // constructors yield a handle satisfying the read-side and
+    // write-side trait bounds.
+
+    /// Required W1 test 1 ("open"): a nonexistent bpffs root
+    /// surfaces a clear error from [`ProtectedPidsHandle::open`]
+    /// rather than panicking. Error chain references both
+    /// `PROTECTED_PIDS` (the map name) and the failed path so the
+    /// operator log line points at the right thing.
+    #[test]
+    fn protected_pids_handle_open_fails_when_pin_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // dir exists but no `PROTECTED_PIDS` pin file inside.
+        let err = ProtectedPidsHandle::open(dir.path()).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(PROTECTED_PIDS_MAP_NAME),
+            "error chain should mention the map name, got: {chain}"
+        );
+        assert!(
+            chain.contains(dir.path().to_str().unwrap()),
+            "error chain should mention the attempted path, got: {chain}"
+        );
+    }
+
+    /// Required W1 test 2 ("open"): a path that points to a
+    /// regular file (not a valid pinned BPF map) also surfaces
+    /// `from_pin`'s error rather than panicking. Documents that
+    /// the open() path does NOT silently accept "any file at the
+    /// pin location" — only a real pinned BPF map.
+    #[test]
+    fn protected_pids_handle_open_fails_when_path_is_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_pin = dir.path().join(PROTECTED_PIDS_MAP_NAME);
+        std::fs::write(&fake_pin, b"not a pinned bpf map").unwrap();
+        let err = ProtectedPidsHandle::open(dir.path()).unwrap_err();
+        // The exact error shape depends on aya's from_pin
+        // internals — we just assert the chain is non-empty AND
+        // mentions the map name (the surrounding context).
+        let chain = format!("{err:#}");
+        assert!(!chain.is_empty());
+        assert!(
+            chain.contains(PROTECTED_PIDS_MAP_NAME),
+            "context should mention {PROTECTED_PIDS_MAP_NAME}, got: {chain}"
+        );
+    }
+
+    /// Required W1 test 3 ("path construction"): the pin path
+    /// `<bpffs_root>/PROTECTED_PIDS` is built from the published
+    /// [`PROTECTED_PIDS_MAP_NAME`] constant. Locks the
+    /// constant-name vs the path convention so a future rename
+    /// breaks this test loudly (vs silently breaking the
+    /// watchdog↔agent contract).
+    #[test]
+    fn protected_pids_pin_path_is_bpffs_root_joined_with_map_name() {
+        assert_eq!(PROTECTED_PIDS_MAP_NAME, "PROTECTED_PIDS");
+        assert_eq!(DEFAULT_BPFFS_ROOT, "/sys/fs/bpf/northnarrow");
+        // Operator-facing path the watchdog will open at runtime.
+        let expected = Path::new(DEFAULT_BPFFS_ROOT).join(PROTECTED_PIDS_MAP_NAME);
+        assert_eq!(
+            expected,
+            Path::new("/sys/fs/bpf/northnarrow/PROTECTED_PIDS")
+        );
+    }
+
+    /// Required W1 test 4 ("compile-time API shape"): both
+    /// constructors (`open` and `from_ebpf`) yield a handle that
+    /// supports the full insert/evict/contains/pids surface.
+    /// This is a pure compile-test — failure shows up at build
+    /// time, not at runtime — guarding against a future trait
+    /// constraint regression that would silently strip one side
+    /// (e.g. accidentally requiring `BorrowMut` for `contains`).
+    #[test]
+    fn protected_pids_handle_constructors_and_method_surface_compile() {
+        // Owned variant (open path — watchdog).
+        fn _exercise_owned(h: &mut ProtectedPidsHandle<MapData>) -> Result<()> {
+            h.insert(1)?;
+            h.evict(1)?;
+            let _: bool = h.contains(1)?;
+            let _: Vec<u32> = h.pids()?;
+            Ok(())
+        }
+        // Borrowed variant (from_ebpf path — agent).
+        fn _exercise_borrowed(h: &mut ProtectedPidsHandle<&mut MapData>) -> Result<()> {
+            h.insert(1)?;
+            h.evict(1)?;
+            let _: bool = h.contains(1)?;
+            let _: Vec<u32> = h.pids()?;
+            Ok(())
+        }
+        // No runtime invocations — these functions exist solely
+        // to compile-check the API surface. Reference them so
+        // dead-code lint doesn't fire.
+        let _ = _exercise_owned as fn(&mut ProtectedPidsHandle<MapData>) -> Result<()>;
+        let _ = _exercise_borrowed
+            as fn(&mut ProtectedPidsHandle<&mut MapData>) -> Result<()>;
     }
 }

@@ -52,11 +52,8 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 
 use std::collections::HashSet;
 
-use anyhow::{anyhow, Context, Result};
-use aya::{
-    maps::{HashMap as AyaHashMap, MapData},
-    Btf, Ebpf,
-};
+use anyhow::{Context, Result};
+use aya::{Btf, Ebpf};
 use tracing::{info, warn};
 
 // ISSUE_002: bpffs root / pin / LSM-attach primitives were
@@ -68,7 +65,14 @@ use tracing::{info, warn};
 pub use antitamper_bpf::{
     attach_lsm, attach_transient, fresh_attach_and_pin, lsm_pin_paths, prepare_pin_root,
     purge_stale_pin, read_proc_comm, read_self_comm, DEFAULT_BPFFS_ROOT,
+    PROTECTED_PIDS_MAP_NAME,
 };
+
+// Watchdog W1: PROTECTED_PIDS userspace manipulation now goes
+// through the typed handle in `antitamper-bpf` so both the agent
+// (in-process, has the `Ebpf`) and the future watchdog binary
+// (cross-process, opens by bpffs path) use the same code path.
+use antitamper_bpf::ProtectedPidsHandle;
 
 // TODO(Tappa 8): the three override arrays — KILL_OVERRIDE,
 // PTRACE_OVERRIDE, FS_PROTECT_OVERRIDE — are now `pinned` by-name
@@ -81,10 +85,13 @@ pub use antitamper_bpf::{
 // is added here in commit #2: it would be dead code with no
 // Tappa-7 caller and is out of this commit's scope.
 
-/// Names mirroring `#[map]` / `#[lsm(hook = "…")]` declarations in
+/// Names mirroring `#[lsm(hook = "…")]` declarations in
 /// `agent-ebpf/src/{task_kill,ptrace_check}.rs`. Kept here as
-/// constants because aya looks them up by string at runtime.
-const PROTECTED_PIDS_MAP: &str = "PROTECTED_PIDS";
+/// constants because aya looks them up by string at runtime. The
+/// map-name constant lives in `antitamper-bpf::PROTECTED_PIDS_MAP_NAME`
+/// (Watchdog W1) since both agent and watchdog reference it; these
+/// hook/program names stay agent-side because only the agent
+/// loads the LSM hooks.
 const TASK_KILL_PROGRAM: &str = "task_kill";
 const TASK_KILL_HOOK: &str = "task_kill";
 const PTRACE_PROGRAM: &str = "ptrace_access_check";
@@ -118,7 +125,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     register_protected_pids(ebpf, pids).context("populating PROTECTED_PIDS before LSM attach")?;
     info!(
         pids = ?pids,
-        map = PROTECTED_PIDS_MAP,
+        map = PROTECTED_PIDS_MAP_NAME,
         "anti-tamper: PIDs registered with kernel"
     );
 
@@ -181,18 +188,15 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     Ok(())
 }
 
-/// Insert each PID into `PROTECTED_PIDS`. `BPF_ANY` upsert
-/// semantics: an entry that already exists is overwritten, so
-/// re-registering the same PID after an eviction race is fine.
+/// Insert each PID into `PROTECTED_PIDS`. Watchdog W1: this is now
+/// a thin wrapper over [`ProtectedPidsHandle::insert`] so the agent
+/// and the watchdog share one canonical map-mutation code path.
+/// `BPF_ANY` upsert semantics are preserved by the handle — an
+/// entry that already exists is overwritten.
 fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
-    let map = ebpf
-        .map_mut(PROTECTED_PIDS_MAP)
-        .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP} missing from eBPF object"))?;
-    let mut hm: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)
-        .with_context(|| format!("{PROTECTED_PIDS_MAP} is not a HashMap<u32, u8>"))?;
+    let mut handle = ProtectedPidsHandle::from_ebpf(ebpf)?;
     for &pid in pids {
-        hm.insert(pid, 1u8, 0)
-            .with_context(|| format!("inserting PID {pid} into {PROTECTED_PIDS_MAP}"))?;
+        handle.insert(pid)?;
     }
     Ok(())
 }
@@ -202,21 +206,20 @@ fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
 /// `allowed_comms`. Returns the number of entries removed.
 ///
 /// This is a no-op on a freshly-loaded eBPF object (the map is
-/// empty); it becomes load-bearing once Tappa 7 task 6 commit #2
+/// empty); it becomes load-bearing once the BPF pinning sprint
 /// pins the map to bpffs, at which point a restarted agent inherits
 /// the prior generation's entries and must clean up stale ones
 /// before the new PIDs take effect.
+///
+/// Watchdog W1: walk + evict now go through the
+/// [`ProtectedPidsHandle`] surface. Snapshot the PID set up front
+/// via [`ProtectedPidsHandle::pids`] (which materialises a `Vec`
+/// internally) so the eviction loop can call
+/// [`ProtectedPidsHandle::evict`] without fighting an iterator
+/// borrow on the underlying map.
 fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<usize> {
-    let map = ebpf
-        .map_mut(PROTECTED_PIDS_MAP)
-        .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP} missing from eBPF object"))?;
-    let mut hm: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)
-        .with_context(|| format!("{PROTECTED_PIDS_MAP} is not a HashMap<u32, u8>"))?;
-
-    // Materialise the key set up-front; aya's `keys()` iterator
-    // holds a borrow of the map, and we need `&mut hm` to call
-    // `remove()`.
-    let existing: Vec<u32> = hm.keys().filter_map(Result::ok).collect();
+    let mut handle = ProtectedPidsHandle::from_ebpf(ebpf)?;
+    let existing = handle.pids()?;
     let mut evicted = 0usize;
     for pid in existing {
         let alive_and_matching = match read_proc_comm(pid) {
@@ -226,7 +229,7 @@ fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<
         if alive_and_matching {
             continue;
         }
-        match hm.remove(&pid) {
+        match handle.evict(pid) {
             Ok(()) => evicted += 1,
             Err(e) => warn!(
                 pid, error = %e,
