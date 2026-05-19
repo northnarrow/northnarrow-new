@@ -181,6 +181,16 @@ fn dispatch(
                 // so this arm only fires when an operator has
                 // deliberately written a line without `unlock`.
                 Err(AdminAuthError::RoleDenied { .. }) => UnlockResult::InvalidSignature,
+                // Tappa 8 A6 introduces QuorumNotMet. The legacy
+                // Unlock wire path is strictly 1-of-N (verify_unlock
+                // delegates to verify_with_role, not verify_quorum)
+                // so this arm is exhaustiveness-only — it can
+                // never fire from `Unlock` dispatch in practice.
+                // Mapped to InvalidSignature on the wire for the
+                // same reason as RoleDenied: UnlockResult predates
+                // A6, and A7's AdminResult will carry the proper
+                // QuorumNotMet { required, provided } variant.
+                Err(AdminAuthError::QuorumNotMet { .. }) => UnlockResult::InvalidSignature,
             };
             AdminMessage::UnlockResult(result)
         }
