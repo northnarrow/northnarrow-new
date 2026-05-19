@@ -438,6 +438,50 @@ async fn main() -> Result<()> {
                 let iso_clone = Arc::clone(iso);
                 let socket_path = cli.admin_socket.clone();
                 let signal_for_serve = shutdown_signal.clone();
+                // Tappa 8 B5: construct the AuditLog once at boot
+                // (post-A14 the file's inode is already in
+                // PROTECTED_INODES so an attacker can't replace
+                // it underneath us). The signing key is the one
+                // bootstrapped pre-attach above; we load it
+                // again here to take ownership of the in-memory
+                // SigningKey rather than wrap the pre-attach
+                // bootstrap result. agent_id is whatever the
+                // pre-attach call minted.
+                let audit_log = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                    std::path::Path::new(
+                        northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
+                    ),
+                ) {
+                    Ok(key) => {
+                        match northnarrow_agent::audit::AuditLog::open(
+                            std::path::Path::new(
+                                northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH,
+                            ),
+                            key,
+                            agent_id,
+                        ) {
+                            Ok(log) => {
+                                Some(Arc::new(parking_lot::Mutex::new(log)))
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "audit log open failed — admin ops will run \
+                                     UNAUDITED this boot"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "agent signing key reload failed — admin ops will \
+                             run UNAUDITED this boot"
+                        );
+                        None
+                    }
+                };
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -448,6 +492,7 @@ async fn main() -> Result<()> {
                             northnarrow_agent::shutdown_marker::DEFAULT_MARKER_PATH,
                         ),
                         Some(signal_for_serve),
+                        audit_log,
                     )
                     .await
                     {

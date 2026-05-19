@@ -16,10 +16,12 @@
 //! request on the same stream (challenge → unlock), so the handler
 //! loops on EOF instead of close-after-first-reply.
 
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -36,6 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::{AdminReleaseError, PostureMachine};
 use crate::shutdown_marker::{self, ShutdownMarker, DEFAULT_MARKER_PATH};
 
@@ -108,6 +111,9 @@ pub async fn serve(
     // Legacy `serve` callers (those that predate A8's
     // ShutdownSignal) get None — the dispatcher still writes the
     // marker, the in-process exit signal is just not delivered.
+    // Audit log also None for legacy callers (predates B5);
+    // production callers use `serve_with_audit_log` which threads
+    // the audit-log writer into every dispatch.
     serve_with_marker_path(
         socket_path,
         auth,
@@ -115,6 +121,34 @@ pub async fn serve(
         isolator,
         PathBuf::from(DEFAULT_MARKER_PATH),
         None,
+        None,
+    )
+    .await
+}
+
+/// Tappa 8 B5 production entry-point — accepts an
+/// `Arc<Mutex<AuditLog>>` so every successful (and failed)
+/// signed admin op emits a chained audit-log entry. main.rs
+/// constructs the AuditLog once at boot from the agent signing
+/// key bootstrapped in B1; the lock is held only during one
+/// `append` call (microseconds) so contention is negligible.
+pub async fn serve_with_audit_log(
+    socket_path: PathBuf,
+    auth: Arc<AdminAuth>,
+    posture: Arc<PostureMachine>,
+    isolator: Arc<NetworkIsolator>,
+    marker_path: PathBuf,
+    shutdown_signal: Option<ShutdownSignal>,
+    audit_log: Arc<Mutex<AuditLog>>,
+) -> Result<()> {
+    serve_with_marker_path(
+        socket_path,
+        auth,
+        posture,
+        isolator,
+        marker_path,
+        shutdown_signal,
+        Some(audit_log),
     )
     .await
 }
@@ -135,6 +169,7 @@ pub async fn serve_with_marker_path(
     isolator: Arc<NetworkIsolator>,
     marker_path: PathBuf,
     shutdown_signal: Option<ShutdownSignal>,
+    audit_log: Option<Arc<Mutex<AuditLog>>>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -168,6 +203,7 @@ pub async fn serve_with_marker_path(
         let isolator = Arc::clone(&isolator);
         let marker_path = marker_path.clone();
         let shutdown_signal = shutdown_signal.clone();
+        let audit_log = audit_log.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -176,6 +212,7 @@ pub async fn serve_with_marker_path(
                 &isolator,
                 &marker_path,
                 shutdown_signal.as_ref(),
+                audit_log.as_ref(),
             )
             .await
             {
@@ -206,13 +243,20 @@ async fn handle_connection(
     isolator: &NetworkIsolator,
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
+    audit_log: Option<&Arc<Mutex<AuditLog>>>,
 ) -> Result<()> {
+    // Capture peer creds once per connection — the audit log
+    // wants pid/uid/comm of the caller, and a single connection
+    // never changes peers mid-stream (SO_PEERCRED is fixed at
+    // accept time).
+    let client = peer_creds(&stream);
     loop {
         let msg = match read_frame(&mut stream).await? {
             Some(m) => m,
             None => return Ok(()),
         };
-        let reply = dispatch(msg, auth, posture, isolator, marker_path, shutdown_signal);
+        let reply = dispatch(msg.clone(), auth, posture, isolator, marker_path, shutdown_signal);
+        emit_audit_for(&msg, &reply, &client, audit_log);
         write_frame(&mut stream, &reply).await?;
     }
 }
@@ -226,6 +270,221 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ── Tappa 8 B5 — SO_PEERCRED + audit-log emission ─────────────────
+
+/// Triple of `(pid, uid, comm)` captured from a Unix-socket peer
+/// via `SO_PEERCRED` + `/proc/<pid>/comm`. The audit log's
+/// per-entry `client_*` fields (design §9.1) come from here so
+/// every admin operation records WHO connected, not just which
+/// key signed.
+#[derive(Debug, Clone)]
+pub(crate) struct AuditClient {
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: String,
+}
+
+impl AuditClient {
+    /// Pre-attach unknown sentinel for callers that haven't (or
+    /// can't) capture peer creds — wire-test mock servers fall
+    /// back here so the audit-emit path is exercised even
+    /// without a real Unix socket.
+    fn unknown() -> Self {
+        Self {
+            pid: 0,
+            uid: 0,
+            comm: "<unknown>".to_string(),
+        }
+    }
+}
+
+/// Read `SO_PEERCRED` from `stream` to recover the peer's PID +
+/// UID, then read `/proc/<pid>/comm` for the executable name. All
+/// three feed the audit log's `client_*` fields. Failure to read
+/// any one is degrade-not-fail — the audit entry is still
+/// written, just with `<unknown>` markers; an audit row with
+/// missing client info is more useful than no audit row at all.
+fn peer_creds(stream: &UnixStream) -> AuditClient {
+    let fd = stream.as_raw_fd();
+    // SAFETY: ucred is repr(C), getsockopt fills `pid`, `uid`,
+    // `gid` if it succeeds. We pass `len` by &mut so the kernel
+    // can tell us the actual returned length.
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return AuditClient::unknown();
+    }
+    let pid = cred.pid as u32;
+    let uid = cred.uid;
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    AuditClient { pid, uid, comm }
+}
+
+/// Inspect the (request, reply) pair after `dispatch` returns
+/// and append a single audit-log entry if the message was an
+/// auditable admin operation (challenge/status are not
+/// auditable — they're plumbing). On any audit failure, log
+/// plus continue: the operator's authorised action MUST succeed
+/// even if the audit log is temporarily unwritable (design §9
+/// states "the entry is the receipt; the action is the action").
+fn emit_audit_for(
+    msg: &AdminMessage,
+    reply: &AdminMessage,
+    client: &AuditClient,
+    audit_log: Option<&Arc<Mutex<AuditLog>>>,
+) {
+    let Some(audit_log) = audit_log else {
+        return;
+    };
+    let (op, extra, result, cosigner_count) = match (msg, reply) {
+        (AdminMessage::Unlock(_), AdminMessage::UnlockResult(r)) => (
+            "unlock",
+            serde_json::json!({}),
+            unlock_result_str(r),
+            0,
+        ),
+        (AdminMessage::ShutdownRequest(req), AdminMessage::ShutdownResult(r)) => {
+            let grace = match &req.payload.extra {
+                OperationExtra::Shutdown(s) => s.grace_secs,
+                _ => 0,
+            };
+            (
+                "shutdown",
+                serde_json::json!({ "grace_secs": grace }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (AdminMessage::ForcePostureRequest(req), AdminMessage::ForcePostureResult(r)) => {
+            let target = match &req.payload.extra {
+                OperationExtra::ForcePosture(f) => format!("{:?}", f.target),
+                _ => "?".to_string(),
+            };
+            (
+                "force_posture",
+                serde_json::json!({ "target": target }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (AdminMessage::RotateKeysAddRequest(req), AdminMessage::RotateKeysAddResult(r)) => {
+            let new_fp = match &req.payload.extra {
+                OperationExtra::RotateKeysAdd(extra) => {
+                    hex::encode(&Sha256::digest(extra.new_pubkey)[..4])
+                }
+                _ => String::new(),
+            };
+            (
+                "rotate_keys_add",
+                serde_json::json!({ "new_key_fp": new_fp }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (
+            AdminMessage::RotateKeysRevokeRequest(req),
+            AdminMessage::RotateKeysRevokeResult(r),
+        ) => {
+            let target_fp = match &req.payload.extra {
+                OperationExtra::RotateKeysRevoke(extra) => hex::encode(extra.fingerprint),
+                _ => String::new(),
+            };
+            (
+                "rotate_keys_revoke",
+                serde_json::json!({ "target_fp": target_fp }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        // Non-auditable: ChallengeRequest, Status, the debug
+        // path. Server-only reply variants reaching dispatch are
+        // out-of-spec and already logged; no audit row.
+        _ => return,
+    };
+    let draft = AuditEntryDraft {
+        op: op.to_string(),
+        extra,
+        // B5 ships the audit emission path with key_fp omitted —
+        // verify_signed_payload_quorum doesn't currently return
+        // the matched key's fingerprint. PHASE_D_004 follow-up
+        // threads it through so this field carries the real
+        // signer fingerprint.
+        key_fp: String::new(),
+        cosigner_fps: vec![String::new(); cosigner_count],
+        result,
+        client_pid: client.pid,
+        client_uid: client.uid,
+        client_comm: client.comm.clone(),
+    };
+    let mut log = audit_log.lock();
+    if let Err(e) = log.append(draft) {
+        warn!(
+            error = %e,
+            op,
+            "audit log append failed — admin op succeeded, audit row missing"
+        );
+    }
+}
+
+/// Map a legacy [`UnlockResult`] (predates the Tappa 8 A7
+/// `AdminResult` superset) to the same `"success"` /
+/// `"failure: <reason>"` shape audit entries use.
+fn unlock_result_str(r: &UnlockResult) -> String {
+    match r {
+        UnlockResult::Success => "success".to_string(),
+        UnlockResult::InvalidSignature => "failure: invalid_signature".to_string(),
+        UnlockResult::NoPendingChallenge => "failure: no_pending_challenge".to_string(),
+        UnlockResult::RateLimited { retry_after_secs } => {
+            format!("failure: rate_limited (retry_after_secs={retry_after_secs})")
+        }
+    }
+}
+
+/// Map an [`AdminResult`] to the audit-log `result` field shape
+/// from design §9.1: `"success"` or `"failure: <reason>"`.
+fn audit_result_str(r: AdminResult) -> String {
+    match r {
+        AdminResult::Success => "success".to_string(),
+        AdminResult::InvalidSignature => "failure: invalid_signature".to_string(),
+        AdminResult::NoPendingChallenge => "failure: no_pending_challenge".to_string(),
+        AdminResult::RateLimited { retry_after_secs } => {
+            format!("failure: rate_limited (retry_after_secs={retry_after_secs})")
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            format!("failure: quorum_not_met (required={required}, provided={provided})")
+        }
+        AdminResult::RoleDenied => "failure: role_denied".to_string(),
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => format!(
+            "failure: timestamp_skew (server_ts={server_ts}, max_skew_secs={max_skew_secs})"
+        ),
+        AdminResult::AgentIdMismatch => "failure: agent_id_mismatch".to_string(),
+        AdminResult::UnknownOperation => "failure: unknown_operation".to_string(),
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            format!("failure: protocol_version_unsupported (server_version={server_version})")
+        }
+    }
 }
 
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
@@ -1170,7 +1429,7 @@ mod tests {
         let marker_c = marker_path.clone();
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
-                socket_c, auth_c, posture_c, isolator_c, marker_c, None,
+                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None,
             )
             .await;
         });
@@ -1399,6 +1658,7 @@ mod tests {
                 isolator_c,
                 marker_c,
                 Some(signal_for_serve),
+                None,
             )
             .await;
         });
@@ -1463,5 +1723,211 @@ mod tests {
             .expect("shutdown signal must fire within 2s of Success");
 
         task.abort();
+    }
+
+    // ── Tappa 8 B5 — audit emission unit tests ─────────────────────
+
+    /// Build an in-memory AuditLog rooted in `dir`, return its
+    /// path + the Arc<Mutex<>> wrapped log. B5 dispatch wiring
+    /// passes this Arc through; tests poke at the underlying
+    /// file to verify emission.
+    fn build_test_audit_log(dir: &TempDir) -> (PathBuf, Arc<Mutex<AuditLog>>) {
+        let key_path = dir.path().join("agent.sig.key");
+        let log_path = dir.path().join("audit.log");
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        (log_path, Arc::new(Mutex::new(log)))
+    }
+
+    fn read_audit_entries(log_path: &Path) -> Vec<crate::audit::AuditEntry> {
+        std::fs::read_to_string(log_path)
+            .ok()
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("parse audit line"))
+            .collect()
+    }
+
+    fn fake_client() -> AuditClient {
+        AuditClient {
+            pid: 12345,
+            uid: 1000,
+            comm: "nn-admin".to_string(),
+        }
+    }
+
+    /// B5 test #1: Unlock success emits one audit row with
+    /// op="unlock" + result="success" + the fake client triple.
+    #[test]
+    fn audit_emits_on_unlock_success() {
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let req = AdminMessage::Unlock(
+            common::wire::admin_protocol::UnlockRequest {
+                signature: [0; 64],
+            },
+        );
+        let reply = AdminMessage::UnlockResult(UnlockResult::Success);
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit));
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "unlock");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].client_pid, 12345);
+        assert_eq!(entries[0].client_uid, 1000);
+        assert_eq!(entries[0].client_comm, "nn-admin");
+        // First entry chains off the genesis hash (B1 invariant).
+        assert_eq!(entries[0].prev_hash, crate::audit::GENESIS_PREV_HASH);
+    }
+
+    /// B5 test #2: Shutdown success records grace_secs in
+    /// `extra` and the cosigner-count comes from the signatures
+    /// vec (len - 1, since the first is the primary signer).
+    #[test]
+    fn audit_emits_on_shutdown_success_with_grace_extra() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload =
+            SignedPayload::new_shutdown([0x11; 32], 1_700_000_000, [0x22; 16], 45);
+        let req = AdminMessage::ShutdownRequest(ShutdownRequest {
+            payload,
+            signatures: vec![
+                KeyedSignature { signature: [0; 64] },
+                KeyedSignature { signature: [1; 64] },
+            ],
+        });
+        let reply = AdminMessage::ShutdownResult(AdminResult::Success);
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit));
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "shutdown");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].extra, serde_json::json!({ "grace_secs": 45 }));
+        // 2 sigs → 1 cosigner.
+        assert_eq!(entries[0].cosigner_fps.len(), 1);
+    }
+
+    /// B5 test #3: ForcePosture failure (RoleDenied) emits a
+    /// row with op="force_posture", result starting with
+    /// "failure: role_denied", and the requested target in
+    /// `extra`. Failures audit the SAME way as successes — the
+    /// chain captures attempts, not just wins.
+    #[test]
+    fn audit_emits_on_force_posture_failure() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        use common::posture_types::PostureKind;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_force_posture(
+            [0x11; 32],
+            1_700_000_000,
+            [0x22; 16],
+            PostureKind::Combat,
+        );
+        let req = AdminMessage::ForcePostureRequest(ForcePostureRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::ForcePostureResult(AdminResult::RoleDenied);
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit));
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "force_posture");
+        assert!(entries[0].result.starts_with("failure: role_denied"));
+        assert_eq!(entries[0].extra, serde_json::json!({ "target": "Combat" }));
+    }
+
+    /// B5 test #4: Two sequential RotateKeysAdd emissions
+    /// chain correctly (second.prev_hash == first.entry_hash) —
+    /// proves the in-memory AuditLog state survives across
+    /// dispatch calls held behind the Mutex. Non-auditable
+    /// messages (ChallengeRequest, Status) are also exercised
+    /// to assert they do NOT emit rows.
+    #[test]
+    fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
+        use common::wire::admin_protocol::{
+            ChallengeRequest, KeyedSignature, StatusRequest,
+        };
+        use common::wire::admin_signed_payload::{Role, SignedPayload};
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+
+        // Non-auditable: ChallengeRequest reply (Challenge nonce).
+        let challenge_req = AdminMessage::ChallengeRequest(ChallengeRequest {});
+        let challenge_reply = AdminMessage::Challenge(Challenge { nonce: [0; 32] });
+        emit_audit_for(
+            &challenge_req,
+            &challenge_reply,
+            &fake_client(),
+            Some(&audit),
+        );
+        // Non-auditable: Status request.
+        let status_req = AdminMessage::Status(StatusRequest {});
+        let status_reply = AdminMessage::StatusResponse(StatusResponse {
+            posture: common::posture_types::PostureKind::Observing,
+            network_isolation_engaged: false,
+            last_admin_action_secs_ago: None,
+        });
+        emit_audit_for(&status_req, &status_reply, &fake_client(), Some(&audit));
+
+        let after_skips = read_audit_entries(&log_path);
+        assert_eq!(
+            after_skips.len(),
+            0,
+            "challenge/status MUST NOT produce audit rows"
+        );
+
+        // Two auditable RotateKeysAdd calls.
+        let payload_a = SignedPayload::new_rotate_keys_add(
+            [0x11; 32],
+            1_700_000_000,
+            [0x22; 16],
+            [0xAA; 32],
+            vec![Role::Unlock],
+        );
+        let req_a = AdminMessage::RotateKeysAddRequest(RotateKeysAddRequest {
+            payload: payload_a,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        emit_audit_for(
+            &req_a,
+            &AdminMessage::RotateKeysAddResult(AdminResult::Success),
+            &fake_client(),
+            Some(&audit),
+        );
+
+        let payload_b = SignedPayload::new_rotate_keys_add(
+            [0x33; 32],
+            1_700_000_001,
+            [0x22; 16],
+            [0xBB; 32],
+            vec![Role::Unlock],
+        );
+        let req_b = AdminMessage::RotateKeysAddRequest(RotateKeysAddRequest {
+            payload: payload_b,
+            signatures: vec![KeyedSignature { signature: [1; 64] }],
+        });
+        emit_audit_for(
+            &req_b,
+            &AdminMessage::RotateKeysAddResult(AdminResult::Success),
+            &fake_client(),
+            Some(&audit),
+        );
+
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 2, "two rotate_keys_add emissions");
+        assert_eq!(entries[0].op, "rotate_keys_add");
+        assert_eq!(entries[1].op, "rotate_keys_add");
+        // CHAIN INVARIANT: second.prev_hash == first.entry_hash.
+        assert_eq!(
+            entries[1].prev_hash, entries[0].entry_hash,
+            "second emission must chain off first"
+        );
+        // The two new_key_fp values differ (different new_pubkey).
+        assert_ne!(entries[0].extra, entries[1].extra);
     }
 }
