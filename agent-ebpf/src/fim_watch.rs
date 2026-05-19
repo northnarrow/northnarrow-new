@@ -26,20 +26,20 @@
 //! | [`fim_unlink_observe`] | `inode_unlink` | `rm` | `Deleted` |
 //! | [`fim_rename_observe`] | `inode_rename` | `mv` | `Renamed` |
 //! | [`fim_link_observe`] | `inode_link` | hardlink creation (Q2 evasion-detection) | `Linked` |
+//! | [`fim_file_open_observe`] | `file_open` | open of a watched inode (any access mode) | `Opened` |
 //!
-//! **`fim_file_open_observe` (`file_open` hook, design §5.1
-//! sixth program) is deferred to a follow-up commit** —
-//! `file_open` fires for EVERY file open in the system, so it
-//! requires reading `struct file::f_flags` to fast-skip
-//! read-only opens before the watched-paths lookup, and that
-//! BTF offset (`FILE_F_FLAGS_OFFSET`) is not yet validated
-//! against `/sys/kernel/btf/vmlinux` on the production target
-//! kernel. C2 ships the five inode-side hooks (Modified /
-//! Created / Deleted / Renamed / Linked) which cover every
-//! file *mutation* path; file_open adds the write-intent
-//! *intent* signal which is duplicative for content-tracking.
-//! The C4 drain loop re-hashes target files on any of the
-//! five existing ops to detect actual content change.
+//! **C5.2 closes the C2-deferred sixth program** — the
+//! `FILE_F_FLAGS_OFFSET = 72` BTF offset is now validated on
+//! the target kernel (Ubuntu 24.04.x / 6.8.x) via
+//! `bpftool btf dump file /sys/kernel/btf/vmlinux format raw`.
+//! V1.0 emits on EVERY open of a watched inode rather than
+//! filtering by access mode in BPF — the WATCHED_PATHS set is
+//! operator-curated (~100 paths) so the volume is bounded, and
+//! userland C5.3 cred-read rules (NN-L-FIM-011..014)
+//! classify by path-vs-access semantics that the BPF layer
+//! couldn't express anyway. The `FILE_F_FLAGS_OFFSET` constant
+//! remains validated + checked in for future read/write-tier
+//! split rules.
 //!
 //! ## Caller-side exemption (PHASE_D_002 symmetric)
 //!
@@ -79,11 +79,12 @@ use aya_ebpf::{
 };
 use northnarrow_common::wire::{
     FimDriftRaw, InodeKey, FIM_OP_CREATED, FIM_OP_DELETED, FIM_OP_LINKED, FIM_OP_MODIFIED,
-    FIM_OP_RENAMED,
+    FIM_OP_OPENED, FIM_OP_RENAMED,
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
+    SUPER_BLOCK_S_DEV_OFFSET,
 };
 
 // ── Maps ────────────────────────────────────────────────────────────
@@ -389,7 +390,40 @@ unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
     0
 }
 
-// `fim_file_open_observe` (design §5.1) deferred — see
-// module doc-comment header. Will land in a separate commit
-// once FILE_F_FLAGS_OFFSET is validated against
-// /sys/kernel/btf/vmlinux on the target kernel.
+/// `file_open` observation — fires on EVERY open of a watched
+/// inode (any access mode). Mapped to `FimOp::Opened`.
+/// `struct file::f_inode` is the resolved target inode pointer
+/// (offset 168, validated via the existing `FILE_F_INODE_OFFSET`
+/// constant), so no dentry-chase is needed.
+///
+/// **Access-mode filter deliberately omitted at the BPF layer**:
+/// C5.2 chose to emit on every open of a watched inode rather
+/// than fast-skip read-only at the kernel side. The WATCHED_PATHS
+/// set is operator-curated (~100 paths in the V1.0 default
+/// `fim-paths.v1`) so the volume is bounded; userland C5.3 rules
+/// (NN-L-FIM-011..014 cloud-credentials-read family) classify
+/// by path-vs-access semantics that the BPF layer can't express
+/// anyway. The validated `crate::btf_offsets::FILE_F_FLAGS_OFFSET`
+/// constant remains checked in for future read/write-tier rules.
+#[lsm(hook = "file_open")]
+pub fn fim_file_open_observe(ctx: LsmContext) -> i32 {
+    unsafe { try_fim_file_open_observe(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_fim_file_open_observe(ctx: &LsmContext) -> i32 {
+    // Kernel signature: (file).
+    let file: *const c_void = ctx.arg(0);
+    if file.is_null() {
+        return 0;
+    }
+    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if let Some(key) = should_emit(inode) {
+        emit_drift(FIM_OP_OPENED, key);
+    }
+    0
+}

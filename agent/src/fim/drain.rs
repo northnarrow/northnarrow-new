@@ -218,6 +218,15 @@ impl DriftClassifier {
             // bucket can throttle them without losing High
             // tokens.
             FimOp::Modified | FimOp::Renamed => DriftSeverity::Medium,
+            // C5.2: FimOp::Opened fires on every open of a
+            // watched inode. Default to Medium so legitimate
+            // periodic reads (cloud-CLI tools, monitoring
+            // agents) can be rate-limited. C5.3 rules
+            // (NN-L-FIM-011..014) classify cred-path reads
+            // separately + the rule fires regardless of the
+            // bucket — Critical-tier path-rule severity comes
+            // from the rule, not this classifier.
+            FimOp::Opened => DriftSeverity::Medium,
         }
     }
 }
@@ -734,6 +743,13 @@ mod tests {
         assert_eq!(c.classify(FimOp::Linked, "/var/tmp/x"), DriftSeverity::Critical);
         assert_eq!(c.classify(FimOp::Linked, "/dev/shm/y"), DriftSeverity::Critical);
         assert_eq!(c.classify(FimOp::Linked, "/home/alice/.x"), DriftSeverity::Critical);
+        // C5.2: Opened defaults to Medium so legitimate
+        // periodic cred-CLI reads can be rate-limited; the
+        // C5.3 NN-L-FIM-011..014 rules upgrade to High at the
+        // rule layer when the path actually matches a cred
+        // file.
+        assert_eq!(c.classify(FimOp::Opened, "/root/.aws/credentials"), DriftSeverity::Medium);
+        assert_eq!(c.classify(FimOp::Opened, "/etc/passwd"), DriftSeverity::Medium);
     }
 
     // ── C4 test 3: RateLimiter never throttles Critical ─────────────
