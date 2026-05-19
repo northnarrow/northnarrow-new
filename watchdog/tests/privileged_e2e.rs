@@ -409,6 +409,24 @@ impl Drop for E2eFixture {
                 .status();
             let _ = a.wait();
         }
+        // Kill any watchdog-respawned agent we never tracked as
+        // a Child (W4 cycles): match on the install basename
+        // (`<bin>-e2etest-<ts>-<pid>`) and SIGQUIT all of them.
+        // Without this, a respawned agent can survive past the
+        // test's teardown, observe unrelated host activity, and
+        // transition POSTURE→COMBAT — which on a dev host can
+        // start applying iptables rules. pkill -QUIT is harmless
+        // when nothing matches.
+        if let Some(install) = &self.agent_install {
+            if let Some(basename) = install.path.file_name().and_then(|s| s.to_str()) {
+                let _ = Command::new("sudo")
+                    .arg("pkill")
+                    .arg("-QUIT")
+                    .arg("-f")
+                    .arg(basename)
+                    .status();
+            }
+        }
         // Purge bpffs so the next test starts clean.
         purge_bpffs_root();
         // InstalledBin drops handle /usr/local/bin/ cleanup.
@@ -438,12 +456,14 @@ fn dump_protected_pids() -> Vec<u32> {
     if !out.status.success() {
         return Vec::new();
     }
-    // bpftool -j output is `[{"key": [..], "value": [..]}, ...]`.
-    // Key is 4 little-endian bytes (a u32 PID); we extract the
-    // bytes by string-match rather than dragging in serde_json.
+    // bpftool -j output for a HashMap<u32, u8> is
+    //   [{"key":["0x15","0xc9","0x00","0x00"],"value":["0x01"]}, ...]
+    // The four key bytes are little-endian, quoted, and hex-formatted
+    // ("0x" prefix). We extract them by string-match rather than
+    // dragging in serde_json — the format is stable and trivially
+    // grepped.
     let body = String::from_utf8_lossy(&out.stdout);
     let mut pids = Vec::new();
-    // Crude parser: scan for `"key":[` followed by 4 numbers.
     let mut idx = 0;
     while let Some(start) = body[idx..].find(r#""key":["#) {
         let abs = idx + start + r#""key":["#.len();
@@ -451,7 +471,11 @@ fn dump_protected_pids() -> Vec<u32> {
             let inner = &body[abs..abs + end];
             let bytes: Vec<u8> = inner
                 .split(',')
-                .filter_map(|s| s.trim().parse::<u8>().ok())
+                .filter_map(|s| {
+                    let t = s.trim().trim_matches('"');
+                    let t = t.strip_prefix("0x").unwrap_or(t);
+                    u8::from_str_radix(t, 16).ok()
+                })
                 .collect();
             if bytes.len() == 4 {
                 let pid = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -473,18 +497,7 @@ fn dump_protected_pids() -> Vec<u32> {
 /// SIGKILL), asserts the PID disappears from PROTECTED_PIDS
 /// within 5 s.
 ///
-/// **Currently #[ignore]'d:** W8 bring-up surfaced a Phase-D
-/// follow-up — the agent's `EbpfLoader::map_pin_path` +
-/// `HashMap::pinned(...)` combo doesn't actually pin
-/// PROTECTED_PIDS by name to bpffs (only the LSM links/programs
-/// land in `/sys/fs/bpf/northnarrow/`). The watchdog's
-/// `ProtectedPidsHandle::open(bpffs_root)` therefore can't open
-/// the map by path, so layer-2 evict is unreachable in
-/// production. Fix is a one-line `ebpf.map_mut("PROTECTED_PIDS")
-/// .unwrap().pin(<bpffs_root>/PROTECTED_PIDS)` in the agent's
-/// post-load path. Tracked as PHASE_D_001.
 #[test]
-#[ignore = "blocked on PHASE_D_001 — agent doesn't pin PROTECTED_PIDS by name (see test doc)"]
 fn watchdog_evicts_agent_pid_on_pidfd_pollin() {
     let mut fx = E2eFixture::setup();
     let agent_pid = fx.spawn_agent();
@@ -529,15 +542,7 @@ fn watchdog_evicts_agent_pid_on_pidfd_pollin() {
 /// the agent through 3 kill cycles, observing 3 distinct PIDs.
 /// Verifies the W4 backoff state machine + reinsert path under
 /// real BPF conditions.
-///
-/// **Currently #[ignore]'d:** same root cause as Test 1
-/// (PHASE_D_001 — agent doesn't pin PROTECTED_PIDS by name).
-/// The respawn cycle's `reinsert_new_agent_pid` path opens the
-/// pinned map and inserts the new PID; without the pin it
-/// errors. Will unblock together with Test 1 once PHASE_D_001
-/// lands.
 #[test]
-#[ignore = "blocked on PHASE_D_001 — agent doesn't pin PROTECTED_PIDS by name (see test doc)"]
 fn watchdog_respawns_agent_3_cycles_with_backoff() {
     let mut fx = E2eFixture::setup();
     let pid0 = fx.spawn_agent();
@@ -597,14 +602,7 @@ fn watchdog_respawns_agent_3_cycles_with_backoff() {
 /// stuck-agent stand-in: bash's trap eats SIGINT, sleep keeps
 /// running, escalation fires after the short test-only
 /// hardkill_grace.
-///
-/// **Currently #[ignore]'d:** same root cause as Tests 1 & 2
-/// (PHASE_D_001 — agent doesn't pin PROTECTED_PIDS by name).
-/// `stuck_recovery`'s final step opens the pinned map to evict
-/// the stuck PID; without the pin it errors. Will unblock
-/// together with Tests 1 & 2 once PHASE_D_001 lands.
 #[test]
-#[ignore = "blocked on PHASE_D_001 — agent doesn't pin PROTECTED_PIDS by name (see test doc)"]
 fn stuck_recovery_kills_sigint_ignoring_subprocess_via_real_bpf() {
     use northnarrow_watchdog::stuck_recovery;
 
