@@ -166,6 +166,27 @@ pub struct ShutdownRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Tappa 8 commit A10 — signed production force-posture request
+/// (design §4 + §12.2). Carries the full [`SignedPayload`] (with
+/// `op = ForcePosture` and `extra = ForcePosture { target }`) plus
+/// a single signature — force-posture is 1-of-N per §3.3, unlike
+/// shutdown's 2-of-N. `Vec<KeyedSignature>` is reused for shape
+/// consistency with `ShutdownRequest`; the agent's quorum verify
+/// enforces `min_distinct=1` so a single signature is sufficient.
+///
+/// **Distinct from `DebugForcePosture`** (the existing
+/// `cfg(feature = "debug-trigger")` test variant): that path
+/// bypasses every authentication layer for integration testing,
+/// while this variant runs the full Tappa-8 verify path (nonce
+/// binding, timestamp skew, agent_id binding, signature verify,
+/// role check). Both variants stay; production callers use this
+/// one, test infrastructure keeps using the debug one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForcePostureRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
 /// Trigger payload for "issue me a fresh challenge nonce". Empty
 /// today; reserved as a struct so future fields (client version,
 /// requested key fingerprint) can be added without an AdminMessage
@@ -249,6 +270,14 @@ pub enum AdminMessage {
     /// superset [`AdminResult`] so future Tappa 8 wire variants
     /// can be added without bumping the wire schema.
     ShutdownResult(AdminResult),
+    /// Tappa 8 commit A10 — signed production force-posture
+    /// request (design §4 + §12.2). Triggers
+    /// [`AdminMessage::ForcePostureResult`] reply. Distinct from
+    /// the existing `cfg(debug-trigger)` `DebugForcePosture`
+    /// variant; both stay.
+    ForcePostureRequest(ForcePostureRequest),
+    /// Reply to [`AdminMessage::ForcePostureRequest`].
+    ForcePostureResult(AdminResult),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -683,7 +712,9 @@ mod tests {
                 | AdminMessage::UnlockResult(_)
                 | AdminMessage::StatusResponse(_)
                 | AdminMessage::ShutdownRequest(_)
-                | AdminMessage::ShutdownResult(_) => {}
+                | AdminMessage::ShutdownResult(_)
+                | AdminMessage::ForcePostureRequest(_)
+                | AdminMessage::ForcePostureResult(_) => {}
             }
         }
     }

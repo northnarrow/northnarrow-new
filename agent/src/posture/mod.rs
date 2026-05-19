@@ -352,6 +352,106 @@ impl PostureMachine {
             .map(|t| t.elapsed().as_secs())
     }
 
+    /// Tappa 8 A10 — production force-posture (design §12.2).
+    /// Capability-gated by [`UnlockToken`] in the same way as
+    /// [`Self::admin_release_combat_with_token`]; consumed at the
+    /// type-system level so only [`crate::anti_tamper::admin_auth::AdminAuth`]
+    /// (the sole minting site outside `cfg(test)`) can drive this
+    /// path. Allowed direction: any state → any state.
+    ///
+    /// Side effects per design §12.2:
+    /// - non-COMBAT → COMBAT fires `combat_entry_hook` (iptables
+    ///   engage — identical to a detector-driven entry).
+    /// - COMBAT → non-COMBAT fires `combat_release_hook` (iptables
+    ///   release — identical to an unlock).
+    /// - Same-direction (before == target) is a no-op: no log, no
+    ///   hooks, token drops out of scope.
+    /// - Lateral non-COMBAT transitions (e.g. Alerted → Engaged)
+    ///   log the transition but fire no hook.
+    ///
+    /// Records `Instant::now()` in `last_admin_action` on any
+    /// actual transition — surfaced via
+    /// [`Self::last_admin_action_secs_ago`] for `nn-admin status`.
+    ///
+    /// Returns the post-transition [`PostureState`] (or the unchanged
+    /// state when before == target). Never errors today — every
+    /// `target` is a valid PostureKind and the type-system gate on
+    /// `UnlockToken` is the only authorisation check.
+    pub fn admin_force_state_with_token(
+        &self,
+        token: UnlockToken,
+        target: PostureKind,
+    ) -> Result<PostureState, AdminReleaseError> {
+        let now = Instant::now();
+        let mut guard = self.inner.state.write();
+        let before = guard.kind();
+        let next = match target {
+            PostureKind::Observing => PostureState::Observing,
+            PostureKind::Alerted => PostureState::Alerted {
+                since: now,
+                last_trigger: now,
+            },
+            PostureKind::Engaged => PostureState::Engaged {
+                since: now,
+                last_trigger: now,
+            },
+            PostureKind::Combat => PostureState::Combat {
+                since: now,
+                locked: true,
+            },
+        };
+        *guard = next.clone();
+        drop(guard);
+
+        if before == target {
+            // No-op transition — no log, no hook. The capability
+            // check (the type-system gate on minting) has already
+            // done its work by the time we got here; the `token`
+            // binding falls out of scope on return. UnlockToken
+            // has no Drop impl so an explicit `drop()` would be a
+            // no-op (clippy::drop_non_drop).
+            let _ = token;
+            return Ok(next);
+        }
+
+        *self.inner.last_admin_action.lock() = Some(now);
+        self.log_transition(
+            before,
+            target,
+            None,
+            "admin token force-posture".into(),
+        );
+
+        // Side-effects per §12.2.
+        if before != PostureKind::Combat && target == PostureKind::Combat {
+            // Non-COMBAT → COMBAT: entry hook fires (iptables
+            // engage). The entry hook's signature is `Fn()`, not
+            // `Fn(UnlockToken)` (entry isn't gated by capability —
+            // detectors can fire it autonomously). The `token`
+            // binding falls out of scope on return.
+            if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
+                hook();
+            }
+            let _ = token;
+        } else if before == PostureKind::Combat && target != PostureKind::Combat {
+            // COMBAT → non-COMBAT: release hook consumes the token
+            // when present (identical to admin_release_combat_with_token).
+            // When no hook is configured, the token binding falls
+            // out of scope on return.
+            if let Some(hook) = self.inner.combat_release_hook.as_ref() {
+                hook(token);
+            } else {
+                let _ = token;
+            }
+        } else {
+            // Lateral non-COMBAT transition (e.g., Alerted →
+            // Engaged). No hook fires.
+            let _ = token;
+        }
+
+        Ok(next)
+    }
+
     /// Test-only hatch used by the `nn-admin debug --force-posture`
     /// integration scenario. Bypasses every trigger and decay rule
     /// to slam the state machine to `target`. Only compiled when

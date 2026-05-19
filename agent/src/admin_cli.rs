@@ -27,9 +27,10 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
+use common::posture_types::PostureKind;
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, ChallengeRequest, KeyedSignature,
-    ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
+    decode_frame, encode_frame, AdminMessage, AdminResult, ChallengeRequest, ForcePostureRequest,
+    KeyedSignature, ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
 };
 use common::wire::admin_signed_payload::{sign, SignedPayload};
 
@@ -46,6 +47,26 @@ pub enum UnlockOutcome {
     InvalidSignature,
     NoPendingChallenge,
     RateLimited { retry_after_secs: u32 },
+}
+
+/// Result of `nn-admin force-posture` (Tappa 8 A10, design §4 +
+/// §12.2). Mirrors [`ShutdownOutcome`] variant-for-variant — the
+/// underlying wire reply is the shared [`AdminResult`] enum, so
+/// the exit-code mapping is identical to shutdown's. Distinct
+/// type so the binary's exit-mapper can format
+/// force-posture-specific operator hints.
+#[derive(Debug)]
+pub enum ForcePostureOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
 }
 
 /// Result of `nn-admin shutdown` (Tappa 8 A9, design §5.1 + §10).
@@ -317,6 +338,101 @@ pub fn run_shutdown(
         AdminResult::UnknownOperation => ShutdownOutcome::UnknownOperation,
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             ShutdownOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    })
+}
+
+/// Tappa 8 A10 — full signed-production-force-posture CLI flow.
+///
+/// Wire path (design §4 + §12.2): challenge → sign → submit →
+/// parse. Single signature (1-of-N quorum per §3.3). Required
+/// admin.pub role: `force-posture` (parsed by A5's allowlist).
+///
+/// Allowed transitions: any → any (the agent's
+/// `admin_force_state_with_token` accepts every PostureKind). The
+/// design notes that this is **NOT** the preferred path out of
+/// COMBAT — use `nn-admin unlock` instead, which carries clearer
+/// audit semantics ("admin acknowledged COMBAT release") than a
+/// force-posture from COMBAT to anything.
+///
+/// Distinct from `nn-admin debug force-posture`, which is the
+/// integration-test path gated by the `debug-trigger` Cargo
+/// feature. Both subcommands stay; production uses this one.
+pub fn run_force_posture(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    target: PostureKind,
+) -> Result<ForcePostureOutcome> {
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr =
+        agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+            format!(
+                "reading agent_id at {} (nn-admin must run on the agent host \
+                 or have the file copied / SSH-forwarded — design §6.5)",
+                agent_id_path.display()
+            )
+        })?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected server reply to ChallengeRequest: {other:?}"),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let payload =
+        SignedPayload::new_force_posture(nonce, now, agent_id_arr, target);
+    let sig: [u8; 64] = sign(&payload, &signing)
+        .map_err(|e| anyhow!("signing force-posture payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::ForcePostureRequest(ForcePostureRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+
+    let result = match read_frame(&mut stream)? {
+        AdminMessage::ForcePostureResult(r) => r,
+        other => bail!(
+            "unexpected server reply to ForcePostureRequest: {other:?}"
+        ),
+    };
+
+    Ok(match result {
+        AdminResult::Success => ForcePostureOutcome::Success,
+        AdminResult::InvalidSignature => ForcePostureOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => ForcePostureOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            ForcePostureOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            ForcePostureOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => ForcePostureOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => ForcePostureOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => ForcePostureOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => ForcePostureOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            ForcePostureOutcome::ProtocolVersionUnsupported { server_version }
         }
     })
 }
