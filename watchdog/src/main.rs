@@ -32,10 +32,12 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
-    read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready, shutdown_was_authorised,
-    spawn_agent, wait_for_agent_death, wait_for_new_agent_pid, write_pidfile_atomic,
-    BackoffOutcome, Cli, RestartBackoff, PIDFD_OPEN_RETRY_DEADLINE,
+    evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry,
+    ping_agent_status, pidfd_open, read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready,
+    shutdown_was_authorised, spawn_agent, stuck_recovery, wait_for_agent_death,
+    wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, PingOutcome,
+    RestartBackoff, StatusPingTracker, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL,
+    STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
 };
 
 /// Path of the A8 shutdown-authorisation marker (Tappa 8 A7
@@ -122,6 +124,21 @@ async fn run(cli: Cli) -> Result<()> {
     let mut backoff = RestartBackoff::new();
     let mut agent_pidfd = unsafe { OwnedFd::from_raw_fd(agent_fd) };
 
+    // W5: spawn the parallel STATUS-ping task. It pings the
+    // agent's admin socket every STATUS_PING_INTERVAL (30s),
+    // tracks consecutive timeouts, and on two-in-a-row sends
+    // a Stuck signal via the channel. The main loop's select
+    // arm below picks it up and runs the recovery sequence.
+    //
+    // Channel capacity 4 is generous — at most one stuck signal
+    // per restart cycle, and the main loop drains before the
+    // ping task can send a second. Buffer of 4 covers any
+    // pathological burst without backpressure-blocking the
+    // ping task.
+    let (stuck_tx, mut stuck_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let ping_socket = cli.admin_socket.clone();
+    let ping_handle = tokio::spawn(run_ping_loop(ping_socket, stuck_tx));
+
     // W4 restart loop. Each iteration:
     //   1. Park on {SIGTERM, SIGINT, agent pidfd POLLIN}
     //   2. On pidfd POLLIN: layer-2 evict, check shutdown marker,
@@ -136,6 +153,32 @@ async fn run(cli: Cli) -> Result<()> {
             _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
             _ = sigterm.recv() => SelectOutcome::Signal("SIGTERM"),
             result = wait_for_agent_death(agent_pidfd) => SelectOutcome::AgentDied(result),
+            // W5 stuck-recovery arm: the parallel ping task has
+            // observed two consecutive STATUS-ping timeouts and
+            // decided the agent is wedged. Run the SIGINT →
+            // grace → evict + SIGKILL sequence; the subsequent
+            // pidfd POLLIN fires inside `stuck_recovery` (it
+            // opens its own fresh pidfd), then we fall through
+            // to the normal layer-2 evict + respawn path below.
+            // We synthesise an `AgentDied(Ok(()))` outcome so
+            // the existing match arm handles the rest.
+            _ = stuck_rx.recv() => {
+                warn!(
+                    target: "watchdog.stuck_recovery",
+                    agent_pid,
+                    "STATUS-ping stuck signal received from ping task — running recovery"
+                );
+                let recovery = stuck_recovery(agent_pid, &cli.bpffs_root, STUCK_RECOVERY_HARDKILL_GRACE).await;
+                if let Err(e) = recovery {
+                    warn!(
+                        target: "watchdog.stuck_recovery",
+                        error = %e,
+                        agent_pid,
+                        "stuck_recovery failed — falling through to restart logic anyway"
+                    );
+                }
+                SelectOutcome::AgentDied(Ok(()))
+            }
         };
 
         match select_outcome {
@@ -285,6 +328,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
 
+    // Abort the ping task so it doesn't outlive the main loop
+    // (cleaner shutdown for journald logs).
+    ping_handle.abort();
+
     info!(target: "watchdog", "watchdog stopped");
     Ok(())
 }
@@ -379,6 +426,69 @@ async fn sleep_or_signal(
         _ = tokio::time::sleep(delay) => None,
         _ = sigint.recv() => Some("SIGINT"),
         _ = sigterm.recv() => Some("SIGTERM"),
+    }
+}
+
+/// W5 STATUS-ping loop. Runs as a parallel tokio task spawned
+/// at boot; pings the agent's admin socket every
+/// `STATUS_PING_INTERVAL` (30 s), tracks consecutive timeouts
+/// via `StatusPingTracker`, and on `StuckDetected` (two-in-a-row)
+/// sends a single message on `stuck_tx` to wake the main loop's
+/// recovery arm.
+///
+/// On send failure (the main loop has exited and dropped the
+/// receiver), this loop exits cleanly — there's no point in
+/// continuing to ping when nobody is listening.
+///
+/// After signalling Stuck, the tracker is reset so the next
+/// respawned agent gets a fresh ping budget. If the new agent
+/// never comes up, the next cycle of timeouts will trigger
+/// another stuck signal — but in practice the W4 restart loop
+/// will hit its 5-in-60s ceiling first and break out, dropping
+/// the channel and stopping this task.
+async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender<()>) {
+    let mut tick = tokio::time::interval(STATUS_PING_INTERVAL);
+    // `interval()` fires immediately on first tick — skip that
+    // so the watchdog isn't immediately pinging the agent
+    // mid-boot (before the agent's admin socket is even bound).
+    tick.tick().await;
+
+    let mut tracker = StatusPingTracker::new();
+    loop {
+        tick.tick().await;
+        let outcome = match ping_agent_status(&socket_path, STATUS_PING_TIMEOUT).await {
+            Ok(()) => tracker.record_ok(),
+            Err(e) => {
+                warn!(
+                    target: "watchdog.status_ping",
+                    error = %e,
+                    socket = %socket_path.display(),
+                    consecutive = tracker.consecutive_timeouts(),
+                    "STATUS ping failed"
+                );
+                tracker.record_timeout()
+            }
+        };
+        match outcome {
+            PingOutcome::Ok | PingOutcome::TimeoutOnce => {}
+            PingOutcome::StuckDetected => {
+                warn!(
+                    target: "watchdog.status_ping",
+                    consecutive = tracker.consecutive_timeouts(),
+                    "STATUS ping threshold tripped — signalling main loop for stuck recovery"
+                );
+                tracker.reset();
+                if stuck_tx.send(()).await.is_err() {
+                    // Main loop has dropped the receiver. Exit
+                    // cleanly — no listener.
+                    info!(
+                        target: "watchdog.status_ping",
+                        "main loop dropped stuck channel; ping task exiting"
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
 
