@@ -187,6 +187,36 @@ pub struct ForcePostureRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Tappa 8 commit A13 — signed key-rotation **add** request
+/// (design §7.2). Carries the full [`SignedPayload`] with
+/// `op = RotateKeysAdd` and `extra = RotateKeysAdd { new_pubkey,
+/// roles }`, plus a 2-of-N quorum (≥1 carrying
+/// [`common::wire::admin_signed_payload::Role::RotateKeys`] per
+/// §3.3). On verify, the agent atomically appends a new line to
+/// `/etc/northnarrow/admin.pub` (tmpfile + fsync + `rename(2)`)
+/// and reloads its in-memory key set so the next challenge
+/// already sees the new key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateKeysAddRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 8 commit A13 — signed key-rotation **revoke** request
+/// (design §7.2 + §7.3). Same quorum requirements as
+/// [`RotateKeysAddRequest`]; the agent removes the line whose
+/// pubkey fingerprint matches the carried `fingerprint` from
+/// `admin.pub` (atomic rewrite) and reloads. Revoking the last
+/// remaining key is rejected at dispatch with
+/// [`AdminResult::InvalidSignature`] — losing the last key would
+/// soft-brick the agent (no one can unlock or shutdown
+/// thereafter), so the operator must `add` a replacement first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotateKeysRevokeRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
 /// Trigger payload for "issue me a fresh challenge nonce". Empty
 /// today; reserved as a struct so future fields (client version,
 /// requested key fingerprint) can be added without an AdminMessage
@@ -278,6 +308,16 @@ pub enum AdminMessage {
     ForcePostureRequest(ForcePostureRequest),
     /// Reply to [`AdminMessage::ForcePostureRequest`].
     ForcePostureResult(AdminResult),
+    /// Tappa 8 commit A13 — signed key-rotation add request.
+    /// Triggers [`AdminMessage::RotateKeysAddResult`].
+    RotateKeysAddRequest(RotateKeysAddRequest),
+    /// Reply to [`AdminMessage::RotateKeysAddRequest`].
+    RotateKeysAddResult(AdminResult),
+    /// Tappa 8 commit A13 — signed key-rotation revoke request.
+    /// Triggers [`AdminMessage::RotateKeysRevokeResult`].
+    RotateKeysRevokeRequest(RotateKeysRevokeRequest),
+    /// Reply to [`AdminMessage::RotateKeysRevokeRequest`].
+    RotateKeysRevokeResult(AdminResult),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -714,7 +754,11 @@ mod tests {
                 | AdminMessage::ShutdownRequest(_)
                 | AdminMessage::ShutdownResult(_)
                 | AdminMessage::ForcePostureRequest(_)
-                | AdminMessage::ForcePostureResult(_) => {}
+                | AdminMessage::ForcePostureResult(_)
+                | AdminMessage::RotateKeysAddRequest(_)
+                | AdminMessage::RotateKeysAddResult(_)
+                | AdminMessage::RotateKeysRevokeRequest(_)
+                | AdminMessage::RotateKeysRevokeResult(_) => {}
             }
         }
     }
@@ -724,6 +768,51 @@ mod tests {
     fn roundtrip_debug_force_posture() {
         roundtrip(AdminMessage::DebugForcePosture(DebugForcePosture::Combat));
         roundtrip(AdminMessage::DebugForcePostureAck);
+    }
+
+    // ── A13: RotateKeys{Add,Revoke}Request wire round-trip ──────────
+
+    /// A13 wire test #1: encoding a `RotateKeysAddRequest` and
+    /// decoding it back yields the exact same struct. Anchors the
+    /// CBOR / postcard wire shape against accidental field
+    /// reordering (which would silently break signature verify
+    /// because the payload pre-image is re-serialised before
+    /// hashing).
+    #[test]
+    fn roundtrip_rotate_keys_add_request() {
+        use crate::wire::admin_signed_payload::{Role, SignedPayload};
+        let payload =
+            SignedPayload::new_rotate_keys_add([0x11; 32], 1_700_000_000, [0x22; 16], [0x33; 32], vec![Role::Unlock]);
+        roundtrip(AdminMessage::RotateKeysAddRequest(RotateKeysAddRequest {
+            payload,
+            signatures: vec![
+                KeyedSignature { signature: [0x55; 64] },
+                KeyedSignature { signature: [0x77; 64] },
+            ],
+        }));
+        roundtrip(AdminMessage::RotateKeysAddResult(AdminResult::Success));
+    }
+
+    /// A13 wire test #2: same for `RotateKeysRevokeRequest`.
+    #[test]
+    fn roundtrip_rotate_keys_revoke_request() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_rotate_keys_revoke(
+            [0x88; 32],
+            1_700_000_000,
+            [0x99; 16],
+            [0xAA; 4],
+        );
+        roundtrip(AdminMessage::RotateKeysRevokeRequest(
+            RotateKeysRevokeRequest {
+                payload,
+                signatures: vec![
+                    KeyedSignature { signature: [0xCC; 64] },
+                    KeyedSignature { signature: [0xEE; 64] },
+                ],
+            },
+        ));
+        roundtrip(AdminMessage::RotateKeysRevokeResult(AdminResult::Success));
     }
 
     // ── A1: VersionedAdminMessage envelope (Tappa 8 design §6.2) ────

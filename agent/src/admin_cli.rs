@@ -467,6 +467,217 @@ pub fn run_verify_keys(path: &Path) -> Result<VerifyKeysOutcome> {
     Ok(VerifyKeysOutcome { fingerprints })
 }
 
+// ── Tappa 8 A13 — rotate-keys add / revoke ──────────────────────────
+
+/// Outcome of `nn-admin rotate-keys {add,revoke}`. Mirrors
+/// [`ShutdownOutcome`] (same wire surface — 2-of-N quorum,
+/// `Role::RotateKeys` requirement); kept as a separate enum so
+/// the binary can render distinct human messages.
+#[derive(Debug)]
+pub enum RotateKeysOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
+}
+
+/// `nn-admin rotate-keys add` — submit a 2-of-N quorum-signed
+/// request to install `new_pubkey` (with the given role
+/// allowlist) into the agent's `admin.pub`. The agent atomically
+/// rewrites the file + reloads its in-memory key set so the next
+/// challenge already sees the addition (design §7.2).
+///
+/// Two keys are required — distinct fingerprints, both carrying
+/// `Role::RotateKeys`. Same wire flow as `run_shutdown`: read
+/// keys, get nonce, build SignedPayload, sign with both,
+/// transmit.
+pub fn run_rotate_keys_add(
+    socket: &Path,
+    key_path: &Path,
+    cosign_key_path: &Path,
+    agent_id_path: &Path,
+    new_pubkey_hex: &str,
+    roles: &[common::wire::admin_signed_payload::Role],
+) -> Result<RotateKeysOutcome> {
+    let new_pubkey_bytes = parse_pubkey_hex(new_pubkey_hex)?;
+
+    let signing_a = read_priv_key(key_path)?;
+    let signing_b = read_priv_key(cosign_key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+        format!("reading agent_id at {}", agent_id_path.display())
+    })?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let payload = SignedPayload::new_rotate_keys_add(
+        nonce,
+        now,
+        agent_id_arr,
+        new_pubkey_bytes,
+        roles.to_vec(),
+    );
+    let sig_a: [u8; 64] =
+        sign(&payload, &signing_a).map_err(|e| anyhow!("signing payload with primary key: {e}"))?;
+    let sig_b: [u8; 64] =
+        sign(&payload, &signing_b).map_err(|e| anyhow!("signing payload with cosign key: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::RotateKeysAddRequest(
+            common::wire::admin_protocol::RotateKeysAddRequest {
+                payload,
+                signatures: vec![
+                    KeyedSignature { signature: sig_a },
+                    KeyedSignature { signature: sig_b },
+                ],
+            },
+        ),
+    )?;
+
+    let result = match read_frame(&mut stream)? {
+        AdminMessage::RotateKeysAddResult(r) => r,
+        other => bail!("unexpected reply to RotateKeysAddRequest: {other:?}"),
+    };
+    Ok(map_admin_result_to_rotate(result))
+}
+
+/// `nn-admin rotate-keys revoke` — submit a 2-of-N quorum-signed
+/// request to remove the line whose pubkey fingerprint matches
+/// `fingerprint_hex` (8 hex chars / 4 bytes). The agent refuses
+/// to revoke the last key — operators must add a replacement
+/// first (design §7.2).
+pub fn run_rotate_keys_revoke(
+    socket: &Path,
+    key_path: &Path,
+    cosign_key_path: &Path,
+    agent_id_path: &Path,
+    fingerprint_hex: &str,
+) -> Result<RotateKeysOutcome> {
+    let target_fp = parse_fingerprint_hex(fingerprint_hex)?;
+    let signing_a = read_priv_key(key_path)?;
+    let signing_b = read_priv_key(cosign_key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+        format!("reading agent_id at {}", agent_id_path.display())
+    })?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let payload =
+        SignedPayload::new_rotate_keys_revoke(nonce, now, agent_id_arr, target_fp);
+    let sig_a: [u8; 64] =
+        sign(&payload, &signing_a).map_err(|e| anyhow!("signing payload with primary key: {e}"))?;
+    let sig_b: [u8; 64] =
+        sign(&payload, &signing_b).map_err(|e| anyhow!("signing payload with cosign key: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::RotateKeysRevokeRequest(
+            common::wire::admin_protocol::RotateKeysRevokeRequest {
+                payload,
+                signatures: vec![
+                    KeyedSignature { signature: sig_a },
+                    KeyedSignature { signature: sig_b },
+                ],
+            },
+        ),
+    )?;
+
+    let result = match read_frame(&mut stream)? {
+        AdminMessage::RotateKeysRevokeResult(r) => r,
+        other => bail!("unexpected reply to RotateKeysRevokeRequest: {other:?}"),
+    };
+    Ok(map_admin_result_to_rotate(result))
+}
+
+fn parse_pubkey_hex(s: &str) -> Result<[u8; 32]> {
+    let trimmed = s.trim();
+    if trimmed.len() != 64 {
+        bail!("--new-pubkey must be 64 hex chars (got {})", trimmed.len());
+    }
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| anyhow!("--new-pubkey is not valid hex: {e}"))?;
+    let arr: [u8; 32] = bytes.try_into().expect("hex pre-validated to 32 bytes");
+    // Reject all-zero pubkeys (not a valid Ed25519 point) early so
+    // the agent doesn't have to.
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| anyhow!("--new-pubkey is not a valid Ed25519 pubkey: {e}"))?;
+    Ok(arr)
+}
+
+fn parse_fingerprint_hex(s: &str) -> Result<[u8; 4]> {
+    let trimmed = s.trim();
+    if trimmed.len() != 8 {
+        bail!(
+            "--fingerprint must be 8 hex chars (got {}); the value matches \
+             `nn-admin verify-keys` output",
+            trimmed.len()
+        );
+    }
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| anyhow!("--fingerprint is not valid hex: {e}"))?;
+    let arr: [u8; 4] = bytes.try_into().expect("hex pre-validated to 4 bytes");
+    Ok(arr)
+}
+
+fn map_admin_result_to_rotate(r: AdminResult) -> RotateKeysOutcome {
+    match r {
+        AdminResult::Success => RotateKeysOutcome::Success,
+        AdminResult::InvalidSignature => RotateKeysOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => RotateKeysOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            RotateKeysOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            RotateKeysOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => RotateKeysOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => RotateKeysOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => RotateKeysOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => RotateKeysOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            RotateKeysOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
 // ── Tappa 8 A12 — audit read / audit verify ─────────────────────────
 
 /// Outcome of `nn-admin audit verify`. Mapped to exit codes in

@@ -34,8 +34,9 @@ use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
     load_audit_pubkey, run_audit_read, run_audit_verify, run_force_posture, run_init,
-    run_shutdown, run_status, run_unlock, run_verify_keys, AuditVerifyOutcome,
-    ForcePostureOutcome, ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
+    run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown, run_status, run_unlock,
+    run_verify_keys, AuditVerifyOutcome, ForcePostureOutcome, RotateKeysOutcome,
+    ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -189,6 +190,25 @@ enum Cmd {
         socket: PathBuf,
     },
 
+    /// Tappa 8 A13 — atomically add or revoke an admin key in
+    /// `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both
+    /// `add` and `revoke` need a 2-of-N quorum signed by two
+    /// distinct admin keys carrying the `rotate-keys` role. On
+    /// success the agent rewrites the file via tmpfile +
+    /// `rename(2)` and reloads its in-memory key set so the next
+    /// challenge already sees the change.
+    ///
+    /// Operator workflow per design §7.2:
+    ///   1. `nn-admin init --priv-out new.key --bootstrap-only`
+    ///      on a trusted host.
+    ///   2. Transfer the **public** key (out-of-band).
+    ///   3. `nn-admin rotate-keys add --new-pubkey <hex>
+    ///      --new-roles unlock,audit-read --key … --cosign-key …`
+    RotateKeys {
+        #[command(subcommand)]
+        sub: RotateKeysCmd,
+    },
+
     /// Tappa 8 A12 — read or verify the tamper-evident audit log
     /// (design §9). Two subcommands: `read` streams entries from
     /// the on-disk JSONL log, `verify` runs the SHA-256 hash
@@ -211,6 +231,51 @@ enum Cmd {
     Debug {
         #[command(subcommand)]
         sub: DebugCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RotateKeysCmd {
+    /// Install a new admin key. Requires --new-pubkey (64 hex
+    /// chars) and --new-roles (CSV of role keywords: unlock,
+    /// shutdown, force-posture, rotate-keys, audit-read, all).
+    Add {
+        /// 64-hex-char Ed25519 verifying key to install.
+        #[arg(long = "new-pubkey")]
+        new_pubkey: String,
+        /// Comma-separated role allowlist for the new key. At
+        /// least one role required. Maps to design §3.2 roles.
+        #[arg(long = "new-roles", default_value = "unlock,audit-read")]
+        new_roles: String,
+        /// Path to the operator's primary admin private key
+        /// (must carry the `rotate-keys` role).
+        #[arg(long)]
+        key: PathBuf,
+        /// Path to a SECOND, DISTINCT admin private key
+        /// (cosigner; also `rotate-keys` role).
+        #[arg(long = "cosign-key")]
+        cosign_key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Remove the admin.pub line whose pubkey 8-hex-char
+    /// fingerprint matches `--fingerprint` (the same value
+    /// `nn-admin verify-keys` prints). Refuses to revoke the
+    /// last remaining key.
+    Revoke {
+        /// 8-hex-char fingerprint of the key to revoke.
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "cosign-key")]
+        cosign_key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 }
 
@@ -391,6 +456,61 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::RotateKeys {
+            sub:
+                RotateKeysCmd::Add {
+                    new_pubkey,
+                    new_roles,
+                    key,
+                    cosign_key,
+                    agent_id_file,
+                    socket,
+                },
+        } => {
+            let roles = match parse_roles_csv(&new_roles) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("rotate-keys add: {e:#}");
+                    return ExitCode::from(1);
+                }
+            };
+            match run_rotate_keys_add(
+                &socket,
+                &key,
+                &cosign_key,
+                &agent_id_file,
+                &new_pubkey,
+                &roles,
+            ) {
+                Ok(out) => exit_from_rotate_keys(out, "rotate-keys add"),
+                Err(e) => {
+                    eprintln!("rotate-keys add: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
+        Cmd::RotateKeys {
+            sub:
+                RotateKeysCmd::Revoke {
+                    fingerprint,
+                    key,
+                    cosign_key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_rotate_keys_revoke(
+            &socket,
+            &key,
+            &cosign_key,
+            &agent_id_file,
+            &fingerprint,
+        ) {
+            Ok(out) => exit_from_rotate_keys(out, "rotate-keys revoke"),
+            Err(e) => {
+                eprintln!("rotate-keys revoke: {e:#}");
+                ExitCode::from(5)
+            }
+        },
         Cmd::Audit {
             sub: AuditCmd::Read { path, since, json },
         } => match run_audit_read(&path, since.as_deref(), json) {
@@ -864,5 +984,104 @@ fn colorize(s: &str, sgr: &str, tty: bool) -> String {
         format!("\x1b[{sgr}m{s}\x1b[0m")
     } else {
         s.to_string()
+    }
+}
+
+/// Parse a CSV role list (`unlock,audit-read`, …) into the wire
+/// [`common::wire::admin_signed_payload::Role`] enum. Empty input
+/// is rejected — A13's `add` flow requires at least one role.
+fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<common::wire::admin_signed_payload::Role>> {
+    use common::wire::admin_signed_payload::Role;
+    use anyhow::{anyhow, bail};
+    let mut out = Vec::new();
+    for raw in s.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let role = match token {
+            "unlock" => Role::Unlock,
+            "shutdown" => Role::Shutdown,
+            "force-posture" => Role::ForcePosture,
+            "rotate-keys" => Role::RotateKeys,
+            "audit-read" => Role::AuditRead,
+            "all" => Role::All,
+            other => {
+                return Err(anyhow!(
+                    "unknown role keyword `{other}`; valid: unlock, shutdown, \
+                     force-posture, rotate-keys, audit-read, all"
+                ));
+            }
+        };
+        out.push(role);
+    }
+    if out.is_empty() {
+        bail!("--new-roles must list at least one role keyword");
+    }
+    Ok(out)
+}
+
+/// Map a [`RotateKeysOutcome`] to a stable exit code (mirrors
+/// `exit_from_shutdown`'s contract: Success=0, transport/
+/// timestamp/agentid/unknown-op all under exit 5, distinct
+/// security failures get 2/4/6/7 per design §5.3).
+fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        RotateKeysOutcome::Success => {
+            println!("{}", colorize(&format!("{op_label}: success"), "32", tty));
+            ExitCode::SUCCESS
+        }
+        RotateKeysOutcome::InvalidSignature => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!("{op_label}: invalid signature, key-already-present, key-not-found, or last-key guard"),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(2)
+        }
+        RotateKeysOutcome::NoPendingChallenge => {
+            eprintln!("{op_label}: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        RotateKeysOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("{op_label}: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        RotateKeysOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("{op_label}: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        RotateKeysOutcome::RoleDenied => {
+            eprintln!(
+                "{op_label}: role denied (one of the submitted keys lacks the \
+                 `rotate-keys` role in admin.pub)"
+            );
+            ExitCode::from(7)
+        }
+        RotateKeysOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "{op_label}: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s); NTP-sync and retry"
+            );
+            ExitCode::from(5)
+        }
+        RotateKeysOutcome::AgentIdMismatch => {
+            eprintln!("{op_label}: agent_id mismatch (--agent-id-file points at the wrong agent)");
+            ExitCode::from(5)
+        }
+        RotateKeysOutcome::UnknownOperation => {
+            eprintln!("{op_label}: server rejected operation (op_extra mismatch or no config path)");
+            ExitCode::from(5)
+        }
+        RotateKeysOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("{op_label}: server speaks protocol v{server_version}; this nn-admin is newer");
+            ExitCode::from(5)
+        }
     }
 }
