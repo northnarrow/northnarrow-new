@@ -1,0 +1,25 @@
+[package]
+name = "northnarrow-antitamper-bpf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared aya-handling primitives for the NorthNarrow XDR anti-tamper layer (bpffs pin paths, LSM hook attach/reuse, PROTECTED_PIDS handle). Consumed by `northnarrow-agent` and the forthcoming watchdog binary so both share one canonical pin contract."
+
+[lib]
+name = "northnarrow_antitamper_bpf"
+path = "src/lib.rs"
+
+[dependencies]
+# aya is the load-bearing dep. The whole reason this crate exists is
+# so the watchdog binary can consume it WITHOUT pulling the rest of
+# `agent` (tokio, ADE, posture machine, RAG, …).
+aya = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

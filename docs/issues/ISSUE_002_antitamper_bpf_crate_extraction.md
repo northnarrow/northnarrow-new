@@ -1,5 +1,72 @@
 # ISSUE_002 — Extract anti-tamper aya code into a `northnarrow-antitamper-bpf` workspace crate
 
+**Status:** ✅ **RESOLVED 2026-05-19** — extraction shipped on
+branch `issue-002-antitamper-bpf-crate-extraction`. Watchdog
+implementation (per `docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md`
+§2.2 / commit W1) is unblocked: it can `northnarrow-antitamper-bpf
+= { workspace = true }` and pick up `attach_lsm`, `prepare_pin_root`,
+`fresh_attach_and_pin`, `read_proc_comm`, etc. without dragging
+the agent's tokio/ADE/posture/RAG dependency tree.
+
+## Resolution summary
+
+- **What moved:** `DEFAULT_BPFFS_ROOT`, `prepare_pin_root`,
+  `is_bpffs` (private), `read_self_comm`, `read_proc_comm`,
+  `lsm_pin_paths`, `purge_stale_pin`, `fresh_attach_and_pin`,
+  `attach_transient`, `attach_lsm` → `antitamper-bpf/src/lib.rs`.
+  Their 4 unit tests moved with them; 3 supplementary tests added
+  (`lsm_pin_paths_uses_hook_name_for_both_pins`,
+  `purge_stale_pin_swallows_not_found`,
+  `purge_stale_pin_removes_regular_file`).
+- **What stayed in `agent/src/anti_tamper/mod.rs`:** the agent
+  eBPF-object-specific constants (`PROTECTED_PIDS_MAP`,
+  `TASK_KILL_PROGRAM`, `PTRACE_PROGRAM`, hook names), the
+  `attach()` orchestrator (calls into the extracted helpers with
+  the agent-specific names), `register_protected_pids`, and
+  `evict_stale_pids`. These all use the agent's `Ebpf` instance
+  via `&mut` and know which programs / maps the agent loads —
+  they belong with the agent.
+- **Public-API stability:** `agent/src/anti_tamper/mod.rs` adds a
+  `pub use antitamper_bpf::{…}` block that re-exports every
+  extracted name. Existing consumers
+  (`crate::anti_tamper::attach_lsm`,
+  `crate::anti_tamper::prepare_pin_root`, etc.) compile
+  byte-identically — sensors/multiplexer.rs, filesystem.rs,
+  main.rs all unchanged.
+- **Deviation from §5 acceptance criterion** "agent/Cargo.toml no
+  longer lists `aya` as a direct dep": NOT met, intentionally.
+  `agent/src/sensors/multiplexer.rs` and `agent/src/sensors/exec.rs`
+  use aya directly (the sensor multiplexer is the agent's
+  primary aya consumer). Per the user task brief override
+  ("sensors stay"), sensors keep their direct aya usage; agent
+  Cargo.toml therefore keeps `aya = { workspace = true }`. The
+  ISSUE_002 §5 criterion was written before the refactor scope
+  was bounded to "anti-tamper code only"; this resolution
+  notes the deviation and treats it as the correct call.
+- **Watchdog enabler property held:** the watchdog binary will
+  depend on `antitamper-bpf` (which pulls aya + libc + tracing +
+  anyhow — total ~6 transitive deps) and NOT on `agent` (which
+  would pull tokio, candle, tantivy, ade, posture, decision,
+  rag, …). The dependency-light watchdog binary footprint
+  ISSUE_002 was about is achieved.
+
+## Live verification
+
+- **Pre-extraction baseline:** 432 agent lib + 61 common lib + 4
+  integration = 497 tests.
+- **Post-extraction:** 428 agent lib (432 - 4 moved) + 7
+  antitamper-bpf lib (4 moved + 3 new) + 61 common lib + 4
+  integration = 500 tests. Net **+3 tests, zero regressions**.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo build --release --workspace`: clean.
+- No production code path's behaviour changed (the extracted
+  functions are byte-identical to their pre-extraction bodies;
+  only the home crate moved).
+
+---
+
+## Historical context (kept for posterity)
+
 **Status:** OPEN — deferred refactor, blocking gate for Watchdog
 implementation start.
 **Filed:** 2026-05-19.
