@@ -19,4 +19,5 @@ pub mod posture;
 pub mod rag;
 pub mod response;
 pub mod sensors;
+pub mod shutdown_marker;
 pub mod xai;

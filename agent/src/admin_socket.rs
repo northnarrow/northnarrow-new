@@ -26,13 +26,16 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, Challenge, StatusResponse, UnlockResult,
-    MAX_FRAME_BODY,
+    decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, ShutdownRequest,
+    StatusResponse, UnlockResult, MAX_FRAME_BODY,
 };
+use common::wire::admin_signed_payload::{OperationCode, Role};
+use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::posture::{AdminReleaseError, PostureMachine};
+use crate::shutdown_marker::{self, ShutdownMarker, DEFAULT_MARKER_PATH};
 
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
@@ -47,6 +50,30 @@ pub async fn serve(
     auth: Arc<AdminAuth>,
     posture: Arc<PostureMachine>,
     isolator: Arc<NetworkIsolator>,
+) -> Result<()> {
+    // The shutdown-marker path is fixed per design §10.3 in
+    // production. `serve_with_marker_path` lets tests substitute
+    // a tempdir path; production serve() pins the canonical one.
+    serve_with_marker_path(
+        socket_path,
+        auth,
+        posture,
+        isolator,
+        PathBuf::from(DEFAULT_MARKER_PATH),
+    )
+    .await
+}
+
+/// Test-injectable variant of [`serve`] that lets the caller
+/// substitute the shutdown-marker file path (so unit tests can
+/// land the marker in a tempdir instead of `/run/northnarrow/`,
+/// which requires root and is process-global).
+pub async fn serve_with_marker_path(
+    socket_path: PathBuf,
+    auth: Arc<AdminAuth>,
+    posture: Arc<PostureMachine>,
+    isolator: Arc<NetworkIsolator>,
+    marker_path: PathBuf,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -78,8 +105,11 @@ pub async fn serve(
         let auth = Arc::clone(&auth);
         let posture = Arc::clone(&posture);
         let isolator = Arc::clone(&isolator);
+        let marker_path = marker_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &auth, &posture, &isolator).await {
+            if let Err(e) =
+                handle_connection(stream, &auth, &posture, &isolator, &marker_path).await
+            {
                 warn!(error = ?e, "admin connection handler errored");
             }
         });
@@ -105,15 +135,27 @@ async fn handle_connection(
     auth: &AdminAuth,
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
+    marker_path: &Path,
 ) -> Result<()> {
     loop {
         let msg = match read_frame(&mut stream).await? {
             Some(m) => m,
             None => return Ok(()),
         };
-        let reply = dispatch(msg, auth, posture, isolator);
+        let reply = dispatch(msg, auth, posture, isolator, marker_path);
         write_frame(&mut stream, &reply).await?;
     }
+}
+
+/// Read the current wall-clock as UNIX seconds for the
+/// `verify_signed_payload_quorum` skew check. Production-only
+/// helper; tests can call the verify path directly with an
+/// injected `server_now_unix_secs` value.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
@@ -124,6 +166,7 @@ fn dispatch(
     auth: &AdminAuth,
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
+    marker_path: &Path,
 ) -> AdminMessage {
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
@@ -191,6 +234,23 @@ fn dispatch(
                 // A6, and A7's AdminResult will carry the proper
                 // QuorumNotMet { required, provided } variant.
                 Err(AdminAuthError::QuorumNotMet { .. }) => UnlockResult::InvalidSignature,
+                // Tappa 8 A7 introduces additional AdminAuthError
+                // variants used exclusively by
+                // `verify_signed_payload_quorum` (the SignedPayload
+                // path consumed by `ShutdownRequest`, not by
+                // legacy `Unlock`). These arms are exhaustiveness-
+                // only — the legacy `verify_unlock` →
+                // `verify_with_role` path can never produce them.
+                // Mapped to `UnlockResult::InvalidSignature`
+                // because the legacy wire surface has no
+                // dedicated variant; A7's `AdminResult` (consumed
+                // by `ShutdownRequest`) is the proper home for the
+                // distinct semantics.
+                Err(AdminAuthError::TimestampSkew { .. })
+                | Err(AdminAuthError::AgentIdMismatch)
+                | Err(AdminAuthError::NonceMismatch)
+                | Err(AdminAuthError::UnknownOperation { .. })
+                | Err(AdminAuthError::PayloadVerify(_)) => UnlockResult::InvalidSignature,
             };
             AdminMessage::UnlockResult(result)
         }
@@ -201,12 +261,17 @@ fn dispatch(
             last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
         }),
 
+        AdminMessage::ShutdownRequest(req) => {
+            AdminMessage::ShutdownResult(dispatch_shutdown(req, auth, marker_path))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
         AdminMessage::Challenge(_)
         | AdminMessage::UnlockResult(_)
-        | AdminMessage::StatusResponse(_) => {
+        | AdminMessage::StatusResponse(_)
+        | AdminMessage::ShutdownResult(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -237,6 +302,129 @@ fn dispatch(
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
     }
+}
+
+/// Handle one [`ShutdownRequest`] (Tappa 8 A7, design §10.3).
+/// On verify success, atomically write the shutdown-authorisation
+/// marker (so the watchdog will stand down when it observes the
+/// agent's pidfd POLLIN — design §10.4) and return
+/// [`AdminResult::Success`]. On verify failure, surface the
+/// corresponding [`AdminResult`] variant; the marker is NOT
+/// written, so the watchdog will respawn the agent normally if
+/// the dispatcher later exits for any reason.
+///
+/// Note: this commit (A7) intentionally does NOT trigger the
+/// agent's graceful exit. The dispatcher writes the marker and
+/// replies; the actual `std::process::exit(0)` is part of A8's
+/// integration story (which wires a shutdown channel from the
+/// dispatcher → main.rs → the agent's tokio runtime). For now,
+/// the cross-component contract is "marker on disk = the agent
+/// authorised this exit"; production E2E will be exercised once
+/// A8 lands the main-loop integration.
+fn dispatch_shutdown(
+    req: ShutdownRequest,
+    auth: &AdminAuth,
+    marker_path: &Path,
+) -> AdminResult {
+    // Per §10.3 step 1: quorum verify (2-of-N including ≥1
+    // Role::Shutdown). The integrated verify path
+    // (verify_signed_payload_quorum) chains nonce-binding +
+    // op-tag check + agent_id check + ±60s skew check + per-sig
+    // verify_strict + distinct-key tally + role check, returning
+    // the precise error so we can map to the wire variant.
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let verify_outcome = auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        2,
+        &[Role::Shutdown],
+        OperationCode::Shutdown,
+        server_now,
+    );
+
+    let _token = match verify_outcome {
+        Ok(token) => token,
+        Err(AdminAuthError::NoPendingChallenge) => return AdminResult::NoPendingChallenge,
+        Err(AdminAuthError::NonceMismatch) => return AdminResult::InvalidSignature,
+        Err(AdminAuthError::UnknownOperation { .. }) => return AdminResult::UnknownOperation,
+        Err(AdminAuthError::AgentIdMismatch) => return AdminResult::AgentIdMismatch,
+        Err(AdminAuthError::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        }) => {
+            return AdminResult::TimestampSkew {
+                server_ts,
+                max_skew_secs,
+            };
+        }
+        Err(AdminAuthError::InvalidSignature) => return AdminResult::InvalidSignature,
+        Err(AdminAuthError::QuorumNotMet { required, provided }) => {
+            return AdminResult::QuorumNotMet { required, provided };
+        }
+        Err(AdminAuthError::RoleDenied { .. }) => return AdminResult::RoleDenied,
+        Err(AdminAuthError::RateLimited { retry_after_secs }) => {
+            return AdminResult::RateLimited { retry_after_secs };
+        }
+        Err(AdminAuthError::PayloadVerify(e)) => {
+            warn!(error = ?e, "shutdown payload verify failed at common layer");
+            return AdminResult::InvalidSignature;
+        }
+    };
+
+    // Per §10.3 step 2: build the marker. entry_hash is the
+    // SHA-256 over signing_digest(payload) — a stable opaque
+    // token until A11's audit hash chain replaces it with the
+    // actual audit-log entry hash. grace_deadline = now + grace.
+    let grace_secs = match &req.payload.extra {
+        common::wire::admin_signed_payload::OperationExtra::Shutdown(s) => s.grace_secs,
+        // Other extras can't reach here — verify_signed_payload_quorum
+        // already enforced expected_op = Shutdown, which implies the
+        // extra variant via SignedPayload's op/extra invariant.
+        // Belt-and-suspenders default keeps the match exhaustive.
+        _ => 30,
+    };
+    let grace_deadline_unix_ts = server_now.saturating_add(u64::from(grace_secs));
+
+    let digest = match common::wire::admin_signed_payload::signing_digest(&req.payload) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = ?e, "computing signing digest for marker entry_hash failed");
+            return AdminResult::InvalidSignature;
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(digest);
+    let entry_hash = hex::encode(hasher.finalize());
+
+    let marker = ShutdownMarker {
+        entry_hash,
+        grace_deadline_unix_ts,
+    };
+
+    // Per §10.3 step 2 (atomic write): tmpfile + fsync + rename.
+    if let Err(e) = shutdown_marker::write_marker(marker_path, &marker) {
+        warn!(
+            error = ?e,
+            marker_path = %marker_path.display(),
+            "failed to write shutdown-authorisation marker — refusing to ack"
+        );
+        // Refuse to ack the operator — without the marker, the
+        // watchdog won't stand down and we'd just respawn after
+        // exit. Surface as InvalidSignature so the client retries.
+        return AdminResult::InvalidSignature;
+    }
+
+    info!(
+        target: "admin.shutdown",
+        grace_secs,
+        grace_deadline_unix_ts,
+        marker_path = %marker_path.display(),
+        "shutdown authorised — marker written, watchdog will stand down on next pidfd POLLIN"
+    );
+
+    AdminResult::Success
 }
 
 async fn read_frame(stream: &mut UnixStream) -> Result<Option<AdminMessage>> {
@@ -501,5 +689,189 @@ mod tests {
         std::fs::write(&p, "# comment only\n").unwrap();
         let out = run_verify_keys(&p).expect("verify");
         assert!(out.fingerprints.is_empty());
+    }
+
+    // ── A7: signed shutdown — mock-server e2e ──────────────────────
+
+    use common::wire::admin_protocol::{
+        AdminResult, KeyedSignature, ShutdownRequest,
+    };
+    use common::wire::admin_signed_payload::{sign, SignedPayload};
+
+    /// Spin up a [`serve_with_marker_path`] task plus two
+    /// admin keypairs, both holding `Role::Shutdown` so the
+    /// 2-of-N quorum is satisfiable. Returns:
+    /// - the socket path,
+    /// - the marker file path (in the tempdir, NOT the
+    ///   process-global `/run/northnarrow/`),
+    /// - both signing keys + their pubkeys,
+    /// - the bootstrapped `agent_id`,
+    /// - the JoinHandle so the test can cancel the server.
+    async fn spawn_shutdown_server(
+    ) -> (
+        TempDir,
+        PathBuf,
+        PathBuf,
+        SigningKey,
+        SigningKey,
+        [u8; 16],
+        JoinHandle<()>,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let marker_path = dir.path().join("agent.shutdown_authorised");
+        let pub_path = dir.path().join("admin.pub");
+        let rules = rules_path();
+
+        let signing_a = SigningKey::generate(&mut OsRng);
+        let signing_b = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &pub_path,
+            format!(
+                "{} shutdown,unlock\n{} shutdown,unlock\n",
+                hex::encode(signing_a.verifying_key().to_bytes()),
+                hex::encode(signing_b.verifying_key().to_bytes()),
+            ),
+        )
+        .unwrap();
+
+        let agent_id: [u8; 16] = [0x7Eu8; 16];
+        let auth = Arc::new(
+            AdminAuth::load_with_agent_id(&pub_path, agent_id).expect("load"),
+        );
+        let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
+        let posture = Arc::new(PostureMachine::new());
+
+        let auth_c = Arc::clone(&auth);
+        let posture_c = Arc::clone(&posture);
+        let isolator_c = Arc::clone(&isolator);
+        let socket_c = socket.clone();
+        let marker_c = marker_path.clone();
+        let task = tokio::spawn(async move {
+            let _ = serve_with_marker_path(
+                socket_c, auth_c, posture_c, isolator_c, marker_c,
+            )
+            .await;
+        });
+
+        // Wait for the socket to appear.
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        (dir, socket, marker_path, signing_a, signing_b, agent_id, task)
+    }
+
+    /// Read+decode one frame from a UnixStream. Mock-server-friendly
+    /// reader used only by the A7 test (the production reader is
+    /// `read_frame` above, which is async tokio-only).
+    fn sync_read_frame(stream: &mut std::os::unix::net::UnixStream) -> AdminMessage {
+        use std::io::Read;
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).expect("read hdr");
+        let body_len = u32::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body).expect("read body");
+        let mut full = Vec::with_capacity(4 + body_len);
+        full.extend_from_slice(&header);
+        full.extend_from_slice(&body);
+        let (msg, _) = decode_frame(&full).expect("decode").expect("complete");
+        msg
+    }
+
+    fn sync_write_frame(stream: &mut std::os::unix::net::UnixStream, msg: &AdminMessage) {
+        use std::io::Write;
+        let bytes = encode_frame(msg).expect("encode");
+        stream.write_all(&bytes).expect("write");
+    }
+
+    /// Required A7 mock-server e2e: a full ShutdownRequest cycle
+    /// with two valid signatures from two distinct keys, both
+    /// carrying the Shutdown role. The dispatcher must reply
+    /// `AdminResult::Success` AND write a well-formed marker at
+    /// the agreed path; the marker's `grace_deadline_unix_ts`
+    /// must equal `server_now + grace_secs`.
+    #[tokio::test]
+    async fn shutdown_request_writes_marker_and_replies_success() {
+        let (_dir, socket, marker_path, signing_a, signing_b, agent_id, task) =
+            spawn_shutdown_server().await;
+
+        // Build the SignedPayload: shutdown op + nonce from
+        // server challenge + current wall-clock ts + agent_id.
+        let socket_c = socket.clone();
+        let agent_id_c = agent_id;
+        let marker_c = marker_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket_c).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+            // Step 1: request a challenge.
+            sync_write_frame(
+                &mut stream,
+                &AdminMessage::ChallengeRequest(
+                    common::wire::admin_protocol::ChallengeRequest {},
+                ),
+            );
+            let nonce = match sync_read_frame(&mut stream) {
+                AdminMessage::Challenge(c) => c.nonce,
+                other => panic!("expected Challenge, got {other:?}"),
+            };
+
+            // Step 2: build the SignedPayload and sign with both
+            // keys. ts = current wall-clock (in-window for the
+            // ±60s skew check).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let payload =
+                SignedPayload::new_shutdown(nonce, now, agent_id_c, /* grace_secs */ 30);
+            let sig_a: [u8; 64] = sign(&payload, &signing_a).expect("sign a");
+            let sig_b: [u8; 64] = sign(&payload, &signing_b).expect("sign b");
+
+            // Step 3: submit the ShutdownRequest.
+            sync_write_frame(
+                &mut stream,
+                &AdminMessage::ShutdownRequest(ShutdownRequest {
+                    payload,
+                    signatures: vec![
+                        KeyedSignature { signature: sig_a },
+                        KeyedSignature { signature: sig_b },
+                    ],
+                }),
+            );
+
+            // Step 4: assert the dispatcher replied Success and
+            // wrote a well-formed marker.
+            let reply = sync_read_frame(&mut stream);
+            assert!(
+                matches!(reply, AdminMessage::ShutdownResult(AdminResult::Success)),
+                "expected ShutdownResult(Success), got {reply:?}"
+            );
+            let marker = shutdown_marker::read_marker(&marker_c)
+                .expect("read")
+                .expect("marker present after Success");
+            assert_eq!(marker.entry_hash.len(), 64);
+            // grace_deadline = now + 30s; allow ±2s drift around
+            // the system clock read at sign time vs dispatch time.
+            let expected = now + 30;
+            assert!(
+                marker.grace_deadline_unix_ts.abs_diff(expected) <= 2,
+                "grace_deadline_unix_ts={} expected ~{}",
+                marker.grace_deadline_unix_ts,
+                expected
+            );
+
+            // Suppress unused-key warnings from the move closure.
+            let _ = (signing_a, signing_b);
+        })
+        .await;
+
+        task.abort();
+        result.expect("test panic");
     }
 }

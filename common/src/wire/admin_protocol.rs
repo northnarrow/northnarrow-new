@@ -62,10 +62,13 @@
 //! keeps A1 a pure additive change with zero behavioural impact on
 //! the existing unlock/status/challenge paths.
 
+use alloc::vec::Vec;
+
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
 use crate::posture_types::PostureKind;
+use crate::wire::admin_signed_payload::SignedPayload;
 
 /// Cryptographic-quality random nonce minted by the server and
 /// returned to the client. The client must sign exactly these 32
@@ -98,6 +101,69 @@ pub enum UnlockResult {
     InvalidSignature,
     NoPendingChallenge,
     RateLimited { retry_after_secs: u32 },
+}
+
+/// Tappa 8 commit A7 — superset reply enum for the new wire
+/// operations (Shutdown today; ForcePosture / RotateKeys /
+/// AuditRead in subsequent sprints). The legacy
+/// [`UnlockResult`] is preserved unchanged so existing unlock
+/// callers stay byte-identical.
+///
+/// Variant set mirrors design §6.6 verbatim. Add new variants by
+/// APPENDING to preserve postcard discriminants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdminResult {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    /// Signature verifies but the matched key's allowlist does
+    /// not include the operation's required role (A5).
+    RoleDenied,
+    /// Multi-signature quorum was short of `required` distinct
+    /// valid signatures (A6).
+    QuorumNotMet { required: u8, provided: u8 },
+    /// `payload.ts` was outside the server's ±skew window (A4).
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    /// `payload.agent_id` did not match the agent's bootstrapped
+    /// install UUID (A3).
+    AgentIdMismatch,
+    /// `payload.op` was not the operation expected on this wire
+    /// variant (e.g., a `ShutdownRequest` carrying `op=Unlock`).
+    UnknownOperation,
+    /// `version > PROTOCOL_VERSION` on the envelope (A1).
+    ProtocolVersionUnsupported { server_version: u16 },
+}
+
+/// One signature in a multi-sig quorum submission. Wrapped in a
+/// named struct so `Vec<KeyedSignature>` serialises via serde's
+/// auto-derive (a bare `Vec<[u8; 64]>` would need a custom
+/// `with = "BigArray"`-equivalent at the Vec level). The struct
+/// is also a forward extension point — a future hardening tappa
+/// may add a `fingerprint_hint: [u8; 4]` field to let the agent
+/// route the per-signature verify faster on large key sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyedSignature {
+    #[serde(with = "BigArray")]
+    pub signature: [u8; 64],
+}
+
+impl From<[u8; 64]> for KeyedSignature {
+    fn from(signature: [u8; 64]) -> Self {
+        Self { signature }
+    }
+}
+
+/// Tappa 8 commit A7 — signed shutdown request (design §10.2).
+/// Carries the full [`SignedPayload`] (with `op = Shutdown`) plus
+/// the multi-signature quorum (min 2-of-N, ≥1 carrying
+/// `Role::Shutdown` per §3.3). Signatures are Ed25519 over
+/// `signing_digest(payload)` — not over the raw nonce, unlike
+/// the legacy [`UnlockRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
 }
 
 /// Trigger payload for "issue me a fresh challenge nonce". Empty
@@ -142,7 +208,14 @@ pub enum DebugForcePosture {
 ///
 /// Wire ordering note: the postcard discriminant is a varint over
 /// the variant index. We never reorder variants — appending only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Copy` is intentionally NOT derived: Tappa 8 A7's
+/// [`ShutdownRequest`] variant carries a `Vec<KeyedSignature>` for
+/// the quorum payload, which is heap-backed and therefore not
+/// `Copy`. Existing callers all consume `AdminMessage` by move
+/// (encoder/decoder paths) or by `&` (test exhaustiveness checks),
+/// so dropping `Copy` is source-compatible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
     /// "Mint me a fresh nonce." Triggers [`Challenge`] reply.
@@ -164,6 +237,18 @@ pub enum AdminMessage {
     StatusResponse(StatusResponse),
     #[cfg(feature = "debug-trigger")]
     DebugForcePostureAck,
+
+    // ── Tappa 8 commit A7 — appended last to preserve every
+    //    prior variant's postcard discriminant. New variants in
+    //    future Tappa-8 commits (force-posture production,
+    //    rotate-keys, audit-read) likewise append below.
+    /// Signed shutdown request (design §10.2). Triggers
+    /// [`AdminMessage::ShutdownResult`] reply.
+    ShutdownRequest(ShutdownRequest),
+    /// Reply to [`AdminMessage::ShutdownRequest`]. Uses the
+    /// superset [`AdminResult`] so future Tappa 8 wire variants
+    /// can be added without bumping the wire schema.
+    ShutdownResult(AdminResult),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -596,7 +681,9 @@ mod tests {
                 | AdminMessage::Status(_)
                 | AdminMessage::Challenge(_)
                 | AdminMessage::UnlockResult(_)
-                | AdminMessage::StatusResponse(_) => {}
+                | AdminMessage::StatusResponse(_)
+                | AdminMessage::ShutdownRequest(_)
+                | AdminMessage::ShutdownResult(_) => {}
             }
         }
     }
