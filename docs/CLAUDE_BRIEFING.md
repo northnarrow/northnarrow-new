@@ -104,9 +104,44 @@ Documentato in `VISION.md` repo. NESSUN ridimensionamento ammesso. Assistente ch
   - Task 3 (PROTECTED_PID map): ✅
   - Task 4 (Userland LSM loader): ✅
   - **Task 5 (Filesystem protection, 5 LSM hooks): ✅ COMPLETED 13 maggio** (HEAD `8ff04c7` fix + `c33d089` doc, attack matrix tutta DENIED incluso chattr)
-  - Task 6 (Watchdog secondary process): TODO
+  - Task 6 (Watchdog secondary process): TODO — daemon itself unimplemented; **BPF pinning prerequisite shipped 2026-05-13** (see "Task 6 BPF pinning sprint (#2a/#2b) — SHIPPED" subsection below).
   - **Task 7 (Emergency Network Isolation autonomous via COMBAT): PARTIAL — code-complete, integration test self-kills via R009 from `/home/*` paths (see "Task 7 known issue (2026-05-19)" below and `docs/issues/ISSUE_001_eni_test_r009_selfkill.md`). NOT SHIPPED.**
-- Tappa 8: Ed25519 challenge-response auth admin override: TODO
+- Tappa 8: Ed25519 challenge-response auth admin override: TODO — design merged 2026-05-19 in `docs/design/TAPPA8_ED25519_ADMIN_OVERRIDE_DESIGN.md`; ~60% already implemented in `admin_auth`/`admin_socket`/`admin_cli`/`nn-admin`.
+
+#### Task 6 BPF pinning sprint (#2a / #2b / verify) — SHIPPED 2026-05-13
+
+The two-track prerequisite for Watchdog implementation (cross-restart
+survival of anti-tamper maps + LSM links so the watchdog can rely on
+their persistence) is in production on main:
+
+- `916f1a4` — `fix(anti-tamper): by-name pin the 6 anti-tamper maps (Tappa 7 task 6 #2a)`
+- `17cccf8`, `d6de54d` — #2a test follow-ups (map_id lookup, attach poll)
+- `56362c4` — `feat(anti-tamper): pin + reuse all 7 LSM programs & links (Tappa 7 task 6 #2b core)`
+- `07cccda` — `test(anti-tamper): 2b-verify — prog/link id stability + behavioural gap harness`
+- `954537a`, `989c292`, `6e746c6`, `a52d0b6` — `verify-2b` harness reliability fixes (pgrep, comm truncation, SIGINT/SIGQUIT semantics, locale stabilisation)
+- `86f5f41` — `feat(anti-tamper)+fix(verify-2b): --pid-file flag + harness file-poll resolution`
+
+Net behaviour shipping on main: maps pinned at
+`/sys/fs/bpf/northnarrow/<MAP_NAME>`, programs at
+`/sys/fs/bpf/northnarrow/prog_<hook>`, links at
+`/sys/fs/bpf/northnarrow/link_<hook>`; agent restart **reuses** existing
+pins (logs `reused pinned LSM link`) or **purges-then-fresh-attaches**
+on corrupt pins (`purged stale pin and freshly attached`); LSM hooks
+keep **firing** through the agent death→respawn gap (the keystone
+property — see `agent/src/anti_tamper/mod.rs:469-555`); `verify-2b.sh`
+exercises the full sequence end-to-end on a real BPF-LSM kernel and
+emits a JSON verdict at `/tmp/2b_verdict.json`.
+
+The original WIP branch `tappa-7-task6-bpf-pinning-WIP` (single commit
+`53ecae7`) carried the same functionality plus an additional
+**workspace-crate extraction** (`antitamper-bpf/`). That branch is
+**closed as superseded 2026-05-19** — the pin/reuse semantics shipped
+in-place via the SHAs above; only the crate-extraction refactor is
+unique to the WIP and is **deferred to a separate task** under
+`docs/issues/ISSUE_002_antitamper_bpf_crate_extraction.md` (scope
+~4-6 h, scheduled before Watchdog implementation needs the shared
+aya-handling crate per `docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md`
+§2.2).
 
 #### Task 7 known issue (2026-05-19)
 
