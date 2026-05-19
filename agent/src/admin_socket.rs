@@ -167,6 +167,20 @@ fn dispatch(
                 Err(AdminAuthError::RateLimited { retry_after_secs }) => {
                     UnlockResult::RateLimited { retry_after_secs }
                 }
+                // Tappa 8 A5 introduces RoleDenied; the wire layer
+                // currently has no dedicated variant for it
+                // (UnlockResult predates A5). A7 lands the new
+                // AdminResult enum with a real RoleDenied wire
+                // variant; until then, surface as InvalidSignature
+                // — the operator-facing detail is in the agent's
+                // own journald `anti_tamper.admin_auth.verify_failure`
+                // line (reason="role_denied", key_fingerprint, …).
+                // For an `unlock` request specifically, RoleDenied
+                // is also vanishingly rare: every legacy admin.pub
+                // line gets `Role::Unlock` in its default allowlist,
+                // so this arm only fires when an operator has
+                // deliberately written a line without `unlock`.
+                Err(AdminAuthError::RoleDenied { .. }) => UnlockResult::InvalidSignature,
             };
             AdminMessage::UnlockResult(result)
         }
