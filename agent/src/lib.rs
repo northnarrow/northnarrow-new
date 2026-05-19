@@ -16,6 +16,7 @@ pub mod anti_tamper;
 pub mod audit;
 pub mod correlation;
 pub mod decision;
+pub mod fim;
 pub mod posture;
 pub mod rag;
 pub mod response;
