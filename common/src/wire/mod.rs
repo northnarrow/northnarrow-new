@@ -270,6 +270,14 @@ impl FsProtectDenialRaw {
 #[cfg(feature = "std")]
 pub mod admin_protocol;
 
+/// Tappa 8 signed-payload value layer (operation code + nonce + ts +
+/// agent_id + op-specific extra) plus the Ed25519 sign/verify
+/// pipeline. Std-only because it pulls ciborium + ed25519-dalek +
+/// sha2, all of which require `alloc`/std and are not needed by the
+/// kernel eBPF half.
+#[cfg(feature = "std")]
+pub mod admin_signed_payload;
+
 /// Decode a fixed-size, possibly NUL-terminated byte buffer into a
 /// borrowed `&str`, stopping at the first NUL or at the end of the
 /// buffer. Invalid UTF-8 is replaced lossily by the caller.
