@@ -254,3 +254,78 @@ cannot. Verified empirically 12 May 2026 15:14 UTC.
   now that BTF emission works.
 
 Target completion: settimana lunedì 19 maggio 2026.
+
+---
+
+## UPDATE 19 maggio 2026 — Task 7 ENI ✅ SHIPPED
+
+### Status
+
+Task 7 (Emergency Network Isolation autonomous via COMBAT) is
+**SHIPPED**. Live-verify complete on
+`northnarrowdev` (Ubuntu Server VM, kernel `6.8.0-117-generic`).
+
+### Live-verify evidence
+
+- **Host:** `northnarrowdev`
+- **Kernel:** `6.8.0-117-generic`
+- **LSM chain runtime:**
+  `lockdown,capability,landlock,yama,apparmor,bpf` (bpf present)
+- **Build:** `cargo test --release --features
+  test-privileged,debug-trigger -p northnarrow-agent --test
+  privileged_e2e --no-run`
+- **Run dir:** `/tmp/eni_run/r009fix_1779177273/`
+- **Target test (`e2e_force_combat_then_unlock_via_cli`):**
+  exit code **0**, `test result: ok. 1 passed; 0 failed`,
+  finished in **1.11 s**.
+- **Full privileged_e2e suite:** exit code **0**, `3 passed;
+  0 failed; 1 ignored` (the ignored one is the
+  rate-limit-window timing test, still `#[ignore]` per existing
+  doc note).
+- **iptables side-effect:** pre-vs-post diff shows only
+  packet/byte counter deltas; no chain added, no rule added,
+  `NORTHNARROW_COMBAT` absent post-run — full engage→unlock
+  cycle clean.
+- **Agent log excerpts** (full log at
+  `/tmp/eni_run/r009fix_1779177273/test.log`):
+  ```
+  decision engine ready rules=10 demo_tappa5=false
+  admin socket listening (mode 0600) ...
+  COMBAT: network isolated (loopback only) ...
+  admin challenge issued (32-byte nonce)
+  admin signature verified, unlock token minted
+  COMBAT: network isolation released
+  ```
+- **Workspace clippy:** clean
+  (`cargo clippy --workspace --all-targets -- -D warnings`).
+- **Workspace default test suite:** `381 lib tests: 371 passed,
+  0 failed, 10 ignored` + 50 integration tests, 0 failures.
+
+### What shipped
+
+Code-complete since the BPF pinning sprint
+(`tappa-7-task6-bpf-pinning-WIP`); the live-verify was blocked
+by `ISSUE_001` (test self-kill via R009 from `/home/*` paths)
+and is now unblocked. No production code change shipped in this
+verify step — only the test infrastructure under
+`agent/tests/privileged_e2e.rs` was modified to sudo-install
+both binaries into `/usr/local/bin/<name>-e2etest-<ts>-<pid>`
+before each test (Option A from ISSUE_001 §4). RAII cleanup via
+the existing `AgentGuard` removes both binaries on test exit;
+verified no residue in `/usr/local/bin/` post-run.
+
+### Invariants preserved
+
+- ✅ No change to `agent/src/decision/rules/r009_*.rs`
+- ✅ No change to `agent/src/anti_tamper/network_isolate.rs`
+- ✅ No change to `configs/combat-rules.v4`
+- ✅ No new agent CLI flags
+- ✅ `cargo clippy -- -D warnings` 0/0
+- ✅ All workspace tests pass
+
+### Cross-references
+
+- `docs/issues/ISSUE_001_eni_test_r009_selfkill.md` (root cause +
+  remediation analysis + RESOLVED status with this same evidence).
+- `docs/CLAUDE_BRIEFING.md` § "FASE 3: Anti-Tamper", Task 7 line.
+- `agent/tests/privileged_e2e.rs` — fixture changes.

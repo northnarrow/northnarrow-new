@@ -105,7 +105,7 @@ Documentato in `VISION.md` repo. NESSUN ridimensionamento ammesso. Assistente ch
   - Task 4 (Userland LSM loader): ✅
   - **Task 5 (Filesystem protection, 5 LSM hooks): ✅ COMPLETED 13 maggio** (HEAD `8ff04c7` fix + `c33d089` doc, attack matrix tutta DENIED incluso chattr)
   - Task 6 (Watchdog secondary process): TODO
-  - Task 7 (Emergency Network Isolation autonomous via COMBAT): TODO
+  - **Task 7 (Emergency Network Isolation autonomous via COMBAT): ✅ SHIPPED 2026-05-19** — live-verify on `northnarrowdev` kernel `6.8.0-117-generic`, `e2e_force_combat_then_unlock_via_cli` PASS (1.11 s), full COMBAT engage→Ed25519-unlock→release cycle clean, `NORTHNARROW_COMBAT` chain absent post-run, RAII install cleanup verified. ISSUE_001 (R009 self-kill on `/home/*` paths) RESOLVED via Option A: test fixture sudo-installs binaries to `/usr/local/bin/<name>-e2etest-<ts>-<pid>`. NO production code touched. See `docs/issues/ISSUE_001_eni_test_r009_selfkill.md` §5.
 - Tappa 8: Ed25519 challenge-response auth admin override: TODO
 
 ### FASE 4-7: come da `docs/XDR_ROADMAP.md`

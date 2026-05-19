@@ -18,15 +18,131 @@
 //! test-privileged` runs them when invoked with `-- --ignored` or
 //! when a sudo wrapper has root; we don't `#[ignore]` here because
 //! the feature gate already keeps them off the default test path.
+//!
+//! ## Why both binaries are installed to `/usr/local/bin/` at fixture
+//! ## setup
+//!
+//! Cargo resolves `CARGO_BIN_EXE_northnarrow-agent` and
+//! `CARGO_BIN_EXE_nn-admin` to `<repo>/target/<profile>/<name>`. In
+//! any developer environment that path lives under
+//! `/home/<user>/...`. The production decision rule
+//! `R009_RootExecFromUserPath`
+//! (`agent/src/decision/rules/r009_root_exec_from_user_path.rs`)
+//! matches on `uid == 0` plus a `/home/`, `/tmp/`, or `/var/tmp/`
+//! prefix and returns `ResponseAction::KillProcess` — so `nn-admin`
+//! spawned from the cargo path dies ~µs after spawn, before it can
+//! drive any admin frame onto the socket.
+//!
+//! [`install_to_priv_bin`] sudo-copies the binary to
+//! `/usr/local/bin/<name>-e2etest-<ts>-<pid>` (mode 0755, owner
+//! root:root), which is NOT a user-writable prefix and therefore not
+//! matched by R009. Each test spawns the relocated copy. The agent
+//! install is owned by [`AgentGuard`] and cleaned up on drop; the
+//! `nn-admin` install is cached per test in a thread-local so
+//! repeated `run_nn_admin` calls share one install, and is cleaned
+//! up by [`AgentGuard::drop`] along with the agent install.
+//!
+//! Full root-cause and remediation analysis:
+//! `docs/issues/ISSUE_001_eni_test_r009_selfkill.md`.
 
 #![cfg(feature = "test-privileged")]
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// System directory we copy the test binaries into. Outside every
+/// prefix in `R009_RootExecFromUserPath::USER_WRITABLE_PREFIXES`, so
+/// a root exec from here is not flagged.
+const PRIV_BIN_DIR: &str = "/usr/local/bin";
+
+thread_local! {
+    /// Per-test cache of the relocated `nn-admin` binary. Lazily
+    /// populated by [`nn_admin_priv`] on first use and torn down by
+    /// [`AgentGuard::drop`] when the owning test ends — so each test
+    /// gets a fresh install with a unique timestamp+PID suffix, and
+    /// nothing leaks into `/usr/local/bin/` past the test process.
+    static NN_ADMIN_INSTALL: RefCell<Option<InstalledBin>> = const { RefCell::new(None) };
+}
+
+/// RAII wrapper for a binary copy under [`PRIV_BIN_DIR`]. Drop
+/// `sudo rm -f`s the file so a test panic does not leave it behind.
+/// Failures during drop are swallowed (best-effort cleanup; the
+/// timestamp+PID suffix means a leftover never blocks a future run).
+struct InstalledBin {
+    path: PathBuf,
+}
+impl Drop for InstalledBin {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .arg("rm")
+            .arg("-f")
+            .arg(&self.path)
+            .status();
+    }
+}
+
+/// Copy `src` to `/usr/local/bin/<basename>-e2etest-<ts_ns>-<pid>`
+/// with mode 0755 and owner root:root. Uses `sudo install` so the
+/// fixture works whether the cargo-test process is already root or
+/// invoked via passwordless sudo. Panics if the install command
+/// fails — there is no graceful degrade: without the relocated copy
+/// R009 will eat any spawn of the binary and the test cannot run.
+fn install_to_priv_bin(src: &Path) -> InstalledBin {
+    let basename = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("binary path has a UTF-8 basename");
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let dst = PathBuf::from(format!(
+        "{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"
+    ));
+    let status = Command::new("sudo")
+        .arg("install")
+        .arg("-m")
+        .arg("755")
+        .arg("-o")
+        .arg("root")
+        .arg("-g")
+        .arg("root")
+        .arg(src)
+        .arg(&dst)
+        .status()
+        .expect("spawn sudo install");
+    assert!(
+        status.success(),
+        "sudo install of {} to {} failed (status={:?})",
+        src.display(),
+        dst.display(),
+        status.code()
+    );
+    InstalledBin { path: dst }
+}
+
+/// Path to the per-test `nn-admin` install under [`PRIV_BIN_DIR`].
+/// Installs lazily on first call within a thread/test and caches the
+/// path so repeated `run_nn_admin` calls share one copy. Cleared by
+/// [`AgentGuard::drop`].
+fn nn_admin_priv() -> PathBuf {
+    NN_ADMIN_INSTALL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(install_to_priv_bin(Path::new(nn_admin_bin())));
+        }
+        slot.as_ref()
+            .expect("just populated above")
+            .path
+            .clone()
+    })
+}
 
 /// Production combat ruleset used by every scenario. Copied verbatim
 /// from `configs/combat-rules.v4` so tests exercise the same bytes
@@ -52,10 +168,19 @@ fn nn_admin_bin() -> &'static str {
 /// leaks a daemon. The agent's Tappa 7 LSM hook blocks SIGKILL and
 /// SIGTERM from userland; SIGQUIT is the documented escape hatch
 /// (see agent/src/anti_tamper/* docstrings).
-struct AgentGuard(Option<Child>);
+///
+/// Also owns the per-test installs under [`PRIV_BIN_DIR`]: the
+/// `agent_install` field is dropped after the child is reaped, and
+/// the thread-local `nn-admin` cache is cleared on the same path so
+/// both binaries are removed before the test returns.
+struct AgentGuard {
+    child: Option<Child>,
+    #[allow(dead_code, reason = "field exists solely for its Drop side effect")]
+    agent_install: Option<InstalledBin>,
+}
 impl Drop for AgentGuard {
     fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
+        if let Some(mut c) = self.child.take() {
             // SIGQUIT(3) — bypasses the LSM kill block for the agent
             // process. `kill -QUIT $pid` is the supported shutdown.
             unsafe {
@@ -63,18 +188,29 @@ impl Drop for AgentGuard {
             }
             let _ = c.wait();
         }
+        // Drop the agent install BEFORE clearing the nn-admin cache
+        // so a panic inside one cleanup still runs the other.
+        self.agent_install.take();
+        NN_ADMIN_INSTALL.with(|cell| {
+            cell.borrow_mut().take();
+        });
     }
 }
 
 /// Spawn the agent with the per-test tempdir paths. Returns the
 /// running child + the socket path the tests will connect to.
+///
+/// The agent binary is sudo-installed to [`PRIV_BIN_DIR`] before
+/// spawn so the production R009 rule does not target it; the install
+/// is owned by the returned [`AgentGuard`] and removed on drop.
 fn spawn_agent(tempdir: &Path) -> (AgentGuard, PathBuf) {
     let socket = tempdir.join("admin.sock");
     let pubkey = tempdir.join("admin.pub");
     let rules = tempdir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
 
-    let child = Command::new(agent_bin())
+    let agent_install = install_to_priv_bin(Path::new(agent_bin()));
+    let child = Command::new(&agent_install.path)
         .arg("--combat-rules")
         .arg(&rules)
         .arg("--admin-pub")
@@ -87,7 +223,10 @@ fn spawn_agent(tempdir: &Path) -> (AgentGuard, PathBuf) {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn northnarrow-agent");
-    let guard = AgentGuard(Some(child));
+    let guard = AgentGuard {
+        child: Some(child),
+        agent_install: Some(agent_install),
+    };
 
     wait_for_socket(&socket);
     (guard, socket)
@@ -113,7 +252,7 @@ fn wait_for_socket(path: &Path) {
 fn init_admin_keypair(tempdir: &Path) -> PathBuf {
     let priv_path = tempdir.join("admin.priv");
     let pub_path = tempdir.join("admin.pub");
-    let status = Command::new(nn_admin_bin())
+    let status = Command::new(nn_admin_priv())
         .arg("init")
         .arg("--priv-out")
         .arg(&priv_path)
@@ -128,7 +267,7 @@ fn init_admin_keypair(tempdir: &Path) -> PathBuf {
 }
 
 fn run_nn_admin(args: &[&str]) -> std::process::Output {
-    Command::new(nn_admin_bin())
+    Command::new(nn_admin_priv())
         .args(args)
         .output()
         .expect("spawn nn-admin")
