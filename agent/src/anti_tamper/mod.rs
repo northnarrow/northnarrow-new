@@ -51,6 +51,7 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 }
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use aya::{Btf, Ebpf};
@@ -73,6 +74,76 @@ pub use antitamper_bpf::{
 // (in-process, has the `Ebpf`) and the future watchdog binary
 // (cross-process, opens by bpffs path) use the same code path.
 use antitamper_bpf::ProtectedPidsHandle;
+
+/// Watchdog W6: TASK_COMM_LEN-truncated comm of the watchdog
+/// binary. The watchdog's W2 boot sequence calls
+/// `prctl(PR_SET_NAME, "northnarrow-wat")` (15 chars + NUL fits
+/// the kernel's 16-byte field exactly), so this is the literal
+/// string `/proc/<watchdog_pid>/comm` produces.
+///
+/// Adding this to `attach()`'s `allowed_comms` set means
+/// `evict_stale_pids` will NOT evict the watchdog's
+/// `PROTECTED_PIDS` entry on the agent's next restart —
+/// preserves the LSM kill/ptrace protection for the watchdog
+/// across the agent death→respawn gap (per design §7.1).
+pub const WATCHDOG_COMM: &str = "northnarrow-wat";
+
+/// Watchdog W6: best-effort read of the watchdog's PID file.
+/// Returns `Some(pid)` when the file exists AND parses as a
+/// `u32`; returns `None` for every failure mode (file absent,
+/// permission denied, garbage content, empty) AFTER logging.
+/// Failure is NEVER propagated — a deployment that hasn't yet
+/// rolled out the watchdog binary must boot the agent
+/// unchanged (per design §7.1 "the agent runs without a
+/// watchdog before W6 lands").
+///
+/// Trims a single trailing newline (the watchdog's atomic
+/// pidfile writer emits `<pid>\n`); rejects multi-line content
+/// because the canonical writer never produces such bytes.
+pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                target: "anti_tamper.watchdog_pid",
+                path = %path.display(),
+                "no watchdog pidfile present — agent boots without watchdog co-protection"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                target: "anti_tamper.watchdog_pid",
+                error = %e,
+                path = %path.display(),
+                "watchdog pidfile read failed — falling back to agent-only protection"
+            );
+            return None;
+        }
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<u32>() {
+        Ok(pid) => {
+            info!(
+                target: "anti_tamper.watchdog_pid",
+                path = %path.display(),
+                watchdog_pid = pid,
+                "watchdog pidfile present — co-registering watchdog PID in PROTECTED_PIDS"
+            );
+            Some(pid)
+        }
+        Err(e) => {
+            warn!(
+                target: "anti_tamper.watchdog_pid",
+                error = %e,
+                path = %path.display(),
+                content = %trimmed,
+                "watchdog pidfile content is not a valid u32 — falling back to agent-only"
+            );
+            None
+        }
+    }
+}
 
 // TODO(Tappa 8): the three override arrays — KILL_OVERRIDE,
 // PTRACE_OVERRIDE, FS_PROTECT_OVERRIDE — are now `pinned` by-name
@@ -246,3 +317,86 @@ fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<
 // to `northnarrow-antitamper-bpf` and are re-exported via the
 // `pub use` block at the top of this module. Functional behaviour
 // is byte-identical; the only delta is the home crate.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── Watchdog W6: pidfile reader + comm constant ────────────────
+
+    /// Required W6 test 1: read_watchdog_pid_optional returns
+    /// the PID when the watchdog pidfile is present and contains
+    /// a valid u32 (with the canonical `<pid>\n` shape the
+    /// watchdog's W2 atomic writer emits).
+    #[test]
+    fn read_watchdog_pid_optional_returns_pid_when_file_present() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("watchdog.pid");
+        std::fs::write(&p, "4242\n").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p), Some(4242));
+
+        // No-newline shape also works (forward-compat with
+        // alternate writers).
+        let p2 = dir.path().join("watchdog2.pid");
+        std::fs::write(&p2, "9999").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p2), Some(9999));
+    }
+
+    /// Required W6 test 2: read_watchdog_pid_optional returns
+    /// None — NOT an error — when the file is absent. Anchors
+    /// the "agent boots without watchdog" no-op contract: a
+    /// deployment that hasn't rolled out the watchdog binary
+    /// MUST still boot the agent unchanged.
+    #[test]
+    fn read_watchdog_pid_optional_returns_none_when_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("does-not-exist.pid");
+        assert!(!p.exists());
+        assert_eq!(read_watchdog_pid_optional(&p), None);
+    }
+
+    // ── Supplementary W6 tests ─────────────────────────────────────
+
+    /// Garbage content surfaces as None (logged WARN), not an
+    /// error. Documents that a corrupted pidfile degrades the
+    /// agent to "no watchdog co-protection" rather than
+    /// failing boot — a missing or wrong watchdog should never
+    /// take the agent down.
+    #[test]
+    fn read_watchdog_pid_optional_returns_none_on_garbage() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("garbage.pid");
+        std::fs::write(&p, "this is definitely not a pid\n").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p), None);
+
+        // Empty file also surfaces as None.
+        let p2 = dir.path().join("empty.pid");
+        std::fs::write(&p2, "").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p2), None);
+
+        // Whitespace-only also None.
+        let p3 = dir.path().join("ws.pid");
+        std::fs::write(&p3, "   \n\t\n").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p3), None);
+    }
+
+    /// Cross-crate consistency anchor: WATCHDOG_COMM must match
+    /// the literal string the watchdog's W2 `harden_self` sets
+    /// via prctl(PR_SET_NAME). TASK_COMM_LEN is 16 bytes
+    /// (including NUL terminator), so the value fits exactly
+    /// with 15 chars + NUL. A future rename of the watchdog
+    /// binary that changes its prctl name MUST update this
+    /// constant in lock-step, or evict_stale_pids would silently
+    /// evict the watchdog's PROTECTED_PIDS entry.
+    #[test]
+    fn watchdog_comm_constant_is_task_comm_len_safe() {
+        assert_eq!(WATCHDOG_COMM, "northnarrow-wat");
+        // 15 chars + implicit NUL = 16 bytes (TASK_COMM_LEN).
+        assert_eq!(WATCHDOG_COMM.len(), 15);
+        assert!(
+            WATCHDOG_COMM.len() < 16,
+            "TASK_COMM_LEN is 16 (incl. NUL); name must be ≤15"
+        );
+    }
+}
