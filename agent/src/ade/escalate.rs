@@ -54,6 +54,11 @@ pub fn transform_to_escalate(
         Event::FsProtectDenial { pid, operation, .. } => {
             (*pid, format!("fs_protect_denial:{operation}"))
         }
+        // Tappa 9 (C4): FIM drift events don't reach ADE in V1.0
+        // (Tappa 6's escalate path is for the deterministic-rule
+        // / decision-engine flow). C9 optional commit may add
+        // FIM-aware ADE; until then this arm is unreachable.
+        Event::Fim(fe) => (fe.modifier_pid, fe.path.clone()),
     };
 
     AdeVerdict {

@@ -790,6 +790,23 @@ async fn process_event(
             // posture trigger above is the response; we are done.
             return;
         }
+        // Tappa 9 (C4): FIM drift events. The drain loop in
+        // agent/src/fim/drain.rs already wrote the chained
+        // fim_drift.jsonl audit row + emitted Event::Fim
+        // here only if NOT rate-limited (§6.5). Log a one-
+        // line summary; the rule engine (C5 NN-L-FIM-001..009)
+        // picks up the event via the normal `engine.evaluate`
+        // path below.
+        Event::Fim(fe) => {
+            warn!(
+                path = %fe.path,
+                op = ?fe.op,
+                modifier_pid = fe.modifier_pid,
+                modifier_uid = fe.modifier_uid,
+                modifier_comm = %fe.modifier_comm,
+                "FIM DRIFT"
+            );
+        }
     }
 
     if let Some(verdict) = engine.evaluate(&event) {

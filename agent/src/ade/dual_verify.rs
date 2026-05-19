@@ -151,6 +151,10 @@ fn pid_of(e: &Event) -> u32 {
         | Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }
         | Event::FsProtectDenial { pid, .. } => *pid,
+        // Tappa 9 (C4): FIM drift carries `modifier_pid` as the
+        // analogous field. dual_verify reaches Fim only via the
+        // C9 ADE-enrichment path.
+        Event::Fim(fe) => fe.modifier_pid,
     }
 }
 

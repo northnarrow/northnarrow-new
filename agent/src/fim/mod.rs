@@ -11,3 +11,4 @@
 //!   `agent/src/decision/rules/fim.rs` (C5 follow-up commit).
 
 pub mod baseline;
+pub mod drain;
