@@ -30,7 +30,7 @@
 //! regardless of outcome. A failed attempt forces the attacker to
 //! request a fresh challenge AND to incur a rate-limit hit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ use common::wire::admin_signed_payload::{
     self, Role, SignedPayload, SignedPayloadError,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -185,7 +185,15 @@ impl KeyEntry {
 /// which pins the field to [`DEFAULT_RATE_LIMIT_WINDOW`].
 #[derive(Debug)]
 pub struct AdminAuth {
-    pub_keys: Vec<KeyEntry>,
+    /// Tappa 8 A13: behind an `RwLock` so the dispatcher can
+    /// hot-swap the key set after a successful `rotate-keys
+    /// add`/`revoke` without rebuilding the whole `AdminAuth`
+    /// behind its `Arc`. Verify paths take a brief read lock;
+    /// rotation takes a write lock (one-shot, microseconds).
+    /// `RwLock` over `Mutex` because verify is the hot path —
+    /// many concurrent admin requests reading should never
+    /// serialise on each other.
+    pub_keys: RwLock<Vec<KeyEntry>>,
     pending_challenge: Mutex<Option<[u8; 32]>>,
     failure_count: AtomicU32,
     last_failure: Mutex<Option<Instant>>,
@@ -199,6 +207,16 @@ pub struct AdminAuth {
     /// `verify_unlock` / `verify_with_role` / `verify_quorum`
     /// surfaces never touch this field.
     agent_id: [u8; 16],
+    /// Tappa 8 A13: source path of the `admin.pub` file this
+    /// instance was loaded from. `None` for test builders that
+    /// constructed the auth in-memory; `Some` for production
+    /// `load_with_agent_id` callers. The rotate-keys dispatch
+    /// path uses this to know where to atomically rewrite +
+    /// reload on a successful rotation. A test build calling
+    /// `dispatch_rotate_keys_add` without a config_path gets a
+    /// clear "no on-disk config" error rather than a silent
+    /// no-op.
+    config_path: Option<PathBuf>,
 }
 
 impl AdminAuth {
@@ -258,11 +276,16 @@ impl AdminAuth {
             ));
         }
 
-        Ok(Self::build_entries_with_agent_id(
+        let mut auth = Self::build_entries_with_agent_id(
             pub_keys,
             DEFAULT_RATE_LIMIT_WINDOW,
             agent_id,
-        ))
+        );
+        // A13: remember the file we loaded from so the
+        // rotate-keys dispatcher can atomically rewrite + reload
+        // without an extra path threading through `dispatch()`.
+        auth.config_path = Some(config_path.to_path_buf());
+        Ok(auth)
     }
 
     /// The bootstrapped agent install UUID (Tappa 8 A3 + A7
@@ -270,6 +293,57 @@ impl AdminAuth {
     /// can read it back (e.g., to surface in `status` replies).
     pub fn agent_id(&self) -> [u8; 16] {
         self.agent_id
+    }
+
+    /// Path of the `admin.pub` file this auth was loaded from,
+    /// if any. Tappa 8 A13 rotate-keys uses it to know where to
+    /// atomically rewrite. `None` for in-memory test builds.
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Tappa 8 A13: re-parse `admin.pub` and swap the in-memory
+    /// key set in one write-lock window. Used by the rotate-keys
+    /// dispatcher after a successful atomic rewrite so the next
+    /// challenge already sees the new key set (design §7.2 step
+    /// 5). The empty-file guard mirrors [`Self::load_with_agent_id`]
+    /// — a rotation that wipes the file is rejected at the
+    /// dispatch layer; defending in depth here keeps the
+    /// in-memory state non-empty.
+    pub fn reload(&self, config_path: &Path) -> Result<()> {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?;
+        let mut new_keys = Vec::new();
+        for (idx, raw) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let entry = parse_admin_line(line)
+                .map_err(|e| anyhow!("{}:{}: {e}", config_path.display(), line_no))?;
+            new_keys.push(entry);
+        }
+        if new_keys.is_empty() {
+            return Err(anyhow!(
+                "{}: refusing to reload an empty admin.pub (would soft-brick the agent)",
+                config_path.display()
+            ));
+        }
+        *self.pub_keys.write() = new_keys;
+        Ok(())
+    }
+
+    /// Test-only: snapshot the current in-memory key fingerprints.
+    /// Lets reload tests assert "after reload, the new key is
+    /// present" without exposing `KeyEntry` to test code.
+    #[cfg(test)]
+    pub fn key_fingerprints_snapshot(&self) -> Vec<String> {
+        self.pub_keys
+            .read()
+            .iter()
+            .map(|e| fingerprint(&e.key))
+            .collect()
     }
 
     /// Wrap pre-existing verifying keys in the [`default_roles`]
@@ -309,12 +383,13 @@ impl AdminAuth {
         agent_id: [u8; 16],
     ) -> Self {
         Self {
-            pub_keys,
+            pub_keys: RwLock::new(pub_keys),
             pending_challenge: Mutex::new(None),
             failure_count: AtomicU32::new(0),
             last_failure: Mutex::new(None),
             rate_limit_window,
             agent_id,
+            config_path: None,
         }
     }
 
@@ -410,12 +485,18 @@ impl AdminAuth {
 
         let sig = Signature::from_bytes(signature);
 
+        // A13: snapshot the keys behind a read lock for the
+        // duration of the verify. Rotate-keys takes a write
+        // lock; verifies serialise only against the rare
+        // rotation, never against each other.
+        let pub_keys = self.pub_keys.read();
+
         // Constant-time across keys (no short-circuit) — record
         // the matched index so we can check the matched key's
         // role allowlist after the loop. ed25519-dalek's
         // `verify_strict` is itself constant-time.
         let mut matched_idx: Option<usize> = None;
-        for (idx, entry) in self.pub_keys.iter().enumerate() {
+        for (idx, entry) in pub_keys.iter().enumerate() {
             if entry.key.verify_strict(&nonce, &sig).is_ok() {
                 matched_idx = Some(idx);
                 // intentionally NOT `break` — preserve constant-time iteration
@@ -424,7 +505,7 @@ impl AdminAuth {
 
         match matched_idx {
             Some(idx) => {
-                let entry = &self.pub_keys[idx];
+                let entry = &pub_keys[idx];
                 if entry.authorizes(required_role) {
                     self.failure_count.store(0, Ordering::SeqCst);
                     *self.last_failure.lock() = None;
@@ -539,13 +620,18 @@ impl AdminAuth {
             }
         };
 
+        // A13: snapshot the keys behind a read lock for the
+        // duration of the verify; see verify_with_role for the
+        // rationale.
+        let pub_keys = self.pub_keys.read();
+
         // Tally distinct matched pubkey indices across every
         // submitted signature.
         let mut matched: Vec<usize> = Vec::new();
         for sig_bytes in signatures {
             let sig = Signature::from_bytes(sig_bytes);
             let mut this_match: Option<usize> = None;
-            for (idx, entry) in self.pub_keys.iter().enumerate() {
+            for (idx, entry) in pub_keys.iter().enumerate() {
                 if entry.key.verify_strict(&nonce, &sig).is_ok() {
                     this_match = Some(idx);
                     // intentionally no break — preserve constant-time
@@ -598,12 +684,12 @@ impl AdminAuth {
         for &required in role_requirements {
             let satisfied = matched
                 .iter()
-                .any(|&idx| self.pub_keys[idx].authorizes(required));
+                .any(|&idx| pub_keys[idx].authorizes(required));
             if !satisfied {
                 // Surface the first matched key's fingerprint —
                 // it's the most useful audit-log breadcrumb when
                 // the operator sees "RoleDenied: which key?"
-                let fp = fingerprint(&self.pub_keys[matched[0]].key);
+                let fp = fingerprint(&pub_keys[matched[0]].key);
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "role_denied",
@@ -788,6 +874,10 @@ impl AdminAuth {
         // SHA-512 over `domain_sep || cbor(payload)` from A2.
         let digest = admin_signed_payload::signing_digest(payload)?;
 
+        // A13: snapshot the keys behind a read lock for the
+        // duration of the per-signature scan.
+        let pub_keys = self.pub_keys.read();
+
         // Per-signature constant-time scan, distinct-key tally
         // (same machinery as verify_quorum, except the message
         // bytes are the SignedPayload digest instead of the raw
@@ -797,7 +887,7 @@ impl AdminAuth {
         for sig_bytes in signatures {
             let sig = Signature::from_bytes(sig_bytes);
             let mut this_match: Option<usize> = None;
-            for (idx, entry) in self.pub_keys.iter().enumerate() {
+            for (idx, entry) in pub_keys.iter().enumerate() {
                 if entry.key.verify_strict(&digest, &sig).is_ok() {
                     this_match = Some(idx);
                     // intentionally no break — constant-time
@@ -842,9 +932,9 @@ impl AdminAuth {
         for &required in role_requirements {
             let satisfied = matched
                 .iter()
-                .any(|&idx| self.pub_keys[idx].authorizes(required));
+                .any(|&idx| pub_keys[idx].authorizes(required));
             if !satisfied {
-                let fp = fingerprint(&self.pub_keys[matched[0]].key);
+                let fp = fingerprint(&pub_keys[matched[0]].key);
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "role_denied",
@@ -1001,6 +1091,173 @@ fn fingerprint(vk: &VerifyingKey) -> String {
     h.update(vk.to_bytes());
     let digest = h.finalize();
     hex::encode(&digest[..4])
+}
+
+/// 4-byte short fingerprint used by [`RotateKeysRevokeExtra`]
+/// (design §7.3). Same SHA-256 prefix the hex `fingerprint`
+/// helper formats; this returns the raw bytes for wire-side
+/// comparisons.
+pub fn fingerprint_bytes(vk: &VerifyingKey) -> [u8; 4] {
+    let mut h = Sha256::new();
+    h.update(vk.to_bytes());
+    let digest = h.finalize();
+    [digest[0], digest[1], digest[2], digest[3]]
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tappa 8 sub-sprint B commit B3 (A13) — atomic admin.pub rewrite
+// ────────────────────────────────────────────────────────────────────
+
+/// Outcome of an [`atomic_rewrite_admin_pub_add`] /
+/// [`atomic_rewrite_admin_pub_revoke`] call. Surfaced distinctly
+/// (rather than via `anyhow::Error`) so the dispatcher can map
+/// each variant to the right [`common::wire::admin_protocol::AdminResult`]
+/// without string-matching.
+#[derive(Debug, thiserror::Error)]
+pub enum RotateKeysError {
+    /// The new pubkey requested by `rotate-keys add` already
+    /// matches a line in `admin.pub`. Idempotent operations
+    /// would silently succeed here; we reject so the operator
+    /// notices an unexpected duplicate (a common cause is two
+    /// admins trying to add the same out-of-band-shared key).
+    #[error("pubkey {fingerprint} already present in admin.pub")]
+    KeyAlreadyPresent { fingerprint: String },
+    /// The fingerprint requested by `rotate-keys revoke`
+    /// doesn't match any line in `admin.pub`.
+    #[error("no admin.pub line matches fingerprint {fingerprint}")]
+    KeyNotFound { fingerprint: String },
+    /// Refusing to revoke the last remaining key — would
+    /// soft-brick the agent (no operator could subsequently
+    /// unlock or shutdown). Operators must add a replacement
+    /// first.
+    #[error("refusing to revoke the last remaining admin key")]
+    LastKey,
+    /// Anything else: I/O on the tmpfile, rename failure, etc.
+    #[error("admin.pub rewrite I/O: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Atomically rewrite `admin.pub` to APPEND a new key line.
+/// Reads the current file, builds a fresh line for the new
+/// pubkey plus its roles, writes the full body to a tmpfile,
+/// fsyncs, then renames over the original. Crash between fsync
+/// and rename is safe (the old file is intact); crash after
+/// rename is safe (the new file is durable).
+pub fn atomic_rewrite_admin_pub_add(
+    config_path: &Path,
+    new_pubkey: &VerifyingKey,
+    roles: &[Role],
+) -> std::result::Result<(), RotateKeysError> {
+    let body = std::fs::read_to_string(config_path).map_err(RotateKeysError::Io)?;
+    let new_fp = fingerprint(new_pubkey);
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Ok(entry) = parse_admin_line(line) {
+            if fingerprint(&entry.key) == new_fp {
+                return Err(RotateKeysError::KeyAlreadyPresent { fingerprint: new_fp });
+            }
+        }
+    }
+    let mut new_body = body;
+    if !new_body.is_empty() && !new_body.ends_with('\n') {
+        new_body.push('\n');
+    }
+    new_body.push_str(&hex::encode(new_pubkey.to_bytes()));
+    if !roles.is_empty() {
+        new_body.push(' ');
+        new_body.push_str(&format_role_list(roles));
+    }
+    new_body.push('\n');
+    write_admin_pub_atomically(config_path, &new_body)?;
+    Ok(())
+}
+
+/// Atomically rewrite `admin.pub` to REMOVE the line whose
+/// pubkey fingerprint matches `target_fp` (4 raw bytes). See
+/// [`atomic_rewrite_admin_pub_add`] for the durability story.
+/// `LastKey` is returned if removing the line would leave the
+/// file empty — design §7.2 "operators must `add` a replacement
+/// first" contract.
+pub fn atomic_rewrite_admin_pub_revoke(
+    config_path: &Path,
+    target_fp: [u8; 4],
+) -> std::result::Result<(), RotateKeysError> {
+    let body = std::fs::read_to_string(config_path).map_err(RotateKeysError::Io)?;
+    let target_hex = hex::encode(target_fp);
+    let mut out = String::new();
+    let mut kept_keys = 0usize;
+    let mut removed = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            // Preserve blank / comment lines unchanged.
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        }
+        if let Ok(entry) = parse_admin_line(line) {
+            if fingerprint(&entry.key) == target_hex {
+                removed = true;
+                continue;
+            }
+            kept_keys += 1;
+        }
+        out.push_str(raw);
+        out.push('\n');
+    }
+    if !removed {
+        return Err(RotateKeysError::KeyNotFound { fingerprint: target_hex });
+    }
+    if kept_keys == 0 {
+        return Err(RotateKeysError::LastKey);
+    }
+    write_admin_pub_atomically(config_path, &out)?;
+    Ok(())
+}
+
+/// Serialise a role allowlist back to the on-disk comma-form
+/// (`unlock,shutdown,force-posture`). Inverse of
+/// [`parse_role_list`]; only used by
+/// [`atomic_rewrite_admin_pub_add`].
+fn format_role_list(roles: &[Role]) -> String {
+    let parts: Vec<&'static str> = roles.iter().map(|r| role_keyword(*r)).collect();
+    parts.join(",")
+}
+
+fn role_keyword(r: Role) -> &'static str {
+    match r {
+        Role::Unlock => "unlock",
+        Role::Shutdown => "shutdown",
+        Role::ForcePosture => "force-posture",
+        Role::RotateKeys => "rotate-keys",
+        Role::AuditRead => "audit-read",
+        Role::All => "all",
+    }
+}
+
+fn write_admin_pub_atomically(config_path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = config_path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp_path = PathBuf::from(tmp);
+    {
+        // 0644 matches the pre-rotation admin.pub layout (design
+        // §6.5 / §8.1: world-readable so non-root admin tools can
+        // inspect, root-only writable).
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp_path)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, config_path)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1170,7 +1427,7 @@ mod tests {
         let hex = hex::encode(vk.to_bytes());
         let f = write_config(&["# top comment", "", "   ", &hex, "# trailing", ""]);
         let auth = AdminAuth::load(f.path()).expect("should load");
-        assert_eq!(auth.pub_keys.len(), 1);
+        assert_eq!(auth.pub_keys.read().len(), 1);
     }
 
     #[test]
@@ -1184,7 +1441,7 @@ mod tests {
             &hex::encode(k3.to_bytes()),
         ]);
         let auth = AdminAuth::load(f.path()).expect("load");
-        assert_eq!(auth.pub_keys.len(), 3);
+        assert_eq!(auth.pub_keys.read().len(), 3);
     }
 
     // ── issue_challenge ────────────────────────────────────────────
@@ -1546,8 +1803,8 @@ mod tests {
         let (_, vk) = make_keypair();
         let f = write_config(&[&hex::encode(vk.to_bytes())]);
         let auth = AdminAuth::load(f.path()).expect("load");
-        assert_eq!(auth.pub_keys.len(), 1);
-        let entry = &auth.pub_keys[0];
+        assert_eq!(auth.pub_keys.read().len(), 1);
+        let entry = &auth.pub_keys.read()[0];
         assert_eq!(entry.roles, default_roles());
         assert_eq!(entry.roles, vec![Role::Unlock, Role::AuditRead]);
     }
@@ -1561,7 +1818,7 @@ mod tests {
         let line = format!("{} shutdown", hex::encode(vk.to_bytes()));
         let f = write_config(&[&line]);
         let auth = AdminAuth::load(f.path()).expect("load");
-        assert_eq!(auth.pub_keys[0].roles, vec![Role::Shutdown]);
+        assert_eq!(auth.pub_keys.read()[0].roles, vec![Role::Shutdown]);
     }
 
     /// Required A5 test (parse + multi-role): comma-separated role
@@ -1578,7 +1835,7 @@ mod tests {
         // Duplicate `unlock` is collapsed; order of first
         // appearance is preserved.
         assert_eq!(
-            auth.pub_keys[0].roles,
+            auth.pub_keys.read()[0].roles,
             vec![Role::Unlock, Role::Shutdown, Role::AuditRead]
         );
     }
@@ -1603,7 +1860,7 @@ mod tests {
             let auth = AdminAuth::load(f.path())
                 .unwrap_or_else(|e| panic!("load failed for `{keyword}`: {e}"));
             assert_eq!(
-                auth.pub_keys[0].roles,
+                auth.pub_keys.read()[0].roles,
                 vec![expected],
                 "keyword `{keyword}` should map to {expected:?}"
             );
@@ -1973,5 +2230,153 @@ mod tests {
         // Required role is RotateKeys — only the All-key satisfies.
         auth.verify_quorum(&sigs, 2, &[Role::RotateKeys])
             .expect("Role::All must satisfy RotateKeys role requirement");
+    }
+
+    // ── A13 (B3) — rotate-keys atomic rewrite + reload ─────────────
+
+    /// A13 test #1: `atomic_rewrite_admin_pub_add` appends a new
+    /// line for a previously-unknown pubkey and preserves all
+    /// existing lines verbatim. Idempotency rejection (same key
+    /// added twice) returns `KeyAlreadyPresent`.
+    #[test]
+    fn rotate_keys_add_appends_and_rejects_duplicate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let primary = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &admin_pub,
+            format!("{} unlock,rotate-keys\n", hex::encode(primary.verifying_key().to_bytes())),
+        )
+        .unwrap();
+
+        let new_key = SigningKey::generate(&mut OsRng);
+        atomic_rewrite_admin_pub_add(
+            &admin_pub,
+            &new_key.verifying_key(),
+            &[Role::Unlock, Role::AuditRead],
+        )
+        .expect("first add should succeed");
+
+        let body = std::fs::read_to_string(&admin_pub).unwrap();
+        assert_eq!(body.lines().count(), 2, "file body: {body}");
+        assert!(body.contains(&hex::encode(primary.verifying_key().to_bytes())));
+        assert!(body.contains(&hex::encode(new_key.verifying_key().to_bytes())));
+        assert!(body.contains("unlock,audit-read"));
+
+        let err = atomic_rewrite_admin_pub_add(
+            &admin_pub,
+            &new_key.verifying_key(),
+            &[Role::Unlock],
+        )
+        .expect_err("second add of the same key must reject");
+        assert!(matches!(err, RotateKeysError::KeyAlreadyPresent { .. }));
+    }
+
+    /// A13 test #2: `atomic_rewrite_admin_pub_revoke` removes
+    /// the matching line, KeyNotFound when the fingerprint is
+    /// absent, LastKey when removing would empty the file.
+    #[test]
+    fn rotate_keys_revoke_removes_line_and_guards_last_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &admin_pub,
+            format!(
+                "{} unlock\n{} unlock,rotate-keys\n",
+                hex::encode(key_a.verifying_key().to_bytes()),
+                hex::encode(key_b.verifying_key().to_bytes()),
+            ),
+        )
+        .unwrap();
+
+        // Revoke key_a — succeeds; file now has only key_b.
+        let fp_a = fingerprint_bytes(&key_a.verifying_key());
+        atomic_rewrite_admin_pub_revoke(&admin_pub, fp_a).expect("revoke of key_a");
+        let body = std::fs::read_to_string(&admin_pub).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.contains(&hex::encode(key_b.verifying_key().to_bytes())));
+        assert!(!body.contains(&hex::encode(key_a.verifying_key().to_bytes())));
+
+        // Revoke a bogus fingerprint — KeyNotFound.
+        let err = atomic_rewrite_admin_pub_revoke(&admin_pub, [0xAA; 4])
+            .expect_err("bogus fingerprint must error");
+        assert!(matches!(err, RotateKeysError::KeyNotFound { .. }));
+
+        // Revoke the last remaining key — LastKey guard fires.
+        let fp_b = fingerprint_bytes(&key_b.verifying_key());
+        let err = atomic_rewrite_admin_pub_revoke(&admin_pub, fp_b)
+            .expect_err("revoking the last key must error");
+        assert!(matches!(err, RotateKeysError::LastKey));
+        // File body must be intact when LastKey fires (no atomic
+        // rewrite occurred).
+        let still = std::fs::read_to_string(&admin_pub).unwrap();
+        assert!(still.contains(&hex::encode(key_b.verifying_key().to_bytes())));
+    }
+
+    /// A13 test #3: `AdminAuth::reload` re-parses the file and
+    /// hot-swaps the in-memory key set so the next verify sees
+    /// the new keys. Round-trip: load → snapshot fingerprints →
+    /// rewrite file (add a key) → reload → snapshot → assert new
+    /// key present.
+    #[test]
+    fn admin_auth_reload_picks_up_rewritten_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let primary = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &admin_pub,
+            format!(
+                "{} unlock,rotate-keys\n",
+                hex::encode(primary.verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+        let auth = AdminAuth::load(&admin_pub).expect("load");
+        let before = auth.key_fingerprints_snapshot();
+        assert_eq!(before.len(), 1);
+
+        // Rewrite the file via the new helper.
+        let new_key = SigningKey::generate(&mut OsRng);
+        atomic_rewrite_admin_pub_add(&admin_pub, &new_key.verifying_key(), &[Role::Unlock])
+            .expect("rewrite");
+        auth.reload(&admin_pub).expect("reload");
+
+        let after = auth.key_fingerprints_snapshot();
+        assert_eq!(after.len(), 2, "after reload: {after:?}");
+        let new_fp = fingerprint(&new_key.verifying_key());
+        assert!(after.contains(&new_fp), "new_fp {new_fp} missing in {after:?}");
+    }
+
+    /// A13 test #4: `reload` refuses to swap in an empty key set
+    /// (soft-brick guard). Mirrors the load() guard so the
+    /// invariant `pub_keys.is_empty() == false` holds across the
+    /// AdminAuth lifetime.
+    #[test]
+    fn admin_auth_reload_rejects_empty_admin_pub() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let primary = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &admin_pub,
+            format!("{} unlock\n", hex::encode(primary.verifying_key().to_bytes())),
+        )
+        .unwrap();
+        let auth = AdminAuth::load(&admin_pub).expect("load");
+
+        // Truncate to empty (the LastKey guard prevents this in
+        // production, but a manual operator edit could).
+        std::fs::write(&admin_pub, "").unwrap();
+        let err = auth.reload(&admin_pub).expect_err("empty file must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty admin.pub") || msg.contains("soft-brick"),
+            "reload error must mention empty/soft-brick; got: {msg}"
+        );
+        // In-memory key set is UNCHANGED — verify still works
+        // against the original key.
+        let snap = auth.key_fingerprints_snapshot();
+        assert_eq!(snap.len(), 1);
     }
 }

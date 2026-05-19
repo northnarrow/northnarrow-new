@@ -27,9 +27,11 @@ use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, ForcePostureRequest,
-    ShutdownRequest, StatusResponse, UnlockResult, MAX_FRAME_BODY,
+    RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest, StatusResponse,
+    UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
@@ -343,6 +345,14 @@ fn dispatch(
             AdminMessage::ForcePostureResult(dispatch_force_posture(req, auth, posture))
         }
 
+        AdminMessage::RotateKeysAddRequest(req) => {
+            AdminMessage::RotateKeysAddResult(dispatch_rotate_keys_add(req, auth))
+        }
+
+        AdminMessage::RotateKeysRevokeRequest(req) => {
+            AdminMessage::RotateKeysRevokeResult(dispatch_rotate_keys_revoke(req, auth))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -350,7 +360,9 @@ fn dispatch(
         | AdminMessage::UnlockResult(_)
         | AdminMessage::StatusResponse(_)
         | AdminMessage::ShutdownResult(_)
-        | AdminMessage::ForcePostureResult(_) => {
+        | AdminMessage::ForcePostureResult(_)
+        | AdminMessage::RotateKeysAddResult(_)
+        | AdminMessage::RotateKeysRevokeResult(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -623,6 +635,214 @@ fn dispatch_force_posture(
                 target = ?target,
                 "admin_force_state_with_token errored unexpectedly"
             );
+            AdminResult::InvalidSignature
+        }
+    }
+}
+
+/// Tappa 8 A13 — handle one [`RotateKeysAddRequest`] (design
+/// §7.2). Verifies 2-of-N quorum carrying `Role::RotateKeys`,
+/// atomically appends a new line to `admin.pub`, and reloads
+/// the in-memory key set so the next challenge already sees
+/// the addition.
+///
+/// `AdminAuth::config_path()` MUST be `Some` — production
+/// `AdminAuth::load_with_agent_id` always sets it; test builders
+/// that go through `build_*` don't, and trying to rotate keys
+/// against an in-memory-only auth surfaces as a clear log line
+/// + `AdminResult::UnknownOperation`.
+fn dispatch_rotate_keys_add(req: RotateKeysAddRequest, auth: &AdminAuth) -> AdminResult {
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let _token = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        2, // 2-of-N per §3.3
+        &[Role::RotateKeys],
+        OperationCode::RotateKeysAdd,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return map_admin_auth_error(e, "rotate-keys-add"),
+    };
+
+    let (new_pubkey_bytes, roles) = match &req.payload.extra {
+        OperationExtra::RotateKeysAdd(extra) => (extra.new_pubkey, extra.roles.clone()),
+        other => {
+            warn!(
+                extra = ?other,
+                "rotate-keys-add payload extra is not RotateKeysAdd variant"
+            );
+            return AdminResult::UnknownOperation;
+        }
+    };
+
+    let Some(config_path) = auth.config_path() else {
+        warn!(
+            "rotate-keys-add: AdminAuth has no config_path — agent was loaded \
+             via in-memory builder, rotation requires a real admin.pub file"
+        );
+        return AdminResult::UnknownOperation;
+    };
+    let config_path = config_path.to_path_buf();
+
+    let new_pubkey = match VerifyingKey::from_bytes(&new_pubkey_bytes) {
+        Ok(vk) => vk,
+        Err(e) => {
+            warn!(error = ?e, "rotate-keys-add: new_pubkey not a valid Ed25519 key");
+            return AdminResult::InvalidSignature;
+        }
+    };
+
+    match crate::anti_tamper::admin_auth::atomic_rewrite_admin_pub_add(
+        &config_path,
+        &new_pubkey,
+        &roles,
+    ) {
+        Ok(()) => {}
+        Err(crate::anti_tamper::admin_auth::RotateKeysError::KeyAlreadyPresent { fingerprint }) => {
+            warn!(
+                target: "admin.rotate_keys",
+                fingerprint,
+                "rotate-keys-add rejected: pubkey already present"
+            );
+            return AdminResult::InvalidSignature;
+        }
+        Err(e) => {
+            warn!(error = ?e, "rotate-keys-add: atomic rewrite failed");
+            return AdminResult::InvalidSignature;
+        }
+    }
+
+    if let Err(e) = auth.reload(&config_path) {
+        warn!(error = ?e, "rotate-keys-add: admin.pub rewrite succeeded but reload failed");
+        return AdminResult::InvalidSignature;
+    }
+
+    info!(
+        target: "admin.rotate_keys",
+        new_key_fp = %hex::encode(crate::anti_tamper::admin_auth::fingerprint_bytes(&new_pubkey)),
+        role_count = roles.len(),
+        "rotate-keys add: admin.pub updated + in-memory keys reloaded"
+    );
+    AdminResult::Success
+}
+
+/// Tappa 8 A13 — handle one [`RotateKeysRevokeRequest`] (design
+/// §7.2 + §7.3). Symmetric to [`dispatch_rotate_keys_add`]: 2-of-N
+/// quorum with `Role::RotateKeys`, atomic file rewrite removing
+/// the matched line, in-memory reload. Refuses to revoke the
+/// LAST remaining key — that would soft-brick the agent
+/// (`AdminResult::InvalidSignature` rather than a dedicated
+/// variant; the operator-facing detail is in the agent's own log).
+fn dispatch_rotate_keys_revoke(req: RotateKeysRevokeRequest, auth: &AdminAuth) -> AdminResult {
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let _token = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        2, // 2-of-N per §3.3
+        &[Role::RotateKeys],
+        OperationCode::RotateKeysRevoke,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return map_admin_auth_error(e, "rotate-keys-revoke"),
+    };
+
+    let target_fp = match &req.payload.extra {
+        OperationExtra::RotateKeysRevoke(extra) => extra.fingerprint,
+        other => {
+            warn!(
+                extra = ?other,
+                "rotate-keys-revoke payload extra is not RotateKeysRevoke variant"
+            );
+            return AdminResult::UnknownOperation;
+        }
+    };
+
+    let Some(config_path) = auth.config_path() else {
+        warn!(
+            "rotate-keys-revoke: AdminAuth has no config_path — agent was loaded \
+             via in-memory builder, rotation requires a real admin.pub file"
+        );
+        return AdminResult::UnknownOperation;
+    };
+    let config_path = config_path.to_path_buf();
+
+    match crate::anti_tamper::admin_auth::atomic_rewrite_admin_pub_revoke(
+        &config_path,
+        target_fp,
+    ) {
+        Ok(()) => {}
+        Err(crate::anti_tamper::admin_auth::RotateKeysError::KeyNotFound { fingerprint }) => {
+            warn!(
+                target: "admin.rotate_keys",
+                fingerprint,
+                "rotate-keys-revoke rejected: no matching pubkey"
+            );
+            return AdminResult::InvalidSignature;
+        }
+        Err(crate::anti_tamper::admin_auth::RotateKeysError::LastKey) => {
+            warn!(
+                target: "admin.rotate_keys",
+                "rotate-keys-revoke rejected: would remove the last admin key \
+                 (soft-brick guard — add a replacement key first)"
+            );
+            return AdminResult::InvalidSignature;
+        }
+        Err(e) => {
+            warn!(error = ?e, "rotate-keys-revoke: atomic rewrite failed");
+            return AdminResult::InvalidSignature;
+        }
+    }
+
+    if let Err(e) = auth.reload(&config_path) {
+        warn!(
+            error = ?e,
+            "rotate-keys-revoke: admin.pub rewrite succeeded but reload failed"
+        );
+        return AdminResult::InvalidSignature;
+    }
+
+    info!(
+        target: "admin.rotate_keys",
+        revoked_fp = %hex::encode(target_fp),
+        "rotate-keys revoke: admin.pub updated + in-memory keys reloaded"
+    );
+    AdminResult::Success
+}
+
+/// Shared mapper from [`AdminAuthError`] to the wire
+/// [`AdminResult`]. Identical to the inline matches in
+/// dispatch_shutdown / dispatch_force_posture; factored out by
+/// A13 because dispatch_rotate_keys_add / _revoke would
+/// duplicate the same 11-arm match otherwise.
+fn map_admin_auth_error(e: AdminAuthError, op_for_log: &str) -> AdminResult {
+    match e {
+        AdminAuthError::NoPendingChallenge => AdminResult::NoPendingChallenge,
+        AdminAuthError::NonceMismatch => AdminResult::InvalidSignature,
+        AdminAuthError::UnknownOperation { .. } => AdminResult::UnknownOperation,
+        AdminAuthError::AgentIdMismatch => AdminResult::AgentIdMismatch,
+        AdminAuthError::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminAuthError::InvalidSignature => AdminResult::InvalidSignature,
+        AdminAuthError::QuorumNotMet { required, provided } => {
+            AdminResult::QuorumNotMet { required, provided }
+        }
+        AdminAuthError::RoleDenied { .. } => AdminResult::RoleDenied,
+        AdminAuthError::RateLimited { retry_after_secs } => {
+            AdminResult::RateLimited { retry_after_secs }
+        }
+        AdminAuthError::PayloadVerify(pe) => {
+            warn!(op = op_for_log, error = ?pe, "payload verify failed at common layer");
             AdminResult::InvalidSignature
         }
     }
