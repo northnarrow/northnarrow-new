@@ -107,6 +107,23 @@ struct Cli {
     )]
     agent_id_file: PathBuf,
 
+    /// Tappa 7 task 6 Watchdog W6: best-effort path to the
+    /// watchdog daemon's PID file. If the file exists at agent
+    /// startup, the agent reads the PID and includes it in
+    /// `PROTECTED_PIDS` alongside its own — the LSM
+    /// `task_kill` + `ptrace_access_check` hooks then deny
+    /// SIGKILL/SIGTERM/ptrace against the watchdog too, giving
+    /// the same anti-tamper coverage to both halves of the
+    /// supervisor pair. The agent boots normally if the file
+    /// is missing (no watchdog deployed yet) — W6 is purely
+    /// additive co-protection.
+    #[arg(
+        long = "watchdog-pidfile",
+        value_name = "PATH",
+        default_value = "/run/northnarrow/watchdog.pid"
+    )]
+    watchdog_pidfile: PathBuf,
+
     /// Unix-socket path nn-admin connects to. Removed on startup if
     /// it already exists (stale file from prior unclean shutdown).
     #[arg(
@@ -163,16 +180,37 @@ async fn main() -> Result<()> {
     // leak. Per-hook failures are logged WARN inside the call and
     // tolerated so the agent still runs on kernels without BPF-LSM.
     //
-    // The PID set + allowed-comm set are scoped to the agent for now;
-    // Tappa 7 task 6 commit #4 will widen both to include the
-    // watchdog (PID read from /run/northnarrow/watchdog.pid).
+    // Watchdog W6: if the watchdog daemon is also deployed (its
+    // pidfile present at cli.watchdog_pidfile), co-register its
+    // PID into PROTECTED_PIDS so the LSM hooks deny kill/ptrace
+    // against the watchdog too. WATCHDOG_COMM goes into
+    // allowed_comms unconditionally — `evict_stale_pids` only
+    // KEEPS entries whose /proc/<pid>/comm matches an allowed
+    // name, so even if the watchdog isn't running yet we want
+    // its comm in the allowlist to avoid evicting it once it
+    // starts. read_watchdog_pid_optional NEVER errors — a
+    // missing/garbage pidfile just falls back to agent-only
+    // protection (logged).
     let agent_pid = std::process::id();
     let agent_comm = northnarrow_agent::anti_tamper::read_self_comm()
         .context("reading own /proc/self/comm for anti-tamper allowed-comm set")?;
     let mut allowed_comms = std::collections::HashSet::new();
     allowed_comms.insert(agent_comm);
-    if let Err(e) = sensor.attach_anti_tamper(&[agent_pid], &allowed_comms) {
-        warn!(error = %e, agent_pid, "anti-tamper setup failed");
+    allowed_comms.insert(northnarrow_agent::anti_tamper::WATCHDOG_COMM.to_string());
+
+    let watchdog_pid =
+        northnarrow_agent::anti_tamper::read_watchdog_pid_optional(&cli.watchdog_pidfile);
+    let pids: Vec<u32> = match watchdog_pid {
+        Some(wpid) => vec![agent_pid, wpid],
+        None => vec![agent_pid],
+    };
+    if let Err(e) = sensor.attach_anti_tamper(&pids, &allowed_comms) {
+        warn!(
+            error = %e,
+            agent_pid,
+            watchdog_pid = ?watchdog_pid,
+            "anti-tamper setup failed"
+        );
     }
 
     #[cfg(feature = "demo-tappa5")]
