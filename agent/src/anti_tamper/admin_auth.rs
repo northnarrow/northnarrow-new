@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use common::wire::admin_signed_payload::Role;
+use common::wire::admin_signed_payload::{
+    self, Role, SignedPayload, SignedPayloadError,
+};
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::Mutex;
 use rand::rngs::OsRng;
@@ -101,6 +103,48 @@ pub enum AdminAuthError {
     /// (a co-signer hasn't replied yet), not an attack signal.
     #[error("quorum not met: {provided} distinct valid signatures (need {required})")]
     QuorumNotMet { required: u8, provided: u8 },
+    /// Tappa 8 A7: `payload.ts` was outside the server's ±skew
+    /// window. Mirrors `AdminResult::TimestampSkew` in the wire
+    /// layer. Returned by [`AdminAuth::verify_signed_payload_quorum`]
+    /// (and any future SignedPayload-consuming verify path).
+    /// Does NOT increment the rate-limit counter — clock skew
+    /// is an operator-environment issue, not an attack signal.
+    #[error("timestamp outside ±{max_skew_secs}s window (server_ts={server_ts})")]
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    /// Tappa 8 A7: `payload.agent_id` did not match the agent's
+    /// bootstrapped install UUID — a captured signature was
+    /// replayed against a different agent install (design §6.4
+    /// layer 3). Rate-limit IS incremented: this can only happen
+    /// from a deliberate attack (legitimate clients always read
+    /// `agent_id` from the same agent's `status` reply before
+    /// signing).
+    #[error("agent_id mismatch")]
+    AgentIdMismatch,
+    /// Tappa 8 A7: `payload.nonce` did not match the outstanding
+    /// challenge nonce — a signed-payload submission whose
+    /// nonce-binding was forged or stale. Rate-limit IS
+    /// incremented; this is an attack signal under the same
+    /// rationale as `InvalidSignature`.
+    #[error("nonce mismatch")]
+    NonceMismatch,
+    /// Tappa 8 A7: `payload.op` was not the operation expected
+    /// on this wire variant (e.g., a `ShutdownRequest` carrying
+    /// `op = Unlock`). Surfaces design §6.6
+    /// `AdminResult::UnknownOperation`. Rate-limit IS
+    /// incremented — a wire-shape mismatch can only come from a
+    /// confused or hostile client.
+    #[error("unknown operation: payload.op={got:?} expected {expected:?}")]
+    UnknownOperation {
+        expected: common::wire::admin_signed_payload::OperationCode,
+        got: common::wire::admin_signed_payload::OperationCode,
+    },
+    /// Tappa 8 A7: signing-payload CBOR / hashing failed during
+    /// verify. Wraps the underlying `SignedPayloadError` from
+    /// `common::wire::admin_signed_payload`. In practice this
+    /// only fires on malformed input that already passed CBOR
+    /// decode at the frame layer.
+    #[error("signed payload error: {0}")]
+    PayloadVerify(#[from] SignedPayloadError),
 }
 
 /// One loaded admin pubkey plus its parsed role allowlist. Stored
@@ -146,6 +190,15 @@ pub struct AdminAuth {
     failure_count: AtomicU32,
     last_failure: Mutex<Option<Instant>>,
     rate_limit_window: Duration,
+    /// Per-install agent identity (Tappa 8 A3). Bootstrapped by
+    /// [`crate::agent_id::load_or_bootstrap`] and passed in via
+    /// [`Self::load_with_agent_id`]. The legacy [`Self::load`]
+    /// defaults to `[0u8; 16]` for backward compatibility — that
+    /// matters only for the new
+    /// [`Self::verify_signed_payload_quorum`] path; the legacy
+    /// `verify_unlock` / `verify_with_role` / `verify_quorum`
+    /// surfaces never touch this field.
+    agent_id: [u8; 16],
 }
 
 impl AdminAuth {
@@ -160,7 +213,28 @@ impl AdminAuth {
     /// preserves the behaviour of every admin.pub written before
     /// A5 — those pubkey-only lines authorise unlock exactly as
     /// they did pre-A5.
+    ///
+    /// Tappa 8 A7: defaults `agent_id` to `[0u8; 16]`. The new
+    /// SignedPayload-consuming verify
+    /// ([`Self::verify_signed_payload_quorum`]) compares incoming
+    /// `payload.agent_id` against this field; production code
+    /// should use [`Self::load_with_agent_id`] to bind the real
+    /// install UUID (bootstrapped via
+    /// [`crate::agent_id::load_or_bootstrap`]). Existing
+    /// `verify_unlock` / `verify_with_role` / `verify_quorum`
+    /// paths are unaffected.
     pub fn load(config_path: &Path) -> Result<Self> {
+        Self::load_with_agent_id(config_path, [0u8; 16])
+    }
+
+    /// Like [`Self::load`] but also binds the agent's
+    /// bootstrapped install UUID (design §6.5). Production agent
+    /// startup (`main.rs`) is the intended caller; the value is
+    /// the return of [`crate::agent_id::load_or_bootstrap`].
+    pub fn load_with_agent_id(
+        config_path: &Path,
+        agent_id: [u8; 16],
+    ) -> Result<Self> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
 
@@ -184,7 +258,18 @@ impl AdminAuth {
             ));
         }
 
-        Ok(Self::build_entries(pub_keys, DEFAULT_RATE_LIMIT_WINDOW))
+        Ok(Self::build_entries_with_agent_id(
+            pub_keys,
+            DEFAULT_RATE_LIMIT_WINDOW,
+            agent_id,
+        ))
+    }
+
+    /// The bootstrapped agent install UUID (Tappa 8 A3 + A7
+    /// wiring). Exposed so the dispatcher / future Tappa 8 callers
+    /// can read it back (e.g., to surface in `status` replies).
+    pub fn agent_id(&self) -> [u8; 16] {
+        self.agent_id
     }
 
     /// Wrap pre-existing verifying keys in the [`default_roles`]
@@ -206,16 +291,30 @@ impl AdminAuth {
         Self::build_entries(entries, rate_limit_window)
     }
 
-    /// Lower-level builder consumed by [`Self::load`] (which has
-    /// already parsed roles per-line) and by tests that want to
-    /// pin custom role allowlists per key.
+    /// Lower-level builder used by tests that want to pin custom
+    /// role allowlists per key without going through admin.pub
+    /// parsing. Defaults `agent_id` to `[0u8; 16]` — call
+    /// [`Self::build_entries_with_agent_id`] to bind a specific
+    /// UUID (only matters for `verify_signed_payload_quorum`).
+    /// Production callers go through [`Self::load_with_agent_id`].
+    #[cfg(test)]
     fn build_entries(pub_keys: Vec<KeyEntry>, rate_limit_window: Duration) -> Self {
+        Self::build_entries_with_agent_id(pub_keys, rate_limit_window, [0u8; 16])
+    }
+
+    /// Lowest-level builder, used by [`Self::load_with_agent_id`].
+    fn build_entries_with_agent_id(
+        pub_keys: Vec<KeyEntry>,
+        rate_limit_window: Duration,
+        agent_id: [u8; 16],
+    ) -> Self {
         Self {
             pub_keys,
             pending_challenge: Mutex::new(None),
             failure_count: AtomicU32::new(0),
             last_failure: Mutex::new(None),
             rate_limit_window,
+            agent_id,
         }
     }
 
@@ -530,6 +629,247 @@ impl AdminAuth {
             required = min_distinct,
             role_count = role_requirements.len(),
             "admin quorum verified, unlock token minted"
+        );
+        Ok(mint_unlock_token())
+    }
+
+    /// Tappa 8 A7 — full signed-payload quorum verify, integrating
+    /// every prior A-sprint commit:
+    /// - A2: signatures are over `signing_digest(payload)` (not
+    ///   over the raw nonce), so the operation tag is inside the
+    ///   signed scope (cross-op replay defence).
+    /// - A3 + A7: `payload.agent_id` must match the agent's
+    ///   bootstrapped install UUID — captured signatures can't
+    ///   be replayed across agents.
+    /// - A4: `payload.ts` must be within ±[`MAX_TIMESTAMP_SKEW_SECS`]
+    ///   of `server_now_unix_secs` — captured signatures can't
+    ///   be replayed across an unrealistic clock window.
+    /// - A5: each matched key's role allowlist must satisfy
+    ///   `role_requirements`.
+    /// - A6: distinct-key tally must meet `min_distinct`.
+    ///
+    /// The outstanding nonce is consumed at the top of this
+    /// method (single-use, regardless of outcome) AND
+    /// `payload.nonce` must equal that nonce — same nonce-binding
+    /// the legacy [`Self::verify_unlock`] enforces, surfaced as
+    /// `NonceMismatch` for the SignedPayload path.
+    ///
+    /// Failure-mode summary (matching design §6.6 wire variants):
+    /// - `NoPendingChallenge` → no challenge has been issued.
+    /// - `NonceMismatch` → payload nonce ≠ outstanding nonce
+    ///   (rate-limit++ — attack signal).
+    /// - `UnknownOperation` → `payload.op` is not the expected
+    ///   one for this wire variant (rate-limit++).
+    /// - `AgentIdMismatch` → `payload.agent_id` ≠ `self.agent_id`
+    ///   (rate-limit++).
+    /// - `TimestampSkew` → outside ±60 s window (no rate-limit —
+    ///   operator-clock issue).
+    /// - `QuorumNotMet` → fewer distinct valid signatures than
+    ///   `min_distinct` (no rate-limit — operator UX).
+    /// - `InvalidSignature` → zero valid matches in non-empty
+    ///   submission (rate-limit++).
+    /// - `RoleDenied` → matched keys are short of a required
+    ///   role (no rate-limit).
+    /// - Success → mint `UnlockToken`.
+    ///
+    /// Caller pattern (production dispatcher, A7):
+    /// ```ignore
+    /// let now = SystemClock.now_unix_secs();
+    /// auth.verify_signed_payload_quorum(
+    ///     &req.payload,
+    ///     &sigs,
+    ///     2,                        // shutdown quorum
+    ///     &[Role::Shutdown],        // §3.3 role requirement
+    ///     OperationCode::Shutdown,  // expected op
+    ///     now,
+    /// )?;
+    /// ```
+    pub fn verify_signed_payload_quorum(
+        &self,
+        payload: &SignedPayload,
+        signatures: &[[u8; 64]],
+        min_distinct: u8,
+        role_requirements: &[Role],
+        expected_op: admin_signed_payload::OperationCode,
+        server_now_unix_secs: u64,
+    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+        debug_assert!(
+            min_distinct >= 1,
+            "verify_signed_payload_quorum: min_distinct must be >= 1 \
+             (got {min_distinct}); 0 would mint a token with no signature"
+        );
+
+        // Consume the outstanding nonce up front (single-use,
+        // regardless of subsequent failure). Mirrors verify_quorum.
+        let nonce = match self.pending_challenge.lock().take() {
+            Some(n) => n,
+            None => {
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "no_pending_challenge",
+                    "signed-payload quorum verify with no outstanding challenge"
+                );
+                return Err(AdminAuthError::NoPendingChallenge);
+            }
+        };
+
+        // Operation tag must match what this wire variant expects.
+        // Cheap field check first — surfaces a clear "wrong wire
+        // shape" error before we burn an Ed25519 verify on it.
+        if payload.op != expected_op {
+            self.failure_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_failure.lock() = Some(Instant::now());
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "unknown_operation",
+                expected = ?expected_op,
+                got = ?payload.op,
+                "signed-payload op tag mismatch"
+            );
+            return Err(AdminAuthError::UnknownOperation {
+                expected: expected_op,
+                got: payload.op,
+            });
+        }
+
+        // Nonce binding: payload must reference THE nonce the
+        // server issued. A forged payload that names some other
+        // nonce can't replay an old signature here.
+        if payload.nonce != nonce {
+            self.failure_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_failure.lock() = Some(Instant::now());
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "nonce_mismatch",
+                "signed-payload nonce does not match outstanding challenge"
+            );
+            return Err(AdminAuthError::NonceMismatch);
+        }
+
+        // Agent-ID binding (design §6.4 layer 3). A captured
+        // signature from agent-A is rejected against agent-B.
+        if payload.agent_id != self.agent_id {
+            self.failure_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_failure.lock() = Some(Instant::now());
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "agent_id_mismatch",
+                "signed-payload agent_id does not match this agent install"
+            );
+            return Err(AdminAuthError::AgentIdMismatch);
+        }
+
+        // Timestamp skew (design §6.4 layer 2). Pure predicate
+        // from A4 — no rate-limit increment on failure (operator
+        // clock issue, not attack).
+        if let Err(TimestampSkewError::OutOfWindow {
+            server_ts,
+            max_skew_secs,
+        }) = check_timestamp_skew(
+            payload.ts,
+            server_now_unix_secs,
+            MAX_TIMESTAMP_SKEW_SECS,
+        ) {
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "timestamp_skew",
+                server_ts,
+                client_ts = payload.ts,
+                max_skew_secs,
+                "signed-payload timestamp outside skew window"
+            );
+            return Err(AdminAuthError::TimestampSkew {
+                server_ts,
+                max_skew_secs,
+            });
+        }
+
+        // Compute the per-signature verification message: the
+        // SHA-512 over `domain_sep || cbor(payload)` from A2.
+        let digest = admin_signed_payload::signing_digest(payload)?;
+
+        // Per-signature constant-time scan, distinct-key tally
+        // (same machinery as verify_quorum, except the message
+        // bytes are the SignedPayload digest instead of the raw
+        // nonce — that's the parameter swap A6's forward note
+        // promised).
+        let mut matched: Vec<usize> = Vec::new();
+        for sig_bytes in signatures {
+            let sig = Signature::from_bytes(sig_bytes);
+            let mut this_match: Option<usize> = None;
+            for (idx, entry) in self.pub_keys.iter().enumerate() {
+                if entry.key.verify_strict(&digest, &sig).is_ok() {
+                    this_match = Some(idx);
+                    // intentionally no break — constant-time
+                }
+            }
+            if let Some(idx) = this_match {
+                if !matched.contains(&idx) {
+                    matched.push(idx);
+                }
+            }
+        }
+
+        // Zero matches + non-empty submission = attack signal.
+        if matched.is_empty() && !signatures.is_empty() {
+            self.failure_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_failure.lock() = Some(Instant::now());
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "invalid_sig",
+                submitted = signatures.len(),
+                "signed-payload quorum verify: zero valid signatures"
+            );
+            return Err(AdminAuthError::InvalidSignature);
+        }
+
+        let distinct: u8 = matched.len().min(u8::MAX as usize) as u8;
+        if distinct < min_distinct {
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "quorum_not_met",
+                required = min_distinct,
+                provided = distinct,
+                "signed-payload quorum verify: insufficient distinct valid signatures"
+            );
+            return Err(AdminAuthError::QuorumNotMet {
+                required: min_distinct,
+                provided: distinct,
+            });
+        }
+
+        // Role check (same as verify_quorum).
+        for &required in role_requirements {
+            let satisfied = matched
+                .iter()
+                .any(|&idx| self.pub_keys[idx].authorizes(required));
+            if !satisfied {
+                let fp = fingerprint(&self.pub_keys[matched[0]].key);
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "role_denied",
+                    required_role = ?required,
+                    matched_count = distinct,
+                    first_matched_fingerprint = %fp,
+                    "signed-payload quorum verify: required role not carried by any matched key"
+                );
+                return Err(AdminAuthError::RoleDenied {
+                    key_fingerprint: fp,
+                    required_role: required,
+                });
+            }
+        }
+
+        // All checks pass.
+        self.failure_count.store(0, Ordering::SeqCst);
+        *self.last_failure.lock() = None;
+        info!(
+            target: "anti_tamper.admin_auth.verify_success",
+            op = ?expected_op,
+            distinct,
+            required = min_distinct,
+            role_count = role_requirements.len(),
+            "signed-payload quorum verified, unlock token minted"
         );
         Ok(mint_unlock_token())
     }
