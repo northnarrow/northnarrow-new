@@ -1248,6 +1248,10 @@ fn role_keyword(r: Role) -> &'static str {
         Role::ForcePosture => "force-posture",
         Role::RotateKeys => "rotate-keys",
         Role::AuditRead => "audit-read",
+        // Tappa 9 (C1) additions — same wire-byte keyword
+        // shape operators see in admin.pub lines + CLI.
+        Role::FimManage => "fim-manage",
+        Role::FimRead => "fim-read",
         Role::All => "all",
     }
 }

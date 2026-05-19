@@ -263,6 +263,160 @@ impl FsProtectDenialRaw {
     }
 }
 
+// Tappa 9 (C1) — FIM drift detection codes. The kernel-side
+// observe-only LSM hooks (agent-ebpf/src/fim_watch.rs, C2) write
+// one of these into `FimDriftRaw.op` when they reserve a ringbuf
+// slot. Userland inflates the byte into the typed
+// `wire::FimOp` enum.
+//
+// Discriminants are stable wire bytes — never renumber; appending
+// only. Mirrors the Tappa 7 `FS_OP_*` style.
+pub const FIM_OP_MODIFIED: u8 = 1;
+pub const FIM_OP_CREATED: u8 = 2;
+pub const FIM_OP_DELETED: u8 = 3;
+pub const FIM_OP_RENAMED: u8 = 4;
+pub const FIM_OP_LINKED: u8 = 5;
+
+/// Tappa 9 (C1) — kernel↔userland record emitted by the FIM
+/// observation hooks (design §5). One record per watched-inode
+/// drift event. Userland's `agent/src/fim/drain.rs` (C4) decodes
+/// these into the richer userland [`FimEvent`].
+///
+/// Layout: timestamp + (dev,ino) target + modifier triple + op
+/// byte + pad. 56 bytes total, 8-byte aligned — identical shape
+/// to Tappa 7's [`FsProtectDenialRaw`] by design (keeps the
+/// ringbuf-record arithmetic symmetric, simplifies the C4 drain
+/// loop's per-record decode).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FimDriftRaw {
+    pub timestamp_ns: u64,
+    pub target_dev: u64,
+    pub target_ino: u64,
+    pub modifier_pid: u32,
+    pub modifier_uid: u32,
+    pub modifier_comm: [u8; TASK_COMM_LEN],
+    /// One of the `FIM_OP_*` discriminants above. Inflated by
+    /// userland into [`FimOp`].
+    pub op: u8,
+    pub _pad: [u8; 7],
+}
+
+impl FimDriftRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            target_dev: 0,
+            target_ino: 0,
+            modifier_pid: 0,
+            modifier_uid: 0,
+            modifier_comm: [0u8; TASK_COMM_LEN],
+            op: 0,
+            _pad: [0u8; 7],
+        }
+    }
+}
+
+/// Tappa 9 (C1) — userland-decoded FIM drift event. The drain
+/// loop (C4) constructs one of these per kernel-observed drift
+/// after resolving `(target_dev, target_ino)` → absolute path,
+/// re-hashing the file, and diffing against the baseline.
+///
+/// Std-only because the userland-facing shape carries heap-
+/// allocated `String` + `Option<[u8;32]>` fields. The eBPF
+/// kernel half consumes only [`FimDriftRaw`].
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FimEvent {
+    /// Monotonic-clock ns since boot — same source as
+    /// [`ProcessSpawnRaw::timestamp_ns`].
+    pub timestamp_ns: u64,
+    /// The watched path that drifted. UTF-8 lossy — non-UTF-8
+    /// paths are escaped (`\xNN`) rather than dropped.
+    pub path: alloc::string::String,
+    pub op: FimOp,
+    /// SHA-256 of the file's content AFTER the modification.
+    /// `None` for `Deleted` / `Renamed` (target gone).
+    pub new_sha256: Option<[u8; 32]>,
+    /// Baseline SHA-256 the drift diverged from. `None` if the
+    /// path was just added to the watch set and no baseline
+    /// exists yet (operator forgot to re-baseline).
+    pub baseline_sha256: Option<[u8; 32]>,
+    /// `/proc/<pid>/exe` of the modifying process if resolvable
+    /// at decode time.
+    pub modifier_exe: Option<alloc::string::String>,
+    pub modifier_pid: u32,
+    pub modifier_uid: u32,
+    pub modifier_comm: alloc::string::String,
+}
+
+/// Tappa 9 (C1) — typed inflation of [`FimDriftRaw::op`]. Wire
+/// bytes are the `FIM_OP_*` constants; the `serde(into = "u8",
+/// try_from = "u8")` attribute pair makes the on-disk JSONL +
+/// admin-wire form a bare integer rather than a string variant
+/// (saves bytes on the chained baseline + drift logs).
+///
+/// Variant order MUST track the `FIM_OP_*` discriminant order —
+/// asserted by the `fim_op_discriminants_lock_in` test in
+/// `mod.rs::tests`.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
+#[repr(u8)]
+pub enum FimOp {
+    Modified = FIM_OP_MODIFIED,
+    Created = FIM_OP_CREATED,
+    Deleted = FIM_OP_DELETED,
+    Renamed = FIM_OP_RENAMED,
+    Linked = FIM_OP_LINKED,
+}
+
+#[cfg(feature = "std")]
+impl From<FimOp> for u8 {
+    fn from(op: FimOp) -> Self {
+        op as u8
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::convert::TryFrom<u8> for FimOp {
+    type Error = FimOpDecodeError;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            FIM_OP_MODIFIED => Ok(Self::Modified),
+            FIM_OP_CREATED => Ok(Self::Created),
+            FIM_OP_DELETED => Ok(Self::Deleted),
+            FIM_OP_RENAMED => Ok(Self::Renamed),
+            FIM_OP_LINKED => Ok(Self::Linked),
+            other => Err(FimOpDecodeError::UnknownByte(other)),
+        }
+    }
+}
+
+/// Error path for [`FimOp::try_from`]. A future kernel running a
+/// newer eBPF program could emit a `FIM_OP_*` constant this build
+/// doesn't know about; userland surfaces it instead of panicking.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FimOpDecodeError {
+    UnknownByte(u8),
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for FimOpDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FimOpDecodeError::UnknownByte(b) => {
+                write!(f, "unknown FIM_OP discriminant byte: 0x{b:02x}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for FimOpDecodeError {}
+
 /// nn-admin ↔ agent protocol carried over the Unix socket at
 /// `/run/northnarrow/admin.sock`. Std-only because the agent is the
 /// only consumer and `StatusResponse` references `PostureKind` which
@@ -347,5 +501,127 @@ mod tests {
 
         let s = cstr_lossy(b"no-nul-here");
         assert_eq!(s, "no-nul-here");
+    }
+
+    // ── Tappa 9 C1 — FIM wire types ────────────────────────────────
+
+    /// C1 test #1: [`FimDriftRaw`] layout matches the kernel↔userland
+    /// ABI exactly. 56 bytes, 8-aligned, identical to
+    /// [`FsProtectDenialRaw`] (Tappa 7's analogue). Wire-byte stability
+    /// is the property — any drift here is a coordinated kernel+user
+    /// upgrade.
+    #[test]
+    fn fim_drift_raw_layout_is_stable() {
+        // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 = 56 bytes, 8-aligned.
+        assert_eq!(size_of::<FimDriftRaw>(), 56);
+        assert_eq!(align_of::<FimDriftRaw>(), 8);
+        // Same shape as Tappa 7's denial record (intentional —
+        // simplifies the C4 drain-loop's per-record decode).
+        assert_eq!(size_of::<FimDriftRaw>(), size_of::<FsProtectDenialRaw>());
+    }
+
+    /// C1 test #2: [`FimDriftRaw`] bytemuck round-trip. The eBPF
+    /// kernel side serialises via `bytes_of`; userland decodes via
+    /// `from_bytes`. Anchors the Pod/Zeroable derive.
+    #[test]
+    fn fim_drift_raw_round_trips_via_bytes() {
+        let original = FimDriftRaw {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            target_dev: 0x800002,
+            target_ino: 12345,
+            modifier_pid: 42,
+            modifier_uid: 0,
+            modifier_comm: *b"sshd\0\0\0\0\0\0\0\0\0\0\0\0",
+            op: FIM_OP_MODIFIED,
+            _pad: [0u8; 7],
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&original);
+        assert_eq!(bytes.len(), size_of::<FimDriftRaw>());
+        let restored: FimDriftRaw = *bytemuck::from_bytes::<FimDriftRaw>(bytes);
+        assert_eq!(restored.timestamp_ns, original.timestamp_ns);
+        assert_eq!(restored.target_dev, original.target_dev);
+        assert_eq!(restored.target_ino, original.target_ino);
+        assert_eq!(restored.modifier_pid, original.modifier_pid);
+        assert_eq!(restored.modifier_comm, original.modifier_comm);
+        assert_eq!(restored.op, original.op);
+    }
+
+    /// C1 test #3: [`FimOp`] discriminants lock in the wire bytes
+    /// 1..=5. Variant order MUST track `FIM_OP_*` discriminant
+    /// order — a reorder would silently change the byte semantics
+    /// of every kernel-emitted `FimDriftRaw` record.
+    #[test]
+    fn fim_op_discriminants_lock_in() {
+        assert_eq!(FimOp::Modified as u8, FIM_OP_MODIFIED);
+        assert_eq!(FimOp::Created as u8, FIM_OP_CREATED);
+        assert_eq!(FimOp::Deleted as u8, FIM_OP_DELETED);
+        assert_eq!(FimOp::Renamed as u8, FIM_OP_RENAMED);
+        assert_eq!(FimOp::Linked as u8, FIM_OP_LINKED);
+        // Discriminant values are STABLE wire bytes — never
+        // renumber. Anchor literal values.
+        assert_eq!(FIM_OP_MODIFIED, 1);
+        assert_eq!(FIM_OP_CREATED, 2);
+        assert_eq!(FIM_OP_DELETED, 3);
+        assert_eq!(FIM_OP_RENAMED, 4);
+        assert_eq!(FIM_OP_LINKED, 5);
+    }
+
+    /// C1 test #4: [`FimOp`] try_from round-trip + unknown-byte
+    /// rejection. A future kernel could emit an op byte this build
+    /// doesn't know about; userland surfaces it as
+    /// [`FimOpDecodeError::UnknownByte`] instead of panicking.
+    #[test]
+    fn fim_op_try_from_round_trips_and_rejects_unknown() {
+        use core::convert::TryFrom;
+        for op in [
+            FimOp::Modified,
+            FimOp::Created,
+            FimOp::Deleted,
+            FimOp::Renamed,
+            FimOp::Linked,
+        ] {
+            let byte: u8 = op.into();
+            let round: FimOp = FimOp::try_from(byte).expect("known byte must decode");
+            assert_eq!(round, op);
+        }
+        // 0 is reserved (zeroed memory) — must reject.
+        assert!(matches!(
+            FimOp::try_from(0u8),
+            Err(FimOpDecodeError::UnknownByte(0))
+        ));
+        // 99 simulates a future kernel emitting an unknown op.
+        assert!(matches!(
+            FimOp::try_from(99u8),
+            Err(FimOpDecodeError::UnknownByte(99))
+        ));
+    }
+
+    /// C1 test #5: [`FimEvent`] serde JSON round-trip. The
+    /// userland-decoded event flows into the audit chain + `Event`
+    /// channel; JSON serialisation is what the C3 baseline DB +
+    /// C6 `nn-admin fim report --json` consume.
+    #[test]
+    fn fim_event_serde_json_round_trip() {
+        let original = FimEvent {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            path: "/usr/bin/sshd".to_string(),
+            op: FimOp::Modified,
+            new_sha256: Some([0xAA; 32]),
+            baseline_sha256: Some([0xBB; 32]),
+            modifier_exe: Some("/usr/bin/dpkg".to_string()),
+            modifier_pid: 42,
+            modifier_uid: 0,
+            modifier_comm: "dpkg".to_string(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, original);
+        // op should serialise as a bare integer (serde(into="u8"))
+        // — not a variant name string. Saves bytes in the chained
+        // fim_drift.jsonl and matches the on-disk schema §4.1.
+        assert!(
+            json.contains(r#""op":1"#),
+            "FimOp must serialise as integer wire byte; got: {json}"
+        );
     }
 }

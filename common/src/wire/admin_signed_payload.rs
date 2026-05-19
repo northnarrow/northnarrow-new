@@ -100,6 +100,12 @@ pub enum OperationCode {
     RotateKeysAdd = 4,
     RotateKeysRevoke = 5,
     AuditRead = 6,
+    /// Tappa 9 (C1) — operator-initiated FIM baseline
+    /// (re)computation. Authorised by `Role::FimManage`.
+    FimBaseline = 7,
+    /// Tappa 9 (C1) — operator-initiated read of the chained
+    /// `fim_drift.jsonl`. Authorised by `Role::FimRead`.
+    FimReport = 8,
 }
 
 impl From<OperationCode> for u8 {
@@ -118,6 +124,8 @@ impl TryFrom<u8> for OperationCode {
             4 => Ok(Self::RotateKeysAdd),
             5 => Ok(Self::RotateKeysRevoke),
             6 => Ok(Self::AuditRead),
+            7 => Ok(Self::FimBaseline),
+            8 => Ok(Self::FimReport),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -143,6 +151,16 @@ pub enum Role {
     ForcePosture = 3,
     RotateKeys = 4,
     AuditRead = 5,
+    /// Tappa 9 (C1) — authorises `fim baseline` (compute + write
+    /// new baseline rows) AND the `disable:` list in
+    /// `fim-paths.local` (Q7 resolution). Operationally the
+    /// higher-privilege FIM role.
+    FimManage = 6,
+    /// Tappa 9 (C1) — authorises `fim status` + `fim report`
+    /// (read the chained drift log + acknowledge entries). The
+    /// lower-privilege FIM role; defaults to operators who hold
+    /// `AuditRead` since FIM read is the same trust level.
+    FimRead = 7,
     All = 255,
 }
 
@@ -161,6 +179,8 @@ impl TryFrom<u8> for Role {
             3 => Ok(Self::ForcePosture),
             4 => Ok(Self::RotateKeys),
             5 => Ok(Self::AuditRead),
+            6 => Ok(Self::FimManage),
+            7 => Ok(Self::FimRead),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -220,6 +240,24 @@ pub struct AuditReadExtra {
     pub since_unix_ts: Option<u64>,
 }
 
+/// Op-specific signed-scope fields for [`OperationCode::FimBaseline`]
+/// (Tappa 9 design §5 + §6.1). Empty today — the agent's default
+/// behaviour is to rebaseline every path in `WATCHED_PATHS`. A
+/// future field could narrow to a single path; kept as a named
+/// struct (not a unit variant) so a future addition is backward-
+/// compatible at the CBOR level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FimBaselineExtra {}
+
+/// Op-specific signed-scope fields for [`OperationCode::FimReport`]
+/// (Tappa 9 design §6.3 + §9). `since_unix_ts` filters the streamed
+/// drift log to events at-or-after the threshold; `None` means
+/// "from genesis."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FimReportExtra {
+    pub since_unix_ts: Option<u64>,
+}
+
 /// Discriminated union of every op-specific extra. The variant order
 /// MUST track [`OperationCode`] (Unlock, Shutdown, …); a SignedPayload
 /// whose `op` and `extra` variants disagree is well-formed at the
@@ -233,6 +271,10 @@ pub enum OperationExtra {
     RotateKeysAdd(RotateKeysAddExtra),
     RotateKeysRevoke(RotateKeysRevokeExtra),
     AuditRead(AuditReadExtra),
+    /// Tappa 9 (C1). Pairs with [`OperationCode::FimBaseline`].
+    FimBaseline(FimBaselineExtra),
+    /// Tappa 9 (C1). Pairs with [`OperationCode::FimReport`].
+    FimReport(FimReportExtra),
 }
 
 impl OperationExtra {
@@ -247,6 +289,8 @@ impl OperationExtra {
             OperationExtra::RotateKeysAdd(_) => OperationCode::RotateKeysAdd,
             OperationExtra::RotateKeysRevoke(_) => OperationCode::RotateKeysRevoke,
             OperationExtra::AuditRead(_) => OperationCode::AuditRead,
+            OperationExtra::FimBaseline(_) => OperationCode::FimBaseline,
+            OperationExtra::FimReport(_) => OperationCode::FimReport,
         }
     }
 }
@@ -475,6 +519,40 @@ impl SignedPayload {
             extra: OperationExtra::AuditRead(AuditReadExtra { since_unix_ts }),
         }
     }
+
+    /// Tappa 9 (C1) — `fim baseline` signed payload constructor.
+    /// The `FimBaselineExtra` is empty today (default-construct) —
+    /// the agent rebaselines every path in WATCHED_PATHS. Future
+    /// fields could narrow to a single path; kept as a constructor
+    /// rather than an `extra` parameter so the call-site shape
+    /// matches the other ops.
+    pub fn new_fim_baseline(nonce: [u8; 32], ts: u64, agent_id: [u8; 16]) -> Self {
+        Self {
+            op: OperationCode::FimBaseline,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::FimBaseline(FimBaselineExtra {}),
+        }
+    }
+
+    /// Tappa 9 (C1) — `fim report` signed payload constructor.
+    /// `since_unix_ts` filters the streamed drift log; `None`
+    /// means "from genesis." Mirrors [`Self::new_audit_read`].
+    pub fn new_fim_report(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        since_unix_ts: Option<u64>,
+    ) -> Self {
+        Self {
+            op: OperationCode::FimReport,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::FimReport(FimReportExtra { since_unix_ts }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,8 +577,12 @@ mod tests {
     const TS: u64 = 1_710_000_000;
 
     /// Helper: build one [`SignedPayload`] per [`OperationCode`] so
-    /// each test can iterate over all six operations in one place.
-    fn one_payload_per_op() -> [SignedPayload; 6] {
+    /// each test can iterate over all operations in one place.
+    /// Tappa 9 (C1) grew the array from 6 to 8 with the new
+    /// `FimBaseline` and `FimReport` constructors so sign-verify
+    /// round-trip, cbor determinism, and op/extra invariant tests
+    /// automatically cover the new ops.
+    fn one_payload_per_op() -> [SignedPayload; 8] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -514,6 +596,8 @@ mod tests {
             ),
             SignedPayload::new_rotate_keys_revoke(nonce(), TS, agent_id(), [0x11, 0x22, 0x33, 0x44]),
             SignedPayload::new_audit_read(nonce(), TS, agent_id(), Some(1_700_000_000)),
+            SignedPayload::new_fim_baseline(nonce(), TS, agent_id()),
+            SignedPayload::new_fim_report(nonce(), TS, agent_id(), Some(1_700_000_000)),
         ]
     }
 
@@ -681,6 +765,9 @@ mod tests {
             (OperationCode::RotateKeysAdd, 4),
             (OperationCode::RotateKeysRevoke, 5),
             (OperationCode::AuditRead, 6),
+            // Tappa 9 (C1) additions — APPENDED, never renumber.
+            (OperationCode::FimBaseline, 7),
+            (OperationCode::FimReport, 8),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -710,6 +797,9 @@ mod tests {
             (Role::ForcePosture, 3),
             (Role::RotateKeys, 4),
             (Role::AuditRead, 5),
+            // Tappa 9 (C1) additions — APPENDED, never renumber.
+            (Role::FimManage, 6),
+            (Role::FimRead, 7),
             (Role::All, 255),
         ];
         for (r, expected) in cases {
@@ -752,6 +842,41 @@ mod tests {
                 assert_eq!(extra_op, OperationCode::Shutdown);
             }
             other => panic!("expected OperationExtraMismatch first, got {other:?}"),
+        }
+    }
+
+    /// C1 test #6 — focused coverage of the two new
+    /// [`SignedPayload`] constructors (`new_fim_baseline` +
+    /// `new_fim_report`): each produces a payload whose
+    /// `op` agrees with its `extra` variant tag, signs + verifies
+    /// against a fresh keypair, and round-trips through cbor
+    /// without bit-level drift. The other 5 tests in this module
+    /// pick up the new ops automatically via `one_payload_per_op`,
+    /// but this anchors them explicitly so a future refactor
+    /// that drops them from the helper still leaves the wire
+    /// coverage intact.
+    #[test]
+    fn new_fim_constructors_round_trip_sign_and_verify() {
+        let (signing, verifying) = fixed_keypair();
+        for payload in [
+            SignedPayload::new_fim_baseline(nonce(), TS, agent_id()),
+            SignedPayload::new_fim_report(nonce(), TS, agent_id(), Some(1_700_000_000)),
+        ] {
+            // op/extra invariant holds by construction.
+            assert_eq!(payload.op, payload.extra.op_code());
+            // Sign-verify round-trip.
+            let digest = signing_digest(&payload).expect("digest");
+            let sig = signing.sign(&digest).to_bytes();
+            verify(&payload, &sig, &verifying).expect("verify");
+            // Cbor round-trip (no field-order drift).
+            let bytes = {
+                let mut v = Vec::new();
+                ciborium::ser::into_writer(&payload, &mut v).expect("cbor encode");
+                v
+            };
+            let restored: SignedPayload =
+                ciborium::de::from_reader(&bytes[..]).expect("cbor decode");
+            assert_eq!(restored, payload);
         }
     }
 }
