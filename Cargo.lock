@@ -1793,6 +1793,7 @@ dependencies = [
  "libc",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

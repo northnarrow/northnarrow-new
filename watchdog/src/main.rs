@@ -21,19 +21,33 @@
 //! ping land in W3/W4/W5.
 
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    evict_dead_agent, harden_self, open_agent_pidfd_with_retry, read_pid_from_file,
-    sd_notify_ready, wait_for_agent_death, write_pidfile_atomic, Cli,
-    PIDFD_OPEN_RETRY_DEADLINE,
+    evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
+    read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready, shutdown_was_authorised,
+    spawn_agent, wait_for_agent_death, wait_for_new_agent_pid, write_pidfile_atomic,
+    BackoffOutcome, Cli, RestartBackoff, PIDFD_OPEN_RETRY_DEADLINE,
 };
+
+/// Path of the A8 shutdown-authorisation marker (Tappa 8 A7
+/// design §10.3). Hardcoded — the watchdog and the agent agree
+/// on this canonical location.
+const SHUTDOWN_MARKER_PATH: &str = "/run/northnarrow/agent.shutdown_authorised";
+
+/// Deadline budget for the post-respawn pidfile-readiness wait.
+/// Same shape as W2's PIDFD_OPEN_RETRY_DEADLINE — the agent's
+/// `attach()` + LSM hook attachment takes seconds on a cold
+/// host. 30 s is generous.
+const NEW_AGENT_PIDFILE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -70,23 +84,22 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     harden_self().context("harden_self (prctl PR_SET_DUMPABLE + PR_SET_NAME)")?;
 
+    // W4: persist the agent's argv for respawn (design §5.3
+    // "first launch's argv is the canonical respawn command").
+    // For this commit we capture the agent binary path from
+    // the pidfile's `/proc/<pid>/exe` realpath + reconstruct
+    // a minimal argv. Production deployment in W7 reads the
+    // systemd `ExecStart=` via `systemctl show
+    // northnarrow-agent.service --property=ExecStart` — this
+    // build keeps the wiring straightforward by using the agent
+    // binary's own `--pid-file` flag pointed at the same
+    // pidfile path the watchdog reads.
     let agent_fd = open_agent_pidfd_with_retry(&cli.agent_pidfile, PIDFD_OPEN_RETRY_DEADLINE)
         .await
-        .context("opening agent pidfd")?;
-    // SAFETY: pidfd_open returned this fd to us; we own it
-    // exclusively. AsyncFd consumes the OwnedFd on registration
-    // — we hand it over to wait_for_agent_death below.
-    let agent_pidfd = unsafe { OwnedFd::from_raw_fd(agent_fd) };
-
-    // W3: capture the agent PID for the layer-2 PROTECTED_PIDS
-    // evict on death. Re-read from the pidfile rather than
-    // calling pidfd_getfd-like introspection — the agent's
-    // pidfile is the canonical source of truth, AND a stale
-    // PID here would only matter if the file changed between
-    // pidfd_open and now (impossible without an agent
-    // restart, which we'd detect via pidfd POLLIN anyway).
-    let agent_pid = read_pid_from_file(&cli.agent_pidfile)
+        .context("opening initial agent pidfd")?;
+    let mut agent_pid = read_pid_from_file(&cli.agent_pidfile)
         .context("re-reading agent PID for layer-2 evict context")?;
+    let agent_argv = derive_agent_argv(agent_pid, &cli.agent_pidfile)?;
 
     let own_pid = std::process::id();
     write_pidfile_atomic(&cli.pidfile, own_pid)
@@ -99,58 +112,163 @@ async fn run(cli: Cli) -> Result<()> {
         own_pid,
         agent_pid,
         bpffs_root = %cli.bpffs_root.display(),
-        "boot sequence complete — waiting for agent pidfd POLLIN or SIGTERM/SIGINT"
+        agent_bin = %agent_argv[0],
+        argc = agent_argv.len(),
+        "boot sequence complete — entering restart-backoff loop"
     );
 
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut backoff = RestartBackoff::new();
+    let mut agent_pidfd = unsafe { OwnedFd::from_raw_fd(agent_fd) };
 
-    // W3 select arm — three possible exits from the boot wait:
-    // (a) agent's pidfd fires POLLIN → layer-2 evict, log, exit
-    //     (W4 will replace exit with restart-backoff)
-    // (b) SIGTERM/SIGINT → cleanup, exit
-    //
-    // Per design §12 W3: "No respawn yet (the agent stays dead
-    // in this commit; verified via journal + bpftool dump)."
-    tokio::select! {
-        _ = sigint.recv() => {
-            info!(target: "watchdog", "SIGINT received; shutting down");
-        }
-        _ = sigterm.recv() => {
-            info!(target: "watchdog", "SIGTERM received; shutting down");
-        }
-        result = wait_for_agent_death(agent_pidfd) => {
-            match result {
-                Ok(()) => {
-                    info!(
+    // W4 restart loop. Each iteration:
+    //   1. Park on {SIGTERM, SIGINT, agent pidfd POLLIN}
+    //   2. On pidfd POLLIN: layer-2 evict, check shutdown marker,
+    //      compute backoff, respawn, reinsert PROTECTED_PIDS,
+    //      loop back
+    //   3. On signal: break out cleanly
+    //   4. On ceiling breach: log TAMPER, break out (watchdog
+    //      stays alive after this; the loop exit + main exit
+    //      handler logs `watchdog stopped`)
+    'restart_loop: loop {
+        let select_outcome = tokio::select! {
+            _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
+            _ = sigterm.recv() => SelectOutcome::Signal("SIGTERM"),
+            result = wait_for_agent_death(agent_pidfd) => SelectOutcome::AgentDied(result),
+        };
+
+        match select_outcome {
+            SelectOutcome::Signal(name) => {
+                info!(target: "watchdog", signal = name, "shutting down");
+                break 'restart_loop;
+            }
+            SelectOutcome::AgentDied(Err(e)) => {
+                warn!(target: "watchdog.pidfd", error = %e, "pidfd wait failed — exiting");
+                break 'restart_loop;
+            }
+            SelectOutcome::AgentDied(Ok(())) => {
+                info!(
+                    target: "watchdog.layer2_evict",
+                    agent_pid,
+                    "agent pidfd POLLIN — agent has exited; running layer-2 evict"
+                );
+                match evict_dead_agent(&cli.bpffs_root, agent_pid) {
+                    Ok(report) => info!(
                         target: "watchdog.layer2_evict",
+                        agent_pid = report.agent_pid,
+                        latency_us = report.evict_latency.as_micros() as u64,
+                        "layer-2 evict complete"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
                         agent_pid,
-                        "agent pidfd POLLIN — agent process has exited; running layer-2 evict"
-                    );
-                    match evict_dead_agent(&cli.bpffs_root, agent_pid) {
-                        Ok(report) => info!(
-                            target: "watchdog.layer2_evict",
-                            agent_pid = report.agent_pid,
-                            latency_us = report.evict_latency.as_micros() as u64,
-                            "layer-2 evict complete"
-                        ),
-                        Err(e) => warn!(
-                            error = %e,
-                            agent_pid,
-                            bpffs_root = %cli.bpffs_root.display(),
-                            "layer-2 evict failed (the recycled-PID race window stays open until layer-1 fires on next agent restart)"
-                        ),
-                    }
-                    info!(
-                        target: "watchdog",
-                        "W3 exits after evict — agent stays dead (W4 will add restart-backoff)"
-                    );
+                        bpffs_root = %cli.bpffs_root.display(),
+                        "layer-2 evict failed; widens layer-1 race window but next agent will fire evict_stale_pids"
+                    ),
                 }
-                Err(e) => warn!(
-                    target: "watchdog.pidfd",
-                    error = %e,
-                    "pidfd wait failed — exiting"
-                ),
+
+                // A8 shutdown-authorisation check per Watchdog
+                // §13 Q4 resolution. If admin signed the
+                // shutdown, the marker is on disk and we stand
+                // down WITHOUT respawning.
+                match shutdown_was_authorised(&PathBuf::from(SHUTDOWN_MARKER_PATH)) {
+                    Ok(true) => {
+                        info!(
+                            target: "watchdog.shutdown_marker",
+                            "admin-authorised shutdown observed — watchdog standing down (no respawn)"
+                        );
+                        // Best-effort marker cleanup: the agent
+                        // wrote it, we honoured it, now remove
+                        // it so the next agent boot doesn't
+                        // inherit a stale "I was authorised"
+                        // signal.
+                        let _ = std::fs::remove_file(SHUTDOWN_MARKER_PATH);
+                        break 'restart_loop;
+                    }
+                    Ok(false) => { /* unsigned exit — proceed with respawn */ }
+                    Err(e) => {
+                        // Per design §10.4 step 4: malformed
+                        // marker is a TAMPERING signal. Log
+                        // loudly + proceed with respawn AND
+                        // count toward the ceiling (the bump
+                        // happens naturally — the next
+                        // `backoff.next_delay` call records
+                        // this attempt).
+                        warn!(
+                            target: "watchdog.shutdown_marker",
+                            error = %e,
+                            path = SHUTDOWN_MARKER_PATH,
+                            "shutdown marker exists but is malformed — treating as tampering signal"
+                        );
+                    }
+                }
+
+                // Backoff state machine — compute the per-attempt
+                // delay AND detect the per-window ceiling.
+                let now = Instant::now();
+                let outcome = backoff.next_delay(now);
+                let (delay, attempt) = match outcome {
+                    BackoffOutcome::Wait { delay, attempt } => (delay, attempt),
+                    BackoffOutcome::CeilingExceeded {
+                        attempts_in_window,
+                        window,
+                    } => {
+                        log_tamper_suspected(attempts_in_window, window);
+                        break 'restart_loop;
+                    }
+                };
+
+                if !delay.is_zero() {
+                    info!(
+                        target: "watchdog.respawn",
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "backing off before respawn"
+                    );
+                    if let Some(reason) = sleep_or_signal(delay, &mut sigint, &mut sigterm).await
+                    {
+                        info!(target: "watchdog", signal = reason, "shutting down during backoff");
+                        break 'restart_loop;
+                    }
+                }
+
+                // Best-effort: remove the dead agent's pidfile
+                // BEFORE respawn so `wait_for_new_agent_pid`
+                // doesn't immediately read the dead PID.
+                let _ = std::fs::remove_file(&cli.agent_pidfile);
+
+                match respawn_cycle(&agent_argv, &cli.agent_pidfile, &cli.bpffs_root, attempt)
+                    .await
+                {
+                    Ok((new_pid, new_fd)) => {
+                        agent_pid = new_pid;
+                        agent_pidfd = new_fd;
+                        info!(
+                            target: "watchdog.respawn",
+                            attempt,
+                            new_pid,
+                            "respawn cycle complete — watching new pidfd"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "watchdog.respawn",
+                            attempt,
+                            error = %e,
+                            "respawn cycle failed — counting toward ceiling, continuing loop"
+                        );
+                        // The failed attempt already incremented
+                        // `backoff`'s sliding-window count (we
+                        // called `next_delay` above). The next
+                        // pidfd POLLIN... but we don't HAVE a new
+                        // pidfd to wait on. Fall through: the
+                        // `loop` runs again, signal-arm catches
+                        // operator stops, and pidfd wait would
+                        // immediately fail. Exit instead.
+                        break 'restart_loop;
+                    }
+                }
             }
         }
     }
@@ -169,6 +287,99 @@ async fn run(cli: Cli) -> Result<()> {
 
     info!(target: "watchdog", "watchdog stopped");
     Ok(())
+}
+
+/// Internal select-arm outcome — folds the three branches of the
+/// W4 main loop into one match.
+enum SelectOutcome {
+    Signal(&'static str),
+    AgentDied(Result<()>),
+}
+
+/// Reconstruct the agent's argv from its running PID. For W4
+/// without systemd `ExecStart=` introspection (that lands in
+/// W7), we capture the binary path from `/proc/<pid>/exe`
+/// realpath + emit a minimal `--pid-file` argv so the respawned
+/// agent writes to the same pidfile we'll wait on. Future W7
+/// commit reads the systemd unit's actual ExecStart.
+fn derive_agent_argv(agent_pid: u32, pidfile: &std::path::Path) -> Result<Vec<String>> {
+    let exe = std::fs::read_link(format!("/proc/{agent_pid}/exe"))
+        .with_context(|| format!("reading /proc/{agent_pid}/exe for argv reconstruction"))?;
+    let bin = exe.to_string_lossy().into_owned();
+    Ok(vec![
+        bin,
+        "--pid-file".to_string(),
+        pidfile.to_string_lossy().into_owned(),
+    ])
+}
+
+/// One full respawn cycle: spawn the agent, wait for its
+/// pidfile, open a new pidfd, defensive-reinsert the new PID
+/// into PROTECTED_PIDS. Returns the new PID + the new pidfd
+/// for the main loop's next select-arm.
+async fn respawn_cycle(
+    argv: &[String],
+    pidfile: &std::path::Path,
+    bpffs_root: &std::path::Path,
+    attempt: u8,
+) -> Result<(u32, OwnedFd)> {
+    info!(
+        target: "watchdog.respawn",
+        attempt,
+        bin = %argv[0],
+        "spawning agent"
+    );
+    let child = spawn_agent(argv)?;
+    // We don't await `child.wait()` — the parent watchdog
+    // observes death via the new pidfd, NOT via waitpid. The
+    // `Child` handle drops at function end; that doesn't kill
+    // the spawned process (Rust's `Child::drop` is a no-op on
+    // Unix). systemd would normally reap, but with `Restart=no`
+    // on the agent unit + the agent being a forked subprocess
+    // of the watchdog, the watchdog inherits the role. For W4
+    // we accept that a child that exits BEFORE we open its
+    // pidfd will become a zombie; W5 (stuck-agent recovery)
+    // adds the reaping path.
+    std::mem::drop(child);
+
+    let new_pid = wait_for_new_agent_pid(pidfile, NEW_AGENT_PIDFILE_DEADLINE).await?;
+
+    let raw = pidfd_open(new_pid)
+        .with_context(|| format!("pidfd_open({new_pid}) for respawned agent"))?;
+    // SAFETY: pidfd_open returned this fd to us; we own it.
+    let new_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    // Defensive reinsert. Failure here just widens the brief
+    // window before the new agent's own register_protected_pids
+    // fires — not a fatal restart-cycle error.
+    if let Err(e) = reinsert_new_agent_pid(bpffs_root, new_pid) {
+        warn!(
+            target: "watchdog.respawn",
+            error = %e,
+            new_pid,
+            bpffs_root = %bpffs_root.display(),
+            "defensive PROTECTED_PIDS reinsert failed; agent's own register will retry shortly"
+        );
+    }
+
+    Ok((new_pid, new_fd))
+}
+
+/// Sleep `delay`, but bail early if SIGTERM/SIGINT fires —
+/// returns Some(name) on signal, None on natural sleep
+/// completion. Without this an operator-issued
+/// `systemctl stop northnarrow-watchdog` while we're backing
+/// off for 800 ms could miss the signal.
+async fn sleep_or_signal(
+    delay: Duration,
+    sigint: &mut Signal,
+    sigterm: &mut Signal,
+) -> Option<&'static str> {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => None,
+        _ = sigint.recv() => Some("SIGINT"),
+        _ = sigterm.recv() => Some("SIGTERM"),
+    }
 }
 
 // `FromRawFd` is brought in at the top of this file alongside

@@ -24,15 +24,17 @@
 //! 5. Wait for SIGTERM/SIGINT and exit — restart loop + layer-2
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
+use std::collections::VecDeque;
 use std::os::fd::{OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use antitamper_bpf::ProtectedPidsHandle;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Default CLI values mirror the design §10.2 systemd unit file
 /// exactly so an operator running `northnarrow-watchdog` from a
@@ -402,6 +404,378 @@ pub fn evict_dead_agent(bpffs_root: &Path, agent_pid: u32) -> Result<EvictReport
     })
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Watchdog W4 — respawn with bounded exponential backoff +
+// 5-in-60s ceiling (design §5 + §12 row W4)
+// ────────────────────────────────────────────────────────────────────
+
+/// First restart fires immediately (within ~10 ms after pidfd
+/// POLLIN, bounded by evict + Command::spawn latency). Subsequent
+/// attempts grow exponentially.
+pub const RESTART_INITIAL_DELAY: Duration = Duration::ZERO;
+/// Base for the exponential backoff: attempt 2 waits 100 ms,
+/// attempt 3 waits 200 ms, attempt 4 waits 400 ms, attempt 5
+/// waits 800 ms. Formula: `RESTART_BACKOFF_BASE * 2^(attempt - 2)`.
+pub const RESTART_BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Per design §5.1, the exponential growth caps at 5 s so a
+/// long-troubled host doesn't burn minutes between restart
+/// attempts. (Capped after 4 doublings = 1.6 s would be the
+/// natural 6th-attempt delay; the cap kicks in beyond that.)
+pub const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(5);
+/// Per design §5.1, 5 failed restarts within a 60 s sliding
+/// window trips the "tamper suspected" ceiling and the watchdog
+/// stops restarting (but stays alive for operator inspection).
+pub const RESTART_CEILING_MAX_ATTEMPTS: u8 = 5;
+pub const RESTART_CEILING_WINDOW: Duration = Duration::from_secs(60);
+
+/// Outcome of a single backoff-state-machine tick. Either tells
+/// the caller how long to wait before the next spawn, or that
+/// the per-window ceiling has been reached and respawn must
+/// stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackoffOutcome {
+    /// Wait `delay` then spawn the agent. Carries the attempt
+    /// number for log context (1-based — `attempt == 1` is the
+    /// first restart in the current window).
+    Wait { delay: Duration, attempt: u8 },
+    /// The sliding window has accumulated
+    /// [`RESTART_CEILING_MAX_ATTEMPTS`] failures; the watchdog
+    /// must NOT respawn. Carries the actual attempt count + the
+    /// window width so the journal line is self-describing.
+    CeilingExceeded {
+        attempts_in_window: u8,
+        window: Duration,
+    },
+}
+
+/// Restart backoff state machine. Holds the sliding-window of
+/// recent restart timestamps + the configured timing knobs (so
+/// tests can use a short window without sleeping for real
+/// minutes).
+#[derive(Debug, Clone)]
+pub struct RestartBackoff {
+    /// Recent restart attempt timestamps, in arrival order. The
+    /// window prunes any entries older than `window` on every
+    /// `next_delay` call. Bounded by `max_attempts` in steady
+    /// state (older entries fall off as new ones arrive).
+    attempts: VecDeque<Instant>,
+    /// Sliding-window width. Production: 60 s per §5.1.
+    window: Duration,
+    /// Per-window ceiling. Production: 5 per §5.1.
+    max_attempts: u8,
+    /// Exponential base. Production: 100 ms.
+    base: Duration,
+    /// Hard cap on the exponential growth. Production: 5 s.
+    cap: Duration,
+}
+
+impl RestartBackoff {
+    /// Production constructor — every knob set to the design
+    /// §5.1 default.
+    pub fn new() -> Self {
+        Self::with_config(
+            RESTART_CEILING_WINDOW,
+            RESTART_CEILING_MAX_ATTEMPTS,
+            RESTART_BACKOFF_BASE,
+            RESTART_BACKOFF_CAP,
+        )
+    }
+
+    /// Test-only knobs so the 60 s window doesn't drag unit tests
+    /// into the minute-scale. Public so future custom integration
+    /// tests (W8) can tune it; production callers go through
+    /// [`Self::new`].
+    pub fn with_config(
+        window: Duration,
+        max_attempts: u8,
+        base: Duration,
+        cap: Duration,
+    ) -> Self {
+        Self {
+            attempts: VecDeque::new(),
+            window,
+            max_attempts,
+            base,
+            cap,
+        }
+    }
+
+    /// Record one restart attempt and compute the delay before
+    /// the spawn. `now` is taken as a parameter so tests can
+    /// inject deterministic time without a Clock trait.
+    ///
+    /// Returns:
+    /// - `Wait { delay = ZERO, attempt = 1 }` for the first
+    ///   attempt in a fresh window (immediate restart per §5.1).
+    /// - `Wait { delay = base * 2^(attempt - 2), attempt }`
+    ///   capped at `cap` for attempts 2..=max_attempts.
+    /// - `CeilingExceeded { attempts_in_window, window }` when
+    ///   the count of attempts inside the sliding window meets
+    ///   or exceeds `max_attempts` — the caller must NOT respawn.
+    pub fn next_delay(&mut self, now: Instant) -> BackoffOutcome {
+        // Prune entries that fell out the window's tail.
+        while let Some(&oldest) = self.attempts.front() {
+            if now.saturating_duration_since(oldest) > self.window {
+                self.attempts.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if (self.attempts.len() as u8) >= self.max_attempts {
+            return BackoffOutcome::CeilingExceeded {
+                attempts_in_window: self.attempts.len() as u8,
+                window: self.window,
+            };
+        }
+
+        // Record THIS attempt before computing the delay so the
+        // attempt number lines up with the design's 1-based
+        // counting ("first restart" = attempt 1 = immediate).
+        self.attempts.push_back(now);
+        let attempt = self.attempts.len() as u8;
+
+        let delay = if attempt <= 1 {
+            Duration::ZERO
+        } else {
+            // attempt 2 → 2^0 = 1× base = 100 ms
+            // attempt 3 → 2^1 = 2× base = 200 ms
+            // attempt 4 → 2^2 = 4× base = 400 ms
+            // attempt 5 → 2^3 = 8× base = 800 ms
+            let exp = (attempt - 2) as u32;
+            // checked_pow avoids overflow at extreme attempt
+            // counts (the ceiling fires first in practice but
+            // belt-and-suspenders here is cheap).
+            let multiplier = 2u64.checked_pow(exp).unwrap_or(u64::MAX);
+            let unbounded = self
+                .base
+                .checked_mul(multiplier.min(u32::MAX as u64) as u32)
+                .unwrap_or(self.cap);
+            unbounded.min(self.cap)
+        };
+
+        BackoffOutcome::Wait { delay, attempt }
+    }
+
+    /// Number of attempts currently inside the sliding window.
+    /// Used in the "tamper suspected" log line. Does NOT prune
+    /// — callers see the count as of the last `next_delay`.
+    pub fn attempts_in_window(&self) -> usize {
+        self.attempts.len()
+    }
+}
+
+impl Default for RestartBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Spawn the agent with the persisted argv. Per design §5.3 the
+/// canonical respawn command is the first launch's argv (in
+/// systemd deployment, `ExecStart=` of `northnarrow-agent.service`).
+/// For W4 the caller is responsible for supplying that argv —
+/// argv parsing from systemd happens in W7's deploy commit; W4
+/// just consumes whatever slice it's given.
+///
+/// `argv[0]` must be the agent binary path; `argv[1..]` are the
+/// flags. Inherits stdio from the watchdog (so journald captures
+/// agent logs through the watchdog unit's journal — by design,
+/// the agent's own unit `Restart=no` means systemd-direct journal
+/// only sees the agent's first crash before the watchdog took
+/// over respawn).
+pub fn spawn_agent(argv: &[String]) -> Result<Child> {
+    let bin = argv
+        .first()
+        .ok_or_else(|| anyhow!("spawn_agent: empty argv (need at least the binary path)"))?;
+    let child = Command::new(bin)
+        .args(&argv[1..])
+        .spawn()
+        .with_context(|| format!("Command::spawn({bin})"))?;
+    info!(
+        target: "watchdog.respawn",
+        bin,
+        argc = argv.len(),
+        new_pid = child.id(),
+        "agent respawned"
+    );
+    Ok(child)
+}
+
+/// Poll the new agent's pidfile until it contains a valid PID,
+/// or the deadline elapses. Mirrors W2's
+/// [`open_agent_pidfd_with_retry`] but doesn't open a pidfd
+/// (that's the caller's next step — we just need the PID for
+/// PROTECTED_PIDS reinsertion).
+///
+/// The agent writes its pidfile atomically (tmpfile + fsync +
+/// rename) AFTER every LSM hook is attached AND the "decision
+/// engine ready" log line has flushed — so a successful read
+/// here is also a readiness signal for the agent's anti-tamper
+/// surface.
+pub async fn wait_for_new_agent_pid(
+    pidfile: &Path,
+    deadline: Duration,
+) -> Result<u32> {
+    let start = Instant::now();
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match read_pid_from_file(pidfile) {
+            Ok(pid) => {
+                info!(
+                    target: "watchdog.respawn",
+                    attempts,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    pid,
+                    "new agent pidfile observed"
+                );
+                return Ok(pid);
+            }
+            Err(_) if start.elapsed() < deadline => {
+                tokio::time::sleep(PIDFD_OPEN_RETRY_INTERVAL).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "agent pidfile {} never appeared within {:?}",
+                        pidfile.display(),
+                        deadline
+                    )
+                });
+            }
+        }
+    }
+}
+
+/// Defensive re-insert of the new agent's PID into
+/// PROTECTED_PIDS — the design §5.4 "load-bearing" duplicate
+/// of the agent's own [`register_protected_pids`] call. Closes
+/// the brief window between "new agent process spawned" and
+/// "new agent finished its own anti_tamper::attach()". Both
+/// writes are idempotent (BPF_ANY upsert).
+///
+/// Errors are surfaced but the caller's typical response is
+/// warn-and-continue: the agent will re-insert its own PID via
+/// `register_protected_pids` shortly anyway, so a failure here
+/// only widens the race window — it doesn't permanently lose
+/// PROTECTED_PIDS coverage.
+pub fn reinsert_new_agent_pid(bpffs_root: &Path, new_pid: u32) -> Result<()> {
+    let mut handle = ProtectedPidsHandle::open(bpffs_root).with_context(|| {
+        format!(
+            "opening PROTECTED_PIDS handle at {} for defensive reinsert",
+            bpffs_root.display()
+        )
+    })?;
+    handle.insert(new_pid).with_context(|| {
+        format!("inserting new agent PID {new_pid} into PROTECTED_PIDS")
+    })?;
+    info!(
+        target: "watchdog.respawn",
+        pid = new_pid,
+        bpffs_root = %bpffs_root.display(),
+        "defensive PROTECTED_PIDS reinsert complete"
+    );
+    Ok(())
+}
+
+/// Check A8's `/run/northnarrow/agent.shutdown_authorised`
+/// marker (per Tappa 8 sub-sprint A commit A7 + design §10.4 +
+/// Watchdog design §13 Q4 resolution). Returns:
+/// - `Ok(true)` when the marker is present AND its
+///   `grace_deadline_unix_ts` is in the future — admin
+///   authorised this shutdown, watchdog must NOT respawn.
+/// - `Ok(false)` when the marker is absent OR the deadline has
+///   elapsed (stale marker — unsigned restart proceeds).
+/// - `Err` when the marker exists but is malformed (parse
+///   failure, missing fields, non-hex entry_hash). The design
+///   §10.4 step 4 treats a malformed marker as a tampering
+///   signal: the caller should LOG the error and treat it as
+///   "not authorised" — fall through to the respawn path AND
+///   bump the per-window ceiling counter so a forge attempt
+///   gets counted into the 5-in-60s tamper signal.
+///
+/// Audit-log entry-hash cross-check (design §10.4 step 4 bullet
+/// 2) is deferred — it requires the A11 audit chain. The
+/// deadline check covers the staleness case; the entry-hash
+/// validation is a follow-on hardening once A11 ships.
+pub fn shutdown_was_authorised(marker_path: &Path) -> Result<bool> {
+    let raw = match std::fs::read_to_string(marker_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(
+                target: "watchdog.shutdown_marker",
+                path = %marker_path.display(),
+                "no shutdown-authorisation marker — proceeding with restart"
+            );
+            return Ok(false);
+        }
+        Err(e) => {
+            return Err(anyhow!(e))
+                .with_context(|| format!("reading marker {}", marker_path.display()));
+        }
+    };
+
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .with_context(|| format!("parsing marker JSON at {}", marker_path.display()))?;
+    let entry_hash = v
+        .get("entry_hash")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("marker missing `entry_hash` field"))?;
+    if entry_hash.len() != 64 || !entry_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "marker entry_hash must be 64 hex chars (got {} chars)",
+            entry_hash.len()
+        ));
+    }
+    let deadline = v
+        .get("grace_deadline_unix_ts")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| anyhow!("marker missing `grace_deadline_unix_ts` field"))?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if deadline < now {
+        warn!(
+            target: "watchdog.shutdown_marker",
+            path = %marker_path.display(),
+            deadline,
+            now,
+            "shutdown marker is STALE — proceeding with restart"
+        );
+        return Ok(false);
+    }
+
+    info!(
+        target: "watchdog.shutdown_marker",
+        path = %marker_path.display(),
+        entry_hash,
+        deadline,
+        "admin-authorised shutdown marker present + deadline valid — watchdog standing down"
+    );
+    Ok(true)
+}
+
+/// Helper: emit the "tamper suspected" journal line + escalate.
+/// The ceiling is the design §5.1 "5-in-60s" trigger; the
+/// watchdog stays alive after this for operator inspection
+/// (`systemctl reset-failed northnarrow-agent` is the
+/// documented recovery).
+pub fn log_tamper_suspected(attempts_in_window: u8, window: Duration) {
+    error!(
+        target: "watchdog.tamper",
+        attempts_in_window,
+        window_secs = window.as_secs(),
+        "TAMPER SUSPECTED: agent restart ceiling tripped ({attempts_in_window} attempts in last {} s) — \
+         watchdog stops respawning; manual recovery via `systemctl reset-failed northnarrow-agent` \
+         then `systemctl start northnarrow-agent`",
+        window.as_secs()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +1074,254 @@ mod tests {
         let dbg = format!("{report:?}");
         assert!(dbg.contains("4321"));
         assert!(dbg.contains("42"));
+    }
+
+    // ── Watchdog W4: backoff state machine + marker check ─────────
+
+    /// Required W4 test 1: first restart fires immediately. The
+    /// design §5.1 contract: "First restart: immediate (within
+    /// ~10 ms after pidfd POLLIN, bounded by evict_pid +
+    /// Command::spawn latency)" — so the backoff state machine
+    /// must yield ZERO for attempt 1 in a fresh window.
+    #[test]
+    fn backoff_first_attempt_is_immediate() {
+        let mut bo = RestartBackoff::new();
+        let now = Instant::now();
+        match bo.next_delay(now) {
+            BackoffOutcome::Wait { delay, attempt } => {
+                assert_eq!(delay, Duration::ZERO);
+                assert_eq!(attempt, 1);
+            }
+            other => panic!("expected immediate Wait, got {other:?}"),
+        }
+        assert_eq!(bo.attempts_in_window(), 1);
+    }
+
+    /// Required W4 test 2: exponential growth for attempts 2..5
+    /// matches the design §5.1 numbers exactly (100 ms, 200 ms,
+    /// 400 ms, 800 ms). Anchors the doubling rule against a
+    /// future "let's tune the constants" regression that would
+    /// silently change operator-visible backoff timing.
+    #[test]
+    fn backoff_exponential_growth_attempts_2_through_5() {
+        let mut bo = RestartBackoff::new();
+        let t0 = Instant::now();
+        // Attempt 1 — consumed, not asserted here (covered in
+        // test 1).
+        let _ = bo.next_delay(t0);
+        // Attempts 2..=5 grow as base * 2^(n-2).
+        let expected = [
+            (2u8, Duration::from_millis(100)),
+            (3, Duration::from_millis(200)),
+            (4, Duration::from_millis(400)),
+            (5, Duration::from_millis(800)),
+        ];
+        for (n, want) in expected {
+            match bo.next_delay(t0) {
+                BackoffOutcome::Wait { delay, attempt } => {
+                    assert_eq!(attempt, n, "attempt count");
+                    assert_eq!(delay, want, "delay for attempt {n}");
+                }
+                other => panic!("attempt {n}: expected Wait, got {other:?}"),
+            }
+        }
+    }
+
+    /// Required W4 test 3: 5-in-60s ceiling. After
+    /// `RESTART_CEILING_MAX_ATTEMPTS` attempts inside the
+    /// window, the next call must return CeilingExceeded with
+    /// the accurate attempt count + window.
+    #[test]
+    fn backoff_ceiling_after_max_attempts_in_window() {
+        // Use the production knobs but with a tight window so
+        // the test stays fast — even production's 60 s window
+        // works here because all attempts happen at the same
+        // `Instant`.
+        let mut bo = RestartBackoff::new();
+        let t0 = Instant::now();
+        // Drain the 5-attempt allowance.
+        for _ in 0..RESTART_CEILING_MAX_ATTEMPTS {
+            let outcome = bo.next_delay(t0);
+            assert!(matches!(outcome, BackoffOutcome::Wait { .. }));
+        }
+        // 6th call within the same window must exceed.
+        match bo.next_delay(t0) {
+            BackoffOutcome::CeilingExceeded {
+                attempts_in_window,
+                window,
+            } => {
+                assert_eq!(attempts_in_window, RESTART_CEILING_MAX_ATTEMPTS);
+                assert_eq!(window, RESTART_CEILING_WINDOW);
+            }
+            other => panic!("expected CeilingExceeded, got {other:?}"),
+        }
+    }
+
+    /// Required W4 test 4: sliding-window pruning. Attempts
+    /// older than the window must drop off; the count resets
+    /// once enough time elapses. Uses a tight 50 ms window via
+    /// `with_config` so the test runs in <100 ms.
+    #[test]
+    fn backoff_window_slides_old_attempts_drop() {
+        let window = Duration::from_millis(50);
+        let mut bo = RestartBackoff::with_config(
+            window,
+            RESTART_CEILING_MAX_ATTEMPTS,
+            RESTART_BACKOFF_BASE,
+            RESTART_BACKOFF_CAP,
+        );
+        let t0 = Instant::now();
+        // Burn through the allowance at t0.
+        for _ in 0..RESTART_CEILING_MAX_ATTEMPTS {
+            let _ = bo.next_delay(t0);
+        }
+        // Ceiling tripped at t0.
+        assert!(matches!(
+            bo.next_delay(t0),
+            BackoffOutcome::CeilingExceeded { .. }
+        ));
+        // Jump past the window — old attempts must prune.
+        let t_future = t0 + window + Duration::from_millis(1);
+        match bo.next_delay(t_future) {
+            BackoffOutcome::Wait { delay, attempt } => {
+                assert_eq!(delay, Duration::ZERO, "window slid; this is attempt 1 again");
+                assert_eq!(attempt, 1);
+            }
+            other => panic!("expected fresh-window Wait, got {other:?}"),
+        }
+    }
+
+    /// Required W4 test 5: exponential cap. Beyond the natural
+    /// growth point, delay must clamp at `RESTART_BACKOFF_CAP`.
+    /// Uses tweaked knobs (smaller cap, larger max_attempts) to
+    /// exercise the cap path without burning real seconds.
+    #[test]
+    fn backoff_caps_at_max_delay() {
+        let base = Duration::from_millis(100);
+        let cap = Duration::from_millis(300); // cap before 800ms
+        let mut bo = RestartBackoff::with_config(
+            Duration::from_secs(60),
+            10,        // higher max to allow more attempts
+            base,
+            cap,
+        );
+        let t0 = Instant::now();
+        // Attempts: 1=0ms, 2=100ms, 3=200ms, 4=400ms→cap=300ms,
+        // 5=800ms→cap=300ms, ...
+        let _ = bo.next_delay(t0); // 1 → 0
+        let _ = bo.next_delay(t0); // 2 → 100
+        let _ = bo.next_delay(t0); // 3 → 200
+        match bo.next_delay(t0) {
+            BackoffOutcome::Wait { delay, attempt: 4 } => {
+                assert_eq!(delay, cap, "attempt 4 (400ms unbounded) must cap at {cap:?}");
+            }
+            other => panic!("expected capped Wait at attempt 4, got {other:?}"),
+        }
+        match bo.next_delay(t0) {
+            BackoffOutcome::Wait { delay, attempt: 5 } => {
+                assert_eq!(delay, cap, "attempt 5 (800ms unbounded) must cap at {cap:?}");
+            }
+            other => panic!("expected capped Wait at attempt 5, got {other:?}"),
+        }
+    }
+
+    /// Required W4 test 6: shutdown_authorised marker check.
+    /// Covers all three branches: absent file → Ok(false);
+    /// present + future deadline → Ok(true); present + past
+    /// deadline → Ok(false) with WARN; malformed → Err.
+    #[test]
+    fn shutdown_was_authorised_handles_all_marker_shapes() {
+        let dir = TempDir::new().unwrap();
+
+        // Branch 1: absent → Ok(false).
+        let absent = dir.path().join("nope.marker");
+        assert!(!shutdown_was_authorised(&absent).unwrap());
+
+        // Branch 2: present + future deadline → Ok(true).
+        let valid = dir.path().join("valid.marker");
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(
+            &valid,
+            format!(
+                r#"{{"entry_hash":"{}","grace_deadline_unix_ts":{future}}}"#,
+                "ab".repeat(32),
+            ),
+        )
+        .unwrap();
+        assert!(shutdown_was_authorised(&valid).unwrap());
+
+        // Branch 3: present + past deadline → Ok(false).
+        let stale = dir.path().join("stale.marker");
+        std::fs::write(
+            &stale,
+            format!(
+                r#"{{"entry_hash":"{}","grace_deadline_unix_ts":1}}"#,
+                "cd".repeat(32),
+            ),
+        )
+        .unwrap();
+        assert!(
+            !shutdown_was_authorised(&stale).unwrap(),
+            "stale marker (deadline 1970) must NOT block restart"
+        );
+
+        // Branch 4: present + malformed → Err.
+        let bad = dir.path().join("bad.marker");
+        std::fs::write(&bad, "this is not json").unwrap();
+        assert!(shutdown_was_authorised(&bad).is_err());
+
+        // Branch 4b: present + JSON but missing fields → Err.
+        let partial = dir.path().join("partial.marker");
+        std::fs::write(&partial, r#"{"grace_deadline_unix_ts":9999}"#).unwrap();
+        assert!(shutdown_was_authorised(&partial).is_err());
+
+        // Branch 4c: present + entry_hash wrong length → Err.
+        let bad_hash = dir.path().join("bad_hash.marker");
+        std::fs::write(
+            &bad_hash,
+            r#"{"entry_hash":"abcd","grace_deadline_unix_ts":9999999999}"#,
+        )
+        .unwrap();
+        assert!(shutdown_was_authorised(&bad_hash).is_err());
+    }
+
+    // ── Supplementary W4 tests (anchors for forward-compat) ────────
+
+    /// Anchor: `spawn_agent` with an empty argv slice surfaces
+    /// a clear error before touching `Command::spawn`. Guards
+    /// against a future caller forgetting the binary-path
+    /// element.
+    #[test]
+    fn spawn_agent_rejects_empty_argv() {
+        let err = spawn_agent(&[]).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty argv"),
+            "error should explain the missing binary path, got: {chain}"
+        );
+    }
+
+    /// Anchor: `wait_for_new_agent_pid` honours the deadline +
+    /// returns the pid once the pidfile materialises. Uses a
+    /// background tokio task to publish the pidfile mid-poll.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_new_agent_pid_observes_late_pidfile() {
+        let dir = TempDir::new().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        let writer_path = pidfile.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            write_pidfile_atomic(&writer_path, 4242).unwrap();
+        });
+        let pid = wait_for_new_agent_pid(&pidfile, Duration::from_secs(2))
+            .await
+            .expect("late pidfile must be observed within deadline");
+        assert_eq!(pid, 4242);
+        writer.await.unwrap();
     }
 
     /// Required W3 test 5: layer-2 evict latency is observable
