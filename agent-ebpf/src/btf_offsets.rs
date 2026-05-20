@@ -35,3 +35,16 @@ pub(crate) const SUPER_BLOCK_S_DEV_OFFSET: usize = 16;
 /// `struct file.f_inode` — pointer to the file's inode.
 /// `bits_offset=1344`.
 pub(crate) const FILE_F_INODE_OFFSET: usize = 168;
+
+/// `struct file.f_flags` — `unsigned int` open-flag bitmap
+/// (`O_RDONLY` / `O_WRONLY` / `O_RDWR` / `O_TRUNC` / etc.).
+/// `bits_offset=576` on Ubuntu 24.04.x / kernel 6.8.x —
+/// validated 2026-05-19 against `/sys/kernel/btf/vmlinux` on
+/// `6.8.0-117-generic` via `bpftool btf dump file /sys/kernel/
+/// btf/vmlinux format raw` (look for `STRUCT 'file' size=232`
+/// → `'f_flags' type_id=6 bits_offset=576`). The Tappa 9 C5.2
+/// `fim_file_open_observe` reads this offset; the C2-deferred
+/// concern (untrusted BTF-offset guess) is closed by the
+/// dump-verified value.
+#[allow(dead_code)]
+pub(crate) const FILE_F_FLAGS_OFFSET: usize = 72;

@@ -276,6 +276,12 @@ pub const FIM_OP_CREATED: u8 = 2;
 pub const FIM_OP_DELETED: u8 = 3;
 pub const FIM_OP_RENAMED: u8 = 4;
 pub const FIM_OP_LINKED: u8 = 5;
+/// Tappa 9 (C5.2): `file_open` LSM observation. Emitted by
+/// `fim_file_open_observe` on EVERY open of a watched inode
+/// (read or write). Userland C5.3 cred-read rules classify
+/// downstream — the BPF layer doesn't filter by access mode
+/// since the WATCHED_PATHS set is already operator-curated.
+pub const FIM_OP_OPENED: u8 = 6;
 
 /// Tappa 9 (C1) — kernel↔userland record emitted by the FIM
 /// observation hooks (design §5). One record per watched-inode
@@ -370,6 +376,10 @@ pub enum FimOp {
     Deleted = FIM_OP_DELETED,
     Renamed = FIM_OP_RENAMED,
     Linked = FIM_OP_LINKED,
+    /// Tappa 9 (C5.2): emitted by `fim_file_open_observe`
+    /// on every open of a watched inode. Drives C5.3
+    /// cloud-credentials-read detection (NN-L-FIM-011..014).
+    Opened = FIM_OP_OPENED,
 }
 
 #[cfg(feature = "std")]
@@ -389,6 +399,7 @@ impl core::convert::TryFrom<u8> for FimOp {
             FIM_OP_DELETED => Ok(Self::Deleted),
             FIM_OP_RENAMED => Ok(Self::Renamed),
             FIM_OP_LINKED => Ok(Self::Linked),
+            FIM_OP_OPENED => Ok(Self::Opened),
             other => Err(FimOpDecodeError::UnknownByte(other)),
         }
     }
@@ -557,6 +568,8 @@ mod tests {
         assert_eq!(FimOp::Deleted as u8, FIM_OP_DELETED);
         assert_eq!(FimOp::Renamed as u8, FIM_OP_RENAMED);
         assert_eq!(FimOp::Linked as u8, FIM_OP_LINKED);
+        // C5.2 addition (APPENDED, byte 6).
+        assert_eq!(FimOp::Opened as u8, FIM_OP_OPENED);
         // Discriminant values are STABLE wire bytes — never
         // renumber. Anchor literal values.
         assert_eq!(FIM_OP_MODIFIED, 1);
@@ -564,6 +577,7 @@ mod tests {
         assert_eq!(FIM_OP_DELETED, 3);
         assert_eq!(FIM_OP_RENAMED, 4);
         assert_eq!(FIM_OP_LINKED, 5);
+        assert_eq!(FIM_OP_OPENED, 6);
     }
 
     /// C1 test #4: [`FimOp`] try_from round-trip + unknown-byte
@@ -579,6 +593,7 @@ mod tests {
             FimOp::Deleted,
             FimOp::Renamed,
             FimOp::Linked,
+            FimOp::Opened,
         ] {
             let byte: u8 = op.into();
             let round: FimOp = FimOp::try_from(byte).expect("known byte must decode");
