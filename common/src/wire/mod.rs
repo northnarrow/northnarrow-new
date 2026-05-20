@@ -745,6 +745,20 @@ pub struct NetFlowEvent {
     /// Per-flow stable ID — `SHA-256(start_ns || five_tuple ||
     /// pid)[..16]` rendered as 32-char lowercase hex.
     pub flow_id: alloc::string::String,
+    /// Tappa 10 (N3) — low 8 bits of `sock->sk_err` propagated
+    /// from the kernel close event (see N2 [`NetFlowCloseRaw`]).
+    /// `0` = graceful FIN (or UDP — no close semantics — or
+    /// open-flow snapshot before the close arrived);
+    /// `104` = `ECONNRESET` (RST received); `110` = `ETIMEDOUT`
+    /// (keepalive timeout). N6 detection rules read this to
+    /// distinguish "abrupt close" anomalies from clean
+    /// connection teardown.
+    ///
+    /// `#[serde(default)]` keeps pre-N3 chains parseable —
+    /// rows without the field deserialise to `close_reason: 0`,
+    /// which matches the most common "graceful" case anyway.
+    #[serde(default)]
+    pub close_reason: u8,
 }
 
 /// Tappa 10 (N1) — userland-decoded `inet_csk_listen` event.
@@ -1085,6 +1099,7 @@ mod tests {
                 alpn: vec!["h2".to_string()],
             }),
             flow_id: "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
+            close_reason: 0,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: NetFlowEvent = serde_json::from_str(&json).expect("deserialize");
