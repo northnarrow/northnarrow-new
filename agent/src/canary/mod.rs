@@ -20,3 +20,4 @@
 pub mod access_log;
 pub mod detector;
 pub mod registry;
+pub mod templates;
