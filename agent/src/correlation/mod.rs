@@ -130,6 +130,11 @@ fn event_timestamp_ns(e: &Event) -> u64 {
         // timestamp_ns (preserved from the source Event::Fim /
         // Event::ProcessSpawn the detector remapped).
         Event::CanaryTripped { timestamp_ns, .. } => *timestamp_ns,
+        // Tappa 10 (N6). NetFlow uses start_ns as the
+        // correlation-window anchor (the connect-side
+        // timestamp); NetListener uses timestamp_ns.
+        Event::NetFlow(nf) => nf.start_ns,
+        Event::NetListener(nl) => nl.timestamp_ns,
     }
 }
 
@@ -163,6 +168,11 @@ fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
             canary_name,
             ..
         } => (*accessor_pid, None, Some(canary_name.as_str())),
+        // Tappa 10 (N6): NetFlow keys off (pid, exe-or-comm).
+        // No ppid in the flow event (the connect kprobe doesn't
+        // capture it; N7 admin-CLI may stitch in ppid later).
+        Event::NetFlow(nf) => (nf.pid, None, nf.exe.as_deref().or(Some(nf.comm.as_str()))),
+        Event::NetListener(nl) => (nl.pid, None, nl.exe.as_deref().or(Some(nl.comm.as_str()))),
     }
 }
 

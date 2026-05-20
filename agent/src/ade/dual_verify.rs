@@ -158,6 +158,9 @@ fn pid_of(e: &Event) -> u32 {
         // Tappa 9.5 (K3): canary trips short-circuit in main —
         // never reach dual_verify; arm for exhaustiveness only.
         Event::CanaryTripped { accessor_pid, .. } => *accessor_pid,
+        // Tappa 10 (N6).
+        Event::NetFlow(nf) => nf.pid,
+        Event::NetListener(nl) => nl.pid,
     }
 }
 

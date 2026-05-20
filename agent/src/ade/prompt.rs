@@ -207,6 +207,24 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             "- fim_drift path={} op={:?} modifier_pid={} modifier_comm={}",
             fe.path, fe.op, fe.modifier_pid, fe.modifier_comm
         ),
+        // Tappa 10 (N6): one-liner sketch; N10 ADE template will
+        // produce the richer NetFlow prompt block.
+        Event::NetFlow(nf) => format!(
+            "- net_flow pid={} uid={} comm={} dst_addr={} dst_port={} proto={} \
+             bytes_sent={} resolved_hostname={}",
+            nf.pid,
+            nf.uid,
+            nf.comm,
+            nf.dst_addr,
+            nf.dst_port,
+            nf.proto,
+            nf.bytes_sent,
+            nf.resolved_hostname.as_deref().unwrap_or("-"),
+        ),
+        Event::NetListener(nl) => format!(
+            "- net_listener pid={} uid={} comm={} bind_addr={} bind_port={} proto={}",
+            nl.pid, nl.uid, nl.comm, nl.bind_addr, nl.bind_port, nl.proto
+        ),
     }
 }
 

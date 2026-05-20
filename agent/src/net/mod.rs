@@ -15,6 +15,7 @@
 //! [`NetFlowEvent`]: northnarrow_common::wire::NetFlowEvent
 //! [`NetListenerEvent`]: northnarrow_common::wire::NetListenerEvent
 
+pub mod blocklist;
 pub mod dns_cache;
 pub mod flow_tracker;
 pub mod tls_parser;

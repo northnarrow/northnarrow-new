@@ -68,6 +68,11 @@ pub fn transform_to_escalate(
             canary_name,
             ..
         } => (*accessor_pid, canary_name.clone()),
+        // Tappa 10 (N6): NetFlow / NetListener escalation arm
+        // for exhaustiveness. N10 ADE wiring will refine the
+        // prompt payload; for V1.0 we surface (pid, comm).
+        Event::NetFlow(nf) => (nf.pid, nf.comm.clone()),
+        Event::NetListener(nl) => (nl.pid, nl.comm.clone()),
     };
 
     AdeVerdict {

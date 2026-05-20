@@ -168,6 +168,9 @@ fn event_kind_label(e: &Event) -> &'static str {
         // Tappa 9.5 (K3): canary trip label. Canary precedence
         // short-circuits before ADE; arm for exhaustiveness.
         Event::CanaryTripped { .. } => "canary_tripped",
+        // Tappa 10 (N6) — labels for the new variants.
+        Event::NetFlow(_) => "net_flow",
+        Event::NetListener(_) => "net_listener",
     }
 }
 
@@ -187,6 +190,9 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
             accessor_uid,
             ..
         } => (*accessor_pid, *accessor_uid),
+        // Tappa 10 (N6).
+        Event::NetFlow(nf) => (nf.pid, nf.uid),
+        Event::NetListener(nl) => (nl.pid, nl.uid),
     };
     buf.push_str(&format!("pid: {pid}\nuid: {uid}\n"));
 }
