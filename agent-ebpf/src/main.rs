@@ -21,10 +21,13 @@ mod dns_query;
 mod exec_check;
 mod file_open;
 mod fim_watch;
+mod inet_csk_listen;
 mod inode_protect;
 mod ptrace_check;
 mod task_kill;
+mod tcp_close;
 mod tcp_connect;
+mod udp_sendmsg_outbound;
 
 use aya_ebpf::{
     helpers::{
