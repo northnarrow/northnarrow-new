@@ -17,3 +17,4 @@
 
 pub mod dns_cache;
 pub mod flow_tracker;
+pub mod tls_parser;
