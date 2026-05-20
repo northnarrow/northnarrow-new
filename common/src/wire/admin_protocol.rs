@@ -400,6 +400,125 @@ pub struct CanaryRefreshRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+// ── Tappa 10 N7 — network observability admin ops ─────────────────
+//
+// Four operator-facing admin ops mirroring the Tappa 9 C6 FIM CLI
+// shape + the Tappa 9.5 K6 canary CLI shape. All four are 1-of-N
+// quorum (workflow gates, not security gates) authorised by
+// `Role::NetRead` per design §9 + §13 Q6 lock-in (single-sig
+// admin reads remain the operator-ergonomics standard).
+//
+// V1.0 dispatch semantics:
+//   * `NetFlowsRequest` reads `/var/lib/northnarrow/netflow.jsonl`
+//     when present (returns empty if the chain doesn't exist yet);
+//     the N7 commit ships the wire shape + auth surface, the
+//     drain that populates the chain is N8/follow-up.
+//   * `NetListenersRequest` returns the in-process listener
+//     snapshot. V1.0 ships the wire shape + empty stub; the
+//     userland listener cache wiring is a future commit.
+//   * `NetResolveRequest` carries the IP the operator wants the
+//     DNS attribution for. V1.0 returns `qname: None` because
+//     the back-correlation cache doesn't store resolved IPs
+//     (V1.1 DNS-response observer fills this in).
+//   * `NetFingerprintRequest` returns recent JA3/JA4 fingerprints
+//     observed by the agent. V1.0 stub returns empty; persistence
+//     wiring is a future commit.
+//
+// Every response shares the FimReport-style `entries_jsonl` +
+// `entries_count` + `entries_truncated` triple (except NetResolve
+// which is a single-record reply).
+
+/// Tappa 10 (N7) — signed NetFlow chain read request (design §9 +
+/// §13 Q6). Carries `op = NetFlows` with the optional
+/// `since_unix_ts` filter in
+/// [`crate::wire::admin_signed_payload::NetFlowsExtra`]. 1-of-N,
+/// `Role::NetRead`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetFlowsRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 10 (N7) — `NetFlows` reply payload. Same truncation-aware
+/// shape as `FimReportResponse` — the chained `netflow.jsonl` rows
+/// go in `entries_jsonl` (one row per line); `entries_count` for
+/// the summary line; `entries_truncated` signals overflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetFlowsResponse {
+    pub result: AdminResult,
+    pub entries_jsonl: String,
+    pub entries_count: u32,
+    pub entries_truncated: bool,
+}
+
+/// Tappa 10 (N7) — signed listener-snapshot request. 1-of-N,
+/// `Role::NetRead`. Carries `op = NetListeners` with the empty
+/// [`crate::wire::admin_signed_payload::NetListenersExtra`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetListenersRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 10 (N7) — `NetListeners` reply payload. Same truncation
+/// triple as `NetFlowsResponse`. Each row is one [`crate::wire::
+/// NetListenerEvent`] in its canonical JSONL form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetListenersResponse {
+    pub result: AdminResult,
+    pub entries_jsonl: String,
+    pub entries_count: u32,
+    pub entries_truncated: bool,
+}
+
+/// Tappa 10 (N7) — signed DNS-attribution lookup request. Carries
+/// `op = NetResolve` with the target IP in
+/// [`crate::wire::admin_signed_payload::NetResolveExtra::ip`].
+/// 1-of-N, `Role::NetRead`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetResolveRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 10 (N7) — `NetResolve` reply payload. Single-shot reply
+/// (not chain-shaped). `qname` is `None` when the DNS cache has
+/// no attribution for the requested IP, OR when V1.1's DNS-response
+/// observer hasn't shipped yet (V1.0 always returns `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetResolveResponse {
+    pub result: AdminResult,
+    /// Resolved hostname (V1.1+) or `None` (V1.0 always, AND
+    /// V1.1+ on cache miss).
+    pub qname: Option<String>,
+    /// UNIX timestamp when the resolution was observed. `None`
+    /// when `qname` is None.
+    pub queried_at_unix_ts: Option<u64>,
+}
+
+/// Tappa 10 (N7) — signed TLS fingerprint dump request. 1-of-N,
+/// `Role::NetRead`. Carries `op = NetFingerprint` with the
+/// optional `flow_id` filter in
+/// [`crate::wire::admin_signed_payload::NetFingerprintExtra`]
+/// (V1.0 returns the recent fingerprints regardless of the
+/// filter; V1.1 will honor it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetFingerprintRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 10 (N7) — `NetFingerprint` reply payload. Same shape as
+/// `NetFlowsResponse` — each row is one [`crate::wire::TlsFingerprint`]
+/// observation alongside the flow_id it was extracted from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetFingerprintResponse {
+    pub result: AdminResult,
+    pub entries_jsonl: String,
+    pub entries_count: u32,
+    pub entries_truncated: bool,
+}
+
 /// Trigger payload for "issue me a fresh challenge nonce". Empty
 /// today; reserved as a struct so future fields (client version,
 /// requested key fingerprint) can be added without an AdminMessage
@@ -543,6 +662,30 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::CanaryRefreshRequest`]. Bare
     /// `AdminResult` — same rationale as `CanaryBurnResult`.
     CanaryRefreshResult(AdminResult),
+    /// Tappa 10 (N7) — signed NetFlows chain read request.
+    /// Triggers [`AdminMessage::NetFlowsResponse`].
+    NetFlowsRequest(NetFlowsRequest),
+    /// Reply to [`AdminMessage::NetFlowsRequest`] — carries the
+    /// chained JSONL body + truncation flag.
+    NetFlowsResponse(NetFlowsResponse),
+    /// Tappa 10 (N7) — signed listener snapshot request.
+    /// Triggers [`AdminMessage::NetListenersResponse`].
+    NetListenersRequest(NetListenersRequest),
+    /// Reply to [`AdminMessage::NetListenersRequest`] —
+    /// listener-snapshot JSONL body.
+    NetListenersResponse(NetListenersResponse),
+    /// Tappa 10 (N7) — signed DNS-attribution lookup request.
+    /// Triggers [`AdminMessage::NetResolveResponse`].
+    NetResolveRequest(NetResolveRequest),
+    /// Reply to [`AdminMessage::NetResolveRequest`] — single-
+    /// shot reply carrying the resolved qname or `None`.
+    NetResolveResponse(NetResolveResponse),
+    /// Tappa 10 (N7) — signed TLS fingerprint dump request.
+    /// Triggers [`AdminMessage::NetFingerprintResponse`].
+    NetFingerprintRequest(NetFingerprintRequest),
+    /// Reply to [`AdminMessage::NetFingerprintRequest`] —
+    /// fingerprint-observation JSONL body.
+    NetFingerprintResponse(NetFingerprintResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -997,7 +1140,15 @@ mod tests {
                 | AdminMessage::CanaryBurnRequest(_)
                 | AdminMessage::CanaryBurnResult(_)
                 | AdminMessage::CanaryRefreshRequest(_)
-                | AdminMessage::CanaryRefreshResult(_) => {}
+                | AdminMessage::CanaryRefreshResult(_)
+                | AdminMessage::NetFlowsRequest(_)
+                | AdminMessage::NetFlowsResponse(_)
+                | AdminMessage::NetListenersRequest(_)
+                | AdminMessage::NetListenersResponse(_)
+                | AdminMessage::NetResolveRequest(_)
+                | AdminMessage::NetResolveResponse(_)
+                | AdminMessage::NetFingerprintRequest(_)
+                | AdminMessage::NetFingerprintResponse(_) => {}
             }
         }
     }
@@ -1257,6 +1408,102 @@ mod tests {
             }],
         }));
         roundtrip(AdminMessage::CanaryRefreshResult(AdminResult::RoleDenied));
+    }
+
+    /// N7 wire test #1 — NetFlowsRequest + NetFlowsResponse
+    /// round-trip via postcard.
+    #[test]
+    fn net_flows_round_trips() {
+        let payload =
+            SignedPayload::new_net_flows([0x11; 32], 1_700_000_000, [0x22; 16], Some(1_700_000));
+        roundtrip(AdminMessage::NetFlowsRequest(NetFlowsRequest {
+            payload,
+            signatures: vec![KeyedSignature {
+                signature: [0x33; 64],
+            }],
+        }));
+        roundtrip(AdminMessage::NetFlowsResponse(NetFlowsResponse {
+            result: AdminResult::Success,
+            entries_jsonl: "{\"flow_id\":\"abc\"}\n".to_string(),
+            entries_count: 1,
+            entries_truncated: false,
+        }));
+        roundtrip(AdminMessage::NetFlowsResponse(NetFlowsResponse {
+            result: AdminResult::RoleDenied,
+            entries_jsonl: String::new(),
+            entries_count: 0,
+            entries_truncated: false,
+        }));
+    }
+
+    /// N7 wire test #2 — NetListenersRequest + NetListenersResponse.
+    #[test]
+    fn net_listeners_round_trips() {
+        let payload = SignedPayload::new_net_listeners([0x44; 32], 1_700_000_000, [0x55; 16]);
+        roundtrip(AdminMessage::NetListenersRequest(NetListenersRequest {
+            payload,
+            signatures: vec![KeyedSignature {
+                signature: [0x66; 64],
+            }],
+        }));
+        roundtrip(AdminMessage::NetListenersResponse(NetListenersResponse {
+            result: AdminResult::Success,
+            entries_jsonl: String::new(),
+            entries_count: 0,
+            entries_truncated: false,
+        }));
+    }
+
+    /// N7 wire test #3 — NetResolveRequest + NetResolveResponse.
+    #[test]
+    fn net_resolve_round_trips() {
+        let payload = SignedPayload::new_net_resolve(
+            [0x77; 32],
+            1_700_000_000,
+            [0x88; 16],
+            "8.8.8.8".to_string(),
+        );
+        roundtrip(AdminMessage::NetResolveRequest(NetResolveRequest {
+            payload,
+            signatures: vec![KeyedSignature {
+                signature: [0x99; 64],
+            }],
+        }));
+        roundtrip(AdminMessage::NetResolveResponse(NetResolveResponse {
+            result: AdminResult::Success,
+            qname: Some("example.com".to_string()),
+            queried_at_unix_ts: Some(1_700_000_000),
+        }));
+        roundtrip(AdminMessage::NetResolveResponse(NetResolveResponse {
+            result: AdminResult::Success,
+            qname: None,
+            queried_at_unix_ts: None,
+        }));
+    }
+
+    /// N7 wire test #4 — NetFingerprintRequest + NetFingerprintResponse.
+    #[test]
+    fn net_fingerprint_round_trips() {
+        let payload = SignedPayload::new_net_fingerprint(
+            [0xAA; 32],
+            1_700_000_000,
+            [0xBB; 16],
+            "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
+        );
+        roundtrip(AdminMessage::NetFingerprintRequest(NetFingerprintRequest {
+            payload,
+            signatures: vec![KeyedSignature {
+                signature: [0xCC; 64],
+            }],
+        }));
+        roundtrip(AdminMessage::NetFingerprintResponse(
+            NetFingerprintResponse {
+                result: AdminResult::Success,
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            },
+        ));
     }
 
     // ── A1: VersionedAdminMessage envelope (Tappa 8 design §6.2) ────

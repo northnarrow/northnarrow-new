@@ -1725,6 +1725,320 @@ fn current_utc_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+// ── Tappa 10 N7 — nn-admin net subcommands ─────────────────────────
+//
+// Four operator-facing helpers mirroring the FIM C6 + canary K6
+// CLI shape:
+//
+//   * `run_net_flows`        — reads the chained `netflow.jsonl`,
+//                              optional `--since-unix` filter.
+//   * `run_net_listeners`    — in-process listener snapshot.
+//   * `run_net_resolve`      — DNS-attribution lookup for an IP.
+//   * `run_net_fingerprint`  — recent JA3/JA4 observations.
+//
+// All four are 1-of-N quorum, `Role::NetRead`. The CLI streams
+// the JSONL body to stdout + a summary line to stderr (so
+// `nn-admin net flows | jq` works out-of-box, same shape as
+// `nn-admin fim report`).
+
+/// Shared outcome shape across the three chain-style net ops
+/// (flows / listeners / fingerprint). NetResolve uses its own
+/// outcome — the single-record reply doesn't fit the chain
+/// shape.
+#[derive(Debug)]
+pub enum NetJsonlOutcome {
+    Success {
+        entries_jsonl: String,
+        entries_count: u32,
+        entries_truncated: bool,
+    },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    RoleDenied,
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
+    Transport,
+}
+
+/// Outcome of `nn-admin net resolve <ip>`. Success carries the
+/// resolved hostname + when it was observed; V1.0 always returns
+/// `qname: None` (V1.1 DNS-response observer wire-up).
+#[derive(Debug)]
+pub enum NetResolveOutcome {
+    Success {
+        qname: Option<String>,
+        queried_at_unix_ts: Option<u64>,
+    },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    RoleDenied,
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
+    Transport,
+}
+
+fn map_admin_result_to_net_jsonl(
+    result: common::wire::admin_protocol::AdminResult,
+    entries_jsonl: String,
+    entries_count: u32,
+    entries_truncated: bool,
+) -> NetJsonlOutcome {
+    use common::wire::admin_protocol::AdminResult;
+    match result {
+        AdminResult::Success => NetJsonlOutcome::Success {
+            entries_jsonl,
+            entries_count,
+            entries_truncated,
+        },
+        AdminResult::InvalidSignature => NetJsonlOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => NetJsonlOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            NetJsonlOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::RoleDenied => NetJsonlOutcome::RoleDenied,
+        AdminResult::QuorumNotMet { .. } => NetJsonlOutcome::InvalidSignature,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => NetJsonlOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => NetJsonlOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => NetJsonlOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            NetJsonlOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+/// `nn-admin net flows [--since-unix N]` — read the chained
+/// netflow.jsonl. 1-of-N, `Role::NetRead`.
+pub fn run_net_flows(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    since_unix_ts: Option<u64>,
+) -> Result<NetJsonlOutcome> {
+    use common::wire::admin_protocol::NetFlowsRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_net_flows(nonce, now, agent_id_arr, since_unix_ts);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing net-flows payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::NetFlowsRequest(NetFlowsRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::NetFlowsResponse(resp) => Ok(map_admin_result_to_net_jsonl(
+            resp.result,
+            resp.entries_jsonl,
+            resp.entries_count,
+            resp.entries_truncated,
+        )),
+        _ => Ok(NetJsonlOutcome::Transport),
+    }
+}
+
+/// `nn-admin net listeners` — in-process listener snapshot.
+pub fn run_net_listeners(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+) -> Result<NetJsonlOutcome> {
+    use common::wire::admin_protocol::NetListenersRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_net_listeners(nonce, now, agent_id_arr);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing net-listeners payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::NetListenersRequest(NetListenersRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::NetListenersResponse(resp) => Ok(map_admin_result_to_net_jsonl(
+            resp.result,
+            resp.entries_jsonl,
+            resp.entries_count,
+            resp.entries_truncated,
+        )),
+        _ => Ok(NetJsonlOutcome::Transport),
+    }
+}
+
+/// `nn-admin net resolve <ip>` — DNS attribution lookup.
+pub fn run_net_resolve(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    ip: String,
+) -> Result<NetResolveOutcome> {
+    use common::wire::admin_protocol::{AdminResult, NetResolveRequest};
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_net_resolve(nonce, now, agent_id_arr, ip);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing net-resolve payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::NetResolveRequest(NetResolveRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::NetResolveResponse(resp) => Ok(match resp.result {
+            AdminResult::Success => NetResolveOutcome::Success {
+                qname: resp.qname,
+                queried_at_unix_ts: resp.queried_at_unix_ts,
+            },
+            AdminResult::InvalidSignature => NetResolveOutcome::InvalidSignature,
+            AdminResult::NoPendingChallenge => NetResolveOutcome::NoPendingChallenge,
+            AdminResult::RateLimited { retry_after_secs } => {
+                NetResolveOutcome::RateLimited { retry_after_secs }
+            }
+            AdminResult::RoleDenied => NetResolveOutcome::RoleDenied,
+            AdminResult::QuorumNotMet { .. } => NetResolveOutcome::InvalidSignature,
+            AdminResult::TimestampSkew {
+                server_ts,
+                max_skew_secs,
+            } => NetResolveOutcome::TimestampSkew {
+                server_ts,
+                max_skew_secs,
+            },
+            AdminResult::AgentIdMismatch => NetResolveOutcome::AgentIdMismatch,
+            AdminResult::UnknownOperation => NetResolveOutcome::UnknownOperation,
+            AdminResult::ProtocolVersionUnsupported { server_version } => {
+                NetResolveOutcome::ProtocolVersionUnsupported { server_version }
+            }
+        }),
+        _ => Ok(NetResolveOutcome::Transport),
+    }
+}
+
+/// `nn-admin net fingerprint --flow-id <hex>` — JA3/JA4 dump.
+pub fn run_net_fingerprint(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    flow_id: String,
+) -> Result<NetJsonlOutcome> {
+    use common::wire::admin_protocol::NetFingerprintRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_net_fingerprint(nonce, now, agent_id_arr, flow_id);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing net-fingerprint payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::NetFingerprintRequest(NetFingerprintRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::NetFingerprintResponse(resp) => Ok(map_admin_result_to_net_jsonl(
+            resp.result,
+            resp.entries_jsonl,
+            resp.entries_count,
+            resp.entries_truncated,
+        )),
+        _ => Ok(NetJsonlOutcome::Transport),
+    }
+}
+
 // ── tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
