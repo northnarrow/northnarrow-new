@@ -1388,6 +1388,29 @@ async fn process_event(
                 "CANARY TRIPPED"
             );
         }
+        // Tappa 10 (N6) — minimal logging arms; the N3 flow
+        // tracker + N2 listener kprobe feed these into the rule
+        // engine below. Full drain wiring is a follow-up commit.
+        Event::NetFlow(nf) => {
+            info!(
+                pid = %nf.pid,
+                comm = %nf.comm,
+                dst_addr = %nf.dst_addr,
+                dst_port = %nf.dst_port,
+                proto = %nf.proto,
+                bytes_sent = %nf.bytes_sent,
+                "net flow"
+            );
+        }
+        Event::NetListener(nl) => {
+            info!(
+                pid = %nl.pid,
+                comm = %nl.comm,
+                bind_addr = %nl.bind_addr,
+                bind_port = %nl.bind_port,
+                "net listener"
+            );
+        }
     }
 
     if let Some(verdict) = engine.evaluate(&event) {

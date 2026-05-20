@@ -265,6 +265,16 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             pid_for_pkg = *accessor_pid;
             filename_for_pkg = canary_name.clone();
         }
+        // Tappa 10 (N6): N10 ADE wiring will refine the
+        // inference payload; until then surface pid + comm.
+        Event::NetFlow(nf) => {
+            pid_for_pkg = nf.pid;
+            filename_for_pkg = nf.comm.clone();
+        }
+        Event::NetListener(nl) => {
+            pid_for_pkg = nl.pid;
+            filename_for_pkg = nl.comm.clone();
+        }
     }
 
     let metadata = AdeMetadata {

@@ -421,6 +421,20 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
             accessor_comm,
             ..
         } => (canary_name.clone(), accessor_comm.clone(), String::new()),
+        // Tappa 10 (N6): NetFlow + NetListener feed N10 ADE
+        // wiring (deferred). Until then surface comm + resolved
+        // hostname so sanitize doesn't crash on the new variants;
+        // ADE prompt template is N10 territory.
+        Event::NetFlow(nf) => (
+            nf.exe.clone().unwrap_or_default(),
+            nf.comm.clone(),
+            nf.resolved_hostname.clone().unwrap_or_default(),
+        ),
+        Event::NetListener(nl) => (
+            nl.exe.clone().unwrap_or_default(),
+            nl.comm.clone(),
+            String::new(),
+        ),
     }
 }
 
@@ -444,6 +458,16 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
             accessor_comm,
             ..
         } => vec![accessor_comm.clone(), canary_name.clone()],
+        // Tappa 10 (N6): comm + resolved-hostname / bind-port
+        // sketch; refined by N10 ADE prompt template.
+        Event::NetFlow(nf) => {
+            let mut v = vec![nf.comm.clone()];
+            if let Some(h) = &nf.resolved_hostname {
+                v.push(h.clone());
+            }
+            v
+        }
+        Event::NetListener(nl) => vec![nl.comm.clone(), nl.bind_port.to_string()],
     }
 }
 

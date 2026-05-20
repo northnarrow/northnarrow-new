@@ -5,6 +5,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 use super::Rule;
 
 pub mod canary;
+pub mod net;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
 mod r003_exec_from_var_tmp;
@@ -56,6 +57,10 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     ];
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
+    // Tappa 10 (N6) — 9 NN-L-NET rules with empty boot
+    // blocklists; production wire-up replaces these with the
+    // loaded-from-disk variants once N8 ships.
+    rules.extend(net::net_rules_empty());
     rules
 }
 

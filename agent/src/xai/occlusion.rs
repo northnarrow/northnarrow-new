@@ -154,6 +154,16 @@ fn event_kind_label(e: &Event) -> String {
             access_kind,
             ..
         } => format!("CanaryTripped name={canary_name} kind={access_kind:?}"),
+        // Tappa 10 (N6): XAI occlusion for NetFlow / NetListener
+        // is deferred to a follow-up commit; surface short label.
+        Event::NetFlow(nf) => format!(
+            "NetFlow comm={} dst_port={} proto={}",
+            nf.comm, nf.dst_port, nf.proto
+        ),
+        Event::NetListener(nl) => format!(
+            "NetListener comm={} bind_port={} proto={}",
+            nl.comm, nl.bind_port, nl.proto
+        ),
     }
 }
 
@@ -419,6 +429,26 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
                 "focal accessor uid".into(),
                 Identifier,
             ));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
+        }
+        // Tappa 10 (N6): NetFlow / NetListener focal-field
+        // enumeration. XAI on NetFlow events is a future N10+
+        // commit; arm exhaustive coverage with a minimal field
+        // set (comm + pid + ts).
+        Event::NetFlow(_) | Event::NetListener(_) => {
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal net-event comm".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
+            units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
             units.push(focal_unit(
                 F::Timestamp,
                 "ts",
@@ -706,6 +736,26 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Pid => *accessor_pid = 0,
             F::Uid => *accessor_uid = 0,
             F::Timestamp => *timestamp_ns = 0,
+            _ => {}
+        },
+        // Tappa 10 (N6): NetFlow / NetListener neutralisation —
+        // V1.0 XAI doesn't run on these, but exhaustive
+        // coverage is needed for the rule-side enumerate path.
+        Event::NetFlow(nf) => match field {
+            F::Comm => nf.comm.clear(),
+            F::Pid => nf.pid = 0,
+            F::Uid => nf.uid = 0,
+            F::Timestamp => {
+                nf.start_ns = 0;
+                nf.end_ns = 0;
+            }
+            _ => {}
+        },
+        Event::NetListener(nl) => match field {
+            F::Comm => nl.comm.clear(),
+            F::Pid => nl.pid = 0,
+            F::Uid => nl.uid = 0,
+            F::Timestamp => nl.timestamp_ns = 0,
             _ => {}
         },
     }

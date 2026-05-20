@@ -59,6 +59,18 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
             access_kind,
             ..
         } => format!("canary trip {canary_name} kind {access_kind:?}"),
+        // Tappa 10 (N6): N10 ADE wiring refines the RAG query;
+        // V1.0 surfaces comm + dst for sigma-rule grep.
+        Event::NetFlow(nf) => format!(
+            "net flow from {} to {} port {} hostname {}",
+            nf.comm,
+            nf.dst_addr,
+            nf.dst_port,
+            nf.resolved_hostname.as_deref().unwrap_or("-"),
+        ),
+        Event::NetListener(nl) => {
+            format!("net listener {} bound on port {}", nl.comm, nl.bind_port)
+        }
     }
 }
 

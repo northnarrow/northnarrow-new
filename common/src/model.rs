@@ -138,6 +138,19 @@ pub enum Event {
         /// record's wall-clock context isn't lost.
         timestamp_ns: u64,
     },
+    /// Tappa 10 (N3) — userland-finalised network flow. The
+    /// agent's `net::flow_tracker` stitches the BPF-side
+    /// connect kprobe + tcp_close fexit (N2) into one
+    /// [`crate::wire::NetFlowEvent`] per closed flow, OR
+    /// emits one per outbound UDP send. N6 rules
+    /// (NN-L-NET-001..009) consume this variant.
+    NetFlow(crate::wire::NetFlowEvent),
+    /// Tappa 10 (N2) — TCP listener observation (kprobe on
+    /// `inet_csk_listen_start`). Emitted unconditionally per
+    /// §13 Q6 (forensic-visibility lock-in); the rule layer
+    /// (NN-L-NET-006) applies the operator-tunable comm + port
+    /// allowlist filter.
+    NetListener(crate::wire::NetListenerEvent),
 }
 
 /// Std-side mirror of [`crate::wire::admin_signed_payload::
