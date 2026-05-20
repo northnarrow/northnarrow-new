@@ -331,6 +331,31 @@ async fn main() -> Result<()> {
              created on first append (and unprotected this boot)"
         );
     }
+    // Tappa 9.5 K7: bootstrap the two canary state logs pre-attach
+    // for the same reason as the FIM logs — STATE_PROTECTED_FILES
+    // needs an inode to register against before LSM hooks come up.
+    // A present file is left untouched (existing canary registry +
+    // access chain preserved across restarts).
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_canary_log(&cli.canary_registry_file)
+    {
+        warn!(
+            error = %e,
+            path = %cli.canary_registry_file.display(),
+            "canary registry log bootstrap failed pre-attach — file will be lazily \
+             created on first deploy (and unprotected this boot)"
+        );
+    }
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_canary_log(&cli.canary_access_file)
+    {
+        warn!(
+            error = %e,
+            path = %cli.canary_access_file.display(),
+            "canary access log bootstrap failed pre-attach — file will be lazily \
+             created on first trip (and unprotected this boot)"
+        );
+    }
     // agent_id bootstrap moved up from line ~360 so its inode is
     // present in PROTECTED_INODES from boot. The post-attach
     // re-read at line ~360 stays for the SignedPayload wiring path

@@ -35,6 +35,15 @@ WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 # boot and merges any operator overlay at /etc/northnarrow/fim-paths.local.
 FIM_PATHS_V1_SRC="$REPO_ROOT/configs/fim-paths.v1"
 
+# Tappa 9.5 K7: canary content templates the K4 renderer reads at
+# `canary deploy` time. install.sh drops the 5 .tmpl files into
+# /etc/northnarrow/canary-templates/. PROTECTED_INODES covers each
+# individual .tmpl file (see ETC_PROTECTED_TEMPLATES in
+# agent/src/anti_tamper/filesystem.rs) — tamper would silently
+# widen / narrow what bytes get written onto the host when an
+# operator deploys a credential canary.
+CANARY_TEMPLATES_SRC_DIR="$REPO_ROOT/configs/canary-templates"
+
 # ── pre-flight ──────────────────────────────────────────────────────
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -59,6 +68,21 @@ require_file "$WATCHDOG_BIN" "run \`cargo build --release -p northnarrow-watchdo
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
+
+require_dir() {
+    local path=$1
+    local hint=$2
+    if [[ ! -d "$path" ]]; then
+        echo "install.sh: required directory missing: $path" >&2
+        echo "install.sh: $hint" >&2
+        exit 1
+    fi
+}
+
+require_dir "$CANARY_TEMPLATES_SRC_DIR" "expected at $CANARY_TEMPLATES_SRC_DIR (Tappa 9.5 K7 canary content templates)"
+for tmpl in aws.tmpl azure.tmpl docker.tmpl gcp.tmpl generic.tmpl; do
+    require_file "$CANARY_TEMPLATES_SRC_DIR/$tmpl" "expected at $CANARY_TEMPLATES_SRC_DIR/$tmpl (Tappa 9.5 K4 canary template)"
+done
 
 # ── install ─────────────────────────────────────────────────────────
 echo "install.sh: copying binaries to $BIN_DIR/"
@@ -102,6 +126,41 @@ for fim_log in fim_baseline.jsonl fim_drift.jsonl; do
     fi
 done
 
+# Tappa 9.5 K7: pre-touch the two canary chain files for the same
+# reason as the FIM logs — STATE_PROTECTED_FILES needs an inode to
+# register against before LSM hooks come up. Existing chains are
+# preserved (we MUST NOT silently erase a prior canary registry or
+# access log on upgrade).
+for canary_log in canaries.jsonl canary_access.jsonl; do
+    if [[ -f "$STATE_DIR/$canary_log" ]]; then
+        echo "install.sh: $STATE_DIR/$canary_log already present — leaving chain intact"
+    else
+        echo "install.sh: bootstrapping $STATE_DIR/$canary_log (zero-byte placeholder)"
+        install -m 0644 -o root -g root /dev/null "$STATE_DIR/$canary_log"
+    fi
+done
+
+# Tappa 9.5 K7: install the 5 canary content templates into
+# /etc/northnarrow/canary-templates/. Templates are read by the
+# K4 renderer at `nn-admin canary deploy` time; PROTECTED_INODES
+# covers each individual .tmpl per ETC_PROTECTED_TEMPLATES.
+# Idempotent per file: an existing operator-customised template
+# is left untouched (the source-of-truth for any one family is
+# the file on the operator host once installed; the next agent
+# upgrade ships fresh templates only when the family didn't
+# already exist on the host).
+echo "install.sh: ensuring $ETC_DIR/canary-templates (mode 0755, root:root)"
+install -d -m 0755 -o root -g root "$ETC_DIR/canary-templates"
+
+for tmpl in aws.tmpl azure.tmpl docker.tmpl gcp.tmpl generic.tmpl; do
+    if [[ -f "$ETC_DIR/canary-templates/$tmpl" ]]; then
+        echo "install.sh: $ETC_DIR/canary-templates/$tmpl already present — leaving operator copy untouched"
+    else
+        echo "install.sh: copying canary template $tmpl"
+        install -m 0644 -o root -g root "$CANARY_TEMPLATES_SRC_DIR/$tmpl" "$ETC_DIR/canary-templates/$tmpl"
+    fi
+done
+
 # Tappa 9 §13 Q5 TOFU baseline marker: a missing fim_baseline.jsonl
 # (or one that contains only a stray comment / no chain entries) is
 # the agent's signal at boot to run a first-boot baseline pass
@@ -124,12 +183,16 @@ echo "       systemctl status northnarrow-agent.service"
 echo "       systemctl status northnarrow-watchdog.service"
 echo ""
 echo "  2. Confirm /etc/northnarrow/ has admin.pub + combat-rules.v4 +"
-echo "     agent_id + fim-paths.v1 (the agent will bootstrap agent_id"
-echo "     on first start; admin.pub + combat-rules.v4 are operator-"
-echo "     provided; fim-paths.v1 was just installed above)."
+echo "     agent_id + fim-paths.v1 + canary-templates/ (the agent will"
+echo "     bootstrap agent_id on first start; admin.pub + combat-rules.v4"
+echo "     are operator-provided; fim-paths.v1 + canary-templates/ were"
+echo "     just installed above)."
 echo "     Optional: drop /etc/northnarrow/fim-paths.local to customise"
 echo "     the FIM watched-paths set (\`+/path\` add, \`-/path\` disable —"
 echo "     see docs/operator/TAPPA9_FIM_TRUST_MODEL.md §13 Q7)."
+echo "     Deploy canaries with \`nn-admin canary deploy <type> --path ...\`"
+echo "     (Tappa 9.5 §12 Q1 EXPLICIT-PER-HOST: no default canaries —"
+echo "     placement is operator-curated)."
 echo ""
 echo "  3. Confirm bpffs is mounted at /sys/fs/bpf:"
 echo "       mount | grep ' /sys/fs/bpf'"

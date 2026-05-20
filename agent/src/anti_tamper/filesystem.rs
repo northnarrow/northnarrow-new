@@ -90,11 +90,12 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "fim-paths.local",
 ];
 
-/// Tappa 9 C7: the files inside [`STATE_DIR`] that PROTECTED_INODES
-/// covers. The directory itself is already registered (Tappa 7 task
-/// 5); these per-file registrations cover the case where an attacker
-/// can `creat`/`unlink` inside the dir but not the dir itself —
-/// `inode_unlink` checks the TARGET inode, not the parent.
+/// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
+/// PROTECTED_INODES covers. The directory itself is already
+/// registered (Tappa 7 task 5); these per-file registrations
+/// cover the case where an attacker can `creat`/`unlink` inside
+/// the dir but not the dir itself — `inode_unlink` checks the
+/// TARGET inode, not the parent.
 ///
 /// - `fim_baseline.jsonl`: chained baseline DB per §6.2. Agent
 ///   appends via `BaselineDb::append`; everyone else must be denied
@@ -103,7 +104,54 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
 /// - `fim_drift.jsonl`: chained drift log per §6.3. Same shape;
 ///   tampering would let an attacker erase evidence of past
 ///   drift detections.
-pub const STATE_PROTECTED_FILES: &[&str] = &["fim_baseline.jsonl", "fim_drift.jsonl"];
+/// - `canaries.jsonl` (Tappa 9.5 K7): chained canary registry
+///   per Tappa 9.5 §3.4. Agent appends via `Registry::deploy` /
+///   `burn` / `refresh`; tampering would let an attacker drop a
+///   `burn` row to fake-retire a canary that's still trapping
+///   them, OR delete the chain to erase the operator's complete
+///   deployment history.
+/// - `canary_access.jsonl` (Tappa 9.5 K7): chained canary
+///   access log per Tappa 9.5 §3.5. One row per observed trip;
+///   tampering would erase the audit-grade incident record an
+///   operator hands to IR.
+///
+/// Tappa 9.5 K7 APPENDS the two canary chains at the END of the
+/// list — existing FIM positions stay stable so any audit reader
+/// indexing by slot doesn't break across the upgrade.
+pub const STATE_PROTECTED_FILES: &[&str] = &[
+    "fim_baseline.jsonl",
+    "fim_drift.jsonl",
+    "canaries.jsonl",
+    "canary_access.jsonl",
+];
+
+/// Tappa 9.5 K7: subdirectory under [`CONFIG_DIR`] holding the
+/// K4 canary content templates the renderer reads at
+/// `canary deploy` time. The directory itself is created by
+/// `install.sh`; the individual `.tmpl` files are listed in
+/// [`ETC_PROTECTED_TEMPLATES`] so PROTECTED_INODES covers each.
+pub const CANARY_TEMPLATES_SUBDIR: &str = "canary-templates";
+
+/// Tappa 9.5 K7: the five `.tmpl` files inside
+/// `/etc/northnarrow/canary-templates/` that PROTECTED_INODES
+/// covers. Tamper here would silently widen / narrow what bytes
+/// get written onto the host at `canary deploy` time — a
+/// realistic attack path against an operator who's deployed
+/// credential canaries (the renderer's output IS the on-disk
+/// canary content the attacker sees).
+///
+/// Order is alphabetical for audit-log stability, matching the
+/// same convention as [`ETC_PROTECTED_FILES`] +
+/// [`STATE_PROTECTED_FILES`]. Each entry is a BARE BASENAME so
+/// the same path-traversal invariant holds (asserted by
+/// `etc_protected_files_have_no_path_traversal` shape tests).
+pub const ETC_PROTECTED_TEMPLATES: &[&str] = &[
+    "aws.tmpl",
+    "azure.tmpl",
+    "docker.tmpl",
+    "gcp.tmpl",
+    "generic.tmpl",
+];
 
 /// Permission bits applied at create time and re-asserted on every
 /// startup (defends against an admin loosening perms while the
@@ -185,21 +233,39 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
         );
     }
 
-    // Step 3.6 (Tappa 9 C7): register the two
-    // /var/lib/northnarrow/ FIM logs in PROTECTED_INODES. The
+    // Step 3.6 (Tappa 9 C7 + Tappa 9.5 K7): register the four
+    // /var/lib/northnarrow/ chain logs in PROTECTED_INODES. The
     // parent dir is already protected (Step 2 above), but
     // inode_unlink + inode_setattr check the TARGET inode, so
     // a file inside the dir is unprotected without an explicit
     // per-file registration. Lenient like Step 3.5: a fresh
     // install that hasn't yet run its first baseline (no
-    // fim_baseline.jsonl yet) skips with a warn. The
+    // fim_baseline.jsonl yet) OR hasn't deployed any canary
+    // yet (no canaries.jsonl) skips with a warn. The
     // PROTECTED_PIDS caller-side exemption lets the agent
     // append legitimately.
     if let Err(e) = register_state_files(ebpf, Path::new(STATE_DIR)) {
         warn!(
             error = %e,
-            "anti-tamper FS: /var/lib/northnarrow FIM-log registration failed — \
-             baseline + drift logs defended only by POSIX perms + dir-LSM this boot"
+            "anti-tamper FS: /var/lib/northnarrow chain-log registration failed — \
+             baseline + drift + canary logs defended only by POSIX perms + dir-LSM this boot"
+        );
+    }
+
+    // Step 3.7 (Tappa 9.5 K7): register the five canary content
+    // templates in /etc/northnarrow/canary-templates/ in
+    // PROTECTED_INODES. Tamper here would silently widen /
+    // narrow what bytes get written onto the host at
+    // `canary deploy` time — a realistic attack path against
+    // an operator who's deployed credential canaries (the
+    // renderer's output IS the on-disk canary content the
+    // attacker sees). Lenient: a fresh install before
+    // install.sh has dropped the templates skips with a warn.
+    if let Err(e) = register_etc_templates(ebpf, Path::new(CONFIG_DIR)) {
+        warn!(
+            error = %e,
+            "anti-tamper FS: canary template registration failed — \
+             /etc/northnarrow/canary-templates/ defended only by POSIX perms this boot"
         );
     }
 
@@ -329,6 +395,100 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
         "anti-tamper FS: /var/lib/northnarrow FIM-log registration complete"
     );
     Ok(registered)
+}
+
+/// Tappa 9.5 K7: register each of the five
+/// [`ETC_PROTECTED_TEMPLATES`] in `PROTECTED_INODES` so the same
+/// LSM hooks that defend `/etc/northnarrow/` files also defend
+/// the K4 canary content templates. Missing files are skipped
+/// with a warn (a fresh install before `install.sh` has dropped
+/// the templates, or an operator who's deleted an unused family
+/// to avoid future-renderer confusion); the next agent restart
+/// after the file appears picks them up.
+///
+/// Returns the number of files actually registered, for the
+/// info-log line.
+pub(crate) fn register_etc_templates(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usize> {
+    let mut registered = 0usize;
+    let templates_dir = etc_dir.join(CANARY_TEMPLATES_SUBDIR);
+    for name in ETC_PROTECTED_TEMPLATES {
+        let path = templates_dir.join(name);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    path = %path.display(),
+                    "anti-tamper FS: skip register_etc_templates entry — file missing \
+                     (will be unprotected until next agent restart with the file present)"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "anti-tamper FS: stat failed for register_etc_templates entry"
+                );
+                continue;
+            }
+        };
+        let key = InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        };
+        register_inode(ebpf, &key)
+            .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        info!(
+            path = %path.display(),
+            kernel_dev = key.dev,
+            ino = key.ino,
+            "anti-tamper FS: canary template registered in {PROTECTED_INODES_MAP}"
+        );
+        registered += 1;
+    }
+    info!(
+        templates_dir = %templates_dir.display(),
+        registered,
+        total = ETC_PROTECTED_TEMPLATES.len(),
+        "anti-tamper FS: canary template registration complete"
+    );
+    Ok(registered)
+}
+
+/// Tappa 9.5 K7: bootstrap an empty canary state log file
+/// (either `canaries.jsonl` or `canary_access.jsonl`) if it
+/// doesn't exist yet, so PROTECTED_INODES has an inode to
+/// register at attach time. Same shape as [`bootstrap_fim_log`]
+/// — parent directory's mode is 0700 to match [`STATE_DIR_MODE`].
+pub fn bootstrap_canary_log(canary_log_path: &Path) -> Result<()> {
+    if canary_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = canary_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(STATE_DIR_MODE)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| format!("creating canary-log parent dir {}", parent.display()))?;
+        }
+    }
+    // 0644: world-readable for operator `cat`-inspection, only
+    // root + the agent's user can write (LSM-enforced append-only
+    // applies via PROTECTED_INODES + PROTECTED_PIDS exemption,
+    // same as the FIM logs).
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(canary_log_path)
+        .with_context(|| format!("creating canary log {}", canary_log_path.display()))?;
+    info!(
+        path = %canary_log_path.display(),
+        "anti-tamper FS: canary log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
 }
 
 /// Tappa 9 C7: bootstrap an empty FIM log file (either
@@ -564,18 +724,89 @@ mod tests {
         assert_eq!(CONFIG_DIR, "/etc/northnarrow");
     }
 
-    /// C7 test: `STATE_PROTECTED_FILES` lists the two
-    /// /var/lib/northnarrow/ FIM logs that PROTECTED_INODES
-    /// must cover per design §6.4. Order anchored for the
-    /// same audit-readability rationale as the etc list.
+    /// C7 + K7 test: `STATE_PROTECTED_FILES` lists the four
+    /// /var/lib/northnarrow/ chain files that PROTECTED_INODES
+    /// must cover. C7 shipped the two FIM logs; Tappa 9.5 K7
+    /// APPENDS the two canary chain files at the END of the
+    /// list (canaries.jsonl + canary_access.jsonl) so existing
+    /// entries' positions stay stable for any audit-log reader
+    /// that indexes by slot. Order anchored explicitly per
+    /// design §9 + §6.4.
     #[test]
-    fn state_protected_files_lists_the_two_fim_logs() {
+    fn state_protected_files_lists_the_four_state_logs() {
         assert_eq!(
             STATE_PROTECTED_FILES,
-            &["fim_baseline.jsonl", "fim_drift.jsonl"],
-            "design §6.4 specifies these two files in this order"
+            &[
+                "fim_baseline.jsonl",
+                "fim_drift.jsonl",
+                "canaries.jsonl",
+                "canary_access.jsonl",
+            ],
+            "design §6.4 + Tappa 9.5 §9 specify these four files in this order"
         );
         assert_eq!(STATE_DIR, "/var/lib/northnarrow");
+    }
+
+    /// K7 test: `bootstrap_canary_log` creates a zero-byte file
+    /// at mode 0644 when missing — mirrors the
+    /// `bootstrap_fim_log` + `bootstrap_audit_log` contract so
+    /// the LSM-protected layout invariants hold uniformly across
+    /// all four /var/lib/northnarrow/ chain files.
+    #[test]
+    fn bootstrap_canary_log_creates_zero_byte_file_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        assert!(!log_path.exists());
+        bootstrap_canary_log(&log_path).expect("bootstrap missing canary log");
+        assert!(log_path.exists());
+        let meta = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    /// K7 test: `bootstrap_canary_log` is idempotent — a second
+    /// call on an existing file is a no-op and does NOT truncate
+    /// (defends against the same defensive-bootstrap-on-every-
+    /// boot foot-gun that bootstrap_fim_log + bootstrap_audit_log
+    /// guard against; we MUST NOT silently erase a prior canary
+    /// registry chain on agent restart).
+    #[test]
+    fn bootstrap_canary_log_is_idempotent_and_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canary_access.jsonl");
+        bootstrap_canary_log(&log_path).expect("first bootstrap");
+        std::fs::write(&log_path, b"existing canary access line\n").unwrap();
+        bootstrap_canary_log(&log_path).expect("second bootstrap");
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            body, "existing canary access line\n",
+            "second bootstrap must NOT truncate"
+        );
+    }
+
+    /// K7 test: `ETC_PROTECTED_TEMPLATES` lists the five canary
+    /// content templates the K4 renderer reads from
+    /// `/etc/northnarrow/canary-templates/`. Tamper here would
+    /// silently widen / narrow what bytes get written onto the
+    /// host at `canary deploy` time, so they must be in
+    /// PROTECTED_INODES. Order anchored for audit-log stability,
+    /// matching the same convention as ETC_PROTECTED_FILES +
+    /// STATE_PROTECTED_FILES.
+    #[test]
+    fn etc_protected_templates_lists_the_five_template_files() {
+        assert_eq!(
+            ETC_PROTECTED_TEMPLATES,
+            &[
+                "aws.tmpl",
+                "azure.tmpl",
+                "docker.tmpl",
+                "gcp.tmpl",
+                "generic.tmpl",
+            ],
+            "design §9 + Tappa 9.5 K7 specify these five .tmpl basenames \
+             (the K4 canary template families) in alphabetical order"
+        );
+        assert_eq!(CANARY_TEMPLATES_SUBDIR, "canary-templates");
     }
 
     /// C7 test: `bootstrap_fim_log` creates a zero-byte file at
