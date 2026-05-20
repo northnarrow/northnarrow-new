@@ -38,8 +38,9 @@ use northnarrow_agent::admin_cli::{
     run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
     run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, CanaryBurnOutcome,
     CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome, CanaryRefreshOutcome,
-    FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, RotateKeysOutcome,
-    ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
+    FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome,
+    NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome, UnlockOutcome,
+    VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -247,6 +248,17 @@ enum Cmd {
     Canary {
         #[command(subcommand)]
         sub: CanaryCmd,
+    },
+
+    /// Tappa 10 N7 — network observability operator surface.
+    /// `net flows` reads the chained netflow log,
+    /// `net listeners` snapshots active listeners,
+    /// `net resolve <ip>` looks up DNS attribution,
+    /// `net fingerprint --flow-id <hex>` dumps JA3/JA4.
+    /// All four are `Role::NetRead` (1-of-N quorum per §13 Q6).
+    Net {
+        #[command(subcommand)]
+        sub: NetCmd,
     },
 
     /// Debug-only: force the agent's posture state machine into a
@@ -538,6 +550,65 @@ impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
             }
         }
     }
+}
+
+/// Tappa 10 N7 — net subcommand surface (mirrors FimCmd shape).
+#[derive(Subcommand, Debug)]
+enum NetCmd {
+    /// Stream the chained netflow log. `--since-unix <ts>`
+    /// filters server-side; missing = full chain (capped).
+    Flows {
+        /// Path to the operator's `net-read`-role admin
+        /// private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// UNIX-timestamp lower bound; entries with `ts >=
+        /// since` are returned.
+        #[arg(long = "since-unix")]
+        since_unix: Option<u64>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// Snapshot the in-process listener set.
+    Listeners {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// DNS attribution lookup for a destination IP. V1.0 always
+    /// returns `qname: None` (V1.1 DNS-response observer wire-up).
+    Resolve {
+        /// Target IP address (v4 or v6, string form).
+        #[arg(long)]
+        ip: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// JA3/JA4 fingerprint dump for a flow_id.
+    Fingerprint {
+        /// 32-hex-char per-flow stable ID from a prior
+        /// `net flows` row.
+        #[arg(long = "flow-id")]
+        flow_id: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
 }
 
 #[cfg(feature = "debug-trigger")]
@@ -868,6 +939,79 @@ fn main() -> ExitCode {
                 ExitCode::from(5)
             }
         },
+
+        // ── Tappa 10 N7 — net subcommands ─────────────────────────
+        Cmd::Net {
+            sub:
+                NetCmd::Flows {
+                    key,
+                    since_unix,
+                    agent_id_file,
+                    socket,
+                },
+        } => match northnarrow_agent::admin_cli::run_net_flows(
+            &socket,
+            &key,
+            &agent_id_file,
+            since_unix,
+        ) {
+            Ok(outcome) => exit_from_net_jsonl(outcome, "net flows"),
+            Err(e) => {
+                eprintln!("net flows: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Net {
+            sub:
+                NetCmd::Listeners {
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match northnarrow_agent::admin_cli::run_net_listeners(&socket, &key, &agent_id_file) {
+            Ok(outcome) => exit_from_net_jsonl(outcome, "net listeners"),
+            Err(e) => {
+                eprintln!("net listeners: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Net {
+            sub:
+                NetCmd::Resolve {
+                    ip,
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match northnarrow_agent::admin_cli::run_net_resolve(&socket, &key, &agent_id_file, ip)
+        {
+            Ok(outcome) => exit_from_net_resolve(outcome),
+            Err(e) => {
+                eprintln!("net resolve: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Net {
+            sub:
+                NetCmd::Fingerprint {
+                    flow_id,
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match northnarrow_agent::admin_cli::run_net_fingerprint(
+            &socket,
+            &key,
+            &agent_id_file,
+            flow_id,
+        ) {
+            Ok(outcome) => exit_from_net_jsonl(outcome, "net fingerprint"),
+            Err(e) => {
+                eprintln!("net fingerprint: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+
         #[cfg(feature = "debug-trigger")]
         Cmd::Debug {
             sub: DebugCmd::ForcePosture { state, socket },
@@ -1845,6 +1989,135 @@ fn exit_from_canary_refresh(outcome: CanaryRefreshOutcome) -> ExitCode {
         }
         CanaryRefreshOutcome::Transport => {
             eprintln!("canary refresh: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// Tappa 10 N7 — shared exit handler for net subcommands that
+/// return JSONL bodies (flows / listeners / fingerprint). Stable
+/// exit shape mirrors [`exit_from_fim_report`].
+fn exit_from_net_jsonl(outcome: NetJsonlOutcome, op: &str) -> ExitCode {
+    match outcome {
+        NetJsonlOutcome::Success {
+            entries_jsonl,
+            entries_count,
+            entries_truncated,
+        } => {
+            print!("{entries_jsonl}");
+            if entries_truncated {
+                eprintln!(
+                    "{op}: {entries_count} entries (truncated; pass --since-unix <ts> to narrow)"
+                );
+            } else {
+                eprintln!("{op}: {entries_count} entries");
+            }
+            ExitCode::SUCCESS
+        }
+        NetJsonlOutcome::InvalidSignature => {
+            eprintln!("{op}: invalid signature");
+            ExitCode::from(2)
+        }
+        NetJsonlOutcome::NoPendingChallenge => {
+            eprintln!("{op}: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        NetJsonlOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("{op}: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        NetJsonlOutcome::RoleDenied => {
+            eprintln!("{op}: role denied (the submitted key lacks `net-read`)");
+            ExitCode::from(7)
+        }
+        NetJsonlOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!("{op}: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::AgentIdMismatch => {
+            eprintln!("{op}: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::UnknownOperation => {
+            eprintln!("{op}: server rejected operation");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("{op}: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::Transport => {
+            eprintln!("{op}: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// Tappa 10 N7 — exit handler for `nn-admin net resolve`.
+/// Single-record reply, distinct shape from the JSONL ops.
+fn exit_from_net_resolve(outcome: NetResolveOutcome) -> ExitCode {
+    match outcome {
+        NetResolveOutcome::Success {
+            qname,
+            queried_at_unix_ts,
+        } => {
+            match qname {
+                Some(name) => {
+                    println!("{name}");
+                    if let Some(ts) = queried_at_unix_ts {
+                        eprintln!("net resolve: queried_at_unix_ts={ts}");
+                    } else {
+                        eprintln!("net resolve: queried_at_unix_ts=unknown");
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "net resolve: no attribution available (V1.0: DNS-response observer is V1.1)"
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        NetResolveOutcome::InvalidSignature => {
+            eprintln!("net resolve: invalid signature");
+            ExitCode::from(2)
+        }
+        NetResolveOutcome::NoPendingChallenge => {
+            eprintln!("net resolve: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        NetResolveOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("net resolve: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        NetResolveOutcome::RoleDenied => {
+            eprintln!("net resolve: role denied (key lacks `net-read`)");
+            ExitCode::from(7)
+        }
+        NetResolveOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!("net resolve: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
+            ExitCode::from(5)
+        }
+        NetResolveOutcome::AgentIdMismatch => {
+            eprintln!("net resolve: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        NetResolveOutcome::UnknownOperation => {
+            eprintln!("net resolve: server rejected operation");
+            ExitCode::from(5)
+        }
+        NetResolveOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("net resolve: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        NetResolveOutcome::Transport => {
+            eprintln!("net resolve: unexpected server reply");
             ExitCode::from(5)
         }
     }

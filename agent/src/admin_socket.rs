@@ -31,7 +31,9 @@ use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
     FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
-    ForcePostureRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
+    ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
+    NetFlowsResponse, NetListenersRequest, NetListenersResponse, NetResolveRequest,
+    NetResolveResponse, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
     StatusResponse, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
@@ -717,6 +719,69 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // N7: 4 net admin ops. Each row carries the response
+        // counters / qname slot so an off-host audit reader sees
+        // the same "what did the operator just learn?" detail
+        // that fim_report + fim_status capture for their domain.
+        (AdminMessage::NetFlowsRequest(req), AdminMessage::NetFlowsResponse(resp)) => {
+            use common::wire::admin_signed_payload::NetFlowsExtra;
+            let since = match &req.payload.extra {
+                OperationExtra::NetFlows(NetFlowsExtra { since_unix_ts }) => *since_unix_ts,
+                _ => None,
+            };
+            (
+                "net_flows",
+                serde_json::json!({
+                    "since_unix_ts": since,
+                    "entries_count": resp.entries_count,
+                    "truncated": resp.entries_truncated,
+                }),
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (AdminMessage::NetListenersRequest(req), AdminMessage::NetListenersResponse(resp)) => (
+            "net_listeners",
+            serde_json::json!({
+                "entries_count": resp.entries_count,
+                "truncated": resp.entries_truncated,
+            }),
+            audit_result_str(resp.result),
+            req.signatures.len().saturating_sub(1),
+        ),
+        (AdminMessage::NetResolveRequest(req), AdminMessage::NetResolveResponse(resp)) => {
+            use common::wire::admin_signed_payload::NetResolveExtra;
+            let ip = match &req.payload.extra {
+                OperationExtra::NetResolve(NetResolveExtra { ip }) => ip.clone(),
+                _ => String::new(),
+            };
+            (
+                "net_resolve",
+                serde_json::json!({
+                    "ip": ip,
+                    "resolved": resp.qname.is_some(),
+                }),
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (AdminMessage::NetFingerprintRequest(req), AdminMessage::NetFingerprintResponse(resp)) => {
+            use common::wire::admin_signed_payload::NetFingerprintExtra;
+            let flow_id = match &req.payload.extra {
+                OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }) => flow_id.clone(),
+                _ => String::new(),
+            };
+            (
+                "net_fingerprint",
+                serde_json::json!({
+                    "flow_id": flow_id,
+                    "entries_count": resp.entries_count,
+                    "truncated": resp.entries_truncated,
+                }),
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -953,6 +1018,20 @@ fn dispatch(
             dispatch_canary_refresh(req, auth, canary_state, fps_out),
         ),
 
+        // Tappa 10 N7 — net admin ops.
+        AdminMessage::NetFlowsRequest(req) => {
+            AdminMessage::NetFlowsResponse(dispatch_net_flows(req, auth, fps_out))
+        }
+        AdminMessage::NetListenersRequest(req) => {
+            AdminMessage::NetListenersResponse(dispatch_net_listeners(req, auth, fps_out))
+        }
+        AdminMessage::NetResolveRequest(req) => {
+            AdminMessage::NetResolveResponse(dispatch_net_resolve(req, auth, fps_out))
+        }
+        AdminMessage::NetFingerprintRequest(req) => {
+            AdminMessage::NetFingerprintResponse(dispatch_net_fingerprint(req, auth, fps_out))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -969,7 +1048,11 @@ fn dispatch(
         | AdminMessage::CanaryDeployResponse(_)
         | AdminMessage::CanaryListResponse(_)
         | AdminMessage::CanaryBurnResult(_)
-        | AdminMessage::CanaryRefreshResult(_) => {
+        | AdminMessage::CanaryRefreshResult(_)
+        | AdminMessage::NetFlowsResponse(_)
+        | AdminMessage::NetListenersResponse(_)
+        | AdminMessage::NetResolveResponse(_)
+        | AdminMessage::NetFingerprintResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -2328,6 +2411,257 @@ fn dispatch_canary_refresh(
     }
 }
 
+// ── Tappa 10 N7 — net admin dispatches ────────────────────────────
+//
+// Four dispatches mirroring the FIM C6 + canary K6 shape:
+//   * Auth via `verify_signed_payload_quorum` (1-of-N per §13 Q6).
+//   * Op-extra-variant defensive check.
+//   * Emit audit-grade `info!` line with the matched signer fp.
+//   * V1.0 stubs for listener/resolve/fingerprint dispatches:
+//     return empty bodies. The wire shape ships now; the data
+//     sources are wired in N8 and beyond.
+
+/// Default on-disk location of the chained NetFlow log (design
+/// §4.4 + §10). The future N8 deploy commit drops a zero-byte
+/// placeholder here via `install.sh`. `dispatch_net_flows`
+/// tolerates the file being absent — returns empty body + 0
+/// count without erroring.
+pub const DEFAULT_NETFLOW_JSONL_PATH: &str = "/var/lib/northnarrow/netflow.jsonl";
+
+fn dispatch_net_flows(
+    req: NetFlowsRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> NetFlowsResponse {
+    use common::wire::admin_signed_payload::NetFlowsExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::NetRead],
+        OperationCode::NetFlows,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return NetFlowsResponse {
+                result: map_admin_auth_error(e, "net-flows"),
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+    *fps_out = matched_fps;
+
+    let since = match &req.payload.extra {
+        OperationExtra::NetFlows(NetFlowsExtra { since_unix_ts }) => *since_unix_ts,
+        _ => {
+            warn!("net-flows payload extra is not NetFlows variant");
+            return NetFlowsResponse {
+                result: AdminResult::UnknownOperation,
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+
+    // Re-use the FIM-drift JSONL reader (same on-disk shape: one
+    // chained row per line, optional `ts` lexicographic filter).
+    // N3 emission into `netflow.jsonl` is wired in a future
+    // commit; until then, the read returns (empty, 0, false).
+    let (entries_jsonl, entries_count, entries_truncated) =
+        read_fim_drift_jsonl(DEFAULT_NETFLOW_JSONL_PATH, since);
+    info!(
+        target: "admin.net_flows",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        entries = entries_count,
+        truncated = entries_truncated,
+        "net flows served"
+    );
+    NetFlowsResponse {
+        result: AdminResult::Success,
+        entries_jsonl,
+        entries_count,
+        entries_truncated,
+    }
+}
+
+fn dispatch_net_listeners(
+    req: NetListenersRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> NetListenersResponse {
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::NetRead],
+        OperationCode::NetListeners,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return NetListenersResponse {
+                result: map_admin_auth_error(e, "net-listeners"),
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+    *fps_out = matched_fps;
+
+    if !matches!(&req.payload.extra, OperationExtra::NetListeners(_)) {
+        warn!("net-listeners payload extra is not NetListeners variant");
+        return NetListenersResponse {
+            result: AdminResult::UnknownOperation,
+            entries_jsonl: String::new(),
+            entries_count: 0,
+            entries_truncated: false,
+        };
+    }
+
+    // V1.0 stub: the userland listener snapshot wiring is a
+    // future commit (the N2 BPF program emits into
+    // NET_LISTEN_EVENTS but no userland drain stores them
+    // for admin-CLI consumption yet). Return Success + empty
+    // body so the wire surface is exercised + audited.
+    info!(
+        target: "admin.net_listeners",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        "net listeners served (V1.0 empty stub)"
+    );
+    NetListenersResponse {
+        result: AdminResult::Success,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
+    }
+}
+
+fn dispatch_net_resolve(
+    req: NetResolveRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> NetResolveResponse {
+    use common::wire::admin_signed_payload::NetResolveExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::NetRead],
+        OperationCode::NetResolve,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return NetResolveResponse {
+                result: map_admin_auth_error(e, "net-resolve"),
+                qname: None,
+                queried_at_unix_ts: None,
+            };
+        }
+    };
+    *fps_out = matched_fps;
+
+    let ip_query = match &req.payload.extra {
+        OperationExtra::NetResolve(NetResolveExtra { ip }) => ip.clone(),
+        _ => {
+            warn!("net-resolve payload extra is not NetResolve variant");
+            return NetResolveResponse {
+                result: AdminResult::UnknownOperation,
+                qname: None,
+                queried_at_unix_ts: None,
+            };
+        }
+    };
+
+    // V1.0 stub: the back-correlation N4 cache doesn't index by
+    // resolved IP (no DNS-response observer yet — V1.1 ships
+    // that). Return Success + `qname = None`. The wire shape is
+    // ready; V1.1 plumbs DnsCache::lookup_for_ip into this slot.
+    info!(
+        target: "admin.net_resolve",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        ip = %ip_query,
+        "net resolve served (V1.0: no V1.1 DNS-response observer)"
+    );
+    NetResolveResponse {
+        result: AdminResult::Success,
+        qname: None,
+        queried_at_unix_ts: None,
+    }
+}
+
+fn dispatch_net_fingerprint(
+    req: NetFingerprintRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> NetFingerprintResponse {
+    use common::wire::admin_signed_payload::NetFingerprintExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::NetRead],
+        OperationCode::NetFingerprint,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return NetFingerprintResponse {
+                result: map_admin_auth_error(e, "net-fingerprint"),
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+    *fps_out = matched_fps;
+
+    let flow_id = match &req.payload.extra {
+        OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }) => flow_id.clone(),
+        _ => {
+            warn!("net-fingerprint payload extra is not NetFingerprint variant");
+            return NetFingerprintResponse {
+                result: AdminResult::UnknownOperation,
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+
+    // V1.0 stub. Future commit wires the N3 FlowTracker's
+    // in-process fingerprint cache (or reads netflow.jsonl
+    // rows whose `tls_fingerprint` is populated).
+    info!(
+        target: "admin.net_fingerprint",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        flow_id = %flow_id,
+        "net fingerprint served (V1.0 empty stub)"
+    );
+    NetFingerprintResponse {
+        result: AdminResult::Success,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3639,5 +3973,125 @@ mod tests {
         let mut fps = Vec::new();
         let r = dispatch_canary_refresh(req, &auth, None, &mut fps);
         assert!(matches!(r, AdminResult::UnknownOperation));
+    }
+
+    // ── Tappa 10 N7 — net admin dispatch + audit tests ────────────
+
+    /// N7 dispatch test #1 — `net flows` with a `net-read` key
+    /// returns Success + empty body when `netflow.jsonl` is
+    /// absent (the V1.0 default — N3 emission into the file is
+    /// future scope). Exercises the auth + extra-parse + empty-
+    /// file-tolerance paths.
+    #[test]
+    fn dispatch_net_flows_returns_empty_success_when_log_absent() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xAA; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "net-read", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, None);
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = NetFlowsRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let resp = dispatch_net_flows(req, &auth, &mut fps);
+        assert!(matches!(resp.result, AdminResult::Success));
+        // V1.0: netflow.jsonl doesn't exist at the default path
+        // in this test env, so the body is empty.
+        assert_eq!(resp.entries_count, 0);
+        assert!(!resp.entries_truncated);
+        assert!(!fps.is_empty(), "matched signer fp must be captured");
+    }
+
+    /// N7 dispatch test #2 — `net flows` with a key that lacks
+    /// `net-read` returns `RoleDenied`. Anchors the role gate.
+    #[test]
+    fn dispatch_net_flows_role_denied_without_net_read() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xBB; 16];
+        // Key carries `unlock` only — not `net-read`.
+        let (auth, _dir) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, None);
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = NetFlowsRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let resp = dispatch_net_flows(req, &auth, &mut fps);
+        assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    /// N7 dispatch test #3 — `net resolve` returns Success +
+    /// `qname: None` for V1.0 (DNS-response observer is V1.1).
+    #[test]
+    fn dispatch_net_resolve_returns_none_qname_in_v1_0() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xCC; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "net-read", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload =
+            SignedPayload::new_net_resolve(nonce, now_unix_secs(), agent_id, "1.2.3.4".to_string());
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = NetResolveRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let resp = dispatch_net_resolve(req, &auth, &mut fps);
+        assert!(matches!(resp.result, AdminResult::Success));
+        assert!(resp.qname.is_none(), "V1.0 always returns qname=None");
+    }
+
+    /// N7 audit test — a successful NetFlowsRequest +
+    /// NetFlowsResponse emits one row with `op="net_flows"` +
+    /// the `entries_count` + `truncated` extra, mirroring the
+    /// fim_report shape.
+    #[test]
+    fn audit_emits_on_net_flows_success_with_counts_extra() {
+        use common::wire::admin_protocol::{KeyedSignature, NetFlowsRequest, NetFlowsResponse};
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload =
+            SignedPayload::new_net_flows([0x77; 32], 1_700_000_000, [0x88; 16], Some(1_700_000));
+        let req = AdminMessage::NetFlowsRequest(NetFlowsRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::NetFlowsResponse(NetFlowsResponse {
+            result: AdminResult::Success,
+            entries_jsonl: String::new(),
+            entries_count: 3,
+            entries_truncated: false,
+        });
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["aabbccdd".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "net_flows");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].key_fp, "aabbccdd");
+        assert_eq!(entries[0].extra["entries_count"], 3);
+        assert_eq!(entries[0].extra["since_unix_ts"], 1_700_000);
     }
 }
