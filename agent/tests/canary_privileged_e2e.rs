@@ -44,6 +44,8 @@
 
 #![cfg(feature = "test-privileged")]
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -594,10 +596,25 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
         64,
         "entry_hash should be 64 hex chars (SHA-256)"
     );
+    // K8.2: `agent_sig` is base64 of the 64-byte Ed25519
+    // signature, NOT hex. See `agent/src/canary/access_log.rs`
+    // `entry.agent_sig = B64.encode(sig.to_bytes())` and the
+    // matching `B64.decode + len==64` check in the verifier
+    // (mirrors `agent/src/audit.rs` + `agent/src/fim/baseline.rs`).
+    // Standard-padded base64 of 64 bytes is 88 chars, but
+    // decode+length-check is the robust shape — it also catches
+    // truncated / non-base64 garbage.
+    let sig_b64 = row["agent_sig"]
+        .as_str()
+        .expect("agent_sig field must be present on a sealed row");
+    let sig_bytes = B64
+        .decode(sig_b64)
+        .expect("agent_sig must be valid base64");
     assert_eq!(
-        row["agent_sig"].as_str().unwrap_or("").len(),
-        128,
-        "agent_sig should be 128 hex chars (Ed25519 signature)"
+        sig_bytes.len(),
+        64,
+        "agent_sig must decode to 64 bytes (Ed25519 signature); got {} bytes",
+        sig_bytes.len()
     );
 }
 
