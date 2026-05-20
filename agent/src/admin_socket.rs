@@ -2422,10 +2422,10 @@ fn dispatch_canary_refresh(
 //     sources are wired in N8 and beyond.
 
 /// Default on-disk location of the chained NetFlow log (design
-/// §4.4 + §10). The future N8 deploy commit drops a zero-byte
-/// placeholder here via `install.sh`. `dispatch_net_flows`
-/// tolerates the file being absent — returns empty body + 0
-/// count without erroring.
+/// §4.4 + §10). The Tappa 10 N8 deploy commit drops a zero-byte
+/// placeholder here via `install.sh` + `bootstrap_netflow_log` at
+/// agent startup. `dispatch_net_flows` tolerates the file being
+/// absent — returns empty body + 0 count without erroring.
 pub const DEFAULT_NETFLOW_JSONL_PATH: &str = "/var/lib/northnarrow/netflow.jsonl";
 
 fn dispatch_net_flows(

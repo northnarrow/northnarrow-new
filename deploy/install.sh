@@ -44,6 +44,17 @@ FIM_PATHS_V1_SRC="$REPO_ROOT/configs/fim-paths.v1"
 # operator deploys a credential canary.
 CANARY_TEMPLATES_SRC_DIR="$REPO_ROOT/configs/canary-templates"
 
+# Tappa 10 N8: default NetFlow blocklists consumed by NN-L-NET-001
+# (IP / CIDR) + NN-L-NET-003 (JA3 fingerprint). install.sh drops
+# these at /etc/northnarrow/netflow-blocklist.v1 +
+# /etc/northnarrow/netflow-ja3-blocklist.v1 if missing; operators
+# extend / narrow via the matching `.local` overlays. ETC_PROTECTED_FILES
+# (agent/src/anti_tamper/filesystem.rs) widens to cover the four
+# blocklist filenames so PROTECTED_INODES defends them against
+# tamper — the same lock-in as fim-paths.v1 / .local.
+NETFLOW_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-blocklist.v1"
+NETFLOW_JA3_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-ja3-blocklist.v1"
+
 # ── pre-flight ──────────────────────────────────────────────────────
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -68,6 +79,8 @@ require_file "$WATCHDOG_BIN" "run \`cargo build --release -p northnarrow-watchdo
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
+require_file "$NETFLOW_BLOCKLIST_V1_SRC"     "expected at $NETFLOW_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow IP/CIDR blocklist)"
+require_file "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "expected at $NETFLOW_JA3_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow JA3 blocklist)"
 
 require_dir() {
     local path=$1
@@ -108,6 +121,26 @@ else
     install -m 0644 -o root -g root "$FIM_PATHS_V1_SRC" "$ETC_DIR/fim-paths.v1"
 fi
 
+# Tappa 10 N8: ship the default NetFlow IP/CIDR + JA3 blocklists.
+# Same idempotency contract as fim-paths.v1 — existing operator
+# copies (likely customised from the threat-intel feed of choice)
+# are left untouched; only fresh installs receive the seed file.
+# The matching `.local` overlays are NOT shipped by install.sh
+# (operator-curated, deploy via configuration management).
+if [[ -f "$ETC_DIR/netflow-blocklist.v1" ]]; then
+    echo "install.sh: $ETC_DIR/netflow-blocklist.v1 already present — leaving operator copy untouched"
+else
+    echo "install.sh: copying default NetFlow IP/CIDR blocklist to $ETC_DIR/netflow-blocklist.v1"
+    install -m 0644 -o root -g root "$NETFLOW_BLOCKLIST_V1_SRC" "$ETC_DIR/netflow-blocklist.v1"
+fi
+
+if [[ -f "$ETC_DIR/netflow-ja3-blocklist.v1" ]]; then
+    echo "install.sh: $ETC_DIR/netflow-ja3-blocklist.v1 already present — leaving operator copy untouched"
+else
+    echo "install.sh: copying default NetFlow JA3 blocklist to $ETC_DIR/netflow-ja3-blocklist.v1"
+    install -m 0644 -o root -g root "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "$ETC_DIR/netflow-ja3-blocklist.v1"
+fi
+
 # Tappa 9 C7: ensure /var/lib/northnarrow/ exists at mode 0700
 # (matches STATE_DIR_MODE in agent/src/anti_tamper/filesystem.rs)
 # and pre-touch the two chained FIM logs so PROTECTED_INODES has
@@ -139,6 +172,19 @@ for canary_log in canaries.jsonl canary_access.jsonl; do
         install -m 0644 -o root -g root /dev/null "$STATE_DIR/$canary_log"
     fi
 done
+
+# Tappa 10 N8: pre-touch the NetFlow chain log for the same reason
+# as the FIM + canary logs — STATE_PROTECTED_FILES (now five
+# entries) needs an inode to register against before LSM hooks
+# come up. The agent's bootstrap_netflow_log helper also handles
+# this at boot, but doing it here closes the brief race window on
+# first start (same lock-in as fim_baseline.jsonl).
+if [[ -f "$STATE_DIR/netflow.jsonl" ]]; then
+    echo "install.sh: $STATE_DIR/netflow.jsonl already present — leaving chain intact"
+else
+    echo "install.sh: bootstrapping $STATE_DIR/netflow.jsonl (zero-byte placeholder)"
+    install -m 0644 -o root -g root /dev/null "$STATE_DIR/netflow.jsonl"
+fi
 
 # Tappa 9.5 K7: install the 5 canary content templates into
 # /etc/northnarrow/canary-templates/. Templates are read by the
@@ -183,13 +229,19 @@ echo "       systemctl status northnarrow-agent.service"
 echo "       systemctl status northnarrow-watchdog.service"
 echo ""
 echo "  2. Confirm /etc/northnarrow/ has admin.pub + combat-rules.v4 +"
-echo "     agent_id + fim-paths.v1 + canary-templates/ (the agent will"
+echo "     agent_id + fim-paths.v1 + canary-templates/ +"
+echo "     netflow-blocklist.v1 + netflow-ja3-blocklist.v1 (the agent will"
 echo "     bootstrap agent_id on first start; admin.pub + combat-rules.v4"
-echo "     are operator-provided; fim-paths.v1 + canary-templates/ were"
-echo "     just installed above)."
+echo "     are operator-provided; fim-paths.v1 + canary-templates/ +"
+echo "     netflow-{,ja3-}blocklist.v1 were just installed above)."
 echo "     Optional: drop /etc/northnarrow/fim-paths.local to customise"
 echo "     the FIM watched-paths set (\`+/path\` add, \`-/path\` disable —"
 echo "     see docs/operator/TAPPA9_FIM_TRUST_MODEL.md §13 Q7)."
+echo "     Optional: drop /etc/northnarrow/netflow-blocklist.local +"
+echo "     /etc/northnarrow/netflow-ja3-blocklist.local to extend the"
+echo "     NetFlow blocklists from a threat-intel feed (\`+entry\` add,"
+echo "     \`-entry\` disable — same schema as fim-paths.local; see"
+echo "     docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md §10 + §13 Q5)."
 echo "     Deploy canaries with \`nn-admin canary deploy <type> --path ...\`"
 echo "     (Tappa 9.5 §12 Q1 EXPLICIT-PER-HOST: no default canaries —"
 echo "     placement is operator-curated)."
