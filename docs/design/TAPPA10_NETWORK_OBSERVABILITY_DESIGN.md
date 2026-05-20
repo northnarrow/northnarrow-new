@@ -1,6 +1,9 @@
 # Tappa 10 — Network Observability Design
 
-**Status:** RFC / design only — no production code in this branch.
+**Status:** RFC RESOLVED 2026-05-19 (§13 — all 10 owner-accepted
+decisions documented in-place). N1 implementation sequenced AFTER
+the Tappa 9.5 K1-K8 sprint per the project SHIP order
+(T9 ✅ → T9.5 → T10).
 **Author:** Claude Code (architecture), pending owner sign-off.
 **Date:** 2026-05-20.
 **Prerequisite track:** Tappa 4 (multi-sensor BPF multiplexer),
@@ -24,8 +27,9 @@ SHIPPED. Tappa 10 builds on five existing layers:
   tiered cap) — Tappa 10 ports the same 10/min + 1/min
   hierarchical bucket for NetFlow-driven ADE prompts.
 
-This doc is reviewable as a PR. Implementation begins after
-owner ruling on the open questions in §13.
+This doc is reviewable as a PR. All §13 RFC items resolved
+2026-05-19; implementation begins at N1 once the Tappa 9.5
+K1-K8 sprint completes (project SHIP order).
 
 ---
 
@@ -756,176 +760,217 @@ and Network domains.
 
 ---
 
-## 13. RFC items for owner ruling
+## 13. RFC resolutions
 
-Ten RFC items, framed for the same crisp-decision pattern as
-Tappa 9 §13. Each lists the question, the engineering
-recommendation, and the reversibility cost so the owner can
-rule fast.
+All 10 RFC items resolved 2026-05-19 (owner-accepted engineering
+recommendations). N1 implementation unblocked, sequenced AFTER
+the Tappa 9.5 K1-K8 sprint per project SHIP order. Each block
+below: **Decision**, **Rationale**, **Implementation note**
+(where in this doc / commit plan the decision manifests),
+**Reversibility cost**.
 
 ### Q1 — JA3/JA4 collection scope
 
-- **Question:** Compute JA3/JA4 for EVERY TLS flow (high
-  signal, high CPU cost on busy hosts) OR sample
-  (1-in-N flows + always for new dst_addr) OR opt-in per-
-  process (allowlist of comms that get fingerprinted)?
-- **Recommendation:** COMPUTE FOR EVERY TLS FLOW (V1.0).
-  Modern hosts process ~50 TLS handshakes/s peak — the JA3
-  parser runs in <100 µs per flow (mostly MD5 + a few
+- **Decision:** COMPUTE FOR EVERY TLS FLOW in V1.0. No
+  sampling, no per-process opt-in.
+- **Rationale:** modern hosts process ~50 TLS handshakes/s
+  peak; the JA3 parser runs in <100 µs per flow (MD5 +
   malloc-free reads). Total CPU budget < 0.5% on a busy
   host. Sampling complicates rule logic (rules expect
-  fingerprints to be present); opt-in degrades the threat-
-  hunting use case ("operator forgot to allowlist the
-  comm that turned out to be C2").
-- **Reversibility:** easy (add a sample-rate knob if real-
-  world CPU profiling shows pain; the data model is
+  fingerprints present); opt-in degrades the threat-
+  hunting use case.
+- **Implementation note:** §6.3 + N5 `tls_parser.rs`
+  unconditional per-flow extraction. CPU budget verified
+  in the N5 unit-test microbenchmark suite.
+- **Reversibility:** easy (add a sample-rate knob if
+  real-world CPU profiling shows pain; data model
   unchanged).
 
 ### Q2 — Packet capture primitive activation
 
-- **Question:** Tappa 10 ships the BPF trigger for first-N-
-  bytes capture but defers the userland writer to
-  Tappa 11.5. Should the trigger be ACTIVE in V1.0 (always
-  reserving + dropping bytes into the ringbuf, with no
-  consumer) OR DORMANT (compiled-in but not attached;
-  Tappa 11.5 attaches + adds the writer)?
-- **Recommendation:** DORMANT in V1.0. An active trigger
-  with no consumer wastes ringbuf memory + adds verifier
-  surface for no operator-visible value. Tappa 11.5 attaches
-  the kprobe alongside the writer task in one atomic
-  commit.
-- **Reversibility:** easy (Tappa 11.5 just adds the attach
-  + the writer; no V1.0 data-format commitment to honour).
+- **Decision:** DORMANT in V1.0. The first-N-bytes BPF
+  trigger compiles into the agent-ebpf object but is NOT
+  attached — Tappa 11.5 attaches the kprobe alongside its
+  user-space pcap writer in one atomic commit.
+- **Rationale:** an active trigger with no consumer wastes
+  ringbuf memory + adds verifier surface for no operator-
+  visible value. Coupling the attach to the writer commit
+  keeps the wire surface honest.
+- **Implementation note:** §1.1 OUT OF SCOPE + §5.2 N2
+  builds the program; main.rs N3 does NOT call its attach
+  helper.
+- **Reversibility:** easy (Tappa 11.5 just adds the
+  attach + the writer; no V1.0 data-format commitment to
+  honour).
 
 ### Q3 — DNS-to-flow attribution time window
 
-- **Question:** The cache TTL — 1 minute / 5 minutes /
-  30 minutes / OS-default? Too short loses
-  long-lived-flow attribution (operator browser tab open
-  for hours); too long pollutes attribution when a process
-  reuses an IP that DNS-resolved differently weeks ago.
-- **Recommendation:** **5 minutes** as the default. Matches
-  the typical OS-resolver cache TTL (glibc nscd, systemd-
-  resolved). Operator-tunable via
-  `net.dns_cache_ttl_secs` in V1.1.
-- **Reversibility:** easy (runtime-tuneable; default change
-  doesn't break the wire format).
+- **Decision:** 5 minutes default TTL. Operator-tunable in
+  V1.1 via `net.dns_cache_ttl_secs` in
+  `/etc/northnarrow/config.toml`.
+- **Rationale:** matches typical OS-resolver cache TTL
+  (glibc nscd, systemd-resolved). 1 minute loses long-
+  lived-flow attribution (browser-tab scenarios);
+  30 minutes pollutes attribution when a process reuses
+  an IP that resolved differently earlier.
+- **Implementation note:** §6.2 + N4 `dns_cache.rs`
+  `DnsResolutionCache::DEFAULT_TTL_SECS = 300`.
+- **Reversibility:** easy (runtime-tuneable; default
+  change doesn't break the wire format).
 
 ### Q4 — NetFlow rate-limiting tiers + caps
 
-- **Question:** Per-tier defaults? Same shape as Tappa 9
-  §13 Q4 (Critical uncapped, High capped, Medium capped)?
-- **Recommendation:** YES same shape. Defaults: Critical
-  **NO LIMIT**, High **200/min**, Medium **1000/min** (higher
-  than FIM's 50/100 because NetFlow events are inherently
-  higher-volume — a typical web browse session generates
-  100+ flows/minute).
+- **Decision:** PER-FLOW to audit chain (always) + HIERARCHICAL
+  TOKEN-BUCKET on `Event::NetFlow` emission to the decision
+  engine. Defaults: Critical **NO LIMIT**, High **200/min**,
+  Medium **1000/min**. Suppressed events get
+  `decision_engine_skipped: true` on the persisted entry.
+- **Rationale:** same shape as Tappa 9 §13 Q4 — per-flow
+  evidence preservation is non-negotiable; per-tier
+  buckets protect the decision engine from web-browse
+  flow volume (100+ flows/minute) without losing visibility.
+  Critical-uncapped lock-in mirrors NN-L-FIM-001 + NN-L-FIM-010
+  precedent (documented attack patterns must not be
+  suppressible).
+- **Implementation note:** §6.5 + N6 NN-L-NET-001/003
+  Critical rules tagged "never throttled" in their match
+  predicates; N3 flow_tracker implements the bucket
+  between diff and emit.
 - **Reversibility:** medium —
-  `decision_engine_skipped: true` schema field commits to
-  disk; bucket parameters are runtime-tuneable.
+  `decision_engine_skipped: true` field commits to disk;
+  bucket parameters are runtime-tuneable.
 
 ### Q5 — Operator blocklist format
 
-- **Question:** Bare IP/CIDR list (mirrors
-  fim-paths.v1's flat shape — simple, no YAML dep) OR
-  structured YAML/TOML (allows comments, tagging, source
-  attribution)?
-- **Recommendation:** BARE FLAT LIST per file, mirroring
-  the Tappa 9 C7 `fim-paths.v1` precedent. Two files:
-  `netflow-blocklist.v1` (IPs/CIDRs) + `netflow-ja3-
-  blocklist.v1` (JA3 hashes). Each one path per line,
-  `#` comments, blanks ignored. Operator overlay via
-  `.local` with `+entry` / `-entry` prefixes (Tappa 9 §13
-  Q7 pattern).
+- **Decision:** BARE FLAT LIST per file. Two files:
+  `netflow-blocklist.v1` (IPs/CIDRs) +
+  `netflow-ja3-blocklist.v1` (JA3 hashes). Each one entry
+  per line, `#` comments, blanks ignored. Operator overlay
+  via `.local` with `+entry` / `-entry` prefixes
+  (Tappa 9 §13 Q7 precedent verbatim).
+- **Rationale:** mirrors the Tappa 9 C7 `fim-paths.v1`
+  shipping shape — no new YAML dep on the agent crate,
+  operators inspect with `cat` + edit with `vi`. Same
+  parser, same overlay semantics, same boot-WARN-on-
+  disabled-default lock-in.
+- **Implementation note:** §10 + N6 blocklist parser
+  (reuses the Tappa 9 C7 `paths_config.rs` shape
+  verbatim).
 - **Reversibility:** easy (V1.1 can add a structured
-  format alongside; the flat format stays as the simple
+  format alongside; flat format stays as the simple
   on-disk shape).
 
 ### Q6 — Listener tracking scope
 
-- **Question:** Track EVERY listener (every `inet_csk_listen`
-  syscall — high noise from short-lived test servers) OR
-  filter to NEW listeners (those that persist > N seconds)?
-- **Recommendation:** TRACK EVERY, surface to operator via
-  `nn-admin net listeners` with a `--since <ts>` filter.
-  The on-disk chain captures every listen() — operators
-  can analyse historical noise post-incident. The rule
-  layer (NN-L-NET-006) filters via the comm + port
+- **Decision:** TRACK EVERY listener (every
+  `inet_csk_listen` syscall). The chain captures all;
+  the rule layer NN-L-NET-006 filters via comm + port
   allowlist, not via TTL.
+- **Rationale:** historical visibility matters (post-
+  incident: "did a listener appear in the 30 minutes
+  before the C2 connect?"); TTL filtering at capture
+  time discards forensic signal. Rule-side filtering
+  keeps the operator-tunable comm/port allowlist
+  authoritative.
+- **Implementation note:** §5.2 + N2 `inet_csk_listen`
+  BPF emits unconditionally; N6 NN-L-NET-006 rule does
+  the allowlist filter.
 - **Reversibility:** easy (V1.1 can add a "persistent
   listener only" filter as a rule-side option).
 
 ### Q7 — TLS handshake parser dependency
 
-- **Question:** Pull in a maintained TLS-parser crate
-  (`tls-parser`, `rustls-pemfile`) OR hand-roll the
-  ClientHello bit-reading?
-- **Recommendation:** HAND-ROLL. The parsing surface is
-  ~200 lines of straightforward bit-reading (RFC 5246
-  §7.4.1.2 is short and stable; TLS 1.3 ClientHello is a
-  superset, parsing the V1.0 subset captures all current
-  JA3/JA4 inputs). Pulling a crate violates Tappa 0's
-  "minimal dep" charter, and the JA3/JA4 hash inputs are
-  exactly the fields the standard JA3 spec lists — no
-  parser-crate flexibility is needed.
+- **Decision:** HAND-ROLL the ClientHello bit-reader.
+  No `tls-parser` / `rustls-*` crate dep.
+- **Rationale:** the parsing surface is ~200 lines
+  (RFC 5246 §7.4.1.2 short and stable; TLS 1.3
+  ClientHello is a superset of V1.0 inputs). Pulling a
+  crate violates Tappa 0's "minimal dep" charter; JA3/JA4
+  hash inputs are exactly the fields the standard JA3
+  spec lists — no parser-crate flexibility needed.
+- **Implementation note:** §6.3 + N5 `tls_parser.rs`
+  hand-rolled with comprehensive fixture suite (curl /
+  firefox / chrome / java keytool + known-bad samples).
 - **Reversibility:** medium (a parse-bug fix may take a
-  follow-up commit; comprehensive fixture suite up-front
-  mitigates).
+  follow-up commit; fixture-up-front mitigates).
 
 ### Q8 — NetFlow chain rotation policy
 
-- **Question:** Same as Tappa 9 §13 Q8 — V1.0 keep full
-  chain, V1.1 signed rotation op?
-- **Recommendation:** YES same. A 1000-flow/day host
-  generates ~30 MB / month; the chain stays manageable for
-  ~6 months without rotation. V1.1 adds
-  `nn-admin net rotate` mirroring Tappa 8 §14 Q9 +
-  Tappa 9 §13 Q8.
-- **Reversibility:** easy (additive future feature).
+- **Decision:** V1.0 KEEPS FULL CHAIN. V1.1 ships signed
+  `nn-admin net rotate` op with chain-of-chains
+  continuation (same shape as Tappa 8 §14 Q9 audit-rotate
+  + Tappa 9 §13 Q8 baseline-rotate + Tappa 9.5 §12 Q8
+  canary-rotate).
+- **Rationale:** a 1000-flow/day host generates ~30 MB
+  per month; chains stay manageable for ~6 months. V1.1
+  rotate joins the V1.1 rotation set across all four
+  chained-audit primitives.
+- **Implementation note:** no V1.0 implementation work;
+  documented as deferred follow-up.
+- **Reversibility:** easy (V1.1 rotate is additive; un-
+  rotated chains stay verifiable forever).
 
-### Q9 — ADE prompt cost ceiling (port from Tappa 9)
+### Q9 — ADE prompt cost ceiling
 
-- **Question:** Same tiered cap as Tappa 9 C9 (10 individual
-  + 1 batched overflow per minute, per domain)?
-- **Recommendation:** YES PORT VERBATIM. Two separate
-  domains, two separate budgets. Total ADE call budget
-  across FIM + NetFlow = **22 calls/minute** worst case
-  (11 each).
-- **Reversibility:** easy (runtime-tuneable per domain).
+- **Decision:** PORT VERBATIM the Tappa 9 §13 Q9 tiered
+  cap. 10 individual prompts / minute + 1 batched
+  overflow prompt / minute, per domain. Total ADE call
+  budget across FIM + NetFlow domains = **22 calls/minute**
+  worst case (11 each).
+- **Rationale:** same operational signal-density
+  trade-off Tappa 9 C9 already locked in. Two separate
+  domains = two separate budgets; cross-domain
+  attribution is V1.1+.
+- **Implementation note:** §8.1 + N10 (optional)
+  `ade/net_template.rs` mirrors `agent/src/ade/fim_template.rs::AdeFimRateLimiter`
+  + `OverflowBuffer` shape verbatim. Domain-scoped
+  naming (`AdeNetRateLimiter`) keeps the budget
+  separation explicit.
+- **Reversibility:** easy (runtime-tuneable per domain;
+  batched-overflow disabled by setting overflow cap to
+  0 per Tappa 9 precedent).
 
-### Q10 — Default ALPN/SNI handling for fingerprint chain
+### Q10 — SNI persistence in fingerprint chain
 
-- **Question:** Persist SNI to disk (potentially
-  privacy-sensitive — internal hostnames may leak via the
-  chain) OR strip SNI from `netflow.jsonl` rows but keep
-  in-memory for rule matching?
-- **Recommendation:** PERSIST. The chain is LSM-protected,
-  operator-only-readable, and SNI is already in-band on the
-  wire (any threat actor with a tap sees it). Stripping
-  would degrade `nn-admin net resolve` / `nn-admin net
-  fingerprint` operator utility for no real privacy gain.
+- **Decision:** PERSIST SNI in `netflow.jsonl` rows. No
+  strip mode in V1.0.
+- **Rationale:** the chain is LSM-protected (Tappa 7 +
+  Tappa 9 C7 STATE_PROTECTED_FILES coverage), operator-
+  only-readable, and SNI is already in-band on the wire
+  (any threat actor with a tap sees it pre-encrypted).
+  Stripping would degrade `nn-admin net resolve` +
+  `nn-admin net fingerprint` operator utility for no
+  real privacy gain.
+- **Implementation note:** §4.2 `TlsFingerprint.sni:
+  Option<String>` field carries through to the on-disk
+  row + the wire response.
 - **Reversibility:** easy (V1.1 can add an opt-in strip
-  mode; rotation invalidates the historical chain anyway).
+  mode; rotation invalidates the historical chain).
 
-### Cross-cutting consistency (anticipated lock-ins)
+### Cross-cutting consistency (lock-ins captured above)
 
 1. **Q1 (per-flow JA3) + Q7 (hand-rolled parser)** → §6.3
-   pulls in zero extra workspace deps; CPU budget verified
-   in N5 unit-test microbenchmarks.
+   + N5 pull in zero extra workspace deps; CPU budget
+   verified in N5 unit-test microbenchmarks. The whole
+   TLS-fingerprinting path is dependency-free Rust.
 2. **Q3 (5-min TTL) + Q6 (track every listener)** → both
-   compound the DnsResolutionCache + listener-table memory
-   footprint; bounded by §5.3 capacity caps + the
+   compound the `DnsResolutionCache` + listener-table
+   memory footprint; bounded by §5.3 capacity caps + the
    per-process-PID-keyed shape.
 3. **Q4 (Critical uncapped) + Q9 (ADE tiered cap)** →
    deterministic rule path always fires; ADE enrichment
-   throttled by the same shape as Tappa 9.
-4. **Q5 (flat blocklist) + Q7 (hand-rolled parser)** → keeps
-   the V1.0 deploy surface dependency-free; install.sh
-   ships an empty blocklist (operator populates) + a
-   non-empty cipher-suite table for the parser.
+   throttled by the same shape as Tappa 9 C9 (port
+   verbatim). Two domains, two budgets.
+4. **Q5 (flat blocklist) + Q7 (hand-rolled parser)** →
+   keeps the V1.0 deploy surface dependency-free;
+   install.sh ships an empty blocklist (operator
+   populates) + a non-empty cipher-suite table for
+   the parser.
 5. **Q2 (dormant pcap trigger) + Tappa 11.5** → Tappa 10's
-   on-disk schema is forward-compatible (pcap_ref field as
-   `Option<String>` populated by Tappa 11.5).
+   on-disk schema is forward-compatible (pcap_ref field
+   as `Option<String>` populated by Tappa 11.5). N2
+   compiles the program; main.rs N3 holds off on the
+   attach.
 
 ---
 
