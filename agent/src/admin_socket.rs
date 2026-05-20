@@ -28,9 +28,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, ForcePostureRequest,
-    RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest, StatusResponse,
-    UnlockResult, MAX_FRAME_BODY,
+    decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, FimBaselineRequest,
+    FimReportRequest, FimReportResponse, ForcePostureRequest, RotateKeysAddRequest,
+    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use ed25519_dalek::VerifyingKey;
@@ -429,6 +429,30 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // C6: FIM admin ops. Both are 1-of-N so cosigner_count
+        // is 0 (saturating_sub on a 1-element signatures vec).
+        (AdminMessage::FimBaselineRequest(req), AdminMessage::FimBaselineResult(r)) => (
+            "fim_baseline",
+            serde_json::json!({}),
+            audit_result_str(*r),
+            req.signatures.len().saturating_sub(1),
+        ),
+        (AdminMessage::FimReportRequest(req), AdminMessage::FimReportResponse(resp)) => {
+            let since = match &req.payload.extra {
+                OperationExtra::FimReport(extra) => extra.since_unix_ts,
+                _ => None,
+            };
+            (
+                "fim_report",
+                serde_json::json!({
+                    "since_unix_ts": since,
+                    "entries_count": resp.entries_count,
+                    "truncated": resp.entries_truncated,
+                }),
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -636,6 +660,14 @@ fn dispatch(
             AdminMessage::RotateKeysRevokeResult(dispatch_rotate_keys_revoke(req, auth, fps_out))
         }
 
+        AdminMessage::FimBaselineRequest(req) => {
+            AdminMessage::FimBaselineResult(dispatch_fim_baseline(req, auth, fps_out))
+        }
+
+        AdminMessage::FimReportRequest(req) => {
+            AdminMessage::FimReportResponse(dispatch_fim_report(req, auth, fps_out))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -645,7 +677,9 @@ fn dispatch(
         | AdminMessage::ShutdownResult(_)
         | AdminMessage::ForcePostureResult(_)
         | AdminMessage::RotateKeysAddResult(_)
-        | AdminMessage::RotateKeysRevokeResult(_) => {
+        | AdminMessage::RotateKeysRevokeResult(_)
+        | AdminMessage::FimBaselineResult(_)
+        | AdminMessage::FimReportResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -1115,6 +1149,201 @@ fn dispatch_rotate_keys_revoke(
         "rotate-keys revoke: admin.pub updated + in-memory keys reloaded"
     );
     AdminResult::Success
+}
+
+// PHASE_D_004: `fps_out` populated on success with the matched
+// signer fingerprint (1-of-N quorum → one fingerprint).
+//
+/// Tappa 9 C6 — handle one [`FimBaselineRequest`] (design §6.1 +
+/// §13 Q6). Verifies 1-of-N quorum carrying `Role::FimManage`,
+/// then signals the agent's FIM baseline subsystem to recompute.
+/// V1.0 doesn't have an in-process baseline-recompute channel
+/// yet (C7 deploy wires that alongside the FIM drain loop); for
+/// now the dispatcher writes an operator-visible info log + a
+/// `fim.baseline_pending` marker (similar shape to Tappa 8 A7
+/// shutdown_authorised marker; C7 wires the actual recompute on
+/// agent restart). The operator sees `nn-admin fim baseline:
+/// success` and the marker triggers a baseline pass at the next
+/// agent restart — sufficient for V1.0 since `fim baseline` is
+/// a "snapshot of trust" operation that's allowed to be lazy.
+fn dispatch_fim_baseline(
+    req: FimBaselineRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> AdminResult {
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1, // 1-of-N per §13 Q6 (workflow gate, not security gate)
+        &[Role::FimManage],
+        OperationCode::FimBaseline,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return map_admin_auth_error(e, "fim-baseline"),
+    };
+    *fps_out = matched_fps;
+
+    // The payload's extra MUST be FimBaseline (op/extra invariant
+    // already enforced inside verify_signed_payload_quorum).
+    if !matches!(&req.payload.extra, OperationExtra::FimBaseline(_)) {
+        warn!(
+            extra = ?req.payload.extra,
+            "fim-baseline payload extra is not FimBaseline variant"
+        );
+        return AdminResult::UnknownOperation;
+    }
+
+    info!(
+        target: "admin.fim_baseline",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        "fim baseline requested — recompute scheduled for next agent restart \
+         (V1.0 lazy semantics per design §13 Q6)"
+    );
+    AdminResult::Success
+}
+
+/// Tappa 9 C6 — handle one [`FimReportRequest`] (design §6.3 +
+/// §13 Q6). Verifies 1-of-N quorum carrying `Role::FimRead`,
+/// reads the drift log from disk, returns the chained JSONL
+/// body (or a truncation flag if the chain exceeds the wire
+/// frame budget). Filtering by `since_unix_ts` from the
+/// payload's extra is best-effort: the dispatcher walks the
+/// chain in order and yields entries whose `ts` field is `>=`
+/// the threshold (lexicographic ISO-8601 compare, valid
+/// because the format is fixed-width).
+fn dispatch_fim_report(
+    req: FimReportRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> FimReportResponse {
+    use common::wire::admin_signed_payload::FimReportExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1, // 1-of-N per §13 Q6
+        &[Role::FimRead],
+        OperationCode::FimReport,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return FimReportResponse {
+                result: map_admin_auth_error(e, "fim-report"),
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+    *fps_out = matched_fps;
+
+    let since = match &req.payload.extra {
+        OperationExtra::FimReport(FimReportExtra { since_unix_ts }) => *since_unix_ts,
+        _ => {
+            warn!("fim-report payload extra is not FimReport variant");
+            return FimReportResponse {
+                result: AdminResult::UnknownOperation,
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+
+    let (entries_jsonl, entries_count, entries_truncated) =
+        read_fim_drift_jsonl(crate::fim::drain::DEFAULT_DRIFT_LOG_PATH, since);
+    info!(
+        target: "admin.fim_report",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        entries = entries_count,
+        truncated = entries_truncated,
+        "fim report served"
+    );
+    FimReportResponse {
+        result: AdminResult::Success,
+        entries_jsonl,
+        entries_count,
+        entries_truncated,
+    }
+}
+
+/// Read the drift log at `path` and return `(jsonl_body,
+/// count, truncated_flag)`. Filter rule: keep entries whose
+/// `ts` field is lexicographically `>=` the supplied `since`
+/// (UNIX-ts encoded as ISO-8601, falls back to "include all"
+/// when `since` is None). Caps the wire-side body at half of
+/// MAX_FRAME_BODY so the rest of the FimReportResponse envelope
+/// fits comfortably in one frame. On overflow, sets
+/// `truncated=true` and stops appending; the operator can
+/// narrow via the CLI's `--since` flag.
+fn read_fim_drift_jsonl(path: &str, since: Option<u64>) -> (String, u32, bool) {
+    use std::io::{BufRead, BufReader};
+    const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
+    let f = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return (String::new(), 0, false),
+    };
+    let reader = BufReader::new(f);
+    let since_str = since.map(format_iso8601_unix);
+    let mut out = String::new();
+    let mut count = 0u32;
+    let mut truncated = false;
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(threshold) = &since_str {
+            // Coarse pass: substring-match the first ts field
+            // rather than parse JSON. Format §4.2 puts ts as
+            // the first field, so the second `"` opens the
+            // ISO timestamp string.
+            if let Some(ts_value) = extract_ts_field(&line) {
+                if ts_value.as_str() < threshold.as_str() {
+                    continue;
+                }
+            }
+        }
+        if out.len() + line.len() + 1 > SOFT_CAP {
+            truncated = true;
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+        count += 1;
+    }
+    (out, count, truncated)
+}
+
+fn format_iso8601_unix(unix_ts: u64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(unix_ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00".to_string())
+}
+
+/// Extract the `ts` field from a JSONL drift entry without a
+/// full JSON parse. Returns the string between the value's
+/// opening + closing `"` quotes. Returns `None` on a malformed
+/// line — the caller treats that as "include the entry" to
+/// avoid silently dropping evidence the operator might need.
+fn extract_ts_field(line: &str) -> Option<String> {
+    // Expected shape: {"ts":"<iso8601>", ...
+    // We find `"ts":"` and then the next `"`.
+    let key = "\"ts\":\"";
+    let start = line.find(key)? + key.len();
+    let end = line[start..].find('"')?;
+    Some(line[start..start + end].to_string())
 }
 
 /// Shared mapper from [`AdminAuthError`] to the wire
@@ -2011,5 +2240,105 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key_fp, "");
         assert!(entries[0].cosigner_fps.iter().all(String::is_empty));
+    }
+
+    // ── C6 — fim baseline / report audit emission tests ────────
+
+    /// C6 audit test #1: FimBaselineRequest + Success result
+    /// emit one audit row with op="fim_baseline",
+    /// result="success", populated key_fp from matched_fps.
+    #[test]
+    fn audit_emits_on_fim_baseline_success() {
+        use common::wire::admin_protocol::{FimBaselineRequest, KeyedSignature};
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_fim_baseline([0x11; 32], 1_700_000_000, [0x22; 16]);
+        let req = AdminMessage::FimBaselineRequest(FimBaselineRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::FimBaselineResult(AdminResult::Success);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["aaaaaaaa".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "fim_baseline");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].key_fp, "aaaaaaaa");
+        // 1-of-N quorum → 0 cosigners.
+        assert!(entries[0].cosigner_fps.is_empty());
+    }
+
+    /// C6 audit test #2: FimReportRequest + Success response
+    /// emit one row with the extra carrying entries_count +
+    /// truncated flag (operator-visible in `nn-admin audit
+    /// read`).
+    #[test]
+    fn audit_emits_on_fim_report_success_with_extra() {
+        use common::wire::admin_protocol::{FimReportRequest, FimReportResponse, KeyedSignature};
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_fim_report(
+            [0x33; 32],
+            1_700_000_000,
+            [0x44; 16],
+            Some(1_700_000_000),
+        );
+        let req = AdminMessage::FimReportRequest(FimReportRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::FimReportResponse(FimReportResponse {
+            result: AdminResult::Success,
+            entries_jsonl: "{\"ts\":\"2026-05-20T00:00:00Z\"}\n".to_string(),
+            entries_count: 1,
+            entries_truncated: false,
+        });
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["bbbbbbbb".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "fim_report");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].key_fp, "bbbbbbbb");
+        // Extra surfaces entries_count + truncated flag for
+        // operator visibility via `nn-admin audit read`.
+        assert_eq!(entries[0].extra["entries_count"], 1);
+        assert_eq!(entries[0].extra["truncated"], false);
+        assert_eq!(entries[0].extra["since_unix_ts"], 1_700_000_000);
+    }
+
+    /// C6 audit test #3: a fim-baseline RoleDenied result still
+    /// emits an audit row (failures audit the same way as
+    /// successes — the chain captures attempts).
+    #[test]
+    fn audit_emits_on_fim_baseline_failure_role_denied() {
+        use common::wire::admin_protocol::{FimBaselineRequest, KeyedSignature};
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_fim_baseline([0x55; 32], 1_700_000_000, [0x66; 16]);
+        let req = AdminMessage::FimBaselineRequest(FimBaselineRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::FimBaselineResult(AdminResult::RoleDenied);
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "fim_baseline");
+        assert!(entries[0].result.starts_with("failure: role_denied"));
     }
 }

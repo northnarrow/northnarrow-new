@@ -217,6 +217,63 @@ pub struct RotateKeysRevokeRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Tappa 9 commit C6 — signed FIM baseline (re)compute request
+/// (design §6.1 + §13 Q6). Carries the full [`SignedPayload`]
+/// (with `op = FimBaseline` and `extra = FimBaseline {}`) plus
+/// a single signature — 1-of-N per §13 Q6 ("baseline is a
+/// workflow op, not a security gate"). Required role:
+/// [`common::wire::admin_signed_payload::Role::FimManage`].
+/// `Vec<KeyedSignature>` is reused for shape consistency with
+/// the other Tappa-8 ops; the agent's quorum verify enforces
+/// `min_distinct=1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimBaselineRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9 commit C6 — signed FIM drift-log read request
+/// (design §6.3 + §13 Q6). Carries `op = FimReport` with the
+/// optional `since_unix_ts` filter in
+/// [`common::wire::admin_signed_payload::FimReportExtra`].
+/// 1-of-N quorum (single-sig, `Role::FimRead` — the
+/// lower-privilege FIM role). Reply on the success path is a
+/// [`FimReportResponse`] carrying the JSONL-encoded chain
+/// rather than the bare [`AdminResult`] superset — the chain
+/// IS the response payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimReportRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9 commit C6 — `FimReport` reply payload. On success
+/// carries the chain entries the operator's `nn-admin fim
+/// report` reads + the count for the summary line. On
+/// failure, `result` carries the auth/quorum/role error
+/// shape consistent with the other Tappa-8 ops; `entries_jsonl`
+/// is then empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimReportResponse {
+    /// Auth result — `Success` when the chain follows.
+    pub result: AdminResult,
+    /// Chained drift-log entries in their canonical on-disk
+    /// JSONL form (one entry per line, `\n`-separated).
+    /// Empty on auth failure. Bounded by
+    /// [`MAX_FRAME_BODY`] minus a few bytes of envelope; the
+    /// agent's dispatch caps the export length and surfaces
+    /// truncation in `entries_truncated`.
+    pub entries_jsonl: String,
+    /// Number of entries returned. Lets the CLI print a
+    /// summary line without re-parsing the JSONL body.
+    pub entries_count: u32,
+    /// `true` if the agent's dispatch truncated the body
+    /// because the full chain exceeded the wire-frame
+    /// budget. CLI surfaces this as
+    /// `"... (truncated; pass --since <ts> to narrow)"`.
+    pub entries_truncated: bool,
+}
+
 /// Trigger payload for "issue me a fresh challenge nonce". Empty
 /// today; reserved as a struct so future fields (client version,
 /// requested key fingerprint) can be added without an AdminMessage
@@ -318,6 +375,17 @@ pub enum AdminMessage {
     RotateKeysRevokeRequest(RotateKeysRevokeRequest),
     /// Reply to [`AdminMessage::RotateKeysRevokeRequest`].
     RotateKeysRevokeResult(AdminResult),
+    /// Tappa 9 commit C6 — signed FIM baseline (re)compute
+    /// request. Triggers [`AdminMessage::FimBaselineResult`].
+    FimBaselineRequest(FimBaselineRequest),
+    /// Reply to [`AdminMessage::FimBaselineRequest`].
+    FimBaselineResult(AdminResult),
+    /// Tappa 9 commit C6 — signed FIM drift-log read request.
+    /// Triggers [`AdminMessage::FimReportResponse`].
+    FimReportRequest(FimReportRequest),
+    /// Reply to [`AdminMessage::FimReportRequest`] — carries
+    /// the chained JSONL body on success.
+    FimReportResponse(FimReportResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -758,7 +826,11 @@ mod tests {
                 | AdminMessage::RotateKeysAddRequest(_)
                 | AdminMessage::RotateKeysAddResult(_)
                 | AdminMessage::RotateKeysRevokeRequest(_)
-                | AdminMessage::RotateKeysRevokeResult(_) => {}
+                | AdminMessage::RotateKeysRevokeResult(_)
+                | AdminMessage::FimBaselineRequest(_)
+                | AdminMessage::FimBaselineResult(_)
+                | AdminMessage::FimReportRequest(_)
+                | AdminMessage::FimReportResponse(_) => {}
             }
         }
     }
@@ -813,6 +885,51 @@ mod tests {
             },
         ));
         roundtrip(AdminMessage::RotateKeysRevokeResult(AdminResult::Success));
+    }
+
+    // ── C6: FimBaseline / FimReport wire round-trip ─────────────
+
+    /// C6 wire test #1: `FimBaselineRequest` encodes + decodes
+    /// without bit-level drift. 1-of-N quorum so one signature.
+    #[test]
+    fn roundtrip_fim_baseline_request() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_fim_baseline([0x11; 32], 1_700_000_000, [0x22; 16]);
+        roundtrip(AdminMessage::FimBaselineRequest(FimBaselineRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0x55; 64] }],
+        }));
+        roundtrip(AdminMessage::FimBaselineResult(AdminResult::Success));
+    }
+
+    /// C6 wire test #2: `FimReportRequest` + `FimReportResponse`
+    /// round-trip including the JSONL body + truncation flag.
+    #[test]
+    fn roundtrip_fim_report_request_and_response() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_fim_report(
+            [0x33; 32],
+            1_700_000_000,
+            [0x44; 16],
+            Some(1_700_000_000),
+        );
+        roundtrip(AdminMessage::FimReportRequest(FimReportRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0x77; 64] }],
+        }));
+        roundtrip(AdminMessage::FimReportResponse(FimReportResponse {
+            result: AdminResult::Success,
+            entries_jsonl: r#"{"ts":"2026-05-20T00:00:00Z","path":"/etc/passwd"}"#.to_string(),
+            entries_count: 1,
+            entries_truncated: false,
+        }));
+        // Auth-failure variant: empty body + non-Success result.
+        roundtrip(AdminMessage::FimReportResponse(FimReportResponse {
+            result: AdminResult::RoleDenied,
+            entries_jsonl: String::new(),
+            entries_count: 0,
+            entries_truncated: false,
+        }));
     }
 
     // ── A1: VersionedAdminMessage envelope (Tappa 8 design §6.2) ────

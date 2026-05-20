@@ -33,10 +33,11 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
-    load_audit_pubkey, run_audit_read, run_audit_verify, run_force_posture, run_init,
-    run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown, run_status, run_unlock,
-    run_verify_keys, AuditVerifyOutcome, ForcePostureOutcome, RotateKeysOutcome,
-    ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
+    load_audit_pubkey, run_audit_read, run_audit_verify, run_fim_baseline, run_fim_report,
+    run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
+    run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, FimBaselineOutcome,
+    FimReportOutcome, ForcePostureOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
+    UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -224,6 +225,16 @@ enum Cmd {
         sub: AuditCmd,
     },
 
+    /// Tappa 9 C6 — FIM operator surface. `fim baseline` queues
+    /// a re-compute of the watched-paths SHA-256 baseline
+    /// (signed payload, single-sig `fim-manage` role per §13 Q6).
+    /// `fim report [--since <unix-ts>]` reads the chained drift
+    /// log (signed payload, single-sig `fim-read` role).
+    Fim {
+        #[command(subcommand)]
+        sub: FimCmd,
+    },
+
     /// Debug-only: force the agent's posture state machine into a
     /// chosen state. Only compiled when the `debug-trigger` Cargo
     /// feature is on.
@@ -325,6 +336,45 @@ enum AuditCmd {
         /// 0400 — usually requires sudo.
         #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
         agent_sig_key: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FimCmd {
+    /// Queue a baseline (re)compute. Signed payload, single-sig
+    /// `fim-manage` role per §13 Q6. V1.0 semantics: success
+    /// schedules the recompute for the next agent restart
+    /// (lazy — baseline is a "snapshot of trust" workflow op,
+    /// not a security gate).
+    Baseline {
+        /// Path to the operator's `fim-manage`-role admin
+        /// private key.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// Stream the chained drift log to stdout. Signed payload,
+    /// single-sig `fim-read` role. `--since <unix-ts>` filters
+    /// server-side; missing returns the full chain (capped at
+    /// half MAX_FRAME_BODY — exit prints a truncation hint when
+    /// the cap fires).
+    Report {
+        /// Path to the operator's `fim-read`-role admin
+        /// private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// Unix-timestamp lower bound. Entries with `ts >=
+        /// since` are returned.
+        #[arg(long)]
+        since: Option<u64>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 }
 
@@ -555,6 +605,35 @@ fn main() -> ExitCode {
             Err(e) => {
                 eprintln!("audit: {e:#}");
                 ExitCode::from(1)
+            }
+        },
+        Cmd::Fim {
+            sub:
+                FimCmd::Baseline {
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_fim_baseline(&socket, &key, &agent_id_file) {
+            Ok(outcome) => exit_from_fim_baseline(outcome),
+            Err(e) => {
+                eprintln!("fim baseline: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Fim {
+            sub:
+                FimCmd::Report {
+                    key,
+                    since,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_fim_report(&socket, &key, &agent_id_file, since) {
+            Ok(outcome) => exit_from_fim_report(outcome),
+            Err(e) => {
+                eprintln!("fim report: {e:#}");
+                ExitCode::from(5)
             }
         },
         #[cfg(feature = "debug-trigger")]
@@ -1081,6 +1160,135 @@ fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode
         }
         RotateKeysOutcome::ProtocolVersionUnsupported { server_version } => {
             eprintln!("{op_label}: server speaks protocol v{server_version}; this nn-admin is newer");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// C6: map [`FimBaselineOutcome`] to a stable exit code.
+/// Mirrors the rotate-keys mapping (0=success, 2=invalid-sig,
+/// 4=rate-limited, 5=transport/clock/agent-id/unknown-op,
+/// 6=quorum, 7=role).
+fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        FimBaselineOutcome::Success => {
+            println!(
+                "{}",
+                colorize("fim baseline: success", "32", tty)
+            );
+            ExitCode::SUCCESS
+        }
+        FimBaselineOutcome::InvalidSignature => {
+            eprintln!("fim baseline: invalid signature");
+            ExitCode::from(2)
+        }
+        FimBaselineOutcome::NoPendingChallenge => {
+            eprintln!("fim baseline: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        FimBaselineOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("fim baseline: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        FimBaselineOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("fim baseline: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        FimBaselineOutcome::RoleDenied => {
+            eprintln!(
+                "fim baseline: role denied (the submitted key lacks `fim-manage` in admin.pub)"
+            );
+            ExitCode::from(7)
+        }
+        FimBaselineOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "fim baseline: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s); NTP-sync and retry"
+            );
+            ExitCode::from(5)
+        }
+        FimBaselineOutcome::AgentIdMismatch => {
+            eprintln!("fim baseline: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        FimBaselineOutcome::UnknownOperation => {
+            eprintln!("fim baseline: server rejected operation");
+            ExitCode::from(5)
+        }
+        FimBaselineOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("fim baseline: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// C6: map [`FimReportOutcome`] to an exit code AND stream
+/// the JSONL body to stdout on success. The summary line goes
+/// to STDERR so `nn-admin fim report | jq` keeps a clean
+/// JSONL stream on stdout (mirrors `nn-admin audit read
+/// --json | jq`).
+fn exit_from_fim_report(outcome: FimReportOutcome) -> ExitCode {
+    match outcome {
+        FimReportOutcome::Success {
+            entries_jsonl,
+            entries_count,
+            entries_truncated,
+        } => {
+            // Stream verbatim — the body is already \n-terminated
+            // JSONL from the server (the dispatch appends \n per
+            // entry in read_fim_drift_jsonl).
+            print!("{entries_jsonl}");
+            if entries_truncated {
+                eprintln!(
+                    "fim report: {entries_count} entries (truncated; pass --since <unix-ts> to narrow)"
+                );
+            } else {
+                eprintln!("fim report: {entries_count} entries");
+            }
+            ExitCode::SUCCESS
+        }
+        FimReportOutcome::InvalidSignature => {
+            eprintln!("fim report: invalid signature");
+            ExitCode::from(2)
+        }
+        FimReportOutcome::NoPendingChallenge => {
+            eprintln!("fim report: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        FimReportOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("fim report: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        FimReportOutcome::RoleDenied => {
+            eprintln!("fim report: role denied (the submitted key lacks `fim-read`)");
+            ExitCode::from(7)
+        }
+        FimReportOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "fim report: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)"
+            );
+            ExitCode::from(5)
+        }
+        FimReportOutcome::AgentIdMismatch => {
+            eprintln!("fim report: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        FimReportOutcome::UnknownOperation => {
+            eprintln!("fim report: server rejected operation");
+            ExitCode::from(5)
+        }
+        FimReportOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("fim report: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        FimReportOutcome::Transport => {
+            eprintln!("fim report: unexpected server reply");
             ExitCode::from(5)
         }
     }
