@@ -125,6 +125,14 @@ impl ExecCheckRaw {
 /// addresses are stored in the first 4 bytes with the rest zeroed.
 /// Ports are network-order shorts converted to host order before
 /// emission so userland doesn't have to know.
+///
+/// Tappa 10 (N2) — appended `sk_ptr` field. The kernel-side
+/// `struct sock` pointer is what `FLOW_SOCK_MAP` keys on, so
+/// userland needs it to correlate this connect event with the
+/// later `NetFlowCloseRaw` emitted by the `tcp_close` fexit
+/// (which carries `flow_id` looked up from `FLOW_SOCK_MAP[sk_ptr]`).
+/// Wire-size grew from 72 → 80 bytes; both kernel + userland are
+/// rebuilt in the same N2 commit so there's no straddle window.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -140,6 +148,10 @@ pub struct TcpConnectRaw {
     pub dst_addr: [u8; ADDR_LEN],
     pub comm: [u8; TASK_COMM_LEN],
     pub timestamp_ns: u64,
+    /// Tappa 10 N2 — kernel `struct sock *` address. Opaque on
+    /// the userland side (don't dereference); used as the key
+    /// into `FLOW_SOCK_MAP` to correlate connect ↔ close.
+    pub sk_ptr: u64,
 }
 
 impl TcpConnectRaw {
@@ -156,6 +168,155 @@ impl TcpConnectRaw {
             dst_addr: [0; ADDR_LEN],
             comm: [0u8; TASK_COMM_LEN],
             timestamp_ns: 0,
+            sk_ptr: 0,
+        }
+    }
+}
+
+// ── Tappa 10 (N2) — Network Observability BPF wire types ──────────────
+//
+// These are the `#[repr(C)]` POD records the new BPF programs emit
+// into their ringbufs. Userland decodes via bytemuck, same pattern
+// as `TcpConnectRaw` + `DnsQueryRaw` + `FimDriftRaw`.
+//
+// Capacity constants are shared with the eBPF crate (which is
+// `no_std` but reads them via `northnarrow_common::wire::*`) so
+// the byte sizing for ringbuf reservations + map max_entries is
+// defined in ONE place — bumping a size doesn't require an
+// out-of-band coordinated edit across two crates.
+
+/// Tappa 10 (N2) — capacity of the `NET_FLOW_CLOSE_EVENTS` ringbuf
+/// shared by `tcp_close` (TCP fexit) and `udp_sendmsg_outbound`
+/// (UDP kprobe). Sized per design §5.3 — 256 KiB buffers ~3000
+/// close events/s burst before back-pressure.
+pub const NET_FLOW_CLOSE_EVENTS_BYTES: u32 = 256 * 1024;
+
+/// Tappa 10 (N2) — capacity of the `NET_LISTEN_EVENTS` ringbuf.
+/// Listener changes are rare; 64 KiB per §5.3.
+pub const NET_LISTEN_EVENTS_BYTES: u32 = 64 * 1024;
+
+/// Tappa 10 (N2) — `FLOW_SOCK_MAP` LRU HashMap entry cap. Bounds
+/// the per-flow kernel-side state; LRU eviction keeps memory
+/// bounded under DDoS load. Per design §5.3.
+pub const FLOW_SOCK_MAP_MAX_ENTRIES: u32 = 4096;
+
+/// Tappa 10 (N2) — `inet_csk_listen_start` kprobe event. Emitted
+/// once per listen() syscall on a TCP/UDP socket, unconditionally
+/// per design §13 Q6 (operator-visible filter happens rule-side
+/// in N6 NN-L-NET-006 against the comm + port allowlist).
+///
+/// `bind_port` is host-order (the kernel stores `skc_num` host-order
+/// after the bind syscall converts it). `bind_addr` is 16 bytes
+/// regardless of family — IPv4 in bytes 0..4, IPv6 in bytes 0..16,
+/// same pattern as `TcpConnectRaw`.
+///
+/// Layout chosen for natural u64 alignment with no implicit
+/// padding before the trailing arrays: 8 + 4 + 4 + 1 + 1 + 2 + 2
+/// + 2 + 16 + 16 = 56 bytes, 8-aligned (struct alignment = u64).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct NetListenRaw {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub family: u8,
+    pub proto: u8,
+    pub _pad0: [u8; 2],
+    pub bind_port: u16,
+    pub _pad1: [u8; 2],
+    pub bind_addr: [u8; ADDR_LEN],
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+impl NetListenRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            pid: 0,
+            uid: 0,
+            family: 0,
+            proto: 0,
+            _pad0: [0; 2],
+            bind_port: 0,
+            _pad1: [0; 2],
+            bind_addr: [0; ADDR_LEN],
+            comm: [0u8; TASK_COMM_LEN],
+        }
+    }
+}
+
+/// Tappa 10 (N2) — flow close / outbound emission. UNIFIED record
+/// across `tcp_close` (fexit, accurate byte counters via
+/// `tcp_sock` reads) AND `udp_sendmsg_outbound` (kprobe, per-send
+/// abbreviated). `proto` byte (IPPROTO_TCP / IPPROTO_UDP)
+/// discriminates which kernel hook produced the row; both share
+/// one ringbuf per design §13 Q3 lock-in ("UDP flow close is
+/// conceptually equivalent to TCP flow close, single drain task").
+///
+/// TCP path populates:
+///   - `flow_id` from `FLOW_SOCK_MAP[sk_ptr]` (set by the
+///     connect kprobe at flow start).
+///   - `bytes_sent` / `bytes_recv` from `tcp_sock` fields.
+///   - `close_reason` from `sk->sk_err & 0xFF`: 0 = graceful
+///     FIN exchange, 104 (ECONNRESET) = RST received, 110
+///     (ETIMEDOUT) = keepalive timeout, other = errored close.
+///
+/// UDP path populates:
+///   - `flow_id` = zeros (no sock-lifetime; N3 synthesises one
+///     per (pid, five_tuple) burst window).
+///   - `bytes_sent` = `len` arg of the udp_sendmsg call (this
+///     send only — N3 accumulates across the burst window).
+///   - `bytes_recv` = 0.
+///   - `close_reason` = 0.
+///
+/// Layout: 8 + 8 + 8 + 16 + 4 + 4 + 16 + 16 + 16 + 1 + 1 + 1 +
+/// 1 + 2 + 2 + 8 = 112 bytes, 8-aligned.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct NetFlowCloseRaw {
+    pub timestamp_ns: u64,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    /// 16-byte correlation ID. TCP: copied from `FLOW_SOCK_MAP[sk_ptr]`
+    /// (written by the connect kprobe). UDP: zeros.
+    pub flow_id: [u8; ADDR_LEN],
+    pub pid: u32,
+    pub uid: u32,
+    pub src_addr: [u8; ADDR_LEN],
+    pub dst_addr: [u8; ADDR_LEN],
+    pub comm: [u8; TASK_COMM_LEN],
+    pub family: u8,
+    pub proto: u8,
+    /// Low 8 bits of `sock->sk_err` for TCP fexit; 0 for UDP.
+    /// 0 = graceful, 104 = ECONNRESET, 110 = ETIMEDOUT.
+    pub close_reason: u8,
+    pub _pad0: [u8; 1],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub _pad1: [u8; 8],
+}
+
+impl NetFlowCloseRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            flow_id: [0u8; ADDR_LEN],
+            pid: 0,
+            uid: 0,
+            src_addr: [0; ADDR_LEN],
+            dst_addr: [0; ADDR_LEN],
+            comm: [0u8; TASK_COMM_LEN],
+            family: 0,
+            proto: 0,
+            close_reason: 0,
+            _pad0: [0; 1],
+            src_port: 0,
+            dst_port: 0,
+            _pad1: [0; 8],
         }
     }
 }
@@ -965,5 +1126,171 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: NetListenerEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, original);
+    }
+
+    // ── Tappa 10 N2 — BPF emission wire types ──────────────────────
+
+    /// N2 test #1: [`TcpConnectRaw`] layout after the N2 `sk_ptr`
+    /// extension. The struct grew from 72 → 80 bytes; userland +
+    /// kernel rebuild together in this commit so the wire change
+    /// is atomic. Anchor the new size + 8-alignment so a future
+    /// reorder fails fast.
+    #[test]
+    fn tcp_connect_raw_layout_is_stable_after_sk_ptr_extension() {
+        // 4+4+1+1+2+2+2+16+16+16+8+8 = 80 bytes.
+        assert_eq!(size_of::<TcpConnectRaw>(), 80);
+        assert_eq!(align_of::<TcpConnectRaw>(), 8);
+    }
+
+    /// N2 test #2: [`TcpConnectRaw`] round-trip with the new
+    /// `sk_ptr` field populated. Bytemuck-decoded record on
+    /// userland MUST observe the same `sk_ptr` value the BPF
+    /// kprobe stored — that's the load-bearing property for the
+    /// userland `connect_event_by_sk_ptr` correlation map.
+    #[test]
+    fn tcp_connect_raw_round_trips_via_bytes() {
+        let original = TcpConnectRaw {
+            pid: 12345,
+            uid: 1000,
+            family: 2, // AF_INET
+            _pad0: [0; 1],
+            src_port: 0,
+            dst_port: 443,
+            _pad1: [0; 2],
+            src_addr: [0; ADDR_LEN],
+            dst_addr: {
+                let mut a = [0u8; ADDR_LEN];
+                a[0] = 1;
+                a[1] = 2;
+                a[2] = 3;
+                a[3] = 4;
+                a
+            },
+            comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
+            timestamp_ns: 1_700_000_000_000_000_000,
+            sk_ptr: 0xFFFF_FFFF_DEAD_BEEF,
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&original);
+        assert_eq!(bytes.len(), size_of::<TcpConnectRaw>());
+        let restored: TcpConnectRaw = *bytemuck::from_bytes::<TcpConnectRaw>(bytes);
+        assert_eq!(restored.pid, original.pid);
+        assert_eq!(restored.dst_port, original.dst_port);
+        assert_eq!(restored.dst_addr, original.dst_addr);
+        assert_eq!(restored.timestamp_ns, original.timestamp_ns);
+        assert_eq!(
+            restored.sk_ptr, original.sk_ptr,
+            "sk_ptr round-trip MUST preserve the kernel pointer bits"
+        );
+    }
+
+    /// N2 test #3: [`NetListenRaw`] layout. 56 bytes, 8-aligned
+    /// — anchor the wire size so an inadvertent field reorder
+    /// surfaces here before reaching the BPF verifier.
+    #[test]
+    fn net_listen_raw_layout_is_stable() {
+        // 8 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 16 + 16 = 56 bytes.
+        assert_eq!(size_of::<NetListenRaw>(), 56);
+        assert_eq!(align_of::<NetListenRaw>(), 8);
+    }
+
+    /// N2 test #4: [`NetListenRaw`] bytemuck round-trip. The BPF
+    /// program builds the record in ringbuf-reserved memory;
+    /// userland decodes via `from_bytes`. This test pins the
+    /// Pod / Zeroable derives on the wire shape.
+    #[test]
+    fn net_listen_raw_round_trips_via_bytes() {
+        let original = NetListenRaw {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            pid: 1234,
+            uid: 0,
+            family: 2, // AF_INET
+            proto: 6,  // IPPROTO_TCP
+            _pad0: [0; 2],
+            bind_port: 22,
+            _pad1: [0; 2],
+            bind_addr: [0u8; ADDR_LEN],
+            comm: *b"sshd\0\0\0\0\0\0\0\0\0\0\0\0",
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&original);
+        assert_eq!(bytes.len(), size_of::<NetListenRaw>());
+        let restored: NetListenRaw = *bytemuck::from_bytes::<NetListenRaw>(bytes);
+        assert_eq!(restored.bind_port, original.bind_port);
+        assert_eq!(restored.proto, original.proto);
+        assert_eq!(restored.family, original.family);
+        assert_eq!(restored.pid, original.pid);
+        assert_eq!(restored.comm, original.comm);
+    }
+
+    /// N2 test #5: [`NetFlowCloseRaw`] layout. 112 bytes,
+    /// 8-aligned. This struct is the LARGEST of the N2 wire
+    /// types (carries 5-tuple + byte counters + correlation
+    /// ID); an unexpected size regression here likely means a
+    /// field reorder broke bytemuck Pod's no-padding contract.
+    #[test]
+    fn net_flow_close_raw_layout_is_stable() {
+        // 8 + 8 + 8 + 16 + 4 + 4 + 16 + 16 + 16 + 1 + 1 + 1 + 1 +
+        // 2 + 2 + 8 = 112 bytes.
+        assert_eq!(size_of::<NetFlowCloseRaw>(), 112);
+        assert_eq!(align_of::<NetFlowCloseRaw>(), 8);
+    }
+
+    /// N2 test #6: [`NetFlowCloseRaw`] bytemuck round-trip,
+    /// exercising the unified TCP + UDP shape — populate
+    /// every "TCP-only" field (`flow_id`, `bytes_recv`,
+    /// `close_reason`) plus the shared 5-tuple so the test
+    /// fixture covers both code paths' contributions to the
+    /// wire bytes.
+    #[test]
+    fn net_flow_close_raw_round_trips_via_bytes() {
+        let mut flow_id = [0u8; ADDR_LEN];
+        for (i, b) in flow_id.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let original = NetFlowCloseRaw {
+            timestamp_ns: 1_700_000_000_500_000_000,
+            bytes_sent: 12_345,
+            bytes_recv: 67_890,
+            flow_id,
+            pid: 8888,
+            uid: 0,
+            src_addr: [0; ADDR_LEN],
+            dst_addr: {
+                let mut a = [0u8; ADDR_LEN];
+                a[0] = 1;
+                a[1] = 2;
+                a[2] = 3;
+                a[3] = 4;
+                a
+            },
+            comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
+            family: 2,
+            proto: 6,
+            close_reason: 104, // ECONNRESET
+            _pad0: [0; 1],
+            src_port: 54321,
+            dst_port: 443,
+            _pad1: [0; 8],
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&original);
+        assert_eq!(bytes.len(), size_of::<NetFlowCloseRaw>());
+        let restored: NetFlowCloseRaw = *bytemuck::from_bytes::<NetFlowCloseRaw>(bytes);
+        assert_eq!(restored.flow_id, original.flow_id);
+        assert_eq!(restored.bytes_sent, original.bytes_sent);
+        assert_eq!(restored.bytes_recv, original.bytes_recv);
+        assert_eq!(restored.close_reason, original.close_reason);
+        assert_eq!(restored.proto, original.proto);
+        assert_eq!(restored.dst_port, original.dst_port);
+    }
+
+    /// N2 test #7: capacity-constant lock-in. The byte sizes
+    /// of the new ringbufs + the LRU map entry cap are
+    /// design-doc literals (§5.3); a future "tune them" PR
+    /// must update both the constant AND this test in the
+    /// same commit so review catches sizing changes.
+    #[test]
+    fn n2_map_capacity_constants_lock_in() {
+        assert_eq!(NET_FLOW_CLOSE_EVENTS_BYTES, 256 * 1024);
+        assert_eq!(NET_LISTEN_EVENTS_BYTES, 64 * 1024);
+        assert_eq!(FLOW_SOCK_MAP_MAX_ENTRIES, 4096);
     }
 }
