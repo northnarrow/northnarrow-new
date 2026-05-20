@@ -314,8 +314,7 @@ impl Canon {
         Self { buf }
     }
     fn str(&mut self, s: &str) {
-        self.buf
-            .extend_from_slice(&(s.len() as u32).to_be_bytes());
+        self.buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
         self.buf.extend_from_slice(s.as_bytes());
     }
     fn u32(&mut self, v: u32) {
@@ -626,8 +625,7 @@ mod tests {
         let bytes = sample().canonical_bytes();
         let hash = lower_hex(Sha256::digest(&bytes).as_slice());
         assert_eq!(
-            hash,
-            "3514e399ef2ca32bd0bf078dd565b14d8e966330c3738e93b993dfc1835a88e6",
+            hash, "3514e399ef2ca32bd0bf078dd565b14d8e966330c3738e93b993dfc1835a88e6",
             "canonical encoding drifted — if intentional, bump CANON_DOMAIN \
              and update this lock with a rationale in the commit body"
         );
@@ -642,7 +640,10 @@ mod tests {
         assert_eq!(ade_severity_tag(&AdeSeverity::Critical), "critical");
         assert_eq!(region_tag(&Region::Correlated), "correlated");
         assert_eq!(refinement_tag(&Refinement::Coarse), "coarse");
-        assert_eq!(occlusion_tag(&OcclusionMode::AnonymiseInPlace), "anonymise_in_place");
+        assert_eq!(
+            occlusion_tag(&OcclusionMode::AnonymiseInPlace),
+            "anonymise_in_place"
+        );
         assert_eq!(thread_tag(&ThreadMode::SingleThread), "single_thread");
     }
 

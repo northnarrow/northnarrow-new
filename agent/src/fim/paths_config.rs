@@ -76,10 +76,7 @@ pub struct WatchedPathsLoad {
 ///
 /// Errors propagate only on read/parse failures of a file that DID
 /// exist. Missing-file is fine.
-pub fn load_watched_paths(
-    v1_path: &Path,
-    local_path: &Path,
-) -> Result<WatchedPathsLoad> {
+pub fn load_watched_paths(v1_path: &Path, local_path: &Path) -> Result<WatchedPathsLoad> {
     let defaults = match read_default_list(v1_path) {
         Ok(set) => set,
         Err(e) => {
@@ -192,8 +189,7 @@ fn read_local_overlay(path: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBu
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => {
-            return Err(anyhow!(e)
-                .context(format!("reading operator overlay {}", path.display())))
+            return Err(anyhow!(e).context(format!("reading operator overlay {}", path.display())))
         }
     };
     let mut adds = BTreeSet::new();
@@ -272,14 +268,10 @@ mod tests {
         .unwrap();
         // local file ABSENT — that's the no-overlay case.
         let out = load_watched_paths(&v1, &local).expect("load");
-        let expected: BTreeSet<PathBuf> = [
-            "/usr/sbin/sshd",
-            "/etc/passwd",
-            "/etc/shadow",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
+        let expected: BTreeSet<PathBuf> = ["/usr/sbin/sshd", "/etc/passwd", "/etc/shadow"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
         assert_eq!(out.effective, expected);
         assert!(out.added.is_empty());
         assert!(out.disabled.is_empty());

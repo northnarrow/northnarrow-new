@@ -70,7 +70,9 @@ use common::Event;
 
 use crate::ade::EventContext;
 use crate::xai::occlusion::{self, FieldClass, PerturbableUnit, UnitAddr};
-use crate::xai::source::{composite, decision_delta, DecisionProbe, XaiProbeError, DEFAULT_WEIGHTS};
+use crate::xai::source::{
+    composite, decision_delta, DecisionProbe, XaiProbeError, DEFAULT_WEIGHTS,
+};
 
 /// ── Cost-envelope ledger (R-P3.2) ───────────────────────────────────
 ///
@@ -623,11 +625,7 @@ mod tests {
     /// is exactly 0 (audit checklist #1: "what if all regions show ~0").
     struct ConstProbe;
     impl DecisionProbe for ConstProbe {
-        async fn probe(
-            &self,
-            _f: &Event,
-            _c: &EventContext,
-        ) -> Result<AdeVerdict, XaiProbeError> {
+        async fn probe(&self, _f: &Event, _c: &EventContext) -> Result<AdeVerdict, XaiProbeError> {
             Ok(verdict(AdeAction::Monitor, AdeSeverity::Low, 0.5))
         }
     }
@@ -643,8 +641,7 @@ mod tests {
             focal: &Event,
             ctx: &EventContext,
         ) -> Result<AdeVerdict, XaiProbeError> {
-            let focal_bad =
-                matches!(focal, Event::ProcessSpawn { comm, .. } if comm == "miner");
+            let focal_bad = matches!(focal, Event::ProcessSpawn { comm, .. } if comm == "miner");
             let corr_bad = ctx.recent_events.iter().any(|e| {
                 matches!(e, Event::DnsQuery { query_name, .. } if query_name.contains("c2.evil"))
             });
@@ -670,11 +667,7 @@ mod tests {
         per_ms: u64,
     }
     impl DecisionProbe for SlowProbe {
-        async fn probe(
-            &self,
-            _f: &Event,
-            _c: &EventContext,
-        ) -> Result<AdeVerdict, XaiProbeError> {
+        async fn probe(&self, _f: &Event, _c: &EventContext) -> Result<AdeVerdict, XaiProbeError> {
             self.clock.set(self.clock.get() + self.per_ms);
             Ok(verdict(AdeAction::Allow, AdeSeverity::None, 0.1))
         }

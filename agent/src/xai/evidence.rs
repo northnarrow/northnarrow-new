@@ -80,7 +80,7 @@ mod tests {
     use super::*;
     use common::ade_types::{AdeAction, AdeSeverity};
     use common::xai_types::{
-        InferenceSettings, OcclusionMode, Region, Refinement, SaliencyDelta, SaliencyEntry,
+        InferenceSettings, OcclusionMode, Refinement, Region, SaliencyDelta, SaliencyEntry,
         SaliencyWeights, ThreadMode, XaiBaselineVerdict, XaiInputSnapshot, XaiMethod, XaiModelRef,
         XaiStatus, XAI_BUDGET_MS, XAI_SCHEMA_VERSION,
     };
@@ -162,10 +162,7 @@ mod tests {
     #[test]
     fn unsigned_chain_is_rejected() {
         let c = unsigned_chain();
-        assert!(matches!(
-            verify_evidence(&c),
-            Err(XaiVerifyError::Unsigned)
-        ));
+        assert!(matches!(verify_evidence(&c), Err(XaiVerifyError::Unsigned)));
     }
 
     #[test]

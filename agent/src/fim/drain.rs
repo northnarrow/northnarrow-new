@@ -440,8 +440,8 @@ impl FimDriftDb {
 
     pub fn append(&mut self, draft: FimDriftDraft) -> Result<FimDriftEntry> {
         let entry = build_signed_drift_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
-        let mut line = serde_json::to_string(&entry)
-            .map_err(|e| anyhow!("serialising drift entry: {e}"))?;
+        let mut line =
+            serde_json::to_string(&entry).map_err(|e| anyhow!("serialising drift entry: {e}"))?;
         line.push('\n');
         let mut f = OpenOptions::new()
             .create(true)
@@ -477,8 +477,8 @@ fn read_tail_hash(path: &Path) -> Result<String> {
         if line.is_empty() {
             continue;
         }
-        let entry: FimDriftEntry = serde_json::from_str(&line)
-            .with_context(|| format!("parsing drift line: {line}"))?;
+        let entry: FimDriftEntry =
+            serde_json::from_str(&line).with_context(|| format!("parsing drift line: {line}"))?;
         last = Some(entry.entry_hash);
     }
     Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
@@ -592,7 +592,10 @@ pub fn process_drift(
     let new_sha256 = match op {
         FimOp::Deleted | FimOp::Renamed => None,
         _ => match compute_baseline(Path::new(&path)) {
-            Ok(drafts) => drafts.iter().find(|d| !d.is_symlink).map(|d| d.sha256.clone()),
+            Ok(drafts) => drafts
+                .iter()
+                .find(|d| !d.is_symlink)
+                .map(|d| d.sha256.clone()),
             Err(e) => {
                 debug!(
                     target: "fim.drain",
@@ -625,10 +628,7 @@ pub fn process_drift(
     // bytes are unchanged). The C8 cache work only filtered
     // touch-induced setattr; preserving Opened keeps the cred-
     // read detection path intact.
-    let suppress_on_match = matches!(
-        op,
-        FimOp::Modified | FimOp::Created | FimOp::Linked
-    );
+    let suppress_on_match = matches!(op, FimOp::Modified | FimOp::Created | FimOp::Linked);
     if !real_drift && suppress_on_match {
         debug!(
             target: "fim.drain",
@@ -782,14 +782,13 @@ pub async fn drain_loop(
             // hash the file, which can take milliseconds). Owning
             // `raw` by value already disconnected from the borrow.
             let _ = item; // keep clippy happy + readable
-            // Resolve the watched path BEFORE locking the drift DB
-            // so the BaselineCache lookup doesn't hold the DB mutex.
+                          // Resolve the watched path BEFORE locking the drift DB
+                          // so the BaselineCache lookup doesn't hold the DB mutex.
             let path_for_lookup = inode_map.lookup(&InodeKey {
                 dev: raw.target_dev,
                 ino: raw.target_ino,
             });
-            let last_baseline =
-                path_for_lookup.and_then(|p| baseline_cache.get_content(&p));
+            let last_baseline = path_for_lookup.and_then(|p| baseline_cache.get_content(&p));
             let mut db = drift_db.lock();
             if let Err(e) = process_drift(
                 &raw,
@@ -877,7 +876,10 @@ mod tests {
     fn inode_path_map_insert_and_lookup_round_trip() {
         let map = InodePathMap::new();
         assert!(map.is_empty());
-        let key = InodeKey { dev: 0x800002, ino: 42 };
+        let key = InodeKey {
+            dev: 0x800002,
+            ino: 42,
+        };
         map.insert(key, "/usr/bin/sshd".to_string());
         assert_eq!(map.len(), 1);
         assert_eq!(map.lookup(&key), Some("/usr/bin/sshd".to_string()));
@@ -886,7 +888,10 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert_eq!(map.lookup(&key), Some("/usr/sbin/sshd".to_string()));
         // Unknown key: None.
-        let other = InodeKey { dev: 0x800002, ino: 99 };
+        let other = InodeKey {
+            dev: 0x800002,
+            ino: 99,
+        };
         assert_eq!(map.lookup(&other), None);
     }
 
@@ -896,25 +901,58 @@ mod tests {
     fn classifier_assigns_provisional_severity() {
         let c = DriftClassifier::new();
         // Modified + Renamed → Medium (noisy under upgrades).
-        assert_eq!(c.classify(FimOp::Modified, "/usr/bin/sshd"), DriftSeverity::Medium);
-        assert_eq!(c.classify(FimOp::Renamed, "/etc/passwd"), DriftSeverity::Medium);
+        assert_eq!(
+            c.classify(FimOp::Modified, "/usr/bin/sshd"),
+            DriftSeverity::Medium
+        );
+        assert_eq!(
+            c.classify(FimOp::Renamed, "/etc/passwd"),
+            DriftSeverity::Medium
+        );
         // Created + Deleted → High (high-signal).
-        assert_eq!(c.classify(FimOp::Created, "/etc/cron.d/x"), DriftSeverity::High);
-        assert_eq!(c.classify(FimOp::Deleted, "/etc/shadow"), DriftSeverity::High);
+        assert_eq!(
+            c.classify(FimOp::Created, "/etc/cron.d/x"),
+            DriftSeverity::High
+        );
+        assert_eq!(
+            c.classify(FimOp::Deleted, "/etc/shadow"),
+            DriftSeverity::High
+        );
         // Linked to non-user-writable → High.
-        assert_eq!(c.classify(FimOp::Linked, "/usr/local/bin/x"), DriftSeverity::High);
+        assert_eq!(
+            c.classify(FimOp::Linked, "/usr/local/bin/x"),
+            DriftSeverity::High
+        );
         // Linked INTO user-writable → Critical (§13 Q2 evasion path).
-        assert_eq!(c.classify(FimOp::Linked, "/tmp/.x"), DriftSeverity::Critical);
-        assert_eq!(c.classify(FimOp::Linked, "/var/tmp/x"), DriftSeverity::Critical);
-        assert_eq!(c.classify(FimOp::Linked, "/dev/shm/y"), DriftSeverity::Critical);
-        assert_eq!(c.classify(FimOp::Linked, "/home/alice/.x"), DriftSeverity::Critical);
+        assert_eq!(
+            c.classify(FimOp::Linked, "/tmp/.x"),
+            DriftSeverity::Critical
+        );
+        assert_eq!(
+            c.classify(FimOp::Linked, "/var/tmp/x"),
+            DriftSeverity::Critical
+        );
+        assert_eq!(
+            c.classify(FimOp::Linked, "/dev/shm/y"),
+            DriftSeverity::Critical
+        );
+        assert_eq!(
+            c.classify(FimOp::Linked, "/home/alice/.x"),
+            DriftSeverity::Critical
+        );
         // C5.2: Opened defaults to Medium so legitimate
         // periodic cred-CLI reads can be rate-limited; the
         // C5.3 NN-L-FIM-011..014 rules upgrade to High at the
         // rule layer when the path actually matches a cred
         // file.
-        assert_eq!(c.classify(FimOp::Opened, "/root/.aws/credentials"), DriftSeverity::Medium);
-        assert_eq!(c.classify(FimOp::Opened, "/etc/passwd"), DriftSeverity::Medium);
+        assert_eq!(
+            c.classify(FimOp::Opened, "/root/.aws/credentials"),
+            DriftSeverity::Medium
+        );
+        assert_eq!(
+            c.classify(FimOp::Opened, "/etc/passwd"),
+            DriftSeverity::Medium
+        );
     }
 
     // ── C4 test 3: RateLimiter never throttles Critical ─────────────
@@ -964,9 +1002,7 @@ mod tests {
         // Exhaust High.
         rl.try_consume_with_now(DriftSeverity::High, t0).unwrap();
         rl.try_consume_with_now(DriftSeverity::High, t0).unwrap();
-        assert!(rl
-            .try_consume_with_now(DriftSeverity::High, t0)
-            .is_err());
+        assert!(rl.try_consume_with_now(DriftSeverity::High, t0).is_err());
         // Medium is independent — still full.
         for _ in 0..50 {
             rl.try_consume_with_now(DriftSeverity::Medium, t0).unwrap();
@@ -1066,7 +1102,11 @@ mod tests {
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
         let (tx, mut rx) = mpsc::channel::<Event>(8);
-        let raw = fake_raw(watched_meta.dev(), watched_meta.ino(), FimOp::Modified as u8);
+        let raw = fake_raw(
+            watched_meta.dev(),
+            watched_meta.ino(),
+            FimOp::Modified as u8,
+        );
         let emitted = process_drift(
             &raw,
             &path_map,
@@ -1121,7 +1161,11 @@ mod tests {
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
         let (tx, mut rx) = mpsc::channel::<Event>(8);
-        let raw = fake_raw(watched_meta.dev(), watched_meta.ino(), FimOp::Modified as u8);
+        let raw = fake_raw(
+            watched_meta.dev(),
+            watched_meta.ino(),
+            FimOp::Modified as u8,
+        );
         let emitted = process_drift(
             &raw,
             &path_map,
@@ -1135,9 +1179,7 @@ mod tests {
         assert!(!emitted, "no-op drift (hash matches) must not emit");
         assert!(rx.try_recv().is_err(), "no event must be sent");
         // Drift log also empty — no point recording a no-op.
-        assert!(
-            !drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty()
-        );
+        assert!(!drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty());
     }
 
     // ── C4 test 10: rate-limited drift still records to audit chain ─
@@ -1159,14 +1201,17 @@ mod tests {
             ino: watched_meta.ino(),
         };
         path_map.insert(key_ino, watched.to_string_lossy().to_string());
-        let stale_baseline =
-            dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
+        let stale_baseline = dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
 
         let classifier = DriftClassifier::new();
         // Zero Medium tokens → first Modified drift suppressed.
         let rate_limiter = DriftRateLimiter::with_caps(50, 0);
         let (tx, mut rx) = mpsc::channel::<Event>(8);
-        let raw = fake_raw(watched_meta.dev(), watched_meta.ino(), FimOp::Modified as u8);
+        let raw = fake_raw(
+            watched_meta.dev(),
+            watched_meta.ino(),
+            FimOp::Modified as u8,
+        );
         let emitted = process_drift(
             &raw,
             &path_map,

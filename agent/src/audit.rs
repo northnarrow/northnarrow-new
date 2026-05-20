@@ -251,9 +251,7 @@ fn persist_signing_key_atomically(path: &Path, key: &SigningKey) -> Result<()> {
                 .mode(PARENT_DIR_MODE)
                 .recursive(true)
                 .create(parent)
-                .with_context(|| {
-                    format!("creating signing-key parent dir {}", parent.display())
-                })?;
+                .with_context(|| format!("creating signing-key parent dir {}", parent.display()))?;
         }
     }
     let tmp_path = tmp_path_for(path);
@@ -266,9 +264,8 @@ fn persist_signing_key_atomically(path: &Path, key: &SigningKey) -> Result<()> {
             .with_context(|| format!("creating signing-key tmpfile {}", tmp_path.display()))?;
         let mut line = hex::encode(key.to_bytes());
         line.push('\n');
-        f.write_all(line.as_bytes()).with_context(|| {
-            format!("writing signing-key bytes to {}", tmp_path.display())
-        })?;
+        f.write_all(line.as_bytes())
+            .with_context(|| format!("writing signing-key bytes to {}", tmp_path.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync {}", tmp_path.display()))?;
     }
@@ -414,8 +411,8 @@ impl AuditLog {
     /// persisted.
     pub fn append(&mut self, draft: AuditEntryDraft) -> Result<AuditEntry> {
         let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
-        let mut line = serde_json::to_string(&entry)
-            .map_err(|e| anyhow!("serialising audit entry: {e}"))?;
+        let mut line =
+            serde_json::to_string(&entry).map_err(|e| anyhow!("serialising audit entry: {e}"))?;
         line.push('\n');
         let mut f = OpenOptions::new()
             .create(true)
@@ -572,12 +569,11 @@ pub fn verify_chain(entries: &[AuditEntry], pubkey: &VerifyingKey) -> Result<(),
         let mut stripped = entry.clone();
         stripped.entry_hash.clear();
         stripped.agent_sig.clear();
-        let recomputed = compute_entry_hash(&stripped).map_err(|e| {
-            AuditVerifyError::MalformedField {
+        let recomputed =
+            compute_entry_hash(&stripped).map_err(|e| AuditVerifyError::MalformedField {
                 idx,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
         let recomputed_hex = hex::encode(recomputed);
         if recomputed_hex != entry.entry_hash {
             return Err(AuditVerifyError::EntryHashMismatch {
@@ -586,12 +582,12 @@ pub fn verify_chain(entries: &[AuditEntry], pubkey: &VerifyingKey) -> Result<(),
                 stored: entry.entry_hash.clone(),
             });
         }
-        let sig_bytes = B64
-            .decode(&entry.agent_sig)
-            .map_err(|e| AuditVerifyError::MalformedField {
-                idx,
-                reason: format!("agent_sig base64 decode: {e}"),
-            })?;
+        let sig_bytes =
+            B64.decode(&entry.agent_sig)
+                .map_err(|e| AuditVerifyError::MalformedField {
+                    idx,
+                    reason: format!("agent_sig base64 decode: {e}"),
+                })?;
         if sig_bytes.len() != 64 {
             return Err(AuditVerifyError::MalformedField {
                 idx,

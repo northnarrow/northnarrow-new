@@ -254,9 +254,7 @@ pub fn run_shutdown(
 ) -> Result<ShutdownOutcome> {
     const MAX_GRACE_SECS: u32 = 300;
     if grace_secs > MAX_GRACE_SECS {
-        bail!(
-            "grace_secs {grace_secs} exceeds design §10.2 cap of {MAX_GRACE_SECS}"
-        );
+        bail!("grace_secs {grace_secs} exceeds design §10.2 cap of {MAX_GRACE_SECS}");
     }
 
     // Read both keys + the agent_id BEFORE opening the socket so a
@@ -264,14 +262,13 @@ pub fn run_shutdown(
     // dispatcher connection while we error.
     let signing_a = read_priv_key(key_path)?;
     let signing_b = read_priv_key(cosign_key_path)?;
-    let agent_id_arr =
-        agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
-            format!(
-                "reading agent_id at {} (nn-admin must run on the agent host \
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+        format!(
+            "reading agent_id at {} (nn-admin must run on the agent host \
                  or have the file copied / SSH-forwarded — design §6.5)",
-                agent_id_path.display()
-            )
-        })?;
+            agent_id_path.display()
+        )
+    })?;
     // Compile-time guarantee that the wire shape matches the file
     // shape — if a future hardening tappa changes either width the
     // build breaks before we ship a mismatched signer.
@@ -293,12 +290,11 @@ pub fn run_shutdown(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let payload =
-        SignedPayload::new_shutdown(nonce, now, agent_id_arr, grace_secs);
-    let sig_a: [u8; 64] = sign(&payload, &signing_a)
-        .map_err(|e| anyhow!("signing payload with primary key: {e}"))?;
-    let sig_b: [u8; 64] = sign(&payload, &signing_b)
-        .map_err(|e| anyhow!("signing payload with cosign key: {e}"))?;
+    let payload = SignedPayload::new_shutdown(nonce, now, agent_id_arr, grace_secs);
+    let sig_a: [u8; 64] =
+        sign(&payload, &signing_a).map_err(|e| anyhow!("signing payload with primary key: {e}"))?;
+    let sig_b: [u8; 64] =
+        sign(&payload, &signing_b).map_err(|e| anyhow!("signing payload with cosign key: {e}"))?;
 
     write_frame(
         &mut stream,
@@ -365,14 +361,13 @@ pub fn run_force_posture(
     target: PostureKind,
 ) -> Result<ForcePostureOutcome> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr =
-        agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
-            format!(
-                "reading agent_id at {} (nn-admin must run on the agent host \
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+        format!(
+            "reading agent_id at {} (nn-admin must run on the agent host \
                  or have the file copied / SSH-forwarded — design §6.5)",
-                agent_id_path.display()
-            )
-        })?;
+            agent_id_path.display()
+        )
+    })?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -391,10 +386,9 @@ pub fn run_force_posture(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let payload =
-        SignedPayload::new_force_posture(nonce, now, agent_id_arr, target);
-    let sig: [u8; 64] = sign(&payload, &signing)
-        .map_err(|e| anyhow!("signing force-posture payload: {e}"))?;
+    let payload = SignedPayload::new_force_posture(nonce, now, agent_id_arr, target);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing force-posture payload: {e}"))?;
 
     write_frame(
         &mut stream,
@@ -406,9 +400,7 @@ pub fn run_force_posture(
 
     let result = match read_frame(&mut stream)? {
         AdminMessage::ForcePostureResult(r) => r,
-        other => bail!(
-            "unexpected server reply to ForcePostureRequest: {other:?}"
-        ),
+        other => bail!("unexpected server reply to ForcePostureRequest: {other:?}"),
     };
 
     Ok(match result {
@@ -509,9 +501,8 @@ pub fn run_rotate_keys_add(
 
     let signing_a = read_priv_key(key_path)?;
     let signing_b = read_priv_key(cosign_key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
-        format!("reading agent_id at {}", agent_id_path.display())
-    })?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -542,15 +533,13 @@ pub fn run_rotate_keys_add(
 
     write_frame(
         &mut stream,
-        &AdminMessage::RotateKeysAddRequest(
-            common::wire::admin_protocol::RotateKeysAddRequest {
-                payload,
-                signatures: vec![
-                    KeyedSignature { signature: sig_a },
-                    KeyedSignature { signature: sig_b },
-                ],
-            },
-        ),
+        &AdminMessage::RotateKeysAddRequest(common::wire::admin_protocol::RotateKeysAddRequest {
+            payload,
+            signatures: vec![
+                KeyedSignature { signature: sig_a },
+                KeyedSignature { signature: sig_b },
+            ],
+        }),
     )?;
 
     let result = match read_frame(&mut stream)? {
@@ -575,9 +564,8 @@ pub fn run_rotate_keys_revoke(
     let target_fp = parse_fingerprint_hex(fingerprint_hex)?;
     let signing_a = read_priv_key(key_path)?;
     let signing_b = read_priv_key(cosign_key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
-        format!("reading agent_id at {}", agent_id_path.display())
-    })?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -594,8 +582,7 @@ pub fn run_rotate_keys_revoke(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let payload =
-        SignedPayload::new_rotate_keys_revoke(nonce, now, agent_id_arr, target_fp);
+    let payload = SignedPayload::new_rotate_keys_revoke(nonce, now, agent_id_arr, target_fp);
     let sig_a: [u8; 64] =
         sign(&payload, &signing_a).map_err(|e| anyhow!("signing payload with primary key: {e}"))?;
     let sig_b: [u8; 64] =
@@ -626,8 +613,7 @@ fn parse_pubkey_hex(s: &str) -> Result<[u8; 32]> {
     if trimmed.len() != 64 {
         bail!("--new-pubkey must be 64 hex chars (got {})", trimmed.len());
     }
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| anyhow!("--new-pubkey is not valid hex: {e}"))?;
+    let bytes = hex::decode(trimmed).map_err(|e| anyhow!("--new-pubkey is not valid hex: {e}"))?;
     let arr: [u8; 32] = bytes.try_into().expect("hex pre-validated to 32 bytes");
     // Reject all-zero pubkeys (not a valid Ed25519 point) early so
     // the agent doesn't have to.
@@ -645,8 +631,7 @@ fn parse_fingerprint_hex(s: &str) -> Result<[u8; 4]> {
             trimmed.len()
         );
     }
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| anyhow!("--fingerprint is not valid hex: {e}"))?;
+    let bytes = hex::decode(trimmed).map_err(|e| anyhow!("--fingerprint is not valid hex: {e}"))?;
     let arr: [u8; 4] = bytes.try_into().expect("hex pre-validated to 4 bytes");
     Ok(arr)
 }
@@ -732,7 +717,8 @@ pub fn run_audit_read(log_path: &Path, since: Option<&str>, json: bool) -> Resul
     let mut out = stdout.lock();
     let mut count = 0usize;
     for (idx, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading line {} of {}", idx + 1, log_path.display()))?;
+        let line =
+            line.with_context(|| format!("reading line {} of {}", idx + 1, log_path.display()))?;
         if line.is_empty() {
             continue;
         }
@@ -792,9 +778,8 @@ pub fn run_audit_verify(from_path: &Path, pubkey: &VerifyingKey) -> Result<Audit
     let reader = BufReader::new(f);
     let mut entries: Vec<crate::audit::AuditEntry> = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| {
-            format!("reading line {} of {}", idx + 1, from_path.display())
-        })?;
+        let line =
+            line.with_context(|| format!("reading line {} of {}", idx + 1, from_path.display()))?;
         if line.is_empty() {
             continue;
         }
@@ -824,10 +809,7 @@ pub fn run_audit_verify(from_path: &Path, pubkey: &VerifyingKey) -> Result<Audit
 /// --from /etc/northnarrow/audit.log`); the former is the
 /// off-host path (auditor receives the pubkey hex via an
 /// out-of-band channel).
-pub fn load_audit_pubkey(
-    explicit_hex: Option<&str>,
-    key_path: &Path,
-) -> Result<VerifyingKey> {
+pub fn load_audit_pubkey(explicit_hex: Option<&str>, key_path: &Path) -> Result<VerifyingKey> {
     if let Some(hex_str) = explicit_hex {
         let trimmed = hex_str.trim();
         if trimmed.len() != 64 {
@@ -836,8 +818,8 @@ pub fn load_audit_pubkey(
                 trimmed.len()
             );
         }
-        let bytes = hex::decode(trimmed)
-            .map_err(|e| anyhow!("--agent-pubkey is not valid hex: {e}"))?;
+        let bytes =
+            hex::decode(trimmed).map_err(|e| anyhow!("--agent-pubkey is not valid hex: {e}"))?;
         let arr: [u8; 32] = bytes.try_into().expect("hex pre-validated to 32 bytes");
         return VerifyingKey::from_bytes(&arr)
             .map_err(|e| anyhow!("--agent-pubkey is not a valid Ed25519 pubkey: {e}"));
@@ -883,16 +865,25 @@ pub enum FimReportOutcome {
     },
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
     RoleDenied,
-    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
     AgentIdMismatch,
     UnknownOperation,
-    ProtocolVersionUnsupported { server_version: u16 },
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
     Transport,
 }
 
-fn map_admin_result_to_baseline(r: common::wire::admin_protocol::AdminResult) -> FimBaselineOutcome {
+fn map_admin_result_to_baseline(
+    r: common::wire::admin_protocol::AdminResult,
+) -> FimBaselineOutcome {
     use common::wire::admin_protocol::AdminResult;
     match r {
         AdminResult::Success => FimBaselineOutcome::Success,
@@ -982,8 +973,8 @@ pub fn run_fim_baseline(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let payload = SignedPayload::new_fim_baseline(nonce, now, agent_id_arr);
-    let sig: [u8; 64] = sign(&payload, &signing)
-        .map_err(|e| anyhow!("signing fim-baseline payload: {e}"))?;
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing fim-baseline payload: {e}"))?;
 
     write_frame(
         &mut stream,
@@ -1018,12 +1009,19 @@ pub enum FimStatusOutcome {
     },
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
     RoleDenied,
-    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
     AgentIdMismatch,
     UnknownOperation,
-    ProtocolVersionUnsupported { server_version: u16 },
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
     Transport,
 }
 
@@ -1097,8 +1095,8 @@ pub fn run_fim_status(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let payload = SignedPayload::new_fim_status(nonce, now, agent_id_arr);
-    let sig: [u8; 64] = sign(&payload, &signing)
-        .map_err(|e| anyhow!("signing fim-status payload: {e}"))?;
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing fim-status payload: {e}"))?;
 
     write_frame(
         &mut stream,
@@ -1151,8 +1149,8 @@ pub fn run_fim_report(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let payload = SignedPayload::new_fim_report(nonce, now, agent_id_arr, since_unix_ts);
-    let sig: [u8; 64] = sign(&payload, &signing)
-        .map_err(|e| anyhow!("signing fim-report payload: {e}"))?;
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing fim-report payload: {e}"))?;
 
     write_frame(
         &mut stream,
@@ -1584,11 +1582,7 @@ mod tests {
     /// Run `mock_server_fn` in a thread bound to `socket_path`,
     /// while `client_fn` runs in the foreground. Joins the server
     /// thread at the end so any server-side panic is surfaced.
-    fn run_with_mock_server<S, C, R>(
-        socket_path: &Path,
-        mock_server_fn: S,
-        client_fn: C,
-    ) -> R
+    fn run_with_mock_server<S, C, R>(socket_path: &Path, mock_server_fn: S, client_fn: C) -> R
     where
         S: FnOnce(&mut UnixStream) + Send + 'static,
         C: FnOnce() -> R,
@@ -1633,9 +1627,7 @@ mod tests {
                 }
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(
-                        common::wire::admin_protocol::Challenge { nonce },
-                    ),
+                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge { nonce }),
                 );
 
                 // Step 2: server receives ShutdownRequest, verifies
@@ -1645,8 +1637,14 @@ mod tests {
                     AdminMessage::ShutdownRequest(r) => r,
                     other => panic!("expected ShutdownRequest, got {other:?}"),
                 };
-                assert_eq!(req.payload.nonce, nonce, "payload.nonce must echo served nonce");
-                assert_eq!(req.payload.agent_id, agent_id, "payload.agent_id must match the file");
+                assert_eq!(
+                    req.payload.nonce, nonce,
+                    "payload.nonce must echo served nonce"
+                );
+                assert_eq!(
+                    req.payload.agent_id, agent_id,
+                    "payload.agent_id must match the file"
+                );
                 assert_eq!(req.signatures.len(), 2, "exactly 2 sigs in quorum");
                 // Both sigs verify against the SAME payload — the
                 // design's "one nonce signed by both" resolution.
@@ -1656,10 +1654,7 @@ mod tests {
                     .expect("sig_b must verify under key B");
 
                 // Step 3: server replies Success.
-                server_write_frame(
-                    stream,
-                    &AdminMessage::ShutdownResult(AdminResult::Success),
-                );
+                server_write_frame(stream, &AdminMessage::ShutdownResult(AdminResult::Success));
             },
             || run_shutdown(&socket_for_client, &priv_a, &priv_b, &agent_id_path, 30),
         );
@@ -1691,9 +1686,9 @@ mod tests {
                 let _ = server_read_frame(stream);
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(
-                        common::wire::admin_protocol::Challenge { nonce: [0u8; 32] },
-                    ),
+                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                        nonce: [0u8; 32],
+                    }),
                 );
                 let _ = server_read_frame(stream);
                 server_write_frame(
@@ -1738,9 +1733,9 @@ mod tests {
                 let _ = server_read_frame(stream);
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(
-                        common::wire::admin_protocol::Challenge { nonce: [0u8; 32] },
-                    ),
+                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                        nonce: [0u8; 32],
+                    }),
                 );
                 let _ = server_read_frame(stream);
                 server_write_frame(
@@ -1771,19 +1766,24 @@ mod tests {
         let priv_b = dir.path().join("admin_b.key");
         std::fs::write(
             &priv_a,
-            format!("{}\n", hex::encode(SigningKey::generate(&mut OsRng).to_bytes())),
+            format!(
+                "{}\n",
+                hex::encode(SigningKey::generate(&mut OsRng).to_bytes())
+            ),
         )
         .unwrap();
         std::fs::write(
             &priv_b,
-            format!("{}\n", hex::encode(SigningKey::generate(&mut OsRng).to_bytes())),
+            format!(
+                "{}\n",
+                hex::encode(SigningKey::generate(&mut OsRng).to_bytes())
+            ),
         )
         .unwrap();
         let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
         let socket = dir.path().join("never_bound.sock");
 
-        let err = run_shutdown(&socket, &priv_a, &priv_b, &agent_id_path, 9999)
-            .unwrap_err();
+        let err = run_shutdown(&socket, &priv_a, &priv_b, &agent_id_path, 9999).unwrap_err();
         let s = format!("{err:#}");
         assert!(
             s.contains("grace_secs"),
@@ -1803,7 +1803,12 @@ mod tests {
     fn build_audit_log(
         dir: &TempDir,
         n: usize,
-    ) -> (PathBuf, PathBuf, VerifyingKey, Vec<crate::audit::AuditEntry>) {
+    ) -> (
+        PathBuf,
+        PathBuf,
+        VerifyingKey,
+        Vec<crate::audit::AuditEntry>,
+    ) {
         let key_path = dir.path().join("agent.sig.key");
         let log_path = dir.path().join("audit.log");
         let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
@@ -1897,10 +1902,9 @@ mod tests {
 
         let outcome = run_audit_verify(&log_path, &pubkey).unwrap();
         match outcome {
-            AuditVerifyOutcome::ChainBroken(crate::audit::AuditVerifyError::EntryHashMismatch {
-                idx: 0,
-                ..
-            }) => {} // expected
+            AuditVerifyOutcome::ChainBroken(
+                crate::audit::AuditVerifyError::EntryHashMismatch { idx: 0, .. },
+            ) => {} // expected
             other => panic!("expected EntryHashMismatch on entry 0; got: {other:?}"),
         }
     }
@@ -1914,8 +1918,7 @@ mod tests {
         // 1) Fresh signing key in the tempdir; pubkey from file
         //    matches the one load_audit_pubkey derives.
         let key_path = dir.path().join("agent.sig.key");
-        let on_disk_key =
-            crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let on_disk_key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         let on_disk_pub = on_disk_key.verifying_key();
         let derived = load_audit_pubkey(None, &key_path).expect("file fallback");
         assert_eq!(derived.to_bytes(), on_disk_pub.to_bytes());
@@ -1926,8 +1929,7 @@ mod tests {
         //    explicit-hex path is wired.
         let other = SigningKey::generate(&mut OsRng);
         let other_pub_hex = hex::encode(other.verifying_key().to_bytes());
-        let from_hex =
-            load_audit_pubkey(Some(&other_pub_hex), &key_path).expect("explicit hex");
+        let from_hex = load_audit_pubkey(Some(&other_pub_hex), &key_path).expect("explicit hex");
         assert_eq!(from_hex.to_bytes(), other.verifying_key().to_bytes());
         assert_ne!(
             from_hex.to_bytes(),

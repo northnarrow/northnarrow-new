@@ -415,12 +415,7 @@ impl PostureMachine {
         }
 
         *self.inner.last_admin_action.lock() = Some(now);
-        self.log_transition(
-            before,
-            target,
-            None,
-            "admin token force-posture".into(),
-        );
+        self.log_transition(before, target, None, "admin token force-posture".into());
 
         // Side-effects per §12.2.
         if before != PostureKind::Combat && target == PostureKind::Combat {

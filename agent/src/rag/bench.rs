@@ -122,16 +122,48 @@ pub fn golden_cases() -> Vec<Golden> {
     }
     vec![
         // ── ATT&CK technique queries (exact, deterministic ids) ──
-        g!("powershell encoded command execution", ["attack:T1059.001"], false),
-        g!("/etc/shadow /etc/passwd credential dumping linux", ["attack:T1003.008"], false),
-        g!("cryptocurrency mining resource hijacking", ["attack:T1496"], false),
-        g!("process injection into another process", ["attack:T1055"], false),
-        g!("ingress tool transfer download file", ["attack:T1105"], false),
+        g!(
+            "powershell encoded command execution",
+            ["attack:T1059.001"],
+            false
+        ),
+        g!(
+            "/etc/shadow /etc/passwd credential dumping linux",
+            ["attack:T1003.008"],
+            false
+        ),
+        g!(
+            "cryptocurrency mining resource hijacking",
+            ["attack:T1496"],
+            false
+        ),
+        g!(
+            "process injection into another process",
+            ["attack:T1055"],
+            false
+        ),
+        g!(
+            "ingress tool transfer download file",
+            ["attack:T1105"],
+            false
+        ),
         g!("exploit public-facing application", ["attack:T1190"], false),
-        g!("valid accounts legitimate credentials", ["attack:T1078"], false),
+        g!(
+            "valid accounts legitimate credentials",
+            ["attack:T1078"],
+            false
+        ),
         g!("scheduled task job persistence", ["attack:T1053"], false),
-        g!("command and scripting interpreter unix shell", ["attack:T1059.004"], false),
-        g!("data encrypted for impact ransomware", ["attack:T1486"], false),
+        g!(
+            "command and scripting interpreter unix shell",
+            ["attack:T1059.004"],
+            false
+        ),
+        g!(
+            "data encrypted for impact ransomware",
+            ["attack:T1486"],
+            false
+        ),
         // ── Sigma rule queries (sigma: prefix presence) ──
         g!("access to /etc/shadow sensitive file", [], true),
         g!("certutil download urlcache", [], true),
@@ -141,14 +173,38 @@ pub fn golden_cases() -> Vec<Golden> {
         g!("crontab persistence modification", [], true),
         // ── 6.7 kb_seed queries (exact seed ids) ──
         g!("xmrig miner pool stratum", ["sigma_xmrig_detection"], false),
-        g!("cobalt strike beacon malleable c2", ["tool_cobaltstrike"], false),
-        g!("certutil lolbas living off the land", ["lolbas_certutil"], false),
-        g!("powershell -enc base64 obfuscation", ["sigma_powershell_encoded"], false),
+        g!(
+            "cobalt strike beacon malleable c2",
+            ["tool_cobaltstrike"],
+            false
+        ),
+        g!(
+            "certutil lolbas living off the land",
+            ["lolbas_certutil"],
+            false
+        ),
+        g!(
+            "powershell -enc base64 obfuscation",
+            ["sigma_powershell_encoded"],
+            false
+        ),
         g!("empire post-exploitation agent", ["tool_empire"], false),
         // ── cross-source (ATT&CK + Sigma together) ──
-        g!("powershell credential dump lsass", ["attack:T1003.001"], true),
-        g!("linux shadow file unauthorized read", ["attack:T1003.008"], true),
-        g!("scripting interpreter powershell abuse", ["attack:T1059.001"], true),
+        g!(
+            "powershell credential dump lsass",
+            ["attack:T1003.001"],
+            true
+        ),
+        g!(
+            "linux shadow file unauthorized read",
+            ["attack:T1003.008"],
+            true
+        ),
+        g!(
+            "scripting interpreter powershell abuse",
+            ["attack:T1059.001"],
+            true
+        ),
     ]
 }
 
@@ -222,7 +278,10 @@ mod tests {
 
     #[test]
     fn golden_suite_has_at_least_20_cases() {
-        assert!(golden_cases().len() >= 20, "owner requires ≥20 golden cases");
+        assert!(
+            golden_cases().len() >= 20,
+            "owner requires ≥20 golden cases"
+        );
     }
 
     /// Latency budget gate — `retrieve` p95 ≤ 50 ms, cold open ≤ 5 s.

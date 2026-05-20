@@ -86,7 +86,10 @@ enum Backend {
     /// Sub-tappa 6.7 hashed-n-gram embedding + cosine store (legacy /
     /// transition path; the P5 canary may still exercise it when the
     /// BM25 index is not wired).
-    Embedding { embedder: RagEmbedder, store: RagStore },
+    Embedding {
+        embedder: RagEmbedder,
+        store: RagStore,
+    },
     /// Tappa 6.9.7 deterministic BM25 over the canonical KB index.
     Bm25 {
         index: tantivy::Index,
@@ -435,14 +438,21 @@ mod tests {
         assert!(!r.documents.is_empty(), "BM25 must find the marker doc");
         let top = &r.documents[0];
         assert_eq!(top.id, "attack:T1059.001");
-        assert_eq!(top.category, KbCategory::MitreTechnique, "category mapped back");
+        assert_eq!(
+            top.category,
+            KbCategory::MitreTechnique,
+            "category mapped back"
+        );
         assert_eq!(top.similarity, 1.0, "top hit normalised to 1.0 (§3.4a)");
         // Within-result normalisation ⇒ all in [0,1], non-increasing.
         assert!(r
             .documents
             .iter()
             .all(|d| d.similarity >= 0.0 && d.similarity <= 1.0));
-        assert!(r.documents.windows(2).all(|w| w[0].similarity >= w[1].similarity));
+        assert!(r
+            .documents
+            .windows(2)
+            .all(|w| w[0].similarity >= w[1].similarity));
         // BM25 path has no embedding step (field reserved for §7).
         assert_eq!(r.query_embedding_ms, 0);
     }

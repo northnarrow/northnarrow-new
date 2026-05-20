@@ -55,11 +55,7 @@ pub enum XaiSourceError {
 /// verdict?". The only seam the perturbation engine needs.
 #[allow(async_fn_in_trait)]
 pub trait DecisionProbe {
-    async fn probe(
-        &self,
-        focal: &Event,
-        ctx: &EventContext,
-    ) -> Result<AdeVerdict, XaiProbeError>;
+    async fn probe(&self, focal: &Event, ctx: &EventContext) -> Result<AdeVerdict, XaiProbeError>;
 }
 
 /// One scored input unit (P2-internal; P4 maps it onto
@@ -176,12 +172,12 @@ impl SaliencySource for PerturbationSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ade::HostContext;
     use common::ade_types::{
         AdeAction, AdeMetadata, AdeVerdict, AlternativeExplanations, Evidence, FollowUp,
         FollowUpPolicy, MitreAttack, ReasoningSteps, RecommendedAction, ThreatClassification,
         ADE_SCHEMA_VERSION,
     };
-    use crate::ade::HostContext;
 
     fn verdict(a: AdeAction, s: AdeSeverity, c: f64) -> AdeVerdict {
         AdeVerdict {
@@ -366,7 +362,10 @@ mod tests {
         // An irrelevant correlated event and any host field move nothing.
         let c0 = scores.iter().find(|u| u.unit_id == "correlated:0").unwrap();
         assert_eq!(c0.score, 0.0);
-        let hn = scores.iter().find(|u| u.unit_id == "host:hostname").unwrap();
+        let hn = scores
+            .iter()
+            .find(|u| u.unit_id == "host:hostname")
+            .unwrap();
         assert_eq!(hn.score, 0.0);
         // Focal comm is not the cause here ⇒ zero.
         let fc = scores.iter().find(|u| u.unit_id == "focal:comm").unwrap();

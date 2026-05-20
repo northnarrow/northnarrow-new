@@ -290,7 +290,9 @@ mod tests {
         });
         let block = format_rag_block(&r).expect("non-empty ⇒ Some");
         assert!(block.starts_with("RAG_CONTEXT:\n"));
-        assert!(block.contains("\nSigma Intel (high severity): Sigma: Cryptominer Process Names.\n"));
+        assert!(
+            block.contains("\nSigma Intel (high severity): Sigma: Cryptominer Process Names.\n")
+        );
         assert!(block.contains("\nIntel: Cobalt Strike.\n"));
         assert!(block.ends_with("\n\n"));
         // Old P5 markers are gone.
@@ -349,10 +351,7 @@ mod tests {
     #[test]
     fn severity_parse_malformed_returns_none() {
         // Compound / unknown tokens must NOT partial-match.
-        assert_eq!(
-            extract_sigma_severity("desc\nLevel: medium-to-high"),
-            None
-        );
+        assert_eq!(extract_sigma_severity("desc\nLevel: medium-to-high"), None);
         assert_eq!(extract_sigma_severity("desc\nLevel: bogus"), None);
         assert_eq!(extract_sigma_severity("desc\nLevel:"), None);
     }

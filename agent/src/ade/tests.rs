@@ -646,8 +646,8 @@ async fn with_rag_splices_block_into_assembled_prompt() {
     )
     .unwrap();
     let ix = tempfile::tempdir().unwrap();
-    let rag = super::super::rag::rag_canary(true, jl.path(), ix.path())
-        .expect("valid paths ⇒ Some");
+    let rag =
+        super::super::rag::rag_canary(true, jl.path(), ix.path()).expect("valid paths ⇒ Some");
     let engine = engine.with_rag(Arc::new(rag));
 
     let event = Event::ProcessSpawn {
@@ -663,7 +663,9 @@ async fn with_rag_splices_block_into_assembled_prompt() {
         recent_events: vec![],
         host_context: HostContext::discover(),
     };
-    let assembled = engine.assembled_prompt(&event, &ctx).expect("prompt produced");
+    let assembled = engine
+        .assembled_prompt(&event, &ctx)
+        .expect("prompt produced");
     assert!(
         assembled.contains("RAG_CONTEXT:\n"),
         "RAG-on must splice the compact knowledge block"

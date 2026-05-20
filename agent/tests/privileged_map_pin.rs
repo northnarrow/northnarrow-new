@@ -334,12 +334,7 @@ fn find_lsm_prog_using_map(map_id: u64) -> Result<ProgInfo, String> {
     let lsm: Vec<String> = parse_progs(&text)
         .into_iter()
         .filter(|p| p.prog_type == "lsm")
-        .map(|p| {
-            format!(
-                "  id={} name={:?} map_ids={:?}",
-                p.id, p.name, p.map_ids
-            )
-        })
+        .map(|p| format!("  id={} name={:?} map_ids={:?}", p.id, p.name, p.map_ids))
         .collect();
     Err(format!(
         "no loaded LSM program references pinned PROTECTED_PIDS id \

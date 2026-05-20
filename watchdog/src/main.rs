@@ -32,12 +32,12 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry,
-    ping_agent_status, pidfd_open, read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready,
+    evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
+    ping_agent_status, read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready,
     shutdown_was_authorised, spawn_agent, stuck_recovery, wait_for_agent_death,
-    wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, PingOutcome,
-    RestartBackoff, StatusPingTracker, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL,
-    STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
+    wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, PingOutcome, RestartBackoff,
+    StatusPingTracker, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
+    STUCK_RECOVERY_HARDKILL_GRACE,
 };
 
 /// Path of the A8 shutdown-authorisation marker (Tappa 8 A7
@@ -276,8 +276,7 @@ async fn run(cli: Cli) -> Result<()> {
                         delay_ms = delay.as_millis() as u64,
                         "backing off before respawn"
                     );
-                    if let Some(reason) = sleep_or_signal(delay, &mut sigint, &mut sigterm).await
-                    {
+                    if let Some(reason) = sleep_or_signal(delay, &mut sigint, &mut sigterm).await {
                         info!(target: "watchdog", signal = reason, "shutting down during backoff");
                         break 'restart_loop;
                     }
@@ -288,8 +287,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // doesn't immediately read the dead PID.
                 let _ = std::fs::remove_file(&cli.agent_pidfile);
 
-                match respawn_cycle(&agent_argv, &cli.agent_pidfile, &cli.bpffs_root, attempt)
-                    .await
+                match respawn_cycle(&agent_argv, &cli.agent_pidfile, &cli.bpffs_root, attempt).await
                 {
                     Ok((new_pid, new_fd)) => {
                         agent_pid = new_pid;
@@ -504,7 +502,10 @@ async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender
 // `IntoRawFd` import is kept for forward-compat with W4's
 // AgentGuard pattern (it'll consume + re-wrap raw fds for child
 // process inheritance during agent respawn).
-#[allow(dead_code, reason = "IntoRawFd is used by W4's respawn path; kept in scope here for forward-compat")]
+#[allow(
+    dead_code,
+    reason = "IntoRawFd is used by W4's respawn path; kept in scope here for forward-compat"
+)]
 fn _trait_anchor() {
     let _: fn(OwnedFd) -> i32 = |fd| fd.into_raw_fd();
 }
