@@ -1,6 +1,7 @@
 # Tappa 9.5 — Deception Layer / Canary Tokens Design
 
-**Status:** RFC / design only — no production code in this branch.
+**Status:** RFC RESOLVED 2026-05-19 (§12 — all 10 owner-accepted
+decisions documented in-place). K1 implementation unblocked.
 **Author:** Claude Code (architecture), pending owner sign-off.
 **Date:** 2026-05-20.
 **Prerequisite track:** Tappa 7 (anti-tamper LSM + watchdog),
@@ -27,8 +28,9 @@ Every canary trip is, by construction, an intrusion signal —
 no operator workflow legitimately reads a `north-narrow-canary-
 *` file or connects to a deception-port listener.
 
-This doc is reviewable as a PR. Implementation begins after
-owner ruling on the open questions in §13.
+This doc is reviewable as a PR. All §12 RFC items resolved
+2026-05-19; implementation begins at K1 (§11 commit-by-commit
+plan).
 
 ---
 
@@ -412,17 +414,20 @@ paths set AND the canary registry. A match in the canary
 registry takes precedence: emits `Event::CanaryTripped`
 INSTEAD OF `Event::Fim`, skips the FIM rule layer entirely.
 
-**Q4 resolution lock-in (anticipated):** SHARE the
+**Q4 resolution (locked-in 2026-05-19):** SHARE the
 WATCHED_PATHS map (single source of truth for "kernel cares
 about this inode"); userland discriminates via a parallel
-in-memory `CanaryRegistry` lookup. NO new BPF map.
+in-memory `Registry` lookup. NO new BPF map. The K3 detector
+exposes `Registry::is_canary_inode((dev, ino)) -> bool` as the
+hot-path discriminator that runs BEFORE the FIM rule layer
+(§12 Q9 inline-filter lock-in).
 
 ### 5.2 Process canaries
 
 Reuse Tappa 4 `sched_process_exec`. Every exec event already
-fires; the canary detector (a new tokio task in main.rs
-spawned alongside the sensor pumps) intercepts
-`Event::ProcessSpawn` and checks `event.filename` against the
+fires; the K3 inline detector intercepts `Event::ProcessSpawn`
+in `main::process_event` BEFORE the rule engine (§12 Q9
+inline-filter lock-in) and checks `event.filename` against the
 registry's `CanaryType::Process` entries.
 
 ### 5.3 Network canaries
@@ -701,200 +706,223 @@ FIM heuristics, not a full deception suite.
 
 ---
 
-## 12. RFC items for owner ruling
+## 12. RFC resolutions
 
-Ten RFC items, framed for the same crisp-decision pattern as
-Tappa 9 §13. Each lists the question, the engineering
-recommendation, and the reversibility cost so the owner can
-rule fast.
+All 10 RFC items resolved 2026-05-19 (owner-accepted engineering
+recommendations). K1 implementation now unblocked. Each block
+below: **Decision**, **Rationale**, **Implementation note**
+(where in this doc / commit plan the decision manifests),
+**Reversibility cost**.
 
-### Q1 — Canary placement strategy (default content + paths)
+### Q1 — Canary placement strategy
 
-- **Question:** Ship default canary placements (e.g.,
-  `/root/.aws/credentials.bak` always exists as a
-  credential canary on every host) OR require explicit
-  per-host operator `nn-admin canary deploy` calls?
-- **Recommendation:** **EXPLICIT PER-HOST DEPLOYMENT.**
-  Default placements defeat the deception purpose — any
-  attacker familiar with NorthNarrow checks those paths
-  FIRST and avoids them. Operator-curated placement
+- **Decision:** EXPLICIT PER-HOST DEPLOYMENT. V1.0 ships
+  content templates (`canary-templates/*.tmpl`), NOT
+  default deployments. Every canary placement is an
+  operator-driven `nn-admin canary deploy` call.
+- **Rationale:** default placements defeat deception —
+  any attacker familiar with NorthNarrow checks those
+  paths FIRST and avoids them. Operator-curated placement
   (informed by the host's actual workflow shape) is the
   irreducible-minimum-effort cost of a useful deception
-  layer. V1.0 ships templates (content), not deployment
-  defaults (placement).
+  layer.
+- **Implementation note:** §7 deploy/lifecycle + §9 deploy
+  install.sh ships templates only; K6 CLI surfaces
+  `nn-admin canary deploy <type> --path <...>`.
 - **Reversibility:** medium — adding default deployment
-  later would force operators to either trip-then-burn the
+  later forces operators to either trip-then-burn the
   defaults OR live with them; deferring keeps the option
   open.
 
 ### Q2 — Refresh policy (auto vs manual)
 
-- **Question:** When a canary trips, leave it tripped
-  forever (manual refresh required) OR auto-refresh after
-  N minutes / on agent restart?
-- **Recommendation:** **MANUAL REFRESH ONLY.** Auto-refresh
-  would lose the "this host has been compromised" signal
-  from subsequent agent boots. The operator's IR process
-  involves explicit `nn-admin canary refresh` as a
-  step — it's an audit-chained operator decision, not an
-  automatic state change.
+- **Decision:** MANUAL REFRESH ONLY. A tripped canary stays
+  tripped until `nn-admin canary refresh <id>` (signed,
+  audit-chained); subsequent accesses log to the chain but
+  do NOT re-fire posture transitions.
+- **Rationale:** auto-refresh would lose the "this host has
+  been compromised" signal from subsequent agent boots.
+  IR processes need the explicit operator decision —
+  audit-chained, not magic state change.
+- **Implementation note:** §7.4 + K2 `Registry::mark_tripped`
+  / `Registry::refresh`; K5 rule abstains when
+  `canary.tripped == true`.
 - **Reversibility:** easy (operators can script
-  `nn-admin canary refresh` as a cron-like job if their
-  policy genuinely wants auto-refresh).
+  `nn-admin canary refresh` as a cron job if policy wants
+  auto-refresh).
 
 ### Q3 — Multi-canary correlation in audit chain
 
-- **Question:** When MULTIPLE canaries trip within a short
-  window (e.g., 30 seconds — recon scan touching three
-  decoys), record an additional "campaign" audit row
-  cross-referencing all tripped canary IDs?
-- **Recommendation:** **NO — V1.0 keeps it simple.** Each
-  trip is its own audit row; cross-canary correlation is an
-  operator post-hoc analysis (a `jq` query on the chain).
-  Auto-correlation would require correlation-window logic
-  + a new chain entry type + corresponding rules — adds
-  complexity for a feature that's strictly additive to
-  what V1.0's individual-trip records already provide.
+- **Decision:** NO V1.0 correlation. Each trip is an
+  independent audit row; cross-canary correlation is
+  operator post-hoc analysis via `jq` on the chain.
+- **Rationale:** auto-correlation would add a correlation-
+  window state machine + a new chain entry type + matching
+  rules — complexity strictly additive over what V1.0's
+  individual-trip records already provide.
+- **Implementation note:** K2 registry stays single-trip-
+  per-event; no `canary_campaign.jsonl` shipped in K2-K8.
 - **Reversibility:** easy (V1.1 can add a separate
   `canary_campaign.jsonl` chain that references existing
   trip entries by entry_hash).
 
 ### Q4 — WATCHED_PATHS map sharing vs separate CANARY_PATHS
 
-- **Question:** Reuse the FIM `WATCHED_PATHS` BPF map for
-  canary inode tracking (single source of truth, userland
-  discriminates) OR add a separate `CANARY_PATHS` map (cleaner
-  kernel-side discrimination but doubles the map footprint)?
-- **Recommendation:** **SHARE WATCHED_PATHS, USERLAND
-  DISCRIMINATES.** The 8192-entry capacity of WATCHED_PATHS
-  has plenty of headroom (typical ~100 FIM paths + ~10-50
-  canaries = well under cap). Userland discrimination is
-  cheap (one HashMap lookup per kernel event). Separate map
-  would double the kernel-side BPF complexity without
-  operational benefit.
+- **Decision:** SHARE the FIM `WATCHED_PATHS` BPF map for
+  canary inode tracking. Userland discriminates via a
+  parallel `Registry` lookup. NO new BPF map.
+- **Rationale:** 8192-entry capacity of WATCHED_PATHS has
+  plenty of headroom (~100 FIM + ~10-50 canaries = well
+  under cap). Userland discrimination is a microsecond
+  HashMap lookup. Separate map would double the BPF
+  complexity for no operational benefit.
+- **Implementation note:** §5.1 SHARE lock-in. K3 detector
+  inspects `Registry::is_canary_inode((dev, ino))`
+  BEFORE the FIM rule layer sees the event (race-free
+  precedence per Q9).
 - **Reversibility:** medium — if real-world deployments
-  hit the cap, V1.1 can split into two maps. Migration
-  path: operators export canary registry → bump map sizes →
-  re-deploy. No on-disk format change.
+  hit the cap, V1.1 can split into two maps. Migration:
+  operators export registry → bump map size → re-deploy.
+  No on-disk format change.
 
 ### Q5 — Credential canary content authenticity
 
-- **Question:** Credential canaries SHOULD look real
-  enough to fool a casual attacker. How real?
-  - **Level A:** valid format / valid checksum (AWS
-    AKIA-prefixed key with correct format), but no
-    actual API key behind it.
-  - **Level B:** Level A + the agent registers the fake
-    key fingerprint with a backend (Tappa 13 SaaS) so a
-    real attempted login alerts.
-  - **Level C:** Level A only; operators integrate Level B
-    via their own SOAR.
-- **Recommendation:** **LEVEL A in V1.0** — valid format,
-  valid checksum, no online verification. Level B is a
-  Tappa 13 SaaS-Backend feature (sovereign deployments
-  don't have the backend to verify against). Operators
-  with online-verification budgets integrate via their own
-  SIEM/SOAR feeding off the `canary_access.jsonl` chain.
-- **Reversibility:** easy (Level B is additive; the V1.0
-  Level A canaries stay valid Level-A canaries under
-  Tappa 13).
+- **Decision:** LEVEL A in V1.0 — valid format + valid
+  checksum (AWS AKIA-prefixed key with correct format,
+  GCP service-account JSON with valid structure, SSH
+  RSA private key shape), no online verification.
+- **Rationale:** Level B (online registration with a
+  backend) is a Tappa 13 SaaS-Backend feature; sovereign
+  deployments can't validate online tokens. Operators
+  with online-verification budgets integrate via their
+  own SIEM/SOAR feeding off `canary_access.jsonl`.
+- **Implementation note:** §1 OUT OF SCOPE + K4 templates
+  ship 5 cred families (AWS/GCP/Azure/SSH/Git) all at
+  Level A. Tappa 13 adds the online-verify backend
+  additively.
+- **Reversibility:** easy (Level B is additive; V1.0
+  Level A canaries stay valid Level A under Tappa 13).
 
 ### Q6 — Network canary connection handling
 
-- **Question:** On a tripped network canary, the agent's
-  accept() returns a real TCP socket. Should the agent:
-  - **Option A:** immediately close (zero data sent or
-    received; the connect itself is the signal).
-  - **Option B:** send a fake banner (`SSH-2.0-OpenSSH_8.4`)
-    then close (delays attacker analysis by ~5 seconds).
-  - **Option C:** keep the connection open + record
-    everything the attacker sends (data-collection
-    honeypot).
-- **Recommendation:** **OPTION A (immediate close).**
-  Option B leaks "this is a deception" to a clever
-  attacker via the banner-then-disconnect pattern. Option
-  C is honeypot territory (Tappa 11+ if ever). Option A
-  is the irreducible signal: KillProcessTree fires on
-  the local accessor before any attacker payload arrives.
+- **Decision:** IMMEDIATE CLOSE on connect. Zero data
+  sent or received; the connect itself is the signal.
+  `tokio::TcpListener::accept()` returns; the agent
+  immediately records the trip + drops the socket
+  without read/write.
+- **Rationale:** banner-then-disconnect (Option B) leaks
+  "this is deception" to a clever attacker via the
+  fingerprintable banner+RST pattern. Honeypot-style
+  (Option C) is Tappa 11+ territory + adds attacker-
+  controlled-input attack surface. Immediate-close is
+  the irreducible signal — KillProcessTree fires on the
+  local accessor before any attacker payload arrives.
+- **Implementation note:** §5.3 trip phase + K2 registry's
+  network-canary task. NO `.read()` / `.write()` call on
+  the accepted socket.
 - **Reversibility:** easy (operator-tunable in V1.1; V1.0
   immediate-close is the safe default).
 
 ### Q7 — Operator key role allocation
 
-- **Question:** Single role (`CanaryManage`) for all four
-  canary ops (deploy / list / burn / refresh) OR split into
-  `CanaryRead` (list only) + `CanaryManage` (deploy / burn /
-  refresh)?
-- **Recommendation:** **SPLIT.** Same shape as
-  Tappa 9 C6's `FimManage` + `FimRead`. Audit-only
-  operators (incident response, compliance) get
-  `CanaryRead` without deploy authority. Operational
-  operators (sysadmins) get `CanaryManage`.
-- **Reversibility:** easy (add roles later means re-
-  issuing operator keys; doing the split at v1.0 means
-  operators provision the right granularity from day one).
+- **Decision:** SPLIT into `Role::CanaryRead` (list-only,
+  audit-grade read access) + `Role::CanaryManage` (deploy +
+  burn + refresh). Same shape as Tappa 9 C6's `FimManage`
+  + `FimRead`.
+- **Rationale:** audit-only operators (IR, compliance)
+  get read without deploy authority. Operational
+  operators (sysadmins) get the full surface. Two roles
+  at V1.0 means operators provision the right
+  granularity from day one; adding roles later means
+  re-issuing keys.
+- **Implementation note:** K1 wire types + K6 CLI dispatch
+  enforces `Role::CanaryManage` on deploy/burn/refresh,
+  `Role::CanaryRead` on list. Same `verify_signed_payload_quorum`
+  1-of-N pattern from Tappa 9 C6 (§13 Q6 workflow-gate
+  precedent).
+- **Reversibility:** easy (adding roles later is additive;
+  splitting day one avoids the operator-key-migration
+  cost).
 
 ### Q8 — Canary chain rotation policy
 
-- **Question:** Same as Tappa 9 §13 Q8 — V1.0 keep full
-  chain, V1.1 signed rotation op?
-- **Recommendation:** **YES SAME.** Canary chains stay
-  tiny (operator deploys ~10-50, trips ~rare) — full
-  chain retention through V1.x is easy. Rotation joins
-  the V1.1 set alongside Tappa 8 audit + Tappa 9 FIM
-  rotations.
-- **Reversibility:** easy (additive future feature).
+- **Decision:** V1.0 KEEPS FULL CHAIN. V1.1 ships signed
+  `nn-admin canary rotate` op with chain-of-chains
+  continuation (same shape as Tappa 8 §14 Q9 audit-rotate
+  + Tappa 9 §13 Q8 baseline-rotate).
+- **Rationale:** canary chains stay tiny (operator deploys
+  ~10-50; trips are rare by zero-FP construction). Full
+  retention is operationally trivial — a 100-entry chain
+  is ~25 KB.
+- **Implementation note:** no V1.0 implementation work;
+  documented as deferred follow-up. V1.1 rotate joins
+  Tappa 8 audit + Tappa 9 FIM rotations.
+- **Reversibility:** easy (V1.1 rotate is additive; un-
+  rotated chains stay verifiable forever).
 
-### Q9 — Detector task vs main-loop integration
+### Q9 — Detector integration point
 
-- **Question:** The canary detector reads the
-  `Event::*` channel — should it run as:
-  - **Option A:** a separate tokio task with its own
-    receiver clone (parallel to the FIM drain).
-  - **Option B:** an inline filter in `main::process_event`
-    BEFORE the rule engine sees the event.
-- **Recommendation:** **OPTION B (inline filter).**
-  The canary detector's discriminator (lookup in the
-  registry) is microseconds; running it inline preserves
-  the canary-vs-FIM precedence guarantee (the canary
-  rule fires BEFORE the FIM rule layer sees the event)
-  without channel duplication. Option A would race —
-  the FIM rule could win + fire NN-L-FIM-011 alongside
-  NN-L-CANARY-004.
+- **Decision:** OPTION B (inline filter) — the canary
+  detector runs as a synchronous discriminator inside
+  `main::process_event`, BEFORE the rule engine sees the
+  `Event::Fim` / `Event::ProcessSpawn` / `Event::NetFlow`.
+- **Rationale:** the canary lookup (registry HashMap query
+  by inode/path/exe) is microseconds. Running it inline
+  preserves the canary-vs-FIM precedence GUARANTEE (canary
+  rule fires BEFORE the FIM rule layer sees the event).
+  Option A (separate tokio task with channel clone) would
+  race — NN-L-FIM-011 could fire alongside NN-L-CANARY-004.
+- **Implementation note:** §3 architecture + K3 `detector.rs`
+  exposes `process_event(event, registry) -> Option<Event::CanaryTripped>`;
+  main.rs calls it inline pre-rule-engine. K3 returns
+  `None` for non-canary events so the rule engine sees
+  the original event unchanged.
 - **Reversibility:** medium — refactor to Option A later
   is a self-contained change but invalidates the test
-  fixtures.
+  fixtures' inline-filter assertions.
 
-### Q10 — Tappa 13 backend mirror (canary chain)
+### Q10 — Tappa 13 backend mirror
 
-- **Question:** Mirror `canaries.jsonl` +
-  `canary_access.jsonl` to a future Tappa 13 SaaS-Backend?
-- **Recommendation:** **DEFER TO TAPPA 13.** Same shape
-  as Tappa 9 §13 Q10: V1.0 local chain + signed
+- **Decision:** DEFER TO TAPPA 13. V1.0 local
+  `canaries.jsonl` + `canary_access.jsonl` + signed
   `nn-admin canary list --json` export is the audit-
   grade primitive; remote mirroring is an additive
-  Tappa 13 feature.
+  future feature.
+- **Rationale:** mirroring requires backend-SaaS
+  architecture decisions out of Tappa 9.5 scope. The
+  on-disk format Tappa 9.5 ships IS the streaming
+  protocol Tappa 13 will consume (Tappa 9 §13 Q10
+  precedent — same on-disk-IS-the-wire-format design).
+- **Implementation note:** no V1.0 implementation work.
 - **Reversibility:** easy (additive future feature; no
   V1.0 commitment to preclude).
 
-### Cross-cutting consistency (anticipated lock-ins)
+### Cross-cutting consistency (lock-ins captured above)
 
 1. **Q1 (no defaults) + Q5 (Level A content)** → V1.0
    ships TEMPLATES, not deployments. Operator does the
-   placement; agent renders the content.
+   placement; agent renders the content from the
+   templates K4 installs.
 2. **Q4 (shared map) + Q9 (inline filter)** → the canary
    detector intercepts Event::Fim BEFORE the FIM rule
    layer; one map, one lookup, race-free precedence.
+   `Registry::is_canary_inode` is the K3 hot-path
+   discriminator.
 3. **Q2 (manual refresh) + Q6 (immediate close)** → both
    reflect the "tight, surgical, audit-chained" design
-   philosophy. Avoid magic auto-state-changes.
+   philosophy. Avoid magic auto-state-changes. Operator
+   intent + audit chain are the only state-transition
+   triggers.
 4. **Q7 (split roles) + Q3 (no correlation)** → the V1.0
-   surface stays small; growing it (auto-correlation, more
-   roles) is additive future work.
+   surface stays small; growing it (auto-correlation,
+   more roles) is additive future work. `Role::CanaryRead`
+   audit-grade access composes cleanly with future
+   correlation views.
 5. **Q8 (V1.0 keep) + Q10 (defer mirror)** → Tappa 9
-   precedents adopted verbatim; consistency reduces
-   operator cognitive overhead across the chained-audit
-   primitives.
+   precedents adopted verbatim. Consistency reduces
+   operator cognitive overhead across the chained-
+   audit primitives (Tappa 8 audit / Tappa 9 FIM
+   baseline+drift / Tappa 9.5 canary registry+access).
 
 ---
 
