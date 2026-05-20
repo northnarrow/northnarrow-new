@@ -671,6 +671,22 @@ pub fn process_drift(
     }
 
     if let Some(tx) = event_tx {
+        // Polish #3: resolve the rename dest path via InodePathMap.
+        // Populated only when raw.dest_dev + raw.dest_ino are non-
+        // zero (the kernel-side fim_rename_observe sets them when
+        // it can extract a dest inode from the rename's dentry
+        // args) AND the dest inode is in the userland map. Misses
+        // fall back to None and the NN-L-FIM-010 rule's dest-side
+        // matcher skips silently — the rule still fires on src-side
+        // matches.
+        let dest_path = if matches!(op, FimOp::Renamed) && raw.dest_ino != 0 {
+            path_map.lookup(&InodeKey {
+                dev: raw.dest_dev,
+                ino: raw.dest_ino,
+            })
+        } else {
+            None
+        };
         let event = Event::Fim(FimEvent {
             timestamp_ns: raw.timestamp_ns,
             path: path.clone(),
@@ -681,6 +697,7 @@ pub fn process_drift(
             modifier_pid: raw.modifier_pid,
             modifier_uid: raw.modifier_uid,
             modifier_comm: comm_to_string(&raw.modifier_comm),
+            dest_path,
         });
         if tx.try_send(event).is_err() {
             warn!(
@@ -829,6 +846,11 @@ mod tests {
             modifier_comm: *b"dpkg\0\0\0\0\0\0\0\0\0\0\0\0",
             op,
             _pad: [0u8; 7],
+            // Polish #3 defaults — non-Rename events leave the
+            // dest pair zeroed; rename-specific tests construct
+            // FimDriftRaw directly with non-zero dest values.
+            dest_dev: 0,
+            dest_ino: 0,
         }
     }
 

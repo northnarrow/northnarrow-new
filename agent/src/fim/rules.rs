@@ -584,10 +584,22 @@ impl Rule for NnLFim010RansomwareExtensionRename {
         if fe.op != FimOp::Renamed {
             return None;
         }
-        if !RANSOMWARE_EXTENSIONS
+        // Polish #3: check the DEST path (canonical ransomware
+        // case: watched `<doc>.docx` renamed to `<doc>.docx.crypted`
+        // — `fe.path` is still the source watched path, `fe.dest_path`
+        // carries the new name once C8's drain resolved it). The
+        // src-side check stays as the fallback (symmetric edge:
+        // a watched `<doc>.crypted` being renamed away by the
+        // operator — rare but consistent).
+        let dest_match = fe
+            .dest_path
+            .as_deref()
+            .map(|d| RANSOMWARE_EXTENSIONS.iter().any(|ext| d.ends_with(ext)))
+            .unwrap_or(false);
+        let src_match = RANSOMWARE_EXTENSIONS
             .iter()
-            .any(|ext| fe.path.ends_with(ext))
-        {
+            .any(|ext| fe.path.ends_with(ext));
+        if !dest_match && !src_match {
             return None;
         }
         Some(fim_verdict(
@@ -833,6 +845,25 @@ mod tests {
             modifier_pid: 42,
             modifier_uid: 0,
             modifier_comm: "attacker".to_string(),
+            dest_path: None,
+        })
+    }
+
+    /// Polish #3 helper: construct a `Renamed` event with both
+    /// src and dest paths populated. Used by the new NN-L-FIM-010
+    /// dest-aware tests.
+    fn fim_renamed_with_dest(src: &str, dest: &str) -> Event {
+        Event::Fim(FimEvent {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            path: src.to_string(),
+            op: FimOp::Renamed,
+            new_sha256: None,
+            baseline_sha256: Some([0xBB; 32]),
+            modifier_exe: None,
+            modifier_pid: 42,
+            modifier_uid: 0,
+            modifier_comm: "attacker".to_string(),
+            dest_path: Some(dest.to_string()),
         })
     }
 
@@ -1216,6 +1247,83 @@ mod tests {
         assert!(r.evaluate(&fim_event(FimOp::Linked, path)).is_none());
     }
 
+    // ── Polish #3 — NN-L-FIM-010 dest-path matcher tests ────────
+
+    /// Polish #3 test: a watched file renamed TO a ransomware
+    /// extension fires the rule via the new `dest_path` matcher.
+    /// This is the canonical ransomware scenario the rule was
+    /// designed for: src (watched path) is `doc.docx`, dest is
+    /// `doc.docx.crypted`.
+    #[test]
+    fn fim010_fires_on_dest_path_match_when_src_clean() {
+        let r = NnLFim010RansomwareExtensionRename;
+        let v = r
+            .evaluate(&fim_renamed_with_dest(
+                "/home/u/documents/quarterly.docx",
+                "/home/u/documents/quarterly.docx.crypted",
+            ))
+            .expect("dest .crypted must fire rule");
+        assert_eq!(v.severity, Severity::Critical);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(v.rule_id.contains("NN-L-FIM-010"));
+    }
+
+    /// Polish #3 test: both src and dest are LEGITIMATE (no
+    /// ransomware extension on either side) — the rule must
+    /// abstain. Defends the false-positive boundary.
+    #[test]
+    fn fim010_does_not_fire_when_neither_src_nor_dest_match() {
+        let r = NnLFim010RansomwareExtensionRename;
+        assert!(
+            r.evaluate(&fim_renamed_with_dest(
+                "/home/u/draft.docx",
+                "/home/u/draft.final.docx"
+            ))
+            .is_none(),
+            "legitimate doc rename must NOT fire NN-L-FIM-010"
+        );
+        assert!(
+            r.evaluate(&fim_renamed_with_dest(
+                "/var/log/auth.log",
+                "/var/log/auth.log.1"
+            ))
+            .is_none(),
+            "logrotate-style rename must NOT fire"
+        );
+    }
+
+    /// Polish #3 test: dest_path None preserves the C5.1 src-side
+    /// behaviour — the existing tests already cover src-side
+    /// firing via the `fim_event` helper (dest_path: None). This
+    /// test explicitly asserts the rule still abstains on a clean
+    /// rename with dest_path None (no regression).
+    #[test]
+    fn fim010_does_not_fire_when_src_clean_and_dest_path_none() {
+        let r = NnLFim010RansomwareExtensionRename;
+        assert!(
+            r.evaluate(&fim_event(FimOp::Renamed, "/home/u/clean.docx"))
+                .is_none(),
+            "clean rename with dest_path=None must NOT fire"
+        );
+    }
+
+    /// Polish #3 test: src-side match still fires (NN-L-FIM-010
+    /// catches the SYMMETRIC edge — a previously-encrypted file
+    /// being renamed away). The C5.1 tests cover this; this test
+    /// confirms polish #3's rule extension didn't drop the
+    /// src-side branch.
+    #[test]
+    fn fim010_still_fires_on_src_match_with_dest_clean() {
+        let r = NnLFim010RansomwareExtensionRename;
+        let v = r
+            .evaluate(&fim_renamed_with_dest(
+                "/home/u/document.docx.locked",
+                "/tmp/quarantine/document.docx.locked",
+            ))
+            .expect("src .locked must still fire");
+        assert!(v.rule_id.contains("NN-L-FIM-010"));
+    }
+
     #[test]
     fn fim010_extension_list_uses_leading_dot() {
         // Curated invariant: every RANSOMWARE_EXTENSIONS entry
@@ -1244,6 +1352,7 @@ mod tests {
             modifier_pid: 42,
             modifier_uid: 0,
             modifier_comm: comm.to_string(),
+            dest_path: None,
         })
     }
 
