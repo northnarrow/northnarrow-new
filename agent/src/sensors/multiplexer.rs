@@ -36,6 +36,12 @@ pub struct SensorMultiplexer {
     ebpf: Ebpf,
     pumps: Vec<JoinHandle<()>>,
     rx: mpsc::Receiver<Event>,
+    /// Tappa 9 C8: cloneable handle to the same `Event` channel
+    /// the sensor pumps feed. The FIM drain loop (also spawned at
+    /// agent boot) clones this to push `Event::Fim` items into the
+    /// same main-loop receiver — no extra `select!` arm needed in
+    /// `main.rs`.
+    event_tx: mpsc::Sender<Event>,
 }
 
 impl SensorMultiplexer {
@@ -112,10 +118,37 @@ impl SensorMultiplexer {
             spawn_pump::<ExecCheckRaw>("exec_check", exec_check_rb, tx.clone()),
             spawn_pump::<TcpConnectRaw>("tcp_connect", tcp_connect_rb, tx.clone()),
             spawn_pump::<DnsQueryRaw>("dns_query", dns_query_rb, tx.clone()),
-            spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx),
+            spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
         ];
 
-        Ok(Self { ebpf, pumps, rx })
+        Ok(Self {
+            ebpf,
+            pumps,
+            rx,
+            event_tx: tx,
+        })
+    }
+
+    /// Tappa 9 C8 — mutable access to the underlying [`Ebpf`] object
+    /// for the FIM observe-program attach + the WATCHED_PATHS map
+    /// population. Boot-time helper called once from `main.rs` after
+    /// `attach_anti_tamper`; not intended for repeated runtime use.
+    pub fn ebpf_mut(&mut self) -> &mut Ebpf {
+        &mut self.ebpf
+    }
+
+    /// Tappa 9 C8 — clone of the cross-sensor `Event` channel sender.
+    /// The FIM drain loop pushes `Event::Fim` items through this so
+    /// they land in the same `next_event()` receiver the main loop
+    /// already polls.
+    pub fn event_tx(&self) -> mpsc::Sender<Event> {
+        self.event_tx.clone()
+    }
+
+    /// Tappa 9 C8 — register the spawned FIM drain task with the
+    /// multiplexer so `Drop` aborts it alongside the sensor pumps.
+    pub fn register_pump_handle(&mut self, handle: JoinHandle<()>) {
+        self.pumps.push(handle);
     }
 
     /// Drain the next event. Returns `None` when every pump task has
