@@ -168,6 +168,47 @@ struct Cli {
     )]
     shutdown_marker_file: PathBuf,
 
+    /// Tappa 9 C7: path to the curated default FIM watched-paths
+    /// list (`fim-paths.v1` format — one absolute path per line,
+    /// `#` comments). install.sh drops this at the default location;
+    /// the agent reads + merges with the operator overlay at boot.
+    #[arg(
+        long = "fim-paths-v1",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::paths_config::DEFAULT_PATHS_V1,
+    )]
+    fim_paths_v1: PathBuf,
+
+    /// Tappa 9 C7 / §13 Q7: path to the operator overlay.
+    /// `+/abs/path` adds, `-/abs/path` disables a default. Optional
+    /// — missing file means "no overlay", v1 is used as-is.
+    #[arg(
+        long = "fim-paths-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::paths_config::DEFAULT_PATHS_LOCAL,
+    )]
+    fim_paths_local: PathBuf,
+
+    /// Tappa 9 C3 / C7: configurable path of the chained FIM
+    /// baseline log. Tests override this to a tempdir so each test
+    /// run gets a fresh chain.
+    #[arg(
+        long = "fim-baseline-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::baseline::DEFAULT_BASELINE_PATH,
+    )]
+    fim_baseline_file: PathBuf,
+
+    /// Tappa 9 C4 / C7: configurable path of the chained FIM
+    /// drift log. Same per-test override rationale as
+    /// `--fim-baseline-file`.
+    #[arg(
+        long = "fim-drift-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::drain::DEFAULT_DRIFT_LOG_PATH,
+    )]
+    fim_drift_file: PathBuf,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -228,6 +269,30 @@ async fn main() -> Result<()> {
             path = %cli.audit_log_file.display(),
             "audit log bootstrap failed pre-attach — file will be lazily created \
              on first append (and protected only from agent restart onwards)"
+        );
+    }
+    // Tappa 9 C7: bootstrap the two FIM logs pre-attach for the
+    // same reason audit.log gets it — STATE_PROTECTED_FILES needs
+    // an inode to register against before LSM hooks come up. A
+    // present file is left untouched (existing chain preserved).
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(
+        &cli.fim_baseline_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.fim_baseline_file.display(),
+            "fim baseline log bootstrap failed pre-attach — file will be lazily \
+             created on first append (and unprotected this boot)"
+        );
+    }
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(
+        &cli.fim_drift_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.fim_drift_file.display(),
+            "fim drift log bootstrap failed pre-attach — file will be lazily \
+             created on first append (and unprotected this boot)"
         );
     }
     // agent_id bootstrap moved up from line ~360 so its inode is
@@ -462,6 +527,142 @@ async fn main() -> Result<()> {
     // here for the select-arm `wait()`.
     let shutdown_signal = ShutdownSignal::new();
 
+    // ── Tappa 9 C7 — FIM subsystem boot ────────────────────────────
+    //
+    // Order:
+    //  1. Load the watched-paths set (v1 default + .local overlay
+    //     merge per §13 Q7). A missing v1 just yields an empty
+    //     effective set + WARN; the agent stays up so a misconfigured
+    //     install is still operator-recoverable.
+    //  2. Open the [`BaselineDb`] for the chained baseline log.
+    //     Failure here is also tolerated: the recompute channel
+    //     stays unwired so admin `fim baseline` returns
+    //     `UnknownOperation` rather than crashing.
+    //  3. Build the [`BaselineRecomputeChannel`] + spawn the
+    //     long-lived recompute task.
+    //  4. Fire `RecomputeReason::FirstBootTofu` (§13 Q5 trust-on-
+    //     first-use) when the baseline DB is empty AND at least
+    //     one path is configured. First-boot trust model is
+    //     documented in `docs/operator/TAPPA9_FIM_TRUST_MODEL.md`.
+    //  5. Build the [`FimAdminState`] for the admin socket so
+    //     `fim baseline` triggers (3) and `fim status` reads the
+    //     in-process snapshot.
+    let watched_paths_load =
+        match northnarrow_agent::fim::paths_config::load_watched_paths(
+            &cli.fim_paths_v1,
+            &cli.fim_paths_local,
+        ) {
+            Ok(load) => load,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    v1 = %cli.fim_paths_v1.display(),
+                    local = %cli.fim_paths_local.display(),
+                    "fim paths-config: load failed — proceeding with empty watched-paths set"
+                );
+                Default::default()
+            }
+        };
+    let paths_summary =
+        admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
+
+    let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
+        // Re-derive the signing key + agent_id for FIM the same way
+        // the audit log does (re-load rather than steal the audit
+        // log's clone — they're separate domains with separate Db
+        // handles). A failure here downgrades the FIM CLI surface
+        // to "scheduled for next restart" + zero-snapshot status.
+        let baseline_db_opt =
+            match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                &cli.signing_key_file,
+            ) {
+                Ok(key) => {
+                    match northnarrow_agent::fim::baseline::BaselineDb::open(
+                        &cli.fim_baseline_file,
+                        key,
+                        agent_id,
+                    ) {
+                        Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                path = %cli.fim_baseline_file.display(),
+                                "fim baseline DB open failed — admin `fim baseline` will \
+                                 reject; status snapshot will report zero rows"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "fim baseline DB needs the agent signing key — load failed; \
+                         FIM admin surface degraded"
+                    );
+                    None
+                }
+            };
+        match baseline_db_opt {
+            Some(baseline_db) => {
+                use northnarrow_agent::fim::drain::{DriftRateLimiter, InodePathMap};
+                use northnarrow_agent::fim::recompute::{
+                    run_recompute_task, BaselineRecomputeChannel, RecomputeReason,
+                };
+                let rate_limiter = Arc::new(DriftRateLimiter::new());
+                let mut recompute_chan = BaselineRecomputeChannel::new();
+                let sender = recompute_chan.sender();
+                let receiver = recompute_chan
+                    .take_receiver()
+                    .expect("freshly-constructed channel has a receiver");
+                let inode_map = Arc::new(InodePathMap::new());
+                // The recompute task snapshots the merged watched-
+                // paths set every iteration — operators who edit
+                // fim-paths.local and run `nn-admin fim baseline`
+                // pick up the new set without an agent restart.
+                let v1_for_snapshot = cli.fim_paths_v1.clone();
+                let local_for_snapshot = cli.fim_paths_local.clone();
+                tokio::spawn(run_recompute_task(
+                    receiver,
+                    Arc::clone(&baseline_db),
+                    Arc::clone(&inode_map),
+                    move || {
+                        northnarrow_agent::fim::paths_config::load_watched_paths(
+                            &v1_for_snapshot,
+                            &local_for_snapshot,
+                        )
+                        .map(|l| l.effective)
+                        .unwrap_or_default()
+                    },
+                ));
+
+                // §13 Q5 TOFU: empty baseline file + non-empty paths
+                // set = first boot, fire a recompute. The task above
+                // is already running (tokio::spawn doesn't block on
+                // the future's first poll).
+                if baseline_db.lock().last_hash()
+                    == northnarrow_agent::audit::GENESIS_PREV_HASH
+                    && !watched_paths_load.effective.is_empty()
+                {
+                    info!(
+                        paths = watched_paths_load.effective.len(),
+                        "fim: first-boot TOFU baseline triggered (§13 Q5)"
+                    );
+                    sender.trigger(RecomputeReason::FirstBootTofu);
+                }
+
+                Some(Arc::new(admin_socket::FimAdminState {
+                    recompute_sender: sender,
+                    rate_limiter,
+                    paths_summary,
+                    baseline_log_path: cli.fim_baseline_file.clone(),
+                    drift_log_path: cli.fim_drift_file.clone(),
+                }))
+            }
+            None => None,
+        }
+    };
+
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
     // runs but COMBAT can only be cleared by reboot.
@@ -516,6 +717,7 @@ async fn main() -> Result<()> {
                     }
                 };
                 let marker_path = cli.shutdown_marker_file.clone();
+                let fim_state_for_serve = fim_admin_state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -525,6 +727,7 @@ async fn main() -> Result<()> {
                         marker_path,
                         Some(signal_for_serve),
                         audit_log,
+                        fim_state_for_serve,
                     )
                     .await
                     {

@@ -329,6 +329,35 @@ impl DriftRateLimiter {
     pub fn try_consume(&self, severity: DriftSeverity) -> Result<(), String> {
         self.try_consume_with_now(severity, Instant::now())
     }
+
+    /// C7 — read-only snapshot of bucket state for the
+    /// `nn-admin fim status` reply. Returns
+    /// `(high_remaining, medium_remaining, secs_until_window_resets)`.
+    /// Holds the mutex for microseconds (three field reads + an
+    /// arithmetic on `Instant`); same lock-contention budget as
+    /// `try_consume`.
+    pub fn snapshot(&self) -> (u32, u32, u32) {
+        let s = self.state.lock().expect("DriftRateLimiter mutex poisoned");
+        let elapsed = Instant::now().duration_since(s.window_started);
+        let remaining_secs = Duration::from_secs(60)
+            .checked_sub(elapsed)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        (s.high_remaining, s.medium_remaining, remaining_secs)
+    }
+
+    /// C7 — configured High-tier cap. Surfaced in
+    /// `FimStatusResponse` so the CLI can render
+    /// `<remaining>/<cap>` ratios.
+    pub fn high_cap_per_min(&self) -> u32 {
+        self.high_per_min
+    }
+
+    /// C7 — configured Medium-tier cap. Same rationale as
+    /// [`Self::high_cap_per_min`].
+    pub fn medium_cap_per_min(&self) -> u32 {
+        self.medium_per_min
+    }
 }
 
 impl Default for DriftRateLimiter {

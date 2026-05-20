@@ -29,8 +29,9 @@ use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, FimBaselineRequest,
-    FimReportRequest, FimReportResponse, ForcePostureRequest, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, UnlockResult, MAX_FRAME_BODY,
+    FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
+    ForcePostureRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
+    StatusResponse, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use ed25519_dalek::VerifyingKey;
@@ -39,6 +40,8 @@ use sha2::{Digest, Sha256};
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::fim::drain::DriftRateLimiter;
+use crate::fim::recompute::{BaselineRecomputeSender, RecomputeReason};
 use crate::posture::{AdminReleaseError, PostureMachine};
 use crate::shutdown_marker::{self, ShutdownMarker, DEFAULT_MARKER_PATH};
 
@@ -91,6 +94,68 @@ impl ShutdownSignal {
     }
 }
 
+/// Tappa 9 C7 — FIM admin-socket state bundle. Threaded through
+/// dispatch so two newly-wired ops can run:
+///
+/// - `FimBaselineRequest` triggers the in-process recompute
+///   channel rather than just logging "scheduled for next restart"
+///   (C6 deferral closure).
+/// - `FimStatusRequest` reads the in-process snapshot
+///   (token-bucket counts, paths-watched count, baseline +
+///   drift chain lengths, last baseline ts) and returns it.
+///
+/// All fields are `Arc`-shared with main.rs's other tokio tasks
+/// (the recompute task + the future drain loop). Construction
+/// happens once at boot; the admin socket gets an `Arc<FimAdminState>`
+/// it never mutates.
+#[derive(Clone)]
+pub struct FimAdminState {
+    /// Recompute channel sender. `dispatch_fim_baseline` fires
+    /// `RecomputeReason::AdminRequest` here on a successful
+    /// quorum verify. The boot-time recompute task (see
+    /// [`crate::fim::recompute::run_recompute_task`]) consumes
+    /// the request and re-walks every watched path.
+    pub recompute_sender: BaselineRecomputeSender,
+    /// Token-bucket state for the §6.5 hierarchical rate-limiter.
+    /// `dispatch_fim_status` snapshots the remaining counts +
+    /// window-reset timer for operator visibility.
+    pub rate_limiter: Arc<DriftRateLimiter>,
+    /// Watched-paths summary captured at boot (after the
+    /// `fim-paths.local` overlay merge). Cheap-to-clone counts
+    /// for the status response.
+    pub paths_summary: WatchedPathsSummary,
+    /// Path to the on-disk baseline log. Status reads the file's
+    /// row count + last `ts` for the snapshot. Empty (or non-
+    /// existent) file means zero rows + empty ts.
+    pub baseline_log_path: PathBuf,
+    /// Path to the on-disk drift log. Same shape as
+    /// `baseline_log_path` — read for the row count only.
+    pub drift_log_path: PathBuf,
+}
+
+/// `Copy`-able subset of [`crate::fim::paths_config::WatchedPathsLoad`]
+/// — just the operator-visible counts that the status response
+/// surfaces. Owning the counts here (rather than reading the
+/// `BTreeSet`s every time) keeps the admin-socket path
+/// allocation-free.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WatchedPathsSummary {
+    pub watched_paths_count: u32,
+    pub disabled_default_count: u32,
+    pub added_path_count: u32,
+}
+
+impl WatchedPathsSummary {
+    /// Build from a [`crate::fim::paths_config::WatchedPathsLoad`].
+    pub fn from_load(load: &crate::fim::paths_config::WatchedPathsLoad) -> Self {
+        Self {
+            watched_paths_count: load.effective.len() as u32,
+            disabled_default_count: load.disabled.len() as u32,
+            added_path_count: load.added.len() as u32,
+        }
+    }
+}
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
 /// agent's main loop is expected to also exit on the same condition.
@@ -122,6 +187,7 @@ pub async fn serve(
         PathBuf::from(DEFAULT_MARKER_PATH),
         None,
         None,
+        None,
     )
     .await
 }
@@ -149,6 +215,39 @@ pub async fn serve_with_audit_log(
         marker_path,
         shutdown_signal,
         Some(audit_log),
+        None,
+    )
+    .await
+}
+
+/// Tappa 9 C7 production entry-point — extends
+/// [`serve_with_audit_log`] with the FIM state bundle. main.rs
+/// constructs an [`FimAdminState`] at boot from the recompute
+/// channel sender, the drift-rate-limiter handle, and the
+/// watched-paths summary, then hands an `Arc` clone here. The
+/// admin socket forwards a borrow to dispatch so
+/// `FimBaselineRequest` triggers the recompute channel and
+/// `FimStatusRequest` returns the in-process snapshot.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_fim_state(
+    socket_path: PathBuf,
+    auth: Arc<AdminAuth>,
+    posture: Arc<PostureMachine>,
+    isolator: Arc<NetworkIsolator>,
+    marker_path: PathBuf,
+    shutdown_signal: Option<ShutdownSignal>,
+    audit_log: Option<Arc<Mutex<AuditLog>>>,
+    fim_state: Arc<FimAdminState>,
+) -> Result<()> {
+    serve_with_marker_path(
+        socket_path,
+        auth,
+        posture,
+        isolator,
+        marker_path,
+        shutdown_signal,
+        audit_log,
+        Some(fim_state),
     )
     .await
 }
@@ -162,6 +261,7 @@ pub async fn serve_with_audit_log(
 /// break and exit cleanly (Tappa 8 A8). When `None`, the
 /// dispatcher still writes the marker but no in-process signal is
 /// delivered (legacy + test callers that don't care).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_marker_path(
     socket_path: PathBuf,
     auth: Arc<AdminAuth>,
@@ -170,6 +270,7 @@ pub async fn serve_with_marker_path(
     marker_path: PathBuf,
     shutdown_signal: Option<ShutdownSignal>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
+    fim_state: Option<Arc<FimAdminState>>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -204,6 +305,7 @@ pub async fn serve_with_marker_path(
         let marker_path = marker_path.clone();
         let shutdown_signal = shutdown_signal.clone();
         let audit_log = audit_log.clone();
+        let fim_state = fim_state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -213,6 +315,7 @@ pub async fn serve_with_marker_path(
                 &marker_path,
                 shutdown_signal.as_ref(),
                 audit_log.as_ref(),
+                fim_state.as_ref(),
             )
             .await
             {
@@ -236,6 +339,7 @@ pub fn unlink_socket(path: &Path) {
 /// iteration reads exactly one frame and writes exactly one reply;
 /// the `nn-admin unlock` flow uses two iterations (challenge then
 /// unlock) and then closes.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
     auth: &AdminAuth,
@@ -244,6 +348,7 @@ async fn handle_connection(
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    fim_state: Option<&Arc<FimAdminState>>,
 ) -> Result<()> {
     // Capture peer creds once per connection — the audit log
     // wants pid/uid/comm of the caller, and a single connection
@@ -263,6 +368,7 @@ async fn handle_connection(
             isolator,
             marker_path,
             shutdown_signal,
+            fim_state.map(|s| s.as_ref()),
             &mut matched_fps,
         );
         emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
@@ -453,6 +559,22 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // C7: fim_status. Extra captures the snapshot counts so an
+        // off-host audit reader can answer "at the moment the
+        // operator ran status, what did the agent report?" without
+        // needing a parallel time-series collector.
+        (AdminMessage::FimStatusRequest(req), AdminMessage::FimStatusResponse(resp)) => (
+            "fim_status",
+            serde_json::json!({
+                "watched_paths_count": resp.watched_paths_count,
+                "disabled_default_count": resp.disabled_default_count,
+                "added_path_count": resp.added_path_count,
+                "baseline_entries_total": resp.baseline_entries_total,
+                "drift_entries_total": resp.drift_entries_total,
+            }),
+            audit_result_str(resp.result),
+            req.signatures.len().saturating_sub(1),
+        ),
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -536,6 +658,7 @@ fn audit_result_str(r: AdminResult) -> String {
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
 /// methods are sync; we don't `await` between read and write inside
 /// `handle_connection`, so the dispatch itself can stay sync.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     msg: AdminMessage,
     auth: &AdminAuth,
@@ -543,6 +666,7 @@ fn dispatch(
     isolator: &NetworkIsolator,
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
+    fim_state: Option<&FimAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminMessage {
     match msg {
@@ -661,11 +785,17 @@ fn dispatch(
         }
 
         AdminMessage::FimBaselineRequest(req) => {
-            AdminMessage::FimBaselineResult(dispatch_fim_baseline(req, auth, fps_out))
+            AdminMessage::FimBaselineResult(dispatch_fim_baseline(
+                req, auth, fim_state, fps_out,
+            ))
         }
 
         AdminMessage::FimReportRequest(req) => {
             AdminMessage::FimReportResponse(dispatch_fim_report(req, auth, fps_out))
+        }
+
+        AdminMessage::FimStatusRequest(req) => {
+            AdminMessage::FimStatusResponse(dispatch_fim_status(req, auth, fim_state, fps_out))
         }
 
         // Server-only variants — clients sending these are speaking
@@ -679,7 +809,8 @@ fn dispatch(
         | AdminMessage::RotateKeysAddResult(_)
         | AdminMessage::RotateKeysRevokeResult(_)
         | AdminMessage::FimBaselineResult(_)
-        | AdminMessage::FimReportResponse(_) => {
+        | AdminMessage::FimReportResponse(_)
+        | AdminMessage::FimStatusResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -1154,21 +1285,19 @@ fn dispatch_rotate_keys_revoke(
 // PHASE_D_004: `fps_out` populated on success with the matched
 // signer fingerprint (1-of-N quorum → one fingerprint).
 //
-/// Tappa 9 C6 — handle one [`FimBaselineRequest`] (design §6.1 +
+/// Tappa 9 C6 → C7 — handle one [`FimBaselineRequest`] (design §6.1 +
 /// §13 Q6). Verifies 1-of-N quorum carrying `Role::FimManage`,
-/// then signals the agent's FIM baseline subsystem to recompute.
-/// V1.0 doesn't have an in-process baseline-recompute channel
-/// yet (C7 deploy wires that alongside the FIM drain loop); for
-/// now the dispatcher writes an operator-visible info log + a
-/// `fim.baseline_pending` marker (similar shape to Tappa 8 A7
-/// shutdown_authorised marker; C7 wires the actual recompute on
-/// agent restart). The operator sees `nn-admin fim baseline:
-/// success` and the marker triggers a baseline pass at the next
-/// agent restart — sufficient for V1.0 since `fim baseline` is
-/// a "snapshot of trust" operation that's allowed to be lazy.
+/// then fires the in-process recompute channel so the running
+/// agent re-walks every watched path without an operator-driven
+/// restart (C7 closes C6's lazy deferral). When the agent boots
+/// WITHOUT a recompute channel — every legacy `serve_with_*`
+/// callsite that hasn't migrated to `serve_with_fim_state` —
+/// the dispatcher falls back to the C6 info-log shape ("scheduled
+/// for next restart") so legacy unit-test fixtures stay green.
 fn dispatch_fim_baseline(
     req: FimBaselineRequest,
     auth: &AdminAuth,
+    fim_state: Option<&FimAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
     let server_now = now_unix_secs();
@@ -1197,13 +1326,165 @@ fn dispatch_fim_baseline(
         return AdminResult::UnknownOperation;
     }
 
-    info!(
-        target: "admin.fim_baseline",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
-        "fim baseline requested — recompute scheduled for next agent restart \
-         (V1.0 lazy semantics per design §13 Q6)"
-    );
+    match fim_state {
+        Some(state) => {
+            let queued = state
+                .recompute_sender
+                .trigger(RecomputeReason::AdminRequest);
+            info!(
+                target: "admin.fim_baseline",
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                queued,
+                "fim baseline requested — recompute channel fired"
+            );
+        }
+        None => {
+            info!(
+                target: "admin.fim_baseline",
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                "fim baseline requested — recompute scheduled for next agent restart \
+                 (legacy serve_with_marker_path path; production main.rs uses \
+                 serve_with_fim_state)"
+            );
+        }
+    }
     AdminResult::Success
+}
+
+/// Tappa 9 C7 — handle one [`FimStatusRequest`] (closes the C6
+/// deferral). Verifies 1-of-N quorum carrying `Role::FimRead` and
+/// returns the in-process snapshot. Read-only — no disk-side
+/// effects. When `fim_state` is `None` (legacy serve path) the
+/// snapshot is zeroed and the result is `UnknownOperation` so a
+/// stale test fixture doesn't accidentally serve stale data; the
+/// production code path always supplies state via
+/// `serve_with_fim_state`.
+fn dispatch_fim_status(
+    req: FimStatusRequest,
+    auth: &AdminAuth,
+    fim_state: Option<&FimAdminState>,
+    fps_out: &mut Vec<String>,
+) -> FimStatusResponse {
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1, // 1-of-N per §13 Q6
+        &[Role::FimRead],
+        OperationCode::FimStatus,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return empty_fim_status(map_admin_auth_error(e, "fim-status")),
+    };
+    *fps_out = matched_fps;
+
+    if !matches!(&req.payload.extra, OperationExtra::FimStatus(_)) {
+        warn!(
+            extra = ?req.payload.extra,
+            "fim-status payload extra is not FimStatus variant"
+        );
+        return empty_fim_status(AdminResult::UnknownOperation);
+    }
+
+    let state = match fim_state {
+        Some(s) => s,
+        None => {
+            warn!("fim-status: agent boot did not wire FimAdminState — returning empty snapshot");
+            return empty_fim_status(AdminResult::UnknownOperation);
+        }
+    };
+
+    let (high_remaining, medium_remaining, bucket_window_resets_in_secs) =
+        state.rate_limiter.snapshot();
+    let (baseline_entries_total, last_baseline_ts) =
+        count_and_last_ts_jsonl(&state.baseline_log_path);
+    let (drift_entries_total, _) = count_and_last_ts_jsonl(&state.drift_log_path);
+
+    info!(
+        target: "admin.fim_status",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        watched = state.paths_summary.watched_paths_count,
+        baseline_total = baseline_entries_total,
+        drift_total = drift_entries_total,
+        "fim status served"
+    );
+
+    FimStatusResponse {
+        result: AdminResult::Success,
+        watched_paths_count: state.paths_summary.watched_paths_count,
+        disabled_default_count: state.paths_summary.disabled_default_count,
+        added_path_count: state.paths_summary.added_path_count,
+        last_baseline_ts,
+        baseline_entries_total,
+        drift_entries_total,
+        high_remaining,
+        high_cap_per_min: state.rate_limiter.high_cap_per_min(),
+        medium_remaining,
+        medium_cap_per_min: state.rate_limiter.medium_cap_per_min(),
+        bucket_window_resets_in_secs,
+    }
+}
+
+/// Build a zero/empty [`FimStatusResponse`] carrying the supplied
+/// auth `result`. Used by both the auth-failure path and the
+/// "agent boot didn't wire FIM state" fallback.
+fn empty_fim_status(result: AdminResult) -> FimStatusResponse {
+    FimStatusResponse {
+        result,
+        watched_paths_count: 0,
+        disabled_default_count: 0,
+        added_path_count: 0,
+        last_baseline_ts: String::new(),
+        baseline_entries_total: 0,
+        drift_entries_total: 0,
+        high_remaining: 0,
+        high_cap_per_min: 0,
+        medium_remaining: 0,
+        medium_cap_per_min: 0,
+        bucket_window_resets_in_secs: 0,
+    }
+}
+
+/// Count JSONL rows + return the `ts` of the last row in a
+/// chained log file at `path`. Missing file → `(0, "")`. Used by
+/// `dispatch_fim_status` for the baseline + drift counts; the
+/// chain integrity is already enforced at append time, so a
+/// best-effort line-count is appropriate here (verify happens at
+/// the dedicated `verify_chain` paths, not at every status query).
+fn count_and_last_ts_jsonl(path: &Path) -> (u32, String) {
+    use std::io::BufRead;
+    let f = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, String::new()),
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "fim-status: jsonl read failed — reporting (0, empty)"
+            );
+            return (0, String::new());
+        }
+    };
+    let reader = std::io::BufReader::new(f);
+    let mut count = 0u32;
+    let mut last_ts = String::new();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        count = count.saturating_add(1);
+        if let Some(ts) = extract_ts_field(trimmed) {
+            last_ts = ts;
+        }
+    }
+    (count, last_ts)
 }
 
 /// Tappa 9 C6 — handle one [`FimReportRequest`] (design §6.3 +
@@ -1701,7 +1982,7 @@ mod tests {
         let marker_c = marker_path.clone();
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
-                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None,
+                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None,
             )
             .await;
         });
@@ -1930,6 +2211,7 @@ mod tests {
                 isolator_c,
                 marker_c,
                 Some(signal_for_serve),
+                None,
                 None,
             )
             .await;
@@ -2318,6 +2600,59 @@ mod tests {
         assert_eq!(entries[0].extra["entries_count"], 1);
         assert_eq!(entries[0].extra["truncated"], false);
         assert_eq!(entries[0].extra["since_unix_ts"], 1_700_000_000);
+    }
+
+    /// C7 audit test: FimStatusRequest + Success response emits one
+    /// row with op="fim_status", result="success", populated key_fp,
+    /// AND the extra carrying the snapshot counts. This anchors the
+    /// audit-emit arm wired in C7 so a future refactor that drops
+    /// it would surface as a test failure rather than silently
+    /// missing fim-status from the audit chain.
+    #[test]
+    fn audit_emits_on_fim_status_success_with_extra() {
+        use common::wire::admin_protocol::{
+            FimStatusRequest, FimStatusResponse, KeyedSignature,
+        };
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_fim_status([0x77; 32], 1_700_000_000, [0x88; 16]);
+        let req = AdminMessage::FimStatusRequest(FimStatusRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::FimStatusResponse(FimStatusResponse {
+            result: AdminResult::Success,
+            watched_paths_count: 142,
+            disabled_default_count: 3,
+            added_path_count: 5,
+            last_baseline_ts: "2026-05-20T08:14:02.123456Z".to_string(),
+            baseline_entries_total: 142,
+            drift_entries_total: 17,
+            high_remaining: 42,
+            high_cap_per_min: 50,
+            medium_remaining: 87,
+            medium_cap_per_min: 100,
+            bucket_window_resets_in_secs: 23,
+        });
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["cccccccc".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "fim_status");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].key_fp, "cccccccc");
+        // Extra surfaces the snapshot counts.
+        assert_eq!(entries[0].extra["watched_paths_count"], 142);
+        assert_eq!(entries[0].extra["disabled_default_count"], 3);
+        assert_eq!(entries[0].extra["added_path_count"], 5);
+        assert_eq!(entries[0].extra["baseline_entries_total"], 142);
+        assert_eq!(entries[0].extra["drift_entries_total"], 17);
     }
 
     /// C6 audit test #3: a fim-baseline RoleDenied result still

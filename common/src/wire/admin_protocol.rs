@@ -247,6 +247,56 @@ pub struct FimReportRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Tappa 9 commit C7 — signed FIM in-process status request
+/// (C6 deferral). 1-of-N quorum (single-sig, `Role::FimRead`).
+/// Read-only: surfaces token-bucket counts, watched-path count,
+/// last baseline ts. No on-disk side effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimStatusRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9 commit C7 — `FimStatus` reply payload. On success
+/// carries the live in-process snapshot. On failure, `result`
+/// carries the auth/quorum/role error and the other fields are
+/// zero/empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimStatusResponse {
+    /// Auth result — `Success` when the snapshot fields follow.
+    pub result: AdminResult,
+    /// Effective watched-paths set size (after `fim-paths.local`
+    /// add+disable merge per §13 Q7). The headline operator
+    /// summary line.
+    pub watched_paths_count: u32,
+    /// Default-list paths the operator overlay disabled. Surfaces
+    /// the §13 Q7 lock-in ("no silent hiding") to the CLI.
+    pub disabled_default_count: u32,
+    /// Operator-added paths (overlay `+` lines or bare-path lines).
+    pub added_path_count: u32,
+    /// ISO-8601 `ts` of the most recent `BaselineEntry` row, or
+    /// empty when the baseline DB is empty (pre-TOFU first boot,
+    /// or pre-C7 deploy).
+    pub last_baseline_ts: String,
+    /// Total `BaselineEntry` rows the chain currently holds.
+    pub baseline_entries_total: u32,
+    /// Total `FimDriftEntry` rows the chain currently holds.
+    pub drift_entries_total: u32,
+    /// Current token-bucket state for the §6.5 hierarchical
+    /// rate-limiter. `Critical` is always uncapped per §13 Q4
+    /// lock-in; the snapshot reports `high_remaining` and
+    /// `medium_remaining` against the configured caps.
+    pub high_remaining: u32,
+    pub high_cap_per_min: u32,
+    pub medium_remaining: u32,
+    pub medium_cap_per_min: u32,
+    /// Seconds until the current 60-second token-bucket window
+    /// rolls over. `0` immediately after a roll. Helps the
+    /// operator decide whether observed throttling is about to
+    /// release on its own.
+    pub bucket_window_resets_in_secs: u32,
+}
+
 /// Tappa 9 commit C6 — `FimReport` reply payload. On success
 /// carries the chain entries the operator's `nn-admin fim
 /// report` reads + the count for the summary line. On
@@ -386,6 +436,12 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::FimReportRequest`] — carries
     /// the chained JSONL body on success.
     FimReportResponse(FimReportResponse),
+    /// Tappa 9 commit C7 — signed FIM in-process status request
+    /// (C6 deferral). Triggers [`AdminMessage::FimStatusResponse`].
+    FimStatusRequest(FimStatusRequest),
+    /// Reply to [`AdminMessage::FimStatusRequest`] — carries the
+    /// live status snapshot.
+    FimStatusResponse(FimStatusResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -830,7 +886,9 @@ mod tests {
                 | AdminMessage::FimBaselineRequest(_)
                 | AdminMessage::FimBaselineResult(_)
                 | AdminMessage::FimReportRequest(_)
-                | AdminMessage::FimReportResponse(_) => {}
+                | AdminMessage::FimReportResponse(_)
+                | AdminMessage::FimStatusRequest(_)
+                | AdminMessage::FimStatusResponse(_) => {}
             }
         }
     }
@@ -929,6 +987,51 @@ mod tests {
             entries_jsonl: String::new(),
             entries_count: 0,
             entries_truncated: false,
+        }));
+    }
+
+    // ── C7: FimStatus wire round-trip ──────────────────────────
+
+    /// C7 wire test: `FimStatusRequest` + `FimStatusResponse`
+    /// round-trip including the full snapshot fields. The
+    /// auth-failure variant is also covered so dispatch's
+    /// "result-carries-error, fields-zero" contract is anchored.
+    #[test]
+    fn roundtrip_fim_status_request_and_response() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_fim_status([0xAA; 32], 1_700_000_000, [0xBB; 16]);
+        roundtrip(AdminMessage::FimStatusRequest(FimStatusRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0xCC; 64] }],
+        }));
+        roundtrip(AdminMessage::FimStatusResponse(FimStatusResponse {
+            result: AdminResult::Success,
+            watched_paths_count: 142,
+            disabled_default_count: 3,
+            added_path_count: 5,
+            last_baseline_ts: "2026-05-20T08:14:02.123456Z".to_string(),
+            baseline_entries_total: 142,
+            drift_entries_total: 17,
+            high_remaining: 42,
+            high_cap_per_min: 50,
+            medium_remaining: 87,
+            medium_cap_per_min: 100,
+            bucket_window_resets_in_secs: 23,
+        }));
+        // Auth-failure variant: empty + zero fields.
+        roundtrip(AdminMessage::FimStatusResponse(FimStatusResponse {
+            result: AdminResult::RoleDenied,
+            watched_paths_count: 0,
+            disabled_default_count: 0,
+            added_path_count: 0,
+            last_baseline_ts: String::new(),
+            baseline_entries_total: 0,
+            drift_entries_total: 0,
+            high_remaining: 0,
+            high_cap_per_min: 0,
+            medium_remaining: 0,
+            medium_cap_per_min: 0,
+            bucket_window_resets_in_secs: 0,
         }));
     }
 

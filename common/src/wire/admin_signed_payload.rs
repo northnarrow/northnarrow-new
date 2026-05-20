@@ -106,6 +106,11 @@ pub enum OperationCode {
     /// Tappa 9 (C1) — operator-initiated read of the chained
     /// `fim_drift.jsonl`. Authorised by `Role::FimRead`.
     FimReport = 8,
+    /// Tappa 9 (C7) — operator-initiated read of in-process FIM
+    /// state: token-bucket counts, paths watched, last baseline
+    /// timestamp. No on-disk side effects. Authorised by
+    /// `Role::FimRead` (read-only).
+    FimStatus = 9,
 }
 
 impl From<OperationCode> for u8 {
@@ -126,6 +131,7 @@ impl TryFrom<u8> for OperationCode {
             6 => Ok(Self::AuditRead),
             7 => Ok(Self::FimBaseline),
             8 => Ok(Self::FimReport),
+            9 => Ok(Self::FimStatus),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -258,6 +264,14 @@ pub struct FimReportExtra {
     pub since_unix_ts: Option<u64>,
 }
 
+/// Op-specific signed-scope fields for [`OperationCode::FimStatus`]
+/// (Tappa 9 C7 — C6 deferral). Empty today; the response carries
+/// the entire status snapshot. Kept as a named struct (not a unit
+/// variant) so a future filter field can be added without an op
+/// renumber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FimStatusExtra {}
+
 /// Discriminated union of every op-specific extra. The variant order
 /// MUST track [`OperationCode`] (Unlock, Shutdown, …); a SignedPayload
 /// whose `op` and `extra` variants disagree is well-formed at the
@@ -275,6 +289,8 @@ pub enum OperationExtra {
     FimBaseline(FimBaselineExtra),
     /// Tappa 9 (C1). Pairs with [`OperationCode::FimReport`].
     FimReport(FimReportExtra),
+    /// Tappa 9 (C7). Pairs with [`OperationCode::FimStatus`].
+    FimStatus(FimStatusExtra),
 }
 
 impl OperationExtra {
@@ -291,6 +307,7 @@ impl OperationExtra {
             OperationExtra::AuditRead(_) => OperationCode::AuditRead,
             OperationExtra::FimBaseline(_) => OperationCode::FimBaseline,
             OperationExtra::FimReport(_) => OperationCode::FimReport,
+            OperationExtra::FimStatus(_) => OperationCode::FimStatus,
         }
     }
 }
@@ -553,6 +570,20 @@ impl SignedPayload {
             extra: OperationExtra::FimReport(FimReportExtra { since_unix_ts }),
         }
     }
+
+    /// Tappa 9 (C7) — `fim status` signed payload constructor.
+    /// Read-only op surfacing the in-process FIM state snapshot;
+    /// extra is empty since the response carries the entire
+    /// snapshot.
+    pub fn new_fim_status(nonce: [u8; 32], ts: u64, agent_id: [u8; 16]) -> Self {
+        Self {
+            op: OperationCode::FimStatus,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::FimStatus(FimStatusExtra {}),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -578,11 +609,9 @@ mod tests {
 
     /// Helper: build one [`SignedPayload`] per [`OperationCode`] so
     /// each test can iterate over all operations in one place.
-    /// Tappa 9 (C1) grew the array from 6 to 8 with the new
-    /// `FimBaseline` and `FimReport` constructors so sign-verify
-    /// round-trip, cbor determinism, and op/extra invariant tests
-    /// automatically cover the new ops.
-    fn one_payload_per_op() -> [SignedPayload; 8] {
+    /// Tappa 9 (C1) grew the array from 6 to 8 with `FimBaseline`
+    /// and `FimReport`; Tappa 9 (C7) added `FimStatus`.
+    fn one_payload_per_op() -> [SignedPayload; 9] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -598,6 +627,7 @@ mod tests {
             SignedPayload::new_audit_read(nonce(), TS, agent_id(), Some(1_700_000_000)),
             SignedPayload::new_fim_baseline(nonce(), TS, agent_id()),
             SignedPayload::new_fim_report(nonce(), TS, agent_id(), Some(1_700_000_000)),
+            SignedPayload::new_fim_status(nonce(), TS, agent_id()),
         ]
     }
 
@@ -768,6 +798,8 @@ mod tests {
             // Tappa 9 (C1) additions — APPENDED, never renumber.
             (OperationCode::FimBaseline, 7),
             (OperationCode::FimReport, 8),
+            // Tappa 9 (C7) — APPENDED, never renumber.
+            (OperationCode::FimStatus, 9),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -845,22 +877,23 @@ mod tests {
         }
     }
 
-    /// C1 test #6 — focused coverage of the two new
+    /// C1 + C7 test — focused coverage of the three FIM
     /// [`SignedPayload`] constructors (`new_fim_baseline` +
-    /// `new_fim_report`): each produces a payload whose
-    /// `op` agrees with its `extra` variant tag, signs + verifies
-    /// against a fresh keypair, and round-trips through cbor
-    /// without bit-level drift. The other 5 tests in this module
-    /// pick up the new ops automatically via `one_payload_per_op`,
-    /// but this anchors them explicitly so a future refactor
-    /// that drops them from the helper still leaves the wire
-    /// coverage intact.
+    /// `new_fim_report` + `new_fim_status`): each produces a
+    /// payload whose `op` agrees with its `extra` variant tag,
+    /// signs + verifies against a fresh keypair, and round-trips
+    /// through cbor without bit-level drift. The other tests in
+    /// this module pick up the new ops automatically via
+    /// `one_payload_per_op`, but this anchors them explicitly so
+    /// a future refactor that drops them from the helper still
+    /// leaves the wire coverage intact.
     #[test]
     fn new_fim_constructors_round_trip_sign_and_verify() {
         let (signing, verifying) = fixed_keypair();
         for payload in [
             SignedPayload::new_fim_baseline(nonce(), TS, agent_id()),
             SignedPayload::new_fim_report(nonce(), TS, agent_id(), Some(1_700_000_000)),
+            SignedPayload::new_fim_status(nonce(), TS, agent_id()),
         ] {
             // op/extra invariant holds by construction.
             assert_eq!(payload.op, payload.extra.op_code());
