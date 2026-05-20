@@ -186,6 +186,18 @@ impl CanaryIndexes {
         self.name_index.get(canary_id).cloned()
     }
 
+    /// K6 admin-deploy helper: add a File/Credential canary's
+    /// path into the `exe_index`-shaped path lookup so the K3
+    /// detector's path-based fallback (V1.0 pragmatism while
+    /// FimEvent doesn't carry inode keys) matches on the
+    /// next inbound event. K6's `rebuild_canary_indexes` calls
+    /// this for every File + Credential entry after the
+    /// rebuild_from_registry call populates Process + Network
+    /// indexes naturally.
+    pub fn add_file_path_index(&mut self, path: PathBuf, canary_id: String) {
+        self.exe_index.insert(path, canary_id);
+    }
+
     /// Active canary count (sum across all three index types
     /// since each canary lives in exactly one). Useful for
     /// boot logs + future `nn-admin canary status`.
@@ -794,5 +806,29 @@ mod tests {
         }
         // After everything: 20 canaries deployed; no panics.
         assert_eq!(registry.lock().len(), 20);
+    }
+
+    /// K6 detector test: `add_file_path_index` is the public
+    /// hook the K6 dispatch helper `rebuild_canary_indexes` uses
+    /// to layer File + Credential canary paths into the
+    /// `exe_index` HashMap (the K3 path-based fallback while
+    /// FimEvent doesn't carry (dev, ino)). This test pins the
+    /// shape: after `add_file_path_index(path, id)`, the
+    /// `is_canary_exe(path)` lookup returns Some(id).
+    #[test]
+    fn add_file_path_index_makes_path_queryable_via_is_canary_exe() {
+        use std::path::PathBuf;
+        let mut idx = CanaryIndexes::new();
+        assert!(idx.is_empty());
+        idx.add_file_path_index(
+            PathBuf::from("/var/lib/northnarrow/canaries/aws.creds"),
+            "abc123def4567890".to_string(),
+        );
+        assert_eq!(idx.len(), 1);
+        assert_eq!(
+            idx.is_canary_exe(Path::new("/var/lib/northnarrow/canaries/aws.creds")),
+            Some("abc123def4567890")
+        );
+        assert!(idx.is_canary_exe(Path::new("/other/path")).is_none());
     }
 }

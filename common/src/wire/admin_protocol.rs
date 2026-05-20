@@ -334,6 +334,72 @@ pub struct FimReportResponse {
     pub entries_truncated: bool,
 }
 
+/// Tappa 9.5 commit K6 — signed canary deploy request. Carries
+/// `op = CanaryDeploy` with the operator's chosen canary name +
+/// type + deployment payload in
+/// [`common::wire::admin_signed_payload::CanaryDeployExtra`].
+/// 1-of-N quorum, `Role::CanaryManage` (§12 Q7 split-role
+/// lock-in).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryDeployRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9.5 commit K6 — `CanaryDeploy` reply payload. Success
+/// carries the freshly-allocated `canary_id` so the operator can
+/// reference the deployment in future burn / refresh ops; on
+/// failure, `result` carries the auth/quorum/role error and
+/// `canary_id` is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryDeployResponse {
+    pub result: AdminResult,
+    /// 32-hex-char per-canary stable ID from the K2 registry.
+    /// Empty on auth failure.
+    pub canary_id: String,
+}
+
+/// Tappa 9.5 commit K6 — signed canary list request. 1-of-N
+/// quorum, `Role::CanaryRead` (read-only lower-privilege role
+/// per §12 Q7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryListRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9.5 commit K6 — `CanaryList` reply payload. Same
+/// truncation-aware shape as `FimReportResponse` — the chained
+/// registry rows go in `entries_jsonl` (one row per line);
+/// `entries_count` lets the CLI render a summary line without
+/// re-parsing; `entries_truncated` surfaces when the body
+/// exceeded the wire-frame budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryListResponse {
+    pub result: AdminResult,
+    pub entries_jsonl: String,
+    pub entries_count: u32,
+    pub entries_truncated: bool,
+}
+
+/// Tappa 9.5 commit K6 — signed canary burn request. 1-of-N
+/// quorum, `Role::CanaryManage`. The `canary_id` field rides
+/// in [`common::wire::admin_signed_payload::CanaryBurnExtra`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryBurnRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9.5 commit K6 — signed canary refresh request. 1-of-N
+/// quorum, `Role::CanaryManage`. Per §12 Q2 MANUAL-ONLY lock-in
+/// — only operator action clears the `tripped` flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryRefreshRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
 /// Trigger payload for "issue me a fresh challenge nonce". Empty
 /// today; reserved as a struct so future fields (client version,
 /// requested key fingerprint) can be added without an AdminMessage
@@ -452,6 +518,31 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::FimStatusRequest`] — carries the
     /// live status snapshot.
     FimStatusResponse(FimStatusResponse),
+    /// Tappa 9.5 commit K6 — signed canary deploy request.
+    /// Triggers [`AdminMessage::CanaryDeployResponse`].
+    CanaryDeployRequest(CanaryDeployRequest),
+    /// Reply to [`AdminMessage::CanaryDeployRequest`] — carries
+    /// the freshly-allocated `canary_id` on success.
+    CanaryDeployResponse(CanaryDeployResponse),
+    /// Tappa 9.5 commit K6 — signed canary list request.
+    /// Triggers [`AdminMessage::CanaryListResponse`].
+    CanaryListRequest(CanaryListRequest),
+    /// Reply to [`AdminMessage::CanaryListRequest`] — carries
+    /// the chained registry JSONL body on success.
+    CanaryListResponse(CanaryListResponse),
+    /// Tappa 9.5 commit K6 — signed canary burn request.
+    /// Triggers [`AdminMessage::CanaryBurnResult`].
+    CanaryBurnRequest(CanaryBurnRequest),
+    /// Reply to [`AdminMessage::CanaryBurnRequest`]. Uses the
+    /// bare `AdminResult` superset; no per-op state to surface
+    /// beyond success/failure.
+    CanaryBurnResult(AdminResult),
+    /// Tappa 9.5 commit K6 — signed canary refresh request.
+    /// Triggers [`AdminMessage::CanaryRefreshResult`].
+    CanaryRefreshRequest(CanaryRefreshRequest),
+    /// Reply to [`AdminMessage::CanaryRefreshRequest`]. Bare
+    /// `AdminResult` — same rationale as `CanaryBurnResult`.
+    CanaryRefreshResult(AdminResult),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -898,7 +989,15 @@ mod tests {
                 | AdminMessage::FimReportRequest(_)
                 | AdminMessage::FimReportResponse(_)
                 | AdminMessage::FimStatusRequest(_)
-                | AdminMessage::FimStatusResponse(_) => {}
+                | AdminMessage::FimStatusResponse(_)
+                | AdminMessage::CanaryDeployRequest(_)
+                | AdminMessage::CanaryDeployResponse(_)
+                | AdminMessage::CanaryListRequest(_)
+                | AdminMessage::CanaryListResponse(_)
+                | AdminMessage::CanaryBurnRequest(_)
+                | AdminMessage::CanaryBurnResult(_)
+                | AdminMessage::CanaryRefreshRequest(_)
+                | AdminMessage::CanaryRefreshResult(_) => {}
             }
         }
     }
@@ -1058,6 +1157,98 @@ mod tests {
             medium_cap_per_min: 0,
             bucket_window_resets_in_secs: 0,
         }));
+    }
+
+    // ── K6: canary admin op wire round-trips ───────────────────
+
+    /// K6 wire test #1: `CanaryDeployRequest` +
+    /// `CanaryDeployResponse` round-trip including the
+    /// canary_id surfaced on success + the auth-failure variant
+    /// (empty canary_id when result != Success).
+    #[test]
+    fn roundtrip_canary_deploy_request_and_response() {
+        use crate::wire::admin_signed_payload::{
+            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
+        };
+        let payload = SignedPayload::new_canary_deploy(
+            [0x10; 32],
+            1_700_000_000,
+            [0x20; 16],
+            "test_canary".to_string(),
+            CanaryTypeWire::File,
+            CanaryDeploymentWire::File {
+                path: "/tmp/decoy.txt".to_string(),
+                template: None,
+            },
+        );
+        roundtrip(AdminMessage::CanaryDeployRequest(CanaryDeployRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0x33; 64] }],
+        }));
+        roundtrip(AdminMessage::CanaryDeployResponse(CanaryDeployResponse {
+            result: AdminResult::Success,
+            canary_id: "9f3c8a01b2c3d4e5f6a7b8c9d0e1f2a3".to_string(),
+        }));
+        roundtrip(AdminMessage::CanaryDeployResponse(CanaryDeployResponse {
+            result: AdminResult::RoleDenied,
+            canary_id: String::new(),
+        }));
+    }
+
+    /// K6 wire test #2: `CanaryListRequest` +
+    /// `CanaryListResponse` round-trip including the truncation
+    /// flag + the auth-failure variant (empty body).
+    #[test]
+    fn roundtrip_canary_list_request_and_response() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_canary_list([0x44; 32], 1_700_000_000, [0x55; 16]);
+        roundtrip(AdminMessage::CanaryListRequest(CanaryListRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0x77; 64] }],
+        }));
+        roundtrip(AdminMessage::CanaryListResponse(CanaryListResponse {
+            result: AdminResult::Success,
+            entries_jsonl: r#"{"ts":"2026-05-20T00:00:00Z","canary_id":"abc"}"#.to_string(),
+            entries_count: 1,
+            entries_truncated: true,
+        }));
+        roundtrip(AdminMessage::CanaryListResponse(CanaryListResponse {
+            result: AdminResult::RoleDenied,
+            entries_jsonl: String::new(),
+            entries_count: 0,
+            entries_truncated: false,
+        }));
+    }
+
+    /// K6 wire test #3: `CanaryBurnRequest` + `CanaryBurnResult`
+    /// round-trip. Both burn + refresh use the bare AdminResult
+    /// superset for their reply — same shape, anchored together.
+    #[test]
+    fn roundtrip_canary_burn_and_refresh_request_response() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let burn_payload = SignedPayload::new_canary_burn(
+            [0xAA; 32],
+            1_700_000_000,
+            [0xBB; 16],
+            "9f3c8a01b2c3d4e5f6a7b8c9d0e1f2a3".to_string(),
+        );
+        roundtrip(AdminMessage::CanaryBurnRequest(CanaryBurnRequest {
+            payload: burn_payload,
+            signatures: vec![KeyedSignature { signature: [0xCC; 64] }],
+        }));
+        roundtrip(AdminMessage::CanaryBurnResult(AdminResult::Success));
+
+        let refresh_payload = SignedPayload::new_canary_refresh(
+            [0xDD; 32],
+            1_700_000_000,
+            [0xEE; 16],
+            "9f3c8a01b2c3d4e5f6a7b8c9d0e1f2a3".to_string(),
+        );
+        roundtrip(AdminMessage::CanaryRefreshRequest(CanaryRefreshRequest {
+            payload: refresh_payload,
+            signatures: vec![KeyedSignature { signature: [0xFF; 64] }],
+        }));
+        roundtrip(AdminMessage::CanaryRefreshResult(AdminResult::RoleDenied));
     }
 
     // ── A1: VersionedAdminMessage envelope (Tappa 8 design §6.2) ────

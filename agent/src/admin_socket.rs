@@ -28,10 +28,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, FimBaselineRequest,
-    FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
-    RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, UnlockResult,
-    MAX_FRAME_BODY,
+    decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
+    CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
+    FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
+    ForcePostureRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
+    StatusResponse, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use ed25519_dalek::VerifyingKey;
@@ -40,6 +41,8 @@ use sha2::{Digest, Sha256};
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::canary::detector::CanaryIndexes;
+use crate::canary::registry::{CanaryTokenDraft, Registry, RegistryError};
 use crate::fim::drain::DriftRateLimiter;
 use crate::fim::recompute::{BaselineRecomputeSender, RecomputeReason};
 use crate::posture::{AdminReleaseError, PostureMachine};
@@ -156,6 +159,48 @@ impl WatchedPathsSummary {
     }
 }
 
+/// Tappa 9.5 K6 — canary admin-socket state bundle. Threaded
+/// through dispatch so the 4 canary admin ops (deploy / list /
+/// burn / refresh) can mutate the K2 registry + the K3
+/// detector indexes from a single signed admin call.
+///
+/// All fields are `Arc`-shared with the K3 [`Detector`] that
+/// main.rs hands into `process_event` — same handle, so an
+/// admin `canary deploy` immediately becomes visible to the
+/// detector's hot-path lookups on the next inbound
+/// `Event::Fim` / `Event::ProcessSpawn`. The Indexes lock
+/// width on rebuild is ~µs per deployed canary (operator
+/// scale, ~10-50 deployments per host).
+#[derive(Clone)]
+pub struct CanaryAdminState {
+    /// K2 registry handle (shared with the K3 detector).
+    /// dispatch_canary_deploy / burn / refresh take the
+    /// write-lock; dispatch_canary_list takes the read-lock
+    /// via `Registry::list()`.
+    pub registry: Arc<Mutex<Registry>>,
+    /// K3 hot-path indexes (shared with the K3 detector).
+    /// Rebuilt by every successful deploy / burn / refresh so
+    /// the detector's `is_canary_*` lookups see the new state
+    /// immediately. Indexes rebuild reads the registry's live
+    /// set + a stat-based inode_resolver (filled on
+    /// File/Credential canaries; `None` returner for
+    /// Process/Network).
+    pub indexes: Arc<Mutex<CanaryIndexes>>,
+    /// Path to the on-disk K2 registry log
+    /// (`/var/lib/northnarrow/canaries.jsonl`). dispatch_canary_list
+    /// reads the chain JSONL from here, returns it in the
+    /// `CanaryListResponse::entries_jsonl` field with the
+    /// truncation flag (same shape as `FimReportResponse`).
+    pub registry_log_path: PathBuf,
+    /// Operator-overrideable template directory for the K4
+    /// cred-canary renderer. Defaults to
+    /// `/etc/northnarrow/canary-templates/`; tests inject a
+    /// tempdir for isolation. `None` means "built-in only" —
+    /// the K4 renderer's `include_str!` defaults handle that
+    /// case cleanly.
+    pub template_dir: Option<PathBuf>,
+}
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
 /// agent's main loop is expected to also exit on the same condition.
@@ -188,6 +233,7 @@ pub async fn serve(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -215,6 +261,7 @@ pub async fn serve_with_audit_log(
         marker_path,
         shutdown_signal,
         Some(audit_log),
+        None,
         None,
     )
     .await
@@ -248,6 +295,38 @@ pub async fn serve_with_fim_state(
         shutdown_signal,
         audit_log,
         Some(fim_state),
+        None,
+    )
+    .await
+}
+
+/// Tappa 9.5 K6 production entry-point — adds the canary
+/// admin state bundle alongside fim state. main.rs constructs
+/// the [`CanaryAdminState`] (registry + indexes + log path)
+/// at boot via the same [`Detector::new`] handles fed to
+/// `process_event`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_canary_state(
+    socket_path: PathBuf,
+    auth: Arc<AdminAuth>,
+    posture: Arc<PostureMachine>,
+    isolator: Arc<NetworkIsolator>,
+    marker_path: PathBuf,
+    shutdown_signal: Option<ShutdownSignal>,
+    audit_log: Option<Arc<Mutex<AuditLog>>>,
+    fim_state: Option<Arc<FimAdminState>>,
+    canary_state: Arc<CanaryAdminState>,
+) -> Result<()> {
+    serve_with_marker_path(
+        socket_path,
+        auth,
+        posture,
+        isolator,
+        marker_path,
+        shutdown_signal,
+        audit_log,
+        fim_state,
+        Some(canary_state),
     )
     .await
 }
@@ -271,6 +350,7 @@ pub async fn serve_with_marker_path(
     shutdown_signal: Option<ShutdownSignal>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     fim_state: Option<Arc<FimAdminState>>,
+    canary_state: Option<Arc<CanaryAdminState>>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -306,6 +386,7 @@ pub async fn serve_with_marker_path(
         let shutdown_signal = shutdown_signal.clone();
         let audit_log = audit_log.clone();
         let fim_state = fim_state.clone();
+        let canary_state = canary_state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -316,6 +397,7 @@ pub async fn serve_with_marker_path(
                 shutdown_signal.as_ref(),
                 audit_log.as_ref(),
                 fim_state.as_ref(),
+                canary_state.as_ref(),
             )
             .await
             {
@@ -349,6 +431,7 @@ async fn handle_connection(
     shutdown_signal: Option<&ShutdownSignal>,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
     fim_state: Option<&Arc<FimAdminState>>,
+    canary_state: Option<&Arc<CanaryAdminState>>,
 ) -> Result<()> {
     // Capture peer creds once per connection — the audit log
     // wants pid/uid/comm of the caller, and a single connection
@@ -369,6 +452,7 @@ async fn handle_connection(
             marker_path,
             shutdown_signal,
             fim_state.map(|s| s.as_ref()),
+            canary_state.map(|s| s.as_ref()),
             &mut matched_fps,
         );
         emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
@@ -569,6 +653,76 @@ fn emit_audit_for(
             audit_result_str(resp.result),
             req.signatures.len().saturating_sub(1),
         ),
+        // K6: 4 canary admin ops. Each row carries the canary_id
+        // for the chain (deploy populates it from the response;
+        // burn/refresh from the request's extra). Operator
+        // `nn-admin audit read` greps by canary_id for the
+        // lifecycle trail across the audit chain + the K2
+        // registry chain.
+        (
+            AdminMessage::CanaryDeployRequest(req),
+            AdminMessage::CanaryDeployResponse(resp),
+        ) => {
+            let (name, family) = match &req.payload.extra {
+                OperationExtra::CanaryDeploy(e) => {
+                    let family = match &e.deployment {
+                        common::wire::admin_signed_payload::CanaryDeploymentWire::Credential {
+                            cred_family,
+                            ..
+                        } => cred_family.clone(),
+                        _ => String::new(),
+                    };
+                    (e.name.clone(), family)
+                }
+                _ => (String::new(), String::new()),
+            };
+            (
+                "canary_deploy",
+                serde_json::json!({
+                    "name": name,
+                    "canary_id": resp.canary_id,
+                    "cred_family": family,
+                }),
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (AdminMessage::CanaryListRequest(req), AdminMessage::CanaryListResponse(resp)) => (
+            "canary_list",
+            serde_json::json!({
+                "entries_count": resp.entries_count,
+                "truncated": resp.entries_truncated,
+            }),
+            audit_result_str(resp.result),
+            req.signatures.len().saturating_sub(1),
+        ),
+        (AdminMessage::CanaryBurnRequest(req), AdminMessage::CanaryBurnResult(r)) => {
+            let canary_id = match &req.payload.extra {
+                OperationExtra::CanaryBurn(e) => e.canary_id.clone(),
+                _ => String::new(),
+            };
+            (
+                "canary_burn",
+                serde_json::json!({ "canary_id": canary_id }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (
+            AdminMessage::CanaryRefreshRequest(req),
+            AdminMessage::CanaryRefreshResult(r),
+        ) => {
+            let canary_id = match &req.payload.extra {
+                OperationExtra::CanaryRefresh(e) => e.canary_id.clone(),
+                _ => String::new(),
+            };
+            (
+                "canary_refresh",
+                serde_json::json!({ "canary_id": canary_id }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -661,6 +815,7 @@ fn dispatch(
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
     fim_state: Option<&FimAdminState>,
+    canary_state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminMessage {
     match msg {
@@ -788,6 +943,22 @@ fn dispatch(
             AdminMessage::FimStatusResponse(dispatch_fim_status(req, auth, fim_state, fps_out))
         }
 
+        AdminMessage::CanaryDeployRequest(req) => AdminMessage::CanaryDeployResponse(
+            dispatch_canary_deploy(req, auth, canary_state, fps_out),
+        ),
+
+        AdminMessage::CanaryListRequest(req) => {
+            AdminMessage::CanaryListResponse(dispatch_canary_list(req, auth, canary_state, fps_out))
+        }
+
+        AdminMessage::CanaryBurnRequest(req) => {
+            AdminMessage::CanaryBurnResult(dispatch_canary_burn(req, auth, canary_state, fps_out))
+        }
+
+        AdminMessage::CanaryRefreshRequest(req) => AdminMessage::CanaryRefreshResult(
+            dispatch_canary_refresh(req, auth, canary_state, fps_out),
+        ),
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -800,7 +971,11 @@ fn dispatch(
         | AdminMessage::RotateKeysRevokeResult(_)
         | AdminMessage::FimBaselineResult(_)
         | AdminMessage::FimReportResponse(_)
-        | AdminMessage::FimStatusResponse(_) => {
+        | AdminMessage::FimStatusResponse(_)
+        | AdminMessage::CanaryDeployResponse(_)
+        | AdminMessage::CanaryListResponse(_)
+        | AdminMessage::CanaryBurnResult(_)
+        | AdminMessage::CanaryRefreshResult(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -1681,6 +1856,486 @@ async fn write_frame(stream: &mut UnixStream, msg: &AdminMessage) -> Result<()> 
     Ok(())
 }
 
+// ── Tappa 9.5 K6 — canary admin dispatch handlers ───────────────────
+
+/// Rebuild the K3 detector's hot-path indexes from the K2
+/// registry snapshot. Called by every successful canary
+/// deploy / burn / refresh dispatch so the detector sees the
+/// new state on the next inbound `Event::Fim` /
+/// `Event::ProcessSpawn`. The `inode_resolver` closure
+/// stats() each File/Credential canary path to populate the
+/// inode_index — files that don't yet exist (deploy race)
+/// fall back to the path-based exe_index pathway K3 already
+/// uses (V1.0 pragmatism documented in K3 module doc).
+fn rebuild_canary_indexes(state: &CanaryAdminState) {
+    use common::wire::admin_signed_payload::CanaryDeploymentWire;
+    use common::wire::InodeKey;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    // The K3 detector's `is_canary_exe` HashMap also serves
+    // as the File/Credential path lookup (per the K3 V1.0
+    // pragmatism note). We populate it here from the
+    // deployment.path of every File + Credential canary AND
+    // from the deployment.path of every Process canary. The
+    // rebuild_from_registry helper's match arms only populate
+    // exe_index for Process today, so K6 has to layer the
+    // File/Credential paths in after the rebuild.
+    let mut idx = state.indexes.lock();
+    let reg = state.registry.lock();
+    idx.rebuild_from_registry(&reg, |path: &Path| {
+        std::fs::symlink_metadata(path).ok().map(|m| {
+            let st_dev = m.dev();
+            let major = libc::major(st_dev) as u64;
+            let minor = libc::minor(st_dev) as u64;
+            InodeKey {
+                dev: (major << 20) | minor,
+                ino: m.ino(),
+            }
+        })
+    });
+    // Layer File + Credential paths into the exe_index so the
+    // K3 path-based fallback matches. The K3 V1.0 detector
+    // uses the same `exe_index` HashMap for both Process exe
+    // paths AND File/Credential paths.
+    for canary in reg.list() {
+        match &canary.deployment {
+            CanaryDeploymentWire::File { path, .. }
+            | CanaryDeploymentWire::Credential { path, .. } => {
+                idx.add_file_path_index(path.into(), canary.canary_id.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// dispatch_canary_deploy — verify 1-of-N quorum with
+/// Role::CanaryManage, render template (for Credential
+/// canaries) + write the canary file to disk (for
+/// File/Credential), call Registry::deploy, rebuild indexes,
+/// return the freshly-allocated canary_id. Per §12 Q1
+/// EXPLICIT-PER-HOST lock-in: this is the ONLY way canaries
+/// get on-host (no default deployments).
+fn dispatch_canary_deploy(
+    req: CanaryDeployRequest,
+    auth: &AdminAuth,
+    state: Option<&CanaryAdminState>,
+    fps_out: &mut Vec<String>,
+) -> CanaryDeployResponse {
+    use common::wire::admin_signed_payload::OperationExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::CanaryManage],
+        OperationCode::CanaryDeploy,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return CanaryDeployResponse {
+                result: map_admin_auth_error(e, "canary-deploy"),
+                canary_id: String::new(),
+            };
+        }
+    };
+    *fps_out = matched_fps;
+
+    let extra = match &req.payload.extra {
+        OperationExtra::CanaryDeploy(e) => e.clone(),
+        _ => {
+            warn!("canary-deploy payload extra is not CanaryDeploy variant");
+            return CanaryDeployResponse {
+                result: AdminResult::UnknownOperation,
+                canary_id: String::new(),
+            };
+        }
+    };
+
+    let state = match state {
+        Some(s) => s,
+        None => {
+            warn!("canary-deploy: agent boot did not wire CanaryAdminState — rejecting");
+            return CanaryDeployResponse {
+                result: AdminResult::UnknownOperation,
+                canary_id: String::new(),
+            };
+        }
+    };
+
+    // For File + Credential types: render the file content +
+    // write to the deployment path. The K3 detector matches
+    // on the resulting inode (after rebuild_canary_indexes
+    // stats it).
+    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+    if let Err(e) = materialise_canary_file(&extra.deployment, state, &primary_fp) {
+        warn!(
+            error = %e,
+            "canary-deploy: file materialisation failed"
+        );
+        return CanaryDeployResponse {
+            result: AdminResult::UnknownOperation,
+            canary_id: String::new(),
+        };
+    }
+
+    // Deploy via the K2 registry. Allocates the canary_id +
+    // appends the Deploy row to the chain.
+    let draft = CanaryTokenDraft {
+        name: extra.name.clone(),
+        canary_type: extra.canary_type,
+        deployment: extra.deployment.clone(),
+        deployed_by_fp: primary_fp.clone(),
+    };
+    let entry = {
+        let mut reg = state.registry.lock();
+        match reg.deploy(draft) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "canary registry deploy failed");
+                return CanaryDeployResponse {
+                    result: AdminResult::UnknownOperation,
+                    canary_id: String::new(),
+                };
+            }
+        }
+    };
+
+    // Refresh the K3 detector's hot-path indexes so the new
+    // canary is visible to the next inbound event.
+    rebuild_canary_indexes(state);
+
+    info!(
+        target: "admin.canary_deploy",
+        signer_fp = %primary_fp,
+        canary_id = %entry.canary_id,
+        canary_name = %entry.name,
+        "canary deployed"
+    );
+    CanaryDeployResponse {
+        result: AdminResult::Success,
+        canary_id: entry.canary_id,
+    }
+}
+
+/// Write the canary file to its deployment path. For
+/// `Credential` types, renders the K4 template content for
+/// the operator's chosen `cred_family`. For plain `File`
+/// types, writes a placeholder body that operators can
+/// later override via a future K6.1 `--content-file` flag —
+/// V1.0 ships an explicit marker so the operator's `cat`
+/// of the file (which would trip the canary) shows a
+/// readable "this is a NorthNarrow canary" comment.
+/// Process + Network canaries return Ok(()) — they don't
+/// materialise a file at deploy time.
+fn materialise_canary_file(
+    deployment: &common::wire::admin_signed_payload::CanaryDeploymentWire,
+    state: &CanaryAdminState,
+    deployed_by_fp: &str,
+) -> Result<()> {
+    use common::wire::admin_signed_payload::CanaryDeploymentWire;
+    use crate::canary::templates::{render, CredFamily};
+    match deployment {
+        CanaryDeploymentWire::File { path, .. } => {
+            // File canary content placeholder. Operator can
+            // overwrite via a future --content-file flag. K7
+            // install.sh will ship a sample template
+            // `configs/canary-templates/file_placeholder.tmpl`
+            // for operators who want richer content.
+            let body = format!(
+                "# NorthNarrow XDR canary file.\n\
+                 # Deployed by operator key fp {deployed_by_fp}.\n\
+                 # Any access to this file triggers NN-L-CANARY-001.\n"
+            );
+            ensure_parent_dir(std::path::Path::new(path))?;
+            std::fs::write(path, body)
+                .map_err(|e| anyhow::anyhow!("writing file canary {path}: {e}"))?;
+            Ok(())
+        }
+        CanaryDeploymentWire::Credential { path, cred_family } => {
+            let family = CredFamily::from_wire(cred_family)
+                .map_err(|e| anyhow::anyhow!("unknown cred_family `{cred_family}`: {e}"))?;
+            // Render with the future canary_id (the registry's
+            // compute_canary_id is deterministic per (name +
+            // deployed_at_unix); we can't predict deployed_at_unix
+            // pre-deploy, so use the deployed_by_fp + path as a
+            // stable seed surrogate). K2 registry will re-seed
+            // with the real canary_id post-deploy; the on-disk
+            // content uses this earlier seed but the K3 detector
+            // matches on inode/path not on content.
+            let seed = format!("{deployed_by_fp}:{path}");
+            let body = render(family, &seed, state.template_dir.as_deref())
+                .map_err(|e| anyhow::anyhow!("rendering cred canary: {e}"))?;
+            ensure_parent_dir(std::path::Path::new(path))?;
+            std::fs::write(path, body)
+                .map_err(|e| anyhow::anyhow!("writing cred canary {path}: {e}"))?;
+            Ok(())
+        }
+        // Process + Network canaries: no file materialisation
+        // at deploy time. K7 install.sh / K8 e2e set up the
+        // binary placement + listener spawn separately.
+        CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => Ok(()),
+    }
+}
+
+fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("creating parent dir {}: {e}", parent.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// dispatch_canary_list — verify 1-of-N quorum with
+/// `Role::CanaryRead`, read the chained registry log from
+/// disk, return the JSONL body with the standard truncation
+/// flag (same shape as `dispatch_fim_report`).
+fn dispatch_canary_list(
+    req: CanaryListRequest,
+    auth: &AdminAuth,
+    state: Option<&CanaryAdminState>,
+    fps_out: &mut Vec<String>,
+) -> CanaryListResponse {
+    use common::wire::admin_signed_payload::OperationExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::CanaryRead],
+        OperationCode::CanaryList,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return CanaryListResponse {
+                result: map_admin_auth_error(e, "canary-list"),
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+    *fps_out = matched_fps;
+    if !matches!(&req.payload.extra, OperationExtra::CanaryList(_)) {
+        warn!("canary-list payload extra is not CanaryList variant");
+        return CanaryListResponse {
+            result: AdminResult::UnknownOperation,
+            entries_jsonl: String::new(),
+            entries_count: 0,
+            entries_truncated: false,
+        };
+    }
+
+    let log_path = match state {
+        Some(s) => s.registry_log_path.clone(),
+        None => {
+            warn!("canary-list: agent boot did not wire CanaryAdminState");
+            return CanaryListResponse {
+                result: AdminResult::UnknownOperation,
+                entries_jsonl: String::new(),
+                entries_count: 0,
+                entries_truncated: false,
+            };
+        }
+    };
+    let (entries_jsonl, entries_count, entries_truncated) =
+        read_jsonl_chain(&log_path);
+    info!(
+        target: "admin.canary_list",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        entries = entries_count,
+        truncated = entries_truncated,
+        "canary list served"
+    );
+    CanaryListResponse {
+        result: AdminResult::Success,
+        entries_jsonl,
+        entries_count,
+        entries_truncated,
+    }
+}
+
+/// Generic chain reader matching the `dispatch_fim_report`
+/// truncation contract. Returns `(jsonl_body, count, truncated)`.
+/// Used for canary chains (no `--since` filter today;
+/// canary registries are small enough that operators always
+/// want the full chain).
+fn read_jsonl_chain(path: &std::path::Path) -> (String, u32, bool) {
+    use std::io::{BufRead, BufReader};
+    const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
+    let f = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return (String::new(), 0, false),
+    };
+    let reader = BufReader::new(f);
+    let mut out = String::new();
+    let mut count = 0u32;
+    let mut truncated = false;
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.is_empty() {
+            continue;
+        }
+        if out.len() + line.len() + 1 > SOFT_CAP {
+            truncated = true;
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+        count += 1;
+    }
+    (out, count, truncated)
+}
+
+/// dispatch_canary_burn — verify 1-of-N quorum with
+/// `Role::CanaryManage`, call Registry::burn, rebuild indexes
+/// so the K3 detector stops matching on the burned canary.
+fn dispatch_canary_burn(
+    req: CanaryBurnRequest,
+    auth: &AdminAuth,
+    state: Option<&CanaryAdminState>,
+    fps_out: &mut Vec<String>,
+) -> AdminResult {
+    use common::wire::admin_signed_payload::OperationExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::CanaryManage],
+        OperationCode::CanaryBurn,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return map_admin_auth_error(e, "canary-burn"),
+    };
+    *fps_out = matched_fps;
+
+    let canary_id = match &req.payload.extra {
+        OperationExtra::CanaryBurn(e) => e.canary_id.clone(),
+        _ => {
+            warn!("canary-burn payload extra is not CanaryBurn variant");
+            return AdminResult::UnknownOperation;
+        }
+    };
+    let state = match state {
+        Some(s) => s,
+        None => {
+            warn!("canary-burn: agent boot did not wire CanaryAdminState");
+            return AdminResult::UnknownOperation;
+        }
+    };
+    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+    let result = {
+        let mut reg = state.registry.lock();
+        reg.burn(&canary_id, &primary_fp)
+    };
+    match result {
+        Ok(_) => {
+            rebuild_canary_indexes(state);
+            info!(
+                target: "admin.canary_burn",
+                signer_fp = %primary_fp,
+                canary_id = %canary_id,
+                "canary burned"
+            );
+            AdminResult::Success
+        }
+        Err(e) => {
+            // Distinguish "canary not found" from systemic
+            // errors. K2 surfaces CanaryIdNotFound as a typed
+            // variant; map to a recognisable AdminResult so
+            // the operator gets actionable feedback.
+            if let Some(RegistryError::CanaryIdNotFound) = e.downcast_ref::<RegistryError>() {
+                warn!(canary_id = %canary_id, "canary-burn: canary_id not found");
+                AdminResult::UnknownOperation
+            } else {
+                warn!(error = %e, "canary registry burn failed");
+                AdminResult::UnknownOperation
+            }
+        }
+    }
+}
+
+/// dispatch_canary_refresh — verify 1-of-N quorum with
+/// `Role::CanaryManage`, call Registry::refresh, rebuild
+/// indexes (the registry mutation isn't index-shape-changing
+/// but we rebuild for consistency).
+fn dispatch_canary_refresh(
+    req: CanaryRefreshRequest,
+    auth: &AdminAuth,
+    state: Option<&CanaryAdminState>,
+    fps_out: &mut Vec<String>,
+) -> AdminResult {
+    use common::wire::admin_signed_payload::OperationExtra;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::CanaryManage],
+        OperationCode::CanaryRefresh,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return map_admin_auth_error(e, "canary-refresh"),
+    };
+    *fps_out = matched_fps;
+
+    let canary_id = match &req.payload.extra {
+        OperationExtra::CanaryRefresh(e) => e.canary_id.clone(),
+        _ => {
+            warn!("canary-refresh payload extra is not CanaryRefresh variant");
+            return AdminResult::UnknownOperation;
+        }
+    };
+    let state = match state {
+        Some(s) => s,
+        None => {
+            warn!("canary-refresh: agent boot did not wire CanaryAdminState");
+            return AdminResult::UnknownOperation;
+        }
+    };
+    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+    let result = {
+        let mut reg = state.registry.lock();
+        reg.refresh(&canary_id, &primary_fp)
+    };
+    match result {
+        Ok(_) => {
+            rebuild_canary_indexes(state);
+            info!(
+                target: "admin.canary_refresh",
+                signer_fp = %primary_fp,
+                canary_id = %canary_id,
+                "canary refreshed (tripped flag cleared)"
+            );
+            AdminResult::Success
+        }
+        Err(e) => {
+            if let Some(RegistryError::CanaryIdNotFound) = e.downcast_ref::<RegistryError>() {
+                AdminResult::UnknownOperation
+            } else {
+                warn!(error = %e, "canary registry refresh failed");
+                AdminResult::UnknownOperation
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1964,7 +2619,7 @@ mod tests {
         let marker_c = marker_path.clone();
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
-                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None,
+                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None, None,
             )
             .await;
         });
@@ -2197,6 +2852,7 @@ mod tests {
                 isolator_c,
                 marker_c,
                 Some(signal_for_serve),
+                None,
                 None,
                 None,
             )
@@ -2656,5 +3312,337 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "fim_baseline");
         assert!(entries[0].result.starts_with("failure: role_denied"));
+    }
+
+    // ── Tappa 9.5 K6 — canary admin audit + dispatch tests ─────
+
+    /// K6 audit test #1: a CanaryDeployRequest + Success
+    /// response emits one row with op="canary_deploy",
+    /// result="success", populated key_fp, AND the extra
+    /// carrying the allocated canary_id + name + cred_family.
+    /// Anchors the audit emit arm so future refactors that drop
+    /// it surface as a test failure rather than silently missing
+    /// canary lifecycle from the audit chain.
+    #[test]
+    fn audit_emits_on_canary_deploy_success_with_canary_id_extra() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::{
+            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
+        };
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_canary_deploy(
+            [0x10; 32],
+            1_700_000_000,
+            [0x20; 16],
+            "honeypot-aws".to_string(),
+            CanaryTypeWire::Credential,
+            CanaryDeploymentWire::Credential {
+                path: "/var/lib/northnarrow/canaries/aws.creds".to_string(),
+                cred_family: "aws".to_string(),
+            },
+        );
+        let req = AdminMessage::CanaryDeployRequest(CanaryDeployRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::CanaryDeployResponse(CanaryDeployResponse {
+            result: AdminResult::Success,
+            canary_id: "abc123def4567890".to_string(),
+        });
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["dddddddd".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "canary_deploy");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].key_fp, "dddddddd");
+        assert_eq!(entries[0].extra["name"], "honeypot-aws");
+        assert_eq!(entries[0].extra["canary_id"], "abc123def4567890");
+        assert_eq!(entries[0].extra["cred_family"], "aws");
+    }
+
+    /// K6 audit test #2: a CanaryListRequest + Success response
+    /// emits one row with the extra carrying entries_count +
+    /// truncated flag (matches the FimReport audit shape).
+    #[test]
+    fn audit_emits_on_canary_list_success_with_entries_count_extra() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_canary_list([0x30; 32], 1_700_000_000, [0x40; 16]);
+        let req = AdminMessage::CanaryListRequest(CanaryListRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::CanaryListResponse(CanaryListResponse {
+            result: AdminResult::Success,
+            entries_jsonl: "{\"op\":\"deploy\"}\n".to_string(),
+            entries_count: 3,
+            entries_truncated: false,
+        });
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["eeeeeeee".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "canary_list");
+        assert_eq!(entries[0].extra["entries_count"], 3);
+        assert_eq!(entries[0].extra["truncated"], false);
+    }
+
+    /// K6 audit test #3: a CanaryBurnRequest + Success result
+    /// emits one row with canary_id from the request's extra
+    /// (NOT from the reply — burn replies are bare AdminResult).
+    #[test]
+    fn audit_emits_on_canary_burn_success_with_canary_id_extra() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_canary_burn(
+            [0x50; 32],
+            1_700_000_000,
+            [0x60; 16],
+            "burnedidhex0000".to_string(),
+        );
+        let req = AdminMessage::CanaryBurnRequest(CanaryBurnRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::CanaryBurnResult(AdminResult::Success);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["ffffffff".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "canary_burn");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].extra["canary_id"], "burnedidhex0000");
+    }
+
+    /// K6 audit test #4: a CanaryRefreshRequest + Success result
+    /// emits one row with canary_id from the request's extra.
+    /// Same shape as the burn test — both ops are CanaryManage
+    /// mutations keyed by canary_id.
+    #[test]
+    fn audit_emits_on_canary_refresh_success_with_canary_id_extra() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_canary_refresh(
+            [0x70; 32],
+            1_700_000_000,
+            [0x80; 16],
+            "refreshedidhex0".to_string(),
+        );
+        let req = AdminMessage::CanaryRefreshRequest(CanaryRefreshRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::CanaryRefreshResult(AdminResult::Success);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["aaaa1111".to_string()],
+        );
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "canary_refresh");
+        assert_eq!(entries[0].result, "success");
+        assert_eq!(entries[0].extra["canary_id"], "refreshedidhex0");
+    }
+
+    /// K6 audit test #5: a canary-deploy RoleDenied result still
+    /// emits an audit row (failures audit the same way as
+    /// successes — chains capture attempts, not just successes).
+    #[test]
+    fn audit_emits_on_canary_deploy_failure_role_denied() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::{
+            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
+        };
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let payload = SignedPayload::new_canary_deploy(
+            [0x90; 32],
+            1_700_000_000,
+            [0xa0; 16],
+            "denied".to_string(),
+            CanaryTypeWire::File,
+            CanaryDeploymentWire::File {
+                path: "/tmp/x".to_string(),
+                template: None,
+            },
+        );
+        let req = AdminMessage::CanaryDeployRequest(CanaryDeployRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: [0; 64] }],
+        });
+        let reply = AdminMessage::CanaryDeployResponse(CanaryDeployResponse {
+            result: AdminResult::RoleDenied,
+            canary_id: String::new(),
+        });
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "canary_deploy");
+        assert!(entries[0].result.starts_with("failure: role_denied"));
+    }
+
+    /// Build an [`AdminAuth`] backed by a tempdir admin.pub file
+    /// holding a single key with the supplied roles. Used by the
+    /// K6 dispatch tests to construct an auth handle without
+    /// spinning up the full server harness. The TempDir is
+    /// returned alongside so the test keeps it alive for the
+    /// lifetime of the AdminAuth (load reads the file once, but
+    /// keeping the dir scoped is the cleaner contract).
+    fn build_auth_with_roles(
+        signing: &SigningKey,
+        roles: &str,
+        agent_id: [u8; 16],
+    ) -> (AdminAuth, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("admin.pub");
+        std::fs::write(
+            &pub_path,
+            format!("{}  {roles}\n", hex::encode(signing.verifying_key().to_bytes())),
+        )
+        .unwrap();
+        let auth = AdminAuth::load_with_agent_id(&pub_path, agent_id).unwrap();
+        (auth, dir)
+    }
+
+    /// K6 dispatch test #1: dispatch_canary_deploy short-circuits
+    /// to UnknownOperation when the boot path didn't wire the
+    /// CanaryAdminState (e.g. signing-key load failed, registry
+    /// open failed). The pre-state check fires AFTER quorum
+    /// verification — caller still gets the standardised
+    /// AdminResult::UnknownOperation shape so existing exit-code
+    /// mapping in the CLI works without a new variant.
+    #[test]
+    fn dispatch_canary_deploy_without_state_returns_unknown_operation() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::{
+            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
+        };
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xa0; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_canary_deploy(
+            nonce,
+            now_unix_secs(),
+            agent_id,
+            "n".to_string(),
+            CanaryTypeWire::File,
+            CanaryDeploymentWire::File {
+                path: "/tmp/x".to_string(),
+                template: None,
+            },
+        );
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = CanaryDeployRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let resp = dispatch_canary_deploy(req, &auth, None, &mut fps);
+        assert!(matches!(resp.result, AdminResult::UnknownOperation));
+        assert!(resp.canary_id.is_empty());
+    }
+
+    /// K6 dispatch test #2: dispatch_canary_list short-circuits
+    /// to UnknownOperation when no CanaryAdminState is wired.
+    /// Same protection as deploy.
+    #[test]
+    fn dispatch_canary_list_without_state_returns_unknown_operation() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xb0; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "canary-read", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_canary_list(nonce, now_unix_secs(), agent_id);
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = CanaryListRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let resp = dispatch_canary_list(req, &auth, None, &mut fps);
+        assert!(matches!(resp.result, AdminResult::UnknownOperation));
+        assert_eq!(resp.entries_count, 0);
+        assert!(resp.entries_jsonl.is_empty());
+    }
+
+    /// K6 dispatch test #3: dispatch_canary_burn short-circuits
+    /// to UnknownOperation when no CanaryAdminState is wired.
+    #[test]
+    fn dispatch_canary_burn_without_state_returns_unknown_operation() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xc0; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_canary_burn(
+            nonce,
+            now_unix_secs(),
+            agent_id,
+            "doesnotexist".to_string(),
+        );
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = CanaryBurnRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let r = dispatch_canary_burn(req, &auth, None, &mut fps);
+        assert!(matches!(r, AdminResult::UnknownOperation));
+    }
+
+    /// K6 dispatch test #4: dispatch_canary_refresh
+    /// short-circuits to UnknownOperation when no
+    /// CanaryAdminState is wired.
+    #[test]
+    fn dispatch_canary_refresh_without_state_returns_unknown_operation() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xd0; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_canary_refresh(
+            nonce,
+            now_unix_secs(),
+            agent_id,
+            "doesnotexist".to_string(),
+        );
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let req = CanaryRefreshRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        };
+        let mut fps = Vec::new();
+        let r = dispatch_canary_refresh(req, &auth, None, &mut fps);
+        assert!(matches!(r, AdminResult::UnknownOperation));
     }
 }

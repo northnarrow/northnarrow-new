@@ -209,6 +209,42 @@ struct Cli {
     )]
     fim_drift_file: PathBuf,
 
+    /// Tappa 9.5 K2 / K6: configurable path of the chained canary
+    /// registry log. Tests override this to a tempdir so each test
+    /// run gets a fresh chain. Missing file means an empty registry
+    /// (no canaries deployed); the K6 admin dispatch path creates
+    /// the file lazily on first deploy.
+    #[arg(
+        long = "canary-registry-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::canary::registry::DEFAULT_REGISTRY_PATH,
+    )]
+    canary_registry_file: PathBuf,
+
+    /// Tappa 9.5 K3 / K6: configurable path of the chained canary
+    /// access log. Same per-test override rationale as
+    /// `--canary-registry-file`. The K3 detector appends one row
+    /// per observed canary access (`mark_tripped` + audit emission
+    /// are decoupled).
+    #[arg(
+        long = "canary-access-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::canary::access_log::DEFAULT_ACCESS_LOG_PATH,
+    )]
+    canary_access_file: PathBuf,
+
+    /// Tappa 9.5 K4 / K6: directory holding the canary template
+    /// files (`<family>.tmpl`). The K6 deploy dispatch renders
+    /// File + Credential canary bytes from these templates. None
+    /// disables canary deploys that require a template (Network
+    /// + Process canaries still work — they don't need files).
+    #[arg(
+        long = "canary-template-dir",
+        value_name = "PATH",
+        default_value = northnarrow_agent::canary::templates::DEFAULT_TEMPLATE_DIR,
+    )]
+    canary_template_dir: PathBuf,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -794,6 +830,134 @@ async fn main() -> Result<()> {
         }
     };
 
+    // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
+    //
+    // Order (mirrors the FIM boot above):
+    //  1. Open the [`Registry`] for the chained canary log. Failure
+    //     leaves `canary_admin_state` + `canary_detector` as `None`;
+    //     the agent stays up, admin `canary` ops return
+    //     `UnknownOperation`, and the rule engine sees zero
+    //     `Event::CanaryTripped` events.
+    //  2. Open the [`CanaryAccessDb`] for the chained access log.
+    //     Same degraded-mode policy as the registry.
+    //  3. Build empty [`CanaryIndexes`] and call
+    //     `rebuild_from_registry` so the K3 detector sees any
+    //     canaries deployed in a prior boot.
+    //  4. Layer File + Credential paths into `exe_index` via
+    //     `add_file_path_index` (the K3 path-based fallback for
+    //     FimEvent that doesn't carry (dev, ino) yet — same
+    //     pragmatism the K6 dispatch helper uses post-deploy).
+    //  5. Construct the [`Detector`] holding all three shared
+    //     `Arc<Mutex<_>>` handles + the [`CanaryAdminState`] for
+    //     the admin socket.
+    let (canary_admin_state, canary_detector): (
+        Option<Arc<admin_socket::CanaryAdminState>>,
+        Option<Arc<northnarrow_agent::canary::detector::Detector>>,
+    ) = {
+        let signing_key_for_canary =
+            match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                &cli.signing_key_file,
+            ) {
+                Ok(key) => Some(key),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "canary subsystem needs agent signing key — load failed; \
+                         canary admin surface disabled this boot"
+                    );
+                    None
+                }
+            };
+        let signing_key_for_access =
+            northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
+                .ok();
+        match (signing_key_for_canary, signing_key_for_access) {
+            (Some(reg_key), Some(access_key)) => {
+                let registry = match northnarrow_agent::canary::registry::Registry::open(
+                    &cli.canary_registry_file,
+                    reg_key,
+                    agent_id,
+                ) {
+                    Ok(r) => Some(Arc::new(parking_lot::Mutex::new(r))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.canary_registry_file.display(),
+                            "canary registry open failed — admin `canary` ops will \
+                             return UnknownOperation; rule engine sees no \
+                             CanaryTripped events"
+                        );
+                        None
+                    }
+                };
+                let access_log = match northnarrow_agent::canary::access_log::CanaryAccessDb::open(
+                    &cli.canary_access_file,
+                    access_key,
+                    agent_id,
+                ) {
+                    Ok(a) => Some(Arc::new(parking_lot::Mutex::new(a))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.canary_access_file.display(),
+                            "canary access log open failed — detector trips will \
+                             not be persisted this boot"
+                        );
+                        None
+                    }
+                };
+                match (registry, access_log) {
+                    (Some(registry), Some(access_log)) => {
+                        let indexes = Arc::new(parking_lot::Mutex::new(
+                            northnarrow_agent::canary::detector::CanaryIndexes::new(),
+                        ));
+                        // Rebuild indexes from any pre-existing
+                        // registry entries. V1.0 inode resolver
+                        // returns None — the K3 detector's
+                        // path-based exe_index fallback covers
+                        // File + Credential (added below); Process
+                        // canaries are exe-path keyed (handled by
+                        // rebuild_from_registry directly).
+                        {
+                            use common::wire::admin_signed_payload::CanaryDeploymentWire;
+                            let reg = registry.lock();
+                            let mut idx = indexes.lock();
+                            idx.rebuild_from_registry(&reg, |_| None);
+                            for canary in reg.list() {
+                                match &canary.deployment {
+                                    CanaryDeploymentWire::File { path, .. }
+                                    | CanaryDeploymentWire::Credential { path, .. } => {
+                                        idx.add_file_path_index(
+                                            std::path::PathBuf::from(path),
+                                            canary.canary_id.clone(),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            info!(canaries = idx.len(), "canary indexes rebuilt from registry");
+                        }
+                        let detector =
+                            Arc::new(northnarrow_agent::canary::detector::Detector::new(
+                                registry.clone(),
+                                access_log,
+                                indexes.clone(),
+                            ));
+                        let admin_state = Arc::new(admin_socket::CanaryAdminState {
+                            registry,
+                            indexes,
+                            registry_log_path: cli.canary_registry_file.clone(),
+                            template_dir: Some(cli.canary_template_dir.clone()),
+                        });
+                        (Some(admin_state), Some(detector))
+                    }
+                    _ => (None, None),
+                }
+            }
+            _ => (None, None),
+        }
+    };
+
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
     // runs but COMBAT can only be cleared by reboot.
@@ -847,6 +1011,7 @@ async fn main() -> Result<()> {
                 };
                 let marker_path = cli.shutdown_marker_file.clone();
                 let fim_state_for_serve = fim_admin_state.clone();
+                let canary_state_for_serve = canary_admin_state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -857,6 +1022,7 @@ async fn main() -> Result<()> {
                         Some(signal_for_serve),
                         audit_log,
                         fim_state_for_serve,
+                        canary_state_for_serve,
                     )
                     .await
                     {
@@ -915,13 +1081,13 @@ async fn main() -> Result<()> {
                     &correlation,
                     &host,
                     &posture,
-                    // Tappa 9.5 (K3): canary detector wiring is
-                    // disabled until K6 admin dispatch builds the
-                    // Registry + AccessDb + Indexes at boot. Until
-                    // then, process_event's None branch is a no-op
-                    // and FIM/process events flow through the rule
-                    // engine unchanged.
-                    None,
+                    // Tappa 9.5 K6: detector handle wired in. When
+                    // the canary subsystem boot above failed
+                    // (missing signing key, registry open error),
+                    // canary_detector is None and process_event
+                    // short-circuits to the source event without
+                    // canary filtering.
+                    canary_detector.as_deref(),
                     e,
                 ).await,
                 None => {
