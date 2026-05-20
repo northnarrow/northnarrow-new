@@ -187,6 +187,18 @@ fn caller_is_in_family() -> bool {
 /// so we're emitting an event we definitely want.
 #[inline(always)]
 fn emit_drift(op: u8, key: InodeKey) {
+    emit_drift_with_dest(op, key, None);
+}
+
+/// Polish #3 — variant of [`emit_drift`] that also writes the
+/// rename DEST `(dev, ino)` pair. Userland's drain resolves
+/// `(dest_dev, dest_ino)` against the `InodePathMap` and
+/// populates `FimEvent::dest_path` on success; the NN-L-FIM-010
+/// rule then matches the ransomware extension on EITHER side.
+/// `dest_key: None` writes zeroes (matches the C8 behaviour
+/// for non-Rename ops).
+#[inline(always)]
+fn emit_drift_with_dest(op: u8, key: InodeKey, dest_key: Option<InodeKey>) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
         None => return,
@@ -196,7 +208,8 @@ fn emit_drift(op: u8, key: InodeKey) {
         // SAFETY: ringbuf reservation gives us exclusive write
         // access to a properly aligned region the size of
         // FimDriftRaw. Zero first so the trailing _pad bytes
-        // stay deterministic.
+        // (and dest pair, when dest_key is None) stay
+        // deterministic.
         core::ptr::write_bytes(raw_ptr, 0u8, 1);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         let pid_tgid = bpf_get_current_pid_tgid();
@@ -208,6 +221,10 @@ fn emit_drift(op: u8, key: InodeKey) {
         (*raw_ptr).op = op;
         if let Ok(comm) = bpf_get_current_comm() {
             (*raw_ptr).modifier_comm = comm;
+        }
+        if let Some(dest) = dest_key {
+            (*raw_ptr).dest_dev = dest.dev;
+            (*raw_ptr).dest_ino = dest.ino;
         }
     }
     entry.submit(0);
@@ -328,20 +345,35 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     // by (target_dev, target_ino, timestamp_ns) so duplicate
     // emissions for the same rename don't flood the drift
     // chain.
+    //
+    // Polish #3 — when the OLD dentry's inode is watched, emit
+    // a single combined event with `dest_dev` + `dest_ino` set
+    // to the NEW dir's inode key. Userland's drain resolves the
+    // dest key via InodePathMap so NN-L-FIM-010 can match the
+    // ransomware extension on the destination side. The OTHER
+    // three inode-checks (old_dir / new_dir / new_dentry) keep
+    // the C8 single-event emit path — dedup by
+    // (target_dev, target_ino, timestamp_ns) in userland.
+    let old_dentry: *const c_void = ctx.arg(1);
+    let new_dir: *const c_void = ctx.arg(2);
+    let new_dir_key = inode_key(new_dir);
+    let old_inode_opt = inode_from_dentry(old_dentry);
+    let mut combined_emitted_for_old_inode = false;
+    if let Some(old_inode) = old_inode_opt {
+        if let Some(key) = should_emit(old_inode) {
+            emit_drift_with_dest(FIM_OP_RENAMED, key, new_dir_key);
+            combined_emitted_for_old_inode = true;
+        }
+    }
+
     let old_dir: *const c_void = ctx.arg(0);
     if let Some(key) = should_emit(old_dir) {
         emit_drift(FIM_OP_RENAMED, key);
     }
-    let new_dir: *const c_void = ctx.arg(2);
     if let Some(key) = should_emit(new_dir) {
         emit_drift(FIM_OP_RENAMED, key);
     }
-    let old_dentry: *const c_void = ctx.arg(1);
-    if let Some(old_inode) = inode_from_dentry(old_dentry) {
-        if let Some(key) = should_emit(old_inode) {
-            emit_drift(FIM_OP_RENAMED, key);
-        }
-    }
+    let _ = combined_emitted_for_old_inode; // verifier-friendly no-op
     let new_dentry: *const c_void = ctx.arg(3);
     if let Some(new_inode) = inode_from_dentry(new_dentry) {
         if let Some(key) = should_emit(new_inode) {

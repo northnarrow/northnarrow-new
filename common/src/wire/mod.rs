@@ -288,11 +288,14 @@ pub const FIM_OP_OPENED: u8 = 6;
 /// drift event. Userland's `agent/src/fim/drain.rs` (C4) decodes
 /// these into the richer userland [`FimEvent`].
 ///
-/// Layout: timestamp + (dev,ino) target + modifier triple + op
-/// byte + pad. 56 bytes total, 8-byte aligned — identical shape
-/// to Tappa 7's [`FsProtectDenialRaw`] by design (keeps the
-/// ringbuf-record arithmetic symmetric, simplifies the C4 drain
-/// loop's per-record decode).
+/// Layout: timestamp + (dev,ino) target + (dev,ino) dest +
+/// modifier triple + op byte + pad. **72 bytes**, 8-byte aligned.
+/// Tappa 9 polish #3 (rename dest-path resolution) grew this
+/// from 56 → 72 bytes by appending `dest_dev` + `dest_ino` for
+/// `Renamed` events; older non-Rename emitters set both to 0.
+/// The layout stays a strict superset of the Tappa 7
+/// [`FsProtectDenialRaw`] prefix so the C4 drain decode logic
+/// is still byte-symmetric on the leading 56 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -307,6 +310,18 @@ pub struct FimDriftRaw {
     /// userland into [`FimOp`].
     pub op: u8,
     pub _pad: [u8; 7],
+    /// Polish #3 — rename DEST `(dev, ino)`. Populated by
+    /// `fim_rename_observe` when the SOURCE inode is in
+    /// WATCHED_PATHS (and the dest dentry's inode is reachable
+    /// from the kernel hook args). Userland's drain then
+    /// attempts to resolve `(dest_dev, dest_ino)` → path via
+    /// [`crate::wire::InodeKey`]; success populates
+    /// `FimEvent::dest_path` so the NN-L-FIM-010 rule (and
+    /// future dest-aware rules) can match on the destination
+    /// extension. Zero for non-Rename ops AND for renames
+    /// where the kernel-side couldn't extract a dest inode.
+    pub dest_dev: u64,
+    pub dest_ino: u64,
 }
 
 impl FimDriftRaw {
@@ -320,6 +335,8 @@ impl FimDriftRaw {
             modifier_comm: [0u8; TASK_COMM_LEN],
             op: 0,
             _pad: [0u8; 7],
+            dest_dev: 0,
+            dest_ino: 0,
         }
     }
 }
@@ -355,6 +372,17 @@ pub struct FimEvent {
     pub modifier_pid: u32,
     pub modifier_uid: u32,
     pub modifier_comm: alloc::string::String,
+    /// Tappa 9 polish #3 — DEST path for `Renamed` events when
+    /// userland resolved `(dest_dev, dest_ino)` against the
+    /// `InodePathMap`. `None` for non-rename events AND for
+    /// renames where the dest inode wasn't in the map (e.g.,
+    /// fresh dest inode not previously baselined). The NN-L-FIM-010
+    /// ransomware rule checks BOTH `path` and `dest_path` against
+    /// `RANSOMWARE_EXTENSIONS` so a watched file renamed TO
+    /// `<path>.crypted` fires the rule. `#[serde(default)]`
+    /// keeps pre-polish-#3 JSONL chains deserialisable.
+    #[serde(default)]
+    pub dest_path: Option<alloc::string::String>,
 }
 
 /// Tappa 9 (C1) — typed inflation of [`FimDriftRaw::op`]. Wire
@@ -516,24 +544,30 @@ mod tests {
 
     // ── Tappa 9 C1 — FIM wire types ────────────────────────────────
 
-    /// C1 test #1: [`FimDriftRaw`] layout matches the kernel↔userland
-    /// ABI exactly. 56 bytes, 8-aligned, identical to
-    /// [`FsProtectDenialRaw`] (Tappa 7's analogue). Wire-byte stability
-    /// is the property — any drift here is a coordinated kernel+user
-    /// upgrade.
+    /// C1 (+ polish #3) test #1: [`FimDriftRaw`] layout matches
+    /// the kernel↔userland ABI exactly. **72 bytes**, 8-aligned.
+    /// Polish #3 grew this from 56 → 72 bytes by appending
+    /// `dest_dev` + `dest_ino` (each `u64`) so
+    /// `fim_rename_observe` can communicate the rename
+    /// destination to userland. Wire-byte stability matters —
+    /// any change here is a coordinated kernel+user upgrade.
     #[test]
     fn fim_drift_raw_layout_is_stable() {
-        // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 = 56 bytes, 8-aligned.
-        assert_eq!(size_of::<FimDriftRaw>(), 56);
+        // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 = 72 bytes,
+        // 8-aligned.
+        assert_eq!(size_of::<FimDriftRaw>(), 72);
         assert_eq!(align_of::<FimDriftRaw>(), 8);
-        // Same shape as Tappa 7's denial record (intentional —
-        // simplifies the C4 drain-loop's per-record decode).
-        assert_eq!(size_of::<FimDriftRaw>(), size_of::<FsProtectDenialRaw>());
+        // FsProtectDenialRaw stays at the original 56-byte
+        // shape; the FIM drift record is now a SUPERSET (first
+        // 56 bytes identical, dest_dev + dest_ino appended).
+        assert_eq!(size_of::<FsProtectDenialRaw>(), 56);
     }
 
-    /// C1 test #2: [`FimDriftRaw`] bytemuck round-trip. The eBPF
-    /// kernel side serialises via `bytes_of`; userland decodes via
-    /// `from_bytes`. Anchors the Pod/Zeroable derive.
+    /// C1 (+ polish #3) test #2: [`FimDriftRaw`] bytemuck
+    /// round-trip with the new dest fields populated. The
+    /// kernel-side BPF serialises via `bytes_of`; userland
+    /// decodes via `from_bytes`. Anchors the Pod/Zeroable
+    /// derive on the expanded layout.
     #[test]
     fn fim_drift_raw_round_trips_via_bytes() {
         let original = FimDriftRaw {
@@ -543,8 +577,10 @@ mod tests {
             modifier_pid: 42,
             modifier_uid: 0,
             modifier_comm: *b"sshd\0\0\0\0\0\0\0\0\0\0\0\0",
-            op: FIM_OP_MODIFIED,
+            op: FIM_OP_RENAMED,
             _pad: [0u8; 7],
+            dest_dev: 0x800003,
+            dest_ino: 67890,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<FimDriftRaw>());
@@ -555,6 +591,8 @@ mod tests {
         assert_eq!(restored.modifier_pid, original.modifier_pid);
         assert_eq!(restored.modifier_comm, original.modifier_comm);
         assert_eq!(restored.op, original.op);
+        assert_eq!(restored.dest_dev, original.dest_dev);
+        assert_eq!(restored.dest_ino, original.dest_ino);
     }
 
     /// C1 test #3: [`FimOp`] discriminants lock in the wire bytes
@@ -627,6 +665,7 @@ mod tests {
             modifier_pid: 42,
             modifier_uid: 0,
             modifier_comm: "dpkg".to_string(),
+            dest_path: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -637,6 +676,59 @@ mod tests {
         assert!(
             json.contains(r#""op":1"#),
             "FimOp must serialise as integer wire byte; got: {json}"
+        );
+    }
+
+    /// Polish #3 test: pre-polish-#3 JSONL (no `dest_path` field)
+    /// deserialises cleanly via `#[serde(default)]` → `None`. This
+    /// anchors the forward-compat contract for the new field so a
+    /// V1.0 agent loading a V1.1 chain (or vice-versa) doesn't
+    /// reject rows.
+    #[test]
+    fn fim_event_serde_default_dest_path_on_legacy_row() {
+        let legacy = serde_json::json!({
+            "timestamp_ns": 1u64,
+            "path": "/etc/passwd",
+            "op": 1u8,
+            "new_sha256": null,
+            "baseline_sha256": null,
+            "modifier_exe": null,
+            "modifier_pid": 0u32,
+            "modifier_uid": 0u32,
+            "modifier_comm": "test",
+            // dest_path INTENTIONALLY OMITTED — must default to None.
+        });
+        let parsed: FimEvent =
+            serde_json::from_value(legacy).expect("legacy row must deserialise");
+        assert_eq!(parsed.dest_path, None);
+    }
+
+    /// Polish #3 test: rename event with a resolved dest_path
+    /// round-trips correctly — the rule layer reads
+    /// `fe.dest_path.as_deref().unwrap_or("")` for the
+    /// `ends_with(.crypted)` predicate.
+    #[test]
+    fn fim_event_serde_roundtrip_with_dest_path() {
+        let original = FimEvent {
+            timestamp_ns: 2_000_000_000,
+            path: "/home/u/documents/quarterly.docx".to_string(),
+            op: FimOp::Renamed,
+            new_sha256: None,
+            baseline_sha256: Some([0xCC; 32]),
+            modifier_exe: None,
+            modifier_pid: 99,
+            modifier_uid: 1000,
+            modifier_comm: "ransomware_loop".to_string(),
+            dest_path: Some(
+                "/home/u/documents/quarterly.docx.crypted".to_string(),
+            ),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, original);
+        assert!(
+            json.contains("/home/u/documents/quarterly.docx.crypted"),
+            "dest_path must round-trip on the wire: {json}"
         );
     }
 }
