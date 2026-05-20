@@ -1,0 +1,34 @@
+# NorthNarrow JA3 fingerprint blocklist (Tappa 10 N8 / design §10 + §13 Q5).
+#
+# Loaded at agent boot from /etc/northnarrow/netflow-ja3-blocklist.v1 (the
+# install.sh helper drops this file under /etc/northnarrow/ if missing).
+# Consumed by NN-L-NET-003 (JA3 match against operator-curated threat-actor
+# list — Critical, KillProcessTree + posture → COMBAT). Operators extend /
+# narrow via the /etc/northnarrow/netflow-ja3-blocklist.local overlay — same
+# `+entry` add / `-entry` disable schema as fim-paths.local (Tappa 9 C7).
+#
+# Format: one entry per non-empty / non-comment line. Each entry is a
+# 32-character lowercase hex JA3 MD5 hash (Salesforce 2017 spec). The parser
+# normalises uppercase input to lowercase, so operators can paste vendor-
+# exported fingerprints in either case. `#` starts a comment; blank lines
+# ignored. NO `+` / `-` directives in v1 — those belong in the `.local`
+# overlay only.
+#
+# Curation policy (Tappa 10 §10):
+# - V1.0 ships EMPTY. Populating this file requires threat-intel curation
+#   that is out of scope for the V1.0 deploy. Operators with EDR-vendor
+#   fingerprint exports drop them into the `.local` overlay.
+# - Rationale (per design §10): a shipped public-IoC JA3 list goes stale
+#   fast (offensive tooling rotates ClientHello defaults to evade
+#   signature-based detection, and false-positive risk is high — many
+#   legitimate clients share JA3 hashes with malware that targets the same
+#   TLS library / cipher-suite preference). Operators with their own feed
+#   know which fingerprints are load-bearing for their environment.
+# - The agent boots cleanly with an empty default; NN-L-NET-003 stays
+#   functional but matches nothing until the operator populates the
+#   `.local` overlay.
+#
+# See docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md §13 Q5 + §10 for
+# the rationale.
+
+# (empty default — operator populates via netflow-ja3-blocklist.local)

@@ -245,6 +245,21 @@ struct Cli {
     )]
     canary_template_dir: PathBuf,
 
+    /// Tappa 10 N8: configurable path of the chained NetFlow log.
+    /// Same per-test override rationale as `--fim-baseline-file` —
+    /// tests point this at a tempdir so each run gets a fresh
+    /// chain. The N7 `dispatch_net_flows` admin path reads from
+    /// this file; the future N3 flow_tracker emission commit
+    /// appends to it. N8 (this commit) bootstraps the file
+    /// pre-attach so PROTECTED_INODES has an inode to register
+    /// against before LSM hooks come up.
+    #[arg(
+        long = "netflow-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::admin_socket::DEFAULT_NETFLOW_JSONL_PATH,
+    )]
+    netflow_file: PathBuf,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -354,6 +369,23 @@ async fn main() -> Result<()> {
             path = %cli.canary_access_file.display(),
             "canary access log bootstrap failed pre-attach — file will be lazily \
              created on first trip (and unprotected this boot)"
+        );
+    }
+    // Tappa 10 N8: bootstrap the NetFlow chain log pre-attach for
+    // the same reason as the FIM + canary logs — STATE_PROTECTED_FILES
+    // needs an inode to register against before LSM hooks come up.
+    // A present file is left untouched (existing NetFlow chain
+    // preserved across restarts). N7's `dispatch_net_flows` already
+    // tolerates an absent file, but PROTECTED_INODES does not, so
+    // we bootstrap here to close the brief race window on first boot.
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_netflow_log(&cli.netflow_file)
+    {
+        warn!(
+            error = %e,
+            path = %cli.netflow_file.display(),
+            "netflow log bootstrap failed pre-attach — file will be lazily \
+             created on first flow close (and unprotected this boot)"
         );
     }
     // agent_id bootstrap moved up from line ~360 so its inode is

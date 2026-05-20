@@ -549,6 +549,69 @@ mod tests {
         assert!(!bl.contains("00000000000000000000000000000000"));
     }
 
+    /// N8 deploy test: the shipped `configs/netflow-blocklist.v1`
+    /// default file parses cleanly via `NetBlocklist::load`. The
+    /// file ships under `configs/` in the repo and install.sh
+    /// drops it at `/etc/northnarrow/netflow-blocklist.v1` —
+    /// anchor here so a malformed seed (typo in an RFC range,
+    /// stray `+`/`-` prefix, accidental directive) fails CI
+    /// before reaching an operator's host. Side-load: same
+    /// invariant the Tappa 9 C7 `configs/fim-paths.v1` carries
+    /// via its production loader.
+    #[test]
+    fn net_blocklist_v1_default_loads_clean() {
+        let v1 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("configs")
+            .join("netflow-blocklist.v1");
+        assert!(
+            v1.exists(),
+            "configs/netflow-blocklist.v1 must ship in the repo \
+             (install.sh deploys this file to /etc/northnarrow/)"
+        );
+        let absent_local = v1.with_file_name("netflow-blocklist.local.does-not-exist");
+        let bl = NetBlocklist::load(&v1, &absent_local)
+            .expect("shipped configs/netflow-blocklist.v1 must parse clean");
+        assert!(
+            !bl.is_empty(),
+            "shipped default ships at least one seed entry \
+             (RFC-reserved test prefixes per design §10)"
+        );
+        // Sanity: 192.0.2.1 (RFC 5737 TEST-NET-1) is in the seed.
+        assert!(
+            bl.contains(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            "RFC 5737 TEST-NET-1 entry must be in the shipped seed"
+        );
+    }
+
+    /// N8 deploy test: the shipped `configs/netflow-ja3-blocklist.v1`
+    /// default file parses cleanly via `Ja3Blocklist::load`. The
+    /// V1.0 ship is INTENTIONALLY EMPTY per design §10 (operator
+    /// populates via the `.local` overlay from their EDR vendor's
+    /// fingerprint feed); we still anchor that the file parses so
+    /// a stray byte in a future operator-curated update fails CI
+    /// before reaching a host.
+    #[test]
+    fn net_ja3_blocklist_v1_default_loads_clean() {
+        let v1 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("configs")
+            .join("netflow-ja3-blocklist.v1");
+        assert!(
+            v1.exists(),
+            "configs/netflow-ja3-blocklist.v1 must ship in the repo \
+             (install.sh deploys this file to /etc/northnarrow/)"
+        );
+        let absent_local = v1.with_file_name("netflow-ja3-blocklist.local.does-not-exist");
+        let bl = Ja3Blocklist::load(&v1, &absent_local)
+            .expect("shipped configs/netflow-ja3-blocklist.v1 must parse clean");
+        assert!(
+            bl.is_empty(),
+            "V1.0 ships an empty JA3 default per design §10 — \
+             operator populates via netflow-ja3-blocklist.local"
+        );
+    }
+
     /// Uppercase JA3 entries are normalised to lowercase at
     /// parse time so operators can paste vendor-provided
     /// fingerprints in either case + matches still work.

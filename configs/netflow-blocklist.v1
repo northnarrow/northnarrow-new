@@ -1,0 +1,47 @@
+# NorthNarrow NetFlow IP / CIDR blocklist (Tappa 10 N8 / design §10 + §13 Q5).
+#
+# Loaded at agent boot from /etc/northnarrow/netflow-blocklist.v1 (the
+# install.sh helper drops this file under /etc/northnarrow/ if missing).
+# Consumed by NN-L-NET-001 (Outbound to operator-blocked IP/CIDR — Critical,
+# KillProcessTree + posture → COMBAT). Operators extend / narrow via the
+# /etc/northnarrow/netflow-blocklist.local overlay — same `+entry` add /
+# `-entry` disable schema as fim-paths.local (Tappa 9 C7 / §13 Q7 + §13 Q5).
+#
+# Format: one entry per non-empty / non-comment line. Each entry is either:
+#   - a bare IPv4 / IPv6 address    (e.g. 1.2.3.4 or 2001:db8::1)
+#   - an IPv4 / IPv6 CIDR range     (e.g. 10.0.0.0/8 or 2001:db8::/32)
+# `#` starts a comment; blank lines ignored. NO `+` / `-` directives in v1 —
+# those belong in the `.local` overlay only (the parser rejects v1 files that
+# contain directive prefixes, matching the Tappa 9 C7 fim-paths.v1 contract).
+#
+# Curation policy (Tappa 10 §13 Q5 + §10):
+# - V1.0 ships a minimal seed list. The exhaustive operator-tuned set lives
+#   in /etc/northnarrow/netflow-blocklist.local — the operator pulls from
+#   their threat-intel feed of choice (MISP, OTX, commercial vendor exports,
+#   internal IR-derived IoCs) and curates per-host.
+# - The seed entries below are RFC-reserved test / documentation prefixes
+#   that NO legitimate outbound flow should ever target. A hit on any of
+#   these is a high-confidence "something is misconfigured or hostile."
+#   Operators who run private labs against these ranges should DISABLE the
+#   relevant entry via the `.local` overlay (e.g. `-198.51.100.0/24`).
+#
+# See docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md §13 Q5 for the
+# rationale (flat-list + operator-curated, no shipped IOC feed in V1.0 to
+# avoid stale / wrong-attribution embarrassment).
+
+# ── RFC 5737 — IPv4 documentation prefixes (no legitimate routing) ────
+192.0.2.0/24
+198.51.100.0/24
+203.0.113.0/24
+
+# ── RFC 3849 — IPv6 documentation prefix ──────────────────────────────
+2001:db8::/32
+
+# ── RFC 6598 — shared CGN space (no public Internet egress should hit) ─
+100.64.0.0/10
+
+# ── RFC 2544 — IETF benchmarking range (no public routing) ─────────────
+198.18.0.0/15
+
+# ── RFC 7526 — deprecated 6to4 relay anycast (no current Internet use) ──
+192.88.99.0/24

@@ -81,6 +81,27 @@ pub const CONFIG_DIR: &str = "/etc/northnarrow";
 ///   `-` disable). Same tamper concern; protected once the operator
 ///   places the file (the bootstrap WARN tolerates absence on
 ///   fresh installs).
+/// - `netflow-blocklist.v1` (Tappa 10 N8): the curated default
+///   IP / CIDR threat-intel blocklist consumed by NN-L-NET-001.
+///   Tamper here would silently disable matches against known-bad
+///   destinations (operator-curated baseline must not be erasable
+///   by a foothold attacker).
+/// - `netflow-blocklist.local` (Tappa 10 N8): operator overlay
+///   for the IP / CIDR blocklist (`+entry` add, `-entry` disable).
+///   Same tamper concern as `fim-paths.local`; protected once the
+///   operator drops the file.
+/// - `netflow-ja3-blocklist.v1` (Tappa 10 N8): the curated default
+///   JA3 fingerprint threat-actor blocklist consumed by
+///   NN-L-NET-003. Tamper would silently widen or narrow what
+///   TLS handshakes match against the known-bad fingerprint set.
+/// - `netflow-ja3-blocklist.local` (Tappa 10 N8): operator overlay
+///   for the JA3 fingerprint blocklist. Same shape as the
+///   IP blocklist `.local`.
+///
+/// Tappa 10 N8 APPENDS the four netflow blocklist files at the
+/// END of the list — existing C7 + A14 positions stay stable so
+/// any audit reader indexing by slot doesn't break across the
+/// upgrade.
 pub const ETC_PROTECTED_FILES: &[&str] = &[
     "admin.pub",
     "agent_id",
@@ -88,6 +109,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "agent.sig.key",
     "fim-paths.v1",
     "fim-paths.local",
+    "netflow-blocklist.v1",
+    "netflow-blocklist.local",
+    "netflow-ja3-blocklist.v1",
+    "netflow-ja3-blocklist.local",
 ];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
@@ -114,15 +139,25 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
 ///   access log per Tappa 9.5 §3.5. One row per observed trip;
 ///   tampering would erase the audit-grade incident record an
 ///   operator hands to IR.
+/// - `netflow.jsonl` (Tappa 10 N8): chained NetFlow event log
+///   per design §6.4 + §4.4. Agent appends one row per closed
+///   flow (the §6.5 rate limiter never suppresses the on-disk
+///   row, only the decision-engine emission); tampering would
+///   let an attacker erase the audit-grade flow record an
+///   operator hands to IR — same lock-in as the FIM + canary
+///   chains.
 ///
 /// Tappa 9.5 K7 APPENDS the two canary chains at the END of the
-/// list — existing FIM positions stay stable so any audit reader
-/// indexing by slot doesn't break across the upgrade.
+/// list; Tappa 10 N8 then APPENDS `netflow.jsonl` after the
+/// canary chains. Existing entries' positions stay stable so
+/// any audit reader indexing by slot doesn't break across the
+/// upgrade.
 pub const STATE_PROTECTED_FILES: &[&str] = &[
     "fim_baseline.jsonl",
     "fim_drift.jsonl",
     "canaries.jsonl",
     "canary_access.jsonl",
+    "netflow.jsonl",
 ];
 
 /// Tappa 9.5 K7: subdirectory under [`CONFIG_DIR`] holding the
@@ -491,6 +526,42 @@ pub fn bootstrap_canary_log(canary_log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Tappa 10 N8: bootstrap an empty NetFlow log file
+/// (`netflow.jsonl`) if it doesn't exist yet, so PROTECTED_INODES
+/// has an inode to register at attach time. Same shape as
+/// [`bootstrap_fim_log`] + [`bootstrap_canary_log`] — parent
+/// directory's mode is 0700 to match [`STATE_DIR_MODE`].
+pub fn bootstrap_netflow_log(netflow_log_path: &Path) -> Result<()> {
+    if netflow_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = netflow_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(STATE_DIR_MODE)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| format!("creating netflow-log parent dir {}", parent.display()))?;
+        }
+    }
+    // 0644: world-readable for operator `cat`-inspection, only
+    // root + the agent's user can write (LSM-enforced append-only
+    // applies via PROTECTED_INODES + PROTECTED_PIDS exemption,
+    // same as the FIM + canary logs).
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(netflow_log_path)
+        .with_context(|| format!("creating netflow log {}", netflow_log_path.display()))?;
+    info!(
+        path = %netflow_log_path.display(),
+        "anti-tamper FS: netflow log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
+}
+
 /// Tappa 9 C7: bootstrap an empty FIM log file (either
 /// `fim_baseline.jsonl` or `fim_drift.jsonl`) if it doesn't
 /// exist yet, so PROTECTED_INODES has an inode to register at
@@ -700,12 +771,13 @@ mod tests {
 
     // ── Tappa 8 A14 (B4) — /etc/northnarrow registration tests ─────
 
-    /// A14 + C7 test: `ETC_PROTECTED_FILES` is a stable, ordered
-    /// list of the six file basenames. The ordering matters for
-    /// the operator-visible audit-log entries; anchor it
-    /// explicitly. A14 originally specified four files; Tappa 9
-    /// C7 appended `fim-paths.v1` + `fim-paths.local` at the
-    /// END of the list so existing entries' positions stay
+    /// A14 + C7 + N8 test: `ETC_PROTECTED_FILES` is a stable,
+    /// ordered list of the ten file basenames. The ordering
+    /// matters for the operator-visible audit-log entries; anchor
+    /// it explicitly. A14 originally specified four files; Tappa
+    /// 9 C7 appended `fim-paths.v1` + `fim-paths.local` and Tappa
+    /// 10 N8 appended the four `netflow-*-blocklist*` files —
+    /// each later commit only APPENDS so existing positions stay
     /// stable for any audit-log reader that indexes by slot.
     #[test]
     fn etc_protected_files_lists_the_design_files() {
@@ -718,22 +790,53 @@ mod tests {
                 "agent.sig.key",
                 "fim-paths.v1",
                 "fim-paths.local",
+                "netflow-blocklist.v1",
+                "netflow-blocklist.local",
+                "netflow-ja3-blocklist.v1",
+                "netflow-ja3-blocklist.local",
             ],
-            "design §9 / commit A14 + Tappa 9 C7 specify these files in this order"
+            "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 \
+             specify these files in this order"
         );
         assert_eq!(CONFIG_DIR, "/etc/northnarrow");
     }
 
-    /// C7 + K7 test: `STATE_PROTECTED_FILES` lists the four
+    /// N8 test: `ETC_PROTECTED_FILES` includes the four Tappa 10
+    /// netflow blocklist files — `netflow-blocklist.v1` + its
+    /// `.local` overlay (NN-L-NET-001 IP / CIDR set) and
+    /// `netflow-ja3-blocklist.v1` + its `.local` overlay
+    /// (NN-L-NET-003 JA3 fingerprint set). Focused test alongside
+    /// the exhaustive `etc_protected_files_lists_the_design_files`
+    /// — calls out the N8 widening intent and fails fast if a
+    /// future refactor drops one of the four entries without
+    /// touching the exhaustive list (e.g. a rename that leaves
+    /// the exhaustive list happy but breaks the blocklist tamper
+    /// invariant).
+    #[test]
+    fn etc_protected_files_includes_net_blocklists() {
+        for name in [
+            "netflow-blocklist.v1",
+            "netflow-blocklist.local",
+            "netflow-ja3-blocklist.v1",
+            "netflow-ja3-blocklist.local",
+        ] {
+            assert!(
+                ETC_PROTECTED_FILES.contains(&name),
+                "{name} must be in ETC_PROTECTED_FILES (Tappa 10 N8 LSM widening)"
+            );
+        }
+    }
+
+    /// C7 + K7 + N8 test: `STATE_PROTECTED_FILES` lists the five
     /// /var/lib/northnarrow/ chain files that PROTECTED_INODES
     /// must cover. C7 shipped the two FIM logs; Tappa 9.5 K7
-    /// APPENDS the two canary chain files at the END of the
-    /// list (canaries.jsonl + canary_access.jsonl) so existing
-    /// entries' positions stay stable for any audit-log reader
-    /// that indexes by slot. Order anchored explicitly per
-    /// design §9 + §6.4.
+    /// APPENDED the two canary chain files (canaries.jsonl +
+    /// canary_access.jsonl); Tappa 10 N8 APPENDS `netflow.jsonl`
+    /// at the END so existing entries' positions stay stable for
+    /// any audit-log reader that indexes by slot. Order anchored
+    /// explicitly per design §9 + §6.4.
     #[test]
-    fn state_protected_files_lists_the_four_state_logs() {
+    fn state_protected_files_lists_the_five_state_logs() {
         assert_eq!(
             STATE_PROTECTED_FILES,
             &[
@@ -741,8 +844,10 @@ mod tests {
                 "fim_drift.jsonl",
                 "canaries.jsonl",
                 "canary_access.jsonl",
+                "netflow.jsonl",
             ],
-            "design §6.4 + Tappa 9.5 §9 specify these four files in this order"
+            "design §6.4 + Tappa 9.5 §9 + Tappa 10 §6.4 / §10 \
+             specify these five files in this order"
         );
         assert_eq!(STATE_DIR, "/var/lib/northnarrow");
     }
@@ -807,6 +912,43 @@ mod tests {
              (the K4 canary template families) in alphabetical order"
         );
         assert_eq!(CANARY_TEMPLATES_SUBDIR, "canary-templates");
+    }
+
+    /// N8 test: `bootstrap_netflow_log` creates a zero-byte file
+    /// at mode 0644 when missing — mirrors the
+    /// `bootstrap_fim_log` + `bootstrap_canary_log` contract so
+    /// the LSM-protected layout invariants hold uniformly across
+    /// all five /var/lib/northnarrow/ chain files.
+    #[test]
+    fn bootstrap_netflow_log_creates_zero_byte_file_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("netflow.jsonl");
+        assert!(!log_path.exists());
+        bootstrap_netflow_log(&log_path).expect("bootstrap missing netflow log");
+        assert!(log_path.exists());
+        let meta = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    /// N8 test: `bootstrap_netflow_log` is idempotent — a second
+    /// call on an existing file is a no-op and does NOT truncate
+    /// (defends against the same defensive-bootstrap-on-every-
+    /// boot foot-gun that bootstrap_fim_log + bootstrap_canary_log
+    /// guard against; we MUST NOT silently erase a prior NetFlow
+    /// audit chain on agent restart).
+    #[test]
+    fn bootstrap_netflow_log_is_idempotent_and_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("netflow.jsonl");
+        bootstrap_netflow_log(&log_path).expect("first bootstrap");
+        std::fs::write(&log_path, b"existing chained netflow line\n").unwrap();
+        bootstrap_netflow_log(&log_path).expect("second bootstrap");
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            body, "existing chained netflow line\n",
+            "second bootstrap must NOT truncate"
+        );
     }
 
     /// C7 test: `bootstrap_fim_log` creates a zero-byte file at
