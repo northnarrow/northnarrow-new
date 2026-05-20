@@ -18,6 +18,7 @@ pub mod canary;
 pub mod correlation;
 pub mod decision;
 pub mod fim;
+pub mod net;
 pub mod posture;
 pub mod rag;
 pub mod response;
