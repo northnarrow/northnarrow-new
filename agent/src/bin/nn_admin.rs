@@ -34,6 +34,7 @@ use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
     load_audit_pubkey, run_audit_read, run_audit_verify, run_fim_baseline, run_fim_report,
+    run_fim_status, FimStatusOutcome,
     run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
     run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, FimBaselineOutcome,
     FimReportOutcome, ForcePostureOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
@@ -376,6 +377,23 @@ enum FimCmd {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
+
+    /// Print the in-process FIM status snapshot: watched-paths
+    /// summary (effective / added / disabled-default counts),
+    /// baseline + drift chain row counts, last baseline ts,
+    /// token-bucket state for the §6.5 hierarchical rate-limiter
+    /// (`high_remaining/cap` + `medium_remaining/cap`). Read-only,
+    /// signed payload, single-sig `fim-read` role.
+    Status {
+        /// Path to the operator's `fim-read`-role admin
+        /// private key.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
 }
 
 #[cfg(feature = "debug-trigger")]
@@ -633,6 +651,20 @@ fn main() -> ExitCode {
             Ok(outcome) => exit_from_fim_report(outcome),
             Err(e) => {
                 eprintln!("fim report: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Fim {
+            sub:
+                FimCmd::Status {
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_fim_status(&socket, &key, &agent_id_file) {
+            Ok(outcome) => exit_from_fim_status(outcome),
+            Err(e) => {
+                eprintln!("fim status: {e:#}");
                 ExitCode::from(5)
             }
         },
@@ -1289,6 +1321,93 @@ fn exit_from_fim_report(outcome: FimReportOutcome) -> ExitCode {
         }
         FimReportOutcome::Transport => {
             eprintln!("fim report: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// C7: map [`FimStatusOutcome`] to an exit code AND print the
+/// snapshot to stdout on success. Stable exit shape mirrors
+/// [`exit_from_fim_baseline`] / [`exit_from_fim_report`] so
+/// operator scripts can branch on `$?` without parsing text.
+fn exit_from_fim_status(outcome: FimStatusOutcome) -> ExitCode {
+    match outcome {
+        FimStatusOutcome::Success {
+            watched_paths_count,
+            disabled_default_count,
+            added_path_count,
+            last_baseline_ts,
+            baseline_entries_total,
+            drift_entries_total,
+            high_remaining,
+            high_cap_per_min,
+            medium_remaining,
+            medium_cap_per_min,
+            bucket_window_resets_in_secs,
+        } => {
+            println!("fim status:");
+            println!(
+                "  paths-watched: {watched_paths_count} \
+                 (added {added_path_count}, disabled-default {disabled_default_count})"
+            );
+            if last_baseline_ts.is_empty() {
+                println!(
+                    "  baseline: 0 entries (no chain yet — first-boot TOFU pending or no \
+                     paths configured)"
+                );
+            } else {
+                println!(
+                    "  baseline: {baseline_entries_total} entries (last ts: {last_baseline_ts})"
+                );
+            }
+            println!("  drift:    {drift_entries_total} entries");
+            println!(
+                "  rate-limit (Q4): high {high_remaining}/{high_cap_per_min}, \
+                 medium {medium_remaining}/{medium_cap_per_min}, \
+                 window resets in {bucket_window_resets_in_secs}s \
+                 (Critical: uncapped — §13 Q4 lock-in)"
+            );
+            ExitCode::SUCCESS
+        }
+        FimStatusOutcome::InvalidSignature => {
+            eprintln!("fim status: invalid signature");
+            ExitCode::from(2)
+        }
+        FimStatusOutcome::NoPendingChallenge => {
+            eprintln!("fim status: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        FimStatusOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("fim status: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        FimStatusOutcome::RoleDenied => {
+            eprintln!("fim status: role denied (the submitted key lacks `fim-read`)");
+            ExitCode::from(7)
+        }
+        FimStatusOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "fim status: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)"
+            );
+            ExitCode::from(5)
+        }
+        FimStatusOutcome::AgentIdMismatch => {
+            eprintln!("fim status: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        FimStatusOutcome::UnknownOperation => {
+            eprintln!("fim status: server rejected operation");
+            ExitCode::from(5)
+        }
+        FimStatusOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("fim status: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        FimStatusOutcome::Transport => {
+            eprintln!("fim status: unexpected server reply");
             ExitCode::from(5)
         }
     }

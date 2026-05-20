@@ -1,0 +1,157 @@
+# NorthNarrow FIM watched-paths default list (Tappa 9 C7 / design §10).
+#
+# Loaded at agent boot from /etc/northnarrow/fim-paths.v1 (the install.sh
+# helper drops this file under /etc/northnarrow/ if missing). Operators
+# extend or narrow via /etc/northnarrow/fim-paths.local — see the
+# `add:` and `disable:` lists schema in §13 Q7 of the FIM design.
+#
+# Format: one entry per non-empty / non-comment line, absolute path.
+# YAML headers (`paths:`, `add:`, `disable:`) are NOT parsed in v1; the
+# whole file is the "default paths" list. The .local overlay carries
+# its own YAML schema.
+#
+# Curation policy (per §13 Q3 — V1.0 ships ~100 curated paths, no
+# recursive watches):
+# - System binaries that an attacker would tamper to gain persistence
+#   (sshd, login shells, package-manager helpers, init systems).
+# - Sensitive configs whose tamper signals intrusion (/etc/passwd,
+#   /etc/shadow, /etc/ssh/sshd_config, sudoers).
+# - Authentication endpoints (PAM modules, authorized_keys roots).
+# - Log files that an attacker would truncate to cover tracks
+#   (NN-L-FIM-005 — log truncation rule).
+# - Cron + systemd unit drop-in directories (NN-L-FIM-007 / NN-L-FIM-009).
+# - Cloud-credential paths (NN-L-FIM-011..014) — read-watching catches
+#   exfil-by-curl-from-AWS-CLI-config patterns.
+#
+# Symlinks: §13 Q1 two-row baseline semantics apply automatically —
+# adding /usr/bin/sshd auto-baselines BOTH the symlink (if any) AND
+# the resolved target, one hop deep.
+
+# ── system binaries (Critical-class — NN-L-FIM-001) ───────────────────
+/usr/sbin/sshd
+/usr/bin/sshd
+/usr/sbin/init
+/usr/bin/init
+/usr/lib/systemd/systemd
+/usr/sbin/login
+/usr/bin/login
+/usr/bin/sudo
+/usr/bin/su
+/usr/bin/passwd
+/usr/sbin/cron
+/usr/sbin/crond
+/bin/bash
+/bin/sh
+/bin/dash
+/usr/bin/bash
+/usr/bin/sh
+/usr/bin/dash
+/usr/bin/zsh
+/usr/bin/python3
+/usr/bin/perl
+
+# ── package managers (modify-here = supply-chain compromise) ──────────
+/usr/bin/apt
+/usr/bin/apt-get
+/usr/bin/dpkg
+/usr/bin/yum
+/usr/bin/dnf
+/usr/bin/rpm
+/usr/bin/snap
+/usr/bin/pip
+/usr/bin/pip3
+
+# ── network / firewall tooling ────────────────────────────────────────
+/usr/sbin/iptables
+/usr/sbin/ip6tables
+/usr/sbin/nft
+/usr/sbin/ufw
+/usr/bin/ip
+/usr/bin/curl
+/usr/bin/wget
+/usr/bin/nc
+/usr/bin/ncat
+/usr/bin/socat
+
+# ── sensitive configs ─────────────────────────────────────────────────
+/etc/passwd
+/etc/shadow
+/etc/group
+/etc/gshadow
+/etc/sudoers
+/etc/ssh/sshd_config
+/etc/ssh/ssh_config
+/etc/pam.conf
+/etc/securetty
+/etc/login.defs
+/etc/hosts
+/etc/hosts.allow
+/etc/hosts.deny
+/etc/resolv.conf
+/etc/nsswitch.conf
+/etc/crontab
+/etc/fstab
+/etc/profile
+
+# ── PAM modules (auth bypass surface) ─────────────────────────────────
+/etc/pam.d/su
+/etc/pam.d/sudo
+/etc/pam.d/sshd
+/etc/pam.d/login
+/etc/pam.d/common-auth
+/etc/pam.d/common-account
+/etc/pam.d/common-password
+/etc/pam.d/common-session
+
+# ── authorized_keys roots (NN-L-FIM-004) ──────────────────────────────
+/root/.ssh/authorized_keys
+/root/.ssh/authorized_keys2
+/etc/ssh/authorized_keys
+/etc/ssh/sshd_config.d
+
+# ── log files (NN-L-FIM-005 truncation detection) ─────────────────────
+/var/log/auth.log
+/var/log/secure
+/var/log/syslog
+/var/log/messages
+/var/log/kern.log
+/var/log/audit/audit.log
+/var/log/wtmp
+/var/log/btmp
+/var/log/lastlog
+
+# ── cron drop-in roots (NN-L-FIM-007) ─────────────────────────────────
+/etc/cron.d
+/etc/cron.hourly
+/etc/cron.daily
+/etc/cron.weekly
+/etc/cron.monthly
+/var/spool/cron
+/var/spool/cron/crontabs
+
+# ── kernel modules (NN-L-FIM-008) ─────────────────────────────────────
+/lib/modules
+/etc/modules
+/etc/modules-load.d
+/etc/modprobe.d
+
+# ── systemd unit roots (NN-L-FIM-009) ─────────────────────────────────
+/etc/systemd/system
+/etc/systemd/user
+/lib/systemd/system
+/usr/lib/systemd/system
+
+# ── cloud credentials (NN-L-FIM-011..014 — operator + root copies) ────
+# AWS (NN-L-FIM-011)
+/root/.aws/credentials
+/root/.aws/config
+# Azure (NN-L-FIM-012)
+/root/.azure
+# GCP (NN-L-FIM-013)
+/root/.config/gcloud/credentials.db
+/root/.config/gcloud/access_tokens.db
+/root/.config/gcloud/application_default_credentials.json
+/root/.config/gcloud/legacy_credentials
+# Docker (NN-L-FIM-014)
+/root/.docker/config.json
+/var/lib/docker/credentials.json

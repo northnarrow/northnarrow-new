@@ -999,6 +999,124 @@ pub fn run_fim_baseline(
     Ok(map_admin_result_to_baseline(result))
 }
 
+/// Outcome of `nn-admin fim status`. Success carries the live
+/// in-process snapshot fields the CLI renders to the operator.
+#[derive(Debug)]
+pub enum FimStatusOutcome {
+    Success {
+        watched_paths_count: u32,
+        disabled_default_count: u32,
+        added_path_count: u32,
+        last_baseline_ts: String,
+        baseline_entries_total: u32,
+        drift_entries_total: u32,
+        high_remaining: u32,
+        high_cap_per_min: u32,
+        medium_remaining: u32,
+        medium_cap_per_min: u32,
+        bucket_window_resets_in_secs: u32,
+    },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
+    Transport,
+}
+
+fn map_response_to_fim_status(
+    resp: common::wire::admin_protocol::FimStatusResponse,
+) -> FimStatusOutcome {
+    use common::wire::admin_protocol::AdminResult;
+    match resp.result {
+        AdminResult::Success => FimStatusOutcome::Success {
+            watched_paths_count: resp.watched_paths_count,
+            disabled_default_count: resp.disabled_default_count,
+            added_path_count: resp.added_path_count,
+            last_baseline_ts: resp.last_baseline_ts,
+            baseline_entries_total: resp.baseline_entries_total,
+            drift_entries_total: resp.drift_entries_total,
+            high_remaining: resp.high_remaining,
+            high_cap_per_min: resp.high_cap_per_min,
+            medium_remaining: resp.medium_remaining,
+            medium_cap_per_min: resp.medium_cap_per_min,
+            bucket_window_resets_in_secs: resp.bucket_window_resets_in_secs,
+        },
+        AdminResult::InvalidSignature => FimStatusOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => FimStatusOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            FimStatusOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::RoleDenied => FimStatusOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => FimStatusOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => FimStatusOutcome::AgentIdMismatch,
+        AdminResult::QuorumNotMet { .. } => FimStatusOutcome::InvalidSignature,
+        AdminResult::UnknownOperation => FimStatusOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            FimStatusOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+/// `nn-admin fim status` — submit a 1-of-N quorum-signed
+/// request and pretty-print the in-process snapshot
+/// (token-bucket counts, watched-paths summary, last baseline ts,
+/// chain entry totals). Read-only — no on-disk side effects.
+pub fn run_fim_status(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+) -> Result<FimStatusOutcome> {
+    use common::wire::admin_protocol::FimStatusRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_fim_status(nonce, now, agent_id_arr);
+    let sig: [u8; 64] = sign(&payload, &signing)
+        .map_err(|e| anyhow!("signing fim-status payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::FimStatusRequest(FimStatusRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    let reply = read_frame(&mut stream)?;
+    match reply {
+        AdminMessage::FimStatusResponse(resp) => Ok(map_response_to_fim_status(resp)),
+        other => Ok({
+            let _ = other;
+            FimStatusOutcome::Transport
+        }),
+    }
+}
+
 /// `nn-admin fim report` — submit a 1-of-N quorum-signed
 /// request to read the chained drift log. `since_unix_ts`
 /// filters server-side; `None` returns the full chain (capped
