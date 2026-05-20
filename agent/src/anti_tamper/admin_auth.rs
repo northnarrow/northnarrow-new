@@ -1065,6 +1065,13 @@ fn parse_role_list(s: &str) -> Result<Vec<Role>> {
 /// design §3.2 list verbatim — case-sensitive lowercase. The
 /// `all` keyword maps to [`Role::All`], which authorises every
 /// operation (break-glass).
+///
+/// Tappa 9 (C1) added the `fim-read` / `fim-manage` keywords;
+/// Tappa 9.5 (K1) added `canary-read` / `canary-manage` per
+/// design §12 Q7 split-role lock-in. The list MUST stay in
+/// sync with [`role_keyword`] (the emit-side helper) — the
+/// `load_parses_every_role_keyword_in_design_spec_3_2` test
+/// anchors that invariant.
 fn parse_role_keyword(s: &str) -> Result<Role> {
     match s {
         "unlock" => Ok(Role::Unlock),
@@ -1072,10 +1079,15 @@ fn parse_role_keyword(s: &str) -> Result<Role> {
         "force-posture" => Ok(Role::ForcePosture),
         "rotate-keys" => Ok(Role::RotateKeys),
         "audit-read" => Ok(Role::AuditRead),
+        "fim-manage" => Ok(Role::FimManage),
+        "fim-read" => Ok(Role::FimRead),
+        "canary-read" => Ok(Role::CanaryRead),
+        "canary-manage" => Ok(Role::CanaryManage),
         "all" => Ok(Role::All),
         other => Err(anyhow!(
             "unknown role `{other}` — expected one of: \
-             unlock, shutdown, force-posture, rotate-keys, audit-read, all"
+             unlock, shutdown, force-posture, rotate-keys, audit-read, \
+             fim-manage, fim-read, canary-read, canary-manage, all"
         )),
     }
 }
@@ -1241,6 +1253,9 @@ fn role_keyword(r: Role) -> &'static str {
         // shape operators see in admin.pub lines + CLI.
         Role::FimManage => "fim-manage",
         Role::FimRead => "fim-read",
+        // Tappa 9.5 (K1) — design §12 Q7 split-role lock-in.
+        Role::CanaryRead => "canary-read",
+        Role::CanaryManage => "canary-manage",
         Role::All => "all",
     }
 }
@@ -1870,6 +1885,13 @@ mod tests {
             ("force-posture", Role::ForcePosture),
             ("rotate-keys", Role::RotateKeys),
             ("audit-read", Role::AuditRead),
+            // Tappa 9 (C1) — same wire-keyword shape operators
+            // see in admin.pub lines + CLI.
+            ("fim-manage", Role::FimManage),
+            ("fim-read", Role::FimRead),
+            // Tappa 9.5 (K1) — design §12 Q7 split-role lock-in.
+            ("canary-read", Role::CanaryRead),
+            ("canary-manage", Role::CanaryManage),
             ("all", Role::All),
         ];
         for (keyword, expected) in cases {
