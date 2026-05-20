@@ -609,6 +609,7 @@ async fn main() -> Result<()> {
                     attach_observe_programs, populate_watched_paths,
                     take_fs_fim_events_ringbuf,
                 };
+                use northnarrow_agent::fim::baseline::BaselineCache;
                 use northnarrow_agent::fim::drain::{
                     drain_loop, DriftClassifier, DriftRateLimiter, FimDriftDb, InodePathMap,
                 };
@@ -617,6 +618,33 @@ async fn main() -> Result<()> {
                 };
 
                 let rate_limiter = Arc::new(DriftRateLimiter::new());
+
+                // Polish #2: populate the per-path baseline cache
+                // from the chained baseline log so the drain loop
+                // can suppress no-op kernel events (touch -t,
+                // permission-set-to-same-value, etc.) — the cache
+                // miss path treats the event as a first observation
+                // and emits drift normally.
+                let baseline_cache = match BaselineCache::load_from_log(
+                    &cli.fim_baseline_file,
+                ) {
+                    Ok(c) => {
+                        info!(
+                            entries = c.len(),
+                            "fim: baseline cache loaded"
+                        );
+                        Arc::new(c)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.fim_baseline_file.display(),
+                            "fim baseline cache load failed — drain will emit drift \
+                             for every kernel event (no-op suppression disabled)"
+                        );
+                        Arc::new(BaselineCache::new())
+                    }
+                };
 
                 // C8: attach the 6 fim_*_observe LSM programs +
                 // populate WATCHED_PATHS from the effective paths
@@ -675,6 +703,7 @@ async fn main() -> Result<()> {
                 tokio::spawn(run_recompute_task(
                     receiver,
                     Arc::clone(&baseline_db),
+                    Arc::clone(&baseline_cache),
                     Arc::clone(&inode_map),
                     move || {
                         northnarrow_agent::fim::paths_config::load_watched_paths(
@@ -717,11 +746,14 @@ async fn main() -> Result<()> {
                             let classifier = Arc::new(DriftClassifier::new());
                             let rate_limiter_clone = Arc::clone(&rate_limiter);
                             let inode_map_for_drain = Arc::clone(&inode_map);
+                            let baseline_cache_for_drain =
+                                Arc::clone(&baseline_cache);
                             let event_tx = sensor.event_tx();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = drain_loop(
                                     rb,
                                     inode_map_for_drain,
+                                    baseline_cache_for_drain,
                                     drift_db,
                                     classifier,
                                     rate_limiter_clone,

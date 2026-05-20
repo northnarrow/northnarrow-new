@@ -46,7 +46,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::fim::baseline::{compute_baseline, BaselineDb};
+use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineDb};
 use crate::fim::drain::InodePathMap;
 
 /// Bounded queue depth for the recompute channel. A pending op
@@ -166,9 +166,11 @@ impl BaselineRecomputeSender {
 /// runs `nn-admin fim baseline` gets the freshly-merged set on
 /// the next recompute. The closure re-reads + re-merges on each
 /// iteration — cheap (the file is ~100 lines).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_recompute_task<F>(
     mut receiver: mpsc::Receiver<RecomputeRequest>,
     baseline_db: Arc<Mutex<BaselineDb>>,
+    baseline_cache: Arc<BaselineCache>,
     inode_map: Arc<InodePathMap>,
     paths_snapshot: F,
 ) where
@@ -186,22 +188,16 @@ pub async fn run_recompute_task<F>(
                 Ok(drafts) => {
                     let mut db = baseline_db.lock();
                     for draft in drafts {
-                        let path_for_map = draft.path.clone();
                         match db.append(draft) {
-                            Ok(_entry) => {
+                            Ok(entry) => {
                                 entries_written += 1;
-                                // Refresh path resolution — the
-                                // (dev, ino) lookup requires a
-                                // stat after the recompute, so
-                                // we just leave the inode_map
-                                // entry to be repopulated by the
-                                // next baseline-from-disk pass
-                                // at the next agent boot. C7
-                                // intentionally keeps recompute
-                                // minimal — InodePathMap
-                                // refresh from on-disk baseline
-                                // is the boot path.
-                                let _ = path_for_map;
+                                // Tappa 9 polish #2: keep the cache
+                                // synced with the chain tail so the
+                                // drain loop's no-op-event
+                                // suppression uses the freshly-
+                                // computed SHA on the next kernel
+                                // event for this path.
+                                baseline_cache.upsert(entry);
                                 let _ = &inode_map;
                             }
                             Err(e) => {
