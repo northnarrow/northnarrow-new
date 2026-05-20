@@ -523,10 +523,9 @@ impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
     fn from(k: CanaryDeployKindCmd) -> Self {
         match k {
             CanaryDeployKindCmd::File { path } => CanaryDeploySpec::File { path },
-            CanaryDeployKindCmd::Process { path, fake_arg0 } => CanaryDeploySpec::Process {
-                path,
-                fake_arg0,
-            },
+            CanaryDeployKindCmd::Process { path, fake_arg0 } => {
+                CanaryDeploySpec::Process { path, fake_arg0 }
+            }
             CanaryDeployKindCmd::Network {
                 bind_addr,
                 bind_port,
@@ -1825,9 +1824,7 @@ fn exit_from_canary_refresh(outcome: CanaryRefreshOutcome) -> ExitCode {
             server_ts,
             max_skew_secs,
         } => {
-            eprintln!(
-                "canary refresh: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)"
-            );
+            eprintln!("canary refresh: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
             ExitCode::from(5)
         }
         CanaryRefreshOutcome::AgentIdMismatch => {

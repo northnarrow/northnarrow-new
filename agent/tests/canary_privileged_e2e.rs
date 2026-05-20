@@ -51,6 +51,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::EniIptablesGuard;
+
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -278,8 +281,7 @@ impl CanaryFixture {
         // WATCHED_PATHS.
         let fim_paths_v1 = dir.join("fim-paths.v1");
         {
-            let mut f = std::fs::File::create(&fim_paths_v1)
-                .expect("create fim-paths.v1");
+            let mut f = std::fs::File::create(&fim_paths_v1).expect("create fim-paths.v1");
             for p in prewatched_files {
                 writeln!(f, "{}", p.to_string_lossy()).expect("write fim-paths.v1 line");
             }
@@ -499,9 +501,7 @@ fn parse_canary_id(stdout: &str) -> String {
             }
         }
     }
-    panic!(
-        "no `canary deploy: success (<id>)` line in nn-admin stdout: {stdout:?}"
-    );
+    panic!("no `canary deploy: success (<id>)` line in nn-admin stdout: {stdout:?}");
 }
 
 fn wait_for_socket(path: &Path) {
@@ -548,6 +548,14 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn file_canary_open_triggers_canary_tripped_event_and_combat() {
+    // K5 NN-L-CANARY-001 fires at Critical severity, which the
+    // posture FSM translates to Combat → `NetworkIsolator`
+    // installs the production NORTHNARROW_COMBAT iptables chain.
+    // The test exits without an unlock op, so without the RAII
+    // guard the chain would persist and isolate the host (twice
+    // observed during K8 verification before this hotfix).
+    let _eni = EniIptablesGuard::install();
+
     // Pre-create the decoy file BEFORE agent spawn so its inode
     // is in WATCHED_PATHS when the kernel `inode_file_open` hook
     // attaches. The agent reads fim-paths.v1 + stat()s each path
@@ -607,9 +615,7 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
     let sig_b64 = row["agent_sig"]
         .as_str()
         .expect("agent_sig field must be present on a sealed row");
-    let sig_bytes = B64
-        .decode(sig_b64)
-        .expect("agent_sig must be valid base64");
+    let sig_bytes = B64.decode(sig_b64).expect("agent_sig must be valid base64");
     assert_eq!(
         sig_bytes.len(),
         64,
@@ -639,6 +645,11 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
+    // K5 NN-L-CANARY-002 → Combat → iptables chain. RAII cleanup
+    // restores the host's network on test exit (pass / fail /
+    // panic).
+    let _eni = EniIptablesGuard::install();
+
     // Process canary path can be created post-spawn — sched_process_exec
     // is a tracepoint, not a WATCHED_PATHS-gated LSM hook; the K3
     // detector matches via the registry's exe_index after deploy.
@@ -713,6 +724,10 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn refresh_rearms_canary_for_repeat_trips() {
+    // Two K5 Critical trips during this test → Combat engages
+    // twice. RAII cleanup restores the host's network on exit.
+    let _eni = EniIptablesGuard::install();
+
     let tmp = tempfile::tempdir().expect("decoy tempdir");
     let decoy = tmp.path().join("decoy_rearm.txt");
     std::fs::write(&decoy, b"placeholder\n").expect("seed decoy file");
@@ -727,7 +742,11 @@ fn refresh_rearms_canary_for_repeat_trips() {
         .status()
         .expect("spawn cat (trip #1)");
     let rows = fx.wait_access(1);
-    assert_eq!(rows[0]["first_trip"].as_bool(), Some(true), "trip #1 must be first_trip=true");
+    assert_eq!(
+        rows[0]["first_trip"].as_bool(),
+        Some(true),
+        "trip #1 must be first_trip=true"
+    );
 
     // Refresh — signed admin op, clears the tripped flag.
     fx.refresh(&canary_id);

@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::EniIptablesGuard;
+
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -205,6 +208,13 @@ fn list_combat_chain_rules() -> Vec<String> {
 
 #[test]
 fn e2e_force_combat_then_unlock_via_cli() {
+    // Belt-and-braces: the unlock step at the end of this test
+    // already drives `NetworkIsolator::release`, but if any
+    // assertion before that step fails (or the test panics),
+    // the chain would be left attached and the host loses
+    // outbound networking. The RAII guard runs unconditionally
+    // on scope exit.
+    let _eni = EniIptablesGuard::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let priv_key = init_admin_keypair(dir.path());
     let (_guard, handles) = spawn_agent(dir.path());
@@ -299,6 +309,12 @@ fn e2e_force_combat_then_unlock_via_cli() {
 
 #[test]
 fn e2e_unlock_with_wrong_key() {
+    // The test drives Combat then attempts a wrong-key unlock
+    // (which must fail). The chain stays installed for the
+    // duration; the recovery unlock at the bottom cleans it,
+    // but the RAII guard is here for panic-safety in case any
+    // earlier assertion fires.
+    let _eni = EniIptablesGuard::install();
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Install pubkey A into admin.pub.
@@ -387,6 +403,7 @@ fn e2e_rate_limit_via_full_stack() {
     // until V1.1 introduces NN_ADMIN_RATE_LIMIT_WINDOW_SECS or a
     // CLI flag. The skeleton below is the shape the unignored
     // version will take.
+    let _eni = EniIptablesGuard::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let _correct_priv = init_admin_keypair(dir.path());
     let other = tempfile::tempdir().expect("tempdir2");
