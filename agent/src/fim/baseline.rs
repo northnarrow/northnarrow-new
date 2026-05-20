@@ -277,6 +277,124 @@ fn sha256_of_link_metadata(target: &str, lmeta: &fs::Metadata) -> [u8; 32] {
     h.finalize().into()
 }
 
+// ── per-path baseline cache (Tappa 9 polish #2) ─────────────────────
+
+/// Per-path "latest baseline" cache. Built at agent boot by
+/// walking the chained `fim_baseline.jsonl` log + keeping the
+/// LAST entry per path. The drain loop consults this on each
+/// kernel-observed event to filter no-op events (kernel
+/// `inode_setattr` fires on `touch -t` even when the content
+/// SHA-256 is unchanged; without the cache, every such event
+/// produces a drift entry).
+///
+/// Symbolic-link semantics (§13 Q1 two-row baseline): the cache
+/// keeps the most-recent entry per `(path, is_symlink)` PAIR —
+/// a symlinked watched path has two cache entries (one for the
+/// link metadata, one for the resolved content). The drain loop
+/// queries with `is_symlink: false` since `compute_baseline`
+/// always emits a content-row for any reachable file.
+///
+/// Thread-safety: `RwLock` keeps the lock fast on the
+/// drain-loop's `get` hot path (no contention with the
+/// recompute task's `update` writes — recomputes are infrequent
+/// operator-triggered ops). The map is `BTreeMap` instead of
+/// `HashMap` for deterministic iteration in
+/// `nn-admin fim status`-style summaries.
+#[derive(Debug, Default)]
+pub struct BaselineCache {
+    inner: parking_lot::RwLock<std::collections::BTreeMap<CacheKey, BaselineEntry>>,
+}
+
+/// Composite cache key: the watched path AND whether the entry
+/// is the symlink-metadata row (`true`) or the resolved-content
+/// row (`false`). Same shape as the §13 Q1 two-row baseline
+/// semantics. `Ord` for `BTreeMap`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CacheKey {
+    path: String,
+    is_symlink: bool,
+}
+
+impl BaselineCache {
+    /// Empty cache. Use [`Self::load_from_log`] for the populated
+    /// boot-time variant.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Walk the chained `fim_baseline.jsonl` log at `path` and
+    /// build a cache mapping `(path, is_symlink)` →
+    /// [`BaselineEntry`]. Later rows overwrite earlier rows for
+    /// the same key (matches the §6.2 "last entry per path is
+    /// the current baseline" invariant). Missing file → empty
+    /// cache; malformed lines bubble up as errors.
+    pub fn load_from_log(path: &Path) -> Result<Self> {
+        let cache = Self::new();
+        let f = match OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(cache),
+            Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+        };
+        let reader = BufReader::new(f);
+        {
+            let mut guard = cache.inner.write();
+            for line in reader.lines() {
+                let line =
+                    line.with_context(|| format!("reading line from {}", path.display()))?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let entry: BaselineEntry = serde_json::from_str(trimmed).with_context(|| {
+                    format!("parsing baseline line during cache load: {trimmed}")
+                })?;
+                let key = CacheKey {
+                    path: entry.path.clone(),
+                    is_symlink: entry.is_symlink,
+                };
+                guard.insert(key, entry);
+            }
+        }
+        Ok(cache)
+    }
+
+    /// Look up the latest content-row (`is_symlink == false`)
+    /// baseline for `path`. Returns an owned clone so the read
+    /// lock is dropped immediately — the drain's downstream
+    /// SHA-256 rehash is the expensive step and we don't want
+    /// to hold the lock across it.
+    pub fn get_content(&self, path: &str) -> Option<BaselineEntry> {
+        let key = CacheKey {
+            path: path.to_string(),
+            is_symlink: false,
+        };
+        self.inner.read().get(&key).cloned()
+    }
+
+    /// Insert or replace the entry for `(entry.path, entry.is_symlink)`.
+    /// Called by the recompute task after each successful
+    /// [`BaselineDb::append`] so the cache reflects the freshest
+    /// chain tail.
+    pub fn upsert(&self, entry: BaselineEntry) {
+        let key = CacheKey {
+            path: entry.path.clone(),
+            is_symlink: entry.is_symlink,
+        };
+        self.inner.write().insert(key, entry);
+    }
+
+    /// Number of cached entries. Useful for boot logs +
+    /// `nn-admin fim status` summary counts.
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// True when the cache holds zero entries.
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
+}
+
 // ── on-disk DB ──────────────────────────────────────────────────────
 
 /// Append-only writer for the FIM baseline DB. Holds the
@@ -744,5 +862,160 @@ mod tests {
         // For completeness, assert first.entry_hash != tail (we
         // chained past it).
         assert_ne!(db2.last_hash(), first.entry_hash);
+    }
+
+    // ── Polish #2: BaselineCache (Tappa 9 followup) ───────────────
+
+    /// Cache test #1: `load_from_log` returns the LAST entry per
+    /// (path, is_symlink) — earlier appends are overwritten by
+    /// later ones for the same key. Mirrors the §6.2 "last entry
+    /// per path is the current baseline" invariant.
+    #[test]
+    fn baseline_cache_loads_last_entry_per_path() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        // Two appends for the same path — the second is the
+        // current baseline.
+        let first = db
+            .append(BaselineEntryDraft {
+                path: "/etc/passwd".to_string(),
+                sha256: hex::encode([0x11u8; 32]),
+                mode: "0o644".to_string(),
+                uid: 0,
+                gid: 0,
+                size_bytes: 100,
+                is_symlink: false,
+            })
+            .unwrap();
+        let second = db
+            .append(BaselineEntryDraft {
+                path: "/etc/passwd".to_string(),
+                sha256: hex::encode([0x22u8; 32]),
+                mode: "0o644".to_string(),
+                uid: 0,
+                gid: 0,
+                size_bytes: 105,
+                is_symlink: false,
+            })
+            .unwrap();
+        // And one for a different path.
+        let other = db
+            .append(BaselineEntryDraft {
+                path: "/etc/shadow".to_string(),
+                sha256: hex::encode([0x33u8; 32]),
+                mode: "0o000".to_string(),
+                uid: 0,
+                gid: 0,
+                size_bytes: 200,
+                is_symlink: false,
+            })
+            .unwrap();
+        let cache = BaselineCache::load_from_log(&log_path).unwrap();
+        assert_eq!(cache.len(), 2);
+        let cur_passwd = cache.get_content("/etc/passwd").unwrap();
+        assert_eq!(cur_passwd.sha256, second.sha256);
+        assert_eq!(cur_passwd.entry_hash, second.entry_hash);
+        assert_ne!(cur_passwd.entry_hash, first.entry_hash);
+        let cur_shadow = cache.get_content("/etc/shadow").unwrap();
+        assert_eq!(cur_shadow.entry_hash, other.entry_hash);
+    }
+
+    /// Cache test #2: `get_content` only returns the
+    /// `is_symlink: false` row. A symlinked watched path has
+    /// TWO baseline rows per §13 Q1; the drain wants the
+    /// content row for SHA comparison.
+    #[test]
+    fn baseline_cache_get_content_skips_symlink_metadata_rows() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        // Two rows for the same watched path: symlink metadata
+        // (is_symlink=true) + resolved content (is_symlink=false).
+        let _ = db
+            .append(BaselineEntryDraft {
+                path: "/usr/sbin/sshd".to_string(),
+                sha256: hex::encode([0xAAu8; 32]),
+                mode: "0o755".to_string(),
+                uid: 0,
+                gid: 0,
+                size_bytes: 50,
+                is_symlink: true,
+            })
+            .unwrap();
+        let content = db
+            .append(BaselineEntryDraft {
+                path: "/usr/sbin/sshd".to_string(),
+                sha256: hex::encode([0xBBu8; 32]),
+                mode: "0o755".to_string(),
+                uid: 0,
+                gid: 0,
+                size_bytes: 900_000,
+                is_symlink: false,
+            })
+            .unwrap();
+        let cache = BaselineCache::load_from_log(&log_path).unwrap();
+        assert_eq!(cache.len(), 2, "both rows in the cache");
+        let got = cache.get_content("/usr/sbin/sshd").unwrap();
+        // Returned the content row, not the symlink-metadata row.
+        assert_eq!(got.sha256, content.sha256);
+        assert!(!got.is_symlink);
+    }
+
+    /// Cache test #3: `upsert` replaces the existing entry for
+    /// a (path, is_symlink) key — covers the recompute-task
+    /// freshness update.
+    #[test]
+    fn baseline_cache_upsert_replaces_existing_entry() {
+        let cache = BaselineCache::new();
+        let entry_v1 = BaselineEntry {
+            ts: "2026-05-19T00:00:00.000000Z".to_string(),
+            path: "/etc/sudoers".to_string(),
+            sha256: hex::encode([0x01u8; 32]),
+            mode: "0o440".to_string(),
+            uid: 0,
+            gid: 0,
+            size_bytes: 100,
+            is_symlink: false,
+            agent_id: "00".repeat(16),
+            prev_hash: GENESIS_PREV_HASH.to_string(),
+            entry_hash: "11".repeat(32),
+            agent_sig: "A".repeat(88),
+        };
+        cache.upsert(entry_v1.clone());
+        assert_eq!(cache.len(), 1);
+        let mut entry_v2 = entry_v1.clone();
+        entry_v2.sha256 = hex::encode([0x99u8; 32]);
+        entry_v2.entry_hash = "99".repeat(32);
+        cache.upsert(entry_v2.clone());
+        assert_eq!(cache.len(), 1, "upsert must REPLACE not duplicate");
+        let got = cache.get_content("/etc/sudoers").unwrap();
+        assert_eq!(got.sha256, entry_v2.sha256);
+        assert_eq!(got.entry_hash, entry_v2.entry_hash);
+    }
+
+    /// Cache test #4: missing-file load returns an empty cache
+    /// (no error). Boot-path invariant: agent starting fresh
+    /// (no fim_baseline.jsonl yet) gets an empty cache rather
+    /// than a panic.
+    #[test]
+    fn baseline_cache_load_missing_file_yields_empty() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist.jsonl");
+        let cache = BaselineCache::load_from_log(&missing).expect("missing-file tolerated");
+        assert!(cache.is_empty());
+        assert!(cache.get_content("/anything").is_none());
+    }
+
+    /// Cache test #5: `get_content` for a path that was never
+    /// baselined returns None — the drain treats this as "first
+    /// observation" and process_drift's existing
+    /// (baseline_sha256=None, new_sha256=Some) branch fires.
+    #[test]
+    fn baseline_cache_get_unknown_path_returns_none() {
+        let cache = BaselineCache::new();
+        assert!(cache.get_content("/never/baselined").is_none());
     }
 }

@@ -87,7 +87,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
-use crate::fim::baseline::{compute_baseline, BaselineEntry};
+use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
 
 /// Default location of the chained drift log. Lives alongside
 /// the baseline DB so the Tappa 7 task 5 FS-LSM protection +
@@ -615,11 +615,26 @@ pub fn process_drift(
         (&baseline_sha256, &new_sha256),
         (Some(old), Some(new)) if old == new
     );
-    if !real_drift && !matches!(op, FimOp::Deleted | FimOp::Renamed) {
+    // Polish #2 semantics: ONLY suppress no-op events for
+    // content-class ops (Modified / Created / Linked). Deleted
+    // + Renamed always emit (the file disappeared; operator
+    // wants to know). FimOp::Opened ALWAYS emits regardless of
+    // content-equality — the NN-L-FIM-011..014 cloud-cred
+    // rules care about WHO opens the file, not whether content
+    // changed (a cred file read by `cat` is suspicious even if
+    // bytes are unchanged). The C8 cache work only filtered
+    // touch-induced setattr; preserving Opened keeps the cred-
+    // read detection path intact.
+    let suppress_on_match = matches!(
+        op,
+        FimOp::Modified | FimOp::Created | FimOp::Linked
+    );
+    if !real_drift && suppress_on_match {
         debug!(
             target: "fim.drain",
             path = %path,
-            "no-op drift: sha256 unchanged, skipping"
+            ?op,
+            "no-op drift: sha256 unchanged for content-class op, skipping"
         );
         return Ok(false);
     }
@@ -695,19 +710,24 @@ fn comm_to_string(comm: &[u8]) -> String {
 /// The drain takes ownership of the [`FimDriftDb`] writer because
 /// per-event appends are serialised through it — single-writer DB
 /// invariant matches the recompute-task contract from C7. The
-/// `last_baseline_lookup` closure resolves a path's current
-/// baseline entry (currently always `None` — the first wired
-/// drain treats EVERY kernel-observed event as drift; a per-path
-/// baseline cache is a Tappa-9-followup to filter no-op touches).
+/// [`BaselineCache`] (Tappa 9 polish #2) lets process_drift
+/// compare the kernel-observed event against the previously-
+/// baselined SHA, suppressing no-op events (`touch -t`,
+/// permission-set-to-same-value) before they hit the drift log.
+/// The recompute task updates the cache after each successful
+/// `BaselineDb::append` so on-disk and in-memory views stay
+/// consistent.
 ///
 /// The `event_tx` is the same channel
 /// [`crate::sensors::SensorMultiplexer`] funnels its events into;
 /// `Event::Fim(FimEvent)` lands alongside `ProcessSpawn` /
 /// `FsProtectDenial` so the existing main-loop `process_event`
 /// path picks them up without changes.
+#[allow(clippy::too_many_arguments)]
 pub async fn drain_loop(
     rb: aya::maps::ring_buf::RingBuf<aya::maps::MapData>,
     inode_map: std::sync::Arc<InodePathMap>,
+    baseline_cache: std::sync::Arc<BaselineCache>,
     drift_db: std::sync::Arc<parking_lot::Mutex<FimDriftDb>>,
     classifier: std::sync::Arc<DriftClassifier>,
     rate_limiter: std::sync::Arc<DriftRateLimiter>,
@@ -715,7 +735,11 @@ pub async fn drain_loop(
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
     let mut async_fd = AsyncFd::new(rb)?;
-    info!(target: "fim.drain", "fim drain loop: ready");
+    info!(
+        target: "fim.drain",
+        baseline_cache_entries = baseline_cache.len(),
+        "fim drain loop: ready"
+    );
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -741,11 +765,19 @@ pub async fn drain_loop(
             // hash the file, which can take milliseconds). Owning
             // `raw` by value already disconnected from the borrow.
             let _ = item; // keep clippy happy + readable
+            // Resolve the watched path BEFORE locking the drift DB
+            // so the BaselineCache lookup doesn't hold the DB mutex.
+            let path_for_lookup = inode_map.lookup(&InodeKey {
+                dev: raw.target_dev,
+                ino: raw.target_ino,
+            });
+            let last_baseline =
+                path_for_lookup.and_then(|p| baseline_cache.get_content(&p));
             let mut db = drift_db.lock();
             if let Err(e) = process_drift(
                 &raw,
                 inode_map.as_ref(),
-                None, // C8 simplification: no per-path baseline cache yet
+                last_baseline.as_ref(),
                 &mut db,
                 classifier.as_ref(),
                 rate_limiter.as_ref(),

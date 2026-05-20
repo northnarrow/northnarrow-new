@@ -581,3 +581,73 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
          predicate"
     );
 }
+
+// ── Polish #2: BaselineCache no-op-touch suppression ────────────────
+
+/// Tappa 9 polish #2 e2e — cache suppression for `Modified`
+/// op when content didn't change. `touch -t` on a watched file
+/// fires BOTH `inode_setattr` (mtime update → Modified) and
+/// `file_open` (touch opens the file → Opened). The cache
+/// suppresses the Modified row when content_sha matches; the
+/// Opened row always emits per `process_drift`'s policy
+/// (Opened doesn't get content-equality suppression because
+/// the NN-L-FIM-011..014 cred-read rules care WHO opens
+/// regardless of content).
+///
+/// Asserts ZERO `op=Modified` rows after a sequence of touch -t
+/// calls. Opened rows are unavoidable and not the test target.
+#[test]
+fn fim_baseline_cache_suppresses_noop_modified() {
+    let fx = FimFixture::setup("steady.txt", b"unchanged-content\n");
+    fx.wait_baseline();
+
+    // Sanity: drift log is empty after the TOFU baseline pass —
+    // the cache was populated from the chain post-recompute, so
+    // no drift entries yet.
+    let pre = read_jsonl(&fx.drift_log);
+    assert!(
+        pre.is_empty(),
+        "drift log should be empty post-baseline before any touch: {pre:?}"
+    );
+
+    // Touch the watched file 5 times with different mtimes —
+    // mtime changes but content stays "unchanged-content\n".
+    // Without the cache, each `inode_setattr` event would land
+    // a Modified row. With the cache, content-equality check
+    // skips the Modified emit; only Opened rows from touch's
+    // file_open syscall remain.
+    let watched = fx.watched_file.to_string_lossy().into_owned();
+    for stamp in &[
+        "202301010000.00",
+        "202302010000.00",
+        "202303010000.00",
+        "202304010000.00",
+        "202305010000.00",
+    ] {
+        let status = std::process::Command::new("touch")
+            .arg("-t")
+            .arg(stamp)
+            .arg(&watched)
+            .status()
+            .expect("spawn touch");
+        assert!(status.success(), "touch failed for stamp {stamp}");
+    }
+
+    // Wait long enough for the drain to have processed every
+    // kernel-side event (drain loop polls at ~1ms idle sleep +
+    // AsyncFd wakes immediately on ringbuf data; 1s is
+    // generous).
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let rows = read_jsonl(&fx.drift_log);
+    let modified_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r["op"].as_u64() == Some(OP_MODIFIED))
+        .collect();
+    assert!(
+        modified_rows.is_empty(),
+        "expected ZERO Modified drift rows after no-op touches \
+         (cache suppression should fire); got {} rows: {modified_rows:?}",
+        modified_rows.len()
+    );
+}
