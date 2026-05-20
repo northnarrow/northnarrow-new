@@ -33,7 +33,9 @@ use common::wire::admin_protocol::{
     CanaryListRequest, CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature,
     ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
 };
-use common::wire::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
+use common::wire::admin_signed_payload::{
+    sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
+};
 
 use crate::agent_id::{self, AGENT_ID_LEN};
 
@@ -1178,21 +1180,10 @@ pub fn run_fim_report(
 /// without reaching into common.
 #[derive(Debug, Clone)]
 pub enum CanaryDeploySpec {
-    File {
-        path: String,
-    },
-    Process {
-        path: String,
-        fake_arg0: String,
-    },
-    Network {
-        bind_addr: String,
-        bind_port: u16,
-    },
-    Credential {
-        path: String,
-        cred_family: String,
-    },
+    File { path: String },
+    Process { path: String, fake_arg0: String },
+    Network { bind_addr: String, bind_port: u16 },
+    Credential { path: String, cred_family: String },
 }
 
 impl CanaryDeploySpec {
@@ -1238,28 +1229,16 @@ impl CanaryDeploySpec {
 /// Success carries the per-canary stable id the server allocated.
 #[derive(Debug)]
 pub enum CanaryDeployOutcome {
-    Success {
-        canary_id: String,
-    },
+    Success { canary_id: String },
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited {
-        retry_after_secs: u32,
-    },
-    QuorumNotMet {
-        required: u8,
-        provided: u8,
-    },
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
     RoleDenied,
-    TimestampSkew {
-        server_ts: u64,
-        max_skew_secs: u32,
-    },
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
     AgentIdMismatch,
     UnknownOperation,
-    ProtocolVersionUnsupported {
-        server_version: u16,
-    },
+    ProtocolVersionUnsupported { server_version: u16 },
     Transport,
 }
 

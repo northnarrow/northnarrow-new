@@ -195,12 +195,8 @@ mod tests {
         let _ = Command::new("iptables")
             .args(["-D", "INPUT", "-j", COMBAT_CHAIN])
             .status();
-        let _ = Command::new("iptables")
-            .args(["-F", COMBAT_CHAIN])
-            .status();
-        let _ = Command::new("iptables")
-            .args(["-X", COMBAT_CHAIN])
-            .status();
+        let _ = Command::new("iptables").args(["-F", COMBAT_CHAIN]).status();
+        let _ = Command::new("iptables").args(["-X", COMBAT_CHAIN]).status();
         assert!(
             EniIptablesGuard::is_clean(),
             "test precondition: chain must be absent at start"

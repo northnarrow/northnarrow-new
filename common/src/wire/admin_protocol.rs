@@ -1183,7 +1183,9 @@ mod tests {
         );
         roundtrip(AdminMessage::CanaryDeployRequest(CanaryDeployRequest {
             payload,
-            signatures: vec![KeyedSignature { signature: [0x33; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0x33; 64],
+            }],
         }));
         roundtrip(AdminMessage::CanaryDeployResponse(CanaryDeployResponse {
             result: AdminResult::Success,
@@ -1204,7 +1206,9 @@ mod tests {
         let payload = SignedPayload::new_canary_list([0x44; 32], 1_700_000_000, [0x55; 16]);
         roundtrip(AdminMessage::CanaryListRequest(CanaryListRequest {
             payload,
-            signatures: vec![KeyedSignature { signature: [0x77; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0x77; 64],
+            }],
         }));
         roundtrip(AdminMessage::CanaryListResponse(CanaryListResponse {
             result: AdminResult::Success,
@@ -1234,7 +1238,9 @@ mod tests {
         );
         roundtrip(AdminMessage::CanaryBurnRequest(CanaryBurnRequest {
             payload: burn_payload,
-            signatures: vec![KeyedSignature { signature: [0xCC; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0xCC; 64],
+            }],
         }));
         roundtrip(AdminMessage::CanaryBurnResult(AdminResult::Success));
 
@@ -1246,7 +1252,9 @@ mod tests {
         );
         roundtrip(AdminMessage::CanaryRefreshRequest(CanaryRefreshRequest {
             payload: refresh_payload,
-            signatures: vec![KeyedSignature { signature: [0xFF; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0xFF; 64],
+            }],
         }));
         roundtrip(AdminMessage::CanaryRefreshResult(AdminResult::RoleDenied));
     }

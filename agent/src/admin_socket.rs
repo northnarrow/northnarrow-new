@@ -659,10 +659,7 @@ fn emit_audit_for(
         // `nn-admin audit read` greps by canary_id for the
         // lifecycle trail across the audit chain + the K2
         // registry chain.
-        (
-            AdminMessage::CanaryDeployRequest(req),
-            AdminMessage::CanaryDeployResponse(resp),
-        ) => {
+        (AdminMessage::CanaryDeployRequest(req), AdminMessage::CanaryDeployResponse(resp)) => {
             let (name, family) = match &req.payload.extra {
                 OperationExtra::CanaryDeploy(e) => {
                     let family = match &e.deployment {
@@ -708,10 +705,7 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
-        (
-            AdminMessage::CanaryRefreshRequest(req),
-            AdminMessage::CanaryRefreshResult(r),
-        ) => {
+        (AdminMessage::CanaryRefreshRequest(req), AdminMessage::CanaryRefreshResult(r)) => {
             let canary_id = match &req.payload.extra {
                 OperationExtra::CanaryRefresh(e) => e.canary_id.clone(),
                 _ => String::new(),
@@ -2036,8 +2030,8 @@ fn materialise_canary_file(
     state: &CanaryAdminState,
     deployed_by_fp: &str,
 ) -> Result<()> {
-    use common::wire::admin_signed_payload::CanaryDeploymentWire;
     use crate::canary::templates::{render, CredFamily};
+    use common::wire::admin_signed_payload::CanaryDeploymentWire;
     match deployment {
         CanaryDeploymentWire::File { path, .. } => {
             // File canary content placeholder. Operator can
@@ -2084,9 +2078,8 @@ fn materialise_canary_file(
 fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("creating parent dir {}: {e}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("creating parent dir {}: {e}", parent.display()))?;
         }
     }
     Ok(())
@@ -2147,8 +2140,7 @@ fn dispatch_canary_list(
             };
         }
     };
-    let (entries_jsonl, entries_count, entries_truncated) =
-        read_jsonl_chain(&log_path);
+    let (entries_jsonl, entries_count, entries_truncated) = read_jsonl_chain(&log_path);
     info!(
         target: "admin.canary_list",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
@@ -3523,7 +3515,10 @@ mod tests {
         let pub_path = dir.path().join("admin.pub");
         std::fs::write(
             &pub_path,
-            format!("{}  {roles}\n", hex::encode(signing.verifying_key().to_bytes())),
+            format!(
+                "{}  {roles}\n",
+                hex::encode(signing.verifying_key().to_bytes())
+            ),
         )
         .unwrap();
         let auth = AdminAuth::load_with_agent_id(&pub_path, agent_id).unwrap();

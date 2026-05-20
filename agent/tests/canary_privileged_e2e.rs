@@ -281,8 +281,7 @@ impl CanaryFixture {
         // WATCHED_PATHS.
         let fim_paths_v1 = dir.join("fim-paths.v1");
         {
-            let mut f = std::fs::File::create(&fim_paths_v1)
-                .expect("create fim-paths.v1");
+            let mut f = std::fs::File::create(&fim_paths_v1).expect("create fim-paths.v1");
             for p in prewatched_files {
                 writeln!(f, "{}", p.to_string_lossy()).expect("write fim-paths.v1 line");
             }
@@ -502,9 +501,7 @@ fn parse_canary_id(stdout: &str) -> String {
             }
         }
     }
-    panic!(
-        "no `canary deploy: success (<id>)` line in nn-admin stdout: {stdout:?}"
-    );
+    panic!("no `canary deploy: success (<id>)` line in nn-admin stdout: {stdout:?}");
 }
 
 fn wait_for_socket(path: &Path) {
@@ -618,9 +615,7 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
     let sig_b64 = row["agent_sig"]
         .as_str()
         .expect("agent_sig field must be present on a sealed row");
-    let sig_bytes = B64
-        .decode(sig_b64)
-        .expect("agent_sig must be valid base64");
+    let sig_bytes = B64.decode(sig_b64).expect("agent_sig must be valid base64");
     assert_eq!(
         sig_bytes.len(),
         64,
@@ -747,7 +742,11 @@ fn refresh_rearms_canary_for_repeat_trips() {
         .status()
         .expect("spawn cat (trip #1)");
     let rows = fx.wait_access(1);
-    assert_eq!(rows[0]["first_trip"].as_bool(), Some(true), "trip #1 must be first_trip=true");
+    assert_eq!(
+        rows[0]["first_trip"].as_bool(),
+        Some(true),
+        "trip #1 must be first_trip=true"
+    );
 
     // Refresh — signed admin op, clears the tripped flag.
     fx.refresh(&canary_id);
