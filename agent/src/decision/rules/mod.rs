@@ -4,6 +4,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 
 use super::Rule;
 
+pub mod canary;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
 mod r003_exec_from_var_tmp;
@@ -34,7 +35,12 @@ pub use r010_binary_in_webroot::R010BinaryInWebroot;
 /// match implies high confidence. The Tappa 9 FIM rules
 /// (NN-L-FIM-001..014) APPEND at the bottom since they match on
 /// `Event::Fim` rather than `Event::ProcessSpawn` — the first-match
-/// short-circuit never affects them.
+/// short-circuit never affects them. Tappa 9.5 K5 canary rules
+/// (NN-L-CANARY-001..004) APPEND after the FIM rules — they match
+/// on `Event::CanaryTripped`, so they're independent of both the
+/// process + FIM rule families. K3 detector precedence guarantees
+/// canary events never co-occur with FIM events for the same
+/// inode (§12 Q9 inline-filter lock-in).
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
     let mut rules: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
@@ -49,6 +55,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(R008HiddenHomeBinary),
     ];
     rules.extend(crate::fim::rules::fim_rules());
+    rules.extend(canary::canary_rules());
     rules
 }
 

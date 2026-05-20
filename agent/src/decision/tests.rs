@@ -13,15 +13,17 @@ use super::rules::{
 };
 use super::{Rule, RuleEngine};
 
-/// Tappa 9 C8: the default rule set covers 10 Tappa-2 rules
-/// (R001..R010) + 14 Tappa-9 FIM rules (NN-L-FIM-001..014). The
-/// FIM rules append at the bottom — the existing first-match
-/// short-circuit on `Event::ProcessSpawn` is unaffected because
-/// FIM rules only match `Event::Fim`.
+/// Tappa 9 C8 + Tappa 9.5 K5: the default rule set covers
+/// 10 Tappa-2 rules (R001..R010) + 14 Tappa-9 FIM rules
+/// (NN-L-FIM-001..014) + 4 Tappa-9.5 canary rules
+/// (NN-L-CANARY-001..004). FIM rules append after process
+/// rules; canary rules append after FIM. Each family matches
+/// a distinct `Event::*` variant — first-match short-circuit
+/// is unaffected across families.
 #[test]
-fn default_engine_has_ten_process_rules_plus_fourteen_fim_rules() {
+fn default_engine_has_ten_process_rules_plus_fourteen_fim_plus_four_canary_rules() {
     let engine = RuleEngine::with_default_rules();
-    assert_eq!(engine.rule_count(), 10 + 14);
+    assert_eq!(engine.rule_count(), 10 + 14 + 4);
 }
 
 #[test]
