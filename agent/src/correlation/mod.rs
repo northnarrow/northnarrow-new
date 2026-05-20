@@ -126,6 +126,10 @@ fn event_timestamp_ns(e: &Event) -> u64 {
         // Tappa 9 (C4): FIM events carry timestamp_ns on the
         // inner FimEvent.
         Event::Fim(fe) => fe.timestamp_ns,
+        // Tappa 9.5 (K3): canary trip events carry their own
+        // timestamp_ns (preserved from the source Event::Fim /
+        // Event::ProcessSpawn the detector remapped).
+        Event::CanaryTripped { timestamp_ns, .. } => *timestamp_ns,
     }
 }
 
@@ -150,6 +154,15 @@ fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
         // Tappa 9 (C4): FIM drift keys off (modifier_pid, path).
         // No ppid info from the kernel hook.
         Event::Fim(fe) => (fe.modifier_pid, None, Some(fe.path.as_str())),
+        // Tappa 9.5 (K3): canary trips key off (accessor_pid,
+        // canary_name). The canary_name carries the operator-
+        // chosen label rather than a filesystem path; same role
+        // for correlation purposes.
+        Event::CanaryTripped {
+            accessor_pid,
+            canary_name,
+            ..
+        } => (*accessor_pid, None, Some(canary_name.as_str())),
     }
 }
 

@@ -191,6 +191,18 @@ pub(crate) fn format_event_line(event: &Event) -> String {
         ),
         // Tappa 9 (C4): FIM drift one-liner. Doesn't appear in
         // the ADE prompt in V1.0 — C9 may wire it later.
+        Event::CanaryTripped {
+            canary_id,
+            canary_name,
+            access_kind,
+            accessor_pid,
+            accessor_comm,
+            ..
+        } => format!(
+            "- canary_tripped id={canary_id} name={canary_name} \
+             kind={access_kind:?} accessor_pid={accessor_pid} \
+             accessor_comm={accessor_comm}"
+        ),
         Event::Fim(fe) => format!(
             "- fim_drift path={} op={:?} modifier_pid={} modifier_comm={}",
             fe.path, fe.op, fe.modifier_pid, fe.modifier_comm

@@ -59,6 +59,15 @@ pub fn transform_to_escalate(
         // / decision-engine flow). C9 optional commit may add
         // FIM-aware ADE; until then this arm is unreachable.
         Event::Fim(fe) => (fe.modifier_pid, fe.path.clone()),
+        // Tappa 9.5 (K3): canary trips short-circuit the rule
+        // engine in `main::process_event` (canary precedence over
+        // FIM rules per §12 Q9). They don't reach ADE either —
+        // this arm exists for exhaustiveness only.
+        Event::CanaryTripped {
+            accessor_pid,
+            canary_name,
+            ..
+        } => (*accessor_pid, canary_name.clone()),
     };
 
     AdeVerdict {

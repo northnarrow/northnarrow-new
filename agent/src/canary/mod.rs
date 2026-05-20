@@ -17,4 +17,6 @@
 //! - Rules NN-L-CANARY-001..004 live in
 //!   `agent/src/decision/rules/canary.rs` (K5).
 
+pub mod access_log;
+pub mod detector;
 pub mod registry;

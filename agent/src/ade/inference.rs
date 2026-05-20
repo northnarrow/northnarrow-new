@@ -255,6 +255,16 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             pid_for_pkg = fe.modifier_pid;
             filename_for_pkg = fe.path.clone();
         }
+        // Tappa 9.5 (K3): canary trips short-circuit in main —
+        // never reach inference; arm for exhaustiveness only.
+        Event::CanaryTripped {
+            accessor_pid,
+            canary_name,
+            ..
+        } => {
+            pid_for_pkg = *accessor_pid;
+            filename_for_pkg = canary_name.clone();
+        }
     }
 
     let metadata = AdeMetadata {

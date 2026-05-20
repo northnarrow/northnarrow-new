@@ -915,6 +915,13 @@ async fn main() -> Result<()> {
                     &correlation,
                     &host,
                     &posture,
+                    // Tappa 9.5 (K3): canary detector wiring is
+                    // disabled until K6 admin dispatch builds the
+                    // Registry + AccessDb + Indexes at boot. Until
+                    // then, process_event's None branch is a no-op
+                    // and FIM/process events flow through the rule
+                    // engine unchanged.
+                    None,
                     e,
                 ).await,
                 None => {
@@ -1030,6 +1037,7 @@ async fn main() -> Result<()> {
 /// Tappa 6: every event also lands in the correlation buffer (so ADE
 /// has recent context), and unmatched events get routed through ADE
 /// when the engine is enabled.
+#[allow(clippy::too_many_arguments)]
 async fn process_event(
     engine: &RuleEngine,
     executor: &Executor,
@@ -1037,8 +1045,27 @@ async fn process_event(
     correlation: &CorrelationBuffer,
     host: &HostContext,
     posture: &PostureMachine,
+    canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
     event: Event,
 ) {
+    // Tappa 9.5 (K3): canary precedence over FIM rules per
+    // §12 Q9 OPTION B inline-filter lock-in. The detector
+    // checks the event against the deployed canary registry;
+    // on match, it returns Some(Event::CanaryTripped { … }),
+    // marks the canary as tripped (idempotent per §12 Q2),
+    // and appends to the canary_access.jsonl chain. We
+    // REPLACE the source event with the canary event so
+    // downstream (correlation buffer push, posture observer,
+    // rule engine) routes through the K5 canary rule family
+    // instead of the K9 FIM rule layer.
+    //
+    // When `canary_detector` is `None` (early-boot path
+    // before K6 wires the Detector handle), this is a no-op.
+    let event = match canary_detector.and_then(|d| d.process_event(&event)) {
+        Some(canary_event) => canary_event,
+        None => event,
+    };
+
     // Run posture detection BEFORE we push the focal event into the
     // correlation buffer — the trigger detector counts the focal as
     // a fresh +1 on top of `recent`, and `recent` already containing
@@ -1137,6 +1164,37 @@ async fn process_event(
                 modifier_uid = fe.modifier_uid,
                 modifier_comm = %fe.modifier_comm,
                 "FIM DRIFT"
+            );
+        }
+        // Tappa 9.5 (K3): canary trip events. The K3 inline
+        // detector intercepts source events BEFORE they reach
+        // this match arm and re-emits as `Event::CanaryTripped`
+        // ONLY when a canary fires (§12 Q9 OPTION B inline-
+        // filter lock-in). Reaching this arm via the regular
+        // event-bus path means a downstream component
+        // (correlation snapshot replay, future K6 admin
+        // synthetic-event injection) re-fed the canary event;
+        // we log + let the K5 rule layer fire the standard
+        // KillProcessTree + posture→COMBAT response.
+        Event::CanaryTripped {
+            canary_id,
+            canary_name,
+            canary_type,
+            access_kind,
+            accessor_pid,
+            accessor_uid,
+            accessor_comm,
+            ..
+        } => {
+            warn!(
+                canary_id = %canary_id,
+                canary_name = %canary_name,
+                canary_type = ?canary_type,
+                access_kind = ?access_kind,
+                accessor_pid = %accessor_pid,
+                accessor_uid = %accessor_uid,
+                accessor_comm = %accessor_comm,
+                "CANARY TRIPPED"
             );
         }
     }

@@ -165,6 +165,9 @@ fn event_kind_label(e: &Event) -> &'static str {
         // Tappa 9 (C4): FIM event label. Doesn't appear in the
         // ADE structured prompt in V1.0.
         Event::Fim(_) => "fim_drift",
+        // Tappa 9.5 (K3): canary trip label. Canary precedence
+        // short-circuits before ADE; arm for exhaustiveness.
+        Event::CanaryTripped { .. } => "canary_tripped",
     }
 }
 
@@ -178,6 +181,12 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
         | Event::FsProtectDenial { pid, uid, .. } => (*pid, *uid),
         // Tappa 9 (C4): FIM modifier triple.
         Event::Fim(fe) => (fe.modifier_pid, fe.modifier_uid),
+        // Tappa 9.5 (K3): canary trip accessor triple.
+        Event::CanaryTripped {
+            accessor_pid,
+            accessor_uid,
+            ..
+        } => (*accessor_pid, *accessor_uid),
     };
     buf.push_str(&format!("pid: {pid}\nuid: {uid}\n"));
 }
