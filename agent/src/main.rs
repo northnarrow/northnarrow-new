@@ -605,21 +605,71 @@ async fn main() -> Result<()> {
             };
         match baseline_db_opt {
             Some(baseline_db) => {
-                use northnarrow_agent::fim::drain::{DriftRateLimiter, InodePathMap};
+                use northnarrow_agent::fim::attach::{
+                    attach_observe_programs, populate_watched_paths,
+                    take_fs_fim_events_ringbuf,
+                };
+                use northnarrow_agent::fim::drain::{
+                    drain_loop, DriftClassifier, DriftRateLimiter, FimDriftDb, InodePathMap,
+                };
                 use northnarrow_agent::fim::recompute::{
                     run_recompute_task, BaselineRecomputeChannel, RecomputeReason,
                 };
+
                 let rate_limiter = Arc::new(DriftRateLimiter::new());
+
+                // C8: attach the 6 fim_*_observe LSM programs +
+                // populate WATCHED_PATHS from the effective paths
+                // set. populate_watched_paths returns the populated
+                // InodePathMap so the drain loop can resolve
+                // (dev,ino) → path. Per-step failures are logged
+                // WARN inside the helpers — the agent still boots
+                // (degrade-not-fail posture matches anti_tamper).
+                let btf = match aya::Btf::from_sys_fs() {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "fim: BTF load failed — observe programs cannot attach this boot"
+                        );
+                        None
+                    }
+                };
+                if let Some(btf) = btf.as_ref() {
+                    if let Err(e) =
+                        attach_observe_programs(sensor.ebpf_mut(), btf)
+                    {
+                        warn!(
+                            error = %e,
+                            "fim: attach_observe_programs returned error — \
+                             observe hooks may be partial"
+                        );
+                    }
+                }
+                let inode_map = match populate_watched_paths(
+                    sensor.ebpf_mut(),
+                    &watched_paths_load.effective,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "fim: populate_watched_paths failed — drain loop will see \
+                             zero (dev,ino) → path mappings; events will warn-and-skip"
+                        );
+                        Arc::new(InodePathMap::new())
+                    }
+                };
+
+                // The recompute task snapshots the merged watched-
+                // paths set every iteration — operators who edit
+                // fim-paths.local and run `nn-admin fim baseline`
+                // pick up the new set without an agent restart.
                 let mut recompute_chan = BaselineRecomputeChannel::new();
                 let sender = recompute_chan.sender();
                 let receiver = recompute_chan
                     .take_receiver()
                     .expect("freshly-constructed channel has a receiver");
-                let inode_map = Arc::new(InodePathMap::new());
-                // The recompute task snapshots the merged watched-
-                // paths set every iteration — operators who edit
-                // fim-paths.local and run `nn-admin fim baseline`
-                // pick up the new set without an agent restart.
                 let v1_for_snapshot = cli.fim_paths_v1.clone();
                 let local_for_snapshot = cli.fim_paths_local.clone();
                 tokio::spawn(run_recompute_task(
@@ -636,10 +686,73 @@ async fn main() -> Result<()> {
                     },
                 ));
 
+                // C8: open the chained drift log + spawn the drain
+                // task. The drain takes ownership of the FS_FIM_EVENTS
+                // ringbuf (taken out of the Ebpf object); subsequent
+                // map_mut("FS_FIM_EVENTS") calls would return None,
+                // which is fine because no other code references the
+                // map name.
+                let drift_db_for_drain =
+                    match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                        &cli.signing_key_file,
+                    )
+                    .and_then(|key| {
+                        FimDriftDb::open(&cli.fim_drift_file, key, agent_id)
+                    }) {
+                        Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                path = %cli.fim_drift_file.display(),
+                                "fim drift DB open failed — drain loop will not spawn; \
+                                 kernel drift events will be dropped this boot"
+                            );
+                            None
+                        }
+                    };
+
+                if let Some(drift_db) = drift_db_for_drain {
+                    match take_fs_fim_events_ringbuf(sensor.ebpf_mut()) {
+                        Ok(rb) => {
+                            let classifier = Arc::new(DriftClassifier::new());
+                            let rate_limiter_clone = Arc::clone(&rate_limiter);
+                            let inode_map_for_drain = Arc::clone(&inode_map);
+                            let event_tx = sensor.event_tx();
+                            let handle = tokio::spawn(async move {
+                                if let Err(e) = drain_loop(
+                                    rb,
+                                    inode_map_for_drain,
+                                    drift_db,
+                                    classifier,
+                                    rate_limiter_clone,
+                                    event_tx,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        target: "fim.drain",
+                                        error = %e,
+                                        "fim drain loop exited"
+                                    );
+                                }
+                            });
+                            sensor.register_pump_handle(handle);
+                            info!("fim: drain loop spawned");
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "fim: take_fs_fim_events_ringbuf failed — drain loop \
+                                 not spawned; kernel drift events will be dropped"
+                            );
+                        }
+                    }
+                }
+
                 // §13 Q5 TOFU: empty baseline file + non-empty paths
-                // set = first boot, fire a recompute. The task above
-                // is already running (tokio::spawn doesn't block on
-                // the future's first poll).
+                // set = first boot, fire a recompute. The recompute
+                // task is already running (tokio::spawn doesn't
+                // block on the future's first poll).
                 if baseline_db.lock().last_hash()
                     == northnarrow_agent::audit::GENESIS_PREV_HASH
                     && !watched_paths_load.effective.is_empty()

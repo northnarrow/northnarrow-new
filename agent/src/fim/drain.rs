@@ -683,6 +683,88 @@ fn comm_to_string(comm: &[u8]) -> String {
     String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
+// ── async drain loop (Tappa 9 C8) ──────────────────────────────────
+
+/// Tappa 9 C8 — async tokio task that drains the `FS_FIM_EVENTS`
+/// ringbuf and feeds each event through [`process_drift`]. Mirrors
+/// the [`crate::sensors::multiplexer::pump`] pattern (AsyncFd<RingBuf>
+/// → poll readable → drain iterator). One task is spawned at agent
+/// boot from [`crate::main`] post-attach; the task lifetime equals
+/// the agent's.
+///
+/// The drain takes ownership of the [`FimDriftDb`] writer because
+/// per-event appends are serialised through it — single-writer DB
+/// invariant matches the recompute-task contract from C7. The
+/// `last_baseline_lookup` closure resolves a path's current
+/// baseline entry (currently always `None` — the first wired
+/// drain treats EVERY kernel-observed event as drift; a per-path
+/// baseline cache is a Tappa-9-followup to filter no-op touches).
+///
+/// The `event_tx` is the same channel
+/// [`crate::sensors::SensorMultiplexer`] funnels its events into;
+/// `Event::Fim(FimEvent)` lands alongside `ProcessSpawn` /
+/// `FsProtectDenial` so the existing main-loop `process_event`
+/// path picks them up without changes.
+pub async fn drain_loop(
+    rb: aya::maps::ring_buf::RingBuf<aya::maps::MapData>,
+    inode_map: std::sync::Arc<InodePathMap>,
+    drift_db: std::sync::Arc<parking_lot::Mutex<FimDriftDb>>,
+    classifier: std::sync::Arc<DriftClassifier>,
+    rate_limiter: std::sync::Arc<DriftRateLimiter>,
+    event_tx: mpsc::Sender<Event>,
+) -> std::io::Result<()> {
+    use tokio::io::unix::AsyncFd;
+    let mut async_fd = AsyncFd::new(rb)?;
+    info!(target: "fim.drain", "fim drain loop: ready");
+    loop {
+        let mut guard = async_fd.readable_mut().await?;
+        let inner = guard.get_inner_mut();
+        let mut drained = 0u32;
+        while let Some(item) = inner.next() {
+            drained += 1;
+            let bytes: &[u8] = item.as_ref();
+            let raw = match bytemuck::try_from_bytes::<FimDriftRaw>(bytes) {
+                Ok(r) => *r,
+                Err(e) => {
+                    warn!(
+                        target: "fim.drain",
+                        expected = std::mem::size_of::<FimDriftRaw>(),
+                        got = bytes.len(),
+                        error = %e,
+                        "ringbuf entry rejected"
+                    );
+                    continue;
+                }
+            };
+            // Drop the iterator item so the slot is released before
+            // we call into the rest-of-the-world (process_drift may
+            // hash the file, which can take milliseconds). Owning
+            // `raw` by value already disconnected from the borrow.
+            let _ = item; // keep clippy happy + readable
+            let mut db = drift_db.lock();
+            if let Err(e) = process_drift(
+                &raw,
+                inode_map.as_ref(),
+                None, // C8 simplification: no per-path baseline cache yet
+                &mut db,
+                classifier.as_ref(),
+                rate_limiter.as_ref(),
+                Some(&event_tx),
+            ) {
+                warn!(
+                    target: "fim.drain",
+                    error = %e,
+                    "process_drift error — event dropped, drain continues"
+                );
+            }
+        }
+        guard.clear_ready();
+        if drained == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+}
+
 fn decode_sha_hex(hex_str: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(hex_str).ok()?;
     if bytes.len() != 32 {

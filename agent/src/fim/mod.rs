@@ -19,6 +19,7 @@
 //!   appends to [`baseline::BaselineDb`], and refreshes the
 //!   [`drain::InodePathMap`].
 
+pub mod attach;
 pub mod baseline;
 pub mod drain;
 pub mod paths_config;
