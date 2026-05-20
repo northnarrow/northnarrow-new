@@ -852,6 +852,207 @@ pub fn load_audit_pubkey(
     Ok(key.verifying_key())
 }
 
+// ── Tappa 9 C6 — nn-admin fim baseline / report ────────────────────
+
+/// Outcome of `nn-admin fim baseline`. Mirrors
+/// [`ForcePostureOutcome`] (same 1-of-N quorum shape +
+/// AdminResult mapping); kept as a separate enum so the
+/// binary can render distinct human messages.
+#[derive(Debug)]
+pub enum FimBaselineOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
+}
+
+/// Outcome of `nn-admin fim report`. Success carries the
+/// chained JSONL body the binary streams to stdout.
+#[derive(Debug)]
+pub enum FimReportOutcome {
+    Success {
+        entries_jsonl: String,
+        entries_count: u32,
+        entries_truncated: bool,
+    },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
+    Transport,
+}
+
+fn map_admin_result_to_baseline(r: common::wire::admin_protocol::AdminResult) -> FimBaselineOutcome {
+    use common::wire::admin_protocol::AdminResult;
+    match r {
+        AdminResult::Success => FimBaselineOutcome::Success,
+        AdminResult::InvalidSignature => FimBaselineOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => FimBaselineOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            FimBaselineOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            FimBaselineOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => FimBaselineOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => FimBaselineOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => FimBaselineOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => FimBaselineOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            FimBaselineOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+fn map_response_to_fim_report(
+    resp: common::wire::admin_protocol::FimReportResponse,
+) -> FimReportOutcome {
+    use common::wire::admin_protocol::AdminResult;
+    match resp.result {
+        AdminResult::Success => FimReportOutcome::Success {
+            entries_jsonl: resp.entries_jsonl,
+            entries_count: resp.entries_count,
+            entries_truncated: resp.entries_truncated,
+        },
+        AdminResult::InvalidSignature => FimReportOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => FimReportOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            FimReportOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::RoleDenied => FimReportOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => FimReportOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => FimReportOutcome::AgentIdMismatch,
+        AdminResult::QuorumNotMet { .. } => FimReportOutcome::InvalidSignature,
+        AdminResult::UnknownOperation => FimReportOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            FimReportOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+/// `nn-admin fim baseline` — submit a 1-of-N quorum-signed
+/// request to recompute the FIM baseline. Per §13 Q6 baseline
+/// is a workflow op (not a security gate), so single-sig with
+/// the `fim-manage` role is sufficient.
+pub fn run_fim_baseline(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+) -> Result<FimBaselineOutcome> {
+    use common::wire::admin_protocol::FimBaselineRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_fim_baseline(nonce, now, agent_id_arr);
+    let sig: [u8; 64] = sign(&payload, &signing)
+        .map_err(|e| anyhow!("signing fim-baseline payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::FimBaselineRequest(FimBaselineRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    let result = match read_frame(&mut stream)? {
+        AdminMessage::FimBaselineResult(r) => r,
+        other => bail!("unexpected reply to FimBaselineRequest: {other:?}"),
+    };
+    Ok(map_admin_result_to_baseline(result))
+}
+
+/// `nn-admin fim report` — submit a 1-of-N quorum-signed
+/// request to read the chained drift log. `since_unix_ts`
+/// filters server-side; `None` returns the full chain (capped
+/// at half of MAX_FRAME_BODY — the response carries
+/// `entries_truncated=true` when the cap fires, and the CLI
+/// surfaces it to the operator as `"... pass --since <ts> to
+/// narrow"`).
+pub fn run_fim_report(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    since_unix_ts: Option<u64>,
+) -> Result<FimReportOutcome> {
+    use common::wire::admin_protocol::FimReportRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_fim_report(nonce, now, agent_id_arr, since_unix_ts);
+    let sig: [u8; 64] = sign(&payload, &signing)
+        .map_err(|e| anyhow!("signing fim-report payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::FimReportRequest(FimReportRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    let reply = read_frame(&mut stream)?;
+    match reply {
+        AdminMessage::FimReportResponse(resp) => Ok(map_response_to_fim_report(resp)),
+        other => Ok({
+            let _ = other;
+            FimReportOutcome::Transport
+        }),
+    }
+}
+
 /// Debug-only: send a `DebugForcePosture` request. Only available
 /// when both this crate and `common` are built with the
 /// `debug-trigger` Cargo feature.
