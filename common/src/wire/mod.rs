@@ -480,6 +480,139 @@ pub fn cstr_lossy(buf: &[u8]) -> alloc::borrow::Cow<'_, str> {
     alloc::string::String::from_utf8_lossy(&buf[..end])
 }
 
+// ── Tappa 10 (N1) — Network Observability userland wire types ──────────
+//
+// Userland-decoded shapes for the Tappa 10 NetFlow / NetListener / TLS
+// fingerprint subsystem. Std-only because they carry heap-allocated
+// `String` + `Vec` + `IpAddr` fields — the kernel half consumes raw
+// POD records (TcpConnectRaw, DnsQueryRaw, plus the new N2 BPF
+// programs' raw structs once those ship). These three structs are
+// what the agent's `net/*` drain + correlation layers emit into the
+// rule engine, the audit chain (`netflow.jsonl`), and the nn-admin
+// CLI responses (design §4 + §9).
+
+/// Tappa 10 (N1) — userland-decoded TLS fingerprint extracted from
+/// a ClientHello. Design §4.2.
+///
+/// JA3 + JA4 are the two industry-standard TLS client fingerprints
+/// the N5 hand-rolled parser populates. `sni` and `alpn` are surfaced
+/// alongside the hashes so detection rules can match on the cleartext
+/// metadata without re-parsing the handshake. `ja3_raw` is the
+/// pre-MD5 comma-separated tuple — operators see it via `nn-admin
+/// net fingerprint` when chasing unknown fingerprints.
+///
+/// `None` SNI happens when the ClientHello lacks the SNI extension
+/// (rare) or when extraction failed — kept distinct from `Some("")`.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TlsFingerprint {
+    /// JA3: `MD5(client_version,ciphers,extensions,curves,
+    /// curve_formats)`. Standard 32-char hex form.
+    pub ja3: alloc::string::String,
+    /// JA3 raw pre-MD5 tuple. Operator-visible for debugging
+    /// unknown fingerprints; same string the MD5 above is taken
+    /// over.
+    pub ja3_raw: alloc::string::String,
+    /// JA4: `<protocol>_<version>_<cipher_count>_<extension_count>_
+    /// <alpn>_<sha256_of_extensions>`. FoxIO / Salesforce 2023
+    /// standard with better resistance to extension-reorder evasion.
+    pub ja4: alloc::string::String,
+    /// SNI server name (ClientHello extension 0). `None` when no
+    /// SNI extension OR extraction failed.
+    pub sni: Option<alloc::string::String>,
+    /// ALPN protocol list (`h2`, `http/1.1`, …) advertised by the
+    /// client. Empty if no ALPN extension.
+    pub alpn: alloc::vec::Vec<alloc::string::String>,
+}
+
+/// Tappa 10 (N1) — userland-decoded TCP / UDP flow record. Design
+/// §4.1.
+///
+/// One per (connect → close) pair on the TCP side (the N3 flow
+/// tracker stitches connect kprobe + tcp_close kprobe by socket
+/// cookie). UDP "flows" are synthetic — the N3 tracker emits one
+/// record per `udp_sendmsg` family of outbound packets sharing the
+/// same five-tuple within a short window. `end_ns = 0` means the
+/// flow is still open at observation time (snapshot via `nn-admin
+/// net flows` while a long-lived connection is alive).
+///
+/// `bytes_sent` / `bytes_recv` are populated from tcp_close's
+/// `tcp_sock` struct; UDP records leave both as 0 (no per-socket
+/// counter to harvest). `resolved_hostname` is filled by the N4
+/// DNS attribution cache when the destination IP matches a recent
+/// PID-keyed DNS answer; `None` for IP-literal destinations or
+/// DNS-cache misses.
+///
+/// `flow_id` is the per-flow stable handle the operator references
+/// via `nn-admin net fingerprint <flow_id>` — design §4.1 spec:
+/// `SHA-256(start_ns || five_tuple || pid)[..16]`, hex.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetFlowEvent {
+    /// Monotonic-clock ns since boot — connect (TCP) or first
+    /// outbound packet (UDP).
+    pub start_ns: u64,
+    /// Monotonic-clock ns since boot — close (TCP) or end of the
+    /// UDP burst window. `0` if still open at observation.
+    pub end_ns: u64,
+    /// `AF_INET` (2) or `AF_INET6` (10).
+    pub family: u8,
+    pub src_addr: std::net::IpAddr,
+    pub src_port: u16,
+    pub dst_addr: std::net::IpAddr,
+    pub dst_port: u16,
+    /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17).
+    pub proto: u8,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: alloc::string::String,
+    /// `/proc/<pid>/exe` at connect time, if resolvable.
+    pub exe: Option<alloc::string::String>,
+    /// Bytes sent on this socket (tcp_close `tp->bytes_sent`).
+    /// 0 for UDP and for open snapshots.
+    pub bytes_sent: u64,
+    /// Bytes received on this socket. Same caveat as
+    /// `bytes_sent`.
+    pub bytes_recv: u64,
+    /// DNS QNAME the N4 cache resolved `dst_addr` to within the
+    /// §6 correlation window. `None` for IP-literal destinations
+    /// or cache misses.
+    pub resolved_hostname: Option<alloc::string::String>,
+    /// JA3 / JA4 + SNI / ALPN extracted by the N5 parser post-
+    /// handshake. `None` for non-TLS flows.
+    pub tls_fingerprint: Option<TlsFingerprint>,
+    /// Per-flow stable ID — `SHA-256(start_ns || five_tuple ||
+    /// pid)[..16]` rendered as 32-char lowercase hex.
+    pub flow_id: alloc::string::String,
+}
+
+/// Tappa 10 (N1) — userland-decoded `inet_csk_listen` event.
+/// Design §4.3.
+///
+/// One per bind+listen transition. Snapshots emitted via
+/// `nn-admin net listeners` are a point-in-time enumeration of
+/// the in-process listener set the agent's N3 tracker maintains —
+/// the kernel side surfaces add/remove deltas via the
+/// `NET_LISTEN_EVENTS` ringbuf the N2 commit lands.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetListenerEvent {
+    /// Monotonic-clock ns since boot — listen() transition.
+    pub timestamp_ns: u64,
+    /// `AF_INET` (2) or `AF_INET6` (10).
+    pub family: u8,
+    pub bind_addr: std::net::IpAddr,
+    pub bind_port: u16,
+    /// `IPPROTO_TCP` for TCP listeners. UDP "listeners" (bound
+    /// recv sockets) reuse this same record shape with
+    /// `proto = IPPROTO_UDP` (17).
+    pub proto: u8,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: alloc::string::String,
+    pub exe: Option<alloc::string::String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +860,110 @@ mod tests {
             json.contains("/home/u/documents/quarterly.docx.crypted"),
             "dest_path must round-trip on the wire: {json}"
         );
+    }
+
+    // ── Tappa 10 N1 — Network Observability wire types ─────────────
+
+    /// N1 test #1: [`TlsFingerprint`] CBOR round-trip. The fingerprint
+    /// is what the N6 detection rules + N9 audit chain serialise; the
+    /// admin protocol carries them inside `NetFingerprintResponse` so
+    /// CBOR (not just JSON) determinism is on the critical path.
+    /// Mirrors the cbor-determinism / round-trip pattern in
+    /// `admin_signed_payload::tests::cbor_encoding_is_deterministic`.
+    #[test]
+    fn tls_fingerprint_serde_cbor_round_trip() {
+        let original = TlsFingerprint {
+            ja3: "771,4865-4866-4867,0-23-65281-10-11-35-16-5-13".to_string(),
+            ja3_raw: "771,4865-4866-4867,0-23-65281-10-11-35-16-5-13,29-23-24,0".to_string(),
+            ja4: "t13d1517h2_8daaf6152771_b1ff8ab2d16f".to_string(),
+            sni: Some("example.com".to_string()),
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&original, &mut buf).expect("cbor encode");
+        // Determinism: two encodes of the same value land on the
+        // same bytes. Load-bearing for any future netflow.jsonl
+        // chain that hashes a fingerprint as part of an entry.
+        let mut buf2 = Vec::new();
+        ciborium::ser::into_writer(&original, &mut buf2).expect("cbor encode 2");
+        assert_eq!(buf, buf2, "TlsFingerprint CBOR must be deterministic");
+        let restored: TlsFingerprint =
+            ciborium::de::from_reader(buf.as_slice()).expect("cbor decode");
+        assert_eq!(restored, original);
+    }
+
+    /// N1 test #2: [`NetFlowEvent`] serde JSON round-trip. JSON is
+    /// the on-disk format for `netflow.jsonl` (§4.4) and the
+    /// streamed body of `NetFlowsResponse` (§9). Construct a fully-
+    /// populated record (TLS flow with DNS attribution) so every
+    /// optional field exercises the serde path.
+    #[test]
+    fn net_flow_event_serde_json_round_trip() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let original = NetFlowEvent {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_000_000_500_000_000,
+            family: 2, // AF_INET
+            src_addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            src_port: 54321,
+            dst_addr: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port: 443,
+            proto: 6, // IPPROTO_TCP
+            pid: 8888,
+            uid: 0,
+            comm: "curl".to_string(),
+            exe: Some("/usr/bin/curl".to_string()),
+            bytes_sent: 1234,
+            bytes_recv: 5678,
+            resolved_hostname: Some("example.com".to_string()),
+            tls_fingerprint: Some(TlsFingerprint {
+                ja3: "771,4865,0".to_string(),
+                ja3_raw: "771,4865,0,29,0".to_string(),
+                ja4: "t13d0000h2_0000_0000".to_string(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["h2".to_string()],
+            }),
+            flow_id: "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: NetFlowEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, original);
+        // Spot-check field presence so a reorder/rename in §4.1
+        // surfaces here rather than silently in a downstream test.
+        assert!(
+            json.contains("\"flow_id\""),
+            "flow_id must appear in JSON: {json}"
+        );
+        assert!(
+            json.contains("\"resolved_hostname\""),
+            "resolved_hostname must appear: {json}"
+        );
+        assert!(
+            json.contains("\"tls_fingerprint\""),
+            "tls_fingerprint must appear: {json}"
+        );
+    }
+
+    /// N1 test #3: [`NetListenerEvent`] serde JSON round-trip.
+    /// Same shape contract as the flow event — listener snapshots
+    /// flow through `NetListenersResponse` as a streamed JSONL body
+    /// per design §9.
+    #[test]
+    fn net_listener_event_serde_json_round_trip() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let original = NetListenerEvent {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            family: 10, // AF_INET6
+            bind_addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            bind_port: 22,
+            proto: 6, // IPPROTO_TCP
+            pid: 1234,
+            uid: 0,
+            comm: "sshd".to_string(),
+            exe: Some("/usr/sbin/sshd".to_string()),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: NetListenerEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored, original);
     }
 }
