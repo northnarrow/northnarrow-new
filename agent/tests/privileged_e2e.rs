@@ -66,15 +66,45 @@ impl Drop for AgentGuard {
     }
 }
 
-/// Spawn the agent with the per-test tempdir paths. Returns the
-/// running child + the socket path the tests will connect to.
-fn spawn_agent(tempdir: &Path) -> (AgentGuard, PathBuf) {
+/// Per-test handles carried by [`spawn_agent`]: the installed
+/// agent + nn-admin RAII guards (Drop sudo-removes the
+/// /usr/local/bin/ copies) plus the socket + the nn-admin path
+/// the tests invoke as their CLI binary. R009-safe via the
+/// PHASE_D_003 `install_to_priv_bin` pattern — agent + nn-admin
+/// both run from /usr/local/bin/ (NOT user-writable) so the
+/// `R009_RootExecFromUserPath` rule never matches.
+struct AgentHandles {
+    socket: PathBuf,
+    /// Path the tests pass to `run_nn_admin` — the installed
+    /// nn-admin under /usr/local/bin/. Holding the corresponding
+    /// `InstalledBin` in `_installed_admin` keeps it alive.
+    nn_admin_path: PathBuf,
+    _installed_agent: InstalledBin,
+    _installed_admin: InstalledBin,
+}
+
+/// Spawn the agent from a sudo-installed copy under
+/// /usr/local/bin/ so the per-spawn nn-admin invocations don't
+/// trip the agent's `R009_RootExecFromUserPath` rule (which
+/// kills any root spawn originating from /home/, /tmp/, etc.).
+///
+/// Mirrors `spawn_agent_b5_with_installs` for the simpler
+/// legacy callers that don't need the B5-era signing-key /
+/// audit-log / shutdown-marker per-test overrides.
+fn spawn_agent(tempdir: &Path) -> (AgentGuard, AgentHandles) {
+    let (installed_agent, installed_admin) = install_priv_bins();
     let socket = tempdir.join("admin.sock");
     let pubkey = tempdir.join("admin.pub");
     let rules = tempdir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
 
-    let child = Command::new(agent_bin())
+    // Spawn the installed (root-owned, /usr/local/bin/) agent
+    // under sudo so it inherits root privileges + bypasses
+    // R009. AgentGuard's SIGQUIT-on-drop still works against
+    // the root subprocess because the kill comes from the test
+    // process (also root via the outer `sudo cargo test`).
+    let child = Command::new("sudo")
+        .arg(&installed_agent.path)
         .arg("--combat-rules")
         .arg(&rules)
         .arg("--admin-pub")
@@ -86,11 +116,17 @@ fn spawn_agent(tempdir: &Path) -> (AgentGuard, PathBuf) {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn northnarrow-agent");
+        .expect("spawn northnarrow-agent (installed copy)");
     let guard = AgentGuard(Some(child));
 
     wait_for_socket(&socket);
-    (guard, socket)
+    let handles = AgentHandles {
+        socket,
+        nn_admin_path: installed_admin.path.clone(),
+        _installed_agent: installed_agent,
+        _installed_admin: installed_admin,
+    };
+    (guard, handles)
 }
 
 fn wait_for_socket(path: &Path) {
@@ -108,12 +144,15 @@ fn wait_for_socket(path: &Path) {
     );
 }
 
-/// Run `nn-admin init` to generate a keypair into `tempdir`. Returns
+/// Run `nn-admin init` to generate a keypair into `tempdir`.
+/// The `nn_admin_path` is the binary to invoke — either the
+/// cargo target path (pre-install, when no agent is running so
+/// R009 is harmless) or the /usr/local/bin/ install. Returns
 /// the private key path the caller will use to sign.
-fn init_admin_keypair(tempdir: &Path) -> PathBuf {
+fn init_admin_keypair_at(nn_admin_path: &Path, tempdir: &Path) -> PathBuf {
     let priv_path = tempdir.join("admin.priv");
     let pub_path = tempdir.join("admin.pub");
-    let status = Command::new(nn_admin_bin())
+    let status = Command::new(nn_admin_path)
         .arg("init")
         .arg("--priv-out")
         .arg(&priv_path)
@@ -127,8 +166,19 @@ fn init_admin_keypair(tempdir: &Path) -> PathBuf {
     priv_path
 }
 
-fn run_nn_admin(args: &[&str]) -> std::process::Output {
-    Command::new(nn_admin_bin())
+/// Pre-install convenience: init keypair using the cargo target
+/// path BEFORE the agent boots (R009 only fires on a running
+/// agent, so target/release/nn-admin is safe here).
+fn init_admin_keypair(tempdir: &Path) -> PathBuf {
+    init_admin_keypair_at(Path::new(nn_admin_bin()), tempdir)
+}
+
+/// Run nn-admin via the supplied (installed) path. Tests spawned
+/// via [`spawn_agent`] pass `handles.nn_admin_path` here so the
+/// subprocess runs from /usr/local/bin/ and the agent's R009
+/// rule doesn't kill it mid-op.
+fn run_nn_admin_at(nn_admin_path: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(nn_admin_path)
         .args(args)
         .output()
         .expect("spawn nn-admin")
@@ -156,24 +206,16 @@ fn list_combat_chain_rules() -> Vec<String> {
 #[test]
 fn e2e_force_combat_then_unlock_via_cli() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let _guard;
-    let socket;
-    let priv_key;
-    {
-        // Initialize the pubkey file BEFORE spawning the agent so
-        // AdminAuth::load succeeds at startup.
-        priv_key = init_admin_keypair(dir.path());
-        (_guard, socket) = spawn_agent(dir.path());
-    }
+    let priv_key = init_admin_keypair(dir.path());
+    let (_guard, handles) = spawn_agent(dir.path());
+    let nn = handles.nn_admin_path.as_path();
+    let socket = handles.socket.as_path();
 
     // Drive the agent into COMBAT via the debug feature.
-    let out = run_nn_admin(&[
-        "debug",
-        "force-posture",
-        "combat",
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    let out = run_nn_admin_at(
+        nn,
+        &["debug", "force-posture", "combat", "--socket", socket.to_str().unwrap()],
+    );
     assert!(
         out.status.success(),
         "debug force-posture failed: stderr={:?}",
@@ -181,7 +223,8 @@ fn e2e_force_combat_then_unlock_via_cli() {
     );
 
     // Status mirrors the forced state.
-    let out = run_nn_admin(&["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out =
+        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.contains("\"posture\":\"Combat\""),
@@ -205,13 +248,16 @@ fn e2e_force_combat_then_unlock_via_cli() {
     );
 
     // Sign + submit; should win.
-    let out = run_nn_admin(&[
-        "unlock",
-        "--key",
-        priv_key.to_str().unwrap(),
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    let out = run_nn_admin_at(
+        nn,
+        &[
+            "unlock",
+            "--key",
+            priv_key.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
+    );
     assert!(
         out.status.success(),
         "unlock failed: code={:?} stderr={:?}",
@@ -228,7 +274,8 @@ fn e2e_force_combat_then_unlock_via_cli() {
 
     // Posture dropped to Alerted (per the asymmetry rationale on
     // admin_release_combat_with_token).
-    let out = run_nn_admin(&["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out =
+        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.contains("\"posture\":\"Alerted\""),
@@ -253,26 +300,28 @@ fn e2e_unlock_with_wrong_key() {
     let other = tempfile::tempdir().expect("tempdir2");
     let other_priv = init_admin_keypair(other.path());
 
-    let (_guard, socket) = spawn_agent(dir.path());
+    let (_guard, handles) = spawn_agent(dir.path());
+    let nn = handles.nn_admin_path.as_path();
+    let socket = handles.socket.as_path();
 
     // Force Combat to make the test meaningful.
-    let out = run_nn_admin(&[
-        "debug",
-        "force-posture",
-        "combat",
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    let out = run_nn_admin_at(
+        nn,
+        &["debug", "force-posture", "combat", "--socket", socket.to_str().unwrap()],
+    );
     assert!(out.status.success());
 
     // Unlock with the wrong private key.
-    let out = run_nn_admin(&[
-        "unlock",
-        "--key",
-        other_priv.to_str().unwrap(),
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    let out = run_nn_admin_at(
+        nn,
+        &[
+            "unlock",
+            "--key",
+            other_priv.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
+    );
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -281,7 +330,8 @@ fn e2e_unlock_with_wrong_key() {
     );
 
     // Posture still Combat, isolation still engaged.
-    let out = run_nn_admin(&["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out =
+        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.contains("\"posture\":\"Combat\""),
@@ -294,13 +344,16 @@ fn e2e_unlock_with_wrong_key() {
 
     // Cleanup: tear down the chain via correct unlock so we don't
     // leave the test host network-isolated if the test runner aborts.
-    let _ = run_nn_admin(&[
-        "unlock",
-        "--key",
-        _correct_priv.to_str().unwrap(),
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    let _ = run_nn_admin_at(
+        nn,
+        &[
+            "unlock",
+            "--key",
+            _correct_priv.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
+    );
 }
 
 #[test]
@@ -320,42 +373,45 @@ fn e2e_rate_limit_via_full_stack() {
     let _correct_priv = init_admin_keypair(dir.path());
     let other = tempfile::tempdir().expect("tempdir2");
     let other_priv = init_admin_keypair(other.path());
-    let (_guard, socket) = spawn_agent(dir.path());
+    let (_guard, handles) = spawn_agent(dir.path());
+    let nn = handles.nn_admin_path.as_path();
+    let socket = handles.socket.as_path();
 
     // Force Combat.
-    let _ = run_nn_admin(&[
-        "debug",
-        "force-posture",
-        "combat",
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    let _ = run_nn_admin_at(
+        nn,
+        &["debug", "force-posture", "combat", "--socket", socket.to_str().unwrap()],
+    );
 
     // Three failures.
     for _ in 0..3 {
-        let out = run_nn_admin(&[
-            "unlock",
-            "--key",
-            other_priv.to_str().unwrap(),
-            "--socket",
-            socket.to_str().unwrap(),
-        ]);
+        let out = run_nn_admin_at(
+            nn,
+            &[
+                "unlock",
+                "--key",
+                other_priv.to_str().unwrap(),
+                "--socket",
+                socket.to_str().unwrap(),
+            ],
+        );
         assert_eq!(out.status.code(), Some(2));
     }
 
     // Fourth attempt would be RateLimited if window were short
     // enough; with the 5-minute production window the 4th call
-    // still succeeds at the challenge step (AdminAuth gates
-    // issue_challenge, not verify directly, but the failures
-    // accumulated above ARE counted). Re-enable assertion after
-    // the V1.1 override lands.
-    let out = run_nn_admin(&[
-        "unlock",
-        "--key",
-        other_priv.to_str().unwrap(),
-        "--socket",
-        socket.to_str().unwrap(),
-    ]);
+    // still succeeds at the challenge step. Re-enable assertion
+    // after the V1.1 override lands.
+    let out = run_nn_admin_at(
+        nn,
+        &[
+            "unlock",
+            "--key",
+            other_priv.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
+    );
     // V1.1: assert_eq!(out.status.code(), Some(4));
     let _ = out;
 }
@@ -364,9 +420,12 @@ fn e2e_rate_limit_via_full_stack() {
 fn e2e_status_no_admin_action_initially() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _priv = init_admin_keypair(dir.path());
-    let (_guard, socket) = spawn_agent(dir.path());
+    let (_guard, handles) = spawn_agent(dir.path());
+    let nn = handles.nn_admin_path.as_path();
+    let socket = handles.socket.as_path();
 
-    let out = run_nn_admin(&["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out =
+        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
     assert!(out.status.success());
     let body = String::from_utf8_lossy(&out.stdout);
 
