@@ -1083,11 +1083,16 @@ fn parse_role_keyword(s: &str) -> Result<Role> {
         "fim-read" => Ok(Role::FimRead),
         "canary-read" => Ok(Role::CanaryRead),
         "canary-manage" => Ok(Role::CanaryManage),
+        // Tappa 10 (N1) — network observability split-role
+        // pair; same wire shape operators see in admin.pub.
+        "net-read" => Ok(Role::NetRead),
+        "net-manage" => Ok(Role::NetManage),
         "all" => Ok(Role::All),
         other => Err(anyhow!(
             "unknown role `{other}` — expected one of: \
              unlock, shutdown, force-posture, rotate-keys, audit-read, \
-             fim-manage, fim-read, canary-read, canary-manage, all"
+             fim-manage, fim-read, canary-read, canary-manage, \
+             net-read, net-manage, all"
         )),
     }
 }
@@ -1256,6 +1261,9 @@ fn role_keyword(r: Role) -> &'static str {
         // Tappa 9.5 (K1) — design §12 Q7 split-role lock-in.
         Role::CanaryRead => "canary-read",
         Role::CanaryManage => "canary-manage",
+        // Tappa 10 (N1) — network observability split-role pair.
+        Role::NetRead => "net-read",
+        Role::NetManage => "net-manage",
         Role::All => "all",
     }
 }
@@ -1892,6 +1900,12 @@ mod tests {
             // Tappa 9.5 (K1) — design §12 Q7 split-role lock-in.
             ("canary-read", Role::CanaryRead),
             ("canary-manage", Role::CanaryManage),
+            // Tappa 10 (N1) — Network Observability split-role
+            // pair; design §9 reserved roles 8..=9 for these but
+            // K1 won them. Per append-only, NetRead / NetManage
+            // are now 10 / 11 (admin.pub keyword shape stable).
+            ("net-read", Role::NetRead),
+            ("net-manage", Role::NetManage),
             ("all", Role::All),
         ];
         for (keyword, expected) in cases {

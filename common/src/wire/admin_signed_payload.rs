@@ -130,6 +130,29 @@ pub enum OperationCode {
     /// after a refresh, subsequent accesses fire the rule again).
     /// Authorised by `Role::CanaryManage`.
     CanaryRefresh = 13,
+    /// Tappa 10 (N1) — operator-initiated read of the chained
+    /// `netflow.jsonl` (§4.4). Optional `since_unix_ts` filter
+    /// mirrors `AuditRead` / `FimReport`. Authorised by
+    /// `Role::NetRead`.
+    ///
+    /// Wire-byte note: design §9 reserved code `10` here, but
+    /// the Tappa 9.5 K1 canary ops landed first and own
+    /// 10..=13. Per the append-only / never-renumber rule, the
+    /// Net* codes pick the next free discriminants (14..=17).
+    NetFlows = 14,
+    /// Tappa 10 (N1) — operator-initiated snapshot of the
+    /// in-process listener set (§4.3 / §9). No filter today;
+    /// empty extra. Authorised by `Role::NetRead`.
+    NetListeners = 15,
+    /// Tappa 10 (N1) — operator-initiated DNS-attribution
+    /// lookup for a destination IP (§6.2 / §9). Authorised
+    /// by `Role::NetRead`.
+    NetResolve = 16,
+    /// Tappa 10 (N1) — operator-initiated TLS fingerprint
+    /// dump for a single flow_id, surfacing JA3 / JA4 / SNI /
+    /// ALPN + the raw ClientHello bytes for forensic review
+    /// (§9). Authorised by `Role::NetRead`.
+    NetFingerprint = 17,
 }
 
 impl From<OperationCode> for u8 {
@@ -155,6 +178,10 @@ impl TryFrom<u8> for OperationCode {
             11 => Ok(Self::CanaryList),
             12 => Ok(Self::CanaryBurn),
             13 => Ok(Self::CanaryRefresh),
+            14 => Ok(Self::NetFlows),
+            15 => Ok(Self::NetListeners),
+            16 => Ok(Self::NetResolve),
+            17 => Ok(Self::NetFingerprint),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -201,6 +228,21 @@ pub enum Role {
     /// per §12 Q7. Operational operators (sysadmins) get this
     /// for the full surface.
     CanaryManage = 9,
+    /// Tappa 10 (N1) — authorises `nn-admin net flows /
+    /// listeners / resolve / fingerprint` (the read surface).
+    /// Same trust level as `AuditRead` + `FimRead` — pure
+    /// observation, no mutation.
+    ///
+    /// Wire-byte note: design §9 reserved `8` for this role, but
+    /// Tappa 9.5 K1 landed `CanaryRead = 8` / `CanaryManage = 9`
+    /// first. Per the append-only rule, NetRead picks the next
+    /// free discriminant (10).
+    NetRead = 10,
+    /// Tappa 10 (N1) — authorises future V1.1 mutating Net
+    /// ops (e.g. `nn-admin net add-blocklist <ip>`). Reserved
+    /// now so the discriminant is stable before any caller
+    /// exists; no op currently maps to it.
+    NetManage = 11,
     All = 255,
 }
 
@@ -223,6 +265,8 @@ impl TryFrom<u8> for Role {
             7 => Ok(Self::FimRead),
             8 => Ok(Self::CanaryRead),
             9 => Ok(Self::CanaryManage),
+            10 => Ok(Self::NetRead),
+            11 => Ok(Self::NetManage),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -351,6 +395,43 @@ pub struct CanaryRefreshExtra {
     pub canary_id: String,
 }
 
+/// Op-specific signed-scope fields for [`OperationCode::NetFlows`]
+/// (Tappa 10 design §4.4 + §9). `since_unix_ts` filters the streamed
+/// `netflow.jsonl` body — `None` means "from chain genesis."
+/// Mirrors [`AuditReadExtra`] / [`FimReportExtra`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NetFlowsExtra {
+    pub since_unix_ts: Option<u64>,
+}
+
+/// Op-specific signed-scope fields for
+/// [`OperationCode::NetListeners`] (Tappa 10 design §4.3 + §9).
+/// Empty today — the response carries the full in-process
+/// listener snapshot. Named struct so a future `family_filter`
+/// or `proto_filter` can be added without an op renumber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NetListenersExtra {}
+
+/// Op-specific signed-scope fields for [`OperationCode::NetResolve`]
+/// (Tappa 10 design §6.2 + §9). `ip` is the destination address
+/// the operator wants the DNS-cache QNAME for, as a string so
+/// the wire form covers both IPv4 + IPv6 without two op codes.
+/// The agent parses it via `IpAddr::from_str` server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetResolveExtra {
+    pub ip: String,
+}
+
+/// Op-specific signed-scope fields for
+/// [`OperationCode::NetFingerprint`] (Tappa 10 design §4.2 + §9).
+/// `flow_id` is the 32-hex per-flow stable handle from
+/// [`NetFlowEvent::flow_id`] — the operator typically pipes it
+/// from a prior `nn-admin net flows` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetFingerprintExtra {
+    pub flow_id: String,
+}
+
 /// Canary kind tag. Wire-byte stability mirrors [`OperationCode`]
 /// and [`Role`] (bare u8 via `serde(into = "u8", try_from = "u8")`):
 /// append-only, new variants get the next free discriminant.
@@ -451,6 +532,14 @@ pub enum OperationExtra {
     CanaryBurn(CanaryBurnExtra),
     /// Tappa 9.5 (K1). Pairs with [`OperationCode::CanaryRefresh`].
     CanaryRefresh(CanaryRefreshExtra),
+    /// Tappa 10 (N1). Pairs with [`OperationCode::NetFlows`].
+    NetFlows(NetFlowsExtra),
+    /// Tappa 10 (N1). Pairs with [`OperationCode::NetListeners`].
+    NetListeners(NetListenersExtra),
+    /// Tappa 10 (N1). Pairs with [`OperationCode::NetResolve`].
+    NetResolve(NetResolveExtra),
+    /// Tappa 10 (N1). Pairs with [`OperationCode::NetFingerprint`].
+    NetFingerprint(NetFingerprintExtra),
 }
 
 impl OperationExtra {
@@ -472,6 +561,10 @@ impl OperationExtra {
             OperationExtra::CanaryList(_) => OperationCode::CanaryList,
             OperationExtra::CanaryBurn(_) => OperationCode::CanaryBurn,
             OperationExtra::CanaryRefresh(_) => OperationCode::CanaryRefresh,
+            OperationExtra::NetFlows(_) => OperationCode::NetFlows,
+            OperationExtra::NetListeners(_) => OperationCode::NetListeners,
+            OperationExtra::NetResolve(_) => OperationCode::NetResolve,
+            OperationExtra::NetFingerprint(_) => OperationCode::NetFingerprint,
         }
     }
 }
@@ -825,6 +918,70 @@ impl SignedPayload {
             extra: OperationExtra::CanaryRefresh(CanaryRefreshExtra { canary_id }),
         }
     }
+
+    /// Tappa 10 (N1) — `net flows` signed payload constructor.
+    /// `since_unix_ts` filters the streamed `netflow.jsonl` body;
+    /// `None` means "from chain genesis." Authorised by
+    /// `Role::NetRead`.
+    pub fn new_net_flows(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        since_unix_ts: Option<u64>,
+    ) -> Self {
+        Self {
+            op: OperationCode::NetFlows,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::NetFlows(NetFlowsExtra { since_unix_ts }),
+        }
+    }
+
+    /// Tappa 10 (N1) — `net listeners` signed payload
+    /// constructor. Empty extra (snapshot-style read). Authorised
+    /// by `Role::NetRead`.
+    pub fn new_net_listeners(nonce: [u8; 32], ts: u64, agent_id: [u8; 16]) -> Self {
+        Self {
+            op: OperationCode::NetListeners,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::NetListeners(NetListenersExtra {}),
+        }
+    }
+
+    /// Tappa 10 (N1) — `net resolve` signed payload constructor.
+    /// `ip` is the destination IP (v4 or v6, string form) the
+    /// operator wants the DNS-cache QNAME for. Authorised by
+    /// `Role::NetRead`.
+    pub fn new_net_resolve(nonce: [u8; 32], ts: u64, agent_id: [u8; 16], ip: String) -> Self {
+        Self {
+            op: OperationCode::NetResolve,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::NetResolve(NetResolveExtra { ip }),
+        }
+    }
+
+    /// Tappa 10 (N1) — `net fingerprint` signed payload
+    /// constructor. `flow_id` is the 32-hex stable handle from
+    /// `NetFlowEvent::flow_id`. Authorised by `Role::NetRead`.
+    pub fn new_net_fingerprint(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        flow_id: String,
+    ) -> Self {
+        Self {
+            op: OperationCode::NetFingerprint,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -853,8 +1010,12 @@ mod tests {
     /// Tappa 9 (C1) grew the array from 6 to 8 with `FimBaseline`
     /// and `FimReport`; Tappa 9 (C7) added `FimStatus`; Tappa 9.5
     /// (K1) added the four canary ops (Deploy / List / Burn /
-    /// Refresh) bringing it to 13.
-    fn one_payload_per_op() -> [SignedPayload; 13] {
+    /// Refresh) bringing it to 13. Tappa 10 (N1) added the four
+    /// network ops (NetFlows / NetListeners / NetResolve /
+    /// NetFingerprint) bringing it to 17 — every existing test
+    /// that iterates over this array (sign+verify round-trip,
+    /// CBOR-determinism) silently picks up the Net* ops.
+    fn one_payload_per_op() -> [SignedPayload; 17] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -890,6 +1051,15 @@ mod tests {
             SignedPayload::new_canary_list(nonce(), TS, agent_id()),
             SignedPayload::new_canary_burn(nonce(), TS, agent_id(), "abc123def456".to_string()),
             SignedPayload::new_canary_refresh(nonce(), TS, agent_id(), "abc123def456".to_string()),
+            SignedPayload::new_net_flows(nonce(), TS, agent_id(), Some(1_700_000_000)),
+            SignedPayload::new_net_listeners(nonce(), TS, agent_id()),
+            SignedPayload::new_net_resolve(nonce(), TS, agent_id(), "1.2.3.4".to_string()),
+            SignedPayload::new_net_fingerprint(
+                nonce(),
+                TS,
+                agent_id(),
+                "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
+            ),
         ]
     }
 
@@ -1067,6 +1237,14 @@ mod tests {
             (OperationCode::CanaryList, 11),
             (OperationCode::CanaryBurn, 12),
             (OperationCode::CanaryRefresh, 13),
+            // Tappa 10 (N1) — APPENDED, never renumber. Design
+            // §9 reserved 10..=13 for these but the K1 canary
+            // ops landed first; per append-only, Net* picks
+            // 14..=17.
+            (OperationCode::NetFlows, 14),
+            (OperationCode::NetListeners, 15),
+            (OperationCode::NetResolve, 16),
+            (OperationCode::NetFingerprint, 17),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -1099,6 +1277,11 @@ mod tests {
             // Tappa 9.5 (K1) — APPENDED, never renumber.
             (Role::CanaryRead, 8),
             (Role::CanaryManage, 9),
+            // Tappa 10 (N1) — APPENDED, never renumber. Design
+            // §9 reserved 8..=9 but K1 won them; NetRead /
+            // NetManage take 10 / 11.
+            (Role::NetRead, 10),
+            (Role::NetManage, 11),
             (Role::All, 255),
         ];
         for (r, expected) in cases {
@@ -1296,6 +1479,42 @@ mod tests {
             let restored: CanaryDeploymentWire =
                 ciborium::de::from_reader(&bytes[..]).expect("cbor decode");
             assert_eq!(restored, original);
+        }
+    }
+
+    /// N1 dedicated test — each of the four new [`SignedPayload`]
+    /// constructors (`new_net_flows` / `new_net_listeners` /
+    /// `new_net_resolve` / `new_net_fingerprint`) produces a payload
+    /// that sign+verify round-trips cleanly. The shared
+    /// `one_payload_per_op` array already includes all four, so the
+    /// existing `sign_and_verify_round_trip_for_every_operation_code`
+    /// and `cbor_encoding_is_deterministic` tests cover them silently.
+    /// This test is the explicit "did the dedicated constructors
+    /// land?" anchor that names them by function.
+    #[test]
+    fn net_op_constructors_round_trip_sign_and_verify() {
+        let (signing, verifying) = fixed_keypair();
+        let payloads = [
+            SignedPayload::new_net_flows(nonce(), TS, agent_id(), None),
+            SignedPayload::new_net_flows(nonce(), TS, agent_id(), Some(1_700_000_000)),
+            SignedPayload::new_net_listeners(nonce(), TS, agent_id()),
+            SignedPayload::new_net_resolve(nonce(), TS, agent_id(), "1.2.3.4".to_string()),
+            SignedPayload::new_net_resolve(nonce(), TS, agent_id(), "2001:db8::1".to_string()),
+            SignedPayload::new_net_fingerprint(
+                nonce(),
+                TS,
+                agent_id(),
+                "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
+            ),
+        ];
+        for payload in payloads {
+            let sig = sign(&payload, &signing).expect("sign");
+            verify(&payload, &sig, &verifying).expect("verify");
+            // Anchor the op/extra invariant explicitly: the
+            // discriminated-union pair check is the difference
+            // between a well-formed CBOR record and an authentic
+            // operator intent.
+            assert_eq!(payload.op, payload.extra.op_code());
         }
     }
 }
