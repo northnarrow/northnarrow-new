@@ -51,6 +51,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::EniIptablesGuard;
+
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -548,6 +551,14 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn file_canary_open_triggers_canary_tripped_event_and_combat() {
+    // K5 NN-L-CANARY-001 fires at Critical severity, which the
+    // posture FSM translates to Combat → `NetworkIsolator`
+    // installs the production NORTHNARROW_COMBAT iptables chain.
+    // The test exits without an unlock op, so without the RAII
+    // guard the chain would persist and isolate the host (twice
+    // observed during K8 verification before this hotfix).
+    let _eni = EniIptablesGuard::install();
+
     // Pre-create the decoy file BEFORE agent spawn so its inode
     // is in WATCHED_PATHS when the kernel `inode_file_open` hook
     // attaches. The agent reads fim-paths.v1 + stat()s each path
@@ -639,6 +650,11 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
+    // K5 NN-L-CANARY-002 → Combat → iptables chain. RAII cleanup
+    // restores the host's network on test exit (pass / fail /
+    // panic).
+    let _eni = EniIptablesGuard::install();
+
     // Process canary path can be created post-spawn — sched_process_exec
     // is a tracepoint, not a WATCHED_PATHS-gated LSM hook; the K3
     // detector matches via the registry's exe_index after deploy.
@@ -713,6 +729,10 @@ fn process_canary_exec_triggers_canary_tripped_event_and_combat() {
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn refresh_rearms_canary_for_repeat_trips() {
+    // Two K5 Critical trips during this test → Combat engages
+    // twice. RAII cleanup restores the host's network on exit.
+    let _eni = EniIptablesGuard::install();
+
     let tmp = tempfile::tempdir().expect("decoy tempdir");
     let decoy = tmp.path().join("decoy_rearm.txt");
     std::fs::write(&decoy, b"placeholder\n").expect("seed decoy file");
