@@ -1,8 +1,13 @@
 //! Hardcoded Tappa 2 rule set (R001..=R010).
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use std::sync::Arc;
 
+use common::{Event, ResponseAction, Severity, Verdict};
+use parking_lot::Mutex;
+
+use self::net::DnsBurstWindow;
 use super::Rule;
+use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 pub mod canary;
 pub mod net;
@@ -58,9 +63,38 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
     // Tappa 10 (N6) — 9 NN-L-NET rules with empty boot
-    // blocklists; production wire-up replaces these with the
-    // loaded-from-disk variants once N8 ships.
+    // blocklists. The production agent main.rs path constructs
+    // its engine via [`default_rules_with_net`] instead, threading
+    // operator-loaded blocklists in.
     rules.extend(net::net_rules_empty());
+    rules
+}
+
+/// Tappa 10 N9 — production builder. Same shape as [`default_rules`]
+/// but threads operator-loaded blocklists into the 9 NN-L-NET rules.
+/// `main.rs` calls this once at boot after loading
+/// `/etc/northnarrow/netflow-blocklist.{v1,local}` +
+/// `netflow-ja3-blocklist.{v1,local}` from disk.
+pub fn default_rules_with_net(
+    blocklist: Arc<NetBlocklist>,
+    ja3_blocklist: Arc<Ja3Blocklist>,
+    burst_window: Arc<Mutex<DnsBurstWindow>>,
+) -> Vec<Box<dyn Rule>> {
+    let mut rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(R004ExecFromProcSelfFd),
+        Box::new(R007CryptoMiner),
+        Box::new(R006ReverseShellTooling),
+        Box::new(R009RootExecFromUserPath),
+        Box::new(R010BinaryInWebroot),
+        Box::new(R002ExecFromDevShm),
+        Box::new(R001ExecFromTmp),
+        Box::new(R003ExecFromVarTmp),
+        Box::new(R005NetcatExec),
+        Box::new(R008HiddenHomeBinary),
+    ];
+    rules.extend(crate::fim::rules::fim_rules());
+    rules.extend(canary::canary_rules());
+    rules.extend(net::net_rules(blocklist, ja3_blocklist, burst_window));
     rules
 }
 

@@ -146,10 +146,16 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
 ///   let an attacker erase the audit-grade flow record an
 ///   operator hands to IR — same lock-in as the FIM + canary
 ///   chains.
+/// - `netflow_listeners.jsonl` (Tappa 10 N9): chained NetListener
+///   event log per design §6.4. Same protection rationale as
+///   `netflow.jsonl` — the on-disk row is the IR-grade record
+///   that an attacker would otherwise truncate to hide a
+///   pre-existing reverse-shell listener.
 ///
 /// Tappa 9.5 K7 APPENDS the two canary chains at the END of the
 /// list; Tappa 10 N8 then APPENDS `netflow.jsonl` after the
-/// canary chains. Existing entries' positions stay stable so
+/// canary chains; Tappa 10 N9 APPENDS `netflow_listeners.jsonl`
+/// at the very end. Existing entries' positions stay stable so
 /// any audit reader indexing by slot doesn't break across the
 /// upgrade.
 pub const STATE_PROTECTED_FILES: &[&str] = &[
@@ -158,6 +164,7 @@ pub const STATE_PROTECTED_FILES: &[&str] = &[
     "canaries.jsonl",
     "canary_access.jsonl",
     "netflow.jsonl",
+    "netflow_listeners.jsonl",
 ];
 
 /// Tappa 9.5 K7: subdirectory under [`CONFIG_DIR`] holding the
@@ -526,6 +533,48 @@ pub fn bootstrap_canary_log(canary_log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Tappa 10 N9: bootstrap an empty NetListener log file
+/// (`netflow_listeners.jsonl`) if it doesn't exist yet, so
+/// PROTECTED_INODES has an inode to register at attach time.
+/// Same shape as [`bootstrap_netflow_log`] — parent directory's
+/// mode is 0700 to match [`STATE_DIR_MODE`].
+pub fn bootstrap_netflow_listeners_log(listeners_log_path: &Path) -> Result<()> {
+    if listeners_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = listeners_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(STATE_DIR_MODE)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| {
+                    format!(
+                        "creating netflow_listeners-log parent dir {}",
+                        parent.display()
+                    )
+                })?;
+        }
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(listeners_log_path)
+        .with_context(|| {
+            format!(
+                "creating netflow_listeners log {}",
+                listeners_log_path.display()
+            )
+        })?;
+    info!(
+        path = %listeners_log_path.display(),
+        "anti-tamper FS: netflow_listeners log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
+}
+
 /// Tappa 10 N8: bootstrap an empty NetFlow log file
 /// (`netflow.jsonl`) if it doesn't exist yet, so PROTECTED_INODES
 /// has an inode to register at attach time. Same shape as
@@ -827,16 +876,16 @@ mod tests {
         }
     }
 
-    /// C7 + K7 + N8 test: `STATE_PROTECTED_FILES` lists the five
-    /// /var/lib/northnarrow/ chain files that PROTECTED_INODES
+    /// C7 + K7 + N8 + N9 test: `STATE_PROTECTED_FILES` lists the
+    /// six /var/lib/northnarrow/ chain files that PROTECTED_INODES
     /// must cover. C7 shipped the two FIM logs; Tappa 9.5 K7
-    /// APPENDED the two canary chain files (canaries.jsonl +
-    /// canary_access.jsonl); Tappa 10 N8 APPENDS `netflow.jsonl`
-    /// at the END so existing entries' positions stay stable for
-    /// any audit-log reader that indexes by slot. Order anchored
-    /// explicitly per design §9 + §6.4.
+    /// APPENDED the two canary chain files; Tappa 10 N8 APPENDED
+    /// `netflow.jsonl`; Tappa 10 N9 APPENDS
+    /// `netflow_listeners.jsonl` at the END so existing entries'
+    /// positions stay stable for any audit-log reader that indexes
+    /// by slot.
     #[test]
-    fn state_protected_files_lists_the_five_state_logs() {
+    fn state_protected_files_lists_the_six_state_logs() {
         assert_eq!(
             STATE_PROTECTED_FILES,
             &[
@@ -845,11 +894,27 @@ mod tests {
                 "canaries.jsonl",
                 "canary_access.jsonl",
                 "netflow.jsonl",
+                "netflow_listeners.jsonl",
             ],
             "design §6.4 + Tappa 9.5 §9 + Tappa 10 §6.4 / §10 \
-             specify these five files in this order"
+             specify these six files in this order"
         );
         assert_eq!(STATE_DIR, "/var/lib/northnarrow");
+    }
+
+    /// N9 test: `STATE_PROTECTED_FILES` includes
+    /// `netflow_listeners.jsonl`. Mirrors the focused
+    /// `etc_protected_files_includes_net_blocklists` test — calls
+    /// out the N9 widening intent so a future refactor that drops
+    /// the entry fails fast even if it pacifies the exhaustive
+    /// list assertion above.
+    #[test]
+    fn state_protected_files_includes_netflow_listeners_log() {
+        assert!(
+            STATE_PROTECTED_FILES.contains(&"netflow_listeners.jsonl"),
+            "netflow_listeners.jsonl must be in STATE_PROTECTED_FILES \
+             (Tappa 10 N9 LSM widening)"
+        );
     }
 
     /// K7 test: `bootstrap_canary_log` creates a zero-byte file
@@ -947,6 +1012,41 @@ mod tests {
         let body = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(
             body, "existing chained netflow line\n",
+            "second bootstrap must NOT truncate"
+        );
+    }
+
+    /// N9 test: `bootstrap_netflow_listeners_log` creates a
+    /// zero-byte file at mode 0644 when missing. Same shape as
+    /// the N8 bootstrap_netflow_log invariant for the sibling
+    /// listeners chain.
+    #[test]
+    fn bootstrap_netflow_listeners_log_creates_zero_byte_file_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("netflow_listeners.jsonl");
+        assert!(!log_path.exists());
+        bootstrap_netflow_listeners_log(&log_path)
+            .expect("bootstrap missing netflow_listeners log");
+        assert!(log_path.exists());
+        let meta = std::fs::metadata(&log_path).unwrap();
+        assert_eq!(meta.len(), 0);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    }
+
+    /// N9 test: `bootstrap_netflow_listeners_log` is idempotent —
+    /// a second call preserves prior content (no truncation).
+    /// Defends the same "MUST NOT silently erase a prior chain
+    /// on restart" invariant as bootstrap_netflow_log.
+    #[test]
+    fn bootstrap_netflow_listeners_log_is_idempotent_and_preserves_content() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("netflow_listeners.jsonl");
+        bootstrap_netflow_listeners_log(&log_path).expect("first bootstrap");
+        std::fs::write(&log_path, b"existing chained listeners line\n").unwrap();
+        bootstrap_netflow_listeners_log(&log_path).expect("second bootstrap");
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            body, "existing chained listeners line\n",
             "second bootstrap must NOT truncate"
         );
     }

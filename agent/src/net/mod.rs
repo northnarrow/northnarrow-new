@@ -17,5 +17,6 @@
 
 pub mod blocklist;
 pub mod dns_cache;
+pub mod drain;
 pub mod flow_tracker;
 pub mod tls_parser;

@@ -713,22 +713,41 @@ them into the `.local` overlay.
 
 ### 11.2 Privileged e2e
 
-Three privileged tests reusing the PHASE_D_003
+Two privileged tests reusing the PHASE_D_003
 `install_to_priv_bin` pattern (now ubiquitous post-Tappa 9
-polish #1):
+polish #1). The JA3 priv-e2e originally listed at #2 is
+DEFERRED to Tappa 11.5 per §13 Q2 packet-capture atomicity
+lock-in (see deferral note after the list).
 
 1. `net_outbound_connect_records_flow_with_dns_attribution`
-   — spawn agent, resolve `localhost`, connect to 127.0.0.1
-   on port 22 (SSH banner), close, verify `netflow.jsonl`
-   row with `resolved_hostname = "localhost"`.
-2. `net_ja3_fingerprint_extracted_on_tls_handshake` —
-   spawn agent, `openssl s_client -connect example.com:443`,
-   close, verify `netflow.jsonl` row with non-empty
-   `ja3` + `sni = "example.com"`.
-3. `net_listener_on_uncommon_port_records_event` —
+   — spawn agent, resolve a synthetic non-`/etc/hosts`
+   qname via `getaddrinfo` to force a UDP DNS query, then
+   in the SAME PID connect to 127.0.0.1 on port 22 (SSH
+   banner) + close. Verify `netflow.jsonl` row with
+   `dst_port = 22` and `resolved_hostname = <the qname>`
+   attributed via `DnsCache::lookup_for_connect`. Synthetic
+   qname instead of `localhost` because `localhost` resolves
+   via `/etc/hosts` on every supported distro — no UDP
+   packet is sent, the cache stays empty, and the
+   attribution path is never exercised.
+2. `net_listener_on_uncommon_port_records_event` —
    spawn agent, `nc -l 12345` for 1s, kill, verify
    `netflow_listeners.jsonl` row with `bind_port = 12345`
    AND the matching NN-L-NET-006 rule fires.
+
+**JA3 priv-e2e DEFERRED to Tappa 11.5** per §13 Q2 packet
+capture atomicity lock-in. The `tls_parser` (N5) ships
+shipping-ready with 12 unit-test fixtures (Chrome 120,
+Firefox 120, curl 8, Cobalt Strike default JA3, …); its
+activation gates on the `tcp_data_capture_trigger` BPF
+program landing in Tappa 11.5 alongside the user-space
+pcap writer in one atomic commit. Splitting the capture
+infrastructure across N9 + Tappa 11.5 would violate the Q2
+rationale (an active trigger with no consumer wastes
+ringbuf memory + adds verifier surface for no operator-
+visible value). Operator-visible JA3 detection lights up
+atomically when Tappa 11.5 lands; no functional regression
+in N9, just deferred activation.
 
 ---
 
