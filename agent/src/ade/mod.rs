@@ -24,6 +24,7 @@ pub mod context;
 pub mod dual_verify;
 pub mod error;
 pub mod escalate;
+pub mod fim_template;
 pub mod inference;
 pub mod parser;
 pub mod prompt;
