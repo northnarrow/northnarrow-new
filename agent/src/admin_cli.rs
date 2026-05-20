@@ -29,10 +29,11 @@ use sha2::{Digest, Sha256};
 
 use common::posture_types::PostureKind;
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, ChallengeRequest, ForcePostureRequest,
-    KeyedSignature, ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
+    decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
+    CanaryListRequest, CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature,
+    ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
 };
-use common::wire::admin_signed_payload::{sign, SignedPayload};
+use common::wire::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
 
 use crate::agent_id::{self, AGENT_ID_LEN};
 
@@ -1165,6 +1166,485 @@ pub fn run_fim_report(
         other => Ok({
             let _ = other;
             FimReportOutcome::Transport
+        }),
+    }
+}
+
+// ── Tappa 9.5 K6 — nn-admin canary deploy/list/burn/refresh ─────
+
+/// Operator-facing deployment input for `nn-admin canary deploy`.
+/// Mirrors the on-wire [`CanaryDeploymentWire`] variants but uses
+/// owned strings + a flat shape so the clap layer can build it
+/// without reaching into common.
+#[derive(Debug, Clone)]
+pub enum CanaryDeploySpec {
+    File {
+        path: String,
+    },
+    Process {
+        path: String,
+        fake_arg0: String,
+    },
+    Network {
+        bind_addr: String,
+        bind_port: u16,
+    },
+    Credential {
+        path: String,
+        cred_family: String,
+    },
+}
+
+impl CanaryDeploySpec {
+    fn to_wire(&self) -> (CanaryTypeWire, CanaryDeploymentWire) {
+        match self {
+            CanaryDeploySpec::File { path } => (
+                CanaryTypeWire::File,
+                CanaryDeploymentWire::File {
+                    path: path.clone(),
+                    template: None,
+                },
+            ),
+            CanaryDeploySpec::Process { path, fake_arg0 } => (
+                CanaryTypeWire::Process,
+                CanaryDeploymentWire::Process {
+                    path: path.clone(),
+                    fake_arg0: fake_arg0.clone(),
+                },
+            ),
+            CanaryDeploySpec::Network {
+                bind_addr,
+                bind_port,
+            } => (
+                CanaryTypeWire::Network,
+                CanaryDeploymentWire::Network {
+                    bind_addr: bind_addr.clone(),
+                    bind_port: *bind_port,
+                },
+            ),
+            CanaryDeploySpec::Credential { path, cred_family } => (
+                CanaryTypeWire::Credential,
+                CanaryDeploymentWire::Credential {
+                    path: path.clone(),
+                    cred_family: cred_family.clone(),
+                },
+            ),
+        }
+    }
+}
+
+/// Outcome of `nn-admin canary deploy` (K6 — auth via
+/// `Role::CanaryManage`, single-sig 1-of-N quorum per §12 Q7).
+/// Success carries the per-canary stable id the server allocated.
+#[derive(Debug)]
+pub enum CanaryDeployOutcome {
+    Success {
+        canary_id: String,
+    },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    QuorumNotMet {
+        required: u8,
+        provided: u8,
+    },
+    RoleDenied,
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
+    Transport,
+}
+
+/// Outcome of `nn-admin canary list` (read-only — auth via
+/// `Role::CanaryRead`, single-sig 1-of-N quorum). Success carries
+/// the chained registry JSONL body (capped at half MAX_FRAME_BODY;
+/// `entries_truncated` flips when the cap fires).
+#[derive(Debug)]
+pub enum CanaryListOutcome {
+    Success {
+        entries_jsonl: String,
+        entries_count: u32,
+        entries_truncated: bool,
+    },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    RoleDenied,
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
+    Transport,
+}
+
+/// Outcome of `nn-admin canary burn` (auth via
+/// `Role::CanaryManage`). No body — server replies with
+/// [`AdminResult`] inside `CanaryBurnResult`.
+#[derive(Debug)]
+pub enum CanaryBurnOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    NotFound,
+    ProtocolVersionUnsupported { server_version: u16 },
+    Transport,
+}
+
+/// Outcome of `nn-admin canary refresh` (auth via
+/// `Role::CanaryManage`). Same shape as
+/// [`CanaryBurnOutcome`].
+#[derive(Debug)]
+pub enum CanaryRefreshOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    NotFound,
+    ProtocolVersionUnsupported { server_version: u16 },
+    Transport,
+}
+
+fn map_response_to_canary_deploy(
+    resp: common::wire::admin_protocol::CanaryDeployResponse,
+) -> CanaryDeployOutcome {
+    match resp.result {
+        AdminResult::Success => CanaryDeployOutcome::Success {
+            canary_id: resp.canary_id,
+        },
+        AdminResult::InvalidSignature => CanaryDeployOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => CanaryDeployOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            CanaryDeployOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            CanaryDeployOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => CanaryDeployOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => CanaryDeployOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => CanaryDeployOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => CanaryDeployOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            CanaryDeployOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+fn map_response_to_canary_list(
+    resp: common::wire::admin_protocol::CanaryListResponse,
+) -> CanaryListOutcome {
+    match resp.result {
+        AdminResult::Success => CanaryListOutcome::Success {
+            entries_jsonl: resp.entries_jsonl,
+            entries_count: resp.entries_count,
+            entries_truncated: resp.entries_truncated,
+        },
+        AdminResult::InvalidSignature => CanaryListOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => CanaryListOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            CanaryListOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::RoleDenied => CanaryListOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => CanaryListOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => CanaryListOutcome::AgentIdMismatch,
+        AdminResult::QuorumNotMet { .. } => CanaryListOutcome::InvalidSignature,
+        AdminResult::UnknownOperation => CanaryListOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            CanaryListOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+fn map_admin_result_to_canary_burn(r: AdminResult) -> CanaryBurnOutcome {
+    match r {
+        AdminResult::Success => CanaryBurnOutcome::Success,
+        AdminResult::InvalidSignature => CanaryBurnOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => CanaryBurnOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            CanaryBurnOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            CanaryBurnOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => CanaryBurnOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => CanaryBurnOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => CanaryBurnOutcome::AgentIdMismatch,
+        // K6: the server folds RegistryError::CanaryIdNotFound into
+        // AdminResult::UnknownOperation so V1.0 doesn't need a
+        // dedicated wire variant. The CLI translates that back into
+        // a dedicated NotFound outcome so the operator gets the
+        // right hint ("no canary with that id; check `canary list`").
+        AdminResult::UnknownOperation => CanaryBurnOutcome::NotFound,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            CanaryBurnOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+fn map_admin_result_to_canary_refresh(r: AdminResult) -> CanaryRefreshOutcome {
+    match r {
+        AdminResult::Success => CanaryRefreshOutcome::Success,
+        AdminResult::InvalidSignature => CanaryRefreshOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => CanaryRefreshOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            CanaryRefreshOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            CanaryRefreshOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => CanaryRefreshOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => CanaryRefreshOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => CanaryRefreshOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => CanaryRefreshOutcome::NotFound,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            CanaryRefreshOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+/// `nn-admin canary deploy` — quorum-signed (`Role::CanaryManage`)
+/// op to install a new canary token. The agent renders the
+/// template (for File/Credential), writes the on-disk artefact,
+/// persists the registry row, rebuilds K3 indexes, and emits an
+/// audit row. Returns the per-canary stable id on success.
+pub fn run_canary_deploy(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    name: String,
+    spec: CanaryDeploySpec,
+) -> Result<CanaryDeployOutcome> {
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let (canary_type, deployment) = spec.to_wire();
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload =
+        SignedPayload::new_canary_deploy(nonce, now, agent_id_arr, name, canary_type, deployment);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing canary-deploy payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::CanaryDeployRequest(CanaryDeployRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::CanaryDeployResponse(resp) => Ok(map_response_to_canary_deploy(resp)),
+        other => Ok({
+            let _ = other;
+            CanaryDeployOutcome::Transport
+        }),
+    }
+}
+
+/// `nn-admin canary list` — read-only, signed payload
+/// (`Role::CanaryRead`). Server returns the chained registry log
+/// as JSONL with truncation flag (same shape as `fim report`).
+pub fn run_canary_list(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+) -> Result<CanaryListOutcome> {
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_canary_list(nonce, now, agent_id_arr);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing canary-list payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::CanaryListRequest(CanaryListRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::CanaryListResponse(resp) => Ok(map_response_to_canary_list(resp)),
+        other => Ok({
+            let _ = other;
+            CanaryListOutcome::Transport
+        }),
+    }
+}
+
+/// `nn-admin canary burn` — quorum-signed (`Role::CanaryManage`)
+/// op to mark a canary as burned (on-disk artefact deleted for
+/// File/Credential; listener dropped for Network; process
+/// terminated for Process). The agent persists the burn into the
+/// registry chain + rebuilds K3 indexes so the detector stops
+/// firing for that canary_id.
+pub fn run_canary_burn(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    canary_id: String,
+) -> Result<CanaryBurnOutcome> {
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_canary_burn(nonce, now, agent_id_arr, canary_id);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing canary-burn payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::CanaryBurnRequest(CanaryBurnRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::CanaryBurnResult(r) => Ok(map_admin_result_to_canary_burn(r)),
+        other => Ok({
+            let _ = other;
+            CanaryBurnOutcome::Transport
+        }),
+    }
+}
+
+/// `nn-admin canary refresh` — quorum-signed (`Role::CanaryManage`)
+/// op to re-render a canary's on-disk artefact (rotating its
+/// template-derived bytes). §12 Q2 MANUAL lock-in: no auto-refresh;
+/// the operator MUST run this explicitly when staleness would
+/// undermine the deception.
+pub fn run_canary_refresh(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    canary_id: String,
+) -> Result<CanaryRefreshOutcome> {
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_canary_refresh(nonce, now, agent_id_arr, canary_id);
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing canary-refresh payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::CanaryRefreshRequest(CanaryRefreshRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::CanaryRefreshResult(r) => Ok(map_admin_result_to_canary_refresh(r)),
+        other => Ok({
+            let _ = other;
+            CanaryRefreshOutcome::Transport
         }),
     }
 }

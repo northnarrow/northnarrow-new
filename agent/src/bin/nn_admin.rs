@@ -33,11 +33,13 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
-    load_audit_pubkey, run_audit_read, run_audit_verify, run_fim_baseline, run_fim_report,
-    run_fim_status, run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke,
-    run_shutdown, run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, FimBaselineOutcome,
-    FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, RotateKeysOutcome, ShutdownOutcome,
-    StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
+    load_audit_pubkey, run_audit_read, run_audit_verify, run_canary_burn, run_canary_deploy,
+    run_canary_list, run_canary_refresh, run_fim_baseline, run_fim_report, run_fim_status,
+    run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
+    run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, CanaryBurnOutcome,
+    CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome, CanaryRefreshOutcome,
+    FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, RotateKeysOutcome,
+    ShutdownOutcome, StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -235,6 +237,18 @@ enum Cmd {
         sub: FimCmd,
     },
 
+    /// Tappa 9.5 K6 — deception canary operator surface.
+    /// `canary deploy` installs a new canary (File / Process /
+    /// Network / Credential variants), `canary list` streams the
+    /// chained registry log, `canary burn` permanently retires a
+    /// canary, `canary refresh` re-renders the on-disk artefact.
+    /// Authorisation: `canary-read` for `list`; `canary-manage`
+    /// for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in).
+    Canary {
+        #[command(subcommand)]
+        sub: CanaryCmd,
+    },
+
     /// Debug-only: force the agent's posture state machine into a
     /// chosen state. Only compiled when the `debug-trigger` Cargo
     /// feature is on.
@@ -393,6 +407,138 @@ enum FimCmd {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CanaryCmd {
+    /// Install a new canary (`canary-manage` role). One of four
+    /// variants — `file`, `process`, `network`, `credential`. The
+    /// server renders the on-disk artefact (for file + credential
+    /// canaries) and prints the per-canary stable id on success.
+    Deploy {
+        /// Operator-chosen human label (e.g. "honeypot-aws-creds").
+        /// Free-form; appears in audit + alerts.
+        #[arg(long)]
+        name: String,
+        #[command(subcommand)]
+        kind: CanaryDeployKindCmd,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// Stream the chained canary registry log (`canary-read`
+    /// role). Output mirrors `fim report`: JSONL on stdout, a
+    /// 1-line summary on stderr.
+    List {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// Permanently retire a canary by id (`canary-manage` role).
+    /// File / credential artefacts are unlinked, network
+    /// listeners closed, process canaries terminated. The K3
+    /// detector stops firing for the burned id immediately.
+    Burn {
+        /// The per-canary stable id printed by `canary deploy`
+        /// or `canary list`.
+        #[arg(long = "canary-id")]
+        canary_id: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// Re-render a canary's on-disk artefact (`canary-manage`
+    /// role). §12 Q2 MANUAL lock-in: no auto-refresh; the
+    /// operator must run this explicitly when a canary's bytes
+    /// would otherwise grow stale.
+    Refresh {
+        #[arg(long = "canary-id")]
+        canary_id: String,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+}
+
+/// `nn-admin canary deploy <kind> ...` — distinct subcommand per
+/// canary type so clap can enforce the per-type required flags
+/// (e.g. `process` needs `--fake-arg0`, `network` needs
+/// `--bind-addr/--bind-port`) at parse time, not at server-side
+/// validation time.
+#[derive(Subcommand, Debug)]
+enum CanaryDeployKindCmd {
+    /// Plain file canary. The server creates a placeholder file
+    /// at `--path` (current K4 template renders sentinel bytes).
+    File {
+        /// Absolute on-disk path the canary file should occupy.
+        #[arg(long)]
+        path: String,
+    },
+    /// Process canary. The server materialises a fake binary at
+    /// `--path` and advertises `--fake-arg0` as its argv[0].
+    Process {
+        #[arg(long)]
+        path: String,
+        /// What the canary binary should report as argv[0]
+        /// (mirrors what `ps` shows).
+        #[arg(long = "fake-arg0")]
+        fake_arg0: String,
+    },
+    /// Network listener canary. The server binds a tokio
+    /// TcpListener on `--bind-addr:--bind-port`; any accept()
+    /// trips the canary (immediate close per §12 Q6).
+    Network {
+        #[arg(long = "bind-addr")]
+        bind_addr: String,
+        #[arg(long = "bind-port")]
+        bind_port: u16,
+    },
+    /// Credential canary. Same shape as `file` plus a required
+    /// `--cred-family` selecting which K4 template renders the
+    /// fake credential bytes (e.g. "aws", "docker", "kube").
+    Credential {
+        #[arg(long)]
+        path: String,
+        #[arg(long = "cred-family")]
+        cred_family: String,
+    },
+}
+
+impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
+    fn from(k: CanaryDeployKindCmd) -> Self {
+        match k {
+            CanaryDeployKindCmd::File { path } => CanaryDeploySpec::File { path },
+            CanaryDeployKindCmd::Process { path, fake_arg0 } => CanaryDeploySpec::Process {
+                path,
+                fake_arg0,
+            },
+            CanaryDeployKindCmd::Network {
+                bind_addr,
+                bind_port,
+            } => CanaryDeploySpec::Network {
+                bind_addr,
+                bind_port,
+            },
+            CanaryDeployKindCmd::Credential { path, cred_family } => {
+                CanaryDeploySpec::Credential { path, cred_family }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "debug-trigger")]
@@ -657,6 +803,69 @@ fn main() -> ExitCode {
             Ok(outcome) => exit_from_fim_status(outcome),
             Err(e) => {
                 eprintln!("fim status: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Canary {
+            sub:
+                CanaryCmd::Deploy {
+                    name,
+                    kind,
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => {
+            let spec: CanaryDeploySpec = kind.into();
+            match run_canary_deploy(&socket, &key, &agent_id_file, name, spec) {
+                Ok(outcome) => exit_from_canary_deploy(outcome),
+                Err(e) => {
+                    eprintln!("canary deploy: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
+        Cmd::Canary {
+            sub:
+                CanaryCmd::List {
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_canary_list(&socket, &key, &agent_id_file) {
+            Ok(outcome) => exit_from_canary_list(outcome),
+            Err(e) => {
+                eprintln!("canary list: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Canary {
+            sub:
+                CanaryCmd::Burn {
+                    canary_id,
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_canary_burn(&socket, &key, &agent_id_file, canary_id) {
+            Ok(outcome) => exit_from_canary_burn(outcome),
+            Err(e) => {
+                eprintln!("canary burn: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Canary {
+            sub:
+                CanaryCmd::Refresh {
+                    canary_id,
+                    key,
+                    agent_id_file,
+                    socket,
+                },
+        } => match run_canary_refresh(&socket, &key, &agent_id_file, canary_id) {
+            Ok(outcome) => exit_from_canary_refresh(outcome),
+            Err(e) => {
+                eprintln!("canary refresh: {e:#}");
                 ExitCode::from(5)
             }
         },
@@ -1389,6 +1598,256 @@ fn exit_from_fim_status(outcome: FimStatusOutcome) -> ExitCode {
         }
         FimStatusOutcome::Transport => {
             eprintln!("fim status: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// K6: map [`CanaryDeployOutcome`] to a stable exit code.
+/// Mirrors the FIM exit-code shape (0=success, 2=invalid-sig,
+/// 4=rate-limited, 5=transport/clock/agent-id/unknown-op,
+/// 6=quorum, 7=role) so operator scripts can branch on `$?`
+/// across the FIM + canary surfaces.
+fn exit_from_canary_deploy(outcome: CanaryDeployOutcome) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        CanaryDeployOutcome::Success { canary_id } => {
+            println!(
+                "{}",
+                colorize(&format!("canary deploy: success ({canary_id})"), "32", tty)
+            );
+            ExitCode::SUCCESS
+        }
+        CanaryDeployOutcome::InvalidSignature => {
+            eprintln!("canary deploy: invalid signature");
+            ExitCode::from(2)
+        }
+        CanaryDeployOutcome::NoPendingChallenge => {
+            eprintln!("canary deploy: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        CanaryDeployOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("canary deploy: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        CanaryDeployOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("canary deploy: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        CanaryDeployOutcome::RoleDenied => {
+            eprintln!(
+                "canary deploy: role denied (the submitted key lacks `canary-manage` in admin.pub)"
+            );
+            ExitCode::from(7)
+        }
+        CanaryDeployOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "canary deploy: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s); NTP-sync and retry"
+            );
+            ExitCode::from(5)
+        }
+        CanaryDeployOutcome::AgentIdMismatch => {
+            eprintln!("canary deploy: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        CanaryDeployOutcome::UnknownOperation => {
+            eprintln!("canary deploy: server rejected operation");
+            ExitCode::from(5)
+        }
+        CanaryDeployOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("canary deploy: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        CanaryDeployOutcome::Transport => {
+            eprintln!("canary deploy: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// K6: map [`CanaryListOutcome`] to an exit code AND stream the
+/// JSONL body to stdout on success. Summary line goes to stderr
+/// (matches `fim report`) so `nn-admin canary list | jq` works.
+fn exit_from_canary_list(outcome: CanaryListOutcome) -> ExitCode {
+    match outcome {
+        CanaryListOutcome::Success {
+            entries_jsonl,
+            entries_count,
+            entries_truncated,
+        } => {
+            print!("{entries_jsonl}");
+            if entries_truncated {
+                eprintln!("canary list: {entries_count} entries (truncated)");
+            } else {
+                eprintln!("canary list: {entries_count} entries");
+            }
+            ExitCode::SUCCESS
+        }
+        CanaryListOutcome::InvalidSignature => {
+            eprintln!("canary list: invalid signature");
+            ExitCode::from(2)
+        }
+        CanaryListOutcome::NoPendingChallenge => {
+            eprintln!("canary list: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        CanaryListOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("canary list: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        CanaryListOutcome::RoleDenied => {
+            eprintln!("canary list: role denied (the submitted key lacks `canary-read`)");
+            ExitCode::from(7)
+        }
+        CanaryListOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!("canary list: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
+            ExitCode::from(5)
+        }
+        CanaryListOutcome::AgentIdMismatch => {
+            eprintln!("canary list: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        CanaryListOutcome::UnknownOperation => {
+            eprintln!("canary list: server rejected operation");
+            ExitCode::from(5)
+        }
+        CanaryListOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("canary list: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        CanaryListOutcome::Transport => {
+            eprintln!("canary list: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// K6: map [`CanaryBurnOutcome`] to an exit code. Adds a new
+/// shared exit-code 9 for "canary id not found" — distinct from
+/// the FIM family because the canary surface is the only one
+/// where the operator-supplied id can validly be missing
+/// server-side (deploys go via the server; burns reference an
+/// id the operator typed).
+fn exit_from_canary_burn(outcome: CanaryBurnOutcome) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        CanaryBurnOutcome::Success => {
+            println!("{}", colorize("canary burn: success", "32", tty));
+            ExitCode::SUCCESS
+        }
+        CanaryBurnOutcome::InvalidSignature => {
+            eprintln!("canary burn: invalid signature");
+            ExitCode::from(2)
+        }
+        CanaryBurnOutcome::NoPendingChallenge => {
+            eprintln!("canary burn: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        CanaryBurnOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("canary burn: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        CanaryBurnOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("canary burn: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        CanaryBurnOutcome::RoleDenied => {
+            eprintln!("canary burn: role denied (key lacks `canary-manage`)");
+            ExitCode::from(7)
+        }
+        CanaryBurnOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!("canary burn: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
+            ExitCode::from(5)
+        }
+        CanaryBurnOutcome::AgentIdMismatch => {
+            eprintln!("canary burn: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        CanaryBurnOutcome::UnknownOperation => {
+            eprintln!("canary burn: server rejected operation");
+            ExitCode::from(5)
+        }
+        CanaryBurnOutcome::NotFound => {
+            eprintln!("canary burn: no canary with that id (check `nn-admin canary list`)");
+            ExitCode::from(9)
+        }
+        CanaryBurnOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("canary burn: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        CanaryBurnOutcome::Transport => {
+            eprintln!("canary burn: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// K6: map [`CanaryRefreshOutcome`] to an exit code. Same shape
+/// as [`exit_from_canary_burn`] (both ops are
+/// `canary-manage`-role mutations keyed by canary_id).
+fn exit_from_canary_refresh(outcome: CanaryRefreshOutcome) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        CanaryRefreshOutcome::Success => {
+            println!("{}", colorize("canary refresh: success", "32", tty));
+            ExitCode::SUCCESS
+        }
+        CanaryRefreshOutcome::InvalidSignature => {
+            eprintln!("canary refresh: invalid signature");
+            ExitCode::from(2)
+        }
+        CanaryRefreshOutcome::NoPendingChallenge => {
+            eprintln!("canary refresh: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        CanaryRefreshOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("canary refresh: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        CanaryRefreshOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("canary refresh: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        CanaryRefreshOutcome::RoleDenied => {
+            eprintln!("canary refresh: role denied (key lacks `canary-manage`)");
+            ExitCode::from(7)
+        }
+        CanaryRefreshOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "canary refresh: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)"
+            );
+            ExitCode::from(5)
+        }
+        CanaryRefreshOutcome::AgentIdMismatch => {
+            eprintln!("canary refresh: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        CanaryRefreshOutcome::UnknownOperation => {
+            eprintln!("canary refresh: server rejected operation");
+            ExitCode::from(5)
+        }
+        CanaryRefreshOutcome::NotFound => {
+            eprintln!("canary refresh: no canary with that id (check `nn-admin canary list`)");
+            ExitCode::from(9)
+        }
+        CanaryRefreshOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("canary refresh: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        CanaryRefreshOutcome::Transport => {
+            eprintln!("canary refresh: unexpected server reply");
             ExitCode::from(5)
         }
     }
