@@ -350,8 +350,7 @@ fn fim_baseline_then_modify_records_drift_event() {
     assert!(baseline[0]["sha256"].as_str().unwrap().len() == 64);
 
     // Modify the watched file — the C8-wired drain MUST observe.
-    std::fs::write(&fx.watched_file, b"tampered-content\n")
-        .expect("modify watched file");
+    std::fs::write(&fx.watched_file, b"tampered-content\n").expect("modify watched file");
 
     let drift = fx.wait_drift(1);
     let row = &drift[0];
@@ -413,9 +412,7 @@ fn fim_subprocess_unlink_records_deleted_event() {
                 .find(|r| r["op"].as_u64() == Some(OP_DELETED))
                 .cloned()
                 .unwrap_or_else(|| {
-                    panic!(
-                        "no Deleted-op drift entry found in drift log: rows={more:?}"
-                    )
+                    panic!("no Deleted-op drift entry found in drift log: rows={more:?}")
                 })
         });
     assert_eq!(row["path"], serde_json::json!(watched));

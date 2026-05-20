@@ -109,11 +109,7 @@ pub fn is_critical_fim_rule(verdict: &Verdict) -> bool {
 /// The deterministic rule has already fired by the time this
 /// runs; the prompt's `### already-taken-action:` section makes
 /// that explicit so the LLM doesn't double-recommend.
-pub fn render_individual_prompt(
-    event: &FimEvent,
-    verdict: &Verdict,
-    posture: &str,
-) -> String {
+pub fn render_individual_prompt(event: &FimEvent, verdict: &Verdict, posture: &str) -> String {
     let mut s = String::with_capacity(1024);
     s.push_str("### event: critical_fim_drift\n");
     s.push_str(&format!("rule_id: {}\n", verdict.rule_id));
@@ -397,7 +393,10 @@ impl OverflowBuffer {
     /// Current buffered-event count (operator-visible via
     /// future status surface).
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("OverflowBuffer mutex poisoned").len()
+        self.inner
+            .lock()
+            .expect("OverflowBuffer mutex poisoned")
+            .len()
     }
 
     /// True when zero events are buffered.
@@ -483,10 +482,7 @@ mod tests {
     #[test]
     fn render_individual_prompt_includes_all_structured_sections() {
         let v = fake_critical_verdict("NN-L-FIM-010_RansomwareExtensionRename");
-        let e = fake_fim_event(
-            "/home/u/doc.docx",
-            Some("/home/u/doc.docx.crypted"),
-        );
+        let e = fake_fim_event("/home/u/doc.docx", Some("/home/u/doc.docx.crypted"));
         let prompt = render_individual_prompt(&e, &v, "Combat");
         assert!(prompt.contains("### event: critical_fim_drift\n"));
         assert!(prompt.contains("rule_id: NN-L-FIM-010_RansomwareExtensionRename"));
@@ -522,7 +518,10 @@ mod tests {
         assert!(prompt.contains("### event: critical_fim_drift_batched_overflow"));
         assert!(prompt.contains("event_count: 3"));
         for i in 0..3 {
-            assert!(prompt.contains(&format!("### event[{i}]:")), "missing event[{i}]");
+            assert!(
+                prompt.contains(&format!("### event[{i}]:")),
+                "missing event[{i}]"
+            );
             assert!(prompt.contains(&format!("/home/u/doc{i}.docx")));
         }
         assert!(prompt.contains("ALREADY fired"));

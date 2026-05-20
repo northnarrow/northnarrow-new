@@ -103,10 +103,7 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
 /// - `fim_drift.jsonl`: chained drift log per §6.3. Same shape;
 ///   tampering would let an attacker erase evidence of past
 ///   drift detections.
-pub const STATE_PROTECTED_FILES: &[&str] = &[
-    "fim_baseline.jsonl",
-    "fim_drift.jsonl",
-];
+pub const STATE_PROTECTED_FILES: &[&str] = &["fim_baseline.jsonl", "fim_drift.jsonl"];
 
 /// Permission bits applied at create time and re-asserted on every
 /// startup (defends against an admin loosening perms while the
@@ -259,9 +256,8 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
             dev: stat_dev_to_kernel_dev(meta.dev()),
             ino: meta.ino(),
         };
-        register_inode(ebpf, &key).with_context(|| {
-            format!("registering {} in {PROTECTED_INODES_MAP}", path.display())
-        })?;
+        register_inode(ebpf, &key)
+            .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
@@ -316,9 +312,8 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
             dev: stat_dev_to_kernel_dev(meta.dev()),
             ino: meta.ino(),
         };
-        register_inode(ebpf, &key).with_context(|| {
-            format!("registering {} in {PROTECTED_INODES_MAP}", path.display())
-        })?;
+        register_inode(ebpf, &key)
+            .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
@@ -352,9 +347,7 @@ pub fn bootstrap_fim_log(fim_log_path: &Path) -> Result<()> {
                 .mode(STATE_DIR_MODE)
                 .recursive(true)
                 .create(parent)
-                .with_context(|| {
-                    format!("creating fim-log parent dir {}", parent.display())
-                })?;
+                .with_context(|| format!("creating fim-log parent dir {}", parent.display()))?;
         }
     }
     // 0644: world-readable for operator `cat`-inspection, only
@@ -391,9 +384,7 @@ pub fn bootstrap_audit_log(audit_log_path: &Path) -> Result<()> {
                 .mode(0o755)
                 .recursive(true)
                 .create(parent)
-                .with_context(|| {
-                    format!("creating audit-log parent dir {}", parent.display())
-                })?;
+                .with_context(|| format!("creating audit-log parent dir {}", parent.display()))?;
         }
     }
     // 0644 matches the rest of /etc/northnarrow/ layout (design

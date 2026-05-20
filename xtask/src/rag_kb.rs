@@ -170,8 +170,7 @@ struct StixKillChainPhase {
 }
 
 fn parse_attack(bytes: &[u8]) -> Result<Vec<CanonRecord>> {
-    let bundle: StixBundle =
-        serde_json::from_slice(bytes).context("parsing ATT&CK STIX bundle")?;
+    let bundle: StixBundle = serde_json::from_slice(bytes).context("parsing ATT&CK STIX bundle")?;
     let mut out = Vec::new();
     for o in &bundle.objects {
         if o.otype != "attack-pattern" || o.revoked || o.deprecated {
@@ -296,11 +295,7 @@ fn parse_sigma(tarball_gz: &[u8]) -> Result<Vec<CanonRecord>> {
             skipped += 1;
             continue;
         };
-        let is_linux = rule
-            .logsource
-            .as_ref()
-            .and_then(|l| l.product.as_deref())
-            == Some("linux");
+        let is_linux = rule.logsource.as_ref().and_then(|l| l.product.as_deref()) == Some("linux");
         if !is_linux {
             continue;
         }
@@ -334,7 +329,10 @@ fn parse_sigma(tarball_gz: &[u8]) -> Result<Vec<CanonRecord>> {
     if out.is_empty() {
         bail!("Sigma parse yielded 0 Linux rules (filter/schema drift?)");
     }
-    eprintln!("  sigma: {} linux rules, {skipped} non-rule/unparsed skipped", out.len());
+    eprintln!(
+        "  sigma: {} linux rules, {skipped} non-rule/unparsed skipped",
+        out.len()
+    );
     Ok(out)
 }
 
@@ -440,7 +438,10 @@ fn write_provenance(
     };
     let json = serde_json::to_string_pretty(&p).context("serialising provenance")?;
     write_file(
-        &root.join("docs/kb-sources").join(source).join("provenance.json"),
+        &root
+            .join("docs/kb-sources")
+            .join(source)
+            .join("provenance.json"),
         format!("{json}\n").as_bytes(),
     )
 }
@@ -485,7 +486,10 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
     } else {
         root.join(out)
     };
-    eprintln!("xtask rag-kb: acquiring pinned corpus (mode: {})", if mirror.is_some() { "mirror" } else { "fetch" });
+    eprintln!(
+        "xtask rag-kb: acquiring pinned corpus (mode: {})",
+        if mirror.is_some() { "mirror" } else { "fetch" }
+    );
 
     // ── MITRE ATT&CK ──
     eprintln!("  attack: obtaining {ATTACK_PIN} bundle…");
@@ -532,12 +536,26 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
 
     // ── provenance sidecars (plan §4.2.2) ──
     write_provenance(
-        root, ATTACK_SOURCE_ID, ATTACK_REPO_URL, ATTACK_PIN, ATTACK_COMMIT,
-        &acquired, &attack_dump_sha, "MITRE ATT&CK Terms of Use", ATTACK_LICENSE_FILE,
+        root,
+        ATTACK_SOURCE_ID,
+        ATTACK_REPO_URL,
+        ATTACK_PIN,
+        ATTACK_COMMIT,
+        &acquired,
+        &attack_dump_sha,
+        "MITRE ATT&CK Terms of Use",
+        ATTACK_LICENSE_FILE,
     )?;
     write_provenance(
-        root, SIGMA_SOURCE_ID, SIGMA_REPO_URL, SIGMA_PIN, SIGMA_COMMIT,
-        &acquired, &sigma_dump_sha, "DRL-1.1", SIGMA_LICENSE_FILE,
+        root,
+        SIGMA_SOURCE_ID,
+        SIGMA_REPO_URL,
+        SIGMA_PIN,
+        SIGMA_COMMIT,
+        &acquired,
+        &sigma_dump_sha,
+        "DRL-1.1",
+        SIGMA_LICENSE_FILE,
     )?;
 
     // ── kb_index_hash (plan §3.1.1) ──
@@ -599,8 +617,8 @@ mod tests {
 
     #[test]
     fn canonical_line_is_8_key_alpha_sorted_with_author_array_or_null() {
-        let with = serde_json::to_string(&rec("sigma:a", Some(vec!["X".into(), "Y".into()])))
-            .unwrap();
+        let with =
+            serde_json::to_string(&rec("sigma:a", Some(vec!["X".into(), "Y".into()]))).unwrap();
         assert_eq!(
             with,
             r#"{"author":["X","Y"],"category":"sigma_rule","content":"c","id":"sigma:a","platform":"linux","severity":"high","source_ref":"sigma:a","title":"t"}"#
@@ -635,7 +653,10 @@ mod tests {
             normalize_authors(Some(&Value::String("Florian Roth, Nasreddine B".into()))),
             Some(vec!["Florian Roth".to_string(), "Nasreddine B".to_string()])
         );
-        let seq = Value::Sequence(vec![Value::String("A".into()), Value::String("B, C".into())]);
+        let seq = Value::Sequence(vec![
+            Value::String("A".into()),
+            Value::String("B, C".into()),
+        ]);
         assert_eq!(
             normalize_authors(Some(&seq)),
             Some(vec!["A".to_string(), "B".to_string(), "C".to_string()])
@@ -666,8 +687,7 @@ mod tests {
         // Locks the §3.1.1 preimage encoding; an accidental change to
         // the domain/layout/order flips this and fails CI.
         assert_eq!(
-            h1,
-            "918782f072a02db9378db7c9027ecceae900b20f477bd3b6ae8e813ce8f5c8c9",
+            h1, "918782f072a02db9378db7c9027ecceae900b20f477bd3b6ae8e813ce8f5c8c9",
             "§3.1.1 preimage drift — if intentional, bump KB_CANON_DOMAIN \
              and update this lock with a rationale in the commit body"
         );

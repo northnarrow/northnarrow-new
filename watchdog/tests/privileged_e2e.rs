@@ -113,9 +113,7 @@ fn install_to_priv_bin(src: &Path) -> InstalledBin {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    let dst = PathBuf::from(format!(
-        "{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"
-    ));
+    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
     let status = Command::new("sudo")
         .arg("install")
         .arg("-m")
@@ -164,14 +162,13 @@ fn agent_bin_src() -> PathBuf {
     // we resolve relative to it to find the agent binary in the
     // sibling crate's output. Fallback to repo-root/target/release
     // if the env var isn't set (e.g., invoked outside cargo).
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("target")
-                .to_string_lossy()
-                .into_owned()
-        });
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .to_string_lossy()
+            .into_owned()
+    });
     PathBuf::from(target_dir)
         .join("release")
         .join("northnarrow-agent")

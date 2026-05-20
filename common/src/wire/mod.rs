@@ -698,8 +698,7 @@ mod tests {
             "modifier_comm": "test",
             // dest_path INTENTIONALLY OMITTED — must default to None.
         });
-        let parsed: FimEvent =
-            serde_json::from_value(legacy).expect("legacy row must deserialise");
+        let parsed: FimEvent = serde_json::from_value(legacy).expect("legacy row must deserialise");
         assert_eq!(parsed.dest_path, None);
     }
 
@@ -719,9 +718,7 @@ mod tests {
             modifier_pid: 99,
             modifier_uid: 1000,
             modifier_comm: "ransomware_loop".to_string(),
-            dest_path: Some(
-                "/home/u/documents/quarterly.docx.crypted".to_string(),
-            ),
+            dest_path: Some("/home/u/documents/quarterly.docx.crypted".to_string()),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

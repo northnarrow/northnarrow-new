@@ -93,11 +93,7 @@ impl<'a> AdeProbe<'a> {
 }
 
 impl DecisionProbe for AdeProbe<'_> {
-    async fn probe(
-        &self,
-        focal: &Event,
-        ctx: &EventContext,
-    ) -> Result<AdeVerdict, XaiProbeError> {
+    async fn probe(&self, focal: &Event, ctx: &EventContext) -> Result<AdeVerdict, XaiProbeError> {
         self.engine
             .evaluate(focal, ctx)
             .await
@@ -354,7 +350,9 @@ mod tests {
         let h2 = compute_environment_hash(&e).unwrap();
         assert_eq!(h1, h2, "same inputs ⇒ same hash");
         assert_eq!(h1.len(), 64);
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h1
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 
         // Flip one combat-rules byte ⇒ the deployment identity changes.
         let rules2 = temp_with(b"combat-rules-v5");
@@ -454,7 +452,10 @@ mod tests {
         )
         .unwrap();
         let chain = xai.explain(&focal, &ctx, &bogus).await.unwrap();
-        assert_eq!(chain.ade_trace_id, bogus.trace_id, "FK still the passed verdict");
+        assert_eq!(
+            chain.ade_trace_id, bogus.trace_id,
+            "FK still the passed verdict"
+        );
         assert!(
             (chain.baseline_verdict.confidence - 0.123_456).abs() > 1e-9,
             "baseline must be the deterministic V0, not the passed verdict"

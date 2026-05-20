@@ -375,7 +375,9 @@ impl std::error::Error for SignedPayloadError {}
 /// Caller-facing helper for unit tests and for the off-host
 /// `nn-admin audit verify` path; production sign/verify go through
 /// [`sign`] / [`verify`].
-pub fn signing_digest(payload: &SignedPayload) -> Result<[u8; SIGNING_DIGEST_LEN], SignedPayloadError> {
+pub fn signing_digest(
+    payload: &SignedPayload,
+) -> Result<[u8; SIGNING_DIGEST_LEN], SignedPayloadError> {
     let cbor = encode_cbor(payload)?;
     let mut h = Sha512::new();
     h.update(SIGNED_PAYLOAD_DOMAIN_SEP);
@@ -461,12 +463,7 @@ impl SignedPayload {
         }
     }
 
-    pub fn new_shutdown(
-        nonce: [u8; 32],
-        ts: u64,
-        agent_id: [u8; 16],
-        grace_secs: u32,
-    ) -> Self {
+    pub fn new_shutdown(nonce: [u8; 32], ts: u64, agent_id: [u8; 16], grace_secs: u32) -> Self {
         Self {
             op: OperationCode::Shutdown,
             nonce,
@@ -623,7 +620,12 @@ mod tests {
                 [0x77; 32],
                 vec![Role::Unlock, Role::AuditRead],
             ),
-            SignedPayload::new_rotate_keys_revoke(nonce(), TS, agent_id(), [0x11, 0x22, 0x33, 0x44]),
+            SignedPayload::new_rotate_keys_revoke(
+                nonce(),
+                TS,
+                agent_id(),
+                [0x11, 0x22, 0x33, 0x44],
+            ),
             SignedPayload::new_audit_read(nonce(), TS, agent_id(), Some(1_700_000_000)),
             SignedPayload::new_fim_baseline(nonce(), TS, agent_id()),
             SignedPayload::new_fim_report(nonce(), TS, agent_id(), Some(1_700_000_000)),
@@ -803,10 +805,7 @@ mod tests {
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
-            assert_eq!(
-                OperationCode::try_from(expected).expect("known code"),
-                op
-            );
+            assert_eq!(OperationCode::try_from(expected).expect("known code"), op);
         }
         // Out-of-range bytes surface as UnknownOperationCode.
         match OperationCode::try_from(0u8) {

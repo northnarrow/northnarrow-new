@@ -35,9 +35,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use common::wire::admin_signed_payload::{
-    self, Role, SignedPayload, SignedPayloadError,
-};
+use common::wire::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
 use rand::rngs::OsRng;
@@ -164,9 +162,7 @@ impl KeyEntry {
     /// super-role and unconditionally satisfies any required role
     /// (design §3.2 "break-glass key (kept offline)" pattern).
     fn authorizes(&self, required: Role) -> bool {
-        self.roles
-            .iter()
-            .any(|r| *r == required || *r == Role::All)
+        self.roles.iter().any(|r| *r == required || *r == Role::All)
     }
 }
 
@@ -249,10 +245,7 @@ impl AdminAuth {
     /// bootstrapped install UUID (design §6.5). Production agent
     /// startup (`main.rs`) is the intended caller; the value is
     /// the return of [`crate::agent_id::load_or_bootstrap`].
-    pub fn load_with_agent_id(
-        config_path: &Path,
-        agent_id: [u8; 16],
-    ) -> Result<Self> {
+    pub fn load_with_agent_id(config_path: &Path, agent_id: [u8; 16]) -> Result<Self> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
 
@@ -263,9 +256,8 @@ impl AdminAuth {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let entry = parse_admin_line(line).map_err(|e| {
-                anyhow!("{}:{}: {e}", config_path.display(), line_no)
-            })?;
+            let entry = parse_admin_line(line)
+                .map_err(|e| anyhow!("{}:{}: {e}", config_path.display(), line_no))?;
             pub_keys.push(entry);
         }
 
@@ -276,11 +268,8 @@ impl AdminAuth {
             ));
         }
 
-        let mut auth = Self::build_entries_with_agent_id(
-            pub_keys,
-            DEFAULT_RATE_LIMIT_WINDOW,
-            agent_id,
-        );
+        let mut auth =
+            Self::build_entries_with_agent_id(pub_keys, DEFAULT_RATE_LIMIT_WINDOW, agent_id);
         // A13: remember the file we loaded from so the
         // rotate-keys dispatcher can atomically rewrite + reload
         // without an extra path threading through `dispatch()`.
@@ -858,11 +847,8 @@ impl AdminAuth {
         if let Err(TimestampSkewError::OutOfWindow {
             server_ts,
             max_skew_secs,
-        }) = check_timestamp_skew(
-            payload.ts,
-            server_now_unix_secs,
-            MAX_TIMESTAMP_SKEW_SECS,
-        ) {
+        }) = check_timestamp_skew(payload.ts, server_now_unix_secs, MAX_TIMESTAMP_SKEW_SECS)
+        {
             warn!(
                 target: "anti_tamper.admin_auth.verify_failure",
                 reason = "timestamp_skew",
@@ -1030,8 +1016,7 @@ fn parse_admin_line(line: &str) -> Result<KeyEntry> {
             hex_token.len()
         ));
     }
-    let raw_bytes =
-        hex::decode(hex_token).map_err(|e| anyhow!("invalid hex: {e}"))?;
+    let raw_bytes = hex::decode(hex_token).map_err(|e| anyhow!("invalid hex: {e}"))?;
     let key_bytes: [u8; 32] = raw_bytes
         .try_into()
         .expect("hex decode length pre-validated to 64 chars");
@@ -1171,7 +1156,9 @@ pub fn atomic_rewrite_admin_pub_add(
         }
         if let Ok(entry) = parse_admin_line(line) {
             if fingerprint(&entry.key) == new_fp {
-                return Err(RotateKeysError::KeyAlreadyPresent { fingerprint: new_fp });
+                return Err(RotateKeysError::KeyAlreadyPresent {
+                    fingerprint: new_fp,
+                });
             }
         }
     }
@@ -1223,7 +1210,9 @@ pub fn atomic_rewrite_admin_pub_revoke(
         out.push('\n');
     }
     if !removed {
-        return Err(RotateKeysError::KeyNotFound { fingerprint: target_hex });
+        return Err(RotateKeysError::KeyNotFound {
+            fingerprint: target_hex,
+        });
     }
     if kept_keys == 0 {
         return Err(RotateKeysError::LastKey);
@@ -1300,9 +1289,7 @@ pub const MAX_TIMESTAMP_SKEW_SECS: u32 = 60;
 /// clock.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TimestampSkewError {
-    #[error(
-        "timestamp outside ±{max_skew_secs}s window (server_ts={server_ts})"
-    )]
+    #[error("timestamp outside ±{max_skew_secs}s window (server_ts={server_ts})")]
     OutOfWindow { server_ts: u64, max_skew_secs: u32 },
 }
 
@@ -1667,8 +1654,12 @@ mod tests {
     fn check_timestamp_skew_accepts_in_window_offsets() {
         let server = FixedClock(1_710_000_000);
         // Exact match.
-        check_timestamp_skew(server.now_unix_secs(), server.now_unix_secs(), MAX_TIMESTAMP_SKEW_SECS)
-            .expect("equal timestamps are in-window");
+        check_timestamp_skew(
+            server.now_unix_secs(),
+            server.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect("equal timestamps are in-window");
         // Client one second in the future.
         check_timestamp_skew(
             server.now_unix_secs() + 1,
@@ -1707,7 +1698,10 @@ mod tests {
         let server_now = 1_710_000_000u64;
         let client_ts = server_now + u64::from(MAX_TIMESTAMP_SKEW_SECS) + 1; // one second past cap
         match check_timestamp_skew(client_ts, server_now, MAX_TIMESTAMP_SKEW_SECS) {
-            Err(TimestampSkewError::OutOfWindow { server_ts, max_skew_secs }) => {
+            Err(TimestampSkewError::OutOfWindow {
+                server_ts,
+                max_skew_secs,
+            }) => {
                 assert_eq!(server_ts, server_now);
                 assert_eq!(max_skew_secs, MAX_TIMESTAMP_SKEW_SECS);
             }
@@ -1727,7 +1721,10 @@ mod tests {
         let server_now = 1_710_000_000u64;
         let client_ts = server_now - u64::from(MAX_TIMESTAMP_SKEW_SECS) - 1;
         match check_timestamp_skew(client_ts, server_now, MAX_TIMESTAMP_SKEW_SECS) {
-            Err(TimestampSkewError::OutOfWindow { server_ts, max_skew_secs }) => {
+            Err(TimestampSkewError::OutOfWindow {
+                server_ts,
+                max_skew_secs,
+            }) => {
                 assert_eq!(server_ts, server_now);
                 assert_eq!(max_skew_secs, MAX_TIMESTAMP_SKEW_SECS);
             }
@@ -1786,8 +1783,12 @@ mod tests {
     fn fixed_clock_drives_skew_check_deterministically() {
         let clock = FixedClock(1_710_000_000);
         // In-window: client matches the fixed server time.
-        check_timestamp_skew(clock.now_unix_secs(), clock.now_unix_secs(), MAX_TIMESTAMP_SKEW_SECS)
-            .expect("FixedClock baseline");
+        check_timestamp_skew(
+            clock.now_unix_secs(),
+            clock.now_unix_secs(),
+            MAX_TIMESTAMP_SKEW_SECS,
+        )
+        .expect("FixedClock baseline");
         // Out-of-window: future skew at the same fixed server time.
         check_timestamp_skew(
             clock.now_unix_secs() + 1_000,
@@ -1896,10 +1897,7 @@ mod tests {
         let f = write_config(&["# header", &line]);
         let err = AdminAuth::load(f.path()).unwrap_err();
         let s = format!("{err:#}");
-        assert!(
-            s.contains(":2:"),
-            "error should reference line 2, got: {s}"
-        );
+        assert!(s.contains(":2:"), "error should reference line 2, got: {s}");
         assert!(
             s.contains("doesnotexist"),
             "error should mention the bad role, got: {s}"
@@ -2030,9 +2028,7 @@ mod tests {
     /// roles. Returns the auth + the signing keys (in the same
     /// order as their entries) so tests can mint signatures for
     /// specific keys deterministically.
-    fn build_auth_with_keyed_roles(
-        per_key_roles: &[Vec<Role>],
-    ) -> (AdminAuth, Vec<SigningKey>) {
+    fn build_auth_with_keyed_roles(per_key_roles: &[Vec<Role>]) -> (AdminAuth, Vec<SigningKey>) {
         let mut entries = Vec::with_capacity(per_key_roles.len());
         let mut signers = Vec::with_capacity(per_key_roles.len());
         for roles in per_key_roles {
@@ -2071,10 +2067,8 @@ mod tests {
     /// rate-limit (a co-signer simply hasn't replied yet).
     #[test]
     fn verify_quorum_rejects_insufficient_distinct_signatures_without_rate_limit() {
-        let (auth, signers) = build_auth_with_keyed_roles(&[
-            vec![Role::Shutdown],
-            vec![Role::Shutdown],
-        ]);
+        let (auth, signers) =
+            build_auth_with_keyed_roles(&[vec![Role::Shutdown], vec![Role::Shutdown]]);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [signers[0].sign(&nonce).to_bytes()];
         match auth.verify_quorum(&sigs, 2, &[Role::Shutdown]) {
@@ -2099,10 +2093,8 @@ mod tests {
     /// copies of their own signature.
     #[test]
     fn verify_quorum_tallies_distinct_keys_not_signatures() {
-        let (auth, signers) = build_auth_with_keyed_roles(&[
-            vec![Role::Shutdown],
-            vec![Role::Shutdown],
-        ]);
+        let (auth, signers) =
+            build_auth_with_keyed_roles(&[vec![Role::Shutdown], vec![Role::Shutdown]]);
         let nonce = auth.issue_challenge().unwrap();
         // Same signing key, twice.
         let sig0: [u8; 64] = signers[0].sign(&nonce).to_bytes();
@@ -2172,10 +2164,8 @@ mod tests {
     /// (provided=1), NOT as InvalidSignature.
     #[test]
     fn verify_quorum_counts_only_valid_matching_signatures() {
-        let (auth, signers) = build_auth_with_keyed_roles(&[
-            vec![Role::Shutdown],
-            vec![Role::Shutdown],
-        ]);
+        let (auth, signers) =
+            build_auth_with_keyed_roles(&[vec![Role::Shutdown], vec![Role::Shutdown]]);
         let nonce = auth.issue_challenge().unwrap();
         let valid: [u8; 64] = signers[0].sign(&nonce).to_bytes();
         let garbage: [u8; 64] = [0u8; 64];
@@ -2236,10 +2226,7 @@ mod tests {
     /// Useful for break-glass operators whose key holds `all`.
     #[test]
     fn verify_quorum_role_all_satisfies_any_required_role() {
-        let (auth, signers) = build_auth_with_keyed_roles(&[
-            vec![Role::All],
-            vec![Role::Unlock],
-        ]);
+        let (auth, signers) = build_auth_with_keyed_roles(&[vec![Role::All], vec![Role::Unlock]]);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [
             signers[0].sign(&nonce).to_bytes(),
@@ -2263,7 +2250,10 @@ mod tests {
         let primary = SigningKey::generate(&mut OsRng);
         std::fs::write(
             &admin_pub,
-            format!("{} unlock,rotate-keys\n", hex::encode(primary.verifying_key().to_bytes())),
+            format!(
+                "{} unlock,rotate-keys\n",
+                hex::encode(primary.verifying_key().to_bytes())
+            ),
         )
         .unwrap();
 
@@ -2281,12 +2271,9 @@ mod tests {
         assert!(body.contains(&hex::encode(new_key.verifying_key().to_bytes())));
         assert!(body.contains("unlock,audit-read"));
 
-        let err = atomic_rewrite_admin_pub_add(
-            &admin_pub,
-            &new_key.verifying_key(),
-            &[Role::Unlock],
-        )
-        .expect_err("second add of the same key must reject");
+        let err =
+            atomic_rewrite_admin_pub_add(&admin_pub, &new_key.verifying_key(), &[Role::Unlock])
+                .expect_err("second add of the same key must reject");
         assert!(matches!(err, RotateKeysError::KeyAlreadyPresent { .. }));
     }
 
@@ -2364,7 +2351,10 @@ mod tests {
         let after = auth.key_fingerprints_snapshot();
         assert_eq!(after.len(), 2, "after reload: {after:?}");
         let new_fp = fingerprint(&new_key.verifying_key());
-        assert!(after.contains(&new_fp), "new_fp {new_fp} missing in {after:?}");
+        assert!(
+            after.contains(&new_fp),
+            "new_fp {new_fp} missing in {after:?}"
+        );
     }
 
     /// A13 test #4: `reload` refuses to swap in an empty key set
@@ -2378,7 +2368,10 @@ mod tests {
         let primary = SigningKey::generate(&mut OsRng);
         std::fs::write(
             &admin_pub,
-            format!("{} unlock\n", hex::encode(primary.verifying_key().to_bytes())),
+            format!(
+                "{} unlock\n",
+                hex::encode(primary.verifying_key().to_bytes())
+            ),
         )
         .unwrap();
         let auth = AdminAuth::load(&admin_pub).expect("load");
@@ -2414,8 +2407,7 @@ mod tests {
         // Build a 2-of-N auth with both keys carrying Shutdown
         // role + a stable agent_id we can pass to the payload.
         let agent_id = [0x77; 16];
-        let signers: Vec<SigningKey> =
-            (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let signers: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let entries: Vec<KeyEntry> = signers
             .iter()
             .map(|s| KeyEntry {
@@ -2423,14 +2415,10 @@ mod tests {
                 roles: vec![Role::Shutdown],
             })
             .collect();
-        let auth = AdminAuth::build_entries_with_agent_id(
-            entries,
-            DEFAULT_RATE_LIMIT_WINDOW,
-            agent_id,
-        );
+        let auth =
+            AdminAuth::build_entries_with_agent_id(entries, DEFAULT_RATE_LIMIT_WINDOW, agent_id);
         let nonce = auth.issue_challenge().unwrap();
-        let payload =
-            SignedPayload::new_shutdown(nonce, 1_700_000_000, agent_id, 10);
+        let payload = SignedPayload::new_shutdown(nonce, 1_700_000_000, agent_id, 10);
         // Sanity: signing_digest is non-empty.
         let _ = signing_digest(&payload).expect("digest");
         let sigs: Vec<[u8; 64]> = signers

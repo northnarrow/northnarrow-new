@@ -36,8 +36,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
 use antitamper_bpf::attach_transient;
+use anyhow::{anyhow, Context, Result};
 use aya::maps::{ring_buf::RingBuf, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::wire::InodeKey;
@@ -109,8 +109,7 @@ pub fn attach_observe_programs(ebpf: &mut Ebpf, btf: &Btf) -> Result<usize> {
             Ok(()) => {
                 info!(
                     program,
-                    hook,
-                    "fim: LSM observe program attached (transient — re-attaches on restart)"
+                    hook, "fim: LSM observe program attached (transient — re-attaches on restart)"
                 );
                 attached += 1;
             }

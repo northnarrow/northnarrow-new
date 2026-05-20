@@ -101,9 +101,7 @@ pub fn write_marker(path: &Path, marker: &ShutdownMarker) -> Result<()> {
                 .mode(PARENT_DIR_MODE)
                 .recursive(true)
                 .create(parent)
-                .with_context(|| {
-                    format!("creating marker parent dir {}", parent.display())
-                })?;
+                .with_context(|| format!("creating marker parent dir {}", parent.display()))?;
         }
     }
 
@@ -115,26 +113,16 @@ pub fn write_marker(path: &Path, marker: &ShutdownMarker) -> Result<()> {
             .truncate(true)
             .mode(MARKER_MODE)
             .open(&tmp_path)
-            .with_context(|| {
-                format!("opening tmpfile {}", tmp_path.display())
-            })?;
-        let line = serde_json::to_string(marker)
-            .context("serialising ShutdownMarker to JSON")?;
+            .with_context(|| format!("opening tmpfile {}", tmp_path.display()))?;
+        let line = serde_json::to_string(marker).context("serialising ShutdownMarker to JSON")?;
         f.write_all(line.as_bytes())
-            .with_context(|| {
-                format!("writing marker JSON to {}", tmp_path.display())
-            })?;
+            .with_context(|| format!("writing marker JSON to {}", tmp_path.display()))?;
         f.write_all(b"\n").ok();
         f.sync_all()
             .with_context(|| format!("fsync {}", tmp_path.display()))?;
     }
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "renaming {} → {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
@@ -148,9 +136,7 @@ pub fn read_marker(path: &Path) -> Result<Option<ShutdownMarker>> {
     match fs::read_to_string(path) {
         Ok(content) => {
             let marker: ShutdownMarker = serde_json::from_str(content.trim())
-                .with_context(|| {
-                    format!("parsing marker JSON from {}", path.display())
-                })?;
+                .with_context(|| format!("parsing marker JSON from {}", path.display()))?;
             if marker.entry_hash.len() != 64
                 || !marker.entry_hash.bytes().all(|b| b.is_ascii_hexdigit())
             {
@@ -201,7 +187,7 @@ mod tests {
 
     fn sample_marker() -> ShutdownMarker {
         ShutdownMarker {
-            entry_hash: "ab".repeat(32),       // 64 hex chars
+            entry_hash: "ab".repeat(32), // 64 hex chars
             grace_deadline_unix_ts: 1_710_000_030,
         }
     }
@@ -259,26 +245,38 @@ mod tests {
     fn read_marker_rejects_every_corruption_shape() {
         for (label, content) in [
             ("not JSON at all", "this is not json"),
-            ("JSON missing entry_hash", r#"{"grace_deadline_unix_ts":100}"#),
-            ("JSON missing grace_deadline_unix_ts", r#"{"entry_hash":"ab"}"#),
+            (
+                "JSON missing entry_hash",
+                r#"{"grace_deadline_unix_ts":100}"#,
+            ),
+            (
+                "JSON missing grace_deadline_unix_ts",
+                r#"{"entry_hash":"ab"}"#,
+            ),
             (
                 "entry_hash too short",
                 r#"{"entry_hash":"abc","grace_deadline_unix_ts":1}"#,
             ),
             (
                 "entry_hash too long",
-                &format!(r#"{{"entry_hash":"{}","grace_deadline_unix_ts":1}}"#, "ab".repeat(33)),
+                &format!(
+                    r#"{{"entry_hash":"{}","grace_deadline_unix_ts":1}}"#,
+                    "ab".repeat(33)
+                ),
             ),
             (
                 "entry_hash non-hex",
-                &format!(r#"{{"entry_hash":"{}","grace_deadline_unix_ts":1}}"#, "zz".repeat(32)),
+                &format!(
+                    r#"{{"entry_hash":"{}","grace_deadline_unix_ts":1}}"#,
+                    "zz".repeat(32)
+                ),
             ),
             ("empty file", ""),
         ] {
             let (_dir, path) = fresh_path();
             fs::write(&path, content).unwrap();
-            let err = read_marker(&path)
-                .unwrap_err_or_else(|| panic!("[{label}] should have errored"));
+            let err =
+                read_marker(&path).unwrap_err_or_else(|| panic!("[{label}] should have errored"));
             let chain = format!("{err:#}");
             assert!(
                 !chain.is_empty(),

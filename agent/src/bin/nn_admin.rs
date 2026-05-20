@@ -34,11 +34,10 @@ use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
     load_audit_pubkey, run_audit_read, run_audit_verify, run_fim_baseline, run_fim_report,
-    run_fim_status, FimStatusOutcome,
-    run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
-    run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, FimBaselineOutcome,
-    FimReportOutcome, ForcePostureOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
-    UnlockOutcome, VerifyKeysOutcome,
+    run_fim_status, run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke,
+    run_shutdown, run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, FimBaselineOutcome,
+    FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, RotateKeysOutcome, ShutdownOutcome,
+    StatusOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -566,13 +565,8 @@ fn main() -> ExitCode {
                     agent_id_file,
                     socket,
                 },
-        } => match run_rotate_keys_revoke(
-            &socket,
-            &key,
-            &cosign_key,
-            &agent_id_file,
-            &fingerprint,
-        ) {
+        } => match run_rotate_keys_revoke(&socket, &key, &cosign_key, &agent_id_file, &fingerprint)
+        {
             Ok(out) => exit_from_rotate_keys(out, "rotate-keys revoke"),
             Err(e) => {
                 eprintln!("rotate-keys revoke: {e:#}");
@@ -604,9 +598,7 @@ fn main() -> ExitCode {
         } => match load_audit_pubkey(agent_pubkey.as_deref(), &agent_sig_key) {
             Ok(pubkey) => match run_audit_verify(&from, &pubkey) {
                 Ok(AuditVerifyOutcome::Success { entries }) => {
-                    println!(
-                        "audit: {entries} entries, hash chain intact, all sigs valid"
-                    );
+                    println!("audit: {entries} entries, hash chain intact, all sigs valid");
                     ExitCode::SUCCESS
                 }
                 Ok(AuditVerifyOutcome::ChainBroken(err)) => {
@@ -758,9 +750,7 @@ fn exit_from_force_posture(
             eprintln!(
                 "{}",
                 colorize(
-                    &format!(
-                        "force-posture: rate limited; retry after {retry_after_secs}s"
-                    ),
+                    &format!("force-posture: rate limited; retry after {retry_after_secs}s"),
                     "33",
                     tty
                 )
@@ -868,11 +858,7 @@ fn exit_from_shutdown(outcome: ShutdownOutcome, grace_secs: u32) -> ExitCode {
             // matched fingerprints client-side here.
             println!(
                 "{}",
-                colorize(
-                    "shutdown: 2 signatures collected; quorum met",
-                    "32",
-                    tty
-                )
+                colorize("shutdown: 2 signatures collected; quorum met", "32", tty)
             );
             println!(
                 "{}",
@@ -913,9 +899,7 @@ fn exit_from_shutdown(outcome: ShutdownOutcome, grace_secs: u32) -> ExitCode {
             eprintln!(
                 "{}",
                 colorize(
-                    &format!(
-                        "shutdown: rate limited; retry after {retry_after_secs}s"
-                    ),
+                    &format!("shutdown: rate limited; retry after {retry_after_secs}s"),
                     "33",
                     tty
                 )
@@ -1102,8 +1086,8 @@ fn colorize(s: &str, sgr: &str, tty: bool) -> String {
 /// [`common::wire::admin_signed_payload::Role`] enum. Empty input
 /// is rejected — A13's `add` flow requires at least one role.
 fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<common::wire::admin_signed_payload::Role>> {
-    use common::wire::admin_signed_payload::Role;
     use anyhow::{anyhow, bail};
+    use common::wire::admin_signed_payload::Role;
     let mut out = Vec::new();
     for raw in s.split(',') {
         let token = raw.trim();
@@ -1187,11 +1171,15 @@ fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode
             ExitCode::from(5)
         }
         RotateKeysOutcome::UnknownOperation => {
-            eprintln!("{op_label}: server rejected operation (op_extra mismatch or no config path)");
+            eprintln!(
+                "{op_label}: server rejected operation (op_extra mismatch or no config path)"
+            );
             ExitCode::from(5)
         }
         RotateKeysOutcome::ProtocolVersionUnsupported { server_version } => {
-            eprintln!("{op_label}: server speaks protocol v{server_version}; this nn-admin is newer");
+            eprintln!(
+                "{op_label}: server speaks protocol v{server_version}; this nn-admin is newer"
+            );
             ExitCode::from(5)
         }
     }
@@ -1205,10 +1193,7 @@ fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
     let tty = std::io::stdout().is_terminal();
     match outcome {
         FimBaselineOutcome::Success => {
-            println!(
-                "{}",
-                colorize("fim baseline: success", "32", tty)
-            );
+            println!("{}", colorize("fim baseline: success", "32", tty));
             ExitCode::SUCCESS
         }
         FimBaselineOutcome::InvalidSignature => {
@@ -1302,9 +1287,7 @@ fn exit_from_fim_report(outcome: FimReportOutcome) -> ExitCode {
             server_ts,
             max_skew_secs,
         } => {
-            eprintln!(
-                "fim report: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)"
-            );
+            eprintln!("fim report: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
             ExitCode::from(5)
         }
         FimReportOutcome::AgentIdMismatch => {
@@ -1389,9 +1372,7 @@ fn exit_from_fim_status(outcome: FimStatusOutcome) -> ExitCode {
             server_ts,
             max_skew_secs,
         } => {
-            eprintln!(
-                "fim status: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)"
-            );
+            eprintln!("fim status: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
             ExitCode::from(5)
         }
         FimStatusOutcome::AgentIdMismatch => {

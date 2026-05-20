@@ -364,14 +364,7 @@ pub fn attach_lsm(
                 );
                 purge_stale_pin(&link_path);
                 purge_stale_pin(&prog_path);
-                fresh_attach_and_pin(
-                    ebpf,
-                    program_name,
-                    hook_name,
-                    btf,
-                    &prog_path,
-                    &link_path,
-                )?;
+                fresh_attach_and_pin(ebpf, program_name, hook_name, btf, &prog_path, &link_path)?;
                 info!(
                     hook = hook_name,
                     "anti-tamper: purged stale pin and freshly attached"
@@ -454,12 +447,8 @@ impl ProtectedPidsHandle<MapData> {
         // resulting handle owns the `Map::HashMap(_)` storage
         // — a single `MapData` worth of state, just wrapped.
         let map = AyaMap::HashMap(map_data);
-        let map = AyaHashMap::try_from(map).with_context(|| {
-            format!(
-                "{} is not a HashMap<u32, u8>",
-                PROTECTED_PIDS_MAP_NAME
-            )
-        })?;
+        let map = AyaHashMap::try_from(map)
+            .with_context(|| format!("{} is not a HashMap<u32, u8>", PROTECTED_PIDS_MAP_NAME))?;
         Ok(Self { map })
     }
 }
@@ -473,12 +462,11 @@ impl<'a> ProtectedPidsHandle<&'a mut MapData> {
     /// a map named [`PROTECTED_PIDS_MAP_NAME`] or if the map's
     /// key/value types don't match `HashMap<u32, u8>`.
     pub fn from_ebpf(ebpf: &'a mut Ebpf) -> Result<Self> {
-        let map = ebpf.map_mut(PROTECTED_PIDS_MAP_NAME).ok_or_else(|| {
-            anyhow!("map {PROTECTED_PIDS_MAP_NAME} missing from eBPF object")
-        })?;
-        let map = AyaHashMap::try_from(map).with_context(|| {
-            format!("{PROTECTED_PIDS_MAP_NAME} is not a HashMap<u32, u8>")
-        })?;
+        let map = ebpf
+            .map_mut(PROTECTED_PIDS_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP_NAME} missing from eBPF object"))?;
+        let map = AyaHashMap::try_from(map)
+            .with_context(|| format!("{PROTECTED_PIDS_MAP_NAME} is not a HashMap<u32, u8>"))?;
         Ok(Self { map })
     }
 }
@@ -498,9 +486,7 @@ where
     pub fn insert(&mut self, pid: u32) -> Result<()> {
         self.map
             .insert(pid, 1u8, 0)
-            .with_context(|| {
-                format!("inserting PID {pid} into {PROTECTED_PIDS_MAP_NAME}")
-            })?;
+            .with_context(|| format!("inserting PID {pid} into {PROTECTED_PIDS_MAP_NAME}"))?;
         Ok(())
     }
 
@@ -748,7 +734,6 @@ mod tests {
         // to compile-check the API surface. Reference them so
         // dead-code lint doesn't fire.
         let _ = _exercise_owned as fn(&mut ProtectedPidsHandle<MapData>) -> Result<()>;
-        let _ = _exercise_borrowed
-            as fn(&mut ProtectedPidsHandle<&mut MapData>) -> Result<()>;
+        let _ = _exercise_borrowed as fn(&mut ProtectedPidsHandle<&mut MapData>) -> Result<()>;
     }
 }

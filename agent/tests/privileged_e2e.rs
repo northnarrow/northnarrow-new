@@ -214,7 +214,13 @@ fn e2e_force_combat_then_unlock_via_cli() {
     // Drive the agent into COMBAT via the debug feature.
     let out = run_nn_admin_at(
         nn,
-        &["debug", "force-posture", "combat", "--socket", socket.to_str().unwrap()],
+        &[
+            "debug",
+            "force-posture",
+            "combat",
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
     );
     assert!(
         out.status.success(),
@@ -223,8 +229,10 @@ fn e2e_force_combat_then_unlock_via_cli() {
     );
 
     // Status mirrors the forced state.
-    let out =
-        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out = run_nn_admin_at(
+        nn,
+        &["status", "--socket", socket.to_str().unwrap(), "--json"],
+    );
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.contains("\"posture\":\"Combat\""),
@@ -274,8 +282,10 @@ fn e2e_force_combat_then_unlock_via_cli() {
 
     // Posture dropped to Alerted (per the asymmetry rationale on
     // admin_release_combat_with_token).
-    let out =
-        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out = run_nn_admin_at(
+        nn,
+        &["status", "--socket", socket.to_str().unwrap(), "--json"],
+    );
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.contains("\"posture\":\"Alerted\""),
@@ -307,7 +317,13 @@ fn e2e_unlock_with_wrong_key() {
     // Force Combat to make the test meaningful.
     let out = run_nn_admin_at(
         nn,
-        &["debug", "force-posture", "combat", "--socket", socket.to_str().unwrap()],
+        &[
+            "debug",
+            "force-posture",
+            "combat",
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
     );
     assert!(out.status.success());
 
@@ -330,8 +346,10 @@ fn e2e_unlock_with_wrong_key() {
     );
 
     // Posture still Combat, isolation still engaged.
-    let out =
-        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out = run_nn_admin_at(
+        nn,
+        &["status", "--socket", socket.to_str().unwrap(), "--json"],
+    );
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
         body.contains("\"posture\":\"Combat\""),
@@ -380,7 +398,13 @@ fn e2e_rate_limit_via_full_stack() {
     // Force Combat.
     let _ = run_nn_admin_at(
         nn,
-        &["debug", "force-posture", "combat", "--socket", socket.to_str().unwrap()],
+        &[
+            "debug",
+            "force-posture",
+            "combat",
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
     );
 
     // Three failures.
@@ -424,8 +448,10 @@ fn e2e_status_no_admin_action_initially() {
     let nn = handles.nn_admin_path.as_path();
     let socket = handles.socket.as_path();
 
-    let out =
-        run_nn_admin_at(nn, &["status", "--socket", socket.to_str().unwrap(), "--json"]);
+    let out = run_nn_admin_at(
+        nn,
+        &["status", "--socket", socket.to_str().unwrap(), "--json"],
+    );
     assert!(out.status.success());
     let body = String::from_utf8_lossy(&out.stdout);
 
@@ -494,9 +520,7 @@ fn install_to_priv_bin(src: &Path) -> InstalledBin {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    let dst = PathBuf::from(format!(
-        "{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"
-    ));
+    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
     let status = Command::new("sudo")
         .arg("install")
         .arg("-m")
@@ -766,7 +790,8 @@ fn shutdown_signed_round_trip() {
         "unlock,shutdown",
     );
 
-    let (_guard, paths) = spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
+    let (_guard, paths) =
+        spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
 
     // Submit the signed shutdown.
     let out = Command::new(&paths.nn_admin_path)
@@ -801,8 +826,8 @@ fn shutdown_signed_round_trip() {
     );
 
     // Audit row emitted for the op (B5 wiring).
-    let audit_body = std::fs::read_to_string(&paths.audit_log_file)
-        .expect("audit log readable post-shutdown");
+    let audit_body =
+        std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable post-shutdown");
     let lines: Vec<&str> = audit_body.lines().filter(|l| !l.is_empty()).collect();
     assert!(
         !lines.is_empty(),
@@ -850,7 +875,8 @@ fn rotate_keys_round_trip() {
         "unlock,rotate-keys",
     );
 
-    let (_guard, paths) = spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
+    let (_guard, paths) =
+        spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
 
     // Mint a fresh keypair OUTSIDE the agent's admin.pub so we
     // can inject its pubkey via rotate-keys-add (the production
@@ -934,8 +960,7 @@ fn rotate_keys_round_trip() {
     );
 
     // (c) audit row records the rotate_keys_add success.
-    let audit_body =
-        std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable");
+    let audit_body = std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable");
     assert!(
         audit_body.contains("\"op\":\"rotate_keys_add\""),
         "audit log should have a rotate_keys_add entry: {audit_body}"
@@ -976,7 +1001,8 @@ fn audit_verify_e2e() {
         "unlock,rotate-keys",
     );
 
-    let (_guard, paths) = spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
+    let (_guard, paths) =
+        spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
 
     // Op 1: successful unlock (no Combat to release → server
     // returns Success idempotently per the existing
@@ -1045,8 +1071,7 @@ fn audit_verify_e2e() {
     // Audit log should now have 3 entries: unlock success +
     // unlock failure + rotate_keys_add success. Verify chain
     // integrity via the CLI.
-    let audit_body = std::fs::read_to_string(&paths.audit_log_file)
-        .expect("audit log readable");
+    let audit_body = std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable");
     let entry_count = audit_body.lines().filter(|l| !l.is_empty()).count();
     assert_eq!(
         entry_count, 3,

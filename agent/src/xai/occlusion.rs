@@ -132,9 +132,9 @@ fn event_kind_label(e: &Event) -> String {
         Event::ExecCheck { comm, filename, .. } => {
             format!("ExecCheck comm={comm} file={filename}")
         }
-        Event::TcpConnect {
-            comm, dst_port, ..
-        } => format!("TcpConnect comm={comm} dport={dst_port}"),
+        Event::TcpConnect { comm, dst_port, .. } => {
+            format!("TcpConnect comm={comm} dport={dst_port}")
+        }
         Event::DnsQuery {
             comm, query_name, ..
         } => format!("DnsQuery comm={comm} q={query_name}"),
@@ -163,7 +163,12 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
     // ── focal fields (exhaustive per variant) ──
     match focal {
         Event::ProcessSpawn { .. } => {
-            units.push(focal_unit(F::Comm, "comm", "focal process comm".into(), Semantic));
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
             units.push(focal_unit(
                 F::Filename,
                 "filename",
@@ -174,24 +179,49 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
             units.push(focal_unit(F::Ppid, "ppid", "focal ppid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
             units.push(focal_unit(F::Gid, "gid", "focal gid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
         Event::FileOpen { .. } => {
-            units.push(focal_unit(F::Comm, "comm", "focal process comm".into(), Semantic));
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
             units.push(focal_unit(
                 F::Filename,
                 "filename",
                 "focal opened path".into(),
                 Semantic,
             ));
-            units.push(focal_unit(F::Flags, "flags", "focal open flags".into(), Semantic));
+            units.push(focal_unit(
+                F::Flags,
+                "flags",
+                "focal open flags".into(),
+                Semantic,
+            ));
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
             units.push(focal_unit(F::Gid, "gid", "focal gid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
         Event::ExecCheck { .. } => {
-            units.push(focal_unit(F::Comm, "comm", "focal process comm".into(), Semantic));
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
             units.push(focal_unit(
                 F::Filename,
                 "filename",
@@ -201,10 +231,20 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Ppid, "ppid", "focal ppid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
         Event::TcpConnect { .. } => {
-            units.push(focal_unit(F::Comm, "comm", "focal process comm".into(), Semantic));
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
             units.push(focal_unit(
                 F::DstAddr,
                 "dst_addr",
@@ -217,15 +257,40 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
                 "focal destination port".into(),
                 Semantic,
             ));
-            units.push(focal_unit(F::SrcAddr, "src_addr", "focal source address".into(), Semantic));
-            units.push(focal_unit(F::SrcPort, "src_port", "focal source port".into(), Semantic));
-            units.push(focal_unit(F::Family, "family", "focal address family".into(), Semantic));
+            units.push(focal_unit(
+                F::SrcAddr,
+                "src_addr",
+                "focal source address".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(
+                F::SrcPort,
+                "src_port",
+                "focal source port".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(
+                F::Family,
+                "family",
+                "focal address family".into(),
+                Semantic,
+            ));
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
         Event::DnsQuery { .. } => {
-            units.push(focal_unit(F::Comm, "comm", "focal process comm".into(), Semantic));
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
             units.push(focal_unit(
                 F::QueryName,
                 "query_name",
@@ -244,13 +309,28 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
                 "focal DNS server address".into(),
                 Semantic,
             ));
-            units.push(focal_unit(F::Family, "family", "focal address family".into(), Semantic));
+            units.push(focal_unit(
+                F::Family,
+                "family",
+                "focal address family".into(),
+                Semantic,
+            ));
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
         Event::FsProtectDenial { .. } => {
-            units.push(focal_unit(F::Comm, "comm", "focal process comm".into(), Semantic));
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
             units.push(focal_unit(
                 F::Operation,
                 "operation",
@@ -271,17 +351,42 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
             ));
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
         // Tappa 9 (C4): FIM drift focal-field enumeration.
         // V1.0 doesn't run XAI on FIM events (XAI is process-
         // event-centric in Tappa 6.9). Listed for exhaustive-
         // match coverage; C9 may add a richer enumeration.
         Event::Fim(_) => {
-            units.push(focal_unit(F::Filename, "path", "focal FIM path".into(), Semantic));
-            units.push(focal_unit(F::Pid, "pid", "focal modifier pid".into(), Identifier));
-            units.push(focal_unit(F::Uid, "uid", "focal modifier uid".into(), Identifier));
-            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+            units.push(focal_unit(
+                F::Filename,
+                "path",
+                "focal FIM path".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(
+                F::Pid,
+                "pid",
+                "focal modifier pid".into(),
+                Identifier,
+            ));
+            units.push(focal_unit(
+                F::Uid,
+                "uid",
+                "focal modifier uid".into(),
+                Identifier,
+            ));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
         }
     }
 
@@ -752,6 +857,9 @@ mod tests {
             _ => panic!("variant changed"),
         }
         assert!(c2.host_context.hostname.is_empty());
-        assert_eq!(c2.host_context.kernel_version, "6.8", "untargeted host intact");
+        assert_eq!(
+            c2.host_context.kernel_version, "6.8",
+            "untargeted host intact"
+        );
     }
 }

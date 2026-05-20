@@ -47,8 +47,7 @@ use crate::decision::Rule;
 /// §13 Q2 user-writable directory prefixes — the destination
 /// of a hardlink that lands here gets Critical severity in
 /// NN-L-FIM-002, mirroring `DriftClassifier::classify`.
-const USER_WRITABLE_PREFIXES: &[&str] =
-    &["/tmp/", "/var/tmp/", "/dev/shm/", "/home/"];
+const USER_WRITABLE_PREFIXES: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/", "/home/"];
 
 /// NN-L-FIM-001: system-binary paths. Any Modified-op drift
 /// against these is Critical (T1485-ish persistence /
@@ -539,12 +538,12 @@ const RANSOMWARE_EXTENSIONS: &[&str] = &[
     ".micro",
     ".xxx",
     // Strain-specific markers (named-attribution).
-    ".ryk",       // Ryuk
-    ".wannacry",  // WannaCry
-    ".wcry",      // WannaCry (alt)
-    ".conti",     // Conti
-    ".lockbit",   // LockBit
-    ".blackcat",  // ALPHV/BlackCat
+    ".ryk",      // Ryuk
+    ".wannacry", // WannaCry
+    ".wcry",     // WannaCry (alt)
+    ".conti",    // Conti
+    ".lockbit",  // LockBit
+    ".blackcat", // ALPHV/BlackCat
 ];
 
 /// Ransomware extension rename per legacy M14.4 NN-L-FIM-001,
@@ -908,9 +907,13 @@ mod tests {
     fn fim001_does_not_fire_on_user_binary_modified() {
         let r = NnLFim001SystemBinaryModified;
         // /usr/local/bin/ is NN-L-FIM-006's territory; 001 must NOT fire.
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/usr/local/bin/x")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/usr/local/bin/x"))
+            .is_none());
         // /home/ definitely not.
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/home/u/bin/x")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/home/u/bin/x"))
+            .is_none());
     }
 
     #[test]
@@ -919,8 +922,12 @@ mod tests {
         // Deleted of a system binary is alarming but caught by
         // a different rule (or none in V1.0); 001 only handles
         // Modified.
-        assert!(r.evaluate(&fim_event(FimOp::Deleted, "/usr/bin/sshd")).is_none());
-        assert!(r.evaluate(&fim_event(FimOp::Created, "/usr/bin/sshd")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Deleted, "/usr/bin/sshd"))
+            .is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Created, "/usr/bin/sshd"))
+            .is_none());
     }
 
     // ── NN-L-FIM-002 ────────────────────────────────────────────
@@ -950,9 +957,13 @@ mod tests {
         // Modified op never fires 002.
         assert!(r.evaluate(&fim_event(FimOp::Modified, "/tmp/.x")).is_none());
         // Created in system path NOT user-writable — 001 territory.
-        assert!(r.evaluate(&fim_event(FimOp::Created, "/usr/bin/y")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Created, "/usr/bin/y"))
+            .is_none());
         // Linked into /etc/ — possibly a different rule, NOT 002.
-        assert!(r.evaluate(&fim_event(FimOp::Linked, "/etc/cron.d/x")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Linked, "/etc/cron.d/x"))
+            .is_none());
     }
 
     // ── NN-L-FIM-003 ────────────────────────────────────────────
@@ -980,12 +991,16 @@ mod tests {
     fn fim003_does_not_fire_on_arbitrary_etc_file() {
         let r = NnLFim003SensitiveConfigModified;
         // /etc/hostname is on /etc/ but not in the exact list.
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/etc/hostname")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/etc/hostname"))
+            .is_none());
         // /etc/shadow- (the backup file with trailing dash) is
         // an exact-match miss — operators may legitimately
         // rename shadow + shadow- during password ops; rule
         // 003 only fires on the exact /etc/shadow.
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/etc/shadow-")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/etc/shadow-"))
+            .is_none());
     }
 
     // ── NN-L-FIM-004 ────────────────────────────────────────────
@@ -1009,9 +1024,13 @@ mod tests {
     fn fim004_does_not_fire_on_authorized_keys2_or_other_ssh_files() {
         let r = NnLFim004AuthorizedKeysModified;
         // authorized_keys2 is legacy SSH; not strictly the same path. V1.0 doesn't cover.
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/root/.ssh/authorized_keys2")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/root/.ssh/authorized_keys2"))
+            .is_none());
         // known_hosts isn't a backdoor surface.
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/root/.ssh/known_hosts")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/root/.ssh/known_hosts"))
+            .is_none());
     }
 
     // ── NN-L-FIM-005 ────────────────────────────────────────────
@@ -1019,7 +1038,11 @@ mod tests {
     #[test]
     fn fim005_fires_on_log_modification_but_logs_only() {
         let r = NnLFim005LogTruncated;
-        for path in &["/var/log/auth.log", "/var/log/syslog", "/var/audit/audit.log"] {
+        for path in &[
+            "/var/log/auth.log",
+            "/var/log/syslog",
+            "/var/audit/audit.log",
+        ] {
             let v = r
                 .evaluate(&fim_event(FimOp::Modified, path))
                 .unwrap_or_else(|| panic!("expected fire on {path}"));
@@ -1033,7 +1056,9 @@ mod tests {
     #[test]
     fn fim005_does_not_fire_on_non_log_paths() {
         let r = NnLFim005LogTruncated;
-        assert!(r.evaluate(&fim_event(FimOp::Modified, "/etc/passwd")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/etc/passwd"))
+            .is_none());
         assert!(r.evaluate(&fim_event(FimOp::Modified, "/tmp/x")).is_none());
     }
 
@@ -1072,8 +1097,12 @@ mod tests {
     #[test]
     fn fim007_does_not_fire_on_unrelated_paths() {
         let r = NnLFim007CronDropInCreated;
-        assert!(r.evaluate(&fim_event(FimOp::Created, "/etc/passwd")).is_none());
-        assert!(r.evaluate(&fim_event(FimOp::Created, "/var/spool/lpd/x")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Created, "/etc/passwd"))
+            .is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Created, "/var/spool/lpd/x"))
+            .is_none());
     }
 
     // ── NN-L-FIM-008 ────────────────────────────────────────────
@@ -1114,7 +1143,9 @@ mod tests {
         // /run/systemd/system/ is runtime state, not a unit file
         // root. systemctl writes runtime overrides there; not
         // a persistence vector.
-        assert!(r.evaluate(&fim_event(FimOp::Created, "/run/systemd/system/x.service")).is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Created, "/run/systemd/system/x.service"))
+            .is_none());
     }
 
     // ── builder hygiene ─────────────────────────────────────────
@@ -1128,8 +1159,7 @@ mod tests {
         // built set" + the distinct-IDs guard.
         let n = rules.len();
         assert!(n >= 10, "expected at least 10 FIM rules, got {n}");
-        let ids: std::collections::HashSet<&str> =
-            rules.iter().map(|r| r.id()).collect();
+        let ids: std::collections::HashSet<&str> = rules.iter().map(|r| r.id()).collect();
         assert_eq!(ids.len(), n, "rule IDs must be unique");
         for id in &ids {
             assert!(
@@ -1150,15 +1180,12 @@ mod tests {
         // Smoke: each fires at Critical on its canonical input.
         let events = [
             (
-                NnLFim001SystemBinaryModified.evaluate(&fim_event(
-                    FimOp::Modified,
-                    "/usr/bin/sshd",
-                )),
+                NnLFim001SystemBinaryModified
+                    .evaluate(&fim_event(FimOp::Modified, "/usr/bin/sshd")),
                 Severity::Critical,
             ),
             (
-                NnLFim002NewSuidBinary
-                    .evaluate(&fim_event(FimOp::Linked, "/tmp/.x")),
+                NnLFim002NewSuidBinary.evaluate(&fim_event(FimOp::Linked, "/tmp/.x")),
                 Severity::Critical,
             ),
             (

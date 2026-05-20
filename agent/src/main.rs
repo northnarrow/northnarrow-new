@@ -251,9 +251,9 @@ async fn main() -> Result<()> {
     // window starts at boot rather than at "first signed admin op".
     // audit.log is created as a zero-byte placeholder if absent
     // (first append writes the genesis entry).
-    if let Err(e) = northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-        &cli.signing_key_file,
-    ) {
+    if let Err(e) =
+        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
+    {
         warn!(
             error = %e,
             path = %cli.signing_key_file.display(),
@@ -261,9 +261,9 @@ async fn main() -> Result<()> {
              unsigned this boot"
         );
     }
-    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_audit_log(
-        &cli.audit_log_file,
-    ) {
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_audit_log(&cli.audit_log_file)
+    {
         warn!(
             error = %e,
             path = %cli.audit_log_file.display(),
@@ -275,9 +275,9 @@ async fn main() -> Result<()> {
     // same reason audit.log gets it — STATE_PROTECTED_FILES needs
     // an inode to register against before LSM hooks come up. A
     // present file is left untouched (existing chain preserved).
-    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(
-        &cli.fim_baseline_file,
-    ) {
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(&cli.fim_baseline_file)
+    {
         warn!(
             error = %e,
             path = %cli.fim_baseline_file.display(),
@@ -285,9 +285,9 @@ async fn main() -> Result<()> {
              created on first append (and unprotected this boot)"
         );
     }
-    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(
-        &cli.fim_drift_file,
-    ) {
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(&cli.fim_drift_file)
+    {
         warn!(
             error = %e,
             path = %cli.fim_drift_file.display(),
@@ -547,24 +547,22 @@ async fn main() -> Result<()> {
     //  5. Build the [`FimAdminState`] for the admin socket so
     //     `fim baseline` triggers (3) and `fim status` reads the
     //     in-process snapshot.
-    let watched_paths_load =
-        match northnarrow_agent::fim::paths_config::load_watched_paths(
-            &cli.fim_paths_v1,
-            &cli.fim_paths_local,
-        ) {
-            Ok(load) => load,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    v1 = %cli.fim_paths_v1.display(),
-                    local = %cli.fim_paths_local.display(),
-                    "fim paths-config: load failed — proceeding with empty watched-paths set"
-                );
-                Default::default()
-            }
-        };
-    let paths_summary =
-        admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
+    let watched_paths_load = match northnarrow_agent::fim::paths_config::load_watched_paths(
+        &cli.fim_paths_v1,
+        &cli.fim_paths_local,
+    ) {
+        Ok(load) => load,
+        Err(e) => {
+            warn!(
+                error = %e,
+                v1 = %cli.fim_paths_v1.display(),
+                local = %cli.fim_paths_local.display(),
+                "fim paths-config: load failed — proceeding with empty watched-paths set"
+            );
+            Default::default()
+        }
+    };
+    let paths_summary = admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
 
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // Re-derive the signing key + agent_id for FIM the same way
@@ -572,42 +570,40 @@ async fn main() -> Result<()> {
         // log's clone — they're separate domains with separate Db
         // handles). A failure here downgrades the FIM CLI surface
         // to "scheduled for next restart" + zero-snapshot status.
-        let baseline_db_opt =
-            match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-                &cli.signing_key_file,
-            ) {
-                Ok(key) => {
-                    match northnarrow_agent::fim::baseline::BaselineDb::open(
-                        &cli.fim_baseline_file,
-                        key,
-                        agent_id,
-                    ) {
-                        Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                path = %cli.fim_baseline_file.display(),
-                                "fim baseline DB open failed — admin `fim baseline` will \
-                                 reject; status snapshot will report zero rows"
-                            );
-                            None
-                        }
+        let baseline_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+            &cli.signing_key_file,
+        ) {
+            Ok(key) => {
+                match northnarrow_agent::fim::baseline::BaselineDb::open(
+                    &cli.fim_baseline_file,
+                    key,
+                    agent_id,
+                ) {
+                    Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.fim_baseline_file.display(),
+                            "fim baseline DB open failed — admin `fim baseline` will \
+                             reject; status snapshot will report zero rows"
+                        );
+                        None
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "fim baseline DB needs the agent signing key — load failed; \
-                         FIM admin surface degraded"
-                    );
-                    None
-                }
-            };
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "fim baseline DB needs the agent signing key — load failed; \
+                     FIM admin surface degraded"
+                );
+                None
+            }
+        };
         match baseline_db_opt {
             Some(baseline_db) => {
                 use northnarrow_agent::fim::attach::{
-                    attach_observe_programs, populate_watched_paths,
-                    take_fs_fim_events_ringbuf,
+                    attach_observe_programs, populate_watched_paths, take_fs_fim_events_ringbuf,
                 };
                 use northnarrow_agent::fim::baseline::BaselineCache;
                 use northnarrow_agent::fim::drain::{
@@ -625,14 +621,9 @@ async fn main() -> Result<()> {
                 // permission-set-to-same-value, etc.) — the cache
                 // miss path treats the event as a first observation
                 // and emits drift normally.
-                let baseline_cache = match BaselineCache::load_from_log(
-                    &cli.fim_baseline_file,
-                ) {
+                let baseline_cache = match BaselineCache::load_from_log(&cli.fim_baseline_file) {
                     Ok(c) => {
-                        info!(
-                            entries = c.len(),
-                            "fim: baseline cache loaded"
-                        );
+                        info!(entries = c.len(), "fim: baseline cache loaded");
                         Arc::new(c)
                     }
                     Err(e) => {
@@ -664,9 +655,7 @@ async fn main() -> Result<()> {
                     }
                 };
                 if let Some(btf) = btf.as_ref() {
-                    if let Err(e) =
-                        attach_observe_programs(sensor.ebpf_mut(), btf)
-                    {
+                    if let Err(e) = attach_observe_programs(sensor.ebpf_mut(), btf) {
                         warn!(
                             error = %e,
                             "fim: attach_observe_programs returned error — \
@@ -725,9 +714,8 @@ async fn main() -> Result<()> {
                     match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
                         &cli.signing_key_file,
                     )
-                    .and_then(|key| {
-                        FimDriftDb::open(&cli.fim_drift_file, key, agent_id)
-                    }) {
+                    .and_then(|key| FimDriftDb::open(&cli.fim_drift_file, key, agent_id))
+                    {
                         Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
                         Err(e) => {
                             warn!(
@@ -746,8 +734,7 @@ async fn main() -> Result<()> {
                             let classifier = Arc::new(DriftClassifier::new());
                             let rate_limiter_clone = Arc::clone(&rate_limiter);
                             let inode_map_for_drain = Arc::clone(&inode_map);
-                            let baseline_cache_for_drain =
-                                Arc::clone(&baseline_cache);
+                            let baseline_cache_for_drain = Arc::clone(&baseline_cache);
                             let event_tx = sensor.event_tx();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = drain_loop(
@@ -785,8 +772,7 @@ async fn main() -> Result<()> {
                 // set = first boot, fire a recompute. The recompute
                 // task is already running (tokio::spawn doesn't
                 // block on the future's first poll).
-                if baseline_db.lock().last_hash()
-                    == northnarrow_agent::audit::GENESIS_PREV_HASH
+                if baseline_db.lock().last_hash() == northnarrow_agent::audit::GENESIS_PREV_HASH
                     && !watched_paths_load.effective.is_empty()
                 {
                     info!(
@@ -839,9 +825,7 @@ async fn main() -> Result<()> {
                             key,
                             agent_id,
                         ) {
-                            Ok(log) => {
-                                Some(Arc::new(parking_lot::Mutex::new(log)))
-                            }
+                            Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
                             Err(e) => {
                                 warn!(
                                     error = %e,

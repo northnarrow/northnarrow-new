@@ -116,15 +116,23 @@ pub enum AdminResult {
     Success,
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
     /// Signature verifies but the matched key's allowlist does
     /// not include the operation's required role (A5).
     RoleDenied,
     /// Multi-signature quorum was short of `required` distinct
     /// valid signatures (A6).
-    QuorumNotMet { required: u8, provided: u8 },
+    QuorumNotMet {
+        required: u8,
+        provided: u8,
+    },
     /// `payload.ts` was outside the server's ±skew window (A4).
-    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
     /// `payload.agent_id` did not match the agent's bootstrapped
     /// install UUID (A3).
     AgentIdMismatch,
@@ -132,7 +140,9 @@ pub enum AdminResult {
     /// variant (e.g., a `ShutdownRequest` carrying `op=Unlock`).
     UnknownOperation,
     /// `version > PROTOCOL_VERSION` on the envelope (A1).
-    ProtocolVersionUnsupported { server_version: u16 },
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
 }
 
 /// One signature in a multi-sig quorum submission. Wrapped in a
@@ -911,13 +921,22 @@ mod tests {
     #[test]
     fn roundtrip_rotate_keys_add_request() {
         use crate::wire::admin_signed_payload::{Role, SignedPayload};
-        let payload =
-            SignedPayload::new_rotate_keys_add([0x11; 32], 1_700_000_000, [0x22; 16], [0x33; 32], vec![Role::Unlock]);
+        let payload = SignedPayload::new_rotate_keys_add(
+            [0x11; 32],
+            1_700_000_000,
+            [0x22; 16],
+            [0x33; 32],
+            vec![Role::Unlock],
+        );
         roundtrip(AdminMessage::RotateKeysAddRequest(RotateKeysAddRequest {
             payload,
             signatures: vec![
-                KeyedSignature { signature: [0x55; 64] },
-                KeyedSignature { signature: [0x77; 64] },
+                KeyedSignature {
+                    signature: [0x55; 64],
+                },
+                KeyedSignature {
+                    signature: [0x77; 64],
+                },
             ],
         }));
         roundtrip(AdminMessage::RotateKeysAddResult(AdminResult::Success));
@@ -927,18 +946,18 @@ mod tests {
     #[test]
     fn roundtrip_rotate_keys_revoke_request() {
         use crate::wire::admin_signed_payload::SignedPayload;
-        let payload = SignedPayload::new_rotate_keys_revoke(
-            [0x88; 32],
-            1_700_000_000,
-            [0x99; 16],
-            [0xAA; 4],
-        );
+        let payload =
+            SignedPayload::new_rotate_keys_revoke([0x88; 32], 1_700_000_000, [0x99; 16], [0xAA; 4]);
         roundtrip(AdminMessage::RotateKeysRevokeRequest(
             RotateKeysRevokeRequest {
                 payload,
                 signatures: vec![
-                    KeyedSignature { signature: [0xCC; 64] },
-                    KeyedSignature { signature: [0xEE; 64] },
+                    KeyedSignature {
+                        signature: [0xCC; 64],
+                    },
+                    KeyedSignature {
+                        signature: [0xEE; 64],
+                    },
                 ],
             },
         ));
@@ -955,7 +974,9 @@ mod tests {
         let payload = SignedPayload::new_fim_baseline([0x11; 32], 1_700_000_000, [0x22; 16]);
         roundtrip(AdminMessage::FimBaselineRequest(FimBaselineRequest {
             payload,
-            signatures: vec![KeyedSignature { signature: [0x55; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0x55; 64],
+            }],
         }));
         roundtrip(AdminMessage::FimBaselineResult(AdminResult::Success));
     }
@@ -973,7 +994,9 @@ mod tests {
         );
         roundtrip(AdminMessage::FimReportRequest(FimReportRequest {
             payload,
-            signatures: vec![KeyedSignature { signature: [0x77; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0x77; 64],
+            }],
         }));
         roundtrip(AdminMessage::FimReportResponse(FimReportResponse {
             result: AdminResult::Success,
@@ -1002,7 +1025,9 @@ mod tests {
         let payload = SignedPayload::new_fim_status([0xAA; 32], 1_700_000_000, [0xBB; 16]);
         roundtrip(AdminMessage::FimStatusRequest(FimStatusRequest {
             payload,
-            signatures: vec![KeyedSignature { signature: [0xCC; 64] }],
+            signatures: vec![KeyedSignature {
+                signature: [0xCC; 64],
+            }],
         }));
         roundtrip(AdminMessage::FimStatusResponse(FimStatusResponse {
             result: AdminResult::Success,
@@ -1157,9 +1182,9 @@ mod tests {
         // every too-short prefix to the decoder. Every prefix must
         // return Ok(None) — never a fatal error, never a spurious
         // decode (mirrors the v0 short-body contract).
-        let full = encode_versioned_frame(&VersionedAdminMessage::current(
-            AdminMessage::Status(StatusRequest {}),
-        ))
+        let full = encode_versioned_frame(&VersionedAdminMessage::current(AdminMessage::Status(
+            StatusRequest {},
+        )))
         .unwrap();
         for n in 0..full.len() {
             let res = decode_versioned_frame(&full[..n]).expect("partial is not fatal");

@@ -159,8 +159,7 @@ fn parse(raw: &str) -> Result<[u8; AGENT_ID_LEN]> {
             trimmed.len()
         ));
     }
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| anyhow!("agent_id is not valid hex: {e}"))?;
+    let bytes = hex::decode(trimmed).map_err(|e| anyhow!("agent_id is not valid hex: {e}"))?;
     let mut out = [0u8; AGENT_ID_LEN];
     out.copy_from_slice(&bytes);
     Ok(out)
@@ -193,9 +192,7 @@ fn persist_atomically(path: &Path, id: &[u8; AGENT_ID_LEN]) -> Result<()> {
                 .mode(PARENT_DIR_MODE)
                 .recursive(true)
                 .create(parent)
-                .with_context(|| {
-                    format!("creating agent_id parent dir {}", parent.display())
-                })?;
+                .with_context(|| format!("creating agent_id parent dir {}", parent.display()))?;
         }
     }
 
@@ -220,13 +217,8 @@ fn persist_atomically(path: &Path, id: &[u8; AGENT_ID_LEN]) -> Result<()> {
         f.sync_all()
             .with_context(|| format!("fsync {}", tmp_path.display()))?;
     }
-    fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "renaming {} → {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
@@ -313,7 +305,10 @@ mod tests {
 
         // …and the on-disk file is untouched.
         let raw_after = fs::read_to_string(&path).expect("read");
-        assert_eq!(raw_before, raw_after, "file content must not change on reuse");
+        assert_eq!(
+            raw_before, raw_after,
+            "file content must not change on reuse"
+        );
         let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(mtime_before, mtime_after, "mtime must not change on reuse");
     }
@@ -328,10 +323,16 @@ mod tests {
         for (label, content) in [
             ("empty", ""),
             ("too short", "abcd"),
-            ("too long by one nibble", "0123456789abcdef0123456789abcdef0"),
+            (
+                "too long by one nibble",
+                "0123456789abcdef0123456789abcdef0",
+            ),
             ("right length, non-hex", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
             ("leading whitespace", " 0123456789abcdef0123456789abcdef"),
-            ("trailing extra newline", "0123456789abcdef0123456789abcdef\n\n"),
+            (
+                "trailing extra newline",
+                "0123456789abcdef0123456789abcdef\n\n",
+            ),
             ("embedded newline", "0123456789abcdef\n0123456789abcdef"),
             ("carriage return", "0123456789abcdef0123456789abcdef\r\n"),
         ] {

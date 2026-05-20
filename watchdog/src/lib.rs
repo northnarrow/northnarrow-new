@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
 use antitamper_bpf::ProtectedPidsHandle;
+use anyhow::{anyhow, Context, Result};
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, StatusRequest, MAX_FRAME_BODY,
 };
@@ -134,8 +134,7 @@ pub fn harden_self() -> Result<()> {
         use anyhow::anyhow;
         use std::ffi::CString;
         // PR_SET_DUMPABLE — no core dumps, no readable /proc/<pid>/mem.
-        let r =
-            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
+        let r = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) };
         if r != 0 {
             return Err(anyhow!(
                 "prctl(PR_SET_DUMPABLE, 0) failed: {}",
@@ -172,9 +171,12 @@ pub fn read_pid_from_file(path: &Path) -> Result<u32> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading PID file {}", path.display()))?;
     let trimmed = raw.trim();
-    trimmed
-        .parse::<u32>()
-        .with_context(|| format!("PID file {} did not contain a u32: {trimmed:?}", path.display()))
+    trimmed.parse::<u32>().with_context(|| {
+        format!(
+            "PID file {} did not contain a u32: {trimmed:?}",
+            path.display()
+        )
+    })
 }
 
 /// Raw `pidfd_open(2)` syscall wrapper. Linux 5.3+. Returns the
@@ -291,14 +293,12 @@ pub fn write_pidfile_atomic(path: &Path, pid: u32) -> Result<()> {
             .mode(0o644)
             .open(&tmp_path)
             .with_context(|| format!("opening tmpfile {}", tmp_path.display()))?;
-        writeln!(f, "{pid}")
-            .with_context(|| format!("writing pid to {}", tmp_path.display()))?;
+        writeln!(f, "{pid}").with_context(|| format!("writing pid to {}", tmp_path.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync {}", tmp_path.display()))?;
     }
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!("renaming {} → {}", tmp_path.display(), path.display())
-    })?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
@@ -501,12 +501,7 @@ impl RestartBackoff {
     /// into the minute-scale. Public so future custom integration
     /// tests (W8) can tune it; production callers go through
     /// [`Self::new`].
-    pub fn with_config(
-        window: Duration,
-        max_attempts: u8,
-        base: Duration,
-        cap: Duration,
-    ) -> Self {
+    pub fn with_config(window: Duration, max_attempts: u8, base: Duration, cap: Duration) -> Self {
         Self {
             attempts: VecDeque::new(),
             window,
@@ -629,10 +624,7 @@ pub fn spawn_agent(argv: &[String]) -> Result<Child> {
 /// engine ready" log line has flushed — so a successful read
 /// here is also a readiness signal for the agent's anti-tamper
 /// surface.
-pub async fn wait_for_new_agent_pid(
-    pidfile: &Path,
-    deadline: Duration,
-) -> Result<u32> {
+pub async fn wait_for_new_agent_pid(pidfile: &Path, deadline: Duration) -> Result<u32> {
     let start = Instant::now();
     let mut attempts: u32 = 0;
     loop {
@@ -683,9 +675,9 @@ pub fn reinsert_new_agent_pid(bpffs_root: &Path, new_pid: u32) -> Result<()> {
             bpffs_root.display()
         )
     })?;
-    handle.insert(new_pid).with_context(|| {
-        format!("inserting new agent PID {new_pid} into PROTECTED_PIDS")
-    })?;
+    handle
+        .insert(new_pid)
+        .with_context(|| format!("inserting new agent PID {new_pid} into PROTECTED_PIDS"))?;
     info!(
         target: "watchdog.respawn",
         pid = new_pid,
@@ -1052,9 +1044,7 @@ pub async fn stuck_recovery(
     // Best-effort evict; even on Err we proceed to SIGKILL (the
     // worst case is the kernel rejects the kill with EPERM and
     // we surface the error to the caller, who'll log + retry).
-    if let Err(e) = ProtectedPidsHandle::open(bpffs_root)
-        .and_then(|mut h| h.evict(agent_pid))
-    {
+    if let Err(e) = ProtectedPidsHandle::open(bpffs_root).and_then(|mut h| h.evict(agent_pid)) {
         warn!(
             target: "watchdog.stuck_recovery",
             error = %e,
@@ -1289,7 +1279,12 @@ mod tests {
             // SAFETY: SIGKILL on a known PID is a trivial syscall;
             // we own the child so this is unambiguous.
             let r = unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
-            assert_eq!(r, 0, "kill(child, SIGKILL) must succeed: {}", std::io::Error::last_os_error());
+            assert_eq!(
+                r,
+                0,
+                "kill(child, SIGKILL) must succeed: {}",
+                std::io::Error::last_os_error()
+            );
         });
 
         let start = Instant::now();
@@ -1493,7 +1488,11 @@ mod tests {
         let t_future = t0 + window + Duration::from_millis(1);
         match bo.next_delay(t_future) {
             BackoffOutcome::Wait { delay, attempt } => {
-                assert_eq!(delay, Duration::ZERO, "window slid; this is attempt 1 again");
+                assert_eq!(
+                    delay,
+                    Duration::ZERO,
+                    "window slid; this is attempt 1 again"
+                );
                 assert_eq!(attempt, 1);
             }
             other => panic!("expected fresh-window Wait, got {other:?}"),
@@ -1510,7 +1509,7 @@ mod tests {
         let cap = Duration::from_millis(300); // cap before 800ms
         let mut bo = RestartBackoff::with_config(
             Duration::from_secs(60),
-            10,        // higher max to allow more attempts
+            10, // higher max to allow more attempts
             base,
             cap,
         );
@@ -1522,13 +1521,19 @@ mod tests {
         let _ = bo.next_delay(t0); // 3 → 200
         match bo.next_delay(t0) {
             BackoffOutcome::Wait { delay, attempt: 4 } => {
-                assert_eq!(delay, cap, "attempt 4 (400ms unbounded) must cap at {cap:?}");
+                assert_eq!(
+                    delay, cap,
+                    "attempt 4 (400ms unbounded) must cap at {cap:?}"
+                );
             }
             other => panic!("expected capped Wait at attempt 4, got {other:?}"),
         }
         match bo.next_delay(t0) {
             BackoffOutcome::Wait { delay, attempt: 5 } => {
-                assert_eq!(delay, cap, "attempt 5 (800ms unbounded) must cap at {cap:?}");
+                assert_eq!(
+                    delay, cap,
+                    "attempt 5 (800ms unbounded) must cap at {cap:?}"
+                );
             }
             other => panic!("expected capped Wait at attempt 5, got {other:?}"),
         }
@@ -1763,8 +1768,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("never_bound.sock");
         let start = Instant::now();
-        let result =
-            ping_agent_status(&socket, Duration::from_secs(5)).await;
+        let result = ping_agent_status(&socket, Duration::from_secs(5)).await;
         let elapsed = start.elapsed();
         assert!(result.is_err(), "missing socket must error");
         // Connect fail is near-instant; well under the 5 s

@@ -268,8 +268,8 @@ pub fn load_records(jsonl_dir: &Path, seed: &[KbDocument]) -> Result<Vec<CanonLi
             .collect();
         files.sort();
         for f in files {
-            let text = std::fs::read_to_string(&f)
-                .with_context(|| format!("read {}", f.display()))?;
+            let text =
+                std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?;
             for (n, line) in text.lines().enumerate() {
                 if line.trim().is_empty() {
                     continue;
@@ -301,7 +301,10 @@ pub fn source_fingerprint(records: &[CanonLine]) -> String {
     h.update((ids.len() as u32).to_be_bytes());
     for r in ids {
         for s in [
-            r.author.as_ref().map(|v| v.join("\u{1}")).unwrap_or_default(),
+            r.author
+                .as_ref()
+                .map(|v| v.join("\u{1}"))
+                .unwrap_or_default(),
             r.category.clone(),
             r.content.clone(),
             r.id.clone(),
@@ -375,8 +378,7 @@ pub fn build_index(records: &[CanonLine], dir: &Path) -> Result<()> {
 pub fn open_or_build(records: &[CanonLine], dir: &Path) -> Result<Index> {
     let fp_now = source_fingerprint(records);
     let fp_old = std::fs::read_to_string(dir.join(FINGERPRINT_FILE)).ok();
-    let fresh = fp_old.as_deref() == Some(fp_now.as_str())
-        && dir.join("meta.json").is_file();
+    let fresh = fp_old.as_deref() == Some(fp_now.as_str()) && dir.join("meta.json").is_file();
     if !fresh {
         build_index(records, dir)?;
     }
@@ -513,7 +515,10 @@ mod tests {
             "deadbeefdeadbeef1234",
             "xmrig",
         ] {
-            assert!(toks.iter().any(|t| t == want), "missing token {want:?} in {toks:?}");
+            assert!(
+                toks.iter().any(|t| t == want),
+                "missing token {want:?} in {toks:?}"
+            );
         }
         // Integrity: the technique id must NOT be fragmented.
         assert!(!toks.iter().any(|t| t == "t1059"), "T1059.001 was split");
@@ -561,7 +566,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let idx = open_or_build(&corpus(), dir.path()).unwrap();
         let top = |q: &str| -> Vec<String> {
-            bm25_search(&idx, q, 5).unwrap().into_iter().map(|(_, id)| id).collect()
+            bm25_search(&idx, q, 5)
+                .unwrap()
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect()
         };
         assert!(top("T1059.001 powershell").contains(&"attack:T1059.001".to_string()));
         assert!(top("/etc/shadow").contains(&"sigma:shadow-1".to_string()));
@@ -586,9 +595,16 @@ mod tests {
         let idx = open_or_build(&recs, dir.path()).unwrap();
         let hits = bm25_query(&idx, "process injection technique", 10).unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-        assert_eq!(ids, ["a-dup", "m-dup", "z-dup"], "R1 tie-break must be id-asc");
+        assert_eq!(
+            ids,
+            ["a-dup", "m-dup", "z-dup"],
+            "R1 tie-break must be id-asc"
+        );
         // Scores genuinely tied.
-        assert!((hits[0].score - hits[2].score).abs() < 1e-6, "scores must tie");
+        assert!(
+            (hits[0].score - hits[2].score).abs() < 1e-6,
+            "scores must tie"
+        );
     }
 
     #[test]
@@ -647,7 +663,10 @@ mod tests {
             "process injection",
         ] {
             let hits = bm25_search(&idx, q, 5).unwrap();
-            eprintln!("  q={q:?} -> {:?}", hits.iter().map(|(_, i)| i).collect::<Vec<_>>());
+            eprintln!(
+                "  q={q:?} -> {:?}",
+                hits.iter().map(|(_, i)| i).collect::<Vec<_>>()
+            );
             assert!(!hits.is_empty(), "no hits for {q:?} over the real corpus");
         }
     }
@@ -658,7 +677,12 @@ mod tests {
         open_or_build(&corpus(), dir.path()).unwrap();
         let fp1 = std::fs::read_to_string(dir.path().join(FINGERPRINT_FILE)).unwrap();
         let mut c2 = corpus();
-        c2.push(rec("sigma:new-1", "New Rule", "a brand new linux rule", None));
+        c2.push(rec(
+            "sigma:new-1",
+            "New Rule",
+            "a brand new linux rule",
+            None,
+        ));
         let idx = open_or_build(&c2, dir.path()).unwrap();
         let fp2 = std::fs::read_to_string(dir.path().join(FINGERPRINT_FILE)).unwrap();
         assert_ne!(fp1, fp2, "fingerprint marker must update on rebuild");

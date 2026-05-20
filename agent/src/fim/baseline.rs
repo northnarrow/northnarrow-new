@@ -160,8 +160,7 @@ pub struct BaselineEntryDraft {
 /// The same agent-side helper drives the periodic-rebaseline
 /// flow C6 will expose via `nn-admin fim baseline`.
 pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
-    let lmeta = fs::symlink_metadata(path)
-        .with_context(|| format!("lstat {}", path.display()))?;
+    let lmeta = fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
     let mode_bits = lmeta.permissions().mode() & 0o7777;
     let mode = format!("0o{mode_bits:o}");
     let path_str = path.to_string_lossy().into_owned();
@@ -169,8 +168,7 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
     if lmeta.file_type().is_symlink() {
         // Q1 row #1: hash link-metadata pre-image
         // (`readlink target string` + raw lstat fields).
-        let target = fs::read_link(path)
-            .with_context(|| format!("readlink {}", path.display()))?;
+        let target = fs::read_link(path).with_context(|| format!("readlink {}", path.display()))?;
         let target_str = target.to_string_lossy().into_owned();
         let link_hash = sha256_of_link_metadata(&target_str, &lmeta);
         let link_draft = BaselineEntryDraft {
@@ -211,9 +209,8 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
                 );
                 Ok(vec![link_draft])
             }
-            Err(e) => Err(anyhow!(e)).with_context(|| {
-                format!("stat resolved target via {}", path.display())
-            }),
+            Err(e) => Err(anyhow!(e))
+                .with_context(|| format!("stat resolved target via {}", path.display())),
         }
     } else if lmeta.is_file() {
         let content_hash = sha256_of_file_content(path)
@@ -339,8 +336,7 @@ impl BaselineCache {
         {
             let mut guard = cache.inner.write();
             for line in reader.lines() {
-                let line =
-                    line.with_context(|| format!("reading line from {}", path.display()))?;
+                let line = line.with_context(|| format!("reading line from {}", path.display()))?;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -593,12 +589,11 @@ pub fn verify_chain(
         let mut stripped = entry.clone();
         stripped.entry_hash.clear();
         stripped.agent_sig.clear();
-        let recomputed = compute_entry_hash(&stripped).map_err(|e| {
-            BaselineVerifyError::MalformedField {
+        let recomputed =
+            compute_entry_hash(&stripped).map_err(|e| BaselineVerifyError::MalformedField {
                 idx,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
         let recomputed_hex = hex::encode(recomputed);
         if recomputed_hex != entry.entry_hash {
             return Err(BaselineVerifyError::EntryHashMismatch {
@@ -607,12 +602,12 @@ pub fn verify_chain(
                 stored: entry.entry_hash.clone(),
             });
         }
-        let sig_bytes = B64
-            .decode(&entry.agent_sig)
-            .map_err(|e| BaselineVerifyError::MalformedField {
-                idx,
-                reason: format!("agent_sig base64 decode: {e}"),
-            })?;
+        let sig_bytes =
+            B64.decode(&entry.agent_sig)
+                .map_err(|e| BaselineVerifyError::MalformedField {
+                    idx,
+                    reason: format!("agent_sig base64 decode: {e}"),
+                })?;
         if sig_bytes.len() != 64 {
             return Err(BaselineVerifyError::MalformedField {
                 idx,
@@ -832,8 +827,8 @@ mod tests {
             "entry_hash": "00".repeat(32),
             "agent_sig": "A".repeat(88),
         });
-        let entry: BaselineEntry = serde_json::from_value(legacy)
-            .expect("legacy row must deserialise via serde(default)");
+        let entry: BaselineEntry =
+            serde_json::from_value(legacy).expect("legacy row must deserialise via serde(default)");
         assert!(!entry.is_symlink);
     }
 

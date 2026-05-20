@@ -56,8 +56,8 @@ pub use bench::{golden_cases, run_bench, run_golden, BenchReport, GoldenReport, 
 pub use canary::{env_rag_enabled, env_truthy, open_index_from_env, rag_canary};
 pub use embedder::{cosine_similarity, RagEmbedder};
 pub use index_tantivy::{
-    analyze, bm25_query, bm25_search, build_index, load_records, open_or_build,
-    source_fingerprint, Bm25Hit, CanonLine, SEC_ANALYZER,
+    analyze, bm25_query, bm25_search, build_index, load_records, open_or_build, source_fingerprint,
+    Bm25Hit, CanonLine, SEC_ANALYZER,
 };
 pub use retrieval::{RagEngine, RagQuery, DEFAULT_MIN_SIMILARITY, DEFAULT_TOP_K};
 pub use store::{RagStore, StoreHit};

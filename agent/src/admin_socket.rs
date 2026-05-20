@@ -29,9 +29,9 @@ use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, Challenge, FimBaselineRequest,
-    FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
-    ForcePostureRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
-    StatusResponse, UnlockResult, MAX_FRAME_BODY,
+    FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
+    RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, UnlockResult,
+    MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use ed25519_dalek::VerifyingKey;
@@ -476,12 +476,9 @@ fn emit_audit_for(
         return;
     };
     let (op, extra, result, cosigner_count) = match (msg, reply) {
-        (AdminMessage::Unlock(_), AdminMessage::UnlockResult(r)) => (
-            "unlock",
-            serde_json::json!({}),
-            unlock_result_str(r),
-            0,
-        ),
+        (AdminMessage::Unlock(_), AdminMessage::UnlockResult(r)) => {
+            ("unlock", serde_json::json!({}), unlock_result_str(r), 0)
+        }
         (AdminMessage::ShutdownRequest(req), AdminMessage::ShutdownResult(r)) => {
             let grace = match &req.payload.extra {
                 OperationExtra::Shutdown(s) => s.grace_secs,
@@ -520,10 +517,7 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
-        (
-            AdminMessage::RotateKeysRevokeRequest(req),
-            AdminMessage::RotateKeysRevokeResult(r),
-        ) => {
+        (AdminMessage::RotateKeysRevokeRequest(req), AdminMessage::RotateKeysRevokeResult(r)) => {
             let target_fp = match &req.payload.extra {
                 OperationExtra::RotateKeysRevoke(extra) => hex::encode(extra.fingerprint),
                 _ => String::new(),
@@ -762,15 +756,13 @@ fn dispatch(
             last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
         }),
 
-        AdminMessage::ShutdownRequest(req) => {
-            AdminMessage::ShutdownResult(dispatch_shutdown(
-                req,
-                auth,
-                marker_path,
-                shutdown_signal,
-                fps_out,
-            ))
-        }
+        AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
+            req,
+            auth,
+            marker_path,
+            shutdown_signal,
+            fps_out,
+        )),
 
         AdminMessage::ForcePostureRequest(req) => {
             AdminMessage::ForcePostureResult(dispatch_force_posture(req, auth, posture, fps_out))
@@ -785,9 +777,7 @@ fn dispatch(
         }
 
         AdminMessage::FimBaselineRequest(req) => {
-            AdminMessage::FimBaselineResult(dispatch_fim_baseline(
-                req, auth, fim_state, fps_out,
-            ))
+            AdminMessage::FimBaselineResult(dispatch_fim_baseline(req, auth, fim_state, fps_out))
         }
 
         AdminMessage::FimReportRequest(req) => {
@@ -1239,10 +1229,7 @@ fn dispatch_rotate_keys_revoke(
     };
     let config_path = config_path.to_path_buf();
 
-    match crate::anti_tamper::admin_auth::atomic_rewrite_admin_pub_revoke(
-        &config_path,
-        target_fp,
-    ) {
+    match crate::anti_tamper::admin_auth::atomic_rewrite_admin_pub_revoke(&config_path, target_fp) {
         Ok(()) => {}
         Err(crate::anti_tamper::admin_auth::RotateKeysError::KeyNotFound { fingerprint }) => {
             warn!(
@@ -1926,9 +1913,7 @@ mod tests {
 
     // ── A7: signed shutdown — mock-server e2e ──────────────────────
 
-    use common::wire::admin_protocol::{
-        AdminResult, KeyedSignature, ShutdownRequest,
-    };
+    use common::wire::admin_protocol::{AdminResult, KeyedSignature, ShutdownRequest};
     use common::wire::admin_signed_payload::{sign, SignedPayload};
 
     /// Spin up a [`serve_with_marker_path`] task plus two
@@ -1940,8 +1925,7 @@ mod tests {
     /// - both signing keys + their pubkeys,
     /// - the bootstrapped `agent_id`,
     /// - the JoinHandle so the test can cancel the server.
-    async fn spawn_shutdown_server(
-    ) -> (
+    async fn spawn_shutdown_server() -> (
         TempDir,
         PathBuf,
         PathBuf,
@@ -1969,9 +1953,7 @@ mod tests {
         .unwrap();
 
         let agent_id: [u8; 16] = [0x7Eu8; 16];
-        let auth = Arc::new(
-            AdminAuth::load_with_agent_id(&pub_path, agent_id).expect("load"),
-        );
+        let auth = Arc::new(AdminAuth::load_with_agent_id(&pub_path, agent_id).expect("load"));
         let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
         let posture = Arc::new(PostureMachine::new());
 
@@ -1995,7 +1977,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        (dir, socket, marker_path, signing_a, signing_b, agent_id, task)
+        (
+            dir,
+            socket,
+            marker_path,
+            signing_a,
+            signing_b,
+            agent_id,
+            task,
+        )
     }
 
     /// Read+decode one frame from a UnixStream. Mock-server-friendly
@@ -2045,9 +2035,7 @@ mod tests {
             // Step 1: request a challenge.
             sync_write_frame(
                 &mut stream,
-                &AdminMessage::ChallengeRequest(
-                    common::wire::admin_protocol::ChallengeRequest {},
-                ),
+                &AdminMessage::ChallengeRequest(common::wire::admin_protocol::ChallengeRequest {}),
             );
             let nonce = match sync_read_frame(&mut stream) {
                 AdminMessage::Challenge(c) => c.nonce,
@@ -2188,9 +2176,7 @@ mod tests {
         .unwrap();
 
         let agent_id: [u8; 16] = [0xA8u8; 16];
-        let auth = Arc::new(
-            AdminAuth::load_with_agent_id(&pub_path, agent_id).expect("load"),
-        );
+        let auth = Arc::new(AdminAuth::load_with_agent_id(&pub_path, agent_id).expect("load"));
         let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
         let posture = Arc::new(PostureMachine::new());
 
@@ -2234,9 +2220,7 @@ mod tests {
             stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
             sync_write_frame(
                 &mut stream,
-                &AdminMessage::ChallengeRequest(
-                    common::wire::admin_protocol::ChallengeRequest {},
-                ),
+                &AdminMessage::ChallengeRequest(common::wire::admin_protocol::ChallengeRequest {}),
             );
             let nonce = match sync_read_frame(&mut stream) {
                 AdminMessage::Challenge(c) => c.nonce,
@@ -2317,11 +2301,9 @@ mod tests {
     fn audit_emits_on_unlock_success() {
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
-        let req = AdminMessage::Unlock(
-            common::wire::admin_protocol::UnlockRequest {
-                signature: [0; 64],
-            },
-        );
+        let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+            signature: [0; 64],
+        });
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
         emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
         let entries = read_audit_entries(&log_path);
@@ -2344,8 +2326,7 @@ mod tests {
         use common::wire::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
-        let payload =
-            SignedPayload::new_shutdown([0x11; 32], 1_700_000_000, [0x22; 16], 45);
+        let payload = SignedPayload::new_shutdown([0x11; 32], 1_700_000_000, [0x22; 16], 45);
         let req = AdminMessage::ShutdownRequest(ShutdownRequest {
             payload,
             signatures: vec![
@@ -2371,9 +2352,9 @@ mod tests {
     /// chain captures attempts, not just wins.
     #[test]
     fn audit_emits_on_force_posture_failure() {
+        use common::posture_types::PostureKind;
         use common::wire::admin_protocol::KeyedSignature;
         use common::wire::admin_signed_payload::SignedPayload;
-        use common::posture_types::PostureKind;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_force_posture(
@@ -2403,9 +2384,7 @@ mod tests {
     /// to assert they do NOT emit rows.
     #[test]
     fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
-        use common::wire::admin_protocol::{
-            ChallengeRequest, KeyedSignature, StatusRequest,
-        };
+        use common::wire::admin_protocol::{ChallengeRequest, KeyedSignature, StatusRequest};
         use common::wire::admin_signed_payload::{Role, SignedPayload};
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
@@ -2427,7 +2406,13 @@ mod tests {
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
         });
-        emit_audit_for(&status_req, &status_reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &status_req,
+            &status_reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+        );
 
         let after_skips = read_audit_entries(&log_path);
         assert_eq!(
@@ -2511,11 +2496,9 @@ mod tests {
     fn audit_empty_matched_fps_preserves_b5_empty_string_shape() {
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
-        let req = AdminMessage::Unlock(
-            common::wire::admin_protocol::UnlockRequest {
-                signature: [0; 64],
-            },
-        );
+        let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+            signature: [0; 64],
+        });
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
         emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
         let entries = read_audit_entries(&log_path);
@@ -2610,9 +2593,7 @@ mod tests {
     /// missing fim-status from the audit chain.
     #[test]
     fn audit_emits_on_fim_status_success_with_extra() {
-        use common::wire::admin_protocol::{
-            FimStatusRequest, FimStatusResponse, KeyedSignature,
-        };
+        use common::wire::admin_protocol::{FimStatusRequest, FimStatusResponse, KeyedSignature};
         use common::wire::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
