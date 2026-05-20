@@ -15,4 +15,5 @@
 //! [`NetFlowEvent`]: northnarrow_common::wire::NetFlowEvent
 //! [`NetListenerEvent`]: northnarrow_common::wire::NetListenerEvent
 
+pub mod dns_cache;
 pub mod flow_tracker;
