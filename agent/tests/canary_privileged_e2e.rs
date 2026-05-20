@@ -47,7 +47,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,6 +90,68 @@ impl Drop for AgentGuard {
     }
 }
 
+/// K8.1 R009 avoidance: sudo-install agent + nn-admin under
+/// `/usr/local/bin/<basename>-e2etest-<ts>-<pid>` so the
+/// post-spawn nn-admin canary deploy / refresh calls don't
+/// trip the agent's `R009_RootExecFromUserPath` rule (which
+/// kills any root spawn originating from `/home/`, `/tmp/`,
+/// `/var/tmp/`). Ported verbatim from
+/// `agent/tests/privileged_e2e.rs` PHASE_D_003 / commit 18baa66
+/// (and originally from `watchdog/tests/privileged_e2e.rs`
+/// PHASE_D_001 W8). Same pattern, same RAII cleanup.
+const PRIV_BIN_DIR: &str = "/usr/local/bin";
+
+struct InstalledBin {
+    path: PathBuf,
+}
+impl Drop for InstalledBin {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .arg("rm")
+            .arg("-f")
+            .arg(&self.path)
+            .status();
+    }
+}
+
+fn install_to_priv_bin(src: &Path) -> InstalledBin {
+    let basename = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("binary path has a UTF-8 basename");
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
+    let status = Command::new("sudo")
+        .arg("install")
+        .arg("-m")
+        .arg("755")
+        .arg("-o")
+        .arg("root")
+        .arg("-g")
+        .arg("root")
+        .arg(src)
+        .arg(&dst)
+        .status()
+        .expect("spawn sudo install");
+    assert!(
+        status.success(),
+        "sudo install of {} to {} failed",
+        src.display(),
+        dst.display()
+    );
+    InstalledBin { path: dst }
+}
+
+fn install_priv_bins() -> (InstalledBin, InstalledBin) {
+    let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+    let installed_admin = install_to_priv_bin(Path::new(nn_admin_bin()));
+    (installed_agent, installed_admin)
+}
+
 /// Production-pinned bpffs root the agent writes to. Wiped per-test
 /// so each agent boots with a clean program + map pin tree
 /// (mirrors `fim_privileged_e2e::wipe_pin_tree`).
@@ -120,7 +182,19 @@ struct CanaryFixture {
     admin_socket: PathBuf,
     /// Chain file the e2e tests assert against.
     canary_access_log: PathBuf,
+    /// K8.1 R009 avoidance: the `/usr/local/bin/` installed
+    /// nn-admin path. Every nn-admin subprocess spawn (deploy,
+    /// refresh, init) routes through this path so R009 doesn't
+    /// kill the op mid-flight. Kept alive by `_installed_admin`.
+    nn_admin_path: PathBuf,
+    /// Drop order: AgentGuard first (SIGQUIT the agent), then
+    /// the InstalledBin handles (sudo rm the /usr/local/bin/
+    /// copies). Rust drops struct fields in declaration order,
+    /// so keep `_agent_guard` BEFORE the installed-bin RAII
+    /// handles so the agent is gone before we yank its binary.
     _agent_guard: AgentGuard,
+    _installed_agent: InstalledBin,
+    _installed_admin: InstalledBin,
 }
 
 impl CanaryFixture {
@@ -141,6 +215,15 @@ impl CanaryFixture {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
 
+        // K8.1 R009 avoidance: install agent + nn-admin under
+        // /usr/local/bin/ BEFORE we touch any binary. The init
+        // call below uses the installed nn-admin (R009 doesn't
+        // fire pre-spawn but keeping every nn-admin call uniform
+        // on the installed path avoids surprises if init starts
+        // doing anything the agent observes later).
+        let (installed_agent, installed_admin) = install_priv_bins();
+        let nn_admin_path = installed_admin.path.clone();
+
         // Per-test admin keypair. nn-admin `init` writes a
         // role-less pub line (defaults to unlock + audit-read),
         // which isn't enough for canary ops; we re-write the
@@ -149,7 +232,7 @@ impl CanaryFixture {
         let admin_pub = dir.join("admin.pub");
         let admin_priv = dir.join("admin.priv");
         let tmp_pub = dir.join("admin.pub.tmp");
-        let init_status = Command::new(nn_admin_bin())
+        let init_status = Command::new(&nn_admin_path)
             .arg("init")
             .arg("--priv-out")
             .arg(&admin_priv)
@@ -230,7 +313,15 @@ impl CanaryFixture {
         let canary_registry = dir.join("canaries.jsonl");
         let canary_access = dir.join("canary_access.jsonl");
 
-        let child = Command::new(agent_bin())
+        // K8.1 R009 avoidance: spawn the installed /usr/local/bin/
+        // agent via sudo. Mirrors `agent/tests/privileged_e2e.rs`
+        // `spawn_agent_b5_with_installs`; sudo is a no-op when the
+        // test process is already root (the runbook's `sudo -E
+        // cargo test` invocation) but lets the test work under any
+        // privilege-elevation flow that authorises sudo for the
+        // user.
+        let child = Command::new("sudo")
+            .arg(&installed_agent.path)
             .arg("--combat-rules")
             .arg(&combat)
             .arg("--admin-pub")
@@ -274,7 +365,10 @@ impl CanaryFixture {
             agent_id_file: agent_id,
             admin_socket,
             canary_access_log: canary_access,
+            nn_admin_path,
             _agent_guard: guard,
+            _installed_agent: installed_agent,
+            _installed_admin: installed_admin,
         }
     }
 
@@ -283,7 +377,7 @@ impl CanaryFixture {
     /// id parsed from the success line (`canary deploy: success
     /// (<id>)`).
     fn deploy_file_canary(&self, name: &str, decoy_path: &Path) -> String {
-        let out = Command::new(nn_admin_bin())
+        let out = Command::new(&self.nn_admin_path)
             .arg("canary")
             .arg("deploy")
             .arg("--name")
@@ -313,7 +407,7 @@ impl CanaryFixture {
     /// <bin> --fake-arg0 <arg>` op against the running agent.
     /// Returns the freshly-allocated canary_id.
     fn deploy_process_canary(&self, name: &str, exe_path: &Path, fake_arg0: &str) -> String {
-        let out = Command::new(nn_admin_bin())
+        let out = Command::new(&self.nn_admin_path)
             .arg("canary")
             .arg("deploy")
             .arg("--name")
@@ -346,7 +440,7 @@ impl CanaryFixture {
     /// clears the K2 registry's `tripped` flag so the NEXT
     /// observed access fires again with `first_trip = true`.
     fn refresh(&self, canary_id: &str) {
-        let status = Command::new(nn_admin_bin())
+        let status = Command::new(&self.nn_admin_path)
             .arg("canary")
             .arg("refresh")
             .arg("--canary-id")
