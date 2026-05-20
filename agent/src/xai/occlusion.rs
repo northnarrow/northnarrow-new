@@ -141,6 +141,11 @@ fn event_kind_label(e: &Event) -> String {
         Event::FsProtectDenial {
             comm, operation, ..
         } => format!("FsProtectDenial comm={comm} op={operation:?}"),
+        // Tappa 9 (C4): FIM drift label for XAI occlusion. The
+        // XAI path doesn't generate occlusion maps for FIM
+        // events in V1.0 (XAI is process-event-centric in
+        // Tappa 6.9).
+        Event::Fim(fe) => format!("Fim path={} op={:?}", fe.path, fe.op),
     }
 }
 
@@ -266,6 +271,16 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
             ));
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
+            units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
+        }
+        // Tappa 9 (C4): FIM drift focal-field enumeration.
+        // V1.0 doesn't run XAI on FIM events (XAI is process-
+        // event-centric in Tappa 6.9). Listed for exhaustive-
+        // match coverage; C9 may add a richer enumeration.
+        Event::Fim(_) => {
+            units.push(focal_unit(F::Filename, "path", "focal FIM path".into(), Semantic));
+            units.push(focal_unit(F::Pid, "pid", "focal modifier pid".into(), Identifier));
+            units.push(focal_unit(F::Uid, "uid", "focal modifier uid".into(), Identifier));
             units.push(focal_unit(F::Timestamp, "ts", "focal timestamp".into(), Temporal));
         }
     }
@@ -521,6 +536,16 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Pid => *pid = 0,
             F::Uid => *uid = 0,
             F::Timestamp => *timestamp_ns = 0,
+            _ => {}
+        },
+        // Tappa 9 (C4): FIM drift field neutralisation. V1.0
+        // doesn't run XAI on FIM events; the no-op arms keep
+        // the compiler happy + future-proof the C9 enrichment.
+        Event::Fim(fe) => match field {
+            F::Filename => fe.path.clear(),
+            F::Pid => fe.modifier_pid = 0,
+            F::Uid => fe.modifier_uid = 0,
+            F::Timestamp => fe.timestamp_ns = 0,
             _ => {}
         },
     }

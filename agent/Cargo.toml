@@ -40,6 +40,12 @@ test-privileged = []
 
 [dependencies]
 common = { workspace = true }
+# ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
+# hook attach/reuse, /proc helpers). Watchdog binary consumes this
+# crate directly without pulling the rest of `agent` —
+# anti_tamper/mod.rs re-exports its public surface so existing
+# in-agent callers compile byte-identically.
+antitamper-bpf = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -59,6 +65,7 @@ sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Tappa 6: ADE

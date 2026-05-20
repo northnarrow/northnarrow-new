@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["agent", "common", "cli", "xtask"]
+members = ["agent", "antitamper-bpf", "common", "cli", "watchdog", "xtask"]
 # `agent-ebpf` is a separate cargo project: nightly toolchain,
 # bpfel-unknown-none target, build-std=core. The xtask runner builds it.
 exclude = ["agent-ebpf"]
@@ -15,6 +15,7 @@ authors = ["NorthNarrow"]
 
 [workspace.dependencies]
 common = { package = "northnarrow-common", path = "common" }
+antitamper-bpf = { package = "northnarrow-antitamper-bpf", path = "antitamper-bpf" }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

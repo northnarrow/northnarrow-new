@@ -409,6 +409,11 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
             comm.clone(),
             String::new(),
         ),
+        // Tappa 9 (C4): FIM drift surface fields. Path, comm,
+        // and (path again as 3rd "query" slot) — the sanitizer's
+        // 3-tuple shape is process-event-flavoured; we map FIM
+        // naturally.
+        Event::Fim(fe) => (fe.path.clone(), fe.modifier_comm.clone(), String::new()),
     }
 }
 
@@ -423,6 +428,8 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
             comm, query_name, ..
         } => vec![comm.clone(), query_name.clone()],
         Event::FsProtectDenial { comm, .. } => vec![comm.clone()],
+        // Tappa 9 (C4): FIM drift synth-argv. C9 may refine.
+        Event::Fim(fe) => vec![fe.modifier_comm.clone(), fe.path.clone()],
     }
 }
 

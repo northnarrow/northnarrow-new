@@ -314,6 +314,12 @@ before each test (Option A from ISSUE_001 §4). RAII cleanup via
 the existing `AgentGuard` removes both binaries on test exit;
 verified no residue in `/usr/local/bin/` post-run.
 
+The same Option-A pattern was independently re-applied across
+the full agent priv-e2e suite in **Tappa 9 polish #1** (PR #46,
+SHA `18baa66`, merged 2026-05-20) — the ENI fix was thereby
+generalised to every test that spawns `nn-admin` against a
+running agent.
+
 ### Invariants preserved
 
 - ✅ No change to `agent/src/decision/rules/r009_*.rs`

@@ -31,9 +31,12 @@ pub use r010_binary_in_webroot::R010BinaryInWebroot;
 
 /// Build the default rule set in evaluation order. R004 (proc/self/fd
 /// — fileless exec) and R007 (crypto miner) come early because their
-/// match implies high confidence.
+/// match implies high confidence. The Tappa 9 FIM rules
+/// (NN-L-FIM-001..014) APPEND at the bottom since they match on
+/// `Event::Fim` rather than `Event::ProcessSpawn` — the first-match
+/// short-circuit never affects them.
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
-    vec![
+    let mut rules: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
         Box::new(R007CryptoMiner),
         Box::new(R006ReverseShellTooling),
@@ -44,7 +47,9 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(R003ExecFromVarTmp),
         Box::new(R005NetcatExec),
         Box::new(R008HiddenHomeBinary),
-    ]
+    ];
+    rules.extend(crate::fim::rules::fim_rules());
+    rules
 }
 
 /// Demo rule set for Tappa 5. Returned only when the `demo-tappa5`

@@ -1,0 +1,68 @@
+[package]
+name = "northnarrow-watchdog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NorthNarrow XDR anti-tamper supervisor — observes the agent's liveness via pidfd_open(2), closes the recycled-PID race on agent death via bpf_map_delete_elem on PROTECTED_PIDS, and respawns the agent under a bounded backoff policy. Per docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md."
+
+[[bin]]
+name = "northnarrow-watchdog"
+path = "src/main.rs"
+
+[lib]
+name = "northnarrow_watchdog"
+path = "src/lib.rs"
+
+[dependencies]
+# antitamper-bpf is the LOAD-BEARING dep — it gives us
+# ProtectedPidsHandle::open(bpffs_root) for the W3 layer-2 evict
+# AND the bpffs/pin helpers without dragging the agent's
+# tokio/ADE/posture/RAG transitive cone.
+antitamper-bpf = { workspace = true }
+# common: posture/wire types the W5 STATUS-ping path will need.
+# Imported now so the cargo graph settles in W2; W2 itself only
+# uses the std bits.
+common = { workspace = true }
+# tokio current-thread flavour — the watchdog has at most three
+# concurrent waits at any moment (agent pidfd, SIGTERM/SIGINT,
+# periodic heartbeat). No reason to pay for the multi-thread
+# scheduler.
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "net",
+] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+# Raw libc::syscall(SYS_pidfd_open, …) — pinning a specific nix
+# version just for one syscall would be churn. The pidfd_open(2)
+# ABI has been stable since Linux 5.3 (Ubuntu 6.8 has it).
+libc = "0.2"
+# W4: parse A8's /run/northnarrow/agent.shutdown_authorised
+# marker (JSON) before each restart. serde_json::Value extracts
+# the two fields without needing a serde derive — keeps the dep
+# tree small.
+serde_json = "1"
+
+[features]
+# W8: gate the privileged_e2e.rs integration tests behind an
+# explicit feature flag so the default `cargo test` path (no
+# root, no BPF env required) doesn't compile or run them.
+# Build + run as:
+#   cargo test --release -p northnarrow-watchdog --features test-privileged \
+#       --test privileged_e2e -- --test-threads=1
+# Tests serialise on the bpffs PROTECTED_PIDS pin (process-global),
+# so --test-threads=1 is mandatory.
+test-privileged = []
+
+[dev-dependencies]
+tempfile = "3"

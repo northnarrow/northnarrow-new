@@ -249,6 +249,12 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             pid_for_pkg = *pid;
             filename_for_pkg = format!("fs_protect_denial:{operation}");
         }
+        // Tappa 9 (C4): FIM drift carries modifier triple. Doesn't
+        // reach ADE in V1.0 — see escalate.rs.
+        Event::Fim(fe) => {
+            pid_for_pkg = fe.modifier_pid;
+            filename_for_pkg = fe.path.clone();
+        }
     }
 
     let metadata = AdeMetadata {

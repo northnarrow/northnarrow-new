@@ -1,0 +1,73 @@
+[Unit]
+Description=NorthNarrow XDR watchdog (anti-tamper supervisor)
+Documentation=https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md
+# After (not Requires) — the watchdog tolerates a slow agent
+# start via its W2 PIDFD_OPEN_RETRY_DEADLINE (30 s polling for
+# /run/northnarrow/agent.pid). systemd ordering guarantees the
+# agent unit's ExecStart fires first; the watchdog catches up.
+After=northnarrow-agent.service
+# BindsTo: if the agent unit is STOPPED (operator-invoked
+# `systemctl stop northnarrow-agent`), this watchdog stops too.
+# Avoids the watchdog endlessly respawning an agent the operator
+# wants down. Note: BindsTo does NOT trigger on agent CRASH —
+# that's the watchdog's own pidfd POLLIN → restart path (W4).
+BindsTo=northnarrow-agent.service
+Requires=sys-fs-bpf.mount
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/northnarrow-watchdog \
+    --agent-pidfile /run/northnarrow/agent.pid \
+    --admin-socket /run/northnarrow/admin.sock \
+    --pidfile /run/northnarrow/watchdog.pid \
+    --bpffs-root /sys/fs/bpf/northnarrow
+# Watchdog owns ITS OWN restart policy via systemd: if the
+# watchdog crashes (which would be a bug — W2 process-hardening
+# minimises the surface), systemd brings it back after 2 s. The
+# agent it was protecting is unaffected — the agent's
+# PROTECTED_PIDS entry persists across the watchdog's death
+# because the bpffs map pin is independent of the watchdog
+# process lifetime.
+Restart=on-failure
+RestartSec=2s
+
+# Resource ceilings per design §9 "Resource ceiling (V1 targets)":
+#   RSS ≤ 10 MB steady state. The whole binary is a tokio runtime
+#     + one pidfd + an aya map handle. No model, no rules, no
+#     telemetry buffers. 64 MB cap is 6× over target, leaves
+#     headroom for legitimate spikes (Command::spawn allocations,
+#     log-buffer transients).
+#   CPU ≤ 0.1% steady state. Nothing happens until the agent
+#     dies or 30 s elapses (the STATUS-ping tick). 10% cap is
+#     100× over target — generous slack for restart-cycle bursts
+#     without giving an attacker headroom to mine cryptocurrency.
+#   TasksMax=8 — the watchdog spawns at most: main + ping-loop +
+#     a handful of tokio worker threads. 8 catches any thread leak
+#     well before it matters.
+MemoryMax=64M
+CPUQuota=10%
+TasksMax=8
+
+# Hardening — same shape as the agent's unit. The watchdog is a
+# smaller target but the same posture (no new privileges, no
+# writable system, capability bounding) reduces blast radius if
+# the binary is ever compromised.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# Watchdog only writes /run/northnarrow/watchdog.pid and reads
+# the agent pidfile + shutdown_authorised marker (also under
+# /run/northnarrow/). Needs read+write on the bpffs root so
+# ProtectedPidsHandle::open + .evict (W1+W3) work.
+ReadWritePaths=/run/northnarrow /sys/fs/bpf/northnarrow
+# CAP_BPF        — open the pinned PROTECTED_PIDS map by path,
+#                  call bpf(BPF_MAP_DELETE_ELEM) on agent death
+# CAP_SYS_ADMIN  — kept for the historical bpf(2) shape (kernel
+#                  accepts the union with CAP_BPF on 5.8+; we
+#                  don't need CAP_NET_ADMIN / CAP_DAC_OVERRIDE
+#                  because the watchdog never touches iptables
+#                  and never chattr's anything)
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target

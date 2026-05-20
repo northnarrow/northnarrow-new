@@ -51,41 +51,99 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 }
 
 use std::collections::HashSet;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use aya::{
-    maps::{HashMap as AyaHashMap, MapData},
-    programs::{
-        links::{FdLink, PinnedLink},
-        Lsm,
-    },
-    Btf, Ebpf,
-};
+use anyhow::{Context, Result};
+use aya::{Btf, Ebpf};
 use tracing::{info, warn};
 
-/// Single bpffs directory holding every pinned anti-tamper object.
-/// Commit #2 pins the six anti-tamper maps here; commit #2b adds the
-/// seven LSM programs + links. One self-contained namespace lets the
-/// watchdog and `nn-admin` enumerate the pinned set by listing it,
-/// and keeps `EbpfLoader::map_pin_path` (maps) and the future
-/// `FdLink::pin` (links) sharing one root.
-pub const DEFAULT_BPFFS_ROOT: &str = "/sys/fs/bpf/northnarrow";
+// ISSUE_002: bpffs root / pin / LSM-attach primitives were
+// extracted from this module into the `antitamper-bpf` workspace
+// crate so the forthcoming watchdog binary can consume them
+// without pulling the rest of `agent`. Re-exported here so
+// every pre-extraction caller (sensors/multiplexer.rs,
+// filesystem.rs, main.rs, tests) keeps compiling byte-identically.
+pub use antitamper_bpf::{
+    attach_lsm, attach_transient, fresh_attach_and_pin, lsm_pin_paths, prepare_pin_root,
+    purge_stale_pin, read_proc_comm, read_self_comm, DEFAULT_BPFFS_ROOT,
+    PROTECTED_PIDS_MAP_NAME,
+};
 
-/// `statfs(2)` magic for a BPF filesystem mount (`uapi/linux/magic.h`
-/// `BPF_FS_MAGIC`). Used to fail *soft* with an actionable message
-/// when `/sys/fs/bpf` isn't a bpffs mount, rather than letting aya
-/// surface an opaque `BPF_OBJ_PIN` errno from deep inside `load()`.
-const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+// Watchdog W1: PROTECTED_PIDS userspace manipulation now goes
+// through the typed handle in `antitamper-bpf` so both the agent
+// (in-process, has the `Ebpf`) and the future watchdog binary
+// (cross-process, opens by bpffs path) use the same code path.
+use antitamper_bpf::ProtectedPidsHandle;
 
-/// Mode for [`DEFAULT_BPFFS_ROOT`]. `0700`: only root may list or
-/// unlink the pins. This matters beyond hygiene — in commit #2b an
-/// unprivileged `unlink` of a pinned *link* would detach a live LSM
-/// hook, and even in commit #2 unlinking a pinned *map* re-opens the
-/// split-brain on the next agent restart.
-const PIN_ROOT_MODE: u32 = 0o700;
+/// Watchdog W6: TASK_COMM_LEN-truncated comm of the watchdog
+/// binary. The watchdog's W2 boot sequence calls
+/// `prctl(PR_SET_NAME, "northnarrow-wat")` (15 chars + NUL fits
+/// the kernel's 16-byte field exactly), so this is the literal
+/// string `/proc/<watchdog_pid>/comm` produces.
+///
+/// Adding this to `attach()`'s `allowed_comms` set means
+/// `evict_stale_pids` will NOT evict the watchdog's
+/// `PROTECTED_PIDS` entry on the agent's next restart —
+/// preserves the LSM kill/ptrace protection for the watchdog
+/// across the agent death→respawn gap (per design §7.1).
+pub const WATCHDOG_COMM: &str = "northnarrow-wat";
+
+/// Watchdog W6: best-effort read of the watchdog's PID file.
+/// Returns `Some(pid)` when the file exists AND parses as a
+/// `u32`; returns `None` for every failure mode (file absent,
+/// permission denied, garbage content, empty) AFTER logging.
+/// Failure is NEVER propagated — a deployment that hasn't yet
+/// rolled out the watchdog binary must boot the agent
+/// unchanged (per design §7.1 "the agent runs without a
+/// watchdog before W6 lands").
+///
+/// Trims a single trailing newline (the watchdog's atomic
+/// pidfile writer emits `<pid>\n`); rejects multi-line content
+/// because the canonical writer never produces such bytes.
+pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                target: "anti_tamper.watchdog_pid",
+                path = %path.display(),
+                "no watchdog pidfile present — agent boots without watchdog co-protection"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                target: "anti_tamper.watchdog_pid",
+                error = %e,
+                path = %path.display(),
+                "watchdog pidfile read failed — falling back to agent-only protection"
+            );
+            return None;
+        }
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<u32>() {
+        Ok(pid) => {
+            info!(
+                target: "anti_tamper.watchdog_pid",
+                path = %path.display(),
+                watchdog_pid = pid,
+                "watchdog pidfile present — co-registering watchdog PID in PROTECTED_PIDS"
+            );
+            Some(pid)
+        }
+        Err(e) => {
+            warn!(
+                target: "anti_tamper.watchdog_pid",
+                error = %e,
+                path = %path.display(),
+                content = %trimmed,
+                "watchdog pidfile content is not a valid u32 — falling back to agent-only"
+            );
+            None
+        }
+    }
+}
 
 // TODO(Tappa 8): the three override arrays — KILL_OVERRIDE,
 // PTRACE_OVERRIDE, FS_PROTECT_OVERRIDE — are now `pinned` by-name
@@ -98,89 +156,13 @@ const PIN_ROOT_MODE: u32 = 0o700;
 // is added here in commit #2: it would be dead code with no
 // Tappa-7 caller and is out of this commit's scope.
 
-/// Prepare the bpffs pin directory and return the path to hand to
-/// [`aya::EbpfLoader::map_pin_path`]. Returns `None` when bpffs is
-/// unavailable: the caller then loads the eBPF object WITHOUT
-/// pinning so the sensor half of the agent still runs (anti-tamper
-/// cross-restart persistence is forfeited until the host gains a
-/// bpffs mount). This mirrors the warn-and-continue stance the rest
-/// of anti-tamper takes — losing persistence must not cost the
-/// operator their telemetry.
-pub fn prepare_pin_root() -> Option<&'static Path> {
-    let root = Path::new(DEFAULT_BPFFS_ROOT);
-    let mount = root.parent().unwrap_or_else(|| Path::new("/sys/fs/bpf"));
-
-    if !is_bpffs(mount) {
-        warn!(
-            path = %mount.display(),
-            "anti-tamper: {} is not a bpffs mount — anti-tamper maps will NOT \
-             persist across restart (split-brain risk on respawn). Mount it: \
-             `mount -t bpf bpf /sys/fs/bpf`. Continuing with sensors only.",
-            mount.display()
-        );
-        return None;
-    }
-
-    match std::fs::DirBuilder::new()
-        .mode(PIN_ROOT_MODE)
-        .recursive(true)
-        .create(root)
-    {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            warn!(
-                error = %e, path = %root.display(),
-                "anti-tamper: could not create bpffs pin dir — continuing \
-                 unpinned (sensors only, no anti-tamper persistence)"
-            );
-            return None;
-        }
-    }
-
-    // Re-assert mode unconditionally: a pre-existing dir from an
-    // older build (or a loosened one) must not keep wider perms.
-    // No chown — bpffs inodes are kernel-owned root:root and we
-    // already required root to get this far.
-    if let Ok(meta) = std::fs::metadata(root) {
-        if (meta.permissions().mode() & 0o7777) != PIN_ROOT_MODE {
-            if let Err(e) =
-                std::fs::set_permissions(root, std::fs::Permissions::from_mode(PIN_ROOT_MODE))
-            {
-                warn!(
-                    error = %e, path = %root.display(),
-                    "anti-tamper: could not chmod 0700 the bpffs pin dir \
-                     (pins still created; dir perms wider than intended)"
-                );
-            }
-        }
-    }
-
-    Some(root)
-}
-
-/// `true` iff `p` resides on a bpffs mount. A `statfs` failure or a
-/// non-bpffs magic both return `false` — the caller treats either as
-/// "pinning unavailable" and degrades gracefully.
-fn is_bpffs(p: &Path) -> bool {
-    let Ok(c_path) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `c_path` is a valid NUL-terminated path; `s` is a
-    // fully-owned `statfs` out-param the kernel initialises on
-    // success. We only read `f_type` and only when the call
-    // returned 0.
-    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut s) } != 0 {
-        return false;
-    }
-    s.f_type as i64 == BPF_FS_MAGIC
-}
-
-/// Names mirroring `#[map]` / `#[lsm(hook = "…")]` declarations in
+/// Names mirroring `#[lsm(hook = "…")]` declarations in
 /// `agent-ebpf/src/{task_kill,ptrace_check}.rs`. Kept here as
-/// constants because aya looks them up by string at runtime.
-const PROTECTED_PIDS_MAP: &str = "PROTECTED_PIDS";
+/// constants because aya looks them up by string at runtime. The
+/// map-name constant lives in `antitamper-bpf::PROTECTED_PIDS_MAP_NAME`
+/// (Watchdog W1) since both agent and watchdog reference it; these
+/// hook/program names stay agent-side because only the agent
+/// loads the LSM hooks.
 const TASK_KILL_PROGRAM: &str = "task_kill";
 const TASK_KILL_HOOK: &str = "task_kill";
 const PTRACE_PROGRAM: &str = "ptrace_access_check";
@@ -214,9 +196,40 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     register_protected_pids(ebpf, pids).context("populating PROTECTED_PIDS before LSM attach")?;
     info!(
         pids = ?pids,
-        map = PROTECTED_PIDS_MAP,
+        map = PROTECTED_PIDS_MAP_NAME,
         "anti-tamper: PIDs registered with kernel"
     );
+
+    // PHASE_D_001: pin PROTECTED_PIDS by name to bpffs. The eBPF
+    // source declares `HashMap::pinned(16, 0)` and the loader
+    // calls `map_pin_path(root)`, which is documented to handle
+    // by-name pinning automatically — empirically on aya 0.13.1 +
+    // kernel 6.8 it does not, leaving the watchdog's
+    // `ProtectedPidsHandle::open(bpffs_root)` unable to find the
+    // map. Explicit pin here closes the gap. purge_stale_pin +
+    // pin mirrors the W1 attach_lsm idiom: a leftover pin from a
+    // prior wedged boot may point at a dead kernel map, so we
+    // always re-pin against the live map this boot loaded.
+    if let Some(root) = prepare_pin_root() {
+        let map_pin_path = root.join(PROTECTED_PIDS_MAP_NAME);
+        purge_stale_pin(&map_pin_path);
+        ebpf.map_mut(PROTECTED_PIDS_MAP_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!("map {PROTECTED_PIDS_MAP_NAME} missing from eBPF object")
+            })?
+            .pin(&map_pin_path)
+            .with_context(|| {
+                format!(
+                    "pinning {PROTECTED_PIDS_MAP_NAME} to {}",
+                    map_pin_path.display()
+                )
+            })?;
+        info!(
+            map = PROTECTED_PIDS_MAP_NAME,
+            map_pin = %map_pin_path.display(),
+            "anti-tamper: PROTECTED_PIDS pinned by-name to bpffs (PHASE_D_001)"
+        );
+    }
 
     // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
     // loader resolves `bpf_lsm_<hook>` against it to set the
@@ -277,18 +290,15 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     Ok(())
 }
 
-/// Insert each PID into `PROTECTED_PIDS`. `BPF_ANY` upsert
-/// semantics: an entry that already exists is overwritten, so
-/// re-registering the same PID after an eviction race is fine.
+/// Insert each PID into `PROTECTED_PIDS`. Watchdog W1: this is now
+/// a thin wrapper over [`ProtectedPidsHandle::insert`] so the agent
+/// and the watchdog share one canonical map-mutation code path.
+/// `BPF_ANY` upsert semantics are preserved by the handle — an
+/// entry that already exists is overwritten.
 fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
-    let map = ebpf
-        .map_mut(PROTECTED_PIDS_MAP)
-        .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP} missing from eBPF object"))?;
-    let mut hm: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)
-        .with_context(|| format!("{PROTECTED_PIDS_MAP} is not a HashMap<u32, u8>"))?;
+    let mut handle = ProtectedPidsHandle::from_ebpf(ebpf)?;
     for &pid in pids {
-        hm.insert(pid, 1u8, 0)
-            .with_context(|| format!("inserting PID {pid} into {PROTECTED_PIDS_MAP}"))?;
+        handle.insert(pid)?;
     }
     Ok(())
 }
@@ -298,21 +308,20 @@ fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
 /// `allowed_comms`. Returns the number of entries removed.
 ///
 /// This is a no-op on a freshly-loaded eBPF object (the map is
-/// empty); it becomes load-bearing once Tappa 7 task 6 commit #2
+/// empty); it becomes load-bearing once the BPF pinning sprint
 /// pins the map to bpffs, at which point a restarted agent inherits
 /// the prior generation's entries and must clean up stale ones
 /// before the new PIDs take effect.
+///
+/// Watchdog W1: walk + evict now go through the
+/// [`ProtectedPidsHandle`] surface. Snapshot the PID set up front
+/// via [`ProtectedPidsHandle::pids`] (which materialises a `Vec`
+/// internally) so the eviction loop can call
+/// [`ProtectedPidsHandle::evict`] without fighting an iterator
+/// borrow on the underlying map.
 fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<usize> {
-    let map = ebpf
-        .map_mut(PROTECTED_PIDS_MAP)
-        .ok_or_else(|| anyhow!("map {PROTECTED_PIDS_MAP} missing from eBPF object"))?;
-    let mut hm: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)
-        .with_context(|| format!("{PROTECTED_PIDS_MAP} is not a HashMap<u32, u8>"))?;
-
-    // Materialise the key set up-front; aya's `keys()` iterator
-    // holds a borrow of the map, and we need `&mut hm` to call
-    // `remove()`.
-    let existing: Vec<u32> = hm.keys().filter_map(Result::ok).collect();
+    let mut handle = ProtectedPidsHandle::from_ebpf(ebpf)?;
+    let existing = handle.pids()?;
     let mut evicted = 0usize;
     for pid in existing {
         let alive_and_matching = match read_proc_comm(pid) {
@@ -322,7 +331,7 @@ fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<
         if alive_and_matching {
             continue;
         }
-        match hm.remove(&pid) {
+        match handle.evict(pid) {
             Ok(()) => evicted += 1,
             Err(e) => warn!(
                 pid, error = %e,
@@ -333,264 +342,92 @@ fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<
     Ok(evicted)
 }
 
-/// Read `/proc/self/comm` and return it as an owned `String` with
-/// the trailing newline stripped. Returns an error if the file is
-/// missing or unreadable — both shouldn't happen for our own PID.
-pub fn read_self_comm() -> Result<String> {
-    let raw = std::fs::read_to_string("/proc/self/comm").context("reading /proc/self/comm")?;
-    Ok(raw.trim_end_matches('\n').to_string())
-}
-
-/// Read `/proc/<pid>/comm` and return it as an owned `String`.
-/// Returns `None` if the file does not exist (process gone) or
-/// cannot be read for any other reason — callers treat both
-/// outcomes as "this PID is no longer ours."
-///
-/// `comm` is the kernel-stamped 15-char-plus-NUL `TASK_COMM_LEN`
-/// field, set on exec and updatable via `prctl(PR_SET_NAME)`. We
-/// use it rather than `cmdline` because comm is the value the
-/// kernel itself uses internally; cmdline can be rewritten via
-/// `/proc/self/cmdline` write from userland. Neither defeats a
-/// motivated attacker — comm is a sanity check for PID recycling
-/// race, not a security primitive.
-pub fn read_proc_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/comm");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim_end_matches('\n').to_string())
-}
-
-/// bpffs pin paths for one LSM hook. Commit #2b keeps the path key
-/// the **human-readable hook name** (`task_kill`,
-/// `ptrace_access_check`, …) so an operator listing
-/// [`DEFAULT_BPFFS_ROOT`] sees self-describing names. The kernel
-/// truncates aya's program *name* (the Rust fn symbol) to 15 chars,
-/// so e.g. `bpftool prog show name` reports `ptrace_access_c` — that
-/// truncation is a *verification-harness* concern only; nothing here
-/// or in `bpf_get_object` cares about the kernel prog name.
-///
-/// Two **separate** pins per hook, both required:
-/// - `prog_<hook>` keeps the kernel *program* object loaded.
-/// - `link_<hook>` keeps the *attachment* live — this is the one
-///   that makes the hook keep **firing** across the agent
-///   death→respawn gap. A pinned program with no pinned link is a
-///   loaded-but-inert program; the link pin is the survivability
-///   primitive (see `aya` `programs/links.rs` `FdLink::pin` /
-///   `PinnedLink::from_pin`).
-fn lsm_pin_paths(root: &Path, hook_name: &str) -> (PathBuf, PathBuf) {
-    (
-        root.join(format!("prog_{hook_name}")),
-        root.join(format!("link_{hook_name}")),
-    )
-}
-
-/// Best-effort unlink of a stale/crashed-state pin. A leftover pin
-/// file whose backing kernel object is gone (or is corrupt on disk)
-/// must never wedge agent startup: we remove it and fall through to
-/// a fresh attach. `NotFound` is success (already gone).
-fn purge_stale_pin(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!(
-            error = %e, path = %path.display(),
-            "anti-tamper: could not unlink stale pin (continuing to fresh attach)"
-        ),
-    }
-}
-
-/// Load → attach → pin-program → take-link → pin-link for one hook.
-/// On success the kernel holds: the program (pinned at `prog_path`)
-/// and its LSM attachment (pinned at `link_path`). The `PinnedLink`
-/// is intentionally dropped at end of scope — that closes only the
-/// agent's dup fd; the bpffs pin file retains the kernel reference,
-/// so the hook keeps firing after this process exits. That is the
-/// entire point of commit #2b.
-fn fresh_attach_and_pin(
-    ebpf: &mut Ebpf,
-    program_name: &str,
-    hook_name: &str,
-    btf: &Btf,
-    prog_path: &Path,
-    link_path: &Path,
-) -> Result<()> {
-    let prog: &mut Lsm = ebpf
-        .program_mut(program_name)
-        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
-        .try_into()
-        .with_context(|| format!("program {program_name} is not an LSM program"))?;
-    prog.load(hook_name, btf)
-        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
-    let link_id = prog
-        .attach()
-        .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
-    prog.pin(prog_path).with_context(|| {
-        format!(
-            "pinning LSM program `{program_name}` to {}",
-            prog_path.display()
-        )
-    })?;
-    // `take_link` removes the link from the program's `LinkMap` so it
-    // is NOT detached when `Ebpf` drops at agent exit; we then own it
-    // and hand ownership to the bpffs pin.
-    let link = prog
-        .take_link(link_id)
-        .with_context(|| format!("taking ownership of `{hook_name}` LSM link for pinning"))?;
-    let fd_link: FdLink = link.into();
-    let _pinned: PinnedLink = fd_link
-        .pin(link_path)
-        .with_context(|| format!("pinning LSM link `{hook_name}` to {}", link_path.display()))?;
-    Ok(())
-}
-
-/// Transient attach (pre-#2b behaviour) used only when bpffs is
-/// unavailable: the hook works for *this* boot but is detached on
-/// agent exit. Mirrors the "degrade, keep telemetry" stance the rest
-/// of anti-tamper takes — no bpffs ⇒ no cross-restart persistence,
-/// but the agent still defends itself while it is alive.
-fn attach_transient(
-    ebpf: &mut Ebpf,
-    program_name: &str,
-    hook_name: &str,
-    btf: &Btf,
-) -> Result<()> {
-    let prog: &mut Lsm = ebpf
-        .program_mut(program_name)
-        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
-        .try_into()
-        .with_context(|| format!("program {program_name} is not an LSM program"))?;
-    prog.load(hook_name, btf)
-        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
-    prog.attach()
-        .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
-    Ok(())
-}
-
-/// Attach an LSM hook with cross-restart persistence (#2b), or reuse
-/// the prior boot's still-firing kernel hook if its link pin is
-/// present and valid.
-///
-/// Per hook, given a usable bpffs `pin_root`:
-/// - `link_<hook>` exists and re-opens (`PinnedLink::from_pin`) ⇒
-///   the prior boot's hook never stopped firing (the pin held it
-///   across the death→respawn gap). Validate and return; the program
-///   for this boot is left unloaded. Log: *reused pinned LSM link*.
-/// - `link_<hook>` exists but `from_pin` fails (object gone / pin
-///   corrupt) ⇒ purge both stale pins, then fresh attach+pin. Log:
-///   *purged stale pin and freshly attached*.
-/// - no `link_<hook>` ⇒ fresh attach+pin. Log: *freshly attached +
-///   pinned*.
-///
-/// `pin_root == None` (no bpffs) ⇒ [`attach_transient`]: works this
-/// boot, no persistence. The three success log messages are stable
-/// strings the #2b verification harness greps.
-pub(crate) fn attach_lsm(
-    ebpf: &mut Ebpf,
-    program_name: &str,
-    hook_name: &str,
-    btf: &Btf,
-    pin_root: Option<&Path>,
-) -> Result<()> {
-    let Some(root) = pin_root else {
-        attach_transient(ebpf, program_name, hook_name, btf)?;
-        warn!(
-            hook = hook_name,
-            "anti-tamper: LSM hook attached WITHOUT pin (no bpffs) — will \
-             NOT survive agent restart"
-        );
-        return Ok(());
-    };
-
-    let (prog_path, link_path) = lsm_pin_paths(root, hook_name);
-
-    if link_path.exists() {
-        match PinnedLink::from_pin(&link_path) {
-            Ok(pinned) => {
-                // Dropping `pinned` closes only our dup fd; the bpffs
-                // pin file keeps the kernel link (hook) alive. Do NOT
-                // touch the program — the prior boot's is still live
-                // and bound to the (2a-pinned) PROTECTED_PIDS map.
-                drop(pinned);
-                info!(
-                    hook = hook_name,
-                    link_pin = %link_path.display(),
-                    "anti-tamper: reused pinned LSM link"
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                warn!(
-                    hook = hook_name, error = %e,
-                    link_pin = %link_path.display(),
-                    "anti-tamper: pinned LSM link stale/corrupt — purging \
-                     and re-attaching"
-                );
-                purge_stale_pin(&link_path);
-                purge_stale_pin(&prog_path);
-                fresh_attach_and_pin(
-                    ebpf,
-                    program_name,
-                    hook_name,
-                    btf,
-                    &prog_path,
-                    &link_path,
-                )?;
-                info!(
-                    hook = hook_name,
-                    "anti-tamper: purged stale pin and freshly attached"
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    fresh_attach_and_pin(ebpf, program_name, hook_name, btf, &prog_path, &link_path)?;
-    info!(
-        hook = hook_name,
-        prog_pin = %prog_path.display(),
-        link_pin = %link_path.display(),
-        "anti-tamper: LSM hook freshly attached + pinned"
-    );
-    Ok(())
-}
+// ISSUE_002 extraction note: read_self_comm, read_proc_comm,
+// lsm_pin_paths, purge_stale_pin, fresh_attach_and_pin,
+// attach_transient, attach_lsm — plus their unit tests — all moved
+// to `northnarrow-antitamper-bpf` and are re-exported via the
+// `pub use` block at the top of this module. Functional behaviour
+// is byte-identical; the only delta is the home crate.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
+    // ── Watchdog W6: pidfile reader + comm constant ────────────────
+
+    /// Required W6 test 1: read_watchdog_pid_optional returns
+    /// the PID when the watchdog pidfile is present and contains
+    /// a valid u32 (with the canonical `<pid>\n` shape the
+    /// watchdog's W2 atomic writer emits).
     #[test]
-    fn read_self_comm_returns_non_empty_string() {
-        let c = read_self_comm().expect("read_self_comm should succeed for our own /proc");
-        assert!(!c.is_empty(), "self comm should be non-empty");
-        // Trailing newline must be stripped — every assertion below
-        // depends on the trim contract.
+    fn read_watchdog_pid_optional_returns_pid_when_file_present() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("watchdog.pid");
+        std::fs::write(&p, "4242\n").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p), Some(4242));
+
+        // No-newline shape also works (forward-compat with
+        // alternate writers).
+        let p2 = dir.path().join("watchdog2.pid");
+        std::fs::write(&p2, "9999").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p2), Some(9999));
+    }
+
+    /// Required W6 test 2: read_watchdog_pid_optional returns
+    /// None — NOT an error — when the file is absent. Anchors
+    /// the "agent boots without watchdog" no-op contract: a
+    /// deployment that hasn't rolled out the watchdog binary
+    /// MUST still boot the agent unchanged.
+    #[test]
+    fn read_watchdog_pid_optional_returns_none_when_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("does-not-exist.pid");
+        assert!(!p.exists());
+        assert_eq!(read_watchdog_pid_optional(&p), None);
+    }
+
+    // ── Supplementary W6 tests ─────────────────────────────────────
+
+    /// Garbage content surfaces as None (logged WARN), not an
+    /// error. Documents that a corrupted pidfile degrades the
+    /// agent to "no watchdog co-protection" rather than
+    /// failing boot — a missing or wrong watchdog should never
+    /// take the agent down.
+    #[test]
+    fn read_watchdog_pid_optional_returns_none_on_garbage() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("garbage.pid");
+        std::fs::write(&p, "this is definitely not a pid\n").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p), None);
+
+        // Empty file also surfaces as None.
+        let p2 = dir.path().join("empty.pid");
+        std::fs::write(&p2, "").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p2), None);
+
+        // Whitespace-only also None.
+        let p3 = dir.path().join("ws.pid");
+        std::fs::write(&p3, "   \n\t\n").unwrap();
+        assert_eq!(read_watchdog_pid_optional(&p3), None);
+    }
+
+    /// Cross-crate consistency anchor: WATCHDOG_COMM must match
+    /// the literal string the watchdog's W2 `harden_self` sets
+    /// via prctl(PR_SET_NAME). TASK_COMM_LEN is 16 bytes
+    /// (including NUL terminator), so the value fits exactly
+    /// with 15 chars + NUL. A future rename of the watchdog
+    /// binary that changes its prctl name MUST update this
+    /// constant in lock-step, or evict_stale_pids would silently
+    /// evict the watchdog's PROTECTED_PIDS entry.
+    #[test]
+    fn watchdog_comm_constant_is_task_comm_len_safe() {
+        assert_eq!(WATCHDOG_COMM, "northnarrow-wat");
+        // 15 chars + implicit NUL = 16 bytes (TASK_COMM_LEN).
+        assert_eq!(WATCHDOG_COMM.len(), 15);
         assert!(
-            !c.ends_with('\n'),
-            "trailing newline must be stripped: {c:?}"
+            WATCHDOG_COMM.len() < 16,
+            "TASK_COMM_LEN is 16 (incl. NUL); name must be ≤15"
         );
-    }
-
-    #[test]
-    fn read_proc_comm_for_self_matches_read_self_comm() {
-        let mine = std::process::id();
-        let via_self = read_self_comm().unwrap();
-        let via_pid = read_proc_comm(mine).expect("read_proc_comm should find our own PID");
-        assert_eq!(via_self, via_pid);
-    }
-
-    #[test]
-    fn read_proc_comm_returns_none_for_impossibly_large_pid() {
-        // Linux's pid_max ceiling is 2^22 on 64-bit systems; u32::MAX
-        // is firmly above that, so /proc/<u32::MAX>/comm cannot exist
-        // for any live process.
-        let res = read_proc_comm(u32::MAX);
-        assert!(res.is_none(), "expected None for u32::MAX, got {res:?}");
-    }
-
-    #[test]
-    fn read_proc_comm_returns_none_for_pid_zero() {
-        // PID 0 is the kernel's swapper, not exposed via /proc.
-        let res = read_proc_comm(0);
-        assert!(res.is_none(), "expected None for PID 0, got {res:?}");
     }
 }

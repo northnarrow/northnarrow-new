@@ -1,0 +1,52 @@
+[Unit]
+Description=NorthNarrow XDR agent
+Documentation=https://github.com/northnarrow/northnarrow-new
+# Network online so the agent's outbound posture-engaged behaviour
+# has a fully-up interface; sys-fs-bpf.mount so the bpffs pin
+# directory used by ProtectedPidsHandle (Tappa 7 task 6 W1) is
+# available before any LSM hook attach attempt.
+After=network-online.target sys-fs-bpf.mount
+Wants=network-online.target
+Requires=sys-fs-bpf.mount
+# ConditionPathIsMountPoint is a soft pre-flight — units skip
+# their ExecStart if the condition is unmet rather than failing.
+# Pairs with the agent's own warn-and-continue when bpffs isn't
+# usable, so an operator misconfig produces a clear systemd
+# "skipped" status instead of a startup crash.
+ConditionPathIsMountPoint=/sys/fs/bpf
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/northnarrow-agent \
+    --combat-rules /etc/northnarrow/combat-rules.v4 \
+    --admin-pub /etc/northnarrow/admin.pub \
+    --admin-socket /run/northnarrow/admin.sock \
+    --pid-file /run/northnarrow/agent.pid
+# Watchdog (Tappa 7 task 6 W4) owns restart policy. systemd MUST
+# NOT auto-restart the agent — doing so would race the
+# watchdog's restart-backoff loop and double-spawn agents on
+# every death. Per design §2.3 "restart policy lives only in
+# the watchdog — the agent's systemd unit uses Restart=no and
+# delegates respawn to the watchdog."
+Restart=no
+RuntimeDirectory=northnarrow
+RuntimeDirectoryMode=0700
+
+# Hardening — `ProtectSystem=strict` makes the entire filesystem
+# read-only EXCEPT the ReadWritePaths whitelist below. NoNewPrivileges
+# kills any latent setuid-binary escalation in case the agent ever
+# spawns one.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/northnarrow /var/lib/northnarrow /sys/fs/bpf/northnarrow
+# CAP_BPF        — load+pin BPF maps/programs (Tappa 7 task 5/6/7)
+# CAP_SYS_ADMIN  — bpf(2) historically needed this; CAP_BPF
+#                  separated it on 5.8+ but kernel still accepts
+#                  the union, so we keep both for compat
+# CAP_NET_ADMIN  — iptables-restore on COMBAT entry (Tappa 7 task 7)
+# CAP_DAC_OVERRIDE — chattr +i on /var/lib/northnarrow (Tappa 7 task 5)
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE
+
+[Install]
+WantedBy=multi-user.target

@@ -11,11 +11,15 @@
 pub mod ade;
 pub mod admin_cli;
 pub mod admin_socket;
+pub mod agent_id;
 pub mod anti_tamper;
+pub mod audit;
 pub mod correlation;
 pub mod decision;
+pub mod fim;
 pub mod posture;
 pub mod rag;
 pub mod response;
 pub mod sensors;
+pub mod shutdown_marker;
 pub mod xai;

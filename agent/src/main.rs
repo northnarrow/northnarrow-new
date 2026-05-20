@@ -28,7 +28,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::Event;
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
-use northnarrow_agent::admin_socket;
+use northnarrow_agent::admin_socket::{self, ShutdownSignal};
+use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
@@ -91,6 +92,38 @@ struct Cli {
     )]
     admin_pub: PathBuf,
 
+    /// Tappa 8 A3 + A8: per-install agent identity file. The agent
+    /// reads (or, on first boot, mints) a 16-byte UUID at this
+    /// path; the UUID becomes the third anti-replay layer for the
+    /// signed-payload pipeline (design §6.4 layer 3) — a captured
+    /// admin signature from one agent install cannot be replayed
+    /// against another. Persisted as 32 hex chars + newline at
+    /// mode 0644 per design §6.5. Default path mirrors the design
+    /// spec; override only for testing or unusual install layouts.
+    #[arg(
+        long = "agent-id-file",
+        value_name = "PATH",
+        default_value = "/etc/northnarrow/agent_id"
+    )]
+    agent_id_file: PathBuf,
+
+    /// Tappa 7 task 6 Watchdog W6: best-effort path to the
+    /// watchdog daemon's PID file. If the file exists at agent
+    /// startup, the agent reads the PID and includes it in
+    /// `PROTECTED_PIDS` alongside its own — the LSM
+    /// `task_kill` + `ptrace_access_check` hooks then deny
+    /// SIGKILL/SIGTERM/ptrace against the watchdog too, giving
+    /// the same anti-tamper coverage to both halves of the
+    /// supervisor pair. The agent boots normally if the file
+    /// is missing (no watchdog deployed yet) — W6 is purely
+    /// additive co-protection.
+    #[arg(
+        long = "watchdog-pidfile",
+        value_name = "PATH",
+        default_value = "/run/northnarrow/watchdog.pid"
+    )]
+    watchdog_pidfile: PathBuf,
+
     /// Unix-socket path nn-admin connects to. Removed on startup if
     /// it already exists (stale file from prior unclean shutdown).
     #[arg(
@@ -99,6 +132,82 @@ struct Cli {
         default_value = "/run/northnarrow/admin.sock"
     )]
     admin_socket: PathBuf,
+
+    /// PHASE_D_003: configurable path of the agent's audit
+    /// signing key (Tappa 8 B1). Default mirrors the design's
+    /// canonical location. Tests override this to a per-test
+    /// tempdir so each test run gets a fresh key without
+    /// mutating the host's /etc/northnarrow/ state.
+    #[arg(
+        long = "signing-key-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
+    )]
+    signing_key_file: PathBuf,
+
+    /// PHASE_D_003: configurable path of the agent's audit
+    /// log (Tappa 8 B1 + B5). Default mirrors the design's
+    /// canonical location.
+    #[arg(
+        long = "audit-log-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH,
+    )]
+    audit_log_file: PathBuf,
+
+    /// PHASE_D_003: configurable path of the
+    /// shutdown-authorisation marker (Tappa 8 A8). Default is
+    /// the design's canonical
+    /// `/run/northnarrow/agent.shutdown_authorised`. Tests use
+    /// a per-test tempdir so the watchdog can be mocked or
+    /// skipped without colliding with a real install.
+    #[arg(
+        long = "shutdown-marker-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::shutdown_marker::DEFAULT_MARKER_PATH,
+    )]
+    shutdown_marker_file: PathBuf,
+
+    /// Tappa 9 C7: path to the curated default FIM watched-paths
+    /// list (`fim-paths.v1` format — one absolute path per line,
+    /// `#` comments). install.sh drops this at the default location;
+    /// the agent reads + merges with the operator overlay at boot.
+    #[arg(
+        long = "fim-paths-v1",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::paths_config::DEFAULT_PATHS_V1,
+    )]
+    fim_paths_v1: PathBuf,
+
+    /// Tappa 9 C7 / §13 Q7: path to the operator overlay.
+    /// `+/abs/path` adds, `-/abs/path` disables a default. Optional
+    /// — missing file means "no overlay", v1 is used as-is.
+    #[arg(
+        long = "fim-paths-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::paths_config::DEFAULT_PATHS_LOCAL,
+    )]
+    fim_paths_local: PathBuf,
+
+    /// Tappa 9 C3 / C7: configurable path of the chained FIM
+    /// baseline log. Tests override this to a tempdir so each test
+    /// run gets a fresh chain.
+    #[arg(
+        long = "fim-baseline-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::baseline::DEFAULT_BASELINE_PATH,
+    )]
+    fim_baseline_file: PathBuf,
+
+    /// Tappa 9 C4 / C7: configurable path of the chained FIM
+    /// drift log. Same per-test override rationale as
+    /// `--fim-baseline-file`.
+    #[arg(
+        long = "fim-drift-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::fim::drain::DEFAULT_DRIFT_LOG_PATH,
+    )]
+    fim_drift_file: PathBuf,
 
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
@@ -134,6 +243,72 @@ async fn main() -> Result<()> {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
 
+    // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
+    // BEFORE the sensor multiplexer attaches the LSM hooks, so the
+    // hooks see their inodes in PROTECTED_INODES the moment they
+    // fire. agent_id + signing key bootstraps were previously done
+    // post-attach (line ~360); moved here so the LSM-protected
+    // window starts at boot rather than at "first signed admin op".
+    // audit.log is created as a zero-byte placeholder if absent
+    // (first append writes the genesis entry).
+    if let Err(e) = northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+        &cli.signing_key_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.signing_key_file.display(),
+            "agent signing key bootstrap failed pre-attach — audit log will be \
+             unsigned this boot"
+        );
+    }
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_audit_log(
+        &cli.audit_log_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.audit_log_file.display(),
+            "audit log bootstrap failed pre-attach — file will be lazily created \
+             on first append (and protected only from agent restart onwards)"
+        );
+    }
+    // Tappa 9 C7: bootstrap the two FIM logs pre-attach for the
+    // same reason audit.log gets it — STATE_PROTECTED_FILES needs
+    // an inode to register against before LSM hooks come up. A
+    // present file is left untouched (existing chain preserved).
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(
+        &cli.fim_baseline_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.fim_baseline_file.display(),
+            "fim baseline log bootstrap failed pre-attach — file will be lazily \
+             created on first append (and unprotected this boot)"
+        );
+    }
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_fim_log(
+        &cli.fim_drift_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.fim_drift_file.display(),
+            "fim drift log bootstrap failed pre-attach — file will be lazily \
+             created on first append (and unprotected this boot)"
+        );
+    }
+    // agent_id bootstrap moved up from line ~360 so its inode is
+    // present in PROTECTED_INODES from boot. The post-attach
+    // re-read at line ~360 stays for the SignedPayload wiring path
+    // (it just sees the same value we minted here).
+    let _ = agent_id::load_or_bootstrap(&cli.agent_id_file).map_err(|e| {
+        warn!(
+            error = %e,
+            path = %cli.agent_id_file.display(),
+            "pre-attach agent_id bootstrap failed — post-attach re-read will \
+             surface the same error and fall back to zero UUID"
+        );
+        e
+    });
+
     let mut sensor = SensorMultiplexer::start()
         .await
         .context("starting the sensor multiplexer")?;
@@ -147,16 +322,37 @@ async fn main() -> Result<()> {
     // leak. Per-hook failures are logged WARN inside the call and
     // tolerated so the agent still runs on kernels without BPF-LSM.
     //
-    // The PID set + allowed-comm set are scoped to the agent for now;
-    // Tappa 7 task 6 commit #4 will widen both to include the
-    // watchdog (PID read from /run/northnarrow/watchdog.pid).
+    // Watchdog W6: if the watchdog daemon is also deployed (its
+    // pidfile present at cli.watchdog_pidfile), co-register its
+    // PID into PROTECTED_PIDS so the LSM hooks deny kill/ptrace
+    // against the watchdog too. WATCHDOG_COMM goes into
+    // allowed_comms unconditionally — `evict_stale_pids` only
+    // KEEPS entries whose /proc/<pid>/comm matches an allowed
+    // name, so even if the watchdog isn't running yet we want
+    // its comm in the allowlist to avoid evicting it once it
+    // starts. read_watchdog_pid_optional NEVER errors — a
+    // missing/garbage pidfile just falls back to agent-only
+    // protection (logged).
     let agent_pid = std::process::id();
     let agent_comm = northnarrow_agent::anti_tamper::read_self_comm()
         .context("reading own /proc/self/comm for anti-tamper allowed-comm set")?;
     let mut allowed_comms = std::collections::HashSet::new();
     allowed_comms.insert(agent_comm);
-    if let Err(e) = sensor.attach_anti_tamper(&[agent_pid], &allowed_comms) {
-        warn!(error = %e, agent_pid, "anti-tamper setup failed");
+    allowed_comms.insert(northnarrow_agent::anti_tamper::WATCHDOG_COMM.to_string());
+
+    let watchdog_pid =
+        northnarrow_agent::anti_tamper::read_watchdog_pid_optional(&cli.watchdog_pidfile);
+    let pids: Vec<u32> = match watchdog_pid {
+        Some(wpid) => vec![agent_pid, wpid],
+        None => vec![agent_pid],
+    };
+    if let Err(e) = sensor.attach_anti_tamper(&pids, &allowed_comms) {
+        warn!(
+            error = %e,
+            agent_pid,
+            watchdog_pid = ?watchdog_pid,
+            "anti-tamper setup failed"
+        );
     }
 
     #[cfg(feature = "demo-tappa5")]
@@ -293,20 +489,392 @@ async fn main() -> Result<()> {
     };
     info!("posture state machine initialized (state: OBSERVING)");
 
+    // Tappa 8 A3 + A8: bootstrap (or read) the per-install agent
+    // UUID. The value becomes the third anti-replay layer for the
+    // signed-payload verify path (design §6.4 layer 3, plumbed in
+    // commit A7 via `verify_signed_payload_quorum`). A failure
+    // here is non-fatal: the agent falls back to a zero UUID,
+    // which means signed-payload submissions whose `agent_id`
+    // field is `[0; 16]` will still verify but every other
+    // submission will fail `AgentIdMismatch`. We log loudly so
+    // the operator sees the bootstrap problem; the legacy
+    // unlock/force-posture/status paths are unaffected because
+    // they don't touch agent_id.
+    let agent_id = match agent_id::load_or_bootstrap(&cli.agent_id_file) {
+        Ok(id) => {
+            info!(
+                target: "agent_id",
+                path = %cli.agent_id_file.display(),
+                "agent_id ready"
+            );
+            id
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %cli.agent_id_file.display(),
+                "agent_id bootstrap failed; falling back to zero UUID — \
+                 signed-payload admin operations will reject all clients"
+            );
+            [0u8; 16]
+        }
+    };
+
+    // Tappa 8 A8: shutdown signal — the dispatcher fires it on a
+    // successfully-verified `ShutdownRequest` so this main loop
+    // can break and the agent can exit cleanly. The same Arc is
+    // cloned into `serve_with_marker_path` (Some(...)) and kept
+    // here for the select-arm `wait()`.
+    let shutdown_signal = ShutdownSignal::new();
+
+    // ── Tappa 9 C7 — FIM subsystem boot ────────────────────────────
+    //
+    // Order:
+    //  1. Load the watched-paths set (v1 default + .local overlay
+    //     merge per §13 Q7). A missing v1 just yields an empty
+    //     effective set + WARN; the agent stays up so a misconfigured
+    //     install is still operator-recoverable.
+    //  2. Open the [`BaselineDb`] for the chained baseline log.
+    //     Failure here is also tolerated: the recompute channel
+    //     stays unwired so admin `fim baseline` returns
+    //     `UnknownOperation` rather than crashing.
+    //  3. Build the [`BaselineRecomputeChannel`] + spawn the
+    //     long-lived recompute task.
+    //  4. Fire `RecomputeReason::FirstBootTofu` (§13 Q5 trust-on-
+    //     first-use) when the baseline DB is empty AND at least
+    //     one path is configured. First-boot trust model is
+    //     documented in `docs/operator/TAPPA9_FIM_TRUST_MODEL.md`.
+    //  5. Build the [`FimAdminState`] for the admin socket so
+    //     `fim baseline` triggers (3) and `fim status` reads the
+    //     in-process snapshot.
+    let watched_paths_load =
+        match northnarrow_agent::fim::paths_config::load_watched_paths(
+            &cli.fim_paths_v1,
+            &cli.fim_paths_local,
+        ) {
+            Ok(load) => load,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    v1 = %cli.fim_paths_v1.display(),
+                    local = %cli.fim_paths_local.display(),
+                    "fim paths-config: load failed — proceeding with empty watched-paths set"
+                );
+                Default::default()
+            }
+        };
+    let paths_summary =
+        admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
+
+    let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
+        // Re-derive the signing key + agent_id for FIM the same way
+        // the audit log does (re-load rather than steal the audit
+        // log's clone — they're separate domains with separate Db
+        // handles). A failure here downgrades the FIM CLI surface
+        // to "scheduled for next restart" + zero-snapshot status.
+        let baseline_db_opt =
+            match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                &cli.signing_key_file,
+            ) {
+                Ok(key) => {
+                    match northnarrow_agent::fim::baseline::BaselineDb::open(
+                        &cli.fim_baseline_file,
+                        key,
+                        agent_id,
+                    ) {
+                        Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                path = %cli.fim_baseline_file.display(),
+                                "fim baseline DB open failed — admin `fim baseline` will \
+                                 reject; status snapshot will report zero rows"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "fim baseline DB needs the agent signing key — load failed; \
+                         FIM admin surface degraded"
+                    );
+                    None
+                }
+            };
+        match baseline_db_opt {
+            Some(baseline_db) => {
+                use northnarrow_agent::fim::attach::{
+                    attach_observe_programs, populate_watched_paths,
+                    take_fs_fim_events_ringbuf,
+                };
+                use northnarrow_agent::fim::baseline::BaselineCache;
+                use northnarrow_agent::fim::drain::{
+                    drain_loop, DriftClassifier, DriftRateLimiter, FimDriftDb, InodePathMap,
+                };
+                use northnarrow_agent::fim::recompute::{
+                    run_recompute_task, BaselineRecomputeChannel, RecomputeReason,
+                };
+
+                let rate_limiter = Arc::new(DriftRateLimiter::new());
+
+                // Polish #2: populate the per-path baseline cache
+                // from the chained baseline log so the drain loop
+                // can suppress no-op kernel events (touch -t,
+                // permission-set-to-same-value, etc.) — the cache
+                // miss path treats the event as a first observation
+                // and emits drift normally.
+                let baseline_cache = match BaselineCache::load_from_log(
+                    &cli.fim_baseline_file,
+                ) {
+                    Ok(c) => {
+                        info!(
+                            entries = c.len(),
+                            "fim: baseline cache loaded"
+                        );
+                        Arc::new(c)
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.fim_baseline_file.display(),
+                            "fim baseline cache load failed — drain will emit drift \
+                             for every kernel event (no-op suppression disabled)"
+                        );
+                        Arc::new(BaselineCache::new())
+                    }
+                };
+
+                // C8: attach the 6 fim_*_observe LSM programs +
+                // populate WATCHED_PATHS from the effective paths
+                // set. populate_watched_paths returns the populated
+                // InodePathMap so the drain loop can resolve
+                // (dev,ino) → path. Per-step failures are logged
+                // WARN inside the helpers — the agent still boots
+                // (degrade-not-fail posture matches anti_tamper).
+                let btf = match aya::Btf::from_sys_fs() {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "fim: BTF load failed — observe programs cannot attach this boot"
+                        );
+                        None
+                    }
+                };
+                if let Some(btf) = btf.as_ref() {
+                    if let Err(e) =
+                        attach_observe_programs(sensor.ebpf_mut(), btf)
+                    {
+                        warn!(
+                            error = %e,
+                            "fim: attach_observe_programs returned error — \
+                             observe hooks may be partial"
+                        );
+                    }
+                }
+                let inode_map = match populate_watched_paths(
+                    sensor.ebpf_mut(),
+                    &watched_paths_load.effective,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "fim: populate_watched_paths failed — drain loop will see \
+                             zero (dev,ino) → path mappings; events will warn-and-skip"
+                        );
+                        Arc::new(InodePathMap::new())
+                    }
+                };
+
+                // The recompute task snapshots the merged watched-
+                // paths set every iteration — operators who edit
+                // fim-paths.local and run `nn-admin fim baseline`
+                // pick up the new set without an agent restart.
+                let mut recompute_chan = BaselineRecomputeChannel::new();
+                let sender = recompute_chan.sender();
+                let receiver = recompute_chan
+                    .take_receiver()
+                    .expect("freshly-constructed channel has a receiver");
+                let v1_for_snapshot = cli.fim_paths_v1.clone();
+                let local_for_snapshot = cli.fim_paths_local.clone();
+                tokio::spawn(run_recompute_task(
+                    receiver,
+                    Arc::clone(&baseline_db),
+                    Arc::clone(&baseline_cache),
+                    Arc::clone(&inode_map),
+                    move || {
+                        northnarrow_agent::fim::paths_config::load_watched_paths(
+                            &v1_for_snapshot,
+                            &local_for_snapshot,
+                        )
+                        .map(|l| l.effective)
+                        .unwrap_or_default()
+                    },
+                ));
+
+                // C8: open the chained drift log + spawn the drain
+                // task. The drain takes ownership of the FS_FIM_EVENTS
+                // ringbuf (taken out of the Ebpf object); subsequent
+                // map_mut("FS_FIM_EVENTS") calls would return None,
+                // which is fine because no other code references the
+                // map name.
+                let drift_db_for_drain =
+                    match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                        &cli.signing_key_file,
+                    )
+                    .and_then(|key| {
+                        FimDriftDb::open(&cli.fim_drift_file, key, agent_id)
+                    }) {
+                        Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                path = %cli.fim_drift_file.display(),
+                                "fim drift DB open failed — drain loop will not spawn; \
+                                 kernel drift events will be dropped this boot"
+                            );
+                            None
+                        }
+                    };
+
+                if let Some(drift_db) = drift_db_for_drain {
+                    match take_fs_fim_events_ringbuf(sensor.ebpf_mut()) {
+                        Ok(rb) => {
+                            let classifier = Arc::new(DriftClassifier::new());
+                            let rate_limiter_clone = Arc::clone(&rate_limiter);
+                            let inode_map_for_drain = Arc::clone(&inode_map);
+                            let baseline_cache_for_drain =
+                                Arc::clone(&baseline_cache);
+                            let event_tx = sensor.event_tx();
+                            let handle = tokio::spawn(async move {
+                                if let Err(e) = drain_loop(
+                                    rb,
+                                    inode_map_for_drain,
+                                    baseline_cache_for_drain,
+                                    drift_db,
+                                    classifier,
+                                    rate_limiter_clone,
+                                    event_tx,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        target: "fim.drain",
+                                        error = %e,
+                                        "fim drain loop exited"
+                                    );
+                                }
+                            });
+                            sensor.register_pump_handle(handle);
+                            info!("fim: drain loop spawned");
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "fim: take_fs_fim_events_ringbuf failed — drain loop \
+                                 not spawned; kernel drift events will be dropped"
+                            );
+                        }
+                    }
+                }
+
+                // §13 Q5 TOFU: empty baseline file + non-empty paths
+                // set = first boot, fire a recompute. The recompute
+                // task is already running (tokio::spawn doesn't
+                // block on the future's first poll).
+                if baseline_db.lock().last_hash()
+                    == northnarrow_agent::audit::GENESIS_PREV_HASH
+                    && !watched_paths_load.effective.is_empty()
+                {
+                    info!(
+                        paths = watched_paths_load.effective.len(),
+                        "fim: first-boot TOFU baseline triggered (§13 Q5)"
+                    );
+                    sender.trigger(RecomputeReason::FirstBootTofu);
+                }
+
+                Some(Arc::new(admin_socket::FimAdminState {
+                    recompute_sender: sender,
+                    rate_limiter,
+                    paths_summary,
+                    baseline_log_path: cli.fim_baseline_file.clone(),
+                    drift_log_path: cli.fim_drift_file.clone(),
+                }))
+            }
+            None => None,
+        }
+    };
+
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
     // runs but COMBAT can only be cleared by reboot.
     if let Some(iso) = isolator.as_ref() {
-        match AdminAuth::load(&cli.admin_pub) {
+        match AdminAuth::load_with_agent_id(&cli.admin_pub, agent_id) {
             Ok(auth) => {
                 let auth = Arc::new(auth);
                 let posture_clone = posture.clone();
                 let iso_clone = Arc::clone(iso);
                 let socket_path = cli.admin_socket.clone();
+                let signal_for_serve = shutdown_signal.clone();
+                // Tappa 8 B5: construct the AuditLog once at boot
+                // (post-A14 the file's inode is already in
+                // PROTECTED_INODES so an attacker can't replace
+                // it underneath us). The signing key is the one
+                // bootstrapped pre-attach above; we load it
+                // again here to take ownership of the in-memory
+                // SigningKey rather than wrap the pre-attach
+                // bootstrap result. agent_id is whatever the
+                // pre-attach call minted.
+                let signing_key_path = cli.signing_key_file.clone();
+                let audit_log_path = cli.audit_log_file.clone();
+                let audit_log = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+                    &signing_key_path,
+                ) {
+                    Ok(key) => {
+                        match northnarrow_agent::audit::AuditLog::open(
+                            &audit_log_path,
+                            key,
+                            agent_id,
+                        ) {
+                            Ok(log) => {
+                                Some(Arc::new(parking_lot::Mutex::new(log)))
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "audit log open failed — admin ops will run \
+                                     UNAUDITED this boot"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "agent signing key reload failed — admin ops will \
+                             run UNAUDITED this boot"
+                        );
+                        None
+                    }
+                };
+                let marker_path = cli.shutdown_marker_file.clone();
+                let fim_state_for_serve = fim_admin_state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        admin_socket::serve(socket_path, auth, Arc::new(posture_clone), iso_clone)
-                            .await
+                    if let Err(e) = admin_socket::serve_with_marker_path(
+                        socket_path,
+                        auth,
+                        Arc::new(posture_clone),
+                        iso_clone,
+                        marker_path,
+                        Some(signal_for_serve),
+                        audit_log,
+                        fim_state_for_serve,
+                    )
+                    .await
                     {
                         warn!(error = %e, "admin socket serve loop exited");
                     }
@@ -380,6 +948,34 @@ async fn main() -> Result<()> {
             }
             _ = sighup.recv() => {
                 info!("SIGHUP received; shutting down");
+                break;
+            }
+            // Tappa 8 A8: admin-authorised graceful shutdown. The
+            // dispatcher has already (a) verified the
+            // ShutdownRequest quorum, (b) written the on-disk
+            // marker the watchdog will honour, and (c) replied
+            // Success to the client BEFORE firing this signal.
+            // Breaking the loop runs the existing shutdown
+            // sequence (ADE stats, pid_file removal, admin socket
+            // unlink), then main() returns Ok(()) and the
+            // process exits 0.
+            //
+            // Design note (§10.3 step 4): we deliberately do NOT
+            // release the COMBAT iptables ruleset here. "Shutdown
+            // of the agent is orthogonal to network state" — the
+            // operator's intent is to stop the agent, not to
+            // declare the threat over. The next agent boot
+            // inherits the existing iptables state and reports
+            // COMBAT in `status`; the operator clears it with a
+            // separate `nn-admin unlock` after restart if they
+            // want.
+            _ = shutdown_signal.wait() => {
+                info!(
+                    target: "admin.shutdown",
+                    "admin-authorised shutdown signal received; \
+                     beginning graceful exit (COMBAT state preserved \
+                     across restart per design §10.3 step 4)"
+                );
                 break;
             }
         }
@@ -541,6 +1137,23 @@ async fn process_event(
             // rule engine or ADE LLM should re-evaluate. The
             // posture trigger above is the response; we are done.
             return;
+        }
+        // Tappa 9 (C4): FIM drift events. The drain loop in
+        // agent/src/fim/drain.rs already wrote the chained
+        // fim_drift.jsonl audit row + emitted Event::Fim
+        // here only if NOT rate-limited (§6.5). Log a one-
+        // line summary; the rule engine (C5 NN-L-FIM-001..009)
+        // picks up the event via the normal `engine.evaluate`
+        // path below.
+        Event::Fim(fe) => {
+            warn!(
+                path = %fe.path,
+                op = ?fe.op,
+                modifier_pid = fe.modifier_pid,
+                modifier_uid = fe.modifier_uid,
+                modifier_comm = %fe.modifier_comm,
+                "FIM DRIFT"
+            );
         }
     }
 
