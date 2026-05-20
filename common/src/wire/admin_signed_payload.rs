@@ -111,6 +111,25 @@ pub enum OperationCode {
     /// timestamp. No on-disk side effects. Authorised by
     /// `Role::FimRead` (read-only).
     FimStatus = 9,
+    /// Tappa 9.5 (K1) — operator-initiated canary token
+    /// deployment (file / process / network listener / credential).
+    /// Authorised by `Role::CanaryManage` (design §12 Q7 split-
+    /// role lock-in).
+    CanaryDeploy = 10,
+    /// Tappa 9.5 (K1) — operator-initiated read of the chained
+    /// `canaries.jsonl` registry. Read-only; authorised by
+    /// `Role::CanaryRead` (lower-privilege role per §12 Q7).
+    CanaryList = 11,
+    /// Tappa 9.5 (K1) — operator-initiated canary retirement
+    /// (removes the file / kills the listener / removes the
+    /// binary + appends a `burn` row to the registry chain).
+    /// Authorised by `Role::CanaryManage`.
+    CanaryBurn = 12,
+    /// Tappa 9.5 (K1) — operator-initiated reset of a tripped
+    /// canary's `tripped` flag (single-trip semantics per §12 Q2;
+    /// after a refresh, subsequent accesses fire the rule again).
+    /// Authorised by `Role::CanaryManage`.
+    CanaryRefresh = 13,
 }
 
 impl From<OperationCode> for u8 {
@@ -132,6 +151,10 @@ impl TryFrom<u8> for OperationCode {
             7 => Ok(Self::FimBaseline),
             8 => Ok(Self::FimReport),
             9 => Ok(Self::FimStatus),
+            10 => Ok(Self::CanaryDeploy),
+            11 => Ok(Self::CanaryList),
+            12 => Ok(Self::CanaryBurn),
+            13 => Ok(Self::CanaryRefresh),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -167,6 +190,17 @@ pub enum Role {
     /// lower-privilege FIM role; defaults to operators who hold
     /// `AuditRead` since FIM read is the same trust level.
     FimRead = 7,
+    /// Tappa 9.5 (K1) — authorises `canary list` (read-only
+    /// access to the chained `canaries.jsonl` registry). Lower-
+    /// privilege canary role per design §12 Q7 split-role
+    /// lock-in. Audit-only operators (IR, compliance) get this
+    /// without deploy authority.
+    CanaryRead = 8,
+    /// Tappa 9.5 (K1) — authorises `canary deploy` / `canary
+    /// burn` / `canary refresh`. Higher-privilege canary role
+    /// per §12 Q7. Operational operators (sysadmins) get this
+    /// for the full surface.
+    CanaryManage = 9,
     All = 255,
 }
 
@@ -187,6 +221,8 @@ impl TryFrom<u8> for Role {
             5 => Ok(Self::AuditRead),
             6 => Ok(Self::FimManage),
             7 => Ok(Self::FimRead),
+            8 => Ok(Self::CanaryRead),
+            9 => Ok(Self::CanaryManage),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -272,6 +308,122 @@ pub struct FimReportExtra {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FimStatusExtra {}
 
+/// Op-specific signed-scope fields for [`OperationCode::CanaryDeploy`]
+/// (Tappa 9.5 design §4 + §7.1). Carries the operator's chosen
+/// canary type tag + the per-type deployment data the dispatch
+/// renders into the registry. Path / port / cred family vary by
+/// type — kept as a discriminated union in the payload so the
+/// signature scope binds the exact deployment intent the
+/// operator approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryDeployExtra {
+    /// Operator-supplied human-readable canary name. Used as the
+    /// primary reference in `nn-admin canary list` output.
+    pub name: String,
+    /// The kind of canary being deployed — see [`CanaryTypeWire`].
+    pub canary_type: CanaryTypeWire,
+    /// Type-specific deployment payload (path, port, etc.).
+    pub deployment: CanaryDeploymentWire,
+}
+
+/// Op-specific signed-scope fields for [`OperationCode::CanaryList`]
+/// (Tappa 9.5 design §7.2). Empty today — the response carries
+/// the full registry JSONL body. Kept as a named struct so a
+/// future filter (`since_unix_ts`, `tripped_only`) can be added
+/// without an op renumber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CanaryListExtra {}
+
+/// Op-specific signed-scope fields for [`OperationCode::CanaryBurn`]
+/// (Tappa 9.5 design §7.3). `canary_id` is the per-canary stable
+/// ID (`SHA-256(name || deployed_at || salt)[..16]`) the operator
+/// references via `nn-admin canary burn <id>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryBurnExtra {
+    pub canary_id: String,
+}
+
+/// Op-specific signed-scope fields for
+/// [`OperationCode::CanaryRefresh`] (Tappa 9.5 design §7.4).
+/// Same `canary_id` shape as `CanaryBurnExtra`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryRefreshExtra {
+    pub canary_id: String,
+}
+
+/// Canary kind tag. Wire-byte stability mirrors [`OperationCode`]
+/// and [`Role`] (bare u8 via `serde(into = "u8", try_from = "u8")`):
+/// append-only, new variants get the next free discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
+#[repr(u8)]
+pub enum CanaryTypeWire {
+    /// File at a plausible path; OPEN is the signal. Reuses
+    /// Tappa 9 C5.2 fim_file_open_observe hook (Q4 SHARE
+    /// lock-in).
+    File = 1,
+    /// Executable at a plausible path; EXEC is the signal.
+    /// Reuses Tappa 4 sched_process_exec.
+    Process = 2,
+    /// TCP listener on a deception port; any CONNECT is the
+    /// signal. Network canary type relies on Tappa 10's
+    /// `inet_csk_listen` (feature-gated dormant if Tappa 10
+    /// hasn't shipped at K2 time).
+    Network = 3,
+    /// Credential file (subtype of File with template-rendered
+    /// content from `/etc/northnarrow/canary-templates/`).
+    Credential = 4,
+}
+
+impl From<CanaryTypeWire> for u8 {
+    fn from(t: CanaryTypeWire) -> Self {
+        t as u8
+    }
+}
+
+impl TryFrom<u8> for CanaryTypeWire {
+    type Error = SignedPayloadError;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::File),
+            2 => Ok(Self::Process),
+            3 => Ok(Self::Network),
+            4 => Ok(Self::Credential),
+            other => Err(SignedPayloadError::UnknownCanaryType(other)),
+        }
+    }
+}
+
+/// Discriminated union of canary deployment payloads. Variant
+/// order MUST track [`CanaryTypeWire`] — a `CanaryDeployExtra`
+/// whose `canary_type` and `deployment` disagree is well-formed
+/// at the CBOR layer but semantically invalid; the agent's
+/// dispatch checks this invariant before persisting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanaryDeploymentWire {
+    /// File or credential canary — absolute path on disk + the
+    /// template family (for cred canaries) or `None` (for plain
+    /// file canaries that the operator supplies content for
+    /// out-of-band via a future K6 `--content-file` flag).
+    File {
+        path: String,
+        template: Option<String>,
+    },
+    /// Process canary — absolute path of the canary binary +
+    /// the fake argv[0] string the operator wants the binary
+    /// to advertise (matches what `ps` shows; tunes the
+    /// deception authenticity).
+    Process { path: String, fake_arg0: String },
+    /// Network listener canary — bind address + port. The agent
+    /// spawns a tokio TcpListener on this socket; any accept()
+    /// trips the canary (immediate close per §12 Q6 lock-in).
+    Network { bind_addr: String, bind_port: u16 },
+    /// Credential canary — same shape as File but the template
+    /// family is REQUIRED (so the agent knows which `canary-
+    /// templates/*.tmpl` to render).
+    Credential { path: String, cred_family: String },
+}
+
 /// Discriminated union of every op-specific extra. The variant order
 /// MUST track [`OperationCode`] (Unlock, Shutdown, …); a SignedPayload
 /// whose `op` and `extra` variants disagree is well-formed at the
@@ -291,6 +443,14 @@ pub enum OperationExtra {
     FimReport(FimReportExtra),
     /// Tappa 9 (C7). Pairs with [`OperationCode::FimStatus`].
     FimStatus(FimStatusExtra),
+    /// Tappa 9.5 (K1). Pairs with [`OperationCode::CanaryDeploy`].
+    CanaryDeploy(CanaryDeployExtra),
+    /// Tappa 9.5 (K1). Pairs with [`OperationCode::CanaryList`].
+    CanaryList(CanaryListExtra),
+    /// Tappa 9.5 (K1). Pairs with [`OperationCode::CanaryBurn`].
+    CanaryBurn(CanaryBurnExtra),
+    /// Tappa 9.5 (K1). Pairs with [`OperationCode::CanaryRefresh`].
+    CanaryRefresh(CanaryRefreshExtra),
 }
 
 impl OperationExtra {
@@ -308,6 +468,10 @@ impl OperationExtra {
             OperationExtra::FimBaseline(_) => OperationCode::FimBaseline,
             OperationExtra::FimReport(_) => OperationCode::FimReport,
             OperationExtra::FimStatus(_) => OperationCode::FimStatus,
+            OperationExtra::CanaryDeploy(_) => OperationCode::CanaryDeploy,
+            OperationExtra::CanaryList(_) => OperationCode::CanaryList,
+            OperationExtra::CanaryBurn(_) => OperationCode::CanaryBurn,
+            OperationExtra::CanaryRefresh(_) => OperationCode::CanaryRefresh,
         }
     }
 }
@@ -352,6 +516,10 @@ pub enum SignedPayloadError {
     /// A peer wire byte did not match any known [`Role`]
     /// discriminant.
     UnknownRole(u8),
+    /// A peer wire byte did not match any known
+    /// [`CanaryTypeWire`] discriminant. Bubbles up out of
+    /// `CanaryTypeWire::try_from` during `serde` deserialisation.
+    UnknownCanaryType(u8),
 }
 
 impl core::fmt::Display for SignedPayloadError {
@@ -365,6 +533,7 @@ impl core::fmt::Display for SignedPayloadError {
             ),
             Self::UnknownOperationCode(v) => write!(f, "unknown operation code {v}"),
             Self::UnknownRole(v) => write!(f, "unknown role {v}"),
+            Self::UnknownCanaryType(v) => write!(f, "unknown canary type {v}"),
         }
     }
 }
@@ -581,6 +750,81 @@ impl SignedPayload {
             extra: OperationExtra::FimStatus(FimStatusExtra {}),
         }
     }
+
+    /// Tappa 9.5 (K1) — `canary deploy` signed payload
+    /// constructor. The `name` + `canary_type` + `deployment`
+    /// triple is bound into the signature scope so the operator's
+    /// approved deployment intent is what the agent persists.
+    pub fn new_canary_deploy(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        name: String,
+        canary_type: CanaryTypeWire,
+        deployment: CanaryDeploymentWire,
+    ) -> Self {
+        Self {
+            op: OperationCode::CanaryDeploy,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::CanaryDeploy(CanaryDeployExtra {
+                name,
+                canary_type,
+                deployment,
+            }),
+        }
+    }
+
+    /// Tappa 9.5 (K1) — `canary list` signed payload constructor.
+    /// Read-only op; extra empty since response carries the
+    /// chained registry JSONL body. Authorised by
+    /// `Role::CanaryRead`.
+    pub fn new_canary_list(nonce: [u8; 32], ts: u64, agent_id: [u8; 16]) -> Self {
+        Self {
+            op: OperationCode::CanaryList,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::CanaryList(CanaryListExtra {}),
+        }
+    }
+
+    /// Tappa 9.5 (K1) — `canary burn` signed payload constructor.
+    /// `canary_id` is the per-canary stable ID the operator
+    /// references; authorised by `Role::CanaryManage`.
+    pub fn new_canary_burn(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        canary_id: String,
+    ) -> Self {
+        Self {
+            op: OperationCode::CanaryBurn,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::CanaryBurn(CanaryBurnExtra { canary_id }),
+        }
+    }
+
+    /// Tappa 9.5 (K1) — `canary refresh` signed payload
+    /// constructor. Same `canary_id` shape as `new_canary_burn`;
+    /// authorised by `Role::CanaryManage`.
+    pub fn new_canary_refresh(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        canary_id: String,
+    ) -> Self {
+        Self {
+            op: OperationCode::CanaryRefresh,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::CanaryRefresh(CanaryRefreshExtra { canary_id }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -607,8 +851,10 @@ mod tests {
     /// Helper: build one [`SignedPayload`] per [`OperationCode`] so
     /// each test can iterate over all operations in one place.
     /// Tappa 9 (C1) grew the array from 6 to 8 with `FimBaseline`
-    /// and `FimReport`; Tappa 9 (C7) added `FimStatus`.
-    fn one_payload_per_op() -> [SignedPayload; 9] {
+    /// and `FimReport`; Tappa 9 (C7) added `FimStatus`; Tappa 9.5
+    /// (K1) added the four canary ops (Deploy / List / Burn /
+    /// Refresh) bringing it to 13.
+    fn one_payload_per_op() -> [SignedPayload; 13] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -630,6 +876,20 @@ mod tests {
             SignedPayload::new_fim_baseline(nonce(), TS, agent_id()),
             SignedPayload::new_fim_report(nonce(), TS, agent_id(), Some(1_700_000_000)),
             SignedPayload::new_fim_status(nonce(), TS, agent_id()),
+            SignedPayload::new_canary_deploy(
+                nonce(),
+                TS,
+                agent_id(),
+                "test_file_canary".to_string(),
+                CanaryTypeWire::File,
+                CanaryDeploymentWire::File {
+                    path: "/tmp/canary".to_string(),
+                    template: None,
+                },
+            ),
+            SignedPayload::new_canary_list(nonce(), TS, agent_id()),
+            SignedPayload::new_canary_burn(nonce(), TS, agent_id(), "abc123def456".to_string()),
+            SignedPayload::new_canary_refresh(nonce(), TS, agent_id(), "abc123def456".to_string()),
         ]
     }
 
@@ -802,6 +1062,11 @@ mod tests {
             (OperationCode::FimReport, 8),
             // Tappa 9 (C7) — APPENDED, never renumber.
             (OperationCode::FimStatus, 9),
+            // Tappa 9.5 (K1) — APPENDED, never renumber.
+            (OperationCode::CanaryDeploy, 10),
+            (OperationCode::CanaryList, 11),
+            (OperationCode::CanaryBurn, 12),
+            (OperationCode::CanaryRefresh, 13),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -831,6 +1096,9 @@ mod tests {
             // Tappa 9 (C1) additions — APPENDED, never renumber.
             (Role::FimManage, 6),
             (Role::FimRead, 7),
+            // Tappa 9.5 (K1) — APPENDED, never renumber.
+            (Role::CanaryRead, 8),
+            (Role::CanaryManage, 9),
             (Role::All, 255),
         ];
         for (r, expected) in cases {
@@ -909,6 +1177,125 @@ mod tests {
             let restored: SignedPayload =
                 ciborium::de::from_reader(&bytes[..]).expect("cbor decode");
             assert_eq!(restored, payload);
+        }
+    }
+
+    // ── Tappa 9.5 K1 — canary wire surface ─────────────────────────
+
+    /// K1 test #1: focused coverage of the four canary
+    /// [`SignedPayload`] constructors. Each produces a payload
+    /// whose `op` agrees with its `extra` variant tag, signs +
+    /// verifies against a fresh keypair, and round-trips through
+    /// cbor without bit-level drift. `one_payload_per_op` already
+    /// iterates these implicitly via the other tests; this
+    /// anchors them explicitly so a future refactor doesn't drop
+    /// coverage.
+    #[test]
+    fn new_canary_constructors_round_trip_sign_and_verify() {
+        let (signing, verifying) = fixed_keypair();
+        for payload in [
+            SignedPayload::new_canary_deploy(
+                nonce(),
+                TS,
+                agent_id(),
+                "decoy_aws_creds".to_string(),
+                CanaryTypeWire::Credential,
+                CanaryDeploymentWire::Credential {
+                    path: "/root/.aws/credentials.bak".to_string(),
+                    cred_family: "aws".to_string(),
+                },
+            ),
+            SignedPayload::new_canary_list(nonce(), TS, agent_id()),
+            SignedPayload::new_canary_burn(nonce(), TS, agent_id(), "9f3c8a01b2c3d4e5".to_string()),
+            SignedPayload::new_canary_refresh(
+                nonce(),
+                TS,
+                agent_id(),
+                "9f3c8a01b2c3d4e5".to_string(),
+            ),
+        ] {
+            assert_eq!(payload.op, payload.extra.op_code());
+            let digest = signing_digest(&payload).expect("digest");
+            let sig = signing.sign(&digest).to_bytes();
+            verify(&payload, &sig, &verifying).expect("verify");
+            let bytes = {
+                let mut v = Vec::new();
+                ciborium::ser::into_writer(&payload, &mut v).expect("cbor encode");
+                v
+            };
+            let restored: SignedPayload =
+                ciborium::de::from_reader(&bytes[..]).expect("cbor decode");
+            assert_eq!(restored, payload);
+        }
+    }
+
+    /// K1 test #2: [`CanaryTypeWire`] discriminant freeze. Same
+    /// shape as `operation_code_discriminants_are_stable_on_the_wire`
+    /// — wire-byte stability is a protocol contract; a future
+    /// renumber would silently misroute deploy intents.
+    #[test]
+    fn canary_type_discriminants_lock_in() {
+        let cases = [
+            (CanaryTypeWire::File, 1u8),
+            (CanaryTypeWire::Process, 2),
+            (CanaryTypeWire::Network, 3),
+            (CanaryTypeWire::Credential, 4),
+        ];
+        for (ct, expected) in cases {
+            assert_eq!(u8::from(ct), expected, "{ct:?}");
+            assert_eq!(CanaryTypeWire::try_from(expected).expect("known type"), ct);
+        }
+    }
+
+    /// K1 test #3: out-of-range canary-type wire bytes surface
+    /// as `UnknownCanaryType`. Mirrors the existing
+    /// `UnknownOperationCode` + `UnknownRole` error-path tests.
+    #[test]
+    fn canary_type_try_from_rejects_unknown() {
+        match CanaryTypeWire::try_from(0u8) {
+            Err(SignedPayloadError::UnknownCanaryType(0)) => {}
+            other => panic!("expected UnknownCanaryType(0), got {other:?}"),
+        }
+        match CanaryTypeWire::try_from(99u8) {
+            Err(SignedPayloadError::UnknownCanaryType(99)) => {}
+            other => panic!("expected UnknownCanaryType(99), got {other:?}"),
+        }
+    }
+
+    /// K1 test #4: `CanaryDeployExtra` round-trips through CBOR
+    /// for all 4 deployment-variant shapes. Anchors the wire-byte
+    /// stability of the discriminated union — a variant reorder
+    /// would silently change the on-wire tag and break agent
+    /// dispatch.
+    #[test]
+    fn canary_deployment_round_trips_via_cbor() {
+        let cases = [
+            CanaryDeploymentWire::File {
+                path: "/tmp/decoy.txt".to_string(),
+                template: None,
+            },
+            CanaryDeploymentWire::Process {
+                path: "/usr/local/bin/sysadmin-helper".to_string(),
+                fake_arg0: "sysadmin-helper --serve".to_string(),
+            },
+            CanaryDeploymentWire::Network {
+                bind_addr: "0.0.0.0".to_string(),
+                bind_port: 4444,
+            },
+            CanaryDeploymentWire::Credential {
+                path: "/root/.aws/credentials.bak".to_string(),
+                cred_family: "aws".to_string(),
+            },
+        ];
+        for original in cases {
+            let bytes = {
+                let mut v = Vec::new();
+                ciborium::ser::into_writer(&original, &mut v).expect("cbor encode");
+                v
+            };
+            let restored: CanaryDeploymentWire =
+                ciborium::de::from_reader(&bytes[..]).expect("cbor decode");
+            assert_eq!(restored, original);
         }
     }
 }
