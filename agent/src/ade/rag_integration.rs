@@ -51,6 +51,14 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
         // on path + op (the most-grep-able tokens for sigma-rule
         // search). Doesn't reach RAG in V1.0.
         Event::Fim(fe) => format!("fim drift {} op {:?}", fe.path, fe.op),
+        // Tappa 9.5 (K3): canary trip RAG query — never reached
+        // (canary precedence short-circuits before RAG). Arm
+        // exists for exhaustiveness.
+        Event::CanaryTripped {
+            canary_name,
+            access_kind,
+            ..
+        } => format!("canary trip {canary_name} kind {access_kind:?}"),
     }
 }
 

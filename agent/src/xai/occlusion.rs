@@ -146,6 +146,14 @@ fn event_kind_label(e: &Event) -> String {
         // events in V1.0 (XAI is process-event-centric in
         // Tappa 6.9).
         Event::Fim(fe) => format!("Fim path={} op={:?}", fe.path, fe.op),
+        // Tappa 9.5 (K3): canary trip label. Canary precedence
+        // short-circuits the rule engine in main; XAI doesn't
+        // see these. Arm for exhaustiveness.
+        Event::CanaryTripped {
+            canary_name,
+            access_kind,
+            ..
+        } => format!("CanaryTripped name={canary_name} kind={access_kind:?}"),
     }
 }
 
@@ -379,6 +387,36 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
                 F::Uid,
                 "uid",
                 "focal modifier uid".into(),
+                Identifier,
+            ));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
+        }
+        // Tappa 9.5 (K3): canary trip focal-field enumeration.
+        // XAI doesn't run on canary trips in V1.0 — the rule
+        // engine short-circuits via canary precedence. Listed
+        // for exhaustive-match coverage.
+        Event::CanaryTripped { .. } => {
+            units.push(focal_unit(
+                F::Filename,
+                "canary_name",
+                "focal canary name".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(
+                F::Pid,
+                "pid",
+                "focal accessor pid".into(),
+                Identifier,
+            ));
+            units.push(focal_unit(
+                F::Uid,
+                "uid",
+                "focal accessor uid".into(),
                 Identifier,
             ));
             units.push(focal_unit(
@@ -651,6 +689,23 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Pid => fe.modifier_pid = 0,
             F::Uid => fe.modifier_uid = 0,
             F::Timestamp => fe.timestamp_ns = 0,
+            _ => {}
+        },
+        // Tappa 9.5 (K3): canary trip field neutralisation. XAI
+        // doesn't run on canary trips in V1.0 (rule engine
+        // short-circuits via canary precedence); no-op arms
+        // for exhaustive-match coverage.
+        Event::CanaryTripped {
+            canary_name,
+            accessor_pid,
+            accessor_uid,
+            timestamp_ns,
+            ..
+        } => match field {
+            F::Filename => canary_name.clear(),
+            F::Pid => *accessor_pid = 0,
+            F::Uid => *accessor_uid = 0,
+            F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
     }

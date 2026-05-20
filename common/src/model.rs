@@ -91,6 +91,84 @@ pub enum Event {
     /// emission here means the file actually changed. C5 rule
     /// matchers consume this variant.
     Fim(crate::wire::FimEvent),
+    /// Tappa 9.5 (K3) — canary token access detected by the
+    /// inline detector filter. The filter has already
+    /// (a) verified the (dev,ino) / exe path / port matches a
+    /// deployed canary in the K2 registry, (b) marked the
+    /// canary as `tripped` (idempotent per §12 Q2), and
+    /// (c) appended a `CanaryAccessEntry` to the chained
+    /// `canary_access.jsonl` access log. The K5 rule layer
+    /// (NN-L-CANARY-001..004) consumes this variant —
+    /// always Critical + KillProcessTree + posture→COMBAT
+    /// by design §6 zero-FP contract.
+    ///
+    /// **Precedence over `Event::Fim`** (§12 Q9 OPTION B
+    /// inline-filter lock-in): when the detector returns
+    /// `Some(CanaryTripped)` for an inbound `Event::Fim` /
+    /// `Event::ProcessSpawn`, `main::process_event` REPLACES
+    /// the source event with the canary event AND skips the
+    /// FIM rule layer — so an NN-L-CANARY-004 trip on a
+    /// credential canary never double-fires alongside an
+    /// NN-L-FIM-011 read alert.
+    CanaryTripped {
+        /// Per-canary stable ID from the K2 registry (`SHA-256
+        /// (name || ":" || deployed_at_unix)[..16]` rendered as
+        /// 32 hex chars).
+        canary_id: String,
+        /// Operator-supplied human-readable canary name.
+        canary_name: String,
+        /// Kind of canary that tripped — drives K5 rule
+        /// selection (NN-L-CANARY-001 File / -002 Process /
+        /// -003 Network / -004 Credential).
+        canary_type: CanaryTypeTag,
+        /// What the agent observed the accessor doing.
+        access_kind: CanaryAccessKind,
+        /// Process triple at access time. The K5 rules use
+        /// these to dispatch the `KillProcessTree` response.
+        accessor_pid: u32,
+        accessor_uid: u32,
+        accessor_comm: alloc::string::String,
+        /// `/proc/<pid>/exe` of the accessor if userland
+        /// could resolve it at detect time. Best-effort.
+        accessor_exe: Option<alloc::string::String>,
+        /// Monotonic-clock ns from the source event
+        /// (`Event::Fim::timestamp_ns` or
+        /// `Event::ProcessSpawn::timestamp_ns`). Preserved
+        /// across the canary-precedence remap so the trip
+        /// record's wall-clock context isn't lost.
+        timestamp_ns: u64,
+    },
+}
+
+/// Std-side mirror of [`crate::wire::admin_signed_payload::
+/// CanaryTypeWire`] for `Event::CanaryTripped`. Same 4
+/// variants in the same order; identical serde wire bytes.
+/// Distinct type so the std-only `Event` enum doesn't pull in
+/// the wire-protocol `SignedPayloadError` dependency tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanaryTypeTag {
+    File,
+    Process,
+    Network,
+    Credential,
+}
+
+/// What kind of access tripped a canary. Drives K3 detector
+/// dispatch + K5 rule reasoning text. Mirrors design §4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanaryAccessKind {
+    /// File or credential canary — `inode_file_open` LSM hook
+    /// fired on the watched inode (the K3 detector intercepts
+    /// the `Event::Fim` emit BEFORE the rule layer sees it
+    /// per §12 Q9 inline-filter lock-in).
+    FileOpen,
+    /// Process canary — `sched_process_exec` tracepoint fired
+    /// on the canary binary's path.
+    ProcessExec,
+    /// Network listener canary — the agent's own
+    /// `TcpListener::accept()` returned (immediate-close per
+    /// §12 Q6 lock-in; the connect itself is the signal).
+    NetworkConnect,
 }
 
 /// Which inode operation the LSM hook denied. Wire-side these are

@@ -155,6 +155,9 @@ fn pid_of(e: &Event) -> u32 {
         // analogous field. dual_verify reaches Fim only via the
         // C9 ADE-enrichment path.
         Event::Fim(fe) => fe.modifier_pid,
+        // Tappa 9.5 (K3): canary trips short-circuit in main —
+        // never reach dual_verify; arm for exhaustiveness only.
+        Event::CanaryTripped { accessor_pid, .. } => *accessor_pid,
     }
 }
 

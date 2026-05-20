@@ -414,6 +414,13 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
         // 3-tuple shape is process-event-flavoured; we map FIM
         // naturally.
         Event::Fim(fe) => (fe.path.clone(), fe.modifier_comm.clone(), String::new()),
+        // Tappa 9.5 (K3): canary trips short-circuit before
+        // sanitize; arm for exhaustiveness only.
+        Event::CanaryTripped {
+            canary_name,
+            accessor_comm,
+            ..
+        } => (canary_name.clone(), accessor_comm.clone(), String::new()),
     }
 }
 
@@ -430,6 +437,13 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
         Event::FsProtectDenial { comm, .. } => vec![comm.clone()],
         // Tappa 9 (C4): FIM drift synth-argv. C9 may refine.
         Event::Fim(fe) => vec![fe.modifier_comm.clone(), fe.path.clone()],
+        // Tappa 9.5 (K3): canary trips short-circuit before
+        // sanitize; arm for exhaustiveness only.
+        Event::CanaryTripped {
+            canary_name,
+            accessor_comm,
+            ..
+        } => vec![accessor_comm.clone(), canary_name.clone()],
     }
 }
 
