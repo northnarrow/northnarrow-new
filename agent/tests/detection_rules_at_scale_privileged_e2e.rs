@@ -98,12 +98,26 @@ fn canary_templates_dir() -> PathBuf {
 
 const PRIV_BIN_DIR: &str = "/usr/local/bin";
 
+/// Off-PATH scratch dir for comm-named helpers (see
+/// `install_named_to_priv_bin`). Deliberately NOT on `$PATH`: an
+/// exact-name install (e.g. comm=="sudo") left behind by an
+/// interrupted run must never shadow a real system binary. Still
+/// outside `/tmp`, so R001..R010 location rules don't match.
+const PRIV_NAMED_DIR: &str = "/usr/local/lib/nn-e2etest";
+
+/// Absolute path to the real sudo. Cleanup and install must never go
+/// through a bare `sudo` PATH lookup — a leaked comm-named helper could
+/// otherwise shadow it and silently no-op the very cleanup meant to
+/// remove it (observed: an interrupted run left a `sudo`-named helper
+/// in `/usr/local/bin`, bricking `sudo` VM-wide).
+const REAL_SUDO: &str = "/usr/bin/sudo";
+
 struct InstalledBin {
     path: PathBuf,
 }
 impl Drop for InstalledBin {
     fn drop(&mut self) {
-        let _ = Command::new("sudo")
+        let _ = Command::new(REAL_SUDO)
             .arg("rm")
             .arg("-f")
             .arg(&self.path)
@@ -128,21 +142,24 @@ fn install_to_priv_bin(src: &Path) -> InstalledBin {
     InstalledBin { path: dst }
 }
 
-/// Install `src` to `/usr/local/bin/<exact_name>` so the kernel
+/// Install `src` to `<PRIV_NAMED_DIR>/<exact_name>` so the kernel
 /// `comm` (basename, TASK_COMM_LEN-truncated) is exactly `exact_name`
-/// — needed for the comm-matching process rules (R011 wants
-/// comm="insmod", R017 wants comm="bash"). /usr/local/bin is not a
-/// path any of R001..R010 match, so only the comm rule under test
-/// fires.
+/// — needed for the comm-matching rules (R011 wants comm="insmod",
+/// R017 wants comm="bash", CHAIN-008 wants comm="sudo"). The directory
+/// is off `$PATH` and outside `/tmp`: the comm is the basename only, so
+/// no rule keys on the location, while keeping the file off `$PATH`
+/// guarantees an interrupted run can't leave a binary that shadows a
+/// system command of the same name (e.g. `sudo`).
 fn install_named_to_priv_bin(src: &Path, exact_name: &str) -> InstalledBin {
-    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{exact_name}"));
+    let dst = PathBuf::from(format!("{PRIV_NAMED_DIR}/{exact_name}"));
     install_file(src, &dst);
     InstalledBin { path: dst }
 }
 
 fn install_file(src: &Path, dst: &Path) {
-    let status = Command::new("sudo")
-        .args(["install", "-m", "755", "-o", "root", "-g", "root"])
+    // `-D` creates any missing leading directories (PRIV_NAMED_DIR).
+    let status = Command::new(REAL_SUDO)
+        .args(["install", "-D", "-m", "755", "-o", "root", "-g", "root"])
         .arg(src)
         .arg(dst)
         .status()
