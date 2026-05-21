@@ -29,8 +29,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use tracing::{info, warn};
+use anyhow::{anyhow, Result};
+
+use crate::config::overlay;
 
 /// Default deploy location of the curated paths list. Matches
 /// the path `install.sh` (Tappa 9 C7) drops the repo's
@@ -77,171 +78,44 @@ pub struct WatchedPathsLoad {
 /// Errors propagate only on read/parse failures of a file that DID
 /// exist. Missing-file is fine.
 pub fn load_watched_paths(v1_path: &Path, local_path: &Path) -> Result<WatchedPathsLoad> {
-    let defaults = match read_default_list(v1_path) {
-        Ok(set) => set,
-        Err(e) => {
-            warn!(
-                error = %e,
-                path = %v1_path.display(),
-                "fim paths-config: default v1 list missing or unreadable — no defaults this boot"
-            );
-            BTreeSet::new()
-        }
-    };
-    let (adds, disables) = match read_local_overlay(local_path) {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!(
-                error = %e,
-                path = %local_path.display(),
-                "fim paths-config: operator overlay file unreadable — \
-                 ignoring local overlay this boot"
-            );
-            (BTreeSet::new(), BTreeSet::new())
-        }
-    };
-
-    // Q7 lock-in: per-disabled WARN at every boot so operators
-    // can't silently hide a regression.
-    let mut disabled = BTreeSet::new();
-    let mut unknown_disable = BTreeSet::new();
-    for d in &disables {
-        if defaults.contains(d) {
-            disabled.insert(d.clone());
-            warn!(
-                path = %d.display(),
-                "fim paths-config: default path disabled by operator config (§13 Q7)"
-            );
-        } else {
-            unknown_disable.insert(d.clone());
-            warn!(
-                path = %d.display(),
-                "fim paths-config: operator `disable:` targets a path not in the v1 default \
-                 list — no-op (check spelling)"
-            );
-        }
-    }
-
-    let mut effective: BTreeSet<PathBuf> = defaults
-        .iter()
-        .filter(|p| !disabled.contains(*p))
-        .cloned()
-        .collect();
-    for a in &adds {
-        effective.insert(a.clone());
-    }
-
-    info!(
-        defaults = defaults.len(),
-        added = adds.len(),
-        disabled = disabled.len(),
-        unknown_disable = unknown_disable.len(),
-        effective = effective.len(),
-        "fim paths-config: watched-paths load complete"
-    );
-
+    // Tappa 10.5 D1: the directive-parsing + merge + boot-WARN core
+    // now lives in the shared `config::overlay` loader; this wrapper
+    // adds the FIM-specific absolute-path validation and maps the
+    // generic `String` entries back into `PathBuf`. Behaviour is
+    // unchanged (the tests below pin the contract).
+    let load = overlay::load_flat_list(
+        "fim paths-config",
+        v1_path,
+        local_path,
+        &validate_absolute_path,
+    )?;
     Ok(WatchedPathsLoad {
-        effective,
-        added: adds,
-        disabled,
-        unknown_disable,
+        effective: load.effective.iter().map(PathBuf::from).collect(),
+        added: load.added.iter().map(PathBuf::from).collect(),
+        disabled: load.disabled.iter().map(PathBuf::from).collect(),
+        unknown_disable: load.unknown_disable.iter().map(PathBuf::from).collect(),
     })
 }
 
-/// Read the curated default list. Missing → `NotFound`; the caller
-/// in [`load_watched_paths`] turns that into a WARN + empty set.
+/// FIM entry shape rule: watched paths must be absolute.
+fn validate_absolute_path(entry: &str) -> Result<()> {
+    if !entry.starts_with('/') {
+        return Err(anyhow!(
+            "paths must be absolute (start with `/`), got `{entry}`"
+        ));
+    }
+    Ok(())
+}
+
+/// Read the curated default list. Thin `PathBuf`-typed wrapper over
+/// [`overlay::parse_default_list`] kept for the focused unit tests
+/// below; production goes through [`load_watched_paths`].
+#[cfg(test)]
 fn read_default_list(path: &Path) -> Result<BTreeSet<PathBuf>> {
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("reading default paths file {}", path.display()))?;
-    let mut set = BTreeSet::new();
-    for (lineno, raw) in body.lines().enumerate() {
-        let trimmed = strip_comment(raw).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Defensive: a default list shouldn't have +/- prefixes; if
-        // someone copies a `.local` template over `v1` we surface it.
-        if trimmed.starts_with('+') || trimmed.starts_with('-') {
-            return Err(anyhow!(
-                "{}:{}: default list must not use +/- prefixes (those are local-overlay only)",
-                path.display(),
-                lineno + 1
-            ));
-        }
-        if !trimmed.starts_with('/') {
-            return Err(anyhow!(
-                "{}:{}: paths must be absolute (start with `/`), got `{}`",
-                path.display(),
-                lineno + 1,
-                trimmed
-            ));
-        }
-        set.insert(PathBuf::from(trimmed));
-    }
-    Ok(set)
-}
-
-/// Read the operator overlay file. Returns `(adds, disables)`.
-/// Missing → `NotFound`; caller turns that into a no-overlay
-/// outcome.
-fn read_local_overlay(path: &Path) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>)> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => {
-            return Err(anyhow!(e).context(format!("reading operator overlay {}", path.display())))
-        }
-    };
-    let mut adds = BTreeSet::new();
-    let mut disables = BTreeSet::new();
-    for (lineno, raw) in body.lines().enumerate() {
-        let trimmed = strip_comment(raw).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (directive, rest) = split_directive(trimmed);
-        if !rest.starts_with('/') {
-            return Err(anyhow!(
-                "{}:{}: paths must be absolute (start with `/`), got `{}`",
-                path.display(),
-                lineno + 1,
-                rest
-            ));
-        }
-        let pb = PathBuf::from(rest);
-        match directive {
-            Directive::Add => {
-                adds.insert(pb);
-            }
-            Directive::Disable => {
-                disables.insert(pb);
-            }
-        }
-    }
-    Ok((adds, disables))
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Directive {
-    Add,
-    Disable,
-}
-
-fn split_directive(s: &str) -> (Directive, &str) {
-    if let Some(rest) = s.strip_prefix('+') {
-        (Directive::Add, rest.trim_start())
-    } else if let Some(rest) = s.strip_prefix('-') {
-        (Directive::Disable, rest.trim_start())
-    } else {
-        (Directive::Add, s)
-    }
-}
-
-fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(idx) => &line[..idx],
-        None => line,
-    }
+    Ok(overlay::parse_default_list(path, &validate_absolute_path)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect())
 }
 
 #[cfg(test)]

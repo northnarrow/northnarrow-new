@@ -1,0 +1,47 @@
+# NorthNarrow — NetFlow comm allowlist (default, v1)
+#
+# Tappa 10.5 (D1). BARE PROCESS COMM NAMES (basenames as the kernel
+# reports them, TASK_COMM_LEN-truncated) that the network detection
+# rules treat as TRUSTED ACTORS and suppress on: a flow / listener
+# attributed to one of these comms does not trip the comm-gated net
+# rules (NN-L-NET-006 uncommon-port listener, -007 RFC1918 outbound,
+# -009 byte-count anomaly, and the Tappa 10.5 -010/-011/-018/-019
+# additions).
+#
+# Format: one comm per line; `#` introduces a comment; blank lines
+# ignored; NO `+`/`-` prefixes (those are .local-only). Operators
+# tune via the overlay at /etc/northnarrow/netflow-comm-allowlist.local
+# with `+comm` (add) / `-comm` (re-enable detection on a default).
+# Every disabled default emits a boot WARN (can't silently hide a
+# regression).
+#
+# This default set is seeded from the inline allowlists previously
+# hard-coded in agent/src/decision/rules/net.rs (LISTENER_ALLOWLIST_COMMS
+# + RFC1918_OUTBOUND_ALLOWLIST_COMMS + HIGH_VOLUME_ALLOWLIST_COMMS) so
+# upgrade behaviour is unchanged when the rules switch to reading this
+# file. Tune for your environment.
+
+apache2
+apt
+chronyd
+containerd
+curl
+dnf
+dnsmasq
+dockerd
+git
+httpd
+kubelet
+nginx
+node_exporter
+ntpd
+ping
+podman
+rsync
+scp
+ssh
+sshd
+systemd-network
+systemd-resolve
+wget
+yum

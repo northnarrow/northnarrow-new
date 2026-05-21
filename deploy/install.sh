@@ -55,6 +55,17 @@ CANARY_TEMPLATES_SRC_DIR="$REPO_ROOT/configs/canary-templates"
 NETFLOW_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-blocklist.v1"
 NETFLOW_JA3_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-ja3-blocklist.v1"
 
+# Tappa 10.5 D1: default per-family comm allowlists. process-comm
+# exempts trusted actors from the process detection rules (R011..);
+# netflow-comm is the trusted-actor set the network rules suppress on
+# (seeded from the inline const sets formerly in net.rs). install.sh
+# drops both .v1 files if missing; operators tune via the matching
+# `.local` overlays. ETC_PROTECTED_FILES widens to cover all four
+# filenames so PROTECTED_INODES defends them against tamper — the
+# same lock-in as fim-paths.v1 / netflow-blocklist.v1.
+PROCESS_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/process-comm-allowlist.v1"
+NETFLOW_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/netflow-comm-allowlist.v1"
+
 # ── pre-flight ──────────────────────────────────────────────────────
 require_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -139,6 +150,25 @@ if [[ -f "$ETC_DIR/netflow-ja3-blocklist.v1" ]]; then
 else
     echo "install.sh: copying default NetFlow JA3 blocklist to $ETC_DIR/netflow-ja3-blocklist.v1"
     install -m 0644 -o root -g root "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "$ETC_DIR/netflow-ja3-blocklist.v1"
+fi
+
+# Tappa 10.5 D1: ship the default per-family comm allowlists. Same
+# idempotency contract as fim-paths.v1 — existing operator copies are
+# left untouched; only fresh installs receive the seed file. The
+# matching `.local` overlays are NOT shipped (operator-curated, deploy
+# via configuration management).
+if [[ -f "$ETC_DIR/process-comm-allowlist.v1" ]]; then
+    echo "install.sh: $ETC_DIR/process-comm-allowlist.v1 already present — leaving operator copy untouched"
+else
+    echo "install.sh: copying default process comm allowlist to $ETC_DIR/process-comm-allowlist.v1"
+    install -m 0644 -o root -g root "$PROCESS_COMM_ALLOWLIST_V1_SRC" "$ETC_DIR/process-comm-allowlist.v1"
+fi
+
+if [[ -f "$ETC_DIR/netflow-comm-allowlist.v1" ]]; then
+    echo "install.sh: $ETC_DIR/netflow-comm-allowlist.v1 already present — leaving operator copy untouched"
+else
+    echo "install.sh: copying default NetFlow comm allowlist to $ETC_DIR/netflow-comm-allowlist.v1"
+    install -m 0644 -o root -g root "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "$ETC_DIR/netflow-comm-allowlist.v1"
 fi
 
 # Tappa 9 C7: ensure /var/lib/northnarrow/ exists at mode 0700

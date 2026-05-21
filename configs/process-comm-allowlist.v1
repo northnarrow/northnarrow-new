@@ -1,0 +1,39 @@
+# NorthNarrow — process comm allowlist (default, v1)
+#
+# Tappa 10.5 (D1). BARE PROCESS COMM NAMES (basenames as the kernel
+# reports them, TASK_COMM_LEN-truncated) that are EXEMPT from the
+# Tappa 10.5 process detection rules (R011..). A site that runs a
+# normally-suspicious tool from trusted automation adds its comm here
+# to silence the rule WITHOUT a code change.
+#
+# Format: one comm per line; `#` introduces a comment; blank lines
+# ignored; NO `+`/`-` prefixes (those are .local-only). Operators
+# tune via the overlay at /etc/northnarrow/process-comm-allowlist.local
+# with `+comm` (add) / `-comm` (re-enable detection on a default).
+# Every disabled default emits a boot WARN.
+#
+# IMPORTANT — what NOT to put here: this file holds TRUSTED ACTOR
+# comms, not the detection targets. The process rules already key on
+# specific tool comms (e.g. insmod / modprobe / setcap / nsenter);
+# adding those here would disable the rule globally. The conservative
+# default below is limited to package-manager + configuration-
+# management actors that legitimately perform privileged operations
+# on a fresh-install Linux host and are the most common false-positive
+# sources. Extend per-site via the .local overlay.
+
+# Package managers
+apt
+apt-get
+dpkg
+dnf
+yum
+rpm
+snapd
+unattended-upgr
+
+# Configuration management / provisioning
+cloud-init
+ansible
+puppet
+salt-minion
+chef-client
