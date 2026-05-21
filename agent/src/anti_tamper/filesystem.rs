@@ -102,6 +102,16 @@ pub const CONFIG_DIR: &str = "/etc/northnarrow";
 /// END of the list — existing C7 + A14 positions stay stable so
 /// any audit reader indexing by slot doesn't break across the
 /// upgrade.
+///
+/// Tappa 10.5 D1 APPENDS the four comm-allowlist files
+/// (`process-comm-allowlist.{v1,local}` +
+/// `netflow-comm-allowlist.{v1,local}`) at the very END for the
+/// same reason the C7 + N8 config files get protection: an attacker
+/// who can edit an allowlist could silence detection by adding their
+/// own tool's comm (or disabling a default) without ever touching a
+/// rule. PROTECTED_INODES denies every non-agent caller, so the
+/// allowlist files are as tamper-resistant as the blocklists. Append
+/// keeps existing slots stable.
 pub const ETC_PROTECTED_FILES: &[&str] = &[
     "admin.pub",
     "agent_id",
@@ -113,6 +123,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "netflow-blocklist.local",
     "netflow-ja3-blocklist.v1",
     "netflow-ja3-blocklist.local",
+    "process-comm-allowlist.v1",
+    "process-comm-allowlist.local",
+    "netflow-comm-allowlist.v1",
+    "netflow-comm-allowlist.local",
 ];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
@@ -820,12 +834,13 @@ mod tests {
 
     // ── Tappa 8 A14 (B4) — /etc/northnarrow registration tests ─────
 
-    /// A14 + C7 + N8 test: `ETC_PROTECTED_FILES` is a stable,
-    /// ordered list of the ten file basenames. The ordering
-    /// matters for the operator-visible audit-log entries; anchor
-    /// it explicitly. A14 originally specified four files; Tappa
-    /// 9 C7 appended `fim-paths.v1` + `fim-paths.local` and Tappa
-    /// 10 N8 appended the four `netflow-*-blocklist*` files —
+    /// A14 + C7 + N8 + Tappa 10.5 D1 test: `ETC_PROTECTED_FILES` is
+    /// a stable, ordered list of the fourteen file basenames. The
+    /// ordering matters for the operator-visible audit-log entries;
+    /// anchor it explicitly. A14 originally specified four files;
+    /// Tappa 9 C7 appended `fim-paths.v1` + `fim-paths.local`,
+    /// Tappa 10 N8 appended the four `netflow-*-blocklist*` files,
+    /// and Tappa 10.5 D1 appended the four comm-allowlist files —
     /// each later commit only APPENDS so existing positions stay
     /// stable for any audit-log reader that indexes by slot.
     #[test]
@@ -843,11 +858,37 @@ mod tests {
                 "netflow-blocklist.local",
                 "netflow-ja3-blocklist.v1",
                 "netflow-ja3-blocklist.local",
+                "process-comm-allowlist.v1",
+                "process-comm-allowlist.local",
+                "netflow-comm-allowlist.v1",
+                "netflow-comm-allowlist.local",
             ],
-            "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 \
-             specify these files in this order"
+            "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
+             Tappa 10.5 D1 specify these files in this order"
         );
         assert_eq!(CONFIG_DIR, "/etc/northnarrow");
+    }
+
+    /// Tappa 10.5 D1 test: `ETC_PROTECTED_FILES` includes the four
+    /// comm-allowlist files — `process-comm-allowlist.{v1,local}`
+    /// (process rule exemptions) and `netflow-comm-allowlist.{v1,local}`
+    /// (net rule trusted-actor set). Mirrors the focused N8
+    /// `etc_protected_files_includes_net_blocklists` test — calls
+    /// out the D1 widening intent so a future refactor that drops an
+    /// entry fails fast even if it pacifies the exhaustive list above.
+    #[test]
+    fn etc_protected_files_includes_comm_allowlists() {
+        for name in [
+            "process-comm-allowlist.v1",
+            "process-comm-allowlist.local",
+            "netflow-comm-allowlist.v1",
+            "netflow-comm-allowlist.local",
+        ] {
+            assert!(
+                ETC_PROTECTED_FILES.contains(&name),
+                "{name} must be in ETC_PROTECTED_FILES (Tappa 10.5 D1 LSM widening)"
+            );
+        }
     }
 
     /// N8 test: `ETC_PROTECTED_FILES` includes the four Tappa 10

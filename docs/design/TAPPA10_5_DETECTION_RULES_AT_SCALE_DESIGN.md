@@ -1,9 +1,11 @@
 # Tappa 10.5 — Detection Rules at Scale Design
 
-**Status:** RFC OPEN — 10 owner-ruling items in §13 (engineering
-recommendation supplied for each, awaiting sign-off). NO
-implementation begins until §13 is resolved.
-**Author:** Claude Code (architecture), pending owner sign-off.
+**Status:** RFC RESOLVED 2026-05-21 (§13 — all 10 owner-accepted
+engineering recommendations applied verbatim as resolved decision
+blocks). D1 implementation (shared allowlist infra + LSM widening)
+unblocked; sequenced per the §12 commit chain (D1 → D2 → … → D7,
+D8 optional).
+**Author:** Claude Code (architecture), owner-signed-off 2026-05-21.
 **Date:** 2026-05-21.
 **Prerequisite track:** Tappe 2, 6, 7, 8, 9, 9.5, 10 are all SHIPPED
 and 100% verified on northnarrowdev (kernel 6.8.0-117). Tappa 10.5
@@ -90,8 +92,10 @@ operators in noise.
   history-clearing) need argv. Adding argv is a *wire + BPF* change
   and is therefore **out of Tappa 10.5 scope** (it would violate the
   "no new wire types" goal). Process rules in §6/§7 are scoped to
-  what the current event shape supports; argv-enrichment is flagged
-  as a future tappa.
+  what the current event shape supports; the argv/parent-`comm`
+  enrichment is the **explicit Beta blocker tracked against T10.6**
+  (the combined detection-depth tappa — see §13 "Accepted
+  architectural limits").
 
 ### 1.3 Out of scope (deferred to named successors)
 
@@ -356,8 +360,9 @@ carries no argv and no resolved parent `comm` — only `ppid` as a
 number. Process rules are therefore limited to *"this binary
 (`comm`/`filename`) ran, from this path, as this `uid`"* predicates.
 This is the documented reason (§1.2 non-goal) several attractive
-process TTPs are deferred to a future argv-enrichment tappa rather
-than forced into 10.5 with weak heuristics.
+process TTPs are deferred to the **T10.6** argv/parent-`comm`
+wire+BPF refit (tracked Beta blocker, §13 "Accepted architectural
+limits") rather than forced into 10.5 with weak heuristics.
 
 ### 4.3 Allowlist config schema (on disk)
 
@@ -695,14 +700,18 @@ refit lands first; otherwise they are not in this plan.
 
 ---
 
-## 13. RFC items for owner ruling
+## 13. RFC resolutions
 
-Each: **Question**, **Recommendation** (engineering default),
-**Rationale**, **Reversibility**.
+All 10 RFC items resolved **2026-05-21** (owner-accepted engineering
+recommendations applied verbatim). D1 implementation unblocked;
+sequenced per the §12 commit chain. Each block below: **Decision**,
+**Rationale**, **Implementation note** (where in this doc / commit
+plan the decision manifests), **Reversibility**, **Date resolved**.
 
 ### Q1 — Total rule-count target: 60 / 80 / 100?
 
-- **Recommendation: 60–65 for V1.0 (the §7 plan lands ~61).**
+- **Decision:** TARGET 60–65 for V1.0. The §7 plan lands ~61 live
+  rules. NOT 80 / 100.
 - **Rationale:** the credibility metric is **MITRE tactic breadth**
   (§2.2), not raw count. Wazuh's "thousands" counts per-signature
   syscheck/log-decoder entries — not comparable to curated
@@ -711,14 +720,18 @@ Each: **Question**, **Recommendation** (engineering default),
   detection per host-relevant tactic is the defensible story. Raw
   count past ~65 hits diminishing returns against the
   no-argv/DNS-blocked constraints without new sensors.
+- **Implementation note:** §6/§7 allocation lands 61; §6 "Live-engine
+  count after 10.5" + the D6 `decision/tests.rs` `== 61` assertion
+  pin it.
 - **Reversibility:** easy — append more rules later; IDs are
   immutable so growth is purely additive.
+- **Date resolved:** 2026-05-21.
 
 ### Q2 — Chain rules: V1.0 or V1.1? Correlation engine?
 
-- **Recommendation: ship 3 *stateful single-trigger* chain rules in
-  10.5 (§6.4, shape §3.5-A); defer the N-event/cross-PID set + the
-  two-pass correlation engine to T10.6.**
+- **Decision:** SHIP 3 *stateful single-trigger* chain rules in 10.5
+  (§6.4, shape §3.5-A); DEFER the N-event/cross-PID set + the
+  two-pass correlation engine to **T10.6**.
 - **Rationale:** the existing `Rule` trait + `CorrelationBuffer` +
   the NN-L-NET-005 `DnsBurstWindow` precedent already support
   2-event same-PID chains with no new module. A general correlation
@@ -726,53 +739,72 @@ Each: **Question**, **Recommendation** (engineering default),
   foreshadowed in `decision/mod.rs:15`) and deserves its own tappa.
   T6.9 RAG-Local does **not** cover this — it's LLM enrichment, not
   deterministic multi-event correlation.
-- **Reversibility:** medium — the 3 stateful rules are self-contained;
-  T10.6's engine can subsume them or run alongside.
+- **Implementation note:** §6.4 NN-L-CHAIN-001..003 ship in commit
+  D5 (D5 itself gated on this ruling — now resolved, D5 proceeds).
+  T10.6 (see Q9 + the consolidated-scope note below) carries the
+  engine.
+- **Reversibility:** medium — the 3 stateful rules are
+  self-contained; T10.6's engine can subsume them or run alongside.
+- **Date resolved:** 2026-05-21.
 
 ### Q3 — Allowlist format: per-rule vs per-family?
 
-- **Recommendation: per-FAMILY flat `.v1`/`.local`, mirroring
-  `fim-paths`. NOT per-rule.**
+- **Decision:** PER-FAMILY flat `.v1`/`.local`, mirroring
+  `fim-paths`. NOT per-rule.
 - **Rationale:** per-rule files explode operator surface (60+ files);
   per-family (`process-comm-allowlist`, `netflow-comm-allowlist`,
   `fim-paths`) matches the shipped C7 pattern operators already know,
   reuses one parser, and the `net.rs:69` comment already commits to
   exactly this shape. Rules that need finer scope encode it in their
   predicate (e.g. uid-class), not in a separate file.
+- **Implementation note:** §3.6 generalised
+  `config::overlay::load_flat_list` + §4.3 file schema, both built in
+  commit **D1** (this batch). The inline `net.rs` `const` allowlists
+  externalise to `netflow-comm-allowlist.v1`.
 - **Reversibility:** easy — a per-rule overlay can layer on top later
   if a specific rule proves to need it.
+- **Date resolved:** 2026-05-21.
 
 ### Q4 — MITRE coverage minimum threshold for Beta?
 
-- **Recommendation: ≥1 production detection in each of the 8
-  host-relevant tactics** (Execution, Persistence, PrivEsc, Defense
+- **Decision:** ≥1 production detection in each of the 8
+  host-relevant tactics (Execution, Persistence, PrivEsc, Defense
   Evasion, Credential Access, Lateral Movement, C2, Impact).
   Discovery + Exfiltration = "covered via chain rules"; Initial
-  Access + Collection = explicit best-effort (non-goal).
+  Access + Collection = explicit best-effort (non-goal). NO
+  percentage-of-techniques target.
 - **Rationale:** a percentage-of-techniques target is misleading
   (ATT&CK has 200+ techniques, most irrelevant to a Linux host
   post-exec sensor) and invites checkbox-gaming. "Every applicable
   tactic has a detection" is honest and defensible in a procurement
   review.
+- **Implementation note:** §2.2 matrix is the living coverage
+  tracker; Appendix B is the tactic→rule index verified at each
+  commit.
 - **Reversibility:** easy — the §2.2 matrix is the living tracker.
+- **Date resolved:** 2026-05-21.
 
 ### Q5 — Add an `Informational` severity tier?
 
-- **Recommendation: NO. Keep the 4-tier `Severity`.** Use
+- **Decision:** NO. Keep the 4-tier `Severity`. Use
   `ResponseAction::Log` at `Medium`/`Low` for defense-in-depth
   logging; add the `*_low` rate-limit category (§3.4) to back it.
 - **Rationale:** `Severity` is a wire enum (`common/src/model.rs:372`)
   with a postcard discriminant; adding a variant ripples into
   posture-mapping, ADE gating, audit schema, and every match arm —
   high churn for a tier that `Log`-at-`Low` already expresses.
+- **Implementation note:** §3.2 retains the 4-tier table; §3.4 adds
+  the `*_low` (5000/min) category in commit D1's category-mapping
+  refinement.
 - **Reversibility:** medium — adding the variant later is a
   wire-compat exercise (append-last), so deferring costs nothing.
+- **Date resolved:** 2026-05-21.
 
 ### Q6 — DNS-dependent rules: ship-logic-but-ignore, or defer entirely?
 
-- **Recommendation: author logic if convenient but REGISTER-GATE out
-  of the production engine until the T4 refit (N9.2/10.1) lands.**
-  Mark `#[ignore]` on their priv-e2e; keep unit tests on the pure
+- **Decision:** AUTHOR logic if convenient but REGISTER-GATE out of
+  the production engine until the T4 refit (N9.2/10.1) lands. Mark
+  `#[ignore]` on their priv-e2e; keep unit tests on the pure
   predicate.
 - **Rationale:** a rule registered in the live engine that *cannot
   fire* (because `Event::DnsQuery` never arrives for real resolution
@@ -780,77 +812,115 @@ Each: **Question**, **Recommendation** (engineering default),
   operators reading the rule list. Gating keeps the count truthful;
   the predicate stays unit-tested so the refit lights it up with one
   registration line.
+- **Implementation note:** §6.3 / §7.3 mark NN-L-NET-014/015 **G**
+  (gated, excluded from the count); §1.3 names the T4 refit
+  (N9.2/10.1) dependency.
 - **Reversibility:** easy — registration is one line behind the
   refit.
+- **Date resolved:** 2026-05-21.
 
 ### Q7 — Rate-limit category assignment: same scheme or finer?
 
-- **Recommendation: reuse the existing `*_critical/_high/_medium`
+- **Decision:** REUSE the existing `*_critical/_high/_medium`
   category-string scheme (`net.rs:59`), add `*_low`. Critical NEVER
-  throttled.**
+  throttled. No finer-grained per-rule caps in V1.0.
 - **Rationale:** the bucket-aware emitter already reads
   `Rule::category()`; generalising the existing convention to
   `proc_*`/`fim_*`/`chain_*` is zero new mechanism. Finer-grained
   per-rule caps add tuning surface with no demonstrated need.
+- **Implementation note:** §3.4 tier table + the `*_low` addition
+  land in commit **D1**; each new rule's `category()` carries its
+  tier suffix.
 - **Reversibility:** easy — runtime-tunable caps; categories are
   strings.
+- **Date resolved:** 2026-05-21.
 
 ### Q8 — Test pattern: per-rule pairs or table-driven?
 
-- **Recommendation: HYBRID.** Per-rule positive+negative pairs
-  (shipped convention) for heterogeneous rules; table-driven
-  `(input, expect)` for the homogeneous FIM path-pattern family
-  (FIM-015..023) and the high-risk-port net set.
+- **Decision:** HYBRID. Per-rule positive+negative pairs (shipped
+  convention) for heterogeneous rules; table-driven `(input, expect)`
+  for the homogeneous FIM path-pattern family (FIM-015..023) and the
+  high-risk-port net set.
 - **Rationale:** the FIM family is 9 near-identical path-match rules —
   a table is more readable + maintainable than 18 copy-paste tests;
   the stateful/chain rules each need bespoke window setup where a
   table obscures intent.
+- **Implementation note:** §11.1 test plan per commit; D3 uses the
+  table form, D2/D4/D5 use bespoke pairs.
 - **Reversibility:** easy — test-only choice, per-family.
+- **Date resolved:** 2026-05-21.
 
 ### Q9 — One tappa or split T10.5 / T10.6 / T10.7?
 
-- **Recommendation: ONE tappa T10.5** = process + FIM + shippable-net
-  + allowlist framework + 3 stateful chain rules (D1–D7), with the
-  **full chain-rule set deferred to T10.6** (gated on Q2's
-  correlation engine) and **ADE templates as optional D8** (or folded
-  into a later ADE tappa). Avoid a T10.7.
+- **Decision:** ONE tappa T10.5 = process + FIM + shippable-net +
+  allowlist framework + 3 stateful chain rules (D1–D7), with the
+  **full chain-rule set + correlation engine deferred to T10.6** and
+  **ADE templates as optional D8**. No T10.7.
 - **Rationale:** D1–D7 are one coherent deliverable (content + the
   framework that makes it deployable). The chain *engine* is the only
   genuine architectural fork → it earns the T10.6 split. Splitting
   ADE into its own tappa proliferates ceremony for ~5 h of work.
+- **Implementation note:** §12 commit plan D1–D8; D8 is flagged
+  optional.
 - **Reversibility:** easy — commit chain is internal; D8 can move.
+- **Date resolved:** 2026-05-21.
 
 ### Q10 — Backward-compat: any current rule needs downgrade/split?
 
-- **Recommendation: NO downgrades; NO ID changes** (immutable-ID
-  contract, `decision/mod.rs:12`). One **additive refinement**:
-  NN-L-NET-018 (RFC1918 lateral-movement ports) overlaps
-  NN-L-NET-007 (RFC1918 outbound) — keep both; NET-007 stays the
-  broad Medium catch-all, NET-018 is the High port-specific
-  refinement. Document the intentional overlap so a future reviewer
-  doesn't "dedupe" them.
+- **Decision:** NO downgrades; NO ID changes (immutable-ID contract,
+  `decision/mod.rs:12`). One **additive refinement**: NN-L-NET-018
+  (RFC1918 lateral-movement ports) overlaps NN-L-NET-007 (RFC1918
+  outbound) — keep both; NET-007 stays the broad Medium catch-all,
+  NET-018 is the High port-specific refinement. The intentional
+  overlap is documented so a future reviewer doesn't "dedupe" them.
 - **Rationale:** stability of shipped IDs is a hard contract
   (telemetry/alert-dedup/correlation depend on it). The only real
   question is overlap, resolved by tiering not merging.
+- **Implementation note:** §7.3 lists both NET-007 (shipped) and
+  NET-018 (new) with the tiering documented inline.
 - **Reversibility:** easy — overlap is documented intent.
+- **Date resolved:** 2026-05-21.
+
+### Accepted architectural limits (owner-confirmed 2026-05-21)
+
+Two scope constraints surfaced in the §13 pass were accepted by the
+owner and are tracked here so the deferral is unambiguous:
+
+- **`Event::ProcessSpawn` argv + parent-`comm` enrichment → T10.6.**
+  The current variant (§4.2) carries no command-line args and no
+  resolved parent `comm`. Richer process detection (e.g. `curl … |
+  bash`, `systemctl enable`, history-clearing) needs a **wire + BPF**
+  refit, which is out of 10.5 scope. This is an **explicit Beta
+  blocker tracked against T10.6** — T10.6 is therefore the combined
+  "detection-depth" tappa carrying *both* the correlation engine
+  (Q2/Q9) *and* the ProcessSpawn argv/parent-comm refit. (§1.2,
+  §4.2, §6.1 reference this single T10.6 home.)
+- **DNS-payload detection → blocked on the T4 refit (N9.2/10.1).**
+  Per Q6, those rules are register-gated out of the live engine
+  until `Event::DnsQuery` fires for real resolution with a populated
+  qname (Bug 2 + Bug 3, `agent-ebpf/src/dns_query.rs`). Independent
+  of T10.6.
 
 ### Cross-cutting lock-ins
 
 1. **Q2 (stateful chain subset) + Q9 (one tappa)** → the 3 chain
-   rules ship in 10.5 D5; the engine + the rest defer to T10.6.
+   rules ship in 10.5 D5; the engine + the rest defer to T10.6 (which
+   also carries the ProcessSpawn argv/parent-comm refit per the
+   accepted-limits note above).
 2. **Q3 (per-family allowlist) + Q7 (category scheme) + §3.6
    (generalised loader)** → one parser, one category convention,
-   reused across all families. D1 is the shared-infrastructure
-   commit everything else depends on.
+   reused across all families. **D1 (this batch) is the
+   shared-infrastructure commit everything else depends on.**
 3. **Q5 (no Info tier) + Q7 (`*_low` category)** → defense-in-depth
    logging expressed without a wire-enum change.
 4. **Q6 (gate DNS rules) + §1.3 (JA3 deferred to 11.5)** → the live
    `rule_count()` reflects only rules that can actually fire on the
    current sensor stack; blocked/deferred rules are documented, not
    registered.
-5. **§1.2 (no argv) + Q1 (60–65 target)** → process-family count is
-   bounded by the current `ProcessSpawn` shape; argv-enrichment is a
-   future tappa, not a 10.5 stretch.
+5. **§1.2 (no argv → T10.6) + Q1 (60–65 target)** → process-family
+   count is bounded by the current `ProcessSpawn` shape; the
+   argv-enrichment refit is the tracked T10.6 Beta blocker, not a
+   10.5 stretch.
 
 ---
 
