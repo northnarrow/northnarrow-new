@@ -21,14 +21,16 @@ use super::{Rule, RuleEngine};
 /// 7 Tappa-10.5 process rules (R011..R017), 23 FIM rules
 /// (NN-L-FIM-001..014 from Tappa 9 plus NN-L-FIM-015..023 from
 /// Tappa 10.5 D3), 4 Tappa-9.5 canary rules (NN-L-CANARY-001..004),
-/// and 14 NetFlow rules (NN-L-NET-001..009 from Tappa 10 plus
-/// NN-L-NET-010/011/013/018/019 from Tappa 10.5 D4) — 61 in total.
-/// Each family matches a distinct `Event` variant set, so the
-/// first-match short-circuit is unaffected across families.
+/// and 15 NetFlow rules (NN-L-NET-001..009 from Tappa 10,
+/// NN-L-NET-010/011/013/018/019 from Tappa 10.5 D4, plus
+/// NN-L-NET-014 DNS-tunnel entropy un-gated by the Tappa 4.1 DNS
+/// observability refit) — 62 in total. Each family matches a distinct
+/// `Event` variant set, so the first-match short-circuit is unaffected
+/// across families.
 #[test]
-fn default_engine_has_sixtyone_rules_across_all_families() {
+fn default_engine_has_sixtytwo_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
-    assert_eq!(engine.rule_count(), 3 + 10 + 7 + 23 + 4 + 14);
+    assert_eq!(engine.rule_count(), 3 + 10 + 7 + 23 + 4 + 15);
 }
 
 #[test]
@@ -206,19 +208,24 @@ fn rule_ids_are_pinned() {
 /// per-family tests (`rule_ids_are_pinned` for process,
 /// `chain_rules_builder_returns_three_rules`, the FIM/canary/net
 /// builder tests) each pin their own slice; this walks the FULL
-/// `default_rules()` set and asserts the exact sorted list of all 61
+/// `default_rules()` set and asserts the exact sorted list of all 62
 /// shipped IDs. Any rename, drop, duplicate, or accidental
 /// addition fails here — the immutable-ID contract (decision/mod.rs)
 /// covered end-to-end in one place.
+///
+/// Tappa 4.1 lifted the count 61 → 62 by un-gating NN-L-NET-014
+/// (DNS-tunnel entropy) once the DNS observability refit gave the
+/// engine a real QNAME to score. NN-L-NET-015 (fast-flux) stays gated
+/// pending the V1.1 DNS-response observer.
 #[test]
-fn default_engine_pins_all_sixtyone_rule_ids() {
+fn default_engine_pins_all_sixtytwo_rule_ids() {
     let rules = super::rules::default_rules();
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
-    assert_eq!(ids.len(), 61, "engine ships 61 rules at the §7 target");
+    assert_eq!(ids.len(), 62, "engine ships 62 rules after the T4.1 refit");
     ids.sort_unstable();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 61, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 62, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -265,6 +272,7 @@ fn default_engine_pins_all_sixtyone_rule_ids() {
             "NN-L-NET-010_OutboundToHighRiskC2Port",
             "NN-L-NET-011_PlaintextCredService",
             "NN-L-NET-013_Beacon",
+            "NN-L-NET-014_DnsTunnelEntropy",
             "NN-L-NET-018_Rfc1918LateralPort",
             "NN-L-NET-019_WildcardListener",
             "R001_ExecFromTmp",

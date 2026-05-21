@@ -66,6 +66,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// or may not be running.
 const FLOW_DST_PORT: u16 = 33999;
 
+/// FQDN the DNS-attribution test resolves. `.invalid` (RFC 2606)
+/// guarantees NXDOMAIN — the query hits the wire (what the kprobe +
+/// PID-keyed DnsCache need) but never resolves to a real host, so no
+/// egress leaves the isolated target.
+const DNS_ATTRIBUTION_HOST: &str = "foo.northnarrow-e2etest.invalid";
+
 /// Uncommon listener port for test #2. Outside the §7
 /// allowlist `{22, 53, 80, 443, 8080, 8443}` so NN-L-NET-006
 /// fires; not 12345 (per §11.2 example) because we want a
@@ -438,35 +444,35 @@ where
 /// (operator-visibility gap re container-to-container loopback
 /// C2 in shared-netns Kubernetes pods).
 ///
-/// **§11.2 DNS-attribution coverage NOT exercised here.** The
-/// original §11.2 spec for test #1 asserted `resolved_hostname`
-/// gets populated via `DnsCache::lookup_for_connect`. That
-/// assertion was DEFERRED in the N9.1 hotfix because the Tappa 4
-/// `dns_query` kprobe has two pre-existing bugs the N9 priv-e2e
-/// was the first to expose end-to-end:
-///   - Bug 2 (`agent-ebpf/src/dns_query.rs:100-102`) — early-
-///     returns when `msghdr->msg_name == NULL`, which is exactly
-///     the shape libc resolvers emit (`connect()` + `send()`).
-///     glibc's `res_nquery` uses connected sockets → kprobe
-///     never fires for real DNS resolution.
-///   - Bug 3 (`agent-ebpf/src/dns_query.rs:168-178`) — kernel
-///     side never copies the QNAME bytes from the UDP payload
-///     into `(*raw_ptr).query_name`. `qname_len` stays 0, so
-///     userland decodes an empty string regardless.
+/// **§11.2 DNS-attribution coverage — restored by the Tappa 4.1 DNS
+/// observability refit.** The original §11.2 spec asserted
+/// `resolved_hostname` is populated via `DnsCache::lookup_for_connect`;
+/// that assertion was DEFERRED in the N9.1 hotfix because the Tappa 4
+/// `dns_query` kprobe had two pre-existing bugs the N9 priv-e2e was the
+/// first to expose end-to-end. T4.1 closed both:
+///   - Bug 2 — the kprobe early-returned when `msghdr->msg_name ==
+///     NULL`, which is exactly the connected-UDP shape libc resolvers
+///     emit (`connect()` + `send()`). The kprobe now falls back to the
+///     socket's `__sk_common` destination, so it fires for real
+///     resolution.
+///   - Bug 3 — the kernel side never copied the QNAME. It now walks
+///     `msg_iter` (ITER_UBUF) and copies the label-encoded QNAME, so
+///     userland decodes the real name.
 ///
-/// DNS attribution stays unit-tested via N4's 6
-/// `agent/src/net/dns_cache.rs::tests` (PID-keyed cache + TTL
-/// expiry + cross-PID isolation). The T4 DNS observability
-/// refit is tracked separately — see N9.1 commit message
-/// backlog item "Tappa 10 N9.2 / 10.1: T4 DNS observability
-/// refit".
+/// With both fixed, the PID-keyed `DnsCache` records the helper's
+/// query and `lookup_for_connect` attributes it to the immediately
+/// following connect from the same PID → `resolved_hostname`.
+///
+/// The helper queries an FQDN (trailing dot) so glibc skips
+/// `resolv.conf` search-domain expansion and the most-recent observed
+/// QNAME is deterministically the literal we assert.
 ///
 /// **§11.2 test #2 (JA3 fingerprint)** stays DEFERRED to
 /// Tappa 11.5 per §13 Q2 packet-capture atomicity lock-in
-/// (separate, pre-existing deferral — unchanged by N9.1).
+/// (separate, pre-existing deferral — unchanged here).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
-fn net_outbound_connect_records_flow_for_loopback_destination() {
+fn net_outbound_connect_records_flow_with_dns_attribution() {
     let _eni = EniIptablesGuard::install();
     let fx = NetFixture::setup();
 
@@ -489,14 +495,22 @@ fn net_outbound_connect_records_flow_for_loopback_destination() {
     });
 
     // Spawn the helper. python3 is universally present on the
-    // production target; if it's missing, we want a clear
-    // failure message rather than a silent skip. Connect + close
-    // only — no `gethostbyname` call. DNS attribution coverage
-    // intentionally NOT exercised here (see test docstring
-    // re T4 DNS bugs 2 + 3).
+    // production target; if it's missing, we want a clear failure
+    // message rather than a silent skip. The helper resolves an FQDN
+    // (the kprobe captures the connected-UDP DNS query → PID-keyed
+    // DnsCache), then connects to loopback from the SAME PID so the
+    // drain loop attributes the qname to the flow. The `.invalid`
+    // TLD guarantees NXDOMAIN (no real egress); the query still goes
+    // on the wire, which is all the attribution needs. The trailing
+    // dot makes it absolute → no search-domain expansion, so the
+    // most-recent observed QNAME is exactly the asserted literal.
     let helper = format!(
         r#"
 import socket
+try:
+    socket.gethostbyname("{host}.")
+except Exception:
+    pass
 s = socket.socket()
 s.settimeout(2)
 try:
@@ -509,6 +523,7 @@ except Exception:
     pass
 s.close()
 "#,
+        host = DNS_ATTRIBUTION_HOST,
         port = FLOW_DST_PORT,
     );
     let status = Command::new("python3")
@@ -564,11 +579,16 @@ s.close()
         row["agent_sig"].as_str().is_some_and(|s| !s.is_empty()),
         "agent_sig must be present on a chained row"
     );
-    // resolved_hostname IS NOT ASSERTED — see the test docstring
-    // for the T4 DNS observability refit deferral. A future
-    // commit that fixes Bug 2 + Bug 3 in `agent-ebpf/src/dns_query.rs`
-    // will extend this test (or add a sibling) to pin the
-    // attribution path on a live kernel.
+    // DNS attribution (restored by the T4.1 refit): the helper's
+    // resolution of DNS_ATTRIBUTION_HOST is captured by the dns_query
+    // kprobe and back-correlated to this same-PID connect.
+    assert_eq!(
+        row["resolved_hostname"].as_str(),
+        Some(DNS_ATTRIBUTION_HOST),
+        "resolved_hostname should be the helper's queried FQDN \
+         (T4.1 DNS attribution); got {:?}",
+        row["resolved_hostname"]
+    );
 }
 
 // ── Test 2: uncommon-port listener trips NN-L-NET-006 ──────────────
