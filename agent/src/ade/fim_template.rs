@@ -104,6 +104,38 @@ pub fn is_critical_fim_rule(verdict: &Verdict) -> bool {
             .any(|rid| *rid == verdict.rule_id)
 }
 
+/// Per-rule MITRE / threat-actor context for a Critical FIM rule,
+/// spliced into [`render_individual_prompt`] as a `### rule-context:`
+/// block so the LLM second-opinion is anchored on the SAME TTP mapping
+/// the deterministic rule fired on (rather than re-deriving it from the
+/// raw path). Tappa 10.5 D8 adds the two D3 Critical rules; the four
+/// Tappa 9 rules keep their pre-D8 generic prompt (the file path alone
+/// is self-describing for those — system-binary / SUID / kmod /
+/// ransomware-rename). Returns `None` for any rule without a curated
+/// line, in which case the prompt omits the section entirely
+/// (byte-identical to the pre-D8 output for those rules).
+pub fn critical_fim_rule_context(rule_id: &str) -> Option<&'static str> {
+    match rule_id {
+        "NN-L-FIM-021_PamModuleModified" => Some(
+            "MITRE T1543 (Create or Modify System Process) + T1556 (Modify \
+             Authentication Process). A PAM `.so` written outside the package \
+             manager is a credential-harvesting + auth-bypass persistence \
+             primitive — a staple of Russian-APT and other state-actor Linux \
+             toolkits (capture plaintext credentials at authentication time, \
+             install a hidden backdoor auth path). High-confidence Critical: \
+             legitimate PAM modules ship via dpkg/rpm, not ad-hoc writes.",
+        ),
+        "NN-L-FIM-022_LdSoPreloadModified" => Some(
+            "MITRE T1574.006 (Dynamic Linker Hijacking). /etc/ld.so.preload is \
+             the canonical userland-rootkit anchor and is legitimately ABSENT \
+             on a stock host — any create/modify is a near-certain LD_PRELOAD \
+             rootkit indicator (Diamorphine / HiddenWasp / Symbiote lineage). \
+             High-confidence Critical: no benign comm exemption applies.",
+        ),
+        _ => None,
+    }
+}
+
 // ── prompt builder ──────────────────────────────────────────────────
 
 /// Build the structured ADE prompt envelope for a single
@@ -124,6 +156,16 @@ pub fn render_individual_prompt(event: &FimEvent, verdict: &Verdict, posture: &s
     s.push_str(&format!("severity: {:?}\n", verdict.severity));
     s.push_str(&format!("posture_at_fire: {posture}\n"));
     s.push('\n');
+
+    // System context (MITRE TTP) for the D3 Critical rules — omitted
+    // for rules whose path is already self-describing (see
+    // [`critical_fim_rule_context`]).
+    if let Some(ctx) = critical_fim_rule_context(&verdict.rule_id) {
+        s.push_str("### rule-context:\n");
+        s.push_str(ctx);
+        s.push('\n');
+        s.push('\n');
+    }
 
     s.push_str("### file:\n");
     s.push_str(&format!("path: {}\n", event.path));
@@ -479,10 +521,51 @@ mod tests {
         // Non-FIM Critical rule — skip.
         let non_fim = fake_critical_verdict("R001_ExecFromTmp");
         assert!(!is_critical_fim_rule(&non_fim));
+        // Tappa 10.5 D8 routing: a Critical CHAIN verdict is NOT a FIM
+        // verdict — it routes to chain_template, not here.
+        let chain = fake_critical_verdict("NN-L-CHAIN-001_CredReadThenEgress");
+        assert!(!is_critical_fim_rule(&chain));
         // High-severity FIM rule (e.g., NN-L-FIM-003 sensitive config) — skip.
         let mut high = fake_critical_verdict("NN-L-FIM-003_SensitiveConfigModified");
         high.severity = Severity::High;
         assert!(!is_critical_fim_rule(&high));
+    }
+
+    /// D8 test: `critical_fim_rule_context` carries the per-rule MITRE
+    /// TTP for the two D3 Critical rules and `None` for rules whose
+    /// path is self-describing (FIM-001/002/008/010).
+    #[test]
+    fn critical_fim_rule_context_covers_the_d3_critical_rules() {
+        let pam = critical_fim_rule_context("NN-L-FIM-021_PamModuleModified")
+            .expect("FIM-021 has context");
+        assert!(pam.contains("T1543"));
+        assert!(pam.contains("T1556"));
+        assert!(pam.contains("PAM"));
+        let ld = critical_fim_rule_context("NN-L-FIM-022_LdSoPreloadModified")
+            .expect("FIM-022 has context");
+        assert!(ld.contains("T1574.006"));
+        assert!(ld.contains("ld.so.preload"));
+        // Tappa 9 rules + unknown ids → no curated line.
+        assert!(critical_fim_rule_context("NN-L-FIM-010_RansomwareExtensionRename").is_none());
+        assert!(critical_fim_rule_context("NN-L-FIM-999_Bogus").is_none());
+    }
+
+    /// D8 test: rendering a FIM-021 prompt splices the `### rule-context:`
+    /// MITRE block; rendering a rule without context omits the section
+    /// (byte-compatible with the pre-D8 prompt for those rules).
+    #[test]
+    fn render_individual_prompt_splices_rule_context_only_when_present() {
+        let v21 = fake_critical_verdict("NN-L-FIM-021_PamModuleModified");
+        let e = fake_fim_event("/lib/x86_64-linux-gnu/security/pam_evil.so", None);
+        let p21 = render_individual_prompt(&e, &v21, "Combat");
+        assert!(p21.contains("### rule-context:\n"));
+        assert!(p21.contains("T1543"));
+        assert!(p21.contains("persistence"));
+
+        // FIM-010 has no curated context → no rule-context section.
+        let v10 = fake_critical_verdict("NN-L-FIM-010_RansomwareExtensionRename");
+        let p10 = render_individual_prompt(&e, &v10, "Combat");
+        assert!(!p10.contains("### rule-context:"));
     }
 
     /// C9 test #3: `render_individual_prompt` includes all of:

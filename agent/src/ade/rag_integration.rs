@@ -283,6 +283,66 @@ mod tests {
         assert!(q.contains("4444"));
     }
 
+    /// Tappa 10.5 D8 — RAG-Local integration verification: the FIM-021
+    /// PAM-module path projects to a `fim drift` query carrying the
+    /// `/security/` path + op, so the D8 Critical-rule context flows
+    /// through the existing T6.7 retrieval seam unchanged.
+    #[test]
+    fn fim_query_for_pam_module_carries_path_and_op() {
+        use common::wire::{FimEvent, FimOp};
+        let e = Event::Fim(FimEvent {
+            timestamp_ns: 0,
+            path: "/lib/x86_64-linux-gnu/security/pam_evil.so".into(),
+            op: FimOp::Created,
+            new_sha256: None,
+            baseline_sha256: None,
+            modifier_exe: None,
+            modifier_pid: 1234,
+            modifier_uid: 0,
+            modifier_comm: "attacker".into(),
+            dest_path: None,
+        });
+        let q = build_rag_query_from_event(&e);
+        assert!(q.contains("fim drift"));
+        assert!(q.contains("/security/pam_evil.so"));
+        assert!(q.contains("Created"));
+    }
+
+    /// Tappa 10.5 D8 — RAG-Local integration verification: a chain
+    /// trigger `Event::NetFlow` projects to a `net flow` query carrying
+    /// comm + dst + port, so a CHAIN-00x correlation's trigger flows
+    /// through the same retrieval seam.
+    #[test]
+    fn netflow_query_for_chain_trigger_carries_comm_dst_port() {
+        use common::wire::NetFlowEvent;
+        use std::net::{IpAddr, Ipv4Addr};
+        let e = Event::NetFlow(NetFlowEvent {
+            start_ns: 0,
+            end_ns: 0,
+            family: 2,
+            src_addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            src_port: 54321,
+            dst_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            dst_port: 4444,
+            proto: 6,
+            pid: 1234,
+            uid: 1000,
+            comm: "evilbin".into(),
+            exe: Some("/usr/bin/evilbin".into()),
+            bytes_sent: 4096,
+            bytes_recv: 128,
+            resolved_hostname: Some("exfil.example.org".into()),
+            tls_fingerprint: None,
+            flow_id: "abc".into(),
+            close_reason: 0,
+        });
+        let q = build_rag_query_from_event(&e);
+        assert!(q.contains("net flow"));
+        assert!(q.contains("evilbin"));
+        assert!(q.contains("203.0.113.9"));
+        assert!(q.contains("4444"));
+    }
+
     #[test]
     fn empty_rag_result_renders_no_block() {
         let r = RagResult::default();
