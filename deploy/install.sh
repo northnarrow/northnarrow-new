@@ -14,6 +14,21 @@
 # produced ./target/release/{northnarrow-agent,northnarrow-watchdog}.
 # Pre-flights every step so an incomplete invocation surfaces an
 # actionable error instead of leaving a half-installed system.
+#
+# Tappa 10.6 (D8) deploy-surface verification — NO install change needed:
+#   - D1 grew ProcessSpawnRaw by strict APPEND. The kernel↔userland wire
+#     is bytemuck Pod and the eBPF object is embedded in + rebuilt
+#     atomically with the agent binary this script installs, so there is
+#     no on-disk wire-format compatibility step.
+#   - D2 added kernel reads (argv via mm->arg_start, parent context) to
+#     the EXISTING `sched_process_exec` tracepoint — no new BPF program,
+#     map, pin, or LSM hook, so the bpffs / `lsm=…,bpf` prerequisites
+#     (steps 3-4 below) are unchanged.
+#   - D3-D7 are userland-only (correlation store, CHAIN-004..008, the
+#     ADE process_template). They add NO new config file: R011-R017 reuse
+#     `process-comm-allowlist.v1` and the chain rules need none.
+#   Engine grew 62 → 67 rules; that is internal to the agent binary and
+#   needs no operator action.
 
 set -euo pipefail
 

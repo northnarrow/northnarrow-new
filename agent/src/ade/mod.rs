@@ -28,6 +28,7 @@ pub mod escalate;
 pub mod fim_template;
 pub mod inference;
 pub mod parser;
+pub mod process_template;
 pub mod prompt;
 pub mod rag_integration;
 pub mod sanitize;
