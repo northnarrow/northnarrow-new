@@ -31,8 +31,9 @@ mod udp_sendmsg_outbound;
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_kernel_buf,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
+        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
+        bpf_probe_read_user_buf,
     },
     macros::{map, tracepoint},
     maps::{PerCpuArray, RingBuf},
@@ -40,7 +41,13 @@ use aya_ebpf::{
     EbpfContext,
 };
 use core::mem::MaybeUninit;
-use northnarrow_common::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
+use northnarrow_common::wire::{ProcessSpawnRaw, ARGV_LEN, FILENAME_LEN, TASK_COMM_LEN};
+
+use crate::btf_offsets::{
+    MM_STRUCT_ARG_END_OFFSET, MM_STRUCT_ARG_START_OFFSET, TASK_STRUCT_COMM_OFFSET,
+    TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
+    TASK_STRUCT_TGID_OFFSET,
+};
 
 /// Ringbuffer carrying [`ProcessSpawnRaw`] events to userland.
 /// 256 KiB is room for ~880 events; sized to absorb short bursts.
@@ -158,6 +165,84 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                     *dst.add(i) = 0;
                 }
                 i += 1;
+            }
+        }
+    }
+
+    // ── Tappa 10.6 D2 — parent context + argv ──────────────────────
+    // All reads are best-effort: a failed probe leaves the field zero,
+    // which D1 userland decodes as ppid 0 / empty parent_comm / no argv
+    // (mixed-fleet-safe). Two-deref chains, each step a kernel probe;
+    // the argv block is a single bounded user read (no loop).
+    let task = unsafe { bpf_get_current_task() } as *const u8;
+    if !task.is_null() {
+        // Parent: task->real_parent, then tgid (userspace ppid) +
+        // start_time (PID-reuse key) + comm.
+        if let Ok(parent) = unsafe {
+            bpf_probe_read_kernel::<*const u8>(
+                task.add(TASK_STRUCT_REAL_PARENT_OFFSET) as *const _,
+            )
+        } {
+            if !parent.is_null() {
+                if let Ok(ptgid) = unsafe {
+                    bpf_probe_read_kernel::<u32>(parent.add(TASK_STRUCT_TGID_OFFSET) as *const _)
+                } {
+                    unsafe { (*raw_ptr).ppid = ptgid };
+                }
+                if let Ok(pstart) = unsafe {
+                    bpf_probe_read_kernel::<u64>(
+                        parent.add(TASK_STRUCT_START_TIME_OFFSET) as *const _,
+                    )
+                } {
+                    unsafe { (*raw_ptr).parent_start_ns = pstart };
+                }
+                unsafe {
+                    let dst = core::slice::from_raw_parts_mut(
+                        (*raw_ptr).parent_comm.as_mut_ptr(),
+                        TASK_COMM_LEN,
+                    );
+                    let _ = bpf_probe_read_kernel_buf(
+                        parent.add(TASK_STRUCT_COMM_OFFSET) as *const u8,
+                        dst,
+                    );
+                }
+            }
+        }
+
+        // argv: task->mm, then [mm->arg_start, mm->arg_end) — a
+        // contiguous NUL-separated user block. One bounded read.
+        if let Ok(mm) =
+            unsafe { bpf_probe_read_kernel::<*const u8>(task.add(TASK_STRUCT_MM_OFFSET) as *const _) }
+        {
+            if !mm.is_null() {
+                let arg_start = unsafe {
+                    bpf_probe_read_kernel::<usize>(mm.add(MM_STRUCT_ARG_START_OFFSET) as *const _)
+                }
+                .unwrap_or(0);
+                let arg_end = unsafe {
+                    bpf_probe_read_kernel::<usize>(mm.add(MM_STRUCT_ARG_END_OFFSET) as *const _)
+                }
+                .unwrap_or(0);
+                if arg_start != 0 && arg_end > arg_start {
+                    // Clamp to ARGV_LEN-1, then mask, so the upper bound is
+                    // provable to the verifier (ARGV_LEN is a power of two)
+                    // and the slice index `[..len]` carries no panic branch.
+                    // Capping at 511 (vs 512) costs at most a trailing byte.
+                    let mut len = arg_end - arg_start;
+                    if len > ARGV_LEN - 1 {
+                        len = ARGV_LEN - 1;
+                    }
+                    len &= ARGV_LEN - 1;
+                    unsafe {
+                        let dst = core::slice::from_raw_parts_mut(
+                            (*raw_ptr).argv.as_mut_ptr(),
+                            ARGV_LEN,
+                        );
+                        if bpf_probe_read_user_buf(arg_start as *const u8, &mut dst[..len]).is_ok() {
+                            (*raw_ptr).argv_len = len as u16;
+                        }
+                    }
+                }
             }
         }
     }

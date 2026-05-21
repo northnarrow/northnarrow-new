@@ -18,6 +18,53 @@
 /// `getpid(2)` returns to userland. `bits_offset=19936` from BTF.
 pub(crate) const TASK_STRUCT_TGID_OFFSET: usize = 2492;
 
+// ── Tappa 10.6 D2 — process-spawn argv + parent context ──────────────
+//
+// Validated 2026-05-21 against `/sys/kernel/btf/vmlinux` on
+// `6.8.0-117-generic` via `bpftool btf dump file /sys/kernel/btf/
+// vmlinux format raw` (same procedure as the N2 / T4.1 sets).
+// `[82] STRUCT 'task_struct' size=13696`; `[438] STRUCT 'mm_struct'
+// size=1344`. Two-deref chains (`task → real_parent → field`,
+// `task → mm → field`), each step a `bpf_probe_read_kernel`.
+
+/// `struct task_struct.mm` — `struct mm_struct *` (the new image's mm
+/// at `sched_process_exec`; argv lives off it). `'mm' type_id=94
+/// bits_offset=18880` = byte 2360.
+pub(crate) const TASK_STRUCT_MM_OFFSET: usize = 2360;
+
+/// `struct task_struct.real_parent` — `struct task_struct *` to the
+/// real parent. `'real_parent' type_id=83 bits_offset=20032` = byte
+/// 2504. (Use `real_parent`, not `parent`, for genuine lineage —
+/// `parent` can be a ptracer.) The parent's pid is then
+/// `parent + TASK_STRUCT_TGID_OFFSET` (the userspace pid, not the
+/// thread `pid`).
+pub(crate) const TASK_STRUCT_REAL_PARENT_OFFSET: usize = 2504;
+
+/// `struct task_struct.start_time` — `u64` CLOCK_MONOTONIC nanoseconds
+/// at task creation. `'start_time' type_id=23 bits_offset=22656` =
+/// byte 2832. Chosen over `start_boottime` (byte 2840) because it
+/// shares the `bpf_ktime_get_ns()` clock domain the CorrelationStore
+/// compares against — the PID-reuse-safe ancestry key.
+pub(crate) const TASK_STRUCT_START_TIME_OFFSET: usize = 2832;
+
+/// `struct task_struct.comm` — `char[16]` (`TASK_COMM_LEN`).
+/// `'comm' type_id=125 bits_offset=24256` = byte 3032. Read off the
+/// parent task for `parent_comm`.
+pub(crate) const TASK_STRUCT_COMM_OFFSET: usize = 3032;
+
+/// `struct mm_struct.arg_start` — `unsigned long` USER pointer to the
+/// start of the argv string block. `mm_struct`'s leading member is the
+/// randomized anon struct `[624]` at `bits_offset=0`, so this is
+/// absolute within `mm_struct`: `'arg_start' bits_offset=3008` = byte
+/// 376.
+pub(crate) const MM_STRUCT_ARG_START_OFFSET: usize = 376;
+
+/// `struct mm_struct.arg_end` — `unsigned long` USER pointer to the end
+/// of the argv block. `'arg_end' bits_offset=3072` = byte 384.
+/// `[arg_start, arg_end)` is exactly the NUL-separated argv (envp is
+/// the separate `env_start/env_end` region) — one bounded user read.
+pub(crate) const MM_STRUCT_ARG_END_OFFSET: usize = 384;
+
 /// `struct dentry.d_inode` — the `*inode` pointer. `bits_offset=384`.
 pub(crate) const DENTRY_D_INODE_OFFSET: usize = 48;
 
