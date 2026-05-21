@@ -18,6 +18,7 @@
 
 use common::{Event, Verdict};
 
+pub mod correlation;
 pub mod engine;
 pub mod rules;
 

@@ -105,7 +105,7 @@ pub fn critical_chain_rule_context(rule_id: &str) -> Option<&'static str> {
 ///
 /// `flow` is the triggering outbound [`NetFlowEvent`]; the precursor
 /// event (cred read / `/tmp` exec / canary trip) that completed the
-/// chain lives in the rule's per-PID `ChainCorrelationBuffer` and is
+/// chain lives in the shared `CorrelationStore` (T10.6 D3) and is
 /// summarised in `verdict.reasoning` (the `### correlation:` block) —
 /// the wire `Verdict` carries no separate precursor record and §9
 /// forbids a wire change to add one.

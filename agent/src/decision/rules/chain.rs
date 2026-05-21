@@ -1,14 +1,14 @@
 //! Tappa 10.5 (D5) — chain / correlation detection rules
-//! NN-L-CHAIN-001..003.
+//! NN-L-CHAIN-001..003. Tappa 10.6 D3 re-homed the correlation state
+//! onto the shared [`CorrelationStore`].
 //!
 //! Two-event, same-PID correlation rules in the **stateful
-//! single-trigger** shape locked in by design §13 Q2 / §3.5-A: each
-//! rule holds a purpose-built per-PID rolling [`ChainCorrelationBuffer`]
-//! (mirroring the NN-L-NET-005 `DnsBurstWindow` + NN-L-NET-013
-//! `BeaconWindow` precedent — `Arc<Mutex<_>>` interior mutability
-//! behind the single-event `Rule::evaluate` trait). No two-pass
-//! correlation engine is introduced; the N-event / cross-PID set is
-//! deferred to T10.6 (§13 Q2).
+//! single-trigger** shape (design §13 Q2 / §3.5-A): each rule records a
+//! typed precursor into the shared store and queries it behind the
+//! single-event `Rule::evaluate` trait (`Arc<Mutex<_>>` interior
+//! mutability — the NN-L-NET-005 `DnsBurstWindow` precedent). The
+//! single-pass engine is unchanged (§13 Q3); the N-event + cross-PID
+//! machinery lives in the store (D3) + ancestry tree (D4).
 //!
 //! ## How a single-trigger chain rule works
 //!
@@ -16,13 +16,13 @@
 //! `evaluate` calls:
 //!
 //! 1. A **precursor** event (a credential-store FIM access / a `/tmp`
-//!    exec / a canary trip). On a precursor the rule RECORDS
-//!    `(pid, timestamp)` in its buffer and returns `None` — so the
-//!    event falls through to the precursor's own rule (FIM-015..017 /
-//!    R001 / NN-L-CANARY-*), which fires as usual.
+//!    exec / a canary trip). On a precursor the rule RECORDS its typed
+//!    [`PrecursorKind`] for the PID and returns `None` — so the event
+//!    falls through to the precursor's own rule (FIM-015..017 / R001 /
+//!    NN-L-CANARY-*), which fires as usual.
 //! 2. A **trigger** event — an outbound `Event::NetFlow`. On a flow
-//!    the rule LOOKS UP its buffer for a same-PID precursor within
-//!    the [`CHAIN_WINDOW_NS`] lookback. A hit means "this process
+//!    the rule LOOKS UP its precursor kind for the same PID within
+//!    the [`CORRELATION_WINDOW_NS`] lookback. A hit means "this process
 //!    accessed credentials / ran from /tmp / tripped a canary AND is
 //!    now talking to the network" — a Critical exfiltration / C2
 //!    indicator. It fires `KillProcessTree` → posture COMBAT.
@@ -44,12 +44,16 @@
 //!   any lower-severity net rule (e.g. NN-L-NET-008) matches the same
 //!   flow.
 //!
-//! ## Per-PID isolation (§13 Q2 lock-in)
+//! ## Correlation state (Tappa 10.6 D3)
 //!
-//! Correlation is keyed strictly on a shared PID. Cross-PID chains
-//! (parent→child exfil, etc.) need the resolved parent comm /
-//! ancestry the current `Event` shape lacks and are deferred to
-//! T10.6 alongside the two-pass engine.
+//! The per-rule `ChainCorrelationBuffer` is replaced by one shared
+//! [`CorrelationStore`] (`crate::decision::correlation`) injected into
+//! all three rules. Each rule records a typed [`PrecursorKind`] and
+//! queries it by PID within [`CORRELATION_WINDOW_NS`] — same-PID,
+//! single-precursor behaviour is preserved bit-for-bit. The store keys
+//! on `(pid, start_ns)`; D3 uses the bare-PID API (`start_ns = 0`),
+//! and D4 wires the ancestry tree to resolve real incarnations and add
+//! the cross-PID lineage variants.
 //!
 //! ## Rate limiting (§13 Q4)
 //!
@@ -58,104 +62,14 @@
 //! `chain_*` category (not a `net_*` tier), so the future §6.5
 //! NetFlow rate-limit bucket does not even scope them.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use crate::decision::correlation::{CorrelationStore, PrecursorKind, CORRELATION_WINDOW_NS};
 use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
-
-// ── Correlation window + buffer bounds ───────────────────────────────
-
-/// Lookback window: a precursor older than this can't correlate with
-/// a trigger flow. 5 minutes — matches the §13 Q3 DNS-cache TTL
-/// precedent (long enough to span a real read→exfil gap, short
-/// enough that an unrelated later flow from a reused PID doesn't
-/// false-correlate).
-const CHAIN_WINDOW_NS: u64 = 300 * 1_000_000_000;
-
-/// Bound the per-PID precursor history. A process that legitimately
-/// re-accesses a credential store many times still only needs the
-/// most recent few timestamps to answer "any precursor in window?".
-const CHAIN_MAX_SAMPLES_PER_PID: usize = 16;
-
-/// Bound the number of distinct PIDs tracked. On overflow the buffer
-/// prunes stale (out-of-window) PIDs first; the cap is generous
-/// relative to realistic concurrent precursor-bearing processes.
-const CHAIN_MAX_TRACKED_PIDS: usize = 4096;
-
-/// Per-PID sliding window of precursor-event timestamps. One instance
-/// per chain rule records that rule's precursor kind; the trigger
-/// flow queries [`ChainCorrelationBuffer::has_recent`]. Bounded
-/// memory: per-PID samples are capped + TTL-pruned on every access,
-/// and the tracked-PID count is capped with stale-first eviction.
-#[derive(Debug, Default)]
-pub struct ChainCorrelationBuffer {
-    per_pid: HashMap<u32, VecDeque<u64>>,
-}
-
-impl ChainCorrelationBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a precursor for `pid` at `ts_ns`.
-    pub fn record(&mut self, pid: u32, ts_ns: u64) {
-        if self.per_pid.len() >= CHAIN_MAX_TRACKED_PIDS && !self.per_pid.contains_key(&pid) {
-            self.prune_stale(ts_ns);
-        }
-        let q = self.per_pid.entry(pid).or_default();
-        let cutoff = ts_ns.saturating_sub(CHAIN_WINDOW_NS);
-        while q.front().is_some_and(|&t| t < cutoff) {
-            q.pop_front();
-        }
-        q.push_back(ts_ns);
-        while q.len() > CHAIN_MAX_SAMPLES_PER_PID {
-            q.pop_front();
-        }
-    }
-
-    /// `true` if `pid` has a recorded precursor within
-    /// [`CHAIN_WINDOW_NS`] before `ts_ns`. Prunes out-of-window
-    /// entries (and drops the PID entirely once empty) so the buffer
-    /// stays bounded under steady event flow.
-    pub fn has_recent(&mut self, pid: u32, ts_ns: u64) -> bool {
-        let cutoff = ts_ns.saturating_sub(CHAIN_WINDOW_NS);
-        let hit = if let Some(q) = self.per_pid.get_mut(&pid) {
-            while q.front().is_some_and(|&t| t < cutoff) {
-                q.pop_front();
-            }
-            !q.is_empty()
-        } else {
-            false
-        };
-        if let Some(q) = self.per_pid.get(&pid) {
-            if q.is_empty() {
-                self.per_pid.remove(&pid);
-            }
-        }
-        hit
-    }
-
-    /// Drop PIDs whose every sample is out of the window relative to
-    /// `now_ns`. Called on tracked-PID overflow.
-    fn prune_stale(&mut self, now_ns: u64) {
-        let cutoff = now_ns.saturating_sub(CHAIN_WINDOW_NS);
-        self.per_pid.retain(|_, q| {
-            while q.front().is_some_and(|&t| t < cutoff) {
-                q.pop_front();
-            }
-            !q.is_empty()
-        });
-    }
-
-    #[cfg(test)]
-    fn tracked_pids(&self) -> usize {
-        self.per_pid.len()
-    }
-}
 
 // ── verdict helper ───────────────────────────────────────────────────
 
@@ -181,11 +95,11 @@ fn chain_verdict(rule: &dyn Rule, nf: &common::wire::NetFlowEvent, reasoning: &s
 /// T1555 (Credentials from Password Stores) → T1041 (Exfiltration
 /// Over C2 Channel). Critical + KillProcessTree → COMBAT.
 pub struct NnLChain001CredReadThenEgress {
-    buf: Arc<Mutex<ChainCorrelationBuffer>>,
+    buf: Arc<Mutex<CorrelationStore>>,
 }
 
 impl NnLChain001CredReadThenEgress {
-    pub fn new(buf: Arc<Mutex<ChainCorrelationBuffer>>) -> Self {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
         Self { buf }
     }
 }
@@ -204,12 +118,21 @@ impl Rule for NnLChain001CredReadThenEgress {
         match event {
             // Precursor: record + fall through (FIM-015/016/017 fires).
             Event::Fim(fe) if is_credential_store_access(fe) => {
-                self.buf.lock().record(fe.modifier_pid, fe.timestamp_ns);
+                self.buf.lock().record_for_pid(
+                    fe.modifier_pid,
+                    PrecursorKind::CredRead,
+                    fe.timestamp_ns,
+                );
                 None
             }
             // Trigger: same-PID egress after a recorded cred access.
             Event::NetFlow(nf) => {
-                if !self.buf.lock().has_recent(nf.pid, nf.start_ns) {
+                if !self.buf.lock().has_recent_for_pid(
+                    nf.pid,
+                    PrecursorKind::CredRead,
+                    nf.start_ns,
+                    CORRELATION_WINDOW_NS,
+                ) {
                     return None;
                 }
                 Some(chain_verdict(
@@ -240,7 +163,7 @@ impl Rule for NnLChain001CredReadThenEgress {
 /// call. The `/tmp`-exec precursor is the high-confidence half; the
 /// egress correlation is what escalates it to Critical.
 pub struct NnLChain002TmpExecThenEgress {
-    buf: Arc<Mutex<ChainCorrelationBuffer>>,
+    buf: Arc<Mutex<CorrelationStore>>,
 }
 
 impl NnLChain002TmpExecThenEgress {
@@ -248,7 +171,7 @@ impl NnLChain002TmpExecThenEgress {
     /// the egress that matters; any other port is.
     const DNS_PORT: u16 = 53;
 
-    pub fn new(buf: Arc<Mutex<ChainCorrelationBuffer>>) -> Self {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
         Self { buf }
     }
 }
@@ -265,19 +188,40 @@ impl Rule for NnLChain002TmpExecThenEgress {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
-            // Precursor: a process image under /tmp/ (R001 shape).
+            // Every spawn feeds the shared ancestry tree (D4) — this is
+            // the one chain rule that sees `Event::ProcessSpawn`, so it
+            // hosts lineage observation for the whole store. A `/tmp`
+            // image additionally records the TmpExec precursor (R001
+            // shape). Always returns None (record-only).
             Event::ProcessSpawn {
                 pid,
+                ppid,
                 filename,
                 timestamp_ns,
+                parent_start_ns,
                 ..
-            } if filename.starts_with("/tmp/") => {
-                self.buf.lock().record(*pid, *timestamp_ns);
+            } => {
+                let mut store = self.buf.lock();
+                store.observe_spawn(
+                    *pid,
+                    crate::decision::correlation::ProcKey {
+                        pid: *ppid,
+                        start_ns: *parent_start_ns,
+                    },
+                );
+                if filename.starts_with("/tmp/") {
+                    store.record_for_pid(*pid, PrecursorKind::TmpExec, *timestamp_ns);
+                }
                 None
             }
             // Trigger: same-PID egress to a non-DNS port.
             Event::NetFlow(nf) if nf.dst_port != Self::DNS_PORT => {
-                if !self.buf.lock().has_recent(nf.pid, nf.start_ns) {
+                if !self.buf.lock().has_recent_for_pid(
+                    nf.pid,
+                    PrecursorKind::TmpExec,
+                    nf.start_ns,
+                    CORRELATION_WINDOW_NS,
+                ) {
                     return None;
                 }
                 Some(chain_verdict(
@@ -302,11 +246,11 @@ impl Rule for NnLChain002TmpExecThenEgress {
 /// decoy is now talking to the network. Critical + KillProcessTree →
 /// COMBAT.
 pub struct NnLChain003CanaryThenEgress {
-    buf: Arc<Mutex<ChainCorrelationBuffer>>,
+    buf: Arc<Mutex<CorrelationStore>>,
 }
 
 impl NnLChain003CanaryThenEgress {
-    pub fn new(buf: Arc<Mutex<ChainCorrelationBuffer>>) -> Self {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
         Self { buf }
     }
 }
@@ -329,12 +273,21 @@ impl Rule for NnLChain003CanaryThenEgress {
                 timestamp_ns,
                 ..
             } => {
-                self.buf.lock().record(*accessor_pid, *timestamp_ns);
+                self.buf.lock().record_for_pid(
+                    *accessor_pid,
+                    PrecursorKind::CanaryTrip,
+                    *timestamp_ns,
+                );
                 None
             }
             // Trigger: same-PID egress after the trip.
             Event::NetFlow(nf) => {
-                if !self.buf.lock().has_recent(nf.pid, nf.start_ns) {
+                if !self.buf.lock().has_recent_for_pid(
+                    nf.pid,
+                    PrecursorKind::CanaryTrip,
+                    nf.start_ns,
+                    CORRELATION_WINDOW_NS,
+                ) {
                     return None;
                 }
                 Some(chain_verdict(
@@ -353,25 +306,22 @@ impl Rule for NnLChain003CanaryThenEgress {
 
 // ── Factory ──────────────────────────────────────────────────────────
 
-/// Build the 3 NN-L-CHAIN rules, each with a freshly-allocated
-/// per-PID correlation buffer. Unlike the net blocklists / comm
-/// allowlists, the chain buffers are PRIVATE runtime state (not
-/// operator config), so they're constructed here rather than threaded
-/// from `main.rs` — the `Arc<Mutex<_>>` lives for the engine's
-/// lifetime inside the rule structs. The engine MUST register these
-/// FIRST (see the module docs); the `default_rules*` builders prepend
-/// them.
+/// Build the 3 NN-L-CHAIN rules over **one shared** [`CorrelationStore`]
+/// (Tappa 10.6 D3). Unlike the net blocklists / comm allowlists, the
+/// store is PRIVATE runtime state (not operator config), so it's
+/// constructed here rather than threaded from `main.rs` — the
+/// `Arc<Mutex<_>>` lives for the engine's lifetime, cloned into each
+/// rule. Sharing (vs the old per-rule buffers) is what lets D6's
+/// multi-precursor chains correlate across rule kinds; per-rule
+/// isolation is preserved by the typed [`PrecursorKind`]. The engine
+/// MUST register these FIRST (see the module docs); the `default_rules*`
+/// builders prepend them.
 pub fn chain_rules() -> Vec<Box<dyn Rule>> {
+    let store = Arc::new(Mutex::new(CorrelationStore::new()));
     vec![
-        Box::new(NnLChain001CredReadThenEgress::new(Arc::new(Mutex::new(
-            ChainCorrelationBuffer::new(),
-        )))),
-        Box::new(NnLChain002TmpExecThenEgress::new(Arc::new(Mutex::new(
-            ChainCorrelationBuffer::new(),
-        )))),
-        Box::new(NnLChain003CanaryThenEgress::new(Arc::new(Mutex::new(
-            ChainCorrelationBuffer::new(),
-        )))),
+        Box::new(NnLChain001CredReadThenEgress::new(Arc::clone(&store))),
+        Box::new(NnLChain002TmpExecThenEgress::new(Arc::clone(&store))),
+        Box::new(NnLChain003CanaryThenEgress::new(Arc::clone(&store))),
     ]
 }
 
@@ -450,57 +400,10 @@ mod tests {
         })
     }
 
-    // ── ChainCorrelationBuffer unit tests ───────────────────────────
-
-    #[test]
-    fn buffer_records_and_finds_within_window() {
-        let mut b = ChainCorrelationBuffer::new();
-        b.record(42, 10 * SEC);
-        assert!(
-            b.has_recent(42, 10 * SEC + 30 * SEC),
-            "30s gap is in window"
-        );
-    }
-
-    #[test]
-    fn buffer_evicts_after_ttl() {
-        let mut b = ChainCorrelationBuffer::new();
-        b.record(42, 10 * SEC);
-        // 6 minutes later — past the 5-minute window.
-        assert!(!b.has_recent(42, 10 * SEC + 360 * SEC));
-    }
-
-    #[test]
-    fn buffer_is_per_pid_isolated() {
-        let mut b = ChainCorrelationBuffer::new();
-        b.record(42, 10 * SEC);
-        assert!(!b.has_recent(99, 10 * SEC + SEC), "pid 99 has no precursor");
-        assert!(b.has_recent(42, 10 * SEC + SEC));
-    }
-
-    #[test]
-    fn buffer_caps_samples_per_pid() {
-        let mut b = ChainCorrelationBuffer::new();
-        for i in 0..(CHAIN_MAX_SAMPLES_PER_PID as u64 + 50) {
-            b.record(42, 100 * SEC + i);
-        }
-        // Deque is capped; the pid is still tracked once.
-        assert_eq!(b.tracked_pids(), 1);
-    }
-
-    #[test]
-    fn buffer_drops_pid_once_window_empties() {
-        let mut b = ChainCorrelationBuffer::new();
-        b.record(42, 10 * SEC);
-        // A has_recent past the window prunes + drops the empty pid.
-        assert!(!b.has_recent(42, 10 * SEC + 360 * SEC));
-        assert_eq!(b.tracked_pids(), 0);
-    }
-
     // ── NN-L-CHAIN-001 bespoke pairs ────────────────────────────────
 
     fn chain001() -> NnLChain001CredReadThenEgress {
-        NnLChain001CredReadThenEgress::new(Arc::new(Mutex::new(ChainCorrelationBuffer::new())))
+        NnLChain001CredReadThenEgress::new(Arc::new(Mutex::new(CorrelationStore::new())))
     }
 
     #[test]
@@ -565,7 +468,7 @@ mod tests {
     // ── NN-L-CHAIN-002 bespoke pairs ────────────────────────────────
 
     fn chain002() -> NnLChain002TmpExecThenEgress {
-        NnLChain002TmpExecThenEgress::new(Arc::new(Mutex::new(ChainCorrelationBuffer::new())))
+        NnLChain002TmpExecThenEgress::new(Arc::new(Mutex::new(CorrelationStore::new())))
     }
 
     #[test]
@@ -624,7 +527,7 @@ mod tests {
     // ── NN-L-CHAIN-003 bespoke pairs ────────────────────────────────
 
     fn chain003() -> NnLChain003CanaryThenEgress {
-        NnLChain003CanaryThenEgress::new(Arc::new(Mutex::new(ChainCorrelationBuffer::new())))
+        NnLChain003CanaryThenEgress::new(Arc::new(Mutex::new(CorrelationStore::new())))
     }
 
     #[test]
@@ -667,6 +570,34 @@ mod tests {
                 "NN-L-CHAIN-002_TmpExecThenEgress",
                 "NN-L-CHAIN-003_CanaryThenEgress",
             ]
+        );
+    }
+
+    /// D3 shared-store regression: the 3 rules now share one
+    /// `CorrelationStore`. A credential-read precursor must trigger
+    /// ONLY NN-L-CHAIN-001 on the subsequent egress — the `/tmp` and
+    /// canary rules stay isolated by `PrecursorKind` despite the shared
+    /// memory.
+    #[test]
+    fn shared_store_isolates_precursor_kinds_across_rules() {
+        let rules = chain_rules();
+        let cred = cred_fim(42, 10 * SEC);
+        for r in &rules {
+            assert!(
+                r.evaluate(&cred).is_none(),
+                "precursor records, never fires"
+            );
+        }
+        let egress = flow(42, 443, 10 * SEC + SEC);
+        let fired: Vec<String> = rules
+            .iter()
+            .filter_map(|r| r.evaluate(&egress))
+            .map(|v| v.rule_id)
+            .collect();
+        assert_eq!(
+            fired,
+            vec!["NN-L-CHAIN-001_CredReadThenEgress".to_string()],
+            "only the cred-read chain fires; /tmp + canary kinds isolated"
         );
     }
 }
