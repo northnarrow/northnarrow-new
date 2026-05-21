@@ -1,10 +1,11 @@
 # Tappa 10.7 — Adversarial Validation via Kali Linux Design
 
-**Status:** RFC PENDING — awaiting owner ruling on §13 Q1–Q10. No
-implementation (V1 environment build) begins until the RFC block is
-resolved and this doc is signed off, mirroring the T10.5 gating
-discipline.
-**Author:** Claude Code (architecture), pending owner sign-off.
+**Status:** RFC RESOLVED 2026-05-21 (§13 — all 10 owner-accepted
+engineering recommendations applied verbatim as resolved decision
+blocks). V1 (range setup automation) unblocked; sequenced per the §12
+commit chain (V1 → V2 → … → V8). The 5 ADE Active Defender open
+questions are tracked separately and do **not** gate T10.7.
+**Author:** Claude Code (architecture), owner-signed-off 2026-05-21.
 **Date:** 2026-05-21.
 **Prerequisite track:** Tappe 2, 6, 7, 8, 9, 9.5, 10, **10.5** are all
 SHIPPED and 100% verified on northnarrowdev (kernel 6.8.0-117). T10.5
@@ -525,128 +526,173 @@ real-tool runs surface gaps that benefit from a fix-and-re-run cycle.
 
 ---
 
-## 13. RFC items for owner ruling
+## 13. RFC resolutions
 
-All ten are **OPEN**. Each block: **Question**, **Engineering
-recommendation**, **Rationale**, **Tradeoffs / reversibility**. No
-implementation starts until these are resolved (then this section
-converts to resolved-decision blocks, T10.5-style).
+All 10 RFC items resolved **2026-05-21** (owner-accepted engineering
+recommendations applied verbatim). V1 (range setup automation)
+unblocked; sequenced per the §12 commit chain. Each block below:
+**Decision**, **Rationale**, **Implementation note** (where in this doc
+/ commit plan the decision manifests), **Reversibility**, **Date
+resolved**. The 5 ADE Active Defender open questions
+(`docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md` §7) are tracked
+separately and do **not** gate T10.7.
 
 ### Q1 — Coverage threshold acceptable for Beta: 80% / 90% / 100%?
 
-- **Recommendation:** **80% of applicable rules** (N/A excluded), with
+- **Decision:** **80% of applicable rules** (N/A excluded), with
   **100% on the Critical tier** (FIM-001/002/008/010/021/022 + all
-  CHAIN-*) as a hard sub-gate.
+  CHAIN-*) as a **hard sub-gate**.
 - **Rationale:** 100% overall is brittle — some rules are genuinely
   hard to trigger with catalogued tooling without argv (T10.6) and
   would force contrived tests that prove little. 80% overall is a
   defensible procurement number; making **Critical** detections
   non-negotiable is what actually matters for the security story.
+- **Implementation note:** §8.1 coverage matrix is the gate; the
+  Critical sub-gate is asserted explicitly in the V6 metrics + V8
+  report.
 - **Reversibility:** easy — threshold is a report gate, not code.
+- **Date resolved:** 2026-05-21.
 
 ### Q2 — Atomic Red Team install: full git clone or curated subset?
 
-- **Recommendation:** **full clone, curated execution.** Clone the
-  whole `atomics/` repo (provenance + reproducibility), but run only a
-  **curated index** of atomics mapped to our 61 rules (a
-  `docs/validation/atomic-index.md`).
+- **Decision:** **full clone, curated Linux execution.** Clone the
+  whole `atomics/` repo (provenance + reproducibility), run only a
+  **curated index** of Linux atomics mapped to our 61 rules
+  (`docs/validation/atomic-index.md`).
 - **Rationale:** full clone is the honest, reproducible artifact and
   cheap; running everything wastes time on Windows/cloud atomics
   irrelevant to a Linux host sensor. Curate execution, not the install.
+- **Implementation note:** `04_install_attack_toolkit.sh` (V1) clones
+  the full repo; the curated index is authored in V2.
 - **Reversibility:** easy — the curated index grows/shrinks freely.
+- **Date resolved:** 2026-05-21.
 
 ### Q3 — Sliver vs Metasploit vs both for C2?
 
-- **Recommendation:** **both, with distinct roles.** Sliver = the
-  modern beacon/egress + chain showcase (the headline demo); Metasploit
-  = classic reverse-shell/post-exploitation breadth for R005/R006 + the
-  exec rows. Pupy covers the fileless/in-memory angle.
+- **Decision:** **Sliver + Metasploit + Pupy, distinct roles.** Sliver
+  = modern beacon/egress + chain showcase; Metasploit = classic
+  reverse-shell/post-exploitation breadth (R005/R006 + exec rows);
+  Pupy = fileless/in-memory angle.
 - **Rationale:** they overlap on "reverse shell" but diverge on beacon
   modernity (Sliver mTLS/periodicity → NET-013 beacon detector) vs
-  module breadth (Metasploit). The overlap is small relative to the
-  coverage each uniquely unlocks.
+  module breadth (Metasploit) vs in-memory (Pupy). Overlap is small
+  relative to the coverage each uniquely unlocks.
+- **Implementation note:** all three provisioned in
+  `04_install_attack_toolkit.sh` (V1); exercised in V3 (Sliver/MSF) +
+  V4 (Pupy).
 - **Reversibility:** easy — drop one if V3 shows redundancy.
+- **Date resolved:** 2026-05-21.
 
 ### Q4 — FP baseline: how many hours of legitimate Kali activity?
 
-- **Recommendation:** **a 4-hour scripted baseline** of representative
-  legit activity (package installs, browsing, SSH sessions, dev
-  builds), repeated **twice** (8h total) to separate steady-state noise
-  from one-off events.
+- **Decision:** **8h total — a 4-hour scripted legit-activity baseline,
+  repeated twice** (separate steady-state noise from one-offs).
 - **Rationale:** long enough to catch periodic/cron-driven FPs, short
   enough to fit the campaign; scripted so it's reproducible and the
-  report can state exactly what "legitimate" meant.
+  report states exactly what "legitimate" meant.
+- **Implementation note:** §8.3 + the V5 baseline commit; the scripted
+  activity set is authored in V5.
 - **Reversibility:** easy — extend if the first window is noisy.
+- **Date resolved:** 2026-05-21.
 
 ### Q5 — Refinement scope: fix discovered gaps here or defer?
 
-- **Recommendation:** **fix rule-logic gaps in V7** (narrow predicate
-  hot-fixes only); **defer sensor gaps to T10.6** and config gaps to a
-  config PR. Hard cap V7 at the §12 5h estimate; anything bigger
-  becomes a tracked backlog item, not scope creep.
-- **Rationale:** a rule that *should* fire and doesn't, where the fix is
-  a one-line predicate tweak, is cheap to close while the evidence is
-  fresh and makes the report stronger. Architectural gaps (argv) are
-  explicitly T10.6 and must not balloon T10.7.
+- **Decision:** **fix rule-logic gaps in V7** (narrow predicate
+  hot-fixes, hard-capped at the §12 5h estimate); **route sensor gaps
+  to T10.6** and **config gaps to a separate config PR**. Anything
+  bigger than the cap becomes a tracked backlog item, not scope creep.
+- **Rationale:** a rule that *should* fire and doesn't, where the fix
+  is a one-line predicate tweak, is cheap to close while the evidence
+  is fresh. Architectural gaps (argv) are explicitly T10.6 and must not
+  balloon T10.7.
+- **Implementation note:** §6.3 triage workflow classifies each
+  non-PASS into rule-logic / sensor / config before V7 acts.
 - **Reversibility:** medium — hot-fixes are small, reversible PRs;
   deferral is the safe default if a fix looks risky.
+- **Date resolved:** 2026-05-21.
 
 ### Q6 — Evidence retention: full PCAP or selective?
 
-- **Recommendation:** **selective** — full PCAP for NET + CHAIN runs
-  only; logs + screencaps for everything else. Hash + archive all
-  evidence.
+- **Decision:** **selective** — full PCAP for NET + CHAIN runs only;
+  logs + screencaps for everything else; **hash all** evidence.
 - **Rationale:** packet evidence matters where the detection *is* the
   network behaviour; for FIM/process rows the audit log is the
   authoritative evidence and PCAP just bloats the archive.
+- **Implementation note:** §11 evidence-capture rules; PCAP scoped to
+  the V3 NET/CHAIN runs.
 - **Reversibility:** easy — capture-all is a one-flag change if a
   reviewer wants more.
+- **Date resolved:** 2026-05-21.
 
 ### Q7 — Comparison framework: formal benchmark vs Wazuh, or descriptive?
 
-- **Recommendation:** **descriptive, methodology-first** for V1.0 (see
-  §8.4). Document the comparable method; do not publish a head-to-head
+- **Decision:** **descriptive, methodology-first** for V1.0 (§8.4).
+  Document the comparable method; do **not** publish a head-to-head
   score.
 - **Rationale:** a fair scored benchmark needs a tuned competitor
   install and invites "you misconfigured Wazuh" disputes that
-  undermine the report's credibility. Descriptive comparison is honest
-  and defensible; a formal benchmark is a deliberate post-Beta project.
+  undermine credibility. Descriptive comparison is honest and
+  defensible; a formal benchmark is a deliberate post-Beta project.
+- **Implementation note:** §8.4 documents the method; V8 report carries
+  the descriptive comparison only.
 - **Reversibility:** easy — the descriptive method is the foundation a
   later formal benchmark would build on.
+- **Date resolved:** 2026-05-21.
 
 ### Q8 — Report publication scope: internal / GitHub README / marketing?
 
-- **Recommendation:** **tiered.** Full technical report in-repo
-  (`docs/validation/REPORT.md`); a **summary section linked from the
-  GitHub README**; hold the marketing-landing-page version until after
-  owner review of the in-repo report (don't publish externally
-  pre-review).
+- **Decision:** **tiered.** Full technical report in-repo
+  (`docs/validation/REPORT.md`) → **summary linked from the GitHub
+  README** → marketing-landing version held until **after owner
+  review** of the in-repo report (no external publish pre-review).
 - **Rationale:** the in-repo report is the source of truth and review
   surface; README linkage gives Beta evaluators immediate access;
   external marketing should follow, not lead, the reviewed artifact.
+- **Implementation note:** V8 produces the in-repo report + README
+  summary; marketing promotion is a post-review follow-up.
 - **Reversibility:** easy — promotion is additive once reviewed.
+- **Date resolved:** 2026-05-21.
 
 ### Q9 — Execution cadence: single sprint or multi-day with loops?
 
-- **Recommendation:** **multi-day with refinement loops** (§12 cadence
-  note) — V1–V6, triage gate, V7 fixes + re-run, V8 report.
-- **Rationale:** real-tool runs surface gaps that are cheapest to close
-  in a fix-and-re-run rhythm; a single banner sprint forces either
-  skipping fixes or uncontrolled scope creep.
+- **Decision:** **multi-day with refinement loops** — V1–V6, triage
+  gate, V7 fixes + re-run, V8 report.
+- **Rationale:** real-tool runs surface gaps cheapest to close in a
+  fix-and-re-run rhythm; a single banner sprint forces either skipping
+  fixes or uncontrolled scope creep.
+- **Implementation note:** §12 cadence note + the V7 triage gate.
 - **Reversibility:** easy — the phases are independent commits.
+- **Date resolved:** 2026-05-21.
 
 ### Q10 — VM snapshot strategy: per-TTP revert or per-family?
 
-- **Recommendation:** **per-family revert** as the default, with
-  **per-TTP revert** mandatory only for **state-mutating** tests
-  (PAM/ld.so.preload writes, log tamper, persistence drops) so a prior
-  write can't pre-satisfy or mask a later rule.
+- **Decision:** **per-family revert** as the default; **per-TTP revert
+  mandatory** only for **state-mutating** tests (PAM / `ld.so.preload`
+  writes, log tamper, persistence drops) so a prior write can't
+  pre-satisfy or mask a later rule.
 - **Rationale:** per-TTP revert for all 61 is slow and mostly
   unnecessary (read-only/process tests don't dirty state); targeted
   per-TTP revert where state persists keeps results clean without the
   full cost.
+- **Implementation note:** §6.1 snapshot cadence; `06_baseline_snapshot.sh`
+  (V1) creates the `v1-baseline` revert point both VMs roll back to.
 - **Reversibility:** easy — snapshot cadence is an operator choice per
   run.
+- **Date resolved:** 2026-05-21.
+
+### Resolved cross-cutting notes (owner-confirmed 2026-05-21)
+
+- **§2 network isolation:** the `intnet-adversarial` Internal Network +
+  **NAT-only-during-provisioning** lifecycle is confirmed — Kali gets a
+  NAT adapter only for the V1 tool download, then it is detached before
+  the `armed`/`v1-baseline` snapshot; the target never has NAT.
+- **§4 N/A denominator:** DNS-payload rules (NN-L-NET-014/015,
+  T4-blocked) and argv-dependent process TTPs (T10.6-blocked) are
+  explicitly **excluded** from the coverage denominator; **sensor gaps
+  route to T10.6**, never counted as T10.7 FAILs.
+- **§7 matrix scope:** the full 61-row matrix is the **progressive
+  product of V2–V4** (it is a chunk of the report), not a pre-authored
+  artifact.
 
 ---
 
