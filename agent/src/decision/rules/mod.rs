@@ -234,6 +234,9 @@ pub(crate) mod testutil {
             comm: comm.to_string(),
             filename: filename.to_string(),
             timestamp_ns: 42,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
 
@@ -248,6 +251,9 @@ pub(crate) mod testutil {
             comm: comm.to_string(),
             filename: filename.to_string(),
             timestamp_ns: 42,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
 }

@@ -407,6 +407,9 @@ mod tests {
             comm: "dropper".to_string(),
             filename: "/tmp/dropper".to_string(),
             timestamp_ns: ts_ns,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
 
@@ -596,6 +599,9 @@ mod tests {
             comm: "ls".to_string(),
             filename: "/usr/bin/ls".to_string(),
             timestamp_ns: 10 * SEC,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         r.evaluate(&non_tmp);
         assert!(r.evaluate(&flow(42, 4444, 10 * SEC + SEC)).is_none());

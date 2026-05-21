@@ -605,6 +605,7 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             comm,
             filename,
             timestamp_ns,
+            ..
         } => match field {
             F::Comm => comm.clear(),
             F::Filename => filename.clear(),
@@ -808,6 +809,9 @@ mod tests {
             comm: "miner".to_string(),
             filename: "/tmp/x".to_string(),
             timestamp_ns: 42,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
     fn dns(q: &str) -> Event {

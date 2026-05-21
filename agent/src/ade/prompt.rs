@@ -262,6 +262,9 @@ mod tests {
             comm: "ls".into(),
             filename: "/bin/ls".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         let ctx = EventContext {
             recent_events: vec![],
@@ -289,6 +292,9 @@ mod tests {
             comm: "x".into(),
             filename: "/tmp/x".into(),
             timestamp_ns: 10,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         let recent = Event::ProcessSpawn {
             pid: 41,
@@ -298,6 +304,9 @@ mod tests {
             comm: "p".into(),
             filename: "/tmp/parent".into(),
             timestamp_ns: 5,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         let ctx = EventContext {
             recent_events: vec![recent],

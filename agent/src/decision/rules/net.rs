@@ -1438,7 +1438,9 @@ mod tests {
     fn net_014_ignores_short_label() {
         let rule = NnLNet014DnsTunnelEntropy;
         // High-entropy but under the 25-char minimum.
-        assert!(rule.evaluate(&dns_event(7, "a1b2c3d4e5.example.com", 1)).is_none());
+        assert!(rule
+            .evaluate(&dns_event(7, "a1b2c3d4e5.example.com", 1))
+            .is_none());
     }
 
     #[test]

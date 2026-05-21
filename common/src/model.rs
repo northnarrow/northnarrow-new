@@ -29,6 +29,19 @@ pub enum Event {
         comm: String,
         filename: String,
         timestamp_ns: u64,
+        /// Tappa 10.6: argument vector (decoded from the NUL-separated
+        /// wire blob). Empty until D2 wires the BPF read, and on
+        /// older-agent / mixed-fleet serialized records (`serde` default).
+        #[serde(default)]
+        argv: Vec<String>,
+        /// Tappa 10.6: resolved parent `comm` (empty until D2 / older
+        /// records).
+        #[serde(default)]
+        parent_comm: String,
+        /// Tappa 10.6: parent `start_time` — PID-reuse-safe ancestry key
+        /// for the correlation engine (0 until D2 / older records).
+        #[serde(default)]
+        parent_start_ns: u64,
     },
     /// File open event (LSM `file_open`).
     FileOpen {
@@ -238,6 +251,20 @@ impl core::fmt::Display for FsProtectOperation {
     }
 }
 
+/// Decode the NUL-separated argv blob (Tappa 10.6 §13 Q1) into argument
+/// strings. `len` is the kernel-reported byte count (`argv_len`, clamped
+/// to the buffer). Trailing/empty segments (from a trailing NUL or a
+/// zero-padded tail) are dropped; each arg is UTF-8 lossy-decoded. A
+/// zeroed blob (older BPF / mixed fleet) yields an empty `Vec`.
+pub fn parse_argv_blob(blob: &[u8], len: u16) -> Vec<String> {
+    let end = core::cmp::min(len as usize, blob.len());
+    blob[..end]
+        .split(|&b| b == 0)
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| String::from_utf8_lossy(seg).into_owned())
+        .collect()
+}
+
 impl From<&ProcessSpawnRaw> for Event {
     fn from(raw: &ProcessSpawnRaw) -> Self {
         Event::ProcessSpawn {
@@ -248,6 +275,9 @@ impl From<&ProcessSpawnRaw> for Event {
             comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
             filename: crate::wire::cstr_lossy(&raw.filename).into_owned(),
             timestamp_ns: raw.timestamp_ns,
+            argv: parse_argv_blob(&raw.argv, raw.argv_len),
+            parent_comm: crate::wire::cstr_lossy(&raw.parent_comm).into_owned(),
+            parent_start_ns: raw.parent_start_ns,
         }
     }
 }
@@ -539,6 +569,7 @@ mod tests {
                 comm,
                 filename,
                 timestamp_ns,
+                ..
             } => {
                 assert_eq!(pid, 4242);
                 assert_eq!(ppid, 1);
@@ -553,5 +584,127 @@ mod tests {
         // Sanity: the consts we rely on did not silently drift.
         assert_eq!(TASK_COMM_LEN, 16);
         assert_eq!(FILENAME_LEN, 256);
+    }
+
+    // ── Tappa 10.6 D1 — argv blob + parent context ──────────────────
+
+    #[test]
+    fn parse_argv_blob_empty_is_empty_vec() {
+        assert!(parse_argv_blob(&[0u8; crate::wire::ARGV_LEN], 0).is_empty());
+        // A fully-zeroed blob with a stray len still yields nothing.
+        assert!(parse_argv_blob(&[0u8; crate::wire::ARGV_LEN], 10).is_empty());
+    }
+
+    #[test]
+    fn parse_argv_blob_single_arg() {
+        let mut b = [0u8; crate::wire::ARGV_LEN];
+        b[..3].copy_from_slice(b"ls\0");
+        assert_eq!(parse_argv_blob(&b, 3), vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn parse_argv_blob_multiple_args() {
+        let mut b = [0u8; crate::wire::ARGV_LEN];
+        let blob = b"bash\0-c\0id; whoami\0";
+        b[..blob.len()].copy_from_slice(blob);
+        assert_eq!(
+            parse_argv_blob(&b, blob.len() as u16),
+            vec![
+                "bash".to_string(),
+                "-c".to_string(),
+                "id; whoami".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_argv_blob_truncated_non_nul_terminated() {
+        // Kernel hit the cap mid-arg: last segment has no trailing NUL.
+        let mut b = [0u8; crate::wire::ARGV_LEN];
+        let blob = b"curl\0http://very-long";
+        b[..blob.len()].copy_from_slice(blob);
+        // `argv_len` clamps the slice; the dangling segment is still
+        // returned (best-effort), no panic.
+        assert_eq!(
+            parse_argv_blob(&b, blob.len() as u16),
+            vec!["curl".to_string(), "http://very-long".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_argv_blob_invalid_utf8_is_lossy() {
+        let mut b = [0u8; crate::wire::ARGV_LEN];
+        // "a" + invalid byte 0xFF + NUL.
+        b[0] = b'a';
+        b[1] = 0xFF;
+        b[2] = 0;
+        let out = parse_argv_blob(&b, 3);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with('a'));
+        assert!(out[0].contains('\u{FFFD}')); // lossy replacement char
+    }
+
+    #[test]
+    fn parse_argv_blob_len_clamped_to_buffer() {
+        // A bogus len larger than the buffer must not panic.
+        let mut b = [0u8; crate::wire::ARGV_LEN];
+        b[..3].copy_from_slice(b"ls\0");
+        assert_eq!(parse_argv_blob(&b, u16::MAX), vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn process_spawn_event_roundtrips_with_new_fields() {
+        let mut raw = ProcessSpawnRaw::zeroed();
+        raw.pid = 100;
+        raw.ppid = 50;
+        raw.timestamp_ns = 7;
+        raw.comm[..4].copy_from_slice(b"curl");
+        raw.parent_comm[..4].copy_from_slice(b"bash");
+        raw.parent_start_ns = 999;
+        let blob = b"curl\0-s\0http://x\0";
+        raw.argv[..blob.len()].copy_from_slice(blob);
+        raw.argv_len = blob.len() as u16;
+
+        let evt: Event = (&raw).into();
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back {
+            Event::ProcessSpawn {
+                argv,
+                parent_comm,
+                parent_start_ns,
+                ppid,
+                ..
+            } => {
+                assert_eq!(argv, vec!["curl", "-s", "http://x"]);
+                assert_eq!(parent_comm, "bash");
+                assert_eq!(parent_start_ns, 999);
+                assert_eq!(ppid, 50);
+            }
+            _ => panic!("expected ProcessSpawn"),
+        }
+    }
+
+    #[test]
+    fn process_spawn_event_deserializes_old_record_via_serde_default() {
+        // Mixed-fleet: an older agent's serialized record has none of the
+        // T10.6 fields. `#[serde(default)]` must fill them gracefully.
+        let old = r#"{"ProcessSpawn":{
+            "pid":1,"ppid":0,"uid":0,"gid":0,
+            "comm":"sh","filename":"/bin/sh","timestamp_ns":42}}"#;
+        let evt: Event = serde_json::from_str(old).unwrap();
+        match evt {
+            Event::ProcessSpawn {
+                argv,
+                parent_comm,
+                parent_start_ns,
+                ..
+            } => {
+                assert!(argv.is_empty());
+                assert_eq!(parent_comm, "");
+                assert_eq!(parent_start_ns, 0);
+            }
+            _ => panic!("expected ProcessSpawn"),
+        }
     }
 }

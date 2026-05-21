@@ -240,6 +240,9 @@ mod tests {
             comm: "xmrig".into(),
             filename: "/tmp/.cache/x".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("xmrig"));

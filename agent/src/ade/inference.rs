@@ -612,6 +612,9 @@ mod tests {
             comm: "xmrig".into(),
             filename: "/tmp/.cache/x".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         });
         assert_eq!(v.verdict, AdeAction::Kill);
         assert_eq!(v.severity, AdeSeverity::High);
@@ -627,6 +630,9 @@ mod tests {
             comm: "cargo".into(),
             filename: "/home/dev/.cargo/bin/cargo".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         });
         assert_eq!(v.verdict, AdeAction::Allow);
         assert_eq!(v.severity, AdeSeverity::None);
@@ -642,6 +648,9 @@ mod tests {
             comm: "lockbit3".into(),
             filename: "/tmp/lock.elf".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         });
         assert_eq!(v.verdict, AdeAction::KillTree);
         assert_eq!(v.severity, AdeSeverity::Critical);
@@ -657,6 +666,9 @@ mod tests {
             comm: "zk23x".into(),
             filename: "/opt/internal/zk23x".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         });
         assert_eq!(v.verdict, AdeAction::Escalate);
         assert_eq!(v.escalation_tier, Some(EscalationTier::Tier1Review));
@@ -673,6 +685,9 @@ mod tests {
             comm: "nmap".into(),
             filename: "/usr/bin/nmap".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         });
         assert_eq!(v.verdict, AdeAction::Alert);
         assert_eq!(v.severity, AdeSeverity::Medium);

@@ -156,6 +156,9 @@ fn synthetic_events() -> Vec<(&'static str, Event)> {
         comm: comm.to_string(),
         filename: filename.to_string(),
         timestamp_ns: 0,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
     };
     vec![
         ("xmrig", mk(1001, "xmrig", "/tmp/.cache/x")),

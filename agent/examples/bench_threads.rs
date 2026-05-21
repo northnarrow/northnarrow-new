@@ -232,5 +232,8 @@ fn sample_event() -> Event {
         comm: "xmrig".into(),
         filename: "/tmp/.cache/xmrig".into(),
         timestamp_ns: 0,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
     }
 }

@@ -535,6 +535,9 @@ mod tests {
             comm: "ls".to_string(),
             filename: filename.to_string(),
             timestamp_ns: 1_700_000_000_000_000_000,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
 

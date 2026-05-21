@@ -1368,6 +1368,9 @@ mod tests {
             comm: "x".to_string(),
             filename: "/usr/bin/sshd".to_string(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         for rule in fim_rules() {
             assert!(

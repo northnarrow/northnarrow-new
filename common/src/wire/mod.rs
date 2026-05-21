@@ -22,20 +22,49 @@ pub const ADDR_LEN: usize = 16;
 
 /// One process exec event as captured by the eBPF tracepoint.
 ///
+/// Maximum bytes of the NUL-separated argv blob captured per spawn
+/// (Tappa 10.6 §13 Q1). One bounded `bpf_probe_read_user` of
+/// `[mm->arg_start, mm->arg_end)`; userland splits on NUL. 512 B covers
+/// the overwhelming majority of real command lines.
+pub const ARGV_LEN: usize = 512;
+
 /// Layout MUST stay identical between the eBPF program and userland.
-/// Adding fields means coordinating both sides and bumping a version
-/// constant if we ever add one.
+/// **Strict APPEND only** (Tappa 10.6 §13 Q5): the kernel↔userland
+/// boundary is `bytemuck::Pod` validated by a size-checked
+/// `try_from_bytes`, and the eBPF object is embedded in + rebuilt
+/// atomically with the agent, so new fields go at the END and existing
+/// fields are NEVER reordered (a reorder would silently corrupt the
+/// cast). Explicit trailing padding keeps the struct free of implicit
+/// padding bytes (a `bytemuck::Pod` requirement).
+///
+/// Tappa 10.6 D1 APPENDED `parent_comm` / `parent_start_ns` / `argv` /
+/// `argv_len` (the argv + parent-context refit). The BPF side keeps
+/// emitting zero for these until D2 wires the reads; userland decodes a
+/// zeroed tail into empty/`0` defaults (mixed-fleet safe).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct ProcessSpawnRaw {
     pub pid: u32,
-    pub ppid: u32,
+    pub ppid: u32, // parent tgid — populated in D2 (was hard-coded 0)
     pub uid: u32,
     pub gid: u32,
     pub comm: [u8; TASK_COMM_LEN],
     pub filename: [u8; FILENAME_LEN],
     pub timestamp_ns: u64,
+    // ── Tappa 10.6 APPENDED (never reorder the above) ──
+    /// `real_parent->comm`, NUL-terminated (D2).
+    pub parent_comm: [u8; TASK_COMM_LEN],
+    /// `real_parent->start_time` — PID-reuse-safe ancestry key (D2).
+    pub parent_start_ns: u64,
+    /// NUL-separated argv blob from `[mm->arg_start, mm->arg_end)` (D2).
+    pub argv: [u8; ARGV_LEN],
+    /// Bytes written into `argv` (≤ `ARGV_LEN`); clamp flag if it hit
+    /// the cap. `argc` is derived userland-side by counting NULs.
+    pub argv_len: u16,
+    /// Explicit pad → no implicit `bytemuck::Pod` padding (size 840,
+    /// align 8).
+    pub _pad: [u8; 6],
 }
 
 impl ProcessSpawnRaw {
@@ -50,6 +79,11 @@ impl ProcessSpawnRaw {
             comm: [0u8; TASK_COMM_LEN],
             filename: [0u8; FILENAME_LEN],
             timestamp_ns: 0,
+            parent_comm: [0u8; TASK_COMM_LEN],
+            parent_start_ns: 0,
+            argv: [0u8; ARGV_LEN],
+            argv_len: 0,
+            _pad: [0u8; 6],
         }
     }
 }
@@ -795,10 +829,14 @@ mod tests {
 
     #[test]
     fn process_spawn_raw_layout_is_stable() {
-        // 4 u32 + 16 + 256 + u64 = 16 + 16 + 256 + 8 = 296 bytes.
-        // Aligned to 8 because of the trailing u64.
-        assert_eq!(size_of::<ProcessSpawnRaw>(), 296);
+        // Existing prefix: 4 u32 + 16 + 256 + u64 = 296 (offset of the
+        // T10.6 APPEND). Appended: parent_comm 16 + parent_start_ns 8 +
+        // argv 512 + argv_len 2 + _pad 6 = 544. Total 840, align 8.
+        // The trailing _pad keeps the Pod free of implicit padding.
+        assert_eq!(size_of::<ProcessSpawnRaw>(), 840);
         assert_eq!(align_of::<ProcessSpawnRaw>(), 8);
+        // The existing-field prefix must not have shifted (strict APPEND).
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_comm), 296);
     }
 
     #[test]
@@ -815,6 +853,15 @@ mod tests {
                 f
             },
             timestamp_ns: 1_700_000_000_000_000_000,
+            parent_comm: *b"bash\0\0\0\0\0\0\0\0\0\0\0\0",
+            parent_start_ns: 1_699_999_000_000_000_000,
+            argv: {
+                let mut a = [0u8; ARGV_LEN];
+                a[..7].copy_from_slice(b"ls\0-la\0");
+                a
+            },
+            argv_len: 7,
+            _pad: [0u8; 6],
         };
 
         let bytes: &[u8] = bytemuck::bytes_of(&original);
@@ -827,6 +874,10 @@ mod tests {
         assert_eq!(restored.comm, original.comm);
         assert_eq!(restored.filename, original.filename);
         assert_eq!(restored.timestamp_ns, original.timestamp_ns);
+        assert_eq!(restored.parent_comm, original.parent_comm);
+        assert_eq!(restored.parent_start_ns, original.parent_start_ns);
+        assert_eq!(restored.argv, original.argv);
+        assert_eq!(restored.argv_len, original.argv_len);
     }
 
     #[test]

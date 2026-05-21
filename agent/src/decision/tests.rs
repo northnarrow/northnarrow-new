@@ -83,6 +83,9 @@ fn proc_self_fd_takes_priority_over_other_matches() {
             comm: "memexec".into(),
             filename: "/proc/self/fd/3".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         })
         .expect("should fire");
     assert_eq!(v.rule_id, "R004_ExecFromProcSelfFd");

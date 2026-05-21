@@ -2801,6 +2801,9 @@ mod tests {
             comm: "evil".into(),
             filename: "/tmp/payload".into(),
             timestamp_ns: 500,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         };
         h.posture.observe(&intrusion, &[]);
         assert_eq!(h.posture.current_kind(), PostureKind::Combat);
