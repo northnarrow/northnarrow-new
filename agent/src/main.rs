@@ -318,6 +318,27 @@ struct Cli {
     )]
     netflow_ja3_blocklist_local: PathBuf,
 
+    /// Tappa 10.5 D2: path to the process-comm allowlist default
+    /// (`process-comm-allowlist.v1` — bare comms exempt from the
+    /// R011..R017 process rules). install.sh drops this; the agent
+    /// reads + merges the operator overlay at boot.
+    #[arg(
+        long = "process-comm-allowlist-v1",
+        value_name = "PATH",
+        default_value = northnarrow_agent::config::comm_allowlist::PROCESS_COMM_ALLOWLIST_V1,
+    )]
+    process_comm_allowlist_v1: PathBuf,
+
+    /// Tappa 10.5 D2: path to the process-comm allowlist operator
+    /// overlay (`+comm` adds, `-comm` re-enables detection on a
+    /// default). Missing file is fine — no overlay.
+    #[arg(
+        long = "process-comm-allowlist-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::config::comm_allowlist::PROCESS_COMM_ALLOWLIST_LOCAL,
+    )]
+    process_comm_allowlist_local: PathBuf,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -571,6 +592,27 @@ async fn main() -> Result<()> {
         northnarrow_agent::decision::rules::net::DnsBurstWindow::new(),
     ));
 
+    // Tappa 10.5 D2: load the process-comm allowlist for the
+    // R011..R017 process rules. Same fail-soft contract as the
+    // netflow blocklists — a missing/broken file boots with an empty
+    // allowlist (the rules then fire purely on their predicates).
+    let process_allowlist = Arc::new(
+        northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
+            "process-comm-allowlist",
+            &cli.process_comm_allowlist_v1,
+            &cli.process_comm_allowlist_local,
+        )
+        .unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                v1 = %cli.process_comm_allowlist_v1.display(),
+                local = %cli.process_comm_allowlist_local.display(),
+                "process-comm allowlist load failed — booting with empty allowlist"
+            );
+            northnarrow_agent::config::comm_allowlist::CommAllowlist::default()
+        }),
+    );
+
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
     #[cfg(not(feature = "demo-tappa5"))]
@@ -578,12 +620,14 @@ async fn main() -> Result<()> {
         Arc::clone(&netflow_blocklist),
         Arc::clone(&ja3_blocklist),
         Arc::clone(&burst_window),
+        Arc::clone(&process_allowlist),
     );
     info!(
         rules = engine.rule_count(),
         demo_tappa5 = cfg!(feature = "demo-tappa5"),
         netflow_blocklist_entries = netflow_blocklist.len(),
         ja3_blocklist_entries = ja3_blocklist.len(),
+        process_comm_allowlist_entries = process_allowlist.len(),
         "decision engine ready"
     );
 
