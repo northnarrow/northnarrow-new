@@ -1,8 +1,13 @@
 # Tappa 10.6 — Detection Depth Refit Design
 
-**Status:** DRAFT — RFC PENDING (§13, Q1–Q10 await owner ruling). No
-code lands until the RFC is resolved; the §12 commit chain
-(D1 → D10) is sequenced but gated on the resolution.
+**Status:** RFC RESOLVED 2026-05-21 (§13 — all 10 owner-accepted
+engineering recommendations applied verbatim as resolved decision
+blocks). D1 (wire APPEND) unblocked; sequenced per the §12 commit chain
+(D1 → D2 → … → D10). Wire-compat boundary clarified: `ProcessSpawnRaw`
+is `bytemuck::Pod` (kernel↔userland, atomic rebuild — strict APPEND
+mandatory, no reorder); postcard applies only to the admin protocol
+(§6/§9). The audit-surfaced `ppid`-hard-coded-0 (§1/§2.1) is fixed in
+D2.
 **Author:** Claude Code (architecture).
 **Date:** 2026-05-21.
 **Classification:** **Beta blocker.** T10.5 closeout accepted two
@@ -443,60 +448,146 @@ argv-bound choice (Q1), chain-rule count (Q6), and verifier iteration.
 Cadence: D1→D2 (wire+BPF foundation) gate the rest; D3→D4 (engine),
 D5→D6 (content), D7 (ADE), D9 (proof). D10 is independent/offline.
 
-## 13. RFC items for owner ruling
+## 13. RFC resolutions
 
-Each carries an engineering recommendation; none are resolved until
-owner sign-off (the T10.5 / T10.7 resolution-block pattern).
+**RESOLVED 2026-05-21.** All 10 engineering recommendations accepted by
+the owner verbatim. The §12 commit chain (D1 → D10) is unblocked. Each
+block below is the locked decision; the prose recommendations are
+retained as the rationale.
 
-**Q1 — argv capture bound.** *Recommendation: a single `512`-byte
-NUL-separated blob* (`ARGV_LEN = 512`), not 16×64 or 32×128. One bounded
-user read of `[arg_start, arg_end)`; userland splits on NUL. 512 B
-covers the overwhelming majority of real command lines; a 2-D array
-(1024–4096 B) bloats the Pod struct and ringbuf (256 KiB / event-size =
-buffered events) for marginal gain. Truncate + flag on overflow.
+### Q1 — argv capture bound
 
-**Q2 — parent context depth.** *Recommendation: `parent_comm[16]` +
-populate `ppid` + `parent_start_ns`.* `parent_start_ns` is the
-PID-reuse-safe key the cross-PID store needs (§4.2); `puid/pgid` add
-little detection value and can be a later APPEND if needed.
+- **Decision:** a single **512-byte NUL-separated blob**
+  (`ARGV_LEN = 512`) plus an `argv_len: u16`; not a 16×64 / 32×128
+  2-D array.
+- **Rationale:** one bounded `bpf_probe_read_user` of
+  `[arg_start, arg_end)`; userland splits on NUL. 512 B covers the
+  overwhelming majority of real command lines. A 2-D array bloats the
+  Pod struct + ringbuf occupancy for marginal detection gain.
+- **Implementation note:** truncate at 512 B; `argv_len` records bytes
+  written so userland knows if it was clamped. `argc` is **not** a wire
+  field — userland derives it by counting NULs (avoids a redundant
+  kernel-side loop).
+- **Reversibility:** easy — `ARGV_LEN` is one constant; growing it is a
+  later APPEND (the trailing field is the blob).
+- **Date resolved:** 2026-05-21.
 
-**Q3 — engine shape.** *Recommendation: single-pass with a deferred
-shared `CorrelationStore`.* Keeps the `Rule::evaluate` contract and
-T10.5 ordering; the ProcessSpawn stream feeds the ancestry tree so no
-second pass is required. Two-pass adds latency + buffering for no win.
+### Q2 — parent context depth
 
-**Q4 — correlation window.** *Recommendation: keep `300s` default,
-configurable per chain rule.* Multi-step chains (CHAIN-005+) may want a
-longer window than a 2-step; let each rule set its own.
+- **Decision:** `parent_comm: [u8; 16]` + **populate the existing
+  `ppid`** (today hard-coded 0 — §1/§2.1) + `parent_start_ns: u64`.
+  Drop `puid`/`pgid`.
+- **Rationale:** `parent_start_ns` is the PID-reuse-safe key the
+  cross-PID correlation store needs (§4.2 — `ProcKey = (pid,
+  start_ns)`); `puid`/`pgid` add little detection value.
+- **Implementation note:** D1 APPENDs `parent_comm` + `parent_start_ns`
+  to the wire (kept zero until D2 wires the BPF reads); `ppid` is an
+  existing field, so D1 changes no layout for it — D2 populates it.
+- **Reversibility:** `puid`/`pgid` can be a later APPEND if a rule needs
+  them.
+- **Date resolved:** 2026-05-21.
 
-**Q5 — wire compat.** *Recommendation: strict APPEND, no break, no
-version bump.* The Pod boundary is atomic (§6); serialized boundaries
-use `#[serde(default)]`. A version bump buys nothing here.
+### Q3 — engine shape
 
-**Q6 — new chain rule count.** *Recommendation: 5* (CHAIN-004..008,
-§5.4). Author the highest-value cross-PID sequences; let T10.7
-adversarial validation reveal which others matter rather than
-over-authoring up front.
+- **Decision:** single-pass with a **deferred shared
+  `CorrelationStore`** — no two-pass engine.
+- **Rationale:** keeps the `Rule::evaluate(&Event) -> Option<Verdict>`
+  contract and the T10.5 register-chain-rules-first ordering; the
+  ProcessSpawn stream feeds the ancestry tree, so ancestry is present
+  by the time a trigger arrives. Two-pass adds latency + buffering for
+  no win.
+- **Implementation note:** §4.2/§4.3 — `Arc<Mutex<CorrelationStore>>`
+  injected into the chain rules.
+- **Reversibility:** moderate — a future two-pass mode could wrap the
+  same store.
+- **Date resolved:** 2026-05-21.
 
-**Q7 — argv-aware R011–R017.** *Recommendation: modify in place, keep
-IDs.* argv is additive confidence on an existing predicate, not a new
-detection; forking R011a/b would violate the immutable-ID spirit and
-double the test surface.
+### Q4 — correlation window
 
-**Q8 — process_template fold-in.** *Recommendation: in scope (D7).* The
-T10.5 D8 deferral reason was "no argv"; T10.6 removes that, so this is
-the natural home.
+- **Decision:** **300s default, configurable per chain rule.**
+- **Rationale:** multi-step chains (CHAIN-005+) may want a longer
+  lookback than a 2-step; per-rule windows avoid one global compromise.
+- **Implementation note:** each chain rule owns its window const; the
+  store's TTL prune uses the querying rule's window.
+- **Reversibility:** trivial (per-rule constants).
+- **Date resolved:** 2026-05-21.
 
-**Q9 — BTF path for argv.** *Recommendation: `task->mm->arg_start/
-arg_end`.* Single program, correct post-exec timing, one bounded user
-read. `linux_binprm` needs an LSM hook bpf-linker can't CO-RE (rejected);
-`sys_enter_execve` offset-24 is a fallback only.
+### Q5 — wire compat
 
-**Q10 — mixed-fleet backward compat.** *Recommendation: best-effort via
-`#[serde(default)]`* on serialized boundaries; the kernel↔userland Pod
-boundary is N/A (atomic rebuild). A strict requirement would only matter
-for cross-version admin-protocol / persisted-row reads, which
-serde-default already handles gracefully.
+- **Decision:** **strict APPEND, no break, no version bump.**
+- **Rationale:** the kernel↔userland boundary is `bytemuck::Pod`,
+  validated by the pump's size-checked `try_from_bytes`, and the eBPF
+  object is **embedded in and rebuilt atomically with** the agent — both
+  sides always agree, so APPEND is safe and no on-the-wire version
+  negotiation exists or is needed (§6). Reordering existing fields is
+  **forbidden** (it would silently corrupt the Pod cast).
+- **Implementation note:** new fields APPEND after `timestamp_ns`;
+  explicit trailing padding keeps the Pod free of implicit padding
+  bytes (a `bytemuck::Pod` derive requirement).
+- **Reversibility:** N/A (additive).
+- **Date resolved:** 2026-05-21.
+
+### Q6 — new chain rule count
+
+- **Decision:** **5 new rules — CHAIN-004..008** (§5.4).
+- **Rationale:** author the highest-value cross-PID sequences; let
+  T10.7 adversarial validation reveal which others matter rather than
+  over-authoring up front. Engine 62 → ~67.
+- **Implementation note:** D6; update both rule-count assertions.
+- **Reversibility:** additive; more can follow as T10.6.x.
+- **Date resolved:** 2026-05-21.
+
+### Q7 — argv-aware R011–R017
+
+- **Decision:** **modify in place, keep IDs** (no R011a/b fork).
+- **Rationale:** argv is additive confidence on an existing predicate,
+  not a new detection; forking IDs would violate the immutable-ID
+  contract and double the test surface.
+- **Implementation note:** D5; argv predicates are additional `&&`
+  conditions, gated to no-op when `argv` is empty (mixed-fleet/older
+  BPF that emits no argv must not regress the existing match).
+- **Reversibility:** predicates are local edits.
+- **Date resolved:** 2026-05-21.
+
+### Q8 — process_template fold-in
+
+- **Decision:** **in scope (D7).**
+- **Rationale:** the T10.5 D8 deferral reason was "no argv to enrich
+  with"; T10.6 removes that, so this is the natural home.
+- **Implementation note:** mirror `chain_template.rs`; argv- and
+  lineage-aware context for Critical-tier process/chain verdicts.
+- **Reversibility:** template is operator-gated per §8.
+- **Date resolved:** 2026-05-21.
+
+### Q9 — BTF path for argv
+
+- **Decision:** **`task->mm->arg_start/arg_end`**; reject
+  `linux_binprm`.
+- **Rationale:** single program (`sched_process_exec`), correct
+  post-exec timing, one bounded user read of a contiguous blob.
+  `linux_binprm` needs the `bprm_check_security` LSM hook bpf-linker
+  cannot CO-RE-relocate (the reason `exec_check.rs` is a tracepoint).
+- **Implementation note:** D2 validates the §3 offsets on 6.8.0-117
+  before writing code; the `sys_enter_execve` offset-24 argv pointer is
+  a documented fallback only.
+- **Reversibility:** the fallback path is pre-analysed if the `mm` read
+  proves verifier-hostile.
+- **Date resolved:** 2026-05-21.
+
+### Q10 — mixed-fleet backward compat
+
+- **Decision:** **best-effort via `#[serde(default)]`** on serialized
+  boundaries; the kernel↔userland Pod boundary is **N/A** (atomic
+  rebuild).
+- **Rationale:** a strict requirement would only matter for
+  cross-version admin-protocol / persisted-row (`*.jsonl`) reads, which
+  `serde(default)` handles gracefully (an older reader tolerates a newer
+  writer's appended fields).
+- **Implementation note:** every new `Event::ProcessSpawn` field carries
+  `#[serde(default)]`; the multiplexer decodes zeroed Pod fields into
+  sane defaults (empty argv, `parent_comm = ""`).
+- **Reversibility:** N/A.
+- **Date resolved:** 2026-05-21.
 
 ---
 
