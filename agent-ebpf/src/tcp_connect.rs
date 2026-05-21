@@ -129,12 +129,27 @@ fn try_tcp_connect_v4(ctx: &ProbeContext) -> Result<(), i64> {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    // Skip loopback (127.0.0.0/8 → first byte 127 in network order
-    // since the address is stored big-endian).
+    // Tappa 10 N9.1 hotfix: loopback (127.0.0.0/8) is NO LONGER
+    // skipped here. The pre-existing T4-era filter
+    // (`if addr_bytes[0] == 127 { return Ok(()); }`, commit 210c596)
+    // was a defensible call for Tappa 4's outbound-C2-monitoring
+    // scope, but it's incompatible with Tappa 10's flow-correlation
+    // contract: tcp_close fexit fires on loopback sockets the same
+    // as any other TCP socket, and the userland N3 flow_tracker
+    // can only correlate close-side events against connect-side
+    // events that wrote to FLOW_SOCK_MAP. Skipping the connect kprobe
+    // means no map write → tcp_close lookup misses → drain drops
+    // the close on the floor as an orphan → zero netflow.jsonl rows
+    // for the loopback flow. That's the bug the §11.2 priv-e2e #1
+    // hit on northnarrowdev (kernel 6.8.0-117, 2026-05-21). It's
+    // also a real operator-visibility gap: container-to-container
+    // C2 in shared-netns Kubernetes pods goes over loopback. N6
+    // rules don't false-positive on loopback (NN-L-NET-007 RFC1918
+    // excludes 127/8; -001/-003 gate on empty default blocklists;
+    // -008/-009 gate on specific TTPs); volume is bounded and the
+    // §6.5 rate limiter handles bursts. Tappa 10's contract
+    // supersedes T4's filter.
     let addr_bytes = sa.sin_addr.to_ne_bytes();
-    if addr_bytes[0] == 127 {
-        return Ok(());
-    }
 
     let mut entry = match TCP_CONNECT_EVENTS.reserve::<TcpConnectRaw>(0) {
         Some(e) => e,
@@ -191,19 +206,9 @@ fn try_tcp_connect_v6(ctx: &ProbeContext) -> Result<(), i64> {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    // Skip ::1 (loopback) — bytes 0..15 == 0, byte 15 == 1.
-    let mut all_zero = true;
-    let mut i = 0usize;
-    while i < 15 {
-        if sa.sin6_addr[i] != 0 {
-            all_zero = false;
-            break;
-        }
-        i += 1;
-    }
-    if all_zero && sa.sin6_addr[15] == 1 {
-        return Ok(());
-    }
+    // Tappa 10 N9.1 hotfix: ::1 (IPv6 loopback) is NO LONGER skipped
+    // here — see the matching rationale in `try_tcp_connect_v4`
+    // above. Same flow-correlation contract applies to v6.
 
     let mut entry = match TCP_CONNECT_EVENTS.reserve::<TcpConnectRaw>(0) {
         Some(e) => e,

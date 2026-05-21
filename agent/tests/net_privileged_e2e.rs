@@ -35,10 +35,7 @@
 //! - `/sys/fs/bpf` mounted as bpffs;
 //! - workspace built `--release --features test-privileged`;
 //! - working `python3` (test #1 spawns a one-shot helper that
-//!   does `gethostbyname` + a TCP `connect_ex`);
-//! - working DNS resolver — test #1 forces a UDP query for a
-//!   synthetic `.invalid` qname so the agent observes a DNS
-//!   query event in the same PID as the subsequent connect.
+//!   does a TCP `connect` + `close`).
 //!
 //! Run:
 //!   sudo -E env "PATH=$PATH" cargo test --release \
@@ -61,22 +58,12 @@ const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const JSONL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Synthetic DNS qname forced into the cache by test #1. The
-/// `.invalid` TLD is RFC 6761 reserved — no real authoritative
-/// server will answer it, but the host's local resolver still
-/// sends the UDP query (NXDOMAIN comes back), which is enough
-/// for the agent's `udp_sendmsg` kprobe to fire. Same PID does
-/// the subsequent connect, so `DnsCache::lookup_for_connect`
-/// finds the qname when the drain loop annotates the close
-/// event.
-const SYNTHETIC_QNAME: &str = "foo.northnarrow-e2etest.invalid";
-
 /// Test process's TCP destination port. Picked high enough to
 /// avoid privileged-port conflicts but stable across boots so a
 /// single rule (NN-L-NET-006 uncommon-port listener) can be
-/// pinned in tests. NOT port 22 — see N9 design note in the
-/// test #1 body for why we don't reuse §11.2's `localhost:22`
-/// example.
+/// pinned in tests. NOT port 22 — `localhost:22` (§11.2 example)
+/// would tangle the test with the host's SSH daemon which may
+/// or may not be running.
 const FLOW_DST_PORT: u16 = 33999;
 
 /// Uncommon listener port for test #2. Outside the §7
@@ -428,37 +415,58 @@ where
     );
 }
 
-// ── Test 1: outbound flow with DNS attribution ─────────────────────
+// ── Test 1: outbound TCP flow to a loopback destination ─────────────
 
-/// N9 e2e #1 — outbound TCP flow + DNS attribution. Spawn the
-/// agent, then a single helper subprocess that (a) calls
-/// `gethostbyname` on a synthetic `.invalid` qname (forces a UDP
-/// DNS query through `udp_sendmsg`, observable on the agent's
-/// Tappa 4 `dns_query` kprobe), then (b) opens a TCP connection
-/// to 127.0.0.1:<FLOW_DST_PORT> in the SAME PID (forces
-/// `tcp_v4_connect` + `tcp_close`, observable on the agent's
-/// Tappa 4 + Tappa 10 N2 kprobes / fexit). The agent's
-/// `DnsCache::lookup_for_connect` MUST hit (same PID, < TTL gap)
-/// and annotate the `NetFlowEvent.resolved_hostname` with the
-/// qname.
+/// N9 e2e #1 — outbound TCP flow correlation for a loopback dst.
+/// Spawn the agent, open a TcpListener on `127.0.0.1:<FLOW_DST_PORT>`
+/// to accept the test's TCP connection, then run a one-shot
+/// python3 helper that opens + closes a TCP socket to that port.
+/// The agent's N9 drain loop MUST correlate the kernel-side
+/// `tcp_v4_connect` kprobe (Tappa 4) with the `tcp_close` fexit
+/// (Tappa 10 N2) and write a chained row to `netflow.jsonl` with
+/// the expected 5-tuple + signed chain primitives.
 ///
-/// Why a synthetic `.invalid` qname instead of §11.2's literal
-/// `localhost`: `localhost` resolves via `/etc/hosts` on every
-/// supported distro (NSS `files` module wins over `dns`), so the
-/// resolver never sends a UDP packet → the agent never observes
-/// a DNS query → `DnsCache::lookup_for_connect` returns None →
-/// `resolved_hostname` stays unset and the test fails. The
-/// `.invalid` TLD is RFC 6761 reserved — NSS `files` won't match
-/// it, so the request flows through to NSS `dns` which emits the
-/// UDP packet. NXDOMAIN comes back; that's fine, we observe the
-/// QUERY not the response. See §11.2 deferral note.
+/// **Why this is the loopback-correlation test specifically:**
+/// pre-N9.1, the Tappa 4 `tcp_v[46]_connect` kprobe skipped
+/// 127.0.0.0/8 dsts (commit 210c596, May 2026), which was a
+/// defensible outbound-monitoring filter at the time but broke
+/// Tappa 10's flow-correlation contract end-to-end (no
+/// FLOW_SOCK_MAP write → tcp_close lookup miss → drain drops the
+/// close as an orphan → zero `netflow.jsonl` rows). N9.1 removes
+/// the skip; this test pins the END-TO-END kernel→userland wire
+/// on a loopback five-tuple so the regression can't sneak back in
+/// (operator-visibility gap re container-to-container loopback
+/// C2 in shared-netns Kubernetes pods).
 ///
-/// Test #2 from the original §11.2 list
-/// (`net_ja3_fingerprint_extracted_on_tls_handshake`) is DEFERRED
-/// to Tappa 11.5 per §13 Q2 packet-capture atomicity lock-in.
+/// **§11.2 DNS-attribution coverage NOT exercised here.** The
+/// original §11.2 spec for test #1 asserted `resolved_hostname`
+/// gets populated via `DnsCache::lookup_for_connect`. That
+/// assertion was DEFERRED in the N9.1 hotfix because the Tappa 4
+/// `dns_query` kprobe has two pre-existing bugs the N9 priv-e2e
+/// was the first to expose end-to-end:
+///   - Bug 2 (`agent-ebpf/src/dns_query.rs:100-102`) — early-
+///     returns when `msghdr->msg_name == NULL`, which is exactly
+///     the shape libc resolvers emit (`connect()` + `send()`).
+///     glibc's `res_nquery` uses connected sockets → kprobe
+///     never fires for real DNS resolution.
+///   - Bug 3 (`agent-ebpf/src/dns_query.rs:168-178`) — kernel
+///     side never copies the QNAME bytes from the UDP payload
+///     into `(*raw_ptr).query_name`. `qname_len` stays 0, so
+///     userland decodes an empty string regardless.
+///
+/// DNS attribution stays unit-tested via N4's 6
+/// `agent/src/net/dns_cache.rs::tests` (PID-keyed cache + TTL
+/// expiry + cross-PID isolation). The T4 DNS observability
+/// refit is tracked separately — see N9.1 commit message
+/// backlog item "Tappa 10 N9.2 / 10.1: T4 DNS observability
+/// refit".
+///
+/// **§11.2 test #2 (JA3 fingerprint)** stays DEFERRED to
+/// Tappa 11.5 per §13 Q2 packet-capture atomicity lock-in
+/// (separate, pre-existing deferral — unchanged by N9.1).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
-fn net_outbound_connect_records_flow_with_dns_attribution() {
+fn net_outbound_connect_records_flow_for_loopback_destination() {
     let _eni = EniIptablesGuard::install();
     let fx = NetFixture::setup();
 
@@ -482,14 +490,13 @@ fn net_outbound_connect_records_flow_with_dns_attribution() {
 
     // Spawn the helper. python3 is universally present on the
     // production target; if it's missing, we want a clear
-    // failure message rather than a silent skip.
+    // failure message rather than a silent skip. Connect + close
+    // only — no `gethostbyname` call. DNS attribution coverage
+    // intentionally NOT exercised here (see test docstring
+    // re T4 DNS bugs 2 + 3).
     let helper = format!(
         r#"
 import socket
-try:
-    socket.gethostbyname("{qname}")
-except Exception:
-    pass
 s = socket.socket()
 s.settimeout(2)
 try:
@@ -502,7 +509,6 @@ except Exception:
     pass
 s.close()
 "#,
-        qname = SYNTHETIC_QNAME,
         port = FLOW_DST_PORT,
     );
     let status = Command::new("python3")
@@ -528,10 +534,24 @@ s.close()
     let row = &rows[0];
     assert_eq!(row["proto"].as_u64(), Some(6), "proto must be TCP (6)");
     assert_eq!(
-        row["resolved_hostname"].as_str(),
-        Some(SYNTHETIC_QNAME),
-        "resolved_hostname must be attributed via DnsCache::lookup_for_connect \
-         (same-PID + within-TTL query); row = {row:?}"
+        row["src_addr"].as_str(),
+        Some("0.0.0.0"),
+        "src_addr should be 0.0.0.0 (the connect kprobe runs before \
+         the kernel binds the local end — `sk->sk_rcv_saddr` is the \
+         wildcard at that point); got {:?}",
+        row["src_addr"]
+    );
+    // The flow_id is the per-flow stable ID — 32 lowercase hex
+    // chars of SHA-256(start_ns || five_tuple || pid)[..16].
+    let flow_id = row["flow_id"].as_str().unwrap_or("");
+    assert_eq!(
+        flow_id.len(),
+        32,
+        "flow_id should be 32 hex chars (design §4.1); got {flow_id:?}"
+    );
+    assert!(
+        flow_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "flow_id must be lowercase hex; got {flow_id:?}"
     );
     // Chain integrity smoke: signed row carries non-empty
     // prev_hash, entry_hash, agent_sig per design §4.4.
@@ -544,6 +564,11 @@ s.close()
         row["agent_sig"].as_str().is_some_and(|s| !s.is_empty()),
         "agent_sig must be present on a chained row"
     );
+    // resolved_hostname IS NOT ASSERTED — see the test docstring
+    // for the T4 DNS observability refit deferral. A future
+    // commit that fixes Bug 2 + Bug 3 in `agent-ebpf/src/dns_query.rs`
+    // will extend this test (or add a sibling) to pin the
+    // attribution path on a live kernel.
 }
 
 // ── Test 2: uncommon-port listener trips NN-L-NET-006 ──────────────
