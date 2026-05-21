@@ -155,3 +155,37 @@
 # Docker (NN-L-FIM-014)
 /root/.docker/config.json
 /var/lib/docker/credentials.json
+
+# ── Tappa 10.5 D3: credential stores + persistence/evasion surface ────
+# (NN-L-FIM-015..023). NOTE: the credential-store paths below are the
+# ROOT-account copies. Browser / password-manager / GPG stores live
+# under each human user's $HOME, which varies per host — operators add
+# their /home/<user>/... profile paths via fim-paths.local. The rules
+# match on path FRAGMENTS (e.g. "Login Data", ".kdbx", "/.gnupg/"), so
+# any watched path under those locations trips them.
+
+# Browser stored credentials (NN-L-FIM-015 — T1555.003)
+/root/.config/google-chrome/Default/Login Data
+/root/.config/chromium/Default/Login Data
+/root/.mozilla/firefox
+
+# Password-manager databases (NN-L-FIM-016 — T1555.005)
+/root/.password-store
+
+# GPG keyring (NN-L-FIM-017 — T1552.004)
+/root/.gnupg
+
+# Shell history (NN-L-FIM-020 — T1070.003)
+/root/.bash_history
+/root/.zsh_history
+
+# PAM module object dirs (NN-L-FIM-021 — T1543/T1556). The .so files
+# under these (not the /etc/pam.d/ configs already watched above) are
+# the loadable auth modules an attacker swaps for a credential harvester.
+/lib/security
+/usr/lib/security
+/lib/x86_64-linux-gnu/security
+/usr/lib/x86_64-linux-gnu/security
+
+# Dynamic-linker preload anchor (NN-L-FIM-022 — T1574.006)
+/etc/ld.so.preload

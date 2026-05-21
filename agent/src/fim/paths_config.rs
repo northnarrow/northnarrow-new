@@ -209,6 +209,34 @@ mod tests {
         assert!(out.unknown_disable.is_empty());
     }
 
+    /// Tappa 10.5 D3: the SHIPPED `configs/fim-paths.v1`
+    /// (install.sh drops it to /etc/northnarrow/) parses clean and
+    /// includes the new D3 watch paths. A malformed default (e.g. a
+    /// stray directive prefix) fails the build's test gate rather
+    /// than at an operator's boot.
+    #[test]
+    fn shipped_fim_paths_v1_loads_clean_with_d3_paths() {
+        let v1 = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../configs/fim-paths.v1"
+        ));
+        // No overlay shipped (operator-curated) — exercise v1-only.
+        let local = v1.with_extension("nonexistent.local");
+        let out = load_watched_paths(&v1, &local).expect("shipped fim-paths.v1 must parse clean");
+        for p in [
+            "/etc/ld.so.preload",
+            "/root/.gnupg",
+            "/root/.password-store",
+            "/usr/lib/x86_64-linux-gnu/security",
+            "/root/.config/google-chrome/Default/Login Data",
+        ] {
+            assert!(
+                out.effective.contains(&PathBuf::from(p)),
+                "shipped fim-paths.v1 should watch {p} (D3)"
+            );
+        }
+    }
+
     /// C7 #4: a malformed v1 (relative path) is rejected up-front
     /// rather than silently registering a non-absolute path. The
     /// agent boot continues (load_watched_paths returns Err but
