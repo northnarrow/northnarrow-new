@@ -31,6 +31,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use super::ancestry::AncestryTree;
+
 /// Default correlation lookback (§13 Q4). Rules may pass a different
 /// `window_ns`; this is the value the migrated CHAIN-001..003 use,
 /// matching the T10.5 5-minute precedent.
@@ -88,6 +90,8 @@ pub struct CorrelationStore {
     per_proc: HashMap<ProcKey, VecDeque<Precursor>>,
     /// FIFO insertion order of keys, for stale-first overflow eviction.
     eviction: VecDeque<ProcKey>,
+    /// D4 — parent→child lineage for cross-PID correlation.
+    tree: AncestryTree,
 }
 
 impl CorrelationStore {
@@ -189,6 +193,53 @@ impl CorrelationStore {
         window_ns: u64,
     ) -> bool {
         self.has_sequence(ProcKey::unresolved(pid), kinds, now_ns, window_ns)
+    }
+
+    // ── D4: cross-PID lineage ────────────────────────────────────────
+
+    /// Observe a process spawn: link `child_pid` to its `parent`
+    /// [`ProcKey`] in the ancestry tree. If `child_pid` was already
+    /// known, the PID has been **recycled** — wipe the prior
+    /// incarnation's same-PID precursors so they can't false-correlate
+    /// with the new process (the PID-reuse guard, given the D2 wire
+    /// carries the parent's `start_ns` but not the child's own).
+    pub fn observe_spawn(&mut self, child_pid: u32, parent: ProcKey) {
+        let reused = self.tree.observe(child_pid, parent);
+        if reused {
+            self.forget_pid(child_pid);
+        }
+    }
+
+    /// Same-PID **or** any-ancestor: `true` if `pid` itself, or any
+    /// process in its lineage, has a `kind` precursor in window. The
+    /// cross-PID kill-chain query (design §4 G4) the D6 chains build on.
+    pub fn has_recent_in_lineage(
+        &mut self,
+        pid: u32,
+        kind: PrecursorKind,
+        now_ns: u64,
+        window_ns: u64,
+    ) -> bool {
+        if self.has_recent_for_pid(pid, kind, now_ns, window_ns) {
+            return true;
+        }
+        for ancestor in self.tree.get_ancestors(pid) {
+            if self.has_recent_for_pid(ancestor.pid, kind, now_ns, window_ns) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Read-only view of the ancestry tree (lineage queries / tests).
+    pub fn ancestry(&self) -> &AncestryTree {
+        &self.tree
+    }
+
+    /// Drop every precursor recorded for `pid` (any incarnation key).
+    fn forget_pid(&mut self, pid: u32) {
+        self.per_proc.retain(|k, _| k.pid != pid);
+        self.eviction.retain(|k| k.pid != pid);
     }
 
     // ── internals ────────────────────────────────────────────────────
@@ -427,5 +478,68 @@ mod tests {
         assert!(!s.has_recent_for_pid(42, PrecursorKind::CredRead, 130 * SEC, 10 * SEC));
         // ...but the default window still finds it.
         assert!(s.has_recent_for_pid(42, PrecursorKind::CredRead, 130 * SEC, W));
+    }
+
+    // ── D4 cross-PID lineage ────────────────────────────────────────
+
+    #[test]
+    fn cross_pid_chain_detection_via_ancestry() {
+        // Parent (pid 100) reads creds; it spawns child 200; the child
+        // does the egress. has_recent_in_lineage(child) finds the
+        // parent's precursor via the ancestry walk.
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(100, PrecursorKind::CredRead, 10 * SEC);
+        s.observe_spawn(200, key(100, 1_000));
+        assert!(s.has_recent_in_lineage(200, PrecursorKind::CredRead, 12 * SEC, W));
+        // Same-PID still matches via lineage (self is checked first).
+        s.record_for_pid(300, PrecursorKind::CanaryTrip, 10 * SEC);
+        assert!(s.has_recent_in_lineage(300, PrecursorKind::CanaryTrip, 11 * SEC, W));
+    }
+
+    #[test]
+    fn multi_level_lineage_lookup() {
+        // 100 → 200 → 300; precursor on the grandparent reaches the
+        // grandchild.
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(100, PrecursorKind::TmpExec, 10 * SEC);
+        s.observe_spawn(200, key(100, 1_000));
+        s.observe_spawn(300, key(200, 2_000));
+        assert!(s.has_recent_in_lineage(300, PrecursorKind::TmpExec, 12 * SEC, W));
+    }
+
+    #[test]
+    fn ancestor_chain_breaks_on_unrelated_process() {
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(100, PrecursorKind::CredRead, 10 * SEC);
+        s.observe_spawn(200, key(100, 1_000));
+        // 999 is not in 200's lineage and has no precursor of its own.
+        assert!(!s.has_recent_in_lineage(999, PrecursorKind::CredRead, 12 * SEC, W));
+        // And a different kind along the real lineage still misses.
+        assert!(!s.has_recent_in_lineage(200, PrecursorKind::TmpExec, 12 * SEC, W));
+    }
+
+    #[test]
+    fn pid_reuse_via_observe_spawn_wipes_stale_precursor() {
+        // pid 200 reads creds, then the PID is recycled (a fresh spawn
+        // of 200) — the new incarnation must not inherit the precursor.
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(200, PrecursorKind::CredRead, 10 * SEC);
+        s.observe_spawn(200, key(100, 1_000)); // first sighting (not reuse)
+        assert!(
+            s.has_recent_for_pid(200, PrecursorKind::CredRead, 11 * SEC, W),
+            "first spawn does not wipe"
+        );
+        s.observe_spawn(200, key(150, 9_000)); // second sighting = reuse
+        assert!(
+            !s.has_recent_for_pid(200, PrecursorKind::CredRead, 12 * SEC, W),
+            "recycled PID's stale precursor must be wiped"
+        );
+    }
+
+    #[test]
+    fn lineage_exposes_ancestry_tree() {
+        let mut s = CorrelationStore::new();
+        s.observe_spawn(200, key(100, 1_000));
+        assert!(s.ancestry().is_ancestor(200, 100));
     }
 }

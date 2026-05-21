@@ -188,16 +188,30 @@ impl Rule for NnLChain002TmpExecThenEgress {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
-            // Precursor: a process image under /tmp/ (R001 shape).
+            // Every spawn feeds the shared ancestry tree (D4) — this is
+            // the one chain rule that sees `Event::ProcessSpawn`, so it
+            // hosts lineage observation for the whole store. A `/tmp`
+            // image additionally records the TmpExec precursor (R001
+            // shape). Always returns None (record-only).
             Event::ProcessSpawn {
                 pid,
+                ppid,
                 filename,
                 timestamp_ns,
+                parent_start_ns,
                 ..
-            } if filename.starts_with("/tmp/") => {
-                self.buf
-                    .lock()
-                    .record_for_pid(*pid, PrecursorKind::TmpExec, *timestamp_ns);
+            } => {
+                let mut store = self.buf.lock();
+                store.observe_spawn(
+                    *pid,
+                    crate::decision::correlation::ProcKey {
+                        pid: *ppid,
+                        start_ns: *parent_start_ns,
+                    },
+                );
+                if filename.starts_with("/tmp/") {
+                    store.record_for_pid(*pid, PrecursorKind::TmpExec, *timestamp_ns);
+                }
                 None
             }
             // Trigger: same-PID egress to a non-DNS port.
