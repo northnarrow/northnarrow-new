@@ -1,9 +1,15 @@
 //! Rule engine: holds a sequence of [`Rule`]s and routes events
 //! through them.
 
-use common::{Event, Verdict};
+use std::sync::Arc;
 
-use super::{rules::default_rules, Rule};
+use common::{Event, Verdict};
+use parking_lot::Mutex;
+
+use super::rules::net::DnsBurstWindow;
+use super::rules::{default_rules, default_rules_with_net};
+use super::Rule;
+use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 /// Owns the active rule set and dispatches events to it.
 ///
@@ -24,6 +30,23 @@ impl RuleEngine {
     pub fn with_default_rules() -> Self {
         let mut e = Self::new();
         for r in default_rules() {
+            e.add_rule(r);
+        }
+        e
+    }
+
+    /// Tappa 10 N9 — engine pre-loaded with the full Tappa 2 +
+    /// FIM (Tappa 9) + canary (Tappa 9.5) + NN-L-NET (Tappa 10)
+    /// rule set, with operator-loaded blocklists threaded into
+    /// the 9 net rules. Production `main.rs` calls this once at
+    /// boot after reading the blocklist files from disk.
+    pub fn with_default_rules_and_net(
+        blocklist: Arc<NetBlocklist>,
+        ja3_blocklist: Arc<Ja3Blocklist>,
+        burst_window: Arc<Mutex<DnsBurstWindow>>,
+    ) -> Self {
+        let mut e = Self::new();
+        for r in default_rules_with_net(blocklist, ja3_blocklist, burst_window) {
             e.add_rule(r);
         }
         e

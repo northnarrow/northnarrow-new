@@ -34,6 +34,12 @@ use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::net::blocklist::{
+    Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
+    DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
+};
+use northnarrow_agent::net::dns_cache::DnsCache;
+use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::{CombatEntryHook, CombatReleaseHook, PostureMachine};
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
@@ -260,6 +266,58 @@ struct Cli {
     )]
     netflow_file: PathBuf,
 
+    /// Tappa 10 N9: configurable path of the chained NetListener
+    /// log (`netflow_listeners.jsonl`). Same per-test override
+    /// rationale as `--netflow-file` — tests point this at a
+    /// tempdir so each run gets a fresh chain. The N9 drain loop
+    /// appends one row per observed `inet_csk_listen_start` kernel
+    /// event.
+    #[arg(
+        long = "netflow-listeners-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::net::drain::DEFAULT_NETFLOW_LISTENERS_JSONL_PATH,
+    )]
+    netflow_listeners_file: PathBuf,
+
+    /// Tappa 10 N9: configurable path of the operator-curated
+    /// NetFlow IP/CIDR blocklist (default — read at boot, feeds
+    /// NN-L-NET-001).
+    #[arg(
+        long = "netflow-blocklist-v1",
+        value_name = "PATH",
+        default_value = DEFAULT_NETFLOW_BLOCKLIST_V1,
+    )]
+    netflow_blocklist_v1: PathBuf,
+
+    /// Tappa 10 N9: configurable path of the operator overlay
+    /// for the NetFlow IP/CIDR blocklist (`+` adds, `-` disables
+    /// a default entry). Missing file is fine — no overlay.
+    #[arg(
+        long = "netflow-blocklist-local",
+        value_name = "PATH",
+        default_value = DEFAULT_NETFLOW_BLOCKLIST_LOCAL,
+    )]
+    netflow_blocklist_local: PathBuf,
+
+    /// Tappa 10 N9: configurable path of the operator-curated
+    /// NetFlow JA3 blocklist (default — read at boot, feeds
+    /// NN-L-NET-003). Ships EMPTY per §10 / N8.
+    #[arg(
+        long = "netflow-ja3-blocklist-v1",
+        value_name = "PATH",
+        default_value = DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
+    )]
+    netflow_ja3_blocklist_v1: PathBuf,
+
+    /// Tappa 10 N9: configurable path of the operator overlay
+    /// for the NetFlow JA3 blocklist. Missing file is fine.
+    #[arg(
+        long = "netflow-ja3-blocklist-local",
+        value_name = "PATH",
+        default_value = DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL,
+    )]
+    netflow_ja3_blocklist_local: PathBuf,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -388,6 +446,19 @@ async fn main() -> Result<()> {
              created on first flow close (and unprotected this boot)"
         );
     }
+    // Tappa 10 N9: bootstrap the NetListener chain log pre-attach
+    // for the same reason — STATE_PROTECTED_FILES needs an inode
+    // before LSM hooks come up. A present file is left untouched.
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_netflow_listeners_log(
+        &cli.netflow_listeners_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.netflow_listeners_file.display(),
+            "netflow_listeners log bootstrap failed pre-attach — file will be \
+             lazily created on first listener event (and unprotected this boot)"
+        );
+    }
     // agent_id bootstrap moved up from line ~360 so its inode is
     // present in PROTECTED_INODES from boot. The post-attach
     // re-read at line ~360 stays for the SignedPayload wiring path
@@ -402,12 +473,25 @@ async fn main() -> Result<()> {
         e
     });
 
-    let mut sensor = SensorMultiplexer::start()
+    // Tappa 10 N9 — build the shared net state BEFORE starting the
+    // sensor multiplexer so the TcpConnect + DnsQuery pumps can
+    // feed the FlowTracker / DnsCache the instant they start
+    // pumping. NetWiring is Arc-shared with the net drain task
+    // spawned further down.
+    let flow_tracker = Arc::new(parking_lot::Mutex::new(FlowTracker::default()));
+    let dns_cache = Arc::new(DnsCache::default());
+    let net_wiring = northnarrow_agent::sensors::multiplexer::NetWiring {
+        flow_tracker: Arc::clone(&flow_tracker),
+        dns_cache: Arc::clone(&dns_cache),
+    };
+    let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
         .await
-        .context("starting the sensor multiplexer")?;
+        .context("starting the sensor multiplexer (with net observation)")?;
     info!(
-        sensors = "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query",
-        "sensor multiplexer attached"
+        sensors =
+            "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \
+                   inet_csk_listen_start, tcp_close, udp_sendmsg_outbound",
+        "sensor multiplexer attached (including Tappa 10 N2 net observation programs)"
     );
 
     // Tappa 7: turn ourselves opaque to kill(2) and ptrace(2) before
@@ -448,13 +532,58 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Tappa 10 N9 — load operator-curated netflow blocklists from
+    // disk + thread them into the decision engine. Load failures
+    // degrade gracefully (empty list, like N6 net_rules_empty),
+    // so a missing/broken file never blocks agent boot. The
+    // production deploy bootstrap (N8 install.sh) ships the v1
+    // defaults; missing .local overlay is the normal case for a
+    // host without operator-specific block additions.
+    let netflow_blocklist = Arc::new(
+        NetBlocklist::load(&cli.netflow_blocklist_v1, &cli.netflow_blocklist_local).unwrap_or_else(
+            |e| {
+                warn!(
+                    error = %e,
+                    v1 = %cli.netflow_blocklist_v1.display(),
+                    local = %cli.netflow_blocklist_local.display(),
+                    "netflow blocklist load failed — booting with empty blocklist"
+                );
+                NetBlocklist::empty()
+            },
+        ),
+    );
+    let ja3_blocklist = Arc::new(
+        Ja3Blocklist::load(
+            &cli.netflow_ja3_blocklist_v1,
+            &cli.netflow_ja3_blocklist_local,
+        )
+        .unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                v1 = %cli.netflow_ja3_blocklist_v1.display(),
+                local = %cli.netflow_ja3_blocklist_local.display(),
+                "netflow ja3 blocklist load failed — booting with empty blocklist"
+            );
+            Ja3Blocklist::empty()
+        }),
+    );
+    let burst_window = Arc::new(parking_lot::Mutex::new(
+        northnarrow_agent::decision::rules::net::DnsBurstWindow::new(),
+    ));
+
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
     #[cfg(not(feature = "demo-tappa5"))]
-    let engine = RuleEngine::with_default_rules();
+    let engine = RuleEngine::with_default_rules_and_net(
+        Arc::clone(&netflow_blocklist),
+        Arc::clone(&ja3_blocklist),
+        Arc::clone(&burst_window),
+    );
     info!(
         rules = engine.rule_count(),
         demo_tappa5 = cfg!(feature = "demo-tappa5"),
+        netflow_blocklist_entries = netflow_blocklist.len(),
+        ja3_blocklist_entries = ja3_blocklist.len(),
         "decision engine ready"
     );
 
@@ -1014,6 +1143,95 @@ async fn main() -> Result<()> {
             _ => (None, None),
         }
     };
+
+    // ── Tappa 10 N9 — net drain subsystem boot ─────────────────────
+    //
+    // Closes the kernel→userland net loop: the multiplexer above
+    // has already attached the three N2 BPF programs (kprobe
+    // inet_csk_listen_start + fexit tcp_close + kprobe
+    // udp_sendmsg_outbound) and surfaced the two new ringbufs in
+    // `net_bufs`. Here we:
+    //   1. Open the two chained on-disk logs (`netflow.jsonl` +
+    //      `netflow_listeners.jsonl`) — same chain shape as the
+    //      Tappa 8 audit log + Tappa 9 drift log;
+    //   2. spawn `net::drain::drain_loop` against the two ringbufs
+    //      with shared `flow_tracker` + `dns_cache` (the
+    //      multiplexer's TcpConnect / DnsQuery pumps feed those
+    //      from the connect / DNS-query sides);
+    //   3. register the spawned handle on the multiplexer so a
+    //      clean shutdown aborts it alongside the sensor pumps.
+    //
+    // Per-step failures are warn-logged and skipped — the agent
+    // still boots without net drain (mirrors the FIM degrade-not-
+    // fail posture). Without the drain, kernel close + listen
+    // events accumulate in the ringbuf until it fills + the
+    // verifier-side ringbuf drop counter ticks; NN-L-NET-001..009
+    // see zero events but the agent stays up.
+    {
+        use northnarrow_agent::net::drain::{drain_loop, NetFlowDb, NetListenerDb};
+
+        let netflow_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+            &cli.signing_key_file,
+        )
+        .and_then(|key| NetFlowDb::open(&cli.netflow_file, key, agent_id))
+        {
+            Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %cli.netflow_file.display(),
+                    "netflow DB open failed — net drain loop will not spawn; \
+                     kernel flow close events will be dropped this boot"
+                );
+                None
+            }
+        };
+        let listener_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
+            &cli.signing_key_file,
+        )
+        .and_then(|key| NetListenerDb::open(&cli.netflow_listeners_file, key, agent_id))
+        {
+            Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %cli.netflow_listeners_file.display(),
+                    "netflow_listeners DB open failed — net drain loop will not \
+                     spawn; kernel listen events will be dropped this boot"
+                );
+                None
+            }
+        };
+        if let (Some(netflow_db), Some(listener_db)) = (netflow_db_opt, listener_db_opt) {
+            let flow_tracker_for_drain = Arc::clone(&flow_tracker);
+            let dns_cache_for_drain = Arc::clone(&dns_cache);
+            let event_tx = sensor.event_tx();
+            let close_rb = net_bufs.close_rb;
+            let listen_rb = net_bufs.listen_rb;
+            let handle = tokio::spawn(async move {
+                if let Err(e) = drain_loop(
+                    close_rb,
+                    listen_rb,
+                    flow_tracker_for_drain,
+                    dns_cache_for_drain,
+                    netflow_db,
+                    listener_db,
+                    event_tx,
+                )
+                .await
+                {
+                    warn!(target: "net.drain", error = %e, "net drain loop exited");
+                }
+            });
+            sensor.register_pump_handle(handle);
+            info!("net: drain loop spawned (NET_FLOW_CLOSE_EVENTS + NET_LISTEN_EVENTS)");
+        } else {
+            warn!(
+                "net: drain loop not spawned — see prior warnings for failed \
+                 db open(s); kernel net events will accumulate in ringbufs"
+            );
+        }
+    }
 
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
