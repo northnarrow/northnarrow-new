@@ -100,11 +100,14 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
 /// `/etc/northnarrow/netflow-blocklist.{v1,local}` +
 /// `netflow-ja3-blocklist.{v1,local}` +
 /// `process-comm-allowlist.{v1,local}` from disk.
+#[allow(clippy::too_many_arguments)]
 pub fn default_rules_with_net(
     blocklist: Arc<NetBlocklist>,
     ja3_blocklist: Arc<Ja3Blocklist>,
     burst_window: Arc<Mutex<DnsBurstWindow>>,
     process_allowlist: Arc<CommAllowlist>,
+    netflow_comm_allowlist: Arc<CommAllowlist>,
+    beacon_window: Arc<Mutex<net::BeaconWindow>>,
 ) -> Vec<Box<dyn Rule>> {
     let mut rules: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
@@ -121,7 +124,13 @@ pub fn default_rules_with_net(
     rules.extend(process_rules(process_allowlist));
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
-    rules.extend(net::net_rules(blocklist, ja3_blocklist, burst_window));
+    rules.extend(net::net_rules(
+        blocklist,
+        ja3_blocklist,
+        burst_window,
+        netflow_comm_allowlist,
+        beacon_window,
+    ));
     rules
 }
 

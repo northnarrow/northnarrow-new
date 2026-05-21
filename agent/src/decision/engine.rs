@@ -41,14 +41,24 @@ impl RuleEngine {
     /// rule set, with operator-loaded blocklists threaded into
     /// the 9 net rules. Production `main.rs` calls this once at
     /// boot after reading the blocklist files from disk.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_default_rules_and_net(
         blocklist: Arc<NetBlocklist>,
         ja3_blocklist: Arc<Ja3Blocklist>,
         burst_window: Arc<Mutex<DnsBurstWindow>>,
         process_allowlist: Arc<CommAllowlist>,
+        netflow_comm_allowlist: Arc<CommAllowlist>,
+        beacon_window: Arc<Mutex<super::rules::net::BeaconWindow>>,
     ) -> Self {
         let mut e = Self::new();
-        for r in default_rules_with_net(blocklist, ja3_blocklist, burst_window, process_allowlist) {
+        for r in default_rules_with_net(
+            blocklist,
+            ja3_blocklist,
+            burst_window,
+            process_allowlist,
+            netflow_comm_allowlist,
+            beacon_window,
+        ) {
             e.add_rule(r);
         }
         e
