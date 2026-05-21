@@ -11,6 +11,7 @@ use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 pub mod canary;
+pub mod chain;
 pub mod net;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
@@ -63,7 +64,13 @@ pub use r017_shell_from_nonstandard_path::R017ShellFromNonstandardPath;
 /// canary events never co-occur with FIM events for the same
 /// inode (§12 Q9 inline-filter lock-in).
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
-    let mut rules: Vec<Box<dyn Rule>> = vec![
+    // Tappa 10.5 (D5) — chain rules go FIRST so they OBSERVE precursor
+    // events (recording + returning None, falling through to the
+    // firing rule) before a first-match short-circuits the scan, and
+    // so a correlated flow surfaces the Critical chain verdict ahead
+    // of any lower-severity net rule. See `chain.rs` module docs.
+    let mut rules: Vec<Box<dyn Rule>> = chain::chain_rules();
+    let tappa2: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
         Box::new(R007CryptoMiner),
         Box::new(R006ReverseShellTooling),
@@ -75,6 +82,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(R005NetcatExec),
         Box::new(R008HiddenHomeBinary),
     ];
+    rules.extend(tappa2);
     // Tappa 10.5 (D2) — 7 NN process rules R011..R017 APPEND after
     // the Tappa 2 R001..R010 block so existing process-rule routing
     // (first-match-wins within `Event::ProcessSpawn`) is unchanged.
@@ -109,7 +117,10 @@ pub fn default_rules_with_net(
     netflow_comm_allowlist: Arc<CommAllowlist>,
     beacon_window: Arc<Mutex<net::BeaconWindow>>,
 ) -> Vec<Box<dyn Rule>> {
-    let mut rules: Vec<Box<dyn Rule>> = vec![
+    // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
+    // the chain.rs module docs for the ordering rationale).
+    let mut rules: Vec<Box<dyn Rule>> = chain::chain_rules();
+    let tappa2: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
         Box::new(R007CryptoMiner),
         Box::new(R006ReverseShellTooling),
@@ -121,6 +132,7 @@ pub fn default_rules_with_net(
         Box::new(R005NetcatExec),
         Box::new(R008HiddenHomeBinary),
     ];
+    rules.extend(tappa2);
     rules.extend(process_rules(process_allowlist));
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());

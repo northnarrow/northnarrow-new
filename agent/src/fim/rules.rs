@@ -838,6 +838,26 @@ const GPG_KEYRING_FRAGMENTS: &[&str] = &["/.gnupg/"];
 /// The GnuPG toolchain that legitimately reads the keyring.
 const GPG_COMMS: &[&str] = &["gpg", "gpg2", "gpg-agent", "gpgconf", "gpgsm", "dirmngr"];
 
+/// `true` if this FIM event is an access (read or write) of any
+/// credential-store path that NN-L-FIM-015/016/017 watch (browser
+/// login stores, password-manager DBs, GPG keyrings). Single source
+/// of truth for the "credential-store FIM hit" signal — Tappa 10.5
+/// D5's NN-L-CHAIN-001 reuses it as the chain precursor so the
+/// fragment lists never drift between the FIM rules and the chain.
+/// Note: this does NOT apply the per-app comm exemption the FIM
+/// rules use — the chain rule wants the precursor recorded for ANY
+/// accessor (the correlation with egress is what makes it Critical).
+pub fn is_credential_store_access(fe: &FimEvent) -> bool {
+    if !matches!(fe.op, FimOp::Opened | FimOp::Modified) {
+        return false;
+    }
+    BROWSER_CRED_FRAGMENTS
+        .iter()
+        .chain(PASSWORD_MANAGER_FRAGMENTS.iter())
+        .chain(GPG_KEYRING_FRAGMENTS.iter())
+        .any(|f| fe.path.contains(f))
+}
+
 /// NN-L-FIM-018: the login-record file `utmp`-family writers
 /// legitimately rewrite. A Modified op by anything else is the
 /// log-tamper shape.
