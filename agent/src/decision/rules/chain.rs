@@ -48,16 +48,16 @@
 //!
 //! The per-rule `ChainCorrelationBuffer` is replaced by one shared
 //! [`CorrelationStore`] (`crate::decision::correlation`) injected into
-//! all three rules. Each rule records a typed [`PrecursorKind`] and
-//! queries it by PID within [`CORRELATION_WINDOW_NS`] — same-PID,
-//! single-precursor behaviour is preserved bit-for-bit. The store keys
-//! on `(pid, start_ns)`; D3 uses the bare-PID API (`start_ns = 0`),
-//! and D4 wires the ancestry tree to resolve real incarnations and add
-//! the cross-PID lineage variants.
+//! every chain rule. Each records a typed [`PrecursorKind`] and queries
+//! it by PID within [`CORRELATION_WINDOW_NS`] — same-PID,
+//! single-precursor behaviour (CHAIN-001..003) is preserved bit-for-bit.
+//! D4 wires the ancestry tree, and D6 adds the cross-PID
+//! (`has_recent_in_ancestors`) + N-event (`has_sequence`) chains
+//! CHAIN-004..008 over the same shared store.
 //!
 //! ## Rate limiting (§13 Q4)
 //!
-//! All three rules are Critical and fire the deterministic
+//! All chain rules are Critical and fire the deterministic
 //! `KillProcessTree` unconditionally — never throttled. They carry a
 //! `chain_*` category (not a `net_*` tier), so the future §6.5
 //! NetFlow rate-limit bucket does not even scope them.
@@ -67,7 +67,9 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
-use crate::decision::correlation::{CorrelationStore, PrecursorKind, CORRELATION_WINDOW_NS};
+use crate::decision::correlation::{
+    CorrelationStore, PrecursorKind, ProcKey, CORRELATION_WINDOW_NS,
+};
 use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
 
@@ -304,6 +306,275 @@ impl Rule for NnLChain003CanaryThenEgress {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Tappa 10.6 D6 — CHAIN-004..008: cross-PID + N-event kill chains
+// ════════════════════════════════════════════════════════════════════
+//
+// These build on the shared store (D3) + ancestry tree (D4). The
+// cross-PID rules (004/005/006/008) use `has_recent_in_ancestors`
+// (strictly an ancestor, not self) so they NEVER shadow the same-PID
+// CHAIN-001..003; CHAIN-007 uses the N-event `has_sequence`. All fire
+// Critical + KillProcessTree, like the originals.
+
+/// `sudo`/`su` comms — the privilege-escalation precursor for CHAIN-008.
+const PRIVESC_TOOLS: &[&str] = &["sudo", "su"];
+
+/// NN-L-CHAIN-004 — credential read by an **ancestor**, then a
+/// descendant egresses. The cross-PID form of CHAIN-001 (T1555 →
+/// T1041): e.g. a parent reads `~/.aws/credentials`, the child it
+/// spawned exfiltrates. Reuses the `CredRead` precursor recorded by
+/// CHAIN-001 in the shared store.
+pub struct NnLChain004CrossPidCredExfil {
+    buf: Arc<Mutex<CorrelationStore>>,
+}
+
+impl NnLChain004CrossPidCredExfil {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
+        Self { buf }
+    }
+}
+
+impl Rule for NnLChain004CrossPidCredExfil {
+    fn id(&self) -> &'static str {
+        "NN-L-CHAIN-004_CrossPidCredExfil"
+    }
+    fn name(&self) -> &'static str {
+        "Ancestor credential read followed by descendant egress"
+    }
+    fn category(&self) -> &'static str {
+        "chain_exfiltration"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::NetFlow(nf) = event else {
+            return None;
+        };
+        if !self.buf.lock().has_recent_in_ancestors(
+            nf.pid,
+            PrecursorKind::CredRead,
+            nf.start_ns,
+            CORRELATION_WINDOW_NS,
+        ) {
+            return None;
+        }
+        Some(chain_verdict(
+            self,
+            nf,
+            "A process ancestor read a credential store and a descendant \
+             then opened an outbound flow — cross-PID credential \
+             exfiltration (T1555 → T1041); kill the process tree + \
+             posture → COMBAT",
+        ))
+    }
+}
+
+/// NN-L-CHAIN-005 — `/tmp` exec by an **ancestor**, then a descendant
+/// egresses to a non-DNS port. Cross-PID form of CHAIN-002 (T1059 →
+/// T1571): a dropper spawns a child that calls home. Reuses `TmpExec`.
+pub struct NnLChain005CrossPidTmpC2 {
+    buf: Arc<Mutex<CorrelationStore>>,
+}
+
+impl NnLChain005CrossPidTmpC2 {
+    const DNS_PORT: u16 = 53;
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
+        Self { buf }
+    }
+}
+
+impl Rule for NnLChain005CrossPidTmpC2 {
+    fn id(&self) -> &'static str {
+        "NN-L-CHAIN-005_CrossPidTmpC2"
+    }
+    fn name(&self) -> &'static str {
+        "Ancestor /tmp exec followed by descendant egress"
+    }
+    fn category(&self) -> &'static str {
+        "chain_c2"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::NetFlow(nf) = event else {
+            return None;
+        };
+        if nf.dst_port == Self::DNS_PORT {
+            return None;
+        }
+        if !self.buf.lock().has_recent_in_ancestors(
+            nf.pid,
+            PrecursorKind::TmpExec,
+            nf.start_ns,
+            CORRELATION_WINDOW_NS,
+        ) {
+            return None;
+        }
+        Some(chain_verdict(
+            self,
+            nf,
+            "A process ancestor executed from /tmp/ and a descendant then \
+             opened an outbound flow to a non-DNS port — cross-PID \
+             dropper C2 (T1059 → T1571); kill the process tree + \
+             posture → COMBAT",
+        ))
+    }
+}
+
+/// NN-L-CHAIN-006 — canary trip by an **ancestor**, then a descendant
+/// egresses. Cross-PID form of CHAIN-003 (deception → T1041). Reuses
+/// the `CanaryTrip` precursor.
+pub struct NnLChain006CrossPidCanaryExfil {
+    buf: Arc<Mutex<CorrelationStore>>,
+}
+
+impl NnLChain006CrossPidCanaryExfil {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
+        Self { buf }
+    }
+}
+
+impl Rule for NnLChain006CrossPidCanaryExfil {
+    fn id(&self) -> &'static str {
+        "NN-L-CHAIN-006_CrossPidCanaryExfil"
+    }
+    fn name(&self) -> &'static str {
+        "Ancestor canary trip followed by descendant egress"
+    }
+    fn category(&self) -> &'static str {
+        "chain_exfiltration"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::NetFlow(nf) = event else {
+            return None;
+        };
+        if !self.buf.lock().has_recent_in_ancestors(
+            nf.pid,
+            PrecursorKind::CanaryTrip,
+            nf.start_ns,
+            CORRELATION_WINDOW_NS,
+        ) {
+            return None;
+        }
+        Some(chain_verdict(
+            self,
+            nf,
+            "A process ancestor tripped a deception canary and a \
+             descendant then opened an outbound flow — cross-PID \
+             deception → exfiltration (T1041); kill the process tree + \
+             posture → COMBAT",
+        ))
+    }
+}
+
+/// NN-L-CHAIN-007 — three-step same-PID kill chain: `/tmp` exec **then**
+/// credential read **then** egress, all on one process within the
+/// window (T1059 → T1555 → T1041). Uses the D3 N-event
+/// [`CorrelationStore::has_sequence`]. Registered BEFORE CHAIN-001/002
+/// so this richer 3-step verdict wins over the 2-step ones for the same
+/// flow (the §13 Q10 specific-before-catch-all ordering).
+pub struct NnLChain007TmpCredExfilSequence {
+    buf: Arc<Mutex<CorrelationStore>>,
+}
+
+impl NnLChain007TmpCredExfilSequence {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
+        Self { buf }
+    }
+}
+
+impl Rule for NnLChain007TmpCredExfilSequence {
+    fn id(&self) -> &'static str {
+        "NN-L-CHAIN-007_TmpCredExfilSequence"
+    }
+    fn name(&self) -> &'static str {
+        "/tmp exec then credential read then egress (3-step)"
+    }
+    fn category(&self) -> &'static str {
+        "chain_exfiltration"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::NetFlow(nf) = event else {
+            return None;
+        };
+        if !self.buf.lock().has_sequence(
+            ProcKey::unresolved(nf.pid),
+            &[PrecursorKind::TmpExec, PrecursorKind::CredRead],
+            nf.start_ns,
+            CORRELATION_WINDOW_NS,
+        ) {
+            return None;
+        }
+        Some(chain_verdict(
+            self,
+            nf,
+            "Process executed from /tmp/, then read a credential store, \
+             then opened an outbound flow — three-step dropper → \
+             credential-access → exfil chain (T1059 → T1555 → T1041); \
+             kill the process tree + posture → COMBAT",
+        ))
+    }
+}
+
+/// NN-L-CHAIN-008 — `sudo`/`su` privilege escalation by an **ancestor**,
+/// then a descendant egresses (T1548 → T1041): a privesc'd shell whose
+/// child calls out. Records the `PrivEsc` precursor on the sudo/su spawn
+/// itself (returns None — falls through to any process rule), and
+/// triggers cross-PID on a later descendant flow.
+pub struct NnLChain008CrossPidPrivEscExfil {
+    buf: Arc<Mutex<CorrelationStore>>,
+}
+
+impl NnLChain008CrossPidPrivEscExfil {
+    pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
+        Self { buf }
+    }
+}
+
+impl Rule for NnLChain008CrossPidPrivEscExfil {
+    fn id(&self) -> &'static str {
+        "NN-L-CHAIN-008_CrossPidPrivEscExfil"
+    }
+    fn name(&self) -> &'static str {
+        "Ancestor sudo/su privesc followed by descendant egress"
+    }
+    fn category(&self) -> &'static str {
+        "chain_exfiltration"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        match event {
+            // Precursor: a sudo/su exec — record PrivEsc on its PID.
+            Event::ProcessSpawn {
+                pid,
+                comm,
+                timestamp_ns,
+                ..
+            } if PRIVESC_TOOLS.contains(&comm.as_str()) => {
+                self.buf
+                    .lock()
+                    .record_for_pid(*pid, PrecursorKind::PrivEsc, *timestamp_ns);
+                None
+            }
+            // Trigger: a descendant of the privesc process egresses.
+            Event::NetFlow(nf) => {
+                if !self.buf.lock().has_recent_in_ancestors(
+                    nf.pid,
+                    PrecursorKind::PrivEsc,
+                    nf.start_ns,
+                    CORRELATION_WINDOW_NS,
+                ) {
+                    return None;
+                }
+                Some(chain_verdict(
+                    self,
+                    nf,
+                    "A descendant of a sudo/su privilege-escalation process \
+                     opened an outbound flow — cross-PID privesc → \
+                     exfiltration (T1548 → T1041); kill the process tree + \
+                     posture → COMBAT",
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 // ── Factory ──────────────────────────────────────────────────────────
 
 /// Build the 3 NN-L-CHAIN rules over **one shared** [`CorrelationStore`]
@@ -319,9 +590,18 @@ impl Rule for NnLChain003CanaryThenEgress {
 pub fn chain_rules() -> Vec<Box<dyn Rule>> {
     let store = Arc::new(Mutex::new(CorrelationStore::new()));
     vec![
+        // CHAIN-007 (3-step same-PID) first: the richest verdict wins
+        // first-match over the 2-step CHAIN-001/002 for the same flow.
+        Box::new(NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))),
+        // Same-PID 2-step originals.
         Box::new(NnLChain001CredReadThenEgress::new(Arc::clone(&store))),
         Box::new(NnLChain002TmpExecThenEgress::new(Arc::clone(&store))),
         Box::new(NnLChain003CanaryThenEgress::new(Arc::clone(&store))),
+        // Cross-PID variants (strict ancestor — never shadow the above).
+        Box::new(NnLChain004CrossPidCredExfil::new(Arc::clone(&store))),
+        Box::new(NnLChain005CrossPidTmpC2::new(Arc::clone(&store))),
+        Box::new(NnLChain006CrossPidCanaryExfil::new(Arc::clone(&store))),
+        Box::new(NnLChain008CrossPidPrivEscExfil::new(Arc::clone(&store))),
     ]
 }
 
@@ -559,16 +839,22 @@ mod tests {
     // ── factory ─────────────────────────────────────────────────────
 
     #[test]
-    fn chain_rules_builder_returns_three_rules() {
+    fn chain_rules_builder_returns_eight_rules() {
         let rules = chain_rules();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 8);
         let ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
             vec![
+                // CHAIN-007 first (specific 3-step before the 2-step pair).
+                "NN-L-CHAIN-007_TmpCredExfilSequence",
                 "NN-L-CHAIN-001_CredReadThenEgress",
                 "NN-L-CHAIN-002_TmpExecThenEgress",
                 "NN-L-CHAIN-003_CanaryThenEgress",
+                "NN-L-CHAIN-004_CrossPidCredExfil",
+                "NN-L-CHAIN-005_CrossPidTmpC2",
+                "NN-L-CHAIN-006_CrossPidCanaryExfil",
+                "NN-L-CHAIN-008_CrossPidPrivEscExfil",
             ]
         );
     }
@@ -599,5 +885,165 @@ mod tests {
             vec!["NN-L-CHAIN-001_CredReadThenEgress".to_string()],
             "only the cred-read chain fires; /tmp + canary kinds isolated"
         );
+    }
+
+    // ── D6 CHAIN-004..008 ───────────────────────────────────────────
+
+    fn proc_spawn(pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
+        Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid: 1000,
+            gid: 1000,
+            comm: comm.to_string(),
+            filename: filename.to_string(),
+            timestamp_ns: ts,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+        }
+    }
+
+    /// Feed an event to every rule (no first-match short-circuit) and
+    /// return the rule_ids that fired.
+    fn fire_ids(rules: &[Box<dyn Rule>], event: &Event) -> Vec<String> {
+        rules
+            .iter()
+            .filter_map(|r| r.evaluate(event))
+            .map(|v| v.rule_id)
+            .collect()
+    }
+
+    #[test]
+    fn chain004_cross_pid_cred_exfil_fires() {
+        let rules = chain_rules();
+        // parent 100 spawns child 200 (CHAIN-002 records the ancestry edge).
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        // parent 100 reads a credential store.
+        fire_ids(&rules, &cred_fim(100, 11 * SEC));
+        // child 200 egresses → cross-PID credential exfil.
+        let fired = fire_ids(&rules, &flow(200, 443, 12 * SEC));
+        assert!(
+            fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
+            "{fired:?}"
+        );
+        // Same-PID CHAIN-001 must NOT fire — the cred read was the parent's.
+        assert!(!fired.contains(&"NN-L-CHAIN-001_CredReadThenEgress".to_string()));
+    }
+
+    #[test]
+    fn chain005_cross_pid_tmp_c2_fires() {
+        let rules = chain_rules();
+        // parent 100 ran from /tmp (records TmpExec) and spawned child 200.
+        fire_ids(
+            &rules,
+            &proc_spawn(100, 1, "dropper", "/tmp/dropper", 10 * SEC),
+        );
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 11 * SEC),
+        );
+        let fired = fire_ids(&rules, &flow(200, 4444, 12 * SEC));
+        assert!(
+            fired.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()),
+            "{fired:?}"
+        );
+        // DNS egress from the descendant is the carve-out.
+        let dns = fire_ids(&rules, &flow(200, 53, 13 * SEC));
+        assert!(!dns.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()));
+    }
+
+    #[test]
+    fn chain004_multi_level_ancestry() {
+        let rules = chain_rules();
+        // 100 → 200 → 300; cred read by the grandparent reaches the
+        // grandchild's egress.
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        fire_ids(
+            &rules,
+            &proc_spawn(300, 200, "curl", "/usr/bin/curl", 11 * SEC),
+        );
+        fire_ids(&rules, &cred_fim(100, 12 * SEC));
+        let fired = fire_ids(&rules, &flow(300, 443, 13 * SEC));
+        assert!(
+            fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    #[test]
+    fn chain004_does_not_fire_for_unrelated_process() {
+        let rules = chain_rules();
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        fire_ids(&rules, &cred_fim(100, 11 * SEC));
+        // 999 is not a descendant of 100.
+        let fired = fire_ids(&rules, &flow(999, 443, 12 * SEC));
+        assert!(!fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()));
+    }
+
+    #[test]
+    fn chain007_three_step_sequence_fires() {
+        let rules = chain_rules();
+        // Same PID: /tmp exec → cred read → egress.
+        fire_ids(&rules, &tmp_spawn(42, 10 * SEC));
+        fire_ids(&rules, &cred_fim(42, 11 * SEC));
+        let fired = fire_ids(&rules, &flow(42, 443, 12 * SEC));
+        assert!(
+            fired.contains(&"NN-L-CHAIN-007_TmpCredExfilSequence".to_string()),
+            "{fired:?}"
+        );
+        // CHAIN-007 is registered first, so it wins first-match in the
+        // engine (it heads the fired list here).
+        assert_eq!(
+            fired.first().map(String::as_str),
+            Some("NN-L-CHAIN-007_TmpCredExfilSequence")
+        );
+    }
+
+    #[test]
+    fn chain007_does_not_fire_without_full_sequence() {
+        let rules = chain_rules();
+        // Only the cred read (no prior /tmp exec) → 007 misses, 001 fires.
+        fire_ids(&rules, &cred_fim(42, 10 * SEC));
+        let fired = fire_ids(&rules, &flow(42, 443, 11 * SEC));
+        assert!(!fired.contains(&"NN-L-CHAIN-007_TmpCredExfilSequence".to_string()));
+        assert!(fired.contains(&"NN-L-CHAIN-001_CredReadThenEgress".to_string()));
+    }
+
+    #[test]
+    fn chain008_cross_pid_privesc_exfil_fires() {
+        let rules = chain_rules();
+        // sudo (pid 100) escalates and spawns a shell (200); the shell egresses.
+        fire_ids(
+            &rules,
+            &proc_spawn(100, 1, "sudo", "/usr/bin/sudo", 10 * SEC),
+        );
+        fire_ids(&rules, &proc_spawn(200, 100, "bash", "/bin/bash", 11 * SEC));
+        let fired = fire_ids(&rules, &flow(200, 443, 12 * SEC));
+        assert!(
+            fired.contains(&"NN-L-CHAIN-008_CrossPidPrivEscExfil".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    #[test]
+    fn chain008_does_not_fire_without_privesc_ancestor() {
+        let rules = chain_rules();
+        // Parent is a normal shell, not sudo/su.
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        let fired = fire_ids(&rules, &flow(200, 443, 11 * SEC));
+        assert!(!fired.contains(&"NN-L-CHAIN-008_CrossPidPrivEscExfil".to_string()));
     }
 }

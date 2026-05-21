@@ -16,21 +16,22 @@ use super::rules::{
 use super::{Rule, RuleEngine};
 
 /// Tappa 9 C8 / Tappa 9.5 K5 / Tappa 10 N6 / Tappa 10.5 D2..D5: the
-/// default rule set covers 3 Tappa-10.5 chain rules
-/// (NN-L-CHAIN-001..003), 10 Tappa-2 process rules (R001..R010),
+/// default rule set covers 8 chain rules (NN-L-CHAIN-001..003 from
+/// Tappa 10.5 + NN-L-CHAIN-004..008 cross-PID/N-event from Tappa 10.6
+/// D6), 10 Tappa-2 process rules (R001..R010),
 /// 7 Tappa-10.5 process rules (R011..R017), 23 FIM rules
 /// (NN-L-FIM-001..014 from Tappa 9 plus NN-L-FIM-015..023 from
 /// Tappa 10.5 D3), 4 Tappa-9.5 canary rules (NN-L-CANARY-001..004),
 /// and 15 NetFlow rules (NN-L-NET-001..009 from Tappa 10,
 /// NN-L-NET-010/011/013/018/019 from Tappa 10.5 D4, plus
 /// NN-L-NET-014 DNS-tunnel entropy un-gated by the Tappa 4.1 DNS
-/// observability refit) — 62 in total. Each family matches a distinct
-/// `Event` variant set, so the first-match short-circuit is unaffected
-/// across families.
+/// observability refit) — 62 in total before D6, 67 after. Each family
+/// matches a distinct `Event` variant set, so the first-match
+/// short-circuit is unaffected across families.
 #[test]
-fn default_engine_has_sixtytwo_rules_across_all_families() {
+fn default_engine_has_sixtyseven_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
-    assert_eq!(engine.rule_count(), 3 + 10 + 7 + 23 + 4 + 15);
+    assert_eq!(engine.rule_count(), 8 + 10 + 7 + 23 + 4 + 15);
 }
 
 #[test]
@@ -209,26 +210,29 @@ fn rule_ids_are_pinned() {
 
 /// Tappa 10.5 D6 — comprehensive ID pin across EVERY family. The
 /// per-family tests (`rule_ids_are_pinned` for process,
-/// `chain_rules_builder_returns_three_rules`, the FIM/canary/net
+/// `chain_rules_builder_returns_eight_rules`, the FIM/canary/net
 /// builder tests) each pin their own slice; this walks the FULL
-/// `default_rules()` set and asserts the exact sorted list of all 62
+/// `default_rules()` set and asserts the exact sorted list of all 67
 /// shipped IDs. Any rename, drop, duplicate, or accidental
 /// addition fails here — the immutable-ID contract (decision/mod.rs)
 /// covered end-to-end in one place.
 ///
 /// Tappa 4.1 lifted the count 61 → 62 by un-gating NN-L-NET-014
-/// (DNS-tunnel entropy) once the DNS observability refit gave the
-/// engine a real QNAME to score. NN-L-NET-015 (fast-flux) stays gated
-/// pending the V1.1 DNS-response observer.
+/// (DNS-tunnel entropy). Tappa 10.6 D6 lifts 62 → 67 with the five new
+/// cross-PID / N-event chain rules NN-L-CHAIN-004..008.
 #[test]
-fn default_engine_pins_all_sixtytwo_rule_ids() {
+fn default_engine_pins_all_sixtyseven_rule_ids() {
     let rules = super::rules::default_rules();
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
-    assert_eq!(ids.len(), 62, "engine ships 62 rules after the T4.1 refit");
+    assert_eq!(
+        ids.len(),
+        67,
+        "engine ships 67 rules after the T10.6 D6 chains"
+    );
     ids.sort_unstable();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 62, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 67, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -240,6 +244,11 @@ fn default_engine_pins_all_sixtytwo_rule_ids() {
             "NN-L-CHAIN-001_CredReadThenEgress",
             "NN-L-CHAIN-002_TmpExecThenEgress",
             "NN-L-CHAIN-003_CanaryThenEgress",
+            "NN-L-CHAIN-004_CrossPidCredExfil",
+            "NN-L-CHAIN-005_CrossPidTmpC2",
+            "NN-L-CHAIN-006_CrossPidCanaryExfil",
+            "NN-L-CHAIN-007_TmpCredExfilSequence",
+            "NN-L-CHAIN-008_CrossPidPrivEscExfil",
             "NN-L-FIM-001_SystemBinaryModified",
             "NN-L-FIM-002_NewSuidBinary",
             "NN-L-FIM-003_SensitiveConfigModified",
