@@ -9,21 +9,24 @@ use super::rules::testutil::{spawn, spawn_as};
 use super::rules::{
     R001ExecFromTmp, R002ExecFromDevShm, R003ExecFromVarTmp, R004ExecFromProcSelfFd,
     R005NetcatExec, R006ReverseShellTooling, R007CryptoMiner, R008HiddenHomeBinary,
-    R009RootExecFromUserPath, R010BinaryInWebroot,
+    R009RootExecFromUserPath, R010BinaryInWebroot, R011KernelModuleTooling, R012SetcapTooling,
+    R013NamespaceEscapeTooling, R014AtBatchScheduling, R015EncodingToolingServiceUid,
+    R016DebuggerServiceUid, R017ShellFromNonstandardPath,
 };
 use super::{Rule, RuleEngine};
 
-/// Tappa 9 C8 + Tappa 9.5 K5 + Tappa 10 N6: the default rule
-/// set covers 10 Tappa-2 process rules (R001..R010) + 14
-/// Tappa-9 FIM rules (NN-L-FIM-001..014) + 4 Tappa-9.5 canary
-/// rules (NN-L-CANARY-001..004) + 9 Tappa-10 NetFlow rules
-/// (NN-L-NET-001..009). Each family matches a distinct
-/// `Event::*` variant set — first-match short-circuit is
-/// unaffected across families.
+/// Tappa 9 C8 / Tappa 9.5 K5 / Tappa 10 N6 / Tappa 10.5 D2: the
+/// default rule set covers 10 Tappa-2 process rules (R001..R010),
+/// 7 Tappa-10.5 process rules (R011..R017), 14 Tappa-9 FIM rules
+/// (NN-L-FIM-001..014), 4 Tappa-9.5 canary rules
+/// (NN-L-CANARY-001..004), and 9 Tappa-10 NetFlow rules
+/// (NN-L-NET-001..009) — 44 in total. Each family matches a
+/// distinct `Event` variant set, so the first-match short-circuit
+/// is unaffected across families.
 #[test]
-fn default_engine_has_ten_process_plus_fourteen_fim_plus_four_canary_plus_nine_net_rules() {
+fn default_engine_has_seventeen_process_plus_fourteen_fim_plus_four_canary_plus_nine_net_rules() {
     let engine = RuleEngine::with_default_rules();
-    assert_eq!(engine.rule_count(), 10 + 14 + 4 + 9);
+    assert_eq!(engine.rule_count(), 10 + 7 + 14 + 4 + 9);
 }
 
 #[test]
@@ -164,4 +167,35 @@ fn rule_ids_are_pinned() {
     assert_eq!(R008HiddenHomeBinary.id(), "R008_HiddenHomeBinary");
     assert_eq!(R009RootExecFromUserPath.id(), "R009_RootExecFromUserPath");
     assert_eq!(R010BinaryInWebroot.id(), "R010_BinaryInWebroot");
+    // Tappa 10.5 D2 process rules — instantiated with an empty
+    // allowlist (id() is state-independent).
+    let al = std::sync::Arc::new(crate::config::comm_allowlist::CommAllowlist::default());
+    assert_eq!(
+        R011KernelModuleTooling::new(al.clone()).id(),
+        "R011_KernelModuleTooling"
+    );
+    assert_eq!(
+        R012SetcapTooling::new(al.clone()).id(),
+        "R012_SetcapTooling"
+    );
+    assert_eq!(
+        R013NamespaceEscapeTooling::new(al.clone()).id(),
+        "R013_NamespaceEscapeTooling"
+    );
+    assert_eq!(
+        R014AtBatchScheduling::new(al.clone()).id(),
+        "R014_AtBatchScheduling"
+    );
+    assert_eq!(
+        R015EncodingToolingServiceUid::new(al.clone()).id(),
+        "R015_EncodingToolingServiceUid"
+    );
+    assert_eq!(
+        R016DebuggerServiceUid::new(al.clone()).id(),
+        "R016_DebuggerServiceUid"
+    );
+    assert_eq!(
+        R017ShellFromNonstandardPath::new(al).id(),
+        "R017_ShellFromNonstandardPath"
+    );
 }

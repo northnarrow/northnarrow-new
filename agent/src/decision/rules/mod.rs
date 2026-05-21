@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 
 use self::net::DnsBurstWindow;
 use super::Rule;
+use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 pub mod canary;
@@ -21,6 +22,13 @@ mod r007_crypto_miner;
 mod r008_hidden_home_binary;
 mod r009_root_exec_from_user_path;
 mod r010_binary_in_webroot;
+mod r011_kernel_module_tooling;
+mod r012_setcap_tooling;
+mod r013_namespace_escape_tooling;
+mod r014_at_batch_scheduling;
+mod r015_encoding_tooling_service_uid;
+mod r016_debugger_service_uid;
+mod r017_shell_from_nonstandard_path;
 
 #[cfg(feature = "demo-tappa5")]
 pub mod test_actions;
@@ -35,6 +43,13 @@ pub use r007_crypto_miner::R007CryptoMiner;
 pub use r008_hidden_home_binary::R008HiddenHomeBinary;
 pub use r009_root_exec_from_user_path::R009RootExecFromUserPath;
 pub use r010_binary_in_webroot::R010BinaryInWebroot;
+pub use r011_kernel_module_tooling::R011KernelModuleTooling;
+pub use r012_setcap_tooling::R012SetcapTooling;
+pub use r013_namespace_escape_tooling::R013NamespaceEscapeTooling;
+pub use r014_at_batch_scheduling::R014AtBatchScheduling;
+pub use r015_encoding_tooling_service_uid::R015EncodingToolingServiceUid;
+pub use r016_debugger_service_uid::R016DebuggerServiceUid;
+pub use r017_shell_from_nonstandard_path::R017ShellFromNonstandardPath;
 
 /// Build the default rule set in evaluation order. R004 (proc/self/fd
 /// — fileless exec) and R007 (crypto miner) come early because their
@@ -60,6 +75,13 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(R005NetcatExec),
         Box::new(R008HiddenHomeBinary),
     ];
+    // Tappa 10.5 (D2) — 7 NN process rules R011..R017 APPEND after
+    // the Tappa 2 R001..R010 block so existing process-rule routing
+    // (first-match-wins within `Event::ProcessSpawn`) is unchanged.
+    // Empty allowlist here; the production main.rs path constructs
+    // its engine via [`default_rules_with_net`] instead, threading
+    // the operator-loaded process-comm allowlist in.
+    rules.extend(process_rules_empty());
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
     // Tappa 10 (N6) — 9 NN-L-NET rules with empty boot
@@ -70,15 +92,19 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     rules
 }
 
-/// Tappa 10 N9 — production builder. Same shape as [`default_rules`]
-/// but threads operator-loaded blocklists into the 9 NN-L-NET rules.
-/// `main.rs` calls this once at boot after loading
+/// Tappa 10 N9 / Tappa 10.5 D2 — production builder. Same shape as
+/// [`default_rules`] but threads operator-loaded state in: the
+/// blocklists into the 9 NN-L-NET rules (N9) and the process-comm
+/// allowlist into the 7 R011..R017 process rules (D2). `main.rs`
+/// calls this once at boot after loading
 /// `/etc/northnarrow/netflow-blocklist.{v1,local}` +
-/// `netflow-ja3-blocklist.{v1,local}` from disk.
+/// `netflow-ja3-blocklist.{v1,local}` +
+/// `process-comm-allowlist.{v1,local}` from disk.
 pub fn default_rules_with_net(
     blocklist: Arc<NetBlocklist>,
     ja3_blocklist: Arc<Ja3Blocklist>,
     burst_window: Arc<Mutex<DnsBurstWindow>>,
+    process_allowlist: Arc<CommAllowlist>,
 ) -> Vec<Box<dyn Rule>> {
     let mut rules: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
@@ -92,10 +118,35 @@ pub fn default_rules_with_net(
         Box::new(R005NetcatExec),
         Box::new(R008HiddenHomeBinary),
     ];
+    rules.extend(process_rules(process_allowlist));
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
     rules.extend(net::net_rules(blocklist, ja3_blocklist, burst_window));
     rules
+}
+
+/// Tappa 10.5 (D2) — build the 7 process rules R011..R017 sharing an
+/// operator-loaded `process-comm-allowlist`. Mirrors the Tappa 10 N6
+/// [`net::net_rules`] factory: production threads the loaded allowlist
+/// via `Arc`; tests + the empty-state boot path use
+/// [`process_rules_empty`].
+pub fn process_rules(allowlist: Arc<CommAllowlist>) -> Vec<Box<dyn Rule>> {
+    vec![
+        Box::new(R011KernelModuleTooling::new(Arc::clone(&allowlist))),
+        Box::new(R012SetcapTooling::new(Arc::clone(&allowlist))),
+        Box::new(R013NamespaceEscapeTooling::new(Arc::clone(&allowlist))),
+        Box::new(R014AtBatchScheduling::new(Arc::clone(&allowlist))),
+        Box::new(R015EncodingToolingServiceUid::new(Arc::clone(&allowlist))),
+        Box::new(R016DebuggerServiceUid::new(Arc::clone(&allowlist))),
+        Box::new(R017ShellFromNonstandardPath::new(allowlist)),
+    ]
+}
+
+/// Empty-allowlist convenience for boot + tests, mirroring
+/// [`net::net_rules_empty`]. With no allowlisted comms, the 7 rules
+/// fire purely on their comm/filename/uid predicates.
+pub fn process_rules_empty() -> Vec<Box<dyn Rule>> {
+    process_rules(Arc::new(CommAllowlist::default()))
 }
 
 /// Demo rule set for Tappa 5. Returned only when the `demo-tappa5`

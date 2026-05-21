@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use super::rules::net::DnsBurstWindow;
 use super::rules::{default_rules, default_rules_with_net};
 use super::Rule;
+use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 /// Owns the active rule set and dispatches events to it.
@@ -44,9 +45,10 @@ impl RuleEngine {
         blocklist: Arc<NetBlocklist>,
         ja3_blocklist: Arc<Ja3Blocklist>,
         burst_window: Arc<Mutex<DnsBurstWindow>>,
+        process_allowlist: Arc<CommAllowlist>,
     ) -> Self {
         let mut e = Self::new();
-        for r in default_rules_with_net(blocklist, ja3_blocklist, burst_window) {
+        for r in default_rules_with_net(blocklist, ja3_blocklist, burst_window, process_allowlist) {
             e.add_rule(r);
         }
         e
