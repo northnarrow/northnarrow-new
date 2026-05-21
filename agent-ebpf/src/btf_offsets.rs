@@ -144,3 +144,71 @@ pub(crate) const TCP_SOCK_BYTES_SENT_OFFSET: usize = 1544;
 /// chain as TCP_SOCK_BYTES_SENT_OFFSET, neighbouring field.
 #[allow(dead_code)]
 pub(crate) const TCP_SOCK_BYTES_RECEIVED_OFFSET: usize = 1728;
+
+// ── Tappa 4.1 — DNS observability refit (msghdr / iov_iter walk) ──────
+//
+// All offsets validated 2026-05-21 against `/sys/kernel/btf/vmlinux`
+// on `6.8.0-117-generic` via `bpftool btf dump file /sys/kernel/btf/
+// vmlinux format raw` (same procedure + kernel as the N2 set above).
+//
+// IMPORTANT — the 6.x `iov_iter` is a TAGGED UNION, not the flat
+// pre-5.14 `{iter_type, iov, nr_segs, count}` struct. From BTF
+// `[883] STRUCT 'iov_iter' size=40`:
+//   'iter_type'   bits_offset=0    (byte 0,  u8 enum: ITER_UBUF=0,
+//                                   ITER_IOVEC=1, ITER_BVEC=2, ITER_KVEC=3)
+//   'iov_offset'  bits_offset=64   (byte 8,  size_t — consumed bytes)
+//   (anon UNION)  bits_offset=128  (byte 16, `[881]`, 16 bytes) →
+//        ITER_UBUF: inline `__ubuf_iovec` (`[871] STRUCT 'iovec'`)
+//        else:      `[880]` { ptr-union `__iov`/kvec/… @0 ; count @8 }
+//   'nr_segs'     bits_offset=256  (byte 32, `[882]` union, unsigned long)
+// So byte 16 is the `iov_base` user pointer (ITER_UBUF) OR the `__iov`
+// iovec pointer (ITER_IOVEC); byte 24 is `iov_len` (ITER_UBUF) or the
+// equivalent `count`. This refit handles the ITER_UBUF single-buffer
+// path (the shape glibc's connected-UDP `send()` emits); ITER_IOVEC is
+// a documented follow-up. Offsets are `iov_iter`-relative.
+
+/// `struct iov_iter.iter_type` — the union discriminant.
+/// `[883] STRUCT 'iov_iter'` → `'iter_type' type_id=19 bits_offset=0`
+/// (type_id=19 is `TYPEDEF 'u8'`). Byte 0.
+pub(crate) const IOV_ITER_ITER_TYPE_OFFSET: usize = 0;
+
+/// `iov_iter` byte 16 — for `ITER_UBUF` this is the inline
+/// `__ubuf_iovec.iov_base` (`[871] 'iovec' 'iov_base' bits_offset=0`),
+/// a **user** pointer to the send buffer. (For `ITER_IOVEC` the same
+/// slot holds `__iov`, a pointer to an iovec array — not handled
+/// here.) `[881] UNION` is at `iov_iter bits_offset=128` = byte 16.
+pub(crate) const IOV_ITER_UBUF_BASE_OFFSET: usize = 16;
+
+/// `iov_iter` byte 24 — for `ITER_UBUF` the inline
+/// `__ubuf_iovec.iov_len` (`'iov_len' type_id=30 bits_offset=64`
+/// within `iovec`, so union-base 16 + 8 = byte 24); coincides with the
+/// `count` field of the `ITER_IOVEC` variant. `size_t`.
+#[allow(dead_code)]
+pub(crate) const IOV_ITER_UBUF_LEN_OFFSET: usize = 24;
+
+/// `struct iov_iter.nr_segs` — segment count. `[882] UNION` at
+/// `iov_iter bits_offset=256` = byte 32, `'nr_segs' type_id=1`
+/// (`long unsigned int`). Unused on the ITER_UBUF path (single
+/// buffer) but documented for the ITER_IOVEC follow-up.
+#[allow(dead_code)]
+pub(crate) const IOV_ITER_NR_SEGS_OFFSET: usize = 32;
+
+/// `struct iovec.iov_base` — `void *` to the data. `[871] STRUCT
+/// 'iovec' size=16` → `'iov_base' type_id=65 bits_offset=0`. Byte 0.
+/// (Used when dereferencing the `ITER_IOVEC` `__iov` pointer; the
+/// ITER_UBUF path reaches the same field inline via
+/// `IOV_ITER_UBUF_BASE_OFFSET`.)
+#[allow(dead_code)]
+pub(crate) const IOVEC_IOV_BASE_OFFSET: usize = 0;
+
+/// `struct iovec.iov_len` — `size_t` byte count. `'iov_len'
+/// type_id=30 bits_offset=64` = byte 8.
+#[allow(dead_code)]
+pub(crate) const IOVEC_IOV_LEN_OFFSET: usize = 8;
+
+/// `struct msghdr.msg_iter` — the embedded (inline, not a pointer)
+/// `struct iov_iter`. `[8038] STRUCT 'msghdr' size=104` →
+/// `'msg_iter' type_id=883 bits_offset=128` = byte 16. (The sibling
+/// `msg_name`@0 / `msg_namelen`@8 offsets the kprobe already uses are
+/// confirmed unchanged on this kernel.)
+pub(crate) const MSGHDR_MSG_ITER_OFFSET: usize = 16;

@@ -6,8 +6,10 @@
 //! beacon detector, 018 RFC1918 lateral-movement port, 019
 //! wildcard-bind listener) and switches the comm-gated rules off
 //! their former inline `const` allowlists onto the shared per-family
-//! `netflow-comm-allowlist` (§13 Q3). DNS-payload rules 014/015 are
-//! register-gated out pending the T4 refit (§13 Q6).
+//! `netflow-comm-allowlist` (§13 Q3). Tappa 4.1 un-gates NN-L-NET-014
+//! (DNS-tunnel entropy) now the DNS observability refit populates the
+//! QNAME; NN-L-NET-015 (fast-flux) stays gated — it needs DNS-response
+//! observation (a separate V1.1 sensor), not just the query-path refit.
 //!
 //! Rules consume `Event::NetFlow` / `Event::NetListener` /
 //! `Event::DnsQuery`. Tappa 10 N6 severity + action mapping verbatim
@@ -1043,6 +1045,103 @@ impl Rule for NnLNet019WildcardListener {
     }
 }
 
+// ── NN-L-NET-014 — DNS qname high-entropy label (tunnelling) ────────
+
+/// DNS-tunnelling refinement (MITRE T1071.004). Where NN-L-NET-004
+/// keys on the *base64 charset* + raw length, this rule measures the
+/// **Shannon entropy** of the leftmost label, so it also catches
+/// hex / base32 / custom-alphabet encodings that 004's charset gate
+/// misses. Encoded/compressed exfil payloads pack near-maximal
+/// per-character entropy; ordinary hostnames (even long CDN ones) sit
+/// well below the threshold.
+///
+/// Unblocked by the Tappa 4.1 DNS observability refit — the kprobe now
+/// extracts the QNAME for connected-UDP resolution (glibc), so this
+/// rule finally has a populated `query_name` to score. (NN-L-NET-015
+/// fast-flux stays gated: it needs DNS-*response* observation, a
+/// separate V1.1 sensor — see decision/rules module docs.)
+pub struct NnLNet014DnsTunnelEntropy;
+
+impl NnLNet014DnsTunnelEntropy {
+    /// Minimum first-label length to consider — short labels can't
+    /// carry a meaningful payload and their entropy estimate is noisy.
+    /// Most legitimate labels also sit below this.
+    const MIN_LABEL_LEN: usize = 25;
+    /// Bits-per-character threshold. Random base32 ≈ 5.0, base64 ≈ 6.0,
+    /// hex ≈ 4.0; varied English-ish labels stay below ≈ 3.5. 3.8 over
+    /// a ≥25-char label separates encoded payloads from legitimate
+    /// (even long) hostnames. Both constants are deliberate
+    /// refinement candidates for the T10.7 adversarial-validation loop.
+    const ENTROPY_BITS: f64 = 3.8;
+
+    /// Shannon entropy (bits/byte) of `s` over its observed byte
+    /// distribution. `0.0` for the empty string.
+    fn shannon_entropy(s: &str) -> f64 {
+        if s.is_empty() {
+            return 0.0;
+        }
+        let mut counts = [0u32; 256];
+        for &b in s.as_bytes() {
+            counts[b as usize] += 1;
+        }
+        let len = s.len() as f64;
+        let mut h = 0.0;
+        for &c in counts.iter() {
+            if c == 0 {
+                continue;
+            }
+            let p = c as f64 / len;
+            h -= p * p.log2();
+        }
+        h
+    }
+}
+
+impl Rule for NnLNet014DnsTunnelEntropy {
+    fn id(&self) -> &'static str {
+        "NN-L-NET-014_DnsTunnelEntropy"
+    }
+    fn name(&self) -> &'static str {
+        "DNS qname high-entropy label (tunnelling)"
+    }
+    fn category(&self) -> &'static str {
+        CATEGORY_HIGH
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::DnsQuery {
+            pid,
+            comm,
+            query_name,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        // Score the leftmost label — tunnelling encodes payload there,
+        // the domain suffix stays normal.
+        let first_label = query_name.split('.').next().unwrap_or(query_name);
+        if first_label.len() < Self::MIN_LABEL_LEN {
+            return None;
+        }
+        let entropy = Self::shannon_entropy(first_label);
+        if entropy < Self::ENTROPY_BITS {
+            return None;
+        }
+        Some(net_verdict(
+            self,
+            ResponseAction::KillProcess,
+            Severity::High,
+            "DNS first-label carries high Shannon entropy over a long \
+             label — encoded payload shape regardless of alphabet \
+             (DNS tunnelling / exfil, T1071.004); posture → ENGAGED",
+            *pid,
+            comm.clone(),
+            *timestamp_ns,
+        ))
+    }
+}
+
 // ── Factory ──────────────────────────────────────────────────────────
 
 /// Build the NN-L-NET rules with operator-loaded blocklists, the
@@ -1071,6 +1170,9 @@ pub fn net_rules(
         Box::new(NnLNet002OutboundToBlockedTld),
         Box::new(NnLNet004SuspiciousDnsQname),
         Box::new(NnLNet005DnsBurst::new(burst_window)),
+        // Tappa 4.1 DNS observability refit — entropy-based tunnelling
+        // detector, unblocked now the kprobe extracts the QNAME.
+        Box::new(NnLNet014DnsTunnelEntropy),
         // Tappa 10.5 D4 additions — specific refinements ordered
         // BEFORE the broad Tappa 10 catch-alls (-006 / -007).
         Box::new(NnLNet010OutboundToHighRiskC2Port::new(Arc::clone(
@@ -1316,6 +1418,58 @@ mod tests {
         assert!(rule.evaluate(&dns_event(1, "example.com", 1)).is_none());
     }
 
+    // ── NN-L-NET-014 (DNS-tunnel entropy) ────────────────────────
+
+    #[test]
+    fn net_014_fires_on_high_entropy_label() {
+        let rule = NnLNet014DnsTunnelEntropy;
+        // 40-char near-uniform alphanumeric first label (entropy well
+        // above 3.8) + a normal suffix — the encoded-payload shape.
+        let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
+        let v = rule
+            .evaluate(&dns_event(7, q, 1))
+            .expect("high-entropy label should fire");
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.rule_id, "NN-L-NET-014_DnsTunnelEntropy");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    #[test]
+    fn net_014_ignores_short_label() {
+        let rule = NnLNet014DnsTunnelEntropy;
+        // High-entropy but under the 25-char minimum.
+        assert!(rule.evaluate(&dns_event(7, "a1b2c3d4e5.example.com", 1)).is_none());
+    }
+
+    #[test]
+    fn net_014_ignores_low_entropy_long_label() {
+        let rule = NnLNet014DnsTunnelEntropy;
+        // 40 chars but only two symbols → entropy = 1.0, far below 3.8.
+        let q = format!("{}.example.com", "ab".repeat(20));
+        assert!(rule.evaluate(&dns_event(7, &q, 1)).is_none());
+    }
+
+    #[test]
+    fn net_014_ignores_normal_hostname() {
+        let rule = NnLNet014DnsTunnelEntropy;
+        // Ordinary hostnames have short, low-entropy first labels.
+        assert!(rule.evaluate(&dns_event(7, "www.example.com", 1)).is_none());
+        assert!(rule
+            .evaluate(&dns_event(7, "api.northnarrow.io", 1))
+            .is_none());
+    }
+
+    #[test]
+    fn net_014_shannon_entropy_bounds() {
+        // All-identical bytes carry zero entropy.
+        assert_eq!(NnLNet014DnsTunnelEntropy::shannon_entropy("aaaaaaaa"), 0.0);
+        // A perfectly uniform 4-symbol distribution = log2(4) = 2.0.
+        assert!(
+            (NnLNet014DnsTunnelEntropy::shannon_entropy("abcd") - 2.0).abs() < 1e-9,
+            "uniform 4-symbol entropy must be 2.0 bits/char"
+        );
+    }
+
     // ── NN-L-NET-005 ─────────────────────────────────────────────
 
     #[test]
@@ -1465,9 +1619,13 @@ mod tests {
     /// NN-L-NET-010/011/013/018/019). Future rule additions must
     /// update this assertion.
     #[test]
-    fn net_rules_builder_returns_14_rules() {
+    fn net_rules_builder_returns_15_rules() {
         let rules = net_rules_empty();
-        assert_eq!(rules.len(), 14, "N6 9 + D4 5 = 14 net rules");
+        assert_eq!(
+            rules.len(),
+            15,
+            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 = 15 net rules"
+        );
     }
 
     /// All Critical-tier rules use `CATEGORY_CRITICAL` so the
