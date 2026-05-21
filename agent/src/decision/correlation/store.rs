@@ -75,6 +75,10 @@ pub enum PrecursorKind {
     TmpExec,
     /// NN-L-CHAIN-003 — deception canary trip.
     CanaryTrip,
+    /// NN-L-CHAIN-008 (D6) — `sudo`/`su` privilege-escalation exec
+    /// (T1548). Recorded on the privesc process so a descendant's
+    /// egress can be back-correlated to it.
+    PrivEsc,
 }
 
 #[derive(Clone, Copy)]
@@ -223,6 +227,24 @@ impl CorrelationStore {
         if self.has_recent_for_pid(pid, kind, now_ns, window_ns) {
             return true;
         }
+        for ancestor in self.tree.get_ancestors(pid) {
+            if self.has_recent_for_pid(ancestor.pid, kind, now_ns, window_ns) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Strictly an **ancestor** (not self) has a `kind` precursor in
+    /// window — the pure cross-PID query the D6 CHAIN-004..008 rules use,
+    /// so they never shadow the same-PID CHAIN-001..003.
+    pub fn has_recent_in_ancestors(
+        &mut self,
+        pid: u32,
+        kind: PrecursorKind,
+        now_ns: u64,
+        window_ns: u64,
+    ) -> bool {
         for ancestor in self.tree.get_ancestors(pid) {
             if self.has_recent_for_pid(ancestor.pid, kind, now_ns, window_ns) {
                 return true;
