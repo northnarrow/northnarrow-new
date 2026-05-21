@@ -85,6 +85,12 @@ pub const CRITICAL_FIM_RULE_IDS: &[&str] = &[
     "NN-L-FIM-002_NewSuidBinary",
     "NN-L-FIM-008_KernelModuleModified",
     "NN-L-FIM-010_RansomwareExtensionRename",
+    // Tappa 10.5 D3 Critical FIM rules — route to ADE enrichment
+    // alongside the deterministic kill (§8). The deterministic
+    // KillProcessTree + posture→COMBAT fires regardless; this list
+    // gates only the ADE prompt.
+    "NN-L-FIM-021_PamModuleModified",
+    "NN-L-FIM-022_LdSoPreloadModified",
 ];
 
 /// Returns `true` if `verdict.severity == Critical` AND its
@@ -440,11 +446,13 @@ mod tests {
         }
     }
 
-    /// C9 test #1: `CRITICAL_FIM_RULE_IDS` matches the four
-    /// Critical rules from agent/src/fim/rules.rs. Anchored so a
-    /// rename in rules.rs surfaces here at compile-time-cycle.
+    /// C9 test #1 (+ Tappa 10.5 D3): `CRITICAL_FIM_RULE_IDS` matches
+    /// the six Critical FIM rules from agent/src/fim/rules.rs —
+    /// FIM-001/002/008/010 (Tappa 9) + FIM-021/022 (Tappa 10.5 D3).
+    /// Anchored so a rename in rules.rs surfaces here at
+    /// compile-time-cycle.
     #[test]
-    fn critical_fim_rule_ids_lists_the_four_critical_rules() {
+    fn critical_fim_rule_ids_lists_the_critical_rules() {
         assert_eq!(
             CRITICAL_FIM_RULE_IDS,
             &[
@@ -452,6 +460,8 @@ mod tests {
                 "NN-L-FIM-002_NewSuidBinary",
                 "NN-L-FIM-008_KernelModuleModified",
                 "NN-L-FIM-010_RansomwareExtensionRename",
+                "NN-L-FIM-021_PamModuleModified",
+                "NN-L-FIM-022_LdSoPreloadModified",
             ]
         );
     }

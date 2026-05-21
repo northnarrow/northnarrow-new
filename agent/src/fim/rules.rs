@@ -786,6 +786,465 @@ impl Rule for NnLFim014DockerCredsRead {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Tappa 10.5 D3 — NN-L-FIM-015..023 (credential stores +
+// persistence / defense-evasion surface). Pure path-pattern
+// additions over the shipped FIM machinery; each mirrors the
+// FIM-001..014 shape (stateless struct + `as_fim` + `fim_verdict`).
+// The family allowlist is the `fim-paths.{v1,local}` watched set
+// (§13 Q3); per-rule const comm whitelists exempt the legitimate
+// application that owns each credential store.
+// ════════════════════════════════════════════════════════════════════
+
+// ── D3 path-fragment + comm-whitelist sets ──────────────────────────
+
+/// NN-L-FIM-015: browser stored-credential file fragments. Chrome/
+/// Chromium/Edge/Brave keep logins in an SQLite `Login Data`;
+/// Firefox in `logins.json` + the NSS key DB `key4.db` (legacy
+/// `key3.db` / `signons.sqlite`). Matched with `contains` so the
+/// per-user/per-profile prefix is irrelevant.
+const BROWSER_CRED_FRAGMENTS: &[&str] = &[
+    "/Login Data",
+    "logins.json",
+    "key4.db",
+    "key3.db",
+    "signons.sqlite",
+];
+
+/// The browsers that legitimately read their own credential store —
+/// exempted so the rule fires on a NON-browser process touching the
+/// file (the exfil shape).
+const BROWSER_COMMS: &[&str] = &[
+    "chrome",
+    "chromium",
+    "firefox",
+    "firefox-bin",
+    "brave",
+    "msedge",
+    "opera",
+    "vivaldi",
+];
+
+/// NN-L-FIM-016: password-manager database fragments — KeePass
+/// `*.kdbx` + the `pass` store directory.
+const PASSWORD_MANAGER_FRAGMENTS: &[&str] = &[".kdbx", "/.password-store/"];
+
+/// Password managers that legitimately read their own store.
+const PASSWORD_MANAGER_COMMS: &[&str] = &["keepassxc", "keepass", "keepass2", "pass", "gopass"];
+
+/// NN-L-FIM-017: GPG keyring directory fragment.
+const GPG_KEYRING_FRAGMENTS: &[&str] = &["/.gnupg/"];
+
+/// The GnuPG toolchain that legitimately reads the keyring.
+const GPG_COMMS: &[&str] = &["gpg", "gpg2", "gpg-agent", "gpgconf", "gpgsm", "dirmngr"];
+
+/// NN-L-FIM-018: the login-record file `utmp`-family writers
+/// legitimately rewrite. A Modified op by anything else is the
+/// log-tamper shape.
+const LASTLOG_PATHS: &[&str] = &["/var/log/lastlog"];
+
+/// NN-L-FIM-019: the binary login-record logs (`wtmp` = successful
+/// logins, `btmp` = failed). Same legitimate-writer set as -018.
+const WTMP_BTMP_PATHS: &[&str] = &["/var/log/wtmp", "/var/log/btmp"];
+
+/// The login-session machinery that legitimately appends to the
+/// `utmp`-family records (via the libc utmp API). A Modified op
+/// from any other comm is the tamper shape NN-L-FIM-018/019 catch.
+const LOGIN_RECORD_LEGIT_COMMS: &[&str] = &[
+    "login",
+    "sshd",
+    "systemd-logind",
+    "init",
+    "systemd",
+    "getty",
+    "agetty",
+    "lightdm",
+    "gdm",
+    "gdm-session-wor",
+    "su",
+    "sudo",
+    "lastlog",
+];
+
+/// NN-L-FIM-020: shell-history file fragments. The clear-history
+/// attack deletes or renames these (truncate-in-place is
+/// indistinguishable from a normal append at the rule layer without
+/// file size — deferred; the Deleted/Renamed signal is unambiguous).
+const SHELL_HISTORY_FRAGMENTS: &[&str] = &[".bash_history", ".zsh_history"];
+
+/// NN-L-FIM-021: PAM modules live under a `security/` directory and
+/// end in `.so`. The arch-specific lib dir varies
+/// (`/lib/security/`, `/usr/lib/x86_64-linux-gnu/security/`, …), so
+/// the `/security/` fragment + `.so` suffix is the portable match.
+const PAM_MODULE_DIR_FRAGMENT: &str = "/security/";
+const PAM_MODULE_SUFFIX: &str = ".so";
+
+/// NN-L-FIM-022: the dynamic-linker preload file. Its mere presence
+/// is a near-certain LD_PRELOAD-rootkit indicator (it legitimately
+/// does not exist on a stock host).
+const LD_SO_PRELOAD_PATH: &str = "/etc/ld.so.preload";
+
+/// NN-L-FIM-023: systemd timer units end in `.timer` and live under
+/// the same unit dirs as NN-L-FIM-009 ([`SYSTEMD_UNIT_PREFIXES`]).
+const SYSTEMD_TIMER_SUFFIX: &str = ".timer";
+
+// ── D3 shared helpers ───────────────────────────────────────────────
+
+/// Shared shape for the credential-store access rules
+/// (NN-L-FIM-015/016/017): a read (`Opened`) OR write (`Modified`)
+/// of a credential file by a process OTHER than the store's own
+/// application. Mirrors [`evaluate_cred_read`] but widens the op set
+/// to include writes (a write to a browser/PM/GPG store by a foreign
+/// process is also an indicator). High + KillProcess.
+fn evaluate_cred_store_access(
+    rule: &dyn Rule,
+    event: &Event,
+    path_fragments: &[&str],
+    legit_comms: &[&str],
+    reasoning: &str,
+) -> Option<Verdict> {
+    let fe = as_fim(event)?;
+    if !matches!(fe.op, FimOp::Opened | FimOp::Modified) {
+        return None;
+    }
+    if !path_fragments.iter().any(|f| fe.path.contains(f)) {
+        return None;
+    }
+    // FP guard: the application that owns the store is the dominant
+    // traffic; skip when the modifier comm matches. The audit chain
+    // still captures the event.
+    if legit_comms.iter().any(|c| fe.modifier_comm == *c) {
+        return None;
+    }
+    Some(fim_verdict(
+        rule,
+        fe,
+        ResponseAction::KillProcess,
+        Severity::High,
+        reasoning,
+    ))
+}
+
+/// Shared shape for the login-record tamper rules
+/// (NN-L-FIM-018/019): a `Modified` op on an exact `utmp`-family
+/// path by a comm NOT in [`LOGIN_RECORD_LEGIT_COMMS`]. High +
+/// KillProcess.
+fn evaluate_login_record_tamper(
+    rule: &dyn Rule,
+    event: &Event,
+    exact_paths: &[&str],
+    reasoning: &str,
+) -> Option<Verdict> {
+    let fe = as_fim(event)?;
+    if fe.op != FimOp::Modified {
+        return None;
+    }
+    if !exact_paths.iter().any(|p| fe.path == *p) {
+        return None;
+    }
+    if LOGIN_RECORD_LEGIT_COMMS
+        .iter()
+        .any(|c| fe.modifier_comm == *c)
+    {
+        return None;
+    }
+    Some(fim_verdict(
+        rule,
+        fe,
+        ResponseAction::KillProcess,
+        Severity::High,
+        reasoning,
+    ))
+}
+
+// ── NN-L-FIM-015 — browser stored credentials accessed ─────────────
+
+/// Read or write of a browser credential store by a non-browser
+/// process. MITRE T1555.003 (Credentials from Web Browsers).
+pub struct NnLFim015BrowserCredsAccessed;
+
+impl Rule for NnLFim015BrowserCredsAccessed {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-015_BrowserCredsAccessed"
+    }
+    fn name(&self) -> &'static str {
+        "Browser stored credentials accessed by non-browser process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_store_access(
+            self,
+            event,
+            BROWSER_CRED_FRAGMENTS,
+            BROWSER_COMMS,
+            "Browser stored-credential file accessed by a non-browser \
+             process — MITRE T1555.003; posture → ENGAGED",
+        )
+    }
+}
+
+// ── NN-L-FIM-016 — password-manager DB accessed ────────────────────
+
+/// Read or write of a KeePass `*.kdbx` / `pass` store by a process
+/// other than a known password manager. MITRE T1555.005 (Password
+/// Managers).
+pub struct NnLFim016PasswordManagerDbAccessed;
+
+impl Rule for NnLFim016PasswordManagerDbAccessed {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-016_PasswordManagerDbAccessed"
+    }
+    fn name(&self) -> &'static str {
+        "Password-manager database accessed by foreign process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_store_access(
+            self,
+            event,
+            PASSWORD_MANAGER_FRAGMENTS,
+            PASSWORD_MANAGER_COMMS,
+            "Password-manager database accessed by a process other than a \
+             known password manager — MITRE T1555.005; posture → ENGAGED",
+        )
+    }
+}
+
+// ── NN-L-FIM-017 — GPG keyring accessed ────────────────────────────
+
+/// Read or write of `~/.gnupg/*` by a process other than the GnuPG
+/// toolchain. MITRE T1552.004 (Private Keys).
+pub struct NnLFim017GpgKeyringAccessed;
+
+impl Rule for NnLFim017GpgKeyringAccessed {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-017_GpgKeyringAccessed"
+    }
+    fn name(&self) -> &'static str {
+        "GPG keyring accessed by non-GnuPG process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_credential_access"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_cred_store_access(
+            self,
+            event,
+            GPG_KEYRING_FRAGMENTS,
+            GPG_COMMS,
+            "GPG keyring accessed by a process outside the GnuPG toolchain \
+             — MITRE T1552.004; posture → ENGAGED",
+        )
+    }
+}
+
+// ── NN-L-FIM-018 — lastlog tampered ────────────────────────────────
+
+/// Modification of `/var/log/lastlog` by a non-login-session
+/// process. MITRE T1070 (Indicator Removal).
+pub struct NnLFim018LastlogTampered;
+
+impl Rule for NnLFim018LastlogTampered {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-018_LastlogTampered"
+    }
+    fn name(&self) -> &'static str {
+        "lastlog tampered by non-login process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_defense_evasion"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_login_record_tamper(
+            self,
+            event,
+            LASTLOG_PATHS,
+            "/var/log/lastlog modified by a non-login process — \
+             login-trace tampering (T1070); posture → ENGAGED",
+        )
+    }
+}
+
+// ── NN-L-FIM-019 — wtmp / btmp tampered ────────────────────────────
+
+/// Modification of `/var/log/wtmp` or `/var/log/btmp` by a
+/// non-login-session process. MITRE T1070.
+pub struct NnLFim019WtmpBtmpTampered;
+
+impl Rule for NnLFim019WtmpBtmpTampered {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-019_WtmpBtmpTampered"
+    }
+    fn name(&self) -> &'static str {
+        "wtmp/btmp tampered by non-login process"
+    }
+    fn category(&self) -> &'static str {
+        "fim_defense_evasion"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        evaluate_login_record_tamper(
+            self,
+            event,
+            WTMP_BTMP_PATHS,
+            "/var/log/wtmp or btmp modified by a non-login process — \
+             login-trace tampering (T1070); posture → ENGAGED",
+        )
+    }
+}
+
+// ── NN-L-FIM-020 — shell history cleared ───────────────────────────
+
+/// Deletion or rename of a shell-history file. MITRE T1070.003
+/// (Clear Command History). Medium + Log — operators do clear
+/// history; the audit chain records it for review.
+pub struct NnLFim020ShellHistoryCleared;
+
+impl Rule for NnLFim020ShellHistoryCleared {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-020_ShellHistoryCleared"
+    }
+    fn name(&self) -> &'static str {
+        "Shell history deleted or renamed"
+    }
+    fn category(&self) -> &'static str {
+        "fim_defense_evasion"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if !matches!(fe.op, FimOp::Deleted | FimOp::Renamed) {
+            return None;
+        }
+        if !SHELL_HISTORY_FRAGMENTS.iter().any(|f| fe.path.contains(f)) {
+            return None;
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::Log,
+            Severity::Medium,
+            "Shell-history file deleted or renamed — command-history \
+             clearing (T1070.003); posture → ALERTED",
+        ))
+    }
+}
+
+// ── NN-L-FIM-021 — PAM module modified ─────────────────────────────
+
+/// Creation or modification of a PAM module (`*.so` under a
+/// `security/` directory). MITRE T1543 / T1556 (Modify
+/// Authentication Process). Critical — a malicious PAM module is a
+/// credential-harvesting + auth-bypass persistence primitive.
+pub struct NnLFim021PamModuleModified;
+
+impl Rule for NnLFim021PamModuleModified {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-021_PamModuleModified"
+    }
+    fn name(&self) -> &'static str {
+        "PAM module created or modified"
+    }
+    fn category(&self) -> &'static str {
+        "fim_persistence"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
+            return None;
+        }
+        if !(fe.path.contains(PAM_MODULE_DIR_FRAGMENT) && fe.path.ends_with(PAM_MODULE_SUFFIX)) {
+            return None;
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            "PAM module created or modified — auth-bypass / credential-harvest \
+             persistence (T1543/T1556); kill tree + posture → COMBAT",
+        ))
+    }
+}
+
+// ── NN-L-FIM-022 — ld.so.preload modified ──────────────────────────
+
+/// Creation or modification of `/etc/ld.so.preload`. MITRE
+/// T1574.006 (Dynamic Linker Hijacking). Critical — the file is the
+/// canonical LD_PRELOAD-rootkit anchor and legitimately absent on a
+/// stock host, so no comm exemption is warranted.
+pub struct NnLFim022LdSoPreloadModified;
+
+impl Rule for NnLFim022LdSoPreloadModified {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-022_LdSoPreloadModified"
+    }
+    fn name(&self) -> &'static str {
+        "/etc/ld.so.preload created or modified"
+    }
+    fn category(&self) -> &'static str {
+        "fim_persistence"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
+            return None;
+        }
+        if fe.path != LD_SO_PRELOAD_PATH {
+            return None;
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            "/etc/ld.so.preload created or modified — LD_PRELOAD rootkit \
+             anchor (T1574.006); kill tree + posture → COMBAT",
+        ))
+    }
+}
+
+// ── NN-L-FIM-023 — systemd timer unit created ──────────────────────
+
+/// Creation or modification of a systemd `.timer` unit under a
+/// system unit directory. MITRE T1053.006 (Scheduled Task/Job:
+/// Systemd Timers) — complements the NN-L-FIM-009 `.service`
+/// drop-in rule.
+pub struct NnLFim023SystemdTimerCreated;
+
+impl Rule for NnLFim023SystemdTimerCreated {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-023_SystemdTimerCreated"
+    }
+    fn name(&self) -> &'static str {
+        "systemd timer unit created"
+    }
+    fn category(&self) -> &'static str {
+        "fim_persistence"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
+            return None;
+        }
+        if !(starts_with_any(&fe.path, SYSTEMD_UNIT_PREFIXES)
+            && fe.path.ends_with(SYSTEMD_TIMER_SUFFIX))
+        {
+            return None;
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::KillProcess,
+            Severity::High,
+            "systemd .timer unit created or modified — scheduled-task \
+             persistence (T1053.006); posture → ENGAGED",
+        ))
+    }
+}
+
 // ── public builder ─────────────────────────────────────────────────
 
 /// Build the FIM rules in evaluation order. The agent's
@@ -821,8 +1280,19 @@ pub fn fim_rules() -> Vec<Box<dyn Rule>> {
         Box::new(NnLFim012AzureCredsRead),
         Box::new(NnLFim013GcpCredsRead),
         Box::new(NnLFim014DockerCredsRead),
+        // Tappa 10.5 D3 — Critical first.
+        Box::new(NnLFim021PamModuleModified),
+        Box::new(NnLFim022LdSoPreloadModified),
+        // D3 High tier.
+        Box::new(NnLFim015BrowserCredsAccessed),
+        Box::new(NnLFim016PasswordManagerDbAccessed),
+        Box::new(NnLFim017GpgKeyringAccessed),
+        Box::new(NnLFim018LastlogTampered),
+        Box::new(NnLFim019WtmpBtmpTampered),
+        Box::new(NnLFim023SystemdTimerCreated),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
+        Box::new(NnLFim020ShellHistoryCleared),
     ]
 }
 
@@ -1552,9 +2022,261 @@ mod tests {
     }
 
     #[test]
-    fn cred_read_rules_in_builder_at_14_total_rules() {
-        // C5 shipped 9, C5.1 added 1, C5.3 adds 4 → 14 total.
+    fn fim_builder_has_twenty_three_rules_post_d3() {
+        // C5 shipped 9, C5.1 added 1, C5.3 added 4 → 14; Tappa 10.5
+        // D3 adds NN-L-FIM-015..023 (9) → 23 total.
         let n = fim_rules().len();
-        assert_eq!(n, 14, "expected 14 FIM rules post-C5.3, got {n}");
+        assert_eq!(n, 23, "expected 23 FIM rules post-D3, got {n}");
+    }
+
+    // ── Tappa 10.5 D3 — table-driven coverage (§13 Q8) ──────────────
+    //
+    // The 9 new FIM rules (NN-L-FIM-015..023) are a homogeneous
+    // path-pattern family, so per §13 Q8 they're covered by a single
+    // `(rule, op, path, comm, expect)` table rather than 27
+    // near-identical bespoke pairs. Each row asserts either a fired
+    // verdict (severity + action) or no fire. Positive, negative
+    // (wrong path / wrong op), and comm-exemption cases are all rows.
+
+    /// Expected outcome of a table row.
+    enum Expect {
+        Fire(Severity, ResponseAction),
+        NoFire,
+    }
+
+    fn run_d3_case(rule: &dyn Rule, op: FimOp, path: &str, comm: &str, expect: Expect) {
+        let ev = fim_event_with_comm(op, path, comm);
+        let got = rule.evaluate(&ev);
+        match expect {
+            Expect::Fire(sev, act) => {
+                let v = got.unwrap_or_else(|| {
+                    panic!(
+                        "{} should fire on op={op:?} path={path} comm={comm}",
+                        rule.id()
+                    )
+                });
+                assert_eq!(v.severity, sev, "{} severity", rule.id());
+                assert_eq!(v.action, act, "{} action", rule.id());
+                assert_eq!(v.event_filename, path, "{} event_filename", rule.id());
+            }
+            Expect::NoFire => assert!(
+                got.is_none(),
+                "{} must NOT fire on op={op:?} path={path} comm={comm}",
+                rule.id()
+            ),
+        }
+    }
+
+    #[test]
+    fn d3_fim_rules_table() {
+        use Expect::{Fire, NoFire};
+        use FimOp::*;
+        use ResponseAction::{KillProcess, KillProcessTree, Log};
+
+        // Each tuple: (rule, op, path, modifier_comm, expect).
+        // `attacker` is the canonical non-allowlisted modifier comm.
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(Box<dyn Rule>, FimOp, &str, &str, Expect)> = vec![
+            // FIM-015 browser creds — read/write by non-browser fires;
+            // browser comm exempt; wrong path / wrong op no-fire.
+            (
+                Box::new(NnLFim015BrowserCredsAccessed),
+                Opened,
+                "/home/u/.config/google-chrome/Default/Login Data",
+                "curl",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim015BrowserCredsAccessed),
+                Modified,
+                "/home/u/.mozilla/firefox/p.default/logins.json",
+                "python3",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim015BrowserCredsAccessed),
+                Opened,
+                "/home/u/.mozilla/firefox/p.default/key4.db",
+                "firefox",
+                NoFire, // browser reading its own store
+            ),
+            (
+                Box::new(NnLFim015BrowserCredsAccessed),
+                Opened,
+                "/home/u/Documents/notes.txt",
+                "curl",
+                NoFire, // not a cred store
+            ),
+            (
+                Box::new(NnLFim015BrowserCredsAccessed),
+                Deleted,
+                "/home/u/.config/google-chrome/Default/Login Data",
+                "curl",
+                NoFire, // op outside {Opened, Modified}
+            ),
+            // FIM-016 password manager DB.
+            (
+                Box::new(NnLFim016PasswordManagerDbAccessed),
+                Opened,
+                "/home/u/secrets.kdbx",
+                "cat",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim016PasswordManagerDbAccessed),
+                Opened,
+                "/home/u/.password-store/aws/key.gpg",
+                "exfil",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim016PasswordManagerDbAccessed),
+                Opened,
+                "/home/u/secrets.kdbx",
+                "keepassxc",
+                NoFire, // PM reading its own DB
+            ),
+            // FIM-017 GPG keyring.
+            (
+                Box::new(NnLFim017GpgKeyringAccessed),
+                Opened,
+                "/home/u/.gnupg/private-keys-v1.d/abc.key",
+                "scp",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim017GpgKeyringAccessed),
+                Opened,
+                "/home/u/.gnupg/pubring.kbx",
+                "gpg",
+                NoFire, // gpg reading its own keyring
+            ),
+            // FIM-018 lastlog tamper — Modified by non-login fires;
+            // login-session comm exempt.
+            (
+                Box::new(NnLFim018LastlogTampered),
+                Modified,
+                "/var/log/lastlog",
+                "dd",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim018LastlogTampered),
+                Modified,
+                "/var/log/lastlog",
+                "login",
+                NoFire, // legitimate login writer
+            ),
+            (
+                Box::new(NnLFim018LastlogTampered),
+                Created,
+                "/var/log/lastlog",
+                "dd",
+                NoFire, // only Modified
+            ),
+            // FIM-019 wtmp/btmp tamper.
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/wtmp",
+                "sed",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/btmp",
+                "sshd",
+                NoFire, // legitimate failed-login writer
+            ),
+            // FIM-020 shell history cleared — Delete/Rename fires;
+            // Modified (normal append) does not.
+            (
+                Box::new(NnLFim020ShellHistoryCleared),
+                Deleted,
+                "/home/u/.bash_history",
+                "bash",
+                Fire(Severity::Medium, Log),
+            ),
+            (
+                Box::new(NnLFim020ShellHistoryCleared),
+                Renamed,
+                "/home/u/.zsh_history",
+                "mv",
+                Fire(Severity::Medium, Log),
+            ),
+            (
+                Box::new(NnLFim020ShellHistoryCleared),
+                Modified,
+                "/home/u/.bash_history",
+                "bash",
+                NoFire, // normal append, not a clear
+            ),
+            // FIM-021 PAM module — Created/Modified .so under security/
+            // is Critical.
+            (
+                Box::new(NnLFim021PamModuleModified),
+                Modified,
+                "/usr/lib/x86_64-linux-gnu/security/pam_unix.so",
+                "attacker",
+                Fire(Severity::Critical, KillProcessTree),
+            ),
+            (
+                Box::new(NnLFim021PamModuleModified),
+                Created,
+                "/lib/security/pam_evil.so",
+                "attacker",
+                Fire(Severity::Critical, KillProcessTree),
+            ),
+            (
+                Box::new(NnLFim021PamModuleModified),
+                Modified,
+                "/etc/security/limits.conf",
+                "attacker",
+                NoFire, // under security/ but not a .so
+            ),
+            // FIM-022 ld.so.preload — exact path, Created/Modified,
+            // Critical, no comm exemption.
+            (
+                Box::new(NnLFim022LdSoPreloadModified),
+                Created,
+                "/etc/ld.so.preload",
+                "attacker",
+                Fire(Severity::Critical, KillProcessTree),
+            ),
+            (
+                Box::new(NnLFim022LdSoPreloadModified),
+                Modified,
+                "/etc/ld.so.preload",
+                "root-but-still-fires",
+                Fire(Severity::Critical, KillProcessTree),
+            ),
+            (
+                Box::new(NnLFim022LdSoPreloadModified),
+                Modified,
+                "/etc/ld.so.conf",
+                "attacker",
+                NoFire, // similar name, different file
+            ),
+            // FIM-023 systemd timer.
+            (
+                Box::new(NnLFim023SystemdTimerCreated),
+                Created,
+                "/etc/systemd/system/backdoor.timer",
+                "attacker",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim023SystemdTimerCreated),
+                Created,
+                "/etc/systemd/system/backdoor.service",
+                "attacker",
+                NoFire, // .service is NN-L-FIM-009's job, not -023
+            ),
+        ];
+
+        for (rule, op, path, comm, expect) in cases {
+            run_d3_case(rule.as_ref(), op, path, comm, expect);
+        }
     }
 }
