@@ -201,3 +201,89 @@ fn rule_ids_are_pinned() {
         "R017_ShellFromNonstandardPath"
     );
 }
+
+/// Tappa 10.5 D6 — comprehensive ID pin across EVERY family. The
+/// per-family tests (`rule_ids_are_pinned` for process,
+/// `chain_rules_builder_returns_three_rules`, the FIM/canary/net
+/// builder tests) each pin their own slice; this walks the FULL
+/// `default_rules()` set and asserts the exact sorted list of all 61
+/// shipped IDs. Any rename, drop, duplicate, or accidental
+/// addition fails here — the immutable-ID contract (decision/mod.rs)
+/// covered end-to-end in one place.
+#[test]
+fn default_engine_pins_all_sixtyone_rule_ids() {
+    let rules = super::rules::default_rules();
+    let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
+    assert_eq!(ids.len(), 61, "engine ships 61 rules at the §7 target");
+    ids.sort_unstable();
+
+    let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), 61, "all rule IDs must be unique");
+
+    assert_eq!(
+        ids,
+        vec![
+            "NN-L-CANARY-001_FileAccess",
+            "NN-L-CANARY-002_ProcessExec",
+            "NN-L-CANARY-003_NetworkConnect",
+            "NN-L-CANARY-004_CredentialRead",
+            "NN-L-CHAIN-001_CredReadThenEgress",
+            "NN-L-CHAIN-002_TmpExecThenEgress",
+            "NN-L-CHAIN-003_CanaryThenEgress",
+            "NN-L-FIM-001_SystemBinaryModified",
+            "NN-L-FIM-002_NewSuidBinary",
+            "NN-L-FIM-003_SensitiveConfigModified",
+            "NN-L-FIM-004_AuthorizedKeysModified",
+            "NN-L-FIM-005_LogTruncated",
+            "NN-L-FIM-006_OperatorBinaryModified",
+            "NN-L-FIM-007_CronDropInCreated",
+            "NN-L-FIM-008_KernelModuleModified",
+            "NN-L-FIM-009_SystemdUnitDropped",
+            "NN-L-FIM-010_RansomwareExtensionRename",
+            "NN-L-FIM-011_AwsCredsRead",
+            "NN-L-FIM-012_AzureCredsRead",
+            "NN-L-FIM-013_GcpCredsRead",
+            "NN-L-FIM-014_DockerCredsRead",
+            "NN-L-FIM-015_BrowserCredsAccessed",
+            "NN-L-FIM-016_PasswordManagerDbAccessed",
+            "NN-L-FIM-017_GpgKeyringAccessed",
+            "NN-L-FIM-018_LastlogTampered",
+            "NN-L-FIM-019_WtmpBtmpTampered",
+            "NN-L-FIM-020_ShellHistoryCleared",
+            "NN-L-FIM-021_PamModuleModified",
+            "NN-L-FIM-022_LdSoPreloadModified",
+            "NN-L-FIM-023_SystemdTimerCreated",
+            "NN-L-NET-001_OutboundToBlockedIp",
+            "NN-L-NET-002_OutboundToBlockedTld",
+            "NN-L-NET-003_BadJa3",
+            "NN-L-NET-004_SuspiciousDnsQname",
+            "NN-L-NET-005_DnsTxtNullBurst",
+            "NN-L-NET-006_UncommonListener",
+            "NN-L-NET-007_Rfc1918FromUnusualProc",
+            "NN-L-NET-008_OutboundFromTmpExec",
+            "NN-L-NET-009_ByteAnomaly",
+            "NN-L-NET-010_OutboundToHighRiskC2Port",
+            "NN-L-NET-011_PlaintextCredService",
+            "NN-L-NET-013_Beacon",
+            "NN-L-NET-018_Rfc1918LateralPort",
+            "NN-L-NET-019_WildcardListener",
+            "R001_ExecFromTmp",
+            "R002_ExecFromDevShm",
+            "R003_ExecFromVarTmp",
+            "R004_ExecFromProcSelfFd",
+            "R005_NetcatExec",
+            "R006_ReverseShellTooling",
+            "R007_CryptoMiner",
+            "R008_HiddenHomeBinary",
+            "R009_RootExecFromUserPath",
+            "R010_BinaryInWebroot",
+            "R011_KernelModuleTooling",
+            "R012_SetcapTooling",
+            "R013_NamespaceEscapeTooling",
+            "R014_AtBatchScheduling",
+            "R015_EncodingToolingServiceUid",
+            "R016_DebuggerServiceUid",
+            "R017_ShellFromNonstandardPath",
+        ]
+    );
+}
