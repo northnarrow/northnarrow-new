@@ -214,6 +214,39 @@ mod tests {
     }
 
     #[test]
+    fn decode_event_surfaces_d2_parent_context_and_argv() {
+        // Simulate what the Tappa 10.6 D2 BPF refit writes: populated
+        // ppid (parent tgid), parent_comm, parent_start_ns, and a
+        // NUL-separated argv blob. Locks the agent-side decode contract.
+        let mut raw = make_raw(4242, "ls", "/bin/ls");
+        raw.ppid = 1000;
+        raw.parent_start_ns = 123_000;
+        let pc = b"bash";
+        raw.parent_comm[..pc.len()].copy_from_slice(pc);
+        let argv = b"ls\0-la\0/tmp\0";
+        raw.argv[..argv.len()].copy_from_slice(argv);
+        raw.argv_len = argv.len() as u16;
+
+        let buf: &[u8] = bytemuck::bytes_of(&raw);
+        let evt = decode_event(buf).expect("decode");
+        match evt {
+            Event::ProcessSpawn {
+                ppid,
+                argv,
+                parent_comm,
+                parent_start_ns,
+                ..
+            } => {
+                assert_eq!(ppid, 1000);
+                assert_eq!(parent_comm, "bash");
+                assert_eq!(parent_start_ns, 123_000);
+                assert_eq!(argv, vec!["ls", "-la", "/tmp"]);
+            }
+            _ => panic!("expected ProcessSpawn"),
+        }
+    }
+
+    #[test]
     fn decode_event_rejects_wrong_size() {
         let too_short = [0u8; 8];
         assert!(decode_event(&too_short).is_err());
