@@ -181,6 +181,9 @@ mod tests {
             comm: "x".into(),
             filename: "/x".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
 

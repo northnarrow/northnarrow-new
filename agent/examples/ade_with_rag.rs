@@ -123,6 +123,9 @@ async fn main() -> ExitCode {
         comm: "cobaltstrike-beacon".into(),
         filename: "/usr/local/bin/cobaltstrike-beacon".into(),
         timestamp_ns: 0,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
     };
     let ctx = EventContext {
         recent_events: vec![],

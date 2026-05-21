@@ -325,6 +325,9 @@ mod tests {
             comm: "xmrig".into(),
             filename: "/tmp/x".into(),
             timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
 

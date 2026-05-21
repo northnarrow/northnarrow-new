@@ -243,6 +243,9 @@ mod tests {
             comm: comm.to_string(),
             filename: file.to_string(),
             timestamp_ns: 1,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
         }
     }
     fn dns(q: &str) -> Event {

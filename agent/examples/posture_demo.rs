@@ -126,6 +126,9 @@ fn spawn(pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
         comm: comm.into(),
         filename: filename.into(),
         timestamp_ns: ts,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
     }
 }
 
