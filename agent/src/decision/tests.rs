@@ -15,20 +15,20 @@ use super::rules::{
 };
 use super::{Rule, RuleEngine};
 
-/// Tappa 9 C8 / Tappa 9.5 K5 / Tappa 10 N6 / Tappa 10.5 D2 / D3 / D4:
-/// the default rule set covers 10 Tappa-2 process rules (R001..R010),
+/// Tappa 9 C8 / Tappa 9.5 K5 / Tappa 10 N6 / Tappa 10.5 D2..D5: the
+/// default rule set covers 3 Tappa-10.5 chain rules
+/// (NN-L-CHAIN-001..003), 10 Tappa-2 process rules (R001..R010),
 /// 7 Tappa-10.5 process rules (R011..R017), 23 FIM rules
 /// (NN-L-FIM-001..014 from Tappa 9 plus NN-L-FIM-015..023 from
 /// Tappa 10.5 D3), 4 Tappa-9.5 canary rules (NN-L-CANARY-001..004),
 /// and 14 NetFlow rules (NN-L-NET-001..009 from Tappa 10 plus
-/// NN-L-NET-010/011/013/018/019 from Tappa 10.5 D4) — 58 in total.
+/// NN-L-NET-010/011/013/018/019 from Tappa 10.5 D4) — 61 in total.
 /// Each family matches a distinct `Event` variant set, so the
 /// first-match short-circuit is unaffected across families.
 #[test]
-fn default_engine_has_seventeen_process_plus_twentythree_fim_plus_four_canary_plus_fourteen_net_rules(
-) {
+fn default_engine_has_sixtyone_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
-    assert_eq!(engine.rule_count(), 10 + 7 + 23 + 4 + 14);
+    assert_eq!(engine.rule_count(), 3 + 10 + 7 + 23 + 4 + 14);
 }
 
 #[test]
