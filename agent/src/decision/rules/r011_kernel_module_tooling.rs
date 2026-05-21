@@ -43,7 +43,13 @@ impl Rule for R011KernelModuleTooling {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, .. } = event else {
+        let Event::ProcessSpawn {
+            comm,
+            argv,
+            parent_comm,
+            ..
+        } = event
+        else {
             return None;
         };
         if !KMOD_TOOLS.contains(&comm.as_str()) {
@@ -52,14 +58,28 @@ impl Rule for R011KernelModuleTooling {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // Base detection fires on comm alone (graceful-degrade when the
+        // T10.6 argv refit isn't deployed). argv/parent_comm add
+        // confidence to the verdict reasoning (Q7 — additive, not a gate).
+        let mut reasoning = String::from(
+            "Kernel-module tooling (insmod/modprobe/kmod) exec — kernel \
+             rootkit / persistence indicator (T1547.006); posture → ENGAGED",
+        );
+        if let Some(m) = argv
+            .iter()
+            .find(|a| a.contains("/lib/modules/") || a.ends_with(".ko"))
+        {
+            reasoning = format!("{reasoning} — argv confirms a real module load ({m})");
+        }
+        if !parent_comm.is_empty() {
+            reasoning = format!("{reasoning}; parent={parent_comm}");
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::KillProcess,
             Severity::High,
-            "Kernel-module tooling (insmod/modprobe/kmod) exec — kernel \
-             rootkit / persistence indicator (T1547.006); parent-context \
-             refinement deferred to T10.6 — posture → ENGAGED",
+            &reasoning,
         ))
     }
 }
@@ -67,7 +87,7 @@ impl Rule for R011KernelModuleTooling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn;
+    use crate::decision::rules::testutil::{spawn, spawn_full};
 
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
@@ -83,6 +103,40 @@ mod tests {
             assert_eq!(v.action, ResponseAction::KillProcess);
             assert_eq!(v.severity, Severity::High);
         }
+    }
+
+    #[test]
+    fn argv_module_image_enriches_reasoning() {
+        let ev = spawn_full(
+            "insmod",
+            "/usr/sbin/insmod",
+            0,
+            &["insmod", "/lib/modules/6.8.0/evil.ko"],
+            "bash",
+        );
+        let v = rule().evaluate(&ev).expect("fires");
+        assert_eq!(v.severity, Severity::High); // base severity preserved
+        assert!(v.reasoning.contains("argv confirms a real module load"));
+        assert!(v.reasoning.contains("evil.ko"));
+        assert!(v.reasoning.contains("parent=bash"));
+    }
+
+    #[test]
+    fn fires_without_argv_graceful_degrade() {
+        // Empty argv (D2 not deployed) — base predicate still fires, no
+        // enrichment clause.
+        let v = rule()
+            .evaluate(&spawn("insmod", "/usr/sbin/insmod"))
+            .expect("fires");
+        assert_eq!(v.severity, Severity::High);
+        assert!(!v.reasoning.contains("argv confirms"));
+    }
+
+    #[test]
+    fn argv_without_matching_comm_does_not_fire() {
+        // A `.ko` in argv but the comm isn't a kmod tool → no fire.
+        let ev = spawn_full("ls", "/bin/ls", 0, &["ls", "/lib/modules/x.ko"], "bash");
+        assert!(rule().evaluate(&ev).is_none());
     }
 
     #[test]

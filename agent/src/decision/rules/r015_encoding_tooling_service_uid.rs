@@ -52,7 +52,10 @@ impl Rule for R015EncodingToolingServiceUid {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, uid, .. } = event else {
+        let Event::ProcessSpawn {
+            comm, uid, argv, ..
+        } = event
+        else {
             return None;
         };
         if !ENCODING_TOOLS.contains(&comm.as_str()) {
@@ -65,14 +68,28 @@ impl Rule for R015EncodingToolingServiceUid {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // D5: a decode/decrypt flag in argv (`base64 -d`, `openssl enc
+        // -d`) is the payload-decode tell. Additive — base fires anyway.
+        let mut reasoning = String::from(
+            "Encoding/encryption tool (base64/xxd/openssl) exec by a \
+             service account — exfil-staging / payload-decode shape \
+             (T1027/T1132); posture → ALERTED",
+        );
+        if argv
+            .iter()
+            .any(|a| a == "-d" || a == "--decode" || a == "enc" || a == "-aes-256-cbc")
+        {
+            reasoning = format!(
+                "{reasoning} — decode/cipher flags in argv ({})",
+                argv.join(" ")
+            );
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::Log,
             Severity::Medium,
-            "Encoding/encryption tool (base64/xxd/openssl) exec by a \
-             service account — exfil-staging / payload-decode shape \
-             (T1027/T1132); posture → ALERTED",
+            &reasoning,
         ))
     }
 }
@@ -80,10 +97,23 @@ impl Rule for R015EncodingToolingServiceUid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn_as;
+    use crate::decision::rules::testutil::{spawn_as, spawn_full};
 
     fn rule() -> R015EncodingToolingServiceUid {
         R015EncodingToolingServiceUid::new(Arc::new(CommAllowlist::default()))
+    }
+
+    #[test]
+    fn argv_decode_flag_enriches_reasoning() {
+        let ev = spawn_full(
+            "base64",
+            "/usr/bin/base64",
+            33,
+            &["base64", "-d", "payload.b64"],
+            "sh",
+        );
+        let v = rule().evaluate(&ev).expect("fires");
+        assert!(v.reasoning.contains("decode/cipher flags in argv"));
     }
 
     #[test]

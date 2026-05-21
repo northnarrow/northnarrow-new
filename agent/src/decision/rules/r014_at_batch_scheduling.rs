@@ -37,7 +37,7 @@ impl Rule for R014AtBatchScheduling {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, .. } = event else {
+        let Event::ProcessSpawn { comm, argv, .. } = event else {
             return None;
         };
         if !SCHEDULING_TOOLS.contains(&comm.as_str()) {
@@ -46,13 +46,21 @@ impl Rule for R014AtBatchScheduling {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // D5: surface the scheduled time-spec from argv (e.g. `at now + 1
+        // minute`) for triage. Additive — base fires regardless.
+        let mut reasoning = String::from(
+            "at/batch one-shot scheduling exec — delayed-execution / \
+             persistence primitive (T1053.002); posture → ALERTED",
+        );
+        if argv.len() > 1 {
+            reasoning = format!("{reasoning} — argv: {}", argv.join(" "));
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::Log,
             Severity::Medium,
-            "at/batch one-shot scheduling exec — delayed-execution / \
-             persistence primitive (T1053.002); posture → ALERTED",
+            &reasoning,
         ))
     }
 }
@@ -60,7 +68,7 @@ impl Rule for R014AtBatchScheduling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn;
+    use crate::decision::rules::testutil::{spawn, spawn_full};
 
     fn rule() -> R014AtBatchScheduling {
         R014AtBatchScheduling::new(Arc::new(CommAllowlist::default()))
@@ -76,6 +84,19 @@ mod tests {
             assert_eq!(v.action, ResponseAction::Log);
             assert_eq!(v.severity, Severity::Medium);
         }
+    }
+
+    #[test]
+    fn argv_schedule_spec_enriches_reasoning() {
+        let ev = spawn_full(
+            "at",
+            "/usr/bin/at",
+            1000,
+            &["at", "now", "+", "1", "minute"],
+            "bash",
+        );
+        let v = rule().evaluate(&ev).expect("fires");
+        assert!(v.reasoning.contains("argv: at now + 1 minute"));
     }
 
     #[test]

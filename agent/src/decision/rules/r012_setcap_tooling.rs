@@ -36,7 +36,7 @@ impl Rule for R012SetcapTooling {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, .. } = event else {
+        let Event::ProcessSpawn { comm, argv, .. } = event else {
             return None;
         };
         if comm != "setcap" {
@@ -45,13 +45,24 @@ impl Rule for R012SetcapTooling {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // D5: a capability spec in argv (e.g. `cap_setuid+ep`) names the
+        // exact privilege being granted. Additive — base fires regardless.
+        let mut reasoning = String::from(
+            "setcap exec — file-capability privilege-escalation primitive \
+             (T1548); posture → ENGAGED",
+        );
+        if let Some(cap) = argv
+            .iter()
+            .find(|a| a.contains("cap_") || a.contains("+ep") || a.contains("+ei"))
+        {
+            reasoning = format!("{reasoning} — capability grant in argv ({cap})");
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::KillProcess,
             Severity::High,
-            "setcap exec — file-capability privilege-escalation primitive \
-             (T1548); posture → ENGAGED",
+            &reasoning,
         ))
     }
 }
@@ -59,7 +70,7 @@ impl Rule for R012SetcapTooling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn;
+    use crate::decision::rules::testutil::{spawn, spawn_full};
 
     fn rule() -> R012SetcapTooling {
         R012SetcapTooling::new(Arc::new(CommAllowlist::default()))
@@ -73,6 +84,22 @@ mod tests {
         assert_eq!(v.rule_id, "R012_SetcapTooling");
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert_eq!(v.severity, Severity::High);
+        // Graceful degrade: empty argv → base reasoning, no enrichment.
+        assert!(!v.reasoning.contains("capability grant"));
+    }
+
+    #[test]
+    fn argv_capability_spec_enriches_reasoning() {
+        let ev = spawn_full(
+            "setcap",
+            "/usr/sbin/setcap",
+            0,
+            &["setcap", "cap_setuid+ep", "/tmp/x"],
+            "bash",
+        );
+        let v = rule().evaluate(&ev).expect("fires");
+        assert!(v.reasoning.contains("capability grant in argv"));
+        assert!(v.reasoning.contains("cap_setuid+ep"));
     }
 
     #[test]
