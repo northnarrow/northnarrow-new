@@ -46,7 +46,10 @@ impl Rule for R016DebuggerServiceUid {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, uid, .. } = event else {
+        let Event::ProcessSpawn {
+            comm, uid, argv, ..
+        } = event
+        else {
             return None;
         };
         if !DEBUGGER_TOOLS.contains(&comm.as_str()) {
@@ -58,14 +61,25 @@ impl Rule for R016DebuggerServiceUid {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // D5: `-p <pid>` (attach to a live process) is the credential-dump
+        // / live-tamper tell vs launching a target. Additive.
+        let mut reasoning = String::from(
+            "Debugger/tracer (gdb/strace/ltrace) exec by a service \
+             account — debugger-evasion / credential-dump prep \
+             (T1622); posture → ALERTED",
+        );
+        if argv
+            .iter()
+            .any(|a| a == "-p" || a == "--pid" || a == "--attach")
+        {
+            reasoning = format!("{reasoning} — attaching to a live process (argv has -p/--pid)");
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::Log,
             Severity::Medium,
-            "Debugger/tracer (gdb/strace/ltrace) exec by a service \
-             account — debugger-evasion / credential-dump prep \
-             (T1622); posture → ALERTED",
+            &reasoning,
         ))
     }
 }
@@ -73,10 +87,17 @@ impl Rule for R016DebuggerServiceUid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn_as;
+    use crate::decision::rules::testutil::{spawn_as, spawn_full};
 
     fn rule() -> R016DebuggerServiceUid {
         R016DebuggerServiceUid::new(Arc::new(CommAllowlist::default()))
+    }
+
+    #[test]
+    fn argv_attach_pid_enriches_reasoning() {
+        let ev = spawn_full("gdb", "/usr/bin/gdb", 33, &["gdb", "-p", "4242"], "sh");
+        let v = rule().evaluate(&ev).expect("fires");
+        assert!(v.reasoning.contains("attaching to a live process"));
     }
 
     #[test]

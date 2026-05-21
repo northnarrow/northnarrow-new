@@ -256,4 +256,28 @@ pub(crate) mod testutil {
             parent_start_ns: 0,
         }
     }
+
+    /// Tappa 10.6 D5 — `spawn` plus argv + parent_comm, for the
+    /// argv-enrichment tests. `uid` defaults to a service-class account
+    /// (the R015/R016 gate) so those rules' base predicate passes.
+    pub(crate) fn spawn_full(
+        comm: &str,
+        filename: &str,
+        uid: u32,
+        argv: &[&str],
+        parent_comm: &str,
+    ) -> Event {
+        Event::ProcessSpawn {
+            pid: 1234,
+            ppid: 1,
+            uid,
+            gid: uid,
+            comm: comm.to_string(),
+            filename: filename.to_string(),
+            timestamp_ns: 42,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            parent_comm: parent_comm.to_string(),
+            parent_start_ns: 0,
+        }
+    }
 }

@@ -45,7 +45,13 @@ impl Rule for R013NamespaceEscapeTooling {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, filename, .. } = event else {
+        let Event::ProcessSpawn {
+            comm,
+            filename,
+            argv,
+            ..
+        } = event
+        else {
             return None;
         };
         if !ESCAPE_TOOLS.contains(&comm.as_str()) {
@@ -57,14 +63,33 @@ impl Rule for R013NamespaceEscapeTooling {
         if self.allowlist.contains(comm) {
             return None;
         }
+        // D5: argv flags reveal a host-escape attempt (e.g. `nsenter -t 1
+        // -m`, `--privileged`, `--mount`, `--net=host`). Additive.
+        let mut reasoning = String::from(
+            "Namespace/escape tool (nsenter/unshare/runc) exec from a \
+             non-standard path — container-escape primitive (T1611); \
+             posture → ENGAGED",
+        );
+        if argv.iter().any(|a| {
+            a == "--privileged"
+                || a == "--security-opt"
+                || a.starts_with("--net=host")
+                || a == "-t"
+                || a == "--target"
+                || a == "--mount"
+                || a == "-m"
+        }) {
+            reasoning = format!(
+                "{reasoning} — host-escape flags in argv ({})",
+                argv.join(" ")
+            );
+        }
         Some(build_verdict(
             self,
             event,
             ResponseAction::KillProcess,
             Severity::High,
-            "Namespace/escape tool (nsenter/unshare/runc) exec from a \
-             non-standard path — container-escape primitive (T1611); \
-             posture → ENGAGED",
+            &reasoning,
         ))
     }
 }
@@ -72,7 +97,7 @@ impl Rule for R013NamespaceEscapeTooling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn;
+    use crate::decision::rules::testutil::{spawn, spawn_full};
 
     fn rule() -> R013NamespaceEscapeTooling {
         R013NamespaceEscapeTooling::new(Arc::new(CommAllowlist::default()))
@@ -87,7 +112,22 @@ mod tests {
             assert_eq!(v.rule_id, "R013_NamespaceEscapeTooling");
             assert_eq!(v.action, ResponseAction::KillProcess);
             assert_eq!(v.severity, Severity::High);
+            // Graceful degrade: empty argv → no escape-flag clause.
+            assert!(!v.reasoning.contains("host-escape flags"));
         }
+    }
+
+    #[test]
+    fn argv_escape_flags_enrich_reasoning() {
+        let ev = spawn_full(
+            "nsenter",
+            "/tmp/nsenter",
+            0,
+            &["nsenter", "-t", "1", "-m", "--", "/bin/sh"],
+            "bash",
+        );
+        let v = rule().evaluate(&ev).expect("fires");
+        assert!(v.reasoning.contains("host-escape flags in argv"));
     }
 
     #[test]
