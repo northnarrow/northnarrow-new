@@ -111,9 +111,10 @@ pub struct Golden {
     pub forbid: &'static [&'static str],
 }
 
-/// 24 hand-curated cases (deterministic ids only; queries use the
+/// 30 hand-curated cases (deterministic ids only; queries use the
 /// target docs' own discriminating vocabulary — honest retrieval, not
-/// gamed). Durable across future mechanism swaps.
+/// gamed). Durable across future mechanism swaps. The final 6 (Tappa
+/// 10.6 D10) cover the argv-aware / cross-PID seed additions.
 pub fn golden_cases() -> Vec<Golden> {
     macro_rules! g {
         ($q:expr, [$($w:expr),*], $s:expr) => {
@@ -204,6 +205,37 @@ pub fn golden_cases() -> Vec<Golden> {
             "scripting interpreter powershell abuse",
             ["attack:T1059.001"],
             true
+        ),
+        // ── Tappa 10.6 D10 — argv-aware / cross-PID seed coverage ──
+        g!(
+            "cross-PID kill chain ancestor precursor descendant egress process lineage",
+            ["linux_cross_pid_kill_chain"],
+            false
+        ),
+        g!(
+            "argv and parent_comm execution context for dual-use linux binaries",
+            ["linux_argv_parent_comm_context"],
+            false
+        ),
+        g!(
+            "container escape nsenter unshare mount namespace breakout argv",
+            ["linux_container_escape_argv"],
+            false
+        ),
+        g!(
+            "abuse elevation control mechanism sudo su privilege escalation argv",
+            ["mitre_t1548"],
+            false
+        ),
+        g!(
+            "kernel module insmod modprobe load persistence rootkit argv",
+            ["mitre_t1547_006"],
+            false
+        ),
+        g!(
+            "escape to host container breakout to underlying host",
+            ["mitre_t1611"],
+            false
         ),
     ]
 }
