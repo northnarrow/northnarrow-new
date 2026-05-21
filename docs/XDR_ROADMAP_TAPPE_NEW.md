@@ -7,6 +7,23 @@ This document specifies two new Tappe to be merged into `docs/XDR_ROADMAP.md`:
 
 Both tappe map to the ADE Doctrine framework defined in `docs/ADE_DOCTRINE.md` — specifically Phase 4 (Battle-Time Defense Synthesis) and Phase 1+5 (Knowledge Superiority and Doctrine Evolution).
 
+> **Phase 2 / V1.5 strategic context — ADE Active Defender.** See
+> `docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md` for the post-Beta
+> Active Defender build-out (Environmental Awareness, Vulnerability
+> Intelligence, Adaptive Deception, Panopticon, and the sovereign-side
+> Knowledge Ingestion Service). It maps to DDACD Phase 1 (Knowledge
+> Superiority) + Phase 2 (Strategic Positioning) and formalises the
+> **inbound public knowledge ≠ outbound customer data** sovereignty
+> rule.
+>
+> ⚠️ **Numbering note (strategic audit, 21 May 2026):** the
+> "**Tappa 10.5 — Battle-Time Defense Synthesis**" specified below
+> **collides** with the *shipped* **Tappa 10.5 — Detection Rules at
+> Scale** (the 61-rule engine on `main`). This delta predates the
+> executed numbering. The collision must be resolved when the
+> consolidated `docs/XDR_ROADMAP.md` is authored (Active Defender
+> §7 Q5).
+
 ---
 
 ## Tappa 10.5 — Battle-Time Defense Synthesis

@@ -45,6 +45,17 @@ The doctrine has five phases. They are not strictly sequential in time (multiple
 
 **Roadmap mapping**: Tappa 6.1 (ADE Foundation-Sec backend), Tappa 6.4 (RAG corpus expansion), Tappa 14.x (Threat Intelligence Collection — the legal hack-back alternative), Tappa 15.4 (Adversarial loop ADE vs MAL), Tappa 15.6 (Red Team Qwen 3B continuous attack generation).
 
+**Phase-2 / V1.5 realisation — ADE Active Defender.** Knowledge
+Superiority becomes *live and host-intimate* in the Active Defender
+build-out (`docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md`): the
+Environmental Awareness Module (C1) + Vulnerability Intelligence (C2)
+make this phase a continuous, environment-aware capability, fed by the
+sovereign-side Knowledge Ingestion Service (inbound public intel only;
+zero outbound customer data — see the Active Defender boundary note in
+the §6.9.7 RAG section). The existing Tappa 14.x feeds above are the
+*outbound* (anonymized cross-tenant) direction; the Active Defender
+adds the complementary *inbound* direction.
+
 **Doctrinal principle**: ignorance is the most expensive vulnerability. ADE invests heavily upfront in knowledge so that runtime decisions are informed rather than improvised.
 
 ---
@@ -231,6 +242,19 @@ toward curated evidence. Plan of record:
   identically across independent rebuilds (auditable provenance in
   `docs/kb-sources/`). LOLBAS is excluded (GPL-3.0 — incompatible with
   proprietary distribution).
+  - **Active Defender boundary (canonical clarification, 21 May 2026).**
+    This charter — *the runtime agent never fetches* — is **preserved,
+    not reversed**, by the ADE Active Defender vision
+    (`docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md`). The Active
+    Defender's *autonomous daily inbound threat-intel pull* (CISA KEV /
+    NVD / abuse.ch / MalwareBazaar / SigmaHQ / MITRE) is performed by a
+    **separate sovereign-side Knowledge Ingestion Service**, not the
+    agent; it is the automated realisation of the "or from a customer
+    mirror" clause above. The governing distinction is **inbound public
+    knowledge ≠ outbound customer data**: public intel flows *into* the
+    tenant (cert-pinned, signed, audit-logged), and customer data
+    **never** egresses. Air-gapped tenants receive the identical intel
+    as an offline Ed25519-signed bundle.
 - **Integration.** Behind the byte-stable `RagEngine::retrieve`
   (C2/CLI deserialize charter — plan §0 mechanism swap, §3.4
   within-result normalisation); canary-gated via `NN_ADE_RAG_ENABLED`
@@ -262,3 +286,4 @@ The doctrine is the spec. The Tappe are the implementation.
 *Document version: 1.0 — initial canonical statement, May 17, 2026.*
 *Companion document: `docs/XDR_ROADMAP.md` — Tappa-level implementation map.*
 *Companion document: `docs/ADE_SUITE_VISION.md` — model architecture (ADE-Defense + ADE-Forge) supporting this doctrine.*
+*Companion document: `docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md` — Phase-2 / release-V1.5 Active Defender strategic context (Knowledge Ingestion, Environmental Awareness, Vulnerability Intelligence, Adaptive Deception, Panopticon, sovereignty inbound/outbound).*
