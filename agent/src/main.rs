@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use common::posture_types::PostureKind;
 use common::Event;
 use northnarrow_agent::ade::{
     check_ade_memory, AdeConfig, AdeEngine, AdeMemCheck, EventContext, HostContext,
@@ -90,6 +91,18 @@ struct Cli {
         default_value = "/etc/northnarrow/combat-rules.v4"
     )]
     combat_rules: PathBuf,
+
+    /// Beta Step 4b: opt-in management carve-out CIDR list. Each IPv4
+    /// CIDR in this file is allowed through during COMBAT so a remote
+    /// operator on a declared management network is not locked out.
+    /// Re-read at every COMBAT engage (never cached). Default-empty =
+    /// full isolation (no regression).
+    #[arg(
+        long = "combat-allow-cidrs",
+        value_name = "PATH",
+        default_value = northnarrow_agent::anti_tamper::combat_allow::DEFAULT_COMBAT_ALLOW_CIDRS
+    )]
+    combat_allow_cidrs: PathBuf,
 
     /// Path to the admin pubkey file. If the file is missing, the
     /// admin socket is not started (the agent still runs, posture
@@ -785,7 +798,9 @@ async fn main() -> Result<()> {
     // with no isolator, so the agent still boots in dev environments
     // without /etc/northnarrow/ provisioned.
     let isolator = match NetworkIsolator::new(cli.combat_rules.clone()) {
-        Ok(i) => Some(Arc::new(i)),
+        Ok(i) => Some(Arc::new(
+            i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone()),
+        )),
         Err(e) => {
             warn!(
                 error = %e,
@@ -844,6 +859,31 @@ async fn main() -> Result<()> {
             cli.watchdog_pidfile.clone(),
             cli.watchdog_exe.clone(),
         );
+    }
+
+    // Beta Step 4a: reconcile a stale COMBAT chain left by a crash.
+    // The agent always boots into OBSERVING, so if the
+    // NORTHNARROW_COMBAT chain is already present the previous run died
+    // mid-COMBAT and the orphaned iptables chain is now isolating the
+    // host with no live posture state behind it (the B3 split-brain).
+    // Tear it down and audit it. If an attack is still under way the
+    // posture machine will re-engage COMBAT within seconds; an operator
+    // can also force it via the admin socket.
+    if let Some(iso) = isolator.as_ref() {
+        if posture.current_kind() == PostureKind::Observing {
+            match iso.reconcile_stale_chain() {
+                Ok(outcome) if outcome.chain_existed => {
+                    warn!(
+                        rules_removed = outcome.rules_removed,
+                        "stale COMBAT chain detected at boot — torn down (likely crash-orphaned). \
+                         Re-engage via the admin socket if the threat is still active."
+                    );
+                    audit_combat_reconcile(outcome.rules_removed);
+                }
+                Ok(_) => debug!("no stale COMBAT chain at boot (clean)"),
+                Err(e) => warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed"),
+            }
+        }
     }
 
     // Tappa 8 A3 + A8: bootstrap (or read) the per-install agent
@@ -2083,6 +2123,29 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
 /// each other's tempfile mid-write. Every error is contextualised and
 /// propagated (never swallowed) so the caller can make it fatal and a
 /// failing harness can pinpoint which syscall failed.
+/// Best-effort audit record for a Beta Step 4a stale-COMBAT reconcile.
+/// Appends one JSONL line to `/var/lib/northnarrow/combat-audit.jsonl`;
+/// a write failure is logged but never fatal — the teardown it records
+/// has already happened.
+fn audit_combat_reconcile(rules_removed: usize) {
+    use std::io::Write;
+    const PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
+    let line = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "event": "combat_reconcile",
+        "reason": "stale_reconcile",
+        "rules_torn_down": rules_removed,
+    });
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PATH)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = res {
+        warn!(error = %e, path = PATH, "could not write COMBAT reconcile audit line (non-fatal)");
+    }
+}
+
 fn write_pid_file(path: &std::path::Path) -> Result<()> {
     let pid = std::process::id();
 

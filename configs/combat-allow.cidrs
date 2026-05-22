@@ -1,0 +1,28 @@
+# NorthNarrow COMBAT management carve-out (Beta Step 4b).
+#
+# Each line is an IPv4 address or CIDR allowed THROUGH during COMBAT,
+# so a remote operator on a declared management network keeps an SSH
+# path and is not locked out when the host isolates. The agent re-reads
+# this file at every COMBAT engage (never cached) — you can add an
+# emergency CIDR from a local console mid-COMBAT and it takes effect on
+# the next engage.
+#
+# Format: one IPv4 address (1.2.3.4) or CIDR (1.2.3.0/24) per line.
+# `#` starts a comment; blank lines are ignored. Each entry is allowed
+# BOTH inbound (-s) and outbound (-d).
+#
+# DEFAULT = EMPTY = full isolation (no carve-out). This is the
+# security-first default; only add a network you trust to reach this
+# host during an active incident.
+#
+# Fail-secure: a malformed line is skipped (logged), never widened, and
+# an unreadable file applies NO carve-out at all.
+#
+# IPv6 note: COMBAT isolation is currently IPv4-only, so IPv6 entries
+# are validated but produce no rule (and need none).
+#
+# See docs/operator/COMBAT_RECOVERY.md before editing.
+#
+# Example (commented out — uncomment + edit for your management net):
+#10.0.0.0/24
+#198.51.100.7

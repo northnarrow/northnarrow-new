@@ -3,9 +3,21 @@
 # Loaded by NetworkIsolator::engage() via `iptables-restore`. On
 # COMBAT entry the agent drops the host from the network entirely:
 # every packet on INPUT, OUTPUT, and FORWARD is dropped except
-# loopback. There is intentionally NO management-port carve-out;
-# recovery requires physical access plus an Ed25519-signed admin
-# unlock (see agent/src/anti_tamper/admin_auth.rs).
+# loopback.
+#
+# Beta Step 4b — OPT-IN management carve-out. engage() replaces the
+# `# >>> NORTHNARROW_MGMT_CARVEOUT <<<` marker line below with ACCEPT
+# rules for each IPv4 CIDR in /etc/northnarrow/combat-allow.cidrs
+# (default-empty = no carve-out, byte-identical to full isolation).
+# This lets a remote operator keep an SSH path from a declared
+# management network during COMBAT and avoid lockout. Recovery
+# otherwise still requires an Ed25519-signed admin unlock (see
+# agent/src/anti_tamper/admin_auth.rs); see also
+# docs/operator/COMBAT_RECOVERY.md.
+#
+# Keep the marker line where it is — immediately before the catch-all
+# DROP — so carve-out ACCEPTs are evaluated ahead of the drop. If you
+# remove it, engage() falls back to inserting before the DROP anyway.
 #
 # `iptables-restore` flushes the filter table by default before
 # applying these rules, so any previously installed user rules are
@@ -18,5 +30,6 @@
 -A FORWARD -j NORTHNARROW_COMBAT
 -A NORTHNARROW_COMBAT -i lo -j RETURN
 -A NORTHNARROW_COMBAT -o lo -j RETURN
+# >>> NORTHNARROW_MGMT_CARVEOUT <<<
 -A NORTHNARROW_COMBAT -j DROP
 COMMIT
