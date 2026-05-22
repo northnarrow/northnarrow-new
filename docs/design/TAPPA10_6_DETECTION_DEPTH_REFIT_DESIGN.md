@@ -613,3 +613,35 @@ retained as the rationale.
 | T1611 (escape to host) | R013 argv `nsenter`/`unshare` |
 | T1547 / T1053 (persistence, cross-PID) | CHAIN-007 (cron→shell→FIM) |
 | T1041 (exfil over C2, multi-step) | CHAIN-004 (parent→child→egress) |
+
+---
+
+## Sub-task T10.6.5 — R004 systemd-executor exemption
+
+**Status:** IN PROGRESS 2026-05-22 (hot-fix; branch
+`tappa10-6-5-r004-systemd-executor-exemption`). **Effort:** 2–4 h.
+**Origin:** surfaced while bootstrapping the agent for T10.7 V2 (issue
+tracking the R004 false-positive). **Severity:** Beta blocker — broke
+clean systemd supervision.
+
+**Problem.** systemd ≥ 254 launches every unit via `systemd-executor`,
+which `fexecve()`s an `O_CLOEXEC` fd; the kernel surfaces the exec as
+`/proc/self/fd/<n>`, identical by path to a memfd/fileless exec. With the
+agent live, `R004_ExecFromProcSelfFd` (Critical → KillProcessTree) fired
+on **every** service launch — killing the agent's own systemd restart,
+its watchdog, and any service started after it. Verified deterministically
+with `systemd-run /bin/sleep` on Ubuntu 24.04 / systemd 255.
+
+**Fix.** Exempt R004 when the exec is a legitimate systemd launch:
+`(ppid == 1 || parent_comm == "systemd") && argv[0] is systemd-executor`.
+Both signals required (AND, not OR) so a daemon re-parented to init
+cannot memfd-exec freely and a forged `argv[0]` alone is rejected.
+Residual evasion (re-parent to PID 1 *and* forge argv[0]) is the domain of
+the §4 ancestry correlation / fd-target resolution — tracked, not closed
+here. Implemented in `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs`
+(unit tests for the full matrix + priv-e2e: `systemd-run` exempt,
+user-shell `/proc/self/fd` fires, memfd T1620 fires).
+
+**This is the inverse of §5.1** — the refit uses argv/parent context to
+*enrich* detections; here it *suppresses* a false-positive. Same
+mechanism, recorded here so the two uses stay coherent.
