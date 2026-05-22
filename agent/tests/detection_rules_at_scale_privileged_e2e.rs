@@ -209,6 +209,11 @@ struct Fixture {
     netflow_log: PathBuf,
     netflow_listeners_log: PathBuf,
     drift_log: PathBuf,
+    // Signed-op handles for runtime canary deploys (CHAIN-006).
+    nn_admin_path: PathBuf,
+    admin_priv: PathBuf,
+    agent_id: PathBuf,
+    admin_socket: PathBuf,
     _agent_guard: AgentGuard,
     _installed_agent: InstalledBin,
     _installed_admin: InstalledBin,
@@ -385,10 +390,44 @@ impl Fixture {
             netflow_log,
             netflow_listeners_log,
             drift_log,
+            nn_admin_path: installed_admin.path.clone(),
+            admin_priv,
+            agent_id,
+            admin_socket,
             _agent_guard: guard,
             _installed_agent: installed_agent,
             _installed_admin: installed_admin,
         }
+    }
+
+    /// Deploy a file-canary on `decoy_path` against the running agent
+    /// via a signed `nn-admin canary deploy file` op, so subsequent
+    /// opens of that inode emit `Event::CanaryTripped` (the CHAIN-006
+    /// precursor). `decoy_path` must already exist on disk.
+    fn deploy_file_canary(&self, name: &str, decoy_path: &Path) {
+        let out = Command::new(&self.nn_admin_path)
+            .arg("canary")
+            .arg("deploy")
+            .arg("--name")
+            .arg(name)
+            .arg("--key")
+            .arg(&self.admin_priv)
+            .arg("--agent-id-file")
+            .arg(&self.agent_id)
+            .arg("--socket")
+            .arg(&self.admin_socket)
+            .arg("file")
+            .arg("--path")
+            .arg(decoy_path)
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("spawn nn-admin canary deploy file");
+        assert!(
+            out.status.success(),
+            "nn-admin canary deploy file: exit {:?}, stdout {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     /// Poll `agent.log` until a `VERDICT (rule)` line for `rule_id`
@@ -490,11 +529,22 @@ where
     );
 }
 
-/// Compile a tiny C helper that connects to `127.0.0.1:<port>` as its
-/// first syscalls then exits, at `<dir>/<name>`. Used by the
-/// NN-L-CHAIN-002 test: the connect must beat the R001 kill, so the
-/// helper does no slow startup. Returns the binary path.
-fn compile_connect_helper(dir: &Path, name: &str, port: u16) -> PathBuf {
+/// Settle delay (µs) baked into the cross-PID connect child before it
+/// egresses. The child's `ProcessSpawn` (which records the lineage edge
+/// the cross-PID rules walk) and the egress `NetFlow` arrive via two
+/// *separate* BPF ringbufs drained by independent tasks; under load the
+/// net drain can overtake the process drain, so a bare connect can be
+/// evaluated before the child→parent edge exists → the cross-PID rule
+/// misses. Sleeping here lets the spawn event (and `observe_spawn`) land
+/// first. 1 s is comfortably inside the rules' 300 s correlation window.
+const CHILD_SETTLE_US: u32 = 1_000_000;
+
+/// Compile a tiny C helper that connects to `127.0.0.1:<port>` then
+/// exits, at `<dir>/<name>`. `connect_delay_us` is `usleep`'d before the
+/// connect: pass `0` for the same-PID NN-L-CHAIN-002 helper (the connect
+/// must beat the R001 kill, so no startup delay); pass [`CHILD_SETTLE_US`]
+/// for a cross-PID connect child (see that const). Returns the binary path.
+fn compile_connect_helper(dir: &Path, name: &str, port: u16, connect_delay_us: u32) -> PathBuf {
     let src = dir.join(format!("{name}.c"));
     let bin = dir.join(name);
     std::fs::write(
@@ -506,6 +556,7 @@ fn compile_connect_helper(dir: &Path, name: &str, port: u16) -> PathBuf {
 #include <arpa/inet.h>
 #include <unistd.h>
 int main(void) {{
+    usleep({connect_delay_us}); /* settle (0 = none): let our spawn drain first */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return 1;
     struct sockaddr_in a;
@@ -528,6 +579,182 @@ int main(void) {{
         .status()
         .expect("spawn cc to build chain helper");
     assert!(status.success(), "cc failed to build the chain helper");
+    bin
+}
+
+/// Compile the connect child in `compile_dir` (a `/tmp` scratch dir is
+/// fine — only *executing* from `/tmp` matters) and install it to a
+/// root-owned, non-`/tmp` path via `install_to_priv_bin`.
+///
+/// This is load-bearing for the cross-PID chains (CHAIN-004/005/006/008):
+/// the descendant egress must fall through to the *cross-PID* rule. If
+/// the child ran from `/tmp` (as a bare `tempfile::tempdir()` child
+/// does — that dir lives under `/tmp`), the child's own exec would trip
+/// the **same-PID** TmpExec rule (CHAIN-002) and R009; the engine is
+/// first-match-wins (see `decision::engine`), so the same-PID verdict
+/// would short-circuit the cross-PID rule and the chain under test would
+/// never fire. Running the child from `/usr/local/bin` keeps its exec
+/// off both the `/tmp` (TmpExec) and user-writable (R009) predicates.
+fn install_connect_child(compile_dir: &Path) -> InstalledBin {
+    install_to_priv_bin(&compile_connect_helper(
+        compile_dir,
+        "nnx_connect",
+        C2_PORT,
+        CHILD_SETTLE_US,
+    ))
+}
+
+/// Bind a loopback receiver on `port` and accept ONE connection in a
+/// background thread, bounded by `timeout`. Returns the join handle.
+///
+/// The bound matters: a descendant that never egresses (e.g. killed by
+/// the precursor's response before it connects) must make the test fail
+/// *cleanly* via the verdict timeout — not hang `join()` forever on a
+/// blocking `accept()`. The listener is released when the thread returns
+/// (on a connection or at the deadline), so the next sequential test can
+/// rebind the port.
+fn spawn_oneshot_acceptor(port: u16, timeout: Duration) -> std::thread::JoinHandle<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind receiver");
+    listener
+        .set_nonblocking(true)
+        .expect("set listener non-blocking");
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((s, _)) => {
+                    drop(s);
+                    return;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+/// Acceptor bound for the cross-PID chain tests: longer than
+/// [`VERDICT_POLL_TIMEOUT`] so a connection that does arrive is always
+/// caught, but finite so a non-egressing descendant can't hang the run.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Compile + install the CHAIN-006 **daemonizing** connect child. The
+/// canary-ancestor execs this as a direct child (recording the edge
+/// child→ancestor while the ancestor is alive); it then double-forks so
+/// its egress survives the canary trip's `KillProcessTree` (which would
+/// otherwise kill the whole ancestor tree, the egressing process
+/// included — unlike CHAIN-004/005/008 whose precursors kill only the
+/// parent PID):
+///
+///   phase 1 (the exec'd child / intermediate): fork a grandchild that
+///     re-execs THIS binary as `go` — recording the edge
+///     grandchild→intermediate while we are still alive — then linger
+///     briefly so that exec is observed, then `_exit(0)` so the
+///     grandchild reparents to init and leaves the ancestor's live
+///     process tree. The `AncestryTree` edges
+///     (grandchild→intermediate→ancestor) are keyed by `ProcKey` and
+///     survive the reparenting.
+///   phase 2 (`go`, the grandchild): settle so the ancestor's
+///     `CanaryTrip` is recorded first (precursor-before-egress) and our
+///     own spawn drains (lineage edge), then egress.
+fn compile_daemon_connect_helper(dir: &Path, name: &str, port: u16) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    std::fs::write(
+        &src,
+        format!(
+            r#"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+int main(int argc, char **argv) {{
+    if (argc < 2) {{
+        pid_t g = fork();
+        if (g == 0) {{ execl(argv[0], argv[0], "go", (char *)0); _exit(127); }}
+        usleep(250000); /* let the grandchild's exec be observed (edge g->us) */
+        _exit(0);        /* exit → grandchild reparents to init, escapes the tree */
+    }}
+    usleep({settle}); /* settle: ancestor CanaryTrip recorded first; spawn drained */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in a;
+    a.sin_family = AF_INET;
+    a.sin_port = htons({port});
+    a.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
+    connect(fd, (struct sockaddr *)&a, sizeof(a));
+    close(fd);
+    return 0;
+}}
+"#,
+            settle = CHILD_SETTLE_US + 500_000,
+        ),
+    )
+    .expect("write daemon connect helper source");
+    let status = Command::new("cc")
+        .arg("-O0")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("spawn cc to build daemon connect helper");
+    assert!(
+        status.success(),
+        "cc failed to build the daemon connect helper"
+    );
+    bin
+}
+
+fn install_daemon_connect_child(compile_dir: &Path) -> InstalledBin {
+    install_to_priv_bin(&compile_daemon_connect_helper(
+        compile_dir,
+        "nnx_daemon",
+        C2_PORT,
+    ))
+}
+
+/// Compile the CHAIN-006 canary **ancestor**: `argv[1]` = the
+/// daemonizing connect binary, `argv[2]` = the canary decoy path.
+///
+/// Spawn the descendant FIRST and give it time to daemonize (reparent to
+/// init, leaving our tree) BEFORE tripping the canary — the canary's
+/// `KillProcessTree` targets our live descendants, so the egressing
+/// grandchild must have escaped first. Then open the decoy: the
+/// `CanaryTrip` precursor is recorded on us (the ancestor), and the
+/// already-escaped grandchild survives to egress and back-correlate.
+fn compile_canary_ancestor_helper(dir: &Path, name: &str) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    std::fs::write(
+        &src,
+        r#"
+#include <unistd.h>
+#include <fcntl.h>
+int main(int argc, char **argv) {
+    pid_t p = fork();
+    if (p == 0) { execl(argv[1], argv[1], (char *)0); _exit(127); }
+    usleep(800000); /* descendant execs + double-forks + reparents to init */
+    int f = open(argv[2], O_RDONLY); /* canary trip → KillProcessTree(us) */
+    if (f >= 0) { char b[64]; ssize_t r = read(f, b, sizeof b); (void)r; close(f); }
+    usleep(2500000);
+    return 0;
+}
+"#,
+    )
+    .expect("write canary ancestor helper source");
+    let status = Command::new("cc")
+        .arg("-O0")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("spawn cc to build canary ancestor helper");
+    assert!(
+        status.success(),
+        "cc failed to build the canary ancestor helper"
+    );
     bin
 }
 
@@ -662,12 +889,7 @@ fn net_outbound_high_risk_c2_port_trips_net_010() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
 
-    let listener = TcpListener::bind(("127.0.0.1", C2_PORT)).expect("bind 127.0.0.1:4444 receiver");
-    let accept = std::thread::spawn(move || {
-        if let Ok((s, _)) = listener.accept() {
-            drop(s);
-        }
-    });
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
 
     let helper = format!(
         r#"
@@ -740,12 +962,7 @@ fn chain_tmp_exec_then_egress_trips_chain_002() {
     let fx = Fixture::setup(&[]);
 
     // Receiver for the helper's connect.
-    let listener = TcpListener::bind(("127.0.0.1", C2_PORT)).expect("bind 127.0.0.1:4444 receiver");
-    let accept = std::thread::spawn(move || {
-        if let Ok((s, _)) = listener.accept() {
-            drop(s);
-        }
-    });
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
 
     // Build + exec the connecting helper from /tmp (its dir is a
     // tempdir under /tmp on a standard host).
@@ -753,7 +970,7 @@ fn chain_tmp_exec_then_egress_trips_chain_002() {
         .prefix("nnchain")
         .tempdir_in("/tmp")
         .expect("tempdir under /tmp");
-    let helper = compile_connect_helper(tmproot.path(), "nnchain_drop", C2_PORT);
+    let helper = compile_connect_helper(tmproot.path(), "nnchain_drop", C2_PORT, 0);
     assert!(
         helper.starts_with("/tmp/"),
         "chain helper must live under /tmp/ to trigger the precursor; got {}",
@@ -797,4 +1014,286 @@ fn chain_tmp_exec_without_egress_does_not_trip_chain_002() {
 
     // No egress from that PID → CHAIN-002 must stay silent.
     fx.assert_no_verdict("NN-L-CHAIN-002_TmpExecThenEgress", Duration::from_secs(3));
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Tappa 10.6 D9 — cross-PID + N-event kill chains (CHAIN-004..008)
+// ════════════════════════════════════════════════════════════════════
+//
+// Reproduce the D6 chains END-TO-END on a live kernel: the D2 BPF refit
+// populates ppid + parent_start_ns on every spawn, CHAIN-002's
+// observe_spawn (D4) builds the ancestry tree, and a descendant's real
+// NetFlow trigger correlates back to an ancestor's precursor via the
+// shared CorrelationStore (D3).
+//
+// Helper shape: a tiny cc-compiled PARENT performs the precursor (its
+// own exec name/location, or a file read) then fork+execs a fast
+// connect CHILD. The child is a distinct PID placed OUTSIDE /tmp (so it
+// doesn't itself trip R001/TmpExec), and it connects in its first
+// syscalls — beating the precursor rule's KillProcess roundtrip the
+// same way the CHAIN-002 helper does. The child's egress is the
+// cross-PID trigger.
+
+/// Compile the cross-PID PARENT helper at `<dir>/<name>`:
+///   argv[1] = connect-child binary to fork+exec
+///   argv[2] = a file to read first ("-" to skip) — the cred/canary
+///             precursor for CHAIN-004/006
+/// For CHAIN-005/008 the precursor is the parent's own exec
+/// (location=/tmp / name=sudo), so argv[2] is "-".
+fn compile_xpid_helper(dir: &Path, name: &str) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    std::fs::write(
+        &src,
+        r#"
+#include <unistd.h>
+#include <fcntl.h>
+int main(int argc, char **argv) {
+    if (argc > 2 && argv[2][0] != '-') {
+        int f = open(argv[2], O_RDONLY);
+        if (f >= 0) { char b[64]; ssize_t r = read(f, b, sizeof b); (void)r; close(f); }
+    }
+    pid_t p = fork();
+    if (p == 0) { execl(argv[1], argv[1], (char *)0); _exit(127); }
+    /* Outlive the child's settled egress (CHILD_SETTLE_US) so the tree
+       stays intact through the connect when we aren't killed first. */
+    usleep(2000000);
+    return 0;
+}
+"#,
+    )
+    .expect("write xpid helper source");
+    let status = Command::new("cc")
+        .arg("-O0")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("spawn cc for xpid helper");
+    assert!(status.success(), "cc failed to build the xpid helper");
+    bin
+}
+
+/// Compile the same-PID 3-step helper (CHAIN-007): read `argv[1]` (the
+/// cred precursor) then connect to 127.0.0.1:<C2_PORT> — all one PID.
+/// Run from /tmp so its own exec is the TmpExec precursor; the read is
+/// the CredRead precursor; the connect is the trigger.
+fn compile_seq_helper(dir: &Path, name: &str, port: u16) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    std::fs::write(
+        &src,
+        format!(
+            r#"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+int main(int argc, char **argv) {{
+    if (argc > 1) {{
+        int f = open(argv[1], O_RDONLY);
+        if (f >= 0) {{ char b[64]; ssize_t r = read(f, b, sizeof b); (void)r; close(f); }}
+    }}
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in a;
+    a.sin_family = AF_INET;
+    a.sin_port = htons({port});
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    connect(fd, (struct sockaddr *)&a, sizeof a);
+    close(fd);
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write seq helper source");
+    let status = Command::new("cc")
+        .arg("-O0")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("spawn cc for seq helper");
+    assert!(status.success(), "cc failed to build the seq helper");
+    bin
+}
+
+/// CHAIN-008 — `sudo`/`su` privesc by a parent, descendant egresses
+/// (T1548 → T1041). Cleanest cross-PID repro: no rule kills the `sudo`
+/// comm, so the parent survives to fork the connect child.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn chain_privesc_then_descendant_egress_trips_chain_008() {
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+
+    // Connect child OUTSIDE /tmp (no TmpExec on the child).
+    let childdir = tempfile::tempdir().expect("child tempdir");
+    let connect_child = install_connect_child(childdir.path());
+    // Parent installed as a binary named exactly "sudo" → comm == sudo.
+    let parent = install_named_to_priv_bin(&compile_xpid_helper(childdir.path(), "xpid"), "sudo");
+    let _ = Command::new(&parent.path)
+        .arg(&connect_child.path)
+        .arg("-")
+        .stdout(Stdio::null())
+        .status();
+    let _ = accept.join();
+
+    fx.wait_for_verdict("NN-L-CHAIN-008_CrossPidPrivEscExfil");
+}
+
+/// CHAIN-005 — `/tmp` exec by a parent, descendant egress to a non-DNS
+/// port (T1059 → T1571). R001 KillProcess targets the parent PID only,
+/// so the already-forked child survives to connect.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn chain_tmp_parent_then_descendant_egress_trips_chain_005() {
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+
+    // Child connect helper OUTSIDE /tmp; parent UNDER /tmp (TmpExec).
+    let childdir = tempfile::tempdir().expect("child tempdir");
+    let connect_child = install_connect_child(childdir.path());
+    let tmproot = tempfile::Builder::new()
+        .prefix("nnchain")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    let parent = compile_xpid_helper(tmproot.path(), "xpid");
+    assert!(parent.starts_with("/tmp/"), "parent must be under /tmp");
+    let _ = Command::new(&parent)
+        .arg(&connect_child.path)
+        .arg("-")
+        .stdout(Stdio::null())
+        .status();
+    let _ = accept.join();
+
+    fx.wait_for_verdict("NN-L-CHAIN-005_CrossPidTmpC2");
+}
+
+/// CHAIN-004 — credential read by a parent, descendant egress
+/// (T1555 → T1041). Parent reads a FIM-watched browser-cred file; the
+/// FIM-015 KillProcess targets the parent PID only, so the forked child
+/// egresses and the lineage walk finds the ancestor's CredRead.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn chain_cred_read_parent_then_descendant_egress_trips_chain_004() {
+    let _eni = EniIptablesGuard::install();
+    let creddir = tempfile::tempdir().expect("cred tempdir");
+    let cred = creddir.path().join("Login Data");
+    std::fs::write(&cred, b"placeholder\n").expect("seed cred file");
+    let fx = Fixture::setup(&[&cred]);
+
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+
+    // Parent OUTSIDE /tmp (so only CredRead, not TmpExec). It reads the
+    // watched cred, then fork+execs the connect child.
+    let childdir = tempfile::tempdir().expect("child tempdir");
+    let connect_child = install_connect_child(childdir.path());
+    let parent = install_to_priv_bin(&compile_xpid_helper(childdir.path(), "xpidcred"));
+    let _ = Command::new(&parent.path)
+        .arg(&connect_child.path)
+        .arg(&cred)
+        .stdout(Stdio::null())
+        .status();
+    let _ = accept.join();
+
+    fx.wait_for_verdict("NN-L-CHAIN-004_CrossPidCredExfil");
+}
+
+/// CHAIN-007 — same-PID 3-step: `/tmp` exec → cred read → egress
+/// (T1059 → T1555 → T1041), all one process, via the D3 N-event
+/// has_sequence.
+///
+/// DEFERRED to T10.6.2 — known-flaky, **structural** same-PID
+/// double-kill race: the single process must outrun BOTH the R001
+/// (`/tmp` exec) and the FIM-015 (cred read) `KillProcess` responses to
+/// reach the egress. Unlike the cross-PID chains there is no descendant
+/// to escape via daemonize — the egressing process *is* the kill target,
+/// so the tree-escape technique used for CHAIN-006 does not apply. Under
+/// sequential load the kills win before the connect. Needs a
+/// retry-with-fresh-state harness (or a production rule-semantics
+/// refinement); the rule logic itself is covered by the chain.rs unit
+/// tests. The repro below is retained as the T10.6.2 starting point and
+/// is EXCLUDED from the D9 gating run (filter on `descendant_egress`).
+#[test]
+#[ignore = "T10.6.2: same-PID tmp+cred+egress double-kill race (flaky) — deferred; rule logic unit-tested in chain.rs"]
+fn chain_tmp_then_cred_then_egress_trips_chain_007() {
+    let _eni = EniIptablesGuard::install();
+    let creddir = tempfile::tempdir().expect("cred tempdir");
+    let cred = creddir.path().join("Login Data");
+    std::fs::write(&cred, b"placeholder\n").expect("seed cred file");
+    let fx = Fixture::setup(&[&cred]);
+
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+
+    // Single helper under /tmp: exec (TmpExec) → read cred (CredRead) →
+    // connect (trigger), all one PID.
+    let tmproot = tempfile::Builder::new()
+        .prefix("nnseq")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    let seq = compile_seq_helper(tmproot.path(), "nnseq_drop", C2_PORT);
+    let _ = Command::new(&seq).arg(&cred).stdout(Stdio::null()).status();
+    let _ = accept.join();
+
+    fx.wait_for_verdict("NN-L-CHAIN-007_TmpCredExfilSequence");
+}
+
+/// CHAIN-006 — canary trip by an ancestor, descendant egress (deception
+/// → T1041). Cross-PID form of CHAIN-003.
+///
+/// Unlike CHAIN-004/005/008 (whose precursor responses kill only the
+/// parent PID, so a direct child survives to egress), a canary trip
+/// responds with `KillProcessTree` — it kills the whole ancestor tree,
+/// the egressing process included. So the descendant must **escape the
+/// tree** before the trip: the canary-ancestor spawns a daemonizing
+/// connect child that double-forks (grandchild re-execs, intermediate
+/// exits → grandchild reparents to init) so the grandchild leaves the
+/// ancestor's live tree while the `AncestryTree` edges
+/// (grandchild→intermediate→ancestor) — keyed by `ProcKey`, recorded at
+/// each exec while the parent was alive — persist. The ancestor then
+/// trips the canary; the escaped grandchild egresses afterward and the
+/// lineage walk back-correlates to the ancestor's `CanaryTrip`. Real
+/// post-detection malware daemonizes for exactly this reason.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn chain_canary_trip_parent_then_descendant_egress_trips_chain_006() {
+    let _eni = EniIptablesGuard::install();
+    // The decoy must exist on disk before the canary is deployed (the
+    // agent stat()s the inode at deploy time).
+    let canarydir = tempfile::tempdir().expect("canary tempdir");
+    let decoy = canarydir.path().join("Q4 Secret Plans.docx");
+    std::fs::write(&decoy, b"decoy\n").expect("seed canary decoy");
+    // The decoy must be in WATCHED_PATHS at boot: the canary detector
+    // intercepts `inode_file_open` only for watched inodes (a file
+    // canary that isn't FIM-watched never traps the open). Mirrors
+    // canary_privileged_e2e's `setup(&[&decoy])`.
+    let fx = Fixture::setup(&[&decoy]);
+    // Register the file-canary so opens of the decoy inode emit
+    // Event::CanaryTripped.
+    fx.deploy_file_canary("nnchain006", &decoy);
+
+    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+
+    // Ancestor + daemonizing descendant, both OUTSIDE /tmp (only the
+    // CanaryTrip precursor fires, not TmpExec/R009). The ancestor opens
+    // the decoy after the descendant has daemonized clear of the tree.
+    let childdir = tempfile::tempdir().expect("child tempdir");
+    let daemon_child = install_daemon_connect_child(childdir.path());
+    let ancestor = install_to_priv_bin(&compile_canary_ancestor_helper(
+        childdir.path(),
+        "xpidcanary",
+    ));
+    let _ = Command::new(&ancestor.path)
+        .arg(&daemon_child.path)
+        .arg(&decoy)
+        .stdout(Stdio::null())
+        .status();
+    let _ = accept.join();
+
+    fx.wait_for_verdict("NN-L-CHAIN-006_CrossPidCanaryExfil");
 }
