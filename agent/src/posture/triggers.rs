@@ -29,6 +29,8 @@ use std::collections::HashSet;
 use common::posture_types::TriggerType;
 use common::Event;
 
+use super::exempt::ExemptPids;
+
 /// Recon window: 3+ distinct dst_port from same pid in 10 min.
 pub(super) const RECON_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
 pub(super) const RECON_DISTINCT_PORTS_MIN: usize = 3;
@@ -86,7 +88,8 @@ const PERSISTENCE_PREFIXES: &[&str] = &[
 
 /// Stateless detector — see module docs.
 ///
-/// `self_pid` is the agent's own PID, when known. The defender must
+/// `exempt` holds the NorthNarrow stack's own PIDs (agent + verified
+/// watchdog), when known. The defender must
 /// never classify its *own* I/O as adversary behaviour: the agent
 /// appends to its state logs (`fim_drift.jsonl`, `fim_baseline.jsonl`,
 /// `netflow.jsonl`, the audit chain, …) on every observed event, and
@@ -100,14 +103,16 @@ const PERSISTENCE_PREFIXES: &[&str] = &[
 /// the agent's state by *other* PIDs are still caught: the inode
 /// LSM hooks deny them and surface an `FsProtectDenial`, which
 /// `confirmed_intrusion` treats as COMBAT-tier on its own.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct TriggerDetector {
-    self_pid: Option<u32>,
+    /// PIDs belonging to the NorthNarrow process stack (agent + the
+    /// verified watchdog) whose events must never raise a trigger.
+    exempt: ExemptPids,
 }
 
 impl TriggerDetector {
     pub fn new() -> Self {
-        Self { self_pid: None }
+        Self::default()
     }
 
     /// Construct a detector that ignores events attributed to the
@@ -115,8 +120,15 @@ impl TriggerDetector {
     /// required.
     pub fn with_self_pid(pid: u32) -> Self {
         Self {
-            self_pid: Some(pid),
+            exempt: ExemptPids::with_agent(pid),
         }
+    }
+
+    /// Construct a detector with an explicit, shared [`ExemptPids`]
+    /// (Beta Step 3) so the agent *and* the verified watchdog PID are
+    /// both excluded, the latter refreshed live by `main.rs`.
+    pub fn with_exempt(exempt: ExemptPids) -> Self {
+        Self { exempt }
     }
 
     /// Inspect `(event, recent)` and return every trigger raised.
@@ -125,15 +137,17 @@ impl TriggerDetector {
     /// last) so the caller can `iter().last()` for the dominant
     /// signal or fold them all into the audit log.
     pub fn detect(&self, event: &Event, recent: &[Event]) -> Vec<TriggerType> {
-        // Self-exclusion: never raise a trigger on the agent's own
-        // events. The agent's continuous state-log writes would
-        // otherwise self-trip the mass-write heuristic on a benign
-        // host. `recent` is left untouched — the per-pid counters
-        // inside the heuristics only ever match the focal pid, so an
-        // agent-owned event in `recent` cannot inflate a non-agent
-        // focal's count.
-        if let Some(sp) = self.self_pid {
-            if event_owner_pid(event) == Some(sp) {
+        // Stack-exclusion: never raise a trigger on the NorthNarrow
+        // stack's own events (the agent — PR #123 — and the verified
+        // watchdog — Beta Step 3). The agent's continuous state-log
+        // writes, and the watchdog's reads of /proc/<agent>, the bpffs
+        // map and /run/northnarrow, would otherwise self-trip the
+        // mass-write / sensitive-access heuristics on a benign host.
+        // `recent` is left untouched — the per-pid counters inside the
+        // heuristics only ever match the focal pid, so a stack-owned
+        // event in `recent` cannot inflate a non-stack focal's count.
+        if let Some(pid) = event_owner_pid(event) {
+            if self.exempt.is_exempt(pid) {
                 return Vec::new();
             }
         }
