@@ -796,6 +796,138 @@ fn process_shell_from_nonstandard_path_trips_r017() {
     fx.wait_for_verdict("R017_ShellFromNonstandardPath");
 }
 
+// ── Tappa 10.6.5 — R004 systemd-executor exemption ──────────────────
+//
+// systemd >= 254 launches every unit via systemd-executor, which
+// fexecve()s an O_CLOEXEC fd — the kernel reports the exec target as
+// /proc/self/fd/N, identical by path to a memfd/fileless exec. R004 must
+// EXEMPT the legitimate launcher (else it KillProcessTree's the agent's
+// own restart, the watchdog, and every service started after the agent)
+// while still firing on genuine /proc/self/fd execs from non-systemd
+// parents. See agent/src/decision/rules/r004_exec_from_proc_self_fd.rs.
+
+/// Compile a genuine T1620 fileless-exec helper at `<dir>/<name>`: it
+/// copies `/bin/true` into an anonymous `memfd` and `fexecve()`s it, so
+/// the kernel surfaces the exec as `/proc/self/fd/<n>` from a non-systemd
+/// parent — exactly the case R004 must still catch.
+fn compile_memfd_exec_helper(dir: &Path, name: &str) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    std::fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+int main(void) {
+    int src = open("/bin/true", O_RDONLY);
+    if (src < 0) return 1;
+    int mfd = memfd_create("nnx_memfd", 0);
+    if (mfd < 0) return 2;
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(src, buf, sizeof buf)) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(mfd, buf + off, n - off);
+            if (w < 0) return 3;
+            off += w;
+        }
+    }
+    close(src);
+    char *argv[] = {"nnx_memfd", 0};
+    char *envp[] = {0};
+    fexecve(mfd, argv, envp); /* surfaces as /proc/self/fd/<mfd> */
+    return 4;                 /* only reached if fexecve fails */
+}
+"#,
+    )
+    .expect("write memfd helper source");
+    let status = Command::new("cc")
+        .arg("-O0")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("spawn cc to build memfd helper");
+    assert!(status.success(), "cc failed to build the memfd helper");
+    bin
+}
+
+/// R004 exemption — `systemd-run` launches a transient unit via
+/// systemd-executor (ppid 1, parent_comm "systemd", argv[0] =
+/// systemd-executor), which surfaces as a `/proc/self/fd/N` exec. With
+/// the Tappa 10.6.5 exemption it must NOT fire R004. (Pre-fix, this — and
+/// every other service launch observed during the window — fired
+/// Critical / KillProcessTree.)
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn process_systemd_executor_launch_exempt_from_r004() {
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+
+    // Drive a few real systemd-executor launches inside the observation
+    // window. `--collect` reaps the transient unit after it exits.
+    for i in 0..3 {
+        let unit = format!("nnx-r004-exempt-{i}");
+        let _ = Command::new("systemd-run")
+            .args(["--collect", &format!("--unit={unit}"), "/bin/sleep", "1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // No R004 verdict may appear for any systemd-executor launch in this
+    // window (covers both our systemd-run units and ambient host service
+    // activity).
+    fx.assert_no_verdict("R004_ExecFromProcSelfFd", Duration::from_secs(4));
+}
+
+/// R004 still fires on a `/proc/self/fd` exec from a non-systemd parent
+/// with a forged argv[0] (`bash exec -a <name> /proc/self/fd/<n>`) — the
+/// classic "exec from an open fd" evasion.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn process_user_shell_proc_self_fd_trips_r004() {
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+
+    // Open fd 3 onto a real executable, then exec it through its
+    // /proc/self/fd path with a spoofed argv[0]. The parent is this bash
+    // (not systemd), so the exemption does not apply. R004 fires
+    // KillProcessTree on the subprocess; ignore its exit status.
+    let _ = Command::new("bash")
+        .arg("-c")
+        .arg("exec 3< /bin/true; exec -a evilname /proc/self/fd/3")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    fx.wait_for_verdict("R004_ExecFromProcSelfFd");
+}
+
+/// R004 still fires on a genuine T1620 fileless exec (memfd_create +
+/// fexecve) from a non-systemd parent.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn process_memfd_fileless_exec_trips_r004() {
+    let _eni = EniIptablesGuard::install();
+    let fx = Fixture::setup(&[]);
+
+    // Compile + run the memfd helper from a root-owned, non-/tmp path so
+    // its own exec doesn't trip R001..R010 first (first-match-wins).
+    let scratch = tempfile::tempdir().expect("memfd scratch dir");
+    let helper = install_to_priv_bin(&compile_memfd_exec_helper(scratch.path(), "nnx_memfd"));
+    let _ = Command::new(&helper.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    fx.wait_for_verdict("R004_ExecFromProcSelfFd");
+}
+
 // ════════════════════════════════════════════════════════════════════
 // D3 — FIM rules
 // ════════════════════════════════════════════════════════════════════
