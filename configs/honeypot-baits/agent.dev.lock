@@ -1,0 +1,6 @@
+# NorthNarrow Agent - Developer Lock
+# Holds the agent in passive (observe-only) mode for development.
+# WARNING: modifying this file requires admin authorization
+lock_held=false
+dev_mode_only=true
+last_modified=2026-02-15T09:30:00Z

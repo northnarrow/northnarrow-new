@@ -1,0 +1,6 @@
+# NorthNarrow Agent - Debug Disable Flag
+# Disables enforcement while a debugger is attached to the agent.
+# WARNING: modifying this file requires admin authorization
+debug_level=0
+require_signature=true
+last_modified=2026-02-15T09:30:00Z

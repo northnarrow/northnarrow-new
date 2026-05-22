@@ -1,0 +1,6 @@
+# NorthNarrow Agent - Shutdown Signal
+# Requests a graceful agent shutdown on the next poll cycle.
+# WARNING: modifying this file requires admin authorization
+shutdown_requested=false
+require_signature=true
+last_modified=2026-02-15T09:30:00Z
