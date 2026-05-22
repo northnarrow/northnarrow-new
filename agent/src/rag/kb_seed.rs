@@ -1,21 +1,28 @@
-//! Curated knowledge-base seed (Sub-tappa 6.7).
+//! Curated knowledge-base seed (Sub-tappa 6.7; extended in Tappa 10.6
+//! D10 for the argv-aware / cross-PID detection-depth refit).
 //!
-//! 30 hand-picked documents the agent uses as RAG context. The
+//! 36 hand-picked documents the agent uses as RAG context. The
 //! corpus is intentionally small and deliberate: every entry covers
 //! a behaviour the model is likely to misclassify on its own
 //! because the relevant tooling, technique, or IoC moved after the
 //! base model's knowledge cutoff.
 //!
-//! Distribution (matches Sub-tappa 6.7 spec):
+//! Distribution:
 //!
 //! | Category          | Count |
 //! |-------------------|-------|
-//! | MITRE technique   | 10    |
+//! | MITRE technique   | 13    |
 //! | Sigma rule        |  5    |
 //! | LOLBAS            |  5    |
-//! | Linux pattern     |  5    |
+//! | Linux pattern     |  8    |
 //! | Threat tool       |  5    |
-//! | **Total**         | **30**|
+//! | **Total**         | **36**|
+//!
+//! Tappa 10.6 D10 added (for the argv + parent_comm + cross-PID chain
+//! rules): MITRE T1548 (sudo/su privesc), T1611 (container escape),
+//! T1547.006 (kernel modules); and Linux patterns for the cross-PID
+//! kill chain (NN-L-CHAIN-004..008), argv/parent_comm context, and
+//! container-escape argv.
 //!
 //! Future Sub-tappa 6.7+: replace this hardcoded list with an
 //! ingestion pipeline that pulls from MITRE GitHub, Sigma project,
@@ -28,7 +35,7 @@ use common::rag_types::{KbCategory, KbDocument};
 /// Returns owned documents so the caller can move them into the
 /// store without retaining a borrow on the seed module.
 pub fn seed_documents() -> Vec<KbDocument> {
-    let mut out = Vec::with_capacity(30);
+    let mut out = Vec::with_capacity(36);
     out.extend(mitre_techniques());
     out.extend(sigma_rules());
     out.extend(lolbas_entries());
@@ -118,6 +125,27 @@ fn mitre_techniques() -> Vec<KbDocument> {
             "T1190: Exploit Public-Facing Application",
             "Adversaries exploit weaknesses in internet-facing applications (web servers, VPN gateways, mail servers) to gain initial access. Indicators: web server processes spawning shells (php-fpm → bash, nginx → /bin/sh, java → /bin/sh), exploitation of known CVEs in Confluence / Exchange / Citrix / Fortinet, anomalous POST bodies, webshell drops to webroot. Tactic: Initial Access (TA0001).",
             &["initial_access", "webshell", "exploitation"],
+        ),
+        d(
+            "mitre_t1548",
+            KbCategory::MitreTechnique,
+            "T1548: Abuse Elevation Control Mechanism — sudo/su",
+            "Adversaries circumvent privilege controls to elevate. On Linux this most often surfaces as sudo/su execution: a comm of `sudo`, `su`, `pkexec`, or `doas` in an argv chain that escalates a session, or sudo caching/`NOPASSWD` misuse. argv-aware detection inspects the full argument vector (e.g. `sudo -u root <payload>`) and the parent comm to separate interactive admin use from automated abuse. NorthNarrow maps NN-L-CHAIN-008 (cross-PID privesc → descendant egress) to this technique. Tactic: Privilege Escalation (TA0004) / Defense Evasion (TA0005).",
+            &["privilege_escalation", "sudo", "argv"],
+        ),
+        d(
+            "mitre_t1611",
+            KbCategory::MitreTechnique,
+            "T1611: Escape to Host — container breakout",
+            "Adversaries break out of a container to the underlying host. argv/parent-comm indicators: `unshare`, `nsenter --target 1 --mount`, `capsh`, mounting the host filesystem or the docker/cri socket, writing to release_agent in a cgroup, privileged `runc`/`ctr` invocations. The full argv (namespace + mount flags) and the parent comm distinguish a breakout from benign container tooling. Tactic: Privilege Escalation (TA0004).",
+            &["container_escape", "privilege_escalation", "argv"],
+        ),
+        d(
+            "mitre_t1547_006",
+            KbCategory::MitreTechnique,
+            "T1547.006: Boot or Logon Autostart — Kernel Modules and Extensions",
+            "Adversaries load malicious kernel modules (LKM rootkits) for persistence and stealth. Linux indicators: `insmod`/`modprobe` execution loading a `.ko` from a non-package path, `finit_module`/`init_module` syscalls, comm of `insmod` with an argv pointing at a user-writable path. argv-aware detection reads the module path from the argument vector; NorthNarrow's R011 keys on the `insmod` comm. Tactic: Persistence (TA0003) / Privilege Escalation (TA0004).",
+            &["persistence", "kernel_module", "argv"],
         ),
     ]
 }
@@ -239,6 +267,27 @@ fn linux_patterns() -> Vec<KbDocument> {
             "Cron entries that point at binaries inside user-writable paths, fetch a script over HTTP at execution time (curl|sh / wget -O- |sh), or run with @reboot frequency from a non-root crontab are common Linux persistence implants. Inspect /etc/cron.d/, /etc/crontab, /var/spool/cron/crontabs/. MITRE: T1053.003.",
             &["linux", "persistence", "cron"],
         ),
+        d(
+            "linux_cross_pid_kill_chain",
+            KbCategory::LinuxPattern,
+            "Linux: Cross-PID kill chain — ancestor precursor then descendant egress",
+            "A multi-stage intrusion rarely happens in one process: an ANCESTOR performs a high-signal precursor (credential-store read, /tmp exec, deception-canary trip, or sudo/su privesc) and a later DESCENDANT process opens the outbound C2/exfil flow. Detecting it requires correlating the ancestor's precursor with the descendant's egress across PIDs via a parent→child lineage tree (keyed by pid+start_ns to survive PID reuse), within a bounded window. Real post-detection malware also daemonizes (double-fork → reparent to init) so the egressing child survives a KillProcessTree aimed at the ancestor. NorthNarrow's NN-L-CHAIN-004 (cred→egress), 005 (/tmp→egress), 006 (canary→egress) and 008 (privesc→egress) are the cross-PID forms; CHAIN-007 is the same-PID N-event sequence. MITRE: T1059 → T1041 / T1571.",
+            &["linux", "chain", "lineage", "exfiltration"],
+        ),
+        d(
+            "linux_argv_parent_comm_context",
+            KbCategory::LinuxPattern,
+            "Linux: argv + parent_comm execution context for dual-use binaries",
+            "Many Linux binaries are dual-use: `bash`, `insmod`, `unshare`, `nsenter`, `sudo`, `python` are benign or malicious depending on HOW they are invoked. The discriminating signal is the full argument vector (argv) plus the parent comm. Examples: `bash -c <base64-decoded payload>` vs an interactive shell; `insmod /tmp/x.ko` vs a packaged module load; `sshd → bash → curl <c2>` reveals a remote-driven chain via parent_comm. argv-aware rules read the whole vector rather than just the comm, cutting false positives on legitimate admin use. NorthNarrow's R011–R017 enrich verdicts with argv + parent_comm. MITRE: T1059.004, T1548.",
+            &["linux", "argv", "parent_comm", "execution"],
+        ),
+        d(
+            "linux_container_escape_argv",
+            KbCategory::LinuxPattern,
+            "Linux: Container escape via namespace/mount argv",
+            "Container breakouts are visible in argv: `nsenter --target 1 --mount --uts --ipc --net --pid`, `unshare -m`, mounting the host root or the docker/containerd socket, privileged `runc`/`ctr exec`, or writing a payload to a cgroup `release_agent`. The argument vector (namespace + mount flags + target PID 1) plus a container-runtime parent comm separates a breakout from benign orchestration. MITRE: T1611 (Escape to Host).",
+            &["linux", "container_escape", "argv"],
+        ),
     ]
 }
 
@@ -290,7 +339,7 @@ mod tests {
     #[test]
     fn kb_seed_count_in_target_range() {
         let n = seed_documents().len();
-        assert!((28..=32).contains(&n), "expected 28..=32 docs, got {n}");
+        assert!((34..=38).contains(&n), "expected 34..=38 docs, got {n}");
     }
 
     #[test]
@@ -321,10 +370,10 @@ mod tests {
     fn kb_seed_distribution_matches_spec() {
         let docs = seed_documents();
         let count = |c: KbCategory| docs.iter().filter(|d| d.category == c).count();
-        assert_eq!(count(KbCategory::MitreTechnique), 10);
+        assert_eq!(count(KbCategory::MitreTechnique), 13);
         assert_eq!(count(KbCategory::SigmaRule), 5);
         assert_eq!(count(KbCategory::Lolbas), 5);
-        assert_eq!(count(KbCategory::LinuxPattern), 5);
+        assert_eq!(count(KbCategory::LinuxPattern), 8);
         assert_eq!(count(KbCategory::ThreatTool), 5);
     }
 }
