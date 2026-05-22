@@ -42,6 +42,10 @@ STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
 
 AGENT_BIN="$TARGET_DIR/northnarrow-agent"
 WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
+# Beta Step 4c: nn-admin is the operator's COMBAT-release / admin tool.
+# It must be on-host so an operator can unlock COMBAT, and install.sh
+# uses it below to bootstrap admin.pub on a fresh install (issue #124).
+NN_ADMIN_BIN="$TARGET_DIR/nn-admin"
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 
@@ -93,6 +97,8 @@ PROCESS_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/process-comm-allowlist.v1"
 # escape-to-host detection is preserved on non-container hosts.
 PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC="$REPO_ROOT/configs/process-comm-allowlist.local.example"
 NETFLOW_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/netflow-comm-allowlist.v1"
+# Beta Step 4b: empty-by-default COMBAT management carve-out CIDR list.
+COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 
 # ── pre-flight ──────────────────────────────────────────────────────
 require_root() {
@@ -115,6 +121,7 @@ require_file() {
 require_root
 require_file "$AGENT_BIN"    "run \`cargo build --release -p northnarrow-agent\` first"
 require_file "$WATCHDOG_BIN" "run \`cargo build --release -p northnarrow-watchdog\` first"
+require_file "$NN_ADMIN_BIN" "run \`cargo build --release -p northnarrow-agent --bin nn-admin\` first"
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
@@ -145,6 +152,7 @@ done
 echo "install.sh: copying binaries to $BIN_DIR/"
 install -m 755 -o root -g root "$AGENT_BIN"    "$BIN_DIR/northnarrow-agent"
 install -m 755 -o root -g root "$WATCHDOG_BIN" "$BIN_DIR/northnarrow-watchdog"
+install -m 755 -o root -g root "$NN_ADMIN_BIN" "$BIN_DIR/nn-admin"
 
 echo "install.sh: copying systemd unit files to $UNIT_DIR/"
 install -m 644 -o root -g root "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
@@ -215,6 +223,49 @@ if [[ -f "$ETC_DIR/netflow-comm-allowlist.v1" ]]; then
 else
     echo "install.sh: copying default NetFlow comm allowlist to $ETC_DIR/netflow-comm-allowlist.v1"
     install -m 0644 -o root -g root "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "$ETC_DIR/netflow-comm-allowlist.v1"
+fi
+
+# Beta Step 4b: COMBAT management carve-out CIDR list. Empty default =
+# full isolation (no regression). Operator-editable (NOT in the FIM
+# deny-zone) so an emergency CIDR can be added from a local console
+# mid-COMBAT. Left untouched if the operator already has one.
+if [[ -f "$ETC_DIR/combat-allow.cidrs" ]]; then
+    echo "install.sh: $ETC_DIR/combat-allow.cidrs already present — leaving operator copy untouched"
+else
+    echo "install.sh: seeding empty COMBAT carve-out list at $ETC_DIR/combat-allow.cidrs"
+    install -m 0644 -o root -g root "$COMBAT_ALLOW_CIDRS_SRC" "$ETC_DIR/combat-allow.cidrs"
+fi
+
+# Beta Step 4c (issue #124): bootstrap an admin keypair on a FRESH
+# install so COMBAT is recoverable. Without admin.pub the agent still
+# runs and still enters COMBAT on intrusion, but there is NO way to
+# release it short of a reboot. Generate one ONLY when admin.pub is
+# absent (never overwrite operator-managed keys). The private half is
+# written to the host and MUST be moved offline — see the warning.
+if [[ -f "$ETC_DIR/admin.pub" ]]; then
+    echo "install.sh: $ETC_DIR/admin.pub already present — leaving admin keys untouched"
+else
+    echo "install.sh: no admin.pub found — bootstrapping an Ed25519 admin keypair (nn-admin init)"
+    if "$BIN_DIR/nn-admin" init --priv-out "$ETC_DIR/admin.key" --pub-append "$ETC_DIR/admin.pub"; then
+        chmod 0600 "$ETC_DIR/admin.key" 2>/dev/null || true
+        echo ""
+        echo "  ##########################################################################"
+        echo "  #  SECURITY — an admin PRIVATE key was just written to this host:         #"
+        echo "  #      $ETC_DIR/admin.key  (mode 0600)"
+        echo "  #                                                                        #"
+        echo "  #  This key RELEASES COMBAT isolation. Anyone holding it — or with root   #"
+        echo "  #  on THIS host — can unlock the host. MOVE IT OFF THIS HOST NOW and      #"
+        echo "  #  store it offline, e.g.:                                                #"
+        echo "  #      mv $ETC_DIR/admin.key  <secure-offline-location>"
+        echo "  #  Keep ONLY the public half ($ETC_DIR/admin.pub) on the host.            #"
+        echo "  #  Recovery procedure: docs/operator/COMBAT_RECOVERY.md                   #"
+        echo "  ##########################################################################"
+        echo ""
+    else
+        echo "install.sh: WARNING — nn-admin init failed; admin.pub was NOT created." >&2
+        echo "install.sh: COMBAT will be UNRECOVERABLE without an admin key. Generate one manually:" >&2
+        echo "install.sh:   nn-admin init --priv-out <offline-path> --pub-append $ETC_DIR/admin.pub" >&2
+    fi
 fi
 
 # Tappa 9 C7: ensure /var/lib/northnarrow/ exists at mode 0700
@@ -332,14 +383,20 @@ echo "  1. Verify the install layout:"
 echo "       systemctl status northnarrow-agent.service"
 echo "       systemctl status northnarrow-watchdog.service"
 echo ""
-echo "  2. Confirm /etc/northnarrow/ has admin.pub + combat-rules.v4 +"
-echo "     agent_id + fim-paths.v1 + canary-templates/ +"
+echo "  2. Confirm /etc/northnarrow/ has admin.pub + admin.key +"
+echo "     combat-rules.v4 + combat-allow.cidrs + agent_id +"
+echo "     fim-paths.v1 + canary-templates/ +"
 echo "     netflow-blocklist.v1 + netflow-ja3-blocklist.v1 +"
 echo "     process-comm-allowlist.v1 + netflow-comm-allowlist.v1 (the"
-echo "     agent will bootstrap agent_id on first start; admin.pub +"
-echo "     combat-rules.v4 are operator-provided; fim-paths.v1 +"
-echo "     canary-templates/ + netflow-{,ja3-}blocklist.v1 +"
+echo "     agent bootstraps agent_id on first start; admin.pub + admin.key"
+echo "     were auto-generated above IF admin.pub was absent — MOVE"
+echo "     admin.key OFFLINE now (see docs/operator/COMBAT_RECOVERY.md);"
+echo "     combat-rules.v4 is operator-provided; combat-allow.cidrs +"
+echo "     fim-paths.v1 + canary-templates/ + netflow-{,ja3-}blocklist.v1 +"
 echo "     {process,netflow}-comm-allowlist.v1 were just installed above)."
+echo "     Optional: add management CIDRs to combat-allow.cidrs to keep an"
+echo "     SSH path open during COMBAT (anti-lockout — empty by default;"
+echo "     see docs/operator/COMBAT_RECOVERY.md §2)."
 echo "     Optional: drop /etc/northnarrow/fim-paths.local to customise"
 echo "     the FIM watched-paths set (\`+/path\` add, \`-/path\` disable —"
 echo "     see docs/operator/TAPPA9_FIM_TRUST_MODEL.md §13 Q7)."

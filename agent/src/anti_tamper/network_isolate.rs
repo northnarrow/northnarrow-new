@@ -18,7 +18,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
-use tracing::info;
+use tracing::{info, warn};
+
+use super::combat_allow;
 
 /// `iptables-restore` lookup name. Resolved via `PATH` by
 /// [`std::process::Command`]; we do not pin an absolute path because
@@ -32,8 +34,12 @@ const DEFAULT_RESTORE_BIN: &str = "iptables-restore";
 const DEFAULT_IPTABLES_BIN: &str = "iptables";
 
 /// Name of the chain that `configs/combat-rules.v4` creates.
-#[allow(dead_code)]
 const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
+
+/// Marker line in `configs/combat-rules.v4` that [`NetworkIsolator::engage`]
+/// replaces with the management carve-out ACCEPT rules (Beta Step 4b).
+/// Placed inside the chain, immediately before its catch-all DROP.
+const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
 
 /// Capability token proving that an Ed25519-signed admin unlock has
 /// been verified. The only way to construct one is via
@@ -70,8 +76,11 @@ pub(in crate::anti_tamper) fn mint_unlock_token() -> UnlockToken {
 pub struct NetworkIsolator {
     is_isolated: AtomicBool,
     rules_path: PathBuf,
+    /// Beta Step 4b: opt-in management carve-out CIDR list, re-read at
+    /// every `engage()` (never cached) so an operator can add an
+    /// emergency CIDR from a local console mid-COMBAT.
+    allow_cidrs_path: PathBuf,
     restore_bin: PathBuf,
-    #[allow(dead_code)]
     iptables_bin: PathBuf,
 }
 
@@ -87,9 +96,17 @@ impl NetworkIsolator {
         Ok(Self {
             is_isolated: AtomicBool::new(false),
             rules_path,
+            allow_cidrs_path: combat_allow::default_path(),
             restore_bin: PathBuf::from(DEFAULT_RESTORE_BIN),
             iptables_bin: PathBuf::from(DEFAULT_IPTABLES_BIN),
         })
+    }
+
+    /// Override the management carve-out CIDR file path (Beta Step 4b).
+    /// `main.rs` wires this from `--combat-allow-cidrs`.
+    pub fn with_allow_cidrs_path(mut self, path: PathBuf) -> Self {
+        self.allow_cidrs_path = path;
+        self
     }
 
     /// Test-only constructor that lets unit tests substitute benign
@@ -107,6 +124,7 @@ impl NetworkIsolator {
         Ok(Self {
             is_isolated: AtomicBool::new(false),
             rules_path,
+            allow_cidrs_path: combat_allow::default_path(),
             restore_bin,
             iptables_bin,
         })
@@ -117,13 +135,111 @@ impl NetworkIsolator {
     /// iptables between our calls, re-asserting the ruleset is
     /// exactly what we want.
     pub fn engage(&self) -> Result<()> {
-        run_iptables_restore(&self.restore_bin, &self.rules_path)
+        let (ruleset, carved) = self.build_engaged_ruleset()?;
+        run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
             .context("iptables-restore failed during COMBAT engage")?;
         self.is_isolated.store(true, Ordering::SeqCst);
-        info!(
-            rules = %self.rules_path.display(),
-            "COMBAT: network isolated (loopback only)"
-        );
+        if carved.is_empty() {
+            info!(
+                rules = %self.rules_path.display(),
+                "COMBAT: network isolated (loopback only)"
+            );
+        } else {
+            // WARN so the carve-out is conspicuous in the audit trail:
+            // these CIDRs survive isolation, which is exactly the kind
+            // of thing an operator reviewing a COMBAT event must see.
+            warn!(
+                rules = %self.rules_path.display(),
+                allow_cidrs = ?carved,
+                count = carved.len(),
+                "COMBAT: network isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
+            );
+        }
+        Ok(())
+    }
+
+    /// Build the ruleset to feed `iptables-restore`: the base
+    /// `combat-rules.v4` with the management carve-out (Beta Step 4b)
+    /// spliced in ahead of the catch-all DROP. Returns the rendered
+    /// ruleset and the list of IPv4 CIDRs actually carved out (for
+    /// logging). Re-reads the allow file every call — never cached.
+    fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
+        let base = std::fs::read_to_string(&self.rules_path)
+            .with_context(|| format!("reading {}", self.rules_path.display()))?;
+
+        let load = combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
+        if let Some(reason) = &load.read_error {
+            // The default-secure case is an absent/empty file, so this
+            // is expected on most hosts — debug, not warn.
+            tracing::debug!(
+                allow_file = %self.allow_cidrs_path.display(),
+                reason = %reason,
+                "COMBAT: no management carve-out applied (allow file absent/unreadable — fail-secure)"
+            );
+        }
+        for w in &load.warnings {
+            warn!(
+                allow_file = %self.allow_cidrs_path.display(),
+                reject = %w,
+                "COMBAT carve-out: skipping malformed allow entry (fail-secure — entry ignored)"
+            );
+        }
+        for e in load.entries.iter().filter(|e| e.is_ipv6) {
+            info!(
+                cidr = %e.raw,
+                "COMBAT carve-out: IPv6 entry noted but NOT applied — COMBAT isolation is IPv4-only"
+            );
+        }
+
+        let accept_block = combat_allow::generate_accept_rules(&load.entries, COMBAT_CHAIN);
+        let carved = combat_allow::ipv4_raw(&load.entries);
+        Ok((splice_carveout(&base, &accept_block), carved))
+    }
+
+    /// Beta Step 4a: tear down a STALE COMBAT chain left over from a
+    /// crash. Called once at boot when posture is `OBSERVING` — if the
+    /// `NORTHNARROW_COMBAT` chain exists, the agent died mid-COMBAT and
+    /// systemd/the watchdog restarted it; the orphaned chain would
+    /// otherwise keep the host isolated with no live posture state
+    /// backing it (the B3 split-brain). Reuses the idempotent teardown
+    /// path; a no-op (and cheap) when no chain is present.
+    pub fn reconcile_stale_chain(&self) -> Result<ReconcileOutcome> {
+        let listed = Command::new(&self.iptables_bin)
+            .args(["-S", COMBAT_CHAIN])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("probing for stale {COMBAT_CHAIN} chain"))?;
+        if !listed.status.success() {
+            // Non-zero = chain absent (the normal clean-boot case).
+            return Ok(ReconcileOutcome {
+                chain_existed: false,
+                rules_removed: 0,
+            });
+        }
+        let rules_removed = count_chain_rules(&String::from_utf8_lossy(&listed.stdout));
+        self.tear_down_chain()
+            .context("tearing down stale COMBAT chain")?;
+        self.is_isolated.store(false, Ordering::SeqCst);
+        Ok(ReconcileOutcome {
+            chain_existed: true,
+            rules_removed,
+        })
+    }
+
+    /// Idempotent chain teardown shared by [`Self::release`] and
+    /// [`Self::reconcile_stale_chain`]: delete the jump rules from the
+    /// base chains first (`-X` refuses a still-referenced chain), then
+    /// flush and delete the chain. Each step swallows "already gone".
+    fn tear_down_chain(&self) -> Result<()> {
+        for base in ["INPUT", "OUTPUT", "FORWARD"] {
+            run_iptables_idempotent(&self.iptables_bin, &["-D", base, "-j", COMBAT_CHAIN])
+                .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;
+        }
+        run_iptables_idempotent(&self.iptables_bin, &["-F", COMBAT_CHAIN])
+            .with_context(|| format!("flushing chain {COMBAT_CHAIN}"))?;
+        run_iptables_idempotent(&self.iptables_bin, &["-X", COMBAT_CHAIN])
+            .with_context(|| format!("deleting chain {COMBAT_CHAIN}"))?;
         Ok(())
     }
 
@@ -146,14 +262,7 @@ impl NetworkIsolator {
     /// `mint_unlock_token` is still `pub(in crate::anti_tamper)`,
     /// so no external caller can fabricate a token to slip past this.
     pub fn release(&self, _: UnlockToken) -> Result<()> {
-        for base in ["INPUT", "OUTPUT", "FORWARD"] {
-            run_iptables_idempotent(&self.iptables_bin, &["-D", base, "-j", COMBAT_CHAIN])
-                .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;
-        }
-        run_iptables_idempotent(&self.iptables_bin, &["-F", COMBAT_CHAIN])
-            .with_context(|| format!("flushing chain {COMBAT_CHAIN}"))?;
-        run_iptables_idempotent(&self.iptables_bin, &["-X", COMBAT_CHAIN])
-            .with_context(|| format!("deleting chain {COMBAT_CHAIN}"))?;
+        self.tear_down_chain()?;
         self.is_isolated.store(false, Ordering::SeqCst);
         info!(target: "anti_tamper.network_isolation.released", "COMBAT: network isolation released");
         Ok(())
@@ -196,12 +305,73 @@ fn run_iptables_idempotent(bin: &Path, args: &[&str]) -> Result<()> {
     ))
 }
 
-/// Spawn `bin`, pipe the contents of `rules` to its stdin, and treat
-/// a non-zero exit as a hard failure.
-fn run_iptables_restore(bin: &Path, rules: &Path) -> Result<()> {
+/// Outcome of [`NetworkIsolator::reconcile_stale_chain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    /// Whether a stale `NORTHNARROW_COMBAT` chain was found at boot.
+    pub chain_existed: bool,
+    /// Count of `-A` rules the chain held before teardown (audit detail).
+    pub rules_removed: usize,
+}
+
+/// Count the appended (`-A`) rules in `iptables -S CHAIN` output. The
+/// chain-create line (`-N CHAIN`) and any policy line are excluded.
+fn count_chain_rules(iptables_s_output: &str) -> usize {
+    iptables_s_output
+        .lines()
+        .filter(|l| l.trim_start().starts_with("-A "))
+        .count()
+}
+
+/// Splice the management carve-out ACCEPT block into the base ruleset.
+///
+/// Primary path: replace the [`CARVE_OUT_MARKER`] line. If an operator
+/// stripped the marker from a customised ruleset, fall back to
+/// inserting before the chain's catch-all DROP, then before `COMMIT`,
+/// so the carve-out is never silently dropped on the floor. An empty
+/// block removes the marker line and changes nothing else.
+fn splice_carveout(base: &str, accept_block: &str) -> String {
+    let accept_lines: Vec<&str> = accept_block.lines().collect();
+
+    // Primary: marker replacement.
+    if base.lines().any(|l| l.trim() == CARVE_OUT_MARKER) {
+        let mut out: Vec<String> = Vec::new();
+        for line in base.lines() {
+            if line.trim() == CARVE_OUT_MARKER {
+                out.extend(accept_lines.iter().map(|s| s.to_string()));
+            } else {
+                out.push(line.to_string());
+            }
+        }
+        return finish(out);
+    }
+
+    // Fallback: no marker → insert before the first DROP, else COMMIT.
+    let mut out: Vec<String> = Vec::new();
+    let mut inserted = accept_lines.is_empty();
+    for line in base.lines() {
+        if !inserted && (line.contains("-j DROP") || line.trim() == "COMMIT") {
+            out.extend(accept_lines.iter().map(|s| s.to_string()));
+            inserted = true;
+        }
+        out.push(line.to_string());
+    }
+    if !inserted {
+        out.extend(accept_lines.iter().map(|s| s.to_string()));
+    }
+    finish(out)
+}
+
+fn finish(lines: Vec<String>) -> String {
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Spawn `bin`, pipe `rules_data` to its stdin, and treat a non-zero
+/// exit as a hard failure.
+fn run_iptables_restore_data(bin: &Path, rules_data: &[u8]) -> Result<()> {
     use std::io::Write;
-    let rules_data =
-        std::fs::read(rules).with_context(|| format!("reading {}", rules.display()))?;
 
     let mut child = Command::new(bin)
         .stdin(Stdio::piped())
@@ -219,7 +389,7 @@ fn run_iptables_restore(bin: &Path, rules: &Path) -> Result<()> {
         // A non-reading mock (e.g. `true`) would EPIPE here; we use
         // `cat` in tests precisely because it drains stdin reliably.
         stdin
-            .write_all(&rules_data)
+            .write_all(rules_data)
             .with_context(|| format!("writing ruleset to {} stdin", bin.display()))?;
     }
 
@@ -378,6 +548,103 @@ mod tests {
         // gate `release` at the type system. Asserting the size keeps
         // future refactors from accidentally growing it.
         assert_eq!(std::mem::size_of::<UnlockToken>(), 0);
+    }
+
+    #[test]
+    fn count_chain_rules_counts_only_appends() {
+        let s = "-N NORTHNARROW_COMBAT\n\
+                 -A NORTHNARROW_COMBAT -i lo -j RETURN\n\
+                 -A NORTHNARROW_COMBAT -o lo -j RETURN\n\
+                 -A NORTHNARROW_COMBAT -j DROP\n";
+        assert_eq!(count_chain_rules(s), 3);
+        assert_eq!(count_chain_rules(""), 0);
+    }
+
+    #[test]
+    fn splice_marker_replacement_inserts_block() {
+        let base = "*filter\n\
+                    -A NORTHNARROW_COMBAT -o lo -j RETURN\n\
+                    # >>> NORTHNARROW_MGMT_CARVEOUT <<<\n\
+                    -A NORTHNARROW_COMBAT -j DROP\nCOMMIT\n";
+        let block = "-A NORTHNARROW_COMBAT -s 10.0.0.0/8 -j ACCEPT\n";
+        let out = splice_carveout(base, block);
+        assert!(out.contains("-s 10.0.0.0/8 -j ACCEPT"));
+        // Marker line is gone; ACCEPT precedes the DROP.
+        assert!(!out.contains("NORTHNARROW_MGMT_CARVEOUT"));
+        let accept_at = out.find("-s 10.0.0.0/8").unwrap();
+        let drop_at = out.find("-j DROP").unwrap();
+        assert!(accept_at < drop_at, "ACCEPT must come before DROP");
+    }
+
+    #[test]
+    fn splice_empty_block_just_removes_marker() {
+        let base = "*filter\n# >>> NORTHNARROW_MGMT_CARVEOUT <<<\n-A C -j DROP\nCOMMIT\n";
+        let out = splice_carveout(base, "");
+        assert!(!out.contains("NORTHNARROW_MGMT_CARVEOUT"));
+        assert!(out.contains("-A C -j DROP"));
+    }
+
+    #[test]
+    fn splice_without_marker_falls_back_before_drop() {
+        let base = "*filter\n-A C -i lo -j RETURN\n-A C -j DROP\nCOMMIT\n";
+        let block = "-A C -s 192.168.0.0/16 -j ACCEPT\n";
+        let out = splice_carveout(base, block);
+        let accept_at = out.find("192.168.0.0/16").unwrap();
+        let drop_at = out.find("-j DROP").unwrap();
+        assert!(accept_at < drop_at);
+    }
+
+    #[test]
+    fn engage_with_allow_file_injects_carveout() {
+        let iso = match mock_success_isolator() {
+            Some(i) => i,
+            None => return,
+        };
+        // Point the isolator at a temp allow file with one v4 CIDR.
+        let tmp = std::env::temp_dir().join(format!("nn-allow-{}.cidrs", std::process::id()));
+        std::fs::write(&tmp, "# mgmt\n10.10.0.0/16\n2001:db8::/32\n").unwrap();
+        let iso = iso.with_allow_cidrs_path(tmp.clone());
+        let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
+        assert_eq!(carved, vec!["10.10.0.0/16".to_string()], "only the v4 CIDR is carved");
+        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -s 10.10.0.0/16 -j ACCEPT"));
+        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -d 10.10.0.0/16 -j ACCEPT"));
+        // v6 entry must NOT produce an iptables (v4) rule.
+        assert!(!ruleset.contains("2001:db8"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn engage_without_allow_file_is_loopback_only() {
+        let iso = match mock_success_isolator() {
+            Some(i) => i,
+            None => return,
+        };
+        // Default allow path almost certainly absent in the test env →
+        // fail-secure empty carve-out.
+        let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
+        assert!(carved.is_empty());
+        assert!(!ruleset.contains("-j ACCEPT"));
+        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
+    }
+
+    #[test]
+    fn reconcile_reports_absent_chain_with_mock() {
+        // /bin/false stands in for `iptables -S CHAIN` returning
+        // non-zero (chain absent) — reconcile must report not-existed
+        // and do nothing.
+        let falsebin = PathBuf::from("/bin/false");
+        if !falsebin.exists() {
+            return;
+        }
+        let iso = NetworkIsolator::new_with_bin(
+            combat_rules_path(),
+            PathBuf::from("/usr/bin/cat"),
+            falsebin,
+        )
+        .unwrap();
+        let outcome = iso.reconcile_stale_chain().expect("reconcile");
+        assert!(!outcome.chain_existed);
+        assert_eq!(outcome.rules_removed, 0);
     }
 
     #[test]
