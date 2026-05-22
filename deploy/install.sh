@@ -87,6 +87,11 @@ NETFLOW_JA3_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-ja3-blocklist.v1"
 # filenames so PROTECTED_INODES defends them against tamper — the
 # same lock-in as fim-paths.v1 / netflow-blocklist.v1.
 PROCESS_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/process-comm-allowlist.v1"
+# Beta Step 3: opt-in overlay template (container-runtime exemptions,
+# off by default). Shipped as a `.example` an operator copies to the
+# live `.local` to activate — the v1 default stays conservative so R013
+# escape-to-host detection is preserved on non-container hosts.
+PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC="$REPO_ROOT/configs/process-comm-allowlist.local.example"
 NETFLOW_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/netflow-comm-allowlist.v1"
 
 # ── pre-flight ──────────────────────────────────────────────────────
@@ -190,6 +195,19 @@ if [[ -f "$ETC_DIR/process-comm-allowlist.v1" ]]; then
 else
     echo "install.sh: copying default process comm allowlist to $ETC_DIR/process-comm-allowlist.v1"
     install -m 0644 -o root -g root "$PROCESS_COMM_ALLOWLIST_V1_SRC" "$ETC_DIR/process-comm-allowlist.v1"
+fi
+
+# Beta Step 3: refresh the opt-in overlay TEMPLATE (container-runtime
+# exemptions, off by default). This is a `.example`, never the live
+# `.local`, so it is safe to overwrite on every install — it documents
+# the current set of recommended container-runtime comms. Container
+# hosts activate it with:
+#   cp $ETC_DIR/process-comm-allowlist.local.example \
+#      $ETC_DIR/process-comm-allowlist.local
+# See docs/operator/CONTAINER_HOST_DEPLOY.md for the security tradeoff.
+if [[ -f "$PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC" ]]; then
+    echo "install.sh: refreshing overlay template $ETC_DIR/process-comm-allowlist.local.example"
+    install -m 0644 -o root -g root "$PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC" "$ETC_DIR/process-comm-allowlist.local.example"
 fi
 
 if [[ -f "$ETC_DIR/netflow-comm-allowlist.v1" ]]; then
@@ -335,6 +353,10 @@ echo "     /etc/northnarrow/netflow-comm-allowlist.local to tune the"
 echo "     Tappa 10.5 detection-rule comm exemptions (\`+comm\` add,"
 echo "     \`-comm\` re-enable detection on a default — same schema; see"
 echo "     docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md §13 Q3)."
+echo "     CONTAINER HOSTS: cp process-comm-allowlist.local.example to"
+echo "     .local to exempt container-runtime comms (\`runc\` etc.). This"
+echo "     weakens R013 escape-to-host detection — read the security note"
+echo "     in docs/operator/CONTAINER_HOST_DEPLOY.md before enabling."
 echo "     Deploy canaries with \`nn-admin canary deploy <type> --path ...\`"
 echo "     (Tappa 9.5 §12 Q1 EXPLICIT-PER-HOST: no default canaries —"
 echo "     placement is operator-curated)."

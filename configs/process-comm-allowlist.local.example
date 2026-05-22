@@ -1,0 +1,58 @@
+# NorthNarrow — process comm allowlist OPERATOR OVERLAY (example)
+#
+# Beta Step 3. This is a TEMPLATE. To activate it, copy it to the live
+# overlay path and edit:
+#
+#     cp /etc/northnarrow/process-comm-allowlist.local.example \
+#        /etc/northnarrow/process-comm-allowlist.local
+#
+# The agent merges this overlay on top of the shipped
+# `process-comm-allowlist.v1` default at boot. Unlike the `.v1` file,
+# entries here carry a prefix:
+#
+#     +comm   ADD comm to the allowlist (exempt it from R011..R017)
+#     -comm   RE-ENABLE detection on a comm that `.v1` allowlists
+#
+# Blank lines and `#` comments are ignored. Comms are BARE process
+# names as the kernel reports them — TASK_COMM_LEN-truncated to 15
+# chars (e.g. `containerd-shim-runc-v2` is reported as
+# `containerd-shim`). Every change here is logged at boot.
+#
+# ─────────────────────────────────────────────────────────────────────
+# CONTAINER RUNTIMES — uncomment ONLY on a host that runs containers
+# (Docker, Kubernetes, podman, containerd, CRI-O).
+# ─────────────────────────────────────────────────────────────────────
+#
+# SECURITY IMPLICATION — READ BEFORE ENABLING:
+#
+#   R013 (Namespace/escape tooling, MITRE T1611 Escape-to-Host) fires
+#   when `runc` execs from a NON-standard path (a dropped/modified runc
+#   in /tmp, /dev/shm, a writable bundle dir, …) — the exact shape of
+#   the CVE-2019-5736 runc-overwrite breakout. Adding `+runc` below
+#   exempts `runc` from R013 EVERYWHERE on this host, including those
+#   non-standard paths. Only enable it where legitimate container
+#   activity is producing R013 false positives, and prefer tightening
+#   the path set over a blanket exemption if you can.
+#
+#   Note: of the comms below, only `runc` is currently an R013 target;
+#   the others never trip R013 and are listed for parity / forward
+#   compatibility with future container-aware rules. They are harmless
+#   to enable but also unnecessary for silencing R013 today.
+#
+# Uncomment the lines that match your runtime:
+#
+#+runc
+#+crun
+#+containerd-shim
+#+conmon
+#+docker-init
+#+dumb-init
+
+# ─────────────────────────────────────────────────────────────────────
+# SITE-SPECIFIC EXEMPTIONS — add trusted-actor comms here, each with a
+# comment explaining WHY it is trusted (so the next operator/auditor
+# understands the exemption).
+# ─────────────────────────────────────────────────────────────────────
+#
+# Example:
+#   +my-deploy-tool   # in-house provisioning agent, sets caps on deploy

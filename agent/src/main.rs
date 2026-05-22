@@ -42,7 +42,10 @@ use northnarrow_agent::net::blocklist::{
 };
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
-use northnarrow_agent::posture::{CombatEntryHook, CombatReleaseHook, PostureMachine};
+use northnarrow_agent::posture::{
+    resolve_verified_watchdog_pid, CombatEntryHook, CombatReleaseHook, ExemptPids, PostureMachine,
+    WatchdogResolution,
+};
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal::unix::{signal, SignalKind};
@@ -99,6 +102,17 @@ struct Cli {
         default_value = "/etc/northnarrow/admin.pub"
     )]
     admin_pub: PathBuf,
+
+    /// Beta Step 3: expected install path of the watchdog binary, used
+    /// to verify a candidate watchdog PID's `/proc/<pid>/exe` (a
+    /// kernel-resolved symlink, not forgeable). Override only for
+    /// non-standard install layouts.
+    #[arg(
+        long = "watchdog-exe",
+        value_name = "PATH",
+        default_value = northnarrow_agent::posture::DEFAULT_WATCHDOG_EXE
+    )]
+    watchdog_exe: PathBuf,
 
     /// Tappa 8 A3 + A8: per-install agent identity file. The agent
     /// reads (or, on first boot, mints) a 16-byte UUID at this
@@ -782,6 +796,7 @@ async fn main() -> Result<()> {
         }
     };
 
+    let exempt = ExemptPids::with_agent(std::process::id());
     let posture = if let Some(iso) = isolator.as_ref() {
         let iso_engage = Arc::clone(iso);
         let iso_release = Arc::clone(iso);
@@ -798,20 +813,38 @@ async fn main() -> Result<()> {
                 );
             }
         });
-        // Pass the agent's own PID so the trigger detector excludes
-        // the agent's own state-log writes — otherwise FIM drift
-        // logging alone self-trips the mass-write heuristic into
-        // COMBAT at boot, isolating the network on a benign host
-        // (2026-05-22 sshd-reset diagnosis).
-        PostureMachine::new_with_hooks_and_self_pid(
+        // Exempt the NorthNarrow stack's own PIDs from posture
+        // triggers. The agent's own PID is fixed here; the watchdog's
+        // verified PID is filled in by the refresh task spawned below.
+        // Without this, the agent's FIM drift logging self-trips the
+        // mass-write heuristic into COMBAT at boot, and the watchdog's
+        // startup /proc scan trips it too (2026-05-22 sshd-reset
+        // diagnosis; T7.13 watchdog start cascade).
+        PostureMachine::new_with_hooks_and_exempt(
             engage_hook,
             release_hook,
-            std::process::id(),
+            exempt.clone(),
         )
     } else {
         PostureMachine::new()
     };
     info!("posture state machine initialized (state: OBSERVING)");
+
+    // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog
+    // starts *after* the agent and may be restarted (systemd
+    // Restart=on-failure), so we re-resolve its PID from the pidfile
+    // and re-verify /proc/<pid>/exe every 30 s. Verification failure
+    // (PID reuse, substituted binary, dead PID) clears the exemption —
+    // fail toward over-triggering, never under-triggering. Only wired
+    // when the posture machine actually carries the exemption (the
+    // dev-mode `PostureMachine::new()` branch has none).
+    if isolator.is_some() {
+        spawn_watchdog_exempt_refresh(
+            exempt.clone(),
+            cli.watchdog_pidfile.clone(),
+            cli.watchdog_exe.clone(),
+        );
+    }
 
     // Tappa 8 A3 + A8: bootstrap (or read) the per-install agent
     // UUID. The value becomes the third anti-replay layer for the
@@ -1941,15 +1974,6 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
     }
 }
 
-/// Atomically publish the current PID to `path` (Tappa 7 task 6
-/// #2b-verify). A sibling tempfile is written then `rename(2)`d over
-/// the target, so the rename is a same-filesystem atomic swap and a
-/// concurrent reader observes either the old file or the complete new
-/// one — never a truncated or empty file. The tempfile name carries
-/// the PID so two agents misconfigured onto one path cannot corrupt
-/// each other's tempfile mid-write. Every error is contextualised and
-/// propagated (never swallowed) so the caller can make it fatal and a
-/// failing harness can pinpoint which syscall failed.
 /// Construct the single shared [`AdeEngine`], applying the optional
 /// env-driven RAG overlay. Returns `None` (rule-only fallback) if the
 /// model fails to load.
@@ -1987,6 +2011,78 @@ async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
     }
 }
 
+/// Beta Step 3: background task that keeps the watchdog PID slot of
+/// `exempt` in sync with the live, exe-verified watchdog.
+///
+/// Re-resolves every 30 s (the first tick fires immediately so the
+/// exemption activates as soon as the watchdog publishes its pidfile).
+/// Logs only on a *change* of verified PID so a steady state doesn't
+/// flood the journal; any non-`Verified` outcome clears the exemption
+/// (fail toward over-triggering).
+fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_exe: PathBuf) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        // Last verified PID we stored (`None` == exemption cleared).
+        let mut last: Option<u32> = None;
+        loop {
+            tick.tick().await;
+            let resolution = resolve_verified_watchdog_pid(&pidfile, &expected_exe);
+            let new_pid = match &resolution {
+                WatchdogResolution::Verified(p) => Some(*p),
+                _ => None,
+            };
+            if new_pid == last {
+                continue; // no change — stay quiet on the hot path
+            }
+            match &resolution {
+                WatchdogResolution::Verified(p) => {
+                    exempt.set_watchdog_pid(*p);
+                    info!(
+                        watchdog_pid = *p,
+                        exe = %expected_exe.display(),
+                        "watchdog PID verified; exempting it from posture triggers"
+                    );
+                }
+                WatchdogResolution::NotPresent => {
+                    exempt.set_watchdog_pid(0);
+                    info!(
+                        pidfile = %pidfile.display(),
+                        "watchdog pidfile absent; no watchdog exemption active"
+                    );
+                }
+                WatchdogResolution::InvalidPidfile { reason } => {
+                    exempt.set_watchdog_pid(0);
+                    warn!(%reason, "watchdog pidfile unparseable; watchdog exemption cleared");
+                }
+                WatchdogResolution::Unverifiable { pid, reason } => {
+                    exempt.set_watchdog_pid(0);
+                    warn!(pid, %reason, "watchdog exe verification failed; exemption cleared");
+                }
+                WatchdogResolution::ExeMismatch { pid, resolved } => {
+                    exempt.set_watchdog_pid(0);
+                    warn!(
+                        pid,
+                        resolved = %resolved.display(),
+                        expected = %expected_exe.display(),
+                        "watchdog PID maps to an unexpected binary (PID reuse or \
+                         substitution); exemption refused"
+                    );
+                }
+            }
+            last = new_pid;
+        }
+    });
+}
+
+/// Atomically publish the current PID to `path` (Tappa 7 task 6
+/// #2b-verify). A sibling tempfile is written then `rename(2)`d over
+/// the target, so the rename is a same-filesystem atomic swap and a
+/// concurrent reader observes either the old file or the complete new
+/// one — never a truncated or empty file. The tempfile name carries
+/// the PID so two agents misconfigured onto one path cannot corrupt
+/// each other's tempfile mid-write. Every error is contextualised and
+/// propagated (never swallowed) so the caller can make it fatal and a
+/// failing harness can pinpoint which syscall failed.
 fn write_pid_file(path: &std::path::Path) -> Result<()> {
     let pid = std::process::id();
 
