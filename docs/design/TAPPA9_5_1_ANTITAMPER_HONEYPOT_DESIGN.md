@@ -1,7 +1,9 @@
 # Tappa 9.5.1 — Anti-Tamper Honeypot Design
 
-**Status:** RFC OPEN (Q1–Q5 await owner ruling — see §6).
-**Branch:** `tappa9-5-1-design`.
+**Status:** RFC RESOLVED 2026-05-22 (all 5 items owner-accepted verbatim
++ implementation guidance — see §6). Step 3 (D1–D4) unblocked pending
+go-ahead.
+**Branch:** `tappa9-5-1-design` → `tappa9-5-1-rfc-resolution`.
 **Sequencing:** ships between the T10.6 close and the T10.7 V2 Kali
 execution, so honeypot trips during adversarial validation become
 first-class validation data.
@@ -163,10 +165,17 @@ threading the agent's own PID to the rule (it is already known —
 - Does **not** fire when `modifier_pid == own_pid`.
 - Static assertion: no honeypot path equals any real configured NN path.
 
+**Startup integrity check (`HoneypotIntegrityCheck`, Q5):**
+- All 10 present → `Honeypot integrity: 10/10 present` at Info, no alert.
+- A missing bait → Medium alert + recreate-from-template; the recreate
+  (agent in `PROTECTED_PIDS`) does NOT fire FIM-024.
+
 **Privileged e2e (`detection_rules_at_scale_privileged_e2e.rs` family):**
 - Tamper each honeypot file from an *external* process (not in
   `PROTECTED_PIDS`); assert the `NN-L-FIM-024` Critical verdict, the
   `KillProcessTree` action, and the `POSTURE TRANSITION COMBAT` line.
+- Boot with a deleted bait → assert the Medium `HoneypotIntegrityCheck`
+  alert + recreation, and that recreation does not self-trigger FIM-024.
 - Reuse the existing `EniIptablesGuard` (COMBAT installs the
   `NORTHNARROW_COMBAT` chain) and the bounded-acceptor / off-`/tmp`
   install conventions established in T10.6 D9.
@@ -175,48 +184,106 @@ threading the agent's own PID to the rule (it is already known —
 
 ---
 
-## 6. RFC items (await owner ruling — Step 2 resolves)
+## 6. RFC resolutions
 
-Each item lists the engineering recommendation; **not** a resolution.
+All 5 RFC items resolved 2026-05-22 — owner accepted every engineering
+recommendation verbatim, plus the implementation guidance folded in
+below (bait content template, per-file content, the
+`HoneypotIntegrityCheck` startup event). Step 3 (D1–D4) unblocked pending
+go-ahead. Each block: **Decision**, **Rationale**, **Implementation
+note** (where it manifests in this doc / commit plan), **Reversibility**.
 
 ### Q1 — Bait file content style
-Realistic config-style (header comment + dummy `key=value`) **vs** random
-bytes **vs** a magic header.
-**Recommendation: realistic config-style.** A targeted attacker who
-`cat`s `kill_switch.conf` and sees plausible config is more likely to
-*edit* it (detonation) than one who sees random bytes (smells like a
-trap). Magic headers risk fingerprinting the decoy. Keep contents inert
-and free of any value that hints "honeypot".
+
+- **Decision:** REALISTIC CONFIG-STYLE. Each bait carries a header
+  comment + dummy `key=value` lines whose fields *suggest its function*,
+  per this template (values are inert — parsed by nothing):
+
+  ```
+  # NorthNarrow Agent - {Purpose} Configuration
+  # {Plausible description}
+  # WARNING: modifying this file requires admin authorization
+  {key}={value}
+  last_modified={timestamp}
+  ```
+
+  Content is **unique per file** and themed to the fake function — e.g.
+  `kill_switch.conf` → `enabled=` / `signature_required=`;
+  `maintenance.mode` → `scheduled_window=` / `disable_until=`;
+  `disable.token` → a dummy token-shaped value; etc. The goal is to
+  *incentivise the attacker to edit* it, believing they've found the
+  kill mechanism — which detonates FIM-024.
+- **Rationale:** plausible config invites the edit that detonates; random
+  bytes or a magic header smell like a trap or fingerprint the decoy.
+  No field may hint "honeypot".
+- **Implementation note:** §4 content generation; templates live with
+  `install.sh` (D2). A static test asserts no bait content leaks the
+  word "honeypot"/"decoy"/"canary".
+- **Reversibility:** easy — content is install-time only; restyling is a
+  template edit + re-deploy, no rule change.
 
 ### Q2 — ADE second opinion for NN-L-FIM-024
-**Recommendation: NO ADE second opinion** (deterministic action
-sufficient). Unlike FIM-021 (PAM `.so`, where a rare legitimate package
-update can touch the path and ADE adds nuance), a honeypot path has
-**zero** legitimate writers by construction — the false-positive rate is
-~0, so a deterministic Critical/KillProcessTree is correct and faster.
-ADE enrichment can still annotate the verdict post-hoc for the analyst,
-but should not gate the response.
+
+- **Decision:** NO ADE second opinion. Deterministic
+  Critical/KillProcessTree on the rule alone.
+- **Rationale:** a honeypot path has **zero** legitimate writers by
+  construction → false-positive rate ~0, so the deterministic action is
+  both correct and faster than an ADE round-trip. (Contrast FIM-021: real
+  package updates can touch PAM `.so`, where ADE adds nuance.) ADE may
+  still annotate the emitted verdict post-hoc for the analyst, but must
+  not gate the response.
+- **Implementation note:** §3 — `evaluate` returns the verdict directly;
+  no `process_template` / ADE hook on this rule (consistent with the
+  T10.6 D7 process_template deferral rationale — ADE only where it
+  changes the action).
+- **Reversibility:** easy — adding an ADE annotation later is additive
+  and non-gating.
 
 ### Q3 — Customer-visible documentation placement
-**Recommendation: dedicated `docs/operator/anti-tamper-honeypots.md`**,
-linked from the install README. The "do not touch these paths / touching
-them triggers COMBAT" warning is operationally load-bearing and deserves
-a findable page rather than a buried README paragraph.
+
+- **Decision:** DEDICATED `docs/operator/anti-tamper-honeypots.md`,
+  linked from the install README.
+- **Rationale:** the "do not touch these paths / touching them triggers
+  COMBAT + KillProcessTree" warning is operationally load-bearing and
+  must be findable, not buried in a README paragraph. Transparency is
+  the design's premise (§1).
+- **Implementation note:** §4 + D4. Page lists all 10 paths, the inert
+  nature, and the expected response; README gains a one-line link.
+- **Reversibility:** trivial.
 
 ### Q4 — COMBAT on first trigger vs N-in-window
-**Recommendation: COMBAT on the FIRST trigger.** There is no benign
-honeypot access to debounce — a single tamper is already high-confidence
-hostile intent. N-in-window only adds dwell time for the attacker.
-(Consistent with FIM-021/022 first-trip COMBAT.)
+
+- **Decision:** COMBAT on the FIRST trigger.
+- **Rationale:** no benign honeypot access exists to debounce — one
+  tamper is already high-confidence hostile intent; an N-in-window gate
+  only buys the attacker dwell time. Consistent with FIM-021/022
+  first-trip COMBAT.
+- **Implementation note:** §3 — the rule emits Critical on the first
+  matching `FimEvent`; the posture FSM's existing Critical→COMBAT arm
+  does the transition (no new windowing state).
+- **Reversibility:** easy — a windowed variant could wrap the rule later
+  via the correlation store if policy ever wants it.
 
 ### Q5 — Startup bait-file integrity check
-**Recommendation: YES, verify-and-alert (not silent re-create).** On
-agent boot, stat all 10 baits; if any is **missing**, that itself is a
-tamper signal (an attacker who deleted a bait before the agent started),
-so emit a Medium "honeypot baseline incomplete" alert and re-create it.
-Re-creation is done by the agent (in `PROTECTED_PIDS`), so it cannot
-self-trigger FIM-024 — this is the case the §3 `own_pid` guard backstops.
-Fire-and-forget would let pre-boot deletion go unnoticed.
+
+- **Decision:** YES — verify-and-alert + auto-recreate. A new
+  **`HoneypotIntegrityCheck`** event (Medium severity) runs in the agent
+  startup sequence **after BPF programs attach**:
+  - stat all 10 baits;
+  - **missing** file → log + recreate from its template + emit a Medium
+    alert (a pre-agent-boot deletion is itself a tamper signal);
+  - **all present** → log `Honeypot integrity: 10/10 present` at Info.
+  Auto-recreation is performed by the agent, which is in `PROTECTED_PIDS`
+  → the recreate write does not emit an adversary `FimEvent` and cannot
+  self-trigger FIM-024 (the §3 `own_pid` rule guard backstops it).
+- **Rationale:** fire-and-forget would let an attacker who deletes a bait
+  *before* the agent starts go unnoticed; the boot check converts that
+  into a Medium signal while restoring the trap.
+- **Implementation note:** §5 startup sequence; new event type +
+  Medium-severity emit path (D1/D2). Distinct from the steady-state
+  FIM-024 Critical rule — this is a one-shot boot baseline.
+- **Reversibility:** easy — the check is self-contained at boot; can be
+  gated behind a config flag if an operator ever wants it off.
 
 ---
 
@@ -225,9 +292,9 @@ Fire-and-forget would let pre-boot deletion go unnoticed.
 | Step | Scope |
 |------|-------|
 | D1 | `NnLFim024` rule + `HONEYPOT_PATHS` + own-pid thread + unit tests |
-| D2 | `fim-paths.v1` section + `install.sh` bait generation + tmpfiles.d for `/run` |
-| D3 | privileged-e2e (tamper → Critical + KillProcessTree + COMBAT) |
-| D4 | `docs/operator/` page + install README link |
+| D2 | per-file bait templates + `install.sh` generation + tmpfiles.d for `/run`; `fim-paths.v1` section; `HoneypotIntegrityCheck` boot event (Medium, verify+recreate) |
+| D3 | privileged-e2e (external tamper → Critical + KillProcessTree + COMBAT; deleted-bait boot → Medium alert + recreate) |
+| D4 | `docs/operator/anti-tamper-honeypots.md` + install README link |
 
 Each gated by the cardinal rule (no priv-e2e committed without a verified
 PASS). Builds on T9.5 (`TAPPA9_5_DECEPTION_LAYER_DESIGN.md`).
