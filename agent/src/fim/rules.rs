@@ -1265,6 +1265,96 @@ impl Rule for NnLFim023SystemdTimerCreated {
     }
 }
 
+// ── NN-L-FIM-024 — anti-tamper bait file tampered ──────────────────
+
+/// The inert "NN control-surface" bait files (Tappa 9.5.1). Names
+/// suggest a way to disable the agent (kill switches, maintenance flags,
+/// override tokens); NN never reads them and no operator workflow writes
+/// them, across the config (`/etc`), state (`/var/lib`) and runtime
+/// (`/run`) dirs an attacker inspects for agent state.
+pub const HONEYPOT_PATHS: &[&str] = &[
+    "/etc/northnarrow/agent.dev.lock",
+    "/etc/northnarrow/kill_switch.conf",
+    "/etc/northnarrow/maintenance.mode",
+    "/etc/northnarrow/debug_disable.flag",
+    "/etc/northnarrow/agent.legacy.conf",
+    "/var/lib/northnarrow/shutdown.signal",
+    "/var/lib/northnarrow/disable.token",
+    "/var/lib/northnarrow/override.config",
+    "/run/northnarrow/pause.flag",
+    "/run/northnarrow/unload.signal",
+];
+
+/// NN-L-FIM-024: tamper of an anti-tamper bait file. ANY mutation —
+/// create, modify, delete, rename — is an adversary probing for an
+/// agent off-switch. Critical → KillProcessTree → COMBAT. MITRE
+/// T1562.001 (Impair Defenses: Disable or Modify Tools).
+///
+/// Holds the agent's own PID as a backstop self-guard: the agent +
+/// watchdog are already in `PROTECTED_PIDS` (the C2 BPF layer suppresses
+/// their FimEvents), and the only steady-state agent writer is the Q5
+/// boot integrity refresh — but the explicit `modifier_pid == own_pid`
+/// check guarantees a recreate can never self-detonate even if the BPF
+/// exemption ever regresses.
+pub struct NnLFim024AntiTamperHoneypotModified {
+    own_pid: u32,
+}
+
+impl NnLFim024AntiTamperHoneypotModified {
+    /// Construct with an explicit self-PID (tests pass a fixed value).
+    pub fn new(own_pid: u32) -> Self {
+        Self { own_pid }
+    }
+
+    /// Production constructor — captures the agent's PID at build time
+    /// (`fim_rules()` runs in the agent process at boot).
+    pub fn with_self_pid() -> Self {
+        Self::new(std::process::id())
+    }
+}
+
+impl Rule for NnLFim024AntiTamperHoneypotModified {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-024_AntiTamperHoneypotModified"
+    }
+    fn name(&self) -> &'static str {
+        // No "honeypot/decoy/canary" in any attacker-readable verdict
+        // string — a compromised-host log reader must not learn the file
+        // is bait. (The ID above is the internal operator-facing
+        // telemetry key, deliberately outside the leak contract.)
+        "Anti-tamper control-surface file tampered"
+    }
+    fn category(&self) -> &'static str {
+        "fim_anti_tamper"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if !matches!(
+            fe.op,
+            FimOp::Created | FimOp::Modified | FimOp::Deleted | FimOp::Renamed
+        ) {
+            return None;
+        }
+        if !HONEYPOT_PATHS.contains(&fe.path.as_str()) {
+            return None;
+        }
+        // Backstop self-guard (Q5 boot recreate); PROTECTED_PIDS already
+        // exempts the agent at the BPF layer.
+        if fe.modifier_pid == self.own_pid {
+            return None;
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            "NorthNarrow control-surface file tampered — adversary \
+             probing for an agent off-switch (T1562.001); kill tree + \
+             posture → COMBAT",
+        ))
+    }
+}
+
 // ── public builder ─────────────────────────────────────────────────
 
 /// Build the FIM rules in evaluation order. The agent's
@@ -1303,6 +1393,8 @@ pub fn fim_rules() -> Vec<Box<dyn Rule>> {
         // Tappa 10.5 D3 — Critical first.
         Box::new(NnLFim021PamModuleModified),
         Box::new(NnLFim022LdSoPreloadModified),
+        // Tappa 9.5.1 — anti-tamper bait, Critical.
+        Box::new(NnLFim024AntiTamperHoneypotModified::with_self_pid()),
         // D3 High tier.
         Box::new(NnLFim015BrowserCredsAccessed),
         Box::new(NnLFim016PasswordManagerDbAccessed),
@@ -2045,11 +2137,125 @@ mod tests {
     }
 
     #[test]
-    fn fim_builder_has_twenty_three_rules_post_d3() {
+    fn fim_builder_has_twenty_four_rules_post_t9_5_1() {
         // C5 shipped 9, C5.1 added 1, C5.3 added 4 → 14; Tappa 10.5
-        // D3 adds NN-L-FIM-015..023 (9) → 23 total.
+        // D3 adds NN-L-FIM-015..023 (9) → 23; Tappa 9.5.1 adds
+        // NN-L-FIM-024 (anti-tamper bait) → 24 total.
         let n = fim_rules().len();
-        assert_eq!(n, 23, "expected 23 FIM rules post-D3, got {n}");
+        assert_eq!(n, 24, "expected 24 FIM rules post-T9.5.1, got {n}");
+    }
+
+    // ── Tappa 9.5.1 — NN-L-FIM-024 anti-tamper bait ─────────────────
+
+    /// fim_event() uses modifier_pid = 42; construct the rule with a
+    /// DIFFERENT own_pid so the attacker writes (pid 42) detonate.
+    const TEST_AGENT_PID: u32 = 99_999;
+
+    #[test]
+    fn fim024_fires_on_every_honeypot_path() {
+        let rule = NnLFim024AntiTamperHoneypotModified::new(TEST_AGENT_PID);
+        for p in HONEYPOT_PATHS {
+            let v = rule
+                .evaluate(&fim_event(FimOp::Modified, p))
+                .unwrap_or_else(|| panic!("FIM-024 must fire on {p}"));
+            assert_eq!(v.severity, Severity::Critical, "{p} severity");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{p} action");
+            assert_eq!(v.rule_id, "NN-L-FIM-024_AntiTamperHoneypotModified");
+        }
+    }
+
+    #[test]
+    fn fim024_fires_on_create_delete_rename_too() {
+        let rule = NnLFim024AntiTamperHoneypotModified::new(TEST_AGENT_PID);
+        let p = "/etc/northnarrow/kill_switch.conf";
+        for op in [FimOp::Created, FimOp::Deleted, FimOp::Renamed] {
+            assert!(
+                rule.evaluate(&fim_event(op, p)).is_some(),
+                "FIM-024 must fire on {op:?} of a bait file"
+            );
+        }
+        // Opened/Linked are not mutations → no fire.
+        for op in [FimOp::Opened, FimOp::Linked] {
+            assert!(
+                rule.evaluate(&fim_event(op, p)).is_none(),
+                "FIM-024 must NOT fire on {op:?} (not a mutation)"
+            );
+        }
+    }
+
+    #[test]
+    fn fim024_does_not_fire_on_own_pid_backstop() {
+        // own_pid == the event's modifier_pid (42) → boot-recreate
+        // self-guard suppresses the verdict.
+        let rule = NnLFim024AntiTamperHoneypotModified::new(42);
+        assert!(
+            rule.evaluate(&fim_event(FimOp::Created, "/run/northnarrow/pause.flag"))
+                .is_none(),
+            "FIM-024 must NOT fire when modifier_pid == own_pid"
+        );
+    }
+
+    #[test]
+    fn fim024_does_not_fire_on_non_honeypot_path() {
+        let rule = NnLFim024AntiTamperHoneypotModified::new(TEST_AGENT_PID);
+        // Same dirs, different (real-looking) filenames must not match.
+        for p in [
+            "/etc/northnarrow/agent.conf",
+            "/var/lib/northnarrow/canaries.jsonl",
+            "/run/northnarrow/agent.pid",
+            "/etc/northnarrow/kill_switch.conf.bak",
+        ] {
+            assert!(
+                rule.evaluate(&fim_event(FimOp::Modified, p)).is_none(),
+                "FIM-024 must NOT fire on non-bait path {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn fim024_reasoning_maps_t1562_001() {
+        let rule = NnLFim024AntiTamperHoneypotModified::new(TEST_AGENT_PID);
+        let v = rule
+            .evaluate(&fim_event(FimOp::Modified, HONEYPOT_PATHS[0]))
+            .expect("fires");
+        assert!(
+            v.reasoning.contains("T1562.001"),
+            "reasoning must map MITRE T1562.001, got: {}",
+            v.reasoning
+        );
+    }
+
+    /// Static-leak contract: no attacker-readable verdict string (rule
+    /// name, category, reasoning, or bait PATHS) may reveal the
+    /// deception. The immutable rule ID is the operator-facing telemetry
+    /// key and is deliberately OUTSIDE this contract.
+    #[test]
+    fn fim024_user_visible_strings_have_no_deception_leak() {
+        let banned = ["honeypot", "decoy", "canary", "bait", "trap"];
+        let rule = NnLFim024AntiTamperHoneypotModified::new(TEST_AGENT_PID);
+        let v = rule
+            .evaluate(&fim_event(FimOp::Modified, HONEYPOT_PATHS[0]))
+            .expect("fires");
+        let mut surfaces = vec![
+            rule.name().to_lowercase(),
+            rule.category().to_lowercase(),
+            v.reasoning.to_lowercase(),
+        ];
+        surfaces.extend(HONEYPOT_PATHS.iter().map(|p| p.to_lowercase()));
+        for s in &surfaces {
+            for b in banned {
+                assert!(
+                    !s.contains(b),
+                    "leaky term {b:?} in attacker-visible string {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fim024_honeypot_paths_are_ten_unique() {
+        let set: std::collections::BTreeSet<_> = HONEYPOT_PATHS.iter().collect();
+        assert_eq!(set.len(), 10, "expected 10 unique honeypot paths");
     }
 
     // ── Tappa 10.5 D3 — table-driven coverage (§13 Q8) ──────────────

@@ -488,9 +488,13 @@ mod tests {
         }
     }
 
-    /// C9 test #1 (+ Tappa 10.5 D3): `CRITICAL_FIM_RULE_IDS` matches
-    /// the six Critical FIM rules from agent/src/fim/rules.rs —
+    /// C9 test #1 (+ Tappa 10.5 D3): `CRITICAL_FIM_RULE_IDS` is the set
+    /// of Critical FIM rules that receive an ADE second opinion —
     /// FIM-001/002/008/010 (Tappa 9) + FIM-021/022 (Tappa 10.5 D3).
+    /// NOT every Critical FIM rule: Tappa 9.5.1 NN-L-FIM-024 is Critical
+    /// but deliberately EXCLUDED per its RFC Q2 ruling — a honeypot bait
+    /// has zero legitimate writers, so the deterministic
+    /// KillProcessTree is correct and an ADE round-trip adds no value.
     /// Anchored so a rename in rules.rs surfaces here at
     /// compile-time-cycle.
     #[test]
