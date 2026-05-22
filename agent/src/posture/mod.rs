@@ -101,7 +101,7 @@ struct Inner {
 
 impl PostureMachine {
     pub fn new() -> Self {
-        Self::build(None, None)
+        Self::build(None, None, None)
     }
 
     /// Build a machine that fires `hook` whenever a transition crosses
@@ -115,7 +115,7 @@ impl PostureMachine {
     /// hook is NOT re-invoked. The wiring in `observe()` checks
     /// `before.kind() != Combat && after.kind() == Combat`.
     pub fn new_with_combat_hook(hook: CombatEntryHook) -> Self {
-        Self::build(Some(hook), None)
+        Self::build(Some(hook), None, None)
     }
 
     /// Build a machine that fires both an entry hook (on the
@@ -127,18 +127,35 @@ impl PostureMachine {
     /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
     /// to the posture state machine in one place.
     pub fn new_with_hooks(entry: CombatEntryHook, release: CombatReleaseHook) -> Self {
-        Self::build(Some(entry), Some(release))
+        Self::build(Some(entry), Some(release), None)
+    }
+
+    /// Production constructor: like [`Self::new_with_hooks`] but also
+    /// records the agent's own PID so the trigger detector excludes
+    /// the agent's own events (its continuous state-log writes would
+    /// otherwise self-trip the mass-write heuristic into COMBAT — see
+    /// [`TriggerDetector`] docs). `main.rs` passes `std::process::id()`.
+    pub fn new_with_hooks_and_self_pid(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook,
+        self_pid: u32,
+    ) -> Self {
+        Self::build(Some(entry), Some(release), Some(self_pid))
     }
 
     fn build(
         combat_entry_hook: Option<CombatEntryHook>,
         combat_release_hook: Option<CombatReleaseHook>,
+        self_pid: Option<u32>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
-                triggers: TriggerDetector::new(),
+                triggers: match self_pid {
+                    Some(pid) => TriggerDetector::with_self_pid(pid),
+                    None => TriggerDetector::new(),
+                },
                 combat_entry_hook,
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),

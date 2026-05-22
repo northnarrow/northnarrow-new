@@ -85,12 +85,38 @@ const PERSISTENCE_PREFIXES: &[&str] = &[
 ];
 
 /// Stateless detector — see module docs.
+///
+/// `self_pid` is the agent's own PID, when known. The defender must
+/// never classify its *own* I/O as adversary behaviour: the agent
+/// appends to its state logs (`fim_drift.jsonl`, `fim_baseline.jsonl`,
+/// `netflow.jsonl`, the audit chain, …) on every observed event, and
+/// the observe-only `file_open` sensor reports those writes straight
+/// back into the event stream. Without this guard a fresh boot's FIM
+/// drift logging alone is >20 write-opens from one PID inside the
+/// 60 s window, which trips [`confirmed_intrusion`]'s mass-write /
+/// ransomware heuristic and drives posture all the way to COMBAT —
+/// engaging network isolation against a host that is doing nothing
+/// wrong (see 2026-05-22 sshd-reset diagnosis). Tamper attempts on
+/// the agent's state by *other* PIDs are still caught: the inode
+/// LSM hooks deny them and surface an `FsProtectDenial`, which
+/// `confirmed_intrusion` treats as COMBAT-tier on its own.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TriggerDetector;
+pub struct TriggerDetector {
+    self_pid: Option<u32>,
+}
 
 impl TriggerDetector {
     pub fn new() -> Self {
-        Self
+        Self { self_pid: None }
+    }
+
+    /// Construct a detector that ignores events attributed to the
+    /// agent's own PID. See the struct docs for why self-exclusion is
+    /// required.
+    pub fn with_self_pid(pid: u32) -> Self {
+        Self {
+            self_pid: Some(pid),
+        }
     }
 
     /// Inspect `(event, recent)` and return every trigger raised.
@@ -99,6 +125,19 @@ impl TriggerDetector {
     /// last) so the caller can `iter().last()` for the dominant
     /// signal or fold them all into the audit log.
     pub fn detect(&self, event: &Event, recent: &[Event]) -> Vec<TriggerType> {
+        // Self-exclusion: never raise a trigger on the agent's own
+        // events. The agent's continuous state-log writes would
+        // otherwise self-trip the mass-write heuristic on a benign
+        // host. `recent` is left untouched — the per-pid counters
+        // inside the heuristics only ever match the focal pid, so an
+        // agent-owned event in `recent` cannot inflate a non-agent
+        // focal's count.
+        if let Some(sp) = self.self_pid {
+            if event_owner_pid(event) == Some(sp) {
+                return Vec::new();
+            }
+        }
+
         let mut hits: Vec<TriggerType> = Vec::new();
 
         // OBSERVING -> ALERTED tier
@@ -146,6 +185,21 @@ impl TriggerDetector {
 
 fn within(focal_ts: u64, ts: u64, window_ns: u64) -> bool {
     focal_ts.saturating_sub(ts) <= window_ns
+}
+
+/// PID an event is attributed to, for self-exclusion. Variants the
+/// agent itself never originates (e.g. `CanaryTripped`, `NetFlow`,
+/// `NetListener`) return `None` so they are never filtered.
+fn event_owner_pid(event: &Event) -> Option<u32> {
+    match event {
+        Event::ProcessSpawn { pid, .. }
+        | Event::FileOpen { pid, .. }
+        | Event::ExecCheck { pid, .. }
+        | Event::TcpConnect { pid, .. }
+        | Event::DnsQuery { pid, .. }
+        | Event::FsProtectDenial { pid, .. } => Some(*pid),
+        _ => None,
+    }
 }
 
 fn recon_pattern(focal: &Event, recent: &[Event]) -> bool {
@@ -702,5 +756,87 @@ mod tests {
         let focal = tcp_v4(42, [10, 0, 0, 3], 22, 300);
         let hits = det.detect(&focal, &recent);
         assert!(hits.contains(&TriggerType::LateralMovement));
+    }
+
+    // ── 2026-05-22 self-trigger regression ────────────────────────────
+    //
+    // The agent appends to its own state logs on every observed event;
+    // the observe-only `file_open` sensor reports those writes back into
+    // the stream. >=MASS_WRITE_MIN of them in the 60 s window from one
+    // PID used to self-trip ConfirmedIntrusion → COMBAT at boot,
+    // isolating the network on a benign host. `with_self_pid` excludes
+    // the agent's own events.
+
+    const AGENT_PID: u32 = 4242;
+
+    /// Build MASS_WRITE_MIN write-opens to the agent's drift log from
+    /// `pid`, the exact shape of a fresh-boot FIM-logging burst.
+    fn self_write_burst(pid: u32) -> (Event, Vec<Event>) {
+        let path = "/var/lib/northnarrow/fim_drift.jsonl";
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(pid, 0, path, 1, i + 1))
+            .collect();
+        let focal = file_open(pid, 0, path, 1, MASS_WRITE_MIN as u64 + 1);
+        (focal, recent)
+    }
+
+    #[test]
+    fn mass_write_self_trips_combat_without_exclusion() {
+        // Documents the bug: a plain detector counts the agent's own
+        // burst and fires ConfirmedIntrusion (COMBAT-tier).
+        let det = TriggerDetector::new();
+        let (focal, recent) = self_write_burst(AGENT_PID);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "baseline (no self-pid) must still count the burst: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_does_not_fire_on_agents_own_writes() {
+        // The fix: a detector that knows the agent's PID ignores the
+        // agent's own state-log burst entirely.
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = self_write_burst(AGENT_PID);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.is_empty(),
+            "agent's own writes must raise no triggers, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_still_fires_on_other_pid_when_self_excluded() {
+        // Self-exclusion must not blind us to a real attacker: an
+        // identical burst from a different PID still trips COMBAT.
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let attacker = AGENT_PID + 1;
+        let (focal, recent) = self_write_burst(attacker);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "a non-agent mass-write must still fire: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn fs_protect_denial_still_fires_when_self_excluded() {
+        // Tamper on the agent's own files by another PID is denied by
+        // the LSM and surfaced as FsProtectDenial — self-exclusion must
+        // not suppress it (it is keyed on the *toucher's* PID, not the
+        // agent's).
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let focal = Event::FsProtectDenial {
+            pid: AGENT_PID + 7,
+            uid: 0,
+            comm: "rm".into(),
+            target_dev: 64_770,
+            target_ino: 12345,
+            operation: common::FsProtectOperation::Unlink,
+            timestamp_ns: 1,
+        };
+        let hits = det.detect(&focal, &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
     }
 }

@@ -798,7 +798,16 @@ async fn main() -> Result<()> {
                 );
             }
         });
-        PostureMachine::new_with_hooks(engage_hook, release_hook)
+        // Pass the agent's own PID so the trigger detector excludes
+        // the agent's own state-log writes — otherwise FIM drift
+        // logging alone self-trips the mass-write heuristic into
+        // COMBAT at boot, isolating the network on a benign host
+        // (2026-05-22 sshd-reset diagnosis).
+        PostureMachine::new_with_hooks_and_self_pid(
+            engage_hook,
+            release_hook,
+            std::process::id(),
+        )
     } else {
         PostureMachine::new()
     };
