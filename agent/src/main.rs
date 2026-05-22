@@ -1480,6 +1480,22 @@ async fn main() -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
 
+    // T7.10: the unit is `Type=notify`; tell systemd we are ready now
+    // that every subsystem is wired (anti-tamper attached, decision
+    // engine + ADE loaded, drains + admin socket spawned, signal
+    // handlers installed) and we are about to enter the event loop.
+    // Without this, systemd holds the unit `activating` until
+    // `TimeoutStartSec` then marks it failed — and the agent's own
+    // anti-tamper hook denies the resulting SIGTERM, stranding the
+    // unit `failed` while the process runs and dragging the watchdog
+    // down via `BindsTo`. No-op when not under systemd (NOTIFY_SOCKET
+    // unset), so dev runs and tests are unaffected. Non-fatal: a send
+    // failure is logged, not propagated — a healthy agent must not
+    // refuse to run just because the readiness ping didn't land.
+    if let Err(e) = northnarrow_agent::sd_notify::ready() {
+        warn!(error = %e, "sd_notify(READY=1) failed; systemd may report the unit as not-ready");
+    }
+
     loop {
         tokio::select! {
             evt = sensor.next_event() => match evt {
