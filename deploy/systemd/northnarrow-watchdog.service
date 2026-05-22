@@ -12,7 +12,10 @@ After=northnarrow-agent.service
 # wants down. Note: BindsTo does NOT trigger on agent CRASH —
 # that's the watchdog's own pidfd POLLIN → restart path (W4).
 BindsTo=northnarrow-agent.service
-Requires=sys-fs-bpf.mount
+# No Requires=sys-fs-bpf.mount: /sys/fs/bpf is an API VFS with no
+# materialisable mount unit (see northnarrow-agent.service). The
+# watchdog is ordered After= the agent, which has already validated
+# bpffs via its ConditionPathIsMountPoint guard before this starts.
 
 [Service]
 Type=notify
@@ -57,9 +60,13 @@ ProtectSystem=strict
 ProtectHome=true
 # Watchdog only writes /run/northnarrow/watchdog.pid and reads
 # the agent pidfile + shutdown_authorised marker (also under
-# /run/northnarrow/). Needs read+write on the bpffs root so
-# ProtectedPidsHandle::open + .evict (W1+W3) work.
-ReadWritePaths=/run/northnarrow /sys/fs/bpf/northnarrow
+# /run/northnarrow/). It also reads/evicts the pinned PROTECTED_PIDS
+# map under /sys/fs/bpf/northnarrow (W1+W3), but /sys/fs/bpf is NOT
+# listed here: ProtectSystem=strict exempts /sys from the read-only
+# remount, so the watchdog keeps write access without the entry, and
+# listing it would inject the unsatisfiable sys-fs-bpf.mount dependency
+# (see northnarrow-agent.service).
+ReadWritePaths=/run/northnarrow
 # CAP_BPF        — open the pinned PROTECTED_PIDS map by path,
 #                  call bpf(BPF_MAP_DELETE_ELEM) on agent death
 # CAP_SYS_ADMIN  — kept for the historical bpf(2) shape (kernel
