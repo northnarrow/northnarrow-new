@@ -189,3 +189,19 @@
 
 # Dynamic-linker preload anchor (NN-L-FIM-022 — T1574.006)
 /etc/ld.so.preload
+
+# NorthNarrow control-surface integrity (NN-L-FIM-024 — T1562.001).
+# These agent control files must never be modified outside an
+# admin-authorized workflow; any unauthorized create/modify/delete/
+# rename is a defense-impair attempt → Critical response. See the
+# NorthNarrow operator guide for details.
+/etc/northnarrow/agent.dev.lock
+/etc/northnarrow/kill_switch.conf
+/etc/northnarrow/maintenance.mode
+/etc/northnarrow/debug_disable.flag
+/etc/northnarrow/agent.legacy.conf
+/var/lib/northnarrow/shutdown.signal
+/var/lib/northnarrow/disable.token
+/var/lib/northnarrow/override.config
+/run/northnarrow/pause.flag
+/run/northnarrow/unload.signal

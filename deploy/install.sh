@@ -59,6 +59,14 @@ FIM_PATHS_V1_SRC="$REPO_ROOT/configs/fim-paths.v1"
 # operator deploys a credential canary.
 CANARY_TEMPLATES_SRC_DIR="$REPO_ROOT/configs/canary-templates"
 
+# Tappa 9.5.1: anti-tamper control-surface bait files (NN-L-FIM-024).
+# install.sh writes the 10 inert control files; the agent re-verifies +
+# recreates any missing one from the same embedded content at every boot
+# (HoneypotIntegrityCheck), which also covers the tmpfs /run/northnarrow
+# pair after a reboot. Same bytes either way (configs/honeypot-baits is
+# include_str!'d into the agent).
+HONEYPOT_BAITS_SRC_DIR="$REPO_ROOT/configs/honeypot-baits"
+
 # Tappa 10 N8: default NetFlow blocklists consumed by NN-L-NET-001
 # (IP / CIDR) + NN-L-NET-003 (JA3 fingerprint). install.sh drops
 # these at /etc/northnarrow/netflow-blocklist.v1 +
@@ -121,6 +129,11 @@ require_dir() {
 require_dir "$CANARY_TEMPLATES_SRC_DIR" "expected at $CANARY_TEMPLATES_SRC_DIR (Tappa 9.5 K7 canary content templates)"
 for tmpl in aws.tmpl azure.tmpl docker.tmpl gcp.tmpl generic.tmpl; do
     require_file "$CANARY_TEMPLATES_SRC_DIR/$tmpl" "expected at $CANARY_TEMPLATES_SRC_DIR/$tmpl (Tappa 9.5 K4 canary template)"
+done
+
+require_dir "$HONEYPOT_BAITS_SRC_DIR" "expected at $HONEYPOT_BAITS_SRC_DIR (Tappa 9.5.1 NN-L-FIM-024 control-surface files)"
+for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag agent.legacy.conf shutdown.signal disable.token override.config pause.flag unload.signal; do
+    require_file "$HONEYPOT_BAITS_SRC_DIR/$bait" "expected at $HONEYPOT_BAITS_SRC_DIR/$bait (Tappa 9.5.1 control-surface file)"
 done
 
 # ── install ─────────────────────────────────────────────────────────
@@ -202,6 +215,34 @@ for fim_log in fim_baseline.jsonl fim_drift.jsonl; do
         echo "install.sh: bootstrapping $STATE_DIR/$fim_log (zero-byte placeholder)"
         install -m 0644 -o root -g root /dev/null "$STATE_DIR/$fim_log"
     fi
+done
+
+# Tappa 9.5.1: anti-tamper control-surface bait files (NN-L-FIM-024).
+# 10 inert files across /etc, /var/lib and /run; mode 0644 root:root so a
+# tamper is observable. We (re)write them to the canonical content on
+# every install — they are NN-managed, not operator configuration. The
+# tmpfs /run/northnarrow pair vanishes on reboot; the agent's boot
+# HoneypotIntegrityCheck recreates it (and any deleted persistent bait)
+# from the same embedded bytes.
+RUN_DIR="/run/northnarrow"
+echo "install.sh: ensuring $RUN_DIR (mode 0755, root:root)"
+install -d -m 0755 -o root -g root "$RUN_DIR"
+declare -A HONEYPOT_BAIT_DIRS=(
+    [agent.dev.lock]="$ETC_DIR"
+    [kill_switch.conf]="$ETC_DIR"
+    [maintenance.mode]="$ETC_DIR"
+    [debug_disable.flag]="$ETC_DIR"
+    [agent.legacy.conf]="$ETC_DIR"
+    [shutdown.signal]="$STATE_DIR"
+    [disable.token]="$STATE_DIR"
+    [override.config]="$STATE_DIR"
+    [pause.flag]="$RUN_DIR"
+    [unload.signal]="$RUN_DIR"
+)
+for bait in "${!HONEYPOT_BAIT_DIRS[@]}"; do
+    dst_dir="${HONEYPOT_BAIT_DIRS[$bait]}"
+    echo "install.sh: writing control-surface file $dst_dir/$bait"
+    install -m 0644 -o root -g root "$HONEYPOT_BAITS_SRC_DIR/$bait" "$dst_dir/$bait"
 done
 
 # Tappa 9.5 K7: pre-touch the two canary chain files for the same

@@ -1109,6 +1109,40 @@ async fn main() -> Result<()> {
         }
     };
 
+    // ── Tappa 9.5.1 — anti-tamper honeypot integrity sweep ─────────
+    //
+    // After the FIM observe programs are attached (above) and the agent
+    // is in PROTECTED_PIDS, verify the NN-L-FIM-024 bait files exist and
+    // recreate any missing one from its embedded template. The recreate
+    // is an agent write → PROTECTED_PIDS-exempt, so it cannot
+    // self-trigger NN-L-FIM-024. A missing bait at boot is itself a
+    // tamper signal (Medium); all-present logs at Info.
+    match northnarrow_agent::fim::honeypot::check_and_restore() {
+        Ok(report) if report.all_present() => {
+            info!(
+                present = report.present,
+                total = report.total,
+                "Honeypot integrity: {}/{} present",
+                report.present,
+                report.total
+            );
+        }
+        Ok(report) => {
+            warn!(
+                target: "fim.honeypot",
+                rule = "NN-L-FIM-024-INTEGRITY",
+                severity = "Medium",
+                recreated = report.recreated.len(),
+                "Honeypot integrity: recreated {} missing bait file(s): {:?}",
+                report.recreated.len(),
+                report.recreated
+            );
+        }
+        Err(e) => {
+            warn!(target: "fim.honeypot", error = %e, "Honeypot integrity sweep failed");
+        }
+    }
+
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
     //
     // Order (mirrors the FIM boot above):

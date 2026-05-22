@@ -22,6 +22,7 @@
 pub mod attach;
 pub mod baseline;
 pub mod drain;
+pub mod honeypot;
 pub mod paths_config;
 pub mod recompute;
 pub mod rules;

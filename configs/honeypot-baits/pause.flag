@@ -1,0 +1,5 @@
+# NorthNarrow Agent - Runtime Pause Flag
+# Pauses event processing without unloading the agent.
+# WARNING: modifying this file requires admin authorization
+paused=false
+last_modified=2026-02-15T09:30:00Z
