@@ -2,12 +2,19 @@
 Description=NorthNarrow XDR agent
 Documentation=https://github.com/northnarrow/northnarrow-new
 # Network online so the agent's outbound posture-engaged behaviour
-# has a fully-up interface; sys-fs-bpf.mount so the bpffs pin
-# directory used by ProtectedPidsHandle (Tappa 7 task 6 W1) is
-# available before any LSM hook attach attempt.
-After=network-online.target sys-fs-bpf.mount
+# has a fully-up interface.
+#
+# NOTE: we deliberately do NOT depend on `sys-fs-bpf.mount`. /sys/fs/bpf
+# is an API virtual filesystem — systemd mounts bpffs itself early in
+# boot and REFUSES to materialise a sys-fs-bpf.mount unit ("Cannot
+# create mount unit for API file system /sys/fs/bpf. Refusing."), even
+# with an /etc/fstab entry. So `Requires=sys-fs-bpf.mount` and
+# `After=…sys-fs-bpf.mount` are permanently unsatisfiable and abort the
+# start job with "Unit sys-fs-bpf.mount not found". bpffs is always
+# present by the time this unit runs; the ConditionPathIsMountPoint
+# guard below is the real safety check.
+After=network-online.target
 Wants=network-online.target
-Requires=sys-fs-bpf.mount
 # ConditionPathIsMountPoint is a soft pre-flight — units skip
 # their ExecStart if the condition is unmet rather than failing.
 # Pairs with the agent's own warn-and-continue when bpffs isn't
@@ -36,10 +43,19 @@ RuntimeDirectoryMode=0700
 # read-only EXCEPT the ReadWritePaths whitelist below. NoNewPrivileges
 # kills any latent setuid-binary escalation in case the agent ever
 # spawns one.
+#
+# NOTE: /sys/fs/bpf/northnarrow is intentionally NOT listed. Listing a
+# path under the /sys/fs/bpf API VFS makes systemd inject an implicit
+# Requires=/After= on the (unsatisfiable) sys-fs-bpf.mount unit — the
+# same failure mode as the explicit dep removed above. It is also
+# unnecessary: ProtectSystem=strict EXEMPTS /dev, /proc and /sys from
+# the read-only remount (only ProtectKernelTunables= would make /sys
+# read-only, and we do not set it), so the agent retains write access
+# to its bpffs pin directory without a ReadWritePaths entry.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/northnarrow /var/lib/northnarrow /sys/fs/bpf/northnarrow
+ReadWritePaths=/run/northnarrow /var/lib/northnarrow
 # CAP_BPF        — load+pin BPF maps/programs (Tappa 7 task 5/6/7)
 # CAP_SYS_ADMIN  — bpf(2) historically needed this; CAP_BPF
 #                  separated it on 5.8+ but kernel still accepts
