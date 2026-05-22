@@ -32,6 +32,14 @@ Binari prodotti:
 - `common/` — tipi condivisi (Event, Verdict, ResponseAction, ...).
 - `cli/` — CLI di controllo locale.
 
+## Operator documentation
+
+- [Anti-tamper honeypots (NN-L-FIM-024)](docs/operator/anti-tamper-honeypots.md)
+  — inert bait files that mimic agent control points; tampering triggers
+  Critical + COMBAT. **Read before touching `/etc/northnarrow/`,
+  `/var/lib/northnarrow/`, or `/run/northnarrow/`.**
+- [FIM trust model](docs/operator/TAPPA9_FIM_TRUST_MODEL.md)
+
 ## Licenza
 
 Apache-2.0. Vedi [LICENSE](LICENSE).
