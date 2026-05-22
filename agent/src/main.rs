@@ -1117,30 +1117,28 @@ async fn main() -> Result<()> {
     // is an agent write → PROTECTED_PIDS-exempt, so it cannot
     // self-trigger NN-L-FIM-024. A missing bait at boot is itself a
     // tamper signal (Medium); all-present logs at Info.
-    match northnarrow_agent::fim::honeypot::check_and_restore() {
-        Ok(report) if report.all_present() => {
-            info!(
-                present = report.present,
-                total = report.total,
-                "Honeypot integrity: {}/{} present",
-                report.present,
-                report.total
-            );
-        }
-        Ok(report) => {
-            warn!(
-                target: "fim.honeypot",
-                rule = "NN-L-FIM-024-INTEGRITY",
-                severity = "Medium",
-                recreated = report.recreated.len(),
-                "Honeypot integrity: recreated {} missing bait file(s): {:?}",
-                report.recreated.len(),
-                report.recreated
-            );
-        }
-        Err(e) => {
-            warn!(target: "fim.honeypot", error = %e, "Honeypot integrity sweep failed");
-        }
+    let report = northnarrow_agent::fim::honeypot::check_and_restore();
+    if report.all_present() {
+        info!(
+            present = report.present,
+            total = report.total,
+            "Honeypot integrity: {}/{} present",
+            report.present,
+            report.total
+        );
+    } else {
+        warn!(
+            target: "fim.honeypot",
+            rule = "NN-L-FIM-024-INTEGRITY",
+            severity = "Medium",
+            present = report.present,
+            recreated = report.recreated.len(),
+            failed = report.failed.len(),
+            "Honeypot integrity: {} present, recreated {:?}, unrestorable {:?}",
+            report.present,
+            report.recreated,
+            report.failed
+        );
     }
 
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────

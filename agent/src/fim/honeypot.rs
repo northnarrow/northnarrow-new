@@ -56,23 +56,30 @@ pub struct HoneypotIntegrityReport {
     pub present: usize,
     /// Paths that were missing and have been recreated from template.
     pub recreated: Vec<String>,
+    /// Paths that were missing but could NOT be recreated (e.g. an EPERM
+    /// from the anti-tamper deny layer before the agent is exempt). A
+    /// failure here does not abort the sweep — the remaining baits are
+    /// still restored.
+    pub failed: Vec<String>,
 }
 
 impl HoneypotIntegrityReport {
-    /// `true` when every bait was already on disk.
+    /// `true` when every bait was already on disk (nothing recreated,
+    /// nothing failed).
     pub fn all_present(&self) -> bool {
-        self.recreated.is_empty()
+        self.recreated.is_empty() && self.failed.is_empty()
     }
 }
 
 /// Boot-time integrity sweep (RFC Q5). For each [`HONEYPOT_PATHS`] entry:
 /// present → counted; missing → recreated from its embedded template
 /// (parent dir created first — covers the tmpfs `/run/northnarrow` after
-/// a reboot). Returns the report; the caller logs Info (all present) or
-/// Medium (any recreated). The recreate is an agent write — the agent is
-/// in `PROTECTED_PIDS`, so it cannot self-trigger NN-L-FIM-024 (the rule
-/// also carries an `own_pid` backstop).
-pub fn check_and_restore() -> io::Result<HoneypotIntegrityReport> {
+/// a reboot); missing-but-unrestorable → recorded in `failed` WITHOUT
+/// aborting the rest of the sweep. The caller logs Info (all present) or
+/// Medium (anything recreated/failed). The recreate is an agent write —
+/// the agent is in `PROTECTED_PIDS`, so it cannot self-trigger
+/// NN-L-FIM-024 (the rule also carries an `own_pid` backstop).
+pub fn check_and_restore() -> HoneypotIntegrityReport {
     restore_paths(HONEYPOT_PATHS.iter().map(|p| {
         let c = bait_content(p).expect("every HONEYPOT_PATH has a template");
         (*p, c)
@@ -80,30 +87,36 @@ pub fn check_and_restore() -> io::Result<HoneypotIntegrityReport> {
 }
 
 /// Inner sweep over explicit `(path, content)` pairs — the testable core
-/// (tests pass tempdir-rooted paths so no real `/etc` is touched).
-fn restore_paths<'a>(
-    items: impl Iterator<Item = (&'a str, &'a str)>,
-) -> io::Result<HoneypotIntegrityReport> {
+/// (tests pass tempdir-rooted paths so no real `/etc` is touched). Never
+/// aborts: a per-path write failure is collected into `failed`.
+fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> HoneypotIntegrityReport {
     let mut total = 0;
     let mut present = 0;
     let mut recreated = Vec::new();
+    let mut failed = Vec::new();
     for (path, content) in items {
         total += 1;
         if Path::new(path).exists() {
             present += 1;
             continue;
         }
-        if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
+        let restored = (|| -> io::Result<()> {
+            if let Some(parent) = Path::new(path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, content)
+        })();
+        match restored {
+            Ok(()) => recreated.push(path.to_string()),
+            Err(_) => failed.push(path.to_string()),
         }
-        std::fs::write(path, content)?;
-        recreated.push(path.to_string());
     }
-    Ok(HoneypotIntegrityReport {
+    HoneypotIntegrityReport {
         total,
         present,
         recreated,
-    })
+        failed,
+    }
 }
 
 #[cfg(test)]
@@ -145,7 +158,7 @@ mod tests {
         std::fs::write(&a, "ALREADY").unwrap();
         let (ap, bp) = (a.to_str().unwrap(), b.to_str().unwrap());
 
-        let rep = restore_paths([(ap, "CONTENT_A"), (bp, "CONTENT_B")].into_iter()).unwrap();
+        let rep = restore_paths([(ap, "CONTENT_A"), (bp, "CONTENT_B")].into_iter());
 
         assert_eq!(rep.total, 2);
         assert_eq!(rep.present, 1, "a.conf already present");
@@ -162,7 +175,7 @@ mod tests {
         let a = dir.path().join("a");
         std::fs::write(&a, "x").unwrap();
         let ap = a.to_str().unwrap();
-        let rep = restore_paths([(ap, "x")].into_iter()).unwrap();
+        let rep = restore_paths([(ap, "x")].into_iter());
         assert!(rep.all_present());
         assert_eq!(rep.present, 1);
         assert!(rep.recreated.is_empty());
@@ -194,7 +207,7 @@ mod tests {
         let p = dir.path().join("kill_switch.conf");
         let pp = p.to_str().unwrap();
         let want = bait_content("/etc/northnarrow/kill_switch.conf").unwrap();
-        let rep = restore_paths([(pp, want)].into_iter()).unwrap();
+        let rep = restore_paths([(pp, want)].into_iter());
         assert_eq!(rep.recreated, vec![pp.to_string()]);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), want);
     }
