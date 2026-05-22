@@ -39,6 +39,42 @@ Restart=no
 RuntimeDirectory=northnarrow
 RuntimeDirectoryMode=0700
 
+# Resource ceilings (Beta Step 2a — confine an ADE runaway to the
+# agent's own cgroup instead of letting the kernel OOM-killer roam
+# the host and reap sshd / other critical services — "Family A"
+# resource-exhaustion cascade).
+#
+#   MemoryHigh — soft throttle. Above this the cgroup is put under
+#     reclaim pressure (and briefly stalled) but NOT killed. Set to
+#     9G: the in-process ADE (Foundation-Sec-8B Q4_K_M) peaks ~7 GB
+#     RSS during steady-state inference (see docs/ADE_BACKEND_NOTES.md
+#     "Peak RSS 7.0 GB"), so 9G leaves the legitimate model + agent
+#     working set unthrottled while applying back-pressure the moment
+#     usage climbs past it.
+#   MemoryMax — hard ceiling. The cgroup's own OOM-killer fires here,
+#     killing ONLY the agent (the watchdog then respawns it per its
+#     own restart policy). Set to 11G: ~1.5× the legitimate peak for
+#     transient spikes, and on the 15.24 GiB reference host (Hetzner
+#     CCX23) it still leaves ~4 GiB for the OS, sshd and the watchdog
+#     — so a runaway can never starve the host into a cascade.
+#     On a smaller VM the agent's pre-ADE RAM guard (Beta Step 2b)
+#     skips model load entirely and runs detection-only, so this
+#     ceiling is never approached there.
+#   TasksMax — fork/thread-leak backstop. The agent runs a tokio
+#     runtime (a few workers), candle's CPU kernels (≈ physical_cores
+#     threads), plus FIM / net / admin tasks — a few dozen at most.
+#     512 is well above any legitimate count yet caps a runaway.
+#
+# NOTE: deliberately NO CPUQuota. Unlike the watchdog (idle until the
+# agent dies, so capped at 10%), the agent does latency-sensitive
+# detection and CPU-bound ADE inference that wants every available
+# core; throttling CPU would slow verdicts without bounding the OOM
+# vector this block exists to contain. Memory is the cascade risk, so
+# memory is what we cap.
+MemoryHigh=9G
+MemoryMax=11G
+TasksMax=512
+
 # Hardening — `ProtectSystem=strict` makes the entire filesystem
 # read-only EXCEPT the ReadWritePaths whitelist below. NoNewPrivileges
 # kills any latent setuid-binary escalation in case the agent ever
