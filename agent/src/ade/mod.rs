@@ -27,6 +27,7 @@ pub mod error;
 pub mod escalate;
 pub mod fim_template;
 pub mod inference;
+pub mod mem_guard;
 pub mod parser;
 pub mod process_template;
 pub mod prompt;
@@ -57,6 +58,7 @@ pub use dual_verify::{
 pub use error::AdeError;
 pub use escalate::{transform_to_escalate, EscalateMeta};
 pub use inference::{InferenceBackend, MockBackend, StreamControl};
+pub use mem_guard::{check_ade_memory, AdeMemCheck};
 pub use parser::{ValidationError, VerdictParser};
 pub use rag_integration::{build_rag_query_from_event, format_rag_block};
 pub use sanitize::{sanitize_event_for_ade, InjectionFlag, SanitizedEvent};

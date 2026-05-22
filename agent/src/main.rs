@@ -27,7 +27,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use common::Event;
-use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
+use northnarrow_agent::ade::{
+    check_ade_memory, AdeConfig, AdeEngine, AdeMemCheck, EventContext, HostContext,
+};
 use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
@@ -727,35 +729,33 @@ async fn main() -> Result<()> {
         if let Some(n) = cli.ade_threads {
             cfg.num_threads = Some(n);
         }
-        // Sub-tappa 6.8 audit: this is the ONLY AdeEngine::new call
-        // in the agent's hot path — model weights, tokenizer, KV
-        // state machine and the rayon pool are loaded ONCE at
-        // startup and the resulting handle is shared into
-        // process_event via Arc<AdeEngine> (cheap to clone). Any
-        // future change that constructs a new engine inside the
-        // event loop would silently re-pay the ~5 GiB GGUF mmap
-        // and the warmup pass, so guard this invariant in review.
-        match AdeEngine::new(cfg).await {
-            Ok(engine) => {
-                info!(
-                    backend = engine.backend_name(),
-                    model_path = %engine.config().model_path.display(),
-                    warmup_latency_ms = engine.warmup_latency_ms(),
-                    timeout_s = engine.config().timeout.as_secs(),
-                    "ADE engine ready"
+        // Beta Step 2b: pre-flight RAM guard. Loading the GGUF peaks
+        // ~7 GB RSS; on a VM without that headroom the load OOM-crashes
+        // the agent. Refuse the load when MemAvailable can't cover the
+        // model size + runtime slack and degrade to detection-only,
+        // mirroring the agent's warn-and-continue for an unusable
+        // bpffs. (Step 2a's cgroup ceiling is the backstop; this keeps
+        // us from ever reaching it on an undersized host.)
+        match check_ade_memory(&cfg.model_path) {
+            AdeMemCheck::Insufficient {
+                available_bytes,
+                required_bytes,
+            } => {
+                warn!(
+                    available_mib = available_bytes / (1024 * 1024),
+                    required_mib = required_bytes / (1024 * 1024),
+                    model = %cfg.model_path.display(),
+                    "insufficient free memory to load the ADE model — running \
+                     detection-only (rule engine). Run on a host with more RAM, \
+                     or pass --no-ade to make this explicit."
                 );
-                // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
-                // graceful no-RAG fallback). Uses the existing 6.7
-                // `with_rag` seam; logging is inside `open_index_from_env`.
-                let engine = match northnarrow_agent::rag::open_index_from_env() {
-                    Some(rag) => engine.with_rag(Arc::new(rag)),
-                    None => engine,
-                };
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(?e, "ADE engine unavailable, fallback to rule-only mode");
                 None
+            }
+            check => {
+                if let AdeMemCheck::Unknown { reason } = &check {
+                    warn!(%reason, "ADE memory pre-check inconclusive; attempting load anyway");
+                }
+                load_ade_engine(cfg).await
             }
         }
     };
@@ -1950,6 +1950,43 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
 /// each other's tempfile mid-write. Every error is contextualised and
 /// propagated (never swallowed) so the caller can make it fatal and a
 /// failing harness can pinpoint which syscall failed.
+/// Construct the single shared [`AdeEngine`], applying the optional
+/// env-driven RAG overlay. Returns `None` (rule-only fallback) if the
+/// model fails to load.
+///
+/// Sub-tappa 6.8 audit: this is the ONLY `AdeEngine::new` call in the
+/// agent's hot path — model weights, tokenizer, KV state machine and
+/// the rayon pool are loaded ONCE at startup and the resulting handle
+/// is shared into `process_event` via `Arc<AdeEngine>` (cheap to
+/// clone). Any future change that constructs a new engine inside the
+/// event loop would silently re-pay the ~5 GiB GGUF mmap and the
+/// warmup pass, so guard this invariant in review.
+async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
+    match AdeEngine::new(cfg).await {
+        Ok(engine) => {
+            info!(
+                backend = engine.backend_name(),
+                model_path = %engine.config().model_path.display(),
+                warmup_latency_ms = engine.warmup_latency_ms(),
+                timeout_s = engine.config().timeout.as_secs(),
+                "ADE engine ready"
+            );
+            // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
+            // graceful no-RAG fallback). Uses the existing 6.7
+            // `with_rag` seam; logging is inside `open_index_from_env`.
+            let engine = match northnarrow_agent::rag::open_index_from_env() {
+                Some(rag) => engine.with_rag(Arc::new(rag)),
+                None => engine,
+            };
+            Some(Arc::new(engine))
+        }
+        Err(e) => {
+            warn!(?e, "ADE engine unavailable, fallback to rule-only mode");
+            None
+        }
+    }
+}
+
 fn write_pid_file(path: &std::path::Path) -> Result<()> {
     let pid = std::process::id();
 
