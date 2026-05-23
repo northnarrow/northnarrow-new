@@ -31,6 +31,7 @@
 //! takes a boolean flag. The Tappa 8 milestone replaces it with an
 //! Ed25519-signed command path.
 
+pub mod exempt;
 pub mod modulation;
 pub mod state;
 pub mod transitions;
@@ -50,6 +51,10 @@ use common::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
 
+pub use exempt::{
+    resolve_verified_watchdog_pid, ExemptPids, WatchdogResolution, DEFAULT_WATCHDOG_EXE,
+    DEFAULT_WATCHDOG_PIDFILE,
+};
 pub use state::PostureState;
 pub use triggers::TriggerDetector;
 
@@ -101,7 +106,7 @@ struct Inner {
 
 impl PostureMachine {
     pub fn new() -> Self {
-        Self::build(None, None, None)
+        Self::build(None, None, ExemptPids::default())
     }
 
     /// Build a machine that fires `hook` whenever a transition crosses
@@ -115,7 +120,7 @@ impl PostureMachine {
     /// hook is NOT re-invoked. The wiring in `observe()` checks
     /// `before.kind() != Combat && after.kind() == Combat`.
     pub fn new_with_combat_hook(hook: CombatEntryHook) -> Self {
-        Self::build(Some(hook), None, None)
+        Self::build(Some(hook), None, ExemptPids::default())
     }
 
     /// Build a machine that fires both an entry hook (on the
@@ -127,7 +132,7 @@ impl PostureMachine {
     /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
     /// to the posture state machine in one place.
     pub fn new_with_hooks(entry: CombatEntryHook, release: CombatReleaseHook) -> Self {
-        Self::build(Some(entry), Some(release), None)
+        Self::build(Some(entry), Some(release), ExemptPids::default())
     }
 
     /// Production constructor: like [`Self::new_with_hooks`] but also
@@ -140,22 +145,37 @@ impl PostureMachine {
         release: CombatReleaseHook,
         self_pid: u32,
     ) -> Self {
-        Self::build(Some(entry), Some(release), Some(self_pid))
+        Self::build(
+            Some(entry),
+            Some(release),
+            ExemptPids::with_agent(self_pid),
+        )
+    }
+
+    /// Production constructor (Beta Step 3): like
+    /// [`Self::new_with_hooks_and_self_pid`] but takes a shared
+    /// [`ExemptPids`] so the trigger detector excludes both the agent's
+    /// own PID *and* the verified watchdog PID. `main.rs` builds the
+    /// handle with the agent PID and refreshes the watchdog slot on a
+    /// timer.
+    pub fn new_with_hooks_and_exempt(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook,
+        exempt: ExemptPids,
+    ) -> Self {
+        Self::build(Some(entry), Some(release), exempt)
     }
 
     fn build(
         combat_entry_hook: Option<CombatEntryHook>,
         combat_release_hook: Option<CombatReleaseHook>,
-        self_pid: Option<u32>,
+        exempt: ExemptPids,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
-                triggers: match self_pid {
-                    Some(pid) => TriggerDetector::with_self_pid(pid),
-                    None => TriggerDetector::new(),
-                },
+                triggers: TriggerDetector::with_exempt(exempt),
                 combat_entry_hook,
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),

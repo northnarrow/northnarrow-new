@@ -26,8 +26,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use common::posture_types::PostureKind;
 use common::Event;
-use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
+use northnarrow_agent::ade::{
+    check_ade_memory, AdeConfig, AdeEngine, AdeMemCheck, EventContext, HostContext,
+};
 use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
@@ -40,7 +43,10 @@ use northnarrow_agent::net::blocklist::{
 };
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
-use northnarrow_agent::posture::{CombatEntryHook, CombatReleaseHook, PostureMachine};
+use northnarrow_agent::posture::{
+    resolve_verified_watchdog_pid, CombatEntryHook, CombatReleaseHook, ExemptPids, PostureMachine,
+    WatchdogResolution,
+};
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal::unix::{signal, SignalKind};
@@ -86,6 +92,18 @@ struct Cli {
     )]
     combat_rules: PathBuf,
 
+    /// Beta Step 4b: opt-in management carve-out CIDR list. Each IPv4
+    /// CIDR in this file is allowed through during COMBAT so a remote
+    /// operator on a declared management network is not locked out.
+    /// Re-read at every COMBAT engage (never cached). Default-empty =
+    /// full isolation (no regression).
+    #[arg(
+        long = "combat-allow-cidrs",
+        value_name = "PATH",
+        default_value = northnarrow_agent::anti_tamper::combat_allow::DEFAULT_COMBAT_ALLOW_CIDRS
+    )]
+    combat_allow_cidrs: PathBuf,
+
     /// Path to the admin pubkey file. If the file is missing, the
     /// admin socket is not started (the agent still runs, posture
     /// state still moves into Combat on intrusion, network isolation
@@ -97,6 +115,17 @@ struct Cli {
         default_value = "/etc/northnarrow/admin.pub"
     )]
     admin_pub: PathBuf,
+
+    /// Beta Step 3: expected install path of the watchdog binary, used
+    /// to verify a candidate watchdog PID's `/proc/<pid>/exe` (a
+    /// kernel-resolved symlink, not forgeable). Override only for
+    /// non-standard install layouts.
+    #[arg(
+        long = "watchdog-exe",
+        value_name = "PATH",
+        default_value = northnarrow_agent::posture::DEFAULT_WATCHDOG_EXE
+    )]
+    watchdog_exe: PathBuf,
 
     /// Tappa 8 A3 + A8: per-install agent identity file. The agent
     /// reads (or, on first boot, mints) a 16-byte UUID at this
@@ -727,35 +756,33 @@ async fn main() -> Result<()> {
         if let Some(n) = cli.ade_threads {
             cfg.num_threads = Some(n);
         }
-        // Sub-tappa 6.8 audit: this is the ONLY AdeEngine::new call
-        // in the agent's hot path — model weights, tokenizer, KV
-        // state machine and the rayon pool are loaded ONCE at
-        // startup and the resulting handle is shared into
-        // process_event via Arc<AdeEngine> (cheap to clone). Any
-        // future change that constructs a new engine inside the
-        // event loop would silently re-pay the ~5 GiB GGUF mmap
-        // and the warmup pass, so guard this invariant in review.
-        match AdeEngine::new(cfg).await {
-            Ok(engine) => {
-                info!(
-                    backend = engine.backend_name(),
-                    model_path = %engine.config().model_path.display(),
-                    warmup_latency_ms = engine.warmup_latency_ms(),
-                    timeout_s = engine.config().timeout.as_secs(),
-                    "ADE engine ready"
+        // Beta Step 2b: pre-flight RAM guard. Loading the GGUF peaks
+        // ~7 GB RSS; on a VM without that headroom the load OOM-crashes
+        // the agent. Refuse the load when MemAvailable can't cover the
+        // model size + runtime slack and degrade to detection-only,
+        // mirroring the agent's warn-and-continue for an unusable
+        // bpffs. (Step 2a's cgroup ceiling is the backstop; this keeps
+        // us from ever reaching it on an undersized host.)
+        match check_ade_memory(&cfg.model_path) {
+            AdeMemCheck::Insufficient {
+                available_bytes,
+                required_bytes,
+            } => {
+                warn!(
+                    available_mib = available_bytes / (1024 * 1024),
+                    required_mib = required_bytes / (1024 * 1024),
+                    model = %cfg.model_path.display(),
+                    "insufficient free memory to load the ADE model — running \
+                     detection-only (rule engine). Run on a host with more RAM, \
+                     or pass --no-ade to make this explicit."
                 );
-                // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
-                // graceful no-RAG fallback). Uses the existing 6.7
-                // `with_rag` seam; logging is inside `open_index_from_env`.
-                let engine = match northnarrow_agent::rag::open_index_from_env() {
-                    Some(rag) => engine.with_rag(Arc::new(rag)),
-                    None => engine,
-                };
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(?e, "ADE engine unavailable, fallback to rule-only mode");
                 None
+            }
+            check => {
+                if let AdeMemCheck::Unknown { reason } = &check {
+                    warn!(%reason, "ADE memory pre-check inconclusive; attempting load anyway");
+                }
+                load_ade_engine(cfg).await
             }
         }
     };
@@ -771,7 +798,9 @@ async fn main() -> Result<()> {
     // with no isolator, so the agent still boots in dev environments
     // without /etc/northnarrow/ provisioned.
     let isolator = match NetworkIsolator::new(cli.combat_rules.clone()) {
-        Ok(i) => Some(Arc::new(i)),
+        Ok(i) => Some(Arc::new(
+            i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone()),
+        )),
         Err(e) => {
             warn!(
                 error = %e,
@@ -782,6 +811,7 @@ async fn main() -> Result<()> {
         }
     };
 
+    let exempt = ExemptPids::with_agent(std::process::id());
     let posture = if let Some(iso) = isolator.as_ref() {
         let iso_engage = Arc::clone(iso);
         let iso_release = Arc::clone(iso);
@@ -798,20 +828,63 @@ async fn main() -> Result<()> {
                 );
             }
         });
-        // Pass the agent's own PID so the trigger detector excludes
-        // the agent's own state-log writes — otherwise FIM drift
-        // logging alone self-trips the mass-write heuristic into
-        // COMBAT at boot, isolating the network on a benign host
-        // (2026-05-22 sshd-reset diagnosis).
-        PostureMachine::new_with_hooks_and_self_pid(
+        // Exempt the NorthNarrow stack's own PIDs from posture
+        // triggers. The agent's own PID is fixed here; the watchdog's
+        // verified PID is filled in by the refresh task spawned below.
+        // Without this, the agent's FIM drift logging self-trips the
+        // mass-write heuristic into COMBAT at boot, and the watchdog's
+        // startup /proc scan trips it too (2026-05-22 sshd-reset
+        // diagnosis; T7.13 watchdog start cascade).
+        PostureMachine::new_with_hooks_and_exempt(
             engage_hook,
             release_hook,
-            std::process::id(),
+            exempt.clone(),
         )
     } else {
         PostureMachine::new()
     };
     info!("posture state machine initialized (state: OBSERVING)");
+
+    // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog
+    // starts *after* the agent and may be restarted (systemd
+    // Restart=on-failure), so we re-resolve its PID from the pidfile
+    // and re-verify /proc/<pid>/exe every 30 s. Verification failure
+    // (PID reuse, substituted binary, dead PID) clears the exemption —
+    // fail toward over-triggering, never under-triggering. Only wired
+    // when the posture machine actually carries the exemption (the
+    // dev-mode `PostureMachine::new()` branch has none).
+    if isolator.is_some() {
+        spawn_watchdog_exempt_refresh(
+            exempt.clone(),
+            cli.watchdog_pidfile.clone(),
+            cli.watchdog_exe.clone(),
+        );
+    }
+
+    // Beta Step 4a: reconcile a stale COMBAT chain left by a crash.
+    // The agent always boots into OBSERVING, so if the
+    // NORTHNARROW_COMBAT chain is already present the previous run died
+    // mid-COMBAT and the orphaned iptables chain is now isolating the
+    // host with no live posture state behind it (the B3 split-brain).
+    // Tear it down and audit it. If an attack is still under way the
+    // posture machine will re-engage COMBAT within seconds; an operator
+    // can also force it via the admin socket.
+    if let Some(iso) = isolator.as_ref() {
+        if posture.current_kind() == PostureKind::Observing {
+            match iso.reconcile_stale_chain() {
+                Ok(outcome) if outcome.chain_existed => {
+                    warn!(
+                        rules_removed = outcome.rules_removed,
+                        "stale COMBAT chain detected at boot — torn down (likely crash-orphaned). \
+                         Re-engage via the admin socket if the threat is still active."
+                    );
+                    audit_combat_reconcile(outcome.rules_removed);
+                }
+                Ok(_) => debug!("no stale COMBAT chain at boot (clean)"),
+                Err(e) => warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed"),
+            }
+        }
+    }
 
     // Tappa 8 A3 + A8: bootstrap (or read) the per-install agent
     // UUID. The value becomes the third anti-replay layer for the
@@ -1941,6 +2014,106 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
     }
 }
 
+/// Construct the single shared [`AdeEngine`], applying the optional
+/// env-driven RAG overlay. Returns `None` (rule-only fallback) if the
+/// model fails to load.
+///
+/// Sub-tappa 6.8 audit: this is the ONLY `AdeEngine::new` call in the
+/// agent's hot path — model weights, tokenizer, KV state machine and
+/// the rayon pool are loaded ONCE at startup and the resulting handle
+/// is shared into `process_event` via `Arc<AdeEngine>` (cheap to
+/// clone). Any future change that constructs a new engine inside the
+/// event loop would silently re-pay the ~5 GiB GGUF mmap and the
+/// warmup pass, so guard this invariant in review.
+async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
+    match AdeEngine::new(cfg).await {
+        Ok(engine) => {
+            info!(
+                backend = engine.backend_name(),
+                model_path = %engine.config().model_path.display(),
+                warmup_latency_ms = engine.warmup_latency_ms(),
+                timeout_s = engine.config().timeout.as_secs(),
+                "ADE engine ready"
+            );
+            // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
+            // graceful no-RAG fallback). Uses the existing 6.7
+            // `with_rag` seam; logging is inside `open_index_from_env`.
+            let engine = match northnarrow_agent::rag::open_index_from_env() {
+                Some(rag) => engine.with_rag(Arc::new(rag)),
+                None => engine,
+            };
+            Some(Arc::new(engine))
+        }
+        Err(e) => {
+            warn!(?e, "ADE engine unavailable, fallback to rule-only mode");
+            None
+        }
+    }
+}
+
+/// Beta Step 3: background task that keeps the watchdog PID slot of
+/// `exempt` in sync with the live, exe-verified watchdog.
+///
+/// Re-resolves every 30 s (the first tick fires immediately so the
+/// exemption activates as soon as the watchdog publishes its pidfile).
+/// Logs only on a *change* of verified PID so a steady state doesn't
+/// flood the journal; any non-`Verified` outcome clears the exemption
+/// (fail toward over-triggering).
+fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_exe: PathBuf) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        // Last verified PID we stored (`None` == exemption cleared).
+        let mut last: Option<u32> = None;
+        loop {
+            tick.tick().await;
+            let resolution = resolve_verified_watchdog_pid(&pidfile, &expected_exe);
+            let new_pid = match &resolution {
+                WatchdogResolution::Verified(p) => Some(*p),
+                _ => None,
+            };
+            if new_pid == last {
+                continue; // no change — stay quiet on the hot path
+            }
+            match &resolution {
+                WatchdogResolution::Verified(p) => {
+                    exempt.set_watchdog_pid(*p);
+                    info!(
+                        watchdog_pid = *p,
+                        exe = %expected_exe.display(),
+                        "watchdog PID verified; exempting it from posture triggers"
+                    );
+                }
+                WatchdogResolution::NotPresent => {
+                    exempt.set_watchdog_pid(0);
+                    info!(
+                        pidfile = %pidfile.display(),
+                        "watchdog pidfile absent; no watchdog exemption active"
+                    );
+                }
+                WatchdogResolution::InvalidPidfile { reason } => {
+                    exempt.set_watchdog_pid(0);
+                    warn!(%reason, "watchdog pidfile unparseable; watchdog exemption cleared");
+                }
+                WatchdogResolution::Unverifiable { pid, reason } => {
+                    exempt.set_watchdog_pid(0);
+                    warn!(pid, %reason, "watchdog exe verification failed; exemption cleared");
+                }
+                WatchdogResolution::ExeMismatch { pid, resolved } => {
+                    exempt.set_watchdog_pid(0);
+                    warn!(
+                        pid,
+                        resolved = %resolved.display(),
+                        expected = %expected_exe.display(),
+                        "watchdog PID maps to an unexpected binary (PID reuse or \
+                         substitution); exemption refused"
+                    );
+                }
+            }
+            last = new_pid;
+        }
+    });
+}
+
 /// Atomically publish the current PID to `path` (Tappa 7 task 6
 /// #2b-verify). A sibling tempfile is written then `rename(2)`d over
 /// the target, so the rename is a same-filesystem atomic swap and a
@@ -1950,6 +2123,29 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
 /// each other's tempfile mid-write. Every error is contextualised and
 /// propagated (never swallowed) so the caller can make it fatal and a
 /// failing harness can pinpoint which syscall failed.
+/// Best-effort audit record for a Beta Step 4a stale-COMBAT reconcile.
+/// Appends one JSONL line to `/var/lib/northnarrow/combat-audit.jsonl`;
+/// a write failure is logged but never fatal — the teardown it records
+/// has already happened.
+fn audit_combat_reconcile(rules_removed: usize) {
+    use std::io::Write;
+    const PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
+    let line = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "event": "combat_reconcile",
+        "reason": "stale_reconcile",
+        "rules_torn_down": rules_removed,
+    });
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PATH)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = res {
+        warn!(error = %e, path = PATH, "could not write COMBAT reconcile audit line (non-fatal)");
+    }
+}
+
 fn write_pid_file(path: &std::path::Path) -> Result<()> {
     let pid = std::process::id();
 

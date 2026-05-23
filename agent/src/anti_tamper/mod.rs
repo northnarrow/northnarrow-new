@@ -37,6 +37,7 @@
 //!   SIGCHLD closes it during the death itself.
 
 pub mod admin_auth;
+pub mod combat_allow;
 pub mod filesystem;
 pub mod network_isolate;
 
