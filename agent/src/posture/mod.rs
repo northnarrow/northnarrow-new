@@ -32,6 +32,7 @@
 //! Ed25519-signed command path.
 
 pub mod exempt;
+pub mod lineage;
 pub mod modulation;
 pub mod state;
 pub mod transitions;
@@ -55,6 +56,7 @@ pub use exempt::{
     resolve_verified_watchdog_pid, ExemptPids, WatchdogResolution, DEFAULT_WATCHDOG_EXE,
     DEFAULT_WATCHDOG_PIDFILE,
 };
+pub use lineage::{AuthSessionTracker, AUTH_BINARY_EXES};
 pub use state::PostureState;
 pub use triggers::TriggerDetector;
 
@@ -106,7 +108,12 @@ struct Inner {
 
 impl PostureMachine {
     pub fn new() -> Self {
-        Self::build(None, None, ExemptPids::default())
+        Self::build(
+            None,
+            None,
+            ExemptPids::default(),
+            AuthSessionTracker::default(),
+        )
     }
 
     /// Build a machine that fires `hook` whenever a transition crosses
@@ -120,7 +127,12 @@ impl PostureMachine {
     /// hook is NOT re-invoked. The wiring in `observe()` checks
     /// `before.kind() != Combat && after.kind() == Combat`.
     pub fn new_with_combat_hook(hook: CombatEntryHook) -> Self {
-        Self::build(Some(hook), None, ExemptPids::default())
+        Self::build(
+            Some(hook),
+            None,
+            ExemptPids::default(),
+            AuthSessionTracker::default(),
+        )
     }
 
     /// Build a machine that fires both an entry hook (on the
@@ -132,7 +144,12 @@ impl PostureMachine {
     /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
     /// to the posture state machine in one place.
     pub fn new_with_hooks(entry: CombatEntryHook, release: CombatReleaseHook) -> Self {
-        Self::build(Some(entry), Some(release), ExemptPids::default())
+        Self::build(
+            Some(entry),
+            Some(release),
+            ExemptPids::default(),
+            AuthSessionTracker::default(),
+        )
     }
 
     /// Production constructor: like [`Self::new_with_hooks`] but also
@@ -149,6 +166,7 @@ impl PostureMachine {
             Some(entry),
             Some(release),
             ExemptPids::with_agent(self_pid),
+            AuthSessionTracker::default(),
         )
     }
 
@@ -163,19 +181,41 @@ impl PostureMachine {
         release: CombatReleaseHook,
         exempt: ExemptPids,
     ) -> Self {
-        Self::build(Some(entry), Some(release), exempt)
+        Self::build(
+            Some(entry),
+            Some(release),
+            exempt,
+            AuthSessionTracker::default(),
+        )
+    }
+
+    /// Production constructor (Beta Step 5, T7.13): like
+    /// [`Self::new_with_hooks_and_exempt`] but also accepts a
+    /// shared [`AuthSessionTracker`] so the trigger detector can
+    /// suppress `sensitive_file_access` and the mass-write arm of
+    /// `confirmed_intrusion` for sudo-mediated PIDs. `main.rs`
+    /// constructs the tracker once at boot and shares it through
+    /// the posture machine.
+    pub fn new_with_hooks_and_exempt_and_auth(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook,
+        exempt: ExemptPids,
+        auth: AuthSessionTracker,
+    ) -> Self {
+        Self::build(Some(entry), Some(release), exempt, auth)
     }
 
     fn build(
         combat_entry_hook: Option<CombatEntryHook>,
         combat_release_hook: Option<CombatReleaseHook>,
         exempt: ExemptPids,
+        auth: AuthSessionTracker,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
-                triggers: TriggerDetector::with_exempt(exempt),
+                triggers: TriggerDetector::with_exempt_and_auth(exempt, auth),
                 combat_entry_hook,
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),

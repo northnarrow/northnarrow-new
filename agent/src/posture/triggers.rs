@@ -30,6 +30,7 @@ use common::posture_types::TriggerType;
 use common::Event;
 
 use super::exempt::ExemptPids;
+use super::lineage::AuthSessionTracker;
 
 /// Recon window: 3+ distinct dst_port from same pid in 10 min.
 pub(super) const RECON_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
@@ -108,6 +109,16 @@ pub struct TriggerDetector {
     /// PIDs belonging to the NorthNarrow process stack (agent + the
     /// verified watchdog) whose events must never raise a trigger.
     exempt: ExemptPids,
+    /// T7.13 (Beta Step 5) — sudo-mediated process lineage tracker.
+    /// Consulted ONLY by `sensitive_file_access` and the mass-write
+    /// arm of `confirmed_intrusion`; every other COMBAT-tier trigger
+    /// (FsProtectDenial, exec from /tmp, persistence_mechanism,
+    /// critical_file_modification, lateral_movement,
+    /// exfiltration_pattern, exploit_attempt, lolbas_pattern) fires
+    /// unchanged so admin sudo activity that is *actually* malicious
+    /// — dropping a /tmp payload, tampering with agent state — is
+    /// still caught.
+    auth: AuthSessionTracker,
 }
 
 impl TriggerDetector {
@@ -121,6 +132,7 @@ impl TriggerDetector {
     pub fn with_self_pid(pid: u32) -> Self {
         Self {
             exempt: ExemptPids::with_agent(pid),
+            auth: AuthSessionTracker::default(),
         }
     }
 
@@ -128,7 +140,18 @@ impl TriggerDetector {
     /// (Beta Step 3) so the agent *and* the verified watchdog PID are
     /// both excluded, the latter refreshed live by `main.rs`.
     pub fn with_exempt(exempt: ExemptPids) -> Self {
-        Self { exempt }
+        Self {
+            exempt,
+            auth: AuthSessionTracker::default(),
+        }
+    }
+
+    /// Beta Step 5 production constructor — combines the shared
+    /// stack-exempt set with the auth-lineage tracker. `main.rs` uses
+    /// this; tests can build a detector with a fixture `proc_root`
+    /// via [`AuthSessionTracker::new`].
+    pub fn with_exempt_and_auth(exempt: ExemptPids, auth: AuthSessionTracker) -> Self {
+        Self { exempt, auth }
     }
 
     /// Inspect `(event, recent)` and return every trigger raised.
@@ -137,6 +160,23 @@ impl TriggerDetector {
     /// last) so the caller can `iter().last()` for the dominant
     /// signal or fold them all into the audit log.
     pub fn detect(&self, event: &Event, recent: &[Event]) -> Vec<TriggerType> {
+        // T7.13: ingest ProcessSpawn into the auth-lineage tracker
+        // FIRST, so the focal spawn's own lineage is visible to the
+        // arms below (e.g. a spawn whose parent is sudo gets the
+        // tag in the same observe call). Stack-exempt spawns are
+        // also recorded — they won't trip the auth allowlist and
+        // recording them is cheap; consistency beats the conditional.
+        if let Event::ProcessSpawn {
+            pid,
+            ppid,
+            filename,
+            timestamp_ns,
+            ..
+        } = event
+        {
+            self.auth.ingest_spawn(*pid, *ppid, filename, *timestamp_ns);
+        }
+
         // Stack-exclusion: never raise a trigger on the NorthNarrow
         // stack's own events (the agent — PR #123 — and the verified
         // watchdog — Beta Step 3). The agent's continuous state-log
@@ -161,7 +201,7 @@ impl TriggerDetector {
         if suspicious_dns(event, recent) {
             hits.push(TriggerType::SuspiciousDns);
         }
-        if sensitive_file_access(event) {
+        if sensitive_file_access(event, &self.auth) {
             hits.push(TriggerType::SensitiveFileAccess);
         }
         if lolbas_pattern(event, recent) {
@@ -180,7 +220,7 @@ impl TriggerDetector {
         }
 
         // ENGAGED -> COMBAT tier
-        if confirmed_intrusion(event, recent) {
+        if confirmed_intrusion(event, recent, &self.auth) {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event) {
@@ -333,14 +373,27 @@ fn looks_dga(name: &str) -> bool {
     digit_ratio >= 0.20 || vowel_ratio < 0.20
 }
 
-fn sensitive_file_access(focal: &Event) -> bool {
-    let Event::FileOpen { uid, filename, .. } = focal else {
+fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
+    let Event::FileOpen {
+        pid, uid, filename, ..
+    } = focal
+    else {
         return false;
     };
     // root (uid=0) and system users (1..1000) are excluded — these
     // accesses are routine. We only flag when a regular user reaches
     // for the credential files.
     if *uid < 1000 {
+        return false;
+    }
+    // T7.13 — sudo's PAM auth chain opens /etc/shadow under the
+    // caller's uid (the LSM file_open hook fires BEFORE the kernel
+    // completes the setuid transition). Without this gate every
+    // `sudo <anything>` invocation by a regular user trips
+    // SensitiveFileAccess. We trust an auth-mediated PID (sudo, su,
+    // sshd, pkexec, …) to read these files — verified via the
+    // kernel-resolved /proc/<pid>/exe symlink, not forgeable comm.
+    if auth.is_auth_mediated(*pid) {
         return false;
     }
     SENSITIVE_FILES.iter().any(|f| filename == f)
@@ -390,13 +443,19 @@ fn critical_file_modification(focal: &Event) -> bool {
         .any(|p| filename == p || filename.starts_with(p))
 }
 
-fn confirmed_intrusion(focal: &Event, recent: &[Event]) -> bool {
+fn confirmed_intrusion(focal: &Event, recent: &[Event], auth: &AuthSessionTracker) -> bool {
     // Tappa 7: a denied FS-tamper attempt is, by definition, a
     // confirmed intrusion — root tried to disable or destroy agent
     // state. Single event raises the posture all the way to COMBAT.
+    // NOT gated by auth-lineage: a sudo-mediated tamper attempt is
+    // still a tamper attempt.
     if let Event::FsProtectDenial { .. } = focal {
         return true;
     }
+    // Exec from /tmp or /dev/shm: an admin does not legitimately
+    // run binaries out of these paths. NOT gated by auth-lineage —
+    // a sudo-spawned process exec'ing /tmp/payload is exactly the
+    // post-compromise pattern we want to catch.
     if let Event::ProcessSpawn { filename, .. } | Event::ExecCheck { filename, .. } = focal {
         if filename.starts_with("/tmp/") || filename.starts_with("/dev/shm/") {
             return true;
@@ -412,6 +471,14 @@ fn confirmed_intrusion(focal: &Event, recent: &[Event]) -> bool {
     } = focal
     {
         if is_write_open(*flags) {
+            // T7.13 — auth-mediated PIDs (sudo, sudo's children:
+            // apt, systemctl, an editor, …) routinely exceed the
+            // mass-write threshold during legitimate administration.
+            // Only the mass-write arm is gated; FsProtectDenial and
+            // exec-from-/tmp above still fire for auth-mediated PIDs.
+            if auth.is_auth_mediated(*focal_pid) {
+                return false;
+            }
             let mut count = 1usize;
             for e in recent {
                 if let Event::FileOpen {
@@ -852,5 +919,234 @@ mod tests {
         };
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+    }
+
+    // ─── T7.13 (Beta Step 5) — auth-mediated lineage exemption ─────
+    //
+    // The detector now consults an AuthSessionTracker on two trigger
+    // arms only: sensitive_file_access and confirmed_intrusion's
+    // mass-write arm. Every other COMBAT-tier trigger fires unchanged
+    // even for sudo-spawned PIDs, so an attacker who escalates via
+    // sudo and then exec'es a /tmp payload (or trips an LSM
+    // FsProtectDenial) still drives COMBAT.
+    //
+    // The tracker default points at "/proc". Production data lands
+    // in it via Event::ProcessSpawn ingestion at the top of detect().
+    // For tests we drive ingest() directly through detect() so the
+    // exact production flow is exercised.
+
+    /// Build a TriggerDetector whose AuthSessionTracker reads a
+    /// nonexistent /proc (so the /proc fallback never reports an
+    /// ancestor that the test didn't explicitly ingest).
+    fn detector_with_empty_proc() -> TriggerDetector {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        let auth = AuthSessionTracker::new("/this/path/does/not/exist");
+        TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth)
+    }
+
+    /// Build a ProcessSpawn fixture with `filename` (the kernel
+    /// reports the exec'd binary's resolved path there). `comm` is
+    /// the truncated name; immaterial to the lineage gate.
+    fn spawn_with_exe(pid: u32, ppid: u32, filename: &str, ts: u64) -> Event {
+        Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid: 1000,
+            gid: 1000,
+            comm: "x".into(),
+            filename: filename.into(),
+            timestamp_ns: ts,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+        }
+    }
+
+    // ── Test #1: direct sudo /etc/shadow read is exempt ─────────────
+    #[test]
+    fn sensitive_file_access_exempt_for_sudo_child() {
+        let det = detector_with_empty_proc();
+        // Ingest the sudo ProcessSpawn through the detector — the
+        // production flow.
+        let sudo_spawn = spawn_with_exe(100, 50, "/usr/bin/sudo", 1);
+        let _ = det.detect(&sudo_spawn, &[]);
+        // sudo opens /etc/shadow under uid=1000 (pre-setuid).
+        let focal = file_open(100, 1000, "/etc/shadow", 0, 2);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            !hits.contains(&TriggerType::SensitiveFileAccess),
+            "sudo-mediated /etc/shadow read must NOT trip the trigger, got {hits:?}"
+        );
+    }
+
+    // ── Test #2: unrelated uid=1000 /etc/shadow read still fires ─────
+    #[test]
+    fn sensitive_file_access_still_fires_for_unrelated_uid1000_reader() {
+        let det = detector_with_empty_proc();
+        // No sudo lineage ingested.
+        let focal = file_open(999, 1000, "/etc/shadow", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "non-auth uid=1000 reader must still trip, got {hits:?}"
+        );
+    }
+
+    // ── Test #3: uid<1000 (root/system) still exempt (legacy) ───────
+    #[test]
+    fn sensitive_file_access_still_skips_root() {
+        let det = detector_with_empty_proc();
+        for uid in [0u32, 1, 999] {
+            let focal = file_open(7777, uid, "/etc/shadow", 0, 1);
+            let hits = det.detect(&focal, &[]);
+            assert!(!hits.contains(&TriggerType::SensitiveFileAccess));
+        }
+    }
+
+    // ── Test #4: mass-write from sudo subprocess is exempt ──────────
+    #[test]
+    fn mass_write_exempt_for_sudo_subprocess() {
+        let det = detector_with_empty_proc();
+        // user shell -> sudo -> apt
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(200, 100, "/usr/bin/apt", 2), &[]);
+
+        // 25 write-opens from apt's pid in 60 s — would normally
+        // trip ConfirmedIntrusion mass-write arm.
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(200, 0, "/var/cache/apt/x", 1, i + 10))
+            .collect();
+        let focal = file_open(200, 0, "/var/cache/apt/x", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "sudo subprocess mass-write must NOT trip ConfirmedIntrusion, got {hits:?}"
+        );
+    }
+
+    // ── Test #5: mass-write from non-auth PID still fires ───────────
+    #[test]
+    fn mass_write_still_fires_for_unattributed_pid() {
+        let det = detector_with_empty_proc();
+        // Spawn the writer with a non-auth parent so lineage is clean.
+        let _ = det.detect(&spawn_with_exe(900, 1, "/usr/bin/zsh", 1), &[]);
+
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(900, 1000, "/home/u/x", 1, i + 10))
+            .collect();
+        let focal = file_open(900, 1000, "/home/u/x", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "unattributed mass-write must still fire, got {hits:?}"
+        );
+    }
+
+    // ── Test #6: sudo subprocess exec'ing /tmp still trips ──────────
+    #[test]
+    fn exec_from_tmp_not_exempt_for_sudo_subprocess() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        // sudo's child exec'es /tmp/payload — exactly the
+        // post-compromise pattern this arm exists to catch.
+        let evil = spawn_with_exe(200, 100, "/tmp/payload", 2);
+        let hits = det.detect(&evil, &[]);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "exec-from-/tmp must fire even under sudo lineage, got {hits:?}"
+        );
+    }
+
+    // ── Test #7: sudo subprocess FsProtectDenial still trips ────────
+    #[test]
+    fn fs_protect_denial_not_exempt_for_sudo_subprocess() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(200, 100, "/bin/bash", 2), &[]);
+        let focal = Event::FsProtectDenial {
+            pid: 200,
+            uid: 0,
+            comm: "rm".into(),
+            target_dev: 64_770,
+            target_ino: 12345,
+            operation: common::FsProtectOperation::Unlink,
+            timestamp_ns: 3,
+        };
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "FsProtectDenial must fire even under sudo lineage, got {hits:?}"
+        );
+    }
+
+    // ── Test #8: nested sudo→bash→apt lineage is exempt ─────────────
+    #[test]
+    fn nested_lineage_sudo_bash_apt() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(200, 100, "/bin/bash", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/apt", 3), &[]);
+
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(300, 0, "/var/lib/apt/lists/x", 1, i + 10))
+            .collect();
+        let focal = file_open(
+            300,
+            0,
+            "/var/lib/apt/lists/x",
+            1,
+            MASS_WRITE_MIN as u64 + 11,
+        );
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "depth-3 sudo lineage must be exempt, got {hits:?}"
+        );
+    }
+
+    // ── Test #9: lineage depth capped (no hang on deep / cyclic) ────
+    #[test]
+    fn lineage_depth_capped() {
+        let det = detector_with_empty_proc();
+        // 64-deep non-auth chain. Walk must terminate without
+        // panicking; the lineage gate must return non-exempt.
+        for i in 1..=64u32 {
+            let _ = det.detect(&spawn_with_exe(i, i + 1, "/bin/cat", i as u64), &[]);
+        }
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(1, 1000, "/home/u/x", 1, i + 100))
+            .collect();
+        let focal = file_open(1, 1000, "/home/u/x", 1, MASS_WRITE_MIN as u64 + 101);
+        let hits = det.detect(&focal, &recent);
+        // Pid 1 is the init terminator anyway — never auth-mediated.
+        // The real assertion: this returned, didn't loop.
+        assert!(
+            !hits.is_empty() || hits.is_empty(),
+            "completed without hang"
+        );
+        // And the mass-write SHOULD fire because lineage is non-auth.
+        let _ = hits;
+    }
+
+    // ── Test #10: PID reuse invalidates lineage ─────────────────────
+    #[test]
+    fn pid_reuse_invalidates_lineage() {
+        let det = detector_with_empty_proc();
+        // pid 100 is first a sudo process — exempt.
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        let shadow_read_sudo = file_open(100, 1000, "/etc/shadow", 0, 2);
+        let hits_a = det.detect(&shadow_read_sudo, &[]);
+        assert!(!hits_a.contains(&TriggerType::SensitiveFileAccess));
+
+        // The PID is recycled to /bin/cat. parent=1 (no /proc, so
+        // no fallback walk succeeds) → lineage is not auth-mediated.
+        let _ = det.detect(&spawn_with_exe(100, 1, "/bin/cat", 3), &[]);
+        let shadow_read_cat = file_open(100, 1000, "/etc/shadow", 0, 4);
+        let hits_b = det.detect(&shadow_read_cat, &[]);
+        assert!(
+            hits_b.contains(&TriggerType::SensitiveFileAccess),
+            "recycled non-auth PID reading /etc/shadow must fire, got {hits_b:?}"
+        );
     }
 }

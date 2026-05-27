@@ -44,8 +44,8 @@ use northnarrow_agent::net::blocklist::{
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::{
-    resolve_verified_watchdog_pid, CombatEntryHook, CombatReleaseHook, ExemptPids, PostureMachine,
-    WatchdogResolution,
+    resolve_verified_watchdog_pid, AuthSessionTracker, CombatEntryHook, CombatReleaseHook,
+    ExemptPids, PostureMachine, WatchdogResolution,
 };
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
@@ -813,6 +813,13 @@ async fn main() -> Result<()> {
 
     let exempt = ExemptPids::with_agent(std::process::id());
     let posture = if let Some(iso) = isolator.as_ref() {
+        // T7.13 (Beta Step 5): the auth-lineage tracker shared with
+        // the posture trigger detector. Reads /proc on cache miss;
+        // populated live from Event::ProcessSpawn inside
+        // TriggerDetector::detect. The dev (no-iptables) branch uses
+        // PostureMachine::new() which already constructs a default
+        // tracker internally, so this clone is only needed here.
+        let auth_tracker = AuthSessionTracker::with_proc();
         let iso_engage = Arc::clone(iso);
         let iso_release = Arc::clone(iso);
         let engage_hook: CombatEntryHook = Arc::new(move || {
@@ -834,11 +841,17 @@ async fn main() -> Result<()> {
         // Without this, the agent's FIM drift logging self-trips the
         // mass-write heuristic into COMBAT at boot, and the watchdog's
         // startup /proc scan trips it too (2026-05-22 sshd-reset
-        // diagnosis; T7.13 watchdog start cascade).
-        PostureMachine::new_with_hooks_and_exempt(
+        // diagnosis).
+        //
+        // T7.13 — also pass the auth-lineage tracker so sudo-mediated
+        // PIDs are exempt from sensitive_file_access and the
+        // mass-write arm of confirmed_intrusion. Every other
+        // COMBAT-tier trigger fires unchanged.
+        PostureMachine::new_with_hooks_and_exempt_and_auth(
             engage_hook,
             release_hook,
             exempt.clone(),
+            auth_tracker,
         )
     } else {
         PostureMachine::new()
@@ -881,7 +894,9 @@ async fn main() -> Result<()> {
                     audit_combat_reconcile(outcome.rules_removed);
                 }
                 Ok(_) => debug!("no stale COMBAT chain at boot (clean)"),
-                Err(e) => warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed"),
+                Err(e) => {
+                    warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed")
+                }
             }
         }
     }

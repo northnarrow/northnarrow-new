@@ -12,7 +12,7 @@ use common::posture_types::PostureKind;
 use common::Event;
 
 use super::triggers::testutil::{file_open, spawn, tcp_v4};
-use super::{AdminReleaseError, PostureMachine};
+use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
 
 fn baseline_verdict(action: AdeAction, severity: AdeSeverity) -> AdeVerdict {
     AdeVerdict {
@@ -498,6 +498,145 @@ fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
         1,
         "combat_release_hook should fire exactly once on Combat → non-Combat"
     );
+}
+
+// ─── T7.13 (Beta Step 5) — end-to-end lineage exemption tests ──────
+//
+// Drive the full PostureMachine through realistic event sequences
+// covering the sudo cascade, the negative control (ransomware shape),
+// and the self-write regression guard. These exercise the same code
+// path as production: TriggerDetector::detect ingests ProcessSpawn
+// into the AuthSessionTracker on every observe() call.
+
+/// Helper: build a posture machine carrying a fresh AuthSessionTracker
+/// pointed at a nonexistent /proc, so the lineage gate only sees what
+/// the test explicitly ingests via ProcessSpawn events.
+fn machine_with_isolated_auth() -> PostureMachine {
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+    PostureMachine::new_with_hooks_and_exempt_and_auth(
+        entry_hook,
+        release_hook,
+        ExemptPids::default(),
+        AuthSessionTracker::new("/this/path/does/not/exist"),
+    )
+}
+
+/// Test #15 — sudo cascade end-to-end stays at OBSERVING.
+/// Replays the empirically-observed T7.13 cascade: sudo opens
+/// /etc/shadow (uid=1000), an apt subprocess writes 25 files. With
+/// the lineage gate the posture must NOT transition.
+#[test]
+fn sudo_cascade_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+
+    // 1. sudo spawns: ingested into AuthSessionTracker via detect().
+    let sudo_spawn = spawn(100, 50, "sudo", "/usr/bin/sudo", 1);
+    let r = m.observe(&sudo_spawn, &[]);
+    assert!(r.is_none(), "sudo spawn must not transition: {r:?}");
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // 2. sudo's PAM auth chain reads /etc/shadow as uid=1000 (still
+    //    pre-setuid at LSM file_open fire time).
+    let shadow_read = file_open(100, 1000, "/etc/shadow", 0, 2);
+    let r = m.observe(&shadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "sudo /etc/shadow read must not transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // 3. apt spawns as sudo's child.
+    let apt_spawn = spawn(200, 100, "apt", "/usr/bin/apt", 3);
+    let r = m.observe(&apt_spawn, &[]);
+    assert!(r.is_none(), "apt spawn must not transition: {r:?}");
+
+    // 4. apt mass-writes /var/cache/apt/* — 25 writes in window.
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(200, 0, "/var/cache/apt/x", 1, i + 100))
+        .collect();
+    let focal = file_open(200, 0, "/var/cache/apt/x", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(
+        r.is_none(),
+        "apt mass-write under sudo lineage must NOT transition: {r:?}"
+    );
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Observing,
+        "T7.13 fix did not hold — sudo cascade still escalated"
+    );
+}
+
+/// Test #16 — ransomware-shape from /tmp still reaches COMBAT.
+/// Negative control: a non-auth-mediated exec from /tmp must still
+/// trip ConfirmedIntrusion via the exec-from-/tmp arm. The lineage
+/// gate must NOT be too broad.
+#[test]
+fn ransomware_shape_still_reaches_combat() {
+    let m = machine_with_isolated_auth();
+    // No sudo lineage. Direct exec from /tmp.
+    let evil = spawn(900, 1, "payload", "/tmp/payload", 1);
+    let r = m.observe(&evil, &[]);
+    assert!(r.is_some(), "exec-from-/tmp must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Combat,
+        "non-auth exec from /tmp must still drive COMBAT"
+    );
+}
+
+/// Test #17 — mass-write alone from a non-auth PID still reaches
+/// COMBAT. Confirms the mass-write arm itself still works for
+/// adversarial PIDs (the lineage gate is the only suppressor).
+#[test]
+fn mass_write_alone_from_non_auth_pid_still_reaches_combat() {
+    let m = machine_with_isolated_auth();
+    // Spawn a non-auth parent so the writer's lineage is clean.
+    let _ = m.observe(&spawn(900, 1, "zsh", "/usr/bin/zsh", 1), &[]);
+
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(900, 1000, "/home/u/x", 1, i + 100))
+        .collect();
+    let focal = file_open(900, 1000, "/home/u/x", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_some(), "non-auth mass-write must transition");
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
+/// Test #18 — agent's own writes still exempt (PR #123 regression
+/// guard). Validates that adding the auth-lineage gate did not
+/// break the pre-existing stack-PID exclusion.
+#[test]
+fn agent_self_writes_still_exempt() {
+    const AGENT_PID: u32 = 4242;
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+    let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        entry_hook,
+        release_hook,
+        ExemptPids::with_agent(AGENT_PID),
+        AuthSessionTracker::new("/this/path/does/not/exist"),
+    );
+
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| {
+            file_open(
+                AGENT_PID,
+                0,
+                "/var/lib/northnarrow/fim_drift.jsonl",
+                1,
+                i + 100,
+            )
+        })
+        .collect();
+    let focal = file_open(AGENT_PID, 0, "/var/lib/northnarrow/fim_drift.jsonl", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(
+        r.is_none(),
+        "agent's own state-log writes must still be fully exempt: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
 }
 
 /// Required A10 test 4: same-state transition is a no-op — no
