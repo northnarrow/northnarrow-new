@@ -8,7 +8,7 @@ use common::ade_types::{
     FollowUpPolicy, MitreAttack, ReasoningSteps, RecommendedAction, ThreatClassification,
     ADE_SCHEMA_VERSION,
 };
-use common::posture_types::PostureKind;
+use common::posture_types::{PostureKind, TriggerType};
 use common::Event;
 
 use super::triggers::testutil::{file_open, spawn, tcp_v4};
@@ -677,4 +677,29 @@ fn admin_force_state_with_token_same_state_is_noop() {
         0,
         "no hook should fire on same-state transition"
     );
+}
+
+// ── BUG-015 P-5 regression — observe() returns the firing trigger ──
+
+#[test]
+fn observe_returns_firing_trigger_on_transition() {
+    // exec-from-/tmp fires ConfirmedIntrusion → Combat. The returned
+    // tuple must carry that TriggerType so callers (main.rs WARN log)
+    // can surface which signal caused the escalation.
+    let m = PostureMachine::new();
+    let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
+    let result = m.observe(&focal, &[]);
+    let (new_state, firing) = result.expect("posture transitioned");
+    assert_eq!(new_state.kind(), PostureKind::Combat);
+    assert_eq!(firing, Some(TriggerType::ConfirmedIntrusion));
+}
+
+#[test]
+fn observe_returns_none_when_no_transition() {
+    // A spawn that matches no trigger leaves posture at Observing
+    // and observe() returns None — no log line in main.rs.
+    let m = PostureMachine::new();
+    let benign = spawn(42, 1, "ls", "/usr/bin/ls", 1);
+    assert!(m.observe(&benign, &[]).is_none());
+    assert_eq!(m.current_kind(), PostureKind::Observing);
 }

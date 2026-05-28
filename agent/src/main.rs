@@ -847,11 +847,27 @@ async fn main() -> Result<()> {
         // PIDs are exempt from sensitive_file_access and the
         // mass-write arm of confirmed_intrusion. Every other
         // COMBAT-tier trigger fires unchanged.
-        PostureMachine::new_with_hooks_and_exempt_and_auth(
+        //
+        // BUG-017 P-8 — load the operator-supplemental mass-write
+        // path-prefix carve-out from
+        // /etc/northnarrow/mass-write-carveout.local. Missing file =
+        // empty list (no extra exemptions; hardcoded
+        // MASS_WRITE_CARVEOUT_PREFIXES still applies). The list is
+        // path-prefix-based (e.g. "/home/<user>/.claude/" for dev
+        // tooling), additive on top of the hardcoded kernel-RPC
+        // pseudo-FS prefixes. See SECURITY note in
+        // mass_write_overlay.rs — DO NOT add /home, /var, /tmp
+        // wholesale.
+        let mass_write_extras = northnarrow_agent::posture::mass_write_overlay::
+            load_mass_write_carveout_extras(std::path::Path::new(
+                northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+            ));
+        PostureMachine::new_with_hooks_and_exempt_and_auth_and_extras(
             engage_hook,
             release_hook,
             exempt.clone(),
             auth_tracker,
+            mass_write_extras,
         )
     } else {
         PostureMachine::new()
@@ -1750,8 +1766,17 @@ async fn process_event(
     // a fresh +1 on top of `recent`, and `recent` already containing
     // the focal would double-count it.
     let recent_for_posture = correlation.snapshot();
-    if let Some(new_state) = posture.observe(&event, &recent_for_posture) {
-        warn!(state = %new_state.kind(), "POSTURE TRANSITION");
+    if let Some((new_state, firing_trigger)) = posture.observe(&event, &recent_for_posture) {
+        // BUG-015 observability: include the firing TriggerType so
+        // operators can see in the journal what caused a transition.
+        // `firing_trigger` is `Some` for any upward crossing and `None`
+        // for same-tier re-arms; the latter case still gets a log line
+        // because the kind() display alone is enough to follow state.
+        warn!(
+            state = %new_state.kind(),
+            trigger = ?firing_trigger,
+            "POSTURE TRANSITION"
+        );
     }
     correlation.push(event.clone());
 

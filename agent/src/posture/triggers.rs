@@ -25,6 +25,7 @@
 //!   pipeline syntax.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use common::posture_types::TriggerType;
 use common::Event;
@@ -48,6 +49,56 @@ pub(super) const DNS_DGA_MIN_LABEL_LEN: usize = 16;
 /// Mass encryption / mass write: 20+ writes from same pid in 60 s.
 pub(super) const MASS_WRITE_WINDOW_NS: u64 = 60 * 1_000_000_000;
 pub(super) const MASS_WRITE_MIN: usize = 20;
+
+/// BUG-014 (P-6) — path-class carve-out for the mass-write arm of
+/// `confirmed_intrusion`. Writes to these prefixes are kernel-control
+/// RPCs or system-managed binary state, not the data-mutation pattern
+/// the mass-write heuristic exists to catch (ransomware / mass exfil
+/// staging). Each excluded path class is covered by a dedicated
+/// detection surface so suppression here does not blind the agent:
+///
+/// - `/sys/`            — sysfs control files (cgroupfs writes during
+///                        service setup, kernel parameter writes).
+///                        Tampering is covered by anti-tamper LSM
+///                        hooks (kernel_param, etc.) and the R011
+///                        kernel-module tooling rule.
+/// - `/proc/`           — procfs writes (sysctl-shaped kernel RPCs,
+///                        per-process control). Same anti-tamper
+///                        LSM surface; never a ransomware target.
+/// - `/run/systemd/`    — systemd's own runtime state directory (cgroup
+///                        delegation files, unit transient state).
+///                        Not data; not a ransomware target.
+/// - `/run/log/journal/` — systemd-journal binary log. Anti-forensic
+///                        journal manipulation is its own threat
+///                        category (future R-NN); the mass-write arm
+///                        of confirmed_intrusion would only ever
+///                        catch journald's normal append rhythm here.
+///
+/// Deliberately **NOT** excluded:
+/// - `/dev/`        — includes `/dev/shm/`, a real ransomware staging tmpfs.
+/// - `/run/`        — broad, includes `/run/user/<uid>/` where user
+///                    processes legitimately write (lock files, dbus
+///                    sockets). Counted toward mass-write so a
+///                    compromised user session is still detectable.
+pub(super) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] = &[
+    "/sys/",
+    "/proc/",
+    "/run/systemd/",
+    "/run/log/journal/",
+];
+
+/// Returns true if `filename` is in a path class the mass-write arm of
+/// `confirmed_intrusion` deliberately ignores (kernel-RPC / system
+/// state, not data writes). See [`MASS_WRITE_CARVEOUT_PREFIXES`] for
+/// the per-prefix rationale. `extras` is the operator-supplemental
+/// list loaded from `/etc/northnarrow/mass-write-carveout.local`
+/// (BUG-017 P-8); pass `&[]` to consider only the hardcoded list.
+fn is_mass_write_carveout(filename: &str, extras: &[String]) -> bool {
+    MASS_WRITE_CARVEOUT_PREFIXES
+        .iter()
+        .any(|p| filename.starts_with(p))
+        || extras.iter().any(|p| filename.starts_with(p.as_str()))
+}
 
 /// Lateral movement: 3+ distinct internal hosts on admin ports in 10 min.
 pub(super) const LATERAL_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
@@ -119,6 +170,11 @@ pub struct TriggerDetector {
     /// — dropping a /tmp payload, tampering with agent state — is
     /// still caught.
     auth: AuthSessionTracker,
+    /// BUG-017 P-8 — operator-supplemental mass-write path-prefix
+    /// carve-out, layered on top of [`MASS_WRITE_CARVEOUT_PREFIXES`].
+    /// Loaded from `/etc/northnarrow/mass-write-carveout.local` at
+    /// agent boot. Cheap to clone (`Arc`); empty by default.
+    mass_write_extras: Arc<Vec<String>>,
 }
 
 impl TriggerDetector {
@@ -133,6 +189,7 @@ impl TriggerDetector {
         Self {
             exempt: ExemptPids::with_agent(pid),
             auth: AuthSessionTracker::default(),
+            mass_write_extras: Arc::new(Vec::new()),
         }
     }
 
@@ -143,6 +200,7 @@ impl TriggerDetector {
         Self {
             exempt,
             auth: AuthSessionTracker::default(),
+            mass_write_extras: Arc::new(Vec::new()),
         }
     }
 
@@ -151,7 +209,20 @@ impl TriggerDetector {
     /// this; tests can build a detector with a fixture `proc_root`
     /// via [`AuthSessionTracker::new`].
     pub fn with_exempt_and_auth(exempt: ExemptPids, auth: AuthSessionTracker) -> Self {
-        Self { exempt, auth }
+        Self {
+            exempt,
+            auth,
+            mass_write_extras: Arc::new(Vec::new()),
+        }
+    }
+
+    /// BUG-017 P-8 — builder-style setter for the operator
+    /// supplemental mass-write carve-out prefix list. Production:
+    /// `main.rs` calls this with the parsed
+    /// `mass-write-carveout.local` contents.
+    pub fn with_mass_write_extras(mut self, extras: Vec<String>) -> Self {
+        self.mass_write_extras = Arc::new(extras);
+        self
     }
 
     /// Inspect `(event, recent)` and return every trigger raised.
@@ -220,7 +291,7 @@ impl TriggerDetector {
         }
 
         // ENGAGED -> COMBAT tier
-        if confirmed_intrusion(event, recent, &self.auth) {
+        if confirmed_intrusion(event, recent, &self.auth, &self.mass_write_extras) {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event) {
@@ -443,7 +514,12 @@ fn critical_file_modification(focal: &Event) -> bool {
         .any(|p| filename == p || filename.starts_with(p))
 }
 
-fn confirmed_intrusion(focal: &Event, recent: &[Event], auth: &AuthSessionTracker) -> bool {
+fn confirmed_intrusion(
+    focal: &Event,
+    recent: &[Event],
+    auth: &AuthSessionTracker,
+    mass_write_extras: &[String],
+) -> bool {
     // Tappa 7: a denied FS-tamper attempt is, by definition, a
     // confirmed intrusion — root tried to disable or destroy agent
     // state. Single event raises the posture all the way to COMBAT.
@@ -465,12 +541,27 @@ fn confirmed_intrusion(focal: &Event, recent: &[Event], auth: &AuthSessionTracke
     // a short window.
     if let Event::FileOpen {
         pid: focal_pid,
+        comm: focal_comm,
+        filename: focal_filename,
         flags,
         timestamp_ns: focal_ts,
         ..
     } = focal
     {
         if is_write_open(*flags) {
+            // BUG-014 (P-6) path-class carve-out: a write to a
+            // kernel-RPC pseudo-FS (sysfs cgroupfs, procfs, systemd's
+            // /run state, journald binary log) is not a data write
+            // and should not contribute to the ransomware-shape
+            // mass-write heuristic. See MASS_WRITE_CARVEOUT_PREFIXES
+            // for the full prefix list + per-class rationale. The
+            // focal-event check short-circuits early; the recent-loop
+            // check below mirrors it so an attacker can't pad a
+            // window of real data writes with sysfs noise to dilute
+            // the count.
+            if is_mass_write_carveout(focal_filename, mass_write_extras) {
+                return false;
+            }
             // T7.13 — auth-mediated PIDs (sudo, sudo's children:
             // apt, systemctl, an editor, …) routinely exceed the
             // mass-write threshold during legitimate administration.
@@ -483,6 +574,7 @@ fn confirmed_intrusion(focal: &Event, recent: &[Event], auth: &AuthSessionTracke
             for e in recent {
                 if let Event::FileOpen {
                     pid,
+                    filename,
                     flags: f,
                     timestamp_ns,
                     ..
@@ -490,6 +582,7 @@ fn confirmed_intrusion(focal: &Event, recent: &[Event], auth: &AuthSessionTracke
                 {
                     if *pid == *focal_pid
                         && is_write_open(*f)
+                        && !is_mass_write_carveout(filename, mass_write_extras)
                         && within(*focal_ts, *timestamp_ns, MASS_WRITE_WINDOW_NS)
                     {
                         count += 1;
@@ -497,6 +590,23 @@ fn confirmed_intrusion(focal: &Event, recent: &[Event], auth: &AuthSessionTracke
                 }
             }
             if count >= MASS_WRITE_MIN {
+                // BUG-015 observability: when the mass-write arm of
+                // confirmed_intrusion fires, surface the focal PID +
+                // comm + the count so operators can identify the
+                // writer (vs. having only `POSTURE TRANSITION
+                // trigger=ConfirmedIntrusion` to go on). Single line
+                // per fire — not in any hot loop, the rule engine
+                // visits at most once per Event::FileOpen.
+                tracing::warn!(
+                    trigger = "ConfirmedIntrusion_MassWrite",
+                    focal_pid = *focal_pid,
+                    focal_comm = %focal_comm,
+                    focal_filename = %focal_filename,
+                    count_within_window = count,
+                    threshold = MASS_WRITE_MIN,
+                    window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
+                    "mass-write threshold crossed — posture will escalate to COMBAT"
+                );
                 return true;
             }
         }
@@ -1147,6 +1257,209 @@ mod tests {
         assert!(
             hits_b.contains(&TriggerType::SensitiveFileAccess),
             "recycled non-auth PID reading /etc/shadow must fire, got {hits_b:?}"
+        );
+    }
+
+    // ── BUG-014 P-6 regression — mass-write path-class carve-out ──────
+    //
+    // Ground-truth evidence captured 2026-05-27 22:17 UTC: PID 1
+    // (systemd) writes to /sys/fs/cgroup/* during early-boot service
+    // setup, tripping the mass-write threshold within ~3 s of agent
+    // attach and engaging COMBAT on a benign host. The carve-out below
+    // exempts kernel-RPC pseudo-FS prefixes from the count while
+    // preserving detection for real data-write patterns
+    // (ransomware/exfil).
+
+    /// Build a (focal, recent) burst of MASS_WRITE_MIN + 1 write-opens
+    /// from `pid` all targeting `path`. Same shape as
+    /// `self_write_burst` but parameterised on path so each carve-out
+    /// test can pick its directory.
+    fn write_burst_to(pid: u32, path: &str) -> (Event, Vec<Event>) {
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(pid, 0, path, 1, i + 1))
+            .collect();
+        let focal = file_open(pid, 0, path, 1, MASS_WRITE_MIN as u64 + 1);
+        (focal, recent)
+    }
+
+    const ATTACKER_PID: u32 = AGENT_PID + 100;
+
+    #[test]
+    fn mass_write_excludes_sysfs_writes() {
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(
+            ATTACKER_PID,
+            "/sys/fs/cgroup/system.slice/foo.service/memory.max",
+        );
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "sysfs writes are kernel RPCs, must not count toward mass-write: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_excludes_proc_writes() {
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/proc/sys/kernel/printk");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "procfs writes are kernel RPCs, must not count toward mass-write: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_excludes_systemd_run_writes() {
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/run/systemd/units/foo.unit");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "/run/systemd/ is systemd state, must not count toward mass-write: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_excludes_journal_writes() {
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(
+            ATTACKER_PID,
+            "/run/log/journal/0123456789abcdef/system.journal",
+        );
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "journald binary log is system state, must not count toward mass-write: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_still_fires_for_user_data() {
+        // Regression guard: the actual ransomware shape (user data
+        // mass-rewrite) must still fire.
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/home/alice/Documents/report.docx");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "mass-write on user data must still fire: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_still_fires_for_devshm() {
+        // Regression guard: /dev/shm is canonical ransomware staging
+        // tmpfs and is DELIBERATELY not in the carve-out.
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/dev/shm/staging/payload_42.bin");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "mass-write to /dev/shm staging must still fire: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_still_fires_for_run_user() {
+        // Regression guard: /run/user/<uid>/ is per-user runtime where
+        // a compromised user session could mass-write — kept counted.
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/run/user/1000/foo");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "/run/user/<uid> is user runtime, must still count: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_mixed_excluded_and_user_data_below_threshold() {
+        // Boundary: half-and-half (MASS_WRITE_MIN/2 sysfs + same /home),
+        // only the /home half counts (10 + 1 focal = 11 < 20). No fire —
+        // proves the recent-loop filter properly excludes carve-out
+        // events from the count, not just the focal.
+        let det = TriggerDetector::with_self_pid(AGENT_PID);
+        let mut recent: Vec<Event> = Vec::new();
+        for i in 0..(MASS_WRITE_MIN as u64 / 2) {
+            recent.push(file_open(
+                ATTACKER_PID,
+                0,
+                "/sys/fs/cgroup/foo/cgroup.procs",
+                1,
+                i + 1,
+            ));
+        }
+        for i in 0..(MASS_WRITE_MIN as u64 / 2) {
+            recent.push(file_open(
+                ATTACKER_PID,
+                0,
+                "/home/alice/file",
+                1,
+                (MASS_WRITE_MIN as u64 / 2) + i + 1,
+            ));
+        }
+        let focal = file_open(
+            ATTACKER_PID,
+            0,
+            "/home/alice/file",
+            1,
+            MASS_WRITE_MIN as u64 + 1,
+        );
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "10 /home writes + 10 sysfs writes = 11 counted < 20 threshold, must not fire: {hits:?}"
+        );
+    }
+
+    // ── BUG-017 P-8 regression — runtime mass-write overlay ───────────
+
+    #[test]
+    fn mass_write_extras_overlay_exempts_listed_prefix() {
+        // Without the extras, a /home/<user>/.claude/ burst fires
+        // ConfirmedIntrusion (per `mass_write_still_fires_for_user_data`
+        // logic). With the overlay listing that prefix, the burst is
+        // exempt. Models the BUG-017 ground-truth fix: Claude Code's
+        // subagent-transcript bursts no longer self-trip COMBAT on a
+        // dev host whose operator has populated the .local file.
+        let det = TriggerDetector::with_self_pid(AGENT_PID)
+            .with_mass_write_extras(vec!["/home/alice/.claude/".to_string()]);
+        let (focal, recent) =
+            write_burst_to(ATTACKER_PID, "/home/alice/.claude/projects/x/subagents/a.jsonl");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "extras-listed prefix must exempt the burst: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_extras_overlay_does_not_exempt_outside_prefix() {
+        // The same operator extras don't carve-out a sibling /home
+        // path. Real ransomware in /home/alice/Documents/ still fires.
+        let det = TriggerDetector::with_self_pid(AGENT_PID)
+            .with_mass_write_extras(vec!["/home/alice/.claude/".to_string()]);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/home/alice/Documents/report.docx");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "extras must NOT bleed beyond the listed prefix: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_extras_overlay_empty_preserves_hardcoded_only() {
+        // With an empty extras list, hardcoded MASS_WRITE_CARVEOUT_PREFIXES
+        // still applies (sysfs exempted), and /home is still counted.
+        // Smoke-tests that the extras plumbing doesn't disturb the
+        // built-in carve-out.
+        let det = TriggerDetector::with_self_pid(AGENT_PID).with_mass_write_extras(vec![]);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/sys/fs/cgroup/foo/cgroup.procs");
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "hardcoded sysfs carve-out must survive empty extras: {hits:?}"
         );
     }
 }

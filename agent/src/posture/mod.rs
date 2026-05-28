@@ -33,6 +33,7 @@
 
 pub mod exempt;
 pub mod lineage;
+pub mod mass_write_overlay;
 pub mod modulation;
 pub mod state;
 pub mod transitions;
@@ -113,6 +114,7 @@ impl PostureMachine {
             None,
             ExemptPids::default(),
             AuthSessionTracker::default(),
+            Vec::new(),
         )
     }
 
@@ -132,6 +134,7 @@ impl PostureMachine {
             None,
             ExemptPids::default(),
             AuthSessionTracker::default(),
+            Vec::new(),
         )
     }
 
@@ -149,6 +152,7 @@ impl PostureMachine {
             Some(release),
             ExemptPids::default(),
             AuthSessionTracker::default(),
+            Vec::new(),
         )
     }
 
@@ -167,6 +171,7 @@ impl PostureMachine {
             Some(release),
             ExemptPids::with_agent(self_pid),
             AuthSessionTracker::default(),
+            Vec::new(),
         )
     }
 
@@ -186,6 +191,7 @@ impl PostureMachine {
             Some(release),
             exempt,
             AuthSessionTracker::default(),
+            Vec::new(),
         )
     }
 
@@ -202,7 +208,29 @@ impl PostureMachine {
         exempt: ExemptPids,
         auth: AuthSessionTracker,
     ) -> Self {
-        Self::build(Some(entry), Some(release), exempt, auth)
+        Self::build(Some(entry), Some(release), exempt, auth, Vec::new())
+    }
+
+    /// BUG-017 P-8 production constructor — like
+    /// [`Self::new_with_hooks_and_exempt_and_auth`] but also accepts
+    /// the operator-supplemental mass-write path-prefix carve-out list
+    /// (loaded from `/etc/northnarrow/mass-write-carveout.local` at
+    /// agent boot). Empty list = same behaviour as the simpler
+    /// constructor.
+    pub fn new_with_hooks_and_exempt_and_auth_and_extras(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook,
+        exempt: ExemptPids,
+        auth: AuthSessionTracker,
+        mass_write_extras: Vec<String>,
+    ) -> Self {
+        Self::build(
+            Some(entry),
+            Some(release),
+            exempt,
+            auth,
+            mass_write_extras,
+        )
     }
 
     fn build(
@@ -210,12 +238,14 @@ impl PostureMachine {
         combat_release_hook: Option<CombatReleaseHook>,
         exempt: ExemptPids,
         auth: AuthSessionTracker,
+        mass_write_extras: Vec<String>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
-                triggers: TriggerDetector::with_exempt_and_auth(exempt, auth),
+                triggers: TriggerDetector::with_exempt_and_auth(exempt, auth)
+                    .with_mass_write_extras(mass_write_extras),
                 combat_entry_hook,
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),
@@ -238,7 +268,11 @@ impl PostureMachine {
     ///
     /// `recent_events` should be the correlated context the agent
     /// already maintains (the same slice that ADE consumes).
-    pub fn observe(&self, event: &Event, recent_events: &[Event]) -> Option<PostureState> {
+    pub fn observe(
+        &self,
+        event: &Event,
+        recent_events: &[Event],
+    ) -> Option<(PostureState, Option<TriggerType>)> {
         let now = Instant::now();
         let hits = self.inner.triggers.detect(event, recent_events);
         if hits.is_empty() {
@@ -279,7 +313,7 @@ impl PostureMachine {
                     hook();
                 }
             }
-            Some(current)
+            Some((current, firing))
         } else {
             None
         }
