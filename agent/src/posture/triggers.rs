@@ -446,7 +446,11 @@ fn looks_dga(name: &str) -> bool {
 
 fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     let Event::FileOpen {
-        pid, uid, filename, ..
+        pid,
+        uid,
+        filename,
+        flags,
+        ..
     } = focal
     else {
         return false;
@@ -465,6 +469,37 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     // sshd, pkexec, …) to read these files — verified via the
     // kernel-resolved /proc/<pid>/exe symlink, not forgeable comm.
     if auth.is_auth_mediated(*pid) {
+        return false;
+    }
+    // BUG-018 (tactical) — systemd-user@<uid>.service children
+    // (dbus, xdg-desktop generators, gnome-keyring, …) routinely
+    // open /etc/passwd for NSS lookups; their lineage walks back
+    // to PID 1 systemd without traversing any AUTH_BINARY_EXES
+    // entry, so the T7.13 gate above doesn't catch them and every
+    // boot lands in ALERTED. Tactical carve-out:
+    //
+    //   if filename == "/etc/passwd"     ── one specific FP class
+    //   AND open is read-only             ── writes still flag
+    //   AND /proc/<pid>/loginuid is set   ── PAM-mediated session
+    //
+    // The signal is `loginuid`: set by `pam_loginuid` once per login
+    // session, write-protected after first set, and modifying it
+    // needs CAP_AUDIT_CONTROL — an unprivileged attacker can't
+    // forge it. A truly orphan process (started outside any PAM
+    // chain) has loginuid == 4294967295 and STILL trips this arm.
+    //
+    // Deliberately bounded:
+    //   - /etc/shadow + /etc/sudoers are NOT carved out (writes or
+    //     reads still flag);
+    //   - this is reads only (writes to /etc/passwd by a user
+    //     process are still anomalous and still flag);
+    //   - the binary signal is a tactical fix; the V2
+    //     continuous-trust redesign (POSTURE_FSM_V2_REDESIGN.md §5.2)
+    //     replaces it with a graded score.
+    if filename == "/etc/passwd"
+        && !is_write_open(*flags)
+        && auth.has_valid_loginuid(*pid)
+    {
         return false;
     }
     SENSITIVE_FILES.iter().any(|f| filename == f)
@@ -1237,6 +1272,143 @@ mod tests {
         );
         // And the mass-write SHOULD fire because lineage is non-auth.
         let _ = hits;
+    }
+
+    // ─── BUG-018 (tactical) — loginuid-mediated /etc/passwd carve-out
+    //
+    // The systemd-user@<uid>.service spawns user-session helpers
+    // (dbus, xdg-desktop generators) under PID 1 systemd, whose
+    // lineage never traverses AUTH_BINARY_EXES so the T7.13 gate
+    // doesn't catch them. The tactical fix is a narrowly-scoped
+    // loginuid carve-out: read-only /etc/passwd opens by a process
+    // with a valid /proc/<pid>/loginuid are not flagged.
+    //
+    // These tests use a fixture-backed AuthSessionTracker that reads
+    // /proc from a tempdir so loginuid lookups hit known content.
+
+    fn detector_with_fixture_proc(proc_root: &std::path::Path) -> TriggerDetector {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        let auth = AuthSessionTracker::new(proc_root);
+        TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth)
+    }
+
+    fn write_loginuid_fixture(dir: &std::path::Path, pid: u32, value: u32) {
+        let pid_dir = dir.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("loginuid"), value.to_string()).unwrap();
+    }
+
+    /// BUG-018 #1: PAM-authenticated user session helper (dbus,
+    /// xdg generator, etc.) opens /etc/passwd read-only. Carve-out
+    /// fires → no SensitiveFileAccess.
+    #[test]
+    fn bug018_systemd_user_helper_reading_passwd_is_exempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // pid 4242, loginuid=1000 — the canonical "user logged in
+        // via gdm/sshd and pam_loginuid wrote their UID" shape.
+        write_loginuid_fixture(tmp.path(), 4242, 1000);
+        let det = detector_with_fixture_proc(tmp.path());
+
+        // /etc/passwd, flags=0 (O_RDONLY).
+        let focal = file_open(4242, 1000, "/etc/passwd", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            !hits.contains(&TriggerType::SensitiveFileAccess),
+            "PAM-authenticated /etc/passwd read must NOT fire, got {hits:?}"
+        );
+    }
+
+    /// BUG-018 #2: truly orphan process (loginuid = unset sentinel)
+    /// reading /etc/shadow STILL fires. Two negative properties
+    /// in one test:
+    ///   (a) loginuid==UNSET doesn't pass the carve-out;
+    ///   (b) even with loginuid set, /etc/shadow is NOT in the
+    ///       carve-out scope (only /etc/passwd is).
+    #[test]
+    fn bug018_orphan_process_reading_shadow_still_fires() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Unset sentinel — the kernel default for any process not
+        // descended from pam_loginuid.
+        write_loginuid_fixture(tmp.path(), 9999, u32::MAX);
+        let det = detector_with_fixture_proc(tmp.path());
+
+        let focal = file_open(9999, 1000, "/etc/shadow", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "orphan-process /etc/shadow read must still fire, got {hits:?}"
+        );
+
+        // And even a PAM-authenticated reader of /etc/shadow is NOT
+        // carved out — only /etc/passwd reads are.
+        write_loginuid_fixture(tmp.path(), 8888, 1000);
+        let focal2 = file_open(8888, 1000, "/etc/shadow", 0, 2);
+        let hits2 = det.detect(&focal2, &[]);
+        assert!(
+            hits2.contains(&TriggerType::SensitiveFileAccess),
+            "PAM-authed /etc/shadow read must STILL fire (carve-out is /etc/passwd only), \
+             got {hits2:?}"
+        );
+    }
+
+    /// BUG-018 #3: existing T7.13 lineage (sshd→bash→sudo chain)
+    /// is unchanged. The is_auth_mediated gate fires BEFORE the
+    /// loginuid gate, so the original behavior is preserved.
+    #[test]
+    fn bug018_sshd_sudo_lineage_chain_still_exempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Fixture proc has NO loginuid file — so the only path to
+        // exemption is the T7.13 lineage walk.
+        let det = detector_with_fixture_proc(tmp.path());
+
+        // sshd (200) → bash (300) → sudo (400). Tracker ingest only.
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/bin/bash", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(400, 300, "/usr/bin/sudo", 3), &[]);
+
+        // sudo opens /etc/shadow — T7.13 carve-out applies.
+        let focal = file_open(400, 1000, "/etc/shadow", 0, 4);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            !hits.contains(&TriggerType::SensitiveFileAccess),
+            "sshd→bash→sudo lineage must remain exempt under BUG-018 changes, got {hits:?}"
+        );
+    }
+
+    /// BUG-018 #4: attacker process — invalid loginuid, no auth
+    /// lineage, opens /etc/passwd. carve-out doesn't apply →
+    /// trigger fires. Documents that loginuid is the GATE: without
+    /// it, even a /etc/passwd read still flags. Also covers the
+    /// "attacker writes /etc/passwd" case — writes never get the
+    /// carve-out, even with a valid loginuid.
+    #[test]
+    fn bug018_attacker_without_loginuid_still_fires() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Attacker with no loginuid file at all (started outside
+        // any PAM chain — e.g., dropped via a /tmp payload).
+        let det = detector_with_fixture_proc(tmp.path());
+
+        // /etc/passwd, read-only, but no loginuid → no carve-out.
+        let focal = file_open(31337, 1000, "/etc/passwd", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "attacker without loginuid reading /etc/passwd must fire, got {hits:?}"
+        );
+
+        // Even WITH a valid loginuid, a WRITE to /etc/passwd is
+        // anomalous (legit changes go through `passwd` which is in
+        // AUTH_BINARY_EXES). Carve-out is read-only; writes still
+        // flag.
+        write_loginuid_fixture(tmp.path(), 31338, 1000);
+        let focal2 = file_open(31338, 1000, "/etc/passwd", 1, 2); // O_WRONLY
+        let hits2 = det.detect(&focal2, &[]);
+        assert!(
+            hits2.contains(&TriggerType::SensitiveFileAccess),
+            "PAM-authed WRITE to /etc/passwd must still fire (carve-out is read-only), \
+             got {hits2:?}"
+        );
     }
 
     // ── Test #10: PID reuse invalidates lineage ─────────────────────

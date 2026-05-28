@@ -96,6 +96,30 @@ const TRACKER_CAP: usize = 2048;
 /// past the deepest real process tree on a healthy host.
 const LINEAGE_DEPTH_CAP: usize = 32;
 
+/// BUG-018 (tactical): sentinel value the kernel writes into
+/// `/proc/<pid>/loginuid` when no PAM-authenticated session has been
+/// established for that PID. Matches `AUDIT_UID_UNSET` in
+/// `<linux/audit.h>` — `(uid_t)-1`, which under Linux's `uid_t = u32`
+/// is `0xFFFF_FFFF`.
+///
+/// Why we care: `pam_loginuid` (run by every modern login chain —
+/// sshd, login, gdm, lightdm, systemd-logind's pam_systemd, and the
+/// user@<uid>.service unit it transitively starts) writes the
+/// authenticated user's UID into `loginuid` once per session, AFTER
+/// which the kernel's audit subsystem refuses further writes
+/// (`CONFIG_AUDIT_LOGINUID_IMMUTABLE`, the default since kernel 4.x).
+/// Even when the file IS writable, the write path requires
+/// `CAP_AUDIT_CONTROL` — unprivileged user processes cannot fake a
+/// valid value.
+///
+/// A process whose `loginuid` is NOT this sentinel is therefore in
+/// a PAM-authenticated session that the kernel cooperatively
+/// recorded. Tactical use case: distinguish systemd-user@<uid>.service
+/// children (legitimate user-session helpers) from truly orphan
+/// processes (a binary started outside any PAM chain). See BUG-018
+/// in the catalog for the FP this fixes.
+const LOGINUID_UNSET: u32 = u32::MAX;
+
 /// PID→{ppid, exe, spawn_ns} cache entry recorded from
 /// `Event::ProcessSpawn`. `spawn_ns` is retained for forward
 /// compatibility with a `(pid, start_ns)` PID-reuse disambiguator;
@@ -238,6 +262,47 @@ impl AuthSessionTracker {
         }
     }
 
+    /// BUG-018 (tactical): true iff `/proc/<pid>/loginuid` contains
+    /// a value other than [`LOGINUID_UNSET`].
+    ///
+    /// Interpreted as "this process is descended from a PAM-mediated
+    /// login chain that called `pam_loginuid`." Returns false when:
+    /// - the file is missing (kernel built without
+    ///   `CONFIG_AUDIT_LOGINUID_IMMUTABLE` ⇒ no /proc entry at all,
+    ///   OR the PID died between event and check),
+    /// - the file body doesn't parse as a `u32`,
+    /// - the value is the unset sentinel,
+    /// - PID 0 or 1 (terminator — never has a meaningful loginuid).
+    ///
+    /// Read every call (no cache): the file is one read per check,
+    /// well inside the per-event budget, and caching would just
+    /// duplicate `/proc`'s own per-task state.
+    ///
+    /// Used ONLY by [`super::triggers::sensitive_file_access`]'s
+    /// `/etc/passwd` read carve-out — explicitly bounded so the
+    /// trust widening doesn't bleed into other arms. The V2
+    /// continuous-trust redesign
+    /// (`docs/design/POSTURE_FSM_V2_REDESIGN.md` §5.2) replaces
+    /// this binary signal with a graded score.
+    pub fn has_valid_loginuid(&self, pid: u32) -> bool {
+        if pid == 0 || pid == 1 {
+            return false;
+        }
+        let path = self
+            .inner
+            .proc_root
+            .join(pid.to_string())
+            .join("loginuid");
+        let raw = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        match raw.trim().parse::<u32>() {
+            Ok(v) => v != LOGINUID_UNSET,
+            Err(_) => false,
+        }
+    }
+
     fn lookup_cache(&self, pid: u32) -> Option<(u32, PathBuf)> {
         let s = self.inner.state.read();
         s.map.get(&pid).map(|e| (e.ppid, e.exe.clone()))
@@ -302,6 +367,16 @@ mod tests {
             format!("Name:\tx\nPid:\t{pid}\nPPid:\t{ppid}\n"),
         )
         .unwrap();
+    }
+
+    /// BUG-018 fixture: write `/proc/<pid>/loginuid` with the given
+    /// raw value. Real kernel writes `"4294967295"` (the unset
+    /// sentinel) or a decimal UID; we mirror that exactly so the
+    /// parser path is exercised the way it runs in production.
+    fn write_loginuid(dir: &Path, pid: u32, value: u32) {
+        let pid_dir = dir.join(pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("loginuid"), value.to_string()).unwrap();
     }
 
     fn write_exe(dir: &Path, pid: u32, target: &str) {
@@ -483,6 +558,67 @@ mod tests {
         assert!(!is_auth_binary(Path::new("/tmp/sudo")));
         assert!(!is_auth_binary(Path::new("/usr/local/bin/sudo")));
         assert!(!is_auth_binary(Path::new("/usr/bin/sudo-helper")));
+    }
+
+    // ── BUG-018 (tactical): loginuid signal tests ──────────────────
+
+    /// Happy path: a process with `/proc/<pid>/loginuid` containing
+    /// a real UID (1000) is recognised as PAM-authenticated.
+    /// Mirrors what `pam_loginuid` writes during a real desktop /
+    /// SSH login.
+    #[test]
+    fn has_valid_loginuid_recognises_authenticated_session() {
+        let tmp = TempDir::new().unwrap();
+        write_loginuid(tmp.path(), 100, 1000);
+        let t = AuthSessionTracker::new(tmp.path());
+        assert!(t.has_valid_loginuid(100));
+    }
+
+    /// Negative: an orphan process whose loginuid was never set
+    /// (kernel default = `(uid_t)-1` = 4294967295). Tactical carve-out
+    /// must NOT fire for these.
+    #[test]
+    fn has_valid_loginuid_rejects_unset_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        write_loginuid(tmp.path(), 100, LOGINUID_UNSET);
+        let t = AuthSessionTracker::new(tmp.path());
+        assert!(!t.has_valid_loginuid(100));
+    }
+
+    /// Negative: missing `/proc/<pid>/loginuid` (PID died between
+    /// event and check, OR kernel without audit support). Fail
+    /// closed — treat as not authenticated.
+    #[test]
+    fn has_valid_loginuid_rejects_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        // No write at all — file is absent.
+        let t = AuthSessionTracker::new(tmp.path());
+        assert!(!t.has_valid_loginuid(100));
+    }
+
+    /// Negative: corrupt loginuid file (not parseable as u32).
+    /// Fail closed.
+    #[test]
+    fn has_valid_loginuid_rejects_garbage_content() {
+        let tmp = TempDir::new().unwrap();
+        let pid_dir = tmp.path().join("100");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("loginuid"), "not a number\n").unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        assert!(!t.has_valid_loginuid(100));
+    }
+
+    /// PID 0 (kernel) and PID 1 (init) are unconditional terminators
+    /// — they never have a meaningful loginuid even if /proc happens
+    /// to expose one.
+    #[test]
+    fn has_valid_loginuid_short_circuits_pid_zero_and_one() {
+        let tmp = TempDir::new().unwrap();
+        write_loginuid(tmp.path(), 0, 1000);
+        write_loginuid(tmp.path(), 1, 1000);
+        let t = AuthSessionTracker::new(tmp.path());
+        assert!(!t.has_valid_loginuid(0));
+        assert!(!t.has_valid_loginuid(1));
     }
 
     #[test]
