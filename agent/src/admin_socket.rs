@@ -1355,13 +1355,37 @@ fn dispatch_rotate_keys_add(
     auth: &AdminAuth,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
+    // BUG-013 (PHASE 15.1): bootstrap-mode 1-of-N gate. Consulted
+    // BEFORE verify_signed_payload_quorum so the relaxed min_distinct
+    // (1) goes into the verify call. The gate is evaluated against
+    // on-disk state (sentinel + nonce + admin.pub key count) and ALL
+    // three anti-downgrade conditions must hold; any other outcome
+    // falls through to the permanent 2-of-N path. See
+    // `crate::anti_tamper::bootstrap` for the full security argument.
+    let bootstrap_armed = match auth.config_path() {
+        Some(admin_pub_path) => {
+            let paths = crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(
+                admin_pub_path.to_path_buf(),
+            );
+            matches!(
+                crate::anti_tamper::bootstrap::evaluate(&paths),
+                crate::anti_tamper::bootstrap::BootstrapGate::Armed
+            )
+        }
+        // In-memory test builders have no config_path; bootstrap
+        // gate is structurally inapplicable. Fall through to the
+        // existing 2-of-N path.
+        None => false,
+    };
+    let min_distinct: u8 = if bootstrap_armed { 1 } else { 2 };
+
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
 
     let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
         &req.payload,
         &sigs,
-        2, // 2-of-N per §3.3
+        min_distinct, // 2-of-N normally; 1-of-N when bootstrap-armed (BUG-013)
         &[Role::RotateKeys],
         OperationCode::RotateKeysAdd,
         server_now,
@@ -1424,10 +1448,29 @@ fn dispatch_rotate_keys_add(
         return AdminResult::InvalidSignature;
     }
 
+    // BUG-013 (PHASE 15.1): if we entered this dispatch via the
+    // bootstrap-armed 1-of-N relaxation, scrub the sentinel now that
+    // the add is complete. Best-effort: any failure leaves a stale
+    // sentinel that the NEXT dispatch will scrub via the
+    // BootstrapAlreadyComplete arm (admin.pub now has ≥2 keys, so
+    // `evaluate` will remove it). If the gate was NOT armed (i.e.
+    // we took the normal 2-of-N path), there's nothing to clean up.
+    if bootstrap_armed {
+        let paths =
+            crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(config_path.clone());
+        if let Err(e) = crate::anti_tamper::bootstrap::complete(&paths) {
+            warn!(
+                error = ?e,
+                "BUG-013: post-bootstrap sentinel scrub failed (next dispatch will retry)"
+            );
+        }
+    }
+
     info!(
         target: "admin.rotate_keys",
         new_key_fp = %hex::encode(crate::anti_tamper::admin_auth::fingerprint_bytes(&new_pubkey)),
         role_count = roles.len(),
+        bootstrap_armed,
         "rotate-keys add: admin.pub updated + in-memory keys reloaded"
     );
     AdminResult::Success

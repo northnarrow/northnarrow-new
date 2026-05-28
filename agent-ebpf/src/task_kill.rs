@@ -28,7 +28,7 @@
 
 use aya_ebpf::{
     cty::{c_int, c_void},
-    helpers::bpf_probe_read_kernel,
+    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel},
     macros::{lsm, map},
     maps::{Array, HashMap},
     programs::LsmContext,
@@ -65,18 +65,32 @@ const EPERM: c_int = 1;
 #[map]
 pub static PROTECTED_PIDS: HashMap<u32, u8> = HashMap::pinned(16, 0);
 
-/// Tappa 8 stub: Ed25519-signed override capability. Slot 0 holds a
-/// monotonic token; a non-zero value means "current admin-signed
-/// kill request is in flight and may bypass the deny". In the
-/// Tappa 7 ELF the map is shipped empty and never written by the
-/// agent — that is the entire point of "anti-tamper Linux".
+/// BUG-010 (PHASE 15.1): PID-1 carve-out token. Slot 0 holds the
+/// agent's per-boot session nonce when the carve-out is armed;
+/// zero (the default) means the carve-out is dormant and even PID 1
+/// is denied.
+///
+/// The hook compares `KILL_OVERRIDE[0]` against [`AGENT_SESSION`]`[0]`.
+/// Both are written by the agent at boot (see
+/// `agent/src/anti_tamper/mod.rs::arm_kill_override`); a non-zero
+/// match plus `caller_tgid == 1` bypasses the deny. The double-map
+/// design lets a leftover pinned `KILL_OVERRIDE` from a prior install
+/// be effectively dead after restart (new session nonce won't match
+/// stale slot value).
 ///
 /// Pinned by-name alongside `PROTECTED_PIDS` so the pinned hook and
-/// userland share one kernel object. Tappa-8 caveat: a pinned
-/// override slot now PERSISTS across agent restart; Tappa 8 must
-/// zero slot 0 on boot before trusting it (see commit message).
+/// userland share one kernel object across agent restarts.
 #[map]
 pub static KILL_OVERRIDE: Array<u32> = Array::pinned(1, 0);
+
+/// BUG-010 (PHASE 15.1): per-boot session nonce. The agent picks a
+/// fresh random u32 at boot and writes the SAME value to both this
+/// map and [`KILL_OVERRIDE`] before LSM attach. The hook accepts the
+/// PID-1 carve-out only when both slots are equal and non-zero;
+/// otherwise (stale pinned slot from prior install, attacker who only
+/// wrote `KILL_OVERRIDE`, etc.) it falls through to the deny.
+#[map]
+pub static AGENT_SESSION: Array<u32> = Array::pinned(1, 0);
 
 #[lsm(hook = "task_kill")]
 pub fn task_kill(ctx: LsmContext) -> i32 {
@@ -129,15 +143,33 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
-    // Tappa 8 escape hatch. The map is empty in the shipped Tappa 7
-    // build; the lookup exists so the wiring is in place when the
-    // Ed25519 verifier lands.
-    let override_active = match KILL_OVERRIDE.get(0) {
-        Some(v) => *v,
-        None => 0,
-    };
-    if override_active != 0 {
-        return 0;
+    // BUG-010 (PHASE 15.1): PID-1 carve-out. systemd is the host's
+    // legitimate process supervisor; without this `systemctl restart`
+    // hangs forever (catalog §4). The carve-out fires ONLY when:
+    //   1. The caller is PID 1 (kernel-assigned; not spoofable from
+    //      userspace).
+    //   2. The agent has armed the override by writing matching
+    //      session-nonce values to KILL_OVERRIDE and AGENT_SESSION.
+    //      Both default to zero; a leftover pinned slot from a prior
+    //      install will not match the new agent's freshly-chosen
+    //      nonce, so stale pins are effectively dead.
+    // An attacker running `kill -TERM <agent>` from their own PID has
+    // `caller_tgid != 1` and is still denied. A root attacker capable
+    // of writing both BPF maps already has the kernel-side power to
+    // unpin the LSM hook outright — out of scope for the V1 model.
+    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if caller_tgid == 1 {
+        let override_val = match KILL_OVERRIDE.get(0) {
+            Some(v) => *v,
+            None => 0,
+        };
+        let session_val = match AGENT_SESSION.get(0) {
+            Some(v) => *v,
+            None => 0,
+        };
+        if override_val != 0 && override_val == session_val {
+            return 0;
+        }
     }
 
     -EPERM

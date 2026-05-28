@@ -354,15 +354,45 @@ enum SelectOutcome {
 /// realpath + emit a minimal `--pid-file` argv so the respawned
 /// agent writes to the same pidfile we'll wait on. Future W7
 /// commit reads the systemd unit's actual ExecStart.
+///
+/// BUG-011 (PHASE 15.1): the readlink can fail with EACCES until
+/// the agent's `spawn_watchdog_exempt_refresh` timer has
+/// registered the watchdog PID into PROTECTED_OBSERVERS.
+/// Retry with a 1 s cadence for up to 60 s before giving up —
+/// the agent's timer fires every 30 s, so 60 s is two ticks of
+/// budget. Production systemd units pass `--agent-bin` to skip
+/// this path entirely; the retry is the safety net for dev /
+/// manual installs.
 fn derive_agent_argv(agent_pid: u32, pidfile: &std::path::Path) -> Result<Vec<String>> {
-    let exe = std::fs::read_link(format!("/proc/{agent_pid}/exe"))
-        .with_context(|| format!("reading /proc/{agent_pid}/exe for argv reconstruction"))?;
-    let bin = exe.to_string_lossy().into_owned();
-    Ok(vec![
-        bin,
-        "--pid-file".to_string(),
-        pidfile.to_string_lossy().into_owned(),
-    ])
+    let exe_path = format!("/proc/{agent_pid}/exe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match std::fs::read_link(&exe_path) {
+            Ok(exe) => {
+                let bin = exe.to_string_lossy().into_owned();
+                return Ok(vec![
+                    bin,
+                    "--pid-file".to_string(),
+                    pidfile.to_string_lossy().into_owned(),
+                ]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "reading {exe_path} for argv reconstruction: EACCES persisted past 60s \
+                         deadline (agent's PROTECTED_OBSERVERS registration did not arrive — \
+                         pass --agent-bin in the systemd unit to bypass)"
+                    ));
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading {exe_path} for argv reconstruction"))
+            }
+        }
+    }
 }
 
 /// One full respawn cycle: spawn the agent, wait for its

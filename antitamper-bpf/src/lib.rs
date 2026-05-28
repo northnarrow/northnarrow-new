@@ -69,6 +69,14 @@ use tracing::{info, warn};
 /// joining this name onto the bpffs root.
 pub const PROTECTED_PIDS_MAP_NAME: &str = "PROTECTED_PIDS";
 
+/// BUG-011 (PHASE 15.1): name of the pinned `PROTECTED_OBSERVERS`
+/// map (mirrors the `#[map]` declaration in
+/// `agent-ebpf/src/ptrace_check.rs`). The agent's
+/// `spawn_watchdog_exempt_refresh` timer writes verified observer
+/// PIDs here; the `ptrace_access_check` LSM hook reads it on each
+/// fire. Pinned by-name so the registration survives agent restart.
+pub const PROTECTED_OBSERVERS_MAP_NAME: &str = "PROTECTED_OBSERVERS";
+
 /// Single bpffs directory holding every pinned anti-tamper object.
 /// Pre-extraction commit history (Tappa 7 task 6 #2 / #2b) pinned the
 /// six anti-tamper maps + the seven LSM programs + links here. One
@@ -545,6 +553,122 @@ where
     /// (which needs `&mut`) for each stale entry. Returning a
     /// `Vec` also matches the watchdog's diagnostic use cases
     /// (dump the protected set to a log line).
+    pub fn pids(&self) -> Result<Vec<u32>> {
+        Ok(self.map.keys().filter_map(Result::ok).collect())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BUG-011 (PHASE 15.1) — ProtectedObserversHandle
+// ────────────────────────────────────────────────────────────────────
+
+/// Typed handle to the pinned `PROTECTED_OBSERVERS` BPF map. Same
+/// shape as [`ProtectedPidsHandle`] (`HashMap<u32, u8>` with
+/// presence-as-signal semantics) but a distinct map name AND a
+/// distinct security contract:
+///
+/// - `PROTECTED_PIDS` ⇒ target may not be killed/ptraced; caller-side
+///   reciprocal grants observer rights to other PROTECTED_PIDS members.
+/// - `PROTECTED_OBSERVERS` ⇒ caller may ptrace-read PROTECTED_PIDS
+///   targets, but is NOT itself shielded from kill/ptrace by anyone.
+///
+/// Writers: ONLY the agent. The watchdog never writes this map (the
+/// watchdog is a CONSUMER — its read of `/proc/<agent>/exe` is what
+/// the carve-out exists to permit). Construction mirrors
+/// `ProtectedPidsHandle`: [`Self::open`] for path-based callers,
+/// [`Self::from_ebpf`] for the agent's in-process Ebpf instance.
+#[derive(Debug)]
+pub struct ProtectedObserversHandle<T = MapData> {
+    map: AyaHashMap<T, u32, u8>,
+}
+
+impl ProtectedObserversHandle<MapData> {
+    /// Open the pinned `PROTECTED_OBSERVERS` map at
+    /// `<bpffs_root>/PROTECTED_OBSERVERS`. Same failure modes as
+    /// [`ProtectedPidsHandle::open`] (pin missing, wrong shape).
+    pub fn open(bpffs_root: &Path) -> Result<Self> {
+        let pin_path = bpffs_root.join(PROTECTED_OBSERVERS_MAP_NAME);
+        let map_data = MapData::from_pin(&pin_path).with_context(|| {
+            format!(
+                "opening pinned {} at {}",
+                PROTECTED_OBSERVERS_MAP_NAME,
+                pin_path.display()
+            )
+        })?;
+        let map = AyaMap::HashMap(map_data);
+        let map = AyaHashMap::try_from(map).with_context(|| {
+            format!("{} is not a HashMap<u32, u8>", PROTECTED_OBSERVERS_MAP_NAME)
+        })?;
+        Ok(Self { map })
+    }
+}
+
+impl<'a> ProtectedObserversHandle<&'a mut MapData> {
+    /// Agent-facing constructor — borrow the `PROTECTED_OBSERVERS`
+    /// map from an already-loaded `Ebpf` instance.
+    pub fn from_ebpf(ebpf: &'a mut Ebpf) -> Result<Self> {
+        let map = ebpf
+            .map_mut(PROTECTED_OBSERVERS_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {PROTECTED_OBSERVERS_MAP_NAME} missing from eBPF object"))?;
+        let map = AyaHashMap::try_from(map).with_context(|| {
+            format!("{PROTECTED_OBSERVERS_MAP_NAME} is not a HashMap<u32, u8>")
+        })?;
+        Ok(Self { map })
+    }
+}
+
+impl<T> ProtectedObserversHandle<T>
+where
+    T: BorrowMut<MapData>,
+{
+    /// Register `pid` as a trusted observer. `BPF_ANY` upsert; safe
+    /// to call repeatedly for the same PID.
+    pub fn insert(&mut self, pid: u32) -> Result<()> {
+        self.map
+            .insert(pid, 1u8, 0)
+            .with_context(|| format!("inserting PID {pid} into {PROTECTED_OBSERVERS_MAP_NAME}"))?;
+        Ok(())
+    }
+
+    /// Remove `pid`. Absent ⇒ Ok (idempotent — the agent's refresh
+    /// timer may race with watchdog teardown).
+    pub fn evict(&mut self, pid: u32) -> Result<()> {
+        match self.map.remove(&pid) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if is_not_found_err(&e) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("evicting PID {pid} from {PROTECTED_OBSERVERS_MAP_NAME}")
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl<T> ProtectedObserversHandle<T>
+where
+    T: Borrow<MapData>,
+{
+    /// `true` if `pid` is currently registered as a trusted observer.
+    pub fn contains(&self, pid: u32) -> Result<bool> {
+        match self.map.get(&pid, 0) {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if is_not_found_err(&e) {
+                    Ok(false)
+                } else {
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("looking up PID {pid} in {PROTECTED_OBSERVERS_MAP_NAME}")
+                    })
+                }
+            }
+        }
+    }
+
+    /// Snapshot of every registered observer PID.
     pub fn pids(&self) -> Result<Vec<u32>> {
         Ok(self.map.keys().filter_map(Result::ok).collect())
     }
