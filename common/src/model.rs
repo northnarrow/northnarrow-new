@@ -42,6 +42,17 @@ pub enum Event {
         /// for the correlation engine (0 until D2 / older records).
         #[serde(default)]
         parent_start_ns: u64,
+        /// Cluster 15.3 / R011: BPF read `parent->flags & PF_KTHREAD`
+        /// at exec time. `true` iff the parent was a kernel thread —
+        /// non-forgeable from userspace (no prctl / unshare / ns trick
+        /// can flip this bit). `false` covers BOTH "real userspace
+        /// parent" AND "BPF read failed" — R011 treats both identically
+        /// (fail-secure FIRE) so a mis-validated offset / older BPF /
+        /// flag-unset event never silently exempts. `#[serde(default)]`
+        /// preserves backward compat with pre-cluster-15.3 serialized
+        /// records (they decode as `false` → fail-secure).
+        #[serde(default)]
+        parent_is_kthread: bool,
     },
     /// File open event (LSM `file_open`).
     FileOpen {
@@ -278,6 +289,11 @@ impl From<&ProcessSpawnRaw> for Event {
             argv: parse_argv_blob(&raw.argv, raw.argv_len),
             parent_comm: crate::wire::cstr_lossy(&raw.parent_comm).into_owned(),
             parent_start_ns: raw.parent_start_ns,
+            // Cluster 15.3 / R011: any non-zero byte from the BPF side
+            // is "parent IS a kthread". Zero (the default for a BPF
+            // read failure OR an older BPF that doesn't set this
+            // field) decodes to `false` → R011 fail-secure path.
+            parent_is_kthread: raw.parent_is_kthread != 0,
         }
     }
 }

@@ -243,6 +243,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("xmrig"));

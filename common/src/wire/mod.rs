@@ -41,6 +41,14 @@ pub const ARGV_LEN: usize = 512;
 /// `argv_len` (the argv + parent-context refit). The BPF side keeps
 /// emitting zero for these until D2 wires the reads; userland decodes a
 /// zeroed tail into empty/`0` defaults (mixed-fleet safe).
+///
+/// Cluster 15.3 APPENDED `parent_is_kthread` (one byte + 5 trailing
+/// pad bytes reclaimed from the old 6-byte pad → total size
+/// unchanged at 840). BPF reads
+/// `parent->flags & PF_KTHREAD` and writes `1`/`0`; userland decodes
+/// `0` → "false / unknown" → R011 fires (fail-secure). An old-BPF /
+/// new-userland combination naturally surfaces a zeroed byte which is
+/// the safe default — no fleet-wide upgrade required.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -62,9 +70,19 @@ pub struct ProcessSpawnRaw {
     /// Bytes written into `argv` (≤ `ARGV_LEN`); clamp flag if it hit
     /// the cap. `argc` is derived userland-side by counting NULs.
     pub argv_len: u16,
+    /// Cluster 15.3 / R011: `1` iff the kernel marked the parent task
+    /// with `PF_KTHREAD` at exec time (real kernel thread — kworker
+    /// running udev/hardware-probe modprobe). `0` means either "not a
+    /// kthread" OR "BPF could not read parent->flags" — both are
+    /// treated identically by R011 (fail-secure FIRE). Non-forgeable
+    /// from userspace: PF_KTHREAD is set by the kernel on kthread
+    /// creation and cannot be cleared via `prctl(PR_SET_NAME)` or
+    /// any other unprivileged op.
+    pub parent_is_kthread: u8,
     /// Explicit pad → no implicit `bytemuck::Pod` padding (size 840,
-    /// align 8).
-    pub _pad: [u8; 6],
+    /// align 8). Shrunk from 6 → 5 bytes when `parent_is_kthread`
+    /// was added (cluster 15.3); total size unchanged.
+    pub _pad: [u8; 5],
 }
 
 impl ProcessSpawnRaw {
@@ -83,7 +101,8 @@ impl ProcessSpawnRaw {
             parent_start_ns: 0,
             argv: [0u8; ARGV_LEN],
             argv_len: 0,
-            _pad: [0u8; 6],
+            parent_is_kthread: 0,
+            _pad: [0u8; 5],
         }
     }
 }
@@ -861,7 +880,8 @@ mod tests {
                 a
             },
             argv_len: 7,
-            _pad: [0u8; 6],
+            parent_is_kthread: 0,
+            _pad: [0u8; 5],
         };
 
         let bytes: &[u8] = bytemuck::bytes_of(&original);

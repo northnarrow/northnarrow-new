@@ -18,6 +18,35 @@
 /// `getpid(2)` returns to userland. `bits_offset=19936` from BTF.
 pub(crate) const TASK_STRUCT_TGID_OFFSET: usize = 2492;
 
+/// `struct task_struct.flags` — `unsigned int` per-task flag bitmap
+/// (`PF_KTHREAD=0x00200000` etc., see `include/linux/sched.h`).
+///
+/// Cluster 15.3 / R011: read off the PARENT task to obtain a
+/// non-forgeable "is this exec spawned by a real kernel thread?"
+/// signal. Replaces the userspace `/proc/<ppid>/exe` absence check
+/// (BUG-008' P-7) which raced against kthread reaping and over-fired
+/// on already-gone modprobe spawns.
+///
+/// Validated 2026-05-28 against `/sys/kernel/btf/vmlinux` on
+/// `6.6.114.1-microsoft-standard-WSL2` via `bpftool btf dump file
+/// /sys/kernel/btf/vmlinux format raw` (`[204] STRUCT 'task_struct'
+/// size=13440` → `'flags' type_id=3 bits_offset=352`, byte 44).
+/// `flags` sits right after `thread_info` (40 B on x86_64) and
+/// `__state` (4 B), which is a structurally stable position across
+/// modern x86_64 kernels — every recent Linux LTS / Ubuntu LTS
+/// places it at the same byte. Production Ubuntu 24.04 / 6.8.x is
+/// expected to read the same value; the planned boot-time BTF
+/// revalidator (`btf_offsets.rs` module header TODO) will fail
+/// LOUD on drift, and R011's PF_KTHREAD test fails CLOSED on an
+/// unreadable parent (over-fire, not under-fire).
+pub(crate) const TASK_STRUCT_FLAGS_OFFSET: usize = 44;
+
+/// `PF_KTHREAD` per-task flag (bit 21) — `include/linux/sched.h`.
+/// Set by the kernel on every genuine kernel thread (kworker,
+/// ksoftirqd, etc.); userspace cannot set or clear it. The
+/// canonical "is this a real kthread?" test.
+pub(crate) const PF_KTHREAD: u32 = 0x0020_0000;
+
 // ── Tappa 10.6 D2 — process-spawn argv + parent context ──────────────
 //
 // Validated 2026-05-21 against `/sys/kernel/btf/vmlinux` on

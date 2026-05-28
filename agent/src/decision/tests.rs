@@ -88,6 +88,7 @@ fn proc_self_fd_takes_priority_over_other_matches() {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         })
         .expect("should fire");
     assert_eq!(v.rule_id, "R004_ExecFromProcSelfFd");

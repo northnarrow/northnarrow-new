@@ -44,9 +44,9 @@ use core::mem::MaybeUninit;
 use northnarrow_common::wire::{ProcessSpawnRaw, ARGV_LEN, FILENAME_LEN, TASK_COMM_LEN};
 
 use crate::btf_offsets::{
-    MM_STRUCT_ARG_END_OFFSET, MM_STRUCT_ARG_START_OFFSET, TASK_STRUCT_COMM_OFFSET,
-    TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
-    TASK_STRUCT_TGID_OFFSET,
+    MM_STRUCT_ARG_END_OFFSET, MM_STRUCT_ARG_START_OFFSET, PF_KTHREAD, TASK_STRUCT_COMM_OFFSET,
+    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
+    TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 
 /// Ringbuffer carrying [`ProcessSpawnRaw`] events to userland.
@@ -205,6 +205,29 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                         parent.add(TASK_STRUCT_COMM_OFFSET) as *const u8,
                         dst,
                     );
+                }
+
+                // Cluster 15.3 / R011: read parent->flags and test
+                // PF_KTHREAD. Non-forgeable from userspace — the
+                // kernel sets PF_KTHREAD on kthread creation and no
+                // unprivileged op (prctl, unshare, ns trick) can
+                // toggle it. Replaces R011's prior userspace
+                // /proc/<ppid>/exe absence check which raced against
+                // kthread reaping and over-fired.
+                //
+                // Fail-secure on read error: a failed probe leaves
+                // parent_is_kthread at 0 (false), which R011 treats
+                // as "userspace parent → FIRE". An off-by-offset
+                // BPF / older-BPF-newer-userland combination also
+                // surfaces as zero → fire. The only path to
+                // EXEMPTION is a successful read with the PF_KTHREAD
+                // bit set.
+                if let Ok(flags) = unsafe {
+                    bpf_probe_read_kernel::<u32>(parent.add(TASK_STRUCT_FLAGS_OFFSET) as *const _)
+                } {
+                    if flags & PF_KTHREAD != 0 {
+                        unsafe { (*raw_ptr).parent_is_kthread = 1 };
+                    }
                 }
             }
         }

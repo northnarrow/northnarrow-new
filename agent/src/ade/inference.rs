@@ -615,6 +615,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         });
         assert_eq!(v.verdict, AdeAction::Kill);
         assert_eq!(v.severity, AdeSeverity::High);
@@ -633,6 +634,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         });
         assert_eq!(v.verdict, AdeAction::Allow);
         assert_eq!(v.severity, AdeSeverity::None);
@@ -651,6 +653,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         });
         assert_eq!(v.verdict, AdeAction::KillTree);
         assert_eq!(v.severity, AdeSeverity::Critical);
@@ -669,6 +672,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         });
         assert_eq!(v.verdict, AdeAction::Escalate);
         assert_eq!(v.escalation_tier, Some(EscalationTier::Tier1Review));
@@ -688,6 +692,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         });
         assert_eq!(v.verdict, AdeAction::Alert);
         assert_eq!(v.severity, AdeSeverity::Medium);

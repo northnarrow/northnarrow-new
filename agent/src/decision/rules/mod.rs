@@ -237,6 +237,7 @@ pub(crate) mod testutil {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 
@@ -254,6 +255,7 @@ pub(crate) mod testutil {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 
@@ -278,6 +280,7 @@ pub(crate) mod testutil {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             parent_comm: parent_comm.to_string(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 }

@@ -62,6 +62,7 @@ async fn main() -> ExitCode {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
 
     println!("\nrunning a 4-token decode on a 5-word prompt...");
