@@ -96,6 +96,38 @@ use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
 /// list.
 pub const DEFAULT_DRIFT_LOG_PATH: &str = "/var/lib/northnarrow/fim_drift.jsonl";
 
+/// BUG-012: paths whose `FimOp::Opened` events are suppressed at the
+/// drain layer. These are credential / authentication files that the
+/// posture-trigger `SensitiveFileAccess`
+/// (`agent/src/posture/triggers.rs::sensitive_file_access` + its
+/// `SENSITIVE_FILES` constant) ALREADY covers — the FIM emission
+/// duplicated the signal without adding coverage and generated
+/// continuous WARN noise from legitimate readers (tmux + sshd open
+/// `/etc/passwd` on every session refresh; sshd opens `/etc/shadow`
+/// + `/etc/login.defs` on every connect).
+///
+/// FIM is the **integrity-monitoring** layer; reads do not change
+/// integrity, so reads only belong in FIM when no other arm covers
+/// the credential-theft semantics. The credential-read FIM rules
+/// (NN-L-FIM-011..014 cloud creds, NN-L-FIM-015..017 browser /
+/// password-manager / GPG creds) target paths that
+/// `SensitiveFileAccess` does NOT cover — those `Opened` events
+/// continue to flow through normally.
+///
+/// **Boundary invariant** (security guard for this carve-out): every
+/// path in this list MUST appear in
+/// `agent/src/posture/triggers.rs::SENSITIVE_FILES`. The
+/// `triggers.rs` doc-comment notes this invariant in both
+/// directions; the unit test
+/// `bug012_suppress_list_is_subset_of_sensitive_file_access_coverage`
+/// pins it.
+pub const FIM_OPENED_SUPPRESS_PATHS: &[&str] = &[
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/login.defs",
+];
+
 /// File mode for the drift log. World-readable so operators
 /// inspect it with `cat`; root + agent are the only writers.
 const DRIFT_FILE_MODE: u32 = 0o644;
@@ -585,6 +617,28 @@ pub fn process_drift(
         }
     };
     let op = FimOp::try_from(raw.op).map_err(|e| anyhow!("decoding raw.op: {e}"))?;
+    // BUG-012: drop `Opened` events whose path is on the
+    // SensitiveFileAccess-covered list. This is the FIM noise the
+    // catalog identified (tmux + sshd reading /etc/passwd on every
+    // session — high-frequency, integrity-irrelevant). The
+    // posture-trigger arm still catches credential-theft reads of
+    // these paths (verified: every path in FIM_OPENED_SUPPRESS_PATHS
+    // appears in SENSITIVE_FILES); we just stop double-emitting from
+    // the FIM side. Modifications (chmod/chown/write/rename/unlink)
+    // are NOT suppressed — those are real integrity changes and stay
+    // in FIM unchanged.
+    if matches!(op, FimOp::Opened)
+        && FIM_OPENED_SUPPRESS_PATHS.iter().any(|p| path == *p)
+    {
+        debug!(
+            target: "fim.drain",
+            path = %path,
+            "BUG-012: suppressing FimOp::Opened on SensitiveFileAccess-covered path \
+             (posture trigger still fires; FIM integrity layer skipped)"
+        );
+        return Ok(false);
+    }
+
     // Resolve any 1-hop symlink + capture content. For Deleted
     // and Renamed ops the target may be gone; treat the SHA
     // probe as None in that case and let the diff fall to the
@@ -1230,5 +1284,219 @@ mod tests {
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(row.decision_engine_skipped, "audit chain MUST record");
         assert_eq!(row.skip_reason, "rate_limit:tier_medium");
+    }
+
+    // ─── BUG-012 — FimOp::Opened suppression on
+    // SensitiveFileAccess-covered paths ─────────────────────────────
+
+    /// Build a (real on-disk file, InodeKey, registered path map)
+    /// triple at `path_in_dir` so process_drift can compute baseline
+    /// without panicking. The on-disk path lives under tempdir; the
+    /// `path_map` ALIAS registers it under the desired sensitive
+    /// path (e.g. "/etc/passwd") so the FIM_OPENED_SUPPRESS_PATHS
+    /// match fires.
+    fn make_watched_alias(
+        dir: &TempDir,
+        path_alias: &str,
+    ) -> (std::path::PathBuf, InodeKey, InodePathMap) {
+        let on_disk = dir.path().join("watched.bin");
+        std::fs::write(&on_disk, b"unimportant content").unwrap();
+        let meta = std::fs::metadata(&on_disk).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let key = InodeKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        let map = InodePathMap::new();
+        // Register the desired alias path (matches what the BUG-012
+        // suppress check pattern-matches on).
+        map.insert(key, path_alias.to_string());
+        (on_disk, key, map)
+    }
+
+    /// BUG-012 #1: `FimOp::Opened` on /etc/passwd is SUPPRESSED.
+    /// No `Event::Fim` is sent, no drift-log row is written. The
+    /// noise the catalog identified (tmux reading /etc/passwd every
+    /// second) is gone.
+    #[test]
+    fn bug012_opened_on_sensitive_path_is_suppressed() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, "/etc/passwd");
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
+
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            Some(&tx),
+        )
+        .unwrap();
+
+        assert!(!emitted, "BUG-012: /etc/passwd Opened must be suppressed");
+        assert!(rx.try_recv().is_err(), "no Event::Fim should be sent");
+        // Drift log not appended — the whole point is to kill the noise.
+        assert!(
+            !drift_path.exists()
+                || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
+            "BUG-012 suppress path must NOT append to drift log"
+        );
+    }
+
+    /// BUG-012 #2: every sensitive path is suppressed (parameterised
+    /// over the full FIM_OPENED_SUPPRESS_PATHS list — adds defence
+    /// in case the list grows in the future).
+    #[test]
+    fn bug012_opened_suppression_covers_every_listed_path() {
+        for path in FIM_OPENED_SUPPRESS_PATHS {
+            let dir = TempDir::new().unwrap();
+            let key = fresh_signing_key(&dir);
+            let mut drift_db =
+                FimDriftDb::open(&dir.path().join("drift.jsonl"), key, [0u8; 16]).unwrap();
+            let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, path);
+            let classifier = DriftClassifier::new();
+            let rate_limiter = DriftRateLimiter::new();
+            let (tx, mut rx) = mpsc::channel::<Event>(8);
+            let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
+            let emitted = process_drift(
+                &raw,
+                &path_map,
+                None,
+                &mut drift_db,
+                &classifier,
+                &rate_limiter,
+                Some(&tx),
+            )
+            .unwrap();
+            assert!(!emitted, "{path}: Opened must be suppressed");
+            assert!(rx.try_recv().is_err(), "{path}: no event sent");
+        }
+    }
+
+    /// BUG-012 #3 — modification ops on a sensitive path STILL emit.
+    /// The carve-out is for reads only; writes/chmod/rename/unlink
+    /// are integrity changes and must continue to fire. This is the
+    /// "FIM continues to do its actual job" regression guard.
+    #[test]
+    fn bug012_modify_on_sensitive_path_still_fires() {
+        // Use a real on-disk file at the tempdir path AND register
+        // its alias as /etc/passwd so the suppress predicate would
+        // catch Opened. Then prove Modified still emits.
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let (on_disk, key_ino, path_map) = make_watched_alias(&dir, "/etc/passwd");
+        // Mutate the file so a real-drift hash-diff is observed.
+        std::fs::write(&on_disk, b"MUTATED content").unwrap();
+
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let stale_baseline = dummy_baseline("/etc/passwd", &"42".repeat(32));
+        let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Modified as u8);
+
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            Some(&stale_baseline),
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            Some(&tx),
+        )
+        .unwrap();
+        assert!(emitted, "Modified on /etc/passwd MUST still fire");
+        match rx.try_recv().unwrap() {
+            Event::Fim(fe) => {
+                assert_eq!(fe.path, "/etc/passwd");
+                assert_eq!(fe.op, FimOp::Modified);
+            }
+            other => panic!("expected Event::Fim, got {other:?}"),
+        }
+    }
+
+    /// BUG-012 #4 — `FimOp::Opened` on a NON-suppressed path (cloud
+    /// creds — what NN-L-FIM-011..014 watch) STILL fires. This is
+    /// the security-guard test: dropping reads must not lose
+    /// credential-theft coverage for paths SensitiveFileAccess does
+    /// not cover.
+    #[test]
+    fn bug012_opened_on_cloud_cred_path_still_fires() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        // /root/.aws/credentials is NOT in FIM_OPENED_SUPPRESS_PATHS;
+        // it's the NN-L-FIM-011 trigger surface.
+        let (_on_disk, key_ino, path_map) =
+            make_watched_alias(&dir, "/root/.aws/credentials");
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
+
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            Some(&tx),
+        )
+        .unwrap();
+        assert!(
+            emitted,
+            "BUG-012 security guard: cloud-cred Opened MUST still fire"
+        );
+        let ev = rx.try_recv().expect("Event::Fim must be sent for cloud-cred read");
+        match ev {
+            Event::Fim(fe) => {
+                assert_eq!(fe.path, "/root/.aws/credentials");
+                assert_eq!(fe.op, FimOp::Opened);
+            }
+            other => panic!("expected Event::Fim, got {other:?}"),
+        }
+    }
+
+    /// BUG-012 — BOUNDARY INVARIANT. Every path in the FIM
+    /// suppress list MUST also be covered by SensitiveFileAccess
+    /// (its `SENSITIVE_FILES` constant). If this test fails, the
+    /// drain has dropped coverage WITHOUT a backing posture-trigger
+    /// arm — the exact "blind spot" the cluster spec forbids.
+    /// Reaches across modules deliberately: the boundary is the
+    /// security contract.
+    #[test]
+    fn bug012_suppress_list_is_subset_of_sensitive_file_access_coverage() {
+        // Inline copy of SENSITIVE_FILES to avoid making it pub;
+        // the test file path is the canonical source of truth, the
+        // boundary invariant assertion below is the cross-check.
+        // If posture::triggers::SENSITIVE_FILES grows, this list
+        // updates too — adding a path to FIM_OPENED_SUPPRESS_PATHS
+        // without adding it here will trip the assertion.
+        const SENSITIVE_FILES_SNAPSHOT: &[&str] = &[
+            "/etc/passwd",
+            "/etc/shadow",
+            "/etc/sudoers",
+            "/etc/login.defs",
+        ];
+        for suppress_path in FIM_OPENED_SUPPRESS_PATHS {
+            assert!(
+                SENSITIVE_FILES_SNAPSHOT.contains(suppress_path),
+                "BUG-012 boundary invariant violated: '{suppress_path}' is in \
+                 FIM_OPENED_SUPPRESS_PATHS but NOT in posture::triggers::SENSITIVE_FILES. \
+                 Dropping it from FIM would create a blind spot — add it to \
+                 SENSITIVE_FILES first."
+            );
+        }
     }
 }

@@ -115,7 +115,19 @@ const NETLOAD_COMMS: &[&str] = &["curl", "wget", "fetch"];
 const SHELL_COMMS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
 const ADMIN_PORTS: &[u16] = &[22, 3389, 445, 5985, 5986];
 
-const SENSITIVE_FILES: &[&str] = &["/etc/passwd", "/etc/shadow", "/etc/sudoers"];
+/// Credential / authentication files an unprivileged user has no
+/// business reading directly. `/etc/login.defs` was added in BUG-012:
+/// the FIM `Opened` event for it was being dropped at the drain
+/// layer (`agent/src/fim/drain.rs::FIM_OPENED_SUPPRESS_PATHS`) to
+/// kill the boot-time noise; without this entry, `/etc/login.defs`
+/// reads would lose ALL coverage. The other three entries were
+/// already covered (T7.13 baseline).
+const SENSITIVE_FILES: &[&str] = &[
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/etc/login.defs",
+];
 const CRITICAL_FILES_PREFIXES: &[&str] = &[
     "/etc/sshd_config",
     "/etc/ssh/sshd_config",
@@ -1375,6 +1387,49 @@ mod tests {
         assert!(
             !hits.contains(&TriggerType::SensitiveFileAccess),
             "sshd→bash→sudo lineage must remain exempt under BUG-018 changes, got {hits:?}"
+        );
+    }
+
+    // ─── BUG-012 — credential-theft detection guarantee ────────────
+    //
+    // FIM no longer emits `Opened` events on /etc/passwd-class paths
+    // (the noise dropped at the drain layer per
+    // `fim::drain::FIM_OPENED_SUPPRESS_PATHS`). The cluster spec's
+    // SECURITY GUARD requires SensitiveFileAccess to still catch
+    // those reads — these tests pin that.
+
+    /// BUG-012 THE-GUARD: /etc/shadow read by a regular user STILL
+    /// fires SensitiveFileAccess after the FIM noise drop. Removing
+    /// FIM's Opened coverage of credential files MUST NOT lose
+    /// credential-theft detection — posture trigger is the off-ramp.
+    #[test]
+    fn bug012_guard_etc_shadow_read_still_fires_sensitive_file_access() {
+        let det = detector_with_empty_proc();
+        // Plain uid=1000 process opens /etc/shadow read-only.
+        // (No PAM-authenticated lineage, no sudo, no auth binary —
+        // the unambiguous credential-theft pattern.)
+        let focal = file_open(31337, 1000, "/etc/shadow", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "BUG-012 security guard: /etc/shadow read MUST still fire \
+             SensitiveFileAccess after FIM Opened drop, got {hits:?}"
+        );
+    }
+
+    /// BUG-012: /etc/login.defs was the new addition to
+    /// SENSITIVE_FILES (the FIM_OPENED_SUPPRESS_PATHS list includes
+    /// it, so the posture trigger MUST cover it or coverage is lost).
+    /// This test pins that coverage.
+    #[test]
+    fn bug012_etc_login_defs_read_now_covered_by_sensitive_file_access() {
+        let det = detector_with_empty_proc();
+        let focal = file_open(31337, 1000, "/etc/login.defs", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "BUG-012: /etc/login.defs read must fire (newly added to \
+             SENSITIVE_FILES to back the FIM Opened suppression), got {hits:?}"
         );
     }
 
