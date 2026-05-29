@@ -3,7 +3,7 @@
 **Status:** Catalog. NOT implementation. Read-only design document.
 **Session date:** 2026-05-27 → 2026-05-28.
 **Branch context:** `benchmark/cc-t7-13-fix` on commits `5a0d736` (T7.13 lineage) and `1c15300` (tactical fix sweep). Phase B design doc at `docs/design/POSTURE_FSM_V2_REDESIGN.md` (commit `592bf7f`).
-**Total findings:** 13 + 3 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; all added 2026-05-29 during VM runtime validation — **BUG-019** (credential FIM) fixed + VM-validated, **BUG-020** (install.sh anti-tamper pin) tactical-fixed (structural design-pending), **BUG-021** (logging disk-saturation) fixed + VM-validated).
+**Total findings:** 13 + 9 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; all added 2026-05-29 — **BUG-019** (credential FIM) fixed + VM-validated, **BUG-020** (install.sh anti-tamper pin) tactical-fixed/structural-pending, **BUG-021** (logging journal) fixed + VM-validated; and **BUG-022..027** (§20-25) from the audit sweep run `wf_2027282a-052` — discovered via static analysis + adversarial refutation, **VM-validation PENDING** (operator-owned)).
 
 This document is the authoritative session-findings record. Each entry is
 self-contained (ID, severity, status, symptom, root cause, reproducer, fix or
@@ -33,6 +33,12 @@ recommended fix directions.
 | 14 | BUG-019 | Credential FIM rules dead under `ProtectHome=yes` *(post-session, §17)* | Beta-blocker (security HIGH) | **Fixed + VM-validated** (2026-05-29) |
 | 15 | BUG-020 | `install.sh` reinstall denied by pinned anti-tamper (honeypot-bait rewrite) *(post-session, §18)* | Beta-blocker (operational) | **Tactical fix applied** (reinstall unblocked); structural design-pending |
 | 16 | BUG-021 | Disk saturation: NN journal amplified to an uncapped `/var/log/syslog` *(post-session, §19)* | Beta-blocker (availability) | **Fixed + VM-validated** (2026-05-29) |
+| 17 | BUG-022 | FIM directory watches are bare-inode-only (no populate recursion) → a rule family is dead/blind *(audit sweep, §20)* | Beta-blocker (security) | **Discovered** (static + adversarial) — VM-validation pending |
+| 18 | BUG-023 | No content-write/append FIM hook → in-place content tamper unobserved *(audit sweep, §21)* | Beta-blocker (security) | **Discovered** (static + adversarial) — VM-validation pending |
+| 19 | BUG-024 | FS_PROTECT_EVENTS pinned-ringbuf reuse vs NON-transient producer (FS_FIM_EVENTS sibling) *(audit sweep, §22)* | High | **Discovered** (static + adversarial) — VM-validation pending |
+| 20 | BUG-025 | NN-L-NET-003 BadJa3 dead rule — `tls_fingerprint` has no live producer *(audit sweep, §23)* | Medium | **Discovered** (static + adversarial) — VM-validation pending |
+| 21 | BUG-026 | Uncapped on-disk JSONL logs — second disk-fill vector, **REOPENS BUG-021** *(audit sweep, §24)* | Beta-blocker (availability) | **Discovered** (static + adversarial) — VM-validation pending |
+| 22 | BUG-027 | `DnsCache.by_pid` unbounded per-PID-key growth (no cap/eviction) *(audit sweep, §25)* | Medium | **Discovered** (static + adversarial) — VM-validation pending |
 
 ---
 
@@ -739,6 +745,19 @@ write authority across a directory that should be read-only at runtime.
 (BUG-009-arch) for the migration steps. Eliminates the P-1 drop-in once
 the relocation lands.
 
+**Audit-sweep escalation (2026-05-29, run `wf_2027282a-052`) — fresh-install beta-blocker.**
+The sweep's adversarial pass re-confirmed FOUR distinct `ProtectSystem=strict` EROFS
+exposures on FIRST boot: the mint of `/etc/northnarrow/agent.sig.key` (audit.rs:193,247),
+`agent_id` (agent_id.rs:127,184 → zero-UUID anti-replay degrade), `master.key`
+(response/quarantine.rs:352 → quarantine response fails), and `audit.log` (admin ops run
+UNAUDITED). On THIS dev host they are masked ONLY by the **runtime-only** `readwritepaths.conf`
+drop-in (the BUG-009 P-1 fix, which is NOT in repo). A fresh customer install via
+`deploy/install.sh` does NOT ship that drop-in, so a stock install hits all four on first
+boot. This makes **BUG-009-arch a fresh-install beta-blocker**, not a cleanliness deferral:
+until runtime-state relocates to `/var/lib/northnarrow/` (or the drop-in ships in-repo), a
+stock install is exposed. (These four were filed *refuted* by the sweep only because they are
+not NOVEL — they ARE BUG-009 — not because they are unreachable.)
+
 ---
 
 ## 16. Verification gaps in this catalog
@@ -834,6 +853,7 @@ The rewrite only succeeds on a **fresh boot before the agent attaches** (no pins
 **References.**
 - Cluster: **anti-tamper trust model gap** (§15.1) — BUG-020 is the fourth instance (installer) alongside BUG-010 (controller), BUG-011 (observer), BUG-013 (authority).
 - Discovered while validating **BUG-019** (§17); the manual `daemon-reload` workaround kept that validation unblocked.
+- **Independently re-confirmed by the audit sweep** (run `wf_2027282a-052`) as a CASCADE inconsistent-deploy finding: when a release ships changed bait content to a running (pinned) host, the abort leaves new binaries live + a stale systemd catalogue (the residual above). This is the 4th of the sweep's four cascade findings (the other three are disk-fill — see [[BUG-026]] §24).
 - Code: honeypot rewrite loop in `deploy/install.sh` (`HONEYPOT_BAIT_DIRS`); caller-side exemption in `agent-ebpf/src/inode_protect.rs` (`PROTECTED_PIDS` check); pin lifecycle in `agent/src/anti_tamper/`.
 
 ---
@@ -880,6 +900,151 @@ The journal caps + rotates at the ceiling instead of growing unbounded, and sysl
 - Cluster sibling of **BUG-009** (§3) and **BUG-019** (§17): all three are a systemd/journald **default or hardening directive interacting badly with NN's needs and failing silent** — `ProtectSystem=strict` blocked `/etc` writes (009), `ProtectHome=yes` blocked `/home`+`/root` FIM reads (019), `ForwardToSyslog=yes` + no cap amplified into an unbounded syslog (021). Standing lesson: every `Protect*` / `*Paths` / journald / rsyslog default must be checked against NN's actual runtime footprint.
 - **BUG-020** (§18) was discovered during this fix's reinstall (install.sh honeypot rewrite denied by the pinned anti-tamper hook).
 - Commit `e799d76`. Files: `deploy/systemd/{northnarrow-agent,northnarrow-watchdog}.service`, `deploy/systemd/journald@northnarrow.conf`, `deploy/install.sh`, + 11 `journalctl --namespace=northnarrow` doc/script updates.
+
+---
+
+> **§20–§25 provenance.** All six entries below were surfaced by the discovery-only audit
+> sweep (Dynamic Workflow run `wf_2027282a-052`, 2026-05-29: 38 read-only agents, 31 candidates
+> → 20 confirmed / 11 refuted, each confirmed candidate survived an adversarial refutation pass).
+> Status on every entry: **discovered via static analysis + adversarial refutation — VM-validation
+> PENDING** (the operator runtime-confirms before any fix). NO fixes applied. §20/§21 are CLUSTER
+> headers (one root cause, many symptom rules); §22–§25 are independent findings.
+
+---
+
+## 20. BUG-022 — FIM directory watches are bare-inode-only (no populate recursion): a rule family is dead/blind *(audit sweep; CLUSTER A)*
+
+- **Severity:** Beta-blocker (security — multiple Critical/High persistence + rootkit detectors silently non-functional on the shipped config).
+- **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+
+**Symptom.** A whole family of FIM rules for directory-rooted persistence surfaces never fires on a real host, even though the directories are watched. Unit tests pass because they inject synthetic full child paths the live pipeline never produces.
+
+**Root cause (the cluster).** `populate_watched_paths` (agent/src/fim/attach.rs:214-278) stats each configured path and inserts ONLY that path's own (dev,ino) into WATCHED_PATHS — there is NO recursion / `read_dir` expansion, and `compute_baseline` rejects directories (baseline.rs:227-238). So a fim-paths.v1 DIRECTORY entry watches only the directory inode; no child-file inode is ever enrolled. This produces TWO failure facets:
+- **(i) dead create-detection:** a new-file drop fires `inode_create` on the watched PARENT dir inode, which the drain resolves to the BARE directory path (drain.rs:583-594, no child reconstruction) — e.g. `/etc/systemd/system` — but the rules match a trailing-slash CHILD-path prefix (`/etc/systemd/system/`), so `starts_with` is FALSE and the rule returns None for every real event. A structural producer/matcher mismatch.
+- **(ii) blind in-place-modify:** an in-place edit of an existing child (whose inode was never enrolled) fires hooks only on the unwatched child inode → ZERO events.
+
+**Symptom rules (each confirmed; adversarially survived):**
+
+| Rule | Surface (MITRE) | Why dead/blind | file:line | Sev |
+|---|---|---|---|---|
+| NN-L-FIM-008 | kernel module `.ko` (T1014 rootkit, Critical) | `/lib/modules` dir-inode only; path fails `/lib/modules/`; 6474 `.ko` unwatched; in-place `.ko` modify blind | rules.rs:452-459 | HIGH |
+| NN-L-FIM-009 + 023 | systemd unit / `.timer` (T1543.002 / T1053.006) | 4 unit dirs bare-inode; dir path fails `…/system/`; in-place unit edit blind (runtime-proven: today's reinstall fired 0 verdicts) | rules.rs:488-495 | HIGH |
+| NN-L-FIM-021 | PAM module `.so` (T1556, Critical) | `/security` dirs only; fails `/security/`+`.so`; in-place `.so` swap blind (47 `pam_*.so` unwatched) | rules.rs:1203-1210 | HIGH |
+| NN-L-FIM-007 | cron drop-in (T1053.003) | `/etc/cron.d` etc. bare-inode; fails `/etc/cron.d/`; only `/etc/crontab` literal can fire; in-place cron edit blind | rules.rs:413-423 | HIGH |
+| NN-L-FIM-016 / 017 | password-store / GPG keyring (T1555) | `/root/.password-store`, `/root/.gnupg` dirs; fail `/.password-store/`,`/.gnupg/`,`.kdbx`; default config only | rules.rs:1083-1092 | MEDIUM |
+
+**Evidence / what survived refutation.** Watch granularity (bare dir inode → parent-dir path) is fundamentally incompatible with the rules' slash-terminated child-path prefixes; the dirs are live-populated (pam_unix.so, cron files present) and watched but structurally incapable of matching. FIM-008/009/021 are KillProcess-action detectors blind on 100% of real hosts.
+
+**Reproducer (static; VM-validation PENDING).** Read attach.rs:214-278 (no recursion), drain.rs:583-594 (bare-path resolve), rule prefixes (rules.rs:98,102-106,1208). Runtime (operator): drop a new `.ko`/`.service`/cron file or swap a `pam_x.so` in a watched dir → grep the `northnarrow` namespace journal for the rule verdict → expect none.
+
+**Fix direction (NOT applied — discovery).** Either (a) recursively expand watched directories into WATCHED_PATHS (bounds-check growth), which also closes facet (ii); or (b) have create/setattr hooks resolve+emit the CHILD path so child-prefix matching works. Design call.
+
+**References.** Source: audit sweep `wf_2027282a-052`. Sibling of [[BUG-023]] (content-write gap). The FIM-009 facet is runtime-anchored (BUG-019 validation reinstall fired zero NN-L-FIM-009 despite rewriting the unit in place).
+
+---
+
+## 21. BUG-023 — no content-write/append FIM hook: in-place content tamper is unobserved *(audit sweep; CLUSTER B)*
+
+- **Severity:** Beta-blocker (security — the actual attack form of several rules is silently uncovered).
+- **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+
+**Symptom.** Rules that should catch content changes to a watched FILE do not fire when the change is an in-place write/append (vs a metadata change).
+
+**Root cause (the cluster).** There is no content-write/append LSM hook anywhere in agent-ebpf/src/fim_watch.rs, and no write variant in the `FimOp` enum (common/src/wire/mod.rs:615-624). `FimOp::Modified` is produced ONLY by the `inode_setattr` hook (fim_watch.rs:285) — chmod/chown/truncate, via `notify_change`. A pure `O_APPEND` or same-size in-place overwrite updates mtime via `file_update_time()` WITHOUT `notify_change` → no Modified. The only other signal, `file_open`→`Opened`, is dropped by the drain for non-credential paths (drain.rs:618-627). No periodic re-hash compensates (recompute is event-driven).
+
+**Symptom rules (each confirmed; adversarially survived):**
+
+| Rule | Bypass technique (the real attack form) | file:line | Sev |
+|---|---|---|---|
+| NN-L-FIM-004 | `O_APPEND` a key to `/root/.ssh/authorized_keys` (T1098.004 SSH backdoor) — **fully dead** vs append | drain.rs:618-627; rules.rs:284-305 | HIGH |
+| NN-L-FIM-003 | same-size / `O_WRONLY`-no-`O_TRUNC` rewrite of `/etc/sudoers`, `sshd_config`, `passwd`, `shadow`, `pam.d/*` | drain.rs:705-714; rules.rs:251 | HIGH |
+| NN-L-FIM-005 / 018 / 019 | in-place record `pwrite` to `wtmp`/`btmp`/`lastlog` (T1070 utmp-zeroing) — partial gap | drain.rs:618-627; rules.rs:341,989 | MEDIUM |
+| NN-L-FIM-007 | in-place edit of `/etc/crontab` content (also see [[BUG-022]] for the drop-in dir facet) | rules.rs:418 | (overlap) |
+
+**Evidence / what survived refutation.** `TAPPA9_FIM_DESIGN.md` explicitly PROMISED FIM-004 catches authorized_keys appends (:78,:885) and that `Modified` covers write-then-close (:246) — but the write/close hook was never implemented. Truncate-to-zero / rm / mv ARE still caught (setattr/unlink/rename), so FIM-003/005/018/019 are PARTIAL gaps; FIM-004-against-append is fully dead.
+
+**Reproducer (static; VM-validation PENDING).** Read fim_watch.rs:265-289 (setattr is the only Modified source), drain.rs:618-627 (Opened dropped for non-cred). Runtime (operator): `echo key >> /root/.ssh/authorized_keys` (or `>> /etc/passwd`) → grep namespace journal for NN-L-FIM-004/003 → expect none.
+
+**Fix direction (NOT applied — discovery).** Add a write/close BPF hook emitting `Modified` on content change, OR forward `Opened` on integrity-critical paths and re-hash in userland (reuse the existing baseline-diff machinery). Design call.
+
+**References.** Source: audit sweep `wf_2027282a-052`. Sibling of [[BUG-022]].
+
+---
+
+## 22. BUG-024 — FS_PROTECT_EVENTS pinned ringbuf reused across restart while its producer is NON-transient (PINNED-REUSE sibling of FS_FIM_EVENTS) *(audit sweep)*
+
+- **Severity:** High (silent loss of fs-protect denial telemetry + posture-trigger visibility after restart).
+- **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+
+**Symptom.** After a `systemctl restart` / watchdog respawn (same boot — bpffs persists), the fresh userland consumer of FS_PROTECT_EVENTS desyncs from the reused pinned kernel ring — the FS_FIM_EVENTS failure shape (commit 9e1c229), but SILENT (no SizeMismatch flood) for fs-protect denials.
+
+**Root cause.** FS_PROTECT_EVENTS (agent-ebpf/src/inode_protect.rs:130) is the ONE remaining `RingBuf::pinned` event ring (every other `*_EVENTS` ring is `with_byte_size`/process-local). It is reused across restart via the EbpfLoader `map_pin_path` (multiplexer.rs:143-147). Its five `inode_*`/`file_ioctl` LSM producers are **NON-TRANSIENT**: `attach_lsm` reuses the prior boot's pinned LSM link and returns WITHOUT re-loading (antitamper-bpf/src/lib.rs:351-364, wired filesystem.rs:331-332) — the OLD program keeps firing into the OLD ring across the death→respawn gap. The fresh consumer (multiplexer.rs:213,225 — the identical pump that produced the FIM `expected=72 got=0` flood) drains the reused ring with a stale position view → desync.
+
+**⚠️ CRITICAL CAVEAT — the FIM one-liner fix is UNSAFE here.** Because the producer is non-transient, the `pinned → with_byte_size` fix used for FS_FIM_EVENTS (9e1c229) would split the OLD producer (old ring) from the NEW consumer (new ring) = a SILENT fs-protect blackout. The correct fix must drop the ring-pin AND the `inode_*` link-pins **together** so producer+ring+consumer reattach fresh — but the link-pins exist precisely to keep deny-protection alive across the restart gap, so the teardown must preserve that anti-tamper guarantee. There is an in-tree `TODO(fs-protect-ringbuf-reuse)` at inode_protect.rs:115-128 + multiplexer.rs:131-142 acknowledging exactly this deferred hazard.
+
+**Why reachable.** Restart-without-reboot is routine (watchdog W4 respawn, watchdog/src/lib.rs:424+; operator `systemctl restart`); bpffs survives both (deploy prerequisite, install.sh), wiped only on full reboot. FsProtectDenial telemetry is live downstream (ADE escalate.rs:54, dual_verify.rs:153, correlation/RAG/XAI).
+
+**Reproducer (static; VM-validation PENDING).** Static evidence above. Runtime (operator): trigger an inode_protect denial, `systemctl restart northnarrow-agent`, trigger another denial → confirm the post-restart denial is missing/garbled in the fs_protect pump (the `ringbuf entry rejected expected=56 got=…` path).
+
+**Fix direction (NOT applied — discovery).** Coordinated unpin of the FS_PROTECT_EVENTS ring + the `inode_*` link-pins on (re)attach, preserving the cross-restart deny guarantee. Structural; design call.
+
+**References.** Source: audit sweep `wf_2027282a-052`. Direct sibling of the confirmed FS_FIM_EVENTS PINNED-REUSE (commit 9e1c229). PINNED-REUSE signature.
+
+---
+
+## 23. BUG-025 — NN-L-NET-003 (BadJa3) is a dead rule: `tls_fingerprint` has no live producer *(audit sweep)*
+
+- **Severity:** Medium (false coverage — a Critical/KillProcessTree rule that can never fire; operators get zero JA3 detection).
+- **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+
+**Symptom.** Operators populate `/etc/northnarrow/netflow-ja3-blocklist.{v1,local}` and get ZERO detection.
+
+**Root cause.** `NetFlowEvent.tls_fingerprint` is hardcoded `None` by both production producers (flow_tracker.rs:270,309); the only setter `attach_tls` (flow_tracker.rs:328) is uncalled dead code; the live drain enriches only `resolved_hostname` and never parses a ClientHello (drain.rs:339-425); no TLS/packet-capture eBPF sensor exists or is attached (multiplexer.rs:161-206). NN-L-NET-003 (net.rs:407-412) gates on `tls_fingerprint` → can never fire. DEAD-RULE / MISSING-INPUT (the pre-ProtectHome cred-rule pattern: logic fine, input never produced).
+
+**Reproducer (static; VM-validation PENDING).** Read flow_tracker.rs:270,309,328 + drain.rs:339-425. Runtime (operator): add a known JA3 to the blocklist, make a matching TLS connection → grep namespace journal for NN-L-NET-003 → expect none.
+
+**Fix direction (NOT applied — discovery).** Implement a TLS ClientHello-capture sensor + wire `attach_tls`, OR remove the rule + JA3 blocklist config to avoid false coverage. Design call.
+
+**References.** Source: audit sweep `wf_2027282a-052`. DEAD-RULE signature.
+
+---
+
+## 24. BUG-026 — uncapped on-disk JSONL logs: a second disk-fill vector NOT covered by the BUG-021 journal cap *(audit sweep — REOPENS BUG-021)*
+
+- **Severity:** Beta-blocker (availability — the BUG-021 disk-fill class, via a path BUG-021 did not cap).
+- **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+
+**⚠️ REOPENS [[BUG-021]] (§19).** BUG-021 capped the systemd JOURNAL (LogNamespace + `SystemMaxUse=1G`) but NOT the agent's on-disk JSONL logs — they live under `/var/lib/northnarrow` + `/etc/northnarrow` (separate `ReadWritePaths`, no quota, no LogNamespace coverage). The disk-fill beta-blocker is therefore only PARTIALLY closed.
+
+**Symptom.** Agent-written append-only JSONL hash-chains grow without bound until `/` fills — impairing the agent, the watchdog, and every other service (the Family-A cascade BUG-009/BUG-021 already showed corrupts deploy + truncates files).
+
+**Root cause / vectors (each confirmed; adversarially survived):**
+1. **Seven chained logs, no rotation/cap (audit.rs:54-56).** netflow.jsonl, netflow_listeners.jsonl, the FIM baseline + drift chains, canary access + registry, and `/etc/northnarrow/audit.log` — no eviction/rotation/backoff. The highest-volume, **netflow.jsonl, fsyncs ONE row PER TCP-close and PER UDP-send** (net/drain.rs:149-196, called :416), no sampling/dedup, net drain on by default (main.rs:1454-1476). Fill timeline weeks-to-months (each row ~hundreds of bytes) — slower than BUG-021's 76G rsyslog loop but unbounded. Rotation is an acknowledged deferred item (audit.rs:54-56, RFC §14 Q9 / "audit-rotate").
+2. **fim_drift.jsonl flood-on-churn (drain.rs:734).** The on-disk append is UNCONDITIONAL (before the rate-limit branch); `DriftRateLimiter` gates only the engine emit, Critical tier never throttled (drain.rs:315); Deleted/Renamed bypass SHA no-op suppression (drain.rs:705). Attacker-driven file churn in any watched dir writes unbounded fsync'd rows. The BPF comments (fim_watch.rs:328-330,356-359) claim a userland `(dev,ino,ts)` dedup that does NOT exist in drain.rs → each multi-fire syscall (up to 4 appends/rename) is written in full.
+3. **canary_access.jsonl flood-on-repeat-access (detector.rs:362, LOW).** For a Credential-type canary at a credential path watched at boot, every open appends unconditionally + fsyncs (access_log.rs:154-176) with no throttle/cap; a tight-loop reader (AV/backup) or exfil loop drives unbounded growth. Requires the Credential-type + credential-path + watched-at-boot conjunction.
+
+**Reproducer (static; VM-validation PENDING).** Read net/drain.rs:149-196 + main.rs:1454-1476 (netflow per-connection fsync), drain.rs:734,315,705 (fim_drift unconditional append). Runtime (operator): generate sustained connection or watched-dir churn, watch `du -sh /var/lib/northnarrow/*.jsonl` grow unbounded with no rotation.
+
+**Fix direction (NOT applied — discovery).** Extend the BUG-021 cap discipline to on-disk logs: size-cap + rotation/eviction on the `/var/lib/northnarrow` chains (esp. netflow.jsonl), sampling/dedup on the per-connection netflow append, and gate the fim_drift/canary on-disk append behind the same rate limit as the emit. These are tamper-evident hash-chains — rotation must preserve chain verifiability. Design call.
+
+**References.** Source: audit sweep `wf_2027282a-052`. REOPENS [[BUG-021]] as the second disk-fill vector. (The sweep's 4th cascade finding — install.sh abort = inconsistent deploy — is the already-recorded residual of [[BUG-020]] §18, independently re-confirmed.)
+
+---
+
+## 25. BUG-027 — `DnsCache.by_pid` grows one entry per PID with no global cap or eviction *(audit sweep)*
+
+- **Severity:** Medium (slow unbounded memory growth over agent lifetime).
+- **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+
+**Symptom.** The DNS-attribution cache grows monotonically with PID churn for the agent's whole lifetime (the `Arc` is built once at main.rs:564).
+
+**Root cause.** `DnsCache.by_pid` (agent/src/net/dns_cache.rs:63) has no cap on the NUMBER of pid keys and no path removes an emptied key. `on_dns_query` inserts a key per distinct PID on the hot path (dns_cache.rs:99-110, every `Event::DnsQuery` via multiplexer.rs:541), bounding ONLY the inner per-pid `VecDeque`. The sole prune (`lookup_for_connect`, dns_cache.rs:127-141) TTL-prunes only the looked-up pid's deque, never removes the key, and runs only on TCP-close (drain.rs:407). No `sched_process_exit` sensor exists (ancestry.rs:22) → dead PIDs never reaped; no periodic sweep. UNIQUE exception: every sibling per-process structure HAS a key-count cap + eviction (store.rs `MAX_TRACKED_PROCS=4096` + prune; ancestry.rs `MAX_TRACKED_EDGES=10000` FIFO; lineage.rs `TRACKER_CAP=2048`; flow_tracker.rs capacity + evict).
+
+**Reproducer (static; VM-validation PENDING).** Read dns_cache.rs:63,99-110,127-141. Runtime (operator): sustained PID churn (fork loop) emitting DNS queries; watch the agent RSS climb without plateau over hours.
+
+**Fix direction (NOT applied — discovery).** Add a global key-count cap + eviction to `by_pid` (mirror the sibling structures), and/or drop emptied keys in `lookup_for_connect`. UNCAPPED-RESOURCE signature.
+
+**References.** Source: audit sweep `wf_2027282a-052`.
 
 ---
 
