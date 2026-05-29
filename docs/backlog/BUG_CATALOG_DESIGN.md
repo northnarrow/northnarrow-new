@@ -3,7 +3,7 @@
 **Status:** Catalog. NOT implementation. Read-only design document.
 **Session date:** 2026-05-27 → 2026-05-28.
 **Branch context:** `benchmark/cc-t7-13-fix` on commits `5a0d736` (T7.13 lineage) and `1c15300` (tactical fix sweep). Phase B design doc at `docs/design/POSTURE_FSM_V2_REDESIGN.md` (commit `592bf7f`).
-**Total findings:** 13 + 1 post-session addendum (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; **BUG-019** added 2026-05-29 during VM runtime validation of the FIM fix — fixed + VM-validated).
+**Total findings:** 13 + 2 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; both added 2026-05-29 during VM runtime validation of the FIM fix — **BUG-019** fixed + VM-validated, **BUG-020** open/design-pending).
 
 This document is the authoritative session-findings record. Each entry is
 self-contained (ID, severity, status, symptom, root cause, reproducer, fix or
@@ -31,6 +31,7 @@ recommended fix directions.
 | 12 | BUG-018 | `systemd-user` lineage gap — `uid=1000` helpers not auth-mediated | Beta-blocker architectural | **Deferred** |
 | 13 | P-7 RESIDUAL | R011 `/proc/<ppid>/exe` TOCTOU over-fire on transient kworkers | Cosmetic | **Deferred** (subsumed by PF_KTHREAD-via-BPF) |
 | 14 | BUG-019 | Credential FIM rules dead under `ProtectHome=yes` *(post-session, §17)* | Beta-blocker (security HIGH) | **Fixed + VM-validated** (2026-05-29) |
+| 15 | BUG-020 | `install.sh` reinstall denied by pinned anti-tamper (honeypot-bait rewrite) *(post-session, §18)* | Beta-blocker (operational) | **Open** — design pending |
 
 ---
 
@@ -648,7 +649,7 @@ Multiple findings share a common root cause. Fixing them piecemeal is correct
 short-term; recognizing the cluster is what lets V1.0 / V2.0 ship a coherent
 redesign rather than 13 separate patches.
 
-### 15.1 Anti-tamper trust model gap *(BUG-010 + BUG-011 + BUG-013)*
+### 15.1 Anti-tamper trust model gap *(BUG-010 + BUG-011 + BUG-013 + BUG-020)*
 
 These three are the same problem at different layers: **the V1 anti-tamper
 model has no concept of "trusted local controllers / observers / authorities."**
@@ -667,6 +668,11 @@ question is answered "no, unless the requester is the agent itself."
   graceful shutdown on a fresh single-key install because the 2-of-N quorum
   has a bootstrap chicken-and-egg. The operator is the legitimate authority;
   the system locks them out at install time.
+- **BUG-020**: `install.sh` (the legitimate local installer) cannot rewrite
+  the honeypot/control-surface baits because the pinned `inode_protect` deny
+  hook exempts only the live agent PID. The installer is the legitimate
+  maintainer; it has no protected-channel write authority, so a stopped-agent
+  reinstall is denied.
 
 **Unified fix direction.** Introduce a small explicit trust hierarchy at the
 anti-tamper layer:
@@ -676,8 +682,9 @@ anti-tamper layer:
 | `KILL_OVERRIDE` (BPF map, parallel to FS_PROTECT_OVERRIDE) | "this PID may signal this PID with a TTL'd, agent-self-issued override" | Agent's SIGTERM handler writes the override before graceful drain; systemd → agent SIGTERM authorized. |
 | `PROTECTED_OBSERVERS` (BPF map, parallel to PROTECTED_PIDS) | "this PID is a verified local observer; ptrace-read-access to PROTECTED_PIDS allowed, write/kill still denied" | Watchdog PID registered after exe-path verification (analogous to `ExemptPids`). |
 | `BOOTSTRAP_MODE` sentinel (filesystem, `/etc/northnarrow/.bootstrap`) | "1-of-N quorum permitted for `rotate-keys add` until the sentinel is cleared by a successful 2nd-key add" | install.sh creates; first rotate-keys-add success deletes. |
+| `FS_PROTECT_OVERRIDE` (BPF map, parallel to `KILL_OVERRIDE`) gated by admin-key presentation | "a key-authorized local installer may suspend `inode_protect` bait/pin denial for the duration of an install" | `install.sh` (or a small `nn-admin install-mode` helper) presents the Ed25519 admin key; agent arms a TTL'd override covering protected-inode writes, then clears it. Closes BUG-020. |
 
-Single coherent design — these three become one design doc + one
+Single coherent design — these four become one design doc + one
 implementation PR.
 
 ### 15.2 Detection heuristic crudeness *(BUG-014 + BUG-017 + BUG-018)*
@@ -788,6 +795,43 @@ INFO fim: WATCHED_PATHS populated inserted=88 skipped=37 configured=125
 - Sibling of **BUG-009** (§3 / §15.4): both are systemd unit-hardening directives that silently disabled a subsystem — `ProtectSystem=strict` blocked `/etc` *writes* (BUG-009); `ProtectHome=yes` blocked `/home`+`/root` FIM *reads* (BUG-019). **Cluster pattern: a hardening directive that trades away a capability the agent depends on, failing silent.** Any future `Protect*` / `*Paths` unit change MUST be checked against (a) the FIM watch set and (b) the runtime-state write set.
 - Unlike BUG-009's tactical fix, this one IS committed to repo (not a runtime drop-in), so reinstall cannot revert it.
 - Guard: `agent/src/fim/attach.rs::populate_watched_paths`. Unit: `deploy/systemd/northnarrow-agent.service`.
+
+---
+
+## 18. BUG-020 — `install.sh` reinstall aborts on honeypot-bait rewrite while anti-tamper pins are active *(post-session; finding #15)*
+
+- **Severity:** Beta-blocker (operational — breaks the documented reinstall path). NOT a security hole: this is anti-tamper *failing closed* exactly as designed. The harm is that `install.sh` aborts partway under `set -euo pipefail`, leaving the operator unsure whether the install succeeded and skipping the script's own `daemon-reload` + completion banner.
+- **Status:** **Open — design pending.** Do NOT fix tactically in isolation: the structural fix touches the anti-tamper trust model (same cluster as BUG-010/011, §15.1) and is a design call.
+
+**Symptom.** Re-running `deploy/install.sh` on a host where the agent has booted at least once (so the anti-tamper LSM programs are pinned) aborts at the honeypot control-surface rewrite:
+
+```
+install.sh: writing control-surface file /var/lib/northnarrow/override.config
+install: cannot remove '/var/lib/northnarrow/override.config': Operation not permitted
+```
+
+The binary + unit copies (which run earlier in the script) DID land, so the install is functionally partial-but-usable — but the script never reaches its own `systemctl daemon-reload` or the "install complete" + next-steps banner, so the operator must notice and run `daemon-reload` manually. Observed 2026-05-29 during BUG-019 (§17) validation via the `stop agent → install.sh` flow; worked around with a manual `daemon-reload`.
+
+**Root cause.** The 10 honeypot / control-surface bait files (`override.config`, `shutdown.signal`, `disable.token`, the `/etc/northnarrow/*` control files, the `/run/northnarrow/*` pair) are PROTECTED_INODES. The `inode_protect` deny LSM program (with `inode_unlink` / `inode_setattr` / `inode_rename`) is **pinned** — by Tappa 7 design, the pins survive an agent-restart window so protection never drops. Its only write-exemption is the caller-side `PROTECTED_PIDS.get(caller_tgid)` check — i.e. *the live agent process*. `install.sh` runs as a plain root `install`/`cp`, never the agent PID:
+
+- Agent **stopped** → pins still active, agent PID gone from the exemption → every bait rewrite (replace = unlink + create) is denied (`EPERM`).
+- Agent **running** → `install` still isn't the agent PID → denied, and an anti-tamper verdict may additionally fire against the installer.
+
+The rewrite only succeeds on a **fresh boot before the agent attaches** (no pins yet) — which is why the session's `install.sh → reboot` flow worked but `stop → install.sh` does not.
+
+**Reproducer.**
+1. Boot the agent at least once (pins the anti-tamper programs).
+2. `sudo systemctl stop northnarrow-agent`.
+3. `sudo ./deploy/install.sh` → aborts at the first honeypot bait with `Operation not permitted`; no `daemon-reload`, no completion banner.
+
+**Fix paths (record both; pick during design).**
+- **Tactical — unblock the update flow.** Make the honeypot loop idempotent: skip the rewrite when the on-disk bait already byte-matches the embedded source (the baits are content-stable across installs), or make it pin-aware (`|| true` + a logged WARN when the deny fires). Lets a stopped-agent reinstall run through to `daemon-reload`. Cheap; does not touch the trust model. Caveat: a *tampered* bait would then not be force-corrected by reinstall — acceptable, because the agent's boot `HoneypotIntegrityCheck` re-verifies + recreates baits from the same embedded bytes at next start.
+- **Structural — close the cluster.** Introduce a **trusted-local-installer** principal that presents the Ed25519 admin key to authorize a scoped, TTL'd bait/pin teardown for the duration of an install (analogous to the BUG-010 PID-1 kill-override, but key-gated and covering `inode_protect` writes — the `FS_PROTECT_OVERRIDE` row in §15.1). This is the same "no concept of a trusted local controller / observer / authority / **installer**" gap as BUG-010 (controller) and BUG-011 (observer); solving it once with an explicit trust hierarchy closes BUG-010 / BUG-011 / BUG-020 together.
+
+**References.**
+- Cluster: **anti-tamper trust model gap** (§15.1) — BUG-020 is the fourth instance (installer) alongside BUG-010 (controller), BUG-011 (observer), BUG-013 (authority).
+- Discovered while validating **BUG-019** (§17); the manual `daemon-reload` workaround kept that validation unblocked.
+- Code: honeypot rewrite loop in `deploy/install.sh` (`HONEYPOT_BAIT_DIRS`); caller-side exemption in `agent-ebpf/src/inode_protect.rs` (`PROTECTED_PIDS` check); pin lifecycle in `agent/src/anti_tamper/`.
 
 ---
 
