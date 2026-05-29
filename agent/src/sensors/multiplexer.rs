@@ -111,14 +111,35 @@ impl SensorMultiplexer {
             );
         }
 
-        // Tappa 7 task 6 commit #2: pin the six anti-tamper maps
+        // Tappa 7 task 6 commit #2: pin the anti-tamper STATE maps
         // by-name to bpffs so a restarted agent reuses the SAME
         // kernel map objects the pinned LSM hooks reference (closes
         // the split-brain regression). `prepare_pin_root` returns
         // `None` on a host without bpffs; we then load unpinned so
         // sensors still run. Only maps declared `#[map]` with a
-        // `::pinned(..)` constructor are affected — the five sensor
-        // ringbufs stay process-local by design.
+        // `::pinned(..)` constructor are affected.
+        //
+        // Event RINGBUFS must stay process-local: a ringbuf carries
+        // its consumer/producer position state in the kernel map
+        // object, so pinning + reusing one across a restart desyncs
+        // the new process's fresh consumer (0-length decode flood —
+        // see `FS_FIM_EVENTS` in agent-ebpf/src/fim_watch.rs). The
+        // sensor ringbufs (EVENTS, FILE_OPEN_EVENTS, EXEC_CHECK_EVENTS,
+        // TCP_CONNECT_EVENTS, DNS_QUERY_EVENTS) and FS_FIM_EVENTS are
+        // all `with_byte_size` (unpinned).
+        //
+        // EXCEPTION: `FS_PROTECT_EVENTS` (agent-ebpf/src/inode_protect.rs)
+        // is STILL `::pinned` and so is reused here. It has the same
+        // reuse hazard, BUT its producer is the filesystem anti-tamper
+        // LSM program attached via a REUSED pinned link (non-transient,
+        // anti_tamper/mod.rs `filesystem::attach`), so unpinning the ring
+        // alone would split producer (old reused prog → old ring) from
+        // consumer (new ring) — a SILENT fs-protect blackout instead of a
+        // loud flood. Fixing it means dropping the ring-pin AND the
+        // program-link-pin together so both reattach fresh; that is a
+        // separate change with anti-tamper-persistence implications and is
+        // deliberately deferred. Do not unpin FS_PROTECT_EVENTS in
+        // isolation.
         let pin_root = crate::anti_tamper::prepare_pin_root();
         let mut loader = EbpfLoader::new();
         loader.btf(None);

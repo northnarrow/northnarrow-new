@@ -104,19 +104,31 @@ use crate::btf_offsets::{
 #[map]
 pub static WATCHED_PATHS: HashMap<InodeKey, u8> = HashMap::pinned(8192, 0);
 
-/// Drift-event ringbuffer. 256 KiB ≈ ~4680 [`FimDriftRaw`]
-/// records at 56 bytes each. Userland's C4 drain loop polls
+/// Drift-event ringbuffer. 256 KiB ≈ ~3640 [`FimDriftRaw`]
+/// records at 72 bytes each. Userland's C4 drain loop polls
 /// this via aya's `RingBuf::poll`. If userland is asleep when
 /// a burst lands the kernel ringbuf drops events at the tail
 /// (best-effort by design per §6.5 rate-limit notes — the
 /// audit chain captures events the userland actually saw, not
 /// kernel-dropped overflow).
 ///
-/// Pinned by-name so a restarted agent drains the SAME ringbuf
-/// instead of a fresh one (same split-brain class as
-/// `PROTECTED_INODES`).
+/// PROCESS-LOCAL (NOT pinned). A BPF ringbuf carries its
+/// consumer/producer position counters + data pages inside the
+/// kernel map object itself. Pinning + reusing it across an
+/// agent restart hands the new process a ring whose position
+/// state was left by the dead process; the new process's fresh
+/// `RingBuf` consumer desyncs from that state and decodes every
+/// record header as 0-length → a `FimDriftRaw` `expected=72
+/// got=0` SizeMismatch flood, i.e. total FIM blindness on
+/// `systemctl restart` (a reboot is fine — bpffs is wiped).
+/// Unlike the anti-tamper STATE maps (`PROTECTED_INODES` etc.)
+/// a ringbuf holds NO cross-restart state worth persisting, and
+/// the FIM observe programs that write it are transient
+/// (re-attached fresh each boot — `agent/src/fim/attach.rs`), so
+/// a fresh ring + fresh program + fresh consumer always align.
+/// Keep it unpinned.
 #[map]
-pub static FS_FIM_EVENTS: RingBuf = RingBuf::pinned(256 * 1024, 0);
+pub static FS_FIM_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 // ── Helpers (mirror inode_protect.rs idioms) ────────────────────────
 

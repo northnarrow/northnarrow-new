@@ -111,6 +111,21 @@ pub static FS_PROTECT_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 /// Pinned by-name: the pinned `inode_*` hooks write here, so a
 /// restarted agent must drain the SAME kernel ringbuf rather than a
 /// fresh one (same split-brain class as `PROTECTED_INODES`).
+///
+/// TODO(fs-protect-ringbuf-reuse): a pinned-and-reused BPF ringbuf
+/// desyncs the new process's fresh consumer across `systemctl
+/// restart` (consumer/producer position lives in the kernel map
+/// object) — the exact bug fixed for `FS_FIM_EVENTS` by making it
+/// process-local. Do NOT apply the same one-line `pinned ->
+/// with_byte_size` here in isolation: this ring's producer is the
+/// `inode_*` LSM program attached via a REUSED pinned link
+/// (non-transient — anti_tamper/mod.rs `filesystem::attach`), so
+/// unpinning only the ring splits producer (old reused prog -> old
+/// ring) from consumer (new ring) = a SILENT fs-protect blackout
+/// instead of a loud `expected got=0` flood. The fix must drop the
+/// ring-pin AND the program-link-pin together so both reattach fresh;
+/// that is a separate change with anti-tamper-persistence
+/// implications and is deliberately deferred.
 #[map]
 pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::pinned(64 * 1024, 0);
 
