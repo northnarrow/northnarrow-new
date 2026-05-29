@@ -90,7 +90,26 @@ TasksMax=512
 # to its bpffs pin directory without a ReadWritePaths entry.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+# ProtectHome=read-only — deliberately NOT =yes/=true. The FIM
+# credential-read rules (NN-L-FIM-011..017: AWS/Azure/GCP/Docker/browser/
+# KeePass/GnuPG, plus the /root + /home SSH-key & shell-history watches)
+# depend on the agent being able to stat(2) those files at boot to record
+# their (dev,ino) in the kernel WATCHED_PATHS map — the BPF observe hooks
+# only emit a FIM event for an inode that is IN that map. `ProtectHome=yes`
+# mounts an EMPTY tmpfs over /home, /root and /run/user inside this unit's
+# mount namespace, so every credential stat() returns ENOENT, those inodes
+# never enter WATCHED_PATHS, and the credential-theft rules fire NOTHING —
+# a silent, total coverage hole (the kernel BPF side still sees the opens;
+# it simply has no watched inode to match them against). `read-only`
+# restores visibility while keeping the write-hardening intact: the agent
+# only ever stat()s/reads these paths — it NEVER writes under a home dir
+# (all writes go to the ReadWritePaths below) — so read-only costs us
+# nothing and is verifiable with `systemd-analyze security`. Do NOT revert
+# to =yes without first removing every /root + /home entry from
+# configs/fim-paths.v1; the boot-time regression guard in
+# agent/src/fim/attach.rs (populate_watched_paths) WARNs if this is ever
+# masked again.
+ProtectHome=read-only
 ReadWritePaths=/run/northnarrow /var/lib/northnarrow
 # CAP_BPF        — load+pin BPF maps/programs (Tappa 7 task 5/6/7)
 # CAP_SYS_ADMIN  — bpf(2) historically needed this; CAP_BPF

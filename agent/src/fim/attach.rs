@@ -31,7 +31,7 @@
 //!   exclusive ownership matches the existing sensor-pump
 //!   pattern (`multiplexer::take_ringbuf`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,6 +131,47 @@ pub fn attach_observe_programs(ebpf: &mut Ebpf, btf: &Btf) -> Result<usize> {
     Ok(attached)
 }
 
+/// Mount points that `ProtectHome=` masks. With `ProtectHome=yes`
+/// systemd mounts an empty (and, in the strict variant, inaccessible)
+/// tmpfs over each of these inside the service's mount namespace, so a
+/// credential file beneath one is invisible to the agent's `stat(2)`
+/// even though it exists on the host — the exact failure that left the
+/// NN-L-FIM-011.. credential-read rules silently dead until the unit
+/// switched to `ProtectHome=read-only`.
+const PROTECTHOME_MASK_ROOTS: &[&str] = &["/root", "/home", "/run/user"];
+
+/// If `path` lives *under* a `ProtectHome=`-masked root, return that
+/// root. Lets the populate loop tell "credential file genuinely absent
+/// on this host" (parent visible) apart from "credential file hidden
+/// by the service mount namespace" (parent present-but-empty). Uses
+/// component-wise `starts_with`, so `/rootkit` is not under `/root`.
+fn protecthome_mask_root(path: &Path) -> Option<&'static Path> {
+    for r in PROTECTHOME_MASK_ROOTS {
+        let root = Path::new(*r);
+        if path != root && path.starts_with(root) {
+            return Some(root);
+        }
+    }
+    None
+}
+
+/// Heuristic: does `root` look like a `ProtectHome=` mask rather than
+/// the real host directory? The masking tmpfs is empty (or, for the
+/// inaccessible variant, unreadable), so a present-but-empty or
+/// permission-denied `read_dir` is the signature. A real, populated
+/// /root or /home returns >= 1 entry → not hidden; a root that does not
+/// exist at all → not hidden (genuine). Biased toward reporting hidden:
+/// a genuinely-empty real /root would false-positive, but there the
+/// credential files don't exist anyway and "check ProtectHome" is a
+/// cheap rule-out — far better than re-introducing a silent hole.
+fn mask_root_looks_hidden(root: &Path) -> bool {
+    match std::fs::read_dir(root) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 /// Stat each path in `paths` and insert its `(kernel_dev, ino)`
 /// into the pinned `WATCHED_PATHS` HashMap so the kernel-side
 /// BPF programs can fast-skip non-watched inodes. Also populates
@@ -159,12 +200,43 @@ pub fn populate_watched_paths(
 
     let mut inserted = 0usize;
     let mut skipped = 0usize;
+    // Credential-coverage accounting for the regression guard below.
+    // `cred_*` count ONLY paths under a ProtectHome-maskable home root
+    // (/root, /home, /run/user) — i.e. the credential set (NN-L-FIM-011..)
+    // that the `ProtectHome=yes` mount-namespace bug silently zeroed out.
+    let mut cred_total = 0usize;
+    let mut cred_watched = 0usize;
+    let mut cred_masked = 0usize;
+    let mut masked_example: Option<String> = None;
+    // Probe each mask root at most once instead of re-stat'ing /root for
+    // all ~17 of its credential children.
+    let mut mask_root_hidden: BTreeMap<PathBuf, bool> = BTreeMap::new();
     for path in paths {
+        let mask_root = protecthome_mask_root(path);
+        if mask_root.is_some() {
+            cred_total += 1;
+        }
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Curated list inevitably names paths not present
-                // on every deploy — debug-log + skip.
+                // A genuinely-absent path on a curated list is normal
+                // (debug) — the list names files not present on every
+                // deploy. BUT if this is a credential path and its home
+                // root is present-but-empty/inaccessible, the file is
+                // almost certainly hidden by the service mount namespace
+                // (ProtectHome) rather than truly missing — a SILENT
+                // coverage hole. Tally those for the WARN after the loop.
+                if let Some(root) = mask_root {
+                    let hidden = *mask_root_hidden
+                        .entry(root.to_path_buf())
+                        .or_insert_with(|| mask_root_looks_hidden(root));
+                    if hidden {
+                        cred_masked += 1;
+                        if masked_example.is_none() {
+                            masked_example = Some(path.to_string_lossy().into_owned());
+                        }
+                    }
+                }
                 tracing::debug!(
                     path = %path.display(),
                     "fim populate_watched_paths: path absent on this host — skip"
@@ -189,6 +261,9 @@ pub fn populate_watched_paths(
         match hmap.insert(AyaInodeKey(key), 1u8, 0) {
             Ok(()) => {
                 inserted += 1;
+                if mask_root.is_some() {
+                    cred_watched += 1;
+                }
                 inode_map.insert(key, path.to_string_lossy().into_owned());
             }
             Err(e) => {
@@ -205,8 +280,36 @@ pub fn populate_watched_paths(
         inserted,
         skipped,
         configured = paths.len(),
+        credentials_watched = cred_watched,
+        credentials_total = cred_total,
         "fim: WATCHED_PATHS populated"
     );
+    // Regression guard (silent-FIM screamer). A File Integrity Monitor
+    // that watches NOTHING must scream, not whisper at debug. If any
+    // credential path is unwatched *specifically* because its home root
+    // is masked by the mount namespace, emit a single WARN naming the
+    // most likely cause. This is distinct from genuine absence (parent
+    // visible → stays debug above): it only fires on the hidden-parent
+    // signature. After the `ProtectHome=read-only` fix the real home
+    // dirs are visible, `cred_masked` is 0, and this stays quiet.
+    if cred_masked > 0 {
+        let cred_unwatched = cred_total.saturating_sub(cred_watched);
+        warn!(
+            credential_paths_total = cred_total,
+            credential_paths_unwatched = cred_unwatched,
+            masked_by_namespace = cred_masked,
+            example = %masked_example.as_deref().unwrap_or("<unknown>"),
+            "FIM credential coverage degraded: {}/{} credential paths unwatched \
+             ({} with hidden-parent signature) — check ProtectHome/mount namespace. \
+             ProtectHome=yes mounts /home,/root,/run/user as an empty tmpfs inside \
+             this service's namespace, so credential stat()s return ENOENT, the \
+             inodes never enter WATCHED_PATHS, and the NN-L-FIM-011.. credential-read \
+             rules get no input and fire nothing",
+            cred_unwatched,
+            cred_total,
+            cred_masked,
+        );
+    }
     Ok(inode_map)
 }
 
@@ -272,5 +375,50 @@ mod tests {
         // ext4 + zfs all have non-zero superblock dev numbers).
         assert!(k1.dev != 0);
         assert!(k1.ino != 0);
+    }
+
+    /// Regression guard: the credential classifier must flag exactly
+    /// the ProtectHome-maskable home paths and nothing else — counting
+    /// /etc or /var/lib paths would dilute the "credential coverage"
+    /// signal, and missing /root/.aws would re-hide the original bug.
+    #[test]
+    fn protecthome_mask_root_classifies_home_paths() {
+        let cred = |p: &str| protecthome_mask_root(Path::new(p));
+        // Under a masked root → Some(root).
+        assert_eq!(cred("/root/.aws/credentials"), Some(Path::new("/root")));
+        assert_eq!(
+            cred("/home/alice/.config/gcloud/credentials.db"),
+            Some(Path::new("/home"))
+        );
+        assert_eq!(cred("/run/user/1000/keyring"), Some(Path::new("/run/user")));
+        // Not under a masked root → None. These FIM paths keep working
+        // under ProtectHome=yes and must NOT count as credential
+        // coverage (else the WARN's N/M denominator is wrong).
+        assert_eq!(cred("/etc/passwd"), None);
+        assert_eq!(cred("/var/lib/docker/credentials.json"), None);
+        // The root itself is not "under" it, and the prefix is
+        // component-wise so /rootkit is not mistaken for /root.
+        assert_eq!(cred("/root"), None);
+        assert_eq!(cred("/rootkit/evil"), None);
+    }
+
+    /// Regression guard: the namespace-masking signature must separate
+    /// "empty/inaccessible (looks like a ProtectHome tmpfs)" from both
+    /// "populated real dir" and "absent" — the WARN-vs-debug decision
+    /// hinges on this.
+    #[test]
+    fn mask_root_looks_hidden_distinguishes_empty_from_populated() {
+        // Absent root → not hidden (genuine absence, not masking).
+        assert!(!mask_root_looks_hidden(Path::new(
+            "/nonexistent-northnarrow-test-root"
+        )));
+        // Empty dir → looks like the ProtectHome empty-tmpfs mask.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(mask_root_looks_hidden(empty.path()));
+        // Populated dir (a real /root or /home has entries) → not
+        // hidden; this is the state the read-only fix restores.
+        let populated = tempfile::tempdir().unwrap();
+        std::fs::write(populated.path().join(".bash_history"), b"x").unwrap();
+        assert!(!mask_root_looks_hidden(populated.path()));
     }
 }

@@ -3,7 +3,7 @@
 **Status:** Catalog. NOT implementation. Read-only design document.
 **Session date:** 2026-05-27 → 2026-05-28.
 **Branch context:** `benchmark/cc-t7-13-fix` on commits `5a0d736` (T7.13 lineage) and `1c15300` (tactical fix sweep). Phase B design doc at `docs/design/POSTURE_FSM_V2_REDESIGN.md` (commit `592bf7f`).
-**Total findings:** 13 (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred).
+**Total findings:** 13 + 1 post-session addendum (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; **BUG-019** added 2026-05-29 during VM runtime validation of the FIM fix — fixed + VM-validated).
 
 This document is the authoritative session-findings record. Each entry is
 self-contained (ID, severity, status, symptom, root cause, reproducer, fix or
@@ -30,6 +30,7 @@ recommended fix directions.
 | 11 | BUG-017 | Claude Code Bun-pool I/O trips mass-write threshold | Beta-blocker (dev-env only) | **Fixed** (P-8) |
 | 12 | BUG-018 | `systemd-user` lineage gap — `uid=1000` helpers not auth-mediated | Beta-blocker architectural | **Deferred** |
 | 13 | P-7 RESIDUAL | R011 `/proc/<ppid>/exe` TOCTOU over-fire on transient kworkers | Cosmetic | **Deferred** (subsumed by PF_KTHREAD-via-BPF) |
+| 14 | BUG-019 | Credential FIM rules dead under `ProtectHome=yes` *(post-session, §17)* | Beta-blocker (security HIGH) | **Fixed + VM-validated** (2026-05-29) |
 
 ---
 
@@ -627,6 +628,7 @@ Implementation effort: ~30-50 LOC in agent-ebpf + 1 field in common/src/wire + 1
 | `1c15300` | code | fix: pre-beta bug sweep — R011 bypass, BUG-014 carve-out, BUG-017 overlay, observability **(pushed to origin)** |
 | `592bf7f` | docs | docs(design): POSTURE_FSM_V2 redesign — gradient multi-signal posture + fleet-level architecture **(local only)** |
 | *(this commit)* | docs | docs(backlog): session bug catalog — 13 findings with reproducers, fix paths, thematic clustering **(local only)** |
+| *(2026-05-29)* | code+docs | fix(deploy+fim): BUG-019 — `ProtectHome=read-only` restores credential FIM coverage + boot-time coverage guard + §17 catalog entry **(local only)** |
 
 ### 14.2 Runtime artifacts on the dev host (NOT in repo)
 
@@ -744,6 +746,48 @@ implementation:
 
 Everything else is anchored to specific file:line from session-verified `grep`
 output (commit `1c15300` source).
+
+---
+
+## 17. BUG-019 — credential FIM rules silently dead under `ProtectHome=yes` *(post-session; finding #14)*
+
+- **Severity:** Beta-blocker (security HIGH). The entire credential-theft FIM rule family — NN-L-FIM-011..017 (AWS / Azure / GCP / Docker / browser / KeePass / GnuPG) plus the `/root` SSH-key (NN-L-FIM-004) and shell-history (NN-L-FIM-020) watches — is **dead in production**: it never fires. Unit tests pass, so the gap is invisible to CI.
+- **Status:** **Fix applied + VM-validated (2026-05-29).** Re-validation on the reference VM (Ubuntu 6.8, `lsm=…,bpf`) passed: with the committed unit reinstalled, `systemctl show -p ProtectHome` = `read-only` and populate reports `inserted=90 skipped=35 credentials_watched=2 credentials_total=17` (vs the pre-fix `inserted=88 skipped=37` with creds unwatched); reading `/root/.aws/credentials` fires `NN-L-FIM-011_AwsCredsRead action=KillProcess severity=High` (MITRE T1552.001) with the kill landing on a lingering reader (exit 137); no coverage-degraded WARN. **Guard self-test:** a temporary `ProtectHome=yes` drop-in reproduced `credentials_watched=0` and the boot WARN `FIM credential coverage degraded: 17/17 credential paths unwatched (17 with hidden-parent signature) … masked_by_namespace=17 example=/root/.aws/config`, then was removed and read-only restored.
+
+**Symptom.** Every credential path under a home directory is skipped at FIM populate time; the credential-read rules get no input and never fire. Boot log (pre-fix binary, `ProtectHome=yes`):
+
+```
+INFO fim: WATCHED_PATHS populated inserted=88 skipped=37 configured=125
+```
+
+`/root/.aws/credentials` (and every other `/root/…` / `/home/…` credential path) is among the 37 skipped — even though the file exists `root:root` on the host. Reading it produces NO event and NO verdict:
+
+```
+# cat /root/.aws/credentials      →  completes normally; no NN-L-FIM-011 verdict in the journal
+```
+
+`/etc`-based FIM works (e.g. `op=Modified` on `/etc/hosts` fires) — that asymmetry is the diagnostic tell.
+
+**Root cause.** The shipped unit `deploy/systemd/northnarrow-agent.service:93` set `ProtectHome=true` (≡ `yes`). `ProtectHome=yes` mounts an **empty tmpfs over `/home`, `/root` and `/run/user`** inside the service's mount namespace. `populate_watched_paths()` (`agent/src/fim/attach.rs`) runs in that namespace, so `symlink_metadata("/root/.aws/credentials")` returns `ENOENT`; the path is debug-logged "absent on this host — skip" and never inserted into the kernel `WATCHED_PATHS` map. The BPF `file_open` observe hook is kernel-side (outside the namespace) and DOES see the real open — but with no matching inode in `WATCHED_PATHS` it emits no FIM event, so the rule engine receives nothing. `/etc` is exempt because `ProtectSystem=strict` keeps `/etc` read-only but **visible**, so its inodes populate normally. Classic `ProtectHome` signature: only `/home` + `/root` FIM is dead.
+
+**Why unit tests missed it.** The NN-L-FIM-011.. rule tests and the FIM privileged e2e (`agent/tests/fim_privileged_e2e.rs`) exercise the rule engine + BPF path against files visible to the test process; they never run inside the production unit's mount namespace, so the masking is invisible to them. A green test suite + a dead production subsystem is exactly the failure mode the regression guard (below) exists to convert into a loud runtime signal.
+
+**Reproducer.**
+1. Agent installed with the pre-fix unit. `sudo systemctl show northnarrow-agent -p ProtectHome --value` → `yes`.
+2. `sudo journalctl -u northnarrow-agent -b | grep 'WATCHED_PATHS populated'` → high `skipped`; at debug level, `path absent … /root/.aws/credentials`.
+3. `sudo cat /root/.aws/credentials` → completes; `journalctl -u northnarrow-agent -b | grep NN-L-FIM-011` → nothing.
+4. Inverse confirmation: temporary drop-in `ProtectHome=read-only` + restart → populate stops skipping the `/root` creds; the same `cat` fires `NN-L-FIM-011_AwsCredsRead action=KillProcess severity=High (T1552.001)`.
+
+**Fix applied (this commit).** Two parts, both in repo so `install.sh` ships them. The fix must NOT be a runtime-only VM drop-in like BUG-009's P-1 — `install.sh` copies `deploy/systemd/northnarrow-agent.service` verbatim, so a hand-patched VM unit would be silently reverted on the next reinstall.
+
+1. **`deploy/systemd/northnarrow-agent.service`:** `ProtectHome=true` → `ProtectHome=read-only`, with an inline rationale comment. `read-only` restores `/home` + `/root` + `/run/user` *visibility* (the agent only `stat(2)`s/reads credential paths to record their `(dev,ino)`; it never writes under a home dir — all writes go to `ReadWritePaths`) while keeping the write-hardening of `ProtectHome` intact. **Rejected alternative** `ProtectHome=yes` + `BindReadOnlyPaths=/root /home`: more surgical (keeps `/run/user` hidden) but merely *relocates* the silent hole — a future `/run/user/<uid>/keyring` rule would die exactly as NN-L-FIM-011 did. `read-only` closes the class uniformly with one verifiable directive (`systemd-analyze security`), and for a root EDR with full kernel BPF visibility, hiding `/run/user` from its userland is not a real security boundary. The **watchdog unit is left at `ProtectHome=true`** — it performs no FIM and never needs home visibility (minimal blast radius).
+
+2. **`agent/src/fim/attach.rs` (`populate_watched_paths`):** boot-time regression guard. A FIM that watches nothing must scream, not whisper at debug. Home-rooted credential paths (`/root`, `/home`, `/run/user`) are counted; if any is unwatched *specifically* because its home root is present-but-empty/inaccessible (the namespace-masking signature — kept distinct from a genuinely-absent file, which stays `debug`), the agent emits one WARN: `FIM credential coverage degraded: N/M credential paths unwatched … — check ProtectHome/mount namespace`. The healthy `info!` line gains `credentials_watched` / `credentials_total` for at-a-glance coverage. Classifier locked by `protecthome_mask_root_classifies_home_paths` + `mask_root_looks_hidden_distinguishes_empty_from_populated`.
+
+**References.**
+- Sibling of **BUG-009** (§3 / §15.4): both are systemd unit-hardening directives that silently disabled a subsystem — `ProtectSystem=strict` blocked `/etc` *writes* (BUG-009); `ProtectHome=yes` blocked `/home`+`/root` FIM *reads* (BUG-019). **Cluster pattern: a hardening directive that trades away a capability the agent depends on, failing silent.** Any future `Protect*` / `*Paths` unit change MUST be checked against (a) the FIM watch set and (b) the runtime-state write set.
+- Unlike BUG-009's tactical fix, this one IS committed to repo (not a runtime drop-in), so reinstall cannot revert it.
+- Guard: `agent/src/fim/attach.rs::populate_watched_paths`. Unit: `deploy/systemd/northnarrow-agent.service`.
 
 ---
 
