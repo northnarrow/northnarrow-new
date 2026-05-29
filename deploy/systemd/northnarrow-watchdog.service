@@ -19,6 +19,15 @@ BindsTo=northnarrow-agent.service
 
 [Service]
 Type=notify
+# Logging footprint — same journal namespace as the agent (see agent unit).
+# REQUIRED here too, not cosmetic: on agent CRASH the watchdog fork-execs
+# the agent as its child, which INHERITS the watchdog's stdio (W4 respawn).
+# Without LogNamespace on the watchdog, a watchdog-respawned agent would log
+# to the DEFAULT journal → rsyslog → /var/log/syslog, re-opening the
+# amplification vector for exactly the crash-loop case. Namespacing the
+# watchdog routes both the watchdog AND the agent it respawns into the
+# capped northnarrow journal.
+LogNamespace=northnarrow
 ExecStart=/usr/local/bin/northnarrow-watchdog \
     --agent-pidfile /run/northnarrow/agent.pid \
     --admin-socket /run/northnarrow/admin.sock \

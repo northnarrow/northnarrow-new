@@ -31,7 +31,7 @@ trap 'kill ${JCTL:-0} 2>/dev/null; wait ${JCTL:-0} 2>/dev/null || true' EXIT
 LOG=$(mktemp -t t713-C.XXXX.log)
 echo "Tailing journal -> $LOG"
 
-sudo journalctl -fu northnarrow-agent --since "now" > "$LOG" &
+sudo journalctl --namespace=northnarrow -fu northnarrow-agent --since "now" > "$LOG" &
 JCTL=$!
 sleep 1
 

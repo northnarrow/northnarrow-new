@@ -24,6 +24,17 @@ ConditionPathIsMountPoint=/sys/fs/bpf
 
 [Service]
 Type=notify
+# Logging footprint (product guardrail). Route this unit's stdout/stderr
+# into NorthNarrow's dedicated, hard-capped journal namespace instead of
+# the host default journal. Stock Ubuntu's journald has ForwardToSyslog=yes
+# → rsyslog → /var/log/syslog, which has NO size cap (weekly logrotate
+# only): that is how a noisy bug filled 76G twice in a day. A non-default
+# namespace runs its own systemd-journald@northnarrow (config:
+# /etc/systemd/journald@northnarrow.conf, SystemMaxUse=1G) and by systemd
+# design does NOT forward to syslog — closing the size-cap AND the
+# amplification vectors with one knob, zero customer config. Read NN logs:
+#   journalctl --namespace=northnarrow -u northnarrow-agent
+LogNamespace=northnarrow
 ExecStart=/usr/local/bin/northnarrow-agent \
     --combat-rules /etc/northnarrow/combat-rules.v4 \
     --admin-pub /etc/northnarrow/admin.pub \

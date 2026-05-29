@@ -70,7 +70,7 @@ The agent logs every overlay change at boot (`+`/`-` entries applied).
 After a restart, check the journal:
 
 ```sh
-journalctl -u northnarrow-agent --since "5 min ago" | grep -i allowlist
+journalctl --namespace=northnarrow -u northnarrow-agent --since "5 min ago" | grep -i allowlist
 ```
 
 ## Re-tightening

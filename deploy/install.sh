@@ -64,6 +64,10 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 NN_ADMIN_BIN="$TARGET_DIR/nn-admin"
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
+# Dedicated journal-namespace config (activated by LogNamespace=northnarrow
+# in both units). Capped, isolated journald instance → no /var/log/syslog
+# amplification, hard SystemMaxUse ceiling, zero customer config.
+JOURNALD_NS_CONF_SRC="$REPO_ROOT/deploy/systemd/journald@northnarrow.conf"
 
 # Cluster-15 eBPF staleness guard (install-time half). The compiled
 # eBPF object is built by `cargo xtask` and its provenance stamp
@@ -185,6 +189,7 @@ require_file "$NN_ADMIN_BIN" "run \`cargo xtask build --release\` first (or \`ca
 require_fresh_ebpf
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
+require_file "$JOURNALD_NS_CONF_SRC" "expected at $JOURNALD_NS_CONF_SRC (NN journal-namespace cap; the LogNamespace=northnarrow journald config)"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
 require_file "$NETFLOW_BLOCKLIST_V1_SRC"     "expected at $NETFLOW_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow IP/CIDR blocklist)"
 require_file "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "expected at $NETFLOW_JA3_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow JA3 blocklist)"
@@ -218,6 +223,11 @@ install -m 755 -o root -g root "$NN_ADMIN_BIN" "$BIN_DIR/nn-admin"
 echo "install.sh: copying systemd unit files to $UNIT_DIR/"
 install -m 644 -o root -g root "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
 install -m 644 -o root -g root "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service"
+# Journal-namespace config goes in /etc/systemd/ (read by the
+# systemd-journald@northnarrow instance), NOT the unit dir. NN-managed
+# (always refreshed); operators override via
+# /etc/systemd/journald@northnarrow.conf.d/.
+install -m 644 -o root -g root "$JOURNALD_NS_CONF_SRC" "/etc/systemd/journald@northnarrow.conf"
 
 # Tappa 9 C7: ensure /etc/northnarrow/ exists and ship the default
 # FIM watched-paths list. Idempotent: if the operator has already
@@ -434,6 +444,10 @@ done
 
 echo "install.sh: reloading systemd unit catalogue"
 systemctl daemon-reload
+# Pick up journald@northnarrow.conf on REINSTALL (on a first install the
+# namespace journald socket-activates fresh on the agent's first start, so
+# this is a no-op then). Best-effort — the instance may not be running yet.
+systemctl restart systemd-journald@northnarrow.service 2>/dev/null || true
 
 echo ""
 echo "install.sh: install complete."
@@ -493,5 +507,7 @@ echo "       systemctl enable --now northnarrow-agent.service"
 echo "       systemctl enable --now northnarrow-watchdog.service"
 echo ""
 echo "  6. Follow logs:"
-echo "       journalctl -u northnarrow-agent.service -f"
-echo "       journalctl -u northnarrow-watchdog.service -f"
+echo "       journalctl --namespace=northnarrow -u northnarrow-agent.service -f"
+echo "       journalctl --namespace=northnarrow -u northnarrow-watchdog.service -f"
+echo "     (NN logs live in the 'northnarrow' journal namespace — capped 1G,"
+echo "      NOT forwarded to rsyslog/syslog. The --namespace flag is required.)"

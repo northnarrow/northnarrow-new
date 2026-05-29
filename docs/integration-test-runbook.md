@@ -207,7 +207,7 @@ After `install.sh`, the operator runs:
 sudo systemctl daemon-reload   # install.sh already did this; idempotent
 sudo systemctl enable --now northnarrow-agent.service
 sudo systemctl enable --now northnarrow-watchdog.service
-journalctl -u northnarrow-agent.service -u northnarrow-watchdog.service -f
+journalctl --namespace=northnarrow -u northnarrow-agent.service -u northnarrow-watchdog.service -f
 ```
 
 ### Pre-flight checklist before enabling the units
@@ -244,7 +244,7 @@ sudo bpftool map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_PIDS
 # Expect 2 entries: agent_pid → 1, watchdog_pid → 1
 
 # Steady-state journal shows no errors:
-journalctl -u northnarrow-watchdog.service --since "1 minute ago" | grep -iE 'error|warn'
+journalctl --namespace=northnarrow -u northnarrow-watchdog.service --since "1 minute ago" | grep -iE 'error|warn'
 # Expect: empty (or only the "NOTIFY_SOCKET unset" debug from a
 # Type=notify init misconfig, which shouldn't fire under systemd)
 ```
@@ -266,7 +266,7 @@ sudo bpftool map delete pinned /sys/fs/bpf/northnarrow/PROTECTED_PIDS \
 sudo kill -9 $AGENT_PID
 
 # Expect within ~1s:
-journalctl -u northnarrow-watchdog.service --since "10 seconds ago"
+journalctl --namespace=northnarrow -u northnarrow-watchdog.service --since "10 seconds ago"
 # Look for, in order:
 #   "agent pidfd POLLIN — agent has exited"        (W3)
 #   "layer-2 evict complete"                       (W3)
