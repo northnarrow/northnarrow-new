@@ -3,7 +3,7 @@
 **Status:** Catalog. NOT implementation. Read-only design document.
 **Session date:** 2026-05-27 → 2026-05-28.
 **Branch context:** `benchmark/cc-t7-13-fix` on commits `5a0d736` (T7.13 lineage) and `1c15300` (tactical fix sweep). Phase B design doc at `docs/design/POSTURE_FSM_V2_REDESIGN.md` (commit `592bf7f`).
-**Total findings:** 13 + 2 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; both added 2026-05-29 during VM runtime validation of the FIM fix — **BUG-019** fixed + VM-validated, **BUG-020** open/design-pending).
+**Total findings:** 13 + 3 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; all added 2026-05-29 during VM runtime validation — **BUG-019** (credential FIM) fixed + VM-validated, **BUG-020** (install.sh anti-tamper pin) open/design-pending, **BUG-021** (logging disk-saturation) fixed + VM-validated).
 
 This document is the authoritative session-findings record. Each entry is
 self-contained (ID, severity, status, symptom, root cause, reproducer, fix or
@@ -32,6 +32,7 @@ recommended fix directions.
 | 13 | P-7 RESIDUAL | R011 `/proc/<ppid>/exe` TOCTOU over-fire on transient kworkers | Cosmetic | **Deferred** (subsumed by PF_KTHREAD-via-BPF) |
 | 14 | BUG-019 | Credential FIM rules dead under `ProtectHome=yes` *(post-session, §17)* | Beta-blocker (security HIGH) | **Fixed + VM-validated** (2026-05-29) |
 | 15 | BUG-020 | `install.sh` reinstall denied by pinned anti-tamper (honeypot-bait rewrite) *(post-session, §18)* | Beta-blocker (operational) | **Open** — design pending |
+| 16 | BUG-021 | Disk saturation: NN journal amplified to an uncapped `/var/log/syslog` *(post-session, §19)* | Beta-blocker (availability) | **Fixed + VM-validated** (2026-05-29) |
 
 ---
 
@@ -832,6 +833,51 @@ The rewrite only succeeds on a **fresh boot before the agent attaches** (no pins
 - Cluster: **anti-tamper trust model gap** (§15.1) — BUG-020 is the fourth instance (installer) alongside BUG-010 (controller), BUG-011 (observer), BUG-013 (authority).
 - Discovered while validating **BUG-019** (§17); the manual `daemon-reload` workaround kept that validation unblocked.
 - Code: honeypot rewrite loop in `deploy/install.sh` (`HONEYPOT_BAIT_DIRS`); caller-side exemption in `agent-ebpf/src/inode_protect.rs` (`PROTECTED_PIDS` check); pin lifecycle in `agent/src/anti_tamper/`.
+
+---
+
+## 19. BUG-021 — disk saturation: NN's journal amplified into an uncapped `/var/log/syslog` *(post-session; finding #16)*
+
+- **Severity:** Beta-blocker (availability). NN filled the host's 76G disk twice in one day — risking a full-disk cascade that takes down the agent, the watchdog, and every other service on the box.
+- **Status:** **Fixed + VM-validated (2026-05-29).** Flood-tested on the reference VM (below) under the exact condition that filled the disk.
+
+**Symptom.** `/` hit 100% twice in a day. `/var/log/syslog` reached 44G while the systemd journal sat at 223M — a 200× split.
+
+**Root cause — amplification + no ceiling, NOT agent verbosity.** Measured idle logging is ~3 lines/min; the agent itself is not noisy. The fill is two compounding *host-default* vectors:
+1. **rsyslog amplification.** Stock Ubuntu journald runs `ForwardToSyslog=yes`; every NN message (agent stdout → journal) is forwarded to rsyslog (`imuxsock`) and written by `50-default.conf`'s `*.*;auth,authpriv.none -/var/log/syslog` rule into `/var/log/syslog` — a full second copy. (Confirmed: 101,929 NN lines in a 36M syslog snapshot.)
+2. **No size ceiling on that copy.** `/etc/logrotate.d/rsyslog` rotates syslog `weekly`, `rotate 4`, with **no `size`/`maxsize`** — a one-day flood grows unbounded until the weekly tick. journald itself self-caps (no explicit `SystemMaxUse` → default `min(10% fs, 4G)` ≈ 4G), which is why the journal stayed at 223M while syslog hit 44G.
+
+So the SizeMismatch flood (since fixed) didn't fill the disk by being in the journal — it filled it via the uncapped rsyslog *copy*. The next noisy bug had no guardrail.
+
+**Fix — de-amplify by construction + a hard cap, zero customer config.**
+- **`LogNamespace=northnarrow` on BOTH the agent and watchdog units.** NN logs into its own `systemd-journald@northnarrow` instance. By systemd design a non-default namespace does NOT forward to syslog/kmsg/console (only the default namespace does) — so NN messages never reach rsyslog / `/var/log/syslog`. De-amplification is structural, not a filter.
+- **`deploy/systemd/journald@northnarrow.conf`:** `SystemMaxUse=1G` hard ceiling (+ `SystemMaxFileSize=128M`, `RuntimeMaxUse=128M`, `Storage=persistent`, `ForwardToSyslog=no`). journald vacuums oldest files to stay under the cap — a future noisy bug can churn the 1G window but can never fill the disk.
+- **`install.sh`** ships the conf to `/etc/systemd/`, restarts the namespace journald on reinstall, and the banner + all 11 operator/test `journalctl` invocations gain `--namespace=northnarrow`.
+
+**Watchdog-respawn cascade — why BOTH units need the namespace.** On agent CRASH the watchdog does not `systemctl start` the agent; it `fork-exec`s it as its own child, which **inherits the watchdog's stdio**. So if only the agent unit had `LogNamespace`, a watchdog-respawned agent would log through the *watchdog's* stdio → the default journal → rsyslog — re-opening the amplification vector for exactly the crash-loop case (the worst case: a crashing agent is also the noisiest). Namespacing the watchdog routes both the watchdog and the agent it respawns into the capped namespace.
+
+**Why not the tactical fix.** A global journald `SystemMaxUse` + an rsyslog `:programname … stop` filter was rejected: it edits system-wide journald + rsyslog policy NN must not own, is ordering-fragile (the filter must precede `50-default.conf`), and breaks under syslog-ng / no-rsyslog. The namespace is self-contained and de-amplifies by construction.
+
+**No code change / nothing reads the journal back.** Both binaries log via `tracing_subscriber::fmt()` → stdout (systemd routes it to the namespaced journald). `nn-admin audit` reads the on-disk chained `audit.log` (JSONL), not journald; the watchdog observes via pidfd, not the journal. Composes cleanly with `ProtectSystem=strict` / `ProtectHome=read-only` (the namespaced journald runs as `systemd-journal`, outside the agent's sandbox).
+
+**Validation (reference VM, Ubuntu 6.8, `lsm=…,bpf`).** Reinstalled; both units carry `LogNamespace=northnarrow`; `systemd-journald@northnarrow` socket-activates; the namespace journal is persistent at `/var/log/journal/<machine-id>.northnarrow`. Isolation by PID: agent logs only in the namespace, **0** lines in the default journal, **0** in `/var/log/syslog`. **Flood test** (temporary 64M cap; 94,277 incompressible ~1KB lines ≈ 95MB pushed via `systemd-run -p LogNamespace=northnarrow`):
+
+| Metric | Result |
+|---|---|
+| namespace disk-usage | **56.2M ≤ 64M** (capped, not ~95M) |
+| FLOODTEST lines surviving | **11,160 / 94,277** (oldest vacuumed at the limit) |
+| `/var/log/syslog` delta | **+546 B** (background only — not forwarded) |
+| FLOODTEST in `/var/log/syslog` | **0** |
+| `df /` used delta | **−1,624 KB** (95M flood → zero net disk) |
+
+The journal caps + rotates at the ceiling instead of growing unbounded, and syslog does not grow — both vectors closed under the exact condition that filled the disk.
+
+**Separate follow-ups (NOT bundled).** tty-aware ANSI in logs (`.with_ansi(std::io::stdout().is_terminal())` — the agent currently emits ANSI escapes into the journal) and ProcessSpawn `INFO`→`debug` tiering (audit-useful but the dominant volume; the cap bounds it regardless of source).
+
+**References.**
+- Cluster sibling of **BUG-009** (§3) and **BUG-019** (§17): all three are a systemd/journald **default or hardening directive interacting badly with NN's needs and failing silent** — `ProtectSystem=strict` blocked `/etc` writes (009), `ProtectHome=yes` blocked `/home`+`/root` FIM reads (019), `ForwardToSyslog=yes` + no cap amplified into an unbounded syslog (021). Standing lesson: every `Protect*` / `*Paths` / journald / rsyslog default must be checked against NN's actual runtime footprint.
+- **BUG-020** (§18) was discovered during this fix's reinstall (install.sh honeypot rewrite denied by the pinned anti-tamper hook).
+- Commit `e799d76`. Files: `deploy/systemd/{northnarrow-agent,northnarrow-watchdog}.service`, `deploy/systemd/journald@northnarrow.conf`, `deploy/install.sh`, + 11 `journalctl --namespace=northnarrow` doc/script updates.
 
 ---
 
