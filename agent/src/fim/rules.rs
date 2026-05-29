@@ -858,6 +858,36 @@ pub fn is_credential_store_access(fe: &FimEvent) -> bool {
         .any(|f| fe.path.contains(f))
 }
 
+/// BUG-012 (v2): `true` if `path` is a credential file that one of
+/// the NN-L-FIM-011..017 **read**-detection rules matches on. This is
+/// the SINGLE SOURCE OF TRUTH the FIM drain
+/// (`fim::drain::process_drift`) consults to decide whether an
+/// `Opened` (read) event must still flow to the rule engine.
+///
+/// A read is not an integrity change, so `Opened` never produces a
+/// FIM-DRIFT row. But for these credential paths the `Opened` event is
+/// the ONLY source feeding the cloud-cred (011..014,
+/// [`evaluate_cred_read`]) and browser / password-manager / GPG
+/// keyring (015..017, [`evaluate_cred_store_access`]) read rules —
+/// dropping it at the drain would silently kill credential-theft-read
+/// detection. By deriving this predicate from the very fragment lists
+/// those rules match, the drain forwards exactly — and only — the
+/// `Opened` events some rule can consume; a read of any OTHER watched
+/// path carries no rule and is dropped as noise. The
+/// `bug012_v2_is_credential_path_matches_every_rule_family` test pins
+/// that this stays in lockstep with the rule fragment lists.
+pub fn is_credential_path(path: &str) -> bool {
+    AWS_CRED_FRAGMENTS
+        .iter()
+        .chain(AZURE_CRED_FRAGMENTS.iter())
+        .chain(GCP_CRED_FRAGMENTS.iter())
+        .chain(DOCKER_CRED_FRAGMENTS.iter())
+        .chain(BROWSER_CRED_FRAGMENTS.iter())
+        .chain(PASSWORD_MANAGER_FRAGMENTS.iter())
+        .chain(GPG_KEYRING_FRAGMENTS.iter())
+        .any(|f| path.contains(f))
+}
+
 /// NN-L-FIM-018: the login-record file `utmp`-family writers
 /// legitimately rewrite. A Modified op by anything else is the
 /// log-tamper shape.
@@ -1967,6 +1997,51 @@ mod tests {
             modifier_comm: comm.to_string(),
             dest_path: None,
         })
+    }
+
+    // ── BUG-012 (v2) — is_credential_path source-of-truth guard ──
+
+    /// The FIM drain forwards an `Opened` event to the rule engine
+    /// IFF `is_credential_path` returns true. This pins that the
+    /// predicate matches a representative path for every NN-L-FIM
+    /// read-rule family (011..017) — so the drain never drops a read
+    /// some rule needs — AND returns false for the BUG-012 boot-noise
+    /// paths the report flagged (so they stay dropped). If a rule
+    /// family's fragment list changes, update the sample here.
+    #[test]
+    fn bug012_v2_is_credential_path_matches_every_rule_family() {
+        // One sample per read-rule family — all MUST forward.
+        for path in &[
+            "/root/.aws/credentials",                 // 011 AWS
+            "/home/u/.azure/accessTokens.json",       // 012 Azure
+            "/home/u/.config/gcloud/credentials.db",  // 013 GCP
+            "/home/u/.docker/config.json",            // 014 Docker
+            "/home/u/.mozilla/firefox/p/logins.json", // 015 browser
+            "/home/u/vault.kdbx",                     // 016 password manager
+            "/home/u/.gnupg/private-keys-v1.d/x.key", // 017 GPG keyring
+        ] {
+            assert!(
+                is_credential_path(path),
+                "{path}: must be forwarded — a NN-L-FIM-011..017 rule consumes it"
+            );
+        }
+        // BUG-012 boot-noise paths — none carries a read rule, all
+        // MUST be dropped at the drain (is_credential_path == false).
+        for path in &[
+            "/etc/nsswitch.conf",
+            "/etc/pam.d/common-auth",
+            "/etc/group",
+            "/usr/bin/dash",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/etc/sudoers",
+            "/etc/login.defs",
+        ] {
+            assert!(
+                !is_credential_path(path),
+                "{path}: read carries no rule — must be dropped as noise, not forwarded"
+            );
+        }
     }
 
     // ── NN-L-FIM-011 (AWS) ──────────────────────────────────────

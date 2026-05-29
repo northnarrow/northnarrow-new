@@ -117,11 +117,11 @@ const ADMIN_PORTS: &[u16] = &[22, 3389, 445, 5985, 5986];
 
 /// Credential / authentication files an unprivileged user has no
 /// business reading directly. `/etc/login.defs` was added in BUG-012:
-/// the FIM `Opened` event for it was being dropped at the drain
-/// layer (`agent/src/fim/drain.rs::FIM_OPENED_SUPPRESS_PATHS`) to
-/// kill the boot-time noise; without this entry, `/etc/login.defs`
-/// reads would lose ALL coverage. The other three entries were
-/// already covered (T7.13 baseline).
+/// the FIM `Opened` event for it is dropped at the drain layer
+/// (`fim::drain::process_drift` drops every read on a non-credential
+/// path — see BUG-012 v2) to kill the boot-time noise; without this
+/// entry, `/etc/login.defs` reads would lose ALL coverage. The other
+/// three entries were already covered (T7.13 baseline).
 const SENSITIVE_FILES: &[&str] = &[
     "/etc/passwd",
     "/etc/shadow",

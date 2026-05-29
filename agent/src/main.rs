@@ -1872,14 +1872,32 @@ async fn process_event(
         // picks up the event via the normal `engine.evaluate`
         // path below.
         Event::Fim(fe) => {
-            warn!(
-                path = %fe.path,
-                op = ?fe.op,
-                modifier_pid = fe.modifier_pid,
-                modifier_uid = fe.modifier_uid,
-                modifier_comm = %fe.modifier_comm,
-                "FIM DRIFT"
-            );
+            // BUG-012 (v2): a read (op=Opened) is NOT an integrity
+            // drift, so it must never be logged as "FIM DRIFT" — that
+            // is semantically wrong and just quieter noise. An Opened
+            // event reaches this arm ONLY for a credential path the
+            // FIM drain forwarded for the NN-L-FIM-011..017 read rules
+            // (every other read is dropped at the drain). It flows
+            // silently to `engine.evaluate` below; if a cred-read rule
+            // fires, THE RULE emits the alert with proper framing.
+            // Only integrity-changing ops get the FIM DRIFT line.
+            if fe.op == common::wire::FimOp::Opened {
+                debug!(
+                    path = %fe.path,
+                    modifier_pid = fe.modifier_pid,
+                    modifier_comm = %fe.modifier_comm,
+                    "fim credential-path read forwarded to rule engine (not drift)"
+                );
+            } else {
+                warn!(
+                    path = %fe.path,
+                    op = ?fe.op,
+                    modifier_pid = fe.modifier_pid,
+                    modifier_uid = fe.modifier_uid,
+                    modifier_comm = %fe.modifier_comm,
+                    "FIM DRIFT"
+                );
+            }
         }
         // Tappa 9.5 (K3): canary trip events. The K3 inline
         // detector intercepts source events BEFORE they reach
