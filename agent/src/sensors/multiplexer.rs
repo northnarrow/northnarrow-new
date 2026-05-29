@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    include_bytes_aligned,
     maps::{ring_buf::RingBuf, MapData},
     programs::{FExit, KProbe, TracePoint},
     Btf, Ebpf, EbpfLoader,
@@ -39,10 +38,10 @@ use tracing::{debug, error, info, warn};
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
 
-/// eBPF object embedded by `agent/build.rs`; same alignment trick as
-/// in the Tappa 1 sensor.
-static EBPF_BYTES: &[u8] =
-    include_bytes_aligned!(concat!(env!("OUT_DIR"), "/northnarrow-agent-ebpf"));
+/// eBPF object embedded once in [`crate::sensors::ebpf_object`] (the
+/// single embed site + boot preflight). Re-used here so this loader and
+/// the Tappa 1 [`super::exec`] loader load byte-identical bytes.
+use crate::sensors::ebpf_object::EBPF_BYTES;
 
 /// Channel between the per-ringbuf pumps and the agent main loop.
 const CHANNEL_CAPACITY: usize = 4096;

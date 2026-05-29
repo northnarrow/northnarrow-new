@@ -10,16 +10,32 @@
 # Usage:
 #   sudo ./deploy/install.sh
 #
-# Assumes the repo's `cargo build --release` has already run and
-# produced ./target/release/{northnarrow-agent,northnarrow-watchdog}.
-# Pre-flights every step so an incomplete invocation surfaces an
-# actionable error instead of leaving a half-installed system.
+# Assumes `cargo xtask build --release` has already run and produced
+# ./target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}.
+# Use xtask, NOT a bare `cargo build`: xtask compiles the eBPF object
+# (separate nightly/bpfel toolchain) and the userland in one step, and
+# stamps the object so agent/build.rs can prove it is fresh. A plain
+# `cargo build` does NOT rebuild the eBPF object and cannot produce an
+# installable agent — the build fails on a stale/unstamped object.
+# Pre-flights every step (including eBPF object freshness, see
+# require_fresh_ebpf) so an incomplete or stale invocation surfaces an
+# actionable error instead of leaving a half-installed / silently-stale
+# system.
 #
 # Tappa 10.6 (D8) deploy-surface verification — NO install change needed:
 #   - D1 grew ProcessSpawnRaw by strict APPEND. The kernel↔userland wire
 #     is bytemuck Pod and the eBPF object is embedded in + rebuilt
-#     atomically with the agent binary this script installs, so there is
-#     no on-disk wire-format compatibility step.
+#     atomically with the agent binary this script installs — and that
+#     atomicity is now ENFORCED, not assumed: `cargo xtask build` stamps
+#     the eBPF object with a source-closure hash, `agent/build.rs`
+#     refuses to embed a stale/unstamped object (fail-loud at build), the
+#     agent refuses to start on a placeholder (boot preflight), and
+#     require_fresh_ebpf below refuses to install an agent older than its
+#     object. So there is no on-disk wire-format compatibility step AND
+#     no way for a stale object to reach a running host. (A bytemuck size
+#     check alone could not catch the dangerous case — a new field carved
+#     from reclaimed padding keeps the size identical; the provenance
+#     stamp is what closes it. See ebpf-guard/ + docs/design.)
 #   - D2 added kernel reads (argv via mm->arg_start, parent context) to
 #     the EXISTING `sched_process_exec` tracepoint — no new BPF program,
 #     map, pin, or LSM hook, so the bpffs / `lsm=…,bpf` prerequisites
@@ -48,6 +64,15 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 NN_ADMIN_BIN="$TARGET_DIR/nn-admin"
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
+
+# Cluster-15 eBPF staleness guard (install-time half). The compiled
+# eBPF object is built by `cargo xtask` and its provenance stamp
+# (`.buildhash`) is written alongside it. `require_fresh_ebpf` (below)
+# uses these to refuse installing an agent binary that predates the
+# current eBPF object. Paths MUST match ebpf-guard's ARTIFACT_RELPATH /
+# STAMP_RELPATH (ebpf-guard/src/lib.rs).
+EBPF_ARTIFACT="$REPO_ROOT/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf"
+EBPF_STAMP="$EBPF_ARTIFACT.buildhash"
 
 # Tappa 9 C7: default FIM watched-paths list. install.sh drops this
 # at /etc/northnarrow/fim-paths.v1 if missing; the agent loads it at
@@ -118,10 +143,46 @@ require_file() {
     fi
 }
 
+# Cluster-15 staleness guard, install-time half. The eBPF object is
+# compiled by `cargo xtask` and EMBEDDED into the agent binary at build
+# time; `agent/build.rs` refuses to embed a stale or unstamped object,
+# and the agent refuses to start on the empty placeholder. This check is
+# the belt-and-suspenders: it refuses to install an agent binary that is
+# OLDER than the current eBPF object/stamp (the eBPF was rebuilt but the
+# agent was not, so the binary may still embed a previous object), and
+# requires the xtask provenance stamp to exist at all (a plain
+# `cargo build` does not build the eBPF object and leaves no stamp).
+# Together with the build + startup guards this makes "the eBPF object is
+# rebuilt atomically with the agent" an enforced fact, not a comment.
+require_fresh_ebpf() {
+    if [[ ! -f "$EBPF_STAMP" ]]; then
+        echo "install.sh: eBPF provenance stamp missing: $EBPF_STAMP" >&2
+        echo "install.sh: the eBPF object was not built via xtask (a plain \`cargo build\` does NOT build it)." >&2
+        echo "install.sh: rebuild the eBPF object + agent atomically:  cargo xtask build --release" >&2
+        exit 1
+    fi
+    if [[ "$EBPF_ARTIFACT" -nt "$AGENT_BIN" ]]; then
+        echo "install.sh: STALE agent binary — $AGENT_BIN is older than the eBPF object:" >&2
+        echo "install.sh:   $EBPF_ARTIFACT" >&2
+        echo "install.sh: the eBPF object was rebuilt after the agent; the binary may embed a previous object." >&2
+        echo "install.sh: rebuild atomically:  cargo xtask build --release" >&2
+        exit 1
+    fi
+    if [[ "$EBPF_STAMP" -nt "$AGENT_BIN" ]]; then
+        echo "install.sh: STALE agent binary — $AGENT_BIN is older than the eBPF build stamp:" >&2
+        echo "install.sh:   $EBPF_STAMP" >&2
+        echo "install.sh: rebuild atomically:  cargo xtask build --release" >&2
+        exit 1
+    fi
+    echo "install.sh: eBPF object freshness OK (agent binary is no older than the stamped object)"
+}
+
 require_root
-require_file "$AGENT_BIN"    "run \`cargo build --release -p northnarrow-agent\` first"
-require_file "$WATCHDOG_BIN" "run \`cargo build --release -p northnarrow-watchdog\` first"
-require_file "$NN_ADMIN_BIN" "run \`cargo build --release -p northnarrow-agent --bin nn-admin\` first"
+require_file "$AGENT_BIN"    "run \`cargo xtask build --release\` first (xtask builds the eBPF object + userland atomically; a plain \`cargo build\` cannot produce an installable agent — agent/build.rs refuses a stale/unstamped eBPF object)"
+require_file "$WATCHDOG_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-watchdog\`)"
+require_file "$NN_ADMIN_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-agent --bin nn-admin\`)"
+# Refuse a stale agent binary BEFORE we touch the live system.
+require_fresh_ebpf
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"

@@ -419,6 +419,17 @@ async fn main() -> Result<()> {
 
     info!("NorthNarrow agent starting...");
 
+    // Boot preflight: prove the embedded eBPF half is real and intact
+    // BEFORE doing any work. The build-time staleness guard
+    // (agent/build.rs) refuses to embed a *stale* object; this refuses
+    // to *start* on an *absent* (placeholder) or *corrupted* one. Fail
+    // fast and loud — running without a matching kernel half would
+    // silently disable every sensor, the anti-tamper LSM hooks, and
+    // R011's PF_KTHREAD signal (the exact blindness that let R011
+    // over-fire when a stale .o was embedded by a workspace build).
+    northnarrow_agent::sensors::ebpf_object::preflight()
+        .context("eBPF object boot preflight failed — refusing to start")?;
+
     if let Err(e) = bump_memlock_rlimit() {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }

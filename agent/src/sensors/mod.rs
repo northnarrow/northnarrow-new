@@ -9,8 +9,10 @@
 //! [`ExecSensor`] is preserved as a thin compatibility wrapper so the
 //! existing live integration test keeps working.
 
+pub mod ebpf_object;
 pub mod exec;
 pub mod multiplexer;
 
+pub use ebpf_object::EBPF_BYTES;
 pub use exec::ExecSensor;
 pub use multiplexer::SensorMultiplexer;

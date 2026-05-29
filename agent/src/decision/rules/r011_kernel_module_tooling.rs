@@ -64,6 +64,7 @@ impl Rule for R011KernelModuleTooling {
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::ProcessSpawn {
+            pid,
             comm,
             argv,
             parent_comm,
@@ -79,19 +80,39 @@ impl Rule for R011KernelModuleTooling {
         if self.allowlist.contains(comm) {
             return None;
         }
-        // Cluster 15.3 — kernel-driven module load exemption gated on
-        // the non-forgeable BPF PF_KTHREAD signal (see module
-        // doc-comment). Supersedes the P-7 userspace
-        // `/proc/<ppid>/exe` race. A `false` value means EITHER "real
-        // userspace parent" OR "BPF read failed" — both fall through
-        // to FIRE (fail-secure: over-fire beats missing a forged
-        // rootkit install).
+        // Cluster 15.3 — the kernel-driven-load exemption turns ENTIRELY
+        // on the non-forgeable BPF PF_KTHREAD signal (see module
+        // doc-comment), superseding the P-7 `/proc/<ppid>/exe` race. A
+        // `false` value means EITHER "real userspace parent" OR "BPF
+        // read failed" — both fall through to FIRE (fail-secure:
+        // over-fire beats missing a forged rootkit install).
+        //
+        // Emit ONE dedicated, greppable decision line on BOTH outcomes
+        // so the journal always records WHY R011 did or didn't fire for
+        // a kmod-tooling exec. This is the signal that was invisible the
+        // night a stale .o silently zeroed `parent_is_kthread` and R011
+        // over-fired on benign kworker→modprobe: with this line the same
+        // incident reads as `parent_is_kthread=false decision=fire` at a
+        // glance under `RUST_LOG=…=debug`. Debug level keeps the
+        // (potentially many) boot-time hardware-probe modprobe execs out
+        // of the default journal while staying one flag away when
+        // diagnosing.
+        let decision = if *parent_is_kthread {
+            "exempt_kernel_thread"
+        } else {
+            "fire"
+        };
+        tracing::debug!(
+            rule = "R011_KernelModuleTooling",
+            event = "r011_kthread_decision",
+            pid = *pid,
+            comm = %comm,
+            parent_comm = %parent_comm,
+            parent_is_kthread = *parent_is_kthread,
+            decision,
+            "R011 kernel-module-tooling exec: PF_KTHREAD parent-origin decision"
+        );
         if *parent_is_kthread {
-            tracing::debug!(
-                rule = "R011_KernelModuleTooling",
-                parent_comm = %parent_comm,
-                "skipping verdict — kernel-driven module load (parent PF_KTHREAD set)"
-            );
             return None;
         }
         // Base detection fires on comm alone (graceful-degrade when the

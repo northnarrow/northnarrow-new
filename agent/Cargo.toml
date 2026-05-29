@@ -126,6 +126,13 @@ hex = "0.4"
 # (see verbatim above).
 tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "lz4-compression"] }
 
+[build-dependencies]
+# Staleness guard: build.rs verifies the embedded eBPF `.o` was built
+# from the current source (matches the xtask-written stamp) and refuses
+# to embed a stale one. Shared crate so the hash matches xtask's writer
+# byte-for-byte.
+ebpf-guard = { path = "../ebpf-guard" }
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
