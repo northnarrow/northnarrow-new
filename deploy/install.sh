@@ -381,8 +381,26 @@ declare -A HONEYPOT_BAIT_DIRS=(
 )
 for bait in "${!HONEYPOT_BAIT_DIRS[@]}"; do
     dst_dir="${HONEYPOT_BAIT_DIRS[$bait]}"
-    echo "install.sh: writing control-surface file $dst_dir/$bait"
-    install -m 0644 -o root -g root "$HONEYPOT_BAITS_SRC_DIR/$bait" "$dst_dir/$bait"
+    src="$HONEYPOT_BAITS_SRC_DIR/$bait"
+    dst="$dst_dir/$bait"
+    # BUG-020 tactical (idempotent skip-if-identical). These baits are
+    # PROTECTED_INODES. Once the agent has pinned the anti-tamper LSM hooks,
+    # `install` (which REPLACES the file) is denied EPERM — and under
+    # `set -e` that aborts the whole reinstall before daemon-reload. The
+    # deny hook is pinned, so this fires even with the agent stopped; its
+    # only write-exemption is the live agent PID. The baits are
+    # content-stable across installs, so if the on-disk copy already matches
+    # the shipped bytes, skip the rewrite entirely. A missing or divergent
+    # bait is still (re)written (fresh install; a tampered one is also
+    # recreated from the same embedded bytes by the agent's boot
+    # HoneypotIntegrityCheck). The STRUCTURAL fix — a key-gated trusted-local
+    # installer that can suspend the pin — stays a design call (see §15.1).
+    if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+        echo "install.sh: control-surface file $dst already matches — skip (BUG-020)"
+    else
+        echo "install.sh: writing control-surface file $dst"
+        install -m 0644 -o root -g root "$src" "$dst"
+    fi
 done
 
 # Tappa 9.5 K7: pre-touch the two canary chain files for the same

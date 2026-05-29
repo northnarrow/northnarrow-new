@@ -3,7 +3,7 @@
 **Status:** Catalog. NOT implementation. Read-only design document.
 **Session date:** 2026-05-27 → 2026-05-28.
 **Branch context:** `benchmark/cc-t7-13-fix` on commits `5a0d736` (T7.13 lineage) and `1c15300` (tactical fix sweep). Phase B design doc at `docs/design/POSTURE_FSM_V2_REDESIGN.md` (commit `592bf7f`).
-**Total findings:** 13 + 3 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; all added 2026-05-29 during VM runtime validation — **BUG-019** (credential FIM) fixed + VM-validated, **BUG-020** (install.sh anti-tamper pin) open/design-pending, **BUG-021** (logging disk-saturation) fixed + VM-validated).
+**Total findings:** 13 + 3 post-session addenda (6 fixed this session, 5 architectural deferred, 2 cosmetic deferred; all added 2026-05-29 during VM runtime validation — **BUG-019** (credential FIM) fixed + VM-validated, **BUG-020** (install.sh anti-tamper pin) tactical-fixed (structural design-pending), **BUG-021** (logging disk-saturation) fixed + VM-validated).
 
 This document is the authoritative session-findings record. Each entry is
 self-contained (ID, severity, status, symptom, root cause, reproducer, fix or
@@ -31,7 +31,7 @@ recommended fix directions.
 | 12 | BUG-018 | `systemd-user` lineage gap — `uid=1000` helpers not auth-mediated | Beta-blocker architectural | **Deferred** |
 | 13 | P-7 RESIDUAL | R011 `/proc/<ppid>/exe` TOCTOU over-fire on transient kworkers | Cosmetic | **Deferred** (subsumed by PF_KTHREAD-via-BPF) |
 | 14 | BUG-019 | Credential FIM rules dead under `ProtectHome=yes` *(post-session, §17)* | Beta-blocker (security HIGH) | **Fixed + VM-validated** (2026-05-29) |
-| 15 | BUG-020 | `install.sh` reinstall denied by pinned anti-tamper (honeypot-bait rewrite) *(post-session, §18)* | Beta-blocker (operational) | **Open** — design pending |
+| 15 | BUG-020 | `install.sh` reinstall denied by pinned anti-tamper (honeypot-bait rewrite) *(post-session, §18)* | Beta-blocker (operational) | **Tactical fix applied** (reinstall unblocked); structural design-pending |
 | 16 | BUG-021 | Disk saturation: NN journal amplified to an uncapped `/var/log/syslog` *(post-session, §19)* | Beta-blocker (availability) | **Fixed + VM-validated** (2026-05-29) |
 
 ---
@@ -802,7 +802,7 @@ INFO fim: WATCHED_PATHS populated inserted=88 skipped=37 configured=125
 ## 18. BUG-020 — `install.sh` reinstall aborts on honeypot-bait rewrite while anti-tamper pins are active *(post-session; finding #15)*
 
 - **Severity:** Beta-blocker (operational — breaks the documented reinstall path). NOT a security hole: this is anti-tamper *failing closed* exactly as designed. The harm is that `install.sh` aborts partway under `set -euo pipefail`, leaving the operator unsure whether the install succeeded and skipping the script's own `daemon-reload` + completion banner.
-- **Status:** **Open — design pending.** Do NOT fix tactically in isolation: the structural fix touches the anti-tamper trust model (same cluster as BUG-010/011, §15.1) and is a design call.
+- **Status:** **Tactical fix applied + VM-validated (2026-05-29) — reinstall unblocked; structural deferred (design-pending).** The idempotent skip-if-identical (below) lets a reinstall complete with the agent running, no fresh boot. The structural trusted-installer is still required for the residual case (see **Residual limit** below) and remains a design call (anti-tamper trust model, §15.1).
 
 **Symptom.** Re-running `deploy/install.sh` on a host where the agent has booted at least once (so the anti-tamper LSM programs are pinned) aborts at the honeypot control-surface rewrite:
 
@@ -826,8 +826,10 @@ The rewrite only succeeds on a **fresh boot before the agent attaches** (no pins
 3. `sudo ./deploy/install.sh` → aborts at the first honeypot bait with `Operation not permitted`; no `daemon-reload`, no completion banner.
 
 **Fix paths (record both; pick during design).**
-- **Tactical — unblock the update flow.** Make the honeypot loop idempotent: skip the rewrite when the on-disk bait already byte-matches the embedded source (the baits are content-stable across installs), or make it pin-aware (`|| true` + a logged WARN when the deny fires). Lets a stopped-agent reinstall run through to `daemon-reload`. Cheap; does not touch the trust model. Caveat: a *tampered* bait would then not be force-corrected by reinstall — acceptable, because the agent's boot `HoneypotIntegrityCheck` re-verifies + recreates baits from the same embedded bytes at next start.
+- **Tactical — APPLIED (this commit, VM-validated 2026-05-29).** The honeypot loop is now idempotent: `cmp -s` the on-disk bait against the shipped source and SKIP the rewrite when they match, instead of letting `install` attempt the (denied) replace. A reinstall now completes with the agent running — no fresh boot, no manual `daemon-reload`. A missing/divergent bait is still (re)written, and the agent's boot `HoneypotIntegrityCheck` recreates any tampered one from the same embedded bytes, so coverage is not weakened.
 - **Structural — close the cluster.** Introduce a **trusted-local-installer** principal that presents the Ed25519 admin key to authorize a scoped, TTL'd bait/pin teardown for the duration of an install (analogous to the BUG-010 PID-1 kill-override, but key-gated and covering `inode_protect` writes — the `FS_PROTECT_OVERRIDE` row in §15.1). This is the same "no concept of a trusted local controller / observer / authority / **installer**" gap as BUG-010 (controller) and BUG-011 (observer); solving it once with an explicit trust hierarchy closes BUG-010 / BUG-011 / BUG-020 together.
+
+**Residual limit (the tactical fix is NOT a full close).** Skip-if-identical unblocks exactly two cases: (a) **same-version reinstall** — baits already match the shipped bytes → skipped; and (b) **fresh install** — baits absent → written. It does NOT cover the third case: a reinstall that **changes an existing bait's content** (a release ships different `configs/honeypot-baits/*` bytes). There the `cmp` mismatches, the loop falls through to `install`, and the replace EPERMs against the pinned hook exactly as before — so that update still requires a **fresh boot** (no pins at install time) or the **structural trusted-installer**. The structural fix is therefore not optional forever: it is the ONLY mechanism that can apply a bait-content update on a running host. **Trigger that re-opens BUG-020:** shipping changed honeypot-bait content and reinstalling on a running (pinned) host.
 
 **References.**
 - Cluster: **anti-tamper trust model gap** (§15.1) — BUG-020 is the fourth instance (installer) alongside BUG-010 (controller), BUG-011 (observer), BUG-013 (authority).
