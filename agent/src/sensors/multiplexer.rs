@@ -362,6 +362,60 @@ where
     })
 }
 
+/// Coalesces malformed-ringbuf-entry WARNs to at most one per second with a
+/// running dropped-count. A desynced / garbage ring — e.g. the
+/// FS_PROTECT_EVENTS pinned-reuse desync (catalog BUG-024) — otherwise rejects
+/// every entry and floods the journal at hundreds/sec, filling the
+/// LogNamespace `SystemMaxUse` cap and vacuuming real telemetry out of the
+/// retention window. A sensor fault must never DoS its own log. Used by every
+/// ringbuf pump below.
+struct RejectThrottle {
+    count: u64,
+    last_log: Option<std::time::Instant>,
+    last_got: usize,
+}
+
+impl RejectThrottle {
+    fn new() -> Self {
+        Self { count: 0, last_log: None, last_got: 0 }
+    }
+
+    /// Record one rejected entry; emit a coalesced WARN at most 1/sec.
+    fn record(&mut self, label: &str, expected: usize, got: usize) {
+        self.count += 1;
+        self.last_got = got;
+        if self.due() {
+            self.emit(label, expected);
+        }
+    }
+
+    /// Flush a residual count once the ring goes quiet, so a final burst is
+    /// not silently dropped from the log.
+    fn flush_idle(&mut self, label: &str, expected: usize) {
+        if self.count > 0 && self.due() {
+            self.emit(label, expected);
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.last_log
+            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1))
+    }
+
+    fn emit(&mut self, label: &str, expected: usize) {
+        warn!(
+            label,
+            rejected = self.count,
+            expected,
+            got = self.last_got,
+            "ringbuf entries rejected (malformed; rate-limited to <=1/s — a sustained \
+             count means a desynced ring, e.g. BUG-024 FS_PROTECT_EVENTS)"
+        );
+        self.count = 0;
+        self.last_log = Some(std::time::Instant::now());
+    }
+}
+
 async fn pump<T>(
     label: &'static str,
     rb: RingBuf<MapData>,
@@ -372,6 +426,7 @@ where
     for<'a> Event: From<&'a T>,
 {
     let mut async_fd = AsyncFd::new(rb)?;
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -385,17 +440,12 @@ where
                         return Ok(());
                     }
                 }
-                Err(e) => warn!(
-                    label,
-                    expected = std::mem::size_of::<T>(),
-                    got = bytes.len(),
-                    error = %e,
-                    "ringbuf entry rejected"
-                ),
+                Err(_e) => reject.record(label, std::mem::size_of::<T>(), bytes.len()),
             }
         }
         guard.clear_ready();
         if drained == 0 {
+            reject.flush_idle(label, std::mem::size_of::<T>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -421,6 +471,7 @@ async fn pump_tcp_connect(
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = AsyncFd::new(rb)?;
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -445,16 +496,14 @@ async fn pump_tcp_connect(
                         return Ok(());
                     }
                 }
-                Err(e) => warn!(
-                    expected = std::mem::size_of::<TcpConnectRaw>(),
-                    got = bytes.len(),
-                    error = %e,
-                    "tcp_connect ringbuf entry rejected"
-                ),
+                Err(_e) => {
+                    reject.record("tcp_connect", std::mem::size_of::<TcpConnectRaw>(), bytes.len())
+                }
             }
         }
         guard.clear_ready();
         if drained == 0 {
+            reject.flush_idle("tcp_connect", std::mem::size_of::<TcpConnectRaw>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -517,6 +566,7 @@ async fn pump_dns_query(
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = AsyncFd::new(rb)?;
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -544,16 +594,14 @@ async fn pump_dns_query(
                         return Ok(());
                     }
                 }
-                Err(e) => warn!(
-                    expected = std::mem::size_of::<DnsQueryRaw>(),
-                    got = bytes.len(),
-                    error = %e,
-                    "dns_query ringbuf entry rejected"
-                ),
+                Err(_e) => {
+                    reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len())
+                }
             }
         }
         guard.clear_ready();
         if drained == 0 {
+            reject.flush_idle("dns_query", std::mem::size_of::<DnsQueryRaw>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
