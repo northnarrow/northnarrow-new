@@ -1003,6 +1003,68 @@ async fn main() -> Result<()> {
     };
     let paths_summary = admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
 
+    // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
+    // under /var/lib/northnarrow (netflow + fim_drift share its dance
+    // mutex so two concurrent rotations can't race the dir's chattr +i).
+    // `take_protected_inodes_map` takes the PROTECTED_INODES handle out of
+    // the Ebpf — it MUST run AFTER the anti-tamper bootstrap registered the
+    // protected inodes and (THE VM-VALIDATE ITEM, catalog §24) with nothing
+    // else mutating that map via the Ebpf handle afterward. If a runtime
+    // path (canary deploy / admin) re-registers a protected inode via the
+    // Ebpf, switch this to opening the PINNED map by path instead of
+    // `take`. On failure the rotating writers don't open (degrade-not-fail).
+    let state_protection: Option<
+        std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
+    > = match northnarrow_agent::anti_tamper::filesystem::take_protected_inodes_map(
+        sensor.ebpf_mut(),
+    ) {
+        Ok(h) => Some(std::sync::Arc::new(
+            northnarrow_agent::anti_tamper::filesystem::StateDirProtection::new(
+                std::path::PathBuf::from(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
+                h,
+            ),
+        )),
+        Err(e) => {
+            // ERROR, not warn: anti-tamper FS protection of the state logs is
+            // compromised (PROTECTED_INODES missing) AND rotation is disabled.
+            tracing::error!(
+                error = %e,
+                "BUG-026: take_protected_inodes_map failed — anti-tamper FS protection of the \
+                 state logs is COMPROMISED and on-disk log ROTATION is disabled this boot; \
+                 netflow + fim_drift keep logging APPEND-ONLY (the disk-fill vector returns \
+                 until a restart recovers anti-tamper)"
+            );
+            None
+        }
+    };
+    // Degrade-not-fail (BUG-026 ②): if protection is unavailable, keep
+    // telemetry flowing — open the writers with NoProtection + rotation
+    // DISABLED (append-only) rather than dropping FIM-drift + netflow, the two
+    // core telemetry streams. Losing them is the worse failure for an XDR; the
+    // disk grows (the original vector) only until a restart recovers
+    // anti-tamper. An effectively-infinite cap means the writer never invokes
+    // the chattr dance (which would EPERM under `+i` and stall logging).
+    let rotation_protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager> =
+        match &state_protection {
+            // `p.clone()` clones the concrete Arc, then the match arm
+            // unsize-coerces it to Arc<dyn> (Arc::clone(p) would infer the
+            // wrong type param from the expected `dyn` and mismatch).
+            Some(p) => p.clone(),
+            None => std::sync::Arc::new(northnarrow_agent::chainlog::NoProtection),
+        };
+    let rotation_on = state_protection.is_some();
+    let cap = |bytes: u64| if rotation_on { bytes } else { u64::MAX };
+    let fim_drift_rotation = northnarrow_agent::chainlog::RotationConfig {
+        size_cap_bytes: cap(32 * 1024 * 1024),
+        max_archives: 8,
+        file_mode: 0o644,
+    };
+    let netflow_rotation = northnarrow_agent::chainlog::RotationConfig {
+        size_cap_bytes: cap(16 * 1024 * 1024),
+        max_archives: 16,
+        file_mode: 0o644,
+    };
+
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // Re-derive the signing key + agent_id for FIM the same way
         // the audit log does (re-load rather than steal the audit
@@ -1172,8 +1234,15 @@ async fn main() -> Result<()> {
                     match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
                         &cli.signing_key_file,
                     )
-                    .and_then(|key| FimDriftDb::open(&cli.fim_drift_file, key, agent_id))
-                    {
+                    .and_then(|key| {
+                        FimDriftDb::open(
+                            &cli.fim_drift_file,
+                            key,
+                            agent_id,
+                            std::sync::Arc::clone(&rotation_protection),
+                            fim_drift_rotation,
+                        )
+                    }) {
                         Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
                         Err(e) => {
                             warn!(
@@ -1443,8 +1512,15 @@ async fn main() -> Result<()> {
         let netflow_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
             &cli.signing_key_file,
         )
-        .and_then(|key| NetFlowDb::open(&cli.netflow_file, key, agent_id))
-        {
+        .and_then(|key| {
+            NetFlowDb::open(
+                &cli.netflow_file,
+                key,
+                agent_id,
+                std::sync::Arc::clone(&rotation_protection),
+                netflow_rotation,
+            )
+        }) {
             Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
             Err(e) => {
                 warn!(
@@ -2279,17 +2355,33 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
 fn audit_combat_reconcile(rules_removed: usize) {
     use std::io::Write;
     const PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
+    // BUG-026 B-cap: combat-audit is the lone UNSIGNED / unchained
+    // best-effort log (the forensic upgrade to a signed chainlog is
+    // tracked as BUG-028). `/var/lib/northnarrow` is `chattr +i`, so a
+    // rename-based rotate is a blocked dir-entry op — cap by
+    // TRUNCATE-IN-PLACE (a content op, allowed under `+i`) when the file
+    // exceeds the cap. A full truncate is acceptable for this rare,
+    // unsigned log; keeping the most-recent rows is a BUG-028 nicety.
+    const CAP_BYTES: u64 = 8 * 1024 * 1024;
     let line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "event": "combat_reconcile",
         "reason": "stale_reconcile",
         "rules_torn_down": rules_removed,
     });
-    let res = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(PATH)
-        .and_then(|mut f| writeln!(f, "{line}"));
+    let over_cap = std::fs::metadata(PATH)
+        .map(|m| m.len() > CAP_BYTES)
+        .unwrap_or(false);
+    let open_res = if over_cap {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(PATH)
+    } else {
+        std::fs::OpenOptions::new().create(true).append(true).open(PATH)
+    };
+    let res = open_res.and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = res {
         warn!(error = %e, path = PATH, "could not write COMBAT reconcile audit line (non-fatal)");
     }

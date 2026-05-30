@@ -102,6 +102,41 @@ pub struct NetFlowEntry {
     pub agent_sig: String,
 }
 
+/// BUG-026 migration — the `netflow.jsonl` DATA payload: every
+/// [`NetFlowEntry`] field EXCEPT the chain framing (`prev_hash` /
+/// `entry_hash` / `agent_sig`), in the SAME declaration order. A
+/// [`crate::chainlog::ChainLine<NetFlowPayload>`] with `fmt_ver = None`
+/// therefore serialises BYTE-FOR-BYTE identically to a legacy v1
+/// `NetFlowEntry`, so an existing on-disk `netflow.jsonl` still verifies
+/// under the rotation-aware reader (proven by
+/// `bug026_legacy_v1_netflow_line_still_verifies`). No field carries
+/// `#[serde(default)]`/`skip`, so the mirror is exact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetFlowPayload {
+    pub ts: String,
+    pub flow_id: String,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub family: u8,
+    pub src_addr: String,
+    pub src_port: u16,
+    pub dst_addr: String,
+    pub dst_port: u16,
+    pub proto: u8,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: String,
+    pub exe: Option<String>,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub resolved_hostname: Option<String>,
+    pub ja3: Option<String>,
+    pub ja4: Option<String>,
+    pub sni: Option<String>,
+    pub close_reason: u8,
+    pub agent_id: String,
+}
+
 /// One on-disk JSONL row in `netflow_listeners.jsonl`. Same chain
 /// shape as [`NetFlowEntry`]; thinner body (no five-tuple, no
 /// bytes counters, no TLS fingerprint).
@@ -129,25 +164,27 @@ pub struct NetListenerEntry {
 /// [`crate::fim::drain::FimDriftDb`] — single-writer DB serialised
 /// inside `Arc<Mutex<_>>` from the drain task.
 pub struct NetFlowDb {
-    path: PathBuf,
-    key: AgentSigningKey,
+    inner: crate::chainlog::RotatingChainLog<NetFlowPayload>,
     agent_id: [u8; 16],
-    last_hash: String,
 }
 
 impl NetFlowDb {
-    pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let last_hash = read_tail_hash_flow(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            key,
-            agent_id,
-            last_hash,
-        })
+    pub fn open(
+        path: &Path,
+        key: AgentSigningKey,
+        agent_id: [u8; 16],
+        protection: std::sync::Arc<dyn crate::chainlog::ProtectionManager>,
+        cfg: crate::chainlog::RotationConfig,
+    ) -> Result<Self> {
+        let inner =
+            crate::chainlog::RotatingChainLog::<NetFlowPayload>::open(path, key, cfg, protection)?;
+        Ok(Self { inner, agent_id })
     }
 
-    pub fn append(&mut self, ev: &NetFlowEvent) -> Result<NetFlowEntry> {
-        let mut entry = NetFlowEntry {
+    /// Append one closed-flow row as a signed chainlog data line
+    /// (rotating at the size cap). Returns the new line's `entry_hash`.
+    pub fn append(&mut self, ev: &NetFlowEvent) -> Result<String> {
+        let payload = NetFlowPayload {
             ts: format_ts(Utc::now()),
             flow_id: ev.flow_id.clone(),
             start_ns: ev.start_ns,
@@ -170,33 +207,12 @@ impl NetFlowDb {
             sni: ev.tls_fingerprint.as_ref().and_then(|fp| fp.sni.clone()),
             close_reason: ev.close_reason,
             agent_id: hex::encode(self.agent_id),
-            prev_hash: self.last_hash.clone(),
-            entry_hash: String::new(),
-            agent_sig: String::new(),
         };
-        let hash = compute_flow_entry_hash(&entry)?;
-        entry.entry_hash = hex::encode(hash);
-        let sig = self.key.sign(&hash);
-        entry.agent_sig = B64.encode(sig.to_bytes());
-        let mut line =
-            serde_json::to_string(&entry).map_err(|e| anyhow!("serialising netflow entry: {e}"))?;
-        line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(NET_LOG_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| format!("opening netflow log {} for append", self.path.display()))?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending netflow entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
-        self.last_hash = entry.entry_hash.clone();
-        Ok(entry)
+        self.inner.append(payload)
     }
 
     pub fn last_hash(&self) -> &str {
-        &self.last_hash
+        self.inner.last_hash()
     }
 }
 
@@ -477,10 +493,6 @@ fn comm_to_string(comm: &[u8; 16]) -> String {
     String::from_utf8_lossy(&comm[..len]).into_owned()
 }
 
-fn read_tail_hash_flow(path: &Path) -> Result<String> {
-    read_tail_hash::<NetFlowEntry, _>(path, |e| e.entry_hash)
-}
-
 fn read_tail_hash_listener(path: &Path) -> Result<String> {
     read_tail_hash::<NetListenerEntry, _>(path, |e| e.entry_hash)
 }
@@ -511,6 +523,9 @@ where
     Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
 }
 
+/// Legacy v1 netflow hash — production now uses the chainlog core;
+/// retained ONLY for the BUG-026 byte-compat gate.
+#[cfg(test)]
 fn compute_flow_entry_hash(entry: &NetFlowEntry) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
@@ -575,31 +590,136 @@ mod tests {
         AgentSigningKey::load_or_bootstrap(&dir.path().join("k.sig")).unwrap()
     }
 
+    /// BUG-026 migration GATE for netflow: an existing on-disk **v1**
+    /// `netflow.jsonl` line MUST still verify under the rotation-aware
+    /// reader after the payload/envelope split — the same two-way proof
+    /// as the fim_drift gate (byte-equality + end-to-end of a really-
+    /// signed legacy line).
+    #[test]
+    fn bug026_legacy_v1_netflow_line_still_verifies() {
+        use crate::chainlog::{verify_log_set, ChainLine};
+        let dir = tempfile::tempdir().unwrap();
+        let key = fresh_key();
+        let pk = key.verifying_key();
+
+        // A real legacy v1 line — body fields, then the OLD hash + sign.
+        let mut legacy = NetFlowEntry {
+            ts: "2026-05-30T00:00:00.000000Z".to_string(),
+            flow_id: "abc".to_string(),
+            start_ns: 1000,
+            end_ns: 2000,
+            family: 2,
+            src_addr: "192.0.2.10".to_string(),
+            src_port: 54321,
+            dst_addr: "1.2.3.4".to_string(),
+            dst_port: 443,
+            proto: 6,
+            pid: 1234,
+            uid: 1000,
+            comm: "curl".to_string(),
+            exe: Some("/usr/bin/curl".to_string()),
+            bytes_sent: 100,
+            bytes_recv: 200,
+            resolved_hostname: Some("example.com".to_string()),
+            ja3: None,
+            ja4: None,
+            sni: None,
+            close_reason: 0,
+            agent_id: "07".repeat(16),
+            prev_hash: GENESIS_PREV_HASH.to_string(),
+            entry_hash: String::new(),
+            agent_sig: String::new(),
+        };
+        let h = compute_flow_entry_hash(&legacy).unwrap();
+        legacy.entry_hash = hex::encode(h);
+        legacy.agent_sig = B64.encode(key.sign(&h).to_bytes());
+
+        // (1) byte-equality.
+        let envelope = ChainLine {
+            payload: NetFlowPayload {
+                ts: legacy.ts.clone(),
+                flow_id: legacy.flow_id.clone(),
+                start_ns: legacy.start_ns,
+                end_ns: legacy.end_ns,
+                family: legacy.family,
+                src_addr: legacy.src_addr.clone(),
+                src_port: legacy.src_port,
+                dst_addr: legacy.dst_addr.clone(),
+                dst_port: legacy.dst_port,
+                proto: legacy.proto,
+                pid: legacy.pid,
+                uid: legacy.uid,
+                comm: legacy.comm.clone(),
+                exe: legacy.exe.clone(),
+                bytes_sent: legacy.bytes_sent,
+                bytes_recv: legacy.bytes_recv,
+                resolved_hostname: legacy.resolved_hostname.clone(),
+                ja3: legacy.ja3.clone(),
+                ja4: legacy.ja4.clone(),
+                sni: legacy.sni.clone(),
+                close_reason: legacy.close_reason,
+                agent_id: legacy.agent_id.clone(),
+            },
+            fmt_ver: None,
+            prev_hash: legacy.prev_hash.clone(),
+            entry_hash: legacy.entry_hash.clone(),
+            agent_sig: legacy.agent_sig.clone(),
+        };
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "ChainLine<NetFlowPayload>{{fmt_ver:None}} must serialise byte-identically \
+             to the legacy NetFlowEntry — else on-disk v1 lines stop verifying"
+        );
+
+        // (2) end-to-end.
+        let log = dir.path().join("netflow.jsonl");
+        std::fs::write(&log, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+        let report = verify_log_set::<NetFlowPayload>(&log, &pk).unwrap();
+        assert_eq!(report.total_records, 1);
+    }
+
     /// N9 drain test #1 — appending a NetFlowEvent yields a row
     /// with the chain primitives populated + readable back from
     /// the file. Pins the §4.4 on-disk schema is what the chain
     /// produces.
     #[test]
     fn netflow_db_append_writes_one_chained_row() {
+        use crate::chainlog::{verify_log_set, ChainLine, CHAINLOG_FMT_V2, NoProtection, RotationConfig};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key = fresh_key();
-        let mut db = NetFlowDb::open(&path, key, [0u8; 16]).unwrap();
+        let pk = key.verifying_key();
+        let mut db = NetFlowDb::open(
+            &path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(NoProtection),
+            RotationConfig::default(),
+        )
+        .unwrap();
         let ev = test_event();
-        let entry = db.append(&ev).unwrap();
-        assert_eq!(entry.flow_id, "abc");
-        assert_eq!(entry.dst_addr, "1.2.3.4");
-        assert_eq!(entry.dst_port, 443);
-        assert_eq!(entry.resolved_hostname, Some("example.com".to_string()));
-        assert_eq!(entry.prev_hash.len(), 64);
-        assert_eq!(entry.entry_hash.len(), 64);
-        assert!(!entry.agent_sig.is_empty());
+        let entry_hash = db.append(&ev).unwrap();
 
+        // Read the PERSISTED row and assert the SAME body properties the
+        // pre-migration test checked — now on the ChainLine payload — plus
+        // that the chain VERIFIES (not merely that append returned a hash).
         let body = std::fs::read_to_string(&path).unwrap();
         let rows: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(rows.len(), 1, "expected one chained row");
-        let parsed: NetFlowEntry = serde_json::from_str(rows[0]).unwrap();
-        assert_eq!(parsed.entry_hash, entry.entry_hash);
+        let line: ChainLine<NetFlowPayload> = serde_json::from_str(rows[0]).unwrap();
+        assert_eq!(line.payload.flow_id, "abc");
+        assert_eq!(line.payload.dst_addr, "1.2.3.4");
+        assert_eq!(line.payload.dst_port, 443);
+        assert_eq!(line.payload.resolved_hostname, Some("example.com".to_string()));
+        assert_eq!(line.entry_hash, entry_hash);
+        assert_eq!(line.prev_hash.len(), 64);
+        assert_eq!(line.entry_hash.len(), 64);
+        assert!(!line.agent_sig.is_empty());
+        assert_eq!(line.fmt_ver, Some(CHAINLOG_FMT_V2), "new lines are v2");
+
+        let report = verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
+        assert_eq!(report.total_records, 1);
     }
 
     /// N9 drain test #2 — chain continuity across two appends:
@@ -607,17 +727,42 @@ mod tests {
     /// Same shape as the audit + drift chain tests.
     #[test]
     fn netflow_db_chains_prev_hash_into_next_entry_hash() {
+        use crate::chainlog::{verify_log_set, ChainLine, NoProtection, RotationConfig};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key = fresh_key();
-        let mut db = NetFlowDb::open(&path, key, [1u8; 16]).unwrap();
-        let row1 = db.append(&test_event()).unwrap();
+        let pk = key.verifying_key();
+        let mut db = NetFlowDb::open(
+            &path,
+            key,
+            [1u8; 16],
+            std::sync::Arc::new(NoProtection),
+            RotationConfig::default(),
+        )
+        .unwrap();
+        let h1 = db.append(&test_event()).unwrap();
         let mut ev2 = test_event();
         ev2.flow_id = "def".to_string();
-        let row2 = db.append(&ev2).unwrap();
-        assert_eq!(row2.prev_hash, row1.entry_hash);
-        assert_ne!(row1.entry_hash, row2.entry_hash);
-        assert_eq!(db.last_hash(), &row2.entry_hash);
+        let h2 = db.append(&ev2).unwrap();
+        assert_ne!(h1, h2, "two distinct rows have distinct entry hashes");
+        assert_eq!(db.last_hash(), h2);
+
+        // The on-disk row 2's prev_hash MUST equal row 1's entry_hash —
+        // the chain-continuity property the pre-migration test pinned.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<ChainLine<NetFlowPayload>> = body
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].entry_hash, h1);
+        assert_eq!(
+            rows[1].prev_hash, h1,
+            "row2.prev_hash must chain off row1.entry_hash"
+        );
+        assert_eq!(rows[1].entry_hash, h2);
+        verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
     }
 
     /// N9 drain test #3 — reopening a db on an existing log picks
@@ -628,20 +773,52 @@ mod tests {
     /// the second db sees the same signing identity as the first.
     #[test]
     fn netflow_db_reopen_resumes_chain_from_tail() {
+        use crate::chainlog::{verify_log_set, ChainLine, NoProtection, RotationConfig};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key_path = dir.path().join("k.sig");
+        let pk = AgentSigningKey::load_or_bootstrap(&key_path)
+            .unwrap()
+            .verifying_key();
+
         let key1 = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
-        let mut db = NetFlowDb::open(&path, key1, [2u8; 16]).unwrap();
-        let row1 = db.append(&test_event()).unwrap();
+        let mut db = NetFlowDb::open(
+            &path,
+            key1,
+            [2u8; 16],
+            std::sync::Arc::new(NoProtection),
+            RotationConfig::default(),
+        )
+        .unwrap();
+        let h1 = db.append(&test_event()).unwrap();
         drop(db);
+
         let key2 = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
-        let mut db = NetFlowDb::open(&path, key2, [2u8; 16]).unwrap();
-        assert_eq!(db.last_hash(), &row1.entry_hash);
+        let mut db = NetFlowDb::open(
+            &path,
+            key2,
+            [2u8; 16],
+            std::sync::Arc::new(NoProtection),
+            RotationConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(db.last_hash(), h1, "reopen must resume from the prior tail");
         let mut ev2 = test_event();
         ev2.flow_id = "next".to_string();
-        let row2 = db.append(&ev2).unwrap();
-        assert_eq!(row2.prev_hash, row1.entry_hash);
+        let h2 = db.append(&ev2).unwrap();
+
+        // The post-reopen append must chain off the prior run's last row,
+        // and the whole (across-reopen) chain must verify.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<ChainLine<NetFlowPayload>> = body
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].prev_hash, h1);
+        assert_eq!(rows[1].entry_hash, h2);
+        verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
     }
 
     /// N9 drain test #4 — TlsFingerprint propagates from
@@ -654,7 +831,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key = fresh_key();
-        let mut db = NetFlowDb::open(&path, key, [0u8; 16]).unwrap();
+        let mut db = NetFlowDb::open(
+            &path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         let mut ev = test_event();
         ev.tls_fingerprint = Some(TlsFingerprint {
             ja3: "deadbeef".to_string(),
@@ -663,10 +847,15 @@ mod tests {
             sni: Some("example.com".to_string()),
             alpn: vec!["h2".to_string()],
         });
-        let row = db.append(&ev).unwrap();
-        assert_eq!(row.ja3, Some("deadbeef".to_string()));
-        assert_eq!(row.ja4, Some("t13d1517h2".to_string()));
-        assert_eq!(row.sni, Some("example.com".to_string()));
+        db.append(&ev).unwrap();
+
+        // Assert the persisted ROW preserves every fingerprint field.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let line: crate::chainlog::ChainLine<NetFlowPayload> =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line.payload.ja3, Some("deadbeef".to_string()));
+        assert_eq!(line.payload.ja4, Some("t13d1517h2".to_string()));
+        assert_eq!(line.payload.sni, Some("example.com".to_string()));
     }
 
     /// N9 drain test #5 — `NetListenerDb::append` produces a
@@ -706,7 +895,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does_not_exist.jsonl");
         let key = fresh_key();
-        let db = NetFlowDb::open(&path, key, [0u8; 16]).unwrap();
+        let db = NetFlowDb::open(
+            &path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         assert_eq!(db.last_hash(), GENESIS_PREV_HASH);
         assert!(!path.exists(), "open must not create the file");
     }

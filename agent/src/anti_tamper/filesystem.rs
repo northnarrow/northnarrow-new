@@ -937,6 +937,15 @@ pub fn take_protected_inodes_map(ebpf: &mut Ebpf) -> Result<ProtectedInodesHandl
 /// (e.g. `combat-audit.jsonl`) use `chainlog::NoProtection` instead.
 pub struct StateDirProtection {
     dir: PathBuf,
+    /// Serializes the chattr dance across ALL writers that share this dir:
+    /// `netflow.jsonl` + `fim_drift.jsonl` both live under
+    /// `/var/lib/northnarrow` and share one `Arc<StateDirProtection>`, so
+    /// two concurrent rotations would otherwise race on the dir's `+i`
+    /// (A lifts `-i`, B lifts `-i`, A restores `+i` while B is mid-rename).
+    /// Held for the WHOLE dance, so only one rotation holds the dir `-i`
+    /// at a time. Normal appends never take it (they are `O_APPEND` on the
+    /// file, not dir-entry ops) — only rotation's create/rename/unlink.
+    dance: parking_lot::Mutex<()>,
     inodes: parking_lot::Mutex<ProtectedInodesHandle>,
 }
 
@@ -944,16 +953,19 @@ impl StateDirProtection {
     pub fn new(dir: PathBuf, inodes: ProtectedInodesHandle) -> Self {
         Self {
             dir,
+            dance: parking_lot::Mutex::new(()),
             inodes: parking_lot::Mutex::new(inodes),
         }
     }
 }
 
 impl crate::chainlog::ProtectionManager for StateDirProtection {
-    fn with_mutable_dir<R>(&self, f: &mut dyn FnMut() -> Result<R>) -> Result<R> {
-        // The guard lifts +i now and restores it when this scope exits,
-        // on EVERY path (Ok / Err / panic). `f` does the rename/create/
-        // unlink the +i dir would otherwise block.
+    fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        // Serialize the dance first, THEN lift immutability. Drop order is
+        // reverse-declaration: `_guard` drops before `_dance`, so `+i` is
+        // restored BEFORE the lock releases — the next writer that
+        // acquires the dance lock always finds the dir `+i`.
+        let _dance = self.dance.lock();
         let _guard = ImmutabilityGuard::lift(&self.dir)?;
         f()
     }

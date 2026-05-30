@@ -302,25 +302,33 @@ fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
 /// leave the dir mutable, and registers the new active inode in
 /// `PROTECTED_INODES`. Logs outside the protected dir use
 /// [`NoProtection`].
-pub trait ProtectionManager {
+///
+/// **Object-safe** (no generic methods, `Send + Sync` supertrait) so a
+/// single manager can be shared as `Arc<dyn ProtectionManager>` across
+/// the several writers under one state dir — `netflow.jsonl` +
+/// `fim_drift.jsonl` both live in `/var/lib/northnarrow` and MUST share
+/// the same dance mutex (else two concurrent rotations race the dir's
+/// `+i`). The writers therefore stay non-generic and unit-testable
+/// (tests pass `Arc::new(NoProtection)`).
+pub trait ProtectionManager: Send + Sync {
     /// Run `f` with the state dir mutable, then restore immutability
-    /// before returning (fail-safe). The implementation owns the RAII
-    /// guard; this signature only promises `f` runs with the dir
-    /// writable.
-    fn with_mutable_dir<R>(&self, f: &mut dyn FnMut() -> Result<R>) -> Result<R>;
+    /// before returning (fail-safe). `f` returns `()`; rotation captures
+    /// its outputs (the evicted list) via its own closure environment so
+    /// this method stays object-safe.
+    fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()>;
 
     /// Register a freshly-created active file's inode in
     /// `PROTECTED_INODES` so the LSM defends it like its predecessor.
     fn register_active(&self, path: &Path) -> Result<()>;
 }
 
-/// No-op manager for unprotected logs (`combat-audit.jsonl`) and tests:
-/// the dir is plain-writable, so the dance is a direct call.
+/// No-op manager for unprotected logs and tests: the dir is plain-
+/// writable, so the dance is a direct call.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoProtection;
 
 impl ProtectionManager for NoProtection {
-    fn with_mutable_dir<R>(&self, f: &mut dyn FnMut() -> Result<R>) -> Result<R> {
+    fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
         f()
     }
     fn register_active(&self, _path: &Path) -> Result<()> {
@@ -354,12 +362,12 @@ impl Default for RotationConfig {
 }
 
 /// Append-only, rotation-aware, signed chain writer for one log.
-pub struct RotatingChainLog<P, M: ProtectionManager> {
+pub struct RotatingChainLog<P> {
     active_path: PathBuf,
     manifest_path: PathBuf,
     key: AgentSigningKey,
     cfg: RotationConfig,
-    protection: M,
+    protection: std::sync::Arc<dyn ProtectionManager>,
     /// Tail `entry_hash` the next data line chains off (the previous
     /// file's terminator hash right after a rotation; GENESIS on a
     /// fresh seq-0 file).
@@ -373,7 +381,7 @@ pub struct RotatingChainLog<P, M: ProtectionManager> {
     _marker: std::marker::PhantomData<P>,
 }
 
-impl<P: Serialize + DeserializeOwned, M: ProtectionManager> RotatingChainLog<P, M> {
+impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
     /// Open (or initialise) the log at `active_path`. Scans existing
     /// archives to recover `next_seq`, walks the (bounded) active file
     /// for its tail/size/count, and completes a half-finished rotation
@@ -382,7 +390,7 @@ impl<P: Serialize + DeserializeOwned, M: ProtectionManager> RotatingChainLog<P, 
         active_path: &Path,
         key: AgentSigningKey,
         cfg: RotationConfig,
-        protection: M,
+        protection: std::sync::Arc<dyn ProtectionManager>,
     ) -> Result<Self> {
         let manifest_path = manifest_path_for(active_path);
         let next_seq = scan_max_archive_seq(active_path)?.map_or(1, |m| m + 1);
@@ -489,9 +497,11 @@ impl<P: Serialize + DeserializeOwned, M: ProtectionManager> RotatingChainLog<P, 
         let archive = archive_path(&active, seq);
         let max_archives = self.cfg.max_archives;
         let file_mode = self.cfg.file_mode;
-        let protection = &self.protection;
-        let evicted: Vec<(u64, String)> =
-            protection.with_mutable_dir(&mut || -> Result<Vec<(u64, String)>> {
+        let protection_inner = std::sync::Arc::clone(&self.protection);
+        let mut evicted: Vec<(u64, String)> = Vec::new();
+        {
+            let evicted_ref = &mut evicted;
+            self.protection.with_mutable_dir(&mut || -> Result<()> {
                 fs::rename(&active, &archive).with_context(|| {
                     format!("sealing {} → {}", active.display(), archive.display())
                 })?;
@@ -502,9 +512,11 @@ impl<P: Serialize + DeserializeOwned, M: ProtectionManager> RotatingChainLog<P, 
                     .mode(file_mode)
                     .open(&active)
                     .with_context(|| format!("creating fresh active {}", active.display()))?;
-                protection.register_active(&active)?;
-                evict_excess_archives(&active, max_archives)
+                protection_inner.register_active(&active)?;
+                *evicted_ref = evict_excess_archives(&active, max_archives)?;
+                Ok(())
             })?;
+        }
 
         let sealed_bytes = self.active_bytes;
         let sealed_records = self.active_records;
@@ -539,10 +551,12 @@ impl<P: Serialize + DeserializeOwned, M: ProtectionManager> RotatingChainLog<P, 
         let archive = archive_path(&active, seq);
         let file_mode = self.cfg.file_mode;
         let max_archives = self.cfg.max_archives;
-        let protection = &self.protection;
         let terminator_hash = self.last_hash.clone();
-        let evicted: Vec<(u64, String)> =
-            protection.with_mutable_dir(&mut || -> Result<Vec<(u64, String)>> {
+        let protection_inner = std::sync::Arc::clone(&self.protection);
+        let mut evicted: Vec<(u64, String)> = Vec::new();
+        {
+            let evicted_ref = &mut evicted;
+            self.protection.with_mutable_dir(&mut || -> Result<()> {
                 if !archive.exists() {
                     fs::rename(&active, &archive).with_context(|| {
                         format!("recovering {} → {}", active.display(), archive.display())
@@ -555,9 +569,11 @@ impl<P: Serialize + DeserializeOwned, M: ProtectionManager> RotatingChainLog<P, 
                     .mode(file_mode)
                     .open(&active)
                     .with_context(|| format!("creating fresh active {}", active.display()))?;
-                protection.register_active(&active)?;
-                evict_excess_archives(&active, max_archives)
+                protection_inner.register_active(&active)?;
+                *evicted_ref = evict_excess_archives(&active, max_archives)?;
+                Ok(())
             })?;
+        }
         // Manifest may or may not already carry the Rotated row (crash
         // timing). A duplicate is harmless to the verifier (it matches
         // the terminator); record it to be safe.
@@ -1157,7 +1173,7 @@ mod tests {
         let k = key();
         let pk = k.verifying_key();
         let mut log =
-            RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(2000, 50), NoProtection)
+            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
                 .unwrap();
 
         for i in 0..40 {
@@ -1199,7 +1215,7 @@ mod tests {
         let k = key();
         let pk = k.verifying_key();
         let mut log =
-            RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(300, 2), NoProtection)
+            RotatingChainLog::<TestPayload>::open(&active, k, cfg(300, 2), std::sync::Arc::new(NoProtection))
                 .unwrap();
 
         for i in 0..80 {
@@ -1226,7 +1242,7 @@ mod tests {
         let k = key();
         let pk = k.verifying_key();
         let mut log =
-            RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(2000, 50), NoProtection)
+            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
                 .unwrap();
         for i in 0..40 {
             log.append(payload(i)).unwrap();
@@ -1260,7 +1276,7 @@ mod tests {
         let k = key();
         let pk = k.verifying_key();
         let mut log =
-            RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(2000, 50), NoProtection)
+            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
                 .unwrap();
         for i in 0..40 {
             log.append(payload(i)).unwrap();
@@ -1294,7 +1310,7 @@ mod tests {
         for round in [0u64, 25] {
             let k = AgentSigningKey::load_or_bootstrap(&kpath).unwrap();
             let mut log =
-                RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(2000, 50), NoProtection)
+                RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
                     .unwrap();
             for i in round..round + 25 {
                 log.append(payload(i)).unwrap();
@@ -1317,7 +1333,7 @@ mod tests {
         let k = key();
         let pk = k.verifying_key();
         let mut log =
-            RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(2000, 2), NoProtection)
+            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 2), std::sync::Arc::new(NoProtection))
                 .unwrap();
         for i in 0..60 {
             log.append(payload(i)).unwrap();
@@ -1340,7 +1356,7 @@ mod tests {
         let k = key();
         let pk = k.verifying_key();
         let mut log =
-            RotatingChainLog::<TestPayload, _>::open(&active, k, cfg(2000, 2), NoProtection)
+            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 2), std::sync::Arc::new(NoProtection))
                 .unwrap();
         for i in 0..60 {
             log.append(payload(i)).unwrap();
@@ -1375,7 +1391,8 @@ mod tests {
         let active = dir.path().join("evil.jsonl");
         let k = key();
         let mut log =
-            RotatingChainLog::<Evil, _>::open(&active, k, cfg(2000, 50), NoProtection).unwrap();
+            RotatingChainLog::<Evil>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
+                .unwrap();
         let err = log
             .append(Evil {
                 rotate: 1,

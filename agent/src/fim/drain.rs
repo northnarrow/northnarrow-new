@@ -68,27 +68,32 @@
 //!   refinement on the existing bucket layer.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_TRUNCATED};
 use common::Event;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::audit::AgentSigningKey;
 use crate::fim::attach::{key_for_path, WatchedPathsHandle};
 use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
+
+// BUG-026: production now uses the chainlog core; the legacy-v1
+// `build_signed_drift_entry` / `compute_entry_hash` (kept only so the
+// byte-compat gate can mint a real legacy line) are `#[cfg(test)]`, so
+// their imports are gated to test builds.
+#[cfg(test)]
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+#[cfg(test)]
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+use crate::audit::GENESIS_PREV_HASH;
 
 /// Default location of the chained drift log. Lives alongside
 /// the baseline DB so the Tappa 7 task 5 FS-LSM protection +
@@ -104,10 +109,6 @@ pub const DEFAULT_DRIFT_LOG_PATH: &str = "/var/lib/northnarrow/fim_drift.jsonl";
 // credential-path `Opened` silently to the rule engine). The
 // credential predicate lives in `fim::rules::is_credential_path`,
 // derived from the NN-L-FIM-011..017 rule fragment lists.
-
-/// File mode for the drift log. World-readable so operators
-/// inspect it with `cat`; root + agent are the only writers.
-const DRIFT_FILE_MODE: u32 = 0o644;
 
 // ── userland inode → path map ──────────────────────────────────────
 
@@ -408,6 +409,34 @@ pub struct FimDriftEntry {
     pub agent_sig: String,
 }
 
+/// BUG-026 migration — the `fim_drift.jsonl` DATA payload: every
+/// [`FimDriftEntry`] field EXCEPT the chain framing (`prev_hash` /
+/// `entry_hash` / `agent_sig`), in the SAME declaration order. A
+/// [`crate::chainlog::ChainLine<FimDriftPayload>`] with `fmt_ver = None`
+/// therefore serialises BYTE-FOR-BYTE identically to a legacy v1
+/// `FimDriftEntry`, so an existing on-disk `fim_drift.jsonl` still
+/// verifies under the rotation-aware reader (proven by
+/// `bug026_legacy_v1_drift_line_still_verifies`). The two Q4 fields keep
+/// `#[serde(default)]` with NO `skip_serializing_if`, exactly matching
+/// the legacy struct (they are always serialised).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimDriftPayload {
+    pub ts: String,
+    pub path: String,
+    pub op: FimOp,
+    pub baseline_sha256: Option<String>,
+    pub new_sha256: Option<String>,
+    pub modifier_pid: u32,
+    pub modifier_uid: u32,
+    pub modifier_comm: String,
+    pub severity: DriftSeverity,
+    #[serde(default)]
+    pub decision_engine_skipped: bool,
+    #[serde(default)]
+    pub skip_reason: String,
+    pub agent_id: String,
+}
+
 /// Caller-supplied fields for [`FimDriftDb::append`].
 #[derive(Debug, Clone)]
 pub struct FimDriftDraft {
@@ -425,74 +454,61 @@ pub struct FimDriftDraft {
 
 // ── drift DB (mirror BaselineDb) ───────────────────────────────────
 
-/// Append-only writer for the drift log. Same shape as
-/// [`crate::fim::baseline::BaselineDb`] — chain primitives are
-/// COPIED rather than extracted into a shared trait (same
-/// rationale as C3: extraction is a clean future refactor).
+/// Append-only writer for the drift log. BUG-026: now a thin wrapper
+/// over the shared [`crate::chainlog::RotatingChainLog`] — it builds the
+/// [`FimDriftPayload`] and the core handles chaining, signing, rotation
+/// (size cap + retention), and the chattr dance via the shared
+/// `StateDirProtection`. New lines are v2 (`fmt_ver`); existing v1 lines
+/// stay valid (see `bug026_legacy_v1_drift_line_still_verifies`).
 pub struct FimDriftDb {
-    path: PathBuf,
-    key: AgentSigningKey,
+    inner: crate::chainlog::RotatingChainLog<FimDriftPayload>,
     agent_id: [u8; 16],
-    last_hash: String,
 }
 
 impl FimDriftDb {
-    pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let last_hash = read_tail_hash(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            key,
-            agent_id,
-            last_hash,
-        })
+    pub fn open(
+        path: &Path,
+        key: AgentSigningKey,
+        agent_id: [u8; 16],
+        protection: std::sync::Arc<dyn crate::chainlog::ProtectionManager>,
+        cfg: crate::chainlog::RotationConfig,
+    ) -> Result<Self> {
+        let inner = crate::chainlog::RotatingChainLog::<FimDriftPayload>::open(
+            path, key, cfg, protection,
+        )?;
+        Ok(Self { inner, agent_id })
     }
 
-    pub fn append(&mut self, draft: FimDriftDraft) -> Result<FimDriftEntry> {
-        let entry = build_signed_drift_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
-        let mut line =
-            serde_json::to_string(&entry).map_err(|e| anyhow!("serialising drift entry: {e}"))?;
-        line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(DRIFT_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| format!("opening drift log {} for append", self.path.display()))?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending drift entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
-        self.last_hash = entry.entry_hash.clone();
-        Ok(entry)
+    /// Append one drift row as a signed chainlog data line (rotating the
+    /// log at the size cap). Returns the new line's `entry_hash` hex.
+    pub fn append(&mut self, draft: FimDriftDraft) -> Result<String> {
+        let payload = FimDriftPayload {
+            ts: format_ts(Utc::now()),
+            path: draft.path,
+            op: draft.op,
+            baseline_sha256: draft.baseline_sha256,
+            new_sha256: draft.new_sha256,
+            modifier_pid: draft.modifier_pid,
+            modifier_uid: draft.modifier_uid,
+            modifier_comm: draft.modifier_comm,
+            severity: draft.severity,
+            decision_engine_skipped: draft.decision_engine_skipped,
+            skip_reason: draft.skip_reason,
+            agent_id: hex::encode(self.agent_id),
+        };
+        self.inner.append(payload)
     }
 
     pub fn last_hash(&self) -> &str {
-        &self.last_hash
+        self.inner.last_hash()
     }
 }
 
-fn read_tail_hash(path: &Path) -> Result<String> {
-    let f = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GENESIS_PREV_HASH.to_string());
-        }
-        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
-    };
-    let reader = BufReader::new(f);
-    let mut last: Option<String> = None;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading line from {}", path.display()))?;
-        if line.is_empty() {
-            continue;
-        }
-        let entry: FimDriftEntry =
-            serde_json::from_str(&line).with_context(|| format!("parsing drift line: {line}"))?;
-        last = Some(entry.entry_hash);
-    }
-    Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
-}
-
+/// Build a signed legacy-v1 `FimDriftEntry`. Production now uses the
+/// chainlog core; retained ONLY so the BUG-026 byte-compat gate
+/// (`bug026_legacy_v1_drift_line_still_verifies`) can produce a real
+/// legacy line to verify against the rotation-aware reader.
+#[cfg(test)]
 fn build_signed_drift_entry(
     draft: &FimDriftDraft,
     key: &AgentSigningKey,
@@ -524,6 +540,7 @@ fn build_signed_drift_entry(
     Ok(entry)
 }
 
+#[cfg(test)]
 fn compute_entry_hash(entry: &FimDriftEntry) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
@@ -1029,7 +1046,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let signing = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
 
         // A real watched DIRECTORY + a child dropped into it, so enroll
         // + re-hash operate on real inodes.
@@ -1091,7 +1108,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let signing = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
 
         let dir_str = dir.path().to_string_lossy().into_owned();
         let dir_key = InodeKey { dev: 0x1234, ino: 7 };
@@ -1314,6 +1331,73 @@ mod tests {
         assert_eq!(restored, entry);
     }
 
+    /// BUG-026 migration GATE: an existing on-disk **v1** `fim_drift.jsonl`
+    /// line (legacy flat `FimDriftEntry`, NO `fmt_ver`) MUST still verify
+    /// under the rotation-aware reader after the payload/envelope split —
+    /// breaking files already on disk is the migration's main risk. Proven
+    /// two ways: (1) byte-equality of the serialisations; (2) end-to-end
+    /// verification of a REALLY-signed v1 line via
+    /// `chainlog::verify_log_set::<FimDriftPayload>`.
+    #[test]
+    fn bug026_legacy_v1_drift_line_still_verifies() {
+        use crate::chainlog::{verify_log_set, ChainLine};
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let pk = key.verifying_key();
+        let agent_id = [7u8; 16];
+
+        let draft = FimDriftDraft {
+            path: "/etc/passwd".to_string(),
+            op: FimOp::Modified,
+            baseline_sha256: Some("aa".repeat(32)),
+            new_sha256: Some("bb".repeat(32)),
+            modifier_pid: 4242,
+            modifier_uid: 0,
+            modifier_comm: "evil".to_string(),
+            severity: DriftSeverity::High,
+            decision_engine_skipped: false,
+            skip_reason: String::new(),
+        };
+        // A real legacy v1 line — built + signed EXACTLY as the old writer did.
+        let legacy = build_signed_drift_entry(&draft, &key, &agent_id, GENESIS_PREV_HASH).unwrap();
+
+        // (1) byte-equality: ChainLine<FimDriftPayload>{fmt_ver:None} with the
+        // same field values serialises identically to the legacy entry.
+        let envelope = ChainLine {
+            payload: FimDriftPayload {
+                ts: legacy.ts.clone(),
+                path: legacy.path.clone(),
+                op: legacy.op,
+                baseline_sha256: legacy.baseline_sha256.clone(),
+                new_sha256: legacy.new_sha256.clone(),
+                modifier_pid: legacy.modifier_pid,
+                modifier_uid: legacy.modifier_uid,
+                modifier_comm: legacy.modifier_comm.clone(),
+                severity: legacy.severity,
+                decision_engine_skipped: legacy.decision_engine_skipped,
+                skip_reason: legacy.skip_reason.clone(),
+                agent_id: legacy.agent_id.clone(),
+            },
+            fmt_ver: None,
+            prev_hash: legacy.prev_hash.clone(),
+            entry_hash: legacy.entry_hash.clone(),
+            agent_sig: legacy.agent_sig.clone(),
+        };
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "ChainLine<FimDriftPayload>{{fmt_ver:None}} must serialise byte-identically \
+             to the legacy FimDriftEntry — else on-disk v1 lines stop verifying"
+        );
+
+        // (2) end-to-end: the really-signed legacy line verifies via the
+        // rotation-aware reader (same hash pre-image ⇒ same digest ⇒ sig OK).
+        let log = dir.path().join("fim_drift.jsonl");
+        std::fs::write(&log, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+        let report = verify_log_set::<FimDriftPayload>(&log, &pk).unwrap();
+        assert_eq!(report.total_records, 1);
+    }
+
     // ── C4 test 7: process_drift skips path-unknown events ──────────
 
     #[test]
@@ -1321,7 +1405,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new(); // empty
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
@@ -1354,7 +1438,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new();
 
         // Create a real on-disk file with known content so
@@ -1416,7 +1500,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new();
 
         let watched = dir.path().join("watched.bin");
@@ -1467,7 +1551,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new();
 
         let watched = dir.path().join("watched.bin");
@@ -1569,7 +1653,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let key = fresh_signing_key(&dir);
             let drift_path = dir.path().join("drift.jsonl");
-            let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+            let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
             let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, path);
             let classifier = DriftClassifier::new();
             let rate_limiter = DriftRateLimiter::new();
@@ -1618,7 +1702,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let (_on_disk, key_ino, path_map) =
             make_watched_alias(&dir, "/root/.aws/credentials");
         let classifier = DriftClassifier::new();
@@ -1674,7 +1758,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let (on_disk, key_ino, path_map) = make_watched_alias(&dir, "/etc/passwd");
         // Mutate the file so a real-drift hash-diff is observed.
         std::fs::write(&on_disk, b"MUTATED content").unwrap();
