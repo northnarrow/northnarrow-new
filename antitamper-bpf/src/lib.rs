@@ -392,6 +392,92 @@ pub fn attach_lsm(
     Ok(())
 }
 
+/// Attach an LSM **deny** hook with cross-restart persistence, ALWAYS
+/// freshly — never reusing the prior boot's pinned link. This is the
+/// BUG-024 fix for the `FS_PROTECT_EVENTS` producers (the `inode_*` deny
+/// hooks): reusing the pinned link kept the prior boot's program bound to
+/// the prior (pinned) ring, desyncing the new boot's consumer. Here each
+/// boot loads + attaches a FRESH program (bound to this boot's fresh,
+/// process-local ring), then retires the old pin.
+///
+/// ZERO-WINDOW ORDERING CONTRACT — **attach-NEW strictly precedes
+/// purge-OLD**:
+///   1. load + attach the fresh program. The prior boot's link pin (if
+///      any) is STILL firing across the death→respawn gap (split-brain),
+///      so now BOTH the old and new deny programs are attached — overlap,
+///      never a gap. (BPF-LSM permits multiple programs per hook; any
+///      non-zero verdict denies, so a double-attach is idempotent.)
+///   2. ONLY THEN purge the prior boot's link + program pins. Removing the
+///      old link pin detaches the OLD program; the NEW one (held by our fd
+///      via `link_id`) keeps firing — a deny program is attached at every
+///      instant.
+///   3. pin the NEW program + link, so THIS boot's hook survives the next
+///      death→respawn gap (persistence preserved).
+/// If purge ever preceded attach, a tamper could slip through the gap — so
+/// the 1→2 order is load-bearing. It is also fail-safe: if the fresh attach
+/// errors, we return BEFORE purging, leaving the prior boot's pinned hook
+/// intact (still protecting).
+///
+/// `pin_root == None` (no bpffs) ⇒ [`attach_transient`] (this boot only).
+pub fn reattach_fresh(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    hook_name: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<()> {
+    let Some(root) = pin_root else {
+        attach_transient(ebpf, program_name, hook_name, btf)?;
+        warn!(
+            hook = hook_name,
+            "anti-tamper: deny hook attached WITHOUT pin (no bpffs) — no \
+             cross-restart persistence"
+        );
+        return Ok(());
+    };
+    let (prog_path, link_path) = lsm_pin_paths(root, hook_name);
+
+    // Step 1 — load + attach the FRESH program. A prior boot's pinned link
+    // (if present) is still firing here, so old + new overlap: zero gap.
+    let prog: &mut Lsm = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program_name} is not an LSM program"))?;
+    prog.load(hook_name, btf)
+        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
+    let link_id = prog.attach().with_context(|| {
+        format!("attaching fresh LSM program `{program_name}` to hook `{hook_name}`")
+    })?;
+
+    // Step 2 — ONLY NOW retire the prior boot's pins (MUST follow Step 1 —
+    // the zero-window invariant). The new program, held by our fd via
+    // `link_id`, keeps firing while the old one detaches.
+    purge_stale_pin(&link_path);
+    purge_stale_pin(&prog_path);
+
+    // Step 3 — pin the fresh program + link so this boot's hook survives the
+    // next death→respawn gap (split-brain persistence preserved).
+    prog.pin(&prog_path).with_context(|| {
+        format!(
+            "pinning fresh LSM program `{program_name}` to {}",
+            prog_path.display()
+        )
+    })?;
+    let link = prog
+        .take_link(link_id)
+        .with_context(|| format!("taking ownership of fresh `{hook_name}` LSM link"))?;
+    let fd_link: FdLink = link.into();
+    let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+        format!("pinning fresh LSM link `{hook_name}` to {}", link_path.display())
+    })?;
+    info!(
+        hook = hook_name,
+        "anti-tamper: deny hook re-attached FRESH (attach-before-purge, zero-window) + re-pinned"
+    );
+    Ok(())
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Tappa 7 task 6 Watchdog W1 — ProtectedPidsHandle (design §6.3)
 // ────────────────────────────────────────────────────────────────────

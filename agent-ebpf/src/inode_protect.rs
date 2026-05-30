@@ -112,22 +112,23 @@ pub static FS_PROTECT_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 /// restarted agent must drain the SAME kernel ringbuf rather than a
 /// fresh one (same split-brain class as `PROTECTED_INODES`).
 ///
-/// TODO(fs-protect-ringbuf-reuse): a pinned-and-reused BPF ringbuf
-/// desyncs the new process's fresh consumer across `systemctl
-/// restart` (consumer/producer position lives in the kernel map
-/// object) — the exact bug fixed for `FS_FIM_EVENTS` by making it
-/// process-local. Do NOT apply the same one-line `pinned ->
-/// with_byte_size` here in isolation: this ring's producer is the
-/// `inode_*` LSM program attached via a REUSED pinned link
-/// (non-transient — anti_tamper/mod.rs `filesystem::attach`), so
-/// unpinning only the ring splits producer (old reused prog -> old
-/// ring) from consumer (new ring) = a SILENT fs-protect blackout
-/// instead of a loud `expected got=0` flood. The fix must drop the
-/// ring-pin AND the program-link-pin together so both reattach fresh;
-/// that is a separate change with anti-tamper-persistence
-/// implications and is deliberately deferred.
+/// BUG-024 fix (fs-protect-ringbuf-reuse): this ring is process-local
+/// (`with_byte_size`, fresh per boot) — NOT pinned. A pinned-and-reused
+/// BPF ringbuf desyncs the new process's consumer across `systemctl
+/// restart` (consumer/producer position lives in the kernel map object);
+/// on a real host that replayed stale denials at ~1.6k/sec and DoS'd the
+/// agent's own LogNamespace. The one-line `pinned -> with_byte_size` used
+/// for `FS_FIM_EVENTS` is NOT safe alone here, because this ring's
+/// producers (the `inode_*` LSM deny programs) must not stay
+/// pinned-and-reused against a fresh ring (that would split old-producer/
+/// old-ring from new-consumer = a SILENT blackout). So the ring AND its
+/// producer links are reattached fresh TOGETHER every boot:
+/// `antitamper_bpf::reattach_fresh` (driven by `filesystem::attach`)
+/// attaches this boot's program BEFORE purging the prior boot's pin —
+/// zero-window split-brain — while binding to this fresh ring. task_kill /
+/// ptrace keep the pinned-reuse path (they emit no ring).
 #[map]
-pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::pinned(64 * 1024, 0);
+pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 // ---------------------------------------------------------------------------
 // Helpers — common pointer-chase logic for every hook.

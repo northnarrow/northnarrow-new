@@ -68,7 +68,7 @@ use tracing::{info, warn};
 // filesystem.rs, main.rs, tests) keeps compiling byte-identically.
 pub use antitamper_bpf::{
     attach_lsm, attach_transient, fresh_attach_and_pin, lsm_pin_paths, prepare_pin_root,
-    purge_stale_pin, read_proc_comm, read_self_comm, DEFAULT_BPFFS_ROOT,
+    purge_stale_pin, reattach_fresh, read_proc_comm, read_self_comm, DEFAULT_BPFFS_ROOT,
     PROTECTED_OBSERVERS_MAP_NAME, PROTECTED_PIDS_MAP_NAME,
 };
 

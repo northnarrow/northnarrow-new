@@ -325,11 +325,17 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
         );
     }
 
-    // Step 4: attach (or reuse the prior boot's still-firing) five
-    // LSM hooks. `attach_lsm` logs the per-hook disposition; we only
-    // escalate failures here.
+    // Step 4: attach the five inode_protect deny hooks — the
+    // FS_PROTECT_EVENTS producers. BUG-024: these MUST re-attach FRESH
+    // every boot (binding to this boot's fresh, process-local ring) rather
+    // than reuse the prior boot's pinned link (which kept producing into the
+    // old pinned ring and desynced the new consumer → ~1.6k/sec stale-denial
+    // replay that DoS'd observability). `reattach_fresh` attaches this boot's
+    // program BEFORE purging the old pin, so a deny program is attached at
+    // every instant (zero-window). task_kill/ptrace (anti_tamper/mod.rs) keep
+    // the pinned-reuse path — they emit no ring, so they don't desync.
     for (program, hook) in LSM_PROGRAMS {
-        if let Err(e) = super::attach_lsm(ebpf, program, hook, btf, pin_root) {
+        if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
             warn!(
                 program, hook, error = %e,
                 "anti-tamper FS: LSM hook attach FAILED"
