@@ -625,6 +625,7 @@ mod tests {
             modifier_uid: 1000,
             modifier_comm: "exfil".to_string(),
             dest_path: None,
+            child_truncated: false,
         })
     }
 
@@ -738,6 +739,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "x".to_string(),
             dest_path: None,
+            child_truncated: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

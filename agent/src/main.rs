@@ -1043,6 +1043,7 @@ async fn main() -> Result<()> {
             Some(baseline_db) => {
                 use northnarrow_agent::fim::attach::{
                     attach_observe_programs, populate_watched_paths, take_fs_fim_events_ringbuf,
+                    take_watched_paths_map,
                 };
                 use northnarrow_agent::fim::baseline::BaselineCache;
                 use northnarrow_agent::fim::drain::{
@@ -1117,6 +1118,24 @@ async fn main() -> Result<()> {
                     }
                 };
 
+                // BUG-022 — take an OWNED writable handle to WATCHED_PATHS
+                // (post-populate) so the drain loop can enroll children of
+                // a watched directory on the fly. Best-effort: on failure
+                // the drain still runs — create-detection via child-leaf
+                // reconstruction still works; only the later in-place edit
+                // of a freshly-dropped child would go unwatched.
+                let watched_paths_handle = match take_watched_paths_map(sensor.ebpf_mut()) {
+                    Ok(h) => Some(Arc::new(parking_lot::Mutex::new(h))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "fim: take_watched_paths_map failed — runtime child \
+                             enrollment disabled this boot"
+                        );
+                        None
+                    }
+                };
+
                 // The recompute task snapshots the merged watched-
                 // paths set every iteration — operators who edit
                 // fim-paths.local and run `nn-admin fim baseline`
@@ -1174,6 +1193,7 @@ async fn main() -> Result<()> {
                             let rate_limiter_clone = Arc::clone(&rate_limiter);
                             let inode_map_for_drain = Arc::clone(&inode_map);
                             let baseline_cache_for_drain = Arc::clone(&baseline_cache);
+                            let watched_paths_for_drain = watched_paths_handle.clone();
                             let event_tx = sensor.event_tx();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = drain_loop(
@@ -1183,6 +1203,7 @@ async fn main() -> Result<()> {
                                     drift_db,
                                     classifier,
                                     rate_limiter_clone,
+                                    watched_paths_for_drain,
                                     event_tx,
                                 )
                                 .await

@@ -79,7 +79,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey};
+use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_TRUNCATED};
 use common::Event;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -87,6 +87,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::fim::attach::{key_for_path, WatchedPathsHandle};
 use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
 
 /// Default location of the chained drift log. Lives alongside
@@ -541,6 +542,57 @@ fn format_ts(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
+/// BUG-022 — rebuild a watched directory's child path from the bare
+/// dir path + the kernel-carried leaf in [`FimDriftRaw::child_name`]
+/// (NUL-terminated, UTF-8 lossy). Returns `None` when the leaf is
+/// empty or (defensively) contains a `/` — the kernel hands a single
+/// dentry component, so a slash means a crafted / garbled record.
+fn reconstruct_child_path(dir: &str, raw: &FimDriftRaw) -> Option<String> {
+    let end = raw
+        .child_name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(raw.child_name.len());
+    if end == 0 {
+        return None;
+    }
+    let leaf = String::from_utf8_lossy(&raw.child_name[..end]);
+    if leaf.contains('/') {
+        return None;
+    }
+    Some(format!("{}/{}", dir.trim_end_matches('/'), leaf))
+}
+
+/// BUG-022 — enroll a freshly-dropped child of a watched directory
+/// into the userland [`InodePathMap`] AND (when a handle is wired) the
+/// kernel `WATCHED_PATHS` map, so a later in-place edit of the dropped
+/// file is observed directly by the BUG-023 write-then-close hook. The
+/// child is stat'd for its kernel-form `(dev,ino)`; a vanished child
+/// (created-then-immediately-removed) is silently skipped. A full
+/// `WATCHED_PATHS` (8192 cap) is logged LOUD — a silently-dropped
+/// enroll must not masquerade as coverage.
+fn enroll_child(
+    child_path: &str,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) {
+    let key = match key_for_path(Path::new(child_path)) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    path_map.insert(key, child_path.to_string());
+    if let Some(wp) = watched_paths {
+        if !wp.lock().enroll(key) {
+            warn!(
+                target: "fim.drain",
+                path = %child_path,
+                "BUG-022: WATCHED_PATHS full (8192 cap) — dropped child NOT enrolled; \
+                 its later in-place edits stay unobserved until a re-baseline"
+            );
+        }
+    }
+}
+
 // ── process_drift (pure, testable) ─────────────────────────────────
 
 /// Reusable single-event processor. The async drain loop calls
@@ -574,6 +626,7 @@ pub fn process_drift(
     drift_db: &mut FimDriftDb,
     classifier: &DriftClassifier,
     rate_limiter: &DriftRateLimiter,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
     event_tx: Option<&mpsc::Sender<Event>>,
 ) -> Result<bool> {
     let key = InodeKey {
@@ -593,6 +646,33 @@ pub fn process_drift(
         }
     };
     let op = FimOp::try_from(raw.op).map_err(|e| anyhow!("decoding raw.op: {e}"))?;
+
+    // BUG-022 — child-leaf reconstruction. When the kernel carried a
+    // child leaf (a Create in, or a rename INTO, a watched DIRECTORY),
+    // the `path` resolved above is only the bare watched dir — which no
+    // child-prefix rule matches (the dead-rule root). Rebuild
+    // `dir + "/" + leaf`, normalize a drop-via-rename to Created, mirror
+    // the truncated flag for the rules, and enroll the new child inode
+    // so its later in-place edits are caught by the write-then-close
+    // hook. Events without a child leaf (every non-Create/Rename op, and
+    // renames whose dest dir isn't watched) fall through unchanged.
+    let (path, op, child_truncated) =
+        if matches!(op, FimOp::Created | FimOp::Renamed) && raw.child_name[0] != 0 {
+            match reconstruct_child_path(&path, raw) {
+                Some(child) => {
+                    let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
+                    enroll_child(&child, path_map, watched_paths);
+                    // A rename INTO a watched dir is a drop → present as Created
+                    // (single userland normalization point; the dir-class rules
+                    // keep their Created|Modified op-sets unchanged).
+                    (child, FimOp::Created, truncated)
+                }
+                None => (path, op, false),
+            }
+        } else {
+            (path, op, false)
+        };
+
     // BUG-012 (v2): a read (`FimOp::Opened`) is NEVER an integrity
     // drift. It must produce zero FIM-DRIFT rows — no drift_db
     // append, no `fim_drift.jsonl` line, no "FIM DRIFT" WARN
@@ -650,6 +730,7 @@ pub fn process_drift(
                 modifier_uid: raw.modifier_uid,
                 modifier_comm: comm_to_string(&raw.modifier_comm),
                 dest_path: None,
+                child_truncated,
             });
             if tx.try_send(event).is_err() {
                 warn!(
@@ -772,6 +853,7 @@ pub fn process_drift(
             modifier_uid: raw.modifier_uid,
             modifier_comm: comm_to_string(&raw.modifier_comm),
             dest_path,
+            child_truncated,
         });
         if tx.try_send(event).is_err() {
             warn!(
@@ -822,6 +904,7 @@ pub async fn drain_loop(
     drift_db: std::sync::Arc<parking_lot::Mutex<FimDriftDb>>,
     classifier: std::sync::Arc<DriftClassifier>,
     rate_limiter: std::sync::Arc<DriftRateLimiter>,
+    watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
@@ -871,6 +954,7 @@ pub async fn drain_loop(
                 &mut db,
                 classifier.as_ref(),
                 rate_limiter.as_ref(),
+                watched_paths.as_deref(),
                 Some(&event_tx),
             ) {
                 warn!(
@@ -924,7 +1008,124 @@ mod tests {
             // FimDriftRaw directly with non-zero dest values.
             dest_dev: 0,
             dest_ino: 0,
+            // BUG-022 defaults — no child leaf unless a dir-drop
+            // test seeds child_name explicitly.
+            child_name: [0u8; common::wire::FIM_CHILD_NAME_LEN],
+            child_name_flags: 0,
+            _pad2: [0u8; 7],
         }
+    }
+
+    /// BUG-022 #1 — reconstruction MUST be driven by the REAL wire
+    /// shape: a `FimDriftRaw` keyed on a watched DIRECTORY inode with
+    /// the dropped leaf in `child_name`. Feeding a pre-baked full child
+    /// path — the exact thing that hid BUG-022 (green tests on a path
+    /// the live pipeline never produces) — is forbidden. Asserts the
+    /// emitted event carries `dir/leaf` (so the child-prefix rules
+    /// match), op is normalized to Created, and the dropped child is
+    /// enrolled into the InodePathMap on the fly.
+    #[test]
+    fn bug022_reconstructs_child_path_from_dir_key_plus_leaf() {
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16]).unwrap();
+
+        // A real watched DIRECTORY + a child dropped into it, so enroll
+        // + re-hash operate on real inodes.
+        let watched_dir = dir.path().join("systemd-system");
+        std::fs::create_dir(&watched_dir).unwrap();
+        let child = watched_dir.join("evil.service");
+        std::fs::write(&child, b"[Service]\nExecStart=/tmp/x\n").unwrap();
+        let dir_str = watched_dir.to_string_lossy().into_owned();
+
+        // The pipeline shape: target is the DIR inode (arbitrary key
+        // here), child leaf carried inline. NOT a pre-baked full path.
+        let dir_key = InodeKey { dev: 0x1234, ino: 99 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, dir_str.clone());
+
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        let leaf = b"evil.service";
+        raw.child_name[..leaf.len()].copy_from_slice(leaf);
+
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            None,
+            Some(&tx),
+        )
+        .unwrap();
+
+        assert!(emitted, "a drop into a watched dir must emit");
+        let ev = match rx.try_recv().unwrap() {
+            Event::Fim(fe) => fe,
+            other => panic!("expected Event::Fim, got {other:?}"),
+        };
+        assert_eq!(ev.path, format!("{dir_str}/evil.service"));
+        assert_eq!(ev.op, FimOp::Created, "create/rename into dir → Created");
+        assert!(!ev.child_truncated);
+        // On-the-fly enroll: the dropped child is now resolvable by its
+        // own inode, so a later in-place edit (write-then-close) lands.
+        let child_key = key_for_path(&child).unwrap();
+        assert!(
+            path_map.lookup(&child_key).is_some(),
+            "dropped child must be enrolled into the InodePathMap"
+        );
+    }
+
+    /// BUG-022 #2 — a truncated child leaf (kernel filled the buffer +
+    /// set the flag for a >63-byte name) sets `FimEvent::child_truncated`
+    /// so the suffix-rules (FIM-021/023) still fire when the extension
+    /// was lost to truncation. Again: driven by the wire record, not a
+    /// synthetic path.
+    #[test]
+    fn bug022_truncated_child_leaf_sets_event_flag() {
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16]).unwrap();
+
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let dir_key = InodeKey { dev: 0x1234, ino: 7 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, dir_str.clone());
+
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        // Whole buffer filled, no NUL, truncated flag set — the kernel's
+        // shape for a leaf longer than the inline buffer.
+        raw.child_name = [b'a'; common::wire::FIM_CHILD_NAME_LEN];
+        raw.child_name_flags = FIM_CHILD_TRUNCATED;
+
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            None,
+            Some(&tx),
+        )
+        .unwrap();
+
+        assert!(emitted);
+        let ev = match rx.try_recv().unwrap() {
+            Event::Fim(fe) => fe,
+            other => panic!("expected Event::Fim, got {other:?}"),
+        };
+        assert!(ev.child_truncated, "truncated leaf must flag the event");
+        assert!(ev.path.starts_with(&format!("{dir_str}/")));
     }
 
     fn dummy_baseline(path: &str, sha256: &str) -> BaselineEntry {
@@ -1133,6 +1334,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1188,6 +1390,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1247,6 +1450,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1293,6 +1497,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1378,6 +1583,7 @@ mod tests {
                 &mut drift_db,
                 &classifier,
                 &rate_limiter,
+                None,
                 Some(&tx),
             )
             .unwrap();
@@ -1429,6 +1635,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1485,6 +1692,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();

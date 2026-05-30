@@ -433,10 +433,12 @@ impl Rule for NnLFim007CronDropInCreated {
 
 // ── NN-L-FIM-008 — kernel module file modified ─────────────────────
 
-/// Modification of any file under `/lib/modules/`. Critical —
-/// a modified kernel module is a rootkit-class compromise
-/// (MITRE T1014 Rootkit + T1547.006 Boot/Logon Autostart
-/// Execution: Kernel Modules).
+/// Creation or modification of any file under `/lib/modules/`.
+/// Critical — a dropped or modified kernel module is a rootkit-class
+/// compromise (MITRE T1014 Rootkit + T1547.006 Boot/Logon Autostart
+/// Execution: Kernel Modules). BUG-022: the `Created` arm is what
+/// catches a NEW `.ko` dropped into a watched modules dir — the child
+/// leaf is now reconstructed so the `/lib/modules/` prefix matches.
 pub struct NnLFim008KernelModuleModified;
 
 impl Rule for NnLFim008KernelModuleModified {
@@ -451,7 +453,7 @@ impl Rule for NnLFim008KernelModuleModified {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
-        if fe.op != FimOp::Modified {
+        if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
             return None;
         }
         if !fe.path.starts_with(KMOD_PREFIX) {
@@ -462,7 +464,7 @@ impl Rule for NnLFim008KernelModuleModified {
             fe,
             ResponseAction::KillProcessTree,
             Severity::Critical,
-            "Kernel module file modified — rootkit indicator",
+            "Kernel module file created or modified — rootkit indicator",
         ))
     }
 }
@@ -1205,7 +1207,13 @@ impl Rule for NnLFim021PamModuleModified {
         if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
             return None;
         }
-        if !(fe.path.contains(PAM_MODULE_DIR_FRAGMENT) && fe.path.ends_with(PAM_MODULE_SUFFIX)) {
+        // BUG-022: `child_truncated` means the dropped leaf overflowed
+        // the inline buffer and lost its `.so` suffix — a >63-byte
+        // filename in a `security/` dir is itself anomalous, so fire on
+        // the dir match alone rather than let truncation be a bypass.
+        if !(fe.path.contains(PAM_MODULE_DIR_FRAGMENT)
+            && (fe.path.ends_with(PAM_MODULE_SUFFIX) || fe.child_truncated))
+        {
             return None;
         }
         Some(fim_verdict(
@@ -1279,8 +1287,11 @@ impl Rule for NnLFim023SystemdTimerCreated {
         if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
             return None;
         }
+        // BUG-022: a truncated child leaf (overflowed the inline buffer,
+        // lost its `.timer` suffix) in a unit dir still fires — a
+        // >63-byte unit filename is anomalous and must not be a bypass.
         if !(starts_with_any(&fe.path, SYSTEMD_UNIT_PREFIXES)
-            && fe.path.ends_with(SYSTEMD_TIMER_SUFFIX))
+            && (fe.path.ends_with(SYSTEMD_TIMER_SUFFIX) || fe.child_truncated))
         {
             return None;
         }
@@ -1457,6 +1468,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "attacker".to_string(),
             dest_path: None,
+            child_truncated: false,
         })
     }
 
@@ -1475,7 +1487,56 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "attacker".to_string(),
             dest_path: Some(dest.to_string()),
+            child_truncated: false,
         })
+    }
+
+    /// BUG-022 — rule-side: FIM-008 fires on a `Created` `.ko` (the
+    /// drop, not just in-place modify), and FIM-021/023 fire on a
+    /// `child_truncated` leaf even though the `.so` / `.timer` suffix
+    /// was lost to truncation (a >63-byte leaf must not be a bypass).
+    #[test]
+    fn bug022_created_kmod_and_truncated_suffix_rules_fire() {
+        // FIM-008 on a Created module drop (was Modified-only → dead).
+        assert!(NnLFim008KernelModuleModified
+            .evaluate(&fim_event(FimOp::Created, "/lib/modules/6.8.0/evil.ko"))
+            .is_some());
+
+        // A Created event in a watched dir whose leaf was truncated
+        // (no verifiable suffix survives).
+        let truncated = |path: &str| -> Event {
+            match fim_event(FimOp::Created, path) {
+                Event::Fim(mut fe) => {
+                    fe.child_truncated = true;
+                    Event::Fim(fe)
+                }
+                other => other,
+            }
+        };
+
+        assert!(NnLFim021PamModuleModified
+            .evaluate(&truncated("/usr/lib/x86_64-linux-gnu/security/loooong-no-suffix"))
+            .is_some());
+        assert!(NnLFim023SystemdTimerCreated
+            .evaluate(&truncated("/etc/systemd/system/loooong-no-suffix"))
+            .is_some());
+
+        // Control: a NON-truncated leaf without the suffix must NOT
+        // fire — truncation is the only suffix bypass.
+        assert!(NnLFim021PamModuleModified
+            .evaluate(&fim_event(
+                FimOp::Created,
+                "/usr/lib/x86_64-linux-gnu/security/readme.txt"
+            ))
+            .is_none());
+
+        // Control: a truncated leaf OUTSIDE the rule's dir gate must NOT
+        // fire — `child_truncated` is AND-gated by the dir match
+        // (`contains("/security/")`), never global. A long filename
+        // anywhere else must not be a false positive.
+        assert!(NnLFim021PamModuleModified
+            .evaluate(&truncated("/tmp/loooong-attacker-name-no-dir-match"))
+            .is_none());
     }
 
     // ── universal: FIM rules return None for non-FIM events ─────
@@ -1996,6 +2057,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: comm.to_string(),
             dest_path: None,
+            child_truncated: false,
         })
     }
 

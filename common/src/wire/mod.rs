@@ -497,17 +497,36 @@ pub const FIM_OP_LINKED: u8 = 5;
 /// since the WATCHED_PATHS set is already operator-curated.
 pub const FIM_OP_OPENED: u8 = 6;
 
+/// Tappa 9 (BUG-022) — max bytes of a created/renamed-in child's
+/// leaf name carried inline in [`FimDriftRaw::child_name`]. A NUL
+/// terminator is included, so the longest fully-represented leaf is
+/// `FIM_CHILD_NAME_LEN - 1` bytes; a longer leaf sets
+/// [`FIM_CHILD_TRUNCATED`]. 64 covers every real `.ko` / `.service`
+/// / `pam_*.so` / cron leaf; a >63-byte leaf in a system
+/// persistence directory is itself anomalous and still fires the
+/// rule (via the truncated flag) even though its suffix is lost.
+pub const FIM_CHILD_NAME_LEN: usize = 64;
+
+/// [`FimDriftRaw::child_name_flags`] bit: the child leaf was longer
+/// than [`FIM_CHILD_NAME_LEN`] and was truncated into the buffer.
+/// Userland mirrors it into [`FimEvent::child_truncated`] so the
+/// dir-rooted persistence rules (NN-L-FIM-021/023) fire on a suffix
+/// they can no longer see.
+pub const FIM_CHILD_TRUNCATED: u8 = 0x01;
+
 /// Tappa 9 (C1) — kernel↔userland record emitted by the FIM
 /// observation hooks (design §5). One record per watched-inode
 /// drift event. Userland's `agent/src/fim/drain.rs` (C4) decodes
 /// these into the richer userland [`FimEvent`].
 ///
 /// Layout: timestamp + (dev,ino) target + (dev,ino) dest +
-/// modifier triple + op byte + pad. **72 bytes**, 8-byte aligned.
-/// Tappa 9 polish #3 (rename dest-path resolution) grew this
-/// from 56 → 72 bytes by appending `dest_dev` + `dest_ino` for
-/// `Renamed` events; older non-Rename emitters set both to 0.
-/// The layout stays a strict superset of the Tappa 7
+/// modifier triple + op byte + pad + child-name tail. **144 bytes**,
+/// 8-byte aligned. Tappa 9 polish #3 (rename dest-path resolution)
+/// grew this from 56 → 72 bytes by appending `dest_dev` + `dest_ino`
+/// for `Renamed` events; BUG-022 (dir child-leaf reconstruction)
+/// grew it 72 → 144 by appending `child_name` + flags. All additions
+/// are strict-append (Tappa 10.6 §13 Q5) and older emitters zero the
+/// tail. The layout stays a strict superset of the Tappa 7
 /// [`FsProtectDenialRaw`] prefix so the C4 drain decode logic
 /// is still byte-symmetric on the leading 56 bytes.
 #[repr(C)]
@@ -536,6 +555,21 @@ pub struct FimDriftRaw {
     /// where the kernel-side couldn't extract a dest inode.
     pub dest_dev: u64,
     pub dest_ino: u64,
+    /// Tappa 9 (BUG-022) — leaf name of the child created in (or
+    /// renamed into) a watched DIRECTORY, NUL-terminated, decoded
+    /// UTF-8-lossy by userland. Populated by `fim_create_observe`
+    /// (the new child dentry) and the dest arm of
+    /// `fim_rename_observe`; all-zero for every other op and for a
+    /// create/rename whose target directory is not itself watched.
+    /// Userland reconstructs `dir + "/" + leaf` so the child-prefix
+    /// rules (NN-L-FIM-007/008/009/021/023) can match — without it
+    /// the event carries only the bare watched-directory path, which
+    /// no child-prefix rule matches (the BUG-022 dead-rule root).
+    pub child_name: [u8; FIM_CHILD_NAME_LEN],
+    /// Bit flags describing `child_name`; currently only
+    /// [`FIM_CHILD_TRUNCATED`]. Zero when `child_name` is empty.
+    pub child_name_flags: u8,
+    pub _pad2: [u8; 7],
 }
 
 impl FimDriftRaw {
@@ -551,6 +585,9 @@ impl FimDriftRaw {
             _pad: [0u8; 7],
             dest_dev: 0,
             dest_ino: 0,
+            child_name: [0u8; FIM_CHILD_NAME_LEN],
+            child_name_flags: 0,
+            _pad2: [0u8; 7],
         }
     }
 }
@@ -597,6 +634,17 @@ pub struct FimEvent {
     /// keeps pre-polish-#3 JSONL chains deserialisable.
     #[serde(default)]
     pub dest_path: Option<alloc::string::String>,
+    /// Tappa 9 (BUG-022) — `true` when `path` was reconstructed from
+    /// a watched directory + a child leaf whose name overflowed
+    /// [`FIM_CHILD_NAME_LEN`] (so the trailing extension was lost).
+    /// The dir-rooted persistence rules treat a truncated child in
+    /// their watched dir as a match even without the verifiable
+    /// suffix — a >63-byte filename in `/lib/modules`,
+    /// `/etc/systemd/system`, a `security/` dir, etc. is itself an
+    /// indicator and must not be a bypass. `#[serde(default)]` keeps
+    /// pre-BUG-022 JSONL chains deserialisable.
+    #[serde(default)]
+    pub child_truncated: bool,
 }
 
 /// Tappa 9 (C1) — typed inflation of [`FimDriftRaw::op`]. Wire
@@ -924,17 +972,18 @@ mod tests {
     // ── Tappa 9 C1 — FIM wire types ────────────────────────────────
 
     /// C1 (+ polish #3) test #1: [`FimDriftRaw`] layout matches
-    /// the kernel↔userland ABI exactly. **72 bytes**, 8-aligned.
+    /// the kernel↔userland ABI exactly. **144 bytes**, 8-aligned.
     /// Polish #3 grew this from 56 → 72 bytes by appending
-    /// `dest_dev` + `dest_ino` (each `u64`) so
-    /// `fim_rename_observe` can communicate the rename
-    /// destination to userland. Wire-byte stability matters —
-    /// any change here is a coordinated kernel+user upgrade.
+    /// `dest_dev` + `dest_ino` (each `u64`); BUG-022 grew it
+    /// 72 → 144 by appending the `child_name` tail so
+    /// `fim_create_observe` / `fim_rename_observe` can communicate
+    /// the dropped child's leaf to userland. Wire-byte stability
+    /// matters — any change here is a coordinated kernel+user upgrade.
     #[test]
     fn fim_drift_raw_layout_is_stable() {
-        // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 = 72 bytes,
-        // 8-aligned.
-        assert_eq!(size_of::<FimDriftRaw>(), 72);
+        // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 (= 72, polish #3)
+        // + 64 + 1 + 7 (= 144, BUG-022 child-name tail), 8-aligned.
+        assert_eq!(size_of::<FimDriftRaw>(), 144);
         assert_eq!(align_of::<FimDriftRaw>(), 8);
         // FsProtectDenialRaw stays at the original 56-byte
         // shape; the FIM drift record is now a SUPERSET (first
@@ -960,6 +1009,13 @@ mod tests {
             _pad: [0u8; 7],
             dest_dev: 0x800003,
             dest_ino: 67890,
+            child_name: {
+                let mut c = [0u8; FIM_CHILD_NAME_LEN];
+                c[..7].copy_from_slice(b"evil.ko");
+                c
+            },
+            child_name_flags: 0,
+            _pad2: [0u8; 7],
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<FimDriftRaw>());
@@ -1045,6 +1101,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "dpkg".to_string(),
             dest_path: None,
+            child_truncated: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1098,6 +1155,7 @@ mod tests {
             modifier_uid: 1000,
             modifier_comm: "ransomware_loop".to_string(),
             dest_path: Some("/home/u/documents/quarterly.docx.crypted".to_string()),
+            child_truncated: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

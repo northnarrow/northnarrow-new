@@ -97,6 +97,38 @@ pub(crate) const MM_STRUCT_ARG_END_OFFSET: usize = 384;
 /// `struct dentry.d_inode` — the `*inode` pointer. `bits_offset=384`.
 pub(crate) const DENTRY_D_INODE_OFFSET: usize = 48;
 
+// ── Tappa 9 (BUG-022) — dir child-leaf reconstruction ────────────────
+//
+// `fim_create_observe` / `fim_rename_observe` read the NEW child
+// dentry's leaf name (`dentry->d_name.name`, a `struct qstr`) so
+// userland can rebuild `dir + "/" + leaf` for the child-prefix rules.
+// Validated 2026-05-30 against `/sys/kernel/btf/vmlinux` on
+// `6.6.114.1-microsoft-standard-WSL2` via `bpftool btf dump file
+// /sys/kernel/btf/vmlinux format raw`:
+//   `[811] STRUCT 'dentry' size=192` → `'d_name' type_id=806 bits_offset=256` (byte 32)
+//   `[806] STRUCT 'qstr'   size=16`  → `'name'   type_id=137 bits_offset=64`  (byte 8)
+// The qstr `len` is the second word of the leading hash_len union
+// (`hash`@0, `len`@4). Production Ubuntu 24.04 / 6.8.x must be
+// re-validated (the boot-time BTF revalidator covers this); `dentry`
+// + `qstr` layout has been structurally stable across modern x86_64
+// LTS kernels. A bad offset fails SAFE here: `read_child_leaf`
+// null/err-checks every probe and emits an empty leaf rather than
+// garbage (userland then keeps the bare-dir path — no false rule fire).
+
+/// `struct dentry.d_name` — the embedded `struct qstr`. Byte 32.
+pub(crate) const DENTRY_D_NAME_OFFSET: usize = 32;
+
+/// `struct qstr.name` — `const unsigned char *` to the NUL-terminated
+/// leaf. Byte 8 within the qstr, so `dentry.d_name.name` lives at
+/// `DENTRY_D_NAME_OFFSET + QSTR_NAME_OFFSET` = byte 40.
+pub(crate) const QSTR_NAME_OFFSET: usize = 8;
+
+/// `struct qstr.len` — `u32` leaf length (second word of the
+/// `hash_len` union, after the 4-byte `hash`). Byte 4 within the
+/// qstr; used only to set the truncated flag when `len >=
+/// FIM_CHILD_NAME_LEN`.
+pub(crate) const QSTR_LEN_OFFSET: usize = 4;
+
 /// `struct inode.i_sb` — pointer to `super_block`. `bits_offset=448`.
 pub(crate) const INODE_I_SB_OFFSET: usize = 56;
 

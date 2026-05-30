@@ -305,6 +305,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "attacker".into(),
             dest_path: None,
+            child_truncated: false,
         });
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("fim drift"));

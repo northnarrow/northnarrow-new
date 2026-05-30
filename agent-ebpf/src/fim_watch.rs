@@ -22,11 +22,13 @@
 //! | Program | LSM hook | Trigger | `FimOp` |
 //! |---|---|---|---|
 //! | [`fim_setattr_observe`] | `inode_setattr` | chmod/chown/truncate | `Modified` |
-//! | [`fim_create_observe`] | `inode_create` | new file in watched dir | `Created` |
+//! | [`fim_create_observe`] | `inode_create` | new file in watched dir (carries child leaf, BUG-022) | `Created` |
 //! | [`fim_unlink_observe`] | `inode_unlink` | `rm` | `Deleted` |
-//! | [`fim_rename_observe`] | `inode_rename` | `mv` | `Renamed` |
+//! | [`fim_rename_observe`] | `inode_rename` | `mv` (carries dest leaf on into-dir drops, BUG-022) | `Renamed` |
 //! | [`fim_link_observe`] | `inode_link` | hardlink creation (Q2 evasion-detection) | `Linked` |
 //! | [`fim_file_open_observe`] | `file_open` | open of a watched inode (any access mode) | `Opened` |
+//! | [`fim_write_intent_observe`] | `file_permission` | write (`MAY_WRITE`) to a watched inode — sets a dirty mark, no event (BUG-023) | — |
+//! | [`fim_close_emit_observe`] | `file_free_security` | close of a written watched inode — emits the deferred event (BUG-023) | `Modified` |
 //!
 //! **C5.2 closes the C2-deferred sixth program** — the
 //! `FILE_F_FLAGS_OFFSET = 72` BTF offset is now validated on
@@ -71,20 +73,20 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_kernel,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
     },
     macros::{lsm, map},
     maps::{HashMap, RingBuf},
     programs::LsmContext,
 };
 use northnarrow_common::wire::{
-    FimDriftRaw, InodeKey, FIM_OP_CREATED, FIM_OP_DELETED, FIM_OP_LINKED, FIM_OP_MODIFIED,
-    FIM_OP_OPENED, FIM_OP_RENAMED,
+    FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
+    FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
-    SUPER_BLOCK_S_DEV_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET,
+    INODE_I_SB_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
 };
 
 // ── Maps ────────────────────────────────────────────────────────────
@@ -129,6 +131,49 @@ pub static WATCHED_PATHS: HashMap<InodeKey, u8> = HashMap::pinned(8192, 0);
 /// Keep it unpinned.
 #[map]
 pub static FS_FIM_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// `MAY_WRITE` from `include/linux/fs.h` — the `mask` bit the
+/// `file_permission` LSM hook carries for a write access
+/// (`MAY_EXEC=1`, `MAY_WRITE=2`, `MAY_READ=4`). The BUG-023
+/// write-intent hook gates on it so reads are skipped before any
+/// kernel-pointer work.
+const MAY_WRITE: i32 = 0x2;
+
+/// Tappa 9 (BUG-023) — per-inode "written since last close" marker
+/// plus the WRITER's identity, captured at write-intent time by
+/// [`fim_write_intent_observe`] and consumed by
+/// [`fim_close_emit_observe`]. Carrying the writer (not the closer)
+/// is essential: NN-L-FIM-003/004 are KillProcess rules, so the
+/// emitted `FimOp::Modified` must name the process that changed the
+/// bytes, not whoever happened to close the fd last.
+///
+/// **Multi-writer attribution is LAST-WRITE-WINS.** If several distinct
+/// non-family writers modify the same watched inode before it is
+/// closed, each write-intent `insert` overwrites the mark, so the
+/// single `Modified` emitted at close names the LAST writer to touch
+/// it. This is a deliberate fidelity limit: every candidate is a
+/// non-family writer, so detection still fires; only the KillProcess
+/// target could be one of several concurrent attackers (and the audit
+/// chain still records the event regardless). Family writers NEVER set
+/// or overwrite the mark — `should_emit` excludes them at write-intent
+/// — so a legitimate agent/watchdog write cannot clobber an attacker's
+/// already-recorded attribution, nor manufacture a spurious one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirtyMeta {
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+}
+
+/// Inodes written-but-not-yet-closed (BUG-023 write-then-close).
+/// PROCESS-LOCAL (NOT pinned): purely per-boot transient state, same
+/// rationale as [`FS_FIM_EVENTS`] — a restart starts clean (any
+/// in-flight write re-marks on its next `write()`). Sized for the
+/// count of watched files concurrently open for write, which is
+/// tiny; 4096 is generous headroom.
+#[map]
+pub static FIM_DIRTY_INODES: HashMap<InodeKey, DirtyMeta> = HashMap::with_max_entries(4096, 0);
 
 // ── Helpers (mirror inode_protect.rs idioms) ────────────────────────
 
@@ -242,6 +287,61 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest_key: Option<InodeKey>) {
     entry.submit(0);
 }
 
+/// Tappa 9 (BUG-022) — emit variant that also captures the leaf name
+/// of the child created in / renamed into a watched directory. The
+/// standard fields (ts, modifier triple, target key, op) are the
+/// creating/renaming caller's — correct attribution, since the
+/// dropper IS the current task. Userland reconstructs
+/// `dir + "/" + child_name` so the child-prefix rules can match.
+#[inline(always)]
+fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
+    let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
+        Some(e) => e,
+        None => return,
+    };
+    let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    unsafe {
+        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
+        let pid_tgid = bpf_get_current_pid_tgid();
+        (*raw_ptr).modifier_pid = (pid_tgid >> 32) as u32;
+        let uid_gid = bpf_get_current_uid_gid();
+        (*raw_ptr).modifier_uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        (*raw_ptr).target_dev = key.dev;
+        (*raw_ptr).target_ino = key.ino;
+        (*raw_ptr).op = op;
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw_ptr).modifier_comm = comm;
+        }
+        let flags = read_child_leaf(child_dentry, &mut (*raw_ptr).child_name);
+        (*raw_ptr).child_name_flags = flags;
+    }
+    entry.submit(0);
+}
+
+/// Tappa 9 (BUG-023) — emit a `FimOp::Modified` for a watched inode
+/// that was written and is now closing, using the WRITER's stored
+/// identity (`meta`) rather than the closer's. No child name.
+#[inline(always)]
+fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
+    let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
+        Some(e) => e,
+        None => return,
+    };
+    let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    unsafe {
+        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
+        (*raw_ptr).modifier_pid = meta.pid;
+        (*raw_ptr).modifier_uid = meta.uid;
+        (*raw_ptr).modifier_comm = meta.comm;
+        (*raw_ptr).target_dev = key.dev;
+        (*raw_ptr).target_ino = key.ino;
+        (*raw_ptr).op = FIM_OP_MODIFIED;
+    }
+    entry.submit(0);
+}
+
 /// Standard "should we emit a drift event?" decision used by
 /// every program once it has the target inode key. The order
 /// is: watched-check (fast-skip the common no-match path)
@@ -258,6 +358,57 @@ unsafe fn should_emit(target: *const c_void) -> Option<InodeKey> {
         return None;
     }
     Some(key)
+}
+
+/// Dereference a `*file` and return its `f_inode` pointer (the
+/// resolved target inode). Mirrors the read in
+/// [`try_fim_file_open_observe`]; factored out for the BUG-023
+/// write-intent + close hooks. `None` on null / probe failure.
+#[inline(always)]
+unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
+    if file.is_null() {
+        return None;
+    }
+    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+        Ok(p) if !p.is_null() => Some(p),
+        _ => None,
+    }
+}
+
+/// Tappa 9 (BUG-022) — read the leaf name out of a child `*dentry`
+/// (`dentry->d_name`, a `struct qstr`) into `dst`, NUL-terminated,
+/// and return the child-name flag byte ([`FIM_CHILD_TRUNCATED`] when
+/// the true leaf length overflows `dst`). Fails SAFE: on any
+/// null/probe error it leaves `dst` as the caller zeroed it and
+/// returns 0, so a wrong BTF offset degrades to "no child leaf"
+/// (userland keeps the bare-dir path) rather than emitting garbage.
+#[inline(always)]
+unsafe fn read_child_leaf(child_dentry: *const c_void, dst: &mut [u8; FIM_CHILD_NAME_LEN]) -> u8 {
+    if child_dentry.is_null() {
+        return 0;
+    }
+    let name_ptr_slot = (child_dentry as *const u8)
+        .add(DENTRY_D_NAME_OFFSET + QSTR_NAME_OFFSET)
+        as *const *const u8;
+    let name_ptr = match bpf_probe_read_kernel::<*const u8>(name_ptr_slot) {
+        Ok(p) if !p.is_null() => p,
+        _ => return 0,
+    };
+    // Best-effort NUL-terminated leaf copy, truncated to the buffer.
+    if bpf_probe_read_kernel_str_bytes(name_ptr, &mut dst[..]).is_err() {
+        return 0;
+    }
+    // Truncation: a leaf whose true length (excl. NUL) doesn't fit the
+    // buffer sets the flag so userland rules don't lose a suffix.
+    let len_slot =
+        (child_dentry as *const u8).add(DENTRY_D_NAME_OFFSET + QSTR_LEN_OFFSET) as *const u32;
+    let true_len = bpf_probe_read_kernel::<u32>(len_slot).unwrap_or(0) as usize;
+    if true_len >= FIM_CHILD_NAME_LEN {
+        FIM_CHILD_TRUNCATED
+    } else {
+        0
+    }
 }
 
 // ── LSM programs ────────────────────────────────────────────────────
@@ -302,11 +453,14 @@ pub fn fim_create_observe(ctx: LsmContext) -> i32 {
 #[inline(always)]
 unsafe fn try_fim_create_observe(ctx: &LsmContext) -> i32 {
     // Kernel signature: (dir, dentry, mode). The DIR (arg 0)
-    // is the parent inode we watch; the dentry is the
-    // not-yet-created child.
+    // is the parent inode we watch; the dentry (arg 1) is the
+    // not-yet-created child whose leaf name BUG-022 carries to
+    // userland so the child-prefix rules (FIM-007/008/009/021/023)
+    // can match instead of seeing only the bare watched-dir path.
     let dir: *const c_void = ctx.arg(0);
     if let Some(key) = should_emit(dir) {
-        emit_drift(FIM_OP_CREATED, key);
+        let child_dentry: *const c_void = ctx.arg(1);
+        emit_drift_with_child(FIM_OP_CREATED, key, child_dentry);
     }
     0
 }
@@ -383,7 +537,11 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
         emit_drift(FIM_OP_RENAMED, key);
     }
     if let Some(key) = should_emit(new_dir) {
-        emit_drift(FIM_OP_RENAMED, key);
+        // BUG-022 — a rename INTO a watched dir is a drop; carry the
+        // dest leaf (new_dentry, arg 3) so userland reconstructs the
+        // child path and normalizes this to a Created against it.
+        let new_dentry_for_child: *const c_void = ctx.arg(3);
+        emit_drift_with_child(FIM_OP_RENAMED, key, new_dentry_for_child);
     }
     let _ = combined_emitted_for_old_inode; // verifier-friendly no-op
     let new_dentry: *const c_void = ctx.arg(3);
@@ -468,6 +626,84 @@ unsafe fn try_fim_file_open_observe(ctx: &LsmContext) -> i32 {
     };
     if let Some(key) = should_emit(inode) {
         emit_drift(FIM_OP_OPENED, key);
+    }
+    0
+}
+
+/// `file_permission` (BUG-023 write-intent) — fires on every file
+/// read/write permission check. Gates on `MAY_WRITE` and, for a
+/// watched non-family writer, sets the per-inode dirty marker with
+/// the WRITER's identity. NO event is emitted here: one content edit
+/// is many `write()` calls, so emitting per-write would flood; the
+/// single event is emitted at close ([`fim_close_emit_observe`]).
+/// This is what makes an `O_APPEND` or same-size in-place rewrite
+/// observable at all — neither touches metadata, so `inode_setattr`
+/// never fires (the BUG-023 root cause).
+#[lsm(hook = "file_permission")]
+pub fn fim_write_intent_observe(ctx: LsmContext) -> i32 {
+    unsafe { try_fim_write_intent_observe(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
+    // Kernel signature: (file, mask). Skip reads BEFORE any
+    // kernel-pointer work — file_permission is a hot path.
+    let mask = ctx.arg::<u64>(1) as i32;
+    if mask & MAY_WRITE == 0 {
+        return 0;
+    }
+    let file: *const c_void = ctx.arg(0);
+    if let Some(inode) = inode_from_file(file) {
+        if let Some(key) = should_emit(inode) {
+            let pid_tgid = bpf_get_current_pid_tgid();
+            let uid_gid = bpf_get_current_uid_gid();
+            let mut meta = DirtyMeta {
+                pid: (pid_tgid >> 32) as u32,
+                uid: (uid_gid & 0xFFFF_FFFF) as u32,
+                comm: [0u8; TASK_COMM_LEN],
+            };
+            if let Ok(comm) = bpf_get_current_comm() {
+                meta.comm = comm;
+            }
+            // Best-effort; last writer wins. Map-full is silently fine.
+            let _ = FIM_DIRTY_INODES.insert(&key, &meta, 0);
+        }
+    }
+    0
+}
+
+/// `file_free_security` (BUG-023 close-emit) — fires when a file
+/// object is released (last fput). If the inode was marked dirty by
+/// [`fim_write_intent_observe`], emit ONE `FimOp::Modified` with the
+/// stored writer identity and clear the mark. Userland re-hashes and
+/// suppresses no-ops, so a write that didn't actually change the
+/// bytes (rewriting identical content) yields no drift. No
+/// caller-in-family check — the mark was only ever set for a
+/// non-family writer; the closer is irrelevant.
+///
+/// **Close-hook choice is VM-validation-gated** (catalog §21 / the
+/// agreed plan): `file_free_security` (this), `__fput`-fexit, and
+/// `filp_close`-fexit are the candidates. If this one proves not to
+/// fire with a readable `f_inode` on the target kernel, swap the
+/// attach point — the emit body ([`emit_drift_close`]) is reused.
+#[lsm(hook = "file_free_security")]
+pub fn fim_close_emit_observe(ctx: LsmContext) -> i32 {
+    unsafe { try_fim_close_emit_observe(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_fim_close_emit_observe(ctx: &LsmContext) -> i32 {
+    // Kernel signature: (file).
+    let file: *const c_void = ctx.arg(0);
+    if let Some(inode) = inode_from_file(file) {
+        if let Some(key) = inode_key(inode) {
+            if let Some(meta) = FIM_DIRTY_INODES.get(&key) {
+                // Copy out so the map borrow ends before remove().
+                let meta = *meta;
+                emit_drift_close(key, meta);
+                let _ = FIM_DIRTY_INODES.remove(&key);
+            }
+        }
     }
     0
 }

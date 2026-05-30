@@ -523,6 +523,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "attacker".to_string(),
             dest_path: None,
+            child_truncated: false,
         })
     }
 

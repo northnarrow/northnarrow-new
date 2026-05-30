@@ -45,12 +45,14 @@ use tracing::{info, warn};
 
 use crate::fim::drain::InodePathMap;
 
-/// The six FIM observe programs, paired with their LSM hook
+/// The eight FIM observe programs, paired with their LSM hook
 /// names. Names match the `#[lsm(hook = "...")]` attributes in
 /// `agent-ebpf/src/fim_watch.rs`. Order is the operator-visible
 /// boot-log order; rearranging would scramble the journald
 /// `anti-tamper FS: …` lines that operators grep for in
-/// `docs/integration-test-runbook.md`.
+/// `docs/integration-test-runbook.md`. The BUG-023 write-then-close
+/// pair (`file_permission` + `file_free_security`) is APPENDED so the
+/// original six keep their boot-log positions.
 pub const FIM_OBSERVE_PROGRAMS: &[(&str, &str)] = &[
     ("fim_setattr_observe", "inode_setattr"),
     ("fim_create_observe", "inode_create"),
@@ -58,6 +60,8 @@ pub const FIM_OBSERVE_PROGRAMS: &[(&str, &str)] = &[
     ("fim_rename_observe", "inode_rename"),
     ("fim_link_observe", "inode_link"),
     ("fim_file_open_observe", "file_open"),
+    ("fim_write_intent_observe", "file_permission"),
+    ("fim_close_emit_observe", "file_free_security"),
 ];
 
 /// BPF map name for the pinned `WATCHED_PATHS` HashMap. Matches
@@ -327,6 +331,44 @@ pub fn take_fs_fim_events_ringbuf(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>> {
         .map_err(|e| anyhow!("expected `{FS_FIM_EVENTS_MAP}` to be a RINGBUF: {e}"))
 }
 
+/// Owned writable handle to the `WATCHED_PATHS` HashMap for runtime
+/// child enrollment (Tappa 9 / BUG-022). Wrap in `Arc<Mutex<_>>` to
+/// share with the drain loop — inserts are rare (only on a real drop
+/// into a watched directory), so a coarse mutex is fine.
+pub struct WatchedPathsHandle {
+    map: AyaHashMap<MapData, AyaInodeKey, u8>,
+}
+
+impl WatchedPathsHandle {
+    /// Enroll an inode into `WATCHED_PATHS` so the kernel observe
+    /// programs start watching it directly. Returns `true` on success
+    /// (or already-present), `false` if the insert failed — almost
+    /// always the 8192-entry cap. The caller logs the cap-exhaustion
+    /// with the offending path so a silently-dropped enrollment can't
+    /// masquerade as coverage (mirrors the credential-coverage WARN in
+    /// [`populate_watched_paths`]).
+    pub fn enroll(&mut self, key: InodeKey) -> bool {
+        self.map.insert(AyaInodeKey(key), 1u8, 0).is_ok()
+    }
+}
+
+/// Take an OWNED writable handle to the pinned `WATCHED_PATHS` map out
+/// of the `Ebpf` object (call AFTER [`populate_watched_paths`]) so the
+/// drain loop can enroll children of a watched directory on the fly —
+/// a dropped `.ko`/`.service`/`.so` becomes individually watched, so a
+/// later in-place edit is caught by the BUG-023 write-then-close hook.
+/// Same `take_map` pattern as [`take_fs_fim_events_ringbuf`]: the map
+/// is pinned, so the kernel-side observe programs keep reading it after
+/// the userland handle moves out of `Ebpf`.
+pub fn take_watched_paths_map(ebpf: &mut Ebpf) -> Result<WatchedPathsHandle> {
+    let map = ebpf
+        .take_map(WATCHED_PATHS_MAP)
+        .ok_or_else(|| anyhow!("map `{WATCHED_PATHS_MAP}` missing from eBPF object"))?;
+    let hmap = AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(map)
+        .with_context(|| format!("{WATCHED_PATHS_MAP} is not a HashMap<InodeKey, u8>"))?;
+    Ok(WatchedPathsHandle { map: hmap })
+}
+
 /// Tappa 9 C8 — diagnostic helper. Stat a candidate path and
 /// return its kernel-form `InodeKey` for cross-checking against
 /// `WATCHED_PATHS` map dumps. Used in privileged e2e tests.
@@ -356,6 +398,8 @@ mod tests {
             ("fim_rename_observe", "inode_rename"),
             ("fim_link_observe", "inode_link"),
             ("fim_file_open_observe", "file_open"),
+            ("fim_write_intent_observe", "file_permission"),
+            ("fim_close_emit_observe", "file_free_security"),
         ];
         assert_eq!(FIM_OBSERVE_PROGRAMS, expected);
     }
