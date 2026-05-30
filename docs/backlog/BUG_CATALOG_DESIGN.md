@@ -1069,5 +1069,16 @@ The journal caps + rotates at the ceiling instead of growing unbounded, and sysl
 
 ---
 
+## 26. Test debt — known pre-existing failing/flaky tests (NOT product bugs)
+
+Surfaced 2026-05-30 while building the BUG-022/023 FIM fix (commit `bf4dc59`). **Neither is caused by that work** — neither file is in its diff, and both predate it. Recorded so a red `cargo test --workspace` is not mistaken for a regression. NOT fixed in the FIM commit (out of scope); fix separately.
+
+- **`admin_socket::tests::server_recreates_stale_socket_on_startup` — FLAKY.** Fails intermittently (`Connection refused (os error 111)` connecting to the test `admin.sock`; observed FAILED / ok / FAILED across three back-to-back retries, then passed on a later full run). A socket-startup timing race in the TEST harness, not the product. **Fix:** make the test await listener readiness before the client connects — do not paper over with a fixed `sleep`.
+- **`rag::retrieval::tests::engine_seeds_curated_kb` — STALE EXPECTATION.** Deterministic: `expected ~30 seeded docs, got 36` (`agent/src/rag/retrieval.rs:285`). The curated RAG KB grew to 36; the test's soft bound was written for ~30. **Fix:** update the expected count / widen the bound to the current curated-KB size.
+
+> A third pre-existing breakage found in the same run — `agent/examples/posture_demo.rs` calling `.kind()` on the tuple `PostureMachine::observe()` now returns (`(PostureState, Option<TriggerType>)`) — was a pure compile fix and is **already fixed** in commit `fe71ef9`. (`cargo test` compiles examples; `cargo build`/`check` do not, which is why it stayed hidden.)
+
+---
+
 **End of catalog.** Authoritative reference for Phase B implementation and
 V1.0 backlog grooming.
