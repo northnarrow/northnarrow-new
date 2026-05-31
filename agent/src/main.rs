@@ -1054,8 +1054,22 @@ async fn main() -> Result<()> {
         };
     let rotation_on = state_protection.is_some();
     let cap = |bytes: u64| if rotation_on { bytes } else { u64::MAX };
+    // Test/ops knob: NN_FIM_DRIFT_CAP_BYTES overrides the fim_drift active-file
+    // rotation cap (default 32 MiB) so rotation can be validated without
+    // generating 32 MiB of drift. Unset = default; still gated by rotation_on.
+    const FIM_DRIFT_CAP_DEFAULT: u64 = 32 * 1024 * 1024;
+    let fim_drift_cap = std::env::var("NN_FIM_DRIFT_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(FIM_DRIFT_CAP_DEFAULT);
+    if fim_drift_cap != FIM_DRIFT_CAP_DEFAULT {
+        warn!(
+            cap_bytes = fim_drift_cap,
+            "fim_drift rotation cap OVERRIDDEN via NN_FIM_DRIFT_CAP_BYTES (test/ops knob)"
+        );
+    }
     let fim_drift_rotation = northnarrow_agent::chainlog::RotationConfig {
-        size_cap_bytes: cap(32 * 1024 * 1024),
+        size_cap_bytes: cap(fim_drift_cap),
         max_archives: 8,
         file_mode: 0o644,
     };
