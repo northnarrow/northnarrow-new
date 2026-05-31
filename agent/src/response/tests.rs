@@ -37,10 +37,13 @@ fn execute_log_action_is_a_noop_refusal() {
 }
 
 #[test]
-fn execute_dispatches_new_actions_via_dry_run() {
-    // Tappa 5: every action now has an implementation. With
-    // dry_run = true the executor returns the success outcome
-    // for each one without touching nft / cgroup / fs.
+fn detect_only_suppresses_every_action_with_would_execute() {
+    // BUG-033: with the detect-only gate set (`dry_run = true`), the
+    // dispatcher suppresses EVERY action — including KillProcess, which
+    // previously had no suppression branch and would SIGKILL for real —
+    // and returns the honest `WouldExecute` outcome without touching
+    // nft / cgroup / fs / process table. This is the single coherent
+    // gate: one flag, every action.
     let config = super::ExecutorConfig {
         dry_run: true,
         ..super::ExecutorConfig::default()
@@ -48,35 +51,24 @@ fn execute_dispatches_new_actions_via_dry_run() {
     let exec = Executor::with_config(config);
 
     let pid = 12345;
-    match exec.execute(ResponseAction::BlockOutbound, pid).primary {
-        ExecutionOutcome::Blocked { pid: p } => assert_eq!(p, pid),
-        other => panic!("BlockOutbound → {other:?}"),
-    }
-    match exec
-        .execute(ResponseAction::FullNetworkIsolation, 0)
-        .primary
-    {
-        ExecutionOutcome::NetworkIsolated => (),
-        other => panic!("FullNetworkIsolation → {other:?}"),
-    }
-    match exec.execute(ResponseAction::Quarantine, pid).primary {
-        // /proc/12345/exe almost certainly doesn't exist; that's
-        // fine, the dispatch path is what we're testing.
-        ExecutionOutcome::AlreadyGone { pid: p } => assert_eq!(p, pid),
-        ExecutionOutcome::Quarantined { .. } => {} // possible if pid is real
-        other => panic!("Quarantine → {other:?}"),
-    }
-    match exec.execute(ResponseAction::ThrottleProcess, pid).primary {
-        ExecutionOutcome::Throttled {
-            pid: p,
-            cpu_max_pct,
-            io_weight,
-        } => {
-            assert_eq!(p, pid);
-            assert_eq!(cpu_max_pct, 10);
-            assert_eq!(io_weight, 10);
-        }
-        other => panic!("ThrottleProcess → {other:?}"),
+    for action in [
+        ResponseAction::KillProcess,
+        ResponseAction::KillProcessTree,
+        ResponseAction::BlockOutbound,
+        ResponseAction::FullNetworkIsolation,
+        ResponseAction::Quarantine,
+        ResponseAction::ThrottleProcess,
+    ] {
+        let report = exec.execute(action.clone(), pid);
+        assert_eq!(
+            report.primary,
+            ExecutionOutcome::WouldExecute { pid },
+            "{action:?} must be suppressed to WouldExecute in detect-only"
+        );
+        assert!(
+            report.additional.is_empty(),
+            "{action:?} must produce no child outcomes in detect-only"
+        );
     }
 }
 

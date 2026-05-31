@@ -47,7 +47,7 @@ use northnarrow_agent::posture::{
     resolve_verified_watchdog_pid, AuthSessionTracker, CombatEntryHook, CombatReleaseHook,
     ExemptPids, PostureMachine, WatchdogResolution,
 };
-use northnarrow_agent::response::Executor;
+use northnarrow_agent::response::{Executor, ExecutorConfig};
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
@@ -63,6 +63,17 @@ struct Cli {
     /// Disable the Active Defense Engine (rule engine only).
     #[arg(long = "no-ade", default_value_t = false)]
     no_ade: bool,
+
+    /// Detect-only / monitor mode (BUG-033). Detection runs in full and
+    /// posture still transitions (OBSERVING→ALERTED→COMBAT is logged for
+    /// visibility), but NO enforcement touches the system: every
+    /// response action (kill / block / quarantine / throttle /
+    /// isolation) and COMBAT-posture network isolation are suppressed
+    /// and logged as "would execute". Use for safe rollout / tuning
+    /// before arming autonomous response. Also settable via env
+    /// `NN_DETECT_ONLY=1` (legacy `NORTHNARROW_DRY_RUN=1` is honoured too).
+    #[arg(long = "detect-only", default_value_t = false)]
+    detect_only: bool,
 
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
@@ -743,10 +754,28 @@ async fn main() -> Result<()> {
         debug!("no --pid-file provided; PID file write skipped (production default)");
     }
 
-    let executor = Executor::new();
+    // BUG-033 detect-only: resolve the one no-enforcement gate from the
+    // CLI flag OR-ed with the env inputs (`from_env` reads
+    // `NN_DETECT_ONLY` / legacy `NORTHNARROW_DRY_RUN`). The resolved
+    // value drives BOTH the response Executor (via the config) and the
+    // COMBAT engage-hook below, so there is exactly one switch.
+    let mut exec_cfg = ExecutorConfig::from_env();
+    if cli.detect_only {
+        exec_cfg.dry_run = true;
+    }
+    let detect_only = exec_cfg.dry_run;
+    let executor = Executor::with_config(exec_cfg);
+    if detect_only {
+        warn!(
+            "DETECT-ONLY mode active (--detect-only / NN_DETECT_ONLY / NORTHNARROW_DRY_RUN): \
+             detection + posture run normally, but NO response action or COMBAT network \
+             isolation will touch the system — verdicts are logged as \"would execute\" only"
+        );
+    }
     info!(
         own_pid = executor.own_pid(),
         protected = executor.protected().len(),
+        detect_only,
         "response executor ready (KillProcess + KillProcessTree active)"
     );
 
@@ -834,6 +863,20 @@ async fn main() -> Result<()> {
         let iso_engage = Arc::clone(iso);
         let iso_release = Arc::clone(iso);
         let engage_hook: CombatEntryHook = Arc::new(move || {
+            // BUG-033 detect-only: the COMBAT enforcement entry point.
+            // Posture still transitioned to COMBAT (logged for
+            // visibility); we just don't enforce. engage() never runs,
+            // so NO iptables chain is created and `is_isolated` stays
+            // false — leaving zero persistent state for a later restart
+            // to reconcile. A true no-op beyond this log line.
+            if detect_only {
+                warn!(
+                    target: "anti_tamper.detect_only",
+                    "DETECT-ONLY: posture reached COMBAT — would engage network isolation; \
+                     iptables NOT applied (no enforcement)"
+                );
+                return;
+            }
             if let Err(e) = iso_engage.engage() {
                 tracing::error!(error = %e, "COMBAT engage failed; agent continues in degraded mode");
             }
