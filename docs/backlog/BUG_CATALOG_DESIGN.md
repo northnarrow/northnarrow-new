@@ -33,12 +33,144 @@ recommended fix directions.
 | 14 | BUG-019 | Credential FIM rules dead under `ProtectHome=yes` *(post-session, §17)* | Beta-blocker (security HIGH) | **Fixed + VM-validated** (2026-05-29) |
 | 15 | BUG-020 | `install.sh` reinstall denied by pinned anti-tamper (honeypot-bait rewrite) *(post-session, §18)* | Beta-blocker (operational) | **Tactical fix applied** (reinstall unblocked); structural design-pending |
 | 16 | BUG-021 | Disk saturation: NN journal amplified to an uncapped `/var/log/syslog` *(post-session, §19)* | Beta-blocker (availability) | **Fixed + VM-validated** (2026-05-29) |
-| 17 | BUG-022 | FIM directory watches are bare-inode-only (no populate recursion) → a rule family is dead/blind *(audit sweep, §20)* | Beta-blocker (security) | **Discovered** (static + adversarial) — VM-validation pending |
-| 18 | BUG-023 | No content-write/append FIM hook → in-place content tamper unobserved *(audit sweep, §21)* | Beta-blocker (security) | **Discovered** (static + adversarial) — VM-validation pending |
+| 17 | BUG-022 | FIM directory watches are bare-inode-only (no populate recursion) → a rule family is dead/blind *(audit sweep, §20)* | Beta-blocker (security) | **Discovered**; **VM-smoke 2026-05-31: verifier-accepts, populate=90 explicit paths (no recursion) — EXONERATED for the boot hang** (root cause = BUG-026; see VM Validation Log) |
+| 18 | BUG-023 | No content-write/append FIM hook → in-place content tamper unobserved *(audit sweep, §21)* | Beta-blocker (security) | **Discovered**; **VM-smoke 2026-05-31: both LSM hooks attach (`8/8`) — EXONERATED for the boot hang** (root cause = BUG-026; see VM Validation Log) |
 | 19 | BUG-024 | FS_PROTECT_EVENTS pinned-ringbuf reuse vs NON-transient producer (FS_FIM_EVENTS sibling) *(audit sweep, §22)* | Beta-blocker | **Runtime-CONFIRMED**; log-flood mitigated (`fd55797`); structural fix **(a2) implemented+deployed (`68d5ff3`) — zero-window VALIDATION PENDING (VM)** |
 | 20 | BUG-025 | NN-L-NET-003 BadJa3 dead rule — `tls_fingerprint` has no live producer *(audit sweep, §23)* | Medium | **Discovered** (static + adversarial) — VM-validation pending |
-| 21 | BUG-026 | Uncapped on-disk JSONL logs — second disk-fill vector, **REOPENS BUG-021** *(audit sweep, §24)* | Beta-blocker (availability) | **Discovered** (static + adversarial) — VM-validation pending |
+| 21 | BUG-026 | Uncapped on-disk JSONL logs — second disk-fill vector, **REOPENS BUG-021** *(audit sweep, §24)* | Beta-blocker (availability) | **VM-smoke 2026-05-31 found a ~129 s boot hang** (`open` full-scanned a 1.7 GB legacy `fim_drift.jsonl`); **FIXED same day — O(1) `recover_tail` + attested torn-repair + first-append rotation; chainlog 13/13; re-smoke PASS (~2.6 s, FIM 8/8, OBSERVING)** (see VM Validation Log). Sibling simple chains → BUG-029 |
 | 22 | BUG-027 | `DnsCache.by_pid` unbounded per-PID-key growth (no cap/eviction) *(audit sweep, §25)* | Medium | **Discovered** (static + adversarial) — VM-validation pending |
+| 23 | BUG-029 | Simple chains (audit/baseline/canary) O(n)-walk on open + `audit.log` never rotates → latent BUG-026-class boot hang; plus a fail-closed resilience gap *(found during the BUG-026 fix, §28)* | Medium (post-beta) | **Discovered** (2026-05-31) — slow growth (audit.log 0 B / 4 days); proper fix = rotation + chainlog core + an attestation channel |
+| 24 | BUG-030 | `RotatingChainLog::rotate()` fails + DESTROYS sealed data under the `+i` state dir: `manifest_append` creates `.manifest.jsonl` outside the chattr-lift window (EPERM in immutable dir) → rotate Err; non-atomic failure re-rotates the same seq, overwriting the sealed archive *(fire test #1, §29)* | **Beta-blocker (integrity)** | **FIXED + VM-validated 2026-05-31** — manifest created INSIDE the dance + failure-atomic `finish_rotation` (advance seq right after rename; manifest non-fatal); chainlog **16/16** (incl. manifest-failure injection + 2 recovery cases); VM re-test under real `+i`: **5 clean rotations, manifest written, verify OK (61 records), restart-recovery clean**. **Prereq: prod unit needs `CAP_LINUX_IMMUTABLE` (§29)** |
+| 25 | BUG-031 | COMBAT network isolation is **IPv4-only** (`iptables` `NORTHNARROW_COMBAT`); no `ip6tables` chain → IPv6 egress flows during COMBAT → C2/exfil bypass on any dual-stack host *(fire test #2 setup, §30)* | **Beta-blocker (HIGH, security)** | **VM-CONFIRMED 2026-05-31** — during COMBAT, ip6tables all-ACCEPT + harness IPv6 egress kept flowing. Fix: mirror chain on ip6tables / default-deny egress. COMBAT block AFTER batch |
+| 26 | BUG-032 | No allowlist/exemption for legitimate activity → autonomous defense escalates to COMBAT (network isolation) on legit tooling/admin *(fire test #2 setup, §31)* | **Beta-blocker (usability/safety)** | **VM-CONFIRMED 2026-05-31** — agent → COMBAT on the Claude Code harness's own API egress (ExfiltrationPattern) + operator sensitive-file reads (SensitiveFileAccess); R008 on the harness binary. No exemption mechanism |
+| 27 | BUG-033 | No detection-only / monitor ("alert-only") mode → can't run detection-first; `NORTHNARROW_DRY_RUN` is partial (does NOT gate the kill Executor or the COMBAT isolator) *(fire test #2 blocker, §32)* | **Beta-blocker (usability/rollout)** | **FIXED + VM-validated 2026-05-31** — first-class `--detect-only`/`NN_DETECT_ONLY` gates ALL response paths + COMBAT engage-hook; fire test #2 ran clean in it (37 suppressions, 0 kills, COMBAT zero-residue). §32 |
+| 28 | BUG-034 | **FIM-008 kernel-module watch is non-recursive** → `.ko` dropped in the nested `/lib/modules/<rel>/kernel/…` tree (where real modules + a rootkit load) is **invisible**; fires only on top-level `/lib/modules` drops no attacker uses *(fire test #2, §33)* | **Beta-blocker (HIGH, security)** | **VM-CONFIRMED 2026-05-31** — nested `.ko` missed, top-level fired. Direct consequence of [[BUG-022]] reject-recursion. Fix direction: watch nested module DIRS (stat-only), NOT recursive baseline (would re-create [[BUG-026]] hang) |
+| 29 | BUG-035 | No authenticated **force-kill escape hatch** — `task_kill` denies SIGKILL even from systemd/PID-1, so an agent that hangs on graceful SIGTERM is unrecoverable except by reboot *(fire test #3, §34)* | Enhancement (MEDIUM, operational, **post-beta**) | **VM-CONFIRMED 2026-05-31** — `systemctl kill -s SIGKILL` denied (a2 self-protection working as intended). NOT a protection bug; fix = ADD an Ed25519-signed operator force-kill (COMBAT-release-token pattern), do not weaken the deny. Linked to [[BUG-010]] |
+
+---
+
+## VM Validation Log
+
+> Operational log of real-kernel (BPF-LSM) validation runs on `northnarrowdev`
+> (kernel `6.8.0-117-generic`, `lsm=...,bpf`). Records **what's live** on the VM
+> and the pass/fail of each smoke/fire gate. Newest first.
+
+### 2026-05-31 — Smoke test, commit `33cb91e` (FIM redesign BUG-022/023 + BUG-026 chainlog) — **GATE FAILED (boot hang — root cause: BUG-026 `RotatingChainLog::open` full-scans a 1.7 GB legacy log; ~129 s)**
+
+First-ever real-kernel run of the FIM redesign + RotatingChainLog migration.
+Build clean (eBPF release + userland debug, 0 warnings). Ran the fresh
+`target/debug/northnarrow-agent` (sha `5d51720…`) as a `systemd-run` transient
+unit `nn-smoke-agent`, `--no-ade`, isolated `/tmp` admin socket. The old
+`northnarrow-agent.service` (yesterday's installed release `96e3974…`,
+`/usr/local/bin`) was stopped first (graceful — its PID-1 KILL_OVERRIDE
+carve-out was armed, verified via bpftool, so `systemctl stop` was honoured).
+
+- **Verifier sub-gate: PASS.** All BPF/LSM programs loaded + attached on 6.8.0:
+  core sensors (process/file/exec/tcp v4+v6/dns), net N2 (`inet_csk_listen_start`
+  kprobe + `tcp_close` fexit + `udp_sendmsg_outbound` kprobe), anti-tamper LSM
+  (7: task_kill, ptrace_access_check, inode_unlink/rmdir/rename/setattr,
+  file_ioctl), and **all 8 FIM observe programs (`attached=8 total=8`)** incl.
+  the new BUG-023 pair `fim_write_intent_observe`(file_permission) +
+  `fim_close_emit_observe`(file_free_security). **The new 144B `FimDriftRaw`
+  ABI + kernel-side dentry `d_name` BTF reads were ACCEPTED by the verifier** —
+  the primary load-time risk is cleared. Posture reached **OBSERVING**.
+- **Startup sub-gate: FAIL — root-caused to BUG-026 chainlog open (NOT BUG-022/023).**
+  Characterized via a no-timeout (`Type=simple`) re-run: the agent **fully starts
+  after ~129 s** (`fim: drain loop spawned` at t+129s; systemd "Consumed **2min
+  7.814s CPU**") — a **bounded full-file scan, NOT an infinite loop, and NOT
+  recursion drift.** Mechanism: after the signing-key load (`main.rs:1234`),
+  `FimDriftDb::open` → `RotatingChainLog::open` → **`walk_active`
+  (`chainlog.rs:688`)** does an O(n) `BufReader::lines()` + per-line `serde_json`
+  parse of the **entire active `fim_drift.jsonl` = 1.7 GB / 2,619,721 lines**
+  (~53× the 32 MiB rotation cap) to recover the chain tail/size/count. CPU-bound
+  in userland (utime≈wall, stime flat → JSON parse, not I/O; file page-cached).
+  `walk_active`'s own doc claims it "replaces the old unbounded boot walk over a
+  multi-GB file… the active file is size-capped so this is bounded" — but rotation
+  caps only **forward** (on append, `chainlog.rs:456`); `open()` has **no guard for
+  an already-oversized (legacy/pre-rotation) active file**, so it re-introduces
+  exactly that unbounded boot walk. netflow.jsonl (1863 lines) opened instantly —
+  same code, small file. **Recurs every boot** until fixed, worsening as it grows.
+- **BUG-022/023 EXONERATED (verifier + design).** All 8 FIM observe programs
+  attached (incl. the BUG-023 pair); populate enrolled only **90 explicit
+  configured paths** — no recursive child enrollment, faithful to the Option A
+  design; `run_recompute_task` merely awaits its channel (no boot work, and its
+  first-boot fire sits after the not-yet-reached drain spawn). The hang is upstream
+  of all FIM-drift event handling.
+- **The 1.7 GB `fim_drift.jsonl`** is accumulated uncapped drift writes from the
+  pre-BUG-026 agent — both the hang trigger and itself a disk-fill artifact (the
+  thing BUG-026/021 target). Left **UNTOUCHED** on disk (signed audit chain;
+  operator to archive/clear). 2.6M drift rows may also indicate a prior drift flood.
+- **Fix orientation** (NOT implemented — diagnosis only): make `open` O(1) —
+  recover tail-hash from the last line via seek, byte-size from `fstat`, drop the
+  whole-file record count/parse; and/or seal+rotate an oversized active file on
+  open (one-time legacy migration). The BUG-022 "remove the forbidden recursion"
+  path does **not** apply (no recursion exists here).
+- **Decision:** per gate rules, **STOPPED — did NOT proceed to fire tests.**
+
+**Resolution (2026-05-31, same day).** Fixed in `chainlog.rs`: `open()` now
+recovers the tail **O(1)** (bounded backward read, `recover_tail`) instead of the
+whole-file walk; a torn tail is truncate-repaired AND **attested** in the
+manifest meta-chain (`ManifestEvent::TornTailRepaired` — role, offset, bytes,
+fragment SHA-256); the rotation guard moved to `active_bytes` so an over-cap
+legacy file rotates on first append (verified for **v1** via
+`legacy_v1_over_cap_rotates_on_first_append_and_verifies`). `record_count` is now
+advisory (verifier recounts; confirmed no reader trusts it). Build clean
+(0 warnings); **chainlog 13/13** (5 new tests). The 1.81 GB legacy
+`fim_drift.jsonl` was **archived** (`→ fim_drift.jsonl.legacy-pre-bug026-20260531`,
+kept as forensic evidence). **Re-smoke PASS:** fresh `target/debug` build started
+in **~2.6 s** (was 129 s) — verifier ACCEPT (net N2 + anti-tamper + **FIM 8/8**,
+15 LSM progs), posture **OBSERVING**, `READY=1 sent`, 2.04 s CPU (no walk), no
+torn-repair (clean start). The simple-chain sibling issue is filed as **BUG-029**.
+
+### 2026-05-31 — Fire test #1: BUG-026 drift→rotation path — **Part A PASS, Part B FAIL → BUG-030**
+
+Drove drift through a throwaway watched file (enrolled via `--fim-paths-local`),
+fim_drift cap lowered to 16 KiB via the new `NN_FIM_DRIFT_CAP_BYTES` test knob.
+- **Part A (drift → signed append → verify): PASS.** One modify → one signed line
+  (genesis-rooted, `entry_hash`/`agent_sig` present) → `verify_chainlog`
+  (new example calling `verify_log_set::<FimDriftPayload>`) → **VERIFY OK, total_records=1**.
+- **Part B (rotation): FAIL → [[BUG-030]].** Rotation under the production `+i`
+  state dir loses sealed signed data and breaks the chain (`manifest_append`
+  outside the chattr-lift window → EPERM; non-atomic rotate re-rotates the same
+  seq, overwriting the archive). Filed BUG-030 (Beta-blocker); evidence at
+  `/var/tmp/nn-bug030-rotation-evidence/`. **STOPPED before fire test #2** per
+  one-at-a-time review.
+
+**Current VM state (what's live):** **agent RUNNING in DETECT-ONLY, OBSERVING**
+(2026-05-31). `target/debug/northnarrow-agent` (BUG-026 + BUG-030 + **BUG-033
+`--detect-only`**) runs as transient unit `nn-smoke-agent` with `--no-ade
+--detect-only --admin-socket /tmp/nn_smoke_admin.sock`; carve-out armed (`KILL_OVERRIDE
+== AGENT_SESSION`, `systemctl stop nn-smoke-agent` safe). **BUG-033 FIXED + VM-validated:**
+detection + posture run normally, ALL enforcement (kill / block / quarantine / throttle /
+isolation + COMBAT engage-hook) suppressed to `WouldExecute`.
+**Fire test #2 (FIM functional) PASSED in detect-only** (2026-05-31): FIM-003 (same-size
+sudoers, SHA-based), 004 (authorized_keys), 007 (cron), 009 (systemd unit), 021 (PAM `.so`,
+Critical) all fired correct VERDICTs; both negative controls passed (child-path carried =
+[[BUG-022]] validated; identical-bytes rewrite suppressed on baselined files). 37 response
+actions suppressed, **0 kills**. **COMBAT zero-residue confirmed empirically**: a rule drove
+posture→COMBAT, engage-hook logged "would engage", **no nft chain, no `isolated` flag, no
+re-engage on restart**. **Found [[BUG-034]]** (FIM-008 nested-module watch blind).
+Earlier in the session the pre-detect-only binary self-escalated to COMBAT on harness/operator
+activity (surfaced [[BUG-031]]/[[BUG-032]]/[[BUG-033]]); that was de-escalated before building
+the mode. Old `northnarrow-agent.service` remains **stopped**. **BUG-030 FIXED + VM-validated**
+(5 clean rotations under real `+i`, 61 records, clean restart-recovery; set at
+`/var/tmp/nn-bug030-fix-validated/`). Test-support kept: `NN_FIM_DRIFT_CAP_BYTES` (main.rs) +
+`examples/verify_chainlog.rs`. 1.81 GB legacy + BUG-030 evidence preserved.
+
+**a2 LSM denies confirmed active under detect-only** (root `task_kill` + file-rename denied; detect-only
+gates ONLY userspace response paths, never the BPF-LSM structural denies). **Fire test #3 (a2 anti-tamper
+zero-window) PASSED** (2026-05-31): **~7.2M denied root `mv`/rename attempts, 0 slips** across stable /
+agent-down / 12-relaunch / dual-protected scenarios. Proven: (1) protection is **kernel-resident** — pins +
+7 LSM progs + 22 `PROTECTED_INODES` survive graceful exit; denials hold with **no agent process** (Test A,
+411k tries/0 slips); (2) re-attach is **genuinely zero-window** — 12 relaunches over live pins, 0 slips,
+0 conflicts, startup log confirms `attach-before-purge` + pinned-link reuse (the pre-existing-pin conflict
+risk does NOT occur); (3) `+i` persists across agent death, carrying dual-protected state files (`fim_drift`)
+independent of `inode_protect`. Crash-sim via SIGKILL **not inducible** — denied even via systemd/PID-1
+(a2 working as intended) → filed [[BUG-035]] (authenticated force-kill escape hatch, MEDIUM/post-beta).
+Test target (`fim-paths.local`) + bursters removed; agent restored to **clean detect-only OBSERVING**
+(`PROTECTED_INODES`=21, carve-out armed). **Next: per operator direction** (FIM redesign + a2 both
+functionally validated; open beta-blockers: [[BUG-031]] COMBAT IPv4-only, [[BUG-032]] allowlist,
+[[BUG-034]] FIM-008 nested watch).
 
 ---
 
@@ -1087,6 +1219,7 @@ Surfaced 2026-05-30 while building the BUG-022/023 FIM fix (commit `bf4dc59`). *
 
 - **`admin_socket::tests::server_recreates_stale_socket_on_startup` — FLAKY.** Fails intermittently (`Connection refused (os error 111)` connecting to the test `admin.sock`; observed FAILED / ok / FAILED across three back-to-back retries, then passed on a later full run). A socket-startup timing race in the TEST harness, not the product. **Fix:** make the test await listener readiness before the client connects — do not paper over with a fixed `sleep`.
 - **`rag::retrieval::tests::engine_seeds_curated_kb` — STALE EXPECTATION.** Deterministic: `expected ~30 seeded docs, got 36` (`agent/src/rag/retrieval.rs:285`). The curated RAG KB grew to 36; the test's soft bound was written for ~30. **Fix:** update the expected count / widen the bound to the current curated-KB size.
+- **`anti_tamper::network_isolate::tests::engage_without_allow_file_is_loopback_only` — NON-HERMETIC (environment-dependent).** Surfaced 2026-05-31 on the `northnarrowdev` VM. The test asserts `carved.is_empty()` (no management carve-out) but reads the **real** `combat_allow::default_path()` = `/etc/northnarrow/combat-allow.cidrs`, which **exists on a provisioned host** (the live mgmt carve-out, IPv4 CIDRs) → `carved` is non-empty → assertion fails. Passes on a clean dev box (no `/etc/northnarrow/`), fails on a deployed VM. **Not a product bug** — `engage()`/`build_engaged_ruleset()` behave correctly; the test reaches outside its sandbox. **Fix:** point the test at a temp allow-path (the test already has `with_allow_cidrs_path`) instead of the host default, so it's hermetic regardless of `/etc/northnarrow/` provisioning.
 
 > A third pre-existing breakage found in the same run — `agent/examples/posture_demo.rs` calling `.kind()` on the tuple `PostureMachine::observe()` now returns (`(PostureState, Option<TriggerType>)`) — was a pure compile fix and is **already fixed** in commit `fe71ef9`. (`cargo test` compiles examples; `cargo build`/`check` do not, which is why it stayed hidden.)
 
@@ -1104,6 +1237,139 @@ Surfaced 2026-05-30 while building the BUG-022/023 FIM fix (commit `bf4dc59`). *
 **Fix direction.** Migrate to `RotatingChainLog<CombatAuditPayload, Arc<StateDirProtection>>` (combat-audit IS under the `+i` dir, so the dance applies — unlike the B-cap which sidestepped it via in-place truncate). Pre-open the signed writer at boot so the COMBAT-path append is a fast, non-blocking signed line. Pre-existing unsigned lines won't retro-verify (no regression — they were never signed); the chain is signed forward from adoption. Verify on the VM that signing never stalls COMBAT entry.
 
 **References.** Surfaced by the [[BUG-026]] writer migration. The temporary inconsistency (ad-hoc truncate cap rather than chainlog) is tracked debt until this pass.
+
+---
+
+## 28. BUG-029 — Simple (non-rotating) chains O(n)-walk on open + `audit.log` never rotates → latent BUG-026-class boot hang; plus a fail-closed resilience gap
+
+- **Severity:** Medium (availability, latent) — **post-beta.** Growth is slow in practice (below), so the hang is far off; filed so it is not buried.
+- **Status:** **Discovered 2026-05-31** during the [[BUG-026]] O(1)-open fix. Deliberately NOT folded in (see "Why not").
+
+**Gap.** Three signed chains keep their OWN copy-pasted tail readers (`read_tail_hash` in `agent/src/audit.rs`, `fim/baseline.rs`, `canary/access_log.rs`) — NOT the `chainlog` core fixed in BUG-026. Each:
+1. **Walks the whole file on open** (`BufReader::lines()` over every entry) to recover the chain tail — the exact O(n) pattern that hung the agent ~129 s on a 1.7 GB `fim_drift.jsonl` (BUG-026). `audit.log` additionally has **no rotation** ("grows forever", per its own §54 comment), so it is the next file to cross the hang threshold as it grows.
+2. **Fails closed on a torn tail**: a crash mid-append leaves a partial last line; the reader parses it as its entry type and `?`-propagates → `open()` returns `Err` → no handle → that subsystem is **disabled until manual cleanup**. This is SAFE (no fusion/corruption) but is a resilience gap vs fim_drift/netflow, which now self-heal + attest.
+
+**Growth rate (sets priority).** On `northnarrowdev` after ~4 days: `audit.log` = **0 bytes / 0 lines** (driven by signed `nn-admin` ops, NOT detection events), `fim_baseline.jsonl` = **40 KB** (recompute-driven, rare), `canaries.jsonl` / `canary_access.jsonl` = **0** (canary-access-driven, rare). None are fed by a high-frequency kernel-event firehose — unlike `fim_drift.jsonl`, which reached 1.7 GB. So the O(n)-open hang is **far off → post-beta.** Re-prioritise if admin-op or canary volume ever spikes.
+
+**Why NOT folded into the BUG-026 fix.** (a) There is no fusion bug to fix here — fail-closed already prevents the corruption BUG-026's repair prevents for fim_drift; making these "recover-only" (O(1) tail WITHOUT repair) would *introduce* fusion (recover-then-append-after-fragment). (b) The proper fix needs an **attestation channel they lack**: the BUG-026 repair attests into the per-log manifest meta-chain (`ManifestEvent::TornTailRepaired`), but these chains are manifest-less. Adding recover+repair therefore requires a shared signed **repair-journal** or attest-into-`audit.log` — a real design addition, orthogonal to the boot hang.
+
+**Fix direction.** Migrate the three onto the `chainlog` core (rotation + O(1) `recover_tail` + repair + manifest-attested truncation), and give `audit.log` the rotation policy its §54 defers. Design the attestation channel first (shared repair-journal vs audit-log attestation). Until then they stay fail-closed (safe, not self-healing) — do NOT add recover-only.
+
+**References.** Surfaced by the [[BUG-026]] O(1)-open fix (VM Validation Log, 2026-05-31). Sibling of BUG-026 (same O(n)-open class) and BUG-028 (same "simple chains on legacy writers" cluster).
+
+---
+
+## 29. BUG-030 — `RotatingChainLog` rotation fails + loses sealed signed data under the `+i` state dir
+
+- **Severity:** **Beta-blocker (integrity/availability).** Rotation — BUG-026's whole purpose — FAILS on the first rotation under the production `chattr +i` state dir, and **silently destroys already-sealed signed forensic records**, then blinds FIM-drift (every later drift event dropped). Worse than the uncapped growth it replaced (that at least kept the data).
+- **Status:** **FIXED + VM-validated 2026-05-31** (same day). VM-CONFIRMED during fire test #1; fixed via a shared, failure-atomic `finish_rotation`; re-validated under real `+i` (5 clean rotations, manifest written inside the dance, `verify_log_set` OK over 61 records, clean restart-recovery). Distinct from the BUG-026 O(1)-`open()` fix; this was a pre-existing defect in the BUG-026 *writer migration*, surfaced once rotation actually ran under `+i`.
+
+**Symptom.** Drove ~80 drift events through a watched file with the fim_drift cap lowered to 16 KiB. Result: archive `.000001` held ONLY its terminator (`record_count:25, bytes:15825` — the 25 data lines it attests are gone), active file empty, **no `.manifest.jsonl`**, a flood of `process_drift error … append to drift DB`, and `verify_log_set` FAILS (`.000001` entry 0 `prev_hash != genesis`). Part A (single drift → one signed line → verify) PASSED — the failure is rotation-only.
+
+**Root cause (two compounding bugs).**
+1. **`manifest_append` runs OUTSIDE the immutability dance.** `rotate()` lifts the dir's `chattr +i` only inside `with_mutable_dir` (rename + create-fresh-active + register_active + evict). `manifest_append` runs AFTER that block with `+i` re-applied, and creates `.manifest.jsonl` via `append_and_fsync(create:true)` — creating a NEW dir entry in an immutable dir → **EPERM**. (Verified on the VM: `touch` in the `+i` dir → "Operation not permitted"; appending to the existing active file → OK — the asymmetry. Data lines append fine only because `fim_drift.jsonl` already exists.) So every `rotate()` returns `Err` at the manifest step.
+2. **`rotate()` is not failure-atomic.** `next_seq` + `active_bytes` are reset only at the END, after `manifest_append`. On the manifest failure they stay (`next_seq=1`, `active_bytes` > cap), so the NEXT append re-rotates into the SAME seq: it writes a terminator to the now-empty fresh active and renames it OVER the good `.000001`, **overwriting 25 sealed signed lines with a 380-byte terminator-only file.** Repeats every append → total data loss + the error flood + drift events silently dropped.
+
+**Why units miss it.** The chainlog unit tests use `NoProtection` (no `+i` dir), so `manifest_append`'s create always succeeds, `rotate()` never fails, and the failure-atomicity path is never exercised. Only the real `StateDirProtection` + `+i` dir on the VM triggers it. Both writers — `fim_drift.jsonl` (32 MiB) and `netflow.jsonl` (16 MiB) — fire this on their FIRST production rotation.
+
+**Fix (implemented + VM-validated 2026-05-31).** `rotate()` and
+`complete_interrupted_rotation()` now share one failure-atomic `finish_rotation`:
+- The manifest is created **INSIDE** `with_mutable_dir` (the `+i` lift), so the
+  `.manifest.jsonl` create no longer EPERMs. (Appends to an existing manifest were
+  always fine; only the create needed the lift.)
+- Atomic order: rename → **advance `next_seq` + reset counters immediately** (the
+  commit point) → create fresh active → manifest. A post-rename failure can never
+  re-rotate into the same seq, so a sealed archive can't be overwritten.
+- Manifest/eviction failures AFTER the rename are **non-fatal** (`error!` + continue):
+  never lose signed data > attest. A missing manifest row is recoverable (the
+  verifier doesn't need it for a non-evicted set).
+- Tests (chainlog 13→16): `rotation_survives_manifest_failure_without_data_loss`
+  (failure-injection — manifest path made a directory, proves bug 2 dead: appends
+  don't error, seqs stay contiguous, verify recovers all records),
+  `interrupted_rotation_recovers_cleanly_on_open` (crash after seal, before rename),
+  `post_rename_crash_recovers_with_active_absent` (crash after rename, before fresh
+  active). VM re-test under real `+i` covers the success path units structurally
+  can't: 5 clean rotations, manifest written, verify OK (61 records).
+
+**Production-unit prerequisite (CAP_LINUX_IMMUTABLE).** The fix above makes the
+manifest create happen INSIDE the chattr dance — but the dance itself (`chattr -i`
+to lift, `+i` to restore) needs **CAP_LINUX_IMMUTABLE**, which the production
+`northnarrow-agent.service` `CapabilityBoundingSet` (`CAP_BPF CAP_SYS_ADMIN
+CAP_NET_ADMIN CAP_DAC_OVERRIDE`) does **not** grant. So under the real systemd
+unit the dance — and therefore *every* rotation — would fail outright (and the
+boot-time `+i` apply too). **The production-faithful pass (option 3) is BLOCKED
+until the unit adds `CAP_LINUX_IMMUTABLE` to `CapabilityBoundingSet`** (and
+`AmbientCapabilities`/`CapabilityBoundingSet` as the impl requires). Not blocking
+the systemd-run validation (root has full caps there). Verify on the real unit.
+
+**Related.** Sibling of [[BUG-026]] (same writer) and BUG-028/029 (chainlog cluster). Evidence preserved at `/var/tmp/nn-bug030-rotation-evidence/`.
+
+---
+
+## 30. BUG-031 — COMBAT network isolation is IPv4-only (IPv6 egress bypass)
+
+- **Severity:** Beta-blocker, **HIGH** (security). COMBAT's core promise is autonomous network isolation; covering only IPv4 while IPv6 egress flows means an attacker keeps C2/exfil over IPv6 on any dual-stack host (most modern hosts) — the wedge itself is bypassable. "Production is IPv4-only" is a weak assumption.
+- **Status:** **VM-CONFIRMED 2026-05-31** during fire-test-#2 setup (the agent self-escalated to COMBAT — see VM Validation Log).
+
+**Gap.** `anti_tamper::network_isolate::NetworkIsolator` builds the `NORTHNARROW_COMBAT` chain on **`iptables` (IPv4) only** (INPUT/OUTPUT/FORWARD → management carve-out + DROP). There is no `ip6tables` equivalent. Confirmed: while the agent was in COMBAT, `ip6tables -L` showed every chain at policy ACCEPT with no NN chain, and the host's IPv6 egress (the harness's API flows to `2607:6bc0::…`, `2600:1901::…`) **kept flowing** with `bytes_sent` climbing.
+
+**Fix direction.** Mirror `NORTHNARROW_COMBAT` on `ip6tables` (lift/restore + carve-out + DROP, same fail-safe) alongside IPv4. Assess whether isolation should be a robust **default-deny-egress** posture rather than per-protocol enumeration — what else slips (link-local, ICMPv6 ND, multicast). Tackle in the **COMBAT hardening block AFTER the current batch validation** — a real beta-blocker, deliberately not folded in now.
+
+---
+
+## 31. BUG-032 — No allowlist/exemption for legitimate activity → autonomous escalation isolates legit hosts
+
+- **Severity:** Beta-blocker (usability/safety). Autonomous defense escalating to COMBAT (network isolation) on legitimate activity means, in production, a customer's servers cut off by a legit admin tool or batch job — the concrete realization of the false-positive risk in the [[BUG-029]] cluster.
+- **Status:** **VM-CONFIRMED 2026-05-31** (fire-test-#2 setup).
+
+**Gap.** On a host also running the Claude Code automation harness, the agent escalated OBSERVING → ALERTED → **COMBAT** + network-isolated on entirely legitimate activity: `ExfiltrationPattern` on the **harness's own API egress** (`pid=1172 comm="HTTP Client"`, outbound HTTPS), `SensitiveFileAccess` on operator config reads (`/etc/sudoers`, `fim_baseline.jsonl`), `R008` on the harness binary (`claude.exe`). There is **no mechanism to allowlist/exempt** known-legitimate processes / binaries / paths / egress from the triggers + rules. A security agent cannot distinguish tooling from an attacker without one.
+
+**Fix direction.** An operator-managed allowlist (process comm/exe path, file paths, egress CIDR/host) consulted by the posture triggers + rules BEFORE escalation/alerting (extend the existing `process-comm-allowlist` / `netflow-comm-allowlist` to the escalation path). Pairs with BUG-033: run detection-first, then enable autonomous actions with a tuned allowlist (the standard EDR rollout).
+
+---
+
+## 32. BUG-033 — No detection-only / monitor ("alert-only") mode
+
+- **Severity:** Beta-blocker (usability/rollout). Every serious EDR ships a monitor / "Alert only" mode so customers run detection-first, validate, then enable autonomous actions with a tuned allowlist. NorthNarrow has none — response actions are armed the moment it runs.
+- **Status:** **CONFIRMED 2026-05-31** — blocks fire test #2 (validating FIM *detection* requires NOT executing the Critical `KillProcessTree` / COMBAT isolation those rules carry).
+
+**Gap.** No CLI flag or first-class mode makes the agent log verdicts but execute nothing. The only knob, **`NORTHNARROW_DRY_RUN`** (env), is **partial**: read ONLY by `response::config::ResponseConfig` (gating `block_outbound`, `quarantine`, `throttle`, `response::network_isolation`). It does **NOT** gate the **kill Executor** (`response::executor` → `kill::kill_process[_tree]` — executes regardless) nor the **COMBAT-posture isolator** (`anti_tamper::network_isolate` — no dry_run check; engages regardless). Posture-modulation isn't it either: `modulate_verdict` is *unchanged in OBSERVING*, so a Critical rule's native `KillProcessTree` executes even in OBSERVING (COMBAT only escalates further).
+
+**Fix direction.** A first-class **`--detect-only` / monitor mode** (CLI flag + persisted config) forcing ALL response paths to log-only, posture-independent: gate the `Executor` (kill), the `CombatEntryHook` (isolation engage), and the response actions to emit `"would <action>"` and execute nothing. Unblocks fire test #2 (run detection-first; confirm each rule's VERDICT fires) AND is required for rollout. Pairs with BUG-032 (allowlist).
+
+---
+
+## 33. BUG-034 — FIM-008 kernel-module watch is non-recursive (rootkit `.ko` in the real module tree is invisible)
+
+- **Severity:** Beta-blocker, **HIGH** (security). FIM-008 *is* the kernel-module/rootkit-LKM detector, and it is blind exactly where a rootkit loads. It fires only on a `.ko` dropped at the **top of `/lib/modules`** — a path no real attacker uses. A `.ko` dropped/replaced anywhere in the actual module tree (`/lib/modules/<rel>/kernel/…`) is **not observed at all**.
+- **Status:** **VM-CONFIRMED 2026-05-31** (fire test #2). `.ko` at `/lib/modules/<rel>/nnfire.ko` → **no drift, no verdict**. Identical `.ko` at `/lib/modules/nnfire2.ko` (top-level) → `NN-L-FIM-008_KernelModuleModified action=KillProcessTree severity=Critical`. Rule logic is correct; the **watch coverage** is the gap.
+
+**Mechanism (diagnosed, not assumed).** `populate_watched_paths` (`fim/attach.rs:194`) stats each configured path and inserts *its own* `(dev,ino)` into the 8192-cap `WATCHED_PATHS` BPF map — **no recursion**. The kernel create-hook keys emission on the **parent-directory inode** (`should_emit(parent)`, `agent-ebpf/src/fim_watch.rs:485`; child path rebuilt by the BUG-022 `read_child_leaf`/`emit_drift_with_child` path). So:
+- `/lib/modules` (a configured dir) is watched → a **direct child** create fires + is enrolled.
+- `/lib/modules/<rel>/…` subdirs are **not** in `WATCHED_PATHS` → a create there has no watched parent → **no event**.
+
+**Root cause — the documented [[BUG-022]] residual, now concrete.** BUG-022 deliberately **rejected recursive enrollment**: baselining every file under a dir tree is the O(n) content **hash-walk** that produced the [[BUG-026]]-class startup hang, and the tree is enormous. Measured on this host (one kernel): **1224 subdirs, 6474 `.ko` files** under `/lib/modules/<rel>` vs the **8192** `WATCHED_PATHS` cap. Baselining the `.ko`s would both re-introduce the hash-walk hang AND blow the cap (≥2 kernels). **The reject-recursion decision was correct;** FIM-008's blindness is its known side effect, surfacing on the rootkit-critical path.
+
+**DO NOT fix by re-introducing recursive baselining / a content hash-walk** — that is exactly [[BUG-026]]. 
+
+**Likely direction (to DESIGN next, same diagnose-first loop — not yet implemented).** Watch the nested module **directories** as `WATCHED_PATHS` dir-inodes (stat-only enrollment, **no hashing**), so a `.ko` create/rename/unlink in the tree fires via the existing child-leaf path, and `enroll_child` ([`fim/drain.rs:591`]) auto-enrolls the dropped `.ko` so its later in-place edits are caught by BUG-023. Open design questions to resolve before proposing the fix:
+  1. **`WATCHED_PATHS` budget:** ~1224 dir-inodes per kernel against the 8192 cap. Watch only the running `uname -r` tree? all installed kernels? raise the cap? (Dirs, not files — but still real budget, and the cap-full path must stay LOUD per BUG-022.)
+  2. **In-place overwrite of a *pre-existing* shipped `.ko`:** dir-watch catches DROP / REPLACE-via-rename (the common LKM-rootkit install) and newly-dropped files (via enroll), but not an in-place write to a module that already existed at boot (its inode was never enrolled). Decide if that vector is in scope (and if so, it needs the file-inode, i.e. selective baselining of the existing `.ko`s — back toward the cap/hash cost).
+  3. **Enroll timing/cost:** a one-time boot dir-walk to stat ~1224 dirs is bounded and hash-free (NOT the rejected content walk) — confirm it stays off the startup-latency critical path.
+- **Related:** [[BUG-022]] (child-leaf + the reject-recursion decision this realizes), [[BUG-023]] (write-then-close enroll the fix leans on), [[BUG-026]] (the hash-walk hang the fix must not recreate).
+
+---
+
+## 34. BUG-035 — No authenticated force-kill escape hatch for a wedged agent (enhancement)
+
+- **Severity:** Enhancement, **MEDIUM** (operational), **post-beta**. This is NOT a security bug — it's the opposite: it documents that the self-protection is *exceptionally* strong and proposes the missing operator-recovery counterpart.
+- **Status:** **VM-CONFIRMED 2026-05-31** (fire test #3, a2 zero-window validation). `systemctl kill -s SIGKILL nn-smoke-agent` — SIGKILL issued *by systemd / PID-1* — was **denied**: systemd logged `Sent signal SIGKILL … on client request`, but the process survived. So [[BUG-010]]'s `task_kill` hook blocks SIGKILL even from PID-1, not merely a plain `sudo kill`.
+
+**What's good — do NOT weaken this.** This is the [[BUG-010]] self-protection at full strength: the agent cannot be SIGKILLed by an attacker, by root, or even by systemd. The only stop is the carve-out's **graceful SIGTERM** (`systemctl stop`, gated on `caller_tgid==1 && KILL_OVERRIDE==AGENT_SESSION!=0`). For an anti-tamper agent, that is the correct posture.
+
+**The operational gap.** The flip side: an agent that **hangs during graceful shutdown** (stalls on / ignores SIGTERM) has **no recovery escape hatch but a reboot** — systemd's normal SIGTERM→(TimeoutStopSec)→SIGKILL escalation dies at the SIGKILL step. This is the known [[BUG-010]] tradeoff; the agent-cycle runbook already warns "never `sudo kill`; graceful stop only; getting it wrong historically required a VM reboot."
+
+**Fix direction (enhancement, post-beta).** Do **not** weaken the deny. **ADD** an authenticated operator force-kill that mirrors the COMBAT-release capability: an **Ed25519-signed force-kill token** (operator holds the key) that the `task_kill` hook honours for the agent's own PID — recoverable for the key-holder, still hard for an attacker who lacks the key. Reuse the `UnlockToken`-style capability gate already used by `NetworkIsolator::release` (`anti_tamper/network_isolate.rs`) + the admin-auth Ed25519 pipeline. **Related:** [[BUG-010]] (the protection this complements).
 
 ---
 
