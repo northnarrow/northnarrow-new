@@ -38,6 +38,9 @@
 
 pub mod admin_auth;
 pub mod bootstrap;
+/// BUG-036: boot-time revalidation of the compiled-in kernel struct
+/// offsets against the running kernel's BTF (refuse-to-start on drift).
+pub mod btf_revalidate;
 pub mod combat_allow;
 pub mod filesystem;
 pub mod network_isolate;

@@ -41,6 +41,9 @@ use northnarrow_agent::net::blocklist::{
     Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
     DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
 };
+use northnarrow_agent::anti_tamper::btf_revalidate::{
+    revalidate_offsets, RefuseReason, RevalidateOutcome,
+};
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::{
@@ -50,7 +53,7 @@ use northnarrow_agent::posture::{
 use northnarrow_agent::response::{Executor, ExecutorConfig};
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -440,6 +443,68 @@ async fn main() -> Result<()> {
     // over-fire when a stale .o was embedded by a workspace build).
     northnarrow_agent::sensors::ebpf_object::preflight()
         .context("eBPF object boot preflight failed — refusing to start")?;
+
+    // BUG-036: revalidate every compiled-in kernel struct offset against
+    // the RUNNING kernel's BTF before attaching any program. aya-ebpf has
+    // no CO-RE, so these offsets are baked into the eBPF half; if the
+    // running kernel's layout differs, the LSM hooks and sensors read the
+    // WRONG kernel memory — silently corrupting every decision. Fail
+    // CLOSED + LOUD rather than attach hooks that read garbage. Exit 78
+    // (EX_CONFIG) so the Restart=no agent unit lands in a VISIBLE `failed`
+    // state; the watchdog's 5/60s restart ceiling bounds any respawn.
+    match revalidate_offsets() {
+        RevalidateOutcome::Verified { count } => {
+            info!(
+                count,
+                "BTF offset revalidation passed — all offsets match the running kernel"
+            );
+        }
+        RevalidateOutcome::SkippedNoBtf { reason } => {
+            warn!(
+                reason,
+                "BTF unavailable — offset revalidation SKIPPED. The LSM hooks require BTF \
+                 to attach, so they will not attach this boot (the offsets are never read)."
+            );
+        }
+        RevalidateOutcome::Refuse(reason) => {
+            // sysexits.h EX_CONFIG: a non-zero code systemd surfaces as a
+            // `failed` unit (Restart=no ⇒ no auto-restart loop).
+            const EX_CONFIG: i32 = 78;
+            match reason {
+                RefuseReason::Drift(mismatches) => {
+                    error!(
+                        count = mismatches.len(),
+                        "BTF offset revalidation FAILED — refusing to start. The running \
+                         kernel's struct layout does not match the compiled-in offsets; \
+                         attaching LSM hooks would read the wrong kernel memory (BUG-036)."
+                    );
+                    for m in &mismatches {
+                        error!(
+                            offset = m.name,
+                            kernel_struct = m.struct_name,
+                            expected = m.expected,
+                            actual = ?m.actual,
+                            detail = %m.detail,
+                            "  offset drift"
+                        );
+                    }
+                    error!(
+                        "Fail-closed safety gate (BUG-036): rebuild the eBPF half against \
+                         this kernel's BTF, or run on a supported kernel (6.8.x). Exiting {EX_CONFIG}."
+                    );
+                }
+                RefuseReason::ParseError(e) => {
+                    error!(
+                        error = %e,
+                        "BTF present but unparseable — refusing to start. Cannot verify \
+                         kernel offsets, and aya may still attach hooks with unverified \
+                         offsets. Fail-closed (BUG-036). Exiting {EX_CONFIG}."
+                    );
+                }
+            }
+            std::process::exit(EX_CONFIG);
+        }
+    }
 
     if let Err(e) = bump_memlock_rlimit() {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");

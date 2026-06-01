@@ -20,6 +20,13 @@ extern crate alloc;
 
 pub mod wire;
 
+/// Hard-coded kernel struct field offsets + the boot-time revalidation
+/// table (BUG-036). `no_std`-clean (consts + a `&'static str` table, no
+/// alloc) so the eBPF crate compiles the SAME values the agent
+/// revalidates against. NOT `std`-gated — the eBPF half needs it with
+/// `default-features = false`.
+pub mod btf_offsets;
+
 #[cfg(feature = "std")]
 mod model;
 #[cfg(feature = "std")]
