@@ -46,6 +46,8 @@ recommended fix directions.
 | 27 | BUG-033 | No detection-only / monitor ("alert-only") mode → can't run detection-first; `NORTHNARROW_DRY_RUN` is partial (does NOT gate the kill Executor or the COMBAT isolator) *(fire test #2 blocker, §32)* | **Beta-blocker (usability/rollout)** | **FIXED + VM-validated 2026-05-31** — first-class `--detect-only`/`NN_DETECT_ONLY` gates ALL response paths + COMBAT engage-hook; fire test #2 ran clean in it (37 suppressions, 0 kills, COMBAT zero-residue). §32 |
 | 28 | BUG-034 | **FIM-008 kernel-module watch is non-recursive** → `.ko` dropped in the nested `/lib/modules/<rel>/kernel/…` tree (where real modules + a rootkit load) is **invisible**; fires only on top-level `/lib/modules` drops no attacker uses *(fire test #2, §33)* | **Beta-blocker (HIGH, security)** | **VM-CONFIRMED 2026-05-31** — nested `.ko` missed, top-level fired. Direct consequence of [[BUG-022]] reject-recursion. Fix direction: watch nested module DIRS (stat-only), NOT recursive baseline (would re-create [[BUG-026]] hang) |
 | 29 | BUG-035 | No authenticated **force-kill escape hatch** — `task_kill` denies SIGKILL even from systemd/PID-1, so an agent that hangs on graceful SIGTERM is unrecoverable except by reboot *(fire test #3, §34)* | Enhancement (MEDIUM, operational, **post-beta**) | **VM-CONFIRMED 2026-05-31** — `systemctl kill -s SIGKILL` denied (a2 self-protection working as intended). NOT a protection bug; fix = ADD an Ed25519-signed operator force-kill (COMBAT-release-token pattern), do not weaken the deny. Linked to [[BUG-010]] |
+| 30 | BUG-036 | **eBPF struct offsets hardcoded to one kernel (6.8.x), no BTF revalidation** → on a different / upgraded customer kernel every LSM/probe reads wrong offsets; anti-tamper silently protects nothing, FIM blind — no error, no alert. The header comment promising a BTF revalidator is **false (unimplemented)** *(BUG-034 1b portability check, §35)* | **HIGH / likely beta-blocker (security, systemic)** | **CONFIRMED 2026-06-01** — `btf_offsets.rs` all-hardcoded (no CO-RE; aya-ebpf 0.1 limit); grep for the promised validator = 0 code. Fix: (a) boot-time BTF revalidation → **fail CLOSED** on mismatch (beta-min); (b) full CO-RE/BTF-derived (portable). Blast radius: [[BUG-010]]/inode_protect, fim_watch, R011, net, [[BUG-034]] |
+| 31 | BUG-037 | Module-load detection (R018) is **observe-only** — no deny at `kernel_read_file`, so the *effective* response (block the load) is missing; `KillProcessTree` is interim and buys little (module already loaded by fire time) *(BUG-034 stage-3 fast-follow, §36)* | Enhancement (MEDIUM, post-beta) | **Design-noted 2026-06-01** — the hook is already deny-capable (BPF-LSM); fix = `-EPERM` on the near-certain signal (non-standard path) so the `.ko` read fails + the load aborts. Mirrors inode_protect deny. Linked to [[BUG-034]] |
 
 ---
 
@@ -1370,6 +1372,44 @@ the systemd-run validation (root has full caps there). Verify on the real unit.
 **The operational gap.** The flip side: an agent that **hangs during graceful shutdown** (stalls on / ignores SIGTERM) has **no recovery escape hatch but a reboot** — systemd's normal SIGTERM→(TimeoutStopSec)→SIGKILL escalation dies at the SIGKILL step. This is the known [[BUG-010]] tradeoff; the agent-cycle runbook already warns "never `sudo kill`; graceful stop only; getting it wrong historically required a VM reboot."
 
 **Fix direction (enhancement, post-beta).** Do **not** weaken the deny. **ADD** an authenticated operator force-kill that mirrors the COMBAT-release capability: an **Ed25519-signed force-kill token** (operator holds the key) that the `task_kill` hook honours for the agent's own PID — recoverable for the key-holder, still hard for an attacker who lacks the key. Reuse the `UnlockToken`-style capability gate already used by `NetworkIsolator::release` (`anti_tamper/network_isolate.rs`) + the admin-auth Ed25519 pipeline. **Related:** [[BUG-010]] (the protection this complements).
+
+---
+
+## 35. BUG-036 — eBPF kernel-struct offsets hardcoded to one kernel; no BTF revalidation → protections silently void on a kernel mismatch/upgrade
+
+- **Severity:** **HIGH, systemic — likely beta-blocker** (security). A security agent must not silently void its own protections on a kernel upgrade. NOT introduced by BUG-034 — surfaced by it. SYSTEMIC: affects the entire BPF-LSM/probe layer.
+- **Status:** **CONFIRMED 2026-06-01** during the BUG-034 stage-1b portability check (the green VM-verify on 6.8 did NOT catch it — offsets are correct on 6.8 either way; only an explicit portability question surfaced it).
+
+**The finding.** `agent-ebpf/src/btf_offsets.rs` defines **every** kernel struct field offset as a **hardcoded `const`** (task_struct tgid/flags/real_parent/comm, dentry d_name/d_parent/d_inode, qstr, inode, super_block, file f_path/f_inode/f_flags, sock/tcp_sock, iov_iter, …), captured once from `/sys/kernel/btf/vmlinux` on **Linux 6.8.0-111-generic**. There is **no CO-RE** (the file's own header: *"aya-ebpf 0.1 does not emit CO-RE field relocations from Rust struct definitions, so every kernel pointer dereference … goes through one of these byte offsets plus `bpf_probe_read_kernel`"*) — confirmed: no CO-RE relocation anywhere in the tree.
+
+**The false safety assurance.** The same header claims a safety net that **does not exist**: *"the userland anti-tamper loader revalidates each one against the running kernel's BTF before attaching the hooks (the validation is being added alongside Tappa 7 task 4 follow-ups)."* A grep for any revalidation / BTF-offset-check code across `agent/src` + `common/src` returns **zero**. The validator was never implemented; the comment is a false assurance that an operator (or auditor) would read as "this is handled."
+
+**Blast radius (every offset consumer).** On any kernel whose struct layout differs from 6.8.0-111/117 — a customer's distro kernel, or the SAME host after a routine kernel upgrade:
+- **`inode_protect`** (anti-tamper deny) reads wrong `(dev,ino)` keys → `PROTECTED_INODES` never matches → **the protected files are silently unprotected** (no deny, no error, no alert — the worst failure mode: protection *appears* armed, does nothing).
+- **`fim_watch`** → wrong inodes → FIM blind / misfiring.
+- **`R011`** `parent_is_kthread` (via `TASK_STRUCT_FLAGS_OFFSET`) → exemption logic breaks (over- or under-fire).
+- **net programs** (sock/tcp_sock offsets) → wrong flow/endpoint data.
+- **[[BUG-034]]** module-load walk → wrong dentry offsets → garbage; *fails safe* (null/err → empty path), the least-bad case, but still blind.
+
+**Why detection silently fails:** there is no runtime check, so a mismatched kernel produces NO error — the agent loads, attaches, and runs, reading garbage offsets. A `chattr +i` / kill-self-protection test would *pass its own unit logic* while the kernel-side map never matches. Silent void.
+
+**Fix direction (two levels).**
+1. **Minimum — fail CLOSED (beta-minimum):** at boot, read the running kernel's BTF and **revalidate every offset** in `btf_offsets.rs` against the actual struct-member offsets; on ANY mismatch, **refuse to start** (or hard-alert + run degraded with a LOUD persistent error) rather than silently attaching wrong-offset hooks. If the beta pins a supported-kernel list, this + documented supported kernels may be the beta-minimum: protection fails CLOSED, never silently void.
+2. **Complete — portable:** derive every offset from the target kernel's BTF at load time (BTF-driven offsets), or adopt CO-RE relocations if/when the aya version supports them, so the agent runs correctly on any kernel without a pinned list.
+3. **Fix the false comment:** either implement (1) or remove the "validation is being added" claim from the `btf_offsets.rs` header — a comment must not promise a safety net that isn't there.
+
+- **Related:** [[BUG-010]] (anti-tamper, the highest-stakes consumer — silently void on mismatch), [[BUG-034]] (surfaced this; inherits + fails safe). Affects fim_watch + R011 + the net programs equally.
+
+---
+
+## 36. BUG-037 — module-load detection is observe-only; the effective response (deny the load) is missing (BUG-034 stage-3 fast-follow)
+
+- **Severity:** Enhancement, **MEDIUM**, **post-beta**. BUG-034 v1 (R018) *detects* the load and alerts / autonomous-kills on the near-certain case; this is the next level — actually *blocking* it.
+- **Status:** **Design-noted 2026-06-01** during BUG-034 stage 2.
+
+**The point (surfaced while choosing R018's actions).** R018's `KillProcessTree` on the near-certain case (non-standard path) buys little: by the time the rule fires, the module is already loaded — killing the *loader* process doesn't unload it. The **effective** response is to **deny the load at the `kernel_read_file` LSM hook**: return `-EPERM` so the `.ko` read fails and the load aborts *before* the module enters the kernel. The payoff of choosing the deny-capable BPF-LSM hook (over a tracepoint) — the same reason `inode_protect` denies rather than observes.
+
+**Fix direction (stage 3).** Make `module_read_file_observe` deny-capable: classify the source path **in-kernel** (the dentry walk already resolves the components — check whether the top components are `lib/modules`) and return `-EPERM` on a non-standard-path module load, mirroring `inode_protect`'s deny pattern + its `*_OVERRIDE` escape hatch. Keep observe-only for the suspicious-not-conclusive cases (alert, don't block). The `KillProcessTree` verdict is the interim autonomous response until deny lands. **Related:** [[BUG-034]] (the detection this completes), [[BUG-010]] (the inode_protect deny pattern to mirror).
 
 ---
 
