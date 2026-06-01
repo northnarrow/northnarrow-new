@@ -1947,6 +1947,19 @@ async fn process_event(
 
     match &event {
         Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
+        Event::ModuleLoad {
+            method,
+            loader_pid,
+            loader_comm,
+            path,
+            ..
+        } => info!(
+            loader_pid = *loader_pid,
+            loader_comm = %loader_comm,
+            method = ?method,
+            path = path.as_deref().unwrap_or("none"),
+            "kernel module load detected (BUG-034)"
+        ),
         Event::FileOpen {
             filename,
             comm,

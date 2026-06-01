@@ -23,6 +23,7 @@ mod file_open;
 mod fim_watch;
 mod inet_csk_listen;
 mod inode_protect;
+mod module_load;
 mod ptrace_check;
 mod task_kill;
 mod tcp_close;

@@ -28,7 +28,8 @@ use aya::{
 };
 use bytemuck::Pod;
 use common::wire::{
-    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
+    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ModuleLoadRaw, ProcessSpawnRaw,
+    TcpConnectRaw,
 };
 use common::Event;
 use parking_lot::Mutex;
@@ -211,6 +212,9 @@ impl SensorMultiplexer {
         let tcp_connect_rb = take_ringbuf(&mut ebpf, "TCP_CONNECT_EVENTS")?;
         let dns_query_rb = take_ringbuf(&mut ebpf, "DNS_QUERY_EVENTS")?;
         let fs_protect_rb = take_ringbuf(&mut ebpf, "FS_PROTECT_EVENTS")?;
+        // BUG-034: module-load observations → Event::ModuleLoad → R018.
+        // Maps exist at load time (before attach), so taking it here is safe.
+        let module_load_rb = take_ringbuf(&mut ebpf, "MODULE_LOAD_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
         let flow_tracker_for_tcp = net.as_ref().map(|w| Arc::clone(&w.flow_tracker));
@@ -223,6 +227,7 @@ impl SensorMultiplexer {
             spawn_tcp_connect_pump(tcp_connect_rb, flow_tracker_for_tcp, tx.clone()),
             spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
             spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
+            spawn_pump::<ModuleLoadRaw>("module_load", module_load_rb, tx.clone()),
         ];
 
         Ok((

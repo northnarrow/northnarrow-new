@@ -219,6 +219,13 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
     let mut category = MockCategory::Unknown;
 
     match event {
+        Event::ModuleLoad {
+            loader_pid, path, ..
+        } => {
+            pid_for_pkg = *loader_pid;
+            filename_for_pkg = path.clone().unwrap_or_default();
+            category = MockCategory::Unknown;
+        }
         Event::ProcessSpawn {
             pid,
             comm,

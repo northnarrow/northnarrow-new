@@ -233,6 +233,21 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("file_ioctl", "file_ioctl"),
 ];
 
+/// BUG-034 module-load observe hooks — `MODULE_LOAD_EVENTS` producers.
+/// Observe-only (return 0); the rootkit verdict is userland's (stage 2
+/// rule). Attached via the same `reattach_fresh` discipline as the
+/// `LSM_PROGRAMS` deny set (zero-window + no ring split-brain across
+/// restart). (program-name, hook-name); both share the source file
+/// `agent-ebpf/src/module_load.rs`.
+///
+/// NOTE: temporarily attached here to reuse the `reattach_fresh`
+/// machinery with `btf` + `pin_root` in scope; moves to a dedicated
+/// module-load sensor when the ring consumer + rule land in stage 2.
+const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
+    ("module_read_file_observe", "kernel_read_file"),
+    ("module_load_data_observe", "kernel_load_data"),
+];
+
 pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Result<()> {
     let dir = Path::new(STATE_DIR);
 
@@ -339,6 +354,19 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
             warn!(
                 program, hook, error = %e,
                 "anti-tamper FS: LSM hook attach FAILED"
+            );
+        }
+    }
+
+    // Step 5 (BUG-034): attach the two module-load OBSERVE hooks —
+    // MODULE_LOAD_EVENTS producers — on the same reattach-fresh path as
+    // the deny set above (zero-window + no ring split-brain on restart).
+    // Observe-only; the rootkit verdict is userland's (stage-2 rule).
+    for (program, hook) in MODULE_LOAD_PROGRAMS {
+        if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
+            warn!(
+                program, hook, error = %e,
+                "anti-tamper FS: module-load LSM hook attach FAILED (BUG-034)"
             );
         }
     }

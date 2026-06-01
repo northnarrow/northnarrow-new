@@ -30,6 +30,7 @@ mod r014_at_batch_scheduling;
 mod r015_encoding_tooling_service_uid;
 mod r016_debugger_service_uid;
 mod r017_shell_from_nonstandard_path;
+mod r018_kernel_module_load;
 
 #[cfg(feature = "demo-tappa5")]
 pub mod test_actions;
@@ -51,6 +52,7 @@ pub use r014_at_batch_scheduling::R014AtBatchScheduling;
 pub use r015_encoding_tooling_service_uid::R015EncodingToolingServiceUid;
 pub use r016_debugger_service_uid::R016DebuggerServiceUid;
 pub use r017_shell_from_nonstandard_path::R017ShellFromNonstandardPath;
+pub use r018_kernel_module_load::R018KernelModuleLoad;
 
 /// Build the default rule set in evaluation order. R004 (proc/self/fd
 /// — fileless exec) and R007 (crypto miner) come early because their
@@ -90,6 +92,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // its engine via [`default_rules_with_net`] instead, threading
     // the operator-loaded process-comm allowlist in.
     rules.extend(process_rules_empty());
+    rules.extend(module_load_rules());
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
     // Tappa 10 (N6) — 9 NN-L-NET rules with empty boot
@@ -134,6 +137,7 @@ pub fn default_rules_with_net(
     ];
     rules.extend(tappa2);
     rules.extend(process_rules(process_allowlist));
+    rules.extend(module_load_rules());
     rules.extend(crate::fim::rules::fim_rules());
     rules.extend(canary::canary_rules());
     rules.extend(net::net_rules(
@@ -161,6 +165,31 @@ pub fn process_rules(allowlist: Arc<CommAllowlist>) -> Vec<Box<dyn Rule>> {
         Box::new(R016DebuggerServiceUid::new(Arc::clone(&allowlist))),
         Box::new(R017ShellFromNonstandardPath::new(allowlist)),
     ]
+}
+
+/// BUG-034 — the kernel-module LOAD rule (R018), with its DEDICATED
+/// module-loader allowlist seeded from the trusted system auto-loaders
+/// (`systemd-udevd`, `systemd-modules-load`, `kmod`). Deliberately NOT
+/// `insmod`/`modprobe` (arbitrary-path loaders — allowlisting them
+/// would blind the non-standard-path Critical). Kept separate from the
+/// R011..R017 process-comm allowlist so loosening one never silently
+/// widens the other. v1 seeds in-code; operator extension via a
+/// `module-loader-allowlist.{v1,local}` file is a fast-follow.
+pub fn module_load_rules() -> Vec<Box<dyn Rule>> {
+    // Seed = the kernel's 15-char-truncated `comm` (TASK_COMM_LEN=16,
+    // NUL-terminated), NOT the full binary name: `systemd-modules-load`
+    // → `systemd-modules` (loads via libkmod directly, so ITS comm is
+    // the loader). udev-spawned modprobe is matched via its PARENT comm
+    // `systemd-udevd`; kernel auto-loads (request_module) are
+    // PF_KTHREAD-exempt regardless of comm. `modprobe`/`insmod` are
+    // deliberately NOT seeded — they load arbitrary paths, so seeding
+    // them would blind the non-standard-path Critical.
+    let loader_allowlist = Arc::new(CommAllowlist::from_iter_owned(
+        ["systemd-udevd", "systemd-modules", "kmod"]
+            .into_iter()
+            .map(String::from),
+    ));
+    vec![Box::new(R018KernelModuleLoad::new(loader_allowlist))]
 }
 
 /// Empty-allowlist convenience for boot + tests, mirroring
@@ -204,6 +233,15 @@ pub(crate) fn build_verdict(
             timestamp_ns,
             ..
         } => (*pid, filename.clone(), *timestamp_ns),
+        // BUG-034: R018 fires on Event::ModuleLoad — target the LOADER
+        // process (else a Critical KillProcessTree would carry pid 0 and
+        // be refused at the executor's PID floor, a silent no-op).
+        Event::ModuleLoad {
+            loader_pid,
+            path,
+            timestamp_ns,
+            ..
+        } => (*loader_pid, path.clone().unwrap_or_default(), *timestamp_ns),
         _ => (0, String::new(), 0),
     };
     Verdict {

@@ -145,6 +145,7 @@ impl CriticalActionVerifier for DeterministicVerifier {
 
 fn pid_of(e: &Event) -> u32 {
     match e {
+        Event::ModuleLoad { loader_pid, .. } => *loader_pid,
         Event::ProcessSpawn { pid, .. }
         | Event::FileOpen { pid, .. }
         | Event::ExecCheck { pid, .. }

@@ -117,6 +117,7 @@ impl Default for CorrelationBuffer {
 
 fn event_timestamp_ns(e: &Event) -> u64 {
     match e {
+        Event::ModuleLoad { timestamp_ns, .. } => *timestamp_ns,
         Event::ProcessSpawn { timestamp_ns, .. }
         | Event::FileOpen { timestamp_ns, .. }
         | Event::ExecCheck { timestamp_ns, .. }
@@ -140,6 +141,8 @@ fn event_timestamp_ns(e: &Event) -> u64 {
 
 fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
     match e {
+        // BUG-034: module load keys off (loader_pid, source path).
+        Event::ModuleLoad { loader_pid, path, .. } => (*loader_pid, None, path.as_deref()),
         Event::ProcessSpawn {
             pid,
             ppid,

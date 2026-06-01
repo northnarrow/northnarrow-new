@@ -477,6 +477,63 @@ impl FsProtectDenialRaw {
     }
 }
 
+/// `ModuleLoadRaw.method` — `finit_module(2)` via the `kernel_read_file`
+/// LSM hook (modern path; carries the source `.ko` path, filled in
+/// stage 1b).
+pub const MODULE_LOAD_FINIT: u8 = 1;
+/// `ModuleLoadRaw.method` — `init_module(2)` via the `kernel_load_data`
+/// LSM hook (legacy userspace-buffer path; no file, so no path).
+pub const MODULE_LOAD_INIT: u8 = 2;
+/// Max source-path bytes captured for a finit_module load (stage 1b).
+pub const MODULE_PATH_LEN: usize = 256;
+
+/// Kernel module-load observation (BUG-034). Emitted by the
+/// `kernel_read_file` / `kernel_load_data` BPF-LSM hooks
+/// (`agent-ebpf/src/module_load.rs`) onto `MODULE_LOAD_EVENTS`. The
+/// LOAD is the rootkit-LKM chokepoint that FIM-008 (file path) and
+/// R011 (tool exec) both miss.
+///
+/// Field order chosen for natural u64 alignment with no implicit
+/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 4 + 256 = 312 (8-aligned).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct ModuleLoadRaw {
+    pub timestamp_ns: u64,
+    pub loader_pid: u32,
+    pub loader_uid: u32,
+    pub loader_comm: [u8; TASK_COMM_LEN],
+    /// Real-parent comm — stage 1b (pairs with the PF_KTHREAD exemption).
+    pub parent_comm: [u8; TASK_COMM_LEN],
+    /// [`MODULE_LOAD_FINIT`] | [`MODULE_LOAD_INIT`].
+    pub method: u8,
+    /// `1` if the real parent is a kernel thread (PF_KTHREAD) — a boot
+    /// hardware-probe load. Stage 1b; `0` this commit.
+    pub parent_is_kthread: u8,
+    /// Bytes of `path` populated (`0` for init_module / stage 1).
+    pub path_len: u16,
+    pub _pad: [u8; 4],
+    /// Source `.ko` path for a finit_module load (stage 1b); zeroed otherwise.
+    pub path: [u8; MODULE_PATH_LEN],
+}
+
+impl ModuleLoadRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            timestamp_ns: 0,
+            loader_pid: 0,
+            loader_uid: 0,
+            loader_comm: [0u8; TASK_COMM_LEN],
+            parent_comm: [0u8; TASK_COMM_LEN],
+            method: 0,
+            parent_is_kthread: 0,
+            path_len: 0,
+            _pad: [0u8; 4],
+            path: [0u8; MODULE_PATH_LEN],
+        }
+    }
+}
+
 // Tappa 9 (C1) — FIM drift detection codes. The kernel-side
 // observe-only LSM hooks (agent-ebpf/src/fim_watch.rs, C2) write
 // one of these into `FimDriftRaw.op` when they reserve a ringbuf

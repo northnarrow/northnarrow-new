@@ -73,6 +73,25 @@ pub enum Event {
         filename: String,
         timestamp_ns: u64,
     },
+    /// Kernel module load (BUG-034) — BPF-LSM `kernel_read_file`
+    /// (finit_module) / `kernel_load_data` (init_module). The LOAD is
+    /// the rootkit-LKM chokepoint that FIM-008 (file path) + R011 (tool
+    /// exec) both miss. Scored by R018.
+    ModuleLoad {
+        method: ModuleLoadMethod,
+        loader_pid: u32,
+        loader_uid: u32,
+        loader_comm: String,
+        parent_comm: String,
+        /// Non-forgeable `PF_KTHREAD` on the loader's real parent — a
+        /// kernel-driven (boot / hot-plug) load. R018 exempts it.
+        #[serde(default)]
+        parent_is_kthread: bool,
+        /// Reconstructed source `.ko` path (finit_module). `None` for
+        /// init_module (legacy buffer load — no file).
+        path: Option<String>,
+        timestamp_ns: u64,
+    },
     /// Outbound TCP connect attempt (kprobe `tcp_v[46]_connect`).
     TcpConnect {
         pid: u32,
@@ -323,6 +342,73 @@ impl From<&ExecCheckRaw> for Event {
             timestamp_ns: raw.timestamp_ns,
         }
     }
+}
+
+/// How a kernel module was loaded (BUG-034). Decoded from
+/// [`crate::wire::ModuleLoadRaw::method`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ModuleLoadMethod {
+    /// `finit_module(2)` via the `kernel_read_file` LSM hook — carries a source path.
+    Finit,
+    /// `init_module(2)` via the `kernel_load_data` LSM hook — legacy buffer, no path.
+    Init,
+    /// Unrecognised method byte (forward-compat).
+    Unknown,
+}
+
+impl From<&crate::wire::ModuleLoadRaw> for Event {
+    fn from(raw: &crate::wire::ModuleLoadRaw) -> Self {
+        let method = match raw.method {
+            crate::wire::MODULE_LOAD_FINIT => ModuleLoadMethod::Finit,
+            crate::wire::MODULE_LOAD_INIT => ModuleLoadMethod::Init,
+            _ => ModuleLoadMethod::Unknown,
+        };
+        Event::ModuleLoad {
+            method,
+            loader_pid: raw.loader_pid,
+            loader_uid: raw.loader_uid,
+            loader_comm: crate::wire::cstr_lossy(&raw.loader_comm).into_owned(),
+            parent_comm: crate::wire::cstr_lossy(&raw.parent_comm).into_owned(),
+            parent_is_kthread: raw.parent_is_kthread != 0,
+            path: reconstruct_module_path(&raw.path, raw.path_len as usize),
+            timestamp_ns: raw.timestamp_ns,
+        }
+    }
+}
+
+/// Reverse the leaf→root component slots the `kernel_read_file` hook
+/// wrote (each in a fixed 32-byte slot of [`crate::wire::ModuleLoadRaw::path`])
+/// into a forward path. `slots` = `path_len` (component count).
+/// Returns `None` when nothing resolved (init_module, or a failed walk).
+fn reconstruct_module_path(
+    path: &[u8; crate::wire::MODULE_PATH_LEN],
+    slots: usize,
+) -> Option<String> {
+    const SLOT: usize = 32;
+    let n = slots.min(crate::wire::MODULE_PATH_LEN / SLOT);
+    let mut comps: Vec<&str> = Vec::with_capacity(n);
+    for i in 0..n {
+        let s = &path[i * SLOT..i * SLOT + SLOT];
+        let end = s.iter().position(|&b| b == 0).unwrap_or(SLOT);
+        if end == 0 {
+            continue;
+        }
+        if let Ok(c) = core::str::from_utf8(&s[..end]) {
+            comps.push(c);
+        }
+    }
+    if comps.is_empty() {
+        return None;
+    }
+    comps.reverse(); // kernel wrote leaf→root; flip to root→leaf
+    let joined = comps.join("/");
+    Some(if joined.starts_with("//") {
+        joined[1..].to_string()
+    } else if joined.starts_with('/') {
+        joined
+    } else {
+        format!("/{joined}")
+    })
 }
 
 impl From<&TcpConnectRaw> for Event {

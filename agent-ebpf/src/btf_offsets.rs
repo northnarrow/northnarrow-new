@@ -97,6 +97,14 @@ pub(crate) const MM_STRUCT_ARG_END_OFFSET: usize = 384;
 /// `struct dentry.d_inode` — the `*inode` pointer. `bits_offset=384`.
 pub(crate) const DENTRY_D_INODE_OFFSET: usize = 48;
 
+/// `struct dentry.d_parent` — parent `*dentry`, for the BUG-034 stage-1b
+/// module source-path walk. `bits_offset=192` (byte 24) on 6.8 x86_64,
+/// from the same raw-BTF dump as `d_name` (whose 256/32 cross-checks
+/// [`DENTRY_D_NAME_OFFSET`]). Fails SAFE: a bad offset → the walk reads
+/// null/garbage and stops, yielding a short/empty path (the rule
+/// degrades to "couldn't resolve" — never a false fire).
+pub(crate) const DENTRY_D_PARENT_OFFSET: usize = 24;
+
 // ── Tappa 9 (BUG-022) — dir child-leaf reconstruction ────────────────
 //
 // `fim_create_observe` / `fim_rename_observe` read the NEW child
@@ -143,6 +151,18 @@ pub(crate) const SUPER_BLOCK_S_DEV_OFFSET: usize = 16;
 /// `struct file.f_inode` — pointer to the file's inode.
 /// `bits_offset=1344`.
 pub(crate) const FILE_F_INODE_OFFSET: usize = 168;
+
+/// `struct file.f_path` — the embedded `struct path` (BUG-034 stage 1b
+/// module source-path walk). `bits_offset=1216` (byte 152) on 6.8
+/// x86_64, cross-checked against the SAME dump's `f_inode`@1344/168
+/// (== [`FILE_F_INODE_OFFSET`]) and `f_flags`@576/72 — both match the
+/// existing constants, so the derivation is trustworthy. The module's
+/// source dentry is `*(file + FILE_F_PATH_OFFSET + PATH_DENTRY_OFFSET)`.
+pub(crate) const FILE_F_PATH_OFFSET: usize = 152;
+
+/// `struct path.dentry` — 2nd member of `struct path { vfsmount *mnt;
+/// dentry *dentry; }`. `bits_offset=64` (byte 8).
+pub(crate) const PATH_DENTRY_OFFSET: usize = 8;
 
 /// `struct file.f_flags` — `unsigned int` open-flag bitmap
 /// (`O_RDONLY` / `O_WRONLY` / `O_RDWR` / `O_TRUNC` / etc.).

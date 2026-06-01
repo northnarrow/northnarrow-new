@@ -395,6 +395,9 @@ pub fn sanitize_event_for_ade(event: &Event) -> SanitizedEvent {
 
 fn extract_string_fields(event: &Event) -> (String, String, String) {
     match event {
+        Event::ModuleLoad { path, loader_comm, .. } => {
+            (path.clone().unwrap_or_default(), loader_comm.clone(), String::new())
+        }
         Event::ProcessSpawn { filename, comm, .. }
         | Event::ExecCheck { filename, comm, .. }
         | Event::FileOpen { filename, comm, .. } => (filename.clone(), comm.clone(), String::new()),
@@ -440,6 +443,9 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
 
 fn synth_argv_from_event(event: &Event) -> Vec<String> {
     match event {
+        Event::ModuleLoad { loader_comm, path, .. } => {
+            vec![loader_comm.clone(), path.clone().unwrap_or_default()]
+        }
         Event::ProcessSpawn { filename, comm, .. } | Event::ExecCheck { filename, comm, .. } => {
             vec![filename.clone(), comm.clone()]
         }
