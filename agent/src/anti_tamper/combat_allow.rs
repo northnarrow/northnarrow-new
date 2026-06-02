@@ -140,6 +140,29 @@ pub fn ipv4_raw(entries: &[AllowCidr]) -> Vec<String> {
         .collect()
 }
 
+/// BUG-031 — v6 sibling of [`generate_accept_rules`]: the
+/// `ip6tables-restore` ACCEPT lines for the IPv6 carve-out entries
+/// (which the v4 generator skips). Same `-s`/`-d` shape — `ip6tables-
+/// restore` accepts identical syntax with v6 addresses. Empty when
+/// there are no IPv6 entries.
+pub fn generate_accept_rules_v6(entries: &[AllowCidr], chain: &str) -> String {
+    let mut out = String::new();
+    for e in entries.iter().filter(|e| e.is_ipv6) {
+        out.push_str(&format!("-A {chain} -s {} -j ACCEPT\n", e.raw));
+        out.push_str(&format!("-A {chain} -d {} -j ACCEPT\n", e.raw));
+    }
+    out
+}
+
+/// Convenience for logging: the IPv6 entries actually carved out.
+pub fn ipv6_raw(entries: &[AllowCidr]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.is_ipv6)
+        .map(|e| e.raw.clone())
+        .collect()
+}
+
 /// Default path as a [`PathBuf`].
 pub fn default_path() -> PathBuf {
     PathBuf::from(DEFAULT_COMBAT_ALLOW_CIDRS)
@@ -195,6 +218,20 @@ garbage-line\n\
         assert_eq!(lines.len(), 2, "v4 → -s + -d; v6 → nothing");
         assert_eq!(lines[0], "-A NORTHNARROW_COMBAT -s 10.0.0.0/24 -j ACCEPT");
         assert_eq!(lines[1], "-A NORTHNARROW_COMBAT -d 10.0.0.0/24 -j ACCEPT");
+    }
+
+    // BUG-031: the v6 generator is the mirror — v6 entries → two rules,
+    // v4 → nothing. Together with the v4 test, every entry is applied to
+    // exactly one table (no entry dropped, none double-applied).
+    #[test]
+    fn generate_v6_emits_two_rules_per_ipv6_none_for_ipv4() {
+        let entries = parse_allow_text("10.0.0.0/24\nfd00::/8\n").entries;
+        let rules = generate_accept_rules_v6(&entries, "NORTHNARROW_COMBAT");
+        let lines: Vec<&str> = rules.lines().collect();
+        assert_eq!(lines.len(), 2, "v6 → -s + -d; v4 → nothing");
+        assert_eq!(lines[0], "-A NORTHNARROW_COMBAT -s fd00::/8 -j ACCEPT");
+        assert_eq!(lines[1], "-A NORTHNARROW_COMBAT -d fd00::/8 -j ACCEPT");
+        assert_eq!(ipv6_raw(&entries), vec!["fd00::/8".to_string()]);
     }
 
     #[test]

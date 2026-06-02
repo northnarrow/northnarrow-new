@@ -106,6 +106,18 @@ struct Cli {
     )]
     combat_rules: PathBuf,
 
+    /// BUG-031 — the IPv6 (`ip6tables-restore`) ruleset NetworkIsolator
+    /// applies on COMBAT entry alongside the v4 one. A missing file
+    /// degrades the v6 leg (loud WARN), not the whole COMBAT. Production
+    /// install: /etc/northnarrow/combat-rules.v6; repo dev path:
+    /// configs/combat-rules.v6.
+    #[arg(
+        long = "combat-rules-v6",
+        value_name = "PATH",
+        default_value = "/etc/northnarrow/combat-rules.v6"
+    )]
+    combat_rules_v6: PathBuf,
+
     /// Beta Step 4b: opt-in management carve-out CIDR list. Each IPv4
     /// CIDR in this file is allowed through during COMBAT so a remote
     /// operator on a declared management network is not locked out.
@@ -904,7 +916,8 @@ async fn main() -> Result<()> {
     // without /etc/northnarrow/ provisioned.
     let isolator = match NetworkIsolator::new(cli.combat_rules.clone()) {
         Ok(i) => Some(Arc::new(
-            i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone()),
+            i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone())
+                .with_rules_v6(cli.combat_rules_v6.clone()),
         )),
         Err(e) => {
             warn!(

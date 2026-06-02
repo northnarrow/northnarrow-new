@@ -719,18 +719,22 @@ fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList
     if !ADMIN_PORTS.contains(dst_port) {
         return false;
     }
-    if *family != 2 || !is_rfc1918(dst_addr) {
+    // BUG-039: v4 OR v6, internal dst (RFC1918 / ULA / link-local).
+    if !is_inet_family(*family) || !is_internal(dst_addr, *family) {
         return false;
     }
     // BUG-032 count-filter: an allowlisted (comm,dst) host does not
     // contribute to the distinct-host count (e.g. orchestration tooling
-    // fanning out to a declared internal range).
-    let counts = |dst: &[u8; 16], port: u16| {
-        !allow.excludes(AllowTrigger::Lateral, focal_comm, dst, *family, port)
+    // fanning out to a declared internal range). BUG-039: each
+    // connection's OWN family drives the allowlist lookup (mixed-family).
+    let counts = |dst: &[u8; 16], fam: u8, port: u16| {
+        !allow.excludes(AllowTrigger::Lateral, focal_comm, dst, fam, port)
     };
-    let mut hosts: HashSet<[u8; 4]> = HashSet::new();
-    if counts(dst_addr, *dst_port) {
-        hosts.insert([dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]]);
+    // BUG-039: key on the full 16-byte address — a v6 set keyed on 4
+    // bytes collides.
+    let mut hosts: HashSet<[u8; 16]> = HashSet::new();
+    if counts(dst_addr, *family, *dst_port) {
+        hosts.insert(*dst_addr);
     }
     for e in recent {
         if let Event::TcpConnect {
@@ -743,13 +747,13 @@ fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList
         } = e
         {
             if *pid == *focal_pid
-                && *fam == 2
+                && is_inet_family(*fam)
                 && ADMIN_PORTS.contains(dp)
-                && is_rfc1918(dst)
+                && is_internal(dst, *fam)
                 && within(*focal_ts, *timestamp_ns, LATERAL_WINDOW_NS)
-                && counts(dst, *dp)
+                && counts(dst, *fam, *dp)
             {
-                hosts.insert([dst[0], dst[1], dst[2], dst[3]]);
+                hosts.insert(*dst);
             }
         }
     }
@@ -769,24 +773,26 @@ fn exfiltration_pattern(focal: &Event, recent: &[Event], allow: &EscalationAllow
     else {
         return false;
     };
-    if *family != 2 {
+    if !is_inet_family(*family) {
         return false;
     }
     if !matches!(*dst_port, 80 | 443) {
         return false;
     }
-    if is_rfc1918(dst_addr) {
+    // BUG-039: public dst (NOT internal) for v4 or v6.
+    if is_internal(dst_addr, *family) {
         return false;
     }
     // BUG-032 count-filter: connections to an allowlisted (comm,dst)
     // do NOT count toward the threshold (a real C2 outside the
     // allowlisted CIDR still counts, even under a spoofed comm). Every
-    // counted connection is the same pid → same process → same comm,
-    // so the focal comm applies to the recent matches too.
-    let counts = |dst: &[u8; 16], port: u16| {
-        !allow.excludes(AllowTrigger::Exfil, focal_comm, dst, *family, port)
+    // counted connection is the same pid → same process → same comm, so
+    // the focal comm applies to the recent matches too. BUG-039: each
+    // connection's OWN family drives the allowlist lookup.
+    let counts = |dst: &[u8; 16], fam: u8, port: u16| {
+        !allow.excludes(AllowTrigger::Exfil, focal_comm, dst, fam, port)
     };
-    let mut count = usize::from(counts(dst_addr, *dst_port));
+    let mut count = usize::from(counts(dst_addr, *family, *dst_port));
     for e in recent {
         if let Event::TcpConnect {
             pid,
@@ -798,11 +804,11 @@ fn exfiltration_pattern(focal: &Event, recent: &[Event], allow: &EscalationAllow
         } = e
         {
             if *pid == *focal_pid
-                && *fam == 2
+                && is_inet_family(*fam)
                 && matches!(*dp, 80 | 443)
-                && !is_rfc1918(dst)
+                && !is_internal(dst, *fam)
                 && within(*focal_ts, *timestamp_ns, EXFIL_WINDOW_NS)
-                && counts(dst, *dp)
+                && counts(dst, *fam, *dp)
             {
                 count += 1;
             }
@@ -815,6 +821,27 @@ fn is_rfc1918(addr: &[u8; 16]) -> bool {
     let a = addr[0];
     let b = addr[1];
     matches!((a, b), (10, _) | (172, 16..=31) | (192, 168))
+}
+
+/// AF_INET (2) or AF_INET6 (10) — the families the network heuristics
+/// consider (BUG-039). Other families (e.g. AF_UNIX) are ignored.
+fn is_inet_family(family: u8) -> bool {
+    family == 2 || family == 10
+}
+
+/// Is `addr` (a 16-byte wire address) internal/private for its `family`?
+/// v4: RFC1918. v6: ULA (`fc00::/7`) or link-local (`fe80::/10`).
+/// (BUG-039 — the v6 sibling of `is_rfc1918`; exfil's "public dst" and
+/// lateral's "internal dst" both need the v6 notion.)
+fn is_internal(addr: &[u8; 16], family: u8) -> bool {
+    match family {
+        2 => is_rfc1918(addr),
+        10 => {
+            (addr[0] & 0xfe) == 0xfc // fc00::/7 — unique-local (ULA)
+                || (addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80) // fe80::/10 — link-local
+        }
+        _ => false,
+    }
 }
 
 fn is_write_open(flags: u32) -> bool {
@@ -912,6 +939,22 @@ pub(super) mod testutil {
             target_dev: 1,
             target_ino: 2,
             operation: common::FsProtectOperation::Unlink,
+            timestamp_ns: ts,
+        }
+    }
+
+    /// A v6 `TcpConnect` (family = AF_INET6 = 10) with a 16-byte dst
+    /// (BUG-039 detection tests).
+    pub fn tcp_v6(pid: u32, comm: &str, dst: [u8; 16], dst_port: u16, ts: u64) -> Event {
+        Event::TcpConnect {
+            pid,
+            uid: 1000,
+            comm: comm.into(),
+            family: 10,
+            src_addr: [0u8; 16],
+            src_port: 0,
+            dst_addr: dst,
+            dst_port,
             timestamp_ns: ts,
         }
     }
@@ -1814,6 +1857,75 @@ mod tests {
         assert!(
             det.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
             "non-allowlisted destination must still count + fire"
+        );
+    }
+
+    // ── BUG-039: IPv6 detection (exfil/lateral past the family gate) ──
+    fn v6(prefix: u16, last: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[0] = (prefix >> 8) as u8;
+        a[1] = (prefix & 0xff) as u8;
+        a[15] = last;
+        a
+    }
+
+    #[test]
+    fn is_internal_classifies_v6() {
+        assert!(is_internal(&v6(0xfd00, 1), 10), "fd00::/8 ULA is internal");
+        assert!(is_internal(&v6(0xfc00, 1), 10), "fc00::/7 ULA is internal");
+        assert!(is_internal(&v6(0xfe80, 1), 10), "fe80::/10 link-local is internal");
+        assert!(!is_internal(&v6(0x2606, 1), 10), "2606:: global is public");
+        assert!(!is_internal(&v6(0x2001, 1), 10), "2001:: global is public");
+    }
+
+    #[test]
+    fn exfil_fires_on_v6_public() {
+        // 21 connects from one pid to a PUBLIC v6 on 443 → ExfiltrationPattern.
+        let det = TriggerDetector::new();
+        let dst = v6(0x2606, 1);
+        let recent: Vec<Event> = (0..20u64)
+            .map(|i| tcp_v6(42, "exfilv6", dst, 443, i + 1))
+            .collect();
+        let focal = tcp_v6(42, "exfilv6", dst, 443, 100);
+        assert!(
+            det.detect(&focal, &recent)
+                .contains(&TriggerType::ExfiltrationPattern),
+            "v6 exfil must fire (BUG-039)"
+        );
+    }
+
+    #[test]
+    fn lateral_fires_on_v6_ula() {
+        // 3 distinct ULA hosts on :22 from one pid → LateralMovement.
+        let det = TriggerDetector::new();
+        let recent = vec![
+            tcp_v6(42, "lat6", v6(0xfd00, 1), 22, 1),
+            tcp_v6(42, "lat6", v6(0xfd00, 2), 22, 2),
+        ];
+        let focal = tcp_v6(42, "lat6", v6(0xfd00, 3), 22, 3);
+        assert!(
+            det.detect(&focal, &recent)
+                .contains(&TriggerType::LateralMovement),
+            "v6 lateral must fire on 3 distinct ULA hosts (BUG-039)"
+        );
+    }
+
+    #[test]
+    fn exfil_v6_allowlist_count_filter() {
+        // A v6 allowlist entry count-filters v6 exfil — the BUG-032
+        // count-filter is family-aware (no allowlist change for v6).
+        use super::super::escalation_allow::EscalationAllowList;
+        let (allow, _) = EscalationAllowList::parse("exfil backup 2606::/16 443\n");
+        let det = TriggerDetector::new().with_escalation_allow(allow);
+        let dst = v6(0x2606, 9);
+        let recent: Vec<Event> = (0..20u64)
+            .map(|i| tcp_v6(42, "backup", dst, 443, i + 1))
+            .collect();
+        let focal = tcp_v6(42, "backup", dst, 443, 100);
+        assert!(
+            !det.detect(&focal, &recent)
+                .contains(&TriggerType::ExfiltrationPattern),
+            "allowlisted v6 mirror traffic must be count-filtered (BUG-032 is family-aware)"
         );
     }
 }

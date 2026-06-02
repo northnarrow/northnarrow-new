@@ -1,0 +1,55 @@
+# NorthNarrow COMBAT-state ip6tables ruleset (BUG-031 / block 2).
+#
+# Loaded by NetworkIsolator::engage() via `ip6tables-restore`, ALONGSIDE
+# the v4 ruleset (combat-rules.v4). On COMBAT entry the agent drops the
+# host's IPv6 DATA on INPUT, OUTPUT, and FORWARD — but PRESERVES the v6
+# stack.
+#
+# Why this is NOT a mirror of combat-rules.v4: v4 isolation keeps ARP
+# alive because ARP is L2, OUTSIDE the filter table. v6 Neighbor
+# Discovery (NDP) and Multicast Listener Discovery (MLD) ride ICMPv6 IN
+# this table, so a bare catch-all DROP would brick neighbour resolution
+# — the host could not even reach the management carve-out gateway over
+# v6 (reaching it requires NDP first). We therefore RETURN the essential
+# ICMPv6 control plane before the DROP, so isolation drops DATA, not the
+# stack — the v6 analogue of v4's ARP staying up at L2.
+#
+# Owned limit (BUG-031): this leaves an ICMPv6 NDP/MLD control channel
+# open on the local segment during isolation (a same-segment attacker
+# could in principle tunnel over it; a remote/routed one cannot).
+#
+# Beta Step 4b carve-out marker (same as v4): engage() replaces the
+# `# >>> NORTHNARROW_MGMT_CARVEOUT <<<` line with ip6tables ACCEPT rules
+# for each IPv6 CIDR in /etc/northnarrow/combat-allow.cidrs (default-
+# empty = no carve-out). Keep the marker immediately before the DROP.
+#
+# `ip6tables-restore` flushes the v6 filter table by default before
+# applying these rules (replacing any prior user rules — same semantics
+# as the v4 ruleset; see BUG-041).
+*filter
+:NORTHNARROW_COMBAT - [0:0]
+-A INPUT -j NORTHNARROW_COMBAT
+-A OUTPUT -j NORTHNARROW_COMBAT
+-A FORWARD -j NORTHNARROW_COMBAT
+-A NORTHNARROW_COMBAT -i lo -j RETURN
+-A NORTHNARROW_COMBAT -o lo -j RETURN
+# --- preserve the v6 stack: ICMPv6 control plane (drop DATA, not the stack) ---
+# ICMPv6 errors + PMTUD: 1 dest-unreachable, 2 packet-too-big, 3 time-exceeded, 4 parameter-problem
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 1 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 2 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 3 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 4 -j RETURN
+# MLD: 130 query, 131 report (v1), 132 done, 143 report (v2) — multicast membership NDP depends on
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 130 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 131 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 132 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 143 -j RETURN
+# NDP: 133 router-solicit, 134 router-advert, 135 neighbour-solicit, 136 neighbour-advert, 137 redirect
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 133 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 134 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 135 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 136 -j RETURN
+-A NORTHNARROW_COMBAT -p ipv6-icmp --icmpv6-type 137 -j RETURN
+# >>> NORTHNARROW_MGMT_CARVEOUT <<<
+-A NORTHNARROW_COMBAT -j DROP
+COMMIT

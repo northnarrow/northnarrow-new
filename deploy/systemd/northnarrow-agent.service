@@ -37,6 +37,7 @@ Type=notify
 LogNamespace=northnarrow
 ExecStart=/usr/local/bin/northnarrow-agent \
     --combat-rules /etc/northnarrow/combat-rules.v4 \
+    --combat-rules-v6 /etc/northnarrow/combat-rules.v6 \
     --admin-pub /etc/northnarrow/admin.pub \
     --admin-socket /run/northnarrow/admin.sock \
     --pid-file /run/northnarrow/agent.pid
