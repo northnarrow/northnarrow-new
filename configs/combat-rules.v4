@@ -1,35 +1,37 @@
 # NorthNarrow COMBAT-state iptables ruleset (Tappa 7 task 7 / Tappa 8).
 #
-# Loaded by NetworkIsolator::engage() via `iptables-restore`. On
-# COMBAT entry the agent drops the host from the network entirely:
-# every packet on INPUT, OUTPUT, and FORWARD is dropped except
-# loopback.
+# Loaded by NetworkIsolator::engage() via `iptables-restore --noflush`.
+# ADDITIVE (BUG-041): COMBAT ADDS an isolation layer, it does NOT become
+# the firewall. The `:NORTHNARROW_COMBAT` declaration atomically rebuilds
+# OUR chain (re-reading the carve-out); the `-I … 1` jumps insert it on
+# TOP of the operator's INPUT/OUTPUT/FORWARD rules; `--noflush` leaves
+# every operator chain/rule untouched. During COMBAT our chain is
+# TERMINAL — it decides every packet (ACCEPT lo + carve-out, DROP the
+# rest), so the operator's rules sit beneath it, inert but PRESERVED, and
+# are uncovered intact when teardown removes our jumps + chain.
+#
+# Why our chain is terminal (lo = ACCEPT, not RETURN): under the additive
+# model a RETURN would fall through to the operator's rules, making our
+# loopback guarantee depend on their config. ACCEPT keeps it ours.
 #
 # Beta Step 4b — OPT-IN management carve-out. engage() replaces the
-# `# >>> NORTHNARROW_MGMT_CARVEOUT <<<` marker line below with ACCEPT
-# rules for each IPv4 CIDR in /etc/northnarrow/combat-allow.cidrs
-# (default-empty = no carve-out, byte-identical to full isolation).
-# This lets a remote operator keep an SSH path from a declared
-# management network during COMBAT and avoid lockout. Recovery
-# otherwise still requires an Ed25519-signed admin unlock (see
-# agent/src/anti_tamper/admin_auth.rs); see also
-# docs/operator/COMBAT_RECOVERY.md.
+# `# >>> NORTHNARROW_MGMT_CARVEOUT <<<` marker with `-j ACCEPT` rules for
+# each IPv4 CIDR in /etc/northnarrow/combat-allow.cidrs (default-empty =
+# full isolation). Lets a remote operator keep an SSH path from a
+# declared management network during COMBAT. Recovery otherwise requires
+# an Ed25519-signed admin unlock (agent/src/anti_tamper/admin_auth.rs;
+# docs/operator/COMBAT_RECOVERY.md).
 #
-# Keep the marker line where it is — immediately before the catch-all
-# DROP — so carve-out ACCEPTs are evaluated ahead of the drop. If you
-# remove it, engage() falls back to inserting before the DROP anyway.
-#
-# `iptables-restore` flushes the filter table by default before
-# applying these rules, so any previously installed user rules are
-# replaced atomically.
+# Keep the marker immediately before the catch-all DROP so carve-out
+# ACCEPTs are evaluated ahead of it.
 
 *filter
 :NORTHNARROW_COMBAT - [0:0]
--A INPUT -j NORTHNARROW_COMBAT
--A OUTPUT -j NORTHNARROW_COMBAT
--A FORWARD -j NORTHNARROW_COMBAT
--A NORTHNARROW_COMBAT -i lo -j RETURN
--A NORTHNARROW_COMBAT -o lo -j RETURN
+-A NORTHNARROW_COMBAT -i lo -j ACCEPT
+-A NORTHNARROW_COMBAT -o lo -j ACCEPT
 # >>> NORTHNARROW_MGMT_CARVEOUT <<<
 -A NORTHNARROW_COMBAT -j DROP
+-I INPUT 1 -j NORTHNARROW_COMBAT
+-I OUTPUT 1 -j NORTHNARROW_COMBAT
+-I FORWARD 1 -j NORTHNARROW_COMBAT
 COMMIT

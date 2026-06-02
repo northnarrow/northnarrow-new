@@ -51,7 +51,7 @@ recommended fix directions.
 | 32 | BUG-038 | Watchdog logs a **config-refusal** (agent exit 78 on BUG-036 offset drift) as **"tamper suspected"** — semantically wrong (kernel-offset config refusal, not an attacker); cosmetic/forensic only — the authoritative per-offset reason is in the agent's own loud logs *(surfaced wiring BUG-036's refuse, §37)* | Enhancement (LOW, post-beta, forensic) | **Filed 2026-06-01** — on drift the agent exits 78; the watchdog's 5/60s restart ceiling fires → `log_tamper_suspected()` mislabels the give-up. Fix: distinguish exit-78 config-refusal from rapid-death (a "config-refused" marker or exit-code check) + log accordingly. Deliberately kept OUT of [[BUG-036]] scope. Linked to [[BUG-036]] |
 | 33 | BUG-039 | **COMBAT detection is IPv6-blind too** — `exfiltration_pattern`/`lateral_movement` gate on `family != 2` (AF_INET) and `return false` otherwise, so IPv6 exfil/lateral is never *detected*; combined with [[BUG-031]]'s IPv4-only *isolation*, IPv6 is blind on BOTH sides *(adjacent to BUG-031, §38)* | **HIGH (security) — scope WITH [[BUG-031]]** | **FIXED + VM-VERIFIED 2026-06-02 (block 2, with [[BUG-031]])** — widened the family gate (AF_INET6), `is_internal(addr, family)` (v4 RFC1918 + v6 ULA `fc00::/7` / link-local `fe80::/10`), `[u8;16]` distinct-host key; the BUG-032 allowlist was already family-aware (no change). **VM: v6 exfil → ENGAGED, v6 lateral (3 ULA hosts) → COMBAT (cross-family corroboration).** Linked to [[BUG-031]] |
 | 34 | BUG-040 | No **boot-time** warning when the host is IPv6-capable (`ip6tables` present) but `combat-rules.v6` is absent — the operator only learns of the v6 isolation hole at COMBAT-engage time, mid-incident *(surfaced designing BUG-031, §41)* | Enhancement (LOW, operational) | **Filed 2026-06-02** — natural fit beside the existing `preflight()` (BUG-036): a boot WARN (not refuse) when `ip6tables` exists / v6 is enabled but the v6 ruleset is missing, so the misconfig surfaces before an attack. Kept OUT of block 2. Linked to [[BUG-031]] |
-| 35 | BUG-041 | COMBAT engage **replaces** the `filter` table (`{ip,ip6}tables-restore` flush-by-default); teardown removes only `NORTHNARROW_COMBAT`, so an operator's **pre-existing custom firewall rules are lost across a COMBAT cycle** — on BOTH v4 and v6 *(pre-existing; surfaced by [[BUG-031]] symmetry, §42)* | **MEDIUM (potential beta-blocker — production hosts often have custom rules)** | **Filed 2026-06-02** — not new (existing v4; v6 inherits the same model). Fix is its own work: save/restore the operator's table around engage/release, OR an additive approach (insert/delete our chain without flush-replace) instead of restore-replace. NOT in block-2 scope |
+| 35 | BUG-041 | COMBAT engage **replaced** the `filter` table (`{ip,ip6}tables-restore` flush-by-default); teardown removed only `NORTHNARROW_COMBAT`, so an operator's **pre-existing custom firewall rules were lost across a COMBAT cycle** — on BOTH v4 and v6 *(pre-existing; surfaced by [[BUG-031]] symmetry, §42)* | **MEDIUM (potential beta-blocker — production hosts often have custom rules)** | **FIXED + VM-VERIFIED 2026-06-02** — **ADDITIVE**: engage via `{ip,ip6}tables-restore --noflush` (atomically rebuilds only our chain + `-I … 1` jumps on top; operator rules **preserved** beneath, **uncovered intact** at teardown). lo/NDP `RETURN`→`ACCEPT` so our chain is **terminal**; windowless jump-dedup; teardown/reconcile already additive. v4+v6. **VM (netns): operator rules survived beneath our jump during COMBAT (v4+v6), data DROPped + lo alive, teardown uncovered them intact, re-engage→exactly 1 jump.** Build+units green |
 
 ---
 
@@ -195,6 +195,20 @@ bricked). **(B) Detection (detect-only agent):** 22 v6 connects to a public v6:4
 + test), reconcile then cleared it. **Current VM state:** smoke binary rebuilt with block 2,
 `combat-rules.v6` installed to `/etc/northnarrow/`, no leftover NN chains, `nn-smoke-agent`
 **DETECT-ONLY, OBSERVING**.
+
+**2026-06-02 — BUG-041 (additive, non-destructive COMBAT) VM-verified (netns, real nf_tables).**
+The whole fix rests on `iptables-restore --noflush` doing the additive thing, so it was verified
+directly. Set operator rules in a netns (`--dport 22`, `--dport 80 → OPERATOR_CHAIN`, a custom
+chain), then `iptables-restore --noflush < combat-rules.v4` (the exact engage restore): **(1)**
+`-S INPUT` showed **OUR jump at position 1 with the operator rules intact beneath it**, and the
+operator's custom chain preserved; **isolation worked** (ping over a veth → 100% DROPped while
+`lo` still pinged — terminal chain, stack alive); **(3)** teardown (`-D` jumps, `-F`, `-X`) →
+`-S INPUT` = **operator rules only, uncovered intact**. **Dedup:** two `--noflush` engages → 2
+jumps → the dedup (count + `-D` extras) → exactly 1. **v6:** `combat-rules.v6 --noflush` preserved
+the operator's v6 rule beneath our jump; chain terminal (`lo`/NDP `-j ACCEPT`). A pre-build netns
+probe also confirmed `--noflush` + `:NORTHNARROW_COMBAT` atomically rebuilds only our chain
+(OLD_CARVEOUT→NEW) — the central mechanism. No host chains touched (all in netns). Completes the
+COMBAT-trust triad: precise + complete + non-destructive.
 
 **a2 LSM denies confirmed active under detect-only** (root `task_kill` + file-rename denied; detect-only
 gates ONLY userspace response paths, never the BPF-LSM structural denies). **Fire test #3 (a2 anti-tamper
@@ -1509,7 +1523,15 @@ Pairs with [[BUG-033]] (detect-only) for rollout. The IPv6 detection/isolation g
 
 **The point.** `NetworkIsolator::engage()` applies the ruleset via `{ip,ip6}tables-restore`, which **flushes the `filter` table by default** before loading — replacing any operator rules. On release/reconcile, `tear_down_chain()` removes only `NORTHNARROW_COMBAT` (jumps + chain); it does NOT restore what the flush wiped. So an operator with custom `iptables`/`ip6tables` rules loses them across a COMBAT cycle, on BOTH families. This is the existing v4 behaviour; block 2's v6 mirror inherits the same model — symmetric, not a v6 regression, but the concern is real and rides along.
 
-**Fix direction (its own work, NOT block 2).** Either (a) snapshot the operator's `filter` table (`{ip,ip6}tables-save`) before engage and restore on release, or (b) go **additive** — insert our chain + jumps without a flush-replace and delete exactly those on release, leaving operator rules untouched. (b) is cleaner but needs care around ordering (our DROP must sit ahead of operator ACCEPTs). **Related:** [[BUG-031]].
+**Fix — ADDITIVE (chosen over save/restore).** Two shapes were weighed: (a) snapshot+restore the operator's table, or (b) additive insert. Additive won decisively on **crash persistence** — operator rules are never flushed, so there is *nothing to restore* after a mid-COMBAT crash (reconcile just removes our chain, which it already does); save/restore has to engineer persistence (saved rules surviving a crash; `/run` tmpfs vs `/var` stale-save). "COMBAT ADDS an isolation layer, it does not BECOME the firewall."
+
+Implementation (v4 + v6, symmetric):
+- **engage** → `{ip,ip6}tables-restore --noflush`. Empirically confirmed (netns): the `:NORTHNARROW_COMBAT - [0:0]` declaration **atomically rebuilds only our chain** (re-reading the carve-out — verified OLD→NEW), `-I … 1` inserts our jumps **on top** of the operator's rules, and `--noflush` leaves every operator chain untouched — all in ONE transaction, so **no half-built window** and no tear_down-first.
+- **`lo` / v6 NDP/MLD/errors `RETURN`→`ACCEPT`** — under additive a `RETURN` would fall through to the operator's rules; `ACCEPT` (terminal) keeps the loopback + preserve-NDP guarantees independent of operator config, and makes our chain **fully terminal** during COMBAT (decides every packet; operator rules sit beneath, inert but preserved).
+- **Windowless jump-dedup** after the restore (`dedup_jumps`/`count_jumps`): a re-engage would stack a duplicate jump; trim to exactly one, only ever deleting extras (always ≥ 1 present → never a no-jump moment). Runs AFTER the restore `?`, so it never acts on a zero-jump table from a failed restore.
+- **teardown / reconcile UNCHANGED** — already additive (remove only our chain + jumps); now they genuinely *uncover* the preserved operator rules.
+
+**Related:** [[BUG-031]] (the v6 mirror that surfaced the symmetry). Completes the COMBAT-trust triad: precise ([[BUG-032]]) + complete ([[BUG-031]]/[[BUG-039]]) + non-destructive (this).
 
 ---
 

@@ -174,6 +174,12 @@ impl NetworkIsolator {
         let (ruleset, carved) = self.build_engaged_ruleset()?;
         run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
             .context("iptables-restore failed during COMBAT engage")?;
+        // BUG-041: the restore inserts our jump on top; a re-engage would
+        // stack a duplicate. Trim to exactly one — windowless (only
+        // deletes extras, always leaves >= 1 jump). Runs AFTER the
+        // restore `?`, so it never acts on a zero-jump table from a
+        // failed restore.
+        dedup_jumps(&self.iptables_bin).context("deduplicating v4 COMBAT jumps")?;
         self.is_isolated.store(true, Ordering::SeqCst);
         if carved.is_empty() {
             info!(
@@ -211,16 +217,26 @@ impl NetworkIsolator {
             ),
             Ok(Some((ruleset, carved))) => {
                 match run_iptables_restore_data(&self.restore_bin_v6, ruleset.as_bytes()) {
-                    Ok(()) if carved.is_empty() => info!(
-                        rules_v6 = %self.rules_path_v6.display(),
-                        "COMBAT: IPv6 isolated (NDP/MLD preserved, loopback only)"
-                    ),
-                    Ok(()) => warn!(
-                        rules_v6 = %self.rules_path_v6.display(),
-                        allow_cidrs = ?carved,
-                        count = carved.len(),
-                        "COMBAT: IPv6 isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
-                    ),
+                    Ok(()) => {
+                        // BUG-041: dedup our v6 jumps (best-effort — a dup
+                        // is harmless, both isolate; v4 already succeeded).
+                        if let Err(e) = dedup_jumps(&self.ip6tables_bin) {
+                            warn!(error = %e, "COMBAT: v6 jump dedup failed (best-effort; isolation intact)");
+                        }
+                        if carved.is_empty() {
+                            info!(
+                                rules_v6 = %self.rules_path_v6.display(),
+                                "COMBAT: IPv6 isolated (NDP/MLD preserved, loopback only)"
+                            );
+                        } else {
+                            warn!(
+                                rules_v6 = %self.rules_path_v6.display(),
+                                allow_cidrs = ?carved,
+                                count = carved.len(),
+                                "COMBAT: IPv6 isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
+                            );
+                        }
+                    }
                     Err(e) => warn!(
                         error = %e,
                         "COMBAT: ip6tables-restore FAILED — IPv6 NOT isolated this COMBAT (v4 applied; ip6tables absent or errored)"
@@ -459,6 +475,39 @@ fn probe_chain(bin: &Path) -> Result<Option<usize>> {
     Ok(Some(count_chain_rules(&String::from_utf8_lossy(&listed.stdout))))
 }
 
+/// BUG-041 — after an additive `-I … 1` engage, ensure exactly ONE
+/// `-j COMBAT_CHAIN` jump remains in each base chain (a re-engage would
+/// otherwise stack a duplicate). Windowless: only ever DELETEs extras,
+/// leaving >= 1 jump in place at all times — never a no-jump moment.
+/// Must run AFTER a successful restore (so the count is >= 1).
+fn dedup_jumps(bin: &Path) -> Result<()> {
+    for base in ["INPUT", "OUTPUT", "FORWARD"] {
+        let listed = Command::new(bin)
+            .args(["-S", base])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("listing {base} to dedup {COMBAT_CHAIN} jumps"))?;
+        if !listed.status.success() {
+            continue; // base chain unreadable — skip (best-effort)
+        }
+        let n = count_jumps(&String::from_utf8_lossy(&listed.stdout));
+        // Delete (n - 1) extras, keeping exactly one. `1..n` is empty when
+        // n <= 1, so this never deletes below one jump.
+        for _ in 1..n {
+            run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])
+                .with_context(|| format!("removing duplicate {COMBAT_CHAIN} jump from {base}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Count `-j COMBAT_CHAIN` jump rules in `iptables -S <base>` output.
+fn count_jumps(iptables_s_output: &str) -> usize {
+    let needle = format!("-j {COMBAT_CHAIN}");
+    iptables_s_output.lines().filter(|l| l.contains(&needle)).count()
+}
+
 /// Count the appended (`-A`) rules in `iptables -S CHAIN` output. The
 /// chain-create line (`-N CHAIN`) and any policy line are excluded.
 fn count_chain_rules(iptables_s_output: &str) -> usize {
@@ -519,6 +568,11 @@ fn run_iptables_restore_data(bin: &Path, rules_data: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let mut child = Command::new(bin)
+        // BUG-041: ADDITIVE — never flush the operator's table. The dump
+        // rebuilds only our own declared chain (`:NORTHNARROW_COMBAT`)
+        // and inserts our jumps (`-I … 1`); every operator chain/rule is
+        // left untouched.
+        .arg("--noflush")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -575,6 +629,19 @@ mod tests {
         ));
     }
 
+    // BUG-041: the dedup counts only OUR jumps (so it trims duplicates to
+    // one without touching operator rules in the same base chain).
+    #[test]
+    fn count_jumps_counts_our_jumps_only() {
+        let two = "-P INPUT ACCEPT\n\
+                   -A INPUT -j NORTHNARROW_COMBAT\n\
+                   -A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n\
+                   -A INPUT -j NORTHNARROW_COMBAT\n";
+        assert_eq!(count_jumps(two), 2, "two NN jumps; operator ACCEPT not counted");
+        assert_eq!(count_jumps("-A INPUT -j NORTHNARROW_COMBAT\n"), 1);
+        assert_eq!(count_jumps("-P INPUT ACCEPT\n-A INPUT -j ACCEPT\n"), 0);
+    }
+
     /// Absolute path to `configs/combat-rules.v4` in the repo. Tests
     /// run with `CARGO_MANIFEST_DIR` set to the agent crate root.
     fn combat_rules_path() -> PathBuf {
@@ -596,14 +663,37 @@ mod tests {
     /// Convenience: build a NetworkIsolator with `/usr/bin/cat` for
     /// the restore side and `/bin/true` for the iptables side — the
     /// "success path" mock used by most tests.
+    /// A mock `iptables-restore`: a tiny script that drains stdin to EOF
+    /// and exits 0, IGNORING its args — so it tolerates the `--noflush`
+    /// flag (BUG-041) that `cat` rejects as an unknown option, while
+    /// still avoiding the EPIPE a non-reading mock (`/bin/true`) hits.
+    fn mock_restore_bin() -> Option<PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // UNIQUE per call: tests run in parallel; a shared path would let
+        // one test's File::create (truncate) collide with another test
+        // exec'ing it (ETXTBSY / a truncated script → EPIPE on the write).
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nn-test-mock-restore-{}-{}.sh",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = std::fs::File::create(&path).ok()?;
+        f.write_all(b"#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n").ok()?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        Some(path)
+    }
+
     fn mock_success_isolator() -> Option<NetworkIsolator> {
-        let cat = PathBuf::from("/usr/bin/cat");
+        let restore = mock_restore_bin()?;
         let truebin = PathBuf::from("/bin/true");
-        if !cat.exists() || !truebin.exists() {
-            eprintln!("/usr/bin/cat or /bin/true missing; skipping");
+        if !truebin.exists() {
+            eprintln!("/bin/true missing; skipping");
             return None;
         }
-        Some(NetworkIsolator::new_with_bin(combat_rules_path(), cat, truebin).unwrap())
+        Some(NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap())
     }
 
     #[test]
@@ -821,8 +911,11 @@ mod tests {
             return;
         }
         let rules = std::fs::read(combat_rules_path()).expect("reading configs/combat-rules.v4");
+        // BUG-041: production engages with `--noflush` (additive); test the
+        // same way so the `-I … 1` jumps + `:NORTHNARROW_COMBAT` rebuild
+        // are validated as they're actually applied.
         let mut child = Command::new(bin)
-            .arg("--test")
+            .args(["--test", "--noflush"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
