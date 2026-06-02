@@ -981,12 +981,27 @@ async fn main() -> Result<()> {
             load_mass_write_carveout_extras(std::path::Path::new(
                 northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
             ));
+        // BUG-032 — escalation allowlist (count-filter for exfil/lateral).
+        // Missing file = empty (fail-secure). Loaded once at boot;
+        // reload-on-restart for beta.
+        let escalation_allow = northnarrow_agent::posture::escalation_allow::EscalationAllowList::load(
+            std::path::Path::new(
+                northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
+            ),
+        );
+        if !escalation_allow.is_empty() {
+            info!(
+                entries = escalation_allow.len(),
+                "escalation allowlist loaded — count-filter for exfil/lateral (BUG-032)"
+            );
+        }
         PostureMachine::new_with_hooks_and_exempt_and_auth_and_extras(
             engage_hook,
             release_hook,
             exempt.clone(),
             auth_tracker,
             mass_write_extras,
+            escalation_allow,
         )
     } else {
         PostureMachine::new()

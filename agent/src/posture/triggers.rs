@@ -30,6 +30,7 @@ use std::sync::Arc;
 use common::posture_types::TriggerType;
 use common::Event;
 
+use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::lineage::AuthSessionTracker;
 
@@ -166,7 +167,8 @@ const PERSISTENCE_PREFIXES: &[&str] = &[
 /// wrong (see 2026-05-22 sshd-reset diagnosis). Tamper attempts on
 /// the agent's state by *other* PIDs are still caught: the inode
 /// LSM hooks deny them and surface an `FsProtectDenial`, which
-/// `confirmed_intrusion` treats as COMBAT-tier on its own.
+/// `detect` raises as the Decisive `AntiTamperDenial` trigger
+/// (straight to COMBAT on its own — BUG-032).
 #[derive(Debug, Default, Clone)]
 pub struct TriggerDetector {
     /// PIDs belonging to the NorthNarrow process stack (agent + the
@@ -187,6 +189,12 @@ pub struct TriggerDetector {
     /// Loaded from `/etc/northnarrow/mass-write-carveout.local` at
     /// agent boot. Cheap to clone (`Arc`); empty by default.
     mass_write_extras: Arc<Vec<String>>,
+    /// BUG-032 — escalation allowlist: process×destination tuples whose
+    /// connections are excluded from the `exfiltration_pattern` /
+    /// `lateral_movement` threshold counts (count-filter, not suppress).
+    /// Loaded from `/etc/northnarrow/escalation-allow.local` at boot.
+    /// Empty by default (fail-secure).
+    escalation_allow: Arc<EscalationAllowList>,
 }
 
 impl TriggerDetector {
@@ -202,6 +210,7 @@ impl TriggerDetector {
             exempt: ExemptPids::with_agent(pid),
             auth: AuthSessionTracker::default(),
             mass_write_extras: Arc::new(Vec::new()),
+            escalation_allow: Arc::new(EscalationAllowList::empty()),
         }
     }
 
@@ -213,6 +222,7 @@ impl TriggerDetector {
             exempt,
             auth: AuthSessionTracker::default(),
             mass_write_extras: Arc::new(Vec::new()),
+            escalation_allow: Arc::new(EscalationAllowList::empty()),
         }
     }
 
@@ -225,6 +235,7 @@ impl TriggerDetector {
             exempt,
             auth,
             mass_write_extras: Arc::new(Vec::new()),
+            escalation_allow: Arc::new(EscalationAllowList::empty()),
         }
     }
 
@@ -234,6 +245,14 @@ impl TriggerDetector {
     /// `mass-write-carveout.local` contents.
     pub fn with_mass_write_extras(mut self, extras: Vec<String>) -> Self {
         self.mass_write_extras = Arc::new(extras);
+        self
+    }
+
+    /// BUG-032 — builder for the escalation allowlist. Production:
+    /// `main.rs` calls this with the parsed `escalation-allow.local`
+    /// contents (count-filter for exfil/lateral).
+    pub fn with_escalation_allow(mut self, allow: EscalationAllowList) -> Self {
+        self.escalation_allow = Arc::new(allow);
         self
     }
 
@@ -303,16 +322,22 @@ impl TriggerDetector {
         }
 
         // ENGAGED -> COMBAT tier
+        // BUG-032: a denied anti-tamper attempt is kernel-adjudicated
+        // malice — the Decisive signal that reaches COMBAT on its own
+        // (split out of confirmed_intrusion's old FsProtectDenial arm).
+        if matches!(event, Event::FsProtectDenial { .. }) {
+            hits.push(TriggerType::AntiTamperDenial);
+        }
         if confirmed_intrusion(event, recent, &self.auth, &self.mass_write_extras) {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event) {
             hits.push(TriggerType::PersistenceMechanism);
         }
-        if lateral_movement(event, recent) {
+        if lateral_movement(event, recent, &self.escalation_allow) {
             hits.push(TriggerType::LateralMovement);
         }
-        if exfiltration_pattern(event, recent) {
+        if exfiltration_pattern(event, recent, &self.escalation_allow) {
             hits.push(TriggerType::ExfiltrationPattern);
         }
 
@@ -567,14 +592,11 @@ fn confirmed_intrusion(
     auth: &AuthSessionTracker,
     mass_write_extras: &[String],
 ) -> bool {
-    // Tappa 7: a denied FS-tamper attempt is, by definition, a
-    // confirmed intrusion — root tried to disable or destroy agent
-    // state. Single event raises the posture all the way to COMBAT.
-    // NOT gated by auth-lineage: a sudo-mediated tamper attempt is
-    // still a tamper attempt.
-    if let Event::FsProtectDenial { .. } = focal {
-        return true;
-    }
+    // BUG-032: the FsProtectDenial arm moved OUT to the Decisive
+    // `AntiTamperDenial` trigger (raised directly in `detect`) — a
+    // kernel-adjudicated denial is straight-to-COMBAT, distinct from
+    // these heuristic arms which now require corroboration.
+    //
     // Exec from /tmp or /dev/shm: an admin does not legitimately
     // run binaries out of these paths. NOT gated by auth-lineage —
     // a sudo-spawned process exec'ing /tmp/payload is exactly the
@@ -652,7 +674,12 @@ fn confirmed_intrusion(
                     count_within_window = count,
                     threshold = MASS_WRITE_MIN,
                     window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
-                    "mass-write threshold crossed — posture will escalate to COMBAT"
+                    // BUG-032: this raises ConfirmedIntrusion (COMBAT-tier),
+                    // but as a NeedsCorroboration signal it escalates to
+                    // ENGAGED on its own — COMBAT (auto-isolation) needs a
+                    // second distinct signal. (Pure single-vector ransomware
+                    // tops at ENGAGED unless the sustained knob is on.)
+                    "mass-write threshold crossed — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
                 );
                 return true;
             }
@@ -676,9 +703,10 @@ fn persistence_mechanism(focal: &Event) -> bool {
         .any(|p| filename == p || filename.starts_with(p))
 }
 
-fn lateral_movement(focal: &Event, recent: &[Event]) -> bool {
+fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList) -> bool {
     let Event::TcpConnect {
         pid: focal_pid,
+        comm: focal_comm,
         family,
         dst_addr,
         dst_port,
@@ -694,8 +722,16 @@ fn lateral_movement(focal: &Event, recent: &[Event]) -> bool {
     if *family != 2 || !is_rfc1918(dst_addr) {
         return false;
     }
+    // BUG-032 count-filter: an allowlisted (comm,dst) host does not
+    // contribute to the distinct-host count (e.g. orchestration tooling
+    // fanning out to a declared internal range).
+    let counts = |dst: &[u8; 16], port: u16| {
+        !allow.excludes(AllowTrigger::Lateral, focal_comm, dst, *family, port)
+    };
     let mut hosts: HashSet<[u8; 4]> = HashSet::new();
-    hosts.insert([dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]]);
+    if counts(dst_addr, *dst_port) {
+        hosts.insert([dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]]);
+    }
     for e in recent {
         if let Event::TcpConnect {
             pid,
@@ -711,6 +747,7 @@ fn lateral_movement(focal: &Event, recent: &[Event]) -> bool {
                 && ADMIN_PORTS.contains(dp)
                 && is_rfc1918(dst)
                 && within(*focal_ts, *timestamp_ns, LATERAL_WINDOW_NS)
+                && counts(dst, *dp)
             {
                 hosts.insert([dst[0], dst[1], dst[2], dst[3]]);
             }
@@ -719,9 +756,10 @@ fn lateral_movement(focal: &Event, recent: &[Event]) -> bool {
     hosts.len() >= LATERAL_DISTINCT_DST_MIN
 }
 
-fn exfiltration_pattern(focal: &Event, recent: &[Event]) -> bool {
+fn exfiltration_pattern(focal: &Event, recent: &[Event], allow: &EscalationAllowList) -> bool {
     let Event::TcpConnect {
         pid: focal_pid,
+        comm: focal_comm,
         family,
         dst_addr,
         dst_port,
@@ -740,7 +778,15 @@ fn exfiltration_pattern(focal: &Event, recent: &[Event]) -> bool {
     if is_rfc1918(dst_addr) {
         return false;
     }
-    let mut count = 1usize;
+    // BUG-032 count-filter: connections to an allowlisted (comm,dst)
+    // do NOT count toward the threshold (a real C2 outside the
+    // allowlisted CIDR still counts, even under a spoofed comm). Every
+    // counted connection is the same pid → same process → same comm,
+    // so the focal comm applies to the recent matches too.
+    let counts = |dst: &[u8; 16], port: u16| {
+        !allow.excludes(AllowTrigger::Exfil, focal_comm, dst, *family, port)
+    };
+    let mut count = usize::from(counts(dst_addr, *dst_port));
     for e in recent {
         if let Event::TcpConnect {
             pid,
@@ -756,6 +802,7 @@ fn exfiltration_pattern(focal: &Event, recent: &[Event]) -> bool {
                 && matches!(*dp, 80 | 443)
                 && !is_rfc1918(dst)
                 && within(*focal_ts, *timestamp_ns, EXFIL_WINDOW_NS)
+                && counts(dst, *dp)
             {
                 count += 1;
             }
@@ -833,6 +880,38 @@ pub(super) mod testutil {
             query_type: 1,
             dns_server: [0u8; 16],
             family: 2,
+            timestamp_ns: ts,
+        }
+    }
+
+    /// A `TcpConnect` with an explicit `comm` (for escalation-allow
+    /// count-filter tests, which key on the process name).
+    pub fn tcp_v4_comm(pid: u32, comm: &str, dst: [u8; 4], dst_port: u16, ts: u64) -> Event {
+        let mut a = [0u8; 16];
+        a[..4].copy_from_slice(&dst);
+        Event::TcpConnect {
+            pid,
+            uid: 1000,
+            comm: comm.into(),
+            family: 2,
+            src_addr: [0u8; 16],
+            src_port: 0,
+            dst_addr: a,
+            dst_port,
+            timestamp_ns: ts,
+        }
+    }
+
+    /// A kernel anti-tamper denial — the Decisive `AntiTamperDenial`
+    /// signal that reaches COMBAT on its own (BUG-032).
+    pub fn fs_protect_denial(pid: u32, ts: u64) -> Event {
+        Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: "attacker".into(),
+            target_dev: 1,
+            target_ino: 2,
+            operation: common::FsProtectOperation::Unlink,
             timestamp_ns: ts,
         }
     }
@@ -955,10 +1034,11 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_intrusion_fires_on_any_fs_protect_denial() {
-        // Tappa 7: a kernel-side denial of root's tamper attempt is
-        // by definition a confirmed intrusion — push posture all
-        // the way to COMBAT on a single event.
+    fn anti_tamper_denial_fires_on_fs_protect_denial() {
+        // BUG-032: a kernel-side denial of root's tamper attempt is
+        // adjudicated malice — the Decisive `AntiTamperDenial` trigger
+        // (straight to COMBAT, no corroboration), split out of the old
+        // ConfirmedIntrusion FsProtectDenial arm.
         let det = TriggerDetector::new();
         let focal = Event::FsProtectDenial {
             pid: 9999,
@@ -971,9 +1051,13 @@ mod tests {
         };
         let hits = det.detect(&focal, &[]);
         assert!(
-            hits.contains(&TriggerType::ConfirmedIntrusion),
-            "expected ConfirmedIntrusion, got {:?}",
+            hits.contains(&TriggerType::AntiTamperDenial),
+            "expected AntiTamperDenial, got {:?}",
             hits
+        );
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "FsProtectDenial must NOT also raise ConfirmedIntrusion now: {hits:?}"
         );
     }
 
@@ -1076,7 +1160,7 @@ mod tests {
             timestamp_ns: 1,
         };
         let hits = det.detect(&focal, &[]);
-        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        assert!(hits.contains(&TriggerType::AntiTamperDenial), "{hits:?}");
     }
 
     // ─── T7.13 (Beta Step 5) — auth-mediated lineage exemption ─────
@@ -1233,8 +1317,10 @@ mod tests {
             timestamp_ns: 3,
         };
         let hits = det.detect(&focal, &[]);
+        // BUG-032: the denial now raises the Decisive AntiTamperDenial,
+        // and is still NOT suppressed by sudo lineage.
         assert!(
-            hits.contains(&TriggerType::ConfirmedIntrusion),
+            hits.contains(&TriggerType::AntiTamperDenial),
             "FsProtectDenial must fire even under sudo lineage, got {hits:?}"
         );
     }
@@ -1689,6 +1775,45 @@ mod tests {
         assert!(
             !hits.contains(&TriggerType::ConfirmedIntrusion),
             "hardcoded sysfs carve-out must survive empty extras: {hits:?}"
+        );
+    }
+
+    // ── BUG-032: escalation allowlist count-filter (exfil) ──────────
+    #[test]
+    fn exfil_allowlist_count_filters_mirror_but_not_c2() {
+        use super::super::escalation_allow::EscalationAllowList;
+        // 21 connects by "curl" to a public dst on 443 → exfil shape.
+        let mk = |dst: [u8; 4]| {
+            let recent: Vec<Event> = (0..20u64)
+                .map(|i| tcp_v4_comm(42, "curl", dst, 443, i + 1))
+                .collect();
+            (tcp_v4_comm(42, "curl", dst, 443, 100), recent)
+        };
+
+        // No allowlist → ExfiltrationPattern fires.
+        let bare = TriggerDetector::new();
+        let (f, r) = mk([203, 0, 113, 9]);
+        assert!(
+            bare.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
+            "exfil shape must fire with no allowlist"
+        );
+
+        // "curl 203.0.113.0/24 443" allowlisted → every connect is
+        // count-filtered → below threshold → no trigger.
+        let (allow, _) = EscalationAllowList::parse("exfil curl 203.0.113.0/24 443\n");
+        let det = TriggerDetector::new().with_escalation_allow(allow);
+        let (f, r) = mk([203, 0, 113, 9]);
+        assert!(
+            !det.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
+            "allowlisted mirror traffic must be count-filtered out"
+        );
+
+        // Same allowlist, a non-allowlisted public dst (a real C2) still
+        // fires — the mirror entry must not mask it.
+        let (f, r) = mk([8, 8, 8, 8]);
+        assert!(
+            det.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
+            "non-allowlisted destination must still count + fire"
         );
     }
 }

@@ -11,8 +11,28 @@ use common::ade_types::{
 use common::posture_types::{PostureKind, TriggerType};
 use common::Event;
 
-use super::triggers::testutil::{file_open, spawn, tcp_v4};
+use super::triggers::testutil::{file_open, fs_protect_denial, spawn, tcp_v4};
 use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
+
+/// BUG-032 — an exfiltration burst: 21 connects (focal + 20) by one pid
+/// to a public dst on 443 → `ExfiltrationPattern` (a NeedsCorroboration
+/// COMBAT-tier signal).
+fn exfil_burst(pid: u32) -> (Event, Vec<Event>) {
+    let recent: Vec<Event> = (0..20u64)
+        .map(|i| tcp_v4(pid, [203, 0, 113, 9], 443, i + 1))
+        .collect();
+    (tcp_v4(pid, [203, 0, 113, 9], 443, 100), recent)
+}
+
+/// BUG-032 — a lateral-movement burst: 3 distinct RFC1918 hosts on an
+/// admin port from one pid → `LateralMovement`.
+fn lateral_burst(pid: u32) -> (Event, Vec<Event>) {
+    let recent = vec![
+        tcp_v4(pid, [10, 0, 0, 1], 22, 1),
+        tcp_v4(pid, [10, 0, 0, 2], 22, 2),
+    ];
+    (tcp_v4(pid, [10, 0, 0, 3], 22, 3), recent)
+}
 
 fn baseline_verdict(action: AdeAction, severity: AdeSeverity) -> AdeVerdict {
     AdeVerdict {
@@ -80,7 +100,7 @@ fn admin_release_unauthorized_is_rejected() {
     let m = PostureMachine::new();
     // Force COMBAT first.
     let recent: Vec<Event> = vec![];
-    let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
+    let focal = fs_protect_denial(42, 1);
     m.observe(&focal, &recent);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(
@@ -93,7 +113,7 @@ fn admin_release_unauthorized_is_rejected() {
 #[test]
 fn admin_release_authorized_drops_to_engaged() {
     let m = PostureMachine::new();
-    let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
+    let focal = fs_protect_denial(42, 1);
     m.observe(&focal, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     let next = m.admin_release_combat(true).expect("ok");
@@ -131,7 +151,7 @@ fn full_recon_to_combat_flow() {
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 
     // Phase 3: exec from /tmp → ConfirmedIntrusion → COMBAT.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     let t3 = m.observe(&intrusion, &[]);
     assert!(t3.is_some());
     assert_eq!(m.current_kind(), PostureKind::Combat);
@@ -241,7 +261,7 @@ fn concurrent_observe_and_modulate_is_safe() {
 fn concurrent_admin_release_serializes_correctly() {
     let m = Arc::new(PostureMachine::new());
     // Drive into COMBAT.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 
@@ -270,7 +290,7 @@ fn concurrent_admin_release_serializes_correctly() {
 fn transition_log_caps_at_bound() {
     let m = PostureMachine::new();
     // Force many transitions: alternate intrusion+admin release.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     for _ in 0..300 {
         m.observe(&intrusion, &[]);
         let _ = m.admin_release_combat(true);
@@ -300,11 +320,58 @@ fn combat_hook_fires_on_first_combat_entry() {
     assert_eq!(m.current_kind(), PostureKind::Alerted);
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
-    // ConfirmedIntrusion crosses into COMBAT — hook fires exactly once.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    // A kernel anti-tamper denial (Decisive) crosses into COMBAT —
+    // hook fires exactly once.
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+// ─── BUG-032: corroboration / progression ──────────────────────────
+
+#[test]
+fn single_blunt_combat_signal_caps_at_engaged() {
+    // A lone ExfiltrationPattern (the harness-egress shape) escalates to
+    // ENGAGED (alert), NOT COMBAT (auto-isolation). This is the core
+    // precision win + the documented single-vector limit.
+    let m = PostureMachine::new();
+    let (focal, recent) = exfil_burst(42);
+    let out = m.observe(&focal, &recent);
+    assert!(out.is_some(), "exfil shape must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "a single blunt COMBAT-tier signal must cap at ENGAGED"
+    );
+}
+
+#[test]
+fn corroborated_pair_reaches_combat() {
+    // exfil alone → ENGAGED; a SECOND distinct signal (lateral) within
+    // the window corroborates → COMBAT.
+    let m = PostureMachine::new();
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    let (lf, lr) = lateral_burst(42);
+    m.observe(&lf, &lr);
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Combat,
+        "two distinct blunt signals must corroborate to COMBAT"
+    );
+}
+
+#[test]
+fn decisive_anti_tamper_denial_reaches_combat_alone() {
+    // A kernel-adjudicated FsProtectDenial (AntiTamperDenial, Decisive)
+    // reaches COMBAT on its own — no corroboration required.
+    let m = PostureMachine::new();
+    let out = m.observe(&fs_protect_denial(7, 1), &[]);
+    assert!(out.is_some());
+    assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
 #[test]
@@ -316,7 +383,7 @@ fn combat_hook_does_not_refire_while_already_in_combat() {
         c2.fetch_add(1, Ordering::SeqCst);
     }));
 
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
@@ -336,7 +403,7 @@ fn default_new_has_no_combat_hook() {
     // implicitly rely on this; making it an explicit assertion
     // protects against accidental hook-required regressions.
     let m = PostureMachine::new();
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
@@ -346,7 +413,7 @@ fn default_new_has_no_combat_hook() {
 #[test]
 fn admin_release_with_token_transitions_combat_to_alerted() {
     let m = PostureMachine::new();
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 
@@ -383,7 +450,7 @@ fn release_hook_fires_with_token_on_successful_release() {
         c2.fetch_add(1, Ordering::SeqCst);
     });
     let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -568,12 +635,14 @@ fn sudo_cascade_e2e_stays_at_observing() {
     );
 }
 
-/// Test #16 — ransomware-shape from /tmp still reaches COMBAT.
+/// Test #16 — exec-from-/tmp still escalates (now to ENGAGED).
 /// Negative control: a non-auth-mediated exec from /tmp must still
-/// trip ConfirmedIntrusion via the exec-from-/tmp arm. The lineage
-/// gate must NOT be too broad.
+/// trip ConfirmedIntrusion via the exec-from-/tmp arm — the lineage
+/// gate must NOT be too broad. BUG-032: as a single NeedsCorroboration
+/// signal it now caps at ENGAGED (alert); COMBAT needs a second
+/// distinct signal (see `corroborated_pair_reaches_combat`).
 #[test]
-fn ransomware_shape_still_reaches_combat() {
+fn ransomware_shape_reaches_engaged_alone() {
     let m = machine_with_isolated_auth();
     // No sudo lineage. Direct exec from /tmp.
     let evil = spawn(900, 1, "payload", "/tmp/payload", 1);
@@ -581,16 +650,17 @@ fn ransomware_shape_still_reaches_combat() {
     assert!(r.is_some(), "exec-from-/tmp must transition");
     assert_eq!(
         m.current_kind(),
-        PostureKind::Combat,
-        "non-auth exec from /tmp must still drive COMBAT"
+        PostureKind::Engaged,
+        "non-auth exec from /tmp escalates to ENGAGED on its own (BUG-032)"
     );
 }
 
-/// Test #17 — mass-write alone from a non-auth PID still reaches
-/// COMBAT. Confirms the mass-write arm itself still works for
-/// adversarial PIDs (the lineage gate is the only suppressor).
+/// Test #17 — mass-write alone from a non-auth PID still escalates
+/// (now to ENGAGED). Confirms the mass-write arm itself still works
+/// for adversarial PIDs (the lineage gate is the only suppressor);
+/// BUG-032 caps a single signal at ENGAGED.
 #[test]
-fn mass_write_alone_from_non_auth_pid_still_reaches_combat() {
+fn mass_write_alone_from_non_auth_pid_reaches_engaged() {
     let m = machine_with_isolated_auth();
     // Spawn a non-auth parent so the writer's lineage is clean.
     let _ = m.observe(&spawn(900, 1, "zsh", "/usr/bin/zsh", 1), &[]);
@@ -601,7 +671,7 @@ fn mass_write_alone_from_non_auth_pid_still_reaches_combat() {
     let focal = file_open(900, 1000, "/home/u/x", 1, 200);
     let r = m.observe(&focal, &recent);
     assert!(r.is_some(), "non-auth mass-write must transition");
-    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
 }
 
 /// Test #18 — agent's own writes still exempt (PR #123 regression
@@ -683,15 +753,15 @@ fn admin_force_state_with_token_same_state_is_noop() {
 
 #[test]
 fn observe_returns_firing_trigger_on_transition() {
-    // exec-from-/tmp fires ConfirmedIntrusion → Combat. The returned
-    // tuple must carry that TriggerType so callers (main.rs WARN log)
-    // can surface which signal caused the escalation.
+    // A kernel anti-tamper denial fires the Decisive AntiTamperDenial →
+    // COMBAT. The returned tuple must carry that TriggerType so callers
+    // (main.rs WARN log) can surface which signal caused the escalation.
     let m = PostureMachine::new();
-    let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
+    let focal = fs_protect_denial(42, 1);
     let result = m.observe(&focal, &[]);
     let (new_state, firing) = result.expect("posture transitioned");
     assert_eq!(new_state.kind(), PostureKind::Combat);
-    assert_eq!(firing, Some(TriggerType::ConfirmedIntrusion));
+    assert_eq!(firing, Some(TriggerType::AntiTamperDenial));
 }
 
 #[test]
