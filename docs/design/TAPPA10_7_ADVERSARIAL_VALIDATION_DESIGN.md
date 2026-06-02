@@ -227,10 +227,19 @@ isolation.
 
 ## 4. Test matrix structure
 
-The validation surface is the **61 production rules**, minus the
-**N/A** set (DNS-blocked NET-014/015 are already gated out, so the
-denominator is the live 61; any rule whose only trigger needs argv is
-marked N/A with a T10.6 pointer). Each rule is one matrix row.
+The validation surface is the **69 production rules**, minus the
+**N/A** set, so the denominator is the live 69; any rule whose only
+trigger needs argv is marked N/A with a T10.6 pointer. Each rule is one
+matrix row.
+
+> **Rule-count update (2026-06-02).** This section originally said **61**
+> (the T10.5-era pin). The current source loads **69**
+> (`agent/src/decision/tests.rs` asserts `8+10+7+1+24+4+15`): +5
+> `NN-L-CHAIN-004..008` (T10.6 cross-PID), +1 `NN-L-FIM-024` (T9.5.1
+> anti-tamper bait), +1 `R018` (BUG-034 module-load), and `NN-L-NET-014`
+> un-gated by the T4.1 DNS refit; `NN-L-NET-015` remains the only
+> DNS-payload N/A. A running binary built before 2026-06-01 reports **68**
+> (pre-R018); `bootstrap-target-prod.sh` rebuilds from source → **69**.
 
 ### 4.1 Per-rule row schema
 
@@ -336,9 +345,9 @@ distinguishes "we have a detection hole" from "this needs T10.6".
 
 ---
 
-## 7. Specific test plan — 61-rule × Kali-tool mapping
+## 7. Specific test plan — 69-rule × Kali-tool mapping
 
-The full 61-row matrix is the **product of V2–V4** (it *is* a chunk of
+The full 69-row matrix is the **product of V2–V4** (it *is* a chunk of
 the report). This section fixes the per-family scenario design and the
 exact triggers for the high-value rules; the remaining rows follow the
 same shape.
@@ -477,11 +486,14 @@ detach NAT and snapshot `armed`.
 
 ### 10.2 northnarrowdev production bootstrap
 
-`deploy/adversarial/bootstrap-target-prod.sh`: run `deploy/install.sh`
-**without** `test-privileged`, enable + start `northnarrow.service`,
-seed `/etc/northnarrow/*.v1` defaults, deploy canary files, run a
-health check (engine reports 61 rules, LSM attached, COMBAT chain
-absent at rest), snapshot `clean-prod`.
+`deploy/adversarial/bootstrap-target-prod.sh`: scrub dev runtime state
+(keep `/etc` config + admin keypair), rebuild **without**
+`test-privileged` (`cargo xtask build --release`), `deploy/install.sh`
+(lands the BUG-042 unit), enable + start `northnarrow-agent.service` +
+`northnarrow-watchdog.service`, re-seed the FIM baseline, deploy
+canaries, run a health check (engine reports **69** rules, CapEff =
+BUG-042 set without `cap_sys_admin`, LSM attached, COMBAT absent at
+rest, `+i` on the state dir), snapshot `clean-prod`. See `RANGE_SETUP.md`.
 
 ---
 

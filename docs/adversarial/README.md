@@ -1,5 +1,12 @@
 # Tappa 10.7 — Adversarial Validation Range (V1 setup)
 
+> ⚠️ **SUPERSEDED — do not follow this draft.** It predates the live range
+> and carries placeholder values (192.168.56.x IPs, `/opt` path,
+> `northnarrow.service`, the 61-rule pin). Use
+> [`../../deploy/adversarial/`](../../deploy/adversarial/) +
+> [`../../RANGE_SETUP.md`](../../RANGE_SETUP.md). See
+> [`SUPERSEDED.md`](SUPERSEDED.md). (The engine now loads **69** rules, not 61.)
+
 Automation for the two-VM, fully isolated VirtualBox range that
 validates the 61-rule production engine against real attacker tooling.
 Design of record: `docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md`
