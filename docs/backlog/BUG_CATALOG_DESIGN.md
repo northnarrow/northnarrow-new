@@ -1575,5 +1575,22 @@ Implementation (v4 + v6, symmetric):
 
 ---
 
+## 44. BUG-043 — production watchdog unit missing the documented-required `--agent-bin`; watchdog self-blocked by the agent's own anti-tamper (masked by the dev workflow running the watchdog disabled)
+
+**Severity:** HIGH (resilience — the kill→respawn supervisor never stays up in production). **Filed + FIXED + VM-VERIFIED:** 2026-06-02, provisioning T10.7 production-mode.
+
+**The point.** `deploy/systemd/northnarrow-watchdog.service`'s `ExecStart` omitted `--agent-bin`. Without it, `derive_agent_argv()` (watchdog `main.rs`) reconstructs the agent's argv by `readlink(/proc/<agent_pid>/exe)` at boot — but the agent's own **`ptrace_access_check` BPF-LSM deny hook** refuses that read until the watchdog PID is registered in `PROTECTED_OBSERVERS` (via the agent's `spawn_watchdog_exempt_refresh` timer). The watchdog loses that boot race, so the readlink `EACCES`-es; the function retries 1s/tick for **60s** then returns `Err` → `run()` propagates via `?` **before** `sd_notify(READY=1)` → the process `exit(1)` and systemd restart-loops it (`Type=notify`, never reaches READY).
+
+**The irony (same class as the T10.7 scrub blocker).** The watchdog was blocked by the **agent's own anti-tamper protecting the agent** — the supervisor wasn't yet a PROTECTED_OBSERVER, so `ptrace_access_check` treated its `/proc/<agent>/exe` read as an outsider and denied it. Anti-tamper working exactly as designed, on our own resilience layer.
+
+**Why it was masked.** The dev workflow runs with the **watchdog disabled** (single-host cycling without reboot); it was never started against the bounded production agent, so the boot race never fired. T10.7 production-mode bootstrap (which enables + starts the watchdog) surfaced it immediately — the same fixture-masks-wiring class as [[BUG-042]].
+
+**Fix.** Add the documented production flag to the unit's `ExecStart`:
+`--agent-bin /usr/local/bin/northnarrow-agent`. With an explicit path, `derive_agent_argv()` is never called (`main.rs` takes the `Some(bin)` branch), so the watchdog no longer depends on `/proc/<agent>/exe` or on PROTECTED_OBSERVERS timing at boot. The CLI help already states *"Production systemd units pass this explicitly to skip the race entirely"* — the unit simply didn't. No code change; unit-config only.
+
+**VM-verified (2026-06-02).** Before: watchdog `exit 1` at ~60s, restart-looping (`status=1/FAILURE`). After: watchdog `active` and stable >3 min (past the old 60s death), agent + watchdog both up under the BUG-042 unit, T10.7 health check all-pass. **Related:** [[BUG-042]] (sibling prod-unit defect surfaced the same session), [[BUG-011]] (the PROTECTED_OBSERVERS registration race the retry path was built for).
+
+---
+
 **End of catalog.** Authoritative reference for Phase B implementation and
 V1.0 backlog grooming.
