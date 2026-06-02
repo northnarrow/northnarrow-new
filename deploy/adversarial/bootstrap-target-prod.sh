@@ -158,10 +158,15 @@ systemctl enable --now "$NN_AGENT_UNIT" "$NN_WATCHDOG_UNIT"
 READY_PID=$(systemctl show -p MainPID --value "$NN_AGENT_UNIT" 2>/dev/null || echo 0)
 log "Waiting for agent (PID $READY_PID) to reach readiness + LSM attach..."
 for _ in $(seq 1 30); do
-    if journalctl --namespace="$NN_JOURNAL_NS" _PID="$READY_PID" 2>/dev/null \
-            | grep -q "decision engine ready" \
-       && bpftool prog show 2>/dev/null \
-            | grep -qE 'lsm.*(task_kill|inode_|fim_|ptrace_access)'; then
+    # grep -c (NOT grep -q): grep -q closes the pipe on its first match, so under
+    # the script's `set -o pipefail` the upstream journalctl/bpftool dies with
+    # SIGPIPE (141) and pipefail promotes it — a false negative once the box has
+    # enough log lines / BPF programs loaded. grep -c reads all input → no close.
+    ready=$(journalctl --namespace="$NN_JOURNAL_NS" _PID="$READY_PID" 2>/dev/null \
+            | grep -c "decision engine ready" || true)
+    lsm=$(bpftool prog show 2>/dev/null \
+            | grep -cE 'lsm.*(task_kill|inode_|fim_|ptrace_access)' || true)
+    if [ "${ready:-0}" -gt 0 ] && [ "${lsm:-0}" -gt 0 ]; then
         break
     fi
     sleep 1
@@ -216,8 +221,13 @@ check "engine loaded $EXPECTED_RULE_COUNT rules (got '${RULES:-none}')" \
 
 # (c) LSM attached: bpf in the kernel chain AND NN LSM progs loaded
 check "bpf in kernel LSM chain" "grep -q bpf /sys/kernel/security/lsm"
+# grep -c (NOT grep -q) — same SIGPIPE-under-pipefail trap as the wait-loop:
+# grep -q closes the pipe on its first match and bpftool dies SIGPIPE (141),
+# which pipefail promotes to a false FAIL once enough BPF progs are loaded
+# (this probe passed at boot-time counts, then false-FAILed at 41 progs).
+# grep -c reads all input. Ground-truth cross-check: bpftool link show | grep lsm_mac.
 check "NN BPF-LSM programs attached" \
-      "bpftool prog show 2>/dev/null | grep -qE 'lsm.*(task_kill|inode_|fim_|ptrace_access)'"
+      "[ \"\$(bpftool prog show 2>/dev/null | grep -cE 'lsm.*(task_kill|inode_|fim_|ptrace_access)')\" -gt 0 ]"
 
 # (d) MASTER PROBE — CapEff carries the BUG-042 set, and NOT CAP_SYS_ADMIN
 CAPEFF_HEX=$(awk '/CapEff/{print $2}' "/proc/$MAINPID/status" 2>/dev/null || echo 0)
