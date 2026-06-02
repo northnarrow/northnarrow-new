@@ -52,6 +52,7 @@ recommended fix directions.
 | 33 | BUG-039 | **COMBAT detection is IPv6-blind too** — `exfiltration_pattern`/`lateral_movement` gate on `family != 2` (AF_INET) and `return false` otherwise, so IPv6 exfil/lateral is never *detected*; combined with [[BUG-031]]'s IPv4-only *isolation*, IPv6 is blind on BOTH sides *(adjacent to BUG-031, §38)* | **HIGH (security) — scope WITH [[BUG-031]]** | **FIXED + VM-VERIFIED 2026-06-02 (block 2, with [[BUG-031]])** — widened the family gate (AF_INET6), `is_internal(addr, family)` (v4 RFC1918 + v6 ULA `fc00::/7` / link-local `fe80::/10`), `[u8;16]` distinct-host key; the BUG-032 allowlist was already family-aware (no change). **VM: v6 exfil → ENGAGED, v6 lateral (3 ULA hosts) → COMBAT (cross-family corroboration).** Linked to [[BUG-031]] |
 | 34 | BUG-040 | No **boot-time** warning when the host is IPv6-capable (`ip6tables` present) but `combat-rules.v6` is absent — the operator only learns of the v6 isolation hole at COMBAT-engage time, mid-incident *(surfaced designing BUG-031, §41)* | Enhancement (LOW, operational) | **Filed 2026-06-02** — natural fit beside the existing `preflight()` (BUG-036): a boot WARN (not refuse) when `ip6tables` exists / v6 is enabled but the v6 ruleset is missing, so the misconfig surfaces before an attack. Kept OUT of block 2. Linked to [[BUG-031]] |
 | 35 | BUG-041 | COMBAT engage **replaced** the `filter` table (`{ip,ip6}tables-restore` flush-by-default); teardown removed only `NORTHNARROW_COMBAT`, so an operator's **pre-existing custom firewall rules were lost across a COMBAT cycle** — on BOTH v4 and v6 *(pre-existing; surfaced by [[BUG-031]] symmetry, §42)* | **MEDIUM (potential beta-blocker — production hosts often have custom rules)** | **FIXED + VM-VERIFIED 2026-06-02** — **ADDITIVE**: engage via `{ip,ip6}tables-restore --noflush` (atomically rebuilds only our chain + `-I … 1` jumps on top; operator rules **preserved** beneath, **uncovered intact** at teardown). lo/NDP `RETURN`→`ACCEPT` so our chain is **terminal**; windowless jump-dedup; teardown/reconcile already additive. v4+v6. **VM (netns): operator rules survived beneath our jump during COMBAT (v4+v6), data DROPped + lo alive, teardown uncovered them intact, re-engage→exactly 1 jump.** Build+units green |
+| 36 | BUG-042 | **Production systemd unit's `CapabilityBoundingSet` wrong AND over-broad** — agent runs as **root** (no `User=`) so the set is its hard cap-ceiling; it silently dropped `CAP_LINUX_IMMUTABLE` (the anti-tamper `chattr +i`, falsely credited to `CAP_DAC_OVERRIDE` in the comment) and `CAP_SYS_PTRACE` (`/proc/<pid>/exe` lineage/quarantine), while carrying near-root `CAP_SYS_ADMIN` for BPF work `CAP_BPF`+`CAP_PERFMON` cover. Two agent defences silently absent in production — masked by an unbounded `systemd-run` smoke fixture *(surfaced provisioning T10.7 production-mode, §43)* | **HIGH (security — defence-in-depth silently disabled in production)** | **FIXED + VM-VERIFIED 2026-06-02** — **double win**: ADDED `CAP_LINUX_IMMUTABLE` (+i) + `CAP_SYS_PTRACE` (lineage) AND **dropped near-root `CAP_SYS_ADMIN`** (→ `CAP_PERFMON`; `CAP_MAC_ADMIN` not needed), shrinking blast radius. Kept+relabelled `CAP_DAC_OVERRIDE` (quarantine reach). Every cap A/B-proven load-bearing under real bounded units; comments rewritten. Linked to [[BUG-010]], [[BUG-031]] |
 
 ---
 
@@ -60,6 +61,20 @@ recommended fix directions.
 > Operational log of real-kernel (BPF-LSM) validation runs on `northnarrowdev`
 > (kernel `6.8.0-117-generic`, `lsm=...,bpf`). Records **what's live** on the VM
 > and the pass/fail of each smoke/fire gate. Newest first.
+
+### 2026-06-02 — BUG-042 capability validation, bounded transient units (fresh `target/release/northnarrow-agent`, branch `benchmark/cc-t7-13-fix`) — **PASS (corrected set proven load-bearing; near-root CAP_SYS_ADMIN dropped)**
+
+Provisioning T10.7 production-mode surfaced that the shipping unit's `CapabilityBoundingSet` had never been validated bounded. Smoke agent `nn-smoke-agent` stopped first (carve-out armed → graceful). Ran the fresh release binary `--no-ade --detect-only` (isolated `/tmp` socket + pidfile) under a sequence of `systemd-run` transient units with an explicit `CapabilityBoundingSet` (**real bounding**, NOT the unbounded smoke `systemd-run` that masked the gap) + `NoNewPrivileges=true`. Cleanup between runs (order matters): `systemctl stop` → `rm -rf /sys/fs/bpf/northnarrow` (unpin) → poll `bpftool` to 0 (RCU reclaim — the **pinned** `file_ioctl` deny-hook denies `chattr -i` until reclaimed; pins survive agent exit by design) → `chattr -iR /var/lib/northnarrow`.
+
+- **Run 1** `CAP_BPF` (+NET/IMM/PTRACE/DAC, no SYS_ADMIN): agent **exits** — `BPF_PROG_LOAD` verifier-rejects `sched_process_exec` (tracing prog), `Operation not permitted`. → `CAP_BPF` alone insufficient.
+- **Run 2** exact current shipping set `CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE`: starts fully (17 LSM progs, FIM 8/8, admin socket listening, live process-exec detection) **BUT** `chattr +i failed — FS_IOC_SETFLAGS`, no `i` bit → **+i NEGATIVE control** (the shipping unit silently loses the immutable defence-in-depth in production).
+- **Run 3** full corrected set: full startup + `anti-tamper FS: chattr +i applied`, `lsattr` shows `i` → **+i POSITIVE**; no `/proc/exe` denials (`CAP_SYS_PTRACE` present).
+- **Run M2** `CAP_BPF CAP_PERFMON CAP_MAC_ADMIN` (no SYS_ADMIN): full startup, 17 progs, +i applied → `CAP_SYS_ADMIN` replaceable.
+- **Run M3** `CAP_BPF CAP_PERFMON` (no MAC_ADMIN, no SYS_ADMIN): full startup, **all 17 progs attach** (tracing + LSM deny hooks `task_kill`/`ptrace_access_check`/`inode_*` + FIM observe 8/8) → **`CAP_MAC_ADMIN` not needed either**; minimal BPF/LSM caps = `CAP_BPF`+`CAP_PERFMON` (BPF-LSM attach gates on `perfmon_capable()` on 6.8, same BTF-attach path as tracing).
+- **/proc/exe A/B** (bounded `readlink` of a cross-uid `/proc/<pid>/exe`, target uid `systemd-network`): old set → exit 1 (fail); +`CAP_SYS_PTRACE` → exit 0. (Even same-uid pid-1 fails without it — non-dumpable target.)
+- **COMBAT A/B** (netns): `{ip,ip6}tables-restore --noflush` bounded to `CAP_NET_ADMIN` → exit 0, `NORTHNARROW_COMBAT` present (v4 `lo`-ACCEPT→DROP; v6 16-rule preserve-NDP); bounded without it → `Permission denied (you must be root)`, exit 4.
+
+**Verdict: PASS.** Final set `CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE` — both missing defences restored AND near-root `CAP_SYS_ADMIN` dropped (blast-radius shrink, same diagnosis). Committed as BUG-042 (unit-file + catalog; no agent code change). **Live VM state after:** corrected unit NOT installed standalone (lands as the first piece of T10.7 V1's `bootstrap-target-prod`); smoke agent restarted for interim dev; bpffs + state-dir `+i` cleaned between runs.
 
 ### 2026-05-31 — Smoke test, commit `33cb91e` (FIM redesign BUG-022/023 + BUG-026 chainlog) — **GATE FAILED (boot hang — root cause: BUG-026 `RotatingChainLog::open` full-scans a 1.7 GB legacy log; ~129 s)**
 
@@ -1532,6 +1547,31 @@ Implementation (v4 + v6, symmetric):
 - **teardown / reconcile UNCHANGED** — already additive (remove only our chain + jumps); now they genuinely *uncover* the preserved operator rules.
 
 **Related:** [[BUG-031]] (the v6 mirror that surfaced the symmetry). Completes the COMBAT-trust triad: precise ([[BUG-032]]) + complete ([[BUG-031]]/[[BUG-039]]) + non-destructive (this).
+
+---
+
+## 43. BUG-042 — production systemd unit's CapabilityBoundingSet wrong AND over-broad (two defences silently disabled; masked by an unbounded smoke fixture)
+
+**Severity:** HIGH (security — defence-in-depth silently disabled in production). **Filed + FIXED + VM-VERIFIED:** 2026-06-02, provisioning T10.7 production-mode.
+
+**The point.** The agent runs as **root with no `User=`**, so `deploy/systemd/northnarrow-agent.service`'s `CapabilityBoundingSet` is the *hard ceiling* on its effective caps — a cap not listed is dropped **even from root**. The shipping set `CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE` was wrong three ways:
+
+- **`CAP_LINUX_IMMUTABLE` MISSING.** The anti-tamper `chattr +i` on `/var/lib/northnarrow` (`anti_tamper/filesystem.rs`, `FS_IOC_SETFLAGS|FS_IMMUTABLE_FL`) needs it. The unit comment falsely credited `CAP_DAC_OVERRIDE` for `+i`. Under the real bounded unit the agent logs `chattr +i failed — LSM still protects, but the kernel immutable check is unavailable` and runs **LSM-only** — the kernel-immutable belt of the belt-and-suspenders silently gone.
+- **`CAP_SYS_PTRACE` MISSING.** `readlink /proc/<pid>/exe` in `posture/lineage.rs` (auth-session / sudo correlation), `posture/exempt.rs`, and `response/quarantine.rs`. `ptrace_may_access` denies this to root for a **cross-uid OR non-dumpable** target without the cap, so sudo-lineage correlation + quarantine target-resolution silently degrade.
+- **`CAP_SYS_ADMIN` over-broad.** Carried "for compat"; it is the near-root cap (mount, arbitrary admin). The agent's BPF work — tracing-program load *and* BPF-LSM attach — is covered on 6.8 by `CAP_BPF` + `CAP_PERFMON` (both gate on `perfmon_capable()`; LSM uses the same BTF-attach path).
+
+**Why it was masked.** This session's smoke agent ran via `systemd-run` **without** a `CapabilityBoundingSet` → `CapEff=000001ffffffffff` (all 40 caps). Every privileged path "worked," hiding both gaps. This is exactly the fixture-masks-wiring class T10.7 production-mode validation exists to catch: an over-privileged synthetic harness passing where the real bounded unit fails.
+
+**Fix — a double win from one diagnosis.** The same pass both **restored the two missing defences** (`+i`, lineage) AND **shrank the blast radius** by dropping near-root `CAP_SYS_ADMIN` for the narrow `CAP_PERFMON` — more secure *and* more functional. Final: `CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE`, with every per-cap comment rewritten to its real, verified purpose (comments are forensic records; the old ones were false). `CAP_DAC_OVERRIDE` kept (Forty's call) + relabelled: its only genuine consumer is quarantine read+unlink of a malicious binary in a **non-root, restrictive-perm** dir (`response/quarantine.rs` `fs::remove_file`); NOT `+i`, NOT FIM (all 125 watched paths are root-owned → read by ownership).
+
+**Proven load-bearing** — each cap A/B-tested under bounded `systemd-run` transient units on kernel 6.8.0-117 (NOT the unbounded smoke `systemd-run`); full run log in the VM Validation Log (2026-06-02):
+
+- **+i**: full set → `chattr +i applied` (`lsattr` shows `i`); shipping set (no `CAP_LINUX_IMMUTABLE`) → `chattr +i failed`, no `i`.
+- **/proc/exe**: cross-uid `readlink /proc/<pid>/exe` → exit 1 under the old set, exit 0 with `CAP_SYS_PTRACE`.
+- **COMBAT**: `{ip,ip6}tables-restore --noflush` → exit 0 bounded to `CAP_NET_ADMIN` (chain present, v4 + v6), `Permission denied` exit 4 without it (netns).
+- **SYS_ADMIN minimization**: `CAP_BPF` alone EPERMs the `BPF_PROG_LOAD` of `sched_process_exec`; `CAP_BPF`+`CAP_PERFMON` attaches **all 17 progs** (tracing + BPF-LSM deny + FIM observe) with **no `CAP_SYS_ADMIN` and no `CAP_MAC_ADMIN`**.
+
+**Owned limits (not fixed here).** Quarantine's reach into sticky `/tmp` + its `chmod 000` fallback also want `CAP_FOWNER` (deliberately not added — quarantine reach already partial). Separately, the unit's `ProtectHome=read-only` comment claims `/home` FIM watches, but `fim-paths.v1` has none (all root-owned) — stale comment, doc-hygiene only. **Related:** [[BUG-010]] (the `+i` / LSM-deny defences this re-enables), [[BUG-031]] (`CAP_NET_ADMIN` / COMBAT).
 
 ---
 
