@@ -709,6 +709,73 @@ fn agent_self_writes_still_exempt() {
     assert_eq!(m.current_kind(), PostureKind::Observing);
 }
 
+// ─── (ii) — system package-management daemon exemption, end-to-end ──
+//
+// The 2026-06-02 self-lock: snapd's refresh did a mass-write burst on
+// /var/lib/snapd/state.json (ConfirmedIntrusion → ENGAGED) AND wrote a
+// systemd mount unit (PersistenceMechanism); the two distinct signals
+// corroborated to COMBAT. (ii) exempts the daemon from BOTH arms — but
+// the identical shape from a non-daemon pid must still reach COMBAT.
+
+/// snapd's normal refresh (mass-write + unit write) must NOT escalate.
+#[test]
+fn snapd_refresh_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    // snapd daemon spawned by systemd (pid 1).
+    assert!(m
+        .observe(&spawn(1096, 1, "snapd", "/usr/lib/snapd/snapd", 1), &[])
+        .is_none());
+
+    // 1. 25 atomic state.json rewrites in-window (mass-write arm).
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 100))
+        .collect();
+    let focal = file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_none(), "snapd mass-write must NOT transition: {r:?}");
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // 2. snapd writes its mount unit (persistence arm) — the original
+    //    corroborating signal that pushed ENGAGED → COMBAT.
+    let unit = file_open(1096, 0, "/etc/systemd/system/snap-snapd-26865.mount", 1, 300);
+    let r = m.observe(&unit, &[]);
+    assert!(r.is_none(), "snapd unit write must NOT transition: {r:?}");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Observing,
+        "(ii) did not hold — snapd refresh still escalated"
+    );
+}
+
+/// Detection intact: the IDENTICAL mass-write + persistence pair from a
+/// NON-daemon pid must still corroborate to COMBAT.
+#[test]
+fn non_daemon_masswrite_plus_persistence_reaches_combat() {
+    let m = machine_with_isolated_auth();
+    // Non-daemon writer, clean lineage (parent = init).
+    let _ = m.observe(&spawn(900, 1, "cryptor", "/usr/local/bin/cryptor", 1), &[]);
+
+    // 1. mass-write → ConfirmedIntrusion → ENGAGED (seeds the ledger).
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(900, 1000, "/home/u/docs/f", 1, i + 100))
+        .collect();
+    let focal = file_open(900, 1000, "/home/u/docs/f", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_some(), "non-daemon mass-write must transition");
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    // 2. persistence (systemd unit drop) → PersistenceMechanism; with
+    //    ConfirmedIntrusion still in the ledger (distinct) → COMBAT.
+    let unit = file_open(900, 0, "/etc/systemd/system/evil.service", 1, 300);
+    let r = m.observe(&unit, &[]);
+    assert!(r.is_some(), "persistence must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Combat,
+        "non-daemon mass-write + persistence must corroborate to COMBAT"
+    );
+}
+
 /// Required A10 test 4: same-state transition is a no-op — no
 /// `last_admin_action` timestamp recorded, no log transition
 /// added, no hook fires. Anchors the §12.2 design contract that

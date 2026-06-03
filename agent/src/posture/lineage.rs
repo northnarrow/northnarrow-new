@@ -81,6 +81,35 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
     "/usr/sbin/sshd",
 ];
 
+/// Hard-coded allowlist of system package-management / cache-refresh
+/// daemon exec paths whose mass-write + persistence writes are routine
+/// maintenance, not adversarial. Same exe-path keying as
+/// [`AUTH_BINARY_EXES`] (kernel-resolved `/proc/<pid>/exe`, NEVER comm).
+/// Exact ELF exec paths only — sorted for review legibility.
+///
+/// Deliberately excluded: `/usr/bin/snap` (the *daemon*
+/// `/usr/lib/snapd/snapd` does the writes; the CLI talks over a socket),
+/// `/usr/bin/unattended-upgrade` (a Python *script* → `/proc/<pid>/exe`
+/// is the interpreter, so an exact entry would never fire; its package
+/// writes go through `dpkg`/`apt` children, covered by the ancestry
+/// walk), and the apt transport methods (`/usr/lib/apt/methods/*`,
+/// children of `apt`/`apt-get`).
+///
+/// SECURITY: a lineage match suppresses the mass-write arm of
+/// [`super::triggers::confirmed_intrusion`] AND
+/// [`super::triggers::persistence_mechanism`]. Compromise OF one of
+/// these binaries (root + write to a FIM/fs-protect-guarded system dir)
+/// inherits the exemption — the same trust boundary as
+/// [`AUTH_BINARY_EXES`]. Keep tight; add the most-specific exec path,
+/// never a directory.
+pub const SYSTEM_DAEMON_EXES: &[&str] = &[
+    "/usr/bin/apt",
+    "/usr/bin/apt-get",
+    "/usr/bin/dpkg",
+    "/usr/bin/mandb",
+    "/usr/lib/snapd/snapd",
+];
+
 /// Bounded FIFO cap for the in-memory pid→Entry map. At ~64 bytes
 /// per entry (pid + ppid + spawn_ns + short PathBuf) the cap is
 /// ~128 KiB worst case — comfortably inside the agent's per-task
@@ -224,16 +253,36 @@ impl AuthSessionTracker {
         }
     }
 
-    /// Walk the lineage of `pid` upward through (ppid, exe) pairs
-    /// and return true if any ancestor's exe matches
-    /// [`AUTH_BINARY_EXES`]. Cache miss falls back to
-    /// `/proc/<pid>/exe` (symlink read, kernel-resolved) plus
-    /// `/proc/<pid>/status` `PPid:` parsing. Capped at
-    /// [`LINEAGE_DEPTH_CAP`] hops to bound the worst-case cost.
-    ///
-    /// PIDs 0 and 1 (kernel / init) are never auth-mediated and
-    /// are an unconditional terminator.
+    /// True iff `pid` or any ancestor's exe is a canonical setuid
+    /// administration binary ([`AUTH_BINARY_EXES`]). Thin wrapper over
+    /// [`Self::lineage_exe_matches`] — behaviour is byte-identical to the
+    /// pre-refactor inline walk.
     pub fn is_auth_mediated(&self, pid: u32) -> bool {
+        self.lineage_exe_matches(pid, is_auth_binary)
+    }
+
+    /// True iff `pid` or any ancestor's exe is a known system
+    /// package-management / cache-refresh daemon ([`SYSTEM_DAEMON_EXES`]).
+    /// Same kernel-resolved `/proc/<pid>/exe` keying as
+    /// [`Self::is_auth_mediated`] — `comm` is never consulted
+    /// (`prctl(PR_SET_NAME)`-spoofable). Used by the mass-write arm of
+    /// [`super::triggers::confirmed_intrusion`] and by
+    /// [`super::triggers::persistence_mechanism`] to exempt routine
+    /// snapd / dpkg / apt / mandb maintenance from escalation.
+    pub fn is_system_daemon_mediated(&self, pid: u32) -> bool {
+        self.lineage_exe_matches(pid, is_system_daemon_binary)
+    }
+
+    /// Walk the lineage of `pid` upward through (ppid, exe) pairs and
+    /// return true if any hop's exe satisfies `is_match`. Cache miss
+    /// falls back to `/proc/<pid>/exe` (symlink read, kernel-resolved)
+    /// plus `/proc/<pid>/status` `PPid:` parsing. Capped at
+    /// [`LINEAGE_DEPTH_CAP`] hops to bound the worst-case cost. PIDs 0
+    /// and 1 (kernel / init) never match and are an unconditional
+    /// terminator. Shared by [`Self::is_auth_mediated`] and
+    /// [`Self::is_system_daemon_mediated`] so both use the identical,
+    /// non-forgeable walk.
+    fn lineage_exe_matches(&self, pid: u32, is_match: impl Fn(&Path) -> bool) -> bool {
         if pid == 0 || pid == 1 {
             return false;
         }
@@ -252,7 +301,7 @@ impl AuthSessionTracker {
                     None => return false,
                 },
             };
-            if is_auth_binary(&exe) {
+            if is_match(&exe) {
                 return true;
             }
             if ppid == 0 || ppid == 1 || ppid == cur {
@@ -343,6 +392,11 @@ fn is_auth_binary(exe: &Path) -> bool {
     AUTH_BINARY_EXES.iter().any(|p| s == *p)
 }
 
+fn is_system_daemon_binary(exe: &Path) -> bool {
+    let s = exe.to_string_lossy();
+    SYSTEM_DAEMON_EXES.iter().any(|p| s == *p)
+}
+
 /// Extract the `PPid: <n>` value from a `/proc/<pid>/status` body.
 fn parse_ppid(status_text: &str) -> Option<u32> {
     for line in status_text.lines() {
@@ -424,6 +478,68 @@ mod tests {
         t.ingest_spawn(100, 50, "/usr/bin/sudo", 1);
         t.ingest_spawn(200, 100, "/usr/bin/apt", 2);
         assert!(t.is_auth_mediated(200));
+    }
+
+    // ── (ii) — system package-management daemon lineage ─────────────
+
+    #[test]
+    fn direct_snapd_daemon_is_system_daemon_mediated() {
+        let t = AuthSessionTracker::new("/proc");
+        // snapd daemon, parented by systemd (pid 1).
+        t.ingest_spawn(1096, 1, "/usr/lib/snapd/snapd", 1);
+        assert!(t.is_system_daemon_mediated(1096));
+        // Disjoint from the auth allowlist — snapd is not a setuid admin
+        // binary, so it must NOT also read as auth-mediated.
+        assert!(!t.is_auth_mediated(1096));
+    }
+
+    #[test]
+    fn mandb_is_system_daemon_mediated() {
+        let t = AuthSessionTracker::new("/proc");
+        t.ingest_spawn(3096, 1, "/usr/bin/mandb", 1);
+        assert!(t.is_system_daemon_mediated(3096));
+    }
+
+    #[test]
+    fn dpkg_maintainer_script_is_system_daemon_mediated_via_lineage() {
+        let t = AuthSessionTracker::new("/proc");
+        // dpkg -> /bin/sh maintainer script: exempt via the dpkg ancestor.
+        t.ingest_spawn(400, 1, "/usr/bin/dpkg", 1);
+        t.ingest_spawn(401, 400, "/bin/sh", 2);
+        assert!(t.is_system_daemon_mediated(401));
+    }
+
+    #[test]
+    fn non_daemon_pid_is_not_system_daemon_mediated() {
+        let t = AuthSessionTracker::new("/proc");
+        // A Python interpreter — how `unattended-upgrade` actually
+        // resolves via /proc/<pid>/exe — is NOT in the allowlist (exact
+        // exec-path match, never comm/argv). Nor is a plain shell.
+        t.ingest_spawn(200, 50, "/usr/bin/python3.12", 1);
+        t.ingest_spawn(50, 1, "/bin/bash", 0);
+        assert!(!t.is_system_daemon_mediated(200));
+    }
+
+    #[test]
+    fn sudo_pid_is_not_system_daemon_mediated() {
+        // Cross-grant guard: an auth-mediated (sudo) PID must NOT be
+        // treated as a system daemon. The two allowlists are disjoint.
+        let t = AuthSessionTracker::new("/proc");
+        t.ingest_spawn(100, 50, "/usr/bin/sudo", 1);
+        assert!(t.is_auth_mediated(100));
+        assert!(!t.is_system_daemon_mediated(100));
+    }
+
+    #[test]
+    fn system_daemon_cold_start_falls_back_to_proc() {
+        let tmp = TempDir::new().unwrap();
+        let proc_root = tmp.path();
+        // pid 124 -> exe /usr/bin/dpkg, ppid=1, with an EMPTY cache so
+        // the walk must reconstruct from the /proc fixture.
+        write_exe(proc_root, 124, "/usr/bin/dpkg");
+        write_status(proc_root, 124, 1);
+        let t = AuthSessionTracker::new(proc_root);
+        assert!(t.is_system_daemon_mediated(124));
     }
 
     #[test]

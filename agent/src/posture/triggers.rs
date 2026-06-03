@@ -331,7 +331,7 @@ impl TriggerDetector {
         if confirmed_intrusion(event, recent, &self.auth, &self.mass_write_extras) {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
-        if persistence_mechanism(event) {
+        if persistence_mechanism(event, &self.auth) {
             hits.push(TriggerType::PersistenceMechanism);
         }
         if lateral_movement(event, recent, &self.escalation_allow) {
@@ -631,12 +631,16 @@ fn confirmed_intrusion(
             if is_mass_write_carveout(focal_filename, mass_write_extras) {
                 return false;
             }
-            // T7.13 — auth-mediated PIDs (sudo, sudo's children:
-            // apt, systemctl, an editor, …) routinely exceed the
-            // mass-write threshold during legitimate administration.
-            // Only the mass-write arm is gated; FsProtectDenial and
-            // exec-from-/tmp above still fire for auth-mediated PIDs.
-            if auth.is_auth_mediated(*focal_pid) {
+            // T7.13 — auth-mediated PIDs (sudo + its children: apt,
+            // systemctl, an editor, …) routinely exceed the mass-write
+            // threshold during legitimate administration.
+            // (ii) — system package-management daemons (snapd, dpkg,
+            // apt, mandb) atomic-churn state files / caches well past
+            // the threshold during routine maintenance; same exe-path
+            // lineage keying. Only the mass-write arm is gated here;
+            // FsProtectDenial and exec-from-/tmp above still fire for
+            // these PIDs.
+            if auth.is_auth_mediated(*focal_pid) || auth.is_system_daemon_mediated(*focal_pid) {
                 return false;
             }
             let mut count = 1usize;
@@ -688,9 +692,12 @@ fn confirmed_intrusion(
     false
 }
 
-fn persistence_mechanism(focal: &Event) -> bool {
+fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
     let Event::FileOpen {
-        filename, flags, ..
+        pid,
+        filename,
+        flags,
+        ..
     } = focal
     else {
         return false;
@@ -698,9 +705,23 @@ fn persistence_mechanism(focal: &Event) -> bool {
     if !is_write_open(*flags) {
         return false;
     }
-    PERSISTENCE_PREFIXES
+    if !PERSISTENCE_PREFIXES
         .iter()
         .any(|p| filename == p || filename.starts_with(p))
+    {
+        return false;
+    }
+    // (ii) — package managers legitimately install/refresh systemd
+    // units, cron entries and init scripts (e.g. snapd writing
+    // /etc/systemd/system/snap-*.mount on refresh). Gate ONLY on
+    // system-daemon lineage — NOT auth-mediated: a manual
+    // `sudo systemctl edit` / hand-dropped unit STILL raises
+    // PersistenceMechanism (keeps the persistence exemption tight to
+    // package daemons; an attacker holding sudo gets no free pass here).
+    if auth.is_system_daemon_mediated(*pid) {
+        return false;
+    }
+    true
 }
 
 fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList) -> bool {
@@ -1326,6 +1347,118 @@ mod tests {
         assert!(
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "unattributed mass-write must still fire, got {hits:?}"
+        );
+    }
+
+    // ── (ii) — system package-management daemon exemption ───────────
+    //
+    // snapd / dpkg / apt / mandb cross the mass-write threshold (atomic
+    // state churn, cache rebuilds) AND write systemd units / cron entries
+    // (package install) during normal maintenance. Both arms exempt them
+    // via exe-path lineage; detection stays intact for non-daemon writers.
+
+    #[test]
+    fn mass_write_exempt_for_snapd_daemon() {
+        let det = detector_with_empty_proc();
+        // snapd daemon parented by systemd — the 2026-06-02 self-lock.
+        let _ = det.detect(&spawn_with_exe(1096, 1, "/usr/lib/snapd/snapd", 1), &[]);
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 10))
+            .collect();
+        let focal = file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "snapd state.json churn must NOT trip ConfirmedIntrusion, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_exempt_for_mandb() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(3096, 1, "/usr/bin/mandb", 1), &[]);
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(3096, 0, "/var/cache/man/de/3096", 1, i + 10))
+            .collect();
+        let focal = file_open(3096, 0, "/var/cache/man/de/3096", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "mandb cache rebuild must NOT trip ConfirmedIntrusion, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_exempt_for_dpkg_maintainer_script_via_lineage() {
+        let det = detector_with_empty_proc();
+        // dpkg -> /bin/sh maintainer script: exempt via the dpkg ancestor.
+        let _ = det.detect(&spawn_with_exe(400, 1, "/usr/bin/dpkg", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(401, 400, "/bin/sh", 2), &[]);
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(401, 0, "/usr/share/foo/data", 1, i + 10))
+            .collect();
+        let focal = file_open(401, 0, "/usr/share/foo/data", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "dpkg maintainer-script writes must NOT trip via lineage, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_intact_for_non_daemon_pid() {
+        // Detection intact: a non-daemon, non-auth writer doing the same
+        // burst still fires. Guards against a blanket mass-write blind spot.
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(900, 1, "/usr/local/bin/cryptor", 1), &[]);
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(900, 1000, "/home/u/docs/f", 1, i + 10))
+            .collect();
+        let focal = file_open(900, 1000, "/home/u/docs/f", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "non-daemon mass-write must still fire, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn persistence_exempt_for_snapd_unit_write() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(1096, 1, "/usr/lib/snapd/snapd", 1), &[]);
+        let focal = file_open(1096, 0, "/etc/systemd/system/snap-snapd-26865.mount", 1, 5);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            !hits.contains(&TriggerType::PersistenceMechanism),
+            "snapd mount-unit write must NOT trip PersistenceMechanism, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn persistence_intact_for_non_daemon_unit_write() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(900, 1, "/usr/local/bin/cryptor", 1), &[]);
+        let focal = file_open(900, 0, "/etc/systemd/system/evil.service", 1, 5);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::PersistenceMechanism),
+            "non-daemon unit drop must still fire PersistenceMechanism, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn persistence_intact_for_sudo_mediated_write() {
+        // Scoping decision: persistence gates on system-daemon lineage
+        // ONLY — NOT auth-mediated. A sudo-mediated hand-dropped cron
+        // entry STILL raises PersistenceMechanism (sudo is no free pass).
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(200, 100, "/bin/bash", 2), &[]);
+        let focal = file_open(200, 0, "/etc/cron.d/evil", 1, 5);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::PersistenceMechanism),
+            "sudo-mediated cron write must STILL fire persistence, got {hits:?}"
         );
     }
 
