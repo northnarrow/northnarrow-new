@@ -50,21 +50,65 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-/// Hard-coded allowlist of installed setuid/setgid binaries whose
-/// children we treat as auth-mediated. Covers Debian/Ubuntu,
-/// Fedora/RHEL, Arch, and openSUSE conventions for the canonical
-/// administrative escalation paths. Adding paths is a soft change
-/// (expands exemption); removing is a hard change (operators on a
-/// distro that uses only the removed path lose all sudo coverage).
+/// Hard-coded allowlist of installed authentication binaries whose
+/// children we treat as auth-mediated. Two classes live here:
+///
+///   1. **setuid/setgid escalation binaries** (sudo, su, doas, pkexec,
+///      passwd, …) — a regular user invokes them and their PAM stack
+///      reads `/etc/shadow`/`/etc/gshadow` while the kernel still sees
+///      the *caller's* uid (the LSM `file_open` hook fires before the
+///      setuid transition completes — the original T7.13 FP).
+///   2. **PAM-mediated authentication daemons** (sshd, login,
+///      systemd-logind, polkitd, cron/crond, gdm/lightdm). These run as
+///      root, so a read they perform *as root* is already covered by the
+///      `uid < 1000` gate in [`super::triggers::sensitive_file_access`].
+///      They are listed here for the harder case: a session/job child
+///      observed at the authenticating *user's* pre-setuid uid whose
+///      lineage walks back through the daemon (e.g. a `cron` job's PAM
+///      `session` open, a `gdm-session-worker` PAM `auth` open). Without
+///      the daemon in the allowlist that read is misread as an
+///      unexpected `uid >= 1000` credential access and escalates posture
+///      (the T7.13 class, generalised beyond `sudo`).
+///   3. **PAM setuid credential-verification helpers** (`unix_chkpwd`,
+///      `unix_update`). When an *unprivileged* PAM consumer (a screen
+///      locker, a display-manager greeter, a polkit prompt) verifies or
+///      changes a password it cannot read `/etc/shadow` itself, so
+///      `pam_unix` execs the setuid-root helper `unix_chkpwd`. The helper
+///      keeps the caller's *real* uid (the sensor reads the real uid via
+///      `bpf_get_current_uid_gid`, NOT euid/fsuid), so its `/etc/shadow`
+///      read is observed at `uid >= 1000` and is NOT caught by the
+///      `uid < 1000` gate — without it here, every screen-unlock /
+///      unprivileged-auth password check raises SensitiveFileAccess.
+///      (`sudo`/`su` dodge this because they are setuid-root and
+///      `pam_unix` reads shadow directly in-process — already covered by
+///      class 1.)
+///
+/// Covers Debian/Ubuntu, Fedora/RHEL, Arch, and openSUSE conventions for
+/// the canonical paths. Adding paths is a soft change (expands
+/// exemption); removing is a hard change (operators on a distro that
+/// uses only the removed path lose coverage). A path absent on a given
+/// host simply never matches — harmless.
+///
+/// SECURITY: matching is on the kernel-resolved, non-forgeable
+/// `/proc/<pid>/exe` (NEVER `comm`), exact-path only, and only suppresses
+/// the credential-read (`sensitive_file_access`) + mass-write arms —
+/// every kernel-adjudicated COMBAT trigger (FsProtectDenial, exec from
+/// `/tmp`, persistence, lateral, exfil) still fires. Compromise OF one of
+/// these binaries means root, which is outside the posture machine's
+/// threat model (the anti-tamper LSM is the defence there).
 ///
 /// Sorted alphabetically for review legibility; lookup is a linear
-/// scan over <30 entries, well under any per-event budget.
+/// scan over <40 entries, well under any per-event budget.
 pub const AUTH_BINARY_EXES: &[&str] = &[
     "/bin/login",
     "/bin/su",
     "/bin/sudo",
+    "/lib/systemd/systemd-logind",
+    "/sbin/unix_chkpwd",
+    "/sbin/unix_update",
     "/usr/bin/chfn",
     "/usr/bin/chsh",
+    "/usr/bin/crond",
     "/usr/bin/doas",
     "/usr/bin/gpasswd",
     "/usr/bin/login",
@@ -75,10 +119,24 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
     "/usr/bin/sudo",
     "/usr/bin/sudoedit",
     "/usr/bin/systemd-run",
+    "/usr/bin/unix_chkpwd",
+    "/usr/lib/gdm/gdm-session-worker",
+    "/usr/lib/gdm3/gdm-session-worker",
     "/usr/lib/polkit-1/polkit-agent-helper-1",
+    "/usr/lib/polkit-1/polkitd",
+    "/usr/lib/systemd/systemd-logind",
+    "/usr/libexec/gdm-session-worker",
     "/usr/libexec/openssh/sshd",
     "/usr/libexec/polkit-1/polkit-agent-helper-1",
+    "/usr/libexec/polkit-1/polkitd",
+    "/usr/sbin/cron",
+    "/usr/sbin/crond",
+    "/usr/sbin/gdm",
+    "/usr/sbin/gdm3",
+    "/usr/sbin/lightdm",
     "/usr/sbin/sshd",
+    "/usr/sbin/unix_chkpwd",
+    "/usr/sbin/unix_update",
 ];
 
 /// Hard-coded allowlist of system package-management / cache-refresh
@@ -671,9 +729,62 @@ mod tests {
         assert!(is_auth_binary(Path::new("/usr/bin/sudo")));
         assert!(is_auth_binary(Path::new("/usr/bin/sudoedit")));
         assert!(is_auth_binary(Path::new("/usr/sbin/sshd")));
+        // PAM-mediated login daemons (T7.13 generalisation).
+        assert!(is_auth_binary(Path::new("/usr/sbin/cron")));
+        assert!(is_auth_binary(Path::new("/usr/sbin/crond")));
+        assert!(is_auth_binary(Path::new("/usr/lib/systemd/systemd-logind")));
+        assert!(is_auth_binary(Path::new("/lib/systemd/systemd-logind")));
+        assert!(is_auth_binary(Path::new("/usr/lib/polkit-1/polkitd")));
+        assert!(is_auth_binary(Path::new("/usr/libexec/polkit-1/polkitd")));
+        assert!(is_auth_binary(Path::new("/usr/lib/gdm3/gdm-session-worker")));
+        assert!(is_auth_binary(Path::new("/usr/libexec/gdm-session-worker")));
+        assert!(is_auth_binary(Path::new("/usr/sbin/gdm3")));
+        assert!(is_auth_binary(Path::new("/usr/sbin/lightdm")));
         assert!(!is_auth_binary(Path::new("/tmp/sudo")));
         assert!(!is_auth_binary(Path::new("/usr/local/bin/sudo")));
         assert!(!is_auth_binary(Path::new("/usr/bin/sudo-helper")));
+        // Near-miss daemon paths must NOT match (exact-path only).
+        assert!(!is_auth_binary(Path::new("/usr/sbin/crony")));
+        assert!(!is_auth_binary(Path::new("/usr/lib/systemd/systemd")));
+        assert!(!is_auth_binary(Path::new("/tmp/polkitd")));
+    }
+
+    #[test]
+    fn cron_job_child_is_auth_mediated_via_lineage() {
+        let t = AuthSessionTracker::new("/proc");
+        // crond (root, ppid=1) -> user job shell. The PAM `session` open
+        // of /etc/shadow happens in a child observed at the user's uid;
+        // the lineage walk back to crond must exempt it.
+        t.ingest_spawn(500, 1, "/usr/sbin/cron", 1);
+        t.ingest_spawn(501, 500, "/bin/sh", 2);
+        assert!(t.is_auth_mediated(501));
+    }
+
+    #[test]
+    fn unix_chkpwd_screen_unlock_is_auth_mediated() {
+        let t = AuthSessionTracker::new("/proc");
+        // Unprivileged locker -> setuid-root pam_unix helper. The helper
+        // reads /etc/shadow at the caller's real uid; its own exe is the
+        // auth binary, so it is auth-mediated at hop 0.
+        t.ingest_spawn(700, 1, "/usr/bin/cinnamon-screensaver", 1);
+        t.ingest_spawn(701, 700, "/usr/sbin/unix_chkpwd", 2);
+        assert!(t.is_auth_mediated(701));
+        // Exact-path recognition across distro locations.
+        assert!(is_auth_binary(Path::new("/usr/sbin/unix_chkpwd")));
+        assert!(is_auth_binary(Path::new("/usr/bin/unix_chkpwd")));
+        assert!(is_auth_binary(Path::new("/sbin/unix_chkpwd")));
+        assert!(is_auth_binary(Path::new("/usr/sbin/unix_update")));
+        assert!(!is_auth_binary(Path::new("/tmp/unix_chkpwd")));
+    }
+
+    #[test]
+    fn gdm_session_worker_child_is_auth_mediated_via_lineage() {
+        let t = AuthSessionTracker::new("/proc");
+        // gdm daemon -> gdm-session-worker (the PAM stack runner) -> child.
+        t.ingest_spawn(600, 1, "/usr/sbin/gdm3", 1);
+        t.ingest_spawn(601, 600, "/usr/lib/gdm3/gdm-session-worker", 2);
+        t.ingest_spawn(602, 601, "/bin/bash", 3);
+        assert!(t.is_auth_mediated(602));
     }
 
     // ── BUG-018 (tactical): loginuid signal tests ──────────────────

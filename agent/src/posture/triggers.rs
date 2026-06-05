@@ -121,11 +121,20 @@ const ADMIN_PORTS: &[u16] = &[22, 3389, 445, 5985, 5986];
 /// the FIM `Opened` event for it is dropped at the drain layer
 /// (`fim::drain::process_drift` drops every read on a non-credential
 /// path — see BUG-012 v2) to kill the boot-time noise; without this
-/// entry, `/etc/login.defs` reads would lose ALL coverage. The other
-/// three entries were already covered (T7.13 baseline).
+/// entry, `/etc/login.defs` reads would lose ALL coverage.
+///
+/// `/etc/gshadow` (group shadow — hashed group passwords) is the
+/// group-credential counterpart of `/etc/shadow`; the same auth stack
+/// (`pam_unix`, `gpasswd`, `newgrp`) reads it. It is monitored for the
+/// same reason as `/etc/shadow`: an unexpected `uid >= 1000` reader is
+/// a credential-theft signal. Legitimate auth binaries reading it are
+/// suppressed by the SAME auth-lineage gate that protects `/etc/shadow`
+/// (see [`sensitive_file_access`]), so adding it here does NOT
+/// re-introduce the T7.13 FP for sudo/sshd/login/etc.
 const SENSITIVE_FILES: &[&str] = &[
     "/etc/passwd",
     "/etc/shadow",
+    "/etc/gshadow",
     "/etc/sudoers",
     "/etc/login.defs",
 ];
@@ -352,7 +361,10 @@ fn within(focal_ts: u64, ts: u64, window_ns: u64) -> bool {
 /// PID an event is attributed to, for self-exclusion. Variants the
 /// agent itself never originates (e.g. `CanaryTripped`, `NetFlow`,
 /// `NetListener`) return `None` so they are never filtered.
-fn event_owner_pid(event: &Event) -> Option<u32> {
+/// PID that "owns" an event — the actor whose behaviour the event
+/// attributes. Exposed so the COMBAT ladder can attribute the offending
+/// process from the focal event that drove the COMBAT transition.
+pub fn event_owner_pid(event: &Event) -> Option<u32> {
     match event {
         Event::ProcessSpawn { pid, .. }
         | Event::FileOpen { pid, .. }
@@ -498,13 +510,19 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     if *uid < 1000 {
         return false;
     }
-    // T7.13 — sudo's PAM auth chain opens /etc/shadow under the
-    // caller's uid (the LSM file_open hook fires BEFORE the kernel
-    // completes the setuid transition). Without this gate every
-    // `sudo <anything>` invocation by a regular user trips
-    // SensitiveFileAccess. We trust an auth-mediated PID (sudo, su,
-    // sshd, pkexec, …) to read these files — verified via the
-    // kernel-resolved /proc/<pid>/exe symlink, not forgeable comm.
+    // T7.13 — an authentication chain opens /etc/shadow (or
+    // /etc/gshadow) under the caller's uid: the LSM file_open hook can
+    // fire BEFORE the kernel completes the setuid transition (sudo, su,
+    // pkexec, passwd) or while a PAM-mediated session/job child is still
+    // at the authenticating user's uid (a cron job, a gdm-session-worker
+    // PAM open). Without this gate every `sudo <anything>` — and every
+    // cron/login/display-manager PAM auth — trips SensitiveFileAccess and
+    // escalates a healthy host. We trust a PID whose lineage walks back to
+    // a canonical auth binary or PAM daemon (sudo, su, sshd, login,
+    // systemd-logind, polkitd, cron/crond, gdm/lightdm, …) — verified via
+    // the kernel-resolved /proc/<pid>/exe symlink, NEVER the forgeable
+    // comm. Unexpected readers (cat, less, cp, a /tmp binary, a shell
+    // one-liner) have no such ancestor and still fire below.
     if auth.is_auth_mediated(*pid) {
         return false;
     }
@@ -1309,6 +1327,113 @@ mod tests {
             let hits = det.detect(&focal, &[]);
             assert!(!hits.contains(&TriggerType::SensitiveFileAccess));
         }
+    }
+
+    // ── T7.13 generalisation: PAM-daemon login chains are exempt ────
+    //
+    // Beyond sudo (Test #1), the auth-lineage gate must also exempt the
+    // credential reads a PAM-mediated login daemon performs on behalf of
+    // an authenticating user, observed at that user's pre-setuid uid. Each
+    // case: a leaf PID whose lineage walks back to the daemon reads
+    // /etc/shadow under uid=1000 and must NOT trip SensitiveFileAccess.
+    #[test]
+    fn sensitive_file_access_exempt_for_pam_daemon_lineage() {
+        let daemons = [
+            "/usr/sbin/cron",
+            "/usr/sbin/crond",
+            "/usr/lib/systemd/systemd-logind",
+            "/usr/lib/polkit-1/polkitd",
+            "/usr/libexec/polkit-1/polkitd",
+            "/usr/lib/gdm3/gdm-session-worker",
+            "/usr/libexec/gdm-session-worker",
+            "/usr/sbin/gdm3",
+            "/usr/sbin/lightdm",
+        ];
+        for (i, daemon) in daemons.iter().enumerate() {
+            let det = detector_with_empty_proc();
+            let dpid = 1000 + (i as u32) * 2;
+            let leaf = dpid + 1;
+            // daemon (root, ppid=1) -> PAM session/job child (a shell).
+            let _ = det.detect(&spawn_with_exe(dpid, 1, daemon, 1), &[]);
+            let _ = det.detect(&spawn_with_exe(leaf, dpid, "/bin/bash", 2), &[]);
+            // child reads /etc/shadow at the authenticating user's uid.
+            let focal = file_open(leaf, 1000, "/etc/shadow", 0, 3);
+            let hits = det.detect(&focal, &[]);
+            assert!(
+                !hits.contains(&TriggerType::SensitiveFileAccess),
+                "{daemon}-mediated /etc/shadow read must NOT trip, got {hits:?}"
+            );
+        }
+    }
+
+    /// Screen-unlock / unprivileged-auth path: an unprivileged locker
+    /// (uid 1000) cannot read /etc/shadow, so pam_unix execs the
+    /// setuid-root helper unix_chkpwd, which reads it at the caller's
+    /// REAL uid (1000 — the sensor captures real uid, not euid). The
+    /// helper's own exe is the auth binary; without it here every screen
+    /// unlock would trip SensitiveFileAccess.
+    #[test]
+    fn sensitive_file_access_exempt_for_unix_chkpwd_screen_unlock() {
+        let det = detector_with_empty_proc();
+        // locker -> setuid pam_unix helper.
+        let _ = det.detect(
+            &spawn_with_exe(700, 1, "/usr/bin/cinnamon-screensaver", 1),
+            &[],
+        );
+        let _ = det.detect(&spawn_with_exe(701, 700, "/usr/sbin/unix_chkpwd", 2), &[]);
+        let focal = file_open(701, 1000, "/etc/shadow", 0, 3);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            !hits.contains(&TriggerType::SensitiveFileAccess),
+            "unix_chkpwd (screen-unlock) /etc/shadow read must NOT trip, got {hits:?}"
+        );
+    }
+
+    // ── /etc/gshadow is monitored symmetrically with /etc/shadow ────
+    /// An unexpected uid>=1000 reader of /etc/gshadow trips the trigger
+    /// (group-credential theft is the same signal class as /etc/shadow).
+    #[test]
+    fn sensitive_file_access_fires_on_gshadow_for_unexpected_reader() {
+        let det = detector_with_empty_proc();
+        let focal = file_open(999, 1000, "/etc/gshadow", 0, 1);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "non-auth uid=1000 /etc/gshadow read must trip, got {hits:?}"
+        );
+    }
+
+    /// …but a sudo-mediated /etc/gshadow read is exempt by the SAME
+    /// lineage gate that protects /etc/shadow — no T7.13 regression from
+    /// adding gshadow to the monitored set.
+    #[test]
+    fn sensitive_file_access_exempt_for_sudo_reading_gshadow() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
+        let focal = file_open(100, 1000, "/etc/gshadow", 0, 2);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            !hits.contains(&TriggerType::SensitiveFileAccess),
+            "sudo-mediated /etc/gshadow read must NOT trip, got {hits:?}"
+        );
+    }
+
+    /// Negative control for the expanded daemon allowlist: an unexpected
+    /// reader whose lineage is a plain shell (no auth ancestor anywhere)
+    /// STILL fires — widening the allowlist must not weaken detection of
+    /// real credential theft (the cat/less/cp/one-liner class).
+    #[test]
+    fn sensitive_file_access_still_fires_for_shell_one_liner() {
+        let det = detector_with_empty_proc();
+        // user shell -> cat; neither is an auth binary.
+        let _ = det.detect(&spawn_with_exe(800, 1, "/usr/bin/bash", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(801, 800, "/usr/bin/cat", 2), &[]);
+        let focal = file_open(801, 1000, "/etc/shadow", 0, 3);
+        let hits = det.detect(&focal, &[]);
+        assert!(
+            hits.contains(&TriggerType::SensitiveFileAccess),
+            "cat /etc/shadow (no auth lineage) must still trip, got {hits:?}"
+        );
     }
 
     // ── Test #4: mass-write from sudo subprocess is exempt ──────────

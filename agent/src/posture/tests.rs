@@ -709,6 +709,104 @@ fn agent_self_writes_still_exempt() {
     assert_eq!(m.current_kind(), PostureKind::Observing);
 }
 
+// ─── T7.13 generalisation: PAM-daemon login chains, end-to-end ──────
+//
+// The original T7.13 fix covered sudo; the same false-positive class
+// applies to every PAM-mediated login daemon (cron jobs, display
+// managers, logind sessions) whose credential read is observed at the
+// authenticating user's uid. These FSM-level tests assert such chains
+// never push posture upward — the "trigger bar" guarantee that benign
+// authentication cannot escalate toward COMBAT.
+
+/// A cron job's PAM `session` chain reading /etc/shadow as uid=1000
+/// (lineage: crond → job shell) must NOT transition the posture.
+#[test]
+fn cron_job_shadow_read_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    assert!(m
+        .observe(&spawn(500, 1, "cron", "/usr/sbin/cron", 1), &[])
+        .is_none());
+    assert!(m
+        .observe(&spawn(501, 500, "sh", "/bin/sh", 2), &[])
+        .is_none());
+    let shadow_read = file_open(501, 1000, "/etc/shadow", 0, 3);
+    let r = m.observe(&shadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "cron-job /etc/shadow read must NOT transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+/// A display-manager login (gdm daemon → gdm-session-worker PAM stack →
+/// session child) reading /etc/gshadow as uid=1000 must NOT transition.
+#[test]
+fn gdm_login_gshadow_read_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    assert!(m
+        .observe(&spawn(600, 1, "gdm3", "/usr/sbin/gdm3", 1), &[])
+        .is_none());
+    assert!(m
+        .observe(
+            &spawn(601, 600, "gdm-session-wor", "/usr/lib/gdm3/gdm-session-worker", 2),
+            &[],
+        )
+        .is_none());
+    let gshadow_read = file_open(601, 1000, "/etc/gshadow", 0, 3);
+    let r = m.observe(&gshadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "gdm-session-worker /etc/gshadow read must NOT transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+/// Negative control: an unexpected uid=1000 reader of /etc/gshadow with
+/// no auth lineage STILL escalates (to ALERTED — SensitiveFileAccess is
+/// an ALERTED-tier trigger). gshadow is monitored symmetrically with
+/// /etc/shadow; the expanded daemon allowlist must not blind us to real
+/// group-credential theft.
+#[test]
+fn unexpected_gshadow_read_e2e_reaches_alerted() {
+    let m = machine_with_isolated_auth();
+    // Non-auth lineage: a plain shell child.
+    assert!(m
+        .observe(&spawn(900, 1, "bash", "/usr/bin/bash", 1), &[])
+        .is_none());
+    let r = m.observe(&file_open(900, 1000, "/etc/gshadow", 0, 2), &[]);
+    assert!(r.is_some(), "unexpected /etc/gshadow read must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Alerted,
+        "unexpected /etc/gshadow read escalates to ALERTED (SensitiveFileAccess tier)"
+    );
+}
+
+/// Screen-unlock end-to-end: an unprivileged locker execs the setuid
+/// pam_unix helper unix_chkpwd, which reads /etc/shadow at the caller's
+/// real uid (1000). The unprivileged-auth credential read must NOT push
+/// posture — the screen-unlock FP the user flagged.
+#[test]
+fn screen_unlock_unix_chkpwd_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    assert!(m
+        .observe(
+            &spawn(700, 1, "cinnamon-screen", "/usr/bin/cinnamon-screensaver", 1),
+            &[],
+        )
+        .is_none());
+    assert!(m
+        .observe(&spawn(701, 700, "unix_chkpwd", "/usr/sbin/unix_chkpwd", 2), &[])
+        .is_none());
+    let shadow_read = file_open(701, 1000, "/etc/shadow", 0, 3);
+    let r = m.observe(&shadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "screen-unlock unix_chkpwd /etc/shadow read must NOT transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
 // ─── (ii) — system package-management daemon exemption, end-to-end ──
 //
 // The 2026-06-02 self-lock: snapd's refresh did a mass-write burst on

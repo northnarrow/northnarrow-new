@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -929,6 +929,33 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The COMBAT graduated-response ladder is constructed once agent_id
+    // + the audit log are available (further down). The posture combat
+    // hooks reference it through this slot, so an admin-forced COMBAT
+    // engages the same ladder as a detector-driven one. The slot is set
+    // before the event loop / admin socket start — always populated by
+    // the time any COMBAT transition can fire the hooks.
+    let ladder_slot: Arc<std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Reaching COMBAT now means "enter active-response mode", NOT
+    // "isolate". This entry hook engages the graduated ladder at STAGE 1
+    // INVESTIGATE (network stays UP); the ladder decides if/when isolation
+    // (STAGE 3, last resort) is warranted, honours detect-only internally,
+    // and emits the per-stage signed audit trail. It is wired into BOTH
+    // the prod (isolator) and dev (no-isolator) posture branches so an
+    // admin-forced COMBAT engages the same ladder either way; the detector
+    // path additionally feeds the offending PID + firing trigger via
+    // `process_event` (an idempotent merge).
+    let engage_hook: CombatEntryHook = {
+        let ladder_for_entry = Arc::clone(&ladder_slot);
+        Arc::new(move || {
+            if let Some(ladder) = ladder_for_entry.get() {
+                ladder.engage(None, None, Instant::now());
+            }
+        })
+    };
+
     let exempt = ExemptPids::with_agent(std::process::id());
     let posture = if let Some(iso) = isolator.as_ref() {
         // T7.13 (Beta Step 5): the auth-lineage tracker shared with
@@ -938,28 +965,15 @@ async fn main() -> Result<()> {
         // PostureMachine::new() which already constructs a default
         // tracker internally, so this clone is only needed here.
         let auth_tracker = AuthSessionTracker::with_proc();
-        let iso_engage = Arc::clone(iso);
         let iso_release = Arc::clone(iso);
-        let engage_hook: CombatEntryHook = Arc::new(move || {
-            // BUG-033 detect-only: the COMBAT enforcement entry point.
-            // Posture still transitioned to COMBAT (logged for
-            // visibility); we just don't enforce. engage() never runs,
-            // so NO iptables chain is created and `is_isolated` stays
-            // false — leaving zero persistent state for a later restart
-            // to reconcile. A true no-op beyond this log line.
-            if detect_only {
-                warn!(
-                    target: "anti_tamper.detect_only",
-                    "DETECT-ONLY: posture reached COMBAT — would engage network isolation; \
-                     iptables NOT applied (no enforcement)"
-                );
-                return;
-            }
-            if let Err(e) = iso_engage.engage() {
-                tracing::error!(error = %e, "COMBAT engage failed; agent continues in degraded mode");
-            }
-        });
+        let ladder_for_release = Arc::clone(&ladder_slot);
         let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
+            // Admin released COMBAT: stand the ladder down (clears the
+            // episode + lifts the surgical per-PID soft-egress blocks),
+            // THEN tear down any full isolation STAGE 3 had engaged.
+            if let Some(ladder) = ladder_for_release.get() {
+                ladder.stand_down(Instant::now());
+            }
             if let Err(e) = iso_release.release(token) {
                 tracing::error!(
                     error = %e,
@@ -1017,7 +1031,20 @@ async fn main() -> Result<()> {
             escalation_allow,
         )
     } else {
-        PostureMachine::new()
+        // Dev / no-isolator build: still wire the ladder hooks so a
+        // (detector- or admin-forced) COMBAT engages the same graduated
+        // ladder as production. The ladder's actuator finds no isolator,
+        // so STAGE 3 degrades to a loud warning instead of an iptables
+        // DROP — but INVESTIGATE + NEUTRALIZE still run.
+        let ladder_for_release = Arc::clone(&ladder_slot);
+        let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
+            if let Some(ladder) = ladder_for_release.get() {
+                ladder.stand_down(Instant::now());
+            }
+            // No isolator to release in this build; consume the token.
+            let _ = token;
+        });
+        PostureMachine::new_with_hooks(engage_hook, release_hook)
     };
     info!("posture state machine initialized (state: OBSERVING)");
 
@@ -1094,6 +1121,77 @@ async fn main() -> Result<()> {
             [0u8; 16]
         }
     };
+
+    // ── Shared audit log + COMBAT graduated-response ladder ─────────
+    //
+    // The signed, hash-chained audit log is opened ONCE here (now that
+    // agent_id is ready) and shared by both the COMBAT ladder (per-stage
+    // signed transitions) and the admin socket (admin-op audit). A `None`
+    // audit log (open/key failure) degrades to log-only, exactly as the
+    // admin-op path already tolerates.
+    let audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>> =
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(key) => {
+                match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
+                    Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
+                    Err(e) => {
+                        warn!(error = %e, "audit log open failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                None
+            }
+        };
+
+    // Build the ladder with the system actuator (real kill / quarantine /
+    // per-PID egress / full isolation) + the signed-audit evidence sink,
+    // then publish it to the slot the posture combat hooks read. Driven
+    // from three places: the combat-entry hook (above), `process_event`
+    // (offender context + per-event jump-ahead), and the tick below.
+    let ladder = Arc::new(northnarrow_agent::combat::CombatLadder::new(
+        Box::new(northnarrow_agent::combat::SystemActuator::new(
+            executor.clone(),
+            isolator.clone(),
+            detect_only,
+        )),
+        Box::new(northnarrow_agent::combat::AuditEvidence::new(audit_log.clone())),
+        // Never kill / net-cut PID 1, the agent, its watchdog, or sshd —
+        // skip + escalate to ISOLATE instead. Reuses the same `exempt`
+        // handle the posture machine holds (so the watchdog PID stays the
+        // timer-refreshed value) plus the same `--watchdog-exe` the refresh
+        // task verifies against, so the watchdog branch can re-check
+        // /proc/<pid>/exe inline at the kill/spare decision.
+        Box::new(northnarrow_agent::combat::SystemProtectedProcs::new(
+            executor.own_pid(),
+            exempt.clone(),
+            cli.watchdog_exe.clone(),
+        )),
+        northnarrow_agent::combat::LadderConfig::default(),
+    ));
+    if ladder_slot.set(Arc::clone(&ladder)).is_err() {
+        warn!("COMBAT ladder slot already set — unexpected double-init");
+    }
+    info!(
+        "COMBAT graduated-response ladder armed (INVESTIGATE → NEUTRALIZE → ISOLATE; \
+         isolation is last resort)"
+    );
+
+    // Fast heartbeat advancing the time-bound INVESTIGATE deadline. The
+    // 60 s posture-decay loop is too coarse for the ladder's
+    // seconds-scale windows; this 5 s tick is a no-op unless a COMBAT
+    // episode is active and its investigate deadline has elapsed.
+    let ladder_tick = Arc::clone(&ladder);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            ladder_tick.tick(Instant::now());
+        }
+    });
 
     // Tappa 8 A8: shutdown signal — the dispatcher fires it on a
     // successfully-verified `ShutdownRequest` so this main loop
@@ -1740,46 +1838,12 @@ async fn main() -> Result<()> {
                 let iso_clone = Arc::clone(iso);
                 let socket_path = cli.admin_socket.clone();
                 let signal_for_serve = shutdown_signal.clone();
-                // Tappa 8 B5: construct the AuditLog once at boot
-                // (post-A14 the file's inode is already in
-                // PROTECTED_INODES so an attacker can't replace
-                // it underneath us). The signing key is the one
-                // bootstrapped pre-attach above; we load it
-                // again here to take ownership of the in-memory
-                // SigningKey rather than wrap the pre-attach
-                // bootstrap result. agent_id is whatever the
-                // pre-attach call minted.
-                let signing_key_path = cli.signing_key_file.clone();
-                let audit_log_path = cli.audit_log_file.clone();
-                let audit_log = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-                    &signing_key_path,
-                ) {
-                    Ok(key) => {
-                        match northnarrow_agent::audit::AuditLog::open(
-                            &audit_log_path,
-                            key,
-                            agent_id,
-                        ) {
-                            Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "audit log open failed — admin ops will run \
-                                     UNAUDITED this boot"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "agent signing key reload failed — admin ops will \
-                             run UNAUDITED this boot"
-                        );
-                        None
-                    }
-                };
+                // Tappa 8 B5: the AuditLog is opened ONCE at boot (above,
+                // right after agent_id) and shared with the COMBAT ladder;
+                // the admin socket takes its own Arc clone. post-A14 the
+                // file's inode is already in PROTECTED_INODES so an
+                // attacker can't replace it underneath us.
+                let audit_log = audit_log.clone();
                 let marker_path = cli.shutdown_marker_file.clone();
                 let fim_state_for_serve = fim_admin_state.clone();
                 let canary_state_for_serve = canary_admin_state.clone();
@@ -1868,6 +1932,7 @@ async fn main() -> Result<()> {
                     &correlation,
                     &host,
                     &posture,
+                    &ladder,
                     // Tappa 9.5 K6: detector handle wired in. When
                     // the canary subsystem boot above failed
                     // (missing signing key, registry open error),
@@ -1998,6 +2063,7 @@ async fn process_event(
     correlation: &CorrelationBuffer,
     host: &HostContext,
     posture: &PostureMachine,
+    ladder: &northnarrow_agent::combat::CombatLadder,
     canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
     event: Event,
 ) {
@@ -2035,6 +2101,25 @@ async fn process_event(
             trigger = ?firing_trigger,
             "POSTURE TRANSITION"
         );
+        // On the non-Combat → Combat edge, enrich the ladder with the
+        // offending PID + firing trigger. The combat-entry hook has
+        // already opened the episode (STAGE 1 INVESTIGATE, network up);
+        // this is the idempotent merge that attributes the focal
+        // process. Reaching COMBAT does NOT isolate — the ladder does.
+        if new_state.kind() == PostureKind::Combat {
+            ladder.engage(
+                northnarrow_agent::posture::triggers::event_owner_pid(&event),
+                firing_trigger,
+                Instant::now(),
+            );
+        }
+    }
+    // While a COMBAT episode is active, feed every event to the ladder
+    // for the jump-ahead check: an offender actively exfiltrating or
+    // spawning children DURING INVESTIGATE pre-empts the time-bound
+    // deadline and advances straight to NEUTRALIZE.
+    if ladder.current_stage().is_some() {
+        ladder.observe(&event, Instant::now());
     }
     correlation.push(event.clone());
 

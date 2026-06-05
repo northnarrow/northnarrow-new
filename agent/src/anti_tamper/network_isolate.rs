@@ -872,11 +872,33 @@ mod tests {
             Some(i) => i,
             None => return,
         };
-        // Default allow path almost certainly absent in the test env →
-        // fail-secure empty carve-out.
+        // Hermetic (§26 test-debt fix): point at a guaranteed-ABSENT
+        // allow path so the carve-out is the fail-secure empty set,
+        // regardless of whether the host has a real
+        // /etc/northnarrow/combat-allow.cidrs provisioned. The old test
+        // read `combat_allow::default_path()` directly — it passed on a
+        // clean dev box but failed on a deployed VM (where the live mgmt
+        // carve-out file exists → `carved` non-empty). Mirrors the temp
+        // allow-path pattern the sibling carve-out test already uses.
+        let absent = std::env::temp_dir().join(format!("nn-absent-allow-{}.cidrs", std::process::id()));
+        let _ = std::fs::remove_file(&absent);
+        let iso = iso.with_allow_cidrs_path(absent);
         let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
-        assert!(carved.is_empty());
-        assert!(!ruleset.contains("-j ACCEPT"));
+        assert!(carved.is_empty(), "absent allow file must yield empty carve-out, got {carved:?}");
+        // Loopback-only isolation: the only ACCEPTs are the two lo rules
+        // (the additive model uses `-i/-o lo -j ACCEPT`, NOT RETURN — see
+        // configs/combat-rules.v4 header); NO management carve-out CIDR
+        // ACCEPT (`-s`/`-d <cidr> -j ACCEPT`) was spliced in, and the
+        // carve-out marker was consumed.
+        assert!(
+            ruleset.contains("-A NORTHNARROW_COMBAT -i lo -j ACCEPT")
+                && ruleset.contains("-A NORTHNARROW_COMBAT -o lo -j ACCEPT"),
+            "loopback ACCEPT rules must be present: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains(" -s ") && !ruleset.contains(" -d "),
+            "no management carve-out CIDR ACCEPT expected with an absent allow file: {ruleset}"
+        );
         assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
     }
 
