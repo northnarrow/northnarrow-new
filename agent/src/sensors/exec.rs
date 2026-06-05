@@ -11,19 +11,15 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aya::{include_bytes_aligned, maps::ring_buf::RingBuf, programs::TracePoint, Ebpf, EbpfLoader};
+use aya::{maps::ring_buf::RingBuf, programs::TracePoint, Ebpf, EbpfLoader};
 use common::{wire::ProcessSpawnRaw, Event};
 use tokio::{io::unix::AsyncFd, sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, warn};
 
-/// Compiled eBPF object, staged into OUT_DIR by `build.rs`.
-///
-/// `include_bytes_aligned!` wraps the bytes in a `#[repr(align(32))]`
-/// struct: aya's ELF parser does pointer-aligned reads internally and
-/// fails with "error parsing ELF data" if it gets a 1-byte-aligned
-/// slice (which is what `core::include_bytes!` produces).
-static EBPF_BYTES: &[u8] =
-    include_bytes_aligned!(concat!(env!("OUT_DIR"), "/northnarrow-agent-ebpf"));
+/// Compiled eBPF object, embedded once in [`crate::sensors::ebpf_object`]
+/// (the single embed site + boot preflight). Re-used here so both
+/// loaders load byte-identical bytes.
+use crate::sensors::ebpf_object::EBPF_BYTES;
 
 /// Ringbuffer map name (must match `agent-ebpf/src/main.rs`).
 const RINGBUF_NAME: &str = "EVENTS";

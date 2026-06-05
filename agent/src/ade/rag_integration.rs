@@ -29,6 +29,9 @@ use common::Event;
 /// stay within the embedder's hot path.
 pub fn build_rag_query_from_event(event: &Event) -> String {
     match event {
+        Event::ModuleLoad { loader_comm, path, .. } => {
+            format!("kernel module load by {loader_comm} from {}", path.as_deref().unwrap_or("buffer"))
+        }
         Event::ProcessSpawn { comm, filename, .. } => format!("process {comm} from {filename}"),
         Event::FileOpen { filename, .. } => format!("file open {filename}"),
         Event::ExecCheck { filename, .. } => format!("exec check {filename}"),
@@ -243,6 +246,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("xmrig"));
@@ -304,6 +308,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "attacker".into(),
             dest_path: None,
+            child_truncated: false,
         });
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("fim drift"));

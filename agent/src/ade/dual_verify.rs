@@ -145,6 +145,7 @@ impl CriticalActionVerifier for DeterministicVerifier {
 
 fn pid_of(e: &Event) -> u32 {
     match e {
+        Event::ModuleLoad { loader_pid, .. } => *loader_pid,
         Event::ProcessSpawn { pid, .. }
         | Event::FileOpen { pid, .. }
         | Event::ExecCheck { pid, .. }
@@ -184,6 +185,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 

@@ -156,6 +156,7 @@ fn push_untrusted_block(buf: &mut String, s: &SanitizedEvent) {
 
 fn event_kind_label(e: &Event) -> &'static str {
     match e {
+        Event::ModuleLoad { .. } => "module_load",
         Event::ProcessSpawn { .. } => "process_spawn",
         Event::FileOpen { .. } => "file_open",
         Event::ExecCheck { .. } => "exec_check",
@@ -176,6 +177,7 @@ fn event_kind_label(e: &Event) -> &'static str {
 
 fn push_pid_uid(buf: &mut String, e: &Event) {
     let (pid, uid) = match e {
+        Event::ModuleLoad { loader_pid, loader_uid, .. } => (*loader_pid, *loader_uid),
         Event::ProcessSpawn { pid, uid, .. }
         | Event::FileOpen { pid, uid, .. }
         | Event::ExecCheck { pid, uid, .. }
@@ -262,6 +264,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 

@@ -17,6 +17,10 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 aya-obj = "0.2"
+# Shared eBPF-object provenance logic. xtask writes the build stamp;
+# agent/build.rs verifies it. Same crate on both sides so the hash is
+# computed identically (see ebpf-guard crate docs).
+ebpf-guard = { path = "../ebpf-guard" }
 
 # Tappa 6.9.7 P2 — RAG KB acquisition pipeline (build/release-time
 # tooling only; the agent never fetches at runtime, so the sovereign

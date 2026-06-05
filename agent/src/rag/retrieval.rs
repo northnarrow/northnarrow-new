@@ -282,7 +282,11 @@ mod tests {
     fn engine_seeds_curated_kb() {
         let e = RagEngine::with_seed(None).expect("seed");
         let n = e.document_count();
-        assert!((28..=32).contains(&n), "expected ~30 seeded docs, got {n}");
+        // The curated KB is hand-maintained and grows over time (§26
+        // test-debt: was 36 when this bound last broke at ~30). Bound it
+        // to a generous range that still catches a broken/empty seed
+        // without re-breaking on every curated-doc addition.
+        assert!((28..=64).contains(&n), "expected a curated KB of ~30-60 docs, got {n}");
     }
 
     #[test]

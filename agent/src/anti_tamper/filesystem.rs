@@ -27,7 +27,7 @@ use std::fs::DirBuilder;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
@@ -233,6 +233,21 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("file_ioctl", "file_ioctl"),
 ];
 
+/// BUG-034 module-load observe hooks — `MODULE_LOAD_EVENTS` producers.
+/// Observe-only (return 0); the rootkit verdict is userland's (stage 2
+/// rule). Attached via the same `reattach_fresh` discipline as the
+/// `LSM_PROGRAMS` deny set (zero-window + no ring split-brain across
+/// restart). (program-name, hook-name); both share the source file
+/// `agent-ebpf/src/module_load.rs`.
+///
+/// NOTE: temporarily attached here to reuse the `reattach_fresh`
+/// machinery with `btf` + `pin_root` in scope; moves to a dedicated
+/// module-load sensor when the ring consumer + rule land in stage 2.
+const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
+    ("module_read_file_observe", "kernel_read_file"),
+    ("module_load_data_observe", "kernel_load_data"),
+];
+
 pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Result<()> {
     let dir = Path::new(STATE_DIR);
 
@@ -325,14 +340,33 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
         );
     }
 
-    // Step 4: attach (or reuse the prior boot's still-firing) five
-    // LSM hooks. `attach_lsm` logs the per-hook disposition; we only
-    // escalate failures here.
+    // Step 4: attach the five inode_protect deny hooks — the
+    // FS_PROTECT_EVENTS producers. BUG-024: these MUST re-attach FRESH
+    // every boot (binding to this boot's fresh, process-local ring) rather
+    // than reuse the prior boot's pinned link (which kept producing into the
+    // old pinned ring and desynced the new consumer → ~1.6k/sec stale-denial
+    // replay that DoS'd observability). `reattach_fresh` attaches this boot's
+    // program BEFORE purging the old pin, so a deny program is attached at
+    // every instant (zero-window). task_kill/ptrace (anti_tamper/mod.rs) keep
+    // the pinned-reuse path — they emit no ring, so they don't desync.
     for (program, hook) in LSM_PROGRAMS {
-        if let Err(e) = super::attach_lsm(ebpf, program, hook, btf, pin_root) {
+        if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
             warn!(
                 program, hook, error = %e,
                 "anti-tamper FS: LSM hook attach FAILED"
+            );
+        }
+    }
+
+    // Step 5 (BUG-034): attach the two module-load OBSERVE hooks —
+    // MODULE_LOAD_EVENTS producers — on the same reattach-fresh path as
+    // the deny set above (zero-window + no ring split-brain on restart).
+    // Observe-only; the rootkit verdict is userland's (stage-2 rule).
+    for (program, hook) in MODULE_LOAD_PROGRAMS {
+        if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
+            warn!(
+                program, hook, error = %e,
+                "anti-tamper FS: module-load LSM hook attach FAILED (BUG-034)"
             );
         }
     }
@@ -806,6 +840,168 @@ fn chattr_immutable_add(path: &Path) -> Result<bool> {
             .with_context(|| format!("FS_IOC_SETFLAGS on {}", path.display()));
     }
     Ok(true)
+}
+
+// ── BUG-026 — rotation dance: lift immutability fail-safe ────────────
+
+/// Clear `FS_IMMUTABLE_FL` (the inverse of [`chattr_immutable_add`]).
+/// `Ok(true)` if the bit was set and is now cleared, `Ok(false)` if it
+/// was already clear. Used ONLY through [`ImmutabilityGuard`], which
+/// guarantees a paired re-add.
+fn chattr_immutable_remove(path: &Path) -> Result<bool> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {} for chattr -i", path.display()))?;
+    let fd = file.as_raw_fd();
+    let mut flags: libc::c_long = 0;
+    // SAFETY: `flags` is a valid c_long lvalue; fd is owned.
+    let rc = unsafe { libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("FS_IOC_GETFLAGS on {}", path.display()));
+    }
+    if flags & FS_IMMUTABLE_FL == 0 {
+        return Ok(false);
+    }
+    flags &= !FS_IMMUTABLE_FL;
+    // SAFETY: same `flags` pointer, read by the kernel.
+    let rc = unsafe { libc::ioctl(fd, FS_IOC_SETFLAGS, &flags) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("FS_IOC_SETFLAGS (clear immutable) on {}", path.display()));
+    }
+    Ok(true)
+}
+
+/// RAII fail-safe for the BUG-026 rotation dance. Construction
+/// (`lift`) drops `chattr +i` on the state dir; `Drop` RE-APPLIES it on
+/// EVERY exit path — `Ok`, `Err`, or panic/unwind — so a failed or
+/// interrupted rotation can never leave the directory mutable. The
+/// re-add is idempotent (`chattr_immutable_add` no-ops if already set),
+/// so this also HEALS a directory found already-mutable (e.g. a crash
+/// mid-dance on a prior boot). If `lift` itself fails, no guard is
+/// constructed and the dir stays `+i` — the caller aborts the rotation.
+/// Backstop: the boot-time `chattr_immutable_add` (run on every start,
+/// `prepare_state_dir` Step 3) re-asserts `+i` even if a process died
+/// with the bit cleared and Drop never ran.
+struct ImmutabilityGuard<'a> {
+    dir: &'a Path,
+}
+
+impl<'a> ImmutabilityGuard<'a> {
+    fn lift(dir: &'a Path) -> Result<Self> {
+        chattr_immutable_remove(dir)
+            .with_context(|| format!("lifting immutability on {}", dir.display()))?;
+        Ok(Self { dir })
+    }
+}
+
+impl Drop for ImmutabilityGuard<'_> {
+    fn drop(&mut self) {
+        // Cannot propagate from Drop — re-assert +i, retrying a few times
+        // to shrink the mutable window on a transient ioctl failure before
+        // the loud error. No sleep (Drop must stay quick); the boot
+        // self-heal is the ultimate backstop.
+        let mut last_err = None;
+        for _ in 0..4 {
+            match chattr_immutable_add(self.dir) {
+                Ok(_) => return,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(e) = last_err {
+            tracing::error!(
+                error = %e,
+                path = %self.dir.display(),
+                "anti-tamper FS: FAILED to restore chattr +i after rotation (4 attempts) — \
+                 directory is MUTABLE until the next agent restart re-applies it \
+                 (boot self-heal backstop)"
+            );
+        }
+    }
+}
+
+/// Owned writable handle to the pinned `PROTECTED_INODES` map, for
+/// registering a freshly-rotated active file's inode so the LSM
+/// defends it like its predecessor. Same `take_map` idiom as the FIM
+/// `WatchedPathsHandle`. NOTE (wiring caveat for the writer-migration
+/// step): take this AFTER `prepare_state_dir` finishes its
+/// registrations, and confirm no other post-bootstrap path mutates
+/// `PROTECTED_INODES` via the `Ebpf` handle (else prefer opening the
+/// pin by path instead of `take_map`).
+pub struct ProtectedInodesHandle {
+    map: AyaHashMap<MapData, AyaInodeKey, u8>,
+}
+
+impl ProtectedInodesHandle {
+    pub fn register(&mut self, key: InodeKey) -> Result<()> {
+        self.map.insert(AyaInodeKey(key), 1u8, 0).with_context(|| {
+            format!(
+                "registering (dev={}, ino={}) in {PROTECTED_INODES_MAP}",
+                key.dev, key.ino
+            )
+        })
+    }
+}
+
+/// Take an owned writable `PROTECTED_INODES` handle out of the `Ebpf`
+/// object (see the caveat on [`ProtectedInodesHandle`]).
+pub fn take_protected_inodes_map(ebpf: &mut Ebpf) -> Result<ProtectedInodesHandle> {
+    let map = ebpf
+        .take_map(PROTECTED_INODES_MAP)
+        .ok_or_else(|| anyhow!("map {PROTECTED_INODES_MAP} missing from eBPF object"))?;
+    let map = AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(map)
+        .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
+    Ok(ProtectedInodesHandle { map })
+}
+
+/// Production [`crate::chainlog::ProtectionManager`] for logs that live
+/// under the `chattr +i` / `PROTECTED_INODES` state dir. `with_mutable_dir`
+/// lifts the directory's immutability via [`ImmutabilityGuard`]
+/// (fail-safe restore on drop); `register_active` registers a
+/// freshly-rotated active file's inode. Logs OUTSIDE the protected dir
+/// (e.g. `combat-audit.jsonl`) use `chainlog::NoProtection` instead.
+pub struct StateDirProtection {
+    dir: PathBuf,
+    /// Serializes the chattr dance across ALL writers that share this dir:
+    /// `netflow.jsonl` + `fim_drift.jsonl` both live under
+    /// `/var/lib/northnarrow` and share one `Arc<StateDirProtection>`, so
+    /// two concurrent rotations would otherwise race on the dir's `+i`
+    /// (A lifts `-i`, B lifts `-i`, A restores `+i` while B is mid-rename).
+    /// Held for the WHOLE dance, so only one rotation holds the dir `-i`
+    /// at a time. Normal appends never take it (they are `O_APPEND` on the
+    /// file, not dir-entry ops) — only rotation's create/rename/unlink.
+    dance: parking_lot::Mutex<()>,
+    inodes: parking_lot::Mutex<ProtectedInodesHandle>,
+}
+
+impl StateDirProtection {
+    pub fn new(dir: PathBuf, inodes: ProtectedInodesHandle) -> Self {
+        Self {
+            dir,
+            dance: parking_lot::Mutex::new(()),
+            inodes: parking_lot::Mutex::new(inodes),
+        }
+    }
+}
+
+impl crate::chainlog::ProtectionManager for StateDirProtection {
+    fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        // Serialize the dance first, THEN lift immutability. Drop order is
+        // reverse-declaration: `_guard` drops before `_dance`, so `+i` is
+        // restored BEFORE the lock releases — the next writer that
+        // acquires the dance lock always finds the dir `+i`.
+        let _dance = self.dance.lock();
+        let _guard = ImmutabilityGuard::lift(&self.dir)?;
+        f()
+    }
+
+    fn register_active(&self, path: &Path) -> Result<()> {
+        let key = crate::fim::attach::key_for_path(path)?;
+        self.inodes.lock().register(key)
+    }
 }
 
 #[cfg(test)]

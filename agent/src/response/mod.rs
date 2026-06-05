@@ -48,6 +48,17 @@ pub enum ExecutionOutcome {
     /// Any other syscall / I/O failure; `errno` carries the raw value
     /// when one is available, or 0 when the failure is logical.
     Failed { pid: u32, errno: i32 },
+    /// Detect-only / monitor mode (BUG-033): the agent WOULD have
+    /// executed this action, but enforcement is globally suppressed
+    /// (see [`ExecutorConfig::dry_run`], surfaced as `--detect-only`),
+    /// so the system was left untouched. Deliberately distinct from
+    /// `Refused`: `Refused` means the agent declined on the merits (a
+    /// protected PID, a sub-floor PID); `WouldExecute` means the action
+    /// was approved but not enforced because we are observing only. It
+    /// never claims success it didn't achieve — the honest counterpart
+    /// to the old `dry_run` path that reported `Blocked`/`Killed` for
+    /// things it never did.
+    WouldExecute { pid: u32 },
 
     // ---- Tappa 5 ----
     /// `BlockOutbound`: the PID was placed into the

@@ -68,26 +68,32 @@
 //!   refinement on the existing bucket layer.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use chrono::{DateTime, Utc};
-use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey};
+use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_TRUNCATED};
 use common::Event;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::audit::AgentSigningKey;
+use crate::fim::attach::{key_for_path, WatchedPathsHandle};
 use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
+
+// BUG-026: production now uses the chainlog core; the legacy-v1
+// `build_signed_drift_entry` / `compute_entry_hash` (kept only so the
+// byte-compat gate can mint a real legacy line) are `#[cfg(test)]`, so
+// their imports are gated to test builds.
+#[cfg(test)]
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+#[cfg(test)]
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+use crate::audit::GENESIS_PREV_HASH;
 
 /// Default location of the chained drift log. Lives alongside
 /// the baseline DB so the Tappa 7 task 5 FS-LSM protection +
@@ -96,9 +102,13 @@ use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
 /// list.
 pub const DEFAULT_DRIFT_LOG_PATH: &str = "/var/lib/northnarrow/fim_drift.jsonl";
 
-/// File mode for the drift log. World-readable so operators
-/// inspect it with `cat`; root + agent are the only writers.
-const DRIFT_FILE_MODE: u32 = 0o644;
+// BUG-012 (v2): the v1 `FIM_OPENED_SUPPRESS_PATHS` 4-path allowlist
+// was removed here. A read (`FimOp::Opened`) is never an integrity
+// drift regardless of path, so suppression is now op-level in
+// `process_drift` (drop every non-credential `Opened`; forward
+// credential-path `Opened` silently to the rule engine). The
+// credential predicate lives in `fim::rules::is_credential_path`,
+// derived from the NN-L-FIM-011..017 rule fragment lists.
 
 // ── userland inode → path map ──────────────────────────────────────
 
@@ -399,6 +409,34 @@ pub struct FimDriftEntry {
     pub agent_sig: String,
 }
 
+/// BUG-026 migration — the `fim_drift.jsonl` DATA payload: every
+/// [`FimDriftEntry`] field EXCEPT the chain framing (`prev_hash` /
+/// `entry_hash` / `agent_sig`), in the SAME declaration order. A
+/// [`crate::chainlog::ChainLine<FimDriftPayload>`] with `fmt_ver = None`
+/// therefore serialises BYTE-FOR-BYTE identically to a legacy v1
+/// `FimDriftEntry`, so an existing on-disk `fim_drift.jsonl` still
+/// verifies under the rotation-aware reader (proven by
+/// `bug026_legacy_v1_drift_line_still_verifies`). The two Q4 fields keep
+/// `#[serde(default)]` with NO `skip_serializing_if`, exactly matching
+/// the legacy struct (they are always serialised).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FimDriftPayload {
+    pub ts: String,
+    pub path: String,
+    pub op: FimOp,
+    pub baseline_sha256: Option<String>,
+    pub new_sha256: Option<String>,
+    pub modifier_pid: u32,
+    pub modifier_uid: u32,
+    pub modifier_comm: String,
+    pub severity: DriftSeverity,
+    #[serde(default)]
+    pub decision_engine_skipped: bool,
+    #[serde(default)]
+    pub skip_reason: String,
+    pub agent_id: String,
+}
+
 /// Caller-supplied fields for [`FimDriftDb::append`].
 #[derive(Debug, Clone)]
 pub struct FimDriftDraft {
@@ -416,74 +454,61 @@ pub struct FimDriftDraft {
 
 // ── drift DB (mirror BaselineDb) ───────────────────────────────────
 
-/// Append-only writer for the drift log. Same shape as
-/// [`crate::fim::baseline::BaselineDb`] — chain primitives are
-/// COPIED rather than extracted into a shared trait (same
-/// rationale as C3: extraction is a clean future refactor).
+/// Append-only writer for the drift log. BUG-026: now a thin wrapper
+/// over the shared [`crate::chainlog::RotatingChainLog`] — it builds the
+/// [`FimDriftPayload`] and the core handles chaining, signing, rotation
+/// (size cap + retention), and the chattr dance via the shared
+/// `StateDirProtection`. New lines are v2 (`fmt_ver`); existing v1 lines
+/// stay valid (see `bug026_legacy_v1_drift_line_still_verifies`).
 pub struct FimDriftDb {
-    path: PathBuf,
-    key: AgentSigningKey,
+    inner: crate::chainlog::RotatingChainLog<FimDriftPayload>,
     agent_id: [u8; 16],
-    last_hash: String,
 }
 
 impl FimDriftDb {
-    pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let last_hash = read_tail_hash(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            key,
-            agent_id,
-            last_hash,
-        })
+    pub fn open(
+        path: &Path,
+        key: AgentSigningKey,
+        agent_id: [u8; 16],
+        protection: std::sync::Arc<dyn crate::chainlog::ProtectionManager>,
+        cfg: crate::chainlog::RotationConfig,
+    ) -> Result<Self> {
+        let inner = crate::chainlog::RotatingChainLog::<FimDriftPayload>::open(
+            path, key, cfg, protection,
+        )?;
+        Ok(Self { inner, agent_id })
     }
 
-    pub fn append(&mut self, draft: FimDriftDraft) -> Result<FimDriftEntry> {
-        let entry = build_signed_drift_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
-        let mut line =
-            serde_json::to_string(&entry).map_err(|e| anyhow!("serialising drift entry: {e}"))?;
-        line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(DRIFT_FILE_MODE)
-            .open(&self.path)
-            .with_context(|| format!("opening drift log {} for append", self.path.display()))?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending drift entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
-        self.last_hash = entry.entry_hash.clone();
-        Ok(entry)
+    /// Append one drift row as a signed chainlog data line (rotating the
+    /// log at the size cap). Returns the new line's `entry_hash` hex.
+    pub fn append(&mut self, draft: FimDriftDraft) -> Result<String> {
+        let payload = FimDriftPayload {
+            ts: format_ts(Utc::now()),
+            path: draft.path,
+            op: draft.op,
+            baseline_sha256: draft.baseline_sha256,
+            new_sha256: draft.new_sha256,
+            modifier_pid: draft.modifier_pid,
+            modifier_uid: draft.modifier_uid,
+            modifier_comm: draft.modifier_comm,
+            severity: draft.severity,
+            decision_engine_skipped: draft.decision_engine_skipped,
+            skip_reason: draft.skip_reason,
+            agent_id: hex::encode(self.agent_id),
+        };
+        self.inner.append(payload)
     }
 
     pub fn last_hash(&self) -> &str {
-        &self.last_hash
+        self.inner.last_hash()
     }
 }
 
-fn read_tail_hash(path: &Path) -> Result<String> {
-    let f = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GENESIS_PREV_HASH.to_string());
-        }
-        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
-    };
-    let reader = BufReader::new(f);
-    let mut last: Option<String> = None;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading line from {}", path.display()))?;
-        if line.is_empty() {
-            continue;
-        }
-        let entry: FimDriftEntry =
-            serde_json::from_str(&line).with_context(|| format!("parsing drift line: {line}"))?;
-        last = Some(entry.entry_hash);
-    }
-    Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
-}
-
+/// Build a signed legacy-v1 `FimDriftEntry`. Production now uses the
+/// chainlog core; retained ONLY so the BUG-026 byte-compat gate
+/// (`bug026_legacy_v1_drift_line_still_verifies`) can produce a real
+/// legacy line to verify against the rotation-aware reader.
+#[cfg(test)]
 fn build_signed_drift_entry(
     draft: &FimDriftDraft,
     key: &AgentSigningKey,
@@ -515,6 +540,7 @@ fn build_signed_drift_entry(
     Ok(entry)
 }
 
+#[cfg(test)]
 fn compute_entry_hash(entry: &FimDriftEntry) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
@@ -531,6 +557,57 @@ fn compute_entry_hash(entry: &FimDriftEntry) -> Result<[u8; 32]> {
 
 fn format_ts(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+/// BUG-022 — rebuild a watched directory's child path from the bare
+/// dir path + the kernel-carried leaf in [`FimDriftRaw::child_name`]
+/// (NUL-terminated, UTF-8 lossy). Returns `None` when the leaf is
+/// empty or (defensively) contains a `/` — the kernel hands a single
+/// dentry component, so a slash means a crafted / garbled record.
+fn reconstruct_child_path(dir: &str, raw: &FimDriftRaw) -> Option<String> {
+    let end = raw
+        .child_name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(raw.child_name.len());
+    if end == 0 {
+        return None;
+    }
+    let leaf = String::from_utf8_lossy(&raw.child_name[..end]);
+    if leaf.contains('/') {
+        return None;
+    }
+    Some(format!("{}/{}", dir.trim_end_matches('/'), leaf))
+}
+
+/// BUG-022 — enroll a freshly-dropped child of a watched directory
+/// into the userland [`InodePathMap`] AND (when a handle is wired) the
+/// kernel `WATCHED_PATHS` map, so a later in-place edit of the dropped
+/// file is observed directly by the BUG-023 write-then-close hook. The
+/// child is stat'd for its kernel-form `(dev,ino)`; a vanished child
+/// (created-then-immediately-removed) is silently skipped. A full
+/// `WATCHED_PATHS` (8192 cap) is logged LOUD — a silently-dropped
+/// enroll must not masquerade as coverage.
+fn enroll_child(
+    child_path: &str,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) {
+    let key = match key_for_path(Path::new(child_path)) {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    path_map.insert(key, child_path.to_string());
+    if let Some(wp) = watched_paths {
+        if !wp.lock().enroll(key) {
+            warn!(
+                target: "fim.drain",
+                path = %child_path,
+                "BUG-022: WATCHED_PATHS full (8192 cap) — dropped child NOT enrolled; \
+                 its later in-place edits stay unobserved until a re-baseline"
+            );
+        }
+    }
 }
 
 // ── process_drift (pure, testable) ─────────────────────────────────
@@ -566,6 +643,7 @@ pub fn process_drift(
     drift_db: &mut FimDriftDb,
     classifier: &DriftClassifier,
     rate_limiter: &DriftRateLimiter,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
     event_tx: Option<&mpsc::Sender<Event>>,
 ) -> Result<bool> {
     let key = InodeKey {
@@ -585,6 +663,104 @@ pub fn process_drift(
         }
     };
     let op = FimOp::try_from(raw.op).map_err(|e| anyhow!("decoding raw.op: {e}"))?;
+
+    // BUG-022 — child-leaf reconstruction. When the kernel carried a
+    // child leaf (a Create in, or a rename INTO, a watched DIRECTORY),
+    // the `path` resolved above is only the bare watched dir — which no
+    // child-prefix rule matches (the dead-rule root). Rebuild
+    // `dir + "/" + leaf`, normalize a drop-via-rename to Created, mirror
+    // the truncated flag for the rules, and enroll the new child inode
+    // so its later in-place edits are caught by the write-then-close
+    // hook. Events without a child leaf (every non-Create/Rename op, and
+    // renames whose dest dir isn't watched) fall through unchanged.
+    let (path, op, child_truncated) =
+        if matches!(op, FimOp::Created | FimOp::Renamed) && raw.child_name[0] != 0 {
+            match reconstruct_child_path(&path, raw) {
+                Some(child) => {
+                    let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
+                    enroll_child(&child, path_map, watched_paths);
+                    // A rename INTO a watched dir is a drop → present as Created
+                    // (single userland normalization point; the dir-class rules
+                    // keep their Created|Modified op-sets unchanged).
+                    (child, FimOp::Created, truncated)
+                }
+                None => (path, op, false),
+            }
+        } else {
+            (path, op, false)
+        };
+
+    // BUG-012 (v2): a read (`FimOp::Opened`) is NEVER an integrity
+    // drift. It must produce zero FIM-DRIFT rows — no drift_db
+    // append, no `fim_drift.jsonl` line, no "FIM DRIFT" WARN
+    // (`main.rs` silences the WARN for Opened too). The v1 fix masked
+    // only a 4-path allowlist; every OTHER watched path's reads
+    // (`/etc/nsswitch.conf`, `/etc/pam.d/*`, `/etc/group`,
+    // `/usr/bin/dash`, …) still drifted — the boot-time noise this
+    // refit kills. The op-level rule replaces the path allowlist.
+    //
+    // The one carve-out is coverage, not noise: `Opened` on a
+    // CREDENTIAL path is the ONLY event source for the cloud-cred /
+    // browser / password-manager / GPG-keyring read rules
+    // (NN-L-FIM-011..017). Those paths must still emit `Event::Fim`
+    // so the engine can evaluate them — but SILENTLY: no drift_db
+    // append, no rate-limit accounting, no "FIM DRIFT" line. If a
+    // rule fires it raises the alert with proper credential-read
+    // framing; the drain stays out of it. `is_credential_path` is
+    // derived from the rules' own fragment lists, so the drain
+    // forwards exactly — and only — what a rule consumes.
+    //
+    // Integrity-changing ops (Modified / Created / Deleted / Renamed
+    // / Linked) skip this block entirely and flow through unchanged.
+    if matches!(op, FimOp::Opened) {
+        if !crate::fim::rules::is_credential_path(&path) {
+            debug!(
+                target: "fim.drain",
+                path = %path,
+                "BUG-012 v2: dropping FimOp::Opened on non-credential watched path \
+                 (a read is not integrity drift; no rule consumes it)"
+            );
+            return Ok(false);
+        }
+        // Credential-path read: forward to the rule engine without
+        // recording any drift. No drift_db append (keeps it out of
+        // fim_drift.jsonl) and no rate limiting (a cred-theft read is
+        // high-signal and must not be throttled away). The
+        // NN-L-FIM-011..017 rules need only op / path / modifier_comm,
+        // so we emit a content-less event and skip the baseline probe.
+        debug!(
+            target: "fim.drain",
+            path = %path,
+            modifier_comm = %comm_to_string(&raw.modifier_comm),
+            "BUG-012 v2: forwarding FimOp::Opened on credential path to rule engine \
+             (silent — not recorded as drift)"
+        );
+        if let Some(tx) = event_tx {
+            let event = Event::Fim(FimEvent {
+                timestamp_ns: raw.timestamp_ns,
+                path: path.clone(),
+                op,
+                new_sha256: None,
+                baseline_sha256: None,
+                modifier_exe: None,
+                modifier_pid: raw.modifier_pid,
+                modifier_uid: raw.modifier_uid,
+                modifier_comm: comm_to_string(&raw.modifier_comm),
+                dest_path: None,
+                child_truncated,
+            });
+            if tx.try_send(event).is_err() {
+                warn!(
+                    target: "fim.drain",
+                    path = %path,
+                    "Event::Fim (cred-read) send to decision engine failed (channel full / closed)"
+                );
+            }
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
     // Resolve any 1-hop symlink + capture content. For Deleted
     // and Renamed ops the target may be gone; treat the SHA
     // probe as None in that case and let the diff fall to the
@@ -621,13 +797,9 @@ pub fn process_drift(
     // Polish #2 semantics: ONLY suppress no-op events for
     // content-class ops (Modified / Created / Linked). Deleted
     // + Renamed always emit (the file disappeared; operator
-    // wants to know). FimOp::Opened ALWAYS emits regardless of
-    // content-equality — the NN-L-FIM-011..014 cloud-cred
-    // rules care about WHO opens the file, not whether content
-    // changed (a cred file read by `cat` is suspicious even if
-    // bytes are unchanged). The C8 cache work only filtered
-    // touch-induced setattr; preserving Opened keeps the cred-
-    // read detection path intact.
+    // wants to know). `FimOp::Opened` never reaches here — BUG-012
+    // (v2) handles every read above this point — so it needs no
+    // entry in this set.
     let suppress_on_match = matches!(op, FimOp::Modified | FimOp::Created | FimOp::Linked);
     if !real_drift && suppress_on_match {
         debug!(
@@ -698,6 +870,7 @@ pub fn process_drift(
             modifier_uid: raw.modifier_uid,
             modifier_comm: comm_to_string(&raw.modifier_comm),
             dest_path,
+            child_truncated,
         });
         if tx.try_send(event).is_err() {
             warn!(
@@ -748,6 +921,7 @@ pub async fn drain_loop(
     drift_db: std::sync::Arc<parking_lot::Mutex<FimDriftDb>>,
     classifier: std::sync::Arc<DriftClassifier>,
     rate_limiter: std::sync::Arc<DriftRateLimiter>,
+    watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
@@ -797,6 +971,7 @@ pub async fn drain_loop(
                 &mut db,
                 classifier.as_ref(),
                 rate_limiter.as_ref(),
+                watched_paths.as_deref(),
                 Some(&event_tx),
             ) {
                 warn!(
@@ -850,7 +1025,124 @@ mod tests {
             // FimDriftRaw directly with non-zero dest values.
             dest_dev: 0,
             dest_ino: 0,
+            // BUG-022 defaults — no child leaf unless a dir-drop
+            // test seeds child_name explicitly.
+            child_name: [0u8; common::wire::FIM_CHILD_NAME_LEN],
+            child_name_flags: 0,
+            _pad2: [0u8; 7],
         }
+    }
+
+    /// BUG-022 #1 — reconstruction MUST be driven by the REAL wire
+    /// shape: a `FimDriftRaw` keyed on a watched DIRECTORY inode with
+    /// the dropped leaf in `child_name`. Feeding a pre-baked full child
+    /// path — the exact thing that hid BUG-022 (green tests on a path
+    /// the live pipeline never produces) — is forbidden. Asserts the
+    /// emitted event carries `dir/leaf` (so the child-prefix rules
+    /// match), op is normalized to Created, and the dropped child is
+    /// enrolled into the InodePathMap on the fly.
+    #[test]
+    fn bug022_reconstructs_child_path_from_dir_key_plus_leaf() {
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+
+        // A real watched DIRECTORY + a child dropped into it, so enroll
+        // + re-hash operate on real inodes.
+        let watched_dir = dir.path().join("systemd-system");
+        std::fs::create_dir(&watched_dir).unwrap();
+        let child = watched_dir.join("evil.service");
+        std::fs::write(&child, b"[Service]\nExecStart=/tmp/x\n").unwrap();
+        let dir_str = watched_dir.to_string_lossy().into_owned();
+
+        // The pipeline shape: target is the DIR inode (arbitrary key
+        // here), child leaf carried inline. NOT a pre-baked full path.
+        let dir_key = InodeKey { dev: 0x1234, ino: 99 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, dir_str.clone());
+
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        let leaf = b"evil.service";
+        raw.child_name[..leaf.len()].copy_from_slice(leaf);
+
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            None,
+            Some(&tx),
+        )
+        .unwrap();
+
+        assert!(emitted, "a drop into a watched dir must emit");
+        let ev = match rx.try_recv().unwrap() {
+            Event::Fim(fe) => fe,
+            other => panic!("expected Event::Fim, got {other:?}"),
+        };
+        assert_eq!(ev.path, format!("{dir_str}/evil.service"));
+        assert_eq!(ev.op, FimOp::Created, "create/rename into dir → Created");
+        assert!(!ev.child_truncated);
+        // On-the-fly enroll: the dropped child is now resolvable by its
+        // own inode, so a later in-place edit (write-then-close) lands.
+        let child_key = key_for_path(&child).unwrap();
+        assert!(
+            path_map.lookup(&child_key).is_some(),
+            "dropped child must be enrolled into the InodePathMap"
+        );
+    }
+
+    /// BUG-022 #2 — a truncated child leaf (kernel filled the buffer +
+    /// set the flag for a >63-byte name) sets `FimEvent::child_truncated`
+    /// so the suffix-rules (FIM-021/023) still fire when the extension
+    /// was lost to truncation. Again: driven by the wire record, not a
+    /// synthetic path.
+    #[test]
+    fn bug022_truncated_child_leaf_sets_event_flag() {
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let dir_key = InodeKey { dev: 0x1234, ino: 7 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, dir_str.clone());
+
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        // Whole buffer filled, no NUL, truncated flag set — the kernel's
+        // shape for a leaf longer than the inline buffer.
+        raw.child_name = [b'a'; common::wire::FIM_CHILD_NAME_LEN];
+        raw.child_name_flags = FIM_CHILD_TRUNCATED;
+
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            None,
+            Some(&tx),
+        )
+        .unwrap();
+
+        assert!(emitted);
+        let ev = match rx.try_recv().unwrap() {
+            Event::Fim(fe) => fe,
+            other => panic!("expected Event::Fim, got {other:?}"),
+        };
+        assert!(ev.child_truncated, "truncated leaf must flag the event");
+        assert!(ev.path.starts_with(&format!("{dir_str}/")));
     }
 
     fn dummy_baseline(path: &str, sha256: &str) -> BaselineEntry {
@@ -1039,6 +1331,73 @@ mod tests {
         assert_eq!(restored, entry);
     }
 
+    /// BUG-026 migration GATE: an existing on-disk **v1** `fim_drift.jsonl`
+    /// line (legacy flat `FimDriftEntry`, NO `fmt_ver`) MUST still verify
+    /// under the rotation-aware reader after the payload/envelope split —
+    /// breaking files already on disk is the migration's main risk. Proven
+    /// two ways: (1) byte-equality of the serialisations; (2) end-to-end
+    /// verification of a REALLY-signed v1 line via
+    /// `chainlog::verify_log_set::<FimDriftPayload>`.
+    #[test]
+    fn bug026_legacy_v1_drift_line_still_verifies() {
+        use crate::chainlog::{verify_log_set, ChainLine};
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let pk = key.verifying_key();
+        let agent_id = [7u8; 16];
+
+        let draft = FimDriftDraft {
+            path: "/etc/passwd".to_string(),
+            op: FimOp::Modified,
+            baseline_sha256: Some("aa".repeat(32)),
+            new_sha256: Some("bb".repeat(32)),
+            modifier_pid: 4242,
+            modifier_uid: 0,
+            modifier_comm: "evil".to_string(),
+            severity: DriftSeverity::High,
+            decision_engine_skipped: false,
+            skip_reason: String::new(),
+        };
+        // A real legacy v1 line — built + signed EXACTLY as the old writer did.
+        let legacy = build_signed_drift_entry(&draft, &key, &agent_id, GENESIS_PREV_HASH).unwrap();
+
+        // (1) byte-equality: ChainLine<FimDriftPayload>{fmt_ver:None} with the
+        // same field values serialises identically to the legacy entry.
+        let envelope = ChainLine {
+            payload: FimDriftPayload {
+                ts: legacy.ts.clone(),
+                path: legacy.path.clone(),
+                op: legacy.op,
+                baseline_sha256: legacy.baseline_sha256.clone(),
+                new_sha256: legacy.new_sha256.clone(),
+                modifier_pid: legacy.modifier_pid,
+                modifier_uid: legacy.modifier_uid,
+                modifier_comm: legacy.modifier_comm.clone(),
+                severity: legacy.severity,
+                decision_engine_skipped: legacy.decision_engine_skipped,
+                skip_reason: legacy.skip_reason.clone(),
+                agent_id: legacy.agent_id.clone(),
+            },
+            fmt_ver: None,
+            prev_hash: legacy.prev_hash.clone(),
+            entry_hash: legacy.entry_hash.clone(),
+            agent_sig: legacy.agent_sig.clone(),
+        };
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+            "ChainLine<FimDriftPayload>{{fmt_ver:None}} must serialise byte-identically \
+             to the legacy FimDriftEntry — else on-disk v1 lines stop verifying"
+        );
+
+        // (2) end-to-end: the really-signed legacy line verifies via the
+        // rotation-aware reader (same hash pre-image ⇒ same digest ⇒ sig OK).
+        let log = dir.path().join("fim_drift.jsonl");
+        std::fs::write(&log, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+        let report = verify_log_set::<FimDriftPayload>(&log, &pk).unwrap();
+        assert_eq!(report.total_records, 1);
+    }
+
     // ── C4 test 7: process_drift skips path-unknown events ──────────
 
     #[test]
@@ -1046,7 +1405,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new(); // empty
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
@@ -1059,6 +1418,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1078,7 +1438,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new();
 
         // Create a real on-disk file with known content so
@@ -1114,6 +1474,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1139,7 +1500,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new();
 
         let watched = dir.path().join("watched.bin");
@@ -1173,6 +1534,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1189,7 +1551,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16]).unwrap();
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
         let path_map = InodePathMap::new();
 
         let watched = dir.path().join("watched.bin");
@@ -1219,6 +1581,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             Some(&tx),
         )
         .unwrap();
@@ -1230,5 +1593,200 @@ mod tests {
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(row.decision_engine_skipped, "audit chain MUST record");
         assert_eq!(row.skip_reason, "rate_limit:tier_medium");
+    }
+
+    // ─── BUG-012 (v2) — op-level FimOp::Opened handling ─────────────
+    //
+    // A read is NEVER an integrity drift. The drain drops every
+    // `Opened` on a non-credential watched path (zero drift row, zero
+    // event, hence zero "FIM DRIFT" WARN in main.rs), and forwards
+    // `Opened` on a credential path SILENTLY to the rule engine (event
+    // emitted, but NO drift row) so NN-L-FIM-011..017 keep their only
+    // event source. The v1 4-path allowlist (FIM_OPENED_SUPPRESS_PATHS)
+    // was replaced by this op-level rule.
+
+    /// Build a (real on-disk file, InodeKey, registered path map)
+    /// triple so process_drift can compute baseline without panicking.
+    /// The on-disk path lives under tempdir; the `path_map` ALIAS
+    /// registers it under the desired absolute path (e.g.
+    /// "/etc/nsswitch.conf") so the op-level Opened logic sees the
+    /// real watched path.
+    fn make_watched_alias(
+        dir: &TempDir,
+        path_alias: &str,
+    ) -> (std::path::PathBuf, InodeKey, InodePathMap) {
+        let on_disk = dir.path().join("watched.bin");
+        std::fs::write(&on_disk, b"unimportant content").unwrap();
+        let meta = std::fs::metadata(&on_disk).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let key = InodeKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        let map = InodePathMap::new();
+        map.insert(key, path_alias.to_string());
+        (on_disk, key, map)
+    }
+
+    /// BUG-012 (v2) #1 — the headline fix. `FimOp::Opened` on a
+    /// non-credential watched path yields ZERO FIM drift: no
+    /// `Event::Fim` (so main.rs never logs "FIM DRIFT"), and no row
+    /// appended to `fim_drift.jsonl`. Parameterised over the exact VM
+    /// boot-noise samples from the report plus the paths the v1
+    /// 4-path allowlist used to cover (now subsumed by the op rule).
+    #[test]
+    fn bug012_v2_opened_on_noncred_watched_path_yields_zero_drift() {
+        for path in &[
+            // VM boot-noise samples (BUG-012 v2 report) — the 101 in
+            // a 2-minute boot these were the shape of.
+            "/etc/nsswitch.conf",
+            "/etc/pam.d/common-auth",
+            "/etc/group",
+            "/usr/bin/dash",
+            // Formerly the v1 FIM_OPENED_SUPPRESS_PATHS allowlist —
+            // still dropped, now by the general op rule.
+            "/etc/passwd",
+            "/etc/shadow",
+            "/etc/sudoers",
+            "/etc/login.defs",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let key = fresh_signing_key(&dir);
+            let drift_path = dir.path().join("drift.jsonl");
+            let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+            let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, path);
+            let classifier = DriftClassifier::new();
+            let rate_limiter = DriftRateLimiter::new();
+            let (tx, mut rx) = mpsc::channel::<Event>(8);
+            let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
+
+            let emitted = process_drift(
+                &raw,
+                &path_map,
+                None,
+                &mut drift_db,
+                &classifier,
+                &rate_limiter,
+                None,
+                Some(&tx),
+            )
+            .unwrap();
+
+            assert!(!emitted, "{path}: Opened must yield zero drift");
+            assert!(
+                rx.try_recv().is_err(),
+                "{path}: no Event::Fim → main.rs logs no 'FIM DRIFT' WARN"
+            );
+            assert!(
+                !drift_path.exists()
+                    || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
+                "{path}: read must NOT append to fim_drift.jsonl"
+            );
+        }
+    }
+
+    /// BUG-012 (v2) #2 — `FimOp::Opened` on a CREDENTIAL path
+    /// (`~/.aws/credentials`, NN-L-FIM-011 surface) is forwarded
+    /// SILENTLY: an `Event::Fim` is emitted (so the rule engine can
+    /// evaluate it) but NO drift row is written (no "FIM DRIFT"
+    /// noise). The end-to-end assertion: the very event the drain
+    /// emits, fed to NN-L-FIM-011, STILL fires. This is the
+    /// credential-theft-read coverage the literal "drop all Opened"
+    /// reading would have silently destroyed.
+    #[test]
+    fn bug012_v2_opened_on_cred_path_forwards_to_rules_silently() {
+        use crate::decision::Rule;
+        use crate::fim::rules::NnLFim011AwsCredsRead;
+        use common::ResponseAction;
+
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let (_on_disk, key_ino, path_map) =
+            make_watched_alias(&dir, "/root/.aws/credentials");
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        // fake_raw uses modifier_comm "dpkg" — NOT an AWS CLI, so the
+        // NN-L-FIM-011 FP guard does not exempt it.
+        let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
+
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            None,
+            Some(&tx),
+        )
+        .unwrap();
+
+        assert!(emitted, "cred-path Opened MUST forward to the rule engine");
+        // SILENT: forwarded but NOT recorded as drift.
+        assert!(
+            !drift_path.exists()
+                || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
+            "cred-path read MUST NOT append to fim_drift.jsonl (no 'FIM DRIFT' noise)"
+        );
+
+        let ev = rx.try_recv().expect("Event::Fim must be sent for cred-path read");
+        let fe = match &ev {
+            Event::Fim(fe) => {
+                assert_eq!(fe.path, "/root/.aws/credentials");
+                assert_eq!(fe.op, FimOp::Opened);
+                fe.clone()
+            }
+            other => panic!("expected Event::Fim, got {other:?}"),
+        };
+        // The forwarded event STILL reaches + fires NN-L-FIM-011.
+        assert_eq!(fe.op, common::wire::FimOp::Opened);
+        let verdict = NnLFim011AwsCredsRead
+            .evaluate(&ev)
+            .expect("BUG-012 v2 coverage: NN-L-FIM-011 MUST still fire on the forwarded event");
+        assert_eq!(verdict.rule_id, "NN-L-FIM-011_AwsCredsRead");
+        assert_eq!(verdict.action, ResponseAction::KillProcess);
+    }
+
+    /// BUG-012 (v2) #3 — regression guard: a `Modified` on a critical
+    /// path STILL drifts exactly as before. The read carve-out must
+    /// not touch the integrity-changing ops FIM-001..009 depend on.
+    #[test]
+    fn bug012_v2_modify_on_critical_path_still_fires() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let (on_disk, key_ino, path_map) = make_watched_alias(&dir, "/etc/passwd");
+        // Mutate the file so a real-drift hash-diff is observed.
+        std::fs::write(&on_disk, b"MUTATED content").unwrap();
+
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let stale_baseline = dummy_baseline("/etc/passwd", &"42".repeat(32));
+        let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Modified as u8);
+
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            Some(&stale_baseline),
+            &mut drift_db,
+            &classifier,
+            &rate_limiter,
+            None,
+            Some(&tx),
+        )
+        .unwrap();
+        assert!(emitted, "Modified on /etc/passwd MUST still fire");
+        match rx.try_recv().unwrap() {
+            Event::Fim(fe) => {
+                assert_eq!(fe.path, "/etc/passwd");
+                assert_eq!(fe.op, FimOp::Modified);
+            }
+            other => panic!("expected Event::Fim, got {other:?}"),
+        }
     }
 }

@@ -8,11 +8,31 @@ use common::ade_types::{
     FollowUpPolicy, MitreAttack, ReasoningSteps, RecommendedAction, ThreatClassification,
     ADE_SCHEMA_VERSION,
 };
-use common::posture_types::PostureKind;
+use common::posture_types::{PostureKind, TriggerType};
 use common::Event;
 
-use super::triggers::testutil::{file_open, spawn, tcp_v4};
-use super::{AdminReleaseError, PostureMachine};
+use super::triggers::testutil::{file_open, fs_protect_denial, spawn, tcp_v4};
+use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
+
+/// BUG-032 — an exfiltration burst: 21 connects (focal + 20) by one pid
+/// to a public dst on 443 → `ExfiltrationPattern` (a NeedsCorroboration
+/// COMBAT-tier signal).
+fn exfil_burst(pid: u32) -> (Event, Vec<Event>) {
+    let recent: Vec<Event> = (0..20u64)
+        .map(|i| tcp_v4(pid, [203, 0, 113, 9], 443, i + 1))
+        .collect();
+    (tcp_v4(pid, [203, 0, 113, 9], 443, 100), recent)
+}
+
+/// BUG-032 — a lateral-movement burst: 3 distinct RFC1918 hosts on an
+/// admin port from one pid → `LateralMovement`.
+fn lateral_burst(pid: u32) -> (Event, Vec<Event>) {
+    let recent = vec![
+        tcp_v4(pid, [10, 0, 0, 1], 22, 1),
+        tcp_v4(pid, [10, 0, 0, 2], 22, 2),
+    ];
+    (tcp_v4(pid, [10, 0, 0, 3], 22, 3), recent)
+}
 
 fn baseline_verdict(action: AdeAction, severity: AdeSeverity) -> AdeVerdict {
     AdeVerdict {
@@ -80,7 +100,7 @@ fn admin_release_unauthorized_is_rejected() {
     let m = PostureMachine::new();
     // Force COMBAT first.
     let recent: Vec<Event> = vec![];
-    let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
+    let focal = fs_protect_denial(42, 1);
     m.observe(&focal, &recent);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(
@@ -93,7 +113,7 @@ fn admin_release_unauthorized_is_rejected() {
 #[test]
 fn admin_release_authorized_drops_to_engaged() {
     let m = PostureMachine::new();
-    let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
+    let focal = fs_protect_denial(42, 1);
     m.observe(&focal, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     let next = m.admin_release_combat(true).expect("ok");
@@ -131,7 +151,7 @@ fn full_recon_to_combat_flow() {
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 
     // Phase 3: exec from /tmp → ConfirmedIntrusion → COMBAT.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     let t3 = m.observe(&intrusion, &[]);
     assert!(t3.is_some());
     assert_eq!(m.current_kind(), PostureKind::Combat);
@@ -241,7 +261,7 @@ fn concurrent_observe_and_modulate_is_safe() {
 fn concurrent_admin_release_serializes_correctly() {
     let m = Arc::new(PostureMachine::new());
     // Drive into COMBAT.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 
@@ -270,7 +290,7 @@ fn concurrent_admin_release_serializes_correctly() {
 fn transition_log_caps_at_bound() {
     let m = PostureMachine::new();
     // Force many transitions: alternate intrusion+admin release.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     for _ in 0..300 {
         m.observe(&intrusion, &[]);
         let _ = m.admin_release_combat(true);
@@ -300,11 +320,58 @@ fn combat_hook_fires_on_first_combat_entry() {
     assert_eq!(m.current_kind(), PostureKind::Alerted);
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
-    // ConfirmedIntrusion crosses into COMBAT — hook fires exactly once.
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    // A kernel anti-tamper denial (Decisive) crosses into COMBAT —
+    // hook fires exactly once.
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+// ─── BUG-032: corroboration / progression ──────────────────────────
+
+#[test]
+fn single_blunt_combat_signal_caps_at_engaged() {
+    // A lone ExfiltrationPattern (the harness-egress shape) escalates to
+    // ENGAGED (alert), NOT COMBAT (auto-isolation). This is the core
+    // precision win + the documented single-vector limit.
+    let m = PostureMachine::new();
+    let (focal, recent) = exfil_burst(42);
+    let out = m.observe(&focal, &recent);
+    assert!(out.is_some(), "exfil shape must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "a single blunt COMBAT-tier signal must cap at ENGAGED"
+    );
+}
+
+#[test]
+fn corroborated_pair_reaches_combat() {
+    // exfil alone → ENGAGED; a SECOND distinct signal (lateral) within
+    // the window corroborates → COMBAT.
+    let m = PostureMachine::new();
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    let (lf, lr) = lateral_burst(42);
+    m.observe(&lf, &lr);
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Combat,
+        "two distinct blunt signals must corroborate to COMBAT"
+    );
+}
+
+#[test]
+fn decisive_anti_tamper_denial_reaches_combat_alone() {
+    // A kernel-adjudicated FsProtectDenial (AntiTamperDenial, Decisive)
+    // reaches COMBAT on its own — no corroboration required.
+    let m = PostureMachine::new();
+    let out = m.observe(&fs_protect_denial(7, 1), &[]);
+    assert!(out.is_some());
+    assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
 #[test]
@@ -316,7 +383,7 @@ fn combat_hook_does_not_refire_while_already_in_combat() {
         c2.fetch_add(1, Ordering::SeqCst);
     }));
 
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
@@ -336,7 +403,7 @@ fn default_new_has_no_combat_hook() {
     // implicitly rely on this; making it an explicit assertion
     // protects against accidental hook-required regressions.
     let m = PostureMachine::new();
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
@@ -346,7 +413,7 @@ fn default_new_has_no_combat_hook() {
 #[test]
 fn admin_release_with_token_transitions_combat_to_alerted() {
     let m = PostureMachine::new();
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 
@@ -383,7 +450,7 @@ fn release_hook_fires_with_token_on_successful_release() {
         c2.fetch_add(1, Ordering::SeqCst);
     });
     let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
+    let intrusion = fs_protect_denial(100, 500);
     m.observe(&intrusion, &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -500,6 +567,313 @@ fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
     );
 }
 
+// ─── T7.13 (Beta Step 5) — end-to-end lineage exemption tests ──────
+//
+// Drive the full PostureMachine through realistic event sequences
+// covering the sudo cascade, the negative control (ransomware shape),
+// and the self-write regression guard. These exercise the same code
+// path as production: TriggerDetector::detect ingests ProcessSpawn
+// into the AuthSessionTracker on every observe() call.
+
+/// Helper: build a posture machine carrying a fresh AuthSessionTracker
+/// pointed at a nonexistent /proc, so the lineage gate only sees what
+/// the test explicitly ingests via ProcessSpawn events.
+fn machine_with_isolated_auth() -> PostureMachine {
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+    PostureMachine::new_with_hooks_and_exempt_and_auth(
+        entry_hook,
+        release_hook,
+        ExemptPids::default(),
+        AuthSessionTracker::new("/this/path/does/not/exist"),
+    )
+}
+
+/// Test #15 — sudo cascade end-to-end stays at OBSERVING.
+/// Replays the empirically-observed T7.13 cascade: sudo opens
+/// /etc/shadow (uid=1000), an apt subprocess writes 25 files. With
+/// the lineage gate the posture must NOT transition.
+#[test]
+fn sudo_cascade_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+
+    // 1. sudo spawns: ingested into AuthSessionTracker via detect().
+    let sudo_spawn = spawn(100, 50, "sudo", "/usr/bin/sudo", 1);
+    let r = m.observe(&sudo_spawn, &[]);
+    assert!(r.is_none(), "sudo spawn must not transition: {r:?}");
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // 2. sudo's PAM auth chain reads /etc/shadow as uid=1000 (still
+    //    pre-setuid at LSM file_open fire time).
+    let shadow_read = file_open(100, 1000, "/etc/shadow", 0, 2);
+    let r = m.observe(&shadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "sudo /etc/shadow read must not transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // 3. apt spawns as sudo's child.
+    let apt_spawn = spawn(200, 100, "apt", "/usr/bin/apt", 3);
+    let r = m.observe(&apt_spawn, &[]);
+    assert!(r.is_none(), "apt spawn must not transition: {r:?}");
+
+    // 4. apt mass-writes /var/cache/apt/* — 25 writes in window.
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(200, 0, "/var/cache/apt/x", 1, i + 100))
+        .collect();
+    let focal = file_open(200, 0, "/var/cache/apt/x", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(
+        r.is_none(),
+        "apt mass-write under sudo lineage must NOT transition: {r:?}"
+    );
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Observing,
+        "T7.13 fix did not hold — sudo cascade still escalated"
+    );
+}
+
+/// Test #16 — exec-from-/tmp still escalates (now to ENGAGED).
+/// Negative control: a non-auth-mediated exec from /tmp must still
+/// trip ConfirmedIntrusion via the exec-from-/tmp arm — the lineage
+/// gate must NOT be too broad. BUG-032: as a single NeedsCorroboration
+/// signal it now caps at ENGAGED (alert); COMBAT needs a second
+/// distinct signal (see `corroborated_pair_reaches_combat`).
+#[test]
+fn ransomware_shape_reaches_engaged_alone() {
+    let m = machine_with_isolated_auth();
+    // No sudo lineage. Direct exec from /tmp.
+    let evil = spawn(900, 1, "payload", "/tmp/payload", 1);
+    let r = m.observe(&evil, &[]);
+    assert!(r.is_some(), "exec-from-/tmp must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "non-auth exec from /tmp escalates to ENGAGED on its own (BUG-032)"
+    );
+}
+
+/// Test #17 — mass-write alone from a non-auth PID still escalates
+/// (now to ENGAGED). Confirms the mass-write arm itself still works
+/// for adversarial PIDs (the lineage gate is the only suppressor);
+/// BUG-032 caps a single signal at ENGAGED.
+#[test]
+fn mass_write_alone_from_non_auth_pid_reaches_engaged() {
+    let m = machine_with_isolated_auth();
+    // Spawn a non-auth parent so the writer's lineage is clean.
+    let _ = m.observe(&spawn(900, 1, "zsh", "/usr/bin/zsh", 1), &[]);
+
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(900, 1000, "/home/u/x", 1, i + 100))
+        .collect();
+    let focal = file_open(900, 1000, "/home/u/x", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_some(), "non-auth mass-write must transition");
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// Test #18 — agent's own writes still exempt (PR #123 regression
+/// guard). Validates that adding the auth-lineage gate did not
+/// break the pre-existing stack-PID exclusion.
+#[test]
+fn agent_self_writes_still_exempt() {
+    const AGENT_PID: u32 = 4242;
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+    let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        entry_hook,
+        release_hook,
+        ExemptPids::with_agent(AGENT_PID),
+        AuthSessionTracker::new("/this/path/does/not/exist"),
+    );
+
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| {
+            file_open(
+                AGENT_PID,
+                0,
+                "/var/lib/northnarrow/fim_drift.jsonl",
+                1,
+                i + 100,
+            )
+        })
+        .collect();
+    let focal = file_open(AGENT_PID, 0, "/var/lib/northnarrow/fim_drift.jsonl", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(
+        r.is_none(),
+        "agent's own state-log writes must still be fully exempt: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+// ─── T7.13 generalisation: PAM-daemon login chains, end-to-end ──────
+//
+// The original T7.13 fix covered sudo; the same false-positive class
+// applies to every PAM-mediated login daemon (cron jobs, display
+// managers, logind sessions) whose credential read is observed at the
+// authenticating user's uid. These FSM-level tests assert such chains
+// never push posture upward — the "trigger bar" guarantee that benign
+// authentication cannot escalate toward COMBAT.
+
+/// A cron job's PAM `session` chain reading /etc/shadow as uid=1000
+/// (lineage: crond → job shell) must NOT transition the posture.
+#[test]
+fn cron_job_shadow_read_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    assert!(m
+        .observe(&spawn(500, 1, "cron", "/usr/sbin/cron", 1), &[])
+        .is_none());
+    assert!(m
+        .observe(&spawn(501, 500, "sh", "/bin/sh", 2), &[])
+        .is_none());
+    let shadow_read = file_open(501, 1000, "/etc/shadow", 0, 3);
+    let r = m.observe(&shadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "cron-job /etc/shadow read must NOT transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+/// A display-manager login (gdm daemon → gdm-session-worker PAM stack →
+/// session child) reading /etc/gshadow as uid=1000 must NOT transition.
+#[test]
+fn gdm_login_gshadow_read_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    assert!(m
+        .observe(&spawn(600, 1, "gdm3", "/usr/sbin/gdm3", 1), &[])
+        .is_none());
+    assert!(m
+        .observe(
+            &spawn(601, 600, "gdm-session-wor", "/usr/lib/gdm3/gdm-session-worker", 2),
+            &[],
+        )
+        .is_none());
+    let gshadow_read = file_open(601, 1000, "/etc/gshadow", 0, 3);
+    let r = m.observe(&gshadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "gdm-session-worker /etc/gshadow read must NOT transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+/// Negative control: an unexpected uid=1000 reader of /etc/gshadow with
+/// no auth lineage STILL escalates (to ALERTED — SensitiveFileAccess is
+/// an ALERTED-tier trigger). gshadow is monitored symmetrically with
+/// /etc/shadow; the expanded daemon allowlist must not blind us to real
+/// group-credential theft.
+#[test]
+fn unexpected_gshadow_read_e2e_reaches_alerted() {
+    let m = machine_with_isolated_auth();
+    // Non-auth lineage: a plain shell child.
+    assert!(m
+        .observe(&spawn(900, 1, "bash", "/usr/bin/bash", 1), &[])
+        .is_none());
+    let r = m.observe(&file_open(900, 1000, "/etc/gshadow", 0, 2), &[]);
+    assert!(r.is_some(), "unexpected /etc/gshadow read must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Alerted,
+        "unexpected /etc/gshadow read escalates to ALERTED (SensitiveFileAccess tier)"
+    );
+}
+
+/// Screen-unlock end-to-end: an unprivileged locker execs the setuid
+/// pam_unix helper unix_chkpwd, which reads /etc/shadow at the caller's
+/// real uid (1000). The unprivileged-auth credential read must NOT push
+/// posture — the screen-unlock FP the user flagged.
+#[test]
+fn screen_unlock_unix_chkpwd_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    assert!(m
+        .observe(
+            &spawn(700, 1, "cinnamon-screen", "/usr/bin/cinnamon-screensaver", 1),
+            &[],
+        )
+        .is_none());
+    assert!(m
+        .observe(&spawn(701, 700, "unix_chkpwd", "/usr/sbin/unix_chkpwd", 2), &[])
+        .is_none());
+    let shadow_read = file_open(701, 1000, "/etc/shadow", 0, 3);
+    let r = m.observe(&shadow_read, &[]);
+    assert!(
+        r.is_none(),
+        "screen-unlock unix_chkpwd /etc/shadow read must NOT transition: {r:?}"
+    );
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+// ─── (ii) — system package-management daemon exemption, end-to-end ──
+//
+// The 2026-06-02 self-lock: snapd's refresh did a mass-write burst on
+// /var/lib/snapd/state.json (ConfirmedIntrusion → ENGAGED) AND wrote a
+// systemd mount unit (PersistenceMechanism); the two distinct signals
+// corroborated to COMBAT. (ii) exempts the daemon from BOTH arms — but
+// the identical shape from a non-daemon pid must still reach COMBAT.
+
+/// snapd's normal refresh (mass-write + unit write) must NOT escalate.
+#[test]
+fn snapd_refresh_e2e_stays_at_observing() {
+    let m = machine_with_isolated_auth();
+    // snapd daemon spawned by systemd (pid 1).
+    assert!(m
+        .observe(&spawn(1096, 1, "snapd", "/usr/lib/snapd/snapd", 1), &[])
+        .is_none());
+
+    // 1. 25 atomic state.json rewrites in-window (mass-write arm).
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 100))
+        .collect();
+    let focal = file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_none(), "snapd mass-write must NOT transition: {r:?}");
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // 2. snapd writes its mount unit (persistence arm) — the original
+    //    corroborating signal that pushed ENGAGED → COMBAT.
+    let unit = file_open(1096, 0, "/etc/systemd/system/snap-snapd-26865.mount", 1, 300);
+    let r = m.observe(&unit, &[]);
+    assert!(r.is_none(), "snapd unit write must NOT transition: {r:?}");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Observing,
+        "(ii) did not hold — snapd refresh still escalated"
+    );
+}
+
+/// Detection intact: the IDENTICAL mass-write + persistence pair from a
+/// NON-daemon pid must still corroborate to COMBAT.
+#[test]
+fn non_daemon_masswrite_plus_persistence_reaches_combat() {
+    let m = machine_with_isolated_auth();
+    // Non-daemon writer, clean lineage (parent = init).
+    let _ = m.observe(&spawn(900, 1, "cryptor", "/usr/local/bin/cryptor", 1), &[]);
+
+    // 1. mass-write → ConfirmedIntrusion → ENGAGED (seeds the ledger).
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| file_open(900, 1000, "/home/u/docs/f", 1, i + 100))
+        .collect();
+    let focal = file_open(900, 1000, "/home/u/docs/f", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_some(), "non-daemon mass-write must transition");
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    // 2. persistence (systemd unit drop) → PersistenceMechanism; with
+    //    ConfirmedIntrusion still in the ledger (distinct) → COMBAT.
+    let unit = file_open(900, 0, "/etc/systemd/system/evil.service", 1, 300);
+    let r = m.observe(&unit, &[]);
+    assert!(r.is_some(), "persistence must transition");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Combat,
+        "non-daemon mass-write + persistence must corroborate to COMBAT"
+    );
+}
+
 /// Required A10 test 4: same-state transition is a no-op — no
 /// `last_admin_action` timestamp recorded, no log transition
 /// added, no hook fires. Anchors the §12.2 design contract that
@@ -538,4 +912,29 @@ fn admin_force_state_with_token_same_state_is_noop() {
         0,
         "no hook should fire on same-state transition"
     );
+}
+
+// ── BUG-015 P-5 regression — observe() returns the firing trigger ──
+
+#[test]
+fn observe_returns_firing_trigger_on_transition() {
+    // A kernel anti-tamper denial fires the Decisive AntiTamperDenial →
+    // COMBAT. The returned tuple must carry that TriggerType so callers
+    // (main.rs WARN log) can surface which signal caused the escalation.
+    let m = PostureMachine::new();
+    let focal = fs_protect_denial(42, 1);
+    let result = m.observe(&focal, &[]);
+    let (new_state, firing) = result.expect("posture transitioned");
+    assert_eq!(new_state.kind(), PostureKind::Combat);
+    assert_eq!(firing, Some(TriggerType::AntiTamperDenial));
+}
+
+#[test]
+fn observe_returns_none_when_no_transition() {
+    // A spawn that matches no trigger leaves posture at Observing
+    // and observe() returns None — no log line in main.rs.
+    let m = PostureMachine::new();
+    let benign = spawn(42, 1, "ls", "/usr/bin/ls", 1);
+    assert!(m.observe(&benign, &[]).is_none());
+    assert_eq!(m.current_kind(), PostureKind::Observing);
 }

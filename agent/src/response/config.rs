@@ -36,8 +36,17 @@ pub struct ExecutorConfig {
     /// isolated — placeholder for the Tappa 13 C2 backend.
     pub c2_endpoints: Vec<String>,
 
-    /// Don't actually touch the system; log + return optimistic
-    /// outcomes. Set via env `NORTHNARROW_DRY_RUN=1` from main.
+    /// **The agent-wide detect-only / no-enforcement gate.** When
+    /// `true`, NOTHING touches the system: the [`Executor`](super::Executor)
+    /// dispatcher suppresses every response action (kill, block,
+    /// quarantine, throttle, isolation) and returns
+    /// [`WouldExecute`](super::ExecutionOutcome::WouldExecute); `main.rs`
+    /// gates COMBAT-posture network isolation on the same flag. The
+    /// agent logs the verdict it WOULD have enforced and executes
+    /// nothing — posture-independent (BUG-033). Set by `--detect-only`
+    /// (canonical), or env `NN_DETECT_ONLY` / legacy `NORTHNARROW_DRY_RUN`
+    /// (the legacy name now gates ALL enforcement, including kill +
+    /// COMBAT, closing the old "dry-run that still kills" trap).
     pub dry_run: bool,
 }
 
@@ -45,10 +54,11 @@ impl ExecutorConfig {
     /// Production defaults; `dry_run` may be flipped at construction
     /// time by reading the env var.
     pub fn from_env() -> Self {
-        let dry_run = matches!(
-            std::env::var("NORTHNARROW_DRY_RUN").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        );
+        // One gate, multiple inputs: `--detect-only` is OR-ed in by
+        // main; here we honour the canonical `NN_DETECT_ONLY` and the
+        // legacy `NORTHNARROW_DRY_RUN` alias. Either one now suppresses
+        // ALL enforcement (kill + COMBAT included).
+        let dry_run = env_flag("NN_DETECT_ONLY") || env_flag("NORTHNARROW_DRY_RUN");
         Self {
             dry_run,
             ..Self::default()
@@ -108,4 +118,14 @@ impl Default for ExecutorConfig {
             dry_run: false,
         }
     }
+}
+
+/// True when env `var` is set to a truthy value (`1` / `true` / `yes`).
+/// Shared by the detect-only inputs so `NN_DETECT_ONLY` and the legacy
+/// `NORTHNARROW_DRY_RUN` parse identically.
+fn env_flag(var: &str) -> bool {
+    matches!(
+        std::env::var(var).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }

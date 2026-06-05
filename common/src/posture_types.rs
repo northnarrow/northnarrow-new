@@ -74,6 +74,28 @@ pub enum TriggerType {
     PersistenceMechanism,
     LateralMovement,
     ExfiltrationPattern,
+
+    // Decisive (kernel-adjudicated) — straight to COMBAT, no
+    // corroboration required. Appended last to keep variant ordering
+    // stable (BUG-032). Split out of `ConfirmedIntrusion`'s
+    // FsProtectDenial arm: a *denied* anti-tamper attempt is the kernel
+    // having already blocked malice, not a heuristic pattern.
+    AntiTamperDenial,
+}
+
+/// How much trust a [`TriggerType`] carries when it targets COMBAT.
+///
+/// BUG-032: only a *Decisive* signal escalates straight to locked
+/// COMBAT (auto-isolation). A *NeedsCorroboration* signal is a
+/// heuristic pattern that can be legitimate, so on its own it stops at
+/// ENGAGED (alert) and reaches COMBAT only with a second distinct
+/// escalation signal. Irrelevant for triggers below COMBAT tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    /// Kernel-adjudicated malice (e.g. an LSM denial). Straight to COMBAT.
+    Decisive,
+    /// Heuristic pattern — needs corroboration before auto-isolation.
+    NeedsCorroboration,
 }
 
 impl TriggerType {
@@ -93,7 +115,18 @@ impl TriggerType {
             TriggerType::ConfirmedIntrusion
             | TriggerType::PersistenceMechanism
             | TriggerType::LateralMovement
-            | TriggerType::ExfiltrationPattern => PostureKind::Combat,
+            | TriggerType::ExfiltrationPattern
+            | TriggerType::AntiTamperDenial => PostureKind::Combat,
+        }
+    }
+
+    /// Trust class for COMBAT-targeting triggers (BUG-032). Only
+    /// [`Confidence::Decisive`] escalates straight to COMBAT; every
+    /// heuristic pattern is [`Confidence::NeedsCorroboration`].
+    pub fn confidence(&self) -> Confidence {
+        match self {
+            TriggerType::AntiTamperDenial => Confidence::Decisive,
+            _ => Confidence::NeedsCorroboration,
         }
     }
 
@@ -111,6 +144,7 @@ impl TriggerType {
             TriggerType::PersistenceMechanism => "PersistenceMechanism",
             TriggerType::LateralMovement => "LateralMovement",
             TriggerType::ExfiltrationPattern => "ExfiltrationPattern",
+            TriggerType::AntiTamperDenial => "AntiTamperDenial",
         }
     }
 }

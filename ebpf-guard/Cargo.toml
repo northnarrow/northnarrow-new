@@ -1,0 +1,19 @@
+[package]
+name = "ebpf-guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared eBPF-object provenance: source-closure hashing + build stamp. Used by xtask (writes the stamp after building the .o) and agent/build.rs (verifies it before embedding). Both sides MUST compute the hash identically, so the logic lives here once."
+publish = false
+
+[lib]
+name = "ebpf_guard"
+path = "src/lib.rs"
+
+[dependencies]
+# Same 0.10 line the agent + xtask already pin; no new third-party
+# surface enters the tree.
+sha2 = "0.10"

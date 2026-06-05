@@ -69,6 +69,14 @@ use tracing::{info, warn};
 /// joining this name onto the bpffs root.
 pub const PROTECTED_PIDS_MAP_NAME: &str = "PROTECTED_PIDS";
 
+/// BUG-011 (PHASE 15.1): name of the pinned `PROTECTED_OBSERVERS`
+/// map (mirrors the `#[map]` declaration in
+/// `agent-ebpf/src/ptrace_check.rs`). The agent's
+/// `spawn_watchdog_exempt_refresh` timer writes verified observer
+/// PIDs here; the `ptrace_access_check` LSM hook reads it on each
+/// fire. Pinned by-name so the registration survives agent restart.
+pub const PROTECTED_OBSERVERS_MAP_NAME: &str = "PROTECTED_OBSERVERS";
+
 /// Single bpffs directory holding every pinned anti-tamper object.
 /// Pre-extraction commit history (Tappa 7 task 6 #2 / #2b) pinned the
 /// six anti-tamper maps + the seven LSM programs + links here. One
@@ -384,6 +392,92 @@ pub fn attach_lsm(
     Ok(())
 }
 
+/// Attach an LSM **deny** hook with cross-restart persistence, ALWAYS
+/// freshly — never reusing the prior boot's pinned link. This is the
+/// BUG-024 fix for the `FS_PROTECT_EVENTS` producers (the `inode_*` deny
+/// hooks): reusing the pinned link kept the prior boot's program bound to
+/// the prior (pinned) ring, desyncing the new boot's consumer. Here each
+/// boot loads + attaches a FRESH program (bound to this boot's fresh,
+/// process-local ring), then retires the old pin.
+///
+/// ZERO-WINDOW ORDERING CONTRACT — **attach-NEW strictly precedes
+/// purge-OLD**:
+///   1. load + attach the fresh program. The prior boot's link pin (if
+///      any) is STILL firing across the death→respawn gap (split-brain),
+///      so now BOTH the old and new deny programs are attached — overlap,
+///      never a gap. (BPF-LSM permits multiple programs per hook; any
+///      non-zero verdict denies, so a double-attach is idempotent.)
+///   2. ONLY THEN purge the prior boot's link + program pins. Removing the
+///      old link pin detaches the OLD program; the NEW one (held by our fd
+///      via `link_id`) keeps firing — a deny program is attached at every
+///      instant.
+///   3. pin the NEW program + link, so THIS boot's hook survives the next
+///      death→respawn gap (persistence preserved).
+/// If purge ever preceded attach, a tamper could slip through the gap — so
+/// the 1→2 order is load-bearing. It is also fail-safe: if the fresh attach
+/// errors, we return BEFORE purging, leaving the prior boot's pinned hook
+/// intact (still protecting).
+///
+/// `pin_root == None` (no bpffs) ⇒ [`attach_transient`] (this boot only).
+pub fn reattach_fresh(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    hook_name: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<()> {
+    let Some(root) = pin_root else {
+        attach_transient(ebpf, program_name, hook_name, btf)?;
+        warn!(
+            hook = hook_name,
+            "anti-tamper: deny hook attached WITHOUT pin (no bpffs) — no \
+             cross-restart persistence"
+        );
+        return Ok(());
+    };
+    let (prog_path, link_path) = lsm_pin_paths(root, hook_name);
+
+    // Step 1 — load + attach the FRESH program. A prior boot's pinned link
+    // (if present) is still firing here, so old + new overlap: zero gap.
+    let prog: &mut Lsm = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program_name} is not an LSM program"))?;
+    prog.load(hook_name, btf)
+        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
+    let link_id = prog.attach().with_context(|| {
+        format!("attaching fresh LSM program `{program_name}` to hook `{hook_name}`")
+    })?;
+
+    // Step 2 — ONLY NOW retire the prior boot's pins (MUST follow Step 1 —
+    // the zero-window invariant). The new program, held by our fd via
+    // `link_id`, keeps firing while the old one detaches.
+    purge_stale_pin(&link_path);
+    purge_stale_pin(&prog_path);
+
+    // Step 3 — pin the fresh program + link so this boot's hook survives the
+    // next death→respawn gap (split-brain persistence preserved).
+    prog.pin(&prog_path).with_context(|| {
+        format!(
+            "pinning fresh LSM program `{program_name}` to {}",
+            prog_path.display()
+        )
+    })?;
+    let link = prog
+        .take_link(link_id)
+        .with_context(|| format!("taking ownership of fresh `{hook_name}` LSM link"))?;
+    let fd_link: FdLink = link.into();
+    let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+        format!("pinning fresh LSM link `{hook_name}` to {}", link_path.display())
+    })?;
+    info!(
+        hook = hook_name,
+        "anti-tamper: deny hook re-attached FRESH (attach-before-purge, zero-window) + re-pinned"
+    );
+    Ok(())
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Tappa 7 task 6 Watchdog W1 — ProtectedPidsHandle (design §6.3)
 // ────────────────────────────────────────────────────────────────────
@@ -545,6 +639,122 @@ where
     /// (which needs `&mut`) for each stale entry. Returning a
     /// `Vec` also matches the watchdog's diagnostic use cases
     /// (dump the protected set to a log line).
+    pub fn pids(&self) -> Result<Vec<u32>> {
+        Ok(self.map.keys().filter_map(Result::ok).collect())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// BUG-011 (PHASE 15.1) — ProtectedObserversHandle
+// ────────────────────────────────────────────────────────────────────
+
+/// Typed handle to the pinned `PROTECTED_OBSERVERS` BPF map. Same
+/// shape as [`ProtectedPidsHandle`] (`HashMap<u32, u8>` with
+/// presence-as-signal semantics) but a distinct map name AND a
+/// distinct security contract:
+///
+/// - `PROTECTED_PIDS` ⇒ target may not be killed/ptraced; caller-side
+///   reciprocal grants observer rights to other PROTECTED_PIDS members.
+/// - `PROTECTED_OBSERVERS` ⇒ caller may ptrace-read PROTECTED_PIDS
+///   targets, but is NOT itself shielded from kill/ptrace by anyone.
+///
+/// Writers: ONLY the agent. The watchdog never writes this map (the
+/// watchdog is a CONSUMER — its read of `/proc/<agent>/exe` is what
+/// the carve-out exists to permit). Construction mirrors
+/// `ProtectedPidsHandle`: [`Self::open`] for path-based callers,
+/// [`Self::from_ebpf`] for the agent's in-process Ebpf instance.
+#[derive(Debug)]
+pub struct ProtectedObserversHandle<T = MapData> {
+    map: AyaHashMap<T, u32, u8>,
+}
+
+impl ProtectedObserversHandle<MapData> {
+    /// Open the pinned `PROTECTED_OBSERVERS` map at
+    /// `<bpffs_root>/PROTECTED_OBSERVERS`. Same failure modes as
+    /// [`ProtectedPidsHandle::open`] (pin missing, wrong shape).
+    pub fn open(bpffs_root: &Path) -> Result<Self> {
+        let pin_path = bpffs_root.join(PROTECTED_OBSERVERS_MAP_NAME);
+        let map_data = MapData::from_pin(&pin_path).with_context(|| {
+            format!(
+                "opening pinned {} at {}",
+                PROTECTED_OBSERVERS_MAP_NAME,
+                pin_path.display()
+            )
+        })?;
+        let map = AyaMap::HashMap(map_data);
+        let map = AyaHashMap::try_from(map).with_context(|| {
+            format!("{} is not a HashMap<u32, u8>", PROTECTED_OBSERVERS_MAP_NAME)
+        })?;
+        Ok(Self { map })
+    }
+}
+
+impl<'a> ProtectedObserversHandle<&'a mut MapData> {
+    /// Agent-facing constructor — borrow the `PROTECTED_OBSERVERS`
+    /// map from an already-loaded `Ebpf` instance.
+    pub fn from_ebpf(ebpf: &'a mut Ebpf) -> Result<Self> {
+        let map = ebpf
+            .map_mut(PROTECTED_OBSERVERS_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {PROTECTED_OBSERVERS_MAP_NAME} missing from eBPF object"))?;
+        let map = AyaHashMap::try_from(map).with_context(|| {
+            format!("{PROTECTED_OBSERVERS_MAP_NAME} is not a HashMap<u32, u8>")
+        })?;
+        Ok(Self { map })
+    }
+}
+
+impl<T> ProtectedObserversHandle<T>
+where
+    T: BorrowMut<MapData>,
+{
+    /// Register `pid` as a trusted observer. `BPF_ANY` upsert; safe
+    /// to call repeatedly for the same PID.
+    pub fn insert(&mut self, pid: u32) -> Result<()> {
+        self.map
+            .insert(pid, 1u8, 0)
+            .with_context(|| format!("inserting PID {pid} into {PROTECTED_OBSERVERS_MAP_NAME}"))?;
+        Ok(())
+    }
+
+    /// Remove `pid`. Absent ⇒ Ok (idempotent — the agent's refresh
+    /// timer may race with watchdog teardown).
+    pub fn evict(&mut self, pid: u32) -> Result<()> {
+        match self.map.remove(&pid) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if is_not_found_err(&e) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("evicting PID {pid} from {PROTECTED_OBSERVERS_MAP_NAME}")
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl<T> ProtectedObserversHandle<T>
+where
+    T: Borrow<MapData>,
+{
+    /// `true` if `pid` is currently registered as a trusted observer.
+    pub fn contains(&self, pid: u32) -> Result<bool> {
+        match self.map.get(&pid, 0) {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if is_not_found_err(&e) {
+                    Ok(false)
+                } else {
+                    Err(anyhow!(e)).with_context(|| {
+                        format!("looking up PID {pid} in {PROTECTED_OBSERVERS_MAP_NAME}")
+                    })
+                }
+            }
+        }
+    }
+
+    /// Snapshot of every registered observer PID.
     pub fn pids(&self) -> Result<Vec<u32>> {
         Ok(self.map.keys().filter_map(Result::ok).collect())
     }

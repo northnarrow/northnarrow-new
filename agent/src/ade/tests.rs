@@ -56,6 +56,7 @@ async fn engine_evaluates_and_returns_valid_verdict() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -116,6 +117,7 @@ async fn engine_synthesises_escalate_on_malformed_output() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -179,6 +181,7 @@ async fn engine_surfaces_timeout_as_error() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -246,6 +249,7 @@ async fn rule_engine_short_circuits_before_ade_for_tmp_payload() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
 
     let v = rule_engine
@@ -328,6 +332,7 @@ async fn ignored_candle_real_inference() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -364,6 +369,7 @@ async fn engine_with_rag_evaluates_successfully() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -510,6 +516,7 @@ async fn evaluate_produces_identical_verdict_with_or_without_streaming() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = || EventContext {
         recent_events: vec![],
@@ -557,6 +564,7 @@ async fn rag_none_prompt_is_byte_identical_to_pre_6_7() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -685,6 +693,7 @@ async fn with_rag_splices_block_into_assembled_prompt() {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],

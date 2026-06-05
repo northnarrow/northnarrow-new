@@ -15,6 +15,8 @@ pub mod agent_id;
 pub mod anti_tamper;
 pub mod audit;
 pub mod canary;
+pub mod chainlog;
+pub mod combat;
 pub mod config;
 pub mod correlation;
 pub mod decision;

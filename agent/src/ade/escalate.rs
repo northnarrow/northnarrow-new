@@ -41,6 +41,9 @@ pub fn transform_to_escalate(
     meta: &EscalateMeta<'_>,
 ) -> AdeVerdict {
     let (pid, filename) = match event {
+        Event::ModuleLoad { loader_pid, path, loader_comm, .. } => {
+            (*loader_pid, path.clone().unwrap_or_else(|| loader_comm.clone()))
+        }
         Event::ProcessSpawn { pid, filename, .. }
         | Event::FileOpen { pid, filename, .. }
         | Event::ExecCheck { pid, filename, .. } => (*pid, filename.clone()),
@@ -190,6 +193,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let host = host();
         let m = meta(&host);
@@ -217,6 +221,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let host = host();
         let m = meta(&host);

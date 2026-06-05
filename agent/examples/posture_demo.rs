@@ -44,7 +44,7 @@ fn main() {
     if let Some(state) = machine.observe(&recon_focal, &recon_recent) {
         println!(
             "  POSTURE TRANSITION → {} (trigger: reconnaissance pattern detected)",
-            state.kind()
+            state.0.kind()
         );
     }
     println!("  posture: {}\n", machine.current_kind());
@@ -69,7 +69,7 @@ fn main() {
     if let Some(state) = machine.observe(&nc, &[]) {
         println!(
             "  POSTURE TRANSITION → {} (trigger: confirmed exploit)",
-            state.kind()
+            state.0.kind()
         );
     }
     println!("  posture: {}\n", machine.current_kind());
@@ -80,7 +80,7 @@ fn main() {
     if let Some(state) = machine.observe(&intrusion, &[]) {
         println!(
             "  POSTURE TRANSITION → {} (trigger: confirmed intrusion / persistence)",
-            state.kind()
+            state.0.kind()
         );
     }
     println!("  posture: {}\n", machine.current_kind());
@@ -129,6 +129,7 @@ fn spawn(pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     }
 }
 

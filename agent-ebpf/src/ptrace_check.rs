@@ -35,12 +35,33 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel},
     macros::{lsm, map},
-    maps::Array,
+    maps::{Array, HashMap},
     programs::LsmContext,
 };
 
 use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
 use crate::task_kill::PROTECTED_PIDS;
+
+/// BUG-011 (PHASE 15.1): trusted local-observer set. PIDs in this
+/// map are permitted to `ptrace_access_check` PROTECTED_PIDS targets
+/// — they can read `/proc/<protected_pid>/{exe,cmdline,status,…}` and
+/// perform PTRACE_MODE_READ ops, but the `task_kill` hook is NOT
+/// extended (an observer is not a controller; kill/term stays denied).
+///
+/// Populated by the agent userland after verifying that
+/// `/proc/<candidate_pid>/exe` resolves to the installed watchdog
+/// binary (kernel-resolved symlink, not forgeable from userspace).
+/// See `agent/src/anti_tamper/mod.rs::register_protected_observer`
+/// and the symmetric exe-verification helper at
+/// `agent/src/posture/exempt.rs::resolve_verified_watchdog_pid`.
+///
+/// `max_entries = 8` is generous for V1 (watchdog only); future
+/// trusted-observer integrations (nn-status pollers etc.) fit
+/// without bumping the limit. Pinned by-name so the registration
+/// survives agent restart and the kernel hook + userland share one
+/// kernel object.
+#[map]
+pub static PROTECTED_OBSERVERS: HashMap<u32, u8> = HashMap::pinned(8, 0);
 
 /// Linux `EPERM` value; LSM hooks return `-errno` to deny.
 const EPERM: c_int = 1;
@@ -114,6 +135,25 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // semantics (which checks target *tgid*, not pid).
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if PROTECTED_PIDS.get(&caller_tgid).is_some() {
+        return 0;
+    }
+
+    // BUG-011 (PHASE 15.1): trusted-observer carve-out. The agent
+    // userland registers the watchdog's verified PID here AFTER
+    // confirming `/proc/<pid>/exe` matches the installed watchdog
+    // binary (a kernel-resolved symlink that an attacker can't
+    // substitute). Read-only access — task_kill is NOT extended,
+    // so an observer cannot SIGKILL/SIGTERM us. Asymmetric trust:
+    // PROTECTED_PIDS grants kill+observe immunity AND observer
+    // rights; PROTECTED_OBSERVERS grants observer rights only.
+    //
+    // The map is agent-written; an attacker process cannot
+    // self-register because the writer is the agent. An attacker
+    // who execs at the watchdog's PID after the watchdog dies
+    // would fail the agent's next refresh-cycle exe-check and be
+    // evicted before the next ptrace attempt — minimal race
+    // window (eviction latency, single agent timer cycle).
+    if PROTECTED_OBSERVERS.get(&caller_tgid).is_some() {
         return 0;
     }
 

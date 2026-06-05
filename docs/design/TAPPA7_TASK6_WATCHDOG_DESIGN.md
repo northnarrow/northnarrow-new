@@ -629,8 +629,8 @@ Log lines emitted (and only these):
 
 - `systemctl status northnarrow-watchdog.service` — green/red,
   uptime, last journal line.
-- `journalctl -u northnarrow-watchdog.service -f` — live tail.
-- `journalctl -u northnarrow-watchdog.service -p err` — only the
+- `journalctl --namespace=northnarrow -u northnarrow-watchdog.service -f` — live tail.
+- `journalctl --namespace=northnarrow -u northnarrow-watchdog.service -p err` — only the
   load-bearing failures.
 - `northnarrow status` (the existing CLI under `cli/`) — extended
   with a "watchdog" field that reads

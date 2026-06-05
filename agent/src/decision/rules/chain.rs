@@ -625,6 +625,7 @@ mod tests {
             modifier_uid: 1000,
             modifier_comm: "exfil".to_string(),
             dest_path: None,
+            child_truncated: false,
         })
     }
 
@@ -640,6 +641,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 
@@ -737,6 +739,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "x".to_string(),
             dest_path: None,
+            child_truncated: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(
@@ -785,6 +788,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         r.evaluate(&non_tmp);
         assert!(r.evaluate(&flow(42, 4444, 10 * SEC + SEC)).is_none());
@@ -901,6 +905,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 

@@ -523,6 +523,7 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: "attacker".to_string(),
             dest_path: None,
+            child_truncated: false,
         })
     }
 
@@ -538,6 +539,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 

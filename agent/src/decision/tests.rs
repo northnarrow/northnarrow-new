@@ -26,13 +26,15 @@ use super::{Rule, RuleEngine};
 /// and 15 NetFlow rules (NN-L-NET-001..009 from Tappa 10,
 /// NN-L-NET-010/011/013/018/019 from Tappa 10.5 D4, plus
 /// NN-L-NET-014 DNS-tunnel entropy un-gated by the Tappa 4.1 DNS
-/// observability refit) — 67 before T9.5.1, 68 after. Each family
-/// matches a distinct `Event` variant set, so the first-match
-/// short-circuit is unaffected across families.
+/// observability refit) — 67 before T9.5.1, 68 after, 69 after BUG-034
+/// R018 (module-load). Each family matches a distinct `Event` variant
+/// set, so the first-match short-circuit is unaffected across families.
 #[test]
-fn default_engine_has_sixtyeight_rules_across_all_families() {
+fn default_engine_has_sixtynine_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
-    assert_eq!(engine.rule_count(), 8 + 10 + 7 + 24 + 4 + 15);
+    // chain 8 + tappa2 10 + process 7 + module-load 1 (R018, BUG-034)
+    //   + FIM 24 + canary 4 + net 15
+    assert_eq!(engine.rule_count(), 8 + 10 + 7 + 1 + 24 + 4 + 15);
 }
 
 #[test]
@@ -88,6 +90,7 @@ fn proc_self_fd_takes_priority_over_other_matches() {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         })
         .expect("should fire");
     assert_eq!(v.rule_id, "R004_ExecFromProcSelfFd");
@@ -221,20 +224,21 @@ fn rule_ids_are_pinned() {
 /// Tappa 4.1 lifted the count 61 → 62 by un-gating NN-L-NET-014
 /// (DNS-tunnel entropy). Tappa 10.6 D6 lifts 62 → 67 with the five new
 /// cross-PID / N-event chain rules NN-L-CHAIN-004..008. Tappa 9.5.1
-/// lifts 67 → 68 with NN-L-FIM-024 (anti-tamper bait).
+/// lifts 67 → 68 with NN-L-FIM-024 (anti-tamper bait); BUG-034 R018
+/// (module-load) lifts 68 → 69.
 #[test]
-fn default_engine_pins_all_sixtyeight_rule_ids() {
+fn default_engine_pins_all_sixtynine_rule_ids() {
     let rules = super::rules::default_rules();
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        68,
-        "engine ships 68 rules after T9.5.1 NN-L-FIM-024"
+        69,
+        "engine ships 69 rules after BUG-034 R018_KernelModuleLoad"
     );
     ids.sort_unstable();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 68, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 69, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -307,6 +311,7 @@ fn default_engine_pins_all_sixtyeight_rule_ids() {
             "R015_EncodingToolingServiceUid",
             "R016_DebuggerServiceUid",
             "R017_ShellFromNonstandardPath",
+            "R018_KernelModuleLoad",
         ]
     );
 }

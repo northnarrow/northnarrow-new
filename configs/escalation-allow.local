@@ -1,0 +1,35 @@
+# NorthNarrow — escalation allowlist (BUG-032).
+#
+# process×destination tuples whose connections are EXCLUDED FROM THE
+# COUNT of the COMBAT-tier exfiltration_pattern / lateral_movement
+# heuristics (count-filter, NOT whole-trigger suppress): an allowlisted
+# mirror / orchestration flow cannot inflate the threshold, but a real
+# C2 connection — even from a process with a spoofed comm — still counts
+# because its destination is not in the allowlisted CIDR.
+#
+# Format (one rule per line; blank lines + `#` comments ignored):
+#
+#   <trigger>  <comm|comm*>  <dst-cidr>  [port|*]
+#
+#   trigger : exfil | lateral
+#   comm    : exact process name (<= 15 chars — the kernel truncates to
+#             TASK_COMM_LEN) OR a trailing-'*' prefix glob. USE THE
+#             PREFIX FORM for any name longer than 15 chars, e.g.
+#             `systemd-resolved` -> `systemd-resolv*`, or an exact entry
+#             will silently never match the truncated comm.
+#   dst-cidr: IPv4 (or IPv6) network — `addr` or `addr/prefix`.
+#   port    : optional; a number or `*` (any). Default: any.
+#
+# Fail-secure: this file absent/unreadable = EMPTY allowlist (nothing
+# excluded). Malformed lines are skipped with a WARN — a bad line does
+# not disable the rest of the file.
+#
+# OWNED LIMIT: because the filter keys on the destination, traffic to an
+# allowlisted destination that an attacker abuses as C2 (e.g. exfil to a
+# GitHub repo when GitHub ranges are listed) rides under the filter.
+# Keep allowlisted ranges as tight as the legitimate use requires.
+#
+# Examples (commented out — uncomment + adapt to your environment):
+# exfil    apt          91.189.91.0/24     443     # ubuntu archive mirror
+# exfil    *            140.82.112.0/20    443     # github (any comm)
+# lateral  ansible*     10.0.0.0/8         22      # config-mgmt ssh fan-out

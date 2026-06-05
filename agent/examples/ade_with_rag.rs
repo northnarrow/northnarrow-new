@@ -126,6 +126,7 @@ async fn main() -> ExitCode {
         argv: Vec::new(),
         parent_comm: String::new(),
         parent_start_ns: 0,
+        parent_is_kthread: false,
     };
     let ctx = EventContext {
         recent_events: vec![],

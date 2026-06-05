@@ -8,6 +8,7 @@ use std::{
 };
 
 use common::ResponseAction;
+use tracing::warn;
 
 use super::{
     block_outbound, kill, network_isolation, quarantine, throttle, ExecutionOutcome,
@@ -74,6 +75,29 @@ impl Executor {
     pub fn execute(&self, action: ResponseAction, target_pid: u32) -> ExecutionReport {
         let start = Instant::now();
         let mut additional: Vec<ExecutionOutcome> = Vec::new();
+
+        // Detect-only / monitor mode (BUG-033): the single agent-wide
+        // no-enforcement gate, checked here at the dispatcher so it
+        // covers EVERY action — including KillProcess[Tree], which has
+        // no per-module suppression branch and would otherwise SIGKILL
+        // for real. Log what we would have done and return
+        // `WouldExecute`, touching nothing. main.rs gates COMBAT-posture
+        // isolation on the same flag, so both enforcement entry points
+        // honour one switch.
+        if self.config.dry_run {
+            warn!(
+                target: "response.detect_only",
+                action = ?action,
+                target_pid,
+                "DETECT-ONLY: would execute response action — suppressed, no system change"
+            );
+            return ExecutionReport {
+                action,
+                primary: ExecutionOutcome::WouldExecute { pid: target_pid },
+                additional,
+                elapsed: clamp_elapsed(start.elapsed()),
+            };
+        }
 
         // The PID protection floor only applies to actions that
         // operate on a specific PID. `FullNetworkIsolation` is

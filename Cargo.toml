@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["agent", "antitamper-bpf", "common", "cli", "watchdog", "xtask"]
+members = ["agent", "antitamper-bpf", "common", "cli", "ebpf-guard", "watchdog", "xtask"]
 # `agent-ebpf` is a separate cargo project: nightly toolchain,
 # bpfel-unknown-none target, build-std=core. The xtask runner builds it.
 exclude = ["agent-ebpf"]

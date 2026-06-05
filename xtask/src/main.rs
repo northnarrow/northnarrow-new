@@ -259,6 +259,30 @@ fn build_ebpf(release: bool) -> Result<()> {
         );
     }
     println!("xtask: eBPF artifact at {}", bpf_obj.display());
+
+    // Stamp the RELEASE artifact (the one `agent/build.rs` embeds) with
+    // the source-closure hash. This is the writer half of the staleness
+    // guard: `agent/build.rs` reads this stamp and refuses to embed a
+    // `.o` whose stamp does not match the current source — so a plain
+    // `cargo build` can no longer silently bake in a stale object. It
+    // is what makes "the eBPF object is rebuilt atomically with the
+    // agent" an enforced invariant rather than a hopeful comment.
+    //
+    // Only release is stamped because release is the only profile the
+    // agent ever embeds; a `--release=false` eBPF build is a manual
+    // inspection aid and intentionally leaves no stamp (so a userland
+    // build against it trips the guard).
+    if release {
+        let source_hash = ebpf_guard::ebpf_source_hash(&root)
+            .with_context(|| "hashing the eBPF source closure for the build stamp")?;
+        ebpf_guard::write_stamp(&root, &source_hash)
+            .with_context(|| "writing the eBPF build stamp")?;
+        println!(
+            "xtask: build stamp {} = {}",
+            ebpf_guard::ebpf_stamp_path(&root).display(),
+            source_hash
+        );
+    }
     Ok(())
 }
 

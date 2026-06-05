@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,16 +41,19 @@ use northnarrow_agent::net::blocklist::{
     Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
     DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
 };
+use northnarrow_agent::anti_tamper::btf_revalidate::{
+    revalidate_offsets, RefuseReason, RevalidateOutcome,
+};
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::{
-    resolve_verified_watchdog_pid, CombatEntryHook, CombatReleaseHook, ExemptPids, PostureMachine,
-    WatchdogResolution,
+    resolve_verified_watchdog_pid, AuthSessionTracker, CombatEntryHook, CombatReleaseHook,
+    ExemptPids, PostureMachine, WatchdogResolution,
 };
-use northnarrow_agent::response::Executor;
+use northnarrow_agent::response::{Executor, ExecutorConfig};
 use northnarrow_agent::sensors::SensorMultiplexer;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -63,6 +66,17 @@ struct Cli {
     /// Disable the Active Defense Engine (rule engine only).
     #[arg(long = "no-ade", default_value_t = false)]
     no_ade: bool,
+
+    /// Detect-only / monitor mode (BUG-033). Detection runs in full and
+    /// posture still transitions (OBSERVING→ALERTED→COMBAT is logged for
+    /// visibility), but NO enforcement touches the system: every
+    /// response action (kill / block / quarantine / throttle /
+    /// isolation) and COMBAT-posture network isolation are suppressed
+    /// and logged as "would execute". Use for safe rollout / tuning
+    /// before arming autonomous response. Also settable via env
+    /// `NN_DETECT_ONLY=1` (legacy `NORTHNARROW_DRY_RUN=1` is honoured too).
+    #[arg(long = "detect-only", default_value_t = false)]
+    detect_only: bool,
 
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
@@ -91,6 +105,18 @@ struct Cli {
         default_value = "/etc/northnarrow/combat-rules.v4"
     )]
     combat_rules: PathBuf,
+
+    /// BUG-031 — the IPv6 (`ip6tables-restore`) ruleset NetworkIsolator
+    /// applies on COMBAT entry alongside the v4 one. A missing file
+    /// degrades the v6 leg (loud WARN), not the whole COMBAT. Production
+    /// install: /etc/northnarrow/combat-rules.v6; repo dev path:
+    /// configs/combat-rules.v6.
+    #[arg(
+        long = "combat-rules-v6",
+        value_name = "PATH",
+        default_value = "/etc/northnarrow/combat-rules.v6"
+    )]
+    combat_rules_v6: PathBuf,
 
     /// Beta Step 4b: opt-in management carve-out CIDR list. Each IPv4
     /// CIDR in this file is allowed through during COMBAT so a remote
@@ -419,6 +445,79 @@ async fn main() -> Result<()> {
 
     info!("NorthNarrow agent starting...");
 
+    // Boot preflight: prove the embedded eBPF half is real and intact
+    // BEFORE doing any work. The build-time staleness guard
+    // (agent/build.rs) refuses to embed a *stale* object; this refuses
+    // to *start* on an *absent* (placeholder) or *corrupted* one. Fail
+    // fast and loud — running without a matching kernel half would
+    // silently disable every sensor, the anti-tamper LSM hooks, and
+    // R011's PF_KTHREAD signal (the exact blindness that let R011
+    // over-fire when a stale .o was embedded by a workspace build).
+    northnarrow_agent::sensors::ebpf_object::preflight()
+        .context("eBPF object boot preflight failed — refusing to start")?;
+
+    // BUG-036: revalidate every compiled-in kernel struct offset against
+    // the RUNNING kernel's BTF before attaching any program. aya-ebpf has
+    // no CO-RE, so these offsets are baked into the eBPF half; if the
+    // running kernel's layout differs, the LSM hooks and sensors read the
+    // WRONG kernel memory — silently corrupting every decision. Fail
+    // CLOSED + LOUD rather than attach hooks that read garbage. Exit 78
+    // (EX_CONFIG) so the Restart=no agent unit lands in a VISIBLE `failed`
+    // state; the watchdog's 5/60s restart ceiling bounds any respawn.
+    match revalidate_offsets() {
+        RevalidateOutcome::Verified { count } => {
+            info!(
+                count,
+                "BTF offset revalidation passed — all offsets match the running kernel"
+            );
+        }
+        RevalidateOutcome::SkippedNoBtf { reason } => {
+            warn!(
+                reason,
+                "BTF unavailable — offset revalidation SKIPPED. The LSM hooks require BTF \
+                 to attach, so they will not attach this boot (the offsets are never read)."
+            );
+        }
+        RevalidateOutcome::Refuse(reason) => {
+            // sysexits.h EX_CONFIG: a non-zero code systemd surfaces as a
+            // `failed` unit (Restart=no ⇒ no auto-restart loop).
+            const EX_CONFIG: i32 = 78;
+            match reason {
+                RefuseReason::Drift(mismatches) => {
+                    error!(
+                        count = mismatches.len(),
+                        "BTF offset revalidation FAILED — refusing to start. The running \
+                         kernel's struct layout does not match the compiled-in offsets; \
+                         attaching LSM hooks would read the wrong kernel memory (BUG-036)."
+                    );
+                    for m in &mismatches {
+                        error!(
+                            offset = m.name,
+                            kernel_struct = m.struct_name,
+                            expected = m.expected,
+                            actual = ?m.actual,
+                            detail = %m.detail,
+                            "  offset drift"
+                        );
+                    }
+                    error!(
+                        "Fail-closed safety gate (BUG-036): rebuild the eBPF half against \
+                         this kernel's BTF, or run on a supported kernel (6.8.x). Exiting {EX_CONFIG}."
+                    );
+                }
+                RefuseReason::ParseError(e) => {
+                    error!(
+                        error = %e,
+                        "BTF present but unparseable — refusing to start. Cannot verify \
+                         kernel offsets, and aya may still attach hooks with unverified \
+                         offsets. Fail-closed (BUG-036). Exiting {EX_CONFIG}."
+                    );
+                }
+            }
+            std::process::exit(EX_CONFIG);
+        }
+    }
+
     if let Err(e) = bump_memlock_rlimit() {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
@@ -732,10 +831,28 @@ async fn main() -> Result<()> {
         debug!("no --pid-file provided; PID file write skipped (production default)");
     }
 
-    let executor = Executor::new();
+    // BUG-033 detect-only: resolve the one no-enforcement gate from the
+    // CLI flag OR-ed with the env inputs (`from_env` reads
+    // `NN_DETECT_ONLY` / legacy `NORTHNARROW_DRY_RUN`). The resolved
+    // value drives BOTH the response Executor (via the config) and the
+    // COMBAT engage-hook below, so there is exactly one switch.
+    let mut exec_cfg = ExecutorConfig::from_env();
+    if cli.detect_only {
+        exec_cfg.dry_run = true;
+    }
+    let detect_only = exec_cfg.dry_run;
+    let executor = Executor::with_config(exec_cfg);
+    if detect_only {
+        warn!(
+            "DETECT-ONLY mode active (--detect-only / NN_DETECT_ONLY / NORTHNARROW_DRY_RUN): \
+             detection + posture run normally, but NO response action or COMBAT network \
+             isolation will touch the system — verdicts are logged as \"would execute\" only"
+        );
+    }
     info!(
         own_pid = executor.own_pid(),
         protected = executor.protected().len(),
+        detect_only,
         "response executor ready (KillProcess + KillProcessTree active)"
     );
 
@@ -799,7 +916,8 @@ async fn main() -> Result<()> {
     // without /etc/northnarrow/ provisioned.
     let isolator = match NetworkIsolator::new(cli.combat_rules.clone()) {
         Ok(i) => Some(Arc::new(
-            i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone()),
+            i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone())
+                .with_rules_v6(cli.combat_rules_v6.clone()),
         )),
         Err(e) => {
             warn!(
@@ -811,16 +929,51 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The COMBAT graduated-response ladder is constructed once agent_id
+    // + the audit log are available (further down). The posture combat
+    // hooks reference it through this slot, so an admin-forced COMBAT
+    // engages the same ladder as a detector-driven one. The slot is set
+    // before the event loop / admin socket start — always populated by
+    // the time any COMBAT transition can fire the hooks.
+    let ladder_slot: Arc<std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Reaching COMBAT now means "enter active-response mode", NOT
+    // "isolate". This entry hook engages the graduated ladder at STAGE 1
+    // INVESTIGATE (network stays UP); the ladder decides if/when isolation
+    // (STAGE 3, last resort) is warranted, honours detect-only internally,
+    // and emits the per-stage signed audit trail. It is wired into BOTH
+    // the prod (isolator) and dev (no-isolator) posture branches so an
+    // admin-forced COMBAT engages the same ladder either way; the detector
+    // path additionally feeds the offending PID + firing trigger via
+    // `process_event` (an idempotent merge).
+    let engage_hook: CombatEntryHook = {
+        let ladder_for_entry = Arc::clone(&ladder_slot);
+        Arc::new(move || {
+            if let Some(ladder) = ladder_for_entry.get() {
+                ladder.engage(None, None, Instant::now());
+            }
+        })
+    };
+
     let exempt = ExemptPids::with_agent(std::process::id());
     let posture = if let Some(iso) = isolator.as_ref() {
-        let iso_engage = Arc::clone(iso);
+        // T7.13 (Beta Step 5): the auth-lineage tracker shared with
+        // the posture trigger detector. Reads /proc on cache miss;
+        // populated live from Event::ProcessSpawn inside
+        // TriggerDetector::detect. The dev (no-iptables) branch uses
+        // PostureMachine::new() which already constructs a default
+        // tracker internally, so this clone is only needed here.
+        let auth_tracker = AuthSessionTracker::with_proc();
         let iso_release = Arc::clone(iso);
-        let engage_hook: CombatEntryHook = Arc::new(move || {
-            if let Err(e) = iso_engage.engage() {
-                tracing::error!(error = %e, "COMBAT engage failed; agent continues in degraded mode");
-            }
-        });
+        let ladder_for_release = Arc::clone(&ladder_slot);
         let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
+            // Admin released COMBAT: stand the ladder down (clears the
+            // episode + lifts the surgical per-PID soft-egress blocks),
+            // THEN tear down any full isolation STAGE 3 had engaged.
+            if let Some(ladder) = ladder_for_release.get() {
+                ladder.stand_down(Instant::now());
+            }
             if let Err(e) = iso_release.release(token) {
                 tracing::error!(
                     error = %e,
@@ -834,14 +987,64 @@ async fn main() -> Result<()> {
         // Without this, the agent's FIM drift logging self-trips the
         // mass-write heuristic into COMBAT at boot, and the watchdog's
         // startup /proc scan trips it too (2026-05-22 sshd-reset
-        // diagnosis; T7.13 watchdog start cascade).
-        PostureMachine::new_with_hooks_and_exempt(
+        // diagnosis).
+        //
+        // T7.13 — also pass the auth-lineage tracker so sudo-mediated
+        // PIDs are exempt from sensitive_file_access and the
+        // mass-write arm of confirmed_intrusion. Every other
+        // COMBAT-tier trigger fires unchanged.
+        //
+        // BUG-017 P-8 — load the operator-supplemental mass-write
+        // path-prefix carve-out from
+        // /etc/northnarrow/mass-write-carveout.local. Missing file =
+        // empty list (no extra exemptions; hardcoded
+        // MASS_WRITE_CARVEOUT_PREFIXES still applies). The list is
+        // path-prefix-based (e.g. "/home/<user>/.claude/" for dev
+        // tooling), additive on top of the hardcoded kernel-RPC
+        // pseudo-FS prefixes. See SECURITY note in
+        // mass_write_overlay.rs — DO NOT add /home, /var, /tmp
+        // wholesale.
+        let mass_write_extras = northnarrow_agent::posture::mass_write_overlay::
+            load_mass_write_carveout_extras(std::path::Path::new(
+                northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+            ));
+        // BUG-032 — escalation allowlist (count-filter for exfil/lateral).
+        // Missing file = empty (fail-secure). Loaded once at boot;
+        // reload-on-restart for beta.
+        let escalation_allow = northnarrow_agent::posture::escalation_allow::EscalationAllowList::load(
+            std::path::Path::new(
+                northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
+            ),
+        );
+        if !escalation_allow.is_empty() {
+            info!(
+                entries = escalation_allow.len(),
+                "escalation allowlist loaded — count-filter for exfil/lateral (BUG-032)"
+            );
+        }
+        PostureMachine::new_with_hooks_and_exempt_and_auth_and_extras(
             engage_hook,
             release_hook,
             exempt.clone(),
+            auth_tracker,
+            mass_write_extras,
+            escalation_allow,
         )
     } else {
-        PostureMachine::new()
+        // Dev / no-isolator build: still wire the ladder hooks so a
+        // (detector- or admin-forced) COMBAT engages the same graduated
+        // ladder as production. The ladder's actuator finds no isolator,
+        // so STAGE 3 degrades to a loud warning instead of an iptables
+        // DROP — but INVESTIGATE + NEUTRALIZE still run.
+        let ladder_for_release = Arc::clone(&ladder_slot);
+        let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
+            if let Some(ladder) = ladder_for_release.get() {
+                ladder.stand_down(Instant::now());
+            }
+            // No isolator to release in this build; consume the token.
+            let _ = token;
+        });
+        PostureMachine::new_with_hooks(engage_hook, release_hook)
     };
     info!("posture state machine initialized (state: OBSERVING)");
 
@@ -881,7 +1084,9 @@ async fn main() -> Result<()> {
                     audit_combat_reconcile(outcome.rules_removed);
                 }
                 Ok(_) => debug!("no stale COMBAT chain at boot (clean)"),
-                Err(e) => warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed"),
+                Err(e) => {
+                    warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed")
+                }
             }
         }
     }
@@ -916,6 +1121,77 @@ async fn main() -> Result<()> {
             [0u8; 16]
         }
     };
+
+    // ── Shared audit log + COMBAT graduated-response ladder ─────────
+    //
+    // The signed, hash-chained audit log is opened ONCE here (now that
+    // agent_id is ready) and shared by both the COMBAT ladder (per-stage
+    // signed transitions) and the admin socket (admin-op audit). A `None`
+    // audit log (open/key failure) degrades to log-only, exactly as the
+    // admin-op path already tolerates.
+    let audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>> =
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(key) => {
+                match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
+                    Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
+                    Err(e) => {
+                        warn!(error = %e, "audit log open failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                None
+            }
+        };
+
+    // Build the ladder with the system actuator (real kill / quarantine /
+    // per-PID egress / full isolation) + the signed-audit evidence sink,
+    // then publish it to the slot the posture combat hooks read. Driven
+    // from three places: the combat-entry hook (above), `process_event`
+    // (offender context + per-event jump-ahead), and the tick below.
+    let ladder = Arc::new(northnarrow_agent::combat::CombatLadder::new(
+        Box::new(northnarrow_agent::combat::SystemActuator::new(
+            executor.clone(),
+            isolator.clone(),
+            detect_only,
+        )),
+        Box::new(northnarrow_agent::combat::AuditEvidence::new(audit_log.clone())),
+        // Never kill / net-cut PID 1, the agent, its watchdog, or sshd —
+        // skip + escalate to ISOLATE instead. Reuses the same `exempt`
+        // handle the posture machine holds (so the watchdog PID stays the
+        // timer-refreshed value) plus the same `--watchdog-exe` the refresh
+        // task verifies against, so the watchdog branch can re-check
+        // /proc/<pid>/exe inline at the kill/spare decision.
+        Box::new(northnarrow_agent::combat::SystemProtectedProcs::new(
+            executor.own_pid(),
+            exempt.clone(),
+            cli.watchdog_exe.clone(),
+        )),
+        northnarrow_agent::combat::LadderConfig::default(),
+    ));
+    if ladder_slot.set(Arc::clone(&ladder)).is_err() {
+        warn!("COMBAT ladder slot already set — unexpected double-init");
+    }
+    info!(
+        "COMBAT graduated-response ladder armed (INVESTIGATE → NEUTRALIZE → ISOLATE; \
+         isolation is last resort)"
+    );
+
+    // Fast heartbeat advancing the time-bound INVESTIGATE deadline. The
+    // 60 s posture-decay loop is too coarse for the ladder's
+    // seconds-scale windows; this 5 s tick is a no-op unless a COMBAT
+    // episode is active and its investigate deadline has elapsed.
+    let ladder_tick = Arc::clone(&ladder);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            ladder_tick.tick(Instant::now());
+        }
+    });
 
     // Tappa 8 A8: shutdown signal — the dispatcher fires it on a
     // successfully-verified `ShutdownRequest` so this main loop
@@ -961,6 +1237,82 @@ async fn main() -> Result<()> {
     };
     let paths_summary = admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
 
+    // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
+    // under /var/lib/northnarrow (netflow + fim_drift share its dance
+    // mutex so two concurrent rotations can't race the dir's chattr +i).
+    // `take_protected_inodes_map` takes the PROTECTED_INODES handle out of
+    // the Ebpf — it MUST run AFTER the anti-tamper bootstrap registered the
+    // protected inodes and (THE VM-VALIDATE ITEM, catalog §24) with nothing
+    // else mutating that map via the Ebpf handle afterward. If a runtime
+    // path (canary deploy / admin) re-registers a protected inode via the
+    // Ebpf, switch this to opening the PINNED map by path instead of
+    // `take`. On failure the rotating writers don't open (degrade-not-fail).
+    let state_protection: Option<
+        std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
+    > = match northnarrow_agent::anti_tamper::filesystem::take_protected_inodes_map(
+        sensor.ebpf_mut(),
+    ) {
+        Ok(h) => Some(std::sync::Arc::new(
+            northnarrow_agent::anti_tamper::filesystem::StateDirProtection::new(
+                std::path::PathBuf::from(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
+                h,
+            ),
+        )),
+        Err(e) => {
+            // ERROR, not warn: anti-tamper FS protection of the state logs is
+            // compromised (PROTECTED_INODES missing) AND rotation is disabled.
+            tracing::error!(
+                error = %e,
+                "BUG-026: take_protected_inodes_map failed — anti-tamper FS protection of the \
+                 state logs is COMPROMISED and on-disk log ROTATION is disabled this boot; \
+                 netflow + fim_drift keep logging APPEND-ONLY (the disk-fill vector returns \
+                 until a restart recovers anti-tamper)"
+            );
+            None
+        }
+    };
+    // Degrade-not-fail (BUG-026 ②): if protection is unavailable, keep
+    // telemetry flowing — open the writers with NoProtection + rotation
+    // DISABLED (append-only) rather than dropping FIM-drift + netflow, the two
+    // core telemetry streams. Losing them is the worse failure for an XDR; the
+    // disk grows (the original vector) only until a restart recovers
+    // anti-tamper. An effectively-infinite cap means the writer never invokes
+    // the chattr dance (which would EPERM under `+i` and stall logging).
+    let rotation_protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager> =
+        match &state_protection {
+            // `p.clone()` clones the concrete Arc, then the match arm
+            // unsize-coerces it to Arc<dyn> (Arc::clone(p) would infer the
+            // wrong type param from the expected `dyn` and mismatch).
+            Some(p) => p.clone(),
+            None => std::sync::Arc::new(northnarrow_agent::chainlog::NoProtection),
+        };
+    let rotation_on = state_protection.is_some();
+    let cap = |bytes: u64| if rotation_on { bytes } else { u64::MAX };
+    // Test/ops knob: NN_FIM_DRIFT_CAP_BYTES overrides the fim_drift active-file
+    // rotation cap (default 32 MiB) so rotation can be validated without
+    // generating 32 MiB of drift. Unset = default; still gated by rotation_on.
+    const FIM_DRIFT_CAP_DEFAULT: u64 = 32 * 1024 * 1024;
+    let fim_drift_cap = std::env::var("NN_FIM_DRIFT_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(FIM_DRIFT_CAP_DEFAULT);
+    if fim_drift_cap != FIM_DRIFT_CAP_DEFAULT {
+        warn!(
+            cap_bytes = fim_drift_cap,
+            "fim_drift rotation cap OVERRIDDEN via NN_FIM_DRIFT_CAP_BYTES (test/ops knob)"
+        );
+    }
+    let fim_drift_rotation = northnarrow_agent::chainlog::RotationConfig {
+        size_cap_bytes: cap(fim_drift_cap),
+        max_archives: 8,
+        file_mode: 0o644,
+    };
+    let netflow_rotation = northnarrow_agent::chainlog::RotationConfig {
+        size_cap_bytes: cap(16 * 1024 * 1024),
+        max_archives: 16,
+        file_mode: 0o644,
+    };
+
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // Re-derive the signing key + agent_id for FIM the same way
         // the audit log does (re-load rather than steal the audit
@@ -1001,6 +1353,7 @@ async fn main() -> Result<()> {
             Some(baseline_db) => {
                 use northnarrow_agent::fim::attach::{
                     attach_observe_programs, populate_watched_paths, take_fs_fim_events_ringbuf,
+                    take_watched_paths_map,
                 };
                 use northnarrow_agent::fim::baseline::BaselineCache;
                 use northnarrow_agent::fim::drain::{
@@ -1075,6 +1428,24 @@ async fn main() -> Result<()> {
                     }
                 };
 
+                // BUG-022 — take an OWNED writable handle to WATCHED_PATHS
+                // (post-populate) so the drain loop can enroll children of
+                // a watched directory on the fly. Best-effort: on failure
+                // the drain still runs — create-detection via child-leaf
+                // reconstruction still works; only the later in-place edit
+                // of a freshly-dropped child would go unwatched.
+                let watched_paths_handle = match take_watched_paths_map(sensor.ebpf_mut()) {
+                    Ok(h) => Some(Arc::new(parking_lot::Mutex::new(h))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "fim: take_watched_paths_map failed — runtime child \
+                             enrollment disabled this boot"
+                        );
+                        None
+                    }
+                };
+
                 // The recompute task snapshots the merged watched-
                 // paths set every iteration — operators who edit
                 // fim-paths.local and run `nn-admin fim baseline`
@@ -1111,8 +1482,15 @@ async fn main() -> Result<()> {
                     match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
                         &cli.signing_key_file,
                     )
-                    .and_then(|key| FimDriftDb::open(&cli.fim_drift_file, key, agent_id))
-                    {
+                    .and_then(|key| {
+                        FimDriftDb::open(
+                            &cli.fim_drift_file,
+                            key,
+                            agent_id,
+                            std::sync::Arc::clone(&rotation_protection),
+                            fim_drift_rotation,
+                        )
+                    }) {
                         Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
                         Err(e) => {
                             warn!(
@@ -1132,6 +1510,7 @@ async fn main() -> Result<()> {
                             let rate_limiter_clone = Arc::clone(&rate_limiter);
                             let inode_map_for_drain = Arc::clone(&inode_map);
                             let baseline_cache_for_drain = Arc::clone(&baseline_cache);
+                            let watched_paths_for_drain = watched_paths_handle.clone();
                             let event_tx = sensor.event_tx();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = drain_loop(
@@ -1141,6 +1520,7 @@ async fn main() -> Result<()> {
                                     drift_db,
                                     classifier,
                                     rate_limiter_clone,
+                                    watched_paths_for_drain,
                                     event_tx,
                                 )
                                 .await
@@ -1380,8 +1760,15 @@ async fn main() -> Result<()> {
         let netflow_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
             &cli.signing_key_file,
         )
-        .and_then(|key| NetFlowDb::open(&cli.netflow_file, key, agent_id))
-        {
+        .and_then(|key| {
+            NetFlowDb::open(
+                &cli.netflow_file,
+                key,
+                agent_id,
+                std::sync::Arc::clone(&rotation_protection),
+                netflow_rotation,
+            )
+        }) {
             Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
             Err(e) => {
                 warn!(
@@ -1451,46 +1838,12 @@ async fn main() -> Result<()> {
                 let iso_clone = Arc::clone(iso);
                 let socket_path = cli.admin_socket.clone();
                 let signal_for_serve = shutdown_signal.clone();
-                // Tappa 8 B5: construct the AuditLog once at boot
-                // (post-A14 the file's inode is already in
-                // PROTECTED_INODES so an attacker can't replace
-                // it underneath us). The signing key is the one
-                // bootstrapped pre-attach above; we load it
-                // again here to take ownership of the in-memory
-                // SigningKey rather than wrap the pre-attach
-                // bootstrap result. agent_id is whatever the
-                // pre-attach call minted.
-                let signing_key_path = cli.signing_key_file.clone();
-                let audit_log_path = cli.audit_log_file.clone();
-                let audit_log = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
-                    &signing_key_path,
-                ) {
-                    Ok(key) => {
-                        match northnarrow_agent::audit::AuditLog::open(
-                            &audit_log_path,
-                            key,
-                            agent_id,
-                        ) {
-                            Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "audit log open failed — admin ops will run \
-                                     UNAUDITED this boot"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "agent signing key reload failed — admin ops will \
-                             run UNAUDITED this boot"
-                        );
-                        None
-                    }
-                };
+                // Tappa 8 B5: the AuditLog is opened ONCE at boot (above,
+                // right after agent_id) and shared with the COMBAT ladder;
+                // the admin socket takes its own Arc clone. post-A14 the
+                // file's inode is already in PROTECTED_INODES so an
+                // attacker can't replace it underneath us.
+                let audit_log = audit_log.clone();
                 let marker_path = cli.shutdown_marker_file.clone();
                 let fim_state_for_serve = fim_admin_state.clone();
                 let canary_state_for_serve = canary_admin_state.clone();
@@ -1579,6 +1932,7 @@ async fn main() -> Result<()> {
                     &correlation,
                     &host,
                     &posture,
+                    &ladder,
                     // Tappa 9.5 K6: detector handle wired in. When
                     // the canary subsystem boot above failed
                     // (missing signing key, registry open error),
@@ -1709,6 +2063,7 @@ async fn process_event(
     correlation: &CorrelationBuffer,
     host: &HostContext,
     posture: &PostureMachine,
+    ladder: &northnarrow_agent::combat::CombatLadder,
     canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
     event: Event,
 ) {
@@ -1735,13 +2090,54 @@ async fn process_event(
     // a fresh +1 on top of `recent`, and `recent` already containing
     // the focal would double-count it.
     let recent_for_posture = correlation.snapshot();
-    if let Some(new_state) = posture.observe(&event, &recent_for_posture) {
-        warn!(state = %new_state.kind(), "POSTURE TRANSITION");
+    if let Some((new_state, firing_trigger)) = posture.observe(&event, &recent_for_posture) {
+        // BUG-015 observability: include the firing TriggerType so
+        // operators can see in the journal what caused a transition.
+        // `firing_trigger` is `Some` for any upward crossing and `None`
+        // for same-tier re-arms; the latter case still gets a log line
+        // because the kind() display alone is enough to follow state.
+        warn!(
+            state = %new_state.kind(),
+            trigger = ?firing_trigger,
+            "POSTURE TRANSITION"
+        );
+        // On the non-Combat → Combat edge, enrich the ladder with the
+        // offending PID + firing trigger. The combat-entry hook has
+        // already opened the episode (STAGE 1 INVESTIGATE, network up);
+        // this is the idempotent merge that attributes the focal
+        // process. Reaching COMBAT does NOT isolate — the ladder does.
+        if new_state.kind() == PostureKind::Combat {
+            ladder.engage(
+                northnarrow_agent::posture::triggers::event_owner_pid(&event),
+                firing_trigger,
+                Instant::now(),
+            );
+        }
+    }
+    // While a COMBAT episode is active, feed every event to the ladder
+    // for the jump-ahead check: an offender actively exfiltrating or
+    // spawning children DURING INVESTIGATE pre-empts the time-bound
+    // deadline and advances straight to NEUTRALIZE.
+    if ladder.current_stage().is_some() {
+        ladder.observe(&event, Instant::now());
     }
     correlation.push(event.clone());
 
     match &event {
         Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
+        Event::ModuleLoad {
+            method,
+            loader_pid,
+            loader_comm,
+            path,
+            ..
+        } => info!(
+            loader_pid = *loader_pid,
+            loader_comm = %loader_comm,
+            method = ?method,
+            path = path.as_deref().unwrap_or("none"),
+            "kernel module load detected (BUG-034)"
+        ),
         Event::FileOpen {
             filename,
             comm,
@@ -1821,14 +2217,32 @@ async fn process_event(
         // picks up the event via the normal `engine.evaluate`
         // path below.
         Event::Fim(fe) => {
-            warn!(
-                path = %fe.path,
-                op = ?fe.op,
-                modifier_pid = fe.modifier_pid,
-                modifier_uid = fe.modifier_uid,
-                modifier_comm = %fe.modifier_comm,
-                "FIM DRIFT"
-            );
+            // BUG-012 (v2): a read (op=Opened) is NOT an integrity
+            // drift, so it must never be logged as "FIM DRIFT" — that
+            // is semantically wrong and just quieter noise. An Opened
+            // event reaches this arm ONLY for a credential path the
+            // FIM drain forwarded for the NN-L-FIM-011..017 read rules
+            // (every other read is dropped at the drain). It flows
+            // silently to `engine.evaluate` below; if a cred-read rule
+            // fires, THE RULE emits the alert with proper framing.
+            // Only integrity-changing ops get the FIM DRIFT line.
+            if fe.op == common::wire::FimOp::Opened {
+                debug!(
+                    path = %fe.path,
+                    modifier_pid = fe.modifier_pid,
+                    modifier_comm = %fe.modifier_comm,
+                    "fim credential-path read forwarded to rule engine (not drift)"
+                );
+            } else {
+                warn!(
+                    path = %fe.path,
+                    op = ?fe.op,
+                    modifier_pid = fe.modifier_pid,
+                    modifier_uid = fe.modifier_uid,
+                    modifier_comm = %fe.modifier_comm,
+                    "FIM DRIFT"
+                );
+            }
         }
         // Tappa 9.5 (K3): canary trip events. The K3 inline
         // detector intercepts source events BEFORE they reach
@@ -2064,6 +2478,10 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         // Last verified PID we stored (`None` == exemption cleared).
         let mut last: Option<u32> = None;
+        // BUG-011 (PHASE 15.1): resolve the bpffs root once. None ⇒
+        // no bpffs ⇒ register_protected_observer is a no-op (it
+        // logs the degraded mode internally).
+        let bpffs_root = northnarrow_agent::anti_tamper::prepare_pin_root();
         loop {
             tick.tick().await;
             let resolution = resolve_verified_watchdog_pid(&pidfile, &expected_exe);
@@ -2077,14 +2495,54 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
             match &resolution {
                 WatchdogResolution::Verified(p) => {
                     exempt.set_watchdog_pid(*p);
-                    info!(
-                        watchdog_pid = *p,
-                        exe = %expected_exe.display(),
-                        "watchdog PID verified; exempting it from posture triggers"
-                    );
+                    // BUG-011: register the verified watchdog PID
+                    // in PROTECTED_OBSERVERS so the kernel
+                    // ptrace_access_check hook allows it to read
+                    // /proc/<agent>/exe (the watchdog's argv
+                    // reconstruction path). Eviction of the prior
+                    // verified PID (if any) happens first to keep
+                    // the map's set semantics tight — a watchdog
+                    // restart with a new PID otherwise leaves the
+                    // old PID lingering for whatever else might
+                    // recycle it.
+                    if let Some(prev) = last {
+                        if let Err(e) = northnarrow_agent::anti_tamper::evict_protected_observer(
+                            bpffs_root, prev,
+                        ) {
+                            warn!(
+                                pid = prev,
+                                error = %e,
+                                "BUG-011: failed to evict prior watchdog PID from \
+                                 PROTECTED_OBSERVERS (continuing; new PID will still register)"
+                            );
+                        }
+                    }
+                    match northnarrow_agent::anti_tamper::register_protected_observer(
+                        bpffs_root, *p,
+                    ) {
+                        Ok(()) => info!(
+                            watchdog_pid = *p,
+                            exe = %expected_exe.display(),
+                            "watchdog PID verified; exempting it from posture triggers + \
+                             registering in PROTECTED_OBSERVERS (BUG-011)"
+                        ),
+                        Err(e) => warn!(
+                            watchdog_pid = *p,
+                            error = %e,
+                            "BUG-011: PROTECTED_OBSERVERS register failed; watchdog \
+                             will still be posture-exempt but ptrace_access_check will deny"
+                        ),
+                    }
                 }
                 WatchdogResolution::NotPresent => {
                     exempt.set_watchdog_pid(0);
+                    // BUG-011: withdraw observer rights on watchdog
+                    // teardown so a recycled PID can't inherit them.
+                    if let Some(prev) = last {
+                        let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
+                            bpffs_root, prev,
+                        );
+                    }
                     info!(
                         pidfile = %pidfile.display(),
                         "watchdog pidfile absent; no watchdog exemption active"
@@ -2092,14 +2550,29 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                 }
                 WatchdogResolution::InvalidPidfile { reason } => {
                     exempt.set_watchdog_pid(0);
+                    if let Some(prev) = last {
+                        let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
+                            bpffs_root, prev,
+                        );
+                    }
                     warn!(%reason, "watchdog pidfile unparseable; watchdog exemption cleared");
                 }
                 WatchdogResolution::Unverifiable { pid, reason } => {
                     exempt.set_watchdog_pid(0);
+                    if let Some(prev) = last {
+                        let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
+                            bpffs_root, prev,
+                        );
+                    }
                     warn!(pid, %reason, "watchdog exe verification failed; exemption cleared");
                 }
                 WatchdogResolution::ExeMismatch { pid, resolved } => {
                     exempt.set_watchdog_pid(0);
+                    if let Some(prev) = last {
+                        let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
+                            bpffs_root, prev,
+                        );
+                    }
                     warn!(
                         pid,
                         resolved = %resolved.display(),
@@ -2130,17 +2603,33 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
 fn audit_combat_reconcile(rules_removed: usize) {
     use std::io::Write;
     const PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
+    // BUG-026 B-cap: combat-audit is the lone UNSIGNED / unchained
+    // best-effort log (the forensic upgrade to a signed chainlog is
+    // tracked as BUG-028). `/var/lib/northnarrow` is `chattr +i`, so a
+    // rename-based rotate is a blocked dir-entry op — cap by
+    // TRUNCATE-IN-PLACE (a content op, allowed under `+i`) when the file
+    // exceeds the cap. A full truncate is acceptable for this rare,
+    // unsigned log; keeping the most-recent rows is a BUG-028 nicety.
+    const CAP_BYTES: u64 = 8 * 1024 * 1024;
     let line = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
         "event": "combat_reconcile",
         "reason": "stale_reconcile",
         "rules_torn_down": rules_removed,
     });
-    let res = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(PATH)
-        .and_then(|mut f| writeln!(f, "{line}"));
+    let over_cap = std::fs::metadata(PATH)
+        .map(|m| m.len() > CAP_BYTES)
+        .unwrap_or(false);
+    let open_res = if over_cap {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(PATH)
+    } else {
+        std::fs::OpenOptions::new().create(true).append(true).open(PATH)
+    };
+    let res = open_res.and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = res {
         warn!(error = %e, path = PATH, "could not write COMBAT reconcile audit line (non-fatal)");
     }

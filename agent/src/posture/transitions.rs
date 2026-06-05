@@ -35,7 +35,18 @@ pub const ENGAGED_DECAY: Duration = Duration::from_secs(24 * 60 * 60);
 ///   from `Combat` go through
 ///   [`super::PostureMachine::admin_release_combat`].
 pub fn apply_trigger(state: &PostureState, trigger: TriggerType, now: Instant) -> PostureState {
-    let target = trigger.target_level();
+    apply_to_level(state, trigger.target_level(), now)
+}
+
+/// The level-based core of [`apply_trigger`]. Drives the state up to
+/// `target` (never down — triggers only promote), preserving the
+/// Combat-is-terminal + same-tier-re-arm rules.
+///
+/// BUG-032: `observe()` calls this with an *effective* level — a blunt
+/// COMBAT-tier signal without corroboration is capped at ENGAGED — so
+/// escalation precision lives in `observe()` while the transition
+/// mechanics stay here.
+pub fn apply_to_level(state: &PostureState, target: PostureKind, now: Instant) -> PostureState {
     let current = state.kind();
 
     if matches!(state, PostureState::Combat { .. }) {

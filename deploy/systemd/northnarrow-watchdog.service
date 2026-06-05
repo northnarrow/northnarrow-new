@@ -19,11 +19,27 @@ BindsTo=northnarrow-agent.service
 
 [Service]
 Type=notify
+# Logging footprint — same journal namespace as the agent (see agent unit).
+# REQUIRED here too, not cosmetic: on agent CRASH the watchdog fork-execs
+# the agent as its child, which INHERITS the watchdog's stdio (W4 respawn).
+# Without LogNamespace on the watchdog, a watchdog-respawned agent would log
+# to the DEFAULT journal → rsyslog → /var/log/syslog, re-opening the
+# amplification vector for exactly the crash-loop case. Namespacing the
+# watchdog routes both the watchdog AND the agent it respawns into the
+# capped northnarrow journal.
+LogNamespace=northnarrow
 ExecStart=/usr/local/bin/northnarrow-watchdog \
+    --agent-bin /usr/local/bin/northnarrow-agent \
     --agent-pidfile /run/northnarrow/agent.pid \
     --admin-socket /run/northnarrow/admin.sock \
     --pidfile /run/northnarrow/watchdog.pid \
     --bpffs-root /sys/fs/bpf/northnarrow
+# --agent-bin is REQUIRED in production (not merely an escape hatch): without
+# it the watchdog reads /proc/<agent>/exe at boot to reconstruct argv, and
+# the agent's ptrace_access_check LSM hook denies that read until the
+# watchdog is registered in PROTECTED_OBSERVERS — a boot race that EACCES-es
+# for 60s and exits the watchdog (1). Passing the path skips that path
+# entirely. The dev workflow masked this by leaving the watchdog disabled.
 # Watchdog owns ITS OWN restart policy via systemd: if the
 # watchdog crashes (which would be a bug — W2 process-hardening
 # minimises the surface), systemd brings it back after 2 s. The

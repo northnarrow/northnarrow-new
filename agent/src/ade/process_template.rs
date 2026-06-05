@@ -215,6 +215,7 @@ mod tests {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             parent_comm: parent_comm.to_string(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         }
     }
 

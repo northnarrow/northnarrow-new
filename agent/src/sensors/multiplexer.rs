@@ -22,14 +22,14 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    include_bytes_aligned,
     maps::{ring_buf::RingBuf, MapData},
     programs::{FExit, KProbe, TracePoint},
     Btf, Ebpf, EbpfLoader,
 };
 use bytemuck::Pod;
 use common::wire::{
-    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
+    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ModuleLoadRaw, ProcessSpawnRaw,
+    TcpConnectRaw,
 };
 use common::Event;
 use parking_lot::Mutex;
@@ -39,10 +39,10 @@ use tracing::{debug, error, info, warn};
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
 
-/// eBPF object embedded by `agent/build.rs`; same alignment trick as
-/// in the Tappa 1 sensor.
-static EBPF_BYTES: &[u8] =
-    include_bytes_aligned!(concat!(env!("OUT_DIR"), "/northnarrow-agent-ebpf"));
+/// eBPF object embedded once in [`crate::sensors::ebpf_object`] (the
+/// single embed site + boot preflight). Re-used here so this loader and
+/// the Tappa 1 [`super::exec`] loader load byte-identical bytes.
+use crate::sensors::ebpf_object::EBPF_BYTES;
 
 /// Channel between the per-ringbuf pumps and the agent main loop.
 const CHANNEL_CAPACITY: usize = 4096;
@@ -112,14 +112,35 @@ impl SensorMultiplexer {
             );
         }
 
-        // Tappa 7 task 6 commit #2: pin the six anti-tamper maps
+        // Tappa 7 task 6 commit #2: pin the anti-tamper STATE maps
         // by-name to bpffs so a restarted agent reuses the SAME
         // kernel map objects the pinned LSM hooks reference (closes
         // the split-brain regression). `prepare_pin_root` returns
         // `None` on a host without bpffs; we then load unpinned so
         // sensors still run. Only maps declared `#[map]` with a
-        // `::pinned(..)` constructor are affected — the five sensor
-        // ringbufs stay process-local by design.
+        // `::pinned(..)` constructor are affected.
+        //
+        // Event RINGBUFS must stay process-local: a ringbuf carries
+        // its consumer/producer position state in the kernel map
+        // object, so pinning + reusing one across a restart desyncs
+        // the new process's fresh consumer (0-length decode flood —
+        // see `FS_FIM_EVENTS` in agent-ebpf/src/fim_watch.rs). The
+        // sensor ringbufs (EVENTS, FILE_OPEN_EVENTS, EXEC_CHECK_EVENTS,
+        // TCP_CONNECT_EVENTS, DNS_QUERY_EVENTS) and FS_FIM_EVENTS are
+        // all `with_byte_size` (unpinned).
+        //
+        // EXCEPTION: `FS_PROTECT_EVENTS` (agent-ebpf/src/inode_protect.rs)
+        // is STILL `::pinned` and so is reused here. It has the same
+        // reuse hazard, BUT its producer is the filesystem anti-tamper
+        // LSM program attached via a REUSED pinned link (non-transient,
+        // anti_tamper/mod.rs `filesystem::attach`), so unpinning the ring
+        // alone would split producer (old reused prog → old ring) from
+        // consumer (new ring) — a SILENT fs-protect blackout instead of a
+        // loud flood. Fixing it means dropping the ring-pin AND the
+        // program-link-pin together so both reattach fresh; that is a
+        // separate change with anti-tamper-persistence implications and is
+        // deliberately deferred. Do not unpin FS_PROTECT_EVENTS in
+        // isolation.
         let pin_root = crate::anti_tamper::prepare_pin_root();
         let mut loader = EbpfLoader::new();
         loader.btf(None);
@@ -191,6 +212,9 @@ impl SensorMultiplexer {
         let tcp_connect_rb = take_ringbuf(&mut ebpf, "TCP_CONNECT_EVENTS")?;
         let dns_query_rb = take_ringbuf(&mut ebpf, "DNS_QUERY_EVENTS")?;
         let fs_protect_rb = take_ringbuf(&mut ebpf, "FS_PROTECT_EVENTS")?;
+        // BUG-034: module-load observations → Event::ModuleLoad → R018.
+        // Maps exist at load time (before attach), so taking it here is safe.
+        let module_load_rb = take_ringbuf(&mut ebpf, "MODULE_LOAD_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
         let flow_tracker_for_tcp = net.as_ref().map(|w| Arc::clone(&w.flow_tracker));
@@ -203,6 +227,7 @@ impl SensorMultiplexer {
             spawn_tcp_connect_pump(tcp_connect_rb, flow_tracker_for_tcp, tx.clone()),
             spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
             spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
+            spawn_pump::<ModuleLoadRaw>("module_load", module_load_rb, tx.clone()),
         ];
 
         Ok((
@@ -342,6 +367,60 @@ where
     })
 }
 
+/// Coalesces malformed-ringbuf-entry WARNs to at most one per second with a
+/// running dropped-count. A desynced / garbage ring — e.g. the
+/// FS_PROTECT_EVENTS pinned-reuse desync (catalog BUG-024) — otherwise rejects
+/// every entry and floods the journal at hundreds/sec, filling the
+/// LogNamespace `SystemMaxUse` cap and vacuuming real telemetry out of the
+/// retention window. A sensor fault must never DoS its own log. Used by every
+/// ringbuf pump below.
+struct RejectThrottle {
+    count: u64,
+    last_log: Option<std::time::Instant>,
+    last_got: usize,
+}
+
+impl RejectThrottle {
+    fn new() -> Self {
+        Self { count: 0, last_log: None, last_got: 0 }
+    }
+
+    /// Record one rejected entry; emit a coalesced WARN at most 1/sec.
+    fn record(&mut self, label: &str, expected: usize, got: usize) {
+        self.count += 1;
+        self.last_got = got;
+        if self.due() {
+            self.emit(label, expected);
+        }
+    }
+
+    /// Flush a residual count once the ring goes quiet, so a final burst is
+    /// not silently dropped from the log.
+    fn flush_idle(&mut self, label: &str, expected: usize) {
+        if self.count > 0 && self.due() {
+            self.emit(label, expected);
+        }
+    }
+
+    fn due(&self) -> bool {
+        self.last_log
+            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1))
+    }
+
+    fn emit(&mut self, label: &str, expected: usize) {
+        warn!(
+            label,
+            rejected = self.count,
+            expected,
+            got = self.last_got,
+            "ringbuf entries rejected (malformed; rate-limited to <=1/s — a sustained \
+             count means a desynced ring, e.g. BUG-024 FS_PROTECT_EVENTS)"
+        );
+        self.count = 0;
+        self.last_log = Some(std::time::Instant::now());
+    }
+}
+
 async fn pump<T>(
     label: &'static str,
     rb: RingBuf<MapData>,
@@ -352,6 +431,7 @@ where
     for<'a> Event: From<&'a T>,
 {
     let mut async_fd = AsyncFd::new(rb)?;
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -365,17 +445,12 @@ where
                         return Ok(());
                     }
                 }
-                Err(e) => warn!(
-                    label,
-                    expected = std::mem::size_of::<T>(),
-                    got = bytes.len(),
-                    error = %e,
-                    "ringbuf entry rejected"
-                ),
+                Err(_e) => reject.record(label, std::mem::size_of::<T>(), bytes.len()),
             }
         }
         guard.clear_ready();
         if drained == 0 {
+            reject.flush_idle(label, std::mem::size_of::<T>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -401,6 +476,7 @@ async fn pump_tcp_connect(
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = AsyncFd::new(rb)?;
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -425,16 +501,14 @@ async fn pump_tcp_connect(
                         return Ok(());
                     }
                 }
-                Err(e) => warn!(
-                    expected = std::mem::size_of::<TcpConnectRaw>(),
-                    got = bytes.len(),
-                    error = %e,
-                    "tcp_connect ringbuf entry rejected"
-                ),
+                Err(_e) => {
+                    reject.record("tcp_connect", std::mem::size_of::<TcpConnectRaw>(), bytes.len())
+                }
             }
         }
         guard.clear_ready();
         if drained == 0 {
+            reject.flush_idle("tcp_connect", std::mem::size_of::<TcpConnectRaw>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
@@ -497,6 +571,7 @@ async fn pump_dns_query(
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = AsyncFd::new(rb)?;
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -524,16 +599,14 @@ async fn pump_dns_query(
                         return Ok(());
                     }
                 }
-                Err(e) => warn!(
-                    expected = std::mem::size_of::<DnsQueryRaw>(),
-                    got = bytes.len(),
-                    error = %e,
-                    "dns_query ringbuf entry rejected"
-                ),
+                Err(_e) => {
+                    reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len())
+                }
             }
         }
         guard.clear_ready();
         if drained == 0 {
+            reject.flush_idle("dns_query", std::mem::size_of::<DnsQueryRaw>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }

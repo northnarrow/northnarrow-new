@@ -31,7 +31,11 @@
 //! takes a boolean flag. The Tappa 8 milestone replaces it with an
 //! Ed25519-signed command path.
 
+pub mod corroboration;
+pub mod escalation_allow;
 pub mod exempt;
+pub mod lineage;
+pub mod mass_write_overlay;
 pub mod modulation;
 pub mod state;
 pub mod transitions;
@@ -46,15 +50,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, RwLock};
 
 use common::ade_types::AdeVerdict;
-use common::posture_types::{PostureKind, PostureTransition, TriggerType};
+use common::posture_types::{Confidence, PostureKind, PostureTransition, TriggerType};
 use common::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
+use corroboration::CorroborationLedger;
+use escalation_allow::EscalationAllowList;
 
 pub use exempt::{
     resolve_verified_watchdog_pid, ExemptPids, WatchdogResolution, DEFAULT_WATCHDOG_EXE,
     DEFAULT_WATCHDOG_PIDFILE,
 };
+pub use lineage::{AuthSessionTracker, AUTH_BINARY_EXES};
 pub use state::PostureState;
 pub use triggers::TriggerDetector;
 
@@ -96,6 +103,11 @@ struct Inner {
     state: RwLock<PostureState>,
     transitions: RwLock<Vec<PostureTransition>>,
     triggers: TriggerDetector,
+    /// BUG-032 — recent escalation signals, used to decide whether a
+    /// blunt COMBAT-tier heuristic has corroboration. Only ever touched
+    /// inside `observe()`'s `state.write()` critical section (consistent
+    /// lock order, no hazard).
+    corroboration: Mutex<CorroborationLedger>,
     combat_entry_hook: Option<CombatEntryHook>,
     combat_release_hook: Option<CombatReleaseHook>,
     /// Monotonic timestamp of the most recent successful admin
@@ -106,7 +118,14 @@ struct Inner {
 
 impl PostureMachine {
     pub fn new() -> Self {
-        Self::build(None, None, ExemptPids::default())
+        Self::build(
+            None,
+            None,
+            ExemptPids::default(),
+            AuthSessionTracker::default(),
+            Vec::new(),
+            EscalationAllowList::empty(),
+        )
     }
 
     /// Build a machine that fires `hook` whenever a transition crosses
@@ -120,7 +139,14 @@ impl PostureMachine {
     /// hook is NOT re-invoked. The wiring in `observe()` checks
     /// `before.kind() != Combat && after.kind() == Combat`.
     pub fn new_with_combat_hook(hook: CombatEntryHook) -> Self {
-        Self::build(Some(hook), None, ExemptPids::default())
+        Self::build(
+            Some(hook),
+            None,
+            ExemptPids::default(),
+            AuthSessionTracker::default(),
+            Vec::new(),
+            EscalationAllowList::empty(),
+        )
     }
 
     /// Build a machine that fires both an entry hook (on the
@@ -132,7 +158,14 @@ impl PostureMachine {
     /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
     /// to the posture state machine in one place.
     pub fn new_with_hooks(entry: CombatEntryHook, release: CombatReleaseHook) -> Self {
-        Self::build(Some(entry), Some(release), ExemptPids::default())
+        Self::build(
+            Some(entry),
+            Some(release),
+            ExemptPids::default(),
+            AuthSessionTracker::default(),
+            Vec::new(),
+            EscalationAllowList::empty(),
+        )
     }
 
     /// Production constructor: like [`Self::new_with_hooks`] but also
@@ -149,6 +182,9 @@ impl PostureMachine {
             Some(entry),
             Some(release),
             ExemptPids::with_agent(self_pid),
+            AuthSessionTracker::default(),
+            Vec::new(),
+            EscalationAllowList::empty(),
         )
     }
 
@@ -163,19 +199,79 @@ impl PostureMachine {
         release: CombatReleaseHook,
         exempt: ExemptPids,
     ) -> Self {
-        Self::build(Some(entry), Some(release), exempt)
+        Self::build(
+            Some(entry),
+            Some(release),
+            exempt,
+            AuthSessionTracker::default(),
+            Vec::new(),
+            EscalationAllowList::empty(),
+        )
+    }
+
+    /// Production constructor (Beta Step 5, T7.13): like
+    /// [`Self::new_with_hooks_and_exempt`] but also accepts a
+    /// shared [`AuthSessionTracker`] so the trigger detector can
+    /// suppress `sensitive_file_access` and the mass-write arm of
+    /// `confirmed_intrusion` for sudo-mediated PIDs. `main.rs`
+    /// constructs the tracker once at boot and shares it through
+    /// the posture machine.
+    pub fn new_with_hooks_and_exempt_and_auth(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook,
+        exempt: ExemptPids,
+        auth: AuthSessionTracker,
+    ) -> Self {
+        Self::build(
+            Some(entry),
+            Some(release),
+            exempt,
+            auth,
+            Vec::new(),
+            EscalationAllowList::empty(),
+        )
+    }
+
+    /// BUG-017 P-8 production constructor — like
+    /// [`Self::new_with_hooks_and_exempt_and_auth`] but also accepts
+    /// the operator-supplemental mass-write path-prefix carve-out list
+    /// (loaded from `/etc/northnarrow/mass-write-carveout.local` at
+    /// agent boot). Empty list = same behaviour as the simpler
+    /// constructor.
+    pub fn new_with_hooks_and_exempt_and_auth_and_extras(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook,
+        exempt: ExemptPids,
+        auth: AuthSessionTracker,
+        mass_write_extras: Vec<String>,
+        escalation_allow: EscalationAllowList,
+    ) -> Self {
+        Self::build(
+            Some(entry),
+            Some(release),
+            exempt,
+            auth,
+            mass_write_extras,
+            escalation_allow,
+        )
     }
 
     fn build(
         combat_entry_hook: Option<CombatEntryHook>,
         combat_release_hook: Option<CombatReleaseHook>,
         exempt: ExemptPids,
+        auth: AuthSessionTracker,
+        mass_write_extras: Vec<String>,
+        escalation_allow: EscalationAllowList,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(PostureState::default()),
                 transitions: RwLock::new(Vec::new()),
-                triggers: TriggerDetector::with_exempt(exempt),
+                triggers: TriggerDetector::with_exempt_and_auth(exempt, auth)
+                    .with_mass_write_extras(mass_write_extras)
+                    .with_escalation_allow(escalation_allow),
+                corroboration: Mutex::new(CorroborationLedger::new()),
                 combat_entry_hook,
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),
@@ -198,7 +294,11 @@ impl PostureMachine {
     ///
     /// `recent_events` should be the correlated context the agent
     /// already maintains (the same slice that ADE consumes).
-    pub fn observe(&self, event: &Event, recent_events: &[Event]) -> Option<PostureState> {
+    pub fn observe(
+        &self,
+        event: &Event,
+        recent_events: &[Event],
+    ) -> Option<(PostureState, Option<TriggerType>)> {
         let now = Instant::now();
         let hits = self.inner.triggers.detect(event, recent_events);
         if hits.is_empty() {
@@ -206,22 +306,64 @@ impl PostureMachine {
         }
 
         let mut guard = self.inner.state.write();
+        let mut ledger = self.inner.corroboration.lock();
+        ledger.prune(now);
+
+        // BUG-032 — escalation signals (ENGAGED-tier and above) this
+        // round. They corroborate each other and seed the ledger;
+        // ALERTED-tier recon/DNS is too noisy to count as corroboration.
+        let escalation_now: Vec<TriggerType> = hits
+            .iter()
+            .copied()
+            .filter(|t| t.target_level() >= PostureKind::Engaged)
+            .collect();
+
+        // Effective level: a blunt (NeedsCorroboration) COMBAT-tier
+        // signal is capped at ENGAGED unless a SECOND distinct
+        // escalation signal corroborates it (this round, or a distinct
+        // prior signal in the ledger). Decisive (kernel-adjudicated)
+        // signals reach COMBAT on their own. Computed up-front so the
+        // ledger's immutable read finishes before we record into it.
+        let mut leveled: Vec<(TriggerType, PostureKind)> = hits
+            .iter()
+            .copied()
+            .map(|t| {
+                let level = if t.target_level() == PostureKind::Combat
+                    && t.confidence() == Confidence::NeedsCorroboration
+                {
+                    if escalation_now.iter().any(|o| *o != t) || ledger.corroborated(t) {
+                        PostureKind::Combat
+                    } else {
+                        PostureKind::Engaged
+                    }
+                } else {
+                    t.target_level()
+                };
+                (t, level)
+            })
+            .collect();
+        // Strongest EFFECTIVE level decides the destination. Equal-level
+        // triggers collapse to a single transition.
+        leveled.sort_by_key(|(_, level)| *level);
+
         let before = guard.kind();
         let mut current = (*guard).clone();
         let mut firing: Option<TriggerType> = None;
-
-        // Rank triggers by target_level so the strongest one decides
-        // the destination state. Equal-level triggers all collapse
-        // to a single transition.
-        let mut sorted = hits.clone();
-        sorted.sort_by_key(|t| t.target_level());
-        for t in sorted {
-            let next = transitions::apply_trigger(&current, t, now);
+        for (t, level) in leveled {
+            let next = transitions::apply_to_level(&current, level, now);
             if next.kind() > current.kind() {
                 firing = Some(t);
             }
             current = next;
         }
+
+        // Record this round's escalation signals AFTER the decision, so
+        // the current signal does not self-corroborate via the ledger
+        // (same-round corroboration is handled by `escalation_now`).
+        for t in &escalation_now {
+            ledger.record(*t, now);
+        }
+        drop(ledger);
 
         let after = current.kind();
         *guard = current.clone();
@@ -239,7 +381,7 @@ impl PostureMachine {
                     hook();
                 }
             }
-            Some(current)
+            Some((current, firing))
         } else {
             None
         }

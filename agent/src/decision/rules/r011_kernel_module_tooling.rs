@@ -10,6 +10,26 @@
 //! the false-positive guard is the operator `process-comm-allowlist`:
 //! a site that loads modules from trusted automation adds the tool's
 //! comm to the allowlist `.local` overlay.
+//!
+//! ## Kernel-driven module load exemption (cluster 15.3)
+//!
+//! Genuine kernel-driven module loads — a kworker firing modprobe for
+//! USB / Wi-Fi hardware probe during boot — must NOT trigger R011.
+//! The signal is `parent_is_kthread`: a non-forgeable boolean BPF
+//! reads from `parent->flags & PF_KTHREAD` at exec time and ships
+//! into `Event::ProcessSpawn`. PF_KTHREAD is kernel-set on kthread
+//! creation and impossible to clear from userspace; no `prctl`,
+//! `unshare`, namespace trick, or ELF crafting flips it.
+//!
+//! Supersedes the P-7 `/proc/<ppid>/exe` absence check, which raced
+//! against kthread reaping (kworker exited between exec and userland
+//! readlink → over-fire on a benign modprobe) and required a
+//! userspace `/proc` walk.
+//!
+//! Fail-secure: a BPF read that failed (offset drift, permission
+//! issue, kernel without BTF) lands `parent_is_kthread = false`,
+//! which falls through to the FIRE path — over-fire is acceptable,
+//! under-fire (missing a forged-kworker rootkit install) is not.
 
 use std::sync::Arc;
 
@@ -44,9 +64,11 @@ impl Rule for R011KernelModuleTooling {
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::ProcessSpawn {
+            pid,
             comm,
             argv,
             parent_comm,
+            parent_is_kthread,
             ..
         } = event
         else {
@@ -56,6 +78,41 @@ impl Rule for R011KernelModuleTooling {
             return None;
         }
         if self.allowlist.contains(comm) {
+            return None;
+        }
+        // Cluster 15.3 — the kernel-driven-load exemption turns ENTIRELY
+        // on the non-forgeable BPF PF_KTHREAD signal (see module
+        // doc-comment), superseding the P-7 `/proc/<ppid>/exe` race. A
+        // `false` value means EITHER "real userspace parent" OR "BPF
+        // read failed" — both fall through to FIRE (fail-secure:
+        // over-fire beats missing a forged rootkit install).
+        //
+        // Emit ONE dedicated, greppable decision line on BOTH outcomes
+        // so the journal always records WHY R011 did or didn't fire for
+        // a kmod-tooling exec. This is the signal that was invisible the
+        // night a stale .o silently zeroed `parent_is_kthread` and R011
+        // over-fired on benign kworker→modprobe: with this line the same
+        // incident reads as `parent_is_kthread=false decision=fire` at a
+        // glance under `RUST_LOG=…=debug`. Debug level keeps the
+        // (potentially many) boot-time hardware-probe modprobe execs out
+        // of the default journal while staying one flag away when
+        // diagnosing.
+        let decision = if *parent_is_kthread {
+            "exempt_kernel_thread"
+        } else {
+            "fire"
+        };
+        tracing::debug!(
+            rule = "R011_KernelModuleTooling",
+            event = "r011_kthread_decision",
+            pid = *pid,
+            comm = %comm,
+            parent_comm = %parent_comm,
+            parent_is_kthread = *parent_is_kthread,
+            decision,
+            "R011 kernel-module-tooling exec: PF_KTHREAD parent-origin decision"
+        );
+        if *parent_is_kthread {
             return None;
         }
         // Base detection fires on comm alone (graceful-degrade when the
@@ -91,6 +148,26 @@ mod tests {
 
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
+    }
+
+    /// Build a ProcessSpawn with explicit `parent_is_kthread`. The
+    /// existing `spawn` / `spawn_full` helpers default the flag to
+    /// `false`; tests covering the cluster-15.3 exemption need to
+    /// flip it on without leaking the boilerplate into every assert.
+    fn modprobe_spawn(parent_comm: &str, parent_is_kthread: bool) -> Event {
+        Event::ProcessSpawn {
+            pid: 4242,
+            ppid: 7,
+            uid: 0,
+            gid: 0,
+            comm: "modprobe".to_string(),
+            filename: "/sbin/modprobe".to_string(),
+            timestamp_ns: 1,
+            argv: vec!["modprobe".to_string(), "snd-pcm".to_string()],
+            parent_comm: parent_comm.to_string(),
+            parent_start_ns: 0,
+            parent_is_kthread,
+        }
     }
 
     #[test]
@@ -158,5 +235,71 @@ mod tests {
             .is_none());
         // A different kmod tool not on the allowlist still fires.
         assert!(r.evaluate(&spawn("insmod", "/usr/sbin/insmod")).is_some());
+    }
+
+    // ─── Cluster 15.3 — PF_KTHREAD signal regression suite ──────────
+    //
+    // The key invariant being defended: PF_KTHREAD is a kernel-set
+    // flag that userspace cannot forge, so a `comm = "kworker/0:1"`
+    // claim WITHOUT the flag must STILL fire (the security-critical
+    // guard inherited from the original P-7 fix). The flag is the
+    // ONLY exemption path; without it, R011 always fires.
+
+    /// Real kernel-thread parent (PF_KTHREAD set): legitimate
+    /// kworker→modprobe during USB / hardware-probe boot. R011 MUST
+    /// be exempt. This is the over-fire the old P-7 /proc race
+    /// caused (kworker reaped before userland readlink → fail-safe
+    /// FIRE on a benign modprobe). Now gone.
+    #[test]
+    fn real_kthread_parent_is_exempt() {
+        let ev = modprobe_spawn("kworker/u8:3", true);
+        assert!(
+            rule().evaluate(&ev).is_none(),
+            "real kthread parent (PF_KTHREAD set) must exempt R011"
+        );
+    }
+
+    /// SECURITY-CRITICAL: forged kworker `comm` (attacker calls
+    /// `prctl(PR_SET_NAME, "kworker/0:1")` then forks+execs modprobe)
+    /// but PF_KTHREAD is NOT set (kernel-managed; impossible to flip
+    /// from userspace). R011 MUST fire — this is the bypass the
+    /// original P-7 fix closed, and the cluster-15.3 refactor MUST
+    /// preserve it.
+    #[test]
+    fn forged_kworker_comm_without_pf_kthread_is_not_exempt() {
+        let ev = modprobe_spawn("kworker/0:1", false);
+        let v = rule()
+            .evaluate(&ev)
+            .expect("R011 MUST fire on forged kworker comm (no PF_KTHREAD)");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.severity, Severity::High);
+    }
+
+    /// Sanity: normal userspace parent (bash invoking modprobe).
+    /// PF_KTHREAD is false → R011 fires as expected. Regression
+    /// guard that the new gate doesn't over-suppress.
+    #[test]
+    fn normal_userspace_parent_fires() {
+        let ev = modprobe_spawn("bash", false);
+        assert!(
+            rule().evaluate(&ev).is_some(),
+            "userspace parent (bash) must fire"
+        );
+    }
+
+    /// FAIL-SECURE: BPF read of parent->flags failed (offset drift /
+    /// older BPF / kernel without BTF). The wire field decodes to
+    /// `false`, which falls through to FIRE. Documents the
+    /// fail-secure contract: missing signal != silent exemption.
+    #[test]
+    fn flag_unavailable_fails_secure_and_fires() {
+        // `parent_is_kthread = false` covers both "real userspace
+        // parent" AND "BPF couldn't read the flag" — same code path,
+        // same FIRE outcome. This is exactly the safety guarantee.
+        let ev = modprobe_spawn("", false); // empty parent_comm models BPF best-effort failure
+        assert!(
+            rule().evaluate(&ev).is_some(),
+            "missing PF_KTHREAD signal must fail-secure and fire"
+        );
     }
 }

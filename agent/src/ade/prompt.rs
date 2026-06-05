@@ -127,6 +127,16 @@ fn push_host_context(buf: &mut String, ctx: &HostContext) {
 /// One-line summary used inside the "recent events" block.
 pub(crate) fn format_event_line(event: &Event) -> String {
     match event {
+        Event::ModuleLoad {
+            method,
+            loader_pid,
+            loader_comm,
+            path,
+            ..
+        } => format!(
+            "- module_load method={method:?} loader_pid={loader_pid} loader_comm={loader_comm} path={}",
+            path.as_deref().unwrap_or("none")
+        ),
         Event::ProcessSpawn {
             pid,
             ppid,
@@ -265,6 +275,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let ctx = EventContext {
             recent_events: vec![],
@@ -295,6 +306,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let recent = Event::ProcessSpawn {
             pid: 41,
@@ -307,6 +319,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            parent_is_kthread: false,
         };
         let ctx = EventContext {
             recent_events: vec![recent],

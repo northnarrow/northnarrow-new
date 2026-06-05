@@ -825,6 +825,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
+name = "ebpf-guard"
+version = "0.0.1"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1735,6 +1742,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "clap",
+ "ebpf-guard",
  "ed25519-dalek",
  "hex",
  "hkdf",
@@ -3666,6 +3674,7 @@ dependencies = [
  "aya-obj",
  "chrono",
  "clap",
+ "ebpf-guard",
  "flate2",
  "serde",
  "serde_json",

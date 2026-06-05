@@ -33,7 +33,16 @@ const DEFAULT_RESTORE_BIN: &str = "iptables-restore";
 /// rationale as [`DEFAULT_RESTORE_BIN`].
 const DEFAULT_IPTABLES_BIN: &str = "iptables";
 
-/// Name of the chain that `configs/combat-rules.v4` creates.
+/// BUG-031 — `ip6tables-restore` / `ip6tables` lookup names for the v6
+/// isolation mirror. Same PATH rationale as the v4 binaries.
+const DEFAULT_RESTORE_BIN_V6: &str = "ip6tables-restore";
+const DEFAULT_IPTABLES_BIN_V6: &str = "ip6tables";
+
+/// Default install path for the v6 ruleset (`--combat-rules-v6`).
+const DEFAULT_RULES_V6: &str = "/etc/northnarrow/combat-rules.v6";
+
+/// Name of the chain that `combat-rules.v4` / `combat-rules.v6` create.
+/// The SAME chain name is used on both the v4 and v6 `filter` tables.
 const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 
 /// Marker line in `configs/combat-rules.v4` that [`NetworkIsolator::engage`]
@@ -82,6 +91,14 @@ pub struct NetworkIsolator {
     allow_cidrs_path: PathBuf,
     restore_bin: PathBuf,
     iptables_bin: PathBuf,
+    /// BUG-031 — v6 isolation mirror: the `combat-rules.v6` ruleset path
+    /// (`--combat-rules-v6`) + the `ip6tables-restore` / `ip6tables`
+    /// binaries. The v6 leg is best-effort: a missing ruleset or absent
+    /// `ip6tables` leaves IPv6 un-isolated with a loud WARN (v4 still
+    /// applies), not a refused COMBAT.
+    rules_path_v6: PathBuf,
+    restore_bin_v6: PathBuf,
+    ip6tables_bin: PathBuf,
 }
 
 impl NetworkIsolator {
@@ -99,6 +116,9 @@ impl NetworkIsolator {
             allow_cidrs_path: combat_allow::default_path(),
             restore_bin: PathBuf::from(DEFAULT_RESTORE_BIN),
             iptables_bin: PathBuf::from(DEFAULT_IPTABLES_BIN),
+            rules_path_v6: PathBuf::from(DEFAULT_RULES_V6),
+            restore_bin_v6: PathBuf::from(DEFAULT_RESTORE_BIN_V6),
+            ip6tables_bin: PathBuf::from(DEFAULT_IPTABLES_BIN_V6),
         })
     }
 
@@ -106,6 +126,15 @@ impl NetworkIsolator {
     /// `main.rs` wires this from `--combat-allow-cidrs`.
     pub fn with_allow_cidrs_path(mut self, path: PathBuf) -> Self {
         self.allow_cidrs_path = path;
+        self
+    }
+
+    /// BUG-031 — override the v6 ruleset path. `main.rs` wires this from
+    /// `--combat-rules-v6`. A missing file makes the v6 leg degrade
+    /// (loud WARN), not fail — unlike the v4 ruleset, which `new()`
+    /// requires.
+    pub fn with_rules_v6(mut self, path: PathBuf) -> Self {
+        self.rules_path_v6 = path;
         self
     }
 
@@ -123,6 +152,13 @@ impl NetworkIsolator {
     ) -> Result<Self> {
         Ok(Self {
             is_isolated: AtomicBool::new(false),
+            // v6 fields default to the same (benign) test binaries +
+            // ruleset so existing v4 tests exercise the v6 legs harmlessly
+            // (`/bin/true` / `/usr/bin/cat`). v6-specific tests pass the
+            // same ctor.
+            rules_path_v6: rules_path.clone(),
+            restore_bin_v6: restore_bin.clone(),
+            ip6tables_bin: iptables_bin.clone(),
             rules_path,
             allow_cidrs_path: combat_allow::default_path(),
             restore_bin,
@@ -138,6 +174,12 @@ impl NetworkIsolator {
         let (ruleset, carved) = self.build_engaged_ruleset()?;
         run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
             .context("iptables-restore failed during COMBAT engage")?;
+        // BUG-041: the restore inserts our jump on top; a re-engage would
+        // stack a duplicate. Trim to exactly one — windowless (only
+        // deletes extras, always leaves >= 1 jump). Runs AFTER the
+        // restore `?`, so it never acts on a zero-jump table from a
+        // failed restore.
+        dedup_jumps(&self.iptables_bin).context("deduplicating v4 COMBAT jumps")?;
         self.is_isolated.store(true, Ordering::SeqCst);
         if carved.is_empty() {
             info!(
@@ -155,7 +197,57 @@ impl NetworkIsolator {
                 "COMBAT: network isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
             );
         }
+        // BUG-031 — v6 mirror, best-effort. An attack is already detected;
+        // refusing the whole COMBAT because v6 isn't provisioned would mean
+        // NO isolation (v4 included), letting the attack proceed. Isolate
+        // v4 + WARN loudly on any v6 hole.
+        self.engage_v6();
         Ok(())
+    }
+
+    /// BUG-031 — apply the v6 isolation ruleset via `ip6tables-restore`.
+    /// Best-effort + loud: a missing `combat-rules.v6` or absent
+    /// `ip6tables` leaves IPv6 un-isolated with a WARN, never failing the
+    /// (v4) engage.
+    fn engage_v6(&self) {
+        match self.build_engaged_ruleset_v6() {
+            Ok(None) => warn!(
+                rules_v6 = %self.rules_path_v6.display(),
+                "COMBAT: combat-rules.v6 absent — IPv6 NOT isolated this COMBAT (v4 applied; provision the v6 ruleset to close the gap)"
+            ),
+            Ok(Some((ruleset, carved))) => {
+                match run_iptables_restore_data(&self.restore_bin_v6, ruleset.as_bytes()) {
+                    Ok(()) => {
+                        // BUG-041: dedup our v6 jumps (best-effort — a dup
+                        // is harmless, both isolate; v4 already succeeded).
+                        if let Err(e) = dedup_jumps(&self.ip6tables_bin) {
+                            warn!(error = %e, "COMBAT: v6 jump dedup failed (best-effort; isolation intact)");
+                        }
+                        if carved.is_empty() {
+                            info!(
+                                rules_v6 = %self.rules_path_v6.display(),
+                                "COMBAT: IPv6 isolated (NDP/MLD preserved, loopback only)"
+                            );
+                        } else {
+                            warn!(
+                                rules_v6 = %self.rules_path_v6.display(),
+                                allow_cidrs = ?carved,
+                                count = carved.len(),
+                                "COMBAT: IPv6 isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "COMBAT: ip6tables-restore FAILED — IPv6 NOT isolated this COMBAT (v4 applied; ip6tables absent or errored)"
+                    ),
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                "COMBAT: building the v6 ruleset failed — IPv6 NOT isolated this COMBAT"
+            ),
+        }
     }
 
     /// Build the ruleset to feed `iptables-restore`: the base
@@ -184,16 +276,34 @@ impl NetworkIsolator {
                 "COMBAT carve-out: skipping malformed allow entry (fail-secure — entry ignored)"
             );
         }
-        for e in load.entries.iter().filter(|e| e.is_ipv6) {
-            info!(
-                cidr = %e.raw,
-                "COMBAT carve-out: IPv6 entry noted but NOT applied — COMBAT isolation is IPv4-only"
-            );
-        }
+        // BUG-031: IPv6 carve-out entries are no longer inert — they are
+        // applied to the v6 chain by `build_engaged_ruleset_v6` below.
 
         let accept_block = combat_allow::generate_accept_rules(&load.entries, COMBAT_CHAIN);
         let carved = combat_allow::ipv4_raw(&load.entries);
         Ok((splice_carveout(&base, &accept_block), carved))
+    }
+
+    /// BUG-031 — v6 sibling of [`Self::build_engaged_ruleset`]. Returns
+    /// `Ok(None)` when `combat-rules.v6` is absent (the v6 leg then
+    /// degrades with a WARN). Splices the IPv6 carve-out entries — which
+    /// the v4 path parses but ignores — ahead of the v6 catch-all DROP.
+    fn build_engaged_ruleset_v6(&self) -> Result<Option<(String, Vec<String>)>> {
+        let base = match std::fs::read_to_string(&self.rules_path_v6) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("reading {}", self.rules_path_v6.display()))
+            }
+        };
+        // The allow file's read errors + malformed-line warnings were
+        // already surfaced by the v4 builder (engage() runs v4 first);
+        // here we just take the validated entries.
+        let load = combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
+        let accept_block = combat_allow::generate_accept_rules_v6(&load.entries, COMBAT_CHAIN);
+        let carved = combat_allow::ipv6_raw(&load.entries);
+        Ok(Some((splice_carveout(&base, &accept_block), carved)))
     }
 
     /// Beta Step 4a: tear down a STALE COMBAT chain left over from a
@@ -204,22 +314,24 @@ impl NetworkIsolator {
     /// backing it (the B3 split-brain). Reuses the idempotent teardown
     /// path; a no-op (and cheap) when no chain is present.
     pub fn reconcile_stale_chain(&self) -> Result<ReconcileOutcome> {
-        let listed = Command::new(&self.iptables_bin)
-            .args(["-S", COMBAT_CHAIN])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("probing for stale {COMBAT_CHAIN} chain"))?;
-        if !listed.status.success() {
-            // Non-zero = chain absent (the normal clean-boot case).
+        let v4 = probe_chain(&self.iptables_bin)
+            .with_context(|| format!("probing for stale {COMBAT_CHAIN} v4 chain"))?;
+        // BUG-031: a mid-COMBAT crash can leave a stale v6 chain too —
+        // probe it INDEPENDENTLY so a v6-only orphan is still detected
+        // (the v6 edition of the B3 split-brain). Best-effort: ip6tables
+        // absent ⇒ treat as no v6 chain.
+        let v6 = probe_chain(&self.ip6tables_bin).unwrap_or(None);
+        if v4.is_none() && v6.is_none() {
+            // Neither chain present (the normal clean-boot case).
             return Ok(ReconcileOutcome {
                 chain_existed: false,
                 rules_removed: 0,
             });
         }
-        let rules_removed = count_chain_rules(&String::from_utf8_lossy(&listed.stdout));
+        let rules_removed = v4.unwrap_or(0) + v6.unwrap_or(0);
+        // tear_down_chain clears BOTH tables (best-effort on v6).
         self.tear_down_chain()
-            .context("tearing down stale COMBAT chain")?;
+            .context("tearing down stale COMBAT chain(s)")?;
         self.is_isolated.store(false, Ordering::SeqCst);
         Ok(ReconcileOutcome {
             chain_existed: true,
@@ -228,18 +340,19 @@ impl NetworkIsolator {
     }
 
     /// Idempotent chain teardown shared by [`Self::release`] and
-    /// [`Self::reconcile_stale_chain`]: delete the jump rules from the
-    /// base chains first (`-X` refuses a still-referenced chain), then
-    /// flush and delete the chain. Each step swallows "already gone".
+    /// [`Self::reconcile_stale_chain`]. Clears `COMBAT_CHAIN` on BOTH the
+    /// v4 and v6 tables (BUG-031). v4 is the critical path (errors
+    /// propagate); the v6 leg is best-effort + WARN, so a v4-only host
+    /// (no `ip6tables`) still releases cleanly. Because release() and
+    /// reconcile() both delegate here, the v6 teardown covers both.
     fn tear_down_chain(&self) -> Result<()> {
-        for base in ["INPUT", "OUTPUT", "FORWARD"] {
-            run_iptables_idempotent(&self.iptables_bin, &["-D", base, "-j", COMBAT_CHAIN])
-                .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;
+        tear_down_one(&self.iptables_bin)?;
+        if let Err(e) = tear_down_one(&self.ip6tables_bin) {
+            warn!(
+                error = %e,
+                "COMBAT release: v6 chain teardown failed (best-effort; v4 cleared)"
+            );
         }
-        run_iptables_idempotent(&self.iptables_bin, &["-F", COMBAT_CHAIN])
-            .with_context(|| format!("flushing chain {COMBAT_CHAIN}"))?;
-        run_iptables_idempotent(&self.iptables_bin, &["-X", COMBAT_CHAIN])
-            .with_context(|| format!("deleting chain {COMBAT_CHAIN}"))?;
         Ok(())
     }
 
@@ -289,11 +402,7 @@ fn run_iptables_idempotent(bin: &Path, args: &[&str]) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // `iptables -D` emits this when the rule is already gone:
-    //   "iptables: Bad rule (does a matching rule exist in that chain?)."
-    // `iptables -F`/`-X` emits this when the chain is already gone:
-    //   "iptables: No chain/target/match by that name."
-    if stderr.contains("does a matching rule exist") || stderr.contains("No chain/target/match") {
+    if already_gone(&stderr) {
         return Ok(());
     }
     Err(anyhow!(
@@ -305,6 +414,24 @@ fn run_iptables_idempotent(bin: &Path, args: &[&str]) -> Result<()> {
     ))
 }
 
+/// Does a failed `iptables`/`ip6tables` `stderr` mean the target was
+/// already gone (the idempotent goal)? Messages vary by backend:
+///   `-D` rule already gone (legacy):
+///     "iptables: Bad rule (does a matching rule exist in that chain?)."
+///   `-F`/`-X` chain already gone (legacy):
+///     "iptables: No chain/target/match by that name."
+///   `-D <jump>` whose target chain is absent (nf_tables, BUG-031):
+///     "… (nf_tables): Chain 'NORTHNARROW_COMBAT' does not exist"
+/// The last is the v4/v6 case where one table has no chain while the
+/// other does — `tear_down_one` runs on both, so the absent-table legs
+/// must be no-ops. A "Device or resource busy" (chain still referenced)
+/// is deliberately NOT here — that's a real error, not "already gone".
+fn already_gone(stderr: &str) -> bool {
+    stderr.contains("does a matching rule exist")
+        || stderr.contains("No chain/target/match")
+        || stderr.contains("does not exist")
+}
+
 /// Outcome of [`NetworkIsolator::reconcile_stale_chain`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
@@ -312,6 +439,73 @@ pub struct ReconcileOutcome {
     pub chain_existed: bool,
     /// Count of `-A` rules the chain held before teardown (audit detail).
     pub rules_removed: usize,
+}
+
+/// Idempotent teardown of `COMBAT_CHAIN` on `bin`'s table (BUG-031):
+/// remove the jumps from the base chains first (`-X` refuses a
+/// still-referenced chain), then flush + delete. Each step tolerates
+/// "already gone". Parameterized by `bin` so the v4 (`iptables`) and v6
+/// (`ip6tables`) tables share one implementation.
+fn tear_down_one(bin: &Path) -> Result<()> {
+    for base in ["INPUT", "OUTPUT", "FORWARD"] {
+        run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])
+            .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;
+    }
+    run_iptables_idempotent(bin, &["-F", COMBAT_CHAIN])
+        .with_context(|| format!("flushing chain {COMBAT_CHAIN}"))?;
+    run_iptables_idempotent(bin, &["-X", COMBAT_CHAIN])
+        .with_context(|| format!("deleting chain {COMBAT_CHAIN}"))?;
+    Ok(())
+}
+
+/// Probe whether `COMBAT_CHAIN` exists on `bin`'s table.
+/// `Ok(Some(n))` = present with `n` `-A` rules, `Ok(None)` = absent
+/// (non-zero exit), `Err` = the binary could not be run (BUG-031: the
+/// v6 caller treats that as "no v6 chain").
+fn probe_chain(bin: &Path) -> Result<Option<usize>> {
+    let listed = Command::new(bin)
+        .args(["-S", COMBAT_CHAIN])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("running {} -S {COMBAT_CHAIN}", bin.display()))?;
+    if !listed.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(count_chain_rules(&String::from_utf8_lossy(&listed.stdout))))
+}
+
+/// BUG-041 — after an additive `-I … 1` engage, ensure exactly ONE
+/// `-j COMBAT_CHAIN` jump remains in each base chain (a re-engage would
+/// otherwise stack a duplicate). Windowless: only ever DELETEs extras,
+/// leaving >= 1 jump in place at all times — never a no-jump moment.
+/// Must run AFTER a successful restore (so the count is >= 1).
+fn dedup_jumps(bin: &Path) -> Result<()> {
+    for base in ["INPUT", "OUTPUT", "FORWARD"] {
+        let listed = Command::new(bin)
+            .args(["-S", base])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("listing {base} to dedup {COMBAT_CHAIN} jumps"))?;
+        if !listed.status.success() {
+            continue; // base chain unreadable — skip (best-effort)
+        }
+        let n = count_jumps(&String::from_utf8_lossy(&listed.stdout));
+        // Delete (n - 1) extras, keeping exactly one. `1..n` is empty when
+        // n <= 1, so this never deletes below one jump.
+        for _ in 1..n {
+            run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])
+                .with_context(|| format!("removing duplicate {COMBAT_CHAIN} jump from {base}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Count `-j COMBAT_CHAIN` jump rules in `iptables -S <base>` output.
+fn count_jumps(iptables_s_output: &str) -> usize {
+    let needle = format!("-j {COMBAT_CHAIN}");
+    iptables_s_output.lines().filter(|l| l.contains(&needle)).count()
 }
 
 /// Count the appended (`-A`) rules in `iptables -S CHAIN` output. The
@@ -374,6 +568,11 @@ fn run_iptables_restore_data(bin: &Path, rules_data: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let mut child = Command::new(bin)
+        // BUG-041: ADDITIVE — never flush the operator's table. The dump
+        // rebuilds only our own declared chain (`:NORTHNARROW_COMBAT`)
+        // and inserts our jumps (`-I … 1`); every operator chain/rule is
+        // left untouched.
+        .arg("--noflush")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -412,6 +611,37 @@ fn run_iptables_restore_data(bin: &Path, rules_data: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    // BUG-031: the idempotent-teardown classifier must recognize the
+    // "already gone" messages across backends — including nf_tables'
+    // "Chain '…' does not exist" (the v4/v6-absent-table case) — while
+    // NOT swallowing a real "resource busy" (chain still referenced).
+    #[test]
+    fn already_gone_recognizes_backend_messages() {
+        assert!(already_gone(
+            "iptables: Bad rule (does a matching rule exist in that chain?)."
+        ));
+        assert!(already_gone("iptables: No chain/target/match by that name."));
+        assert!(already_gone(
+            "iptables v1.8.10 (nf_tables): Chain 'NORTHNARROW_COMBAT' does not exist"
+        ));
+        assert!(!already_gone(
+            "ip6tables v1.8.10 (nf_tables):  CHAIN_DEL failed (Device or resource busy): chain NORTHNARROW_COMBAT"
+        ));
+    }
+
+    // BUG-041: the dedup counts only OUR jumps (so it trims duplicates to
+    // one without touching operator rules in the same base chain).
+    #[test]
+    fn count_jumps_counts_our_jumps_only() {
+        let two = "-P INPUT ACCEPT\n\
+                   -A INPUT -j NORTHNARROW_COMBAT\n\
+                   -A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n\
+                   -A INPUT -j NORTHNARROW_COMBAT\n";
+        assert_eq!(count_jumps(two), 2, "two NN jumps; operator ACCEPT not counted");
+        assert_eq!(count_jumps("-A INPUT -j NORTHNARROW_COMBAT\n"), 1);
+        assert_eq!(count_jumps("-P INPUT ACCEPT\n-A INPUT -j ACCEPT\n"), 0);
+    }
+
     /// Absolute path to `configs/combat-rules.v4` in the repo. Tests
     /// run with `CARGO_MANIFEST_DIR` set to the agent crate root.
     fn combat_rules_path() -> PathBuf {
@@ -433,14 +663,37 @@ mod tests {
     /// Convenience: build a NetworkIsolator with `/usr/bin/cat` for
     /// the restore side and `/bin/true` for the iptables side — the
     /// "success path" mock used by most tests.
+    /// A mock `iptables-restore`: a tiny script that drains stdin to EOF
+    /// and exits 0, IGNORING its args — so it tolerates the `--noflush`
+    /// flag (BUG-041) that `cat` rejects as an unknown option, while
+    /// still avoiding the EPIPE a non-reading mock (`/bin/true`) hits.
+    fn mock_restore_bin() -> Option<PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // UNIQUE per call: tests run in parallel; a shared path would let
+        // one test's File::create (truncate) collide with another test
+        // exec'ing it (ETXTBSY / a truncated script → EPIPE on the write).
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nn-test-mock-restore-{}-{}.sh",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = std::fs::File::create(&path).ok()?;
+        f.write_all(b"#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n").ok()?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        Some(path)
+    }
+
     fn mock_success_isolator() -> Option<NetworkIsolator> {
-        let cat = PathBuf::from("/usr/bin/cat");
+        let restore = mock_restore_bin()?;
         let truebin = PathBuf::from("/bin/true");
-        if !cat.exists() || !truebin.exists() {
-            eprintln!("/usr/bin/cat or /bin/true missing; skipping");
+        if !truebin.exists() {
+            eprintln!("/bin/true missing; skipping");
             return None;
         }
-        Some(NetworkIsolator::new_with_bin(combat_rules_path(), cat, truebin).unwrap())
+        Some(NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap())
     }
 
     #[test]
@@ -619,11 +872,33 @@ mod tests {
             Some(i) => i,
             None => return,
         };
-        // Default allow path almost certainly absent in the test env →
-        // fail-secure empty carve-out.
+        // Hermetic (§26 test-debt fix): point at a guaranteed-ABSENT
+        // allow path so the carve-out is the fail-secure empty set,
+        // regardless of whether the host has a real
+        // /etc/northnarrow/combat-allow.cidrs provisioned. The old test
+        // read `combat_allow::default_path()` directly — it passed on a
+        // clean dev box but failed on a deployed VM (where the live mgmt
+        // carve-out file exists → `carved` non-empty). Mirrors the temp
+        // allow-path pattern the sibling carve-out test already uses.
+        let absent = std::env::temp_dir().join(format!("nn-absent-allow-{}.cidrs", std::process::id()));
+        let _ = std::fs::remove_file(&absent);
+        let iso = iso.with_allow_cidrs_path(absent);
         let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
-        assert!(carved.is_empty());
-        assert!(!ruleset.contains("-j ACCEPT"));
+        assert!(carved.is_empty(), "absent allow file must yield empty carve-out, got {carved:?}");
+        // Loopback-only isolation: the only ACCEPTs are the two lo rules
+        // (the additive model uses `-i/-o lo -j ACCEPT`, NOT RETURN — see
+        // configs/combat-rules.v4 header); NO management carve-out CIDR
+        // ACCEPT (`-s`/`-d <cidr> -j ACCEPT`) was spliced in, and the
+        // carve-out marker was consumed.
+        assert!(
+            ruleset.contains("-A NORTHNARROW_COMBAT -i lo -j ACCEPT")
+                && ruleset.contains("-A NORTHNARROW_COMBAT -o lo -j ACCEPT"),
+            "loopback ACCEPT rules must be present: {ruleset}"
+        );
+        assert!(
+            !ruleset.contains(" -s ") && !ruleset.contains(" -d "),
+            "no management carve-out CIDR ACCEPT expected with an absent allow file: {ruleset}"
+        );
         assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
     }
 
@@ -658,8 +933,11 @@ mod tests {
             return;
         }
         let rules = std::fs::read(combat_rules_path()).expect("reading configs/combat-rules.v4");
+        // BUG-041: production engages with `--noflush` (additive); test the
+        // same way so the `-I … 1` jumps + `:NORTHNARROW_COMBAT` rebuild
+        // are validated as they're actually applied.
         let mut child = Command::new(bin)
-            .arg("--test")
+            .args(["--test", "--noflush"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

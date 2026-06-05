@@ -24,8 +24,20 @@ ConditionPathIsMountPoint=/sys/fs/bpf
 
 [Service]
 Type=notify
+# Logging footprint (product guardrail). Route this unit's stdout/stderr
+# into NorthNarrow's dedicated, hard-capped journal namespace instead of
+# the host default journal. Stock Ubuntu's journald has ForwardToSyslog=yes
+# → rsyslog → /var/log/syslog, which has NO size cap (weekly logrotate
+# only): that is how a noisy bug filled 76G twice in a day. A non-default
+# namespace runs its own systemd-journald@northnarrow (config:
+# /etc/systemd/journald@northnarrow.conf, SystemMaxUse=1G) and by systemd
+# design does NOT forward to syslog — closing the size-cap AND the
+# amplification vectors with one knob, zero customer config. Read NN logs:
+#   journalctl --namespace=northnarrow -u northnarrow-agent
+LogNamespace=northnarrow
 ExecStart=/usr/local/bin/northnarrow-agent \
     --combat-rules /etc/northnarrow/combat-rules.v4 \
+    --combat-rules-v6 /etc/northnarrow/combat-rules.v6 \
     --admin-pub /etc/northnarrow/admin.pub \
     --admin-socket /run/northnarrow/admin.sock \
     --pid-file /run/northnarrow/agent.pid
@@ -90,15 +102,67 @@ TasksMax=512
 # to its bpffs pin directory without a ReadWritePaths entry.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+# ProtectHome=read-only — deliberately NOT =yes/=true. The FIM
+# credential-read rules (NN-L-FIM-011..017: AWS/Azure/GCP/Docker/browser/
+# KeePass/GnuPG, plus the /root + /home SSH-key & shell-history watches)
+# depend on the agent being able to stat(2) those files at boot to record
+# their (dev,ino) in the kernel WATCHED_PATHS map — the BPF observe hooks
+# only emit a FIM event for an inode that is IN that map. `ProtectHome=yes`
+# mounts an EMPTY tmpfs over /home, /root and /run/user inside this unit's
+# mount namespace, so every credential stat() returns ENOENT, those inodes
+# never enter WATCHED_PATHS, and the credential-theft rules fire NOTHING —
+# a silent, total coverage hole (the kernel BPF side still sees the opens;
+# it simply has no watched inode to match them against). `read-only`
+# restores visibility while keeping the write-hardening intact: the agent
+# only ever stat()s/reads these paths — it NEVER writes under a home dir
+# (all writes go to the ReadWritePaths below) — so read-only costs us
+# nothing and is verifiable with `systemd-analyze security`. Do NOT revert
+# to =yes without first removing every /root + /home entry from
+# configs/fim-paths.v1; the boot-time regression guard in
+# agent/src/fim/attach.rs (populate_watched_paths) WARNs if this is ever
+# masked again.
+ProtectHome=read-only
 ReadWritePaths=/run/northnarrow /var/lib/northnarrow
-# CAP_BPF        — load+pin BPF maps/programs (Tappa 7 task 5/6/7)
-# CAP_SYS_ADMIN  — bpf(2) historically needed this; CAP_BPF
-#                  separated it on 5.8+ but kernel still accepts
-#                  the union, so we keep both for compat
-# CAP_NET_ADMIN  — iptables-restore on COMBAT entry (Tappa 7 task 7)
-# CAP_DAC_OVERRIDE — chattr +i on /var/lib/northnarrow (Tappa 7 task 5)
-CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_DAC_OVERRIDE
+# CapabilityBoundingSet — the agent runs as root (no User=), so this set is
+# the HARD CEILING on its effective caps: a cap not listed is dropped even
+# from root. It is the blast radius if the agent is ever compromised, so it
+# is kept minimal. Every entry is load-bearing, proven under the real bounded
+# unit on kernel 6.8.0 (BUG-042). The prior set was wrong three ways: it
+# silently dropped CAP_LINUX_IMMUTABLE and CAP_SYS_PTRACE (two agent defenses
+# that only "worked" in unbounded smoke tests), and it carried the near-root
+# CAP_SYS_ADMIN for BPF work that CAP_BPF + CAP_PERFMON actually cover.
+#
+# CAP_BPF          — create + load + pin the eBPF maps/programs/ringbufs.
+# CAP_PERFMON      — BTF-attach the tracing programs (sched_process_exec,
+#                    tcp_connect_v4/v6, dns_query, tcp_close, …) AND the
+#                    BPF-LSM programs (inode_protect deny hooks, task_kill,
+#                    ptrace_access_check, fim observe). On 6.8 both attach
+#                    types gate on perfmon_capable(); with CAP_BPF this fully
+#                    replaces the old CAP_SYS_ADMIN — verified by attaching
+#                    all 17 progs under CAP_BPF+CAP_PERFMON alone, with no
+#                    CAP_SYS_ADMIN and no CAP_MAC_ADMIN (BUG-042). CAP_BPF
+#                    alone EPERMs the BPF_PROG_LOAD of these.
+# CAP_NET_ADMIN    — iptables/ip6tables-restore for the COMBAT isolation
+#                    chain: engage + teardown, v4 AND v6 (BUG-031).
+# CAP_LINUX_IMMUTABLE — chattr +i (FS_IOC_SETFLAGS|FS_IMMUTABLE_FL) on
+#                    /var/lib/northnarrow, the anti-tamper defence-in-depth
+#                    (anti_tamper/filesystem.rs). THIS is the cap +i needs —
+#                    NOT CAP_DAC_OVERRIDE, which the prior comment wrongly
+#                    credited (BUG-042). Without it the agent logs
+#                    "chattr +i failed" and runs with LSM-only protection.
+# CAP_SYS_PTRACE   — readlink /proc/<pid>/exe on OTHER processes
+#                    (posture/lineage.rs, posture/exempt.rs,
+#                    response/quarantine.rs). ptrace_may_access denies this to
+#                    root for a cross-uid OR non-dumpable target without the
+#                    cap (BUG-042) — needed for auth-session lineage
+#                    correlation and quarantine target resolution.
+# CAP_DAC_OVERRIDE — quarantine reach ONLY: read + unlink a malicious binary
+#                    that lives in a non-root, restrictive-perm directory
+#                    (response/quarantine.rs). NOT for +i, NOT for FIM (all
+#                    125 watched paths are root-owned → read by ownership).
+#                    Owned limit: sticky dirs (/tmp) and the chmod-000
+#                    fallback also want CAP_FOWNER, not in this set.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE
 
 [Install]
 WantedBy=multi-user.target
