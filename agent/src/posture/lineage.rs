@@ -168,6 +168,29 @@ pub const SYSTEM_DAEMON_EXES: &[&str] = &[
     "/usr/lib/snapd/snapd",
 ];
 
+/// Kernel-resolved exec paths of the Node.js interpreter. `npm` is a
+/// `#!/usr/bin/env node` script, so a process running `npm install`
+/// has `/proc/<pid>/exe` = the **node** binary (verified empirically),
+/// NOT `/usr/bin/npm` — the identical interpreter-exe shape this file
+/// documents for `unattended-upgrade` above. An exe path alone
+/// therefore cannot name npm without naming *all* node, which would
+/// blow a node-shaped hole in the mass-write / ransomware signal. So
+/// npm is matched by exe ∈ `NODE_EXES` AND argv (see
+/// [`AuthSessionTracker::is_npm_cli_writer`] + [`NPM_CLI_SUFFIX`]),
+/// keeping every other node process subject to the mass-write arm.
+/// Exact ELF paths only — never `comm`. nvm/volta node lives under
+/// `$HOME` and is operator-added, not assumed here.
+pub const NODE_EXES: &[&str] = &["/usr/bin/node", "/usr/local/bin/node"];
+
+/// Path suffix of npm's CLI entrypoint. `/usr/bin/npm` symlinks to
+/// `…/lib/node_modules/npm/bin/npm-cli.js`, which the shebang hands to
+/// node as `argv[1]`. The leading `/npm/bin/` anchors the match so a
+/// file merely *named* `npm-cli.js` in some other directory can't
+/// satisfy it. Only ever consulted together with a [`NODE_EXES`] exe
+/// match, so argv (which a process controls for itself) is never the
+/// sole basis for the exemption.
+const NPM_CLI_SUFFIX: &str = "/npm/bin/npm-cli.js";
+
 /// Bounded FIFO cap for the in-memory pid→Entry map. At ~64 bytes
 /// per entry (pid + ppid + spawn_ns + short PathBuf) the cap is
 /// ~128 KiB worst case — comfortably inside the agent's per-task
@@ -217,6 +240,13 @@ struct Entry {
     exe: PathBuf,
     #[allow(dead_code)]
     spawn_ns: u64,
+    /// FP-2: `true` iff this spawn's `argv[1]` is npm's CLI entrypoint
+    /// ([`NPM_CLI_SUFFIX`]). Precomputed at ingest so the mass-write
+    /// exemption is a single cheap field read AND the variable-length
+    /// argv is never retained in the bounded cache. Meaningful only
+    /// when `exe` ∈ [`NODE_EXES`] — that exe gate is applied at read
+    /// time in [`AuthSessionTracker::is_npm_cli_writer`].
+    argv_npm_cli: bool,
 }
 
 /// Mutex-shielded state. A single lock guards both the map and the
@@ -279,6 +309,28 @@ impl AuthSessionTracker {
     /// PID 0 is the kernel "no process" sentinel and is never
     /// recorded.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
+        self.ingest_inner(pid, ppid, exe, false, spawn_ns);
+    }
+
+    /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
+    /// (FP-2) from `argv`. Production feeds this from
+    /// `Event::ProcessSpawn { argv, .. }`. We store only the derived
+    /// bool (`argv[1]` ends with [`NPM_CLI_SUFFIX`]) — never argv
+    /// itself — so the bounded cache stays small. An empty / 1-element
+    /// argv leaves the flag false.
+    pub fn ingest_spawn_with_argv(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
+        argv: &[String],
+        spawn_ns: u64,
+    ) {
+        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        self.ingest_inner(pid, ppid, exe, argv_npm_cli, spawn_ns);
+    }
+
+    fn ingest_inner(&self, pid: u32, ppid: u32, exe: &str, argv_npm_cli: bool, spawn_ns: u64) {
         if pid == 0 {
             return;
         }
@@ -291,6 +343,7 @@ impl AuthSessionTracker {
                     ppid,
                     exe: PathBuf::from(exe),
                     spawn_ns,
+                    argv_npm_cli,
                 },
             )
             .is_some();
@@ -329,6 +382,39 @@ impl AuthSessionTracker {
     /// snapd / dpkg / apt / mandb maintenance from escalation.
     pub fn is_system_daemon_mediated(&self, pid: u32) -> bool {
         self.lineage_exe_matches(pid, is_system_daemon_binary)
+    }
+
+    /// FP-2 — true iff `pid` is npm's own node process: a DIRECT
+    /// (non-lineage) check that the focal writer's `exe` ∈ [`NODE_EXES`]
+    /// AND its precomputed [`Entry::argv_npm_cli`] flag is set (argv[1]
+    /// = npm's CLI entrypoint). Unlike [`Self::is_system_daemon_mediated`]
+    /// this does NOT walk ancestors — only the npm-cli.js node process
+    /// itself is exempted from the mass-write arm; any child it spawns
+    /// (a postinstall script, node-gyp, make, …) is a different pid with
+    /// a different argv and STILL fires.
+    ///
+    /// Cache-only by design: a miss (spawn never observed or already
+    /// evicted) returns false → the mass-write arm fires (fail toward
+    /// detection). For an actively mass-writing, just-spawned node
+    /// process a hit is near-certain (`TRACKER_CAP` = 2048). PID 0/1 are
+    /// never npm.
+    ///
+    /// SECURITY: argv is process-controlled, but here it is gated behind
+    /// a non-forgeable `exe` ∈ [`NODE_EXES`] match — the exemption is
+    /// "the real node binary, invoked as npm". A malicious *package*
+    /// extracted by that genuine npm process is still exempt from the
+    /// write-VOLUME signal (accepted: a write count cannot separate a
+    /// benign install from a malicious one) but remains covered by the
+    /// exec / network / persistence arms. See the FP-2 note in
+    /// [`super::triggers::confirmed_intrusion`].
+    pub fn is_npm_cli_writer(&self, pid: u32) -> bool {
+        if pid == 0 || pid == 1 {
+            return false;
+        }
+        let s = self.inner.state.read();
+        s.map
+            .get(&pid)
+            .is_some_and(|e| e.argv_npm_cli && is_node_exe(&e.exe))
     }
 
     /// Walk the lineage of `pid` upward through (ppid, exe) pairs and
@@ -453,6 +539,15 @@ fn is_auth_binary(exe: &Path) -> bool {
 fn is_system_daemon_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     SYSTEM_DAEMON_EXES.iter().any(|p| s == *p)
+}
+
+/// FP-2: exact-path match against the Node.js interpreter allowlist
+/// ([`NODE_EXES`]). Same kernel-resolved-exe, never-`comm` keying as
+/// [`is_system_daemon_binary`]. Gates [`AuthSessionTracker::is_npm_cli_writer`]
+/// so a process-controlled argv is never the sole basis for the exemption.
+fn is_node_exe(exe: &Path) -> bool {
+    let s = exe.to_string_lossy();
+    NODE_EXES.iter().any(|p| s == *p)
 }
 
 /// Extract the `PPid: <n>` value from a `/proc/<pid>/status` body.
@@ -598,6 +693,79 @@ mod tests {
         write_status(proc_root, 124, 1);
         let t = AuthSessionTracker::new(proc_root);
         assert!(t.is_system_daemon_mediated(124));
+    }
+
+    // ── FP-2 — npm CLI writer (node + argv[1]=npm-cli.js) ───────────
+
+    fn npm_argv(extra: &[&str]) -> Vec<String> {
+        // argv as the shebang hands it to node: ["node", "<npm-cli.js>", …].
+        let mut v = vec![
+            "node".to_string(),
+            "/usr/lib/node_modules/npm/bin/npm-cli.js".to_string(),
+        ];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn node_running_npm_cli_is_npm_cli_writer() {
+        let t = AuthSessionTracker::new("/proc");
+        // node interpreter running npm's CLI entrypoint.
+        t.ingest_spawn_with_argv(7000, 50, "/usr/bin/node", &npm_argv(&["install", "-g", "x"]), 1);
+        assert!(t.is_npm_cli_writer(7000));
+        // It is NOT auth- or system-daemon-mediated (disjoint signals).
+        assert!(!t.is_auth_mediated(7000));
+        assert!(!t.is_system_daemon_mediated(7000));
+    }
+
+    #[test]
+    fn node_not_running_npm_is_not_npm_cli_writer() {
+        let t = AuthSessionTracker::new("/proc");
+        // Same node binary, but running some OTHER script → not exempt.
+        let argv = vec!["node".to_string(), "/home/u/evil.js".to_string()];
+        t.ingest_spawn_with_argv(7001, 50, "/usr/bin/node", &argv, 1);
+        assert!(!t.is_npm_cli_writer(7001));
+    }
+
+    #[test]
+    fn npm_argv_under_non_node_exe_is_not_npm_cli_writer() {
+        let t = AuthSessionTracker::new("/proc");
+        // argv spoofs npm-cli.js but the exe is NOT the node interpreter
+        // (the non-forgeable half) → not exempt.
+        t.ingest_spawn_with_argv(7002, 50, "/tmp/evil", &npm_argv(&["install"]), 1);
+        assert!(!t.is_npm_cli_writer(7002));
+    }
+
+    #[test]
+    fn npm_cli_writer_is_cache_only_no_proc_fallback() {
+        // A pid never ingested (cache miss) is not exempt even if /proc
+        // would resolve it — fail toward detection.
+        let t = AuthSessionTracker::new("/proc");
+        assert!(!t.is_npm_cli_writer(7003));
+        // pid 1 / 0 are never npm.
+        assert!(!t.is_npm_cli_writer(1));
+        assert!(!t.is_npm_cli_writer(0));
+    }
+
+    #[test]
+    fn npm_cli_flag_matches_user_prefix_path_too() {
+        // npm-cli.js can live under a user global prefix; the suffix
+        // match (…/npm/bin/npm-cli.js) is location-independent.
+        let t = AuthSessionTracker::new("/proc");
+        let argv = vec![
+            "node".to_string(),
+            "/home/forty/.npm-global/lib/node_modules/npm/bin/npm-cli.js".to_string(),
+        ];
+        t.ingest_spawn_with_argv(7004, 50, "/usr/bin/node", &argv, 1);
+        assert!(t.is_npm_cli_writer(7004));
+    }
+
+    #[test]
+    fn plain_ingest_spawn_leaves_npm_flag_false() {
+        // The argv-less ingest path must never set the npm flag.
+        let t = AuthSessionTracker::new("/proc");
+        t.ingest_spawn(7005, 50, "/usr/bin/node", 1);
+        assert!(!t.is_npm_cli_writer(7005));
     }
 
     #[test]

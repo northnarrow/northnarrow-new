@@ -281,11 +281,15 @@ impl TriggerDetector {
             pid,
             ppid,
             filename,
+            argv,
             timestamp_ns,
             ..
         } = event
         {
-            self.auth.ingest_spawn(*pid, *ppid, filename, *timestamp_ns);
+            // FP-2: pass argv so the tracker can precompute the npm-CLI
+            // flag (node running npm-cli.js) for the mass-write exemption.
+            self.auth
+                .ingest_spawn_with_argv(*pid, *ppid, filename, argv, *timestamp_ns);
         }
 
         // Stack-exclusion: never raise a trigger on the NorthNarrow
@@ -658,7 +662,31 @@ fn confirmed_intrusion(
             // lineage keying. Only the mass-write arm is gated here;
             // FsProtectDenial and exec-from-/tmp above still fire for
             // these PIDs.
-            if auth.is_auth_mediated(*focal_pid) || auth.is_system_daemon_mediated(*focal_pid) {
+            // FP-2 — `npm install` unpacks a package tarball (+ writes
+            // the ~/.npm content cache) well past the threshold. npm is
+            // a `#!/usr/bin/env node` script, so the writer's exe is the
+            // node interpreter, NOT `/usr/bin/npm` — exactly the
+            // interpreter-exe shape SYSTEM_DAEMON_EXES documents for
+            // unattended-upgrade. `is_npm_cli_writer` therefore gates on
+            // exe ∈ NODE_EXES AND argv[1] = npm-cli.js, a DIRECT focal-pid
+            // check (no lineage): only npm's own node process is exempt,
+            // every other node — and any child install script npm spawns
+            // — still fires. ACCEPTED residual gap: a malicious package's
+            // files, extracted by the genuine npm process, are exempt
+            // from the write-VOLUME signal (a count can't tell a benign
+            // install from a malicious one); supply-chain malice is
+            // caught by the exec / network / persistence arms, not here.
+            // TODO(FP-2 v2): additionally require the write target under
+            // a node_modules path to also fire on npm mass-writing
+            // elsewhere — deferred because npm legitimately mass-writes
+            // its content cache (~/.npm/_cacache) OUTSIDE node_modules,
+            // so a bare node_modules constraint would reintroduce the FP
+            // for the cache-write burst; a correct v2 must allowlist the
+            // (configurable) cache dir too.
+            if auth.is_auth_mediated(*focal_pid)
+                || auth.is_system_daemon_mediated(*focal_pid)
+                || auth.is_npm_cli_writer(*focal_pid)
+            {
                 return false;
             }
             let mut count = 1usize;
@@ -1288,6 +1316,24 @@ mod tests {
         }
     }
 
+    /// FP-2 helper: a ProcessSpawn with a populated argv (the production
+    /// path threads argv into the lineage tracker for the npm exemption).
+    fn spawn_with_argv(pid: u32, ppid: u32, filename: &str, argv: &[&str], ts: u64) -> Event {
+        Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid: 1000,
+            gid: 1000,
+            comm: "x".into(),
+            filename: filename.into(),
+            timestamp_ns: ts,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            parent_is_kthread: false,
+        }
+    }
+
     // ── Test #1: direct sudo /etc/shadow read is exempt ─────────────
     #[test]
     fn sensitive_file_access_exempt_for_sudo_child() {
@@ -1544,6 +1590,105 @@ mod tests {
         assert!(
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "non-daemon mass-write must still fire, got {hits:?}"
+        );
+    }
+
+    // ── FP-2 — npm install mass-write exemption ─────────────────────
+    //
+    // `npm install` unpacks a tarball (+ writes ~/.npm cache) past the
+    // mass-write threshold. The writer's exe is the node interpreter
+    // (npm is a node shebang script), so the exemption keys on
+    // exe ∈ NODE_EXES AND argv[1] = npm-cli.js — a direct focal-pid
+    // check. Detection stays intact for any other node and for npm's
+    // own child processes.
+
+    #[test]
+    fn mass_write_exempt_for_npm_cli() {
+        let det = detector_with_empty_proc();
+        // node interpreter running npm's CLI, ingested via the argv path.
+        let _ = det.detect(
+            &spawn_with_argv(
+                7000,
+                1,
+                "/usr/bin/node",
+                &["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "install", "-g", "left-pad"],
+                1,
+            ),
+            &[],
+        );
+        // Unpack burst into the global node_modules.
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| {
+                file_open(
+                    7000,
+                    1000,
+                    "/home/forty/.npm-global/lib/node_modules/left-pad/index.js",
+                    1,
+                    i + 10,
+                )
+            })
+            .collect();
+        let focal = file_open(
+            7000,
+            1000,
+            "/home/forty/.npm-global/lib/node_modules/left-pad/package.json",
+            1,
+            MASS_WRITE_MIN as u64 + 11,
+        );
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "npm install unpack must NOT trip ConfirmedIntrusion, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_intact_for_node_not_running_npm() {
+        // Detection intact: the SAME node binary running a non-npm
+        // script (argv[1] is not npm-cli.js) still fires — no blanket
+        // node blind spot.
+        let det = detector_with_empty_proc();
+        let _ = det.detect(
+            &spawn_with_argv(7100, 1, "/usr/bin/node", &["node", "/home/u/cryptor.js"], 1),
+            &[],
+        );
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(7100, 1000, "/home/u/docs/f", 1, i + 10))
+            .collect();
+        let focal = file_open(7100, 1000, "/home/u/docs/f", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "node running a non-npm script must still fire, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn mass_write_intact_for_npm_child_process() {
+        // A child npm spawns (e.g. a postinstall script) is a DIFFERENT
+        // pid with a different argv — it is not the npm-cli.js writer and
+        // its own mass-write still fires (the exemption is non-lineage).
+        let det = detector_with_empty_proc();
+        let _ = det.detect(
+            &spawn_with_argv(
+                7200,
+                1,
+                "/usr/bin/node",
+                &["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "install"],
+                1,
+            ),
+            &[],
+        );
+        // postinstall: npm -> sh -> node build.js (pid 7201), mass-writes.
+        let _ = det.detect(&spawn_with_argv(7201, 7200, "/usr/bin/node", &["node", "build.js"], 2), &[]);
+        let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+            .map(|i| file_open(7201, 1000, "/home/u/.cache/evil/f", 1, i + 10))
+            .collect();
+        let focal = file_open(7201, 1000, "/home/u/.cache/evil/f", 1, MASS_WRITE_MIN as u64 + 11);
+        let hits = det.detect(&focal, &recent);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "npm child (non-npm-cli argv) mass-write must still fire, got {hits:?}"
         );
     }
 
