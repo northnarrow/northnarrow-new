@@ -480,6 +480,8 @@ mod tests {
             op: FimOp::Renamed,
             new_sha256: None,
             baseline_sha256: Some([0xAA; 32]),
+            new_size: None,
+            baseline_size: None,
             modifier_exe: Some("/usr/bin/attacker".to_string()),
             modifier_pid: 1234,
             modifier_uid: 0,

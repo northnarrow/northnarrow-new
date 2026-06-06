@@ -674,6 +674,23 @@ pub struct FimEvent {
     /// path was just added to the watch set and no baseline
     /// exists yet (operator forgot to re-baseline).
     pub baseline_sha256: Option<[u8; 32]>,
+    /// Size in bytes of the file AFTER the modification, when the
+    /// drain's re-hash probe could stat it. `None` for ops whose
+    /// target is gone (`Deleted` / `Renamed`), for content-less
+    /// events (`Opened` cred-reads), and when the probe failed.
+    /// Paired with [`Self::baseline_size`] so a size-delta rule
+    /// (NN-L-FIM-005's rsyslogd-append exemption) can distinguish
+    /// an APPEND (file grew) from a TRUNCATION (file shrank).
+    /// `#[serde(default)]` keeps pre-existing FIM event/JSONL
+    /// chains deserialisable.
+    #[serde(default)]
+    pub new_size: Option<u64>,
+    /// Size in bytes recorded in the baseline the drift diverged
+    /// from. `None` when no baseline exists yet (path freshly
+    /// watched) or the event carries no baseline. See
+    /// [`Self::new_size`]; `#[serde(default)]` for forward-compat.
+    #[serde(default)]
+    pub baseline_size: Option<u64>,
     /// `/proc/<pid>/exe` of the modifying process if resolvable
     /// at decode time.
     pub modifier_exe: Option<alloc::string::String>,
@@ -1153,6 +1170,8 @@ mod tests {
             op: FimOp::Modified,
             new_sha256: Some([0xAA; 32]),
             baseline_sha256: Some([0xBB; 32]),
+            new_size: Some(4096),
+            baseline_size: Some(2048),
             modifier_exe: Some("/usr/bin/dpkg".to_string()),
             modifier_pid: 42,
             modifier_uid: 0,
@@ -1193,6 +1212,11 @@ mod tests {
         });
         let parsed: FimEvent = serde_json::from_value(legacy).expect("legacy row must deserialise");
         assert_eq!(parsed.dest_path, None);
+        // The size fields are also omitted by this legacy row and must
+        // default to None (forward-compat contract for the NN-L-FIM-005
+        // rsyslogd-append size-delta fields).
+        assert_eq!(parsed.new_size, None);
+        assert_eq!(parsed.baseline_size, None);
     }
 
     /// Polish #3 test: rename event with a resolved dest_path
@@ -1207,6 +1231,8 @@ mod tests {
             op: FimOp::Renamed,
             new_sha256: None,
             baseline_sha256: Some([0xCC; 32]),
+            new_size: None,
+            baseline_size: Some(8192),
             modifier_exe: None,
             modifier_pid: 99,
             modifier_uid: 1000,

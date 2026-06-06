@@ -518,6 +518,8 @@ mod tests {
             op: FimOp::Modified,
             new_sha256: None,
             baseline_sha256: None,
+            new_size: None,
+            baseline_size: None,
             modifier_exe: None,
             modifier_pid: pid,
             modifier_uid: 0,
