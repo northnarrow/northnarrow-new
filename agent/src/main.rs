@@ -797,6 +797,10 @@ async fn main() -> Result<()> {
         Arc::clone(&process_allowlist),
         Arc::clone(&netflow_comm_allowlist),
         Arc::clone(&beacon_window),
+        // FP-3: the SAME DnsCache the DnsQuery pump feeds — NN-L-NET-004/
+        // -014 read its reverse index to back-correlate a forwarded leg
+        // to the originating process instead of the stub resolver.
+        Arc::clone(&dns_cache),
     );
     info!(
         rules = engine.rule_count(),

@@ -254,6 +254,7 @@ mod tests {
             pid: 1000,
             uid: 0,
             comm: "curl".to_string(),
+            exe: None,
             query_name: q.to_string(),
             query_type: 1,
             dns_server: [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],

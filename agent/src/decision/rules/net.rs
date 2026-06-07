@@ -61,6 +61,7 @@ use parking_lot::Mutex;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::decision::Rule;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
+use crate::net::dns_cache::DnsCache;
 
 // ── Category tags ────────────────────────────────────────────────────
 
@@ -425,14 +426,130 @@ impl Rule for NnLNet003BadJa3 {
     }
 }
 
+// ── FP-3 DNS originator attribution (NN-L-NET-004/-005/-014) ─────────
+//
+// A DnsQuery's recorded `pid` is whoever called `udp_sendmsg` to port
+// 53. On the standard split-resolver host that's TWO different things:
+//
+//   * the ORIGINATOR's own query to the loopback stub (127.0.0.53), and
+//   * the local forwarder (`systemd-resolved`) relaying it UPSTREAM.
+//
+// Both surface as `Event::DnsQuery`; the forwarded leg carries the
+// resolver's PID. NN-L-NET-004/-014 act with `KillProcess`, so a qname
+// predicate that trips on the forwarded leg would SIGKILL the host's DNS
+// (see docs/findings/NN-L-NET-004_dns_originator_attribution.md). This
+// layer classifies the SENDER by its kernel-resolved exe and re-routes
+// attribution so the resolver is never the kill target.
+
+/// Known DNS forwarder / stub-resolver program names. A DnsQuery whose
+/// sender exe basename is in this set is treated as a FORWARDED leg, not
+/// the originator.
+///
+/// Matched on the basename of the kernel-resolved `/proc/<pid>/exe`
+/// (robust across distro install paths) — NEVER on `comm`. `comm` is
+/// `prctl(PR_SET_NAME)`-spoofable, and here a comm check would hand a
+/// forged resolver KILL-IMMUNITY (an attacker setting
+/// `comm=systemd-resolve` would dodge the kill); the exe symlink is not
+/// forgeable from userspace. This is the same exe-over-comm discipline
+/// `combat/protected.rs` and `posture/lineage.rs` enforce.
+const KNOWN_RESOLVER_PROGRAMS: &[&str] = &[
+    "systemd-resolved",
+    "systemd-resolve",
+    "named",
+    "unbound",
+    "dnsmasq",
+    "dnscrypt-proxy",
+    "pdns_recursor",
+    "kresd",
+    "stubby",
+    "connmand",
+];
+
+/// DNS originator back-correlation window — deliberately TIGHT (≤2 s)
+/// versus the DNS cache's 300 s connect-attribution TTL. The forwarder's
+/// upstream leg and the originator's stub query are microseconds apart,
+/// so 2 s captures the real originator while refusing a stale same-qname
+/// entry from an unrelated earlier PID (finding §6.6).
+const DNS_ORIGINATOR_WINDOW_NS: u64 = 2 * 1_000_000_000;
+
+/// Is the DnsQuery sender a known forwarder/stub resolver? Basename
+/// match on the resolved exe; a `None` exe (resolve miss) is NOT a
+/// forwarder — fail toward today's behaviour (act on the sender).
+fn sender_is_forwarder(exe: Option<&str>) -> bool {
+    let Some(path) = exe else { return false };
+    let base = path.rsplit('/').next().unwrap_or(path);
+    KNOWN_RESOLVER_PROGRAMS.contains(&base)
+}
+
+/// Where a tripped DnsQuery predicate (NN-L-NET-004/-014) should be
+/// attributed once forwarder-awareness is applied.
+enum DnsAttribution {
+    /// Act on this PID with this display label. Either the sender itself
+    /// (originator-issued: direct upstream OR the originator's own stub
+    /// query) or a back-correlated originator (forwarded leg whose
+    /// originator was found in the cache).
+    Act { pid: u32, label: String },
+    /// Forwarded leg with NO attributable originator (Varlink/
+    /// `nss-resolve` case (C), a host acting as a LAN resolver, or a
+    /// cache miss). The suspicious qname is still surfaced but the
+    /// verdict MUST downgrade to `Log` — never act on the forwarder.
+    Downgrade { forwarder_pid: u32, label: String },
+}
+
+/// Forwarder-aware attribution shared by NN-L-NET-004/-014. Given a
+/// tripped DnsQuery, decide who the verdict targets:
+///
+///   * sender is NOT a forwarder → act on the sender (today's behaviour;
+///     covers the no-forwarder direct host AND the originator's own stub
+///     query on a split-resolver host);
+///   * sender IS a forwarder, originator back-correlated → act on the
+///     originator PID (correct kill target, resolver spared);
+///   * sender IS a forwarder, no originator → downgrade to `Log`.
+fn attribute_dns_query(
+    dns_cache: &DnsCache,
+    sender_pid: u32,
+    sender_comm: &str,
+    sender_exe: Option<&str>,
+    query_name: &str,
+    now_ns: u64,
+) -> DnsAttribution {
+    if !sender_is_forwarder(sender_exe) {
+        return DnsAttribution::Act {
+            pid: sender_pid,
+            label: sender_comm.to_string(),
+        };
+    }
+    // Forwarded leg — the resolver must never be the kill target.
+    match dns_cache.originator_for(query_name, now_ns, DNS_ORIGINATOR_WINDOW_NS, sender_pid) {
+        Some(orig) => DnsAttribution::Act {
+            pid: orig,
+            label: format!("pid {orig} (DNS originator of {query_name}, forwarded by {sender_comm})"),
+        },
+        None => DnsAttribution::Downgrade {
+            forwarder_pid: sender_pid,
+            label: format!("{query_name} (forwarded by {sender_comm}; originator unattributable)"),
+        },
+    }
+}
+
 // ── NN-L-NET-004 — Suspicious DNS qname ──────────────────────────────
 
 /// Suspicious DNS qname shape: > 60 chars OR base64-looking
 /// (matches `^[A-Za-z0-9+/]{20,}` — DNS tunnelling payload
 /// shape). Per design §7.
-pub struct NnLNet004SuspiciousDnsQname;
+///
+/// FP-3: holds the shared `Arc<DnsCache>` so a forwarded-leg trip can be
+/// back-correlated to the originating process — a `KillProcess` verdict
+/// must never land on the local stub resolver.
+pub struct NnLNet004SuspiciousDnsQname {
+    dns_cache: Arc<DnsCache>,
+}
 
 impl NnLNet004SuspiciousDnsQname {
+    pub fn new(dns_cache: Arc<DnsCache>) -> Self {
+        Self { dns_cache }
+    }
+
     fn looks_like_base64(s: &str) -> bool {
         // Reject if too short to be a meaningful payload.
         if s.len() < 20 {
@@ -470,6 +587,7 @@ impl Rule for NnLNet004SuspiciousDnsQname {
         let Event::DnsQuery {
             pid,
             comm,
+            exe,
             query_name,
             timestamp_ns,
             ..
@@ -497,15 +615,43 @@ impl Rule for NnLNet004SuspiciousDnsQname {
             }
             (false, false) => unreachable!(),
         };
-        Some(net_verdict(
-            self,
-            ResponseAction::KillProcess,
-            Severity::High,
-            reason,
+        // FP-3: forwarder-aware attribution. An originator-issued query
+        // kills the sender (as before); a forwarded leg back-correlates
+        // to the originator, or downgrades to Log when none is found —
+        // never KillProcess the local stub resolver.
+        Some(match attribute_dns_query(
+            &self.dns_cache,
             *pid,
-            comm.clone(),
+            comm,
+            exe.as_deref(),
+            query_name,
             *timestamp_ns,
-        ))
+        ) {
+            DnsAttribution::Act { pid, label } => net_verdict(
+                self,
+                ResponseAction::KillProcess,
+                Severity::High,
+                reason,
+                pid,
+                label,
+                *timestamp_ns,
+            ),
+            DnsAttribution::Downgrade {
+                forwarder_pid,
+                label,
+            } => net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::High,
+                "Suspicious DNS qname observed on a forwarded leg with no \
+                 attributable originator (Varlink/nss-resolve, LAN-resolver, \
+                 or correlation miss) — surfaced as Log; the local resolver \
+                 is NOT the originator and must not be killed",
+                forwarder_pid,
+                label,
+                *timestamp_ns,
+            ),
+        })
     }
 }
 
@@ -541,6 +687,7 @@ impl Rule for NnLNet005DnsBurst {
         let Event::DnsQuery {
             pid,
             comm,
+            exe,
             query_type,
             timestamp_ns,
             ..
@@ -549,6 +696,19 @@ impl Rule for NnLNet005DnsBurst {
             return None;
         };
         if *query_type != DNS_QTYPE_TXT && *query_type != DNS_QTYPE_NULL {
+            return None;
+        }
+        // FP-3: do NOT count a forwarded leg under the resolver's PID.
+        // The forwarder relays EVERY local TXT/NULL lookup, so counting
+        // its upstream legs would (a) smear the per-PID burst under the
+        // resolver — the mis-attribution this fix targets — and (b)
+        // double-count case-B queries already tallied under the
+        // originator's own stub query. The originator's own query (sender
+        // is NOT the forwarder) is still counted and attributed normally.
+        // Residual: a Varlink/nss-resolve burst (no originator stub
+        // query) goes uncounted here — the documented case-(C) gap; -005
+        // is Log-only and the connect-side NetFlow rules still apply.
+        if sender_is_forwarder(exe.as_deref()) {
             return None;
         }
         let count = self.window.lock().observe(*pid, *timestamp_ns);
@@ -1060,9 +1220,19 @@ impl Rule for NnLNet019WildcardListener {
 /// rule finally has a populated `query_name` to score. (NN-L-NET-015
 /// fast-flux stays gated: it needs DNS-*response* observation, a
 /// separate V1.1 sensor — see decision/rules module docs.)
-pub struct NnLNet014DnsTunnelEntropy;
+///
+/// FP-3: holds the shared `Arc<DnsCache>` for the same forwarder-aware
+/// attribution as NN-L-NET-004 — a `KillProcess` verdict on a forwarded
+/// leg must be re-routed to the originator, never the stub resolver.
+pub struct NnLNet014DnsTunnelEntropy {
+    dns_cache: Arc<DnsCache>,
+}
 
 impl NnLNet014DnsTunnelEntropy {
+    pub fn new(dns_cache: Arc<DnsCache>) -> Self {
+        Self { dns_cache }
+    }
+
     /// Minimum first-label length to consider — short labels can't
     /// carry a meaningful payload and their entropy estimate is noisy.
     /// Most legitimate labels also sit below this.
@@ -1111,6 +1281,7 @@ impl Rule for NnLNet014DnsTunnelEntropy {
         let Event::DnsQuery {
             pid,
             comm,
+            exe,
             query_name,
             timestamp_ns,
             ..
@@ -1128,17 +1299,42 @@ impl Rule for NnLNet014DnsTunnelEntropy {
         if entropy < Self::ENTROPY_BITS {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::KillProcess,
-            Severity::High,
-            "DNS first-label carries high Shannon entropy over a long \
-             label — encoded payload shape regardless of alphabet \
-             (DNS tunnelling / exfil, T1071.004); posture → ENGAGED",
+        // FP-3: forwarder-aware attribution (see NN-L-NET-004).
+        Some(match attribute_dns_query(
+            &self.dns_cache,
             *pid,
-            comm.clone(),
+            comm,
+            exe.as_deref(),
+            query_name,
             *timestamp_ns,
-        ))
+        ) {
+            DnsAttribution::Act { pid, label } => net_verdict(
+                self,
+                ResponseAction::KillProcess,
+                Severity::High,
+                "DNS first-label carries high Shannon entropy over a long \
+                 label — encoded payload shape regardless of alphabet \
+                 (DNS tunnelling / exfil, T1071.004); posture → ENGAGED",
+                pid,
+                label,
+                *timestamp_ns,
+            ),
+            DnsAttribution::Downgrade {
+                forwarder_pid,
+                label,
+            } => net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::High,
+                "High-entropy DNS label observed on a forwarded leg with no \
+                 attributable originator (Varlink/nss-resolve, LAN-resolver, \
+                 or correlation miss) — surfaced as Log; the local resolver \
+                 is NOT the originator and must not be killed",
+                forwarder_pid,
+                label,
+                *timestamp_ns,
+            ),
+        })
     }
 }
 
@@ -1154,25 +1350,28 @@ impl Rule for NnLNet014DnsTunnelEntropy {
 /// High/Medium additions BEFORE the broad Tappa 10 catch-alls so the
 /// specific refinements win first-match (NN-L-NET-018 before -007,
 /// NN-L-NET-019 before -006 — §13 Q10 documented overlaps).
+#[allow(clippy::too_many_arguments)]
 pub fn net_rules(
     blocklist: Arc<NetBlocklist>,
     ja3_blocklist: Arc<Ja3Blocklist>,
     burst_window: Arc<Mutex<DnsBurstWindow>>,
     comm_allowlist: Arc<CommAllowlist>,
     beacon_window: Arc<Mutex<BeaconWindow>>,
+    dns_cache: Arc<DnsCache>,
 ) -> Vec<Box<dyn Rule>> {
     vec![
         // Critical first.
         Box::new(NnLNet001OutboundToBlockedIp::new(blocklist)),
         Box::new(NnLNet003BadJa3::new(ja3_blocklist)),
         // Tappa 10 High/DNS rules whose predicates don't overlap the
-        // D4 additions.
+        // D4 additions. FP-3: -004/-014 take the shared DNS cache for
+        // forwarder-aware originator back-correlation.
         Box::new(NnLNet002OutboundToBlockedTld),
-        Box::new(NnLNet004SuspiciousDnsQname),
+        Box::new(NnLNet004SuspiciousDnsQname::new(Arc::clone(&dns_cache))),
         Box::new(NnLNet005DnsBurst::new(burst_window)),
         // Tappa 4.1 DNS observability refit — entropy-based tunnelling
         // detector, unblocked now the kprobe extracts the QNAME.
-        Box::new(NnLNet014DnsTunnelEntropy),
+        Box::new(NnLNet014DnsTunnelEntropy::new(dns_cache)),
         // Tappa 10.5 D4 additions — specific refinements ordered
         // BEFORE the broad Tappa 10 catch-alls (-006 / -007).
         Box::new(NnLNet010OutboundToHighRiskC2Port::new(Arc::clone(
@@ -1217,6 +1416,7 @@ pub fn net_rules_empty() -> Vec<Box<dyn Rule>> {
                 .map(|s| s.to_string()),
         )),
         Arc::new(Mutex::new(BeaconWindow::new())),
+        Arc::new(DnsCache::default()),
     )
 }
 
@@ -1268,15 +1468,31 @@ mod tests {
     }
 
     fn dns_event(pid: u32, qname: &str, qtype: u16) -> Event {
+        // Originator-issued query (sender exe is a normal client binary,
+        // not a resolver) — the common case.
+        dns_event_full(pid, qname, qtype, "curl", Some("/usr/bin/curl"), 100)
+    }
+
+    /// Full DnsQuery builder so FP-3 tests can vary the sender exe
+    /// (forwarder vs originator) and the timestamp.
+    fn dns_event_full(
+        pid: u32,
+        qname: &str,
+        qtype: u16,
+        comm: &str,
+        exe: Option<&str>,
+        ts_ns: u64,
+    ) -> Event {
         Event::DnsQuery {
             pid,
             uid: 1000,
-            comm: "curl".to_string(),
+            comm: comm.to_string(),
+            exe: exe.map(str::to_string),
             query_name: qname.to_string(),
             query_type: qtype,
             dns_server: [0; 16],
             family: 2,
-            timestamp_ns: 100,
+            timestamp_ns: ts_ns,
         }
     }
 
@@ -1392,9 +1608,19 @@ mod tests {
 
     // ── NN-L-NET-004 ─────────────────────────────────────────────
 
+    /// FP-3 helper — a -004 rule backed by a fresh empty DNS cache.
+    fn net_004() -> NnLNet004SuspiciousDnsQname {
+        NnLNet004SuspiciousDnsQname::new(Arc::new(DnsCache::default()))
+    }
+
+    /// FP-3 helper — a -014 rule backed by a fresh empty DNS cache.
+    fn net_014() -> NnLNet014DnsTunnelEntropy {
+        NnLNet014DnsTunnelEntropy::new(Arc::new(DnsCache::default()))
+    }
+
     #[test]
     fn net_004_fires_on_long_qname() {
-        let rule = NnLNet004SuspiciousDnsQname;
+        let rule = net_004();
         let long = format!("{}.example.com", "a".repeat(80));
         let v = rule.evaluate(&dns_event(1, &long, 1)).expect("long qname");
         assert_eq!(v.severity, Severity::High);
@@ -1402,7 +1628,7 @@ mod tests {
 
     #[test]
     fn net_004_fires_on_base64_shape() {
-        let rule = NnLNet004SuspiciousDnsQname;
+        let rule = net_004();
         // First label is 32 chars of base64-shaped + the actual
         // dot-domain suffix.
         let q = "ZGVhZGJlZWZmZmZmZmZmZmNhZmU=.example.com";
@@ -1414,7 +1640,7 @@ mod tests {
 
     #[test]
     fn net_004_does_not_fire_on_normal_qname() {
-        let rule = NnLNet004SuspiciousDnsQname;
+        let rule = net_004();
         assert!(rule.evaluate(&dns_event(1, "example.com", 1)).is_none());
     }
 
@@ -1422,7 +1648,7 @@ mod tests {
 
     #[test]
     fn net_014_fires_on_high_entropy_label() {
-        let rule = NnLNet014DnsTunnelEntropy;
+        let rule = net_014();
         // 40-char near-uniform alphanumeric first label (entropy well
         // above 3.8) + a normal suffix — the encoded-payload shape.
         let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
@@ -1436,7 +1662,7 @@ mod tests {
 
     #[test]
     fn net_014_ignores_short_label() {
-        let rule = NnLNet014DnsTunnelEntropy;
+        let rule = net_014();
         // High-entropy but under the 25-char minimum.
         assert!(rule
             .evaluate(&dns_event(7, "a1b2c3d4e5.example.com", 1))
@@ -1445,7 +1671,7 @@ mod tests {
 
     #[test]
     fn net_014_ignores_low_entropy_long_label() {
-        let rule = NnLNet014DnsTunnelEntropy;
+        let rule = net_014();
         // 40 chars but only two symbols → entropy = 1.0, far below 3.8.
         let q = format!("{}.example.com", "ab".repeat(20));
         assert!(rule.evaluate(&dns_event(7, &q, 1)).is_none());
@@ -1453,7 +1679,7 @@ mod tests {
 
     #[test]
     fn net_014_ignores_normal_hostname() {
-        let rule = NnLNet014DnsTunnelEntropy;
+        let rule = net_014();
         // Ordinary hostnames have short, low-entropy first labels.
         assert!(rule.evaluate(&dns_event(7, "www.example.com", 1)).is_none());
         assert!(rule
@@ -1496,6 +1722,138 @@ mod tests {
         for _ in 0..100 {
             assert!(rule.evaluate(&dns_event(99, "x.com", 1)).is_none());
         }
+    }
+
+    // ── FP-3 DNS originator attribution (family: -004/-005/-014) ──
+
+    /// A resolver exe path whose basename `systemd-resolved` is in
+    /// [`KNOWN_RESOLVER_PROGRAMS`] — i.e. a forwarded leg.
+    const RESOLVER_EXE: &str = "/usr/lib/systemd/systemd-resolved";
+
+    /// FP-3 helper-unit — basename matching identifies a forwarder
+    /// regardless of install path, and a non-resolver / `None` exe is
+    /// NOT a forwarder (fail toward acting on the sender).
+    #[test]
+    fn fp3_sender_is_forwarder_matches_resolver_basename_only() {
+        assert!(sender_is_forwarder(Some(RESOLVER_EXE)));
+        assert!(sender_is_forwarder(Some("/lib/systemd/systemd-resolved")));
+        assert!(sender_is_forwarder(Some("/usr/sbin/dnsmasq")));
+        assert!(!sender_is_forwarder(Some("/usr/bin/curl")));
+        assert!(!sender_is_forwarder(None));
+    }
+
+    /// FP-3 — originator-issued query (direct case A, or the
+    /// originator's own stub query): -004 kills the SENDER, exactly as
+    /// before. No regression for the no-forwarder host.
+    #[test]
+    fn fp3_004_originator_issued_kills_sender() {
+        let rule = net_004();
+        let long = format!("{}.example.com", "a".repeat(80));
+        let e = dns_event_full(4242, &long, 1, "curl", Some("/usr/bin/curl"), 1_000);
+        let v = rule.evaluate(&e).expect("originator query fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.event_pid, 4242, "kill targets the originating sender");
+    }
+
+    /// FP-3 — forwarded leg with a back-correlatable originator (the
+    /// split-resolver case B): -004 re-routes the KillProcess to the
+    /// ORIGINATOR's PID, never the resolver.
+    #[test]
+    fn fp3_004_forwarded_leg_back_correlates_to_originator() {
+        let cache = Arc::new(DnsCache::default());
+        let long = format!("{}.example.com", "a".repeat(80));
+        // Originator (firefox, pid 5000) issued the stub query first.
+        cache.on_dns_query(5000, long.clone(), 1, 1_000);
+        let rule = NnLNet004SuspiciousDnsQname::new(Arc::clone(&cache));
+        // The forwarder (systemd-resolved, pid 673) relays it upstream.
+        let leg = dns_event_full(673, &long, 1, "systemd-resolved", Some(RESOLVER_EXE), 1_500);
+        let v = rule.evaluate(&leg).expect("forwarded leg still surfaces");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.event_pid, 5000, "verdict attributed to the originator");
+        assert_ne!(v.event_pid, 673, "the resolver is NEVER the kill target");
+    }
+
+    /// FP-3 — forwarded leg with NO attributable originator (Varlink
+    /// case C, LAN-resolver, or cache miss): -004 downgrades to Log and
+    /// names the resolver only as the forwarder — it is NOT killed.
+    #[test]
+    fn fp3_004_forwarded_leg_without_originator_downgrades_to_log() {
+        // Empty cache → no originator on record.
+        let rule = net_004();
+        let long = format!("{}.example.com", "a".repeat(80));
+        let leg = dns_event_full(673, &long, 1, "systemd-resolved", Some(RESOLVER_EXE), 2_000);
+        let v = rule.evaluate(&leg).expect("qname still surfaced");
+        assert_eq!(
+            v.action,
+            ResponseAction::Log,
+            "no originator → Log, never kill the forwarder"
+        );
+        assert_eq!(v.event_pid, 673, "logged against the forwarder, but only Log");
+    }
+
+    /// FP-3 — same forwarder-aware downgrade applies to -014 (entropy):
+    /// the attribution lives at the DnsQuery layer, not per-rule.
+    #[test]
+    fn fp3_014_forwarded_leg_without_originator_downgrades_to_log() {
+        let rule = net_014();
+        let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
+        let leg = dns_event_full(673, q, 1, "systemd-resolved", Some(RESOLVER_EXE), 3_000);
+        let v = rule.evaluate(&leg).expect("entropy still surfaced");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.rule_id, "NN-L-NET-014_DnsTunnelEntropy");
+    }
+
+    /// FP-3 — -014 back-correlates a forwarded leg to the originator
+    /// just like -004.
+    #[test]
+    fn fp3_014_forwarded_leg_back_correlates_to_originator() {
+        let cache = Arc::new(DnsCache::default());
+        let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
+        cache.on_dns_query(8080, q.into(), 1, 4_000);
+        let rule = NnLNet014DnsTunnelEntropy::new(Arc::clone(&cache));
+        let leg = dns_event_full(673, q, 1, "systemd-resolved", Some(RESOLVER_EXE), 4_200);
+        let v = rule.evaluate(&leg).expect("forwarded entropy leg surfaces");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.event_pid, 8080, "attributed to the originator");
+    }
+
+    /// FP-3 — -005 does NOT count a forwarded leg under the resolver's
+    /// PID: 100 TXT legs from the forwarder never trip the burst (the
+    /// FP). An originator's own TXT burst still fires.
+    #[test]
+    fn fp3_005_skips_forwarded_leg_but_fires_on_originator() {
+        let win = Arc::new(Mutex::new(DnsBurstWindow::new()));
+        let rule = NnLNet005DnsBurst::new(win);
+        // 100 forwarded TXT legs (sender = systemd-resolved): never fire.
+        for i in 0..100u64 {
+            let leg = dns_event_full(
+                673,
+                "x.com",
+                DNS_QTYPE_TXT,
+                "systemd-resolved",
+                Some(RESOLVER_EXE),
+                10_000 + i,
+            );
+            assert!(
+                rule.evaluate(&leg).is_none(),
+                "forwarded legs must not accumulate under the resolver"
+            );
+        }
+        // The actual originator (curl) tripping its own burst still fires.
+        let mut last: Option<Verdict> = None;
+        for i in 0..51u64 {
+            let q = dns_event_full(
+                99,
+                "x.com",
+                DNS_QTYPE_TXT,
+                "curl",
+                Some("/usr/bin/curl"),
+                20_000 + i,
+            );
+            last = rule.evaluate(&q);
+        }
+        let v = last.expect("originator burst fires");
+        assert_eq!(v.event_pid, 99);
     }
 
     // ── NN-L-NET-006 ─────────────────────────────────────────────

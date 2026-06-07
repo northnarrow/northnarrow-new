@@ -969,6 +969,7 @@ mod tests {
             pid: 1,
             uid: 1000,
             comm: "x".into(),
+            exe: None,
             query_name: query.into(),
             query_type: 1,
             dns_server: [0u8; 16],

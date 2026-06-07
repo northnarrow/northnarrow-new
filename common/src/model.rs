@@ -109,6 +109,19 @@ pub enum Event {
         pid: u32,
         uid: u32,
         comm: String,
+        /// FP-3 (NN-L-NET-004/-005/-014 originator attribution):
+        /// kernel-resolved `/proc/<pid>/exe` of the UDP/53 *sender*,
+        /// populated best-effort in
+        /// [`crate`]'s `pump_dns_query` (mirrors the FIM drain's
+        /// `modifier_exe` — NEVER `comm`, which is
+        /// `prctl(PR_SET_NAME)`-spoofable and here would grant a forged
+        /// resolver kill-immunity). `None` on a resolve miss (sender
+        /// already exited / link unreadable) → the attribution layer
+        /// treats a `None` sender as a non-forwarder, failing toward
+        /// today's behaviour. `#[serde(default)]` keeps pre-FP-3
+        /// serialized `DnsQuery` records deserialisable.
+        #[serde(default)]
+        exe: Option<String>,
         query_name: String,
         query_type: u16,
         dns_server: [u8; ADDR_LEN],
@@ -452,6 +465,10 @@ impl From<&DnsQueryRaw> for Event {
             pid: raw.pid,
             uid: raw.uid,
             comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
+            // FP-3: the sender exe is NOT carried on the wire (the BPF
+            // event has no room for a path); userland resolves it
+            // best-effort in `pump_dns_query` right after this `From`.
+            exe: None,
             query_name,
             query_type: raw.qtype,
             dns_server: raw.dns_server,

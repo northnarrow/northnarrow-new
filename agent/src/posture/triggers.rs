@@ -970,6 +970,7 @@ pub(super) mod testutil {
             pid,
             uid: 1000,
             comm: "x".into(),
+            exe: None,
             query_name: name.into(),
             query_type: 1,
             dns_server: [0u8; 16],

@@ -40,6 +40,25 @@ pub const DEFAULT_TTL_SECS: u64 = 300;
 /// CI build DNS lookups comfortably.
 pub const DEFAULT_MAX_PER_PID: usize = 1024;
 
+/// FP-3 (NN-L-NET-004/-005/-014 originator attribution) reverse-index
+/// retention. The `qname → (pid, ts)` index that
+/// [`DnsCache::originator_for`] scans serves a deliberately TIGHT
+/// back-correlation window (≤2 s — the forwarder's upstream leg and the
+/// originator's stub query are microseconds apart), so it does NOT need
+/// the 300 s connect-attribution TTL. A short retention also bounds
+/// memory: DGA/tunnelling qnames are unique-by-construction (they never
+/// repeat), so without aggressive pruning the reverse index would grow
+/// one entry per distinct lookup. 30 s is generous headroom over the
+/// 2 s window while keeping the retained set small.
+pub const REVERSE_RETAIN_SECS: u64 = 30;
+
+/// Hard cap on reverse-index entries — a backstop against a query
+/// storm filling the 30 s window faster than retention prunes it.
+/// FIFO-evicts the oldest; the newest (and thus the entries the ≤2 s
+/// back-correlation actually reads) are always retained. ~16 K entries
+/// × ~64 B ≈ 1 MiB worst case.
+const REVERSE_MAX_ENTRIES: usize = 16_384;
+
 /// One observed DNS query (PRE-response, V1.0). The same PID
 /// might issue many queries within the TTL window; we keep the
 /// most-recent N (`max_per_pid`).
@@ -61,6 +80,16 @@ struct RecentQuery {
 struct DnsCacheInner {
     /// PID → recent queries, oldest at the front.
     by_pid: HashMap<u32, VecDeque<RecentQuery>>,
+    /// FP-3 reverse index: recent `(qname, pid, ts_ns)` observations in
+    /// insertion order (≈ monotonic `ts_ns`, single-writer drain),
+    /// pruned to [`REVERSE_RETAIN_SECS`] / [`REVERSE_MAX_ENTRIES`].
+    /// [`DnsCache::originator_for`] scans this back-to-front to find the
+    /// most-recent *other* PID that issued a given qname — the
+    /// forwarder-aware back-correlation that lets NN-L-NET-004/-014
+    /// attribute a forwarded leg to the originating process instead of
+    /// the resolver. Distinct from `by_pid` (forward, 300 s
+    /// connect-attribution); this one is reverse + short-lived.
+    recent_by_time: VecDeque<(String, u32, u64)>,
 }
 
 /// PID-keyed DNS query cache. Construct once at agent boot,
@@ -72,6 +101,8 @@ pub struct DnsCache {
     inner: Mutex<DnsCacheInner>,
     ttl_ns: u64,
     max_per_pid: usize,
+    /// FP-3 reverse-index retention (ns). See [`REVERSE_RETAIN_SECS`].
+    reverse_retain_ns: u64,
 }
 
 impl Default for DnsCache {
@@ -83,12 +114,16 @@ impl Default for DnsCache {
 impl DnsCache {
     /// Custom-bound constructor for tests + future V1.1 config
     /// surface. Production callers should use [`Self::default`]
-    /// (300 s TTL, 1024 per-pid).
+    /// (300 s TTL, 1024 per-pid). The FP-3 reverse-index retention is
+    /// fixed at [`REVERSE_RETAIN_SECS`] regardless of `ttl_secs` — it
+    /// serves the tight ≤2 s back-correlation window, not the 300 s
+    /// connect-attribution window.
     pub fn new(ttl_secs: u64, max_per_pid: usize) -> Self {
         Self {
             inner: Mutex::new(DnsCacheInner::default()),
             ttl_ns: ttl_secs.saturating_mul(1_000_000_000),
             max_per_pid,
+            reverse_retain_ns: REVERSE_RETAIN_SECS.saturating_mul(1_000_000_000),
         }
     }
 
@@ -98,15 +133,84 @@ impl DnsCache {
     /// `max_per_pid`.
     pub fn on_dns_query(&self, pid: u32, qname: String, qtype: u16, ts_ns: u64) {
         let mut g = self.inner.lock();
-        let q = g.by_pid.entry(pid).or_default();
-        q.push_back(RecentQuery {
-            qname,
-            qtype,
-            ts_ns,
-        });
-        while q.len() > self.max_per_pid {
-            q.pop_front();
+        {
+            let q = g.by_pid.entry(pid).or_default();
+            q.push_back(RecentQuery {
+                qname: qname.clone(),
+                qtype,
+                ts_ns,
+            });
+            while q.len() > self.max_per_pid {
+                q.pop_front();
+            }
         }
+        // FP-3 reverse index: record (qname, pid, ts) for forwarder-aware
+        // originator back-correlation, then prune by the short retention
+        // window + the hard size cap so unique DGA qnames can't grow it.
+        g.recent_by_time.push_back((qname, pid, ts_ns));
+        let cutoff = ts_ns.saturating_sub(self.reverse_retain_ns);
+        while g
+            .recent_by_time
+            .front()
+            .is_some_and(|(_, _, t)| *t < cutoff)
+        {
+            g.recent_by_time.pop_front();
+        }
+        while g.recent_by_time.len() > REVERSE_MAX_ENTRIES {
+            g.recent_by_time.pop_front();
+        }
+    }
+
+    /// FP-3 forwarder-aware back-correlation. Returns the most-recent
+    /// PID *other than* `exclude_pid` that issued `qname` within
+    /// `window_ns` of `now_ns`, or `None` if no such originator is on
+    /// record.
+    ///
+    /// NN-L-NET-004/-014 call this when a tripped DnsQuery's *sender* is
+    /// a known forwarder/stub resolver (e.g. `systemd-resolved`): the
+    /// resolver must never be the kill target, so we look back through
+    /// the reverse index for the process whose own (loopback-stub) query
+    /// of the same qname triggered the forward. `exclude_pid` drops the
+    /// forwarder's own just-recorded entry from consideration.
+    ///
+    /// `None` is the safe outcome — Varlink/`nss-resolve` (the
+    /// originator never sent UDP/53), a host acting as a LAN resolver
+    /// (the client is remote, no local PID), or a cache miss all return
+    /// `None`, and the caller downgrades to `Log` rather than acting on
+    /// the resolver.
+    ///
+    /// The `window_ns` is the caller's tight correlation window (≤2 s),
+    /// kept far below the reverse-index retention so a stale same-qname
+    /// entry from an earlier unrelated PID can't be mis-attributed.
+    pub fn originator_for(
+        &self,
+        qname: &str,
+        now_ns: u64,
+        window_ns: u64,
+        exclude_pid: u32,
+    ) -> Option<u32> {
+        let mut g = self.inner.lock();
+        // Opportunistic retain-window prune (keeps the scanned set small
+        // even if no insert has happened recently).
+        let retain_cutoff = now_ns.saturating_sub(self.reverse_retain_ns);
+        while g
+            .recent_by_time
+            .front()
+            .is_some_and(|(_, _, t)| *t < retain_cutoff)
+        {
+            g.recent_by_time.pop_front();
+        }
+        let win_cutoff = now_ns.saturating_sub(window_ns);
+        // Back-to-front = most-recent first; the first qname match from a
+        // different PID inside the window is the strongest originator
+        // candidate.
+        g.recent_by_time
+            .iter()
+            .rev()
+            .find(|(q, pid, ts)| {
+                *ts >= win_cutoff && *ts <= now_ns && *pid != exclude_pid && q == qname
+            })
+            .map(|(_, pid, _)| *pid)
     }
 
     /// V1.0 back-correlation lookup. Returns the qname of the
@@ -490,6 +594,74 @@ mod tests {
         assert_eq!(
             c.lookup_for_connect(42, 3 * ONE_SEC_NS).as_deref(),
             Some("images.example.com")
+        );
+    }
+
+    // ── FP-3 reverse-index (originator_for) ────────────────────────
+
+    /// FP-3 #1 — forwarded-leg back-correlation. The originator (pid
+    /// 1000) issues the qname to the loopback stub; the forwarder (pid
+    /// 673) then re-issues the SAME qname upstream. `originator_for`,
+    /// excluding the forwarder, returns the originator.
+    #[test]
+    fn originator_for_back_correlates_forwarded_leg_to_originator() {
+        let c = DnsCache::default();
+        let q = "ZGVhZGJlZWY.exfil.example.com";
+        // Originator's stub query first…
+        c.on_dns_query(1000, q.into(), 1, 1_000 * ONE_SEC_NS);
+        // …then the forwarder's upstream leg, microseconds later.
+        c.on_dns_query(673, q.into(), 1, 1_000 * ONE_SEC_NS + 5_000);
+        // Excluding the forwarder, the originator is recovered.
+        assert_eq!(
+            c.originator_for(q, 1_000 * ONE_SEC_NS + 10_000, 2 * ONE_SEC_NS, 673),
+            Some(1000)
+        );
+    }
+
+    /// FP-3 #2 — no attributable originator. Only the forwarder ever
+    /// issued the qname (the Varlink/`nss-resolve` case (C), or a host
+    /// acting as a LAN resolver for a remote client). Excluding the
+    /// forwarder leaves nothing → `None`, and the caller downgrades to
+    /// `Log` rather than killing the resolver.
+    #[test]
+    fn originator_for_returns_none_when_only_forwarder_issued() {
+        let c = DnsCache::default();
+        let q = "high-entropy-label.attacker.net";
+        c.on_dns_query(673, q.into(), 1, 5 * ONE_SEC_NS);
+        assert!(c
+            .originator_for(q, 5 * ONE_SEC_NS + 1_000, 2 * ONE_SEC_NS, 673)
+            .is_none());
+    }
+
+    /// FP-3 #3 — the tight window rejects a stale same-qname entry. An
+    /// originator's query 10 s in the past must NOT be back-correlated
+    /// to a forwarded leg now, because the ≤2 s window has elapsed —
+    /// this is the §6.6 stale-attribution guard.
+    #[test]
+    fn originator_for_ignores_stale_entry_outside_window() {
+        let c = DnsCache::default();
+        let q = "shared.example.com";
+        c.on_dns_query(1000, q.into(), 1, ONE_SEC_NS);
+        // Forward leg now, 10 s later — well outside the 2 s window.
+        let now = 11 * ONE_SEC_NS;
+        c.on_dns_query(673, q.into(), 1, now);
+        assert!(c.originator_for(q, now, 2 * ONE_SEC_NS, 673).is_none());
+    }
+
+    /// FP-3 #4 — most-recent OTHER PID wins. If two distinct local PIDs
+    /// issued the same qname inside the window, the later one is the
+    /// stronger originator candidate (most-recent-wins, mirroring the
+    /// forward cache's tie-break).
+    #[test]
+    fn originator_for_picks_most_recent_other_pid() {
+        let c = DnsCache::default();
+        let q = "dup.example.com";
+        c.on_dns_query(100, q.into(), 1, ONE_SEC_NS);
+        c.on_dns_query(200, q.into(), 1, ONE_SEC_NS + 500_000);
+        c.on_dns_query(673, q.into(), 1, ONE_SEC_NS + 600_000);
+        assert_eq!(
+            c.originator_for(q, 2 * ONE_SEC_NS, 2 * ONE_SEC_NS, 673),
+            Some(200)
         );
     }
 

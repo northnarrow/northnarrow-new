@@ -333,6 +333,7 @@ mod tests {
             pid: 1,
             uid: 1000,
             comm: "curl".into(),
+            exe: None,
             query_name: "evil.example.org".into(),
             query_type: 1,
             dns_server: [0u8; 16],
