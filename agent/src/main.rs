@@ -787,6 +787,17 @@ async fn main() -> Result<()> {
         }),
     );
 
+    // FIM-009 self-upgrade (§15.1): construct the trusted-installer
+    // override BEFORE the engine so the NN-L-FIM-009 rule can hold a read
+    // handle (wired next commit). The bpffs maps were pinned +
+    // boot-zeroed by the sensor multiplexer's anti_tamper::attach above;
+    // the audit-chain writer is late-bound below once the AuditLog opens.
+    let installer_override =
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride::boot(
+            northnarrow_agent::anti_tamper::prepare_pin_root().map(|p| p.to_path_buf()),
+            None,
+        );
+
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
     #[cfg(not(feature = "demo-tappa5"))]
@@ -1149,6 +1160,12 @@ async fn main() -> Result<()> {
                 None
             }
         };
+
+    // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
+    // the trusted-installer override so its close/expiry records chain.
+    if let Some(audit) = audit_log.as_ref() {
+        installer_override.set_audit_log(Arc::clone(audit));
+    }
 
     // Build the ladder with the system actuator (real kill / quarantine /
     // per-PID egress / full isolation) + the signed-audit evidence sink,
@@ -1851,6 +1868,9 @@ async fn main() -> Result<()> {
                 let marker_path = cli.shutdown_marker_file.clone();
                 let fim_state_for_serve = fim_admin_state.clone();
                 let canary_state_for_serve = canary_admin_state.clone();
+                // FIM-009 self-upgrade (§15.1): the dispatcher arms this
+                // override on a verified TrustedInstallerGrantRequest.
+                let installer_override_for_serve = Some(Arc::clone(&installer_override));
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -1862,6 +1882,7 @@ async fn main() -> Result<()> {
                         audit_log,
                         fim_state_for_serve,
                         canary_state_for_serve,
+                        installer_override_for_serve,
                     )
                     .await
                     {

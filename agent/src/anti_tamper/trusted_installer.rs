@@ -105,7 +105,10 @@ pub struct TrustedInstallerOverride {
     /// Chain-log writer for the close/expiry record. The ARM record is
     /// written by the admin-socket dispatch path (`emit_audit_for`); the
     /// close is agent-initiated (not an admin op), so it is logged here.
-    audit: Option<Arc<Mutex<AuditLog>>>,
+    /// Late-bound via [`Self::set_audit_log`] — the override is built
+    /// early at boot (before the engine) but the audit log opens a little
+    /// later. `None` ⇒ close is logged to tracing only.
+    audit: Mutex<Option<Arc<Mutex<AuditLog>>>>,
     max_window: Duration,
 }
 
@@ -130,9 +133,17 @@ impl TrustedInstallerOverride {
             inner: Mutex::new(Inner::default()),
             bpffs_root,
             session_nonce,
-            audit,
+            audit: Mutex::new(audit),
             max_window,
         }
+    }
+
+    /// Late-bind the audit-chain writer. main.rs constructs the override
+    /// early (before the engine, so the NN-L-FIM-009 rule can hold it)
+    /// then calls this once the audit log is opened, so close/expiry
+    /// records are chained. A second call replaces the writer.
+    pub fn set_audit_log(&self, audit: Arc<Mutex<AuditLog>>) {
+        *self.audit.lock() = Some(audit);
     }
 
     /// An override that can never engage the FS pin (no bpffs, no session
@@ -195,21 +206,38 @@ impl TrustedInstallerOverride {
     ///
     /// The ARM is recorded in the audit chain by the dispatch path
     /// (`emit_audit_for`), not here.
-    pub fn arm(&self, window_secs: u32, now: Instant) -> Result<Duration> {
+    pub fn arm(&self, window_secs: u32, now: Instant) -> Duration {
         let max = self.max_window.as_secs().min(u32::MAX as u64) as u32;
         let secs = window_secs.clamp(1, max.max(1));
         let window = Duration::from_secs(secs as u64);
 
-        if self.session_nonce != 0 {
-            write_fs_override(self.bpffs_root.as_deref(), self.session_nonce)
-                .context("arming FS_PROTECT_OVERRIDE (suspend FS pin)")?;
+        // Suspend the kernel FS pin (best-effort). A failure here does
+        // NOT abort the grant: the in-memory window still opens so the
+        // NN-L-FIM-009 detection downgrade engages (the part that stops
+        // the agent killing the installer). A failed FS suspension is
+        // self-evident at install time (install.sh EPERMs on a protected
+        // path) and is logged loudly here.
+        let fs_pin_suspended = if self.session_nonce != 0 {
+            match write_fs_override(self.bpffs_root.as_deref(), self.session_nonce) {
+                Ok(()) => self.bpffs_root.is_some(),
+                Err(e) => {
+                    warn!(
+                        target: "anti_tamper.trusted_installer",
+                        error = %e,
+                        "arming FS pin suspension failed — detection downgrade still active, \
+                         but install.sh writes to PROTECTED inodes will still EPERM"
+                    );
+                    false
+                }
+            }
         } else {
             warn!(
                 target: "anti_tamper.trusted_installer",
                 "arming with no session nonce — FS pin NOT suspended; \
                  NN-L-FIM-009 detection downgrade only"
             );
-        }
+            false
+        };
 
         self.inner.lock().deadline = Some(now + window);
         self.armed.store(true, Ordering::SeqCst);
@@ -217,10 +245,10 @@ impl TrustedInstallerOverride {
             target: "anti_tamper.trusted_installer",
             window_secs = secs,
             requested_secs = window_secs,
-            fs_pin_suspended = self.session_nonce != 0,
+            fs_pin_suspended,
             "trusted-installer override ARMED (FIM-009 §15.1)"
         );
-        Ok(window)
+        window
     }
 
     /// Is the window open as of `now`? Pure read (an atomic load plus,
@@ -288,7 +316,8 @@ impl TrustedInstallerOverride {
     }
 
     fn audit_close(&self, reason: &str) {
-        let Some(audit) = &self.audit else {
+        let audit = self.audit.lock().clone();
+        let Some(audit) = audit else {
             return;
         };
         let draft = AuditEntryDraft {
@@ -302,7 +331,8 @@ impl TrustedInstallerOverride {
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
         };
-        if let Err(e) = audit.lock().append(draft) {
+        let appended = audit.lock().append(draft);
+        if let Err(e) = appended {
             warn!(
                 target: "anti_tamper.trusted_installer",
                 error = %e,
@@ -367,7 +397,7 @@ mod tests {
     fn arm_opens_window_until_deadline() {
         let ov = test_override(600);
         let t0 = Instant::now();
-        let window = ov.arm(30, t0).unwrap();
+        let window = ov.arm(30, t0);
         assert_eq!(window, Duration::from_secs(30));
         // Active at t0 and just before the deadline.
         assert!(ov.is_active_at(t0));
@@ -381,7 +411,7 @@ mod tests {
     fn window_clamped_to_max() {
         let ov = test_override(60);
         // Request 99999s, max is 60s → clamped to 60.
-        let window = ov.arm(99_999, Instant::now()).unwrap();
+        let window = ov.arm(99_999, Instant::now());
         assert_eq!(window, Duration::from_secs(60));
     }
 
@@ -390,7 +420,7 @@ mod tests {
         let ov = test_override(600);
         // A zero-second request is clamped up to 1s (never an
         // instantly-stale, but technically-armed, window).
-        let window = ov.arm(0, Instant::now()).unwrap();
+        let window = ov.arm(0, Instant::now());
         assert_eq!(window, Duration::from_secs(1));
     }
 
@@ -398,7 +428,7 @@ mod tests {
     fn close_if_expired_disarms_only_after_deadline() {
         let ov = test_override(600);
         let t0 = Instant::now();
-        ov.arm(30, t0).unwrap();
+        ov.arm(30, t0);
 
         // Before the deadline: not closed, still active.
         assert!(!ov.close_if_expired(t0 + Duration::from_secs(10)));
@@ -421,12 +451,12 @@ mod tests {
     fn re_arm_after_close_reopens_window() {
         let ov = test_override(600);
         let t0 = Instant::now();
-        ov.arm(10, t0).unwrap();
+        ov.arm(10, t0);
         ov.close("manual");
         assert!(!ov.is_active_at(t0 + Duration::from_secs(1)));
         // A fresh grant re-opens the window from a new origin.
         let t1 = t0 + Duration::from_secs(100);
-        ov.arm(10, t1).unwrap();
+        ov.arm(10, t1);
         assert!(ov.is_active_at(t1 + Duration::from_secs(5)));
         assert!(!ov.is_active_at(t1 + Duration::from_secs(10)));
     }

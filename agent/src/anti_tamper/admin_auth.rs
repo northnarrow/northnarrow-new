@@ -1087,12 +1087,13 @@ fn parse_role_keyword(s: &str) -> Result<Role> {
         // pair; same wire shape operators see in admin.pub.
         "net-read" => Ok(Role::NetRead),
         "net-manage" => Ok(Role::NetManage),
+        "trusted-installer" => Ok(Role::TrustedInstaller),
         "all" => Ok(Role::All),
         other => Err(anyhow!(
             "unknown role `{other}` — expected one of: \
              unlock, shutdown, force-posture, rotate-keys, audit-read, \
              fim-manage, fim-read, canary-read, canary-manage, \
-             net-read, net-manage, all"
+             net-read, net-manage, trusted-installer, all"
         )),
     }
 }
@@ -1264,6 +1265,8 @@ fn role_keyword(r: Role) -> &'static str {
         // Tappa 10 (N1) — network observability split-role pair.
         Role::NetRead => "net-read",
         Role::NetManage => "net-manage",
+        // FIM-009 self-upgrade (§15.1).
+        Role::TrustedInstaller => "trusted-installer",
         Role::All => "all",
     }
 }

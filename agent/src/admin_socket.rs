@@ -19,6 +19,7 @@
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -34,7 +35,7 @@ use common::wire::admin_protocol::{
     ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
     NetFlowsResponse, NetListenersRequest, NetListenersResponse, NetResolveRequest,
     NetResolveResponse, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
-    StatusResponse, UnlockResult, MAX_FRAME_BODY,
+    StatusResponse, TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use ed25519_dalek::VerifyingKey;
@@ -42,6 +43,7 @@ use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::canary::detector::CanaryIndexes;
 use crate::canary::registry::{CanaryTokenDraft, Registry, RegistryError};
@@ -236,6 +238,7 @@ pub async fn serve(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -263,6 +266,7 @@ pub async fn serve_with_audit_log(
         marker_path,
         shutdown_signal,
         Some(audit_log),
+        None,
         None,
         None,
     )
@@ -298,6 +302,7 @@ pub async fn serve_with_fim_state(
         audit_log,
         Some(fim_state),
         None,
+        None,
     )
     .await
 }
@@ -329,6 +334,7 @@ pub async fn serve_with_canary_state(
         audit_log,
         fim_state,
         Some(canary_state),
+        None,
     )
     .await
 }
@@ -353,6 +359,9 @@ pub async fn serve_with_marker_path(
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     fim_state: Option<Arc<FimAdminState>>,
     canary_state: Option<Arc<CanaryAdminState>>,
+    // FIM-009 self-upgrade (§15.1): shared override armed by a verified
+    // TrustedInstallerGrantRequest. None on legacy serve paths.
+    installer_override: Option<Arc<TrustedInstallerOverride>>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -389,6 +398,7 @@ pub async fn serve_with_marker_path(
         let audit_log = audit_log.clone();
         let fim_state = fim_state.clone();
         let canary_state = canary_state.clone();
+        let installer_override = installer_override.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -400,6 +410,7 @@ pub async fn serve_with_marker_path(
                 audit_log.as_ref(),
                 fim_state.as_ref(),
                 canary_state.as_ref(),
+                installer_override.as_ref(),
             )
             .await
             {
@@ -434,6 +445,7 @@ async fn handle_connection(
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
     fim_state: Option<&Arc<FimAdminState>>,
     canary_state: Option<&Arc<CanaryAdminState>>,
+    installer_override: Option<&Arc<TrustedInstallerOverride>>,
 ) -> Result<()> {
     // Capture peer creds once per connection — the audit log
     // wants pid/uid/comm of the caller, and a single connection
@@ -455,6 +467,7 @@ async fn handle_connection(
             shutdown_signal,
             fim_state.map(|s| s.as_ref()),
             canary_state.map(|s| s.as_ref()),
+            installer_override.map(|s| s.as_ref()),
             &mut matched_fps,
         );
         emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
@@ -782,6 +795,24 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // FIM-009 self-upgrade (§15.1) — the trusted-installer grant
+        // ARM record (the close/expiry record is written by the
+        // override itself, not on an admin op).
+        (
+            AdminMessage::TrustedInstallerGrantRequest(req),
+            AdminMessage::TrustedInstallerGrantResult(r),
+        ) => {
+            let window = match &req.payload.extra {
+                OperationExtra::TrustedInstallerGrant(e) => e.window_secs,
+                _ => 0,
+            };
+            (
+                "trusted_installer_grant",
+                serde_json::json!({ "window_secs": window }),
+                audit_result_str(*r),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -875,6 +906,7 @@ fn dispatch(
     shutdown_signal: Option<&ShutdownSignal>,
     fim_state: Option<&FimAdminState>,
     canary_state: Option<&CanaryAdminState>,
+    installer_override: Option<&TrustedInstallerOverride>,
     fps_out: &mut Vec<String>,
 ) -> AdminMessage {
     match msg {
@@ -1032,6 +1064,16 @@ fn dispatch(
             AdminMessage::NetFingerprintResponse(dispatch_net_fingerprint(req, auth, fps_out))
         }
 
+        // FIM-009 self-upgrade (§15.1) — signed trusted-installer grant.
+        AdminMessage::TrustedInstallerGrantRequest(req) => {
+            AdminMessage::TrustedInstallerGrantResult(dispatch_trusted_installer_grant(
+                req,
+                auth,
+                installer_override,
+                fps_out,
+            ))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -1052,7 +1094,8 @@ fn dispatch(
         | AdminMessage::NetFlowsResponse(_)
         | AdminMessage::NetListenersResponse(_)
         | AdminMessage::NetResolveResponse(_)
-        | AdminMessage::NetFingerprintResponse(_) => {
+        | AdminMessage::NetFingerprintResponse(_)
+        | AdminMessage::TrustedInstallerGrantResult(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -1631,6 +1674,80 @@ fn dispatch_fim_baseline(
         }
     }
     AdminResult::Success
+}
+
+/// FIM-009 self-upgrade (§15.1) — handle one
+/// [`TrustedInstallerGrantRequest`]. Verifies the signed grant (M=1
+/// quorum carrying [`Role::TrustedInstaller`], with the full nonce +
+/// agent_id + skew binding the standard `verify_signed_payload_quorum`
+/// enforces), then arms the TTL'd FS-pin override + the NN-L-FIM-009
+/// own-unit detection downgrade for the (clamped) signed window. The
+/// ARM is recorded in the audit chain by `emit_audit_for`; the
+/// close/expiry record is written by the override itself.
+///
+/// M=1 today — like COMBAT reactivation — but expressed through
+/// `min_distinct` so a future hardening can require co-signers without
+/// touching this dispatcher.
+fn dispatch_trusted_installer_grant(
+    req: TrustedInstallerGrantRequest,
+    auth: &AdminAuth,
+    installer_override: Option<&TrustedInstallerOverride>,
+    fps_out: &mut Vec<String>,
+) -> AdminResult {
+    // Required distinct signatures (M of N). 1 today; raise to harden.
+    const TRUSTED_INSTALLER_QUORUM: u8 = 1;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        TRUSTED_INSTALLER_QUORUM,
+        &[Role::TrustedInstaller],
+        OperationCode::TrustedInstallerGrant,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return map_admin_auth_error(e, "trusted-installer-grant"),
+    };
+    *fps_out = matched_fps;
+
+    // The op/extra invariant is already enforced inside
+    // verify_signed_payload_quorum; this pulls the signed window out.
+    let window_secs = match &req.payload.extra {
+        OperationExtra::TrustedInstallerGrant(extra) => extra.window_secs,
+        other => {
+            warn!(
+                extra = ?other,
+                "trusted-installer-grant payload extra is not TrustedInstallerGrant variant"
+            );
+            return AdminResult::UnknownOperation;
+        }
+    };
+
+    match installer_override {
+        Some(ov) => {
+            let window = ov.arm(window_secs, Instant::now());
+            info!(
+                target: "admin.trusted_installer_grant",
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                window_secs = window.as_secs(),
+                "trusted-installer override ARMED via signed grant (FIM-009 §15.1)"
+            );
+            AdminResult::Success
+        }
+        None => {
+            // Legacy serve path with no override wired — verified but
+            // nothing to arm. Surface as UnknownOperation so a stale
+            // test fixture doesn't read as a successful arm.
+            warn!(
+                target: "admin.trusted_installer_grant",
+                "trusted-installer grant verified but no override wired (legacy serve path)"
+            );
+            AdminResult::UnknownOperation
+        }
+    }
 }
 
 /// Tappa 9 C7 — handle one [`FimStatusRequest`] (closes the C6
@@ -2992,7 +3109,7 @@ mod tests {
         let marker_c = marker_path.clone();
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
-                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None, None,
+                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None, None, None,
             )
             .await;
         });
@@ -3225,6 +3342,7 @@ mod tests {
                 isolator_c,
                 marker_c,
                 Some(signal_for_serve),
+                None,
                 None,
                 None,
                 None,
@@ -4077,6 +4195,173 @@ mod tests {
         let mut fps = Vec::new();
         let resp = dispatch_net_flows(req, &auth, &mut fps);
         assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    // ── FIM-009 self-upgrade (§15.1) — trusted-installer grant dispatch ──
+
+    /// Build a signed `TrustedInstallerGrantRequest` for the dispatch
+    /// tests. Ed25519 signatures are deterministic, so a replay test can
+    /// reproduce the exact bytes by calling this twice with one nonce.
+    fn signed_grant_req(
+        signing: &ed25519_dalek::SigningKey,
+        nonce: [u8; 32],
+        agent_id: [u8; 16],
+        window_secs: u32,
+        ts: u64,
+    ) -> TrustedInstallerGrantRequest {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::{sign, SignedPayload};
+        let payload = SignedPayload::new_trusted_installer_grant(nonce, ts, agent_id, window_secs);
+        let sig: [u8; 64] = sign(&payload, signing).unwrap();
+        TrustedInstallerGrantRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }
+    }
+
+    fn test_override() -> TrustedInstallerOverride {
+        // No bpffs (map writes are no-ops); the in-memory window still
+        // opens so is_window_open() reflects a successful arm.
+        TrustedInstallerOverride::new(None, 0, None, std::time::Duration::from_secs(600))
+    }
+
+    /// Happy path: a valid M=1 grant carrying `trusted-installer` arms
+    /// the override and captures the signer fingerprint for the audit.
+    #[test]
+    fn dispatch_trusted_installer_grant_arms_on_valid_m1() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1a; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
+        let ov = test_override();
+        let mut fps = Vec::new();
+        let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+        assert!(matches!(resp, AdminResult::Success));
+        assert!(ov.is_window_open(), "a valid grant opens the override window");
+        assert_eq!(fps.len(), 1, "signer fingerprint captured for the audit chain");
+    }
+
+    /// A signature from a key NOT in admin.pub is rejected; the override
+    /// stays disarmed.
+    #[test]
+    fn dispatch_trusted_installer_grant_bad_signature_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1b; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        // Signed by `other` — valid op/nonce/agent_id, but no admin key matches.
+        let req = signed_grant_req(&other, nonce, agent_id, 120, now_unix_secs());
+        let ov = test_override();
+        let mut fps = Vec::new();
+        let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+        assert!(matches!(resp, AdminResult::InvalidSignature));
+        assert!(!ov.is_window_open(), "a bad signature never arms the override");
+    }
+
+    /// A grant whose `agent_id` doesn't match this install is rejected
+    /// (cross-agent replay defence) before the override is touched.
+    #[test]
+    fn dispatch_trusted_installer_grant_wrong_agent_id_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1c; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        // Payload binds a DIFFERENT agent_id (and is validly signed over it).
+        let req = signed_grant_req(&signing, nonce, [0xff; 16], 120, now_unix_secs());
+        let ov = test_override();
+        let mut fps = Vec::new();
+        let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+        assert!(matches!(resp, AdminResult::AgentIdMismatch));
+        assert!(!ov.is_window_open());
+    }
+
+    /// A captured grant cannot be replayed: the challenge nonce is
+    /// single-use, so re-sending the same signed request after a
+    /// successful arm yields `NoPendingChallenge`.
+    #[test]
+    fn dispatch_trusted_installer_grant_replayed_nonce_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1d; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let now = now_unix_secs();
+        let ov = test_override();
+        let mut fps = Vec::new();
+        // First presentation succeeds.
+        let first = signed_grant_req(&signing, nonce, agent_id, 120, now);
+        assert!(matches!(
+            dispatch_trusted_installer_grant(first, &auth, Some(&ov), &mut fps),
+            AdminResult::Success
+        ));
+        // Exact-byte replay (deterministic Ed25519) — nonce already consumed.
+        let replay = signed_grant_req(&signing, nonce, agent_id, 120, now);
+        let resp = dispatch_trusted_installer_grant(replay, &auth, Some(&ov), &mut fps);
+        assert!(matches!(resp, AdminResult::NoPendingChallenge));
+    }
+
+    /// A correctly-signed grant from a key lacking `trusted-installer`
+    /// is RoleDenied; the override stays disarmed.
+    #[test]
+    fn dispatch_trusted_installer_grant_role_denied_without_role() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1e; 16];
+        // Key carries `audit-read` only.
+        let (auth, _dir) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
+        let ov = test_override();
+        let mut fps = Vec::new();
+        let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+        assert!(matches!(resp, AdminResult::RoleDenied));
+        assert!(!ov.is_window_open());
+    }
+
+    /// A grant whose timestamp is outside the ±skew window is rejected
+    /// (captured-signature replay across a clock window).
+    #[test]
+    fn dispatch_trusted_installer_grant_skewed_ts_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1f; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        // 100_000s in the past — well outside the ±60s window.
+        let skewed_ts = now_unix_secs().saturating_sub(100_000);
+        let req = signed_grant_req(&signing, nonce, agent_id, 120, skewed_ts);
+        let ov = test_override();
+        let mut fps = Vec::new();
+        let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
+        assert!(matches!(resp, AdminResult::TimestampSkew { .. }));
+        assert!(!ov.is_window_open());
+    }
+
+    /// A verified grant with no override wired (legacy serve path)
+    /// returns `UnknownOperation` rather than silently succeeding.
+    #[test]
+    fn dispatch_trusted_installer_grant_without_override_unknown_operation() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x20; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
+        let mut fps = Vec::new();
+        let resp = dispatch_trusted_installer_grant(req, &auth, None, &mut fps);
+        assert!(matches!(resp, AdminResult::UnknownOperation));
     }
 
     /// N7 dispatch test #3 — `net resolve` returns Success +
