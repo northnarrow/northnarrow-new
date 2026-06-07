@@ -37,8 +37,12 @@
 //! the whitelist exempts well-known signed-update tools by
 //! comm.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use common::wire::{FimEvent, FimOp};
 use common::{Event, ResponseAction, Severity, Verdict};
+use parking_lot::Mutex;
 
 use crate::decision::Rule;
 
@@ -74,6 +78,18 @@ const SENSITIVE_CONFIG_EXACT: &[&str] = &[
 /// baseline + new size; if either is unknown we err on the
 /// side of alerting).
 const LOG_ROOT_PREFIXES: &[&str] = &["/var/log/", "/var/audit/"];
+
+/// NN-L-FIM-005 false-positive guard: kernel-resolved exec paths of
+/// the rsyslog daemon. A `Modified` op on a [`LOG_ROOT_PREFIXES`] path
+/// whose writer `/proc/<pid>/exe` is one of these — AND running as the
+/// `syslog` user — AND growing the file (an append) is rsyslogd's own
+/// routine logging, not tampering, so it is exempted. `/sbin` and
+/// `/usr/sbin` are BOTH listed because merged-`/usr` systems symlink
+/// one to the other and `/proc/<pid>/exe` reports whichever is the
+/// canonical target; an exact-path match (never `comm`) keeps the
+/// exemption tight. A truncation (file shrank) by this same daemon is
+/// NOT exempted — it still fires (log-tamper indicator). Sorted.
+const RSYSLOGD_EXES: &[&str] = &["/sbin/rsyslogd", "/usr/sbin/rsyslogd"];
 
 /// NN-L-FIM-006: operator-installed binary roots. Modifications
 /// here are Medium (often legit package upgrades), but worth
@@ -148,6 +164,38 @@ fn starts_with_any(path: &str, prefixes: &[&str]) -> bool {
 
 fn is_user_writable(path: &str) -> bool {
     starts_with_any(path, USER_WRITABLE_PREFIXES)
+}
+
+/// Resolve a local system user's uid by parsing `/etc/passwd` once.
+/// Std-only — no NSS/FFI — which is exactly right for the `syslog`
+/// user NN-L-FIM-005 needs: it is always a local account installed by
+/// the rsyslog package, never an LDAP/NSS-only identity. Returns `None`
+/// if the file is unreadable or the user is absent (caller treats that
+/// as "carve-out disabled"). Called once at engine construction, not on
+/// the event hot path.
+fn resolve_uid_by_name(name: &str) -> Option<u32> {
+    let body = std::fs::read_to_string("/etc/passwd").ok()?;
+    parse_passwd_uid(&body, name)
+}
+
+/// Pure parser behind [`resolve_uid_by_name`] — find `name`'s uid
+/// (colon field 3, 0-indexed 2) in a `/etc/passwd` body. Split out so
+/// the parse is unit-testable without touching the real file. Ignores
+/// blank/comment lines and malformed rows; first match wins.
+fn parse_passwd_uid(passwd_body: &str, name: &str) -> Option<u32> {
+    for line in passwd_body.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // name:passwd:uid:gid:gecos:home:shell
+        let mut fields = line.split(':');
+        if fields.next() != Some(name) {
+            continue;
+        }
+        // Skip the password field, then take uid.
+        return fields.nth(1).and_then(|uid| uid.parse().ok());
+    }
+    None
 }
 
 // ── NN-L-FIM-001 — system binary modified ──────────────────────────
@@ -316,15 +364,70 @@ impl Rule for NnLFim004AuthorizedKeysModified {
 /// investigator can see "log /var/log/auth.log shrunk from
 /// 4 MB to 0 at T by uid=… pid=… comm=…".
 ///
-/// `FimEvent` doesn't carry the new size or baseline size
-/// today (they live in `BaselineEntry` + `FimDriftEntry`
-/// respectively); for C5 we fire on *any* modification of
-/// these paths and let the operator distinguish via the
-/// drift log's `baseline_sha256` + `new_sha256` fields. A
-/// future commit may extend `FimEvent` with `new_size` /
-/// `baseline_size` so the rule can fire only on actual
-/// truncation.
-pub struct NnLFim005LogTruncated;
+/// Fires on any `Modified` op against these paths and lets the
+/// operator distinguish real tampering via the drift log's
+/// `baseline_sha256` + `new_sha256` fields, EXCEPT for the one
+/// high-volume false positive carved out below.
+///
+/// ## FP-1 carve-out — rsyslogd's own log appends
+///
+/// `rsyslogd` appends to `/var/log/{syslog,kern,auth}.log` (and
+/// friends) continuously; under the old "fire on *any* Modified"
+/// rule that tripped NN-L-FIM-005 on every flush. The carve-out
+/// suppresses the verdict ONLY when ALL three hold — anything else
+/// still fires (action: Log):
+///   (a) the writer's `/proc/<pid>/exe` is the rsyslog daemon
+///       ([`RSYSLOGD_EXES`]) — kernel-resolved, not `comm`;
+///   (b) the writer's uid is the `syslog` system user
+///       ([`Self::syslog_uid`], resolved once at construction);
+///   (c) the file GREW (`new_size > baseline_size`) — an append.
+///       A shrink/truncation, or unknown sizes, is NOT exempted.
+///
+/// So a non-rsyslogd writer, a uid mismatch, OR a truncation on a
+/// log path all still raise the verdict. Sizes ride on the
+/// `FimEvent` from the drain's re-hash (`new_size`) and the
+/// diverged baseline (`baseline_size`); the rule stays a pure
+/// function of the event (no `/proc` reads here — that resolution
+/// happens upstream in the drain).
+pub struct NnLFim005LogTruncated {
+    /// uid of the `syslog` system user, resolved once when the
+    /// engine is built (a `/etc/passwd` parse — see
+    /// [`resolve_uid_by_name`]). `None` on a host with no `syslog`
+    /// user: the rsyslogd-append carve-out then never applies and
+    /// the rule fires as before (fail toward alerting).
+    syslog_uid: Option<u32>,
+}
+
+impl NnLFim005LogTruncated {
+    /// Build the rule with the host's resolved `syslog` uid (or
+    /// `None` if absent / unresolved). [`fim_rules`] passes the
+    /// live value; tests pass a fixture uid.
+    pub fn new(syslog_uid: Option<u32>) -> Self {
+        Self { syslog_uid }
+    }
+
+    /// True iff this Modified-on-log-path event is rsyslogd's own
+    /// routine append — the FP-1 carve-out (a) ∧ (b) ∧ (c). Pure;
+    /// reads only `FimEvent` fields populated upstream by the drain.
+    fn is_rsyslogd_append(&self, fe: &FimEvent) -> bool {
+        // (a) writer exe is the rsyslog daemon (exact, kernel-resolved).
+        let exe_match = fe
+            .modifier_exe
+            .as_deref()
+            .is_some_and(|exe| RSYSLOGD_EXES.contains(&exe));
+        // (b) writer uid is the syslog system user.
+        let uid_match = self
+            .syslog_uid
+            .is_some_and(|syslog| fe.modifier_uid == syslog);
+        // (c) the file grew — an append, not a truncation. Unknown
+        // sizes on either side fail this check (→ rule still fires).
+        let grew = matches!(
+            (fe.new_size, fe.baseline_size),
+            (Some(new), Some(base)) if new > base
+        );
+        exe_match && uid_match && grew
+    }
+}
 
 impl Rule for NnLFim005LogTruncated {
     fn id(&self) -> &'static str {
@@ -342,6 +445,10 @@ impl Rule for NnLFim005LogTruncated {
             return None;
         }
         if !starts_with_any(&fe.path, LOG_ROOT_PREFIXES) {
+            return None;
+        }
+        // FP-1: rsyslogd's own appends are not tampering — suppress.
+        if self.is_rsyslogd_append(fe) {
             return None;
         }
         Some(fim_verdict(
@@ -393,12 +500,119 @@ impl Rule for NnLFim006OperatorBinaryModified {
 
 // ── NN-L-FIM-007 — cron drop-in created ────────────────────────────
 
+/// FP-3 coalescing window for ONE logical cron edit. 2 s comfortably
+/// spans the multi-syscall op-sequence of a single `crontab` install /
+/// atomic editor save (create + content writes + setattr, all µs
+/// apart) while staying far below the cadence of any plausible distinct
+/// operator edit of the same file.
+const CRON_DEDUP_WINDOW_NS: u64 = 2_000_000_000;
+
+/// Normalize a cron path to its dedup *bucket* — the [`CRON_DROPIN_PATHS`]
+/// root it falls under, trailing slash trimmed (`/var/spool/cron`,
+/// `/etc/cron.d`, `/etc/crontab`, …). One logical crontab edit is atomic
+/// yet touches THREE distinct paths — the temp file, the
+/// renamed-into-place crontab, and the spool directory itself, e.g.
+/// `/var/spool/cron/crontabs/tmp.AbC12`, `/var/spool/cron/crontabs/root`,
+/// and `/var/spool/cron/crontabs` — all of which share the
+/// `/var/spool/cron/` root. Keying the dedup on the bucket (not the exact
+/// path) collapses the trio to ONE `(pid, /var/spool/cron)` verdict.
+/// Returns `None` for a non-cron path, so this doubles as the rule's
+/// path-match check. The bucket is `&'static str` (it IS the matched
+/// root), so the dedup key never allocates.
+fn cron_dedup_bucket(path: &str) -> Option<&'static str> {
+    CRON_DROPIN_PATHS
+        .iter()
+        .copied()
+        .find(|root| path.starts_with(root))
+        .map(|root| root.strip_suffix('/').unwrap_or(root))
+}
+
+/// FP-4 dedup state for NN-L-FIM-007. A single `crontab -e` (or an
+/// editor's atomic-save of `/etc/crontab`) is atomic yet drives the
+/// kernel FIM hooks several times across the THREE distinct paths of one
+/// logical edit — the temp file, the renamed-into-place crontab, and the
+/// spool directory itself — so the drain emits ~6 `Event::Fim`s for one
+/// persistence event and the rule used to raise ~6 (FP-3: still ~3,
+/// one per path) identical KillProcess verdicts. Keying on the cron
+/// *directory bucket* ([`cron_dedup_bucket`]) rather than the exact path
+/// collapses all of them: the FIRST hit on a `(pid, bucket)` fires;
+/// repeats within [`CRON_DEDUP_WINDOW_NS`] are suppressed. A genuinely
+/// separate event — a distinct cron directory, a distinct pid, or the
+/// same pair after the window — still fires, so two real drop-ins never
+/// coalesce.
+///
+/// Stateful-rule precedent: mirrors NN-L-NET-005's
+/// [`DnsBurstWindow`](crate::decision::rules::net::DnsBurstWindow) —
+/// `&mut self` behind an `Arc<Mutex<_>>`, clocked by the event-carried
+/// `timestamp_ns` (no syscall clock, so the rule stays a pure function
+/// of the event + its own state).
+#[derive(Debug, Default)]
+pub struct CronEditWindow {
+    /// `(modifier_pid, cron-directory bucket)` → ns of the last verdict
+    /// we FIRED for it. The bucket is a `&'static str` from
+    /// [`CRON_DROPIN_PATHS`], so the key never allocates.
+    last_fired: HashMap<(u32, &'static str), u64>,
+}
+
+impl CronEditWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a cron-path hit for `(pid, bucket)` at `ts_ns` and report
+    /// whether NN-L-FIM-007 should FIRE for it. `true` for the first hit
+    /// on a pair (and the first after the window lapses); `false` for a
+    /// repeat inside the window. The window is anchored on the last FIRE
+    /// (a suppressed repeat does NOT extend it), so a sustained drip of
+    /// cron drops still surfaces roughly every [`CRON_DEDUP_WINDOW_NS`]
+    /// rather than being silenced outright. Prunes pairs whose last fire
+    /// has aged past the window on every call, so the map only ever
+    /// holds pairs touched in the last window (cron writes are rare — in
+    /// steady state it is empty).
+    pub fn observe(&mut self, pid: u32, bucket: &'static str, ts_ns: u64) -> bool {
+        // Drop pairs whose last fire is older than the window. This both
+        // bounds the map AND makes "present after prune ⇒ still within
+        // the window ⇒ suppress" hold, so the check below is a lookup.
+        self.last_fired
+            .retain(|_, &mut last| ts_ns.saturating_sub(last) < CRON_DEDUP_WINDOW_NS);
+        let key = (pid, bucket);
+        if self.last_fired.contains_key(&key) {
+            return false;
+        }
+        self.last_fired.insert(key, ts_ns);
+        true
+    }
+}
+
 /// `Created` op against any of the cron drop-in roots. High
 /// severity — MITRE T1053.003 (Cron) is the canonical
 /// scheduled-task persistence vector. Includes
 /// `/etc/crontab` as an exact-match path (it's a file, not
 /// a dir, so the `starts_with` check works both ways).
-pub struct NnLFim007CronDropInCreated;
+///
+/// FP-3 dedup: a single logical crontab edit drives the FIM hooks
+/// several times (create + writes + setattr) on one `(pid, path)`,
+/// which previously raised ~6 identical KillProcess verdicts. The rule
+/// now holds a [`CronEditWindow`] and fires ONCE per
+/// `(modifier_pid, path)` per [`CRON_DEDUP_WINDOW_NS`]; distinct paths /
+/// pids, and the same pair after the window, still fire.
+pub struct NnLFim007CronDropInCreated {
+    dedup: Arc<Mutex<CronEditWindow>>,
+}
+
+impl NnLFim007CronDropInCreated {
+    /// Build with a caller-supplied dedup window (symmetry with the
+    /// NN-L-NET stateful-rule factories; lets a test share / inspect it).
+    pub fn new(dedup: Arc<Mutex<CronEditWindow>>) -> Self {
+        Self { dedup }
+    }
+
+    /// Convenience: allocate a fresh, rule-private dedup window. Used by
+    /// [`fim_rules`] (one window per engine) and the unit tests.
+    pub fn with_fresh_window() -> Self {
+        Self::new(Arc::new(Mutex::new(CronEditWindow::new())))
+    }
+}
 
 impl Rule for NnLFim007CronDropInCreated {
     fn id(&self) -> &'static str {
@@ -418,7 +632,19 @@ impl Rule for NnLFim007CronDropInCreated {
         if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
             return None;
         }
-        if !CRON_DROPIN_PATHS.iter().any(|p| fe.path.starts_with(p)) {
+        let bucket = cron_dedup_bucket(&fe.path)?;
+        // FP-4: collapse the multi-FIM-op burst of ONE logical edit into a
+        // single verdict. A crontab install is atomic but touches three
+        // distinct paths — temp file, renamed-into-place crontab, and the
+        // spool directory — all sharing one cron-directory bucket, so we
+        // key on (modifier_pid, bucket): repeats within the window are
+        // suppressed; a distinct cron dir / pid, or the same pair after
+        // the window, still fires.
+        if !self
+            .dedup
+            .lock()
+            .observe(fe.modifier_pid, bucket, fe.timestamp_ns)
+        {
             return None;
         }
         Some(fim_verdict(
@@ -1410,6 +1636,11 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
 /// canonical kill-the-tree-immediately signal so it gets first
 /// pass.
 pub fn fim_rules() -> Vec<Box<dyn Rule>> {
+    // NN-L-FIM-005's rsyslogd-append carve-out (FP-1) needs the host's
+    // `syslog` uid. Resolve it once here (a /etc/passwd parse) instead
+    // of per-event; `None` on a host without the user → the carve-out
+    // simply never applies and the rule fires as before.
+    let syslog_uid = resolve_uid_by_name("syslog");
     vec![
         // Critical first — fire on the worst-case signals
         // before any High/Medium rule has a chance to match.
@@ -1420,8 +1651,8 @@ pub fn fim_rules() -> Vec<Box<dyn Rule>> {
         // High next.
         Box::new(NnLFim003SensitiveConfigModified),
         Box::new(NnLFim004AuthorizedKeysModified),
-        Box::new(NnLFim005LogTruncated),
-        Box::new(NnLFim007CronDropInCreated),
+        Box::new(NnLFim005LogTruncated::new(syslog_uid)),
+        Box::new(NnLFim007CronDropInCreated::with_fresh_window()),
         Box::new(NnLFim009SystemdUnitDropped),
         // C5.3 — cloud credential read family. Same High
         // tier as the rest of the credential-access bucket
@@ -1463,10 +1694,40 @@ mod tests {
             op,
             new_sha256: Some([0xAA; 32]),
             baseline_sha256: Some([0xBB; 32]),
+            new_size: None,
+            baseline_size: None,
             modifier_exe: None,
             modifier_pid: 42,
             modifier_uid: 0,
             modifier_comm: "attacker".to_string(),
+            dest_path: None,
+            child_truncated: false,
+        })
+    }
+
+    /// NN-L-FIM-005 carve-out helper: a `Modified` event on a log
+    /// path with the writer-identity + size fields the rsyslogd-append
+    /// exemption inspects. `exe`/`uid`/`new`/`base` let each test dial
+    /// exactly which of the three carve-out conditions hold.
+    fn fim_log_modify(
+        path: &str,
+        exe: Option<&str>,
+        uid: u32,
+        new: Option<u64>,
+        base: Option<u64>,
+    ) -> Event {
+        Event::Fim(FimEvent {
+            timestamp_ns: 1_700_000_000_000_000_000,
+            path: path.to_string(),
+            op: FimOp::Modified,
+            new_sha256: Some([0xAA; 32]),
+            baseline_sha256: Some([0xBB; 32]),
+            new_size: new,
+            baseline_size: base,
+            modifier_exe: exe.map(str::to_string),
+            modifier_pid: 4242,
+            modifier_uid: uid,
+            modifier_comm: "rsyslogd".to_string(),
             dest_path: None,
             child_truncated: false,
         })
@@ -1482,6 +1743,8 @@ mod tests {
             op: FimOp::Renamed,
             new_sha256: None,
             baseline_sha256: Some([0xBB; 32]),
+            new_size: None,
+            baseline_size: None,
             modifier_exe: None,
             modifier_pid: 42,
             modifier_uid: 0,
@@ -1712,14 +1975,22 @@ mod tests {
 
     // ── NN-L-FIM-005 ────────────────────────────────────────────
 
+    // The host's syslog uid for carve-out tests (matches the
+    // `syslog:x:103:104:` row this code targets); the rule is built
+    // with it so condition (b) can be satisfied or deliberately missed.
+    const TEST_SYSLOG_UID: u32 = 103;
+    const RSYSLOGD_EXE: &str = "/usr/sbin/rsyslogd";
+
     #[test]
     fn fim005_fires_on_log_modification_but_logs_only() {
-        let r = NnLFim005LogTruncated;
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
         for path in &[
             "/var/log/auth.log",
             "/var/log/syslog",
             "/var/audit/audit.log",
         ] {
+            // `fim_event` leaves modifier_exe + sizes None, so the
+            // rsyslogd-append carve-out can't apply — the rule fires.
             let v = r
                 .evaluate(&fim_event(FimOp::Modified, path))
                 .unwrap_or_else(|| panic!("expected fire on {path}"));
@@ -1732,11 +2003,144 @@ mod tests {
 
     #[test]
     fn fim005_does_not_fire_on_non_log_paths() {
-        let r = NnLFim005LogTruncated;
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
         assert!(r
             .evaluate(&fim_event(FimOp::Modified, "/etc/passwd"))
             .is_none());
         assert!(r.evaluate(&fim_event(FimOp::Modified, "/tmp/x")).is_none());
+    }
+
+    // ── NN-L-FIM-005 FP-1 — rsyslogd-append carve-out ────────────
+    //
+    // Suppress ONLY when (a) writer exe is rsyslogd ∧ (b) uid is
+    // syslog ∧ (c) the file grew (append). Any single condition
+    // missing — or a truncation — still fires (action: Log).
+
+    /// (a) ∧ (b) ∧ (c) all hold → rsyslogd's own append is suppressed.
+    #[test]
+    fn fim005_rsyslogd_append_is_exempt() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        for path in &["/var/log/syslog", "/var/log/kern.log", "/var/log/auth.log"] {
+            // file grew 4096 -> 8192 (append).
+            let ev = fim_log_modify(
+                path,
+                Some(RSYSLOGD_EXE),
+                TEST_SYSLOG_UID,
+                Some(8192),
+                Some(4096),
+            );
+            assert!(
+                r.evaluate(&ev).is_none(),
+                "rsyslogd append on {path} must NOT fire"
+            );
+        }
+        // The `/sbin/rsyslogd` merged-/usr alias is exempt too.
+        let ev = fim_log_modify(
+            "/var/log/syslog",
+            Some("/sbin/rsyslogd"),
+            TEST_SYSLOG_UID,
+            Some(200),
+            Some(100),
+        );
+        assert!(r.evaluate(&ev).is_none(), "/sbin/rsyslogd alias must be exempt");
+    }
+
+    /// (c) fails — rsyslogd-as-syslog but the file SHRANK → a
+    /// truncation, the exact tamper signal the rule exists for. Fires.
+    #[test]
+    fn fim005_rsyslogd_truncation_still_fires() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        // 8192 -> 0: log wiped.
+        let ev = fim_log_modify(
+            "/var/log/syslog",
+            Some(RSYSLOGD_EXE),
+            TEST_SYSLOG_UID,
+            Some(0),
+            Some(8192),
+        );
+        let v = r.evaluate(&ev).expect("rsyslogd truncation must fire");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::High);
+    }
+
+    /// (a) fails — a non-rsyslogd writer growing a log path (e.g. an
+    /// attacker appending) is NOT exempt. Fires.
+    #[test]
+    fn fim005_non_rsyslogd_writer_still_fires() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        // exe is some other binary, even at the syslog uid and growing.
+        let ev = fim_log_modify(
+            "/var/log/syslog",
+            Some("/usr/bin/tee"),
+            TEST_SYSLOG_UID,
+            Some(9000),
+            Some(4096),
+        );
+        assert!(r.evaluate(&ev).is_some(), "non-rsyslogd writer must fire");
+        // And an entirely unknown exe (writer already exited) fires too.
+        let ev_none = fim_log_modify("/var/log/syslog", None, TEST_SYSLOG_UID, Some(9000), Some(4096));
+        assert!(r.evaluate(&ev_none).is_some(), "unknown exe must fire");
+    }
+
+    /// (b) fails — the rsyslogd binary running as the WRONG uid (not
+    /// the syslog user) is not the trusted daemon path. Fires.
+    #[test]
+    fn fim005_rsyslogd_exe_wrong_uid_still_fires() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        let ev = fim_log_modify("/var/log/syslog", Some(RSYSLOGD_EXE), 0, Some(8192), Some(4096));
+        assert!(
+            r.evaluate(&ev).is_some(),
+            "rsyslogd exe as root (uid 0) must still fire"
+        );
+    }
+
+    /// No syslog user resolved on the host (carve-out disabled): even a
+    /// textbook rsyslogd append fires — fail toward alerting.
+    #[test]
+    fn fim005_no_syslog_uid_disables_carveout() {
+        let r = NnLFim005LogTruncated::new(None);
+        let ev = fim_log_modify(
+            "/var/log/syslog",
+            Some(RSYSLOGD_EXE),
+            TEST_SYSLOG_UID,
+            Some(8192),
+            Some(4096),
+        );
+        assert!(
+            r.evaluate(&ev).is_some(),
+            "with no resolved syslog uid the carve-out must not apply"
+        );
+    }
+
+    /// Unknown sizes (e.g. baseline missing) fail condition (c): we
+    /// can't prove it's an append, so the rule fires rather than risk
+    /// silencing a truncation behind a None size.
+    #[test]
+    fn fim005_unknown_size_fails_append_check() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        let ev = fim_log_modify("/var/log/syslog", Some(RSYSLOGD_EXE), TEST_SYSLOG_UID, None, None);
+        assert!(r.evaluate(&ev).is_some(), "unknown sizes must fire");
+        // equal sizes are not a "grew" → also fire.
+        let ev_eq = fim_log_modify(
+            "/var/log/syslog",
+            Some(RSYSLOGD_EXE),
+            TEST_SYSLOG_UID,
+            Some(4096),
+            Some(4096),
+        );
+        assert!(r.evaluate(&ev_eq).is_some(), "equal sizes are not an append");
+    }
+
+    /// The /etc/passwd parser behind the syslog-uid resolution.
+    #[test]
+    fn parse_passwd_uid_extracts_uid_field() {
+        let body = "root:x:0:0:root:/root:/bin/bash\n\
+                    # a comment line\n\
+                    syslog:x:103:104::/nonexistent:/usr/sbin/nologin\n\
+                    nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
+        assert_eq!(parse_passwd_uid(body, "syslog"), Some(103));
+        assert_eq!(parse_passwd_uid(body, "root"), Some(0));
+        assert_eq!(parse_passwd_uid(body, "absent"), None);
     }
 
     // ── NN-L-FIM-006 ────────────────────────────────────────────
@@ -1756,7 +2160,7 @@ mod tests {
 
     #[test]
     fn fim007_fires_on_cron_dropin_created_or_modified() {
-        let r = NnLFim007CronDropInCreated;
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
         for (op, path) in &[
             (FimOp::Created, "/etc/cron.d/x"),
             (FimOp::Created, "/etc/cron.daily/y"),
@@ -1773,13 +2177,133 @@ mod tests {
 
     #[test]
     fn fim007_does_not_fire_on_unrelated_paths() {
-        let r = NnLFim007CronDropInCreated;
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
         assert!(r
             .evaluate(&fim_event(FimOp::Created, "/etc/passwd"))
             .is_none());
         assert!(r
             .evaluate(&fim_event(FimOp::Created, "/var/spool/lpd/x"))
             .is_none());
+    }
+
+    /// FP-3 dedup helper: a cron-path event with a caller-chosen
+    /// modifier pid + timestamp so the `(pid, path, ts)` window
+    /// behaviour is exercisable (the default `fim_event` pins both).
+    fn cron_event(op: FimOp, path: &str, pid: u32, ts_ns: u64) -> Event {
+        Event::Fim(FimEvent {
+            timestamp_ns: ts_ns,
+            path: path.to_string(),
+            op,
+            new_sha256: Some([0xAA; 32]),
+            baseline_sha256: Some([0xBB; 32]),
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: None,
+            modifier_pid: pid,
+            modifier_uid: 0,
+            modifier_comm: "crontab".to_string(),
+            dest_path: None,
+            child_truncated: false,
+        })
+    }
+
+    /// FP-4: a single `crontab -e` install is atomic but fans out into
+    /// several FIM ops across THREE distinct paths within milliseconds —
+    /// the temp file, the renamed-into-place crontab, and the spool
+    /// directory itself. The per-path dedup (FP-3) collapsed each path's
+    /// own repeats but still emitted one verdict per path (~3); keying on
+    /// the cron-directory bucket must collapse the whole burst into
+    /// exactly ONE verdict.
+    #[test]
+    fn fim007_dedups_single_edit_burst_into_one_verdict() {
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        let pid = 909;
+        let base = 1_700_000_000_000_000_000u64;
+        // The op-sequence of one `crontab -e` install: write a temp file,
+        // rename it into place (the drain normalizes the rename target to
+        // Created), and the spool directory gets a setattr — three
+        // DISTINCT paths, same pid, all a few ms apart, one logical edit.
+        let tmp = "/var/spool/cron/crontabs/tmp.AbC123";
+        let final_ = "/var/spool/cron/crontabs/root";
+        let dir = "/var/spool/cron/crontabs";
+        let burst = [
+            (FimOp::Created, tmp, base),                  // mkstemp
+            (FimOp::Modified, tmp, base + 1_000_000),     // +1 ms write content
+            (FimOp::Created, final_, base + 5_000_000),   // +5 ms rename → final
+            (FimOp::Modified, dir, base + 5_000_000),     // +5 ms dir entry changed
+            (FimOp::Modified, final_, base + 8_000_000),  // +8 ms setattr on final
+            (FimOp::Modified, dir, base + 10_000_000),    // +10 ms dir setattr
+        ];
+        let fired = burst
+            .iter()
+            .filter(|(op, path, ts)| r.evaluate(&cron_event(*op, *path, pid, *ts)).is_some())
+            .count();
+        assert_eq!(
+            fired, 1,
+            "one logical edit (6 FIM ops across 3 paths in one cron dir) \
+             must yield exactly ONE verdict"
+        );
+    }
+
+    /// The dedup key is now `(pid, cron-directory bucket)`, not
+    /// `(pid, exact path)`: one logical edit touches several paths in ONE
+    /// cron dir, so same-dir / same-pid hits inside the window coalesce.
+    /// But genuinely distinct persistence events are never swallowed: a
+    /// DIFFERENT cron directory, a DIFFERENT pid, and a re-edit of the same
+    /// dir AFTER the window all still fire.
+    #[test]
+    fn fim007_distinct_dirs_pids_and_post_window_edits_still_fire() {
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        let base = 1_700_000_000_000_000_000u64;
+        // First drop-in into /etc/cron.d → fires.
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-a", 5, base))
+                .is_some(),
+            "first distinct drop-in must fire"
+        );
+        // A SECOND file in the SAME cron dir by the SAME pid within the
+        // window is part of one logical edit (temp + final + dir all share
+        // a directory) → coalesced. The KillProcess verdict already targets
+        // pid 5, so the shared actor is still neutralized.
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-b", 5, base + 5_000_000))
+                .is_none(),
+            "a second path in the same cron dir + pid + window must coalesce"
+        );
+        // A DISTINCT cron directory (same pid + instant) → distinct key → fires.
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.daily/job-c", 5, base))
+                .is_some(),
+            "a distinct cron directory must still fire"
+        );
+        // Same cron dir, DIFFERENT pid → distinct key → fires.
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-d", 6, base))
+                .is_some(),
+            "the same cron dir touched by a different pid is a distinct event — must fire"
+        );
+        // A repeat on /etc/cron.d by pid 5 still inside the window → suppressed.
+        assert!(
+            r.evaluate(&cron_event(
+                FimOp::Modified,
+                "/etc/cron.d/job-a",
+                5,
+                base + 100_000_000 // +100 ms
+            ))
+            .is_none(),
+            "a repeat on the same (pid, cron dir) inside the window must be suppressed"
+        );
+        // …and after the 2 s window lapses → fires again (a real 2nd edit).
+        assert!(
+            r.evaluate(&cron_event(
+                FimOp::Modified,
+                "/etc/cron.d/job-a",
+                5,
+                base + CRON_DEDUP_WINDOW_NS
+            ))
+            .is_some(),
+            "a genuinely separate edit after the window must fire again"
+        );
     }
 
     // ── NN-L-FIM-008 ────────────────────────────────────────────
@@ -2052,6 +2576,8 @@ mod tests {
             op,
             new_sha256: Some([0xAA; 32]),
             baseline_sha256: Some([0xBB; 32]),
+            new_size: None,
+            baseline_size: None,
             modifier_exe: None,
             modifier_pid: 42,
             modifier_uid: 0,

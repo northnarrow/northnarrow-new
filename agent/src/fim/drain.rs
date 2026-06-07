@@ -742,6 +742,10 @@ pub fn process_drift(
                 op,
                 new_sha256: None,
                 baseline_sha256: None,
+                // Content-less cred-read event: no size delta, and the
+                // NN-L-FIM-011..017 rules don't consume exe — leave all None.
+                new_size: None,
+                baseline_size: None,
                 modifier_exe: None,
                 modifier_pid: raw.modifier_pid,
                 modifier_uid: raw.modifier_uid,
@@ -764,14 +768,14 @@ pub fn process_drift(
     // Resolve any 1-hop symlink + capture content. For Deleted
     // and Renamed ops the target may be gone; treat the SHA
     // probe as None in that case and let the diff fall to the
-    // baseline-side comparison.
-    let new_sha256 = match op {
+    // baseline-side comparison. We keep the chosen non-symlink
+    // draft so the post-mod SIZE (`size_bytes`) rides alongside
+    // the hash — NN-L-FIM-005's rsyslogd-append exemption needs
+    // the size delta to tell an append (grew) from a truncation.
+    let new_draft = match op {
         FimOp::Deleted | FimOp::Renamed => None,
         _ => match compute_baseline(Path::new(&path)) {
-            Ok(drafts) => drafts
-                .iter()
-                .find(|d| !d.is_symlink)
-                .map(|d| d.sha256.clone()),
+            Ok(drafts) => drafts.into_iter().find(|d| !d.is_symlink),
             Err(e) => {
                 debug!(
                     target: "fim.drain",
@@ -783,7 +787,10 @@ pub fn process_drift(
             }
         },
     };
+    let new_sha256 = new_draft.as_ref().map(|d| d.sha256.clone());
+    let new_size = new_draft.as_ref().map(|d| d.size_bytes);
     let baseline_sha256 = last_baseline.map(|b| b.sha256.clone());
+    let baseline_size = last_baseline.map(|b| b.size_bytes);
 
     // Skip if SHA matches baseline (kernel hook fired but
     // content didn't actually change — e.g., `touch -t` on an
@@ -865,7 +872,13 @@ pub fn process_drift(
             op,
             new_sha256: new_sha256.and_then(|h| decode_sha_hex(&h)),
             baseline_sha256: baseline_sha256.and_then(|h| decode_sha_hex(&h)),
-            modifier_exe: None,
+            new_size,
+            baseline_size,
+            // Best-effort `/proc/<pid>/exe` of the writer. Feeds the
+            // NN-L-FIM-005 rsyslogd-append exemption; a miss (writer
+            // already exited, PID reused, unreadable link) leaves it
+            // None → the rule falls through and still fires.
+            modifier_exe: resolve_pid_exe(raw.modifier_pid),
             modifier_pid: raw.modifier_pid,
             modifier_uid: raw.modifier_uid,
             modifier_comm: comm_to_string(&raw.modifier_comm),
@@ -886,6 +899,22 @@ pub fn process_drift(
 fn comm_to_string(comm: &[u8]) -> String {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     String::from_utf8_lossy(&comm[..end]).into_owned()
+}
+
+/// Best-effort resolve of a writer PID's `/proc/<pid>/exe` for
+/// [`FimEvent::modifier_exe`]. Kernel-resolved symlink (never `comm`,
+/// which is `prctl(PR_SET_NAME)`-spoofable). Returns `None` when the
+/// process has already exited, the link is unreadable, or the path is
+/// non-UTF-8 — every miss is fail-open for detection (the consuming
+/// NN-L-FIM-005 exemption only ever SUPPRESSES on a positive match, so
+/// a miss means the rule still fires). Racy by nature (PID may be reused
+/// between the kernel event and this read); the exemption layers a uid
+/// and size-delta check on top so a stale resolution alone can't
+/// silence a real truncation.
+fn resolve_pid_exe(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 // ── async drain loop (Tappa 9 C8) ──────────────────────────────────
