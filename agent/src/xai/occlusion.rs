@@ -684,6 +684,9 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             pid,
             uid,
             comm,
+            // FP-3 sender exe — not an occludable saliency field (it's an
+            // attribution discriminator, not a model input), bind-ignore.
+            exe: _,
             query_name,
             query_type,
             dns_server,
@@ -828,6 +831,7 @@ mod tests {
             pid: 7,
             uid: 0,
             comm: "curl".to_string(),
+            exe: None,
             query_name: q.to_string(),
             query_type: 1,
             dns_server: [0u8; ADDR_LEN],

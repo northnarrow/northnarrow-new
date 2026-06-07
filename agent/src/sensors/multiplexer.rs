@@ -553,6 +553,24 @@ fn decode_addr(family: u8, bytes: [u8; 16]) -> std::net::IpAddr {
     }
 }
 
+/// FP-3 best-effort resolve of a DNS sender's `/proc/<pid>/exe`.
+/// Kernel-resolved symlink (never `comm`, which is
+/// `prctl(PR_SET_NAME)`-spoofable — and a comm match here would grant a
+/// forged resolver kill-immunity, the exact bypass the attribution layer
+/// must avoid). Returns `None` when the process has already exited, the
+/// link is unreadable, or the path is non-UTF-8; a miss is fail-toward-
+/// today (the rule treats a `None` sender as a non-forwarder and acts on
+/// it as before). Racy by nature (the PID may be reused between the BPF
+/// event and this read) — the same caveat as the FIM drain's
+/// `resolve_pid_exe`; the consuming rule only ever uses a positive
+/// resolver match to REDIRECT a kill off the forwarder, never to silence
+/// detection.
+fn resolve_pid_exe(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
@@ -581,19 +599,31 @@ async fn pump_dns_query(
             let bytes: &[u8] = item.as_ref();
             match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
                 Ok(raw) => {
-                    let event = Event::from(raw);
-                    if let (
-                        Some(cache),
-                        Event::DnsQuery {
-                            pid,
-                            query_name,
-                            query_type,
-                            timestamp_ns,
-                            ..
-                        },
-                    ) = (dns_cache.as_ref(), &event)
+                    let mut event = Event::from(raw);
+                    if let Event::DnsQuery {
+                        pid,
+                        exe,
+                        query_name,
+                        query_type,
+                        timestamp_ns,
+                        ..
+                    } = &mut event
                     {
-                        cache.on_dns_query(*pid, query_name.clone(), *query_type, *timestamp_ns);
+                        // FP-3: resolve the UDP/53 SENDER's
+                        // `/proc/<pid>/exe` (best-effort, kernel-resolved
+                        // symlink — never comm). The DNS rule family uses
+                        // it to tell an originator-issued query apart from
+                        // a forwarder's relayed leg so a KillProcess
+                        // verdict never lands on the local stub resolver.
+                        *exe = resolve_pid_exe(*pid);
+                        if let Some(cache) = dns_cache.as_ref() {
+                            cache.on_dns_query(
+                                *pid,
+                                query_name.clone(),
+                                *query_type,
+                                *timestamp_ns,
+                            );
+                        }
                     }
                     if tx.send(event).await.is_err() {
                         return Ok(());

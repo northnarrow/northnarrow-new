@@ -119,6 +119,7 @@ pub fn default_rules_with_net(
     process_allowlist: Arc<CommAllowlist>,
     netflow_comm_allowlist: Arc<CommAllowlist>,
     beacon_window: Arc<Mutex<net::BeaconWindow>>,
+    dns_cache: Arc<crate::net::dns_cache::DnsCache>,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -146,6 +147,7 @@ pub fn default_rules_with_net(
         burst_window,
         netflow_comm_allowlist,
         beacon_window,
+        dns_cache,
     ));
     rules
 }

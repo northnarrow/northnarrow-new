@@ -212,6 +212,7 @@ fn dns(comm: &str, query: &str) -> Event {
         pid: 4242,
         uid: 1000,
         comm: comm.into(),
+        exe: None,
         query_name: query.into(),
         query_type: 1,
         dns_server: [0u8; 16],

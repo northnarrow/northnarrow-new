@@ -49,6 +49,7 @@ impl RuleEngine {
         process_allowlist: Arc<CommAllowlist>,
         netflow_comm_allowlist: Arc<CommAllowlist>,
         beacon_window: Arc<Mutex<super::rules::net::BeaconWindow>>,
+        dns_cache: Arc<crate::net::dns_cache::DnsCache>,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -58,6 +59,7 @@ impl RuleEngine {
             process_allowlist,
             netflow_comm_allowlist,
             beacon_window,
+            dns_cache,
         ) {
             e.add_rule(r);
         }

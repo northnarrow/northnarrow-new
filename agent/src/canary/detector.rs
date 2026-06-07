@@ -632,6 +632,7 @@ mod tests {
             pid: 1,
             uid: 0,
             comm: "test".to_string(),
+            exe: None,
             query_name: "example.com".to_string(),
             query_type: 1,
             dns_server: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
