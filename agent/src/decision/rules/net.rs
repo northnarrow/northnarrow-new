@@ -496,6 +496,21 @@ enum DnsAttribution {
     Downgrade { forwarder_pid: u32, label: String },
 }
 
+impl DnsAttribution {
+    /// The PID the resulting verdict targets — the (back-correlated or
+    /// originator-issued) originator for `Act`, the forwarder for a
+    /// Log-only `Downgrade`. FP-5 keys its dedup on THIS pid so the
+    /// originator's own stub query and the resolver's back-correlated
+    /// forwarded leg — both routed to the same originator — collapse into
+    /// one verdict (see [`DnsQnameDedupWindow`]).
+    fn target_pid(&self) -> u32 {
+        match self {
+            DnsAttribution::Act { pid, .. } => *pid,
+            DnsAttribution::Downgrade { forwarder_pid, .. } => *forwarder_pid,
+        }
+    }
+}
+
 /// Forwarder-aware attribution shared by NN-L-NET-004/-014. Given a
 /// tripped DnsQuery, decide who the verdict targets:
 ///
@@ -532,6 +547,93 @@ fn attribute_dns_query(
     }
 }
 
+// ── FP-5 per-(originator, qname) qname-shape dedup (NN-L-NET-004/-014) ─
+//
+// ONE logical lookup (`getent hosts <name>`) fans out into several
+// DnsQuery events: glibc issues A + AAAA (+ retries), and on a
+// split-resolver host each of those has TWO legs — the originator's own
+// stub query to 127.0.0.53 AND the forwarder's upstream leg, which FP-3
+// back-correlates to the SAME originator. The qname-shape rules
+// (-004 long/base64, -014 entropy) inspect only the qname, so every one
+// of those events yields an IDENTICAL verdict targeting the originator —
+// the live finding saw ONE `getent` raise 8 NN-L-NET-004 verdicts (4
+// direct+forwarded pairs ~130 ms apart). This layer collapses them: at
+// most ONE verdict per (attributed originator, qname) per window.
+//
+// Per-qname, NOT per-pid: distinct qnames each still fire, so a DGA
+// spraying many distinct names stays fully visible (that IS the signal),
+// and a genuine re-lookup after the window fires again. Same shape as the
+// NN-L-NET-005 [`DnsBurstWindow`] / FP-4's
+// [`CronEditWindow`](crate::fim::rules::CronEditWindow) precedent.
+
+/// FP-5 dedup window: at most one qname-shape verdict per
+/// `(attributed originator pid, qname)` within this span. Sized to the
+/// originator back-correlation window ([`DNS_ORIGINATOR_WINDOW_NS`]) — a
+/// single logical lookup's legs land microseconds apart and the live
+/// fan-out spanned ~130 ms, so 2 s coalesces the burst while a re-lookup
+/// seconds later still surfaces.
+const DNS_QNAME_DEDUP_WINDOW_NS: u64 = 2 * 1_000_000_000;
+
+/// Hash a qname to the `u64` half of the dedup key. The qname is dynamic
+/// (unlike FP-4's `&'static` cron-directory bucket), so keying on a hash
+/// keeps the key `Copy` and allocation-free on the hot path — no owned
+/// `String` per suspicious event. `DefaultHasher` is fixed-seeded, so the
+/// mapping is stable within the process; cross-process stability is
+/// irrelevant (the state is in-memory and per-engine). A 64-bit collision
+/// inside one pid's 2 s window is astronomically unlikely.
+fn hash_qname(qname: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    qname.hash(&mut h);
+    h.finish()
+}
+
+/// FP-5 dedup state for the per-qname shape rules (NN-L-NET-004/-014).
+/// Mirrors the [`DnsBurstWindow`] / `CronEditWindow` stateful-rule
+/// precedent: `&mut self` behind an `Arc<Mutex<_>>`, clocked by the
+/// event-carried `timestamp_ns` (no syscall clock — the rule stays a pure
+/// function of the event + its own state).
+///
+/// Each rule holds its OWN window: a qname that trips both -004 and -014
+/// must still yield one verdict from EACH, so the two rules deliberately
+/// never share a window (no cross-suppression).
+#[derive(Debug, Default)]
+pub struct DnsQnameDedupWindow {
+    /// `(attributed_originator_pid, qname_hash)` → ns of the last verdict
+    /// we FIRED for it. The value is the `u64` hash, not the qname
+    /// `String`, so the key is `Copy` and never allocates.
+    last_fired: HashMap<(u32, u64), u64>,
+}
+
+impl DnsQnameDedupWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a suspicious-qname hit for `(pid, qname_hash)` at `ts_ns`
+    /// and report whether the rule should FIRE. `true` for the first hit
+    /// on a pair (and the first after the window lapses); `false` for a
+    /// repeat inside the window. The window is anchored on the last FIRE
+    /// (a suppressed repeat does NOT extend it), so a sustained drip still
+    /// surfaces roughly once per [`DNS_QNAME_DEDUP_WINDOW_NS`] rather than
+    /// being silenced outright. Prunes aged pairs on every call, so the
+    /// map only ever holds pairs touched within the last window
+    /// (suspicious qnames are rare — in steady state it is empty).
+    pub fn observe(&mut self, pid: u32, qname_hash: u64, ts_ns: u64) -> bool {
+        // Drop pairs whose last fire is older than the window. This both
+        // bounds the map AND makes "present after prune ⇒ still within the
+        // window ⇒ suppress" hold, so the check below is a plain lookup.
+        self.last_fired
+            .retain(|_, &mut last| ts_ns.saturating_sub(last) < DNS_QNAME_DEDUP_WINDOW_NS);
+        let key = (pid, qname_hash);
+        if self.last_fired.contains_key(&key) {
+            return false;
+        }
+        self.last_fired.insert(key, ts_ns);
+        true
+    }
+}
+
 // ── NN-L-NET-004 — Suspicious DNS qname ──────────────────────────────
 
 /// Suspicious DNS qname shape: > 60 chars OR base64-looking
@@ -543,11 +645,16 @@ fn attribute_dns_query(
 /// must never land on the local stub resolver.
 pub struct NnLNet004SuspiciousDnsQname {
     dns_cache: Arc<DnsCache>,
+    /// FP-5: rule-private dedup of repeated (originator, qname) verdicts.
+    dedup: Arc<Mutex<DnsQnameDedupWindow>>,
 }
 
 impl NnLNet004SuspiciousDnsQname {
     pub fn new(dns_cache: Arc<DnsCache>) -> Self {
-        Self { dns_cache }
+        Self {
+            dns_cache,
+            dedup: Arc::new(Mutex::new(DnsQnameDedupWindow::new())),
+        }
     }
 
     fn looks_like_base64(s: &str) -> bool {
@@ -619,14 +726,27 @@ impl Rule for NnLNet004SuspiciousDnsQname {
         // kills the sender (as before); a forwarded leg back-correlates
         // to the originator, or downgrades to Log when none is found —
         // never KillProcess the local stub resolver.
-        Some(match attribute_dns_query(
+        let attribution = attribute_dns_query(
             &self.dns_cache,
             *pid,
             comm,
             exe.as_deref(),
             query_name,
             *timestamp_ns,
+        );
+        // FP-5: collapse ONE logical lookup's fan-out (A+AAAA+retries ×
+        // originator stub + back-correlated forwarded leg) into a single
+        // verdict. Key on the ATTRIBUTED pid so the direct and forwarded
+        // legs — both routed to the originator — dedup together; distinct
+        // qnames/pids, or the same pair after the window, still fire.
+        if !self.dedup.lock().observe(
+            attribution.target_pid(),
+            hash_qname(query_name),
+            *timestamp_ns,
         ) {
+            return None;
+        }
+        Some(match attribution {
             DnsAttribution::Act { pid, label } => net_verdict(
                 self,
                 ResponseAction::KillProcess,
@@ -1226,11 +1346,18 @@ impl Rule for NnLNet019WildcardListener {
 /// leg must be re-routed to the originator, never the stub resolver.
 pub struct NnLNet014DnsTunnelEntropy {
     dns_cache: Arc<DnsCache>,
+    /// FP-5: rule-private dedup of repeated (originator, qname) verdicts.
+    /// Separate from -004's window — a qname that trips both must still
+    /// raise one verdict from EACH rule.
+    dedup: Arc<Mutex<DnsQnameDedupWindow>>,
 }
 
 impl NnLNet014DnsTunnelEntropy {
     pub fn new(dns_cache: Arc<DnsCache>) -> Self {
-        Self { dns_cache }
+        Self {
+            dns_cache,
+            dedup: Arc::new(Mutex::new(DnsQnameDedupWindow::new())),
+        }
     }
 
     /// Minimum first-label length to consider — short labels can't
@@ -1300,14 +1427,27 @@ impl Rule for NnLNet014DnsTunnelEntropy {
             return None;
         }
         // FP-3: forwarder-aware attribution (see NN-L-NET-004).
-        Some(match attribute_dns_query(
+        let attribution = attribute_dns_query(
             &self.dns_cache,
             *pid,
             comm,
             exe.as_deref(),
             query_name,
             *timestamp_ns,
+        );
+        // FP-5: -014 is a per-qname shape rule (one verdict per scored
+        // qname), structurally identical to -004 — the SAME logical-lookup
+        // fan-out applies, so dedup it the same way, keyed on the
+        // attributed pid + qname. (-014 owns its window; a qname tripping
+        // both -004 and -014 still fires once per rule.)
+        if !self.dedup.lock().observe(
+            attribution.target_pid(),
+            hash_qname(query_name),
+            *timestamp_ns,
         ) {
+            return None;
+        }
+        Some(match attribution {
             DnsAttribution::Act { pid, label } => net_verdict(
                 self,
                 ResponseAction::KillProcess,
@@ -1854,6 +1994,152 @@ mod tests {
         }
         let v = last.expect("originator burst fires");
         assert_eq!(v.event_pid, 99);
+    }
+
+    // ── FP-5 per-(originator, qname) qname-shape dedup (-004/-014) ─
+
+    /// FP-5 — ONE logical lookup fans out into A + AAAA + a retry for the
+    /// same name under the same originator; the qname-shape rule emits
+    /// exactly ONE verdict for the burst (the live finding's 8→1 collapse).
+    #[test]
+    fn fp5_004_same_pid_qname_burst_yields_one_verdict() {
+        let rule = net_004();
+        let long = format!("{}.example.com", "a".repeat(80));
+        // (qtype, ts_ns): A, then AAAA 5 ms later, then an A retry 130 ms
+        // later — getent's real fan-out, one originator (pid 1122). The
+        // dedup ignores qtype (the qname-shape rule does too), so A+AAAA
+        // collapse.
+        let legs = [(1u16, 0u64), (28, 5_000_000), (1, 130_000_000)];
+        let fired = legs
+            .iter()
+            .filter(|&&(qt, ts)| {
+                rule.evaluate(&dns_event_full(
+                    1122,
+                    &long,
+                    qt,
+                    "getent",
+                    Some("/usr/bin/getent"),
+                    ts,
+                ))
+                .is_some()
+            })
+            .count();
+        assert_eq!(
+            fired, 1,
+            "A+AAAA+retry for one qname collapse to a single verdict"
+        );
+    }
+
+    /// FP-5 — the finding's exact shape: the originator's own stub query
+    /// AND the resolver's back-correlated forwarded leg (FP-3 routes both
+    /// to the SAME originator pid) collapse into ONE verdict. Proves the
+    /// dedup keys on the ATTRIBUTED pid, not the raw sender.
+    #[test]
+    fn fp5_004_direct_and_back_correlated_forwarded_leg_collapse() {
+        let cache = Arc::new(DnsCache::default());
+        let long = format!("{}.example.com", "a".repeat(80));
+        // Originator (getent, pid 1122) on record so the forwarded leg
+        // back-correlates to it.
+        cache.on_dns_query(1122, long.clone(), 1, 0);
+        let rule = NnLNet004SuspiciousDnsQname::new(Arc::clone(&cache));
+        // Direct leg — the originator's own stub query (sender = 1122, not
+        // a resolver) → Act on 1122 → fires.
+        let direct = dns_event_full(1122, &long, 1, "getent", Some("/usr/bin/getent"), 0);
+        let v = rule.evaluate(&direct).expect("direct originator leg fires");
+        assert_eq!(v.event_pid, 1122);
+        // Forwarded leg ~130 ms later (sender = resolver) → back-correlates
+        // to 1122 → SAME (pid, qname) key → suppressed.
+        let fwd = dns_event_full(673, &long, 1, "systemd-resolved", Some(RESOLVER_EXE), 130_000_000);
+        assert!(
+            rule.evaluate(&fwd).is_none(),
+            "back-correlated forwarded leg collapses into the originator's verdict"
+        );
+    }
+
+    /// FP-5 — distinct qnames are distinct signals: a DGA spraying many
+    /// names must stay fully visible. N names → N verdicts (per-qname, NOT
+    /// per-pid).
+    #[test]
+    fn fp5_004_distinct_qnames_each_fire() {
+        let rule = net_004();
+        for i in 0..5u32 {
+            // 80-char first label, distinct per i, all under one pid.
+            let q = format!("{}{i:02}.example.com", "a".repeat(78));
+            assert!(
+                rule.evaluate(&dns_event_full(
+                    1122,
+                    &q,
+                    1,
+                    "getent",
+                    Some("/usr/bin/getent"),
+                    u64::from(i) * 1_000_000,
+                ))
+                .is_some(),
+                "distinct qname #{i} must fire"
+            );
+        }
+    }
+
+    /// FP-5 — the dedup suppresses a burst, it never silences a rule: a
+    /// genuine re-lookup of the same name AFTER the window fires again.
+    #[test]
+    fn fp5_004_relookup_after_window_fires_again() {
+        let rule = net_004();
+        let long = format!("{}.example.com", "a".repeat(80));
+        let ev = |ts| dns_event_full(1122, &long, 1, "getent", Some("/usr/bin/getent"), ts);
+        let t0 = 1_000_000_000u64;
+        assert!(rule.evaluate(&ev(t0)).is_some(), "first lookup fires");
+        assert!(
+            rule.evaluate(&ev(t0 + DNS_QNAME_DEDUP_WINDOW_NS - 1))
+                .is_none(),
+            "repeat inside the window is suppressed"
+        );
+        assert!(
+            rule.evaluate(&ev(t0 + DNS_QNAME_DEDUP_WINDOW_NS + 1))
+                .is_some(),
+            "re-lookup after the window fires again"
+        );
+    }
+
+    /// FP-5 — the dedup applies to -014 (entropy) too: it is a per-qname
+    /// shape rule (one verdict per scored qname), so the same A+AAAA+retry
+    /// fan-out collapses to one verdict.
+    #[test]
+    fn fp5_014_same_pid_qname_burst_yields_one_verdict() {
+        let rule = net_014();
+        let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
+        let legs = [(1u16, 0u64), (28, 5_000_000), (1, 130_000_000)];
+        let fired = legs
+            .iter()
+            .filter(|&&(qt, ts)| {
+                rule.evaluate(&dns_event_full(
+                    1122,
+                    q,
+                    qt,
+                    "getent",
+                    Some("/usr/bin/getent"),
+                    ts,
+                ))
+                .is_some()
+            })
+            .count();
+        assert_eq!(fired, 1, "-014 collapses the A+AAAA+retry burst too");
+    }
+
+    /// FP-5 — -004 and -014 hold SEPARATE dedup windows: a qname that
+    /// trips both still yields one verdict from EACH (no cross-suppression).
+    #[test]
+    fn fp5_004_and_014_do_not_cross_suppress() {
+        let r4 = net_004();
+        let r14 = net_014();
+        // First label is long (>60 total) AND high-entropy → trips both.
+        let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6.exfil.example.com";
+        let e = dns_event_full(1122, q, 1, "getent", Some("/usr/bin/getent"), 0);
+        assert!(r4.evaluate(&e).is_some(), "-004 fires");
+        assert!(
+            r14.evaluate(&e).is_some(),
+            "-014 fires on the same event — the windows are independent"
+        );
     }
 
     // ── NN-L-NET-006 ─────────────────────────────────────────────
