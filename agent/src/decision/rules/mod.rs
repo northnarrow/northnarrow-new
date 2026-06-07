@@ -93,7 +93,12 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // the operator-loaded process-comm allowlist in.
     rules.extend(process_rules_empty());
     rules.extend(module_load_rules());
-    rules.extend(crate::fim::rules::fim_rules());
+    // FIM-009 self-upgrade (§15.1): the non-production rule set has no
+    // admin dispatcher to arm an override, so FIM-009 gets an inert one
+    // (never armed → unchanged KillProcess behaviour).
+    rules.extend(crate::fim::rules::fim_rules(
+        crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
+    ));
     rules.extend(canary::canary_rules());
     // Tappa 10 (N6) — 9 NN-L-NET rules with empty boot
     // blocklists. The production agent main.rs path constructs
@@ -120,6 +125,9 @@ pub fn default_rules_with_net(
     netflow_comm_allowlist: Arc<CommAllowlist>,
     beacon_window: Arc<Mutex<net::BeaconWindow>>,
     dns_cache: Arc<crate::net::dns_cache::DnsCache>,
+    // FIM-009 self-upgrade (§15.1): the live trusted-installer override
+    // the NN-L-FIM-009 rule reads (armed by the admin dispatcher).
+    installer_override: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -139,7 +147,7 @@ pub fn default_rules_with_net(
     rules.extend(tappa2);
     rules.extend(process_rules(process_allowlist));
     rules.extend(module_load_rules());
-    rules.extend(crate::fim::rules::fim_rules());
+    rules.extend(crate::fim::rules::fim_rules(installer_override));
     rules.extend(canary::canary_rules());
     rules.extend(net::net_rules(
         blocklist,

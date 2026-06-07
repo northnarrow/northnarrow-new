@@ -1169,9 +1169,33 @@ mod tests {
                 | AdminMessage::NetResolveRequest(_)
                 | AdminMessage::NetResolveResponse(_)
                 | AdminMessage::NetFingerprintRequest(_)
-                | AdminMessage::NetFingerprintResponse(_) => {}
+                | AdminMessage::NetFingerprintResponse(_)
+                | AdminMessage::TrustedInstallerGrantRequest(_)
+                | AdminMessage::TrustedInstallerGrantResult(_) => {}
             }
         }
+    }
+
+    /// FIM-009 self-upgrade (§15.1): the trusted-installer grant request
+    /// survives a wire round-trip. The signed pre-image is re-serialised
+    /// before verify, so a field-order drift would silently break
+    /// signature verification — this anchors the CBOR/postcard shape.
+    #[test]
+    fn roundtrip_trusted_installer_grant_request() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload =
+            SignedPayload::new_trusted_installer_grant([0x44; 32], 1_700_000_000, [0x55; 16], 120);
+        roundtrip(AdminMessage::TrustedInstallerGrantRequest(
+            TrustedInstallerGrantRequest {
+                payload,
+                signatures: vec![KeyedSignature {
+                    signature: [0x66; 64],
+                }],
+            },
+        ));
+        roundtrip(AdminMessage::TrustedInstallerGrantResult(
+            AdminResult::Success,
+        ));
     }
 
     #[cfg(feature = "debug-trigger")]

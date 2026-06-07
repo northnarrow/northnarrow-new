@@ -50,6 +50,9 @@ impl RuleEngine {
         netflow_comm_allowlist: Arc<CommAllowlist>,
         beacon_window: Arc<Mutex<super::rules::net::BeaconWindow>>,
         dns_cache: Arc<crate::net::dns_cache::DnsCache>,
+        // FIM-009 self-upgrade (§15.1): the trusted-installer override
+        // the NN-L-FIM-009 rule reads (armed by the admin dispatcher).
+        installer_override: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -60,6 +63,7 @@ impl RuleEngine {
             netflow_comm_allowlist,
             beacon_window,
             dns_cache,
+            installer_override,
         ) {
             e.add_rule(r);
         }

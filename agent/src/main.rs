@@ -812,6 +812,9 @@ async fn main() -> Result<()> {
         // -014 read its reverse index to back-correlate a forwarded leg
         // to the originating process instead of the stub resolver.
         Arc::clone(&dns_cache),
+        // FIM-009 self-upgrade (§15.1): the NN-L-FIM-009 rule reads this
+        // override; the admin dispatcher arms it on a signed grant.
+        Arc::clone(&installer_override),
     );
     info!(
         rules = engine.rule_count(),
@@ -1965,6 +1968,8 @@ async fn main() -> Result<()> {
                     // short-circuits to the source event without
                     // canary filtering.
                     canary_detector.as_deref(),
+                    // FIM-009 self-upgrade (§15.1): lazy TTL expiry sweep.
+                    &installer_override,
                     e,
                 ).await,
                 None => {
@@ -2090,8 +2095,18 @@ async fn process_event(
     posture: &PostureMachine,
     ladder: &northnarrow_agent::combat::CombatLadder,
     canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
+    // FIM-009 self-upgrade (§15.1): consulted for lazy TTL expiry.
+    installer_override: &northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
     event: Event,
 ) {
+    // FIM-009 self-upgrade (§15.1): lazy TTL expiry on the event path —
+    // if a trusted-installer window has passed its deadline, close it
+    // (re-engage the FS pin + audit) before handling this event. A cheap
+    // no-op (a single atomic load) when no window is open. No timer:
+    // detection already expires exactly at the deadline via the rule's
+    // own is_window_open() read; this sweep re-syncs the kernel map.
+    installer_override.close_if_expired(Instant::now());
+
     // Tappa 9.5 (K3): canary precedence over FIM rules per
     // §12 Q9 OPTION B inline-filter lock-in. The detector
     // checks the event against the deployed canary registry;

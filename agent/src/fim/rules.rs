@@ -44,6 +44,7 @@ use common::wire::{FimEvent, FimOp};
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use crate::anti_tamper::trusted_installer::{TrustedInstallerOverride, OWN_SYSTEMD_UNITS};
 use crate::decision::Rule;
 
 // ── shared path-prefix sets ────────────────────────────────────────
@@ -727,7 +728,32 @@ impl Rule for NnLFim008KernelModuleModified {
 /// directory. High severity — MITRE T1543.002 (Systemd
 /// Service) is a persistence vector second only to cron in
 /// prevalence.
-pub struct NnLFim009SystemdUnitDropped;
+///
+/// ## FIM-009 self-upgrade downgrade (§15.1)
+///
+/// When a trusted-installer window is OPEN
+/// ([`TrustedInstallerOverride::is_window_open`]), a write to the
+/// agent's OWN units ([`OWN_SYSTEMD_UNITS`]) is an authorised in-place
+/// upgrade: the verdict is DOWNGRADED from `KillProcess`/High to an
+/// audit-level `Log`/Low — recorded, never silenced. The scope is
+/// tight: a write to ANY OTHER unit path still trips the kill even
+/// inside a window, and once the window closes (TTL / boot) our own
+/// units trip the kill again. The override read is pure (an atomic load
+/// and a deadline compare, no I/O), so the rule stays a pure function of
+/// the event plus the shared state — the same discipline as the FP carve-outs.
+pub struct NnLFim009SystemdUnitDropped {
+    installer_override: Arc<TrustedInstallerOverride>,
+}
+
+impl NnLFim009SystemdUnitDropped {
+    /// Build with the shared trusted-installer override. [`fim_rules`]
+    /// passes the live handle; the default/test rule sets pass
+    /// [`TrustedInstallerOverride::inert_arc`] (never armed → the rule
+    /// behaves exactly as it did before §15.1).
+    pub fn new(installer_override: Arc<TrustedInstallerOverride>) -> Self {
+        Self { installer_override }
+    }
+}
 
 impl Rule for NnLFim009SystemdUnitDropped {
     fn id(&self) -> &'static str {
@@ -746,6 +772,22 @@ impl Rule for NnLFim009SystemdUnitDropped {
         }
         if !starts_with_any(&fe.path, SYSTEMD_UNIT_PREFIXES) {
             return None;
+        }
+        // §15.1: inside an OPEN trusted-installer window, a write to the
+        // agent's OWN unit files is an authorised upgrade — downgrade to
+        // an audit Log (recorded, not silenced). Tight scope: any other
+        // unit, or our units with no open window, still trip the kill.
+        if OWN_SYSTEMD_UNITS.contains(&fe.path.as_str())
+            && self.installer_override.is_window_open()
+        {
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::Log,
+                Severity::Low,
+                "Systemd unit file written under an OPEN trusted-installer window \
+                 (agent's own unit) — authorised in-place upgrade, audit-only",
+            ));
         }
         Some(fim_verdict(
             self,
@@ -1661,7 +1703,7 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
 /// the front of the Critical tier — ransomware is the
 /// canonical kill-the-tree-immediately signal so it gets first
 /// pass.
-pub fn fim_rules() -> Vec<Box<dyn Rule>> {
+pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<dyn Rule>> {
     // NN-L-FIM-005's rsyslogd-append carve-out (FP-1) needs the host's
     // `syslog` uid. Resolve it once here (a /etc/passwd parse) instead
     // of per-event; `None` on a host without the user → the carve-out
@@ -1679,7 +1721,7 @@ pub fn fim_rules() -> Vec<Box<dyn Rule>> {
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
         Box::new(NnLFim007CronDropInCreated::with_fresh_window()),
-        Box::new(NnLFim009SystemdUnitDropped),
+        Box::new(NnLFim009SystemdUnitDropped::new(installer_override)),
         // C5.3 — cloud credential read family. Same High
         // tier as the rest of the credential-access bucket
         // (NN-L-FIM-003 sensitive config / NN-L-FIM-004
@@ -1845,7 +1887,7 @@ mod tests {
             parent_start_ns: 0,
             parent_is_kthread: false,
         };
-        for rule in fim_rules() {
+        for rule in fim_rules(TrustedInstallerOverride::inert_arc()) {
             assert!(
                 rule.evaluate(&proc_event).is_none(),
                 "rule {} must not fire on ProcessSpawn",
@@ -2408,7 +2450,7 @@ mod tests {
 
     #[test]
     fn fim009_fires_on_systemd_unit_dropped_or_modified() {
-        let r = NnLFim009SystemdUnitDropped;
+        let r = NnLFim009SystemdUnitDropped::new(TrustedInstallerOverride::inert_arc());
         for (op, path) in &[
             (FimOp::Created, "/etc/systemd/system/evil.service"),
             (FimOp::Modified, "/lib/systemd/system/sshd.service"),
@@ -2423,7 +2465,7 @@ mod tests {
 
     #[test]
     fn fim009_does_not_fire_on_systemd_socket_or_runtime() {
-        let r = NnLFim009SystemdUnitDropped;
+        let r = NnLFim009SystemdUnitDropped::new(TrustedInstallerOverride::inert_arc());
         // /run/systemd/system/ is runtime state, not a unit file
         // root. systemctl writes runtime overrides there; not
         // a persistence vector.
@@ -2432,11 +2474,71 @@ mod tests {
             .is_none());
     }
 
+    // ── NN-L-FIM-009 — FIM-009 self-upgrade downgrade (§15.1) ────
+
+    /// An armed override with a future deadline. `bpffs_root: None`
+    /// keeps the kernel-map write a no-op; the in-memory window still
+    /// opens, which is exactly what the rule reads.
+    fn armed_override() -> Arc<TrustedInstallerOverride> {
+        let ov = Arc::new(TrustedInstallerOverride::new(
+            None,
+            0,
+            None,
+            std::time::Duration::from_secs(600),
+        ));
+        ov.arm(120, std::time::Instant::now());
+        ov
+    }
+
+    /// Inside an OPEN window, a write to the agent's OWN unit is
+    /// downgraded from KillProcess/High to an audit Log/Low.
+    #[test]
+    fn fim009_downgrades_own_unit_under_open_window() {
+        let r = NnLFim009SystemdUnitDropped::new(armed_override());
+        let v = r
+            .evaluate(&fim_event(
+                FimOp::Modified,
+                "/etc/systemd/system/northnarrow-agent.service",
+            ))
+            .expect("own-unit write still produces a verdict");
+        assert_eq!(v.action, ResponseAction::Log, "downgraded to audit, not silenced");
+        assert_eq!(v.severity, Severity::Low);
+        // The write is still attributed (pid carried for the audit row).
+        assert_eq!(v.event_pid, 42);
+    }
+
+    /// With NO open window (disarmed override), the agent's own unit
+    /// trips the kill exactly as before — the default detect posture.
+    #[test]
+    fn fim009_kills_own_unit_when_window_closed() {
+        let r = NnLFim009SystemdUnitDropped::new(TrustedInstallerOverride::inert_arc());
+        let v = r
+            .evaluate(&fim_event(
+                FimOp::Modified,
+                "/etc/systemd/system/northnarrow-agent.service",
+            ))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.severity, Severity::High);
+    }
+
+    /// Tight scope: a FOREIGN unit still trips KillProcess even while a
+    /// window is open — the downgrade is ONLY for the agent's own units.
+    #[test]
+    fn fim009_kills_foreign_unit_even_under_open_window() {
+        let r = NnLFim009SystemdUnitDropped::new(armed_override());
+        let v = r
+            .evaluate(&fim_event(FimOp::Created, "/etc/systemd/system/evil.service"))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.severity, Severity::High);
+    }
+
     // ── builder hygiene ─────────────────────────────────────────
 
     #[test]
     fn fim_rules_builder_returns_distinct_rules() {
-        let rules = fim_rules();
+        let rules = fim_rules(TrustedInstallerOverride::inert_arc());
         // C5.1 grew the set from 9 → 10 with the
         // NN-L-FIM-010 ransomware-extension rule. Count
         // assertion lifted from a literal 9 to "matches the
@@ -2888,7 +2990,7 @@ mod tests {
         // C5 shipped 9, C5.1 added 1, C5.3 added 4 → 14; Tappa 10.5
         // D3 adds NN-L-FIM-015..023 (9) → 23; Tappa 9.5.1 adds
         // NN-L-FIM-024 (anti-tamper bait) → 24 total.
-        let n = fim_rules().len();
+        let n = fim_rules(TrustedInstallerOverride::inert_arc()).len();
         assert_eq!(n, 24, "expected 24 FIM rules post-T9.5.1, got {n}");
     }
 
