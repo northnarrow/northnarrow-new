@@ -507,16 +507,39 @@ impl Rule for NnLFim006OperatorBinaryModified {
 /// operator edit of the same file.
 const CRON_DEDUP_WINDOW_NS: u64 = 2_000_000_000;
 
-/// FP-3 dedup state for NN-L-FIM-007. A single `crontab -e` (or an
-/// editor's atomic-save of `/etc/crontab`) drives the kernel FIM hooks
-/// several times for ONE logical edit, so the drain emits ~6
-/// `Event::Fim`s on the SAME `(modifier_pid, path)` within a few
-/// milliseconds — and the rule used to raise ~6 identical KillProcess
-/// verdicts for the one persistence event. This window collapses that
-/// burst: the FIRST hit on a `(pid, path)` fires; repeats within
-/// [`CRON_DEDUP_WINDOW_NS`] are suppressed. A genuinely separate edit
-/// (same pair, but after the window) OR a distinct path / pid still
-/// fires, so two real drop-ins never coalesce.
+/// Normalize a cron path to its dedup *bucket* — the [`CRON_DROPIN_PATHS`]
+/// root it falls under, trailing slash trimmed (`/var/spool/cron`,
+/// `/etc/cron.d`, `/etc/crontab`, …). One logical crontab edit is atomic
+/// yet touches THREE distinct paths — the temp file, the
+/// renamed-into-place crontab, and the spool directory itself, e.g.
+/// `/var/spool/cron/crontabs/tmp.AbC12`, `/var/spool/cron/crontabs/root`,
+/// and `/var/spool/cron/crontabs` — all of which share the
+/// `/var/spool/cron/` root. Keying the dedup on the bucket (not the exact
+/// path) collapses the trio to ONE `(pid, /var/spool/cron)` verdict.
+/// Returns `None` for a non-cron path, so this doubles as the rule's
+/// path-match check. The bucket is `&'static str` (it IS the matched
+/// root), so the dedup key never allocates.
+fn cron_dedup_bucket(path: &str) -> Option<&'static str> {
+    CRON_DROPIN_PATHS
+        .iter()
+        .copied()
+        .find(|root| path.starts_with(root))
+        .map(|root| root.strip_suffix('/').unwrap_or(root))
+}
+
+/// FP-4 dedup state for NN-L-FIM-007. A single `crontab -e` (or an
+/// editor's atomic-save of `/etc/crontab`) is atomic yet drives the
+/// kernel FIM hooks several times across the THREE distinct paths of one
+/// logical edit — the temp file, the renamed-into-place crontab, and the
+/// spool directory itself — so the drain emits ~6 `Event::Fim`s for one
+/// persistence event and the rule used to raise ~6 (FP-3: still ~3,
+/// one per path) identical KillProcess verdicts. Keying on the cron
+/// *directory bucket* ([`cron_dedup_bucket`]) rather than the exact path
+/// collapses all of them: the FIRST hit on a `(pid, bucket)` fires;
+/// repeats within [`CRON_DEDUP_WINDOW_NS`] are suppressed. A genuinely
+/// separate event — a distinct cron directory, a distinct pid, or the
+/// same pair after the window — still fires, so two real drop-ins never
+/// coalesce.
 ///
 /// Stateful-rule precedent: mirrors NN-L-NET-005's
 /// [`DnsBurstWindow`](crate::decision::rules::net::DnsBurstWindow) —
@@ -525,8 +548,10 @@ const CRON_DEDUP_WINDOW_NS: u64 = 2_000_000_000;
 /// of the event + its own state).
 #[derive(Debug, Default)]
 pub struct CronEditWindow {
-    /// `(modifier_pid, path)` → ns of the last verdict we FIRED for it.
-    last_fired: HashMap<(u32, String), u64>,
+    /// `(modifier_pid, cron-directory bucket)` → ns of the last verdict
+    /// we FIRED for it. The bucket is a `&'static str` from
+    /// [`CRON_DROPIN_PATHS`], so the key never allocates.
+    last_fired: HashMap<(u32, &'static str), u64>,
 }
 
 impl CronEditWindow {
@@ -534,7 +559,7 @@ impl CronEditWindow {
         Self::default()
     }
 
-    /// Record a cron-path hit for `(pid, path)` at `ts_ns` and report
+    /// Record a cron-path hit for `(pid, bucket)` at `ts_ns` and report
     /// whether NN-L-FIM-007 should FIRE for it. `true` for the first hit
     /// on a pair (and the first after the window lapses); `false` for a
     /// repeat inside the window. The window is anchored on the last FIRE
@@ -544,13 +569,13 @@ impl CronEditWindow {
     /// has aged past the window on every call, so the map only ever
     /// holds pairs touched in the last window (cron writes are rare — in
     /// steady state it is empty).
-    pub fn observe(&mut self, pid: u32, path: &str, ts_ns: u64) -> bool {
+    pub fn observe(&mut self, pid: u32, bucket: &'static str, ts_ns: u64) -> bool {
         // Drop pairs whose last fire is older than the window. This both
         // bounds the map AND makes "present after prune ⇒ still within
         // the window ⇒ suppress" hold, so the check below is a lookup.
         self.last_fired
             .retain(|_, &mut last| ts_ns.saturating_sub(last) < CRON_DEDUP_WINDOW_NS);
-        let key = (pid, path.to_string());
+        let key = (pid, bucket);
         if self.last_fired.contains_key(&key) {
             return false;
         }
@@ -607,18 +632,18 @@ impl Rule for NnLFim007CronDropInCreated {
         if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
             return None;
         }
-        if !CRON_DROPIN_PATHS.iter().any(|p| fe.path.starts_with(p)) {
-            return None;
-        }
-        // FP-3: collapse the multi-FIM-op burst of ONE logical edit
-        // (create + writes + setattr on the same target) into a single
-        // verdict. Repeats on the same (modifier_pid, path) within the
-        // window are suppressed; a distinct path / pid, or the same pair
-        // after the window, still fires.
+        let bucket = cron_dedup_bucket(&fe.path)?;
+        // FP-4: collapse the multi-FIM-op burst of ONE logical edit into a
+        // single verdict. A crontab install is atomic but touches three
+        // distinct paths — temp file, renamed-into-place crontab, and the
+        // spool directory — all sharing one cron-directory bucket, so we
+        // key on (modifier_pid, bucket): repeats within the window are
+        // suppressed; a distinct cron dir / pid, or the same pair after
+        // the window, still fires.
         if !self
             .dedup
             .lock()
-            .observe(fe.modifier_pid, &fe.path, fe.timestamp_ns)
+            .observe(fe.modifier_pid, bucket, fe.timestamp_ns)
         {
             return None;
         }
@@ -2182,63 +2207,82 @@ mod tests {
         })
     }
 
-    /// FP-3: a single crontab edit fans out into several FIM ops on the
-    /// same `(pid, path)` within milliseconds; NN-L-FIM-007 must collapse
-    /// the burst into exactly ONE verdict (was ~6).
+    /// FP-4: a single `crontab -e` install is atomic but fans out into
+    /// several FIM ops across THREE distinct paths within milliseconds —
+    /// the temp file, the renamed-into-place crontab, and the spool
+    /// directory itself. The per-path dedup (FP-3) collapsed each path's
+    /// own repeats but still emitted one verdict per path (~3); keying on
+    /// the cron-directory bucket must collapse the whole burst into
+    /// exactly ONE verdict.
     #[test]
     fn fim007_dedups_single_edit_burst_into_one_verdict() {
         let r = NnLFim007CronDropInCreated::with_fresh_window();
-        let path = "/var/spool/cron/crontabs/root";
         let pid = 909;
         let base = 1_700_000_000_000_000_000u64;
-        // The op-sequence of one `crontab -e` install: a create (rename
-        // normalized to Created by the drain) plus content writes + a
-        // setattr, all a few ms apart on the same target.
+        // The op-sequence of one `crontab -e` install: write a temp file,
+        // rename it into place (the drain normalizes the rename target to
+        // Created), and the spool directory gets a setattr — three
+        // DISTINCT paths, same pid, all a few ms apart, one logical edit.
+        let tmp = "/var/spool/cron/crontabs/tmp.AbC123";
+        let final_ = "/var/spool/cron/crontabs/root";
+        let dir = "/var/spool/cron/crontabs";
         let burst = [
-            (FimOp::Created, base),
-            (FimOp::Modified, base + 1_000_000),  // +1 ms
-            (FimOp::Modified, base + 3_000_000),  // +3 ms
-            (FimOp::Modified, base + 7_000_000),  // +7 ms
-            (FimOp::Modified, base + 12_000_000), // +12 ms
-            (FimOp::Modified, base + 20_000_000), // +20 ms
+            (FimOp::Created, tmp, base),                  // mkstemp
+            (FimOp::Modified, tmp, base + 1_000_000),     // +1 ms write content
+            (FimOp::Created, final_, base + 5_000_000),   // +5 ms rename → final
+            (FimOp::Modified, dir, base + 5_000_000),     // +5 ms dir entry changed
+            (FimOp::Modified, final_, base + 8_000_000),  // +8 ms setattr on final
+            (FimOp::Modified, dir, base + 10_000_000),    // +10 ms dir setattr
         ];
         let fired = burst
             .iter()
-            .filter(|(op, ts)| r.evaluate(&cron_event(*op, path, pid, *ts)).is_some())
+            .filter(|(op, path, ts)| r.evaluate(&cron_event(*op, *path, pid, *ts)).is_some())
             .count();
         assert_eq!(
             fired, 1,
-            "one logical edit (6 FIM ops) must yield exactly ONE verdict"
+            "one logical edit (6 FIM ops across 3 paths in one cron dir) \
+             must yield exactly ONE verdict"
         );
     }
 
-    /// The dedup is per `(pid, path)`: two genuinely distinct drop-ins
-    /// (different files) BOTH fire even back-to-back, the same file
-    /// touched by a different pid fires, and a separate edit of the SAME
-    /// file after the window lapses fires again — real persistence
-    /// events are never swallowed.
+    /// The dedup key is now `(pid, cron-directory bucket)`, not
+    /// `(pid, exact path)`: one logical edit touches several paths in ONE
+    /// cron dir, so same-dir / same-pid hits inside the window coalesce.
+    /// But genuinely distinct persistence events are never swallowed: a
+    /// DIFFERENT cron directory, a DIFFERENT pid, and a re-edit of the same
+    /// dir AFTER the window all still fire.
     #[test]
-    fn fim007_distinct_paths_pids_and_post_window_edits_still_fire() {
+    fn fim007_distinct_dirs_pids_and_post_window_edits_still_fire() {
         let r = NnLFim007CronDropInCreated::with_fresh_window();
         let base = 1_700_000_000_000_000_000u64;
-        // Distinct paths, same pid + instant → both fire (different keys).
+        // First drop-in into /etc/cron.d → fires.
         assert!(
             r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-a", 5, base))
                 .is_some(),
             "first distinct drop-in must fire"
         );
+        // A SECOND file in the SAME cron dir by the SAME pid within the
+        // window is part of one logical edit (temp + final + dir all share
+        // a directory) → coalesced. The KillProcess verdict already targets
+        // pid 5, so the shared actor is still neutralized.
         assert!(
-            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-b", 5, base))
-                .is_some(),
-            "a second, distinct drop-in path must still fire"
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-b", 5, base + 5_000_000))
+                .is_none(),
+            "a second path in the same cron dir + pid + window must coalesce"
         );
-        // Same path, DIFFERENT pid → distinct key → fires.
+        // A DISTINCT cron directory (same pid + instant) → distinct key → fires.
         assert!(
-            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-a", 6, base))
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.daily/job-c", 5, base))
                 .is_some(),
-            "same path by a different pid is a distinct event — must fire"
+            "a distinct cron directory must still fire"
         );
-        // Same (pid, path) again within the window → suppressed.
+        // Same cron dir, DIFFERENT pid → distinct key → fires.
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-d", 6, base))
+                .is_some(),
+            "the same cron dir touched by a different pid is a distinct event — must fire"
+        );
+        // A repeat on /etc/cron.d by pid 5 still inside the window → suppressed.
         assert!(
             r.evaluate(&cron_event(
                 FimOp::Modified,
@@ -2247,7 +2291,7 @@ mod tests {
                 base + 100_000_000 // +100 ms
             ))
             .is_none(),
-            "a repeat on the same (pid, path) inside the window must be suppressed"
+            "a repeat on the same (pid, cron dir) inside the window must be suppressed"
         );
         // …and after the 2 s window lapses → fires again (a real 2nd edit).
         assert!(
