@@ -176,13 +176,33 @@ unsafe fn is_protected(key: &InodeKey) -> bool {
     PROTECTED_INODES.get(key).is_some()
 }
 
-/// Read [`FS_PROTECT_OVERRIDE`] slot 0; non-zero = bypass.
+/// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
+/// is active iff `FS_PROTECT_OVERRIDE[0]` is non-zero AND equals this
+/// boot's session nonce in [`crate::task_kill::AGENT_SESSION`]`[0]`.
+///
+/// Mirrors the `task_kill` PID-1 carve-out shape. The userland agent
+/// arms the override by writing the per-boot session nonce (see
+/// `agent/src/anti_tamper/trusted_installer.rs`) and boot-zeroes
+/// `FS_PROTECT_OVERRIDE` on every start. The session-nonce compare is
+/// the anti-stale-pin backstop: a leftover `FS_PROTECT_OVERRIDE` value
+/// pinned by a PRIOR install cannot re-open the FS pin for THIS boot,
+/// because the freshly-rolled `AGENT_SESSION` nonce won't match it.
+/// (A bare `!= 0` check would honour such a stale value — the original
+/// stub's documented "must be zeroed on boot" caveat, now closed.)
 #[inline(always)]
 fn override_active() -> bool {
-    match FS_PROTECT_OVERRIDE.get(0) {
-        Some(v) => *v != 0,
-        None => false,
+    let ov = match FS_PROTECT_OVERRIDE.get(0) {
+        Some(v) => *v,
+        None => 0,
+    };
+    if ov == 0 {
+        return false;
     }
+    let session = match crate::task_kill::AGENT_SESSION.get(0) {
+        Some(v) => *v,
+        None => 0,
+    };
+    ov == session
 }
 
 /// Best-effort audit record. Silently drops if the ringbuffer is
