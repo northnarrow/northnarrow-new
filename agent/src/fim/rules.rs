@@ -37,8 +37,12 @@
 //! the whitelist exempts well-known signed-update tools by
 //! comm.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use common::wire::{FimEvent, FimOp};
 use common::{Event, ResponseAction, Severity, Verdict};
+use parking_lot::Mutex;
 
 use crate::decision::Rule;
 
@@ -496,12 +500,94 @@ impl Rule for NnLFim006OperatorBinaryModified {
 
 // ── NN-L-FIM-007 — cron drop-in created ────────────────────────────
 
+/// FP-3 coalescing window for ONE logical cron edit. 2 s comfortably
+/// spans the multi-syscall op-sequence of a single `crontab` install /
+/// atomic editor save (create + content writes + setattr, all µs
+/// apart) while staying far below the cadence of any plausible distinct
+/// operator edit of the same file.
+const CRON_DEDUP_WINDOW_NS: u64 = 2_000_000_000;
+
+/// FP-3 dedup state for NN-L-FIM-007. A single `crontab -e` (or an
+/// editor's atomic-save of `/etc/crontab`) drives the kernel FIM hooks
+/// several times for ONE logical edit, so the drain emits ~6
+/// `Event::Fim`s on the SAME `(modifier_pid, path)` within a few
+/// milliseconds — and the rule used to raise ~6 identical KillProcess
+/// verdicts for the one persistence event. This window collapses that
+/// burst: the FIRST hit on a `(pid, path)` fires; repeats within
+/// [`CRON_DEDUP_WINDOW_NS`] are suppressed. A genuinely separate edit
+/// (same pair, but after the window) OR a distinct path / pid still
+/// fires, so two real drop-ins never coalesce.
+///
+/// Stateful-rule precedent: mirrors NN-L-NET-005's
+/// [`DnsBurstWindow`](crate::decision::rules::net::DnsBurstWindow) —
+/// `&mut self` behind an `Arc<Mutex<_>>`, clocked by the event-carried
+/// `timestamp_ns` (no syscall clock, so the rule stays a pure function
+/// of the event + its own state).
+#[derive(Debug, Default)]
+pub struct CronEditWindow {
+    /// `(modifier_pid, path)` → ns of the last verdict we FIRED for it.
+    last_fired: HashMap<(u32, String), u64>,
+}
+
+impl CronEditWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a cron-path hit for `(pid, path)` at `ts_ns` and report
+    /// whether NN-L-FIM-007 should FIRE for it. `true` for the first hit
+    /// on a pair (and the first after the window lapses); `false` for a
+    /// repeat inside the window. The window is anchored on the last FIRE
+    /// (a suppressed repeat does NOT extend it), so a sustained drip of
+    /// cron drops still surfaces roughly every [`CRON_DEDUP_WINDOW_NS`]
+    /// rather than being silenced outright. Prunes pairs whose last fire
+    /// has aged past the window on every call, so the map only ever
+    /// holds pairs touched in the last window (cron writes are rare — in
+    /// steady state it is empty).
+    pub fn observe(&mut self, pid: u32, path: &str, ts_ns: u64) -> bool {
+        // Drop pairs whose last fire is older than the window. This both
+        // bounds the map AND makes "present after prune ⇒ still within
+        // the window ⇒ suppress" hold, so the check below is a lookup.
+        self.last_fired
+            .retain(|_, &mut last| ts_ns.saturating_sub(last) < CRON_DEDUP_WINDOW_NS);
+        let key = (pid, path.to_string());
+        if self.last_fired.contains_key(&key) {
+            return false;
+        }
+        self.last_fired.insert(key, ts_ns);
+        true
+    }
+}
+
 /// `Created` op against any of the cron drop-in roots. High
 /// severity — MITRE T1053.003 (Cron) is the canonical
 /// scheduled-task persistence vector. Includes
 /// `/etc/crontab` as an exact-match path (it's a file, not
 /// a dir, so the `starts_with` check works both ways).
-pub struct NnLFim007CronDropInCreated;
+///
+/// FP-3 dedup: a single logical crontab edit drives the FIM hooks
+/// several times (create + writes + setattr) on one `(pid, path)`,
+/// which previously raised ~6 identical KillProcess verdicts. The rule
+/// now holds a [`CronEditWindow`] and fires ONCE per
+/// `(modifier_pid, path)` per [`CRON_DEDUP_WINDOW_NS`]; distinct paths /
+/// pids, and the same pair after the window, still fire.
+pub struct NnLFim007CronDropInCreated {
+    dedup: Arc<Mutex<CronEditWindow>>,
+}
+
+impl NnLFim007CronDropInCreated {
+    /// Build with a caller-supplied dedup window (symmetry with the
+    /// NN-L-NET stateful-rule factories; lets a test share / inspect it).
+    pub fn new(dedup: Arc<Mutex<CronEditWindow>>) -> Self {
+        Self { dedup }
+    }
+
+    /// Convenience: allocate a fresh, rule-private dedup window. Used by
+    /// [`fim_rules`] (one window per engine) and the unit tests.
+    pub fn with_fresh_window() -> Self {
+        Self::new(Arc::new(Mutex::new(CronEditWindow::new())))
+    }
+}
 
 impl Rule for NnLFim007CronDropInCreated {
     fn id(&self) -> &'static str {
@@ -522,6 +608,18 @@ impl Rule for NnLFim007CronDropInCreated {
             return None;
         }
         if !CRON_DROPIN_PATHS.iter().any(|p| fe.path.starts_with(p)) {
+            return None;
+        }
+        // FP-3: collapse the multi-FIM-op burst of ONE logical edit
+        // (create + writes + setattr on the same target) into a single
+        // verdict. Repeats on the same (modifier_pid, path) within the
+        // window are suppressed; a distinct path / pid, or the same pair
+        // after the window, still fires.
+        if !self
+            .dedup
+            .lock()
+            .observe(fe.modifier_pid, &fe.path, fe.timestamp_ns)
+        {
             return None;
         }
         Some(fim_verdict(
@@ -1529,7 +1627,7 @@ pub fn fim_rules() -> Vec<Box<dyn Rule>> {
         Box::new(NnLFim003SensitiveConfigModified),
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
-        Box::new(NnLFim007CronDropInCreated),
+        Box::new(NnLFim007CronDropInCreated::with_fresh_window()),
         Box::new(NnLFim009SystemdUnitDropped),
         // C5.3 — cloud credential read family. Same High
         // tier as the rest of the credential-access bucket
@@ -2037,7 +2135,7 @@ mod tests {
 
     #[test]
     fn fim007_fires_on_cron_dropin_created_or_modified() {
-        let r = NnLFim007CronDropInCreated;
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
         for (op, path) in &[
             (FimOp::Created, "/etc/cron.d/x"),
             (FimOp::Created, "/etc/cron.daily/y"),
@@ -2054,13 +2152,114 @@ mod tests {
 
     #[test]
     fn fim007_does_not_fire_on_unrelated_paths() {
-        let r = NnLFim007CronDropInCreated;
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
         assert!(r
             .evaluate(&fim_event(FimOp::Created, "/etc/passwd"))
             .is_none());
         assert!(r
             .evaluate(&fim_event(FimOp::Created, "/var/spool/lpd/x"))
             .is_none());
+    }
+
+    /// FP-3 dedup helper: a cron-path event with a caller-chosen
+    /// modifier pid + timestamp so the `(pid, path, ts)` window
+    /// behaviour is exercisable (the default `fim_event` pins both).
+    fn cron_event(op: FimOp, path: &str, pid: u32, ts_ns: u64) -> Event {
+        Event::Fim(FimEvent {
+            timestamp_ns: ts_ns,
+            path: path.to_string(),
+            op,
+            new_sha256: Some([0xAA; 32]),
+            baseline_sha256: Some([0xBB; 32]),
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: None,
+            modifier_pid: pid,
+            modifier_uid: 0,
+            modifier_comm: "crontab".to_string(),
+            dest_path: None,
+            child_truncated: false,
+        })
+    }
+
+    /// FP-3: a single crontab edit fans out into several FIM ops on the
+    /// same `(pid, path)` within milliseconds; NN-L-FIM-007 must collapse
+    /// the burst into exactly ONE verdict (was ~6).
+    #[test]
+    fn fim007_dedups_single_edit_burst_into_one_verdict() {
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        let path = "/var/spool/cron/crontabs/root";
+        let pid = 909;
+        let base = 1_700_000_000_000_000_000u64;
+        // The op-sequence of one `crontab -e` install: a create (rename
+        // normalized to Created by the drain) plus content writes + a
+        // setattr, all a few ms apart on the same target.
+        let burst = [
+            (FimOp::Created, base),
+            (FimOp::Modified, base + 1_000_000),  // +1 ms
+            (FimOp::Modified, base + 3_000_000),  // +3 ms
+            (FimOp::Modified, base + 7_000_000),  // +7 ms
+            (FimOp::Modified, base + 12_000_000), // +12 ms
+            (FimOp::Modified, base + 20_000_000), // +20 ms
+        ];
+        let fired = burst
+            .iter()
+            .filter(|(op, ts)| r.evaluate(&cron_event(*op, path, pid, *ts)).is_some())
+            .count();
+        assert_eq!(
+            fired, 1,
+            "one logical edit (6 FIM ops) must yield exactly ONE verdict"
+        );
+    }
+
+    /// The dedup is per `(pid, path)`: two genuinely distinct drop-ins
+    /// (different files) BOTH fire even back-to-back, the same file
+    /// touched by a different pid fires, and a separate edit of the SAME
+    /// file after the window lapses fires again — real persistence
+    /// events are never swallowed.
+    #[test]
+    fn fim007_distinct_paths_pids_and_post_window_edits_still_fire() {
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        let base = 1_700_000_000_000_000_000u64;
+        // Distinct paths, same pid + instant → both fire (different keys).
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-a", 5, base))
+                .is_some(),
+            "first distinct drop-in must fire"
+        );
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-b", 5, base))
+                .is_some(),
+            "a second, distinct drop-in path must still fire"
+        );
+        // Same path, DIFFERENT pid → distinct key → fires.
+        assert!(
+            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-a", 6, base))
+                .is_some(),
+            "same path by a different pid is a distinct event — must fire"
+        );
+        // Same (pid, path) again within the window → suppressed.
+        assert!(
+            r.evaluate(&cron_event(
+                FimOp::Modified,
+                "/etc/cron.d/job-a",
+                5,
+                base + 100_000_000 // +100 ms
+            ))
+            .is_none(),
+            "a repeat on the same (pid, path) inside the window must be suppressed"
+        );
+        // …and after the 2 s window lapses → fires again (a real 2nd edit).
+        assert!(
+            r.evaluate(&cron_event(
+                FimOp::Modified,
+                "/etc/cron.d/job-a",
+                5,
+                base + CRON_DEDUP_WINDOW_NS
+            ))
+            .is_some(),
+            "a genuinely separate edit after the window must fire again"
+        );
     }
 
     // ── NN-L-FIM-008 ────────────────────────────────────────────
