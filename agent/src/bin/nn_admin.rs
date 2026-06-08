@@ -36,11 +36,11 @@ use northnarrow_agent::admin_cli::{
     load_audit_pubkey, run_audit_read, run_audit_verify, run_canary_burn, run_canary_deploy,
     run_canary_list, run_canary_refresh, run_fim_baseline, run_fim_report, run_fim_status,
     run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
-    run_status, run_unlock, run_verify_keys, AuditVerifyOutcome, CanaryBurnOutcome,
-    CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome, CanaryRefreshOutcome,
-    FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome,
-    NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome, UnlockOutcome,
-    VerifyKeysOutcome,
+    run_status, run_trusted_installer_grant, run_unlock, run_verify_keys, AuditVerifyOutcome,
+    CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome,
+    CanaryRefreshOutcome, FimBaselineOutcome, FimReportOutcome, FimStatusOutcome,
+    ForcePostureOutcome, NetJsonlOutcome, NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome,
+    StatusOutcome, TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -54,6 +54,11 @@ const DEFAULT_AGENT_ID_PATH: &str = "/etc/northnarrow/agent_id";
 /// Operator-chosen default per design §10.2 — 30 s is the typical
 /// "drain in-flight work" window before the watchdog deadline.
 const DEFAULT_GRACE_SECS: u32 = 30;
+/// FIM-009 self-upgrade (§15.1) default override window — short by
+/// design (just enough to run install.sh + `systemctl restart`).
+/// Clamped client-side to the agent's
+/// `MAX_TRUSTED_INSTALLER_WINDOW_SECS` (600 s) ceiling.
+const DEFAULT_TRUSTED_INSTALLER_WINDOW_SECS: u32 = 120;
 
 #[derive(Parser, Debug)]
 #[command(name = "nn-admin", version, about = "NorthNarrow admin CLI")]
@@ -259,6 +264,34 @@ enum Cmd {
     Net {
         #[command(subcommand)]
         sub: NetCmd,
+    },
+
+    /// FIM-009 self-upgrade (§15.1) — arm the trusted-installer
+    /// override for an in-place agent upgrade. Submits a 1-of-N (M=1)
+    /// quorum-signed grant; the admin.pub line for `--key` MUST carry
+    /// the `trusted-installer` role. While the window is open the
+    /// agent's FS pin is suspended (so install.sh can replace the
+    /// protected binary) AND a write to the agent's OWN systemd units
+    /// is downgraded from kill to an audit Log. The window is bounded
+    /// by --window-secs (clamped to the agent's 600 s ceiling) and by
+    /// the next agent restart. Operator flow: grant → install.sh →
+    /// `systemctl restart` → signed `fim baseline`.
+    TrustedInstallerGrant {
+        /// Path to the operator's `trusted-installer`-role admin
+        /// private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// Override window in seconds. Clamped to the agent's 600 s
+        /// ceiling. Keep it short — just long enough to run install.sh
+        /// and restart the unit.
+        #[arg(long = "window-secs", default_value_t = DEFAULT_TRUSTED_INSTALLER_WINDOW_SECS)]
+        window_secs: u32,
+        /// Path to the agent's per-install UUID file (design §6.5) —
+        /// binds the signed grant to this specific agent install.
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 
     /// Debug-only: force the agent's posture state machine into a
@@ -1012,6 +1045,33 @@ fn main() -> ExitCode {
             }
         },
 
+        Cmd::TrustedInstallerGrant {
+            key,
+            window_secs,
+            agent_id_file,
+            socket,
+        } => {
+            // Clamp client-side to the agent's ceiling (the agent also
+            // clamps; this gives the operator a clear message instead
+            // of a silent server-side reduction).
+            let max =
+                northnarrow_agent::anti_tamper::trusted_installer::MAX_TRUSTED_INSTALLER_WINDOW_SECS;
+            let clamped = window_secs.clamp(1, max);
+            if clamped != window_secs {
+                eprintln!(
+                    "trusted-installer-grant: --window-secs {window_secs} clamped to {clamped} \
+                     (agent ceiling)"
+                );
+            }
+            match run_trusted_installer_grant(&socket, &key, &agent_id_file, clamped) {
+                Ok(outcome) => exit_from_trusted_installer_grant(outcome, clamped),
+                Err(e) => {
+                    eprintln!("trusted-installer-grant: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
+
         #[cfg(feature = "debug-trigger")]
         Cmd::Debug {
             sub: DebugCmd::ForcePosture { state, socket },
@@ -1589,6 +1649,85 @@ fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
         }
         FimBaselineOutcome::ProtocolVersionUnsupported { server_version } => {
             eprintln!("fim baseline: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// FIM-009 self-upgrade (§15.1): map [`TrustedInstallerGrantOutcome`]
+/// to a stable exit code — same contract as [`exit_from_fim_baseline`]
+/// (0 success; 2 bad-sig; 3 no-challenge; 4 rate-limited; 5 transport/
+/// skew/agent-id/unknown-op/version; 6 quorum; 7 role-denied).
+fn exit_from_trusted_installer_grant(
+    outcome: TrustedInstallerGrantOutcome,
+    window_secs: u32,
+) -> ExitCode {
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        TrustedInstallerGrantOutcome::Success => {
+            println!(
+                "{}",
+                colorize(
+                    &format!(
+                        "trusted-installer-grant: override armed for {window_secs}s — FS pin \
+                         suspended; the agent's own systemd-unit writes are downgraded to an \
+                         audit Log. Run install.sh + `systemctl restart` now; the window closes \
+                         at the deadline or on restart, whichever comes first."
+                    ),
+                    "32",
+                    tty
+                )
+            );
+            ExitCode::SUCCESS
+        }
+        TrustedInstallerGrantOutcome::InvalidSignature => {
+            eprintln!(
+                "trusted-installer-grant: invalid signature (key not in admin.pub, or wrong bytes)"
+            );
+            ExitCode::from(2)
+        }
+        TrustedInstallerGrantOutcome::NoPendingChallenge => {
+            eprintln!("trusted-installer-grant: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        TrustedInstallerGrantOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("trusted-installer-grant: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        TrustedInstallerGrantOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("trusted-installer-grant: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        TrustedInstallerGrantOutcome::RoleDenied => {
+            eprintln!(
+                "trusted-installer-grant: role denied (the submitted key lacks the \
+                 `trusted-installer` role in admin.pub — add it to the line's role list)"
+            );
+            ExitCode::from(7)
+        }
+        TrustedInstallerGrantOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!(
+                "trusted-installer-grant: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s); \
+                 NTP-sync this host and the agent host, then retry"
+            );
+            ExitCode::from(5)
+        }
+        TrustedInstallerGrantOutcome::AgentIdMismatch => {
+            eprintln!(
+                "trusted-installer-grant: agent_id mismatch (the --agent-id-file content doesn't \
+                 match the agent's bootstrapped UUID)"
+            );
+            ExitCode::from(5)
+        }
+        TrustedInstallerGrantOutcome::UnknownOperation => {
+            eprintln!("trusted-installer-grant: server rejected operation");
+            ExitCode::from(5)
+        }
+        TrustedInstallerGrantOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("trusted-installer-grant: server speaks protocol v{server_version}");
             ExitCode::from(5)
         }
     }
