@@ -389,6 +389,19 @@ impl Rule for NnLFim004AuthorizedKeysModified {
 /// diverged baseline (`baseline_size`); the rule stays a pure
 /// function of the event (no `/proc` reads here — that resolution
 /// happens upstream in the drain).
+///
+/// ## FP-6 carve-out — binary login-record logs
+///
+/// `/var/log/{wtmp,lastlog,btmp}` fall in this rule's `/var/log`
+/// scope but are owned by the login-aware rules NN-L-FIM-018/019,
+/// which fire ONLY when a NON-login process rewrites them. A normal
+/// login writes these via PAM / `login` every session — not a
+/// truncation, yet a `Modified` op on a `/var/log` path, so under the
+/// bare scope match this rule tripped its High verdict on every admin
+/// login. Those three exact paths ([`LASTLOG_PATHS`] ∪
+/// [`WTMP_BTMP_PATHS`]) are therefore deferred entirely to -018/-019;
+/// a real wipe is a non-login writer on them and is still caught
+/// there. Coverage of the rest of `/var/log` is unchanged.
 pub struct NnLFim005LogTruncated {
     /// uid of the `syslog` system user, resolved once when the
     /// engine is built (a `/etc/passwd` parse — see
@@ -445,6 +458,19 @@ impl Rule for NnLFim005LogTruncated {
             return None;
         }
         if !starts_with_any(&fe.path, LOG_ROOT_PREFIXES) {
+            return None;
+        }
+        // FP-6: the binary login-record logs (wtmp/lastlog/btmp) sit in
+        // the /var/log scope but are owned by the login-aware rules
+        // NN-L-FIM-018/019 (they fire only on a non-login writer). A
+        // normal login rewrites these every session — not a truncation —
+        // so defer those three exact paths entirely; a real wipe is a
+        // non-login writer there and is still caught by -018/-019.
+        if LASTLOG_PATHS
+            .iter()
+            .chain(WTMP_BTMP_PATHS.iter())
+            .any(|p| fe.path == *p)
+        {
             return None;
         }
         // FP-1: rsyslogd's own appends are not tampering — suppress.
@@ -2129,6 +2155,63 @@ mod tests {
             Some(4096),
         );
         assert!(r.evaluate(&ev_eq).is_some(), "equal sizes are not an append");
+    }
+
+    // ── NN-L-FIM-005 FP-6 — login-record logs deferred to -018/-019 ──
+    //
+    // wtmp/lastlog/btmp live in this rule's /var/log scope but are owned
+    // by the login-aware rules NN-L-FIM-018/019, which fire only on a
+    // NON-login writer. A normal login rewrites them every session — not
+    // a truncation. FIM-005 must defer those three exact paths for ANY
+    // writer; a real wipe is still caught by -018/-019.
+
+    /// FIM-005 does NOT fire on the binary login-record logs, whatever
+    /// the writer — attacker comm, the login machinery, even a shrink
+    /// (the truncation shape it otherwise fires on). All deferred.
+    #[test]
+    fn fim005_defers_login_record_logs_to_018_019() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        for path in &["/var/log/wtmp", "/var/log/lastlog", "/var/log/btmp"] {
+            // bare attacker-comm Modified event.
+            assert!(
+                r.evaluate(&fim_event(FimOp::Modified, path)).is_none(),
+                "{path}: must defer to -018/-019 (attacker writer)"
+            );
+            // the login machinery itself.
+            assert!(
+                r.evaluate(&fim_event_with_comm(FimOp::Modified, path, "login"))
+                    .is_none(),
+                "{path}: must defer to -018/-019 (login writer)"
+            );
+            // a shrink: without the carve-out this is the textbook
+            // truncation FIM-005 fires on — still deferred.
+            let shrank = fim_log_modify(path, Some("/usr/bin/tee"), 0, Some(0), Some(8192));
+            assert!(
+                r.evaluate(&shrank).is_none(),
+                "{path}: must defer to -018/-019 even on a shrink"
+            );
+        }
+    }
+
+    /// FP-6 regression: the deferral is EXACT-path. An ordinary log root
+    /// still fires, and a path that merely shares a prefix with a login
+    /// record (a rotated `wtmp.1`, a `lastlog.bak`) is NOT a login record
+    /// — it stays in FIM-005's scope and still fires.
+    #[test]
+    fn fim005_still_fires_on_non_login_record_log_roots() {
+        let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
+        for path in &[
+            "/var/log/auth.log",    // ordinary log root — unaffected
+            "/var/log/wtmp.1",      // rotated wtmp — not the exact record
+            "/var/log/lastlog.bak", // backup — not the exact record
+            "/var/log/btmpx",       // prefix-shares with btmp, distinct file
+        ] {
+            let v = r
+                .evaluate(&fim_event(FimOp::Modified, path))
+                .unwrap_or_else(|| panic!("FIM-005 must still fire on {path}"));
+            assert_eq!(v.severity, Severity::High);
+            assert_eq!(v.action, ResponseAction::Log);
+        }
     }
 
     /// The /etc/passwd parser behind the syslog-uid resolution.
