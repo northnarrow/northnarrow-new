@@ -370,7 +370,7 @@ impl Btf {
                     // offset. We refuse instead. Consequence to know: a
                     // FUTURE kernel that adds a new BTF kind ANYWHERE in
                     // the type section refuses-to-start here even if the
-                    // 38 target structs are parseable — at which point
+                    // 40 target structs are parseable — at which point
                     // this match must be EXTENDED with the new kind's
                     // trailing size (BTF format evolution), never made to
                     // skip-and-continue.
@@ -568,7 +568,7 @@ mod tests {
         }
     }
 
-    /// Build a fixture exercising every navigation path the real 38 use:
+    /// Build a fixture exercising every navigation path the real 40 use:
     /// a direct field, an embedded struct, an anonymous union, and a
     /// typedef in the middle of a path.
     fn fixture() -> Vec<u8> {
@@ -691,7 +691,7 @@ mod tests {
         assert!(Btf::parse(b"too short").is_err());
     }
 
-    /// VM-only: derive ALL 38 offsets against the *running* kernel's
+    /// VM-only: derive ALL 40 offsets against the *running* kernel's
     /// real BTF and assert they match the compiled-in values.
     /// `#[ignore]`d so it never runs on a dev box whose kernel differs
     /// from the supported 6.8.x (where the offsets legitimately
@@ -699,10 +699,10 @@ mod tests {
     /// `cargo test -p northnarrow-agent --lib btf_revalidate -- --ignored --nocapture`.
     #[test]
     #[ignore]
-    fn revalidate_real_kernel_btf_all_38_match() {
+    fn revalidate_real_kernel_btf_all_40_match() {
         match revalidate_offsets() {
             RevalidateOutcome::Verified { count } => {
-                assert_eq!(count, 38, "expected all 38 offsets validated");
+                assert_eq!(count, 40, "expected all 40 offsets validated");
                 eprintln!("OK: all {count} offsets match the running kernel's BTF");
             }
             RevalidateOutcome::SkippedNoBtf { reason } => {
