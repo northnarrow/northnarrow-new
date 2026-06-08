@@ -275,6 +275,20 @@ pub const IOVEC_IOV_LEN_OFFSET: usize = 8;
 /// byte 16.
 pub const MSGHDR_MSG_ITER_OFFSET: usize = 16;
 
+/// `struct msghdr.msg_name` — `void *` to the destination socket address
+/// (`sockaddr_in` / `sockaddr_in6`); the DNS refit reads it off the
+/// `udp_sendmsg` path to recover the queried server's IP. `[8038] STRUCT
+/// 'msghdr'` → `'msg_name' bits_offset=0` = byte 0. Folded in from a
+/// `dns_query.rs`-local const so drift on it fail-closes via [`REVALIDATE`]
+/// like the rest, instead of silently mis-reading (BUG-036 gap close).
+pub const MSGHDR_NAME_OFFSET: usize = 0;
+
+/// `struct msghdr.msg_namelen` — `int` byte length of `msg_name`, read to
+/// tell an `AF_INET` sockaddr from an `AF_INET6` one. `'msg_namelen'
+/// bits_offset=64` = byte 8. Folded in from a `dns_query.rs`-local const
+/// (BUG-036 gap close — was outside the revalidation contract).
+pub const MSGHDR_NAMELEN_OFFSET: usize = 8;
+
 // ─────────────────────────────────────────────────────────────────────
 //  Revalidation table — the contract the boot-time validator checks.
 // ─────────────────────────────────────────────────────────────────────
@@ -306,7 +320,7 @@ pub struct OffsetSpec {
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
-/// layout offset). 38 entries — kept in lockstep with the consts above
+/// layout offset). 40 entries — kept in lockstep with the consts above
 /// by `revalidate_table_is_complete` (test).
 pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec { name: "TASK_STRUCT_TGID_OFFSET",        struct_name: "task_struct", field_path: &["tgid"],         expected: TASK_STRUCT_TGID_OFFSET },
@@ -347,6 +361,8 @@ pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec { name: "IOVEC_IOV_BASE_OFFSET",          struct_name: "iovec",       field_path: &["iov_base"],      expected: IOVEC_IOV_BASE_OFFSET },
     OffsetSpec { name: "IOVEC_IOV_LEN_OFFSET",           struct_name: "iovec",       field_path: &["iov_len"],       expected: IOVEC_IOV_LEN_OFFSET },
     OffsetSpec { name: "MSGHDR_MSG_ITER_OFFSET",         struct_name: "msghdr",      field_path: &["msg_iter"],      expected: MSGHDR_MSG_ITER_OFFSET },
+    OffsetSpec { name: "MSGHDR_NAME_OFFSET",             struct_name: "msghdr",      field_path: &["msg_name"],      expected: MSGHDR_NAME_OFFSET },
+    OffsetSpec { name: "MSGHDR_NAMELEN_OFFSET",          struct_name: "msghdr",      field_path: &["msg_namelen"],   expected: MSGHDR_NAMELEN_OFFSET },
 ];
 
 #[cfg(test)]
@@ -354,10 +370,10 @@ mod tests {
     use super::*;
 
     /// Lockstep guard: if a const is added/removed without updating
-    /// REVALIDATE (or vice-versa), this count trips. 38 offsets.
+    /// REVALIDATE (or vice-versa), this count trips. 40 offsets.
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 38, "REVALIDATE must cover all 38 offsets");
+        assert_eq!(REVALIDATE.len(), 40, "REVALIDATE must cover all 40 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).

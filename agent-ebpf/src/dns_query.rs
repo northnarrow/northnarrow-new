@@ -50,7 +50,8 @@ use northnarrow_common::wire::{DnsQueryRaw, ADDR_LEN, QNAME_LEN, TASK_COMM_LEN};
 
 use crate::btf_offsets::{
     IOV_ITER_ITER_TYPE_OFFSET, IOV_ITER_UBUF_BASE_OFFSET, MSGHDR_MSG_ITER_OFFSET,
-    SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET, SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_V6_DADDR_OFFSET,
+    MSGHDR_NAME_OFFSET, MSGHDR_NAMELEN_OFFSET, SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET,
+    SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_V6_DADDR_OFFSET,
 };
 
 #[map]
@@ -59,13 +60,6 @@ static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 const DNS_PORT_BE: u16 = 0x3500; // 53 in network byte order
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
-
-// `struct msghdr` UAPI-relevant prefix (kernel internal struct, but
-// the first two fields have been stable for >15 years):
-//   void *msg_name;     offset 0
-//   int   msg_namelen;  offset 8
-const MSGHDR_NAME_OFFSET: usize = 0;
-const MSGHDR_NAMELEN_OFFSET: usize = 8;
 
 // `iov_iter.iter_type` discriminant value for a single inline user
 // buffer (the connected-UDP `send()` shape). See `btf_offsets.rs`.
