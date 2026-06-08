@@ -2041,6 +2041,104 @@ pub fn run_net_fingerprint(
 
 // ── tests ───────────────────────────────────────────────────────────
 
+// ── FIM-009 self-upgrade (§15.1) — nn-admin trusted-installer-grant ─
+
+/// Outcome of `nn-admin trusted-installer-grant`. Same 1-of-N quorum +
+/// `AdminResult` shape as [`FimBaselineOutcome`]; kept distinct so the
+/// binary renders its own human messages + exit codes.
+#[derive(Debug)]
+pub enum TrustedInstallerGrantOutcome {
+    Success,
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    UnknownOperation,
+    ProtocolVersionUnsupported { server_version: u16 },
+}
+
+fn map_admin_result_to_trusted_installer(
+    r: common::wire::admin_protocol::AdminResult,
+) -> TrustedInstallerGrantOutcome {
+    use common::wire::admin_protocol::AdminResult;
+    match r {
+        AdminResult::Success => TrustedInstallerGrantOutcome::Success,
+        AdminResult::InvalidSignature => TrustedInstallerGrantOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => TrustedInstallerGrantOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
+            TrustedInstallerGrantOutcome::RateLimited { retry_after_secs }
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            TrustedInstallerGrantOutcome::QuorumNotMet { required, provided }
+        }
+        AdminResult::RoleDenied => TrustedInstallerGrantOutcome::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => TrustedInstallerGrantOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => TrustedInstallerGrantOutcome::AgentIdMismatch,
+        AdminResult::UnknownOperation => TrustedInstallerGrantOutcome::UnknownOperation,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            TrustedInstallerGrantOutcome::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+/// `nn-admin trusted-installer-grant` — submit a 1-of-N (M=1)
+/// quorum-signed grant that arms the FIM-009 trusted-installer override
+/// for `window_secs` (the agent clamps to its 600 s ceiling). Single-sig
+/// with the `trusted-installer` role per §15.1. Mirrors
+/// [`run_fim_baseline`]'s transport (challenge → sign → send).
+pub fn run_trusted_installer_grant(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    window_secs: u32,
+) -> Result<TrustedInstallerGrantOutcome> {
+    use common::wire::admin_protocol::TrustedInstallerGrantRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    const _: () = assert!(AGENT_ID_LEN == 16);
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_trusted_installer_grant(nonce, now, agent_id_arr, window_secs);
+    let sig: [u8; 64] = sign(&payload, &signing)
+        .map_err(|e| anyhow!("signing trusted-installer-grant payload: {e}"))?;
+
+    write_frame(
+        &mut stream,
+        &AdminMessage::TrustedInstallerGrantRequest(TrustedInstallerGrantRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    let result = match read_frame(&mut stream)? {
+        AdminMessage::TrustedInstallerGrantResult(r) => r,
+        other => bail!("unexpected reply to TrustedInstallerGrantRequest: {other:?}"),
+    };
+    Ok(map_admin_result_to_trusted_installer(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2235,6 +2333,88 @@ mod tests {
 
         let outcome = run_unlock(&socket, &priv_path).expect("unlock");
         assert!(matches!(outcome, UnlockOutcome::Success));
+        server.join().unwrap();
+    }
+
+    /// FIM-009 self-upgrade (§15.1): the `trusted-installer-grant`
+    /// client signs over the SignedPayload digest (op tag + window
+    /// inside the signed scope) and submits it; a Success reply maps to
+    /// `TrustedInstallerGrantOutcome::Success`. Exercises the real
+    /// challenge → sign → send path against a mock server that verifies
+    /// the signature + the signed window.
+    #[test]
+    fn cli_trusted_installer_grant_happy_path() {
+        use common::wire::admin_signed_payload::{signing_digest, OperationExtra};
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_path = dir.path().join("admin.key");
+        let agent_id_path = dir.path().join("agent_id");
+        let signing = SigningKey::generate(&mut OsRng);
+        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+        let vk = signing.verifying_key();
+        let nonce = [0x33u8; 32];
+
+        let server = spawn_mock_server(&socket, move |stream| {
+            match server_read_frame(stream) {
+                AdminMessage::ChallengeRequest(_) => {}
+                other => panic!("expected ChallengeRequest, got {other:?}"),
+            }
+            server_write_frame(stream, &AdminMessage::Challenge(Challenge { nonce }));
+
+            let req = match server_read_frame(stream) {
+                AdminMessage::TrustedInstallerGrantRequest(r) => r,
+                other => panic!("expected TrustedInstallerGrantRequest, got {other:?}"),
+            };
+            // The window rides inside the signed scope.
+            match &req.payload.extra {
+                OperationExtra::TrustedInstallerGrant(e) => assert_eq!(e.window_secs, 120),
+                other => panic!("expected TrustedInstallerGrant extra, got {other:?}"),
+            }
+            // The signature must verify over the payload's signing digest.
+            let digest = signing_digest(&req.payload).expect("digest");
+            let sig = ed25519_dalek::Signature::from_bytes(&req.signatures[0].signature);
+            vk.verify_strict(&digest, &sig)
+                .expect("client sig must verify over the signing digest");
+
+            server_write_frame(
+                stream,
+                &AdminMessage::TrustedInstallerGrantResult(AdminResult::Success),
+            );
+        });
+
+        let outcome = run_trusted_installer_grant(&socket, &priv_path, &agent_id_path, 120)
+            .expect("trusted-installer-grant");
+        assert!(matches!(outcome, TrustedInstallerGrantOutcome::Success));
+        server.join().unwrap();
+    }
+
+    /// A RoleDenied reply (key lacks `trusted-installer`) maps through
+    /// to the distinct outcome → exit code 7 in the binary.
+    #[test]
+    fn cli_trusted_installer_grant_propagates_role_denied() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_path = dir.path().join("admin.key");
+        let agent_id_path = dir.path().join("agent_id");
+        let signing = SigningKey::generate(&mut OsRng);
+        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+
+        let server = spawn_mock_server(&socket, move |stream| {
+            let _ = server_read_frame(stream); // ChallengeRequest
+            server_write_frame(
+                stream,
+                &AdminMessage::Challenge(Challenge { nonce: [0u8; 32] }),
+            );
+            let _ = server_read_frame(stream); // TrustedInstallerGrantRequest
+            server_write_frame(
+                stream,
+                &AdminMessage::TrustedInstallerGrantResult(AdminResult::RoleDenied),
+            );
+        });
+
+        let outcome = run_trusted_installer_grant(&socket, &priv_path, &agent_id_path, 120)
+            .expect("trusted-installer-grant");
+        assert!(matches!(outcome, TrustedInstallerGrantOutcome::RoleDenied));
         server.join().unwrap();
     }
 

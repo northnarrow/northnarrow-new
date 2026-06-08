@@ -153,6 +153,13 @@ pub enum OperationCode {
     /// ALPN + the raw ClientHello bytes for forensic review
     /// (§9). Authorised by `Role::NetRead`.
     NetFingerprint = 17,
+    /// FIM-009 self-upgrade (§15.1) — operator-signed, TTL'd grant
+    /// authorising a trusted local installer to (a) suspend the
+    /// `inode_protect` FS pin and (b) rewrite the agent's OWN systemd
+    /// units without NN-L-FIM-009 killing the writer, for the duration
+    /// of an in-place upgrade. Authorised by [`Role::TrustedInstaller`];
+    /// verified 1-of-N (M=1) via the standard signed-payload quorum.
+    TrustedInstallerGrant = 18,
 }
 
 impl From<OperationCode> for u8 {
@@ -182,6 +189,7 @@ impl TryFrom<u8> for OperationCode {
             15 => Ok(Self::NetListeners),
             16 => Ok(Self::NetResolve),
             17 => Ok(Self::NetFingerprint),
+            18 => Ok(Self::TrustedInstallerGrant),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -243,6 +251,13 @@ pub enum Role {
     /// now so the discriminant is stable before any caller
     /// exists; no op currently maps to it.
     NetManage = 11,
+    /// FIM-009 self-upgrade (§15.1) — authorises
+    /// [`OperationCode::TrustedInstallerGrant`]: arming the TTL'd
+    /// trusted-installer override that suspends the FS pin and
+    /// downgrades NN-L-FIM-009 for the agent's own units during an
+    /// in-place upgrade. High-privilege (peer of `rotate-keys` /
+    /// `shutdown`); never in a key's default allowlist.
+    TrustedInstaller = 12,
     All = 255,
 }
 
@@ -267,6 +282,7 @@ impl TryFrom<u8> for Role {
             9 => Ok(Self::CanaryManage),
             10 => Ok(Self::NetRead),
             11 => Ok(Self::NetManage),
+            12 => Ok(Self::TrustedInstaller),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -432,6 +448,19 @@ pub struct NetFingerprintExtra {
     pub flow_id: String,
 }
 
+/// Op-specific signed-scope fields for
+/// [`OperationCode::TrustedInstallerGrant`] (FIM-009 self-upgrade,
+/// §15.1). `window_secs` is the operator-chosen TTL of the override
+/// window; the agent clamps it to a hard ceiling
+/// (`MAX_TRUSTED_INSTALLER_WINDOW_SECS` in the agent) so a captured or
+/// fat-fingered grant cannot hold the FS pin open indefinitely. The
+/// window is INSIDE the signed scope, so it cannot be tampered after
+/// signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedInstallerGrantExtra {
+    pub window_secs: u32,
+}
+
 /// Canary kind tag. Wire-byte stability mirrors [`OperationCode`]
 /// and [`Role`] (bare u8 via `serde(into = "u8", try_from = "u8")`):
 /// append-only, new variants get the next free discriminant.
@@ -540,6 +569,9 @@ pub enum OperationExtra {
     NetResolve(NetResolveExtra),
     /// Tappa 10 (N1). Pairs with [`OperationCode::NetFingerprint`].
     NetFingerprint(NetFingerprintExtra),
+    /// FIM-009 self-upgrade (§15.1). Pairs with
+    /// [`OperationCode::TrustedInstallerGrant`].
+    TrustedInstallerGrant(TrustedInstallerGrantExtra),
 }
 
 impl OperationExtra {
@@ -565,6 +597,7 @@ impl OperationExtra {
             OperationExtra::NetListeners(_) => OperationCode::NetListeners,
             OperationExtra::NetResolve(_) => OperationCode::NetResolve,
             OperationExtra::NetFingerprint(_) => OperationCode::NetFingerprint,
+            OperationExtra::TrustedInstallerGrant(_) => OperationCode::TrustedInstallerGrant,
         }
     }
 }
@@ -980,6 +1013,25 @@ impl SignedPayload {
             ts,
             agent_id,
             extra: OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }),
+        }
+    }
+
+    /// FIM-009 self-upgrade (§15.1) — build a trusted-installer grant
+    /// payload. `window_secs` is the requested override TTL (the agent
+    /// clamps it to its ceiling). Signed via [`sign`]; verified 1-of-N
+    /// carrying [`Role::TrustedInstaller`].
+    pub fn new_trusted_installer_grant(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        window_secs: u32,
+    ) -> Self {
+        Self {
+            op: OperationCode::TrustedInstallerGrant,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::TrustedInstallerGrant(TrustedInstallerGrantExtra { window_secs }),
         }
     }
 }

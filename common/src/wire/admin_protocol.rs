@@ -568,6 +568,21 @@ pub enum DebugForcePosture {
 /// `Copy`. Existing callers all consume `AdminMessage` by move
 /// (encoder/decoder paths) or by `&` (test exhaustiveness checks),
 /// so dropping `Copy` is source-compatible.
+/// FIM-009 self-upgrade (§15.1) — signed trusted-installer grant
+/// request. Carries the full [`SignedPayload`] (`op =
+/// TrustedInstallerGrant`, `extra = TrustedInstallerGrant { window_secs
+/// }`) plus the signature quorum. Verified 1-of-N (M=1) today — like
+/// COMBAT reactivation — but expressed through the quorum path so M can
+/// be raised without re-architecting. Required role:
+/// [`common::wire::admin_signed_payload::Role::TrustedInstaller`]. On
+/// verify the agent arms the TTL'd FS-pin override and downgrades
+/// NN-L-FIM-009 for its OWN units for the (clamped) window's duration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedInstallerGrantRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
@@ -686,6 +701,12 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::NetFingerprintRequest`] —
     /// fingerprint-observation JSONL body.
     NetFingerprintResponse(NetFingerprintResponse),
+    /// FIM-009 self-upgrade (§15.1) — signed trusted-installer grant
+    /// request. Triggers [`AdminMessage::TrustedInstallerGrantResult`].
+    TrustedInstallerGrantRequest(TrustedInstallerGrantRequest),
+    /// Reply to [`AdminMessage::TrustedInstallerGrantRequest`]. Bare
+    /// [`AdminResult`] superset (success / verify-failure variants).
+    TrustedInstallerGrantResult(AdminResult),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -1148,9 +1169,33 @@ mod tests {
                 | AdminMessage::NetResolveRequest(_)
                 | AdminMessage::NetResolveResponse(_)
                 | AdminMessage::NetFingerprintRequest(_)
-                | AdminMessage::NetFingerprintResponse(_) => {}
+                | AdminMessage::NetFingerprintResponse(_)
+                | AdminMessage::TrustedInstallerGrantRequest(_)
+                | AdminMessage::TrustedInstallerGrantResult(_) => {}
             }
         }
+    }
+
+    /// FIM-009 self-upgrade (§15.1): the trusted-installer grant request
+    /// survives a wire round-trip. The signed pre-image is re-serialised
+    /// before verify, so a field-order drift would silently break
+    /// signature verification — this anchors the CBOR/postcard shape.
+    #[test]
+    fn roundtrip_trusted_installer_grant_request() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload =
+            SignedPayload::new_trusted_installer_grant([0x44; 32], 1_700_000_000, [0x55; 16], 120);
+        roundtrip(AdminMessage::TrustedInstallerGrantRequest(
+            TrustedInstallerGrantRequest {
+                payload,
+                signatures: vec![KeyedSignature {
+                    signature: [0x66; 64],
+                }],
+            },
+        ));
+        roundtrip(AdminMessage::TrustedInstallerGrantResult(
+            AdminResult::Success,
+        ));
     }
 
     #[cfg(feature = "debug-trigger")]

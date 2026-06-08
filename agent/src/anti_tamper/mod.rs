@@ -44,6 +44,10 @@ pub mod btf_revalidate;
 pub mod combat_allow;
 pub mod filesystem;
 pub mod network_isolate;
+/// FIM-009 self-upgrade (§15.1): userland arming path for the
+/// trusted-installer FS-pin override (fills the `FS_PROTECT_OVERRIDE`
+/// stub the recon flagged).
+pub mod trusted_installer;
 
 /// Test-only mint of an [`network_isolate::UnlockToken`] for unit
 /// tests that exercise code paths consuming the capability (e.g.
@@ -174,7 +178,13 @@ pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
 /// `agent-ebpf/src/task_kill.rs`. Kept here because aya looks maps up
 /// by string at runtime.
 const KILL_OVERRIDE_MAP_NAME: &str = "KILL_OVERRIDE";
-const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
+pub(crate) const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
+/// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
+/// map (mirrors `#[map] pub static FS_PROTECT_OVERRIDE` in
+/// `agent-ebpf/src/inode_protect.rs`). Boot-zeroed + pinned by-name in
+/// [`boot_zero_fs_override`]; armed/disarmed cross-task by
+/// [`trusted_installer::TrustedInstallerOverride`] via its bpffs path.
+pub(crate) const FS_PROTECT_OVERRIDE_MAP_NAME: &str = "FS_PROTECT_OVERRIDE";
 
 /// Names mirroring `#[lsm(hook = "…")]` declarations in
 /// `agent-ebpf/src/{task_kill,ptrace_check}.rs`. Kept here as
@@ -313,6 +323,19 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
         );
     }
 
+    // FIM-009 self-upgrade (§15.1): boot-zero + pin FS_PROTECT_OVERRIDE
+    // AFTER arm_kill_override (which rolls AGENT_SESSION) so the override
+    // starts dormant this boot and the kernel's session-nonce compare in
+    // inode_protect::override_active has a fresh nonce to anchor against.
+    if let Err(e) = boot_zero_fs_override(ebpf) {
+        warn!(
+            error = %e,
+            "anti-tamper: FS_PROTECT_OVERRIDE boot-zero/pin FAILED — trusted-installer \
+             override may carry a stale value this boot (FIM-009 §15.1; kernel session-nonce \
+             compare still bounds any stale value to a prior boot)"
+        );
+    }
+
     // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
     // loader resolves `bpf_lsm_<hook>` against it to set the
     // `attach_btf_id` the kernel expects. If we can't read vmlinux
@@ -438,6 +461,42 @@ fn arm_kill_override(ebpf: &mut Ebpf) -> Result<()> {
         kill_override = KILL_OVERRIDE_MAP_NAME,
         agent_session = AGENT_SESSION_MAP_NAME,
         "anti-tamper: KILL_OVERRIDE armed for PID-1 carve-out (BUG-010)"
+    );
+    Ok(())
+}
+
+/// FIM-009 self-upgrade (§15.1): boot-zero + pin the trusted-installer
+/// FS-pin override map. Writing slot 0 to zero on every boot guarantees
+/// the override NEVER survives a restart — the exact caveat the original
+/// `FS_PROTECT_OVERRIDE` stub flagged ("must be zeroed on boot"). A
+/// grant must be re-presented after a reboot. Pinning by-name lets the
+/// `trusted_installer` userland arm/disarm the SAME kernel object via
+/// its bpffs path after boot, without re-borrowing the `Ebpf` instance.
+///
+/// MUST run after [`arm_kill_override`] (which rolls AGENT_SESSION): the
+/// kernel `override_active` compares `FS_PROTECT_OVERRIDE[0]` against the
+/// session nonce, so a fresh nonce must already be in place.
+fn boot_zero_fs_override(ebpf: &mut Ebpf) -> Result<()> {
+    write_array_u32(ebpf, FS_PROTECT_OVERRIDE_MAP_NAME, 0)
+        .with_context(|| format!("boot-zeroing {FS_PROTECT_OVERRIDE_MAP_NAME}[0]"))?;
+
+    if let Some(root) = prepare_pin_root() {
+        let map_pin_path = root.join(FS_PROTECT_OVERRIDE_MAP_NAME);
+        purge_stale_pin(&map_pin_path);
+        ebpf.map_mut(FS_PROTECT_OVERRIDE_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {FS_PROTECT_OVERRIDE_MAP_NAME} missing from eBPF object"))?
+            .pin(&map_pin_path)
+            .with_context(|| {
+                format!(
+                    "pinning {FS_PROTECT_OVERRIDE_MAP_NAME} to {}",
+                    map_pin_path.display()
+                )
+            })?;
+    }
+
+    info!(
+        map = FS_PROTECT_OVERRIDE_MAP_NAME,
+        "anti-tamper: FS_PROTECT_OVERRIDE boot-zeroed + pinned (FIM-009 §15.1)"
     );
     Ok(())
 }
