@@ -209,6 +209,37 @@ pub const ETC_PROTECTED_TEMPLATES: &[&str] = &[
     "generic.tmpl",
 ];
 
+/// Anti-tamper binary/unit pin: the agent + watchdog executables and
+/// their systemd unit files. Registered in `PROTECTED_INODES` (Step
+/// 3.8 of [`attach`]) so the same five `inode_*` / `file_ioctl` LSM
+/// modification-deny hooks that defend the [`ETC_PROTECTED_FILES`]
+/// identity files also defend the agent's own on-disk image and
+/// service definitions. Without this a root attacker could `cp` over
+/// `/usr/local/bin/northnarrow-agent` (the truncate routes through
+/// `inode_setattr`) or rename a tampered unit into place
+/// (`inode_rename`) and neutralise the agent while `systemctl` still
+/// reports it "running".
+///
+/// Unlike the other protected-path consts (bare basenames under one
+/// directory), these are ABSOLUTE paths — the set spans
+/// `/usr/local/bin` and `/etc/systemd/system`, so there is no single
+/// parent dir to join. The two `.service` files are the same units
+/// the in-flight FIM-009 trusted-installer override is built to
+/// govern; the two binaries are the new coverage.
+///
+/// eBPF-only, NO `chattr +i`: the `+i` belt-and-suspenders stays the
+/// state dir's. These use the file-LSM mechanism for consistency with
+/// the /etc identity files — and so a signed self-upgrade can replace
+/// them during an armed `FS_PROTECT_OVERRIDE` window (a global deny
+/// suspension) without first having to clear a per-inode immutable
+/// bit.
+pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
+    "/usr/local/bin/northnarrow-agent",
+    "/usr/local/bin/northnarrow-watchdog",
+    "/etc/systemd/system/northnarrow-agent.service",
+    "/etc/systemd/system/northnarrow-watchdog.service",
+];
+
 /// Permission bits applied at create time and re-asserted on every
 /// startup (defends against an admin loosening perms while the
 /// agent is offline).
@@ -337,6 +368,27 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
             error = %e,
             "anti-tamper FS: canary template registration failed — \
              /etc/northnarrow/canary-templates/ defended only by POSIX perms this boot"
+        );
+    }
+
+    // Step 3.8 (anti-tamper binary/unit pin): register the agent +
+    // watchdog BINARIES and their systemd UNIT files in
+    // PROTECTED_INODES so the same five LSM modification-deny hooks
+    // that defend the /etc identity files also defend the agent's own
+    // executable + service files. Registered BEFORE the hooks attach
+    // (Step 4) so the kernel never sees an unprotected window — same
+    // ordering as the /etc + state + template registrations above.
+    // Lenient like Step 3.5–3.7: a host without the watchdog binary
+    // (or a package layout that omits a unit) skips that path with a
+    // warn rather than aborting arming. The caller-side PROTECTED_PIDS
+    // exemption already lets the agent re-exec itself and the watchdog
+    // re-install; a signed installer replaces these during an armed
+    // FS_PROTECT_OVERRIDE window.
+    if let Err(e) = register_binary_and_units(ebpf) {
+        warn!(
+            error = %e,
+            "anti-tamper FS: agent binary/unit registration failed — \
+             agent executable + service files defended only by POSIX perms this boot"
         );
     }
 
@@ -541,6 +593,87 @@ pub(crate) fn register_etc_templates(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<
         registered,
         total = ETC_PROTECTED_TEMPLATES.len(),
         "anti-tamper FS: canary template registration complete"
+    );
+    Ok(registered)
+}
+
+/// Stat each absolute path in `paths`, returning the
+/// `(path, InodeKey)` pairs for the ones that currently exist. Missing
+/// files (`NotFound`) are skipped with a warn — NOT fatal — so a host
+/// that lacks, say, the watchdog binary still arms protection for the
+/// paths it does have (mirrors the lenient skip in
+/// [`register_etc_files`]). Any other stat error is likewise skipped
+/// with a warn.
+///
+/// Factored out of [`register_binary_and_units`] as a pure
+/// (no-`Ebpf`) helper so the skip-not-fatal resolution is
+/// unit-testable without a live kernel map; the caller feeds each
+/// returned key through the shared [`register_inode`] helper.
+fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
+    let mut resolved = Vec::with_capacity(paths.len());
+    for &p in paths {
+        let path = PathBuf::from(p);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    path = %path.display(),
+                    "anti-tamper FS: skip register_binary_and_units entry — file missing \
+                     (will be unprotected until next agent restart with the file present)"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "anti-tamper FS: stat failed for register_binary_and_units entry"
+                );
+                continue;
+            }
+        };
+        resolved.push((
+            path,
+            InodeKey {
+                dev: stat_dev_to_kernel_dev(meta.dev()),
+                ino: meta.ino(),
+            },
+        ));
+    }
+    resolved
+}
+
+/// Register each of the [`BINARY_AND_UNIT_PATHS`] in `PROTECTED_INODES`
+/// so the five `inode_*` / `file_ioctl` LSM deny hooks defend the
+/// agent + watchdog executables and their systemd units exactly as
+/// they defend the [`ETC_PROTECTED_FILES`] identity files. Modelled on
+/// [`register_etc_files`]; reuses the shared [`register_inode`] helper.
+///
+/// Modification-only by construction — the LSM hooks deny
+/// `unlink` / `rmdir` / `rename` / `setattr` (chmod, chown, truncate) /
+/// `ioctl` (chattr) but NOT read or exec — so the agent still execs
+/// its own binary and the init system still reads the unit files. NO
+/// `chattr +i` (see [`BINARY_AND_UNIT_PATHS`]). Missing paths are
+/// skipped (not fatal) via [`resolve_protected_paths`].
+///
+/// Returns the number actually registered, for the info-log line.
+pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
+    let mut registered = 0usize;
+    for (path, key) in resolve_protected_paths(BINARY_AND_UNIT_PATHS) {
+        register_inode(ebpf, &key)
+            .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        info!(
+            path = %path.display(),
+            kernel_dev = key.dev,
+            ino = key.ino,
+            "anti-tamper FS: agent binary/unit registered in {PROTECTED_INODES_MAP}"
+        );
+        registered += 1;
+    }
+    info!(
+        registered,
+        total = BINARY_AND_UNIT_PATHS.len(),
+        "anti-tamper FS: agent binary/unit registration complete"
     );
     Ok(registered)
 }
@@ -1411,5 +1544,116 @@ mod tests {
                 "duplicate entry {name} in ETC_PROTECTED_FILES"
             );
         }
+    }
+
+    // ── Anti-tamper binary/unit pin — registration tests ───────────
+
+    /// The binary/unit pin set is exactly the four absolute paths: the
+    /// agent + watchdog executables under `/usr/local/bin` and their
+    /// two systemd units under `/etc/systemd/system`. Anchored
+    /// explicitly so a refactor that drops or moves one fails fast —
+    /// this is the authoritative "these four are in PROTECTED_INODES"
+    /// assertion for the binaries + units.
+    #[test]
+    fn binary_and_unit_paths_lists_the_four_targets() {
+        assert_eq!(
+            BINARY_AND_UNIT_PATHS,
+            &[
+                "/usr/local/bin/northnarrow-agent",
+                "/usr/local/bin/northnarrow-watchdog",
+                "/etc/systemd/system/northnarrow-agent.service",
+                "/etc/systemd/system/northnarrow-watchdog.service",
+            ],
+            "the agent + watchdog binaries and their two systemd units \
+             are the anti-tamper binary/unit pin set"
+        );
+    }
+
+    /// Unlike the basename consts, these entries are ABSOLUTE system
+    /// paths (no parent-dir join), so the shape invariant is inverted
+    /// from `etc_protected_files_have_no_path_traversal`: every entry
+    /// must START with '/', be non-empty, and carry no `..` traversal
+    /// component.
+    #[test]
+    fn binary_and_unit_paths_are_absolute_no_traversal() {
+        for p in BINARY_AND_UNIT_PATHS {
+            assert!(p.starts_with('/'), "{p} must be an absolute path");
+            assert!(
+                !p.is_empty(),
+                "BINARY_AND_UNIT_PATHS entries must be non-empty"
+            );
+            assert!(
+                !p.contains(".."),
+                "{p} must not contain '..' (path-traversal defence)"
+            );
+        }
+    }
+
+    /// Duplicate entries would bump the "registered N of total" log
+    /// line without adding protection (the map insert is idempotent).
+    /// Mirrors `etc_protected_files_are_unique`.
+    #[test]
+    fn binary_and_unit_paths_are_unique() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in BINARY_AND_UNIT_PATHS {
+            assert!(
+                seen.insert(p),
+                "duplicate entry {p} in BINARY_AND_UNIT_PATHS"
+            );
+        }
+    }
+
+    /// `resolve_protected_paths` resolves every path that exists to a
+    /// `(path, InodeKey)` whose key matches the file's real
+    /// `(kernel-dev, ino)`. Exercised through a tempdir so it stays
+    /// hermetic (the real `/usr/local/bin` paths may or may not exist
+    /// on a CI box). This is the "all four register" case.
+    #[test]
+    fn resolve_protected_paths_resolves_every_present_file() {
+        let dir = TempDir::new().unwrap();
+        let mut paths_owned = Vec::new();
+        for name in ["agent-bin", "watchdog-bin", "a.service", "b.service"] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            paths_owned.push(p.to_str().unwrap().to_string());
+        }
+        let refs: Vec<&str> = paths_owned.iter().map(String::as_str).collect();
+
+        let resolved = resolve_protected_paths(&refs);
+
+        assert_eq!(resolved.len(), 4, "all four present files must resolve");
+        for (path, key) in &resolved {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(key.dev, stat_dev_to_kernel_dev(meta.dev()));
+            assert_eq!(key.ino, meta.ino());
+        }
+    }
+
+    /// A missing path is skipped with a warn — NOT fatal: the resolver
+    /// returns the present entries and silently drops the absent one
+    /// (a host without the watchdog binary still arms the paths it
+    /// has). This is the resolution-layer half of "N registered,
+    /// missing skipped"; the actual `register_inode` map insert needs
+    /// a live `Ebpf` and is covered by the privileged e2e suite.
+    #[test]
+    fn resolve_protected_paths_skips_missing_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let present = dir.path().join("present-bin");
+        std::fs::write(&present, b"x").unwrap();
+        let missing = dir.path().join("not-installed");
+        let present_s = present.to_str().unwrap().to_string();
+        let missing_s = missing.to_str().unwrap().to_string();
+
+        let resolved = resolve_protected_paths(&[present_s.as_str(), missing_s.as_str()]);
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "missing path skipped, present kept — not fatal"
+        );
+        assert_eq!(
+            resolved[0].0, present,
+            "the surviving entry is the present file"
+        );
     }
 }
