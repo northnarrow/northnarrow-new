@@ -1951,6 +1951,116 @@ pub fn run_detections(
     }
 }
 
+/// Outcome of `nn-admin detection-set-status` (auth via `Role::Triage`,
+/// 1-of-N). `Success` echoes the id + new status the agent persisted.
+/// `NotFound` covers every non-auth rejection the agent folds into
+/// `UnknownOperation` (no dedicated wire variant, like the K6
+/// canary-burn contract): an out-of-range id (`id == 0` / `id > max`),
+/// AND a server-side persistence failure (the status-event append
+/// errored — e.g. disk full / I/O error). The CLI therefore renders it
+/// as "change not applied — not found, or not persisted; retry" rather
+/// than asserting the detection is gone. (A future wire revision could
+/// split these with a dedicated internal-error result.)
+#[derive(Debug)]
+pub enum DetectionSetStatusOutcome {
+    Success { id: u64, new_status: String },
+    InvalidSignature,
+    NoPendingChallenge,
+    RateLimited { retry_after_secs: u32 },
+    QuorumNotMet { required: u8, provided: u8 },
+    RoleDenied,
+    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    AgentIdMismatch,
+    NotFound,
+    ProtocolVersionUnsupported { server_version: u16 },
+    Transport,
+}
+
+fn map_response_to_set_status(
+    resp: common::wire::admin_protocol::DetectionSetStatusResponse,
+) -> DetectionSetStatusOutcome {
+    use DetectionSetStatusOutcome as O;
+    match resp.result {
+        AdminResult::Success => O::Success {
+            id: resp.id,
+            new_status: resp.new_status,
+        },
+        AdminResult::InvalidSignature => O::InvalidSignature,
+        AdminResult::NoPendingChallenge => O::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => O::RateLimited { retry_after_secs },
+        AdminResult::QuorumNotMet { required, provided } => O::QuorumNotMet { required, provided },
+        AdminResult::RoleDenied => O::RoleDenied,
+        AdminResult::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => O::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        },
+        AdminResult::AgentIdMismatch => O::AgentIdMismatch,
+        // Agent folds the non-auth rejections into UnknownOperation
+        // (mirrors canary-burn): an out-of-range id, the not-wired
+        // degraded boot, an invalid target status, AND a status-event
+        // persistence failure. The NotFound outcome is rendered as a
+        // "not applied — not found / not persisted; retry" message so
+        // a transient write failure isn't misreported as a gone id.
+        AdminResult::UnknownOperation => O::NotFound,
+        AdminResult::ProtocolVersionUnsupported { server_version } => {
+            O::ProtocolVersionUnsupported { server_version }
+        }
+    }
+}
+
+/// Tappa 9.0.c — `nn-admin detection-set-status` — change a persisted
+/// detection's triage status (`Open` → `Acknowledged` → `Investigating`
+/// → `Resolved` / `FalsePositive`). 1-of-N, `Role::Triage`. The new
+/// status is passed as a canonical lowercase string (the CLI restricts
+/// it via a value-enum); the agent appends a signed `StatusEvent` to
+/// the status-event chain and never mutates the detection chain.
+pub fn run_detection_set_status(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    id: u64,
+    new_status: String,
+    note: Option<String>,
+) -> Result<DetectionSetStatusOutcome> {
+    use common::wire::admin_protocol::DetectionSetStatusRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload =
+        SignedPayload::new_detection_set_status(nonce, now, agent_id_arr, id, new_status, note);
+    let sig: [u8; 64] = sign(&payload, &signing)
+        .map_err(|e| anyhow!("signing detection-set-status payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::DetectionSetStatusRequest(DetectionSetStatusRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::DetectionSetStatusResponse(resp) => Ok(map_response_to_set_status(resp)),
+        _ => Ok(DetectionSetStatusOutcome::Transport),
+    }
+}
+
 /// `nn-admin net listeners` — in-process listener snapshot.
 pub fn run_net_listeners(
     socket: &Path,

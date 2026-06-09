@@ -866,6 +866,60 @@ pub fn bootstrap_detections_log(detections_log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Tappa 9.0.c: bootstrap the status-event chainlog
+/// (`status_events.jsonl`) pre-attach — a sibling of the detection log
+/// inside the same `detections/` dir, with the same zero-byte 0644
+/// envelope. Idempotent: a present file (existing chain) is left
+/// untouched.
+///
+/// NOTE on anti-tamper coverage: like its sibling `detections.jsonl`
+/// (9.0.a), this file currently has NO entry in [`STATE_PROTECTED_FILES`]
+/// — `register_state_files` joins each entry onto the top-level state
+/// dir, so it cannot reach a file in the `detections/` SUBDIR, and the
+/// subdir inode itself is not registered. So the FS-modification LSM
+/// deny hooks do NOT yet protect these two files (the chain is still
+/// Ed25519-signed, so tampering is at least detectable as a chain
+/// break, and the dir is 0700). Closing this gap needs subdir-aware
+/// `PROTECTED_INODES` registration covering BOTH files (a follow-up,
+/// out of 9.0.c scope). The pre-attach bootstrap here keeps that future
+/// registration cheap (the inode already exists).
+pub fn bootstrap_status_events_log(status_events_log_path: &Path) -> Result<()> {
+    if status_events_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = status_events_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(STATE_DIR_MODE)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| {
+                    format!("creating status-events-log parent dir {}", parent.display())
+                })?;
+        }
+    }
+    // 0644: world-readable for operator inspection, agent-writable.
+    // (NOT yet PROTECTED_INODES-registered — see the fn doc-comment;
+    // same gap as the sibling detection log.)
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(status_events_log_path)
+        .with_context(|| {
+            format!(
+                "creating status-events log {}",
+                status_events_log_path.display()
+            )
+        })?;
+    info!(
+        path = %status_events_log_path.display(),
+        "anti-tamper FS: status-events log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
+}
+
 /// Tappa 8 A14 (B4): bootstrap an empty audit.log file if it
 /// doesn't exist yet, so PROTECTED_INODES has an inode to
 /// register at attach time. Idempotent: a present file is

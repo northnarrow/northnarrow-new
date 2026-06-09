@@ -167,6 +167,15 @@ pub enum OperationCode {
     /// the low-privilege [`Role::TelemetryRead`]. The filters live in
     /// [`DetectionsExtra`] inside the signed scope.
     Detections = 19,
+    /// Tappa 9.0.c — operator-initiated triage status change on a
+    /// persisted detection (`Open` → `Acknowledged` → `Investigating`
+    /// → `Resolved` / `FalsePositive`). Event-sourced: a verified
+    /// request appends a `StatusEvent` to a SEPARATE signed chain
+    /// (`status_events.jsonl`); `detections.jsonl` is never mutated.
+    /// Authorised by the [`Role::Triage`] role (control roles do NOT
+    /// implicitly get set-status). The target id + new status + note
+    /// live in [`DetectionSetStatusExtra`] inside the signed scope.
+    DetectionSetStatus = 20,
 }
 
 impl From<OperationCode> for u8 {
@@ -198,6 +207,7 @@ impl TryFrom<u8> for OperationCode {
             17 => Ok(Self::NetFingerprint),
             18 => Ok(Self::TrustedInstallerGrant),
             19 => Ok(Self::Detections),
+            20 => Ok(Self::DetectionSetStatus),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -278,6 +288,16 @@ pub enum Role {
     /// telemetry-read-only key reads detections but cannot touch COMBAT.
     /// Never in a key's default allowlist; operators add it explicitly.
     TelemetryRead = 13,
+    /// Tappa 9.0.c — authorises [`OperationCode::DetectionSetStatus`]
+    /// (change a persisted detection's triage status). The triage role
+    /// SUBSUMES [`Role::TelemetryRead`]: a triage key can both read the
+    /// detections it triages AND change their status, so an operator
+    /// running triage needs only this one role. It does NOT confer any
+    /// control authority (`unlock` / `force-posture` / `rotate-keys` /
+    /// `shutdown` / `trusted-installer`); conversely a control role does
+    /// NOT confer triage — set-status requires this role explicitly.
+    /// Never in a key's default allowlist; operators add it explicitly.
+    Triage = 14,
     All = 255,
 }
 
@@ -304,6 +324,7 @@ impl TryFrom<u8> for Role {
             11 => Ok(Self::NetManage),
             12 => Ok(Self::TrustedInstaller),
             13 => Ok(Self::TelemetryRead),
+            14 => Ok(Self::Triage),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -518,6 +539,32 @@ pub struct DetectionsExtra {
     pub path: Option<String>,
 }
 
+/// Op-specific signed-scope fields for
+/// [`OperationCode::DetectionSetStatus`] (Tappa 9.0.c). The target
+/// detection id, the new triage status, and an optional operator note
+/// are all inside the signed scope so a captured request cannot be
+/// re-targeted (id), re-stated (status), or re-annotated (note) after
+/// signing.
+///
+/// - `id` — the monotonic detection id (from a prior `Detections`
+///   read). The agent validates `1 <= id <= current_max_id` cheaply;
+///   an out-of-range id is a clean "detection not found".
+/// - `new_status` — the target triage status as a lowercase string
+///   (`acknowledged` / `investigating` / `resolved` / `false-positive`).
+///   It is carried as a string rather than a wire byte for the same
+///   reason as [`DetectionsExtra`]'s enum filters: the agent-side
+///   `DetectionStatus` discriminants live in the agent crate, not here,
+///   so the wire shape never has to track them — the agent parses the
+///   string server-side. `open` is deliberately not a settable target
+///   (it is the initial state); an unrecognised string is rejected.
+/// - `note` — optional free-text triage note recorded on the event.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DetectionSetStatusExtra {
+    pub id: u64,
+    pub new_status: String,
+    pub note: Option<String>,
+}
+
 /// Canary kind tag. Wire-byte stability mirrors [`OperationCode`]
 /// and [`Role`] (bare u8 via `serde(into = "u8", try_from = "u8")`):
 /// append-only, new variants get the next free discriminant.
@@ -631,6 +678,8 @@ pub enum OperationExtra {
     TrustedInstallerGrant(TrustedInstallerGrantExtra),
     /// Tappa 9.0.b. Pairs with [`OperationCode::Detections`].
     Detections(DetectionsExtra),
+    /// Tappa 9.0.c. Pairs with [`OperationCode::DetectionSetStatus`].
+    DetectionSetStatus(DetectionSetStatusExtra),
 }
 
 impl OperationExtra {
@@ -658,6 +707,7 @@ impl OperationExtra {
             OperationExtra::NetFingerprint(_) => OperationCode::NetFingerprint,
             OperationExtra::TrustedInstallerGrant(_) => OperationCode::TrustedInstallerGrant,
             OperationExtra::Detections(_) => OperationCode::Detections,
+            OperationExtra::DetectionSetStatus(_) => OperationCode::DetectionSetStatus,
         }
     }
 }
@@ -1129,6 +1179,32 @@ impl SignedPayload {
             }),
         }
     }
+
+    /// Tappa 9.0.c — `detection-set-status` signed payload
+    /// constructor. `id` is the target detection id, `new_status` the
+    /// lowercase target status string (`acknowledged` / `investigating`
+    /// / `resolved` / `false-positive`), `note` an optional triage
+    /// note. Authorised by `Role::Triage`; verified 1-of-N (M=1).
+    pub fn new_detection_set_status(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        id: u64,
+        new_status: String,
+        note: Option<String>,
+    ) -> Self {
+        Self {
+            op: OperationCode::DetectionSetStatus,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::DetectionSetStatus(DetectionSetStatusExtra {
+                id,
+                new_status,
+                note,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1163,8 +1239,9 @@ mod tests {
     /// that iterates over this array (sign+verify round-trip,
     /// CBOR-determinism) silently picks up the Net* ops. Tappa
     /// 9.0.b added `TrustedInstallerGrant` (previously omitted) +
-    /// `Detections`, bringing it to 19 — the full op set.
-    fn one_payload_per_op() -> [SignedPayload; 19] {
+    /// `Detections`, bringing it to 19. Tappa 9.0.c added
+    /// `DetectionSetStatus`, bringing it to 20 — the full op set.
+    fn one_payload_per_op() -> [SignedPayload; 20] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -1221,6 +1298,14 @@ mod tests {
                 Some("open".to_string()),
                 Some("network".to_string()),
                 Some("curl".to_string()),
+            ),
+            SignedPayload::new_detection_set_status(
+                nonce(),
+                TS,
+                agent_id(),
+                42,
+                "investigating".to_string(),
+                Some("paging the on-call".to_string()),
             ),
         ]
     }
@@ -1410,6 +1495,8 @@ mod tests {
             // FIM-009 + Tappa 9.0.b — APPENDED, never renumber.
             (OperationCode::TrustedInstallerGrant, 18),
             (OperationCode::Detections, 19),
+            // Tappa 9.0.c — APPENDED, never renumber.
+            (OperationCode::DetectionSetStatus, 20),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -1450,6 +1537,8 @@ mod tests {
             // FIM-009 + Tappa 9.0.b — APPENDED, never renumber.
             (Role::TrustedInstaller, 12),
             (Role::TelemetryRead, 13),
+            // Tappa 9.0.c — APPENDED, never renumber.
+            (Role::Triage, 14),
             (Role::All, 255),
         ];
         for (r, expected) in cases {

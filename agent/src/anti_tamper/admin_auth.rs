@@ -161,8 +161,18 @@ impl KeyEntry {
     /// role is `required`. [`Role::All`] is the break-glass
     /// super-role and unconditionally satisfies any required role
     /// (design §3.2 "break-glass key (kept offline)" pattern).
+    ///
+    /// Tappa 9.0.c role gradient: [`Role::Triage`] SUBSUMES
+    /// [`Role::TelemetryRead`] — a triage key can read the detections it
+    /// triages, so an operator running triage needs only the one role.
+    /// The subsumption is one-directional (read does NOT imply triage):
+    /// a `telemetry-read`-only key still fails a `Triage` requirement.
     fn authorizes(&self, required: Role) -> bool {
-        self.roles.iter().any(|r| *r == required || *r == Role::All)
+        self.roles.iter().any(|r| {
+            *r == required
+                || *r == Role::All
+                || (required == Role::TelemetryRead && *r == Role::Triage)
+        })
     }
 }
 
@@ -1090,12 +1100,15 @@ fn parse_role_keyword(s: &str) -> Result<Role> {
         "trusted-installer" => Ok(Role::TrustedInstaller),
         // Tappa 9.0.b — low-privilege read-only telemetry role.
         "telemetry-read" => Ok(Role::TelemetryRead),
+        // Tappa 9.0.c — triage role (subsumes telemetry-read).
+        "triage" => Ok(Role::Triage),
         "all" => Ok(Role::All),
         other => Err(anyhow!(
             "unknown role `{other}` — expected one of: \
              unlock, shutdown, force-posture, rotate-keys, audit-read, \
              fim-manage, fim-read, canary-read, canary-manage, \
-             net-read, net-manage, trusted-installer, telemetry-read, all"
+             net-read, net-manage, trusted-installer, telemetry-read, \
+             triage, all"
         )),
     }
 }
@@ -1271,6 +1284,8 @@ fn role_keyword(r: Role) -> &'static str {
         Role::TrustedInstaller => "trusted-installer",
         // Tappa 9.0.b — read-only telemetry role.
         Role::TelemetryRead => "telemetry-read",
+        // Tappa 9.0.c — triage role (subsumes telemetry-read).
+        Role::Triage => "triage",
         Role::All => "all",
     }
 }
@@ -1917,6 +1932,8 @@ mod tests {
             ("trusted-installer", Role::TrustedInstaller),
             // Tappa 9.0.b — read-only telemetry role.
             ("telemetry-read", Role::TelemetryRead),
+            // Tappa 9.0.c — triage role (subsumes telemetry-read).
+            ("triage", Role::Triage),
             ("all", Role::All),
         ];
         for (keyword, expected) in cases {
@@ -2075,6 +2092,53 @@ mod tests {
         match auth.verify_with_role(&sig, Role::Unlock).unwrap_err() {
             AdminAuthError::RoleDenied { required_role, .. } => {
                 assert_eq!(required_role, Role::Unlock);
+            }
+            other => panic!("expected RoleDenied for telemetry-read key, got {other:?}"),
+        }
+        assert_eq!(
+            auth.failure_count.load(Ordering::SeqCst),
+            0,
+            "RoleDenied must not count toward rate-limit"
+        );
+    }
+
+    /// Tappa 9.0.c — the triage role SUBSUMES telemetry-read: a key
+    /// whose only role is `triage` authorises a `TelemetryRead`
+    /// requirement (so a triage-only key can read the detections it
+    /// triages). The subsumption is one-directional — the converse is
+    /// covered by `telemetry_read_only_key_is_role_denied_for_triage`.
+    #[test]
+    fn triage_key_authorises_telemetry_read_requirement() {
+        let (signing, vk) = make_keypair();
+        let entry = KeyEntry {
+            key: vk,
+            roles: vec![Role::Triage],
+        };
+        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let nonce = auth.issue_challenge().unwrap();
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        auth.verify_with_role(&sig, Role::TelemetryRead)
+            .expect("triage role must subsume telemetry-read");
+    }
+
+    /// Tappa 9.0.c — the subsumption is one-directional: a
+    /// `telemetry-read`-only key is RoleDenied for a `Triage`
+    /// requirement (read does NOT imply triage). This is the
+    /// gate `DetectionSetStatus` relies on — a read-only dashboard
+    /// key cannot change a detection's status.
+    #[test]
+    fn telemetry_read_only_key_is_role_denied_for_triage() {
+        let (signing, vk) = make_keypair();
+        let entry = KeyEntry {
+            key: vk,
+            roles: vec![Role::TelemetryRead],
+        };
+        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let nonce = auth.issue_challenge().unwrap();
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        match auth.verify_with_role(&sig, Role::Triage).unwrap_err() {
+            AdminAuthError::RoleDenied { required_role, .. } => {
+                assert_eq!(required_role, Role::Triage);
             }
             other => panic!("expected RoleDenied for telemetry-read key, got {other:?}"),
         }

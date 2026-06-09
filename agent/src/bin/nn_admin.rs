@@ -38,9 +38,9 @@ use northnarrow_agent::admin_cli::{
     run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
     run_status, run_trusted_installer_grant, run_unlock, run_verify_keys, AuditVerifyOutcome,
     CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome,
-    CanaryRefreshOutcome, FimBaselineOutcome, FimReportOutcome, FimStatusOutcome,
-    ForcePostureOutcome, NetJsonlOutcome, NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome,
-    StatusOutcome, TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
+    CanaryRefreshOutcome, DetectionSetStatusOutcome, FimBaselineOutcome, FimReportOutcome,
+    FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome, NetResolveOutcome, RotateKeysOutcome,
+    ShutdownOutcome, StatusOutcome, TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -151,6 +151,34 @@ enum Cmd {
         /// matches the process name — the available subject id.)
         #[arg(long)]
         path: Option<String>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
+    /// Tappa 9.0.c — change a persisted detection's triage status over
+    /// the admin socket. Requires a key carrying the `triage` role
+    /// (which also subsumes `telemetry-read`, so a triage key can both
+    /// read detections and re-status them). Event-sourced: the agent
+    /// appends a signed status-change event to a separate chain and
+    /// never mutates the detection log; the new status surfaces on the
+    /// next `nn-admin detections` read.
+    DetectionSetStatus {
+        /// Path to the operator's `triage`-role admin private key.
+        #[arg(long)]
+        key: PathBuf,
+        /// The detection id to re-status (from a prior `detections`
+        /// read). Must reference an existing detection.
+        #[arg(long)]
+        id: u64,
+        /// The new triage status. `open` is not a valid target (it is
+        /// the initial state); the lifecycle only moves forward.
+        #[arg(long, value_enum)]
+        status: StatusTargetArg,
+        /// Optional free-text triage note recorded on the event.
+        #[arg(long)]
+        note: Option<String>,
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
         agent_id_file: PathBuf,
         #[arg(long, default_value = DEFAULT_SOCKET)]
@@ -709,11 +737,16 @@ impl SeverityArg {
 }
 
 /// Tappa 9.0.b — `--status` triage-state filter for `detections`.
+/// Tappa 9.0.c reshaped the lifecycle: the old `closed` rung was
+/// replaced by the richer `investigating` / `resolved` /
+/// `false-positive` triage states. All five are filterable.
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum StatusArg {
     Open,
     Acknowledged,
-    Closed,
+    Investigating,
+    Resolved,
+    FalsePositive,
 }
 
 impl StatusArg {
@@ -721,7 +754,32 @@ impl StatusArg {
         match self {
             StatusArg::Open => "open",
             StatusArg::Acknowledged => "acknowledged",
-            StatusArg::Closed => "closed",
+            StatusArg::Investigating => "investigating",
+            StatusArg::Resolved => "resolved",
+            StatusArg::FalsePositive => "false-positive",
+        }
+    }
+}
+
+/// Tappa 9.0.c — settable triage TARGET for `detection-set-status`.
+/// Distinct from [`StatusArg`]: `open` is the initial state a detection
+/// is recorded in, NOT a target an operator transitions TO, so it is
+/// deliberately absent here (the lifecycle only moves forward).
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum StatusTargetArg {
+    Acknowledged,
+    Investigating,
+    Resolved,
+    FalsePositive,
+}
+
+impl StatusTargetArg {
+    fn as_wire(&self) -> &'static str {
+        match self {
+            StatusTargetArg::Acknowledged => "acknowledged",
+            StatusTargetArg::Investigating => "investigating",
+            StatusTargetArg::Resolved => "resolved",
+            StatusTargetArg::FalsePositive => "false-positive",
         }
     }
 }
@@ -848,6 +906,27 @@ fn main() -> ExitCode {
             Ok(outcome) => exit_from_detections(outcome),
             Err(e) => {
                 eprintln!("detections: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::DetectionSetStatus {
+            key,
+            id,
+            status,
+            note,
+            agent_id_file,
+            socket,
+        } => match northnarrow_agent::admin_cli::run_detection_set_status(
+            &socket,
+            &key,
+            &agent_id_file,
+            id,
+            status.as_wire().to_string(),
+            note,
+        ) {
+            Ok(outcome) => exit_from_detection_set_status(outcome),
+            Err(e) => {
+                eprintln!("detection-set-status: {e:#}");
                 ExitCode::from(5)
             }
         },
@@ -2391,6 +2470,75 @@ fn exit_from_detections(outcome: NetJsonlOutcome) -> ExitCode {
             ExitCode::from(5)
         }
         NetJsonlOutcome::Transport => {
+            eprintln!("{op}: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// Tappa 9.0.c — exit handler for `nn-admin detection-set-status`.
+/// Success prints the id + new status; `NotFound` gets a precise hint.
+fn exit_from_detection_set_status(outcome: DetectionSetStatusOutcome) -> ExitCode {
+    let op = "detection-set-status";
+    let tty = std::io::stdout().is_terminal();
+    match outcome {
+        DetectionSetStatusOutcome::Success { id, new_status } => {
+            println!(
+                "{}",
+                colorize(&format!("{op}: detection {id} → {new_status}"), "32", tty)
+            );
+            ExitCode::SUCCESS
+        }
+        DetectionSetStatusOutcome::InvalidSignature => {
+            eprintln!("{op}: invalid signature");
+            ExitCode::from(2)
+        }
+        DetectionSetStatusOutcome::NoPendingChallenge => {
+            eprintln!("{op}: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        DetectionSetStatusOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("{op}: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        DetectionSetStatusOutcome::QuorumNotMet { required, provided } => {
+            eprintln!("{op}: quorum not met ({provided}/{required})");
+            ExitCode::from(6)
+        }
+        DetectionSetStatusOutcome::RoleDenied => {
+            eprintln!("{op}: role denied (the submitted key lacks `triage`)");
+            ExitCode::from(7)
+        }
+        DetectionSetStatusOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!("{op}: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
+            ExitCode::from(5)
+        }
+        DetectionSetStatusOutcome::AgentIdMismatch => {
+            eprintln!("{op}: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        DetectionSetStatusOutcome::NotFound => {
+            // The agent folds several non-auth rejections into this one
+            // signal (UnknownOperation): an out-of-range id, AND a
+            // server-side persistence failure (e.g. disk full / I/O
+            // error appending the status-event chain). Word it so the
+            // operator is NOT falsely told the detection is gone and
+            // knows the change was NOT applied — check the store + the
+            // agent log, then retry.
+            eprintln!(
+                "{op}: change not applied — no detection with that id, or the server \
+                 could not persist it (check `nn-admin detections` and the agent log, then retry)"
+            );
+            ExitCode::from(9)
+        }
+        DetectionSetStatusOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("{op}: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        DetectionSetStatusOutcome::Transport => {
             eprintln!("{op}: unexpected server reply");
             ExitCode::from(5)
         }
