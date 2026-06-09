@@ -114,6 +114,49 @@ enum Cmd {
         json: bool,
     },
 
+    /// Tappa 9.0.b — read the last N persisted detections
+    /// (newest-first) over the admin socket. Requires a key carrying
+    /// the low-privilege `telemetry-read` role — read-only telemetry,
+    /// no COMBAT/control authority. The records stream as JSONL on
+    /// stdout (so `| jq` works); a summary goes to stderr.
+    Detections {
+        /// Path to the operator's `telemetry-read`-role admin private
+        /// key.
+        #[arg(long)]
+        key: PathBuf,
+        /// Maximum records to return — the bounded "last N". The agent
+        /// caps this server-side and may further truncate to fit the
+        /// wire frame.
+        #[arg(long, default_value_t = northnarrow_agent::detection_store::DEFAULT_DETECTIONS_LIMIT as u32)]
+        limit: u32,
+        /// Inclusive lower time bound (UNIX seconds): keep detections
+        /// recorded at or after this instant.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Inclusive upper time bound (UNIX seconds): keep detections
+        /// recorded at or before this instant.
+        #[arg(long)]
+        until: Option<u64>,
+        /// Keep detections at or above this severity rung.
+        #[arg(long = "min-severity", value_enum)]
+        min_severity: Option<SeverityArg>,
+        /// Exact-match the triage status.
+        #[arg(long, value_enum)]
+        status: Option<StatusArg>,
+        /// Exact-match the originating sensor.
+        #[arg(long, value_enum)]
+        sensor: Option<SensorArg>,
+        /// Substring filter on the acting principal's `comm`. (9.0.a's
+        /// detection record carries no filesystem path, so `--path`
+        /// matches the process name — the available subject id.)
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
     /// Parse the installed admin.pub, count valid keys, print
     /// fingerprints. Local-only — does not touch the agent socket.
     VerifyKeys {
@@ -644,6 +687,70 @@ enum NetCmd {
     },
 }
 
+/// Tappa 9.0.b — `--min-severity` filter for `nn-admin detections`.
+/// The wire string is the canonical lowercase form the agent parses.
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum SeverityArg {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl SeverityArg {
+    fn as_wire(&self) -> &'static str {
+        match self {
+            SeverityArg::Low => "low",
+            SeverityArg::Medium => "medium",
+            SeverityArg::High => "high",
+            SeverityArg::Critical => "critical",
+        }
+    }
+}
+
+/// Tappa 9.0.b — `--status` triage-state filter for `detections`.
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum StatusArg {
+    Open,
+    Acknowledged,
+    Closed,
+}
+
+impl StatusArg {
+    fn as_wire(&self) -> &'static str {
+        match self {
+            StatusArg::Open => "open",
+            StatusArg::Acknowledged => "acknowledged",
+            StatusArg::Closed => "closed",
+        }
+    }
+}
+
+/// Tappa 9.0.b — `--sensor` filter for `detections`. Mirrors the
+/// agent-side `Sensor` taxonomy.
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum SensorArg {
+    Exec,
+    File,
+    ModuleLoad,
+    Network,
+    AntiTamper,
+    Canary,
+}
+
+impl SensorArg {
+    fn as_wire(&self) -> &'static str {
+        match self {
+            SensorArg::Exec => "exec",
+            SensorArg::File => "file",
+            SensorArg::ModuleLoad => "module-load",
+            SensorArg::Network => "network",
+            SensorArg::AntiTamper => "anti-tamper",
+            SensorArg::Canary => "canary",
+        }
+    }
+}
+
 #[cfg(feature = "debug-trigger")]
 #[derive(Subcommand, Debug)]
 enum DebugCmd {
@@ -712,6 +819,35 @@ fn main() -> ExitCode {
             Ok(outcome) => exit_from_unlock(outcome),
             Err(e) => {
                 eprintln!("unlock: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Detections {
+            key,
+            limit,
+            since,
+            until,
+            min_severity,
+            status,
+            sensor,
+            path,
+            agent_id_file,
+            socket,
+        } => match northnarrow_agent::admin_cli::run_detections(
+            &socket,
+            &key,
+            &agent_id_file,
+            limit,
+            since,
+            until,
+            min_severity.map(|s| s.as_wire().to_string()),
+            status.map(|s| s.as_wire().to_string()),
+            sensor.map(|s| s.as_wire().to_string()),
+            path,
+        ) {
+            Ok(outcome) => exit_from_detections(outcome),
+            Err(e) => {
+                eprintln!("detections: {e:#}");
                 ExitCode::from(5)
             }
         },
@@ -2167,6 +2303,72 @@ fn exit_from_net_jsonl(outcome: NetJsonlOutcome, op: &str) -> ExitCode {
         }
         NetJsonlOutcome::RoleDenied => {
             eprintln!("{op}: role denied (the submitted key lacks `net-read`)");
+            ExitCode::from(7)
+        }
+        NetJsonlOutcome::TimestampSkew {
+            server_ts,
+            max_skew_secs,
+        } => {
+            eprintln!("{op}: clock skew (server_ts={server_ts}, max ±{max_skew_secs}s)");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::AgentIdMismatch => {
+            eprintln!("{op}: agent_id mismatch");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::UnknownOperation => {
+            eprintln!("{op}: server rejected operation");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::ProtocolVersionUnsupported { server_version } => {
+            eprintln!("{op}: server speaks protocol v{server_version}");
+            ExitCode::from(5)
+        }
+        NetJsonlOutcome::Transport => {
+            eprintln!("{op}: unexpected server reply");
+            ExitCode::from(5)
+        }
+    }
+}
+
+/// Tappa 9.0.b — exit handler for `nn-admin detections`. Reuses the
+/// shared [`NetJsonlOutcome`] (the reply shape is identical to the
+/// chain-style net reads), but prints detection-specific summary +
+/// role-denied wording. JSONL records → stdout, summary → stderr.
+fn exit_from_detections(outcome: NetJsonlOutcome) -> ExitCode {
+    let op = "detections";
+    match outcome {
+        NetJsonlOutcome::Success {
+            entries_jsonl,
+            entries_count,
+            entries_truncated,
+        } => {
+            print!("{entries_jsonl}");
+            if entries_truncated {
+                eprintln!(
+                    "{op}: {entries_count} records \
+                     (truncated to fit the wire frame; narrow with \
+                     --limit / --since / --min-severity / a filter)"
+                );
+            } else {
+                eprintln!("{op}: {entries_count} records");
+            }
+            ExitCode::SUCCESS
+        }
+        NetJsonlOutcome::InvalidSignature => {
+            eprintln!("{op}: invalid signature");
+            ExitCode::from(2)
+        }
+        NetJsonlOutcome::NoPendingChallenge => {
+            eprintln!("{op}: no pending challenge (retry)");
+            ExitCode::from(3)
+        }
+        NetJsonlOutcome::RateLimited { retry_after_secs } => {
+            eprintln!("{op}: rate limited; retry after {retry_after_secs}s");
+            ExitCode::from(4)
+        }
+        NetJsonlOutcome::RoleDenied => {
+            eprintln!("{op}: role denied (the submitted key lacks `telemetry-read`)");
             ExitCode::from(7)
         }
         NetJsonlOutcome::TimestampSkew {
