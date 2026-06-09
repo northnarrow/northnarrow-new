@@ -828,6 +828,44 @@ pub fn bootstrap_fim_log(fim_log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Tappa 9.0.a: bootstrap the detection chainlog's directory + an empty
+/// active file pre-attach, so PROTECTED_INODES has an inode to register
+/// before the LSM hooks come up — exactly as the FIM / netflow logs do.
+/// Creates the `detections/` sub-dir at [`STATE_DIR_MODE`] (0700) if
+/// missing, then a zero-byte 0644 active file. Idempotent: a present
+/// file (existing chain) is left untouched.
+pub fn bootstrap_detections_log(detections_log_path: &Path) -> Result<()> {
+    if detections_log_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = detections_log_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            DirBuilder::new()
+                .mode(STATE_DIR_MODE)
+                .recursive(true)
+                .create(parent)
+                .with_context(|| {
+                    format!("creating detections-log parent dir {}", parent.display())
+                })?;
+        }
+    }
+    // 0644: world-readable for operator inspection, agent-writable
+    // (append-only enforced via PROTECTED_INODES + the agent's PID
+    // exemption) — same envelope as the FIM drift log.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(detections_log_path)
+        .with_context(|| format!("creating detections log {}", detections_log_path.display()))?;
+    info!(
+        path = %detections_log_path.display(),
+        "anti-tamper FS: detections log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
+}
+
 /// Tappa 8 A14 (B4): bootstrap an empty audit.log file if it
 /// doesn't exist yet, so PROTECTED_INODES has an inode to
 /// register at attach time. Idempotent: a present file is

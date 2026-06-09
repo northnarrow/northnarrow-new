@@ -270,6 +270,16 @@ struct Cli {
     )]
     fim_drift_file: PathBuf,
 
+    /// Tappa 9.0.a: configurable path of the chained detection log
+    /// (default `/var/lib/northnarrow/detections/detections.jsonl`).
+    /// Same per-test override rationale as `--fim-drift-file`.
+    #[arg(
+        long = "detections-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::detection_store::DEFAULT_DETECTIONS_LOG_PATH,
+    )]
+    detections_file: PathBuf,
+
     /// Tappa 9.5 K2 / K6: configurable path of the chained canary
     /// registry log. Tests override this to a tempdir so each test
     /// run gets a fresh chain. Missing file means an empty registry
@@ -572,6 +582,19 @@ async fn main() -> Result<()> {
             path = %cli.fim_drift_file.display(),
             "fim drift log bootstrap failed pre-attach — file will be lazily \
              created on first append (and unprotected this boot)"
+        );
+    }
+    // Tappa 9.0.a: bootstrap the detection chainlog pre-attach (creates
+    // the detections/ sub-dir + a zero-byte active file) — same inode-
+    // registration rationale as the FIM / canary logs.
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_detections_log(&cli.detections_file)
+    {
+        warn!(
+            error = %e,
+            path = %cli.detections_file.display(),
+            "detections log bootstrap failed pre-attach — file will be lazily \
+             created on first detection (and unprotected this boot)"
         );
     }
     // Tappa 9.5 K7: bootstrap the two canary state logs pre-attach
@@ -1337,6 +1360,53 @@ async fn main() -> Result<()> {
         file_mode: 0o644,
     };
 
+    // Tappa 9.0.a: open the detection store + spawn its dedicated writer
+    // task. Detections are lower-volume than netflow → default 16 MiB ×
+    // 8 archives (≈144 MiB budget), overridable via NN_DETECTIONS_CAP_BYTES
+    // for rotation validation. Re-load the signing key (separate domain
+    // handle, like the FIM block below). Degrade-not-fail: any error here
+    // means "no detection persistence this boot", never an agent abort.
+    // The writer JoinHandle is detached on drop (tokio keeps the task
+    // running); the sink is threaded into the event loop.
+    let detection_sink: Option<northnarrow_agent::detection_store::DetectionSink> = {
+        let cap_bytes = std::env::var("NN_DETECTIONS_CAP_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(northnarrow_agent::detection_store::DEFAULT_DETECTIONS_CAP_BYTES);
+        let detections_rotation = northnarrow_agent::chainlog::RotationConfig {
+            size_cap_bytes: cap(cap_bytes),
+            max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
+            file_mode: 0o644,
+        };
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(key) => match northnarrow_agent::detection_store::open(
+                &cli.detections_file,
+                key,
+                detections_rotation,
+                rotation_protection.clone(),
+                northnarrow_agent::detection_store::DEFAULT_QUEUE_CAP,
+            ) {
+                Ok((sink, _writer)) => Some(sink),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %cli.detections_file.display(),
+                        "detection store open failed — detections will NOT persist this boot"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "detection store needs the agent signing key — load failed; \
+                     detections will NOT persist this boot"
+                );
+                None
+            }
+        }
+    };
+
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // Re-derive the signing key + agent_id for FIM the same way
         // the audit log does (re-load rather than steal the audit
@@ -1970,6 +2040,8 @@ async fn main() -> Result<()> {
                     canary_detector.as_deref(),
                     // FIM-009 self-upgrade (§15.1): lazy TTL expiry sweep.
                     &installer_override,
+                    // Tappa 9.0.a: detection-persistence sink (off the hot path).
+                    detection_sink.as_ref(),
                     e,
                 ).await,
                 None => {
@@ -2097,6 +2169,10 @@ async fn process_event(
     canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
     // FIM-009 self-upgrade (§15.1): consulted for lazy TTL expiry.
     installer_override: &northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    // Tappa 9.0.a: detection-persistence sink. `None` ⇒ not persisting
+    // this boot (e.g. signing key / store open failed at startup). All
+    // record calls are off the hot path (bounded queue + writer task).
+    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
     event: Event,
 ) {
     // FIM-009 self-upgrade (§15.1): lazy TTL expiry on the event path —
@@ -2372,6 +2448,15 @@ async fn process_event(
             elapsed_us = report.elapsed.as_micros() as u64,
             "EXECUTED"
         );
+        // Tappa 9.0.a: persist the rule detection (off the hot path).
+        if let Some(sink) = detection_sink {
+            sink.record_rule(
+                &event,
+                &verdict,
+                posture.current_kind(),
+                northnarrow_agent::detection_store::describe_response(&report),
+            );
+        }
         return;
     }
 
@@ -2430,6 +2515,13 @@ async fn process_event(
 
     if !verdict.requires_execution() {
         info!(action = %verdict.verdict, "ADE verdict logged, no execution needed");
+        // Tappa 9.0.a: persist non-benign ADE verdicts even when no
+        // response runs. `Allow` is benign ⇒ not a detection.
+        if let Some(sink) = detection_sink {
+            if verdict.verdict != common::ade_types::AdeAction::Allow {
+                sink.record_ade(&event, &verdict, posture.current_kind(), "none".to_string());
+            }
+        }
         return;
     }
 
@@ -2453,6 +2545,15 @@ async fn process_event(
         elapsed_us = report.elapsed.as_micros() as u64,
         "EXECUTED (from ADE)"
     );
+    // Tappa 9.0.a: persist the ADE detection (a response ran ⇒ non-benign).
+    if let Some(sink) = detection_sink {
+        sink.record_ade(
+            &event,
+            &verdict,
+            posture.current_kind(),
+            northnarrow_agent::detection_store::describe_response(&report),
+        );
+    }
 }
 
 /// Render a 16-byte address according to family (`2` = AF_INET → first
