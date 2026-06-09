@@ -31,7 +31,8 @@ use tracing::{info, warn};
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
-    DetectionsRequest, DetectionsResponse, FimBaselineRequest, FimReportRequest, FimReportResponse,
+    DetectionSetStatusRequest, DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse,
+    FimBaselineRequest, FimReportRequest, FimReportResponse,
     FimStatusRequest, FimStatusResponse, ForcePostureRequest, NetFingerprintRequest,
     NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse, NetListenersRequest,
     NetListenersResponse, NetResolveRequest, NetResolveResponse, RotateKeysAddRequest,
@@ -47,6 +48,8 @@ use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::canary::detector::CanaryIndexes;
+use crate::chainlog::RotatingChainLog;
+use crate::detection_store::{Principal, StatusEvent};
 use crate::canary::registry::{CanaryTokenDraft, Registry, RegistryError};
 use crate::fim::drain::DriftRateLimiter;
 use crate::fim::recompute::{BaselineRecomputeSender, RecomputeReason};
@@ -206,6 +209,31 @@ pub struct CanaryAdminState {
     pub template_dir: Option<PathBuf>,
 }
 
+/// Tappa 9.0.c — detection-triage admin-socket state bundle. Threaded
+/// through dispatch so `DetectionSetStatus` can append a
+/// [`StatusEvent`] to the status-event chain, and `Detections` can
+/// overlay the current (event-sourced) status onto the records it
+/// returns. main.rs constructs this at boot from the agent signing
+/// key + the same anti-tamper protection handle the detection store
+/// uses.
+#[derive(Clone)]
+pub struct DetectionAdminState {
+    /// Open status-event chainlog (`status_events.jsonl`).
+    /// `dispatch_detection_set_status` locks it and appends + fsyncs a
+    /// single `StatusEvent` synchronously on the handler thread (triage
+    /// is human-initiated + low-frequency, NOT the hot path — so no
+    /// off-thread writer like the 9.0.a detection sink). `&mut` for
+    /// `append`, hence the `Mutex`.
+    pub status_log: Arc<Mutex<RotatingChainLog<StatusEvent>>>,
+    /// Path to `detections.jsonl`. `dispatch_detection_set_status`
+    /// reads its max id for the `id <= max` validity guard;
+    /// `dispatch_detections` reads its records.
+    pub detections_path: PathBuf,
+    /// Path to `status_events.jsonl`. `dispatch_detections` builds the
+    /// `{id -> current status}` overlay from here.
+    pub status_events_path: PathBuf,
+}
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
 /// agent's main loop is expected to also exit on the same condition.
@@ -240,6 +268,7 @@ pub async fn serve(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -267,6 +296,7 @@ pub async fn serve_with_audit_log(
         marker_path,
         shutdown_signal,
         Some(audit_log),
+        None,
         None,
         None,
         None,
@@ -304,6 +334,7 @@ pub async fn serve_with_fim_state(
         Some(fim_state),
         None,
         None,
+        None,
     )
     .await
 }
@@ -336,6 +367,7 @@ pub async fn serve_with_canary_state(
         fim_state,
         Some(canary_state),
         None,
+        None,
     )
     .await
 }
@@ -363,6 +395,10 @@ pub async fn serve_with_marker_path(
     // FIM-009 self-upgrade (§15.1): shared override armed by a verified
     // TrustedInstallerGrantRequest. None on legacy serve paths.
     installer_override: Option<Arc<TrustedInstallerOverride>>,
+    // Tappa 9.0.c: status-event chain handle + paths for the detection
+    // triage verbs (set-status write + read overlay). None on legacy /
+    // test serve paths that don't wire the detection store.
+    detection_state: Option<Arc<DetectionAdminState>>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -400,6 +436,7 @@ pub async fn serve_with_marker_path(
         let fim_state = fim_state.clone();
         let canary_state = canary_state.clone();
         let installer_override = installer_override.clone();
+        let detection_state = detection_state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -412,6 +449,7 @@ pub async fn serve_with_marker_path(
                 fim_state.as_ref(),
                 canary_state.as_ref(),
                 installer_override.as_ref(),
+                detection_state.as_ref(),
             )
             .await
             {
@@ -447,6 +485,7 @@ async fn handle_connection(
     fim_state: Option<&Arc<FimAdminState>>,
     canary_state: Option<&Arc<CanaryAdminState>>,
     installer_override: Option<&Arc<TrustedInstallerOverride>>,
+    detection_state: Option<&Arc<DetectionAdminState>>,
 ) -> Result<()> {
     // Capture peer creds once per connection — the audit log
     // wants pid/uid/comm of the caller, and a single connection
@@ -469,6 +508,8 @@ async fn handle_connection(
             fim_state.map(|s| s.as_ref()),
             canary_state.map(|s| s.as_ref()),
             installer_override.map(|s| s.as_ref()),
+            detection_state.map(|s| s.as_ref()),
+            &client,
             &mut matched_fps,
         );
         emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
@@ -840,6 +881,30 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // Tappa 9.0.c — detection triage status change. Records the
+        // target id + new status + note + the auth result so an
+        // off-host audit reader sees the full triage history (the
+        // status-event chain is the data-of-record; this is the
+        // who/when receipt alongside it).
+        (
+            AdminMessage::DetectionSetStatusRequest(req),
+            AdminMessage::DetectionSetStatusResponse(resp),
+        ) => {
+            let extra = match &req.payload.extra {
+                OperationExtra::DetectionSetStatus(e) => serde_json::json!({
+                    "id": e.id,
+                    "new_status": e.new_status,
+                    "note": e.note,
+                }),
+                _ => serde_json::json!({}),
+            };
+            (
+                "detection_set_status",
+                extra,
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -934,6 +999,8 @@ fn dispatch(
     fim_state: Option<&FimAdminState>,
     canary_state: Option<&CanaryAdminState>,
     installer_override: Option<&TrustedInstallerOverride>,
+    detection_state: Option<&DetectionAdminState>,
+    client: &AuditClient,
     fps_out: &mut Vec<String>,
 ) -> AdminMessage {
     match msg {
@@ -1102,11 +1169,19 @@ fn dispatch(
         }
 
         // Tappa 9.0.b — signed detections read (read-only,
-        // Role::TelemetryRead). Reads the detection chainlog at the
-        // default path, so it needs no extra wired state.
-        AdminMessage::DetectionsRequest(req) => {
-            AdminMessage::DetectionsResponse(dispatch_detections(req, auth, fps_out))
-        }
+        // Role::TelemetryRead, or Triage via subsumption). Overlays the
+        // event-sourced current status from the status-event chain
+        // (9.0.c) onto the returned records.
+        AdminMessage::DetectionsRequest(req) => AdminMessage::DetectionsResponse(
+            dispatch_detections(req, auth, detection_state, fps_out),
+        ),
+
+        // Tappa 9.0.c — signed detection triage status-change
+        // (Role::Triage). Appends a StatusEvent to the status-event
+        // chain; detections.jsonl is never mutated.
+        AdminMessage::DetectionSetStatusRequest(req) => AdminMessage::DetectionSetStatusResponse(
+            dispatch_detection_set_status(req, auth, detection_state, client, fps_out),
+        ),
 
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
@@ -1130,7 +1205,8 @@ fn dispatch(
         | AdminMessage::NetResolveResponse(_)
         | AdminMessage::NetFingerprintResponse(_)
         | AdminMessage::TrustedInstallerGrantResult(_)
-        | AdminMessage::DetectionsResponse(_) => {
+        | AdminMessage::DetectionsResponse(_)
+        | AdminMessage::DetectionSetStatusResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -2712,6 +2788,7 @@ fn empty_detections(result: AdminResult) -> DetectionsResponse {
 fn dispatch_detections(
     req: DetectionsRequest,
     auth: &AdminAuth,
+    det_state: Option<&DetectionAdminState>,
     fps_out: &mut Vec<String>,
 ) -> DetectionsResponse {
     use crate::detection_store::{self, DetectionFilter};
@@ -2723,6 +2800,9 @@ fn dispatch_detections(
         &req.payload,
         &sigs,
         1, // 1-of-N: a read verb, like fim-report / net-flows.
+        // Role::TelemetryRead — a Triage key also satisfies this via
+        // the 9.0.c subsumption (triage subsumes read), so a triage-
+        // only key can read the detections it triages.
         &[Role::TelemetryRead],
         OperationCode::Detections,
         server_now,
@@ -2785,8 +2865,22 @@ fn dispatch_detections(
         (extra.limit as usize).min(detection_store::MAX_DETECTIONS_LIMIT)
     };
 
-    let records = detection_store::read_last_n(
-        std::path::Path::new(detection_store::DEFAULT_DETECTIONS_LOG_PATH),
+    // Resolve the store paths from the wired state when present (honours
+    // a custom --detections-file); fall back to the build defaults so
+    // the legacy/test path (no DetectionAdminState) still reads the
+    // canonical location — an absent file simply yields no records / no
+    // overlay. The read OVERLAYS the event-sourced current status from
+    // the status-event chain onto each record (9.0.c).
+    let (detections_path, status_events_path) = match det_state {
+        Some(s) => (s.detections_path.clone(), s.status_events_path.clone()),
+        None => (
+            std::path::PathBuf::from(detection_store::DEFAULT_DETECTIONS_LOG_PATH),
+            std::path::PathBuf::from(detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH),
+        ),
+    };
+    let records = detection_store::read_last_n_overlaid(
+        &detections_path,
+        &status_events_path,
         limit,
         &filter,
     );
@@ -2821,6 +2915,137 @@ fn dispatch_detections(
         entries_jsonl,
         entries_count,
         entries_truncated,
+    }
+}
+
+/// An auth-failure / not-found / unavailable
+/// [`DetectionSetStatusResponse`] carrying `result`, echoing the
+/// requested `id`, with an empty status string.
+fn fail_set_status(result: AdminResult, id: u64) -> DetectionSetStatusResponse {
+    DetectionSetStatusResponse {
+        result,
+        id,
+        new_status: String::new(),
+    }
+}
+
+/// Tappa 9.0.c — handle one [`DetectionSetStatusRequest`]. Verifies the
+/// 1-of-N signed-payload quorum carrying [`Role::Triage`] (control
+/// roles do NOT implicitly authorise set-status, and a
+/// telemetry-read-only key is RoleDenied — read != triage), validates
+/// the target id against the detection store's max id (cheap
+/// `1 <= id <= max` guard; an out-of-range id is a clean "not found",
+/// folded into `UnknownOperation` like the K6 canary-burn contract),
+/// parses the target status string, then appends a signed
+/// [`StatusEvent`] to the status-event chain SYNCHRONOUSLY (triage is
+/// human-initiated + low-frequency, not the hot path — no off-thread
+/// writer). The detection chain (`detections.jsonl`) is never mutated;
+/// status is event-sourced and derived at read time.
+fn dispatch_detection_set_status(
+    req: DetectionSetStatusRequest,
+    auth: &AdminAuth,
+    det_state: Option<&DetectionAdminState>,
+    client: &AuditClient,
+    fps_out: &mut Vec<String>,
+) -> DetectionSetStatusResponse {
+    use crate::detection_store::{self, DetectionStatus};
+
+    // Recover the requested id up front so every reply (including auth
+    // failures) echoes it. Only meaningful for the matching extra
+    // variant; 0 otherwise (an op/extra mismatch is rejected anyway).
+    let req_id = match &req.payload.extra {
+        OperationExtra::DetectionSetStatus(e) => e.id,
+        _ => 0,
+    };
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1, // 1-of-N: a single triage operator suffices.
+        &[Role::Triage],
+        OperationCode::DetectionSetStatus,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return fail_set_status(map_admin_auth_error(e, "detection_set_status"), req_id)
+        }
+    };
+    *fps_out = matched_fps;
+
+    let extra = match &req.payload.extra {
+        OperationExtra::DetectionSetStatus(e) => e,
+        _ => {
+            warn!("detection-set-status payload extra is not DetectionSetStatus variant");
+            return fail_set_status(AdminResult::UnknownOperation, req_id);
+        }
+    };
+
+    // The status-event store must be wired (it isn't on a degraded boot
+    // where the detection store failed to open). Without it set-status
+    // cannot persist — surface UnknownOperation (mirrors the canary
+    // "registry None → UnknownOperation" degraded contract).
+    let Some(state) = det_state else {
+        warn!("detection-set-status: detection store not wired this boot");
+        return fail_set_status(AdminResult::UnknownOperation, extra.id);
+    };
+
+    // Parse the target status. `open` and unknown strings are rejected
+    // (`open` is the initial state, not a settable triage target).
+    let Some(new_status) = DetectionStatus::parse_settable(&extra.new_status) else {
+        warn!(value = %extra.new_status, "detection-set-status: invalid target status");
+        return fail_set_status(AdminResult::UnknownOperation, extra.id);
+    };
+
+    // Validity guard: the id must reference an existing detection.
+    // Cheap `1 <= id <= max` check (full existence scan deferred). An
+    // out-of-range id folds into UnknownOperation → the CLI renders it
+    // as a clean "detection not found".
+    let max_id = detection_store::max_detection_id(&state.detections_path);
+    if extra.id == 0 || extra.id > max_id {
+        warn!(id = extra.id, max_id, "detection-set-status: id out of range (not found)");
+        return fail_set_status(AdminResult::UnknownOperation, extra.id);
+    }
+
+    // Append the StatusEvent synchronously (append + fsync happen inside
+    // the chainlog). The principal is the SO_PEERCRED admin caller —
+    // the local operator process that initiated the change.
+    let event = StatusEvent {
+        detection_id: extra.id,
+        new_status,
+        ts: detection_store::now_ts(),
+        principal: Principal {
+            pid: client.pid,
+            comm: client.comm.clone(),
+            uid: client.uid,
+            ppid: None,
+        },
+        note: extra.note.clone().filter(|s| !s.is_empty()),
+    };
+    {
+        let mut log = state.status_log.lock();
+        if let Err(e) = log.append(event) {
+            warn!(
+                error = %e,
+                id = extra.id,
+                "detection-set-status: status-event append failed (change not persisted)"
+            );
+            return fail_set_status(AdminResult::UnknownOperation, extra.id);
+        }
+    }
+    info!(
+        target: "admin.detection_set_status",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        id = extra.id,
+        new_status = new_status.as_str(),
+        "detection triage status updated",
+    );
+    DetectionSetStatusResponse {
+        result: AdminResult::Success,
+        id: extra.id,
+        new_status: new_status.as_str().to_string(),
     }
 }
 
@@ -3283,6 +3508,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
                 socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None, None, None,
+                None,
             )
             .await;
         });
@@ -3515,6 +3741,7 @@ mod tests {
                 isolator_c,
                 marker_c,
                 Some(signal_for_serve),
+                None,
                 None,
                 None,
                 None,
@@ -4412,7 +4639,7 @@ mod tests {
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
-        let resp = dispatch_detections(req, &auth, &mut fps);
+        let resp = dispatch_detections(req, &auth, None, &mut fps);
         assert!(
             matches!(resp.result, AdminResult::Success),
             "telemetry-read key must be accepted for detections, got {:?}",
@@ -4432,7 +4659,7 @@ mod tests {
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
-        let resp = dispatch_detections(req, &auth, &mut fps);
+        let resp = dispatch_detections(req, &auth, None, &mut fps);
         assert!(matches!(resp.result, AdminResult::RoleDenied));
     }
 
@@ -4447,7 +4674,7 @@ mod tests {
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
-        let resp = dispatch_detections(req, &auth, &mut fps);
+        let resp = dispatch_detections(req, &auth, None, &mut fps);
         assert!(matches!(resp.result, AdminResult::RoleDenied));
     }
 
@@ -4461,8 +4688,223 @@ mod tests {
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
-        let resp = dispatch_detections(req, &auth, &mut fps);
+        let resp = dispatch_detections(req, &auth, None, &mut fps);
         assert!(matches!(resp.result, AdminResult::Success));
+    }
+
+    /// Tappa 9.0.c — a `triage` key is ACCEPTED for `detections`
+    /// (triage subsumes telemetry-read): a triage-only key can read the
+    /// detections it triages.
+    #[test]
+    fn dispatch_detections_accepts_triage() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xE4; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_detections_req(&signing, nonce, agent_id);
+        let mut fps = Vec::new();
+        let resp = dispatch_detections(req, &auth, None, &mut fps);
+        assert!(
+            matches!(resp.result, AdminResult::Success),
+            "triage key must be accepted for detections (subsumes read), got {:?}",
+            resp.result
+        );
+    }
+
+    // ── Tappa 9.0.c — detection-set-status dispatch + auth-gating ────
+
+    /// Build a signed `DetectionSetStatusRequest` for the dispatch
+    /// tests.
+    fn signed_set_status_req(
+        signing: &SigningKey,
+        nonce: [u8; 32],
+        agent_id: [u8; 16],
+        id: u64,
+        status: &str,
+    ) -> DetectionSetStatusRequest {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::{sign, SignedPayload};
+        let payload = SignedPayload::new_detection_set_status(
+            nonce,
+            now_unix_secs(),
+            agent_id,
+            id,
+            status.to_string(),
+            None,
+        );
+        let sig: [u8; 64] = sign(&payload, signing).unwrap();
+        DetectionSetStatusRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }
+    }
+
+    /// A `DetectionAdminState` backed by a tempdir: writes `max_id`
+    /// detection lines (minimal `{"id":N}` shape — enough for the
+    /// `max_detection_id` boot-read guard) and opens a real signed
+    /// status-event chain. Returns the state + the TempDir (kept alive
+    /// by the caller so the files survive the test).
+    fn detection_state_with_max_id(max_id: u64) -> (DetectionAdminState, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let det_path = dir.path().join("detections.jsonl");
+        let evt_path = dir.path().join("status_events.jsonl");
+        let body: String = (1..=max_id).map(|n| format!("{{\"id\":{n}}}\n")).collect();
+        std::fs::write(&det_path, body).unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let log = crate::detection_store::open_status_log(
+            &evt_path,
+            key,
+            crate::chainlog::RotationConfig::default(),
+            Arc::new(crate::chainlog::NoProtection),
+        )
+        .unwrap();
+        let state = DetectionAdminState {
+            status_log: Arc::new(Mutex::new(log)),
+            detections_path: det_path,
+            status_events_path: evt_path,
+        };
+        (state, dir)
+    }
+
+    fn test_client() -> AuditClient {
+        AuditClient {
+            pid: 4321,
+            uid: 0,
+            comm: "nn-admin".to_string(),
+        }
+    }
+
+    /// A `triage` key is ACCEPTED for set-status: the ack echoes the id
+    /// and new status, the signer fp is captured, and the change is
+    /// PERSISTED to the status-event chain (read back via
+    /// `latest_status_for_ids`). A second change on the same id then
+    /// wins (latest-wins), proving the event-sourced semantics through
+    /// the real signed-write path.
+    #[test]
+    fn dispatch_set_status_accepts_triage_and_persists_latest() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xF0; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let (state, _sdir) = detection_state_with_max_id(3);
+
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_set_status_req(&signing, nonce, agent_id, 2, "acknowledged");
+        let mut fps = Vec::new();
+        let resp =
+            dispatch_detection_set_status(req, &auth, Some(&state), &test_client(), &mut fps);
+        assert!(
+            matches!(resp.result, AdminResult::Success),
+            "triage key must be accepted for set-status, got {:?}",
+            resp.result
+        );
+        assert_eq!(resp.id, 2);
+        assert_eq!(resp.new_status, "acknowledged");
+        assert!(!fps.is_empty(), "matched signer fp must be captured");
+
+        // Second change on the SAME id — latest must win.
+        let nonce2 = auth.issue_challenge().unwrap();
+        let req2 = signed_set_status_req(&signing, nonce2, agent_id, 2, "resolved");
+        let resp2 =
+            dispatch_detection_set_status(req2, &auth, Some(&state), &test_client(), &mut fps);
+        assert!(matches!(resp2.result, AdminResult::Success));
+
+        // The status-event chain now resolves id 2 → Resolved (latest).
+        let wanted: std::collections::HashSet<u64> = [2u64].into_iter().collect();
+        let map =
+            crate::detection_store::latest_status_for_ids(&state.status_events_path, &wanted);
+        assert_eq!(
+            map.get(&2),
+            Some(&crate::detection_store::DetectionStatus::Resolved),
+            "latest status event wins through the signed chain"
+        );
+    }
+
+    /// A `telemetry-read`-only key is REJECTED for set-status with
+    /// RoleDenied — read does NOT imply triage (the one-directional
+    /// subsumption). This is the core `read != triage` gate.
+    #[test]
+    fn dispatch_set_status_role_denied_for_telemetry_read_only() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xF1; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "telemetry-read", agent_id);
+        let (state, _sdir) = detection_state_with_max_id(3);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_set_status_req(&signing, nonce, agent_id, 2, "resolved");
+        let mut fps = Vec::new();
+        let resp =
+            dispatch_detection_set_status(req, &auth, Some(&state), &test_client(), &mut fps);
+        assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    /// A control-only key (`unlock`) is REJECTED for set-status —
+    /// control authority does NOT confer triage.
+    #[test]
+    fn dispatch_set_status_role_denied_for_control_only() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xF2; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let (state, _sdir) = detection_state_with_max_id(3);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_set_status_req(&signing, nonce, agent_id, 1, "acknowledged");
+        let mut fps = Vec::new();
+        let resp =
+            dispatch_detection_set_status(req, &auth, Some(&state), &test_client(), &mut fps);
+        assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    /// An id beyond the store's max id is a clean "not found" — folded
+    /// into UnknownOperation (the CLI maps it back to a precise hint).
+    /// Auth still passes (triage key), so this isolates the id guard.
+    #[test]
+    fn dispatch_set_status_not_found_for_id_above_max() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xF3; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let (state, _sdir) = detection_state_with_max_id(3);
+        let nonce = auth.issue_challenge().unwrap();
+        // id 99 > max id 3 → not found.
+        let req = signed_set_status_req(&signing, nonce, agent_id, 99, "resolved");
+        let mut fps = Vec::new();
+        let resp =
+            dispatch_detection_set_status(req, &auth, Some(&state), &test_client(), &mut fps);
+        assert!(
+            matches!(resp.result, AdminResult::UnknownOperation),
+            "id > max must be a clean not-found (UnknownOperation), got {:?}",
+            resp.result
+        );
+        assert_eq!(resp.id, 99, "the not-found reply echoes the requested id");
+    }
+
+    /// id 0 is never a valid detection id (ids start at 1) → not found.
+    #[test]
+    fn dispatch_set_status_not_found_for_id_zero() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xF4; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let (state, _sdir) = detection_state_with_max_id(3);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_set_status_req(&signing, nonce, agent_id, 0, "resolved");
+        let mut fps = Vec::new();
+        let resp =
+            dispatch_detection_set_status(req, &auth, Some(&state), &test_client(), &mut fps);
+        assert!(matches!(resp.result, AdminResult::UnknownOperation));
+    }
+
+    /// With no `DetectionAdminState` wired (degraded boot — the
+    /// detection store failed to open), set-status short-circuits to
+    /// UnknownOperation AFTER quorum verification (auth still runs), so
+    /// the CLI's standard exit mapping works without a new variant.
+    #[test]
+    fn dispatch_set_status_without_state_returns_unknown_operation() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xF5; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_set_status_req(&signing, nonce, agent_id, 1, "resolved");
+        let mut fps = Vec::new();
+        let resp = dispatch_detection_set_status(req, &auth, None, &test_client(), &mut fps);
+        assert!(matches!(resp.result, AdminResult::UnknownOperation));
     }
 
     // ── FIM-009 self-upgrade (§15.1) — trusted-installer grant dispatch ──

@@ -377,6 +377,39 @@ pub struct DetectionsResponse {
     pub entries_truncated: bool,
 }
 
+/// Tappa 9.0.c — signed detection triage status-change request.
+/// Carries `op = DetectionSetStatus` with the target detection id +
+/// new status (lowercase string) + optional note in
+/// [`common::wire::admin_signed_payload::DetectionSetStatusExtra`].
+/// 1-of-N quorum (single-sig, `Role::Triage`). On verify the agent
+/// appends a `StatusEvent` to the SEPARATE `status_events.jsonl`
+/// signed chain (event-sourced; `detections.jsonl` is never mutated)
+/// and replies with a [`DetectionSetStatusResponse`] ack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionSetStatusRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9.0.c — `DetectionSetStatus` reply ack. On success carries
+/// the detection id that was updated and the new status as a lowercase
+/// string (echoing what the agent persisted). On failure, `result`
+/// carries the auth/quorum/role error; `id` echoes the requested id
+/// and `new_status` is empty. A `result` of
+/// [`AdminResult::UnknownOperation`] doubles as the "detection not
+/// found" (id out of range) signal — the CLI maps it back to a
+/// dedicated not-found message (mirrors the K6 canary-burn contract).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionSetStatusResponse {
+    /// Auth/validation result — `Success` when the event was persisted.
+    pub result: AdminResult,
+    /// The detection id the request targeted (echoed on both paths).
+    pub id: u64,
+    /// The new status as a lowercase string on success; empty on
+    /// failure.
+    pub new_status: String,
+}
+
 /// Tappa 9.5 commit K6 — signed canary deploy request. Carries
 /// `op = CanaryDeploy` with the operator's chosen canary name +
 /// type + deployment payload in
@@ -756,6 +789,12 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::DetectionsRequest`] — the persisted
     /// detection records (newest-first JSONL body) on success.
     DetectionsResponse(DetectionsResponse),
+    /// Tappa 9.0.c — signed detection triage status-change request.
+    /// Triggers [`AdminMessage::DetectionSetStatusResponse`].
+    DetectionSetStatusRequest(DetectionSetStatusRequest),
+    /// Reply to [`AdminMessage::DetectionSetStatusRequest`] — the ack
+    /// (id + new status) on success.
+    DetectionSetStatusResponse(DetectionSetStatusResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -1222,7 +1261,9 @@ mod tests {
                 | AdminMessage::TrustedInstallerGrantRequest(_)
                 | AdminMessage::TrustedInstallerGrantResult(_)
                 | AdminMessage::DetectionsRequest(_)
-                | AdminMessage::DetectionsResponse(_) => {}
+                | AdminMessage::DetectionsResponse(_)
+                | AdminMessage::DetectionSetStatusRequest(_)
+                | AdminMessage::DetectionSetStatusResponse(_) => {}
             }
         }
     }
@@ -1281,6 +1322,47 @@ mod tests {
             entries_count: 1,
             entries_truncated: false,
         }));
+    }
+
+    /// Tappa 9.0.c: the `DetectionSetStatus` request + response survive
+    /// a wire round-trip. The signed pre-image (id + status string +
+    /// optional note) is re-serialised before verify, so a field-order
+    /// drift would silently break signature verification — this anchors
+    /// the CBOR/postcard shape, including the success ack + the
+    /// auth-failure (empty new_status, non-Success result) variant.
+    #[test]
+    fn roundtrip_detection_set_status_request_and_response() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_detection_set_status(
+            [0x44; 32],
+            1_700_000_000,
+            [0x55; 16],
+            42,
+            "resolved".to_string(),
+            Some("benign cron job".to_string()),
+        );
+        roundtrip(AdminMessage::DetectionSetStatusRequest(
+            DetectionSetStatusRequest {
+                payload,
+                signatures: vec![KeyedSignature {
+                    signature: [0x66; 64],
+                }],
+            },
+        ));
+        roundtrip(AdminMessage::DetectionSetStatusResponse(
+            DetectionSetStatusResponse {
+                result: AdminResult::Success,
+                id: 42,
+                new_status: "resolved".to_string(),
+            },
+        ));
+        roundtrip(AdminMessage::DetectionSetStatusResponse(
+            DetectionSetStatusResponse {
+                result: AdminResult::RoleDenied,
+                id: 42,
+                new_status: String::new(),
+            },
+        ));
     }
 
     #[cfg(feature = "debug-trigger")]

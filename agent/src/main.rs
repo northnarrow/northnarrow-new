@@ -280,6 +280,17 @@ struct Cli {
     )]
     detections_file: PathBuf,
 
+    /// Tappa 9.0.c: configurable path of the chained status-event log
+    /// (default `/var/lib/northnarrow/detections/status_events.jsonl`).
+    /// The event-sourced triage-status chain, sibling of the detection
+    /// log. Same per-test override rationale as `--detections-file`.
+    #[arg(
+        long = "status-events-file",
+        value_name = "PATH",
+        default_value = northnarrow_agent::detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH,
+    )]
+    status_events_file: PathBuf,
+
     /// Tappa 9.5 K2 / K6: configurable path of the chained canary
     /// registry log. Tests override this to a tempdir so each test
     /// run gets a fresh chain. Missing file means an empty registry
@@ -595,6 +606,19 @@ async fn main() -> Result<()> {
             path = %cli.detections_file.display(),
             "detections log bootstrap failed pre-attach — file will be lazily \
              created on first detection (and unprotected this boot)"
+        );
+    }
+    // Tappa 9.0.c: bootstrap the status-event chainlog pre-attach (same
+    // detections/ dir, sibling of detections.jsonl) — same inode-
+    // registration rationale.
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_status_events_log(
+        &cli.status_events_file,
+    ) {
+        warn!(
+            error = %e,
+            path = %cli.status_events_file.display(),
+            "status-events log bootstrap failed pre-attach — file will be lazily \
+             created on first triage (and unprotected this boot)"
         );
     }
     // Tappa 9.5 K7: bootstrap the two canary state logs pre-attach
@@ -1407,6 +1431,56 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Tappa 9.0.c: open the status-event chainlog + build the detection
+    // admin state for the admin socket (set-status writes here; the
+    // detections read overlays current status from it). Lower-volume
+    // than detections → smaller 4 MiB cap, overridable via
+    // NN_STATUS_EVENTS_CAP_BYTES. Degrade-not-fail: any error here
+    // means "no triage status changes this boot" (the `detections` read
+    // still works, showing initial Open), never an agent abort.
+    let detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>> = {
+        let cap_bytes = std::env::var("NN_STATUS_EVENTS_CAP_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(northnarrow_agent::detection_store::DEFAULT_STATUS_EVENTS_CAP_BYTES);
+        let status_rotation = northnarrow_agent::chainlog::RotationConfig {
+            size_cap_bytes: cap(cap_bytes),
+            max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
+            file_mode: 0o644,
+        };
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(key) => match northnarrow_agent::detection_store::open_status_log(
+                &cli.status_events_file,
+                key,
+                status_rotation,
+                rotation_protection.clone(),
+            ) {
+                Ok(log) => Some(Arc::new(admin_socket::DetectionAdminState {
+                    status_log: Arc::new(parking_lot::Mutex::new(log)),
+                    detections_path: cli.detections_file.clone(),
+                    status_events_path: cli.status_events_file.clone(),
+                })),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %cli.status_events_file.display(),
+                        "status-event store open failed — detection triage \
+                         (set-status) DISABLED this boot"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "status-event store needs the agent signing key — load failed; \
+                     detection triage (set-status) DISABLED this boot"
+                );
+                None
+            }
+        }
+    };
+
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // Re-derive the signing key + agent_id for FIM the same way
         // the audit log does (re-load rather than steal the audit
@@ -1944,6 +2018,8 @@ async fn main() -> Result<()> {
                 // FIM-009 self-upgrade (§15.1): the dispatcher arms this
                 // override on a verified TrustedInstallerGrantRequest.
                 let installer_override_for_serve = Some(Arc::clone(&installer_override));
+                // Tappa 9.0.c: detection triage state (status-event chain).
+                let detection_state_for_serve = detection_admin_state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -1956,6 +2032,7 @@ async fn main() -> Result<()> {
                         fim_state_for_serve,
                         canary_state_for_serve,
                         installer_override_for_serve,
+                        detection_state_for_serve,
                     )
                     .await
                     {

@@ -39,7 +39,7 @@
 //! wiring — [`DetectionRecord::explanation`] is schema-only (`None`)
 //! here (9.0.e).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -66,6 +66,24 @@ use crate::response::{ExecutionOutcome, ExecutionReport};
 /// belongs in `/var/lib`, NOT `/etc` (config). Sealed archives and the
 /// manifest are siblings of this active file inside `detections/`.
 pub const DEFAULT_DETECTIONS_LOG_PATH: &str = "/var/lib/northnarrow/detections/detections.jsonl";
+
+/// Default on-disk location of the Tappa 9.0.c status-event chainlog —
+/// a SECOND signed chain, sibling of [`DEFAULT_DETECTIONS_LOG_PATH`]
+/// inside the same anti-tamper-protected `detections/` dir. Triage
+/// status changes are event-sourced here ([`StatusEvent`] rows);
+/// `detections.jsonl` is never mutated, so its hash chain stays
+/// byte-intact. "Current status" of a detection is derived at read
+/// time as the latest `StatusEvent` for its id (else the record's own
+/// initial `Open`).
+pub const DEFAULT_STATUS_EVENTS_LOG_PATH: &str =
+    "/var/lib/northnarrow/detections/status_events.jsonl";
+
+/// Default active-file rotation cap for the status-event chain.
+/// Status changes are far lower-volume than detections (only operator
+/// triage actions, not every fired detection), so a smaller 4 MiB ×
+/// [`DEFAULT_MAX_ARCHIVES`] budget is ample. Overridable for test/ops
+/// rotation validation via `NN_STATUS_EVENTS_CAP_BYTES` (see `main.rs`).
+pub const DEFAULT_STATUS_EVENTS_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Default active-file rotation cap. Detections are lower-volume than
 /// netflow (only *fired* detections, not every flow), so 16 MiB ×
@@ -150,14 +168,28 @@ pub enum DetectionVerdict {
     Ade(AdeAction),
 }
 
-/// Triage lifecycle of a detection. Initialised [`Open`](Self::Open).
-/// The transition verbs (`Acknowledged`/`Closed`) are wired by 9.0.c —
-/// 9.0.a only persists the initial `Open` state.
+/// Triage lifecycle of a detection. A newly-recorded detection is
+/// [`Open`](Self::Open); a triage operator walks it forward
+/// `Open` → `Acknowledged` → `Investigating` → `Resolved` /
+/// `FalsePositive` via the Tappa 9.0.c `DetectionSetStatus` verb.
+///
+/// IMPORTANT (wire stability): these variants are serde-serialised by
+/// NAME into the event chain, so they are part of the on-disk +
+/// on-wire contract — never rename an existing variant; append new
+/// rungs only. `Open`'s repr is unchanged from 9.0.a/9.0.b.
+///
+/// NOTE: the 9.0.a/9.0.b `Closed` rung was replaced by the richer
+/// `Investigating` / `Resolved` / `FalsePositive` triage lifecycle in
+/// 9.0.c. This is safe because 9.0.a only ever persisted `Open` and
+/// 9.0.b was read-only, so no on-disk `DetectionRecord` ever carried
+/// `Closed` — removing it cannot break deserialisation of real data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectionStatus {
     Open,
     Acknowledged,
-    Closed,
+    Investigating,
+    Resolved,
+    FalsePositive,
 }
 
 /// Process attribution for a detection. Best-effort: `comm` is always
@@ -361,6 +393,36 @@ impl DetectionRecord {
     }
 }
 
+/// Tappa 9.0.c — one triage status-change event. Persisted as a
+/// flattened JSONL line inside its OWN [`RotatingChainLog`]
+/// (`status_events.jsonl`), separate from the detection chain so
+/// `detections.jsonl` lines + hash chain stay byte-intact. The chain
+/// envelope adds `fmt_ver` / `prev_hash` / `entry_hash` / `agent_sig`
+/// around these fields, exactly like a [`DetectionRecord`] line.
+///
+/// "Current status" of a detection is the [`new_status`](Self::new_status)
+/// of the LATEST `StatusEvent` carrying its [`detection_id`](Self::detection_id)
+/// (see [`latest_status_for_ids`]); a detection with no status event
+/// keeps its record's initial `Open`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusEvent {
+    /// The [`DetectionRecord::id`] this event re-statuses.
+    pub detection_id: u64,
+    /// The status the detection transitions TO.
+    pub new_status: DetectionStatus,
+    /// Wall-clock UTC the change was recorded (same format as
+    /// [`DetectionRecord::ts`]).
+    pub ts: String,
+    /// Who made the change — the admin caller's SO_PEERCRED identity
+    /// (pid / comm / uid). Reuses [`Principal`] so the event records
+    /// the acting local operator process, not just the signing key
+    /// (the matched key fingerprint is in the audit log).
+    pub principal: Principal,
+    /// Optional operator triage note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Map the ADE severity (which has a `None` rung reserved for `Allow`)
 /// onto the rule [`Severity`] so the record carries one severity enum.
 /// `None` collapses to `Low` (the lowest concrete rung) — by the time a
@@ -484,8 +546,10 @@ impl DetectionSink {
     }
 }
 
-/// Wall-clock timestamp string, matching the audit log's format.
-fn now_ts() -> String {
+/// Wall-clock timestamp string, matching the audit log's format. Used
+/// to stamp [`DetectionRecord`]s (the sink) and [`StatusEvent`]s (the
+/// 9.0.c set-status dispatch).
+pub fn now_ts() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
@@ -703,14 +767,45 @@ impl Sensor {
 }
 
 impl DetectionStatus {
-    /// Parse a `--status` token (case-insensitive). `None` on an
-    /// unrecognised token.
+    /// Parse a `--status` filter token (case-insensitive). Accepts
+    /// every rung, INCLUDING `open` (an operator can filter for
+    /// still-open detections). `None` on an unrecognised token.
     pub fn parse_filter(s: &str) -> Option<DetectionStatus> {
         match s.trim().to_ascii_lowercase().as_str() {
             "open" => Some(DetectionStatus::Open),
             "acknowledged" | "ack" => Some(DetectionStatus::Acknowledged),
-            "closed" => Some(DetectionStatus::Closed),
+            "investigating" => Some(DetectionStatus::Investigating),
+            "resolved" => Some(DetectionStatus::Resolved),
+            "false-positive" | "false_positive" | "falsepositive" | "fp" => {
+                Some(DetectionStatus::FalsePositive)
+            }
             _ => None,
+        }
+    }
+
+    /// Parse a `detection-set-status` TARGET token (case-insensitive).
+    /// Like [`Self::parse_filter`] but REJECTS `open`: `Open` is the
+    /// initial state a detection is recorded in, not a triage target an
+    /// operator transitions TO (the lifecycle only moves forward). An
+    /// unrecognised token (or `open`) yields `None`.
+    pub fn parse_settable(s: &str) -> Option<DetectionStatus> {
+        match Self::parse_filter(s) {
+            Some(DetectionStatus::Open) | None => None,
+            other => other,
+        }
+    }
+
+    /// Canonical lowercase wire string for this status (the inverse of
+    /// [`Self::parse_filter`]). Used for the `DetectionSetStatus` ack
+    /// echo and for rendering. `false-positive` is hyphenated, matching
+    /// the CLI value-enum + the `Sensor` wire spelling convention.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DetectionStatus::Open => "open",
+            DetectionStatus::Acknowledged => "acknowledged",
+            DetectionStatus::Investigating => "investigating",
+            DetectionStatus::Resolved => "resolved",
+            DetectionStatus::FalsePositive => "false-positive",
         }
     }
 }
@@ -807,7 +902,7 @@ pub fn read_last_n(
     }
     // Monotonic id ⇒ id-desc is newest-first across every file we
     // touched; bound to the requested N.
-    collected.sort_by(|a, b| b.id.cmp(&a.id));
+    collected.sort_by_key(|r| std::cmp::Reverse(r.id));
     collected.truncate(limit);
     collected
 }
@@ -845,7 +940,7 @@ fn collect_matching_from_file(
 /// most recently rotated file, hence the newest archived records.
 fn archives_newest_first(active_path: &Path) -> Vec<PathBuf> {
     let mut archives = archive_paths(active_path);
-    archives.sort_by(|a, b| archive_seq(b).cmp(&archive_seq(a)));
+    archives.sort_by_key(|p| std::cmp::Reverse(archive_seq(p)));
     archives
 }
 
@@ -859,6 +954,166 @@ fn archive_seq(path: &Path) -> u64 {
         .and_then(|name| name.rsplit('.').next())
         .and_then(|suffix| suffix.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+// ── Tappa 9.0.c — status-event chain: open + max-id guard + overlay ──
+
+/// Open (or initialise) the [`StatusEvent`] chainlog at `active_path`.
+/// Thin wrapper over [`RotatingChainLog::open`] specialised to
+/// `StatusEvent` so callers (main.rs boot, the admin set-status
+/// dispatch) don't repeat the turbofish. Unlike [`open`] there is no id
+/// counter to seed — a status event references an existing detection id
+/// rather than minting its own. The active file should already exist
+/// (bootstrapped pre-attach, like `detections.jsonl`) so its inode is
+/// registered with the anti-tamper LSM map before lockdown.
+pub fn open_status_log(
+    active_path: &Path,
+    key: AgentSigningKey,
+    cfg: RotationConfig,
+    protection: Arc<dyn ProtectionManager>,
+) -> Result<RotatingChainLog<StatusEvent>> {
+    let log = RotatingChainLog::<StatusEvent>::open(active_path, key, cfg, protection)
+        .with_context(|| format!("opening status-event chainlog {}", active_path.display()))?;
+    info!(
+        target: "detection_store",
+        path = %active_path.display(),
+        "status-event store opened",
+    );
+    Ok(log)
+}
+
+/// Highest detection `id` currently persisted in the detection chain at
+/// `detections_path` (`0` when the store is empty). The cheap validity
+/// guard for `DetectionSetStatus`: an id in `1..=max_detection_id` is
+/// accepted, anything outside is a clean "detection not found". Reuses
+/// the same bounded boot-read [`open`] uses to seed its id counter — no
+/// unbounded whole-store scan (BUG-026 discipline). NOTE: a gap id
+/// (a record dropped under backpressure) below the max still passes;
+/// the full existence scan is deliberately deferred (id ≤ max suffices).
+pub fn max_detection_id(detections_path: &Path) -> u64 {
+    seed_last_id(detections_path)
+}
+
+/// Read the last `limit` detections (newest-first) from the detection
+/// chain at `detections_path`, with each record's triage status
+/// OVERLAID from the status-event chain at `status_events_path` — i.e.
+/// the CURRENT (event-sourced) status rather than the record's frozen
+/// initial `Open`. This is the read path the Tappa 9.0.c admin
+/// `Detections` verb serves; `detections.jsonl` is never mutated, so a
+/// record's own line still reads `Open` after triage (the chain is
+/// history, the status is derived).
+///
+/// Filter semantics: every filter EXCEPT `status` constrains immutable
+/// record fields and is applied during the bounded base read. The
+/// `status` filter, when present, is applied against the OVERLAID
+/// (current) status — that is what an operator means by
+/// `--status resolved` (the on-disk record still says `Open`; status
+/// lives in the event chain). So the status filter is split off, the
+/// candidates are overlaid, then retained on current status. To let
+/// that post-overlay retain still fill up to `limit` rows, the
+/// candidate scan widens to the hard ceiling [`MAX_DETECTIONS_LIMIT`]
+/// when a status filter is set; the read stays bounded by the retention
+/// window either way.
+pub fn read_last_n_overlaid(
+    detections_path: &Path,
+    status_events_path: &Path,
+    limit: usize,
+    filter: &DetectionFilter,
+) -> Vec<DetectionRecord> {
+    let mut base_filter = filter.clone();
+    let status_target = base_filter.status.take();
+
+    // Common case (no status filter): read exactly `limit` candidates.
+    // With a status filter we can't know up front how many survive the
+    // post-overlay retain, so widen the candidate scan to the ceiling.
+    let scan_limit = if status_target.is_some() {
+        limit.max(MAX_DETECTIONS_LIMIT)
+    } else {
+        limit
+    };
+    let mut records = read_last_n(detections_path, scan_limit, &base_filter);
+
+    // Overlay current status for just the window's ids (bounded).
+    let ids: HashSet<u64> = records.iter().map(|r| r.id).collect();
+    let status_map = latest_status_for_ids(status_events_path, &ids);
+    for record in &mut records {
+        if let Some(&status) = status_map.get(&record.id) {
+            record.status = status;
+        }
+    }
+
+    // Post-overlay status filter: match the CURRENT status.
+    if let Some(target) = status_target {
+        records.retain(|r| r.status == target);
+    }
+    records.truncate(limit);
+    records
+}
+
+/// Build a `{detection_id -> current status}` map for exactly the ids
+/// in `wanted`, reading the status-event chain at `status_events_path`.
+/// Bounded (BUG-026 discipline): the size-capped active file is read
+/// first; sealed archives are descended newest-first ONLY while some
+/// requested id is still unresolved. The active file holds the newest
+/// events, so its latest event for an id wins over any archive's; an id
+/// with no event anywhere is simply absent from the map (the caller
+/// keeps the record's own status). Empty map for an empty `wanted`.
+pub fn latest_status_for_ids(
+    status_events_path: &Path,
+    wanted: &HashSet<u64>,
+) -> HashMap<u64, DetectionStatus> {
+    let mut out: HashMap<u64, DetectionStatus> = HashMap::new();
+    if wanted.is_empty() {
+        return out;
+    }
+    let mut unresolved: HashSet<u64> = wanted.clone();
+    collect_latest_status_from_file(status_events_path, &mut out, &mut unresolved);
+    if !unresolved.is_empty() {
+        for archive in archives_newest_first(status_events_path) {
+            collect_latest_status_from_file(&archive, &mut out, &mut unresolved);
+            if unresolved.is_empty() {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Scan one status-event file (active or archive) for the still-
+/// unresolved ids, recording each id's LATEST event (last matching line
+/// wins within the file, since events are appended oldest-first). Ids
+/// recorded here are removed from `unresolved` AFTER the whole file is
+/// read, so a newer file always shadows an older one for the same id.
+/// Best-effort: a missing/unreadable file contributes nothing; lines
+/// that don't parse as a [`StatusEvent`] (terminators, blanks, the
+/// detection records in a different file) are skipped. Bounded read
+/// (the file is ≤ the rotation cap).
+fn collect_latest_status_from_file(
+    path: &Path,
+    out: &mut HashMap<u64, DetectionStatus>,
+    unresolved: &mut HashSet<u64>,
+) {
+    use std::io::{BufRead, BufReader};
+    let f = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut touched: Vec<u64> = Vec::new();
+    for line in BufReader::new(f).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(ev) = serde_json::from_str::<StatusEvent>(&line) {
+            if unresolved.contains(&ev.detection_id) {
+                out.insert(ev.detection_id, ev.new_status);
+                touched.push(ev.detection_id);
+            }
+        }
+    }
+    for id in touched {
+        unresolved.remove(&id);
+    }
 }
 
 #[cfg(test)]
@@ -1174,7 +1429,7 @@ mod tests {
             &path,
             &[
                 mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
-                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Closed, Sensor::Exec, "b"),
+                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Resolved, Sensor::Exec, "b"),
                 mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "c"),
             ],
         );
@@ -1355,7 +1610,253 @@ mod tests {
         assert_eq!(Sensor::parse_filter("Anti-Tamper"), Some(Sensor::AntiTamper));
         assert_eq!(Sensor::parse_filter("nope"), None);
         assert_eq!(DetectionStatus::parse_filter("Open"), Some(DetectionStatus::Open));
-        assert_eq!(DetectionStatus::parse_filter("closed"), Some(DetectionStatus::Closed));
+        assert_eq!(
+            DetectionStatus::parse_filter("Investigating"),
+            Some(DetectionStatus::Investigating)
+        );
+        assert_eq!(
+            DetectionStatus::parse_filter("RESOLVED"),
+            Some(DetectionStatus::Resolved)
+        );
+        assert_eq!(
+            DetectionStatus::parse_filter("false-positive"),
+            Some(DetectionStatus::FalsePositive)
+        );
+        assert_eq!(
+            DetectionStatus::parse_filter("fp"),
+            Some(DetectionStatus::FalsePositive)
+        );
         assert_eq!(DetectionStatus::parse_filter("nope"), None);
+    }
+
+    // ── Tappa 9.0.c — status parsing + event-sourced overlay ─────────
+
+    #[test]
+    fn parse_settable_rejects_open_and_unknown_accepts_transitions() {
+        // `open` is the initial state, not a settable triage target.
+        assert_eq!(DetectionStatus::parse_settable("open"), None);
+        assert_eq!(DetectionStatus::parse_settable("nope"), None);
+        assert_eq!(
+            DetectionStatus::parse_settable("acknowledged"),
+            Some(DetectionStatus::Acknowledged)
+        );
+        assert_eq!(
+            DetectionStatus::parse_settable("Investigating"),
+            Some(DetectionStatus::Investigating)
+        );
+        assert_eq!(
+            DetectionStatus::parse_settable("resolved"),
+            Some(DetectionStatus::Resolved)
+        );
+        assert_eq!(
+            DetectionStatus::parse_settable("false-positive"),
+            Some(DetectionStatus::FalsePositive)
+        );
+    }
+
+    #[test]
+    fn status_as_str_round_trips_through_parse_filter() {
+        for s in [
+            DetectionStatus::Open,
+            DetectionStatus::Acknowledged,
+            DetectionStatus::Investigating,
+            DetectionStatus::Resolved,
+            DetectionStatus::FalsePositive,
+        ] {
+            assert_eq!(DetectionStatus::parse_filter(s.as_str()), Some(s));
+        }
+    }
+
+    /// Build a [`StatusEvent`] for the overlay tests.
+    fn mk_event(id: u64, ts: &str, status: DetectionStatus) -> StatusEvent {
+        StatusEvent {
+            detection_id: id,
+            new_status: status,
+            ts: ts.to_string(),
+            principal: Principal {
+                pid: 1000,
+                comm: "nn-admin".to_string(),
+                uid: 0,
+                ppid: None,
+            },
+            note: None,
+        }
+    }
+
+    fn write_events(path: &Path, events: &[StatusEvent]) {
+        let body: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn overlay_reflects_latest_status_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let det = dir.path().join("detections.jsonl");
+        let evt = dir.path().join("status_events.jsonl");
+        write_records(&det, &[mk_id(1), mk_id(2), mk_id(3)]);
+        // id 1: two changes — latest (Investigating) wins. id 3: one
+        // change. id 2: no change — keeps its on-disk Open.
+        write_events(
+            &evt,
+            &[
+                mk_event(1, "2026-06-09T12:01:00.000000Z", DetectionStatus::Acknowledged),
+                mk_event(3, "2026-06-09T12:01:01.000000Z", DetectionStatus::Resolved),
+                mk_event(1, "2026-06-09T12:01:02.000000Z", DetectionStatus::Investigating),
+            ],
+        );
+        let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
+        let by_id: std::collections::HashMap<u64, DetectionStatus> =
+            got.iter().map(|r| (r.id, r.status)).collect();
+        assert_eq!(by_id[&1], DetectionStatus::Investigating, "latest event wins");
+        assert_eq!(by_id[&2], DetectionStatus::Open, "no event → initial Open");
+        assert_eq!(by_id[&3], DetectionStatus::Resolved);
+    }
+
+    #[test]
+    fn overlay_leaves_detection_lines_byte_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let det = dir.path().join("detections.jsonl");
+        let evt = dir.path().join("status_events.jsonl");
+        write_records(&det, &[mk_id(1)]);
+        let before = std::fs::read(&det).unwrap();
+        write_events(
+            &evt,
+            &[mk_event(1, "2026-06-09T12:02:00.000000Z", DetectionStatus::Resolved)],
+        );
+        // Reading with overlay must not touch detections.jsonl.
+        let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
+        assert_eq!(got[0].status, DetectionStatus::Resolved, "overlay applied to result");
+        let after = std::fs::read(&det).unwrap();
+        assert_eq!(before, after, "detections.jsonl is byte-for-byte unchanged");
+    }
+
+    #[test]
+    fn overlay_status_filter_matches_current_not_recorded_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let det = dir.path().join("detections.jsonl");
+        let evt = dir.path().join("status_events.jsonl");
+        // All three recorded Open; id 2 resolved via an event.
+        write_records(&det, &[mk_id(1), mk_id(2), mk_id(3)]);
+        write_events(
+            &evt,
+            &[mk_event(2, "2026-06-09T12:03:00.000000Z", DetectionStatus::Resolved)],
+        );
+        // Filter on CURRENT status = resolved → only id 2.
+        let resolved = read_last_n_overlaid(
+            &det,
+            &evt,
+            10,
+            &DetectionFilter {
+                status: Some(DetectionStatus::Resolved),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ids(&resolved), vec![2], "only the currently-resolved detection");
+        // Filter on current status = open → ids 1 and 3 (NOT 2, which
+        // was resolved even though its on-disk line still says Open).
+        let open = read_last_n_overlaid(
+            &det,
+            &evt,
+            10,
+            &DetectionFilter {
+                status: Some(DetectionStatus::Open),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ids(&open), vec![3, 1], "currently-open only, newest-first");
+    }
+
+    #[test]
+    fn latest_status_for_ids_descends_archive_only_when_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("status_events.jsonl");
+        // Active resolves id 1 (newest). Archive .000001 holds an OLDER
+        // id-1 event (must be shadowed) + the only id-2 event.
+        write_events(
+            &active,
+            &[mk_event(1, "2026-06-09T12:05:00.000000Z", DetectionStatus::Resolved)],
+        );
+        write_events(
+            &dir.path().join("status_events.jsonl.000001"),
+            &[
+                mk_event(1, "2026-06-09T12:04:00.000000Z", DetectionStatus::Acknowledged),
+                mk_event(2, "2026-06-09T12:04:01.000000Z", DetectionStatus::Investigating),
+            ],
+        );
+        let wanted: std::collections::HashSet<u64> = [1u64, 2].into_iter().collect();
+        let map = latest_status_for_ids(&active, &wanted);
+        assert_eq!(map[&1], DetectionStatus::Resolved, "active shadows archive for id 1");
+        assert_eq!(map[&2], DetectionStatus::Investigating, "archive resolves id 2");
+    }
+
+    #[tokio::test]
+    async fn status_event_chain_has_signed_envelope() {
+        // A StatusEvent appended via the RotatingChainLog carries the
+        // same prev_hash/entry_hash/agent_sig envelope as a detection
+        // line, and the chain verifies end-to-end.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status_events.jsonl");
+        let key = test_key();
+        let pubkey = key.verifying_key();
+        {
+            let mut log = open_status_log(
+                &path,
+                key,
+                RotationConfig::default(),
+                Arc::new(NoProtection),
+            )
+            .expect("open status log");
+            log.append(mk_event(1, "2026-06-09T12:06:00.000000Z", DetectionStatus::Acknowledged))
+                .unwrap();
+            log.append(mk_event(1, "2026-06-09T12:06:01.000000Z", DetectionStatus::Resolved))
+                .unwrap();
+        }
+        // Each persisted line carries the envelope siblings.
+        let body = std::fs::read_to_string(&path).unwrap();
+        for line in body.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(v.get("prev_hash").is_some(), "envelope prev_hash present");
+            assert!(v.get("entry_hash").is_some(), "envelope entry_hash present");
+            assert!(v.get("agent_sig").is_some(), "envelope agent_sig present");
+            assert!(v.get("detection_id").is_some(), "payload detection_id present");
+        }
+        let report =
+            verify_log_set::<StatusEvent>(&path, &pubkey).expect("status chain verifies");
+        assert_eq!(report.total_records, 2, "both status events in the verified chain");
+    }
+
+    #[test]
+    fn overlay_reads_through_real_signed_chain_envelope() {
+        // End-to-end: status events written THROUGH the RotatingChainLog
+        // (so each line is wrapped in the prev_hash/entry_hash/agent_sig
+        // envelope) must still be parsed by the overlay read — the
+        // overlay must see past the envelope siblings to the payload.
+        let dir = tempfile::tempdir().unwrap();
+        let det = dir.path().join("detections.jsonl");
+        let evt = dir.path().join("status_events.jsonl");
+        write_records(&det, &[mk_id(1)]);
+        {
+            let mut log = open_status_log(
+                &evt,
+                test_key(),
+                RotationConfig::default(),
+                Arc::new(NoProtection),
+            )
+            .expect("open status log");
+            log.append(mk_event(1, "2026-06-09T12:07:00.000000Z", DetectionStatus::Acknowledged))
+                .unwrap();
+            log.append(mk_event(1, "2026-06-09T12:07:01.000000Z", DetectionStatus::Resolved))
+                .unwrap();
+        }
+        let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].status,
+            DetectionStatus::Resolved,
+            "overlay reads the latest status through the real signed chain envelope"
+        );
     }
 }
