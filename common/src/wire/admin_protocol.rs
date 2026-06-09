@@ -334,6 +334,49 @@ pub struct FimReportResponse {
     pub entries_truncated: bool,
 }
 
+/// Tappa 9.0.b — signed detections read request. Carries
+/// `op = Detections` with the bounded "last N" cap + optional
+/// filters (since/until time bounds, min_severity, status, sensor,
+/// path) in
+/// [`common::wire::admin_signed_payload::DetectionsExtra`].
+/// 1-of-N quorum (single-sig, `Role::TelemetryRead` — the
+/// lowest-privilege read-only role). Reply on the success path is a
+/// [`DetectionsResponse`] carrying the JSONL-encoded detection
+/// records rather than the bare [`AdminResult`] superset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionsRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Tappa 9.0.b — `Detections` reply payload. On success carries the
+/// persisted detection records (one per line, `\n`-separated JSONL),
+/// **newest-first**, plus the count for the CLI summary line. The
+/// records are the `DetectionRecord` payloads (the agent unwraps the
+/// chain envelope before serialising), so the `nn-admin` client
+/// deserialises them directly without seeing the chain framing — and
+/// the wire/`common` layer never has to depend on the agent-side
+/// `DetectionRecord` type. On failure, `result` carries the
+/// auth/quorum/role error and `entries_jsonl` is empty. Mirrors the
+/// [`FimReportResponse`] / net-read truncation contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectionsResponse {
+    /// Auth result — `Success` when the records follow.
+    pub result: AdminResult,
+    /// Detection records, newest-first, in JSONL form. Empty on auth
+    /// failure (and legitimately empty when nothing matches / the
+    /// store has no records yet). Bounded by [`MAX_FRAME_BODY`] / 2;
+    /// the agent stops appending and sets `entries_truncated` if the
+    /// matching set would overflow the frame.
+    pub entries_jsonl: String,
+    /// Number of records in `entries_jsonl`.
+    pub entries_count: u32,
+    /// `true` if the agent truncated the body to fit the wire frame.
+    /// CLI surfaces this as `"... (truncated; narrow with --limit /
+    /// --since / a filter)"`.
+    pub entries_truncated: bool,
+}
+
 /// Tappa 9.5 commit K6 — signed canary deploy request. Carries
 /// `op = CanaryDeploy` with the operator's chosen canary name +
 /// type + deployment payload in
@@ -707,6 +750,12 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::TrustedInstallerGrantRequest`]. Bare
     /// [`AdminResult`] superset (success / verify-failure variants).
     TrustedInstallerGrantResult(AdminResult),
+    /// Tappa 9.0.b — signed detections read request. Triggers
+    /// [`AdminMessage::DetectionsResponse`].
+    DetectionsRequest(DetectionsRequest),
+    /// Reply to [`AdminMessage::DetectionsRequest`] — the persisted
+    /// detection records (newest-first JSONL body) on success.
+    DetectionsResponse(DetectionsResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -1171,7 +1220,9 @@ mod tests {
                 | AdminMessage::NetFingerprintRequest(_)
                 | AdminMessage::NetFingerprintResponse(_)
                 | AdminMessage::TrustedInstallerGrantRequest(_)
-                | AdminMessage::TrustedInstallerGrantResult(_) => {}
+                | AdminMessage::TrustedInstallerGrantResult(_)
+                | AdminMessage::DetectionsRequest(_)
+                | AdminMessage::DetectionsResponse(_) => {}
             }
         }
     }
@@ -1196,6 +1247,40 @@ mod tests {
         roundtrip(AdminMessage::TrustedInstallerGrantResult(
             AdminResult::Success,
         ));
+    }
+
+    /// Tappa 9.0.b: the `Detections` request + response survive a wire
+    /// round-trip. The signed pre-image (with its optional string
+    /// filters) is re-serialised before verify, so a field-order drift
+    /// would silently break signature verification — this anchors the
+    /// CBOR/postcard shape, including the `DetectionsExtra` filters.
+    #[test]
+    fn roundtrip_detections_request_and_response() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_detections(
+            [0x44; 32],
+            1_700_000_000,
+            [0x55; 16],
+            25,
+            Some(1_699_000_000),
+            Some(1_700_000_000),
+            Some("high".to_string()),
+            Some("open".to_string()),
+            Some("network".to_string()),
+            Some("sshd".to_string()),
+        );
+        roundtrip(AdminMessage::DetectionsRequest(DetectionsRequest {
+            payload,
+            signatures: vec![KeyedSignature {
+                signature: [0x66; 64],
+            }],
+        }));
+        roundtrip(AdminMessage::DetectionsResponse(DetectionsResponse {
+            result: AdminResult::Success,
+            entries_jsonl: "{\"id\":2,\"ts\":\"2026-06-09T12:00:00.000000Z\"}\n".to_string(),
+            entries_count: 1,
+            entries_truncated: false,
+        }));
     }
 
     #[cfg(feature = "debug-trigger")]

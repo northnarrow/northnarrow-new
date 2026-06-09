@@ -31,11 +31,12 @@ use tracing::{info, warn};
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
-    FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
-    ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
-    NetFlowsResponse, NetListenersRequest, NetListenersResponse, NetResolveRequest,
-    NetResolveResponse, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
-    StatusResponse, TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
+    DetectionsRequest, DetectionsResponse, FimBaselineRequest, FimReportRequest, FimReportResponse,
+    FimStatusRequest, FimStatusResponse, ForcePostureRequest, NetFingerprintRequest,
+    NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse, NetListenersRequest,
+    NetListenersResponse, NetResolveRequest, NetResolveResponse, RotateKeysAddRequest,
+    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, TrustedInstallerGrantRequest,
+    UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use ed25519_dalek::VerifyingKey;
@@ -813,6 +814,32 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // Tappa 9.0.b — detections read. The extra captures the
+        // operator's filters + the response counters so an off-host
+        // audit reader sees exactly what was asked for and how much
+        // was returned (mirrors the fim_report / net_flows rows).
+        (AdminMessage::DetectionsRequest(req), AdminMessage::DetectionsResponse(resp)) => {
+            let extra = match &req.payload.extra {
+                OperationExtra::Detections(e) => serde_json::json!({
+                    "limit": e.limit,
+                    "since_unix_ts": e.since_unix_ts,
+                    "until_unix_ts": e.until_unix_ts,
+                    "min_severity": e.min_severity,
+                    "status": e.status,
+                    "sensor": e.sensor,
+                    "path": e.path,
+                    "entries_count": resp.entries_count,
+                    "truncated": resp.entries_truncated,
+                }),
+                _ => serde_json::json!({}),
+            };
+            (
+                "detections",
+                extra,
+                audit_result_str(resp.result),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -1074,6 +1101,13 @@ fn dispatch(
             ))
         }
 
+        // Tappa 9.0.b — signed detections read (read-only,
+        // Role::TelemetryRead). Reads the detection chainlog at the
+        // default path, so it needs no extra wired state.
+        AdminMessage::DetectionsRequest(req) => {
+            AdminMessage::DetectionsResponse(dispatch_detections(req, auth, fps_out))
+        }
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -1095,7 +1129,8 @@ fn dispatch(
         | AdminMessage::NetListenersResponse(_)
         | AdminMessage::NetResolveResponse(_)
         | AdminMessage::NetFingerprintResponse(_)
-        | AdminMessage::TrustedInstallerGrantResult(_) => {
+        | AdminMessage::TrustedInstallerGrantResult(_)
+        | AdminMessage::DetectionsResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -2651,6 +2686,144 @@ fn dispatch_net_flows(
     }
 }
 
+/// An auth-failure / empty [`DetectionsResponse`] carrying `result`.
+/// Also used for the "filter recognised nothing" success path.
+fn empty_detections(result: AdminResult) -> DetectionsResponse {
+    DetectionsResponse {
+        result,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
+    }
+}
+
+/// Tappa 9.0.b — handle one [`DetectionsRequest`]. Verifies the
+/// 1-of-N signed-payload quorum carrying [`Role::TelemetryRead`]
+/// (read != control: this NEVER accepts a control-only key, and the
+/// read-only key it does accept can never `unlock`), then reads the
+/// last N persisted detections from the chainlog — newest-first, with
+/// the operator's optional filters applied — and returns them as a
+/// JSONL body. The read is bounded (see
+/// [`crate::detection_store::read_last_n`]); the body is capped at the
+/// wire soft cap and `entries_truncated` is set if the matching set
+/// would overflow the frame. Like the FIM/net read verbs, the store
+/// path is the build-default constant, so no extra serve-time state is
+/// threaded.
+fn dispatch_detections(
+    req: DetectionsRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> DetectionsResponse {
+    use crate::detection_store::{self, DetectionFilter};
+    const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
+
+    let server_now = now_unix_secs();
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1, // 1-of-N: a read verb, like fim-report / net-flows.
+        &[Role::TelemetryRead],
+        OperationCode::Detections,
+        server_now,
+    ) {
+        Ok(t) => t,
+        Err(e) => return empty_detections(map_admin_auth_error(e, "detections")),
+    };
+    *fps_out = matched_fps;
+
+    let extra = match &req.payload.extra {
+        OperationExtra::Detections(e) => e,
+        _ => {
+            warn!("detections payload extra is not Detections variant");
+            return empty_detections(AdminResult::UnknownOperation);
+        }
+    };
+
+    // Build the typed filter. A provided-but-unrecognised enum filter
+    // can match nothing, so we short-circuit to an empty success
+    // rather than silently dropping the constraint and widening the
+    // result (the CLI restricts these to valid values; this is the
+    // defensive server-side path).
+    let mut filter = DetectionFilter {
+        since_unix: extra.since_unix_ts.map(|s| s as i64),
+        until_unix: extra.until_unix_ts.map(|s| s as i64),
+        comm_substr: extra.path.clone().filter(|s| !s.is_empty()),
+        ..Default::default()
+    };
+    if let Some(s) = &extra.min_severity {
+        match detection_store::parse_severity_filter(s) {
+            Some(v) => filter.min_severity = Some(v),
+            None => {
+                warn!(value = %s, "detections: unrecognised min_severity filter — empty result");
+                return empty_detections(AdminResult::Success);
+            }
+        }
+    }
+    if let Some(s) = &extra.status {
+        match crate::detection_store::DetectionStatus::parse_filter(s) {
+            Some(v) => filter.status = Some(v),
+            None => {
+                warn!(value = %s, "detections: unrecognised status filter — empty result");
+                return empty_detections(AdminResult::Success);
+            }
+        }
+    }
+    if let Some(s) = &extra.sensor {
+        match crate::detection_store::Sensor::parse_filter(s) {
+            Some(v) => filter.sensor = Some(v),
+            None => {
+                warn!(value = %s, "detections: unrecognised sensor filter — empty result");
+                return empty_detections(AdminResult::Success);
+            }
+        }
+    }
+
+    let limit = if extra.limit == 0 {
+        detection_store::DEFAULT_DETECTIONS_LIMIT
+    } else {
+        (extra.limit as usize).min(detection_store::MAX_DETECTIONS_LIMIT)
+    };
+
+    let records = detection_store::read_last_n(
+        std::path::Path::new(detection_store::DEFAULT_DETECTIONS_LOG_PATH),
+        limit,
+        &filter,
+    );
+
+    // Serialise newest-first, bounding the body at the wire soft cap.
+    // The records are already newest-first, so truncation drops the
+    // oldest of the matching set — a dashboard wants the freshest.
+    let mut entries_jsonl = String::new();
+    let mut entries_count = 0u32;
+    let mut entries_truncated = false;
+    for record in &records {
+        let Ok(line) = serde_json::to_string(record) else {
+            continue;
+        };
+        if entries_jsonl.len() + line.len() + 1 > SOFT_CAP {
+            entries_truncated = true;
+            break;
+        }
+        entries_jsonl.push_str(&line);
+        entries_jsonl.push('\n');
+        entries_count += 1;
+    }
+    info!(
+        target: "admin.detections",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        entries = entries_count,
+        truncated = entries_truncated,
+        "detections served"
+    );
+    DetectionsResponse {
+        result: AdminResult::Success,
+        entries_jsonl,
+        entries_count,
+        entries_truncated,
+    }
+}
+
 fn dispatch_net_listeners(
     req: NetListenersRequest,
     auth: &AdminAuth,
@@ -4195,6 +4368,101 @@ mod tests {
         let mut fps = Vec::new();
         let resp = dispatch_net_flows(req, &auth, &mut fps);
         assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    // ── Tappa 9.0.b — detections read dispatch + auth-gating tests ──
+
+    /// Build a signed `DetectionsRequest` for the dispatch tests.
+    fn signed_detections_req(
+        signing: &SigningKey,
+        nonce: [u8; 32],
+        agent_id: [u8; 16],
+    ) -> DetectionsRequest {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_detections(
+            nonce,
+            now_unix_secs(),
+            agent_id,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, signing).unwrap();
+        DetectionsRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }
+    }
+
+    /// A `telemetry-read` key is ACCEPTED for `detections`: the verify
+    /// path returns Success and captures the signer fingerprint. (The
+    /// store at the default path is unreadable from the test env, so
+    /// the body is legitimately empty — we assert the auth outcome,
+    /// not the record count.)
+    #[test]
+    fn dispatch_detections_accepts_telemetry_read() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xE0; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "telemetry-read", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_detections_req(&signing, nonce, agent_id);
+        let mut fps = Vec::new();
+        let resp = dispatch_detections(req, &auth, &mut fps);
+        assert!(
+            matches!(resp.result, AdminResult::Success),
+            "telemetry-read key must be accepted for detections, got {:?}",
+            resp.result
+        );
+        assert!(!fps.is_empty(), "matched signer fp must be captured");
+    }
+
+    /// A key carrying only `unlock` (a control role, NOT
+    /// `telemetry-read`) is REJECTED for `detections` with RoleDenied
+    /// — control does not imply read.
+    #[test]
+    fn dispatch_detections_role_denied_without_telemetry_read() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xE1; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_detections_req(&signing, nonce, agent_id);
+        let mut fps = Vec::new();
+        let resp = dispatch_detections(req, &auth, &mut fps);
+        assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    /// A key carrying a DIFFERENT read role (`fim-read`) is still
+    /// REJECTED for `detections` — telemetry-read is its own gate, not
+    /// satisfied by any read role.
+    #[test]
+    fn dispatch_detections_role_denied_with_wrong_read_role() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xE2; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "fim-read", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_detections_req(&signing, nonce, agent_id);
+        let mut fps = Vec::new();
+        let resp = dispatch_detections(req, &auth, &mut fps);
+        assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    /// `Role::All` (break-glass) also satisfies the detections gate —
+    /// the super-role subsumes telemetry-read like every other role.
+    #[test]
+    fn dispatch_detections_accepts_role_all() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xE3; 16];
+        let (auth, _dir) = build_auth_with_roles(&signing, "all", agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = signed_detections_req(&signing, nonce, agent_id);
+        let mut fps = Vec::new();
+        let resp = dispatch_detections(req, &auth, &mut fps);
+        assert!(matches!(resp.result, AdminResult::Success));
     }
 
     // ── FIM-009 self-upgrade (§15.1) — trusted-installer grant dispatch ──
