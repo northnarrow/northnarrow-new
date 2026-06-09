@@ -194,9 +194,11 @@ pub enum DetectionStatus {
 
 /// Process attribution for a detection. Best-effort: `comm` is always
 /// present, `ppid` only when the source event carried it (process exec
-/// events do; file / net / canary events do not). `exe` is deliberately
-/// omitted — it is not uniformly available across sensors, and `comm`
-/// is the one field every variant exposes.
+/// events do; file / net / canary events do not). No `exe` lives HERE —
+/// it is not uniformly available across sensors, and `comm` is the one
+/// field every variant exposes; the executable path (exec sensors only)
+/// is carried by the sibling [`DetectionRecord::exe`] (9.0.a.1), not the
+/// principal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     pub pid: u32,
@@ -275,6 +277,33 @@ impl Principal {
     }
 }
 
+/// The full executable path that triggered a detection, when the
+/// originating event names one. ONLY the two exec-sensor events carry
+/// an executable: `ProcessSpawn` (post-exec) and `ExecCheck` (pre-exec
+/// `bprm_check_security`); their `filename` IS the full path (e.g.
+/// `/tmp/payload`). Every other event names no executable — `FileOpen`
+/// carries the *opened* file (not an exe), `ModuleLoad` a `.ko` source
+/// path, the net / canary / anti-tamper events nothing — so they map to
+/// `None`. Exhaustive (no wildcard) on purpose, like [`Sensor::from_event`]
+/// / [`Principal::from_event`]: a new exec-bearing `Event` variant must
+/// force an explicit decision here rather than silently yield `None`.
+fn exe_from_event(event: &Event) -> Option<String> {
+    match event {
+        Event::ProcessSpawn { filename, .. } | Event::ExecCheck { filename, .. } => {
+            Some(filename.clone())
+        }
+        Event::FileOpen { .. }
+        | Event::ModuleLoad { .. }
+        | Event::TcpConnect { .. }
+        | Event::DnsQuery { .. }
+        | Event::FsProtectDenial { .. }
+        | Event::CanaryTripped { .. }
+        | Event::Fim(_)
+        | Event::NetFlow(_)
+        | Event::NetListener(_) => None,
+    }
+}
+
 /// One persisted detection. Serialised as a flattened JSONL line inside
 /// the [`RotatingChainLog`] (the chain envelope adds `fmt_ver` /
 /// `prev_hash` / `entry_hash` / `agent_sig`). No field collides with the
@@ -283,6 +312,16 @@ impl Principal {
 /// NOTE: this record does not duplicate `Verdict.timestamp_ns` (a
 /// monotonic-clock value) — [`ts`](Self::ts) is the wall-clock instant
 /// the detection was recorded, which is what a dashboard needs.
+///
+/// SCHEMA FREEZE: chain verification RE-SERIALISES the decoded record
+/// and re-hashes it (see [`verify_log_set`](crate::chainlog::verify_log_set)),
+/// so the recomputed pre-image must reproduce the stored bytes exactly —
+/// every existing field's name, declaration order, and serialised type
+/// is FROZEN once records exist on disk. The only safe schema change is
+/// ADDING an `Option` field with `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]`: absent on old lines, it decodes to `None` and
+/// re-serialises back to absent, so old records keep chain-verifying
+/// (see [`exe`](Self::exe) for the worked example).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionRecord {
     /// Monotonic, restart-stable id (seeded from the persisted tail).
@@ -305,6 +344,19 @@ pub struct DetectionRecord {
     pub confidence: f64,
     pub mitre: MitreAttack,
     pub principal: Principal,
+    /// Full path of the executable that triggered the detection — set
+    /// for the two exec sensors (`ProcessSpawn` post-exec / `ExecCheck`
+    /// pre-exec, both carrying the kernel `filename`), `None` for every
+    /// non-exec sensor (file / module-load / network / anti-tamper /
+    /// canary), which names no executable. Tappa 9.0.a.1: `comm` alone
+    /// loses the world-writable path R001 ("Exec from /tmp") actually
+    /// fired on; `exe` restores it. Mapped from the event's `filename`
+    /// by [`exe_from_event`]. Absent-on-`None` (`skip_serializing_if`)
+    /// so 9.0.a/b/c lines written before this field stay byte-identical
+    /// on disk and still chain-verify, and re-serialising them (as the
+    /// chain verifier does) omits `exe` exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
     /// Agent posture at the moment of detection.
     pub posture_at: PostureKind,
     /// What the response layer actually did: a [`ResponseAction`] name,
@@ -349,6 +401,7 @@ impl DetectionRecord {
                 technique: Vec::new(),
             },
             principal: Principal::from_event(event),
+            exe: exe_from_event(event),
             posture_at: posture,
             response,
             detection_type: verdict.category.clone(),
@@ -384,6 +437,7 @@ impl DetectionRecord {
             confidence: verdict.confidence,
             mitre: verdict.mitre_attack.clone(),
             principal: Principal::from_event(event),
+            exe: exe_from_event(event),
             posture_at: posture,
             response,
             detection_type,
@@ -404,6 +458,12 @@ impl DetectionRecord {
 /// of the LATEST `StatusEvent` carrying its [`detection_id`](Self::detection_id)
 /// (see [`latest_status_for_ids`]); a detection with no status event
 /// keeps its record's initial `Open`.
+///
+/// SCHEMA FREEZE: same constraint as [`DetectionRecord`] — the chain
+/// verifier re-serialises decoded events, so existing field names,
+/// declaration order and serialised types are frozen; only additive
+/// `Option` fields with `#[serde(default, skip_serializing_if =
+/// "Option::is_none")]` are safe to add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusEvent {
     /// The [`DetectionRecord::id`] this event re-statuses.
@@ -717,11 +777,13 @@ pub struct DetectionFilter {
     pub status: Option<DetectionStatus>,
     /// Exact-match the originating sensor.
     pub sensor: Option<Sensor>,
-    /// Substring match on the acting principal's `comm`. 9.0.a's
-    /// record carries no filesystem path (the `exe`/filename was
-    /// deliberately dropped), so the `--path` operator filter is
-    /// applied against `comm` — the one subject identifier every
-    /// sensor populates.
+    /// Substring match on the acting principal's `comm`. The record now
+    /// carries an executable path ([`DetectionRecord::exe`], 9.0.a.1),
+    /// but the `--path` operator filter is STILL applied against `comm`
+    /// — the one subject identifier every sensor populates (only the
+    /// exec sensors have an `exe`). Repointing `--path` to `exe`, or
+    /// adding a separate `--exe` filter, is a filter-semantics change
+    /// deferred to a later step (pending sign-off), out of scope here.
     pub comm_substr: Option<String>,
 }
 
@@ -1199,6 +1261,7 @@ mod tests {
                 technique: vec!["T1059".to_string()],
             },
             principal: Principal::from_event(&sample_event()),
+            exe: Some("/tmp/payload".to_string()),
             posture_at: PostureKind::Alerted,
             response: "suppressed (detect-only)".to_string(),
             detection_type: "reverse_shell".to_string(),
@@ -1227,6 +1290,177 @@ mod tests {
         assert_eq!(p.pid, 4242);
         assert_eq!(p.comm, "evil");
         assert_eq!(p.ppid, Some(1));
+    }
+
+    // ── Tappa 9.0.a.1 — exec path on the record ──────────────────────
+
+    /// An `ExecCheck` (pre-exec `bprm_check_security`) event — the second
+    /// exec sensor; its `filename` must reach `exe` just like `ProcessSpawn`.
+    fn sample_exec_check() -> Event {
+        Event::ExecCheck {
+            pid: 5151,
+            ppid: 1,
+            uid: 0,
+            comm: "nn-test-mock-re".to_string(),
+            filename: "/tmp/staging/dropper".to_string(),
+            timestamp_ns: 456,
+        }
+    }
+
+    /// A `FileOpen` event — a NON-exec (file) sensor that DOES carry a
+    /// `filename` (the OPENED file, not an executable). The adversarial
+    /// case for `exe`: a `filename` that must NOT leak into `exe`.
+    fn sample_file_open() -> Event {
+        Event::FileOpen {
+            pid: 77,
+            uid: 0,
+            gid: 0,
+            comm: "cat".to_string(),
+            filename: "/etc/shadow".to_string(),
+            flags: 0,
+            timestamp_ns: 789,
+        }
+    }
+
+    #[test]
+    fn exec_detection_records_exe_path() {
+        // R001 "Exec from /tmp": the rule fires on comm="evil", but the
+        // path that actually triggered it is /tmp/payload — `exe` must
+        // carry it (the 9.0.a.1 fix), on BOTH exec sensors.
+        let spawn = DetectionRecord::from_rule(
+            1,
+            now_ts(),
+            &sample_event(),
+            &sample_verdict(),
+            PostureKind::Engaged,
+            "KillProcess".to_string(),
+        );
+        assert_eq!(spawn.exe.as_deref(), Some("/tmp/payload"));
+        // ExecCheck (pre-exec) carries its filename into exe too.
+        assert_eq!(
+            exe_from_event(&sample_exec_check()).as_deref(),
+            Some("/tmp/staging/dropper"),
+        );
+    }
+
+    #[test]
+    fn non_exec_detection_records_no_exe() {
+        // A FileOpen has a `filename` (the OPENED file) but names no
+        // executable — exe must be None, not the opened path. Proves exe
+        // is exec-only, not "any filename".
+        let file = DetectionRecord::from_rule(
+            2,
+            now_ts(),
+            &sample_file_open(),
+            &sample_verdict(),
+            PostureKind::Observing,
+            "none".to_string(),
+        );
+        assert_eq!(file.sensor, Sensor::File);
+        assert_eq!(file.exe, None, "FileOpen.filename is the opened file, not an exe");
+        assert_eq!(file.principal.comm, "cat");
+    }
+
+    #[test]
+    fn record_without_exe_field_deserializes_to_none() {
+        // Simulate a 9.0.a/b/c-era on-disk line: serialise a record, then
+        // STRIP the `exe` key (those binaries had no such field). It must
+        // deserialise back with exe = None (serde default).
+        let rec = DetectionRecord::from_rule(
+            1,
+            "2026-06-08T12:00:00.000000Z".to_string(),
+            &sample_event(),
+            &sample_verdict(),
+            PostureKind::Engaged,
+            "KillProcess".to_string(),
+        );
+        let mut v = serde_json::to_value(&rec).unwrap();
+        v.as_object_mut().unwrap().remove("exe");
+        let line = serde_json::to_string(&v).unwrap();
+        assert!(!line.contains("\"exe\""), "pre-9.0.a.1 line carries no exe key");
+        let decoded: DetectionRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded.exe, None, "absent exe deserialises to None");
+    }
+
+    #[tokio::test]
+    async fn chain_verifies_across_exe_present_and_absent() {
+        // The load-bearing safety test for 9.0.a.1 (recon Q2). Write two
+        // detections through the REAL signed chain: one exec (exe = Some)
+        // and one FileOpen (exe = None). Then:
+        //  * verify_log_set must pass (hashes + sigs + linkage) — adding
+        //    the field did not break chaining;
+        //  * the exe=None line carries NO `exe` key, making it byte-
+        //    identical to a record written by 9.0.a/b/c (no exe field). So
+        //    that line IS a faithful pre-field record, and its passing
+        //    verification proves OLD lines still verify under the new
+        //    schema: the verifier re-serialises the decoded struct, but a
+        //    skipped `None` reproduces the original pre-image byte-for-byte,
+        //    so the recomputed entry_hash matches the stored one;
+        //  * the envelope quartet (fmt_ver/prev_hash/entry_hash/agent_sig)
+        //    is unchanged on every line.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let key = test_key();
+        let pubkey = key.verifying_key();
+        let (sink, _writer) = open(
+            &path,
+            key,
+            RotationConfig::default(),
+            Arc::new(NoProtection),
+            DEFAULT_QUEUE_CAP,
+        )
+        .expect("open detection store");
+
+        sink.record_rule(
+            &sample_event(),
+            &sample_verdict(),
+            PostureKind::Observing,
+            "KillProcess".to_string(),
+        );
+        sink.record_rule(
+            &sample_file_open(),
+            &sample_verdict(),
+            PostureKind::Observing,
+            "none".to_string(),
+        );
+
+        // Poll until the writer task has flushed both (bounded wait).
+        let mut flushed = 0usize;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            flushed = count_data_lines(&path);
+            if flushed >= 2 {
+                break;
+            }
+        }
+        assert_eq!(flushed, 2, "writer appended both records");
+
+        // Chain verifies end-to-end (the decisive recon-Q2 check).
+        let report = verify_log_set::<DetectionRecord>(&path, &pubkey)
+            .expect("detection chain verifies with mixed exe-present/absent records");
+        assert_eq!(report.total_records, 2);
+
+        // Inspect the on-disk lines: envelope shape + exe presence/absence.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        for l in &lines {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            assert!(v.get("fmt_ver").is_some(), "envelope fmt_ver present");
+            assert!(v.get("prev_hash").is_some(), "envelope prev_hash present");
+            assert!(v.get("entry_hash").is_some(), "envelope entry_hash present");
+            assert!(v.get("agent_sig").is_some(), "envelope agent_sig present");
+        }
+        let with_exe = lines
+            .iter()
+            .filter(|l| l.contains("\"exe\":\"/tmp/payload\""))
+            .count();
+        let without_exe = lines.iter().filter(|l| !l.contains("\"exe\"")).count();
+        assert_eq!(with_exe, 1, "exec detection carries its exe path");
+        assert_eq!(
+            without_exe, 1,
+            "non-exec detection omits exe — the pre-9.0.a.1 byte shape",
+        );
     }
 
     #[test]
@@ -1335,6 +1569,7 @@ mod tests {
                 uid: 0,
                 ppid: None,
             },
+            exe: None,
             posture_at: PostureKind::Observing,
             response: "none".to_string(),
             detection_type: "test".to_string(),
