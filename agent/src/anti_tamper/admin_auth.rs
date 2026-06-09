@@ -1088,12 +1088,14 @@ fn parse_role_keyword(s: &str) -> Result<Role> {
         "net-read" => Ok(Role::NetRead),
         "net-manage" => Ok(Role::NetManage),
         "trusted-installer" => Ok(Role::TrustedInstaller),
+        // Tappa 9.0.b — low-privilege read-only telemetry role.
+        "telemetry-read" => Ok(Role::TelemetryRead),
         "all" => Ok(Role::All),
         other => Err(anyhow!(
             "unknown role `{other}` — expected one of: \
              unlock, shutdown, force-posture, rotate-keys, audit-read, \
              fim-manage, fim-read, canary-read, canary-manage, \
-             net-read, net-manage, trusted-installer, all"
+             net-read, net-manage, trusted-installer, telemetry-read, all"
         )),
     }
 }
@@ -1267,6 +1269,8 @@ fn role_keyword(r: Role) -> &'static str {
         Role::NetManage => "net-manage",
         // FIM-009 self-upgrade (§15.1).
         Role::TrustedInstaller => "trusted-installer",
+        // Tappa 9.0.b — read-only telemetry role.
+        Role::TelemetryRead => "telemetry-read",
         Role::All => "all",
     }
 }
@@ -1909,6 +1913,10 @@ mod tests {
             // are now 10 / 11 (admin.pub keyword shape stable).
             ("net-read", Role::NetRead),
             ("net-manage", Role::NetManage),
+            // FIM-009 self-upgrade (§15.1).
+            ("trusted-installer", Role::TrustedInstaller),
+            // Tappa 9.0.b — read-only telemetry role.
+            ("telemetry-read", Role::TelemetryRead),
             ("all", Role::All),
         ];
         for (keyword, expected) in cases {
@@ -2043,6 +2051,38 @@ mod tests {
             auth.verify_with_role(&sig, role)
                 .unwrap_or_else(|e| panic!("Role::All should authorise {role:?}: {e:?}"));
         }
+    }
+
+    /// Tappa 9.0.b — the read/control trust gradient at the auth
+    /// layer: a key whose ONLY role is `telemetry-read` is denied the
+    /// control op `unlock`. The signature over the nonce is valid and
+    /// the key IS loaded, so the refusal is [`AdminAuthError::RoleDenied`]
+    /// (carrying the required role + fingerprint), NOT
+    /// `InvalidSignature` — and it must not count toward the rate
+    /// limit (a config-level refusal, not an attack). This is the
+    /// `read != control` guarantee a telemetry-read-only dashboard key
+    /// must satisfy.
+    #[test]
+    fn telemetry_read_only_key_is_role_denied_for_unlock() {
+        let (signing, vk) = make_keypair();
+        let entry = KeyEntry {
+            key: vk,
+            roles: vec![Role::TelemetryRead],
+        };
+        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let nonce = auth.issue_challenge().unwrap();
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        match auth.verify_with_role(&sig, Role::Unlock).unwrap_err() {
+            AdminAuthError::RoleDenied { required_role, .. } => {
+                assert_eq!(required_role, Role::Unlock);
+            }
+            other => panic!("expected RoleDenied for telemetry-read key, got {other:?}"),
+        }
+        assert_eq!(
+            auth.failure_count.load(Ordering::SeqCst),
+            0,
+            "RoleDenied must not count toward rate-limit"
+        );
     }
 
     /// The pre-A5 [`AdminAuth::verify_unlock`] entry point is now

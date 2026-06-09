@@ -160,6 +160,13 @@ pub enum OperationCode {
     /// of an in-place upgrade. Authorised by [`Role::TrustedInstaller`];
     /// verified 1-of-N (M=1) via the standard signed-payload quorum.
     TrustedInstallerGrant = 18,
+    /// Tappa 9.0.b — operator-initiated read of the last N persisted
+    /// detections from the chained `detections.jsonl` (9.0.a store),
+    /// newest-first, with optional filters (since/until time bounds,
+    /// min_severity, status, sensor, path). Read-only; authorised by
+    /// the low-privilege [`Role::TelemetryRead`]. The filters live in
+    /// [`DetectionsExtra`] inside the signed scope.
+    Detections = 19,
 }
 
 impl From<OperationCode> for u8 {
@@ -190,6 +197,7 @@ impl TryFrom<u8> for OperationCode {
             16 => Ok(Self::NetResolve),
             17 => Ok(Self::NetFingerprint),
             18 => Ok(Self::TrustedInstallerGrant),
+            19 => Ok(Self::Detections),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -258,6 +266,18 @@ pub enum Role {
     /// in-place upgrade. High-privilege (peer of `rotate-keys` /
     /// `shutdown`); never in a key's default allowlist.
     TrustedInstaller = 12,
+    /// Tappa 9.0.b — authorises the read-only `detections` verb
+    /// (read the last N persisted detections). Lowest-privilege
+    /// telemetry role: it gates [`OperationCode::Detections`] and is
+    /// the canonical home for read-only telemetry the local dashboard
+    /// needs, and per design it subsumes `audit-read` (a telemetry-read
+    /// key is the same observation-only trust level — it may read the
+    /// audit log). It NEVER authorises control ops — `unlock`,
+    /// `trusted-installer`, `rotate-keys`, `shutdown`, `force-posture`.
+    /// The trust gradient is read (telemetry-read) < control: a
+    /// telemetry-read-only key reads detections but cannot touch COMBAT.
+    /// Never in a key's default allowlist; operators add it explicitly.
+    TelemetryRead = 13,
     All = 255,
 }
 
@@ -283,6 +303,7 @@ impl TryFrom<u8> for Role {
             10 => Ok(Self::NetRead),
             11 => Ok(Self::NetManage),
             12 => Ok(Self::TrustedInstaller),
+            13 => Ok(Self::TelemetryRead),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -461,6 +482,42 @@ pub struct TrustedInstallerGrantExtra {
     pub window_secs: u32,
 }
 
+/// Op-specific signed-scope fields for [`OperationCode::Detections`]
+/// (Tappa 9.0.b). The optional fields are the operator's filter on
+/// the streamed detection set; all are inside the signed scope so a
+/// captured request cannot be re-scoped after signing.
+///
+/// - `limit` — the bounded "last N" cap. `0` means "server default"
+///   ([`crate`]-side `DEFAULT_DETECTIONS_LIMIT`); the agent clamps it
+///   to a hard ceiling so a huge value can't force an unbounded read.
+/// - `since_unix_ts` / `until_unix_ts` — inclusive UNIX-seconds time
+///   bounds on the detection's wall-clock `ts`. `None` = unbounded on
+///   that side. Mirrors [`AuditReadExtra`] / [`FimReportExtra`].
+/// - `min_severity` — keep detections at or above this severity rung
+///   (`low` < `medium` < `high` < `critical`).
+/// - `status` — exact-match the triage status (`open` / `acknowledged`
+///   / `closed`).
+/// - `sensor` — exact-match the originating sensor (`exec` / `file` /
+///   `module-load` / `network` / `anti-tamper` / `canary`).
+/// - `path` — substring match on the acting principal (see the agent's
+///   `DetectionFilter`; 9.0.a's record carries no filesystem path, so
+///   this matches the principal `comm`).
+///
+/// The enum-valued filters are carried as lowercase strings rather than
+/// wire bytes so the wire shape never has to track the agent-side
+/// `Sensor` / `DetectionStatus` discriminants (those types live in the
+/// agent crate, not here); the agent parses them server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DetectionsExtra {
+    pub limit: u32,
+    pub since_unix_ts: Option<u64>,
+    pub until_unix_ts: Option<u64>,
+    pub min_severity: Option<String>,
+    pub status: Option<String>,
+    pub sensor: Option<String>,
+    pub path: Option<String>,
+}
+
 /// Canary kind tag. Wire-byte stability mirrors [`OperationCode`]
 /// and [`Role`] (bare u8 via `serde(into = "u8", try_from = "u8")`):
 /// append-only, new variants get the next free discriminant.
@@ -572,6 +629,8 @@ pub enum OperationExtra {
     /// FIM-009 self-upgrade (§15.1). Pairs with
     /// [`OperationCode::TrustedInstallerGrant`].
     TrustedInstallerGrant(TrustedInstallerGrantExtra),
+    /// Tappa 9.0.b. Pairs with [`OperationCode::Detections`].
+    Detections(DetectionsExtra),
 }
 
 impl OperationExtra {
@@ -598,6 +657,7 @@ impl OperationExtra {
             OperationExtra::NetResolve(_) => OperationCode::NetResolve,
             OperationExtra::NetFingerprint(_) => OperationCode::NetFingerprint,
             OperationExtra::TrustedInstallerGrant(_) => OperationCode::TrustedInstallerGrant,
+            OperationExtra::Detections(_) => OperationCode::Detections,
         }
     }
 }
@@ -1034,6 +1094,41 @@ impl SignedPayload {
             extra: OperationExtra::TrustedInstallerGrant(TrustedInstallerGrantExtra { window_secs }),
         }
     }
+
+    /// Tappa 9.0.b — `detections` signed payload constructor. `limit`
+    /// is the bounded "last N" cap (`0` ⇒ server default); the other
+    /// arguments are optional filters (time bounds, severity floor,
+    /// triage status, sensor, principal substring). Authorised by
+    /// `Role::TelemetryRead`; verified 1-of-N (M=1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_detections(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        limit: u32,
+        since_unix_ts: Option<u64>,
+        until_unix_ts: Option<u64>,
+        min_severity: Option<String>,
+        status: Option<String>,
+        sensor: Option<String>,
+        path: Option<String>,
+    ) -> Self {
+        Self {
+            op: OperationCode::Detections,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::Detections(DetectionsExtra {
+                limit,
+                since_unix_ts,
+                until_unix_ts,
+                min_severity,
+                status,
+                sensor,
+                path,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1066,8 +1161,10 @@ mod tests {
     /// network ops (NetFlows / NetListeners / NetResolve /
     /// NetFingerprint) bringing it to 17 — every existing test
     /// that iterates over this array (sign+verify round-trip,
-    /// CBOR-determinism) silently picks up the Net* ops.
-    fn one_payload_per_op() -> [SignedPayload; 17] {
+    /// CBOR-determinism) silently picks up the Net* ops. Tappa
+    /// 9.0.b added `TrustedInstallerGrant` (previously omitted) +
+    /// `Detections`, bringing it to 19 — the full op set.
+    fn one_payload_per_op() -> [SignedPayload; 19] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -1111,6 +1208,19 @@ mod tests {
                 TS,
                 agent_id(),
                 "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
+            ),
+            SignedPayload::new_trusted_installer_grant(nonce(), TS, agent_id(), 120),
+            SignedPayload::new_detections(
+                nonce(),
+                TS,
+                agent_id(),
+                50,
+                Some(1_700_000_000),
+                Some(1_710_000_000),
+                Some("high".to_string()),
+                Some("open".to_string()),
+                Some("network".to_string()),
+                Some("curl".to_string()),
             ),
         ]
     }
@@ -1297,6 +1407,9 @@ mod tests {
             (OperationCode::NetListeners, 15),
             (OperationCode::NetResolve, 16),
             (OperationCode::NetFingerprint, 17),
+            // FIM-009 + Tappa 9.0.b — APPENDED, never renumber.
+            (OperationCode::TrustedInstallerGrant, 18),
+            (OperationCode::Detections, 19),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -1334,6 +1447,9 @@ mod tests {
             // NetManage take 10 / 11.
             (Role::NetRead, 10),
             (Role::NetManage, 11),
+            // FIM-009 + Tappa 9.0.b — APPENDED, never renumber.
+            (Role::TrustedInstaller, 12),
+            (Role::TelemetryRead, 13),
             (Role::All, 255),
         ];
         for (r, expected) in cases {

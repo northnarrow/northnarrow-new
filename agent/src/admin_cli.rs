@@ -1880,6 +1880,77 @@ pub fn run_net_flows(
     }
 }
 
+/// Tappa 9.0.b — `nn-admin detections` — read the last N persisted
+/// detections (newest-first) from the detection chainlog, with
+/// optional filters. 1-of-N, `Role::TelemetryRead`. Reuses
+/// [`NetJsonlOutcome`] (the shared JSONL-read outcome) since the reply
+/// shape is identical. The enum filters are passed through as
+/// already-canonical lowercase strings (the CLI restricts them); the
+/// agent parses + applies them server-side.
+#[allow(clippy::too_many_arguments)]
+pub fn run_detections(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    limit: u32,
+    since_unix_ts: Option<u64>,
+    until_unix_ts: Option<u64>,
+    min_severity: Option<String>,
+    status: Option<String>,
+    sensor: Option<String>,
+    path: Option<String>,
+) -> Result<NetJsonlOutcome> {
+    use common::wire::admin_protocol::DetectionsRequest;
+
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_detections(
+        nonce,
+        now,
+        agent_id_arr,
+        limit,
+        since_unix_ts,
+        until_unix_ts,
+        min_severity,
+        status,
+        sensor,
+        path,
+    );
+    let sig: [u8; 64] =
+        sign(&payload, &signing).map_err(|e| anyhow!("signing detections payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::DetectionsRequest(DetectionsRequest {
+            payload,
+            signatures: vec![KeyedSignature { signature: sig }],
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::DetectionsResponse(resp) => Ok(map_admin_result_to_net_jsonl(
+            resp.result,
+            resp.entries_jsonl,
+            resp.entries_count,
+            resp.entries_truncated,
+        )),
+        _ => Ok(NetJsonlOutcome::Transport),
+    }
+}
+
 /// `nn-admin net listeners` — in-process listener snapshot.
 pub fn run_net_listeners(
     socket: &Path,

@@ -622,6 +622,245 @@ fn archive_paths(active_path: &Path) -> Vec<PathBuf> {
     out
 }
 
+// ── bounded last-N read (9.0.b) ─────────────────────────────────────
+
+/// CLI default for `nn-admin detections --limit` when the operator
+/// gives none (the wire carries `limit = 0` ⇒ this default). A live
+/// dashboard wants the freshest handful, not the whole store.
+pub const DEFAULT_DETECTIONS_LIMIT: usize = 50;
+
+/// Hard server-side ceiling on a single `Detections` read. Clamps a
+/// fat-fingered or hostile `--limit`: combined with the wire frame's
+/// own [`crate::admin_socket`] soft cap, the response can never force
+/// an unbounded read of the retained set.
+pub const MAX_DETECTIONS_LIMIT: usize = 1000;
+
+/// Parsed, typed filter for a [`read_last_n`] query. All fields are
+/// optional; `None` means "no constraint on that dimension". Built by
+/// the admin-socket dispatch from the wire `DetectionsExtra` (which
+/// carries the enum filters as lowercase strings).
+#[derive(Debug, Clone, Default)]
+pub struct DetectionFilter {
+    /// Inclusive lower bound on the detection's wall-clock `ts`, in
+    /// UNIX seconds.
+    pub since_unix: Option<i64>,
+    /// Inclusive upper bound on the detection's wall-clock `ts`, in
+    /// UNIX seconds.
+    pub until_unix: Option<i64>,
+    /// Keep detections at or above this severity rung.
+    pub min_severity: Option<Severity>,
+    /// Exact-match the triage status.
+    pub status: Option<DetectionStatus>,
+    /// Exact-match the originating sensor.
+    pub sensor: Option<Sensor>,
+    /// Substring match on the acting principal's `comm`. 9.0.a's
+    /// record carries no filesystem path (the `exe`/filename was
+    /// deliberately dropped), so the `--path` operator filter is
+    /// applied against `comm` — the one subject identifier every
+    /// sensor populates.
+    pub comm_substr: Option<String>,
+}
+
+/// Severity as a comparable rung (`Low` < `Medium` < `High` <
+/// `Critical`). [`common::model::Severity`] is not `Ord`, so the
+/// `min_severity` filter ranks explicitly rather than relying on a
+/// derived ordering that could silently drift if a rung is inserted.
+fn severity_rank(s: Severity) -> u8 {
+    match s {
+        Severity::Low => 0,
+        Severity::Medium => 1,
+        Severity::High => 2,
+        Severity::Critical => 3,
+    }
+}
+
+/// Parse a `--min-severity` token (case-insensitive). `None` on an
+/// unrecognised token.
+pub fn parse_severity_filter(s: &str) -> Option<Severity> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(Severity::Low),
+        "medium" => Some(Severity::Medium),
+        "high" => Some(Severity::High),
+        "critical" => Some(Severity::Critical),
+        _ => None,
+    }
+}
+
+impl Sensor {
+    /// Parse a `--sensor` token (case-insensitive). Accepts both the
+    /// hyphenated and squashed forms of the two-word sensors.
+    pub fn parse_filter(s: &str) -> Option<Sensor> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "exec" => Some(Sensor::Exec),
+            "file" => Some(Sensor::File),
+            "module-load" | "moduleload" => Some(Sensor::ModuleLoad),
+            "network" => Some(Sensor::Network),
+            "anti-tamper" | "antitamper" => Some(Sensor::AntiTamper),
+            "canary" => Some(Sensor::Canary),
+            _ => None,
+        }
+    }
+}
+
+impl DetectionStatus {
+    /// Parse a `--status` token (case-insensitive). `None` on an
+    /// unrecognised token.
+    pub fn parse_filter(s: &str) -> Option<DetectionStatus> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" => Some(DetectionStatus::Open),
+            "acknowledged" | "ack" => Some(DetectionStatus::Acknowledged),
+            "closed" => Some(DetectionStatus::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a record's wall-clock `ts` (RFC-3339, e.g.
+/// `2026-06-09T12:00:00.123456Z`) to UNIX seconds, or `None` if it
+/// does not parse. The agent writes this field itself, so a parse
+/// failure is not expected; the time filter treats it leniently (an
+/// unparseable `ts` is not excluded) rather than silently dropping a
+/// detection an operator might need to see.
+fn ts_to_unix(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+impl DetectionRecord {
+    /// Does this record satisfy every set constraint in `filter`?
+    fn matches(&self, filter: &DetectionFilter) -> bool {
+        if let Some(since) = filter.since_unix {
+            if let Some(t) = ts_to_unix(&self.ts) {
+                if t < since {
+                    return false;
+                }
+            }
+        }
+        if let Some(until) = filter.until_unix {
+            if let Some(t) = ts_to_unix(&self.ts) {
+                if t > until {
+                    return false;
+                }
+            }
+        }
+        if let Some(min) = filter.min_severity {
+            if severity_rank(self.severity) < severity_rank(min) {
+                return false;
+            }
+        }
+        if let Some(status) = filter.status {
+            if self.status != status {
+                return false;
+            }
+        }
+        if let Some(sensor) = filter.sensor {
+            if self.sensor != sensor {
+                return false;
+            }
+        }
+        if let Some(ref sub) = filter.comm_substr {
+            if !self.principal.comm.contains(sub.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Read the last `limit` detections from the chainlog at
+/// `active_path`, **newest-first**, applying `filter`.
+///
+/// Bounded read (BUG-026 discipline): the size-capped active file is
+/// read in full (it is the newest data and ≤ the rotation cap), then
+/// sealed archives are descended **newest-sealed-first** ONLY while
+/// fewer than `limit` matching records have been collected. So the
+/// common case — the active file alone satisfies `limit` — opens
+/// exactly one file, and even a highly selective filter is bounded by
+/// the retention window ([`DEFAULT_MAX_ARCHIVES`] files), never an
+/// unbounded walk. Records are then sorted by `id` descending (the id
+/// is monotonic, so id-desc == newest-first across files) and bounded
+/// to `limit`.
+///
+/// Each line is parsed directly as a [`DetectionRecord`]; the chain
+/// envelope fields (`prev_hash` / `entry_hash` / `agent_sig` /
+/// `fmt_ver`) are flattened siblings and are simply ignored, while a
+/// terminator / manifest / torn line (which carries no `id`) fails to
+/// parse and is skipped. The chain is NOT signature-verified here:
+/// this is an on-host read of an LSM-protected file; integrity
+/// verification is the dedicated `verify_log_set` / `nn-admin audit
+/// verify` path, not every dashboard query.
+pub fn read_last_n(
+    active_path: &Path,
+    limit: usize,
+    filter: &DetectionFilter,
+) -> Vec<DetectionRecord> {
+    let mut collected: Vec<DetectionRecord> = Vec::new();
+    collect_matching_from_file(active_path, filter, &mut collected);
+    if collected.len() < limit {
+        for archive in archives_newest_first(active_path) {
+            collect_matching_from_file(&archive, filter, &mut collected);
+            if collected.len() >= limit {
+                break;
+            }
+        }
+    }
+    // Monotonic id ⇒ id-desc is newest-first across every file we
+    // touched; bound to the requested N.
+    collected.sort_by(|a, b| b.id.cmp(&a.id));
+    collected.truncate(limit);
+    collected
+}
+
+/// Append the matching [`DetectionRecord`]s from one chainlog file
+/// (active or sealed archive) to `out`. Best-effort: a missing /
+/// unreadable file contributes nothing; lines that don't parse as a
+/// `DetectionRecord` (terminators, blanks) are skipped. The file is
+/// size-capped (≤ rotation cap), so this is a bounded read.
+fn collect_matching_from_file(
+    path: &Path,
+    filter: &DetectionFilter,
+    out: &mut Vec<DetectionRecord>,
+) {
+    use std::io::{BufRead, BufReader};
+    let f = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    for line in BufReader::new(f).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<DetectionRecord>(&line) {
+            if record.matches(filter) {
+                out.push(record);
+            }
+        }
+    }
+}
+
+/// Sealed-archive siblings of `active_path`, ordered newest-sealed-
+/// first (highest 6-digit rotation seq first): the highest seq is the
+/// most recently rotated file, hence the newest archived records.
+fn archives_newest_first(active_path: &Path) -> Vec<PathBuf> {
+    let mut archives = archive_paths(active_path);
+    archives.sort_by(|a, b| archive_seq(b).cmp(&archive_seq(a)));
+    archives
+}
+
+/// Extract the trailing 6-digit rotation seq from an archive path
+/// (`<base>.NNNNNN`). [`archive_paths`] only yields well-formed
+/// archive names, so the parse always succeeds in practice; a
+/// malformed name sorts as `0`.
+fn archive_seq(path: &Path) -> u64 {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|name| name.rsplit('.').next())
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +1046,316 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    // ── 9.0.b bounded read + filter tests ───────────────────────────
+
+    /// Build a detection record with the fields the read/filter tests
+    /// vary; everything else is a fixed, valid placeholder.
+    fn mk(
+        id: u64,
+        ts: &str,
+        severity: Severity,
+        status: DetectionStatus,
+        sensor: Sensor,
+        comm: &str,
+    ) -> DetectionRecord {
+        DetectionRecord {
+            id,
+            ts: ts.to_string(),
+            sensor,
+            path: DetectionPath::Rule,
+            rule_id: Some("R001".to_string()),
+            rule_name: Some("rule".to_string()),
+            severity,
+            verdict: DetectionVerdict::Rule(ResponseAction::Log),
+            confidence: 1.0,
+            mitre: MitreAttack {
+                tactic: Vec::new(),
+                technique: Vec::new(),
+            },
+            principal: Principal {
+                pid: 1,
+                comm: comm.to_string(),
+                uid: 0,
+                ppid: None,
+            },
+            posture_at: PostureKind::Observing,
+            response: "none".to_string(),
+            detection_type: "test".to_string(),
+            status,
+            explanation: None,
+        }
+    }
+
+    /// Default-ish record varying only the id (ts derived from id so
+    /// the on-disk append order is chronological, like production).
+    fn mk_id(id: u64) -> DetectionRecord {
+        mk(
+            id,
+            &format!("2026-06-09T12:00:{:02}.000000Z", id % 60),
+            Severity::Medium,
+            DetectionStatus::Open,
+            Sensor::Exec,
+            "proc",
+        )
+    }
+
+    /// Write detection records as plain JSONL (one record per line) to
+    /// `path` — the on-disk data-line shape the reader parses (the
+    /// chain envelope fields are optional siblings the reader ignores).
+    fn write_records(path: &Path, records: &[DetectionRecord]) {
+        let body: String = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn ids(records: &[DetectionRecord]) -> Vec<u64> {
+        records.iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn read_last_n_orders_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        // Appended oldest-first (1..=5); the reader must return them
+        // newest-first.
+        write_records(&path, &[mk_id(1), mk_id(2), mk_id(3), mk_id(4), mk_id(5)]);
+        let got = read_last_n(&path, 10, &DetectionFilter::default());
+        assert_eq!(ids(&got), vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn read_last_n_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let records: Vec<_> = (1..=10).map(mk_id).collect();
+        write_records(&path, &records);
+        let got = read_last_n(&path, 3, &DetectionFilter::default());
+        assert_eq!(ids(&got), vec![10, 9, 8], "the 3 newest only");
+    }
+
+    #[test]
+    fn read_last_n_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.jsonl");
+        let got = read_last_n(&path, 10, &DetectionFilter::default());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn read_last_n_filters_min_severity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        write_records(
+            &path,
+            &[
+                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Low, DetectionStatus::Open, Sensor::Exec, "a"),
+                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "b"),
+                mk(3, "2026-06-09T12:00:03.000000Z", Severity::High, DetectionStatus::Open, Sensor::Exec, "c"),
+                mk(4, "2026-06-09T12:00:04.000000Z", Severity::Critical, DetectionStatus::Open, Sensor::Exec, "d"),
+            ],
+        );
+        let filter = DetectionFilter {
+            min_severity: Some(Severity::High),
+            ..Default::default()
+        };
+        let got = read_last_n(&path, 10, &filter);
+        assert_eq!(ids(&got), vec![4, 3], "only High and Critical, newest-first");
+    }
+
+    #[test]
+    fn read_last_n_filters_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        write_records(
+            &path,
+            &[
+                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
+                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Closed, Sensor::Exec, "b"),
+                mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "c"),
+            ],
+        );
+        let filter = DetectionFilter {
+            status: Some(DetectionStatus::Open),
+            ..Default::default()
+        };
+        let got = read_last_n(&path, 10, &filter);
+        assert_eq!(ids(&got), vec![3, 1]);
+    }
+
+    #[test]
+    fn read_last_n_filters_sensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        write_records(
+            &path,
+            &[
+                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
+                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Network, "b"),
+                mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Network, "c"),
+            ],
+        );
+        let filter = DetectionFilter {
+            sensor: Some(Sensor::Network),
+            ..Default::default()
+        };
+        let got = read_last_n(&path, 10, &filter);
+        assert_eq!(ids(&got), vec![3, 2]);
+    }
+
+    #[test]
+    fn read_last_n_filters_path_against_comm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        write_records(
+            &path,
+            &[
+                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "sshd"),
+                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "curl"),
+                mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "curl-helper"),
+            ],
+        );
+        let filter = DetectionFilter {
+            comm_substr: Some("curl".to_string()),
+            ..Default::default()
+        };
+        let got = read_last_n(&path, 10, &filter);
+        assert_eq!(ids(&got), vec![3, 2], "substring matches both curl* comms");
+    }
+
+    #[test]
+    fn read_last_n_filters_time_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let t1 = "2026-06-09T12:00:01.000000Z";
+        let t2 = "2026-06-09T12:00:02.000000Z";
+        let t3 = "2026-06-09T12:00:03.000000Z";
+        write_records(
+            &path,
+            &[
+                mk(1, t1, Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
+                mk(2, t2, Severity::Medium, DetectionStatus::Open, Sensor::Exec, "b"),
+                mk(3, t3, Severity::Medium, DetectionStatus::Open, Sensor::Exec, "c"),
+            ],
+        );
+        // since = t2 ⇒ keep t2, t3 (inclusive lower bound).
+        let filter = DetectionFilter {
+            since_unix: ts_to_unix(t2),
+            ..Default::default()
+        };
+        assert_eq!(ids(&read_last_n(&path, 10, &filter)), vec![3, 2]);
+        // until = t2 ⇒ keep t1, t2 (inclusive upper bound).
+        let filter = DetectionFilter {
+            until_unix: ts_to_unix(t2),
+            ..Default::default()
+        };
+        assert_eq!(ids(&read_last_n(&path, 10, &filter)), vec![2, 1]);
+        // since = t2 AND until = t2 ⇒ only t2.
+        let filter = DetectionFilter {
+            since_unix: ts_to_unix(t2),
+            until_unix: ts_to_unix(t2),
+            ..Default::default()
+        };
+        assert_eq!(ids(&read_last_n(&path, 10, &filter)), vec![2]);
+    }
+
+    #[test]
+    fn read_last_n_descends_into_archive_when_active_insufficient() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("detections.jsonl");
+        // Active holds the two newest (ids 6, 7); the sealed archive
+        // .000001 holds the older five (ids 1..=5).
+        write_records(&active, &[mk_id(6), mk_id(7)]);
+        write_records(
+            &dir.path().join("detections.jsonl.000001"),
+            &[mk_id(1), mk_id(2), mk_id(3), mk_id(4), mk_id(5)],
+        );
+        // limit 4 isn't satisfied by the active file alone, so the
+        // reader descends into the archive and returns the 4 newest
+        // across both files.
+        let got = read_last_n(&active, 4, &DetectionFilter::default());
+        assert_eq!(ids(&got), vec![7, 6, 5, 4]);
+    }
+
+    #[test]
+    fn read_last_n_stops_at_active_when_limit_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("detections.jsonl");
+        write_records(&active, &[mk_id(6), mk_id(7), mk_id(8), mk_id(9), mk_id(10)]);
+        // White-box probe: the archive carries a SENTINEL id (999)
+        // that would sort to the top IF the reader opened it. Because
+        // the active file already satisfies limit=3, the archive must
+        // NOT be read — so 999 must be absent from the result. (In a
+        // real store an archive only holds OLDER ids than the active
+        // file; the inflated id here exists purely to detect an
+        // unnecessary descent.)
+        write_records(&dir.path().join("detections.jsonl.000001"), &[mk_id(999)]);
+        let got = read_last_n(&active, 3, &DetectionFilter::default());
+        assert_eq!(ids(&got), vec![10, 9, 8]);
+        assert!(!ids(&got).contains(&999), "archive must not be read once N is satisfied");
+    }
+
+    #[test]
+    fn read_last_n_descends_archives_newest_seq_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("detections.jsonl");
+        // Active empty-ish (1 record); two archives — the higher seq
+        // (.000002) is the more-recently-sealed, hence newer records.
+        write_records(&active, &[mk_id(9)]);
+        write_records(&dir.path().join("detections.jsonl.000002"), &[mk_id(7), mk_id(8)]);
+        write_records(&dir.path().join("detections.jsonl.000001"), &[mk_id(1), mk_id(2)]);
+        // limit 3 ⇒ active (9) + newest archive .000002 (8,7); the
+        // older .000001 must not be needed.
+        let got = read_last_n(&active, 3, &DetectionFilter::default());
+        assert_eq!(ids(&got), vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn read_last_n_parses_real_chain_envelope_and_skips_terminators() {
+        // Exercise the REAL on-disk shape: RotatingChainLog writes
+        // each DetectionRecord wrapped in a flattened ChainLine
+        // envelope (prev_hash/entry_hash/agent_sig/fmt_ver). The
+        // reader must parse the payload regardless, and must SKIP a
+        // terminator/torn line (which carries no `id`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        {
+            let mut log = RotatingChainLog::<DetectionRecord>::open(
+                &path,
+                test_key(),
+                RotationConfig::default(),
+                std::sync::Arc::new(NoProtection),
+            )
+            .expect("open chainlog");
+            log.append(mk_id(1)).unwrap();
+            log.append(mk_id(2)).unwrap();
+            log.append(mk_id(3)).unwrap();
+        }
+        // The active file now has 3 envelope-wrapped data lines. Append
+        // a terminator-shaped line (no `id`) — it must be skipped.
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body.push_str(
+            "{\"rotate\":{\"seq\":1},\"prev_hash\":\"a\",\"entry_hash\":\"b\",\"agent_sig\":\"c\"}\n",
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let got = read_last_n(&path, 10, &DetectionFilter::default());
+        assert_eq!(ids(&got), vec![3, 2, 1], "payloads parsed, terminator skipped");
+    }
+
+    #[test]
+    fn severity_and_sensor_and_status_filters_parse_case_insensitively() {
+        assert_eq!(parse_severity_filter("HIGH"), Some(Severity::High));
+        assert_eq!(parse_severity_filter("critical"), Some(Severity::Critical));
+        assert_eq!(parse_severity_filter("nope"), None);
+        assert_eq!(Sensor::parse_filter("module-load"), Some(Sensor::ModuleLoad));
+        assert_eq!(Sensor::parse_filter("Anti-Tamper"), Some(Sensor::AntiTamper));
+        assert_eq!(Sensor::parse_filter("nope"), None);
+        assert_eq!(DetectionStatus::parse_filter("Open"), Some(DetectionStatus::Open));
+        assert_eq!(DetectionStatus::parse_filter("closed"), Some(DetectionStatus::Closed));
+        assert_eq!(DetectionStatus::parse_filter("nope"), None);
     }
 }
