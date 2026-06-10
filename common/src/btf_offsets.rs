@@ -168,6 +168,15 @@ pub const PATH_DENTRY_OFFSET: usize = 8;
 /// `fim_file_open_observe` reads this offset.
 pub const FILE_F_FLAGS_OFFSET: usize = 72;
 
+/// `struct file.f_mode` — `fmode_t` (`unsigned int`) holding `FMODE_*`
+/// (read/write capability resolved at open time). `bits_offset=160`
+/// (byte 20) on 6.8.0-124 x86_64 — verified against
+/// `/sys/kernel/btf/vmlinux` (`'f_mode' ... bits_offset=160`). The
+/// at-authz-1 `protected_open_deny` hook reads `f_mode & FMODE_WRITE`
+/// to deny only write-intent opens (reads, incl. the agent's own
+/// O_RDONLY admin.pub load, pass through).
+pub const FILE_F_MODE_OFFSET: usize = 20;
+
 // ── Tappa 10 (N2) — network observability offsets ────────────────────
 //
 // All offsets validated 2026-05-20 against `/sys/kernel/btf/vmlinux`
@@ -320,7 +329,7 @@ pub struct OffsetSpec {
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
-/// layout offset). 40 entries — kept in lockstep with the consts above
+/// layout offset). 41 entries — kept in lockstep with the consts above
 /// by `revalidate_table_is_complete` (test).
 pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec { name: "TASK_STRUCT_TGID_OFFSET",        struct_name: "task_struct", field_path: &["tgid"],         expected: TASK_STRUCT_TGID_OFFSET },
@@ -343,6 +352,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec { name: "FILE_F_PATH_OFFSET",             struct_name: "file",        field_path: &["f_path"],        expected: FILE_F_PATH_OFFSET },
     OffsetSpec { name: "PATH_DENTRY_OFFSET",             struct_name: "path",        field_path: &["dentry"],        expected: PATH_DENTRY_OFFSET },
     OffsetSpec { name: "FILE_F_FLAGS_OFFSET",            struct_name: "file",        field_path: &["f_flags"],       expected: FILE_F_FLAGS_OFFSET },
+    OffsetSpec { name: "FILE_F_MODE_OFFSET",             struct_name: "file",        field_path: &["f_mode"],        expected: FILE_F_MODE_OFFSET },
     OffsetSpec { name: "SOCK_SKC_DADDR_OFFSET",          struct_name: "sock_common", field_path: &["skc_daddr"],     expected: SOCK_SKC_DADDR_OFFSET },
     OffsetSpec { name: "SOCK_SKC_RCV_SADDR_OFFSET",      struct_name: "sock_common", field_path: &["skc_rcv_saddr"], expected: SOCK_SKC_RCV_SADDR_OFFSET },
     OffsetSpec { name: "SOCK_SKC_DPORT_OFFSET",          struct_name: "sock_common", field_path: &["skc_dport"],     expected: SOCK_SKC_DPORT_OFFSET },
@@ -370,10 +380,11 @@ mod tests {
     use super::*;
 
     /// Lockstep guard: if a const is added/removed without updating
-    /// REVALIDATE (or vice-versa), this count trips. 40 offsets.
+    /// REVALIDATE (or vice-versa), this count trips. 41 offsets
+    /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 40, "REVALIDATE must cover all 40 offsets");
+        assert_eq!(REVALIDATE.len(), 41, "REVALIDATE must cover all 41 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).

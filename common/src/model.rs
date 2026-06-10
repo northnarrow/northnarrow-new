@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_UNLINK,
+    ADDR_LEN, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_UNLINK, FS_OP_WRITE,
 };
 
 /// Canonical event emitted by a sensor.
@@ -256,6 +256,10 @@ pub enum FsProtectOperation {
     Setattr,
     /// `ioctl(FS_IOC_SETFLAGS, ...)` — the `chattr -i` defense.
     Ioctl,
+    /// at-authz-1: a write-intent `open(2)` of a WRITE-protected inode —
+    /// the `file_open` deny that closes the `tee -a admin.pub` /
+    /// in-place-`pwrite` gap.
+    Write,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -269,6 +273,7 @@ impl FsProtectOperation {
             FS_OP_RENAME => Self::Rename,
             FS_OP_SETATTR => Self::Setattr,
             FS_OP_IOCTL => Self::Ioctl,
+            FS_OP_WRITE => Self::Write,
             other => Self::Unknown(other),
         }
     }
@@ -280,6 +285,7 @@ impl FsProtectOperation {
             Self::Rename => "rename",
             Self::Setattr => "setattr",
             Self::Ioctl => "ioctl",
+            Self::Write => "write",
             Self::Unknown(_) => "unknown",
         }
     }

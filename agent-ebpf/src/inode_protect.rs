@@ -49,16 +49,23 @@ use aya_ebpf::{
 
 use northnarrow_common::wire::{
     FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
-    FS_OP_UNLINK,
+    FS_OP_UNLINK, FS_OP_WRITE, FS_PROTECT_MUTATE, FS_PROTECT_WRITE,
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
-    SUPER_BLOCK_S_DEV_OFFSET,
+    DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET,
+    INODE_I_SB_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
 };
 
 /// Linux `EPERM` — LSM hooks return `-errno` to deny.
 const EPERM: c_int = 1;
+
+/// `FMODE_WRITE` from `include/linux/fs.h` — the `file->f_mode` bit set
+/// when a file is opened for writing (`O_WRONLY` / `O_RDWR`). The
+/// at-authz-1 `protected_open_deny` hook denies only opens carrying this
+/// bit; a read-open (the agent's own O_RDONLY admin.pub load, `cat`, the
+/// init system reading a unit) has `FMODE_READ` only and passes through.
+const FMODE_WRITE: u32 = 0x2;
 
 /// `FS_IOC_SETFLAGS = _IOW('f', 2, long)` on a 64-bit kernel.
 /// `chattr +i` / `-i` sends this ioctl with the inode flag bitmap.
@@ -86,9 +93,11 @@ const FS_IOC_FSGETXATTR: c_uint = 0x801c_581f;
 // ---------------------------------------------------------------------------
 
 /// Inodes the userland loader has registered for protection. Up to
-/// 1024 entries; the Tappa 7 build only registers
-/// `/var/lib/northnarrow/` (one entry). Value is unused (presence is
-/// the signal); kept as `u8` to keep the map node tiny.
+/// 1024 entries. The value is an at-authz-1 flag-mask
+/// (`FS_PROTECT_MUTATE` bit0 = the legacy unlink/rmdir/rename/setattr/
+/// ioctl denies, set on every member; `FS_PROTECT_WRITE` bit1 = the new
+/// `file_open` write-open deny, set only on the secret/integrity subset).
+/// `deny_if_protected` reads it op-aware. Kept as `u8` (map node tiny).
 ///
 /// By-name pinned (Tappa 7 task 6 #2): the pinned `inode_*` hooks
 /// must read the same kernel map a restarted agent re-registers
@@ -170,12 +179,6 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
     })
 }
 
-/// `true` if the key is present in [`PROTECTED_INODES`].
-#[inline(always)]
-unsafe fn is_protected(key: &InodeKey) -> bool {
-    PROTECTED_INODES.get(key).is_some()
-}
-
 /// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
 /// is active iff `FS_PROTECT_OVERRIDE[0]` is non-zero AND equals this
 /// boot's session nonce in [`crate::task_kill::AGENT_SESSION`]`[0]`.
@@ -250,7 +253,6 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
     // pre-deny markers in each try_* wrapper, let us localise the
     // current cutoff (body marker fires, REACHED-deny-if does not).
     bpf_printk!(b"nn-diag-REACHED-deny-if");
-    let _ = operation;
     let key = match inode_key(target) {
         Some(k) => k,
         None => {
@@ -259,7 +261,25 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
         }
     };
     bpf_printk!(b"nn-diag-REACHED-key-ok");
-    if !is_protected(&key) {
+    // at-authz-1: the map value is a flag-mask. An absent key is not
+    // protected; a present key is denied for THIS op only if the op's
+    // bit is set. `FS_OP_WRITE` requires `FS_PROTECT_WRITE` (the
+    // secret/integrity subset); every other (mutation) op requires
+    // `FS_PROTECT_MUTATE`, which the loader sets on every member — so
+    // the five existing hooks keep their unchanged presence semantics.
+    let flags = match PROTECTED_INODES.get(&key) {
+        Some(f) => *f,
+        None => {
+            bpf_printk!(b"nn-diag-REACHED-MISS");
+            return false;
+        }
+    };
+    let required = if operation == FS_OP_WRITE {
+        FS_PROTECT_WRITE
+    } else {
+        FS_PROTECT_MUTATE
+    };
+    if flags & required == 0 {
         bpf_printk!(b"nn-diag-REACHED-MISS");
         return false;
     }
@@ -494,6 +514,67 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
     };
     bpf_printk!(b"nn-diag-ioctl-pre-deny");
     if deny_if_protected(FS_OP_IOCTL, inode) {
+        return -EPERM;
+    }
+    0
+}
+
+/// at-authz-1 — write-open deny. The sixth deny hook in the
+/// inode_protect family. The existing five cover dir-entry mutation
+/// (unlink/rmdir/rename) and metadata (setattr/ioctl), but a root caller
+/// could still `open(O_WRONLY|O_APPEND)` + `write(2)` a protected file —
+/// an append/in-place pwrite touches no metadata, so `inode_setattr`
+/// never fires. `tee -a admin.pub` thereby injects a `Role::All` key.
+///
+/// `file_open` fires once per open and carries the resolved write
+/// capability in `file->f_mode`, so denying `FMODE_WRITE` opens of a
+/// `FS_PROTECT_WRITE` inode blocks the write at the chokepoint. It also
+/// forecloses the shared-writable-mmap vector for free: a
+/// `MAP_SHARED|PROT_WRITE` mapping requires `FMODE_WRITE` (`do_mmap`
+/// returns `-EACCES` otherwise), which this deny refuses. Reads
+/// (`FMODE_READ` only — the agent's own O_RDONLY admin.pub load, `cat`,
+/// the init system reading a unit) pass through. Routes through the
+/// shared `deny_if_protected`, so the FS_PROTECT_OVERRIDE +
+/// PROTECTED_PIDS exemptions (the agent's own rename-based rotation /
+/// chain-log appends / signed self-upgrade) are inherited, not
+/// re-implemented.
+#[lsm(hook = "file_open")]
+pub fn protected_open_deny(ctx: LsmContext) -> i32 {
+    // Unconditional body marker — same role as inode_rename / file_ioctl
+    // (see docs/TAPPA7_TASK5_DEEP_DEBUG.md).
+    unsafe { bpf_printk!(b"nn-diag-open-body fired") };
+    unsafe { try_protected_open_deny(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
+    // Kernel signature: `int file_open(struct file *file)` (vlen=1,
+    // verified on 6.8 — the observe-only `fim_file_open_observe` already
+    // attaches here). No prev-retval read.
+    let file: *const c_void = ctx.arg(0);
+    if file.is_null() {
+        return 0;
+    }
+
+    // Only write-intent opens can mutate the file. Read first so the
+    // overwhelmingly-common read path early-returns before the map
+    // lookup in `deny_if_protected`.
+    let mode_slot = (file as *const u8).add(FILE_F_MODE_OFFSET) as *const u32;
+    let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    if f_mode & FMODE_WRITE == 0 {
+        return 0;
+    }
+    bpf_printk!(b"nn-diag-open-write-intent");
+
+    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    if deny_if_protected(FS_OP_WRITE, inode) {
         return -EPERM;
     }
     0

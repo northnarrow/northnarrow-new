@@ -441,6 +441,28 @@ pub const FS_OP_RMDIR: u8 = 2;
 pub const FS_OP_RENAME: u8 = 3;
 pub const FS_OP_SETATTR: u8 = 4;
 pub const FS_OP_IOCTL: u8 = 5;
+/// at-authz-1: a write-intent `open(2)` (`file->f_mode & FMODE_WRITE`)
+/// of a WRITE-protected inode. Denied by the `file_open` deny hook so an
+/// `O_WRONLY|O_APPEND` / in-place `pwrite` (which touches no metadata, so
+/// `inode_setattr` never fires) cannot mutate admin.pub / agent.sig.key /
+/// the integrity chains.
+pub const FS_OP_WRITE: u8 = 6;
+
+/// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
+/// unused `1u8` presence sentinel) now records WHICH deny classes apply to
+/// each registered inode, so the WRITE-open deny can cover a secret/integrity
+/// SUBSET without write-denying operator-tunable config files (which would be
+/// an enforce-mode COMBAT footgun). Userland registration helpers set the bits
+/// per file class; `deny_if_protected` is op-aware against them.
+///
+/// `FS_PROTECT_MUTATE` (bit0): the legacy modification denies
+/// (unlink/rmdir/rename/setattr/ioctl) — set on EVERY registered member, so
+/// "presence" semantics are preserved for the existing five hooks.
+pub const FS_PROTECT_MUTATE: u8 = 0b01;
+/// `FS_PROTECT_WRITE` (bit1): the new write-open deny (`FS_OP_WRITE`) — set
+/// only on the secret/integrity subset (admin.pub, agent_id, audit.log,
+/// agent.sig.key, the state chains, the agent binaries/units).
+pub const FS_PROTECT_WRITE: u8 = 0b10;
 
 /// Audit record emitted whenever a Tappa 7 inode-protection LSM hook
 /// returns `-EPERM`. The denial is the security event — userland
