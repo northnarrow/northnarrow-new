@@ -40,6 +40,7 @@ use common::wire::admin_protocol::{
     UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
+use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
@@ -1493,6 +1494,31 @@ fn dispatch_force_posture(
     }
 }
 
+/// at-authz-1 verify-item 1: re-register the rotated admin.pub inode in
+/// `PROTECTED_INODES` after a rotate-keys rewrite. The atomic rewrite does
+/// tmp-write + `rename(2)`, installing a NEW inode the boot-time
+/// `register_etc_files` never saw — so without this every deny hook (the
+/// five existing + the at-authz-1 write-open deny) lapses on the rotated
+/// admin.pub until the next agent restart, silently reopening the gap.
+/// Best-effort + loud on failure: a failure means the file is unprotected
+/// until restart, NOT that the (already-committed-on-disk) rotation should
+/// be reported as failed. Called right after the rename(2), before the
+/// in-memory reload, so a reload failure cannot skip it.
+fn reregister_admin_pub_after_rotate(config_path: &Path, old_inode_key: Option<common::wire::InodeKey>) {
+    if let Err(e) = crate::anti_tamper::filesystem::reregister_protected_file(
+        crate::anti_tamper::prepare_pin_root(),
+        config_path,
+        old_inode_key,
+        FS_PROTECT_MUTATE | FS_PROTECT_WRITE,
+    ) {
+        warn!(
+            error = ?e,
+            "rotate-keys: re-registering rotated admin.pub inode in PROTECTED_INODES \
+             FAILED — admin.pub is UNPROTECTED against tamper until the next agent restart"
+        );
+    }
+}
+
 /// Tappa 8 A13 — handle one [`RotateKeysAddRequest`] (design
 /// §7.2). Verifies 2-of-N quorum carrying `Role::RotateKeys`,
 /// atomically appends a new line to `admin.pub`, and reloads
@@ -1568,6 +1594,10 @@ fn dispatch_rotate_keys_add(
         return AdminResult::UnknownOperation;
     };
     let config_path = config_path.to_path_buf();
+    // at-authz-1 verify-item 1: capture the CURRENT admin.pub inode before
+    // the rename-based rewrite installs a new one, so we can drop the stale
+    // key from PROTECTED_INODES afterwards.
+    let old_inode_key = crate::fim::attach::key_for_path(&config_path).ok();
 
     let new_pubkey = match VerifyingKey::from_bytes(&new_pubkey_bytes) {
         Ok(vk) => vk,
@@ -1596,6 +1626,14 @@ fn dispatch_rotate_keys_add(
             return AdminResult::InvalidSignature;
         }
     }
+
+    // at-authz-1 verify-item 1: re-register the rotated inode NOW, after the
+    // rename(2) committed the new on-disk inode but BEFORE the reload — the
+    // protection property depends only on the on-disk inode, not the
+    // in-memory key reload (which has its own reachable failure path below).
+    // Re-registering after the reload would skip it on a reload failure and
+    // silently leave the rotated admin.pub unprotected until restart.
+    reregister_admin_pub_after_rotate(&config_path, old_inode_key);
 
     if let Err(e) = auth.reload(&config_path) {
         warn!(error = ?e, "rotate-keys-add: admin.pub rewrite succeeded but reload failed");
@@ -1677,6 +1715,9 @@ fn dispatch_rotate_keys_revoke(
         return AdminResult::UnknownOperation;
     };
     let config_path = config_path.to_path_buf();
+    // at-authz-1 verify-item 1: capture the CURRENT admin.pub inode before
+    // the rename-based rewrite installs a new one.
+    let old_inode_key = crate::fim::attach::key_for_path(&config_path).ok();
 
     match crate::anti_tamper::admin_auth::atomic_rewrite_admin_pub_revoke(&config_path, target_fp) {
         Ok(()) => {}
@@ -1701,6 +1742,11 @@ fn dispatch_rotate_keys_revoke(
             return AdminResult::InvalidSignature;
         }
     }
+
+    // at-authz-1 verify-item 1: re-register BEFORE the reload (see the add
+    // path) — protection of the new on-disk inode must not be gated on the
+    // in-memory reload's reachable failure path.
+    reregister_admin_pub_after_rotate(&config_path, old_inode_key);
 
     if let Err(e) = auth.reload(&config_path) {
         warn!(

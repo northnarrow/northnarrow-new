@@ -31,10 +31,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    maps::{HashMap as AyaHashMap, MapData},
+    maps::{HashMap as AyaHashMap, Map as AyaMap, MapData},
     Btf, Ebpf,
 };
-use common::wire::InodeKey;
+use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
 
 /// Aya requires its own marker trait [`aya::Pod`] for map K/V types,
 /// distinct from `bytemuck::Pod`. The orphan rule prevents the
@@ -128,6 +128,19 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "netflow-comm-allowlist.v1",
     "netflow-comm-allowlist.local",
 ];
+
+/// at-authz-1: the subset of [`ETC_PROTECTED_FILES`] that is also
+/// WRITE-open-denied (`FS_PROTECT_WRITE`), not just mutation-denied.
+/// These are the secret/integrity identity files written ONLY by the
+/// agent at runtime (admin.pub via the rename-based rotate-keys path;
+/// agent_id / agent.sig.key at bootstrap; audit.log via the append-only
+/// chain), so any runtime non-agent write is unambiguous tamper. The
+/// remaining [`ETC_PROTECTED_FILES`] are operator-tunable (allowlists /
+/// blocklists / fim-paths overlays) and stay MUTATE-only — write-denying
+/// them would turn a routine live edit into an enforce-mode COMBAT
+/// (NIC-isolation) trip. Every entry MUST also appear in
+/// [`ETC_PROTECTED_FILES`].
+pub const ETC_WRITE_DENY_FILES: &[&str] = &["admin.pub", "agent_id", "audit.log", "agent.sig.key"];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
 /// PROTECTED_INODES covers. The directory itself is already
@@ -253,15 +266,18 @@ const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
 const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
 const FS_IMMUTABLE_FL: libc::c_long = 0x0000_0010;
 
-/// The five LSM programs from `agent-ebpf/src/inode_protect.rs`.
+/// The six LSM deny programs from `agent-ebpf/src/inode_protect.rs`.
 /// First field is the program name in the ELF, second is the LSM
 /// hook name the kernel exposes as `bpf_lsm_<hook>` in vmlinux BTF.
+/// `protected_open_deny` (at-authz-1) is the `file_open` FMODE_WRITE
+/// deny that closes the write-open gap on `FS_PROTECT_WRITE` inodes.
 const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("inode_unlink", "inode_unlink"),
     ("inode_rmdir", "inode_rmdir"),
     ("inode_rename", "inode_rename"),
     ("inode_setattr", "inode_setattr"),
     ("file_ioctl", "file_ioctl"),
+    ("protected_open_deny", "file_open"),
 ];
 
 /// BUG-034 module-load observe hooks — `MODULE_LOAD_EVENTS` producers.
@@ -300,7 +316,11 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
         dev: stat_dev_to_kernel_dev(st_dev),
         ino: meta.ino(),
     };
-    register_inode(ebpf, &key)?;
+    // The state dir is a directory — a write-open (FMODE_WRITE) of a dir
+    // never happens (open returns EISDIR), so MUTATE-only is the complete
+    // and correct mask for the dir inode itself; the WRITE bit lives on
+    // the chain-log FILES inside it (register_state_files).
+    register_inode(ebpf, &key, FS_PROTECT_MUTATE)?;
     info!(
         path = %dir.display(),
         st_dev = st_dev, kernel_dev = key.dev, ino = key.ino,
@@ -401,13 +421,37 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
     // program BEFORE purging the old pin, so a deny program is attached at
     // every instant (zero-window). task_kill/ptrace (anti_tamper/mod.rs) keep
     // the pinned-reuse path — they emit no ring, so they don't desync.
+    let mut deny_hooks_attached: usize = 0;
     for (program, hook) in LSM_PROGRAMS {
-        if let Err(e) = super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
-            warn!(
+        match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
+            Ok(()) => deny_hooks_attached += 1,
+            Err(e) => warn!(
                 program, hook, error = %e,
                 "anti-tamper FS: LSM hook attach FAILED"
-            );
+            ),
         }
+    }
+    // at-authz-1 verify-item 3: a machine-detectable attach-health signal.
+    // The attach path stays warn-and-continue (a benign failure must not
+    // self-DoS — refuse-to-start is rejected; holistic fail-closed is
+    // ebpf-lsm-1), but emit one structured line carrying the attached vs
+    // expected count so monitoring can alert when `deny_hooks_attached <
+    // deny_hooks_expected` (a silently-absent deny hook = at-authz-1 /
+    // mutation protection partially off while the agent reports healthy).
+    let deny_hooks_expected = LSM_PROGRAMS.len();
+    if deny_hooks_attached == deny_hooks_expected {
+        info!(
+            deny_hooks_attached,
+            deny_hooks_expected,
+            "anti-tamper FS: all inode_protect deny hooks attached"
+        );
+    } else {
+        warn!(
+            deny_hooks_attached,
+            deny_hooks_expected,
+            "anti-tamper FS: DENY HOOK SHORTFALL — write-open/mutation protection \
+             partially absent (monitor: deny_hooks_attached < deny_hooks_expected)"
+        );
     }
 
     // Step 5 (BUG-034): attach the two module-load OBSERVE hooks —
@@ -464,12 +508,21 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
             dev: stat_dev_to_kernel_dev(meta.dev()),
             ino: meta.ino(),
         };
-        register_inode(ebpf, &key)
+        // at-authz-1: secret/integrity identity files (ETC_WRITE_DENY_FILES)
+        // get WRITE+MUTATE; operator-tunable files get MUTATE only.
+        let flags = FS_PROTECT_MUTATE
+            | if ETC_WRITE_DENY_FILES.contains(name) {
+                FS_PROTECT_WRITE
+            } else {
+                0
+            };
+        register_inode(ebpf, &key, flags)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
             ino = key.ino,
+            write_deny = flags & FS_PROTECT_WRITE != 0,
             "anti-tamper FS: /etc/northnarrow file registered in {PROTECTED_INODES_MAP}"
         );
         registered += 1;
@@ -520,7 +573,8 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
             dev: stat_dev_to_kernel_dev(meta.dev()),
             ino: meta.ino(),
         };
-        register_inode(ebpf, &key)
+        // at-authz-1: the integrity chains are agent-append-only — WRITE+MUTATE.
+        register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
@@ -578,7 +632,9 @@ pub(crate) fn register_etc_templates(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<
             dev: stat_dev_to_kernel_dev(meta.dev()),
             ino: meta.ino(),
         };
-        register_inode(ebpf, &key)
+        // at-authz-1: canary templates are operator-tunable content —
+        // MUTATE-only (a live edit must not WRITE-deny-trip COMBAT).
+        register_inode(ebpf, &key, FS_PROTECT_MUTATE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
@@ -660,7 +716,9 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
 pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
     let mut registered = 0usize;
     for (path, key) in resolve_protected_paths(BINARY_AND_UNIT_PATHS) {
-        register_inode(ebpf, &key)
+        // at-authz-1: the agent/watchdog images + units are agent-written
+        // (signed self-upgrade, exempt via FS_PROTECT_OVERRIDE) — WRITE+MUTATE.
+        register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
@@ -1015,13 +1073,18 @@ fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
     (major << 20) | minor
 }
 
-fn register_inode(ebpf: &mut Ebpf, key: &InodeKey) -> Result<()> {
+/// Insert `key` into `PROTECTED_INODES` with the at-authz-1 `flags`
+/// mask (`FS_PROTECT_MUTATE` and/or `FS_PROTECT_WRITE`). The map value
+/// records which deny classes apply to this inode so the eBPF
+/// `deny_if_protected` can be op-aware (the write-open deny covers only
+/// the `FS_PROTECT_WRITE` subset). An existing entry is overwritten.
+fn register_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     let map = ebpf
         .map_mut(PROTECTED_INODES_MAP)
         .ok_or_else(|| anyhow!("map {PROTECTED_INODES_MAP} missing from eBPF object"))?;
     let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
         .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
-    map.insert(AyaInodeKey(*key), 1u8, 0).with_context(|| {
+    map.insert(AyaInodeKey(*key), flags, 0).with_context(|| {
         format!(
             "inserting (dev={}, ino={}) into {PROTECTED_INODES_MAP}",
             key.dev, key.ino
@@ -1161,14 +1224,79 @@ pub struct ProtectedInodesHandle {
 }
 
 impl ProtectedInodesHandle {
-    pub fn register(&mut self, key: InodeKey) -> Result<()> {
-        self.map.insert(AyaInodeKey(key), 1u8, 0).with_context(|| {
+    /// Open the by-name-pinned `PROTECTED_INODES` map directly from bpffs,
+    /// independent of the `Ebpf` object whose handle `StateDirProtection`
+    /// already owns. Lets a runtime caller (the rotate-keys dispatchers)
+    /// re-register an inode without threading a handle through the admin
+    /// socket. Mirrors the `MapData::from_pin` idiom in
+    /// `trusted_installer::write_fs_override` / `register_protected_observer`.
+    pub fn open(bpffs_root: &Path) -> Result<Self> {
+        let pin_path = bpffs_root.join(PROTECTED_INODES_MAP);
+        let map_data = MapData::from_pin(&pin_path).with_context(|| {
+            format!(
+                "opening pinned {PROTECTED_INODES_MAP} at {}",
+                pin_path.display()
+            )
+        })?;
+        let map = AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(AyaMap::HashMap(map_data))
+            .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
+        Ok(ProtectedInodesHandle { map })
+    }
+
+    pub fn register(&mut self, key: InodeKey, flags: u8) -> Result<()> {
+        self.map.insert(AyaInodeKey(key), flags, 0).with_context(|| {
             format!(
                 "registering (dev={}, ino={}) in {PROTECTED_INODES_MAP}",
                 key.dev, key.ino
             )
         })
     }
+
+    /// Drop a stale inode key (best-effort at the call sites that use it):
+    /// after a rename-replace the old inode is freed and its dev/ino could
+    /// later be reused by an unrelated, non-protected file.
+    pub fn remove(&mut self, key: InodeKey) -> Result<()> {
+        self.map.remove(&AyaInodeKey(key)).with_context(|| {
+            format!(
+                "removing stale (dev={}, ino={}) from {PROTECTED_INODES_MAP}",
+                key.dev, key.ino
+            )
+        })
+    }
+}
+
+/// at-authz-1 verify-item 1: re-register a protected file's inode after a
+/// rename-based rewrite. `atomic_rewrite_admin_pub_add/_revoke` write a
+/// `.tmp` and `rename(2)` over admin.pub, which installs a NEW inode the
+/// boot-time `register_etc_files` never saw — so every deny hook (the
+/// existing five AND the at-authz-1 write-open deny) would lapse on the
+/// rotated admin.pub until the next restart. This re-registers the new
+/// inode with `flags` and drops the stale `old_key`.
+///
+/// `bpffs_root: None` ⇒ no pinned map this boot ⇒ no-op success (the
+/// hooks aren't attached either, same degrade as the rest of the family).
+/// The caller logs loudly on `Err` — a failure means the rotated file is
+/// unprotected until restart.
+pub fn reregister_protected_file(
+    bpffs_root: Option<&Path>,
+    path: &Path,
+    old_key: Option<InodeKey>,
+    flags: u8,
+) -> Result<()> {
+    let Some(root) = bpffs_root else {
+        return Ok(());
+    };
+    let new_key = crate::fim::attach::key_for_path(path)
+        .with_context(|| format!("stat {} for re-registration", path.display()))?;
+    let mut handle = ProtectedInodesHandle::open(root)?;
+    handle.register(new_key, flags)?;
+    if let Some(old) = old_key {
+        if old != new_key {
+            // Best-effort: a missing old key (already gone) is fine.
+            let _ = handle.remove(old);
+        }
+    }
+    Ok(())
 }
 
 /// Take an owned writable `PROTECTED_INODES` handle out of the `Ebpf`
@@ -1225,7 +1353,10 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
 
     fn register_active(&self, path: &Path) -> Result<()> {
         let key = crate::fim::attach::key_for_path(path)?;
-        self.inodes.lock().register(key)
+        // at-authz-1: rotated chain logs are integrity files — WRITE+MUTATE.
+        self.inodes
+            .lock()
+            .register(key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
     }
 }
 
