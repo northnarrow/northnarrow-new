@@ -206,6 +206,33 @@ fn list_combat_chain_rules() -> Vec<String> {
         .collect()
 }
 
+/// Poll `nn-admin status --json` until the COMBAT ladder has engaged
+/// network isolation (ISOLATE stage), or panic after the deadline. The
+/// ladder's investigate window is 30 s by default; 75 s leaves room for
+/// the tick cadence on a slow guest.
+fn wait_for_isolation(nn: &std::path::Path, socket: &std::path::Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(75);
+    loop {
+        let out = run_nn_admin_at(
+            nn,
+            &["status", "--socket", socket.to_str().unwrap(), "--json"],
+        );
+        let last = String::from_utf8_lossy(&out.stdout).into_owned();
+        if last.contains("\"network_isolation_engaged\":true") {
+            return last;
+        }
+        assert!(
+            last.contains("\"posture\":\"Combat\""),
+            "posture left COMBAT while waiting for isolation: {last}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ladder never reached ISOLATE within 75s; last status: {last}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 #[test]
 fn e2e_force_combat_then_unlock_via_cli() {
     // Belt-and-braces: the unlock step at the end of this test
@@ -238,18 +265,14 @@ fn e2e_force_combat_then_unlock_via_cli() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Status mirrors the forced state.
-    let out = run_nn_admin_at(
-        nn,
-        &["status", "--socket", socket.to_str().unwrap(), "--json"],
-    );
-    let body = String::from_utf8_lossy(&out.stdout);
+    // Status mirrors the forced state. COMBAT entry arms the graduated
+    // ladder (INVESTIGATE, network UP); with no attributed offender the
+    // ladder escalates to ISOLATE on its own once the investigate
+    // window (30 s default) elapses — wait for that instead of
+    // expecting isolation on entry (lab guest, 2026-10-08).
+    let body = wait_for_isolation(nn, socket);
     assert!(
         body.contains("\"posture\":\"Combat\""),
-        "status body: {body}"
-    );
-    assert!(
-        body.contains("\"network_isolation_engaged\":true"),
         "status body: {body}"
     );
 
@@ -260,9 +283,19 @@ fn e2e_force_combat_then_unlock_via_cli() {
         joined.contains("-j DROP"),
         "expected DROP rule in NORTHNARROW_COMBAT, got: {joined}"
     );
+    // Loopback carve-out: the chain is TERMINAL since combat-rules.v4
+    // switched lo from RETURN to ACCEPT (see configs/combat-rules.v4
+    // header); accept either form so the test tracks the ruleset.
     assert!(
-        joined.contains("-i lo -j RETURN") || joined.contains("-o lo -j RETURN"),
-        "expected loopback RETURN in chain, got: {joined}"
+        [
+            "-i lo -j ACCEPT",
+            "-o lo -j ACCEPT",
+            "-i lo -j RETURN",
+            "-o lo -j RETURN"
+        ]
+        .iter()
+        .any(|r| joined.contains(r)),
+        "expected loopback ACCEPT/RETURN in chain, got: {joined}"
     );
 
     // Sign + submit; should win.
@@ -361,7 +394,9 @@ fn e2e_unlock_with_wrong_key() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Posture still Combat, isolation still engaged.
+    // Posture still Combat; the ladder keeps running and reaches
+    // ISOLATE after the investigate window — a rejected unlock must not
+    // have released it.
     let out = run_nn_admin_at(
         nn,
         &["status", "--socket", socket.to_str().unwrap(), "--json"],
@@ -371,8 +406,9 @@ fn e2e_unlock_with_wrong_key() {
         body.contains("\"posture\":\"Combat\""),
         "status body: {body}"
     );
+    let body = wait_for_isolation(nn, socket);
     assert!(
-        body.contains("\"network_isolation_engaged\":true"),
+        body.contains("\"posture\":\"Combat\""),
         "status body: {body}"
     );
 
