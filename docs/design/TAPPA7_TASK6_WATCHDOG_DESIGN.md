@@ -276,6 +276,12 @@ from the journal.
 
 ### 5.3 CLI for the respawn
 
+> **Superseded (2026-10-08)** by `WATCHDOG_RESPAWN_V2_DESIGN.md`: on a
+> systemd host the respawn is `systemctl start --no-block
+> northnarrow-agent.service` (the agent's own unit supplies the argv);
+> the fork-exec path survives only as the `exec` backend for
+> non-systemd hosts, with the full argv read from `/proc/<pid>/cmdline`.
+
 The watchdog persists the **first launch's argv** as the canonical
 respawn command. On systemd-managed deployment this is exactly
 `ExecStart=` of `northnarrow-agent.service` (the watchdog reads it
