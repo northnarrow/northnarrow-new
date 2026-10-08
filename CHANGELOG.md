@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- Anti-tamper `task_kill` hook is deny-by-default: every userspace signal
+  towards a protected pid is refused (previously only SIGKILL/SIGTERM, so
+  `kill -INT/-HUP/-QUIT/-STOP` from root stopped or froze the agent).
+  Allowed: signal 0, self-signals, signals between protected pids
+  (watchdog ↔ agent) and PID 1 with the armed nonce.
 - R004 (fileless exec) also matches `/dev/fd/N` (what glibc's `fexecve`
   really passes) and `/memfd:` pseudo-paths; previously a memfd exec on
   Ubuntu 24.04 was undetected.

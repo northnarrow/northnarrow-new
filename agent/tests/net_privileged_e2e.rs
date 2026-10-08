@@ -157,6 +157,8 @@ struct AgentGuard(Option<Child>);
 impl Drop for AgentGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.0.take() {
+            // task-kill-signals-1: SIGQUIT is denied towards a protected pid.
+            common::unprotect_pid(c.id());
             unsafe {
                 libc::kill(c.id() as i32, libc::SIGQUIT);
             }

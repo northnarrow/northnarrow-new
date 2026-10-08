@@ -214,3 +214,35 @@ mod tests {
         );
     }
 }
+
+/// Remove `pid` from the pinned `PROTECTED_PIDS` map so a plain signal
+/// from the test runner reaches it. Since `task-kill-signals-1` the
+/// task_kill LSM hook denies EVERY userspace signal towards a protected
+/// pid unless the caller is the process itself, another protected pid
+/// or PID 1 with the armed nonce — the test runner is none of those, so
+/// the SIGQUIT the guards use to stop the agent would be refused (and
+/// the agent would outlive the test). Best effort: a missing pin or a
+/// missing bpftool just means the agent was never protected.
+#[allow(dead_code)]
+pub fn unprotect_pid(pid: u32) {
+    let key_bytes = [
+        pid & 0xFF,
+        (pid >> 8) & 0xFF,
+        (pid >> 16) & 0xFF,
+        (pid >> 24) & 0xFF,
+    ]
+    .map(|b| b.to_string());
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "bpftool",
+            "map",
+            "delete",
+            "pinned",
+            "/sys/fs/bpf/northnarrow/PROTECTED_PIDS",
+            "key",
+        ])
+        .args(key_bytes)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}

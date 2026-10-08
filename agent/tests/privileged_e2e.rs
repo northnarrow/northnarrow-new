@@ -61,6 +61,8 @@ impl Drop for AgentGuard {
         if let Some(mut c) = self.0.take() {
             // SIGQUIT(3) — bypasses the LSM kill block for the agent
             // process. `kill -QUIT $pid` is the supported shutdown.
+            // task-kill-signals-1: SIGQUIT is denied towards a protected pid.
+            common::unprotect_pid(c.id());
             unsafe {
                 libc::kill(c.id() as i32, libc::SIGQUIT);
             }

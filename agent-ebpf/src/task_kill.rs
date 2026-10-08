@@ -36,7 +36,11 @@ use aya_ebpf::{
 
 use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
 
+/// Kept for the doc/trace vocabulary; the policy below is now
+/// deny-by-default for every signal, not a KILL/TERM allowlist.
+#[allow(dead_code)]
 const SIGKILL: c_int = 9;
+#[allow(dead_code)]
 const SIGTERM: c_int = 15;
 
 /// Linux `EPERM` value; LSM hooks return `-errno` to deny.
@@ -108,12 +112,29 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     // non-zero verdict anyway, so we are only ever invoked when all
     // prior LSMs returned 0; the prev-retval read is dead code.
 
-    // We only police the two signals that can terminate a daemon
-    // without coordination. Everything else (SIGCHLD, SIGWINCH,
-    // SIGUSR1, …) goes through untouched so the agent's own
-    // signal handlers (graceful reload, etc.) keep working.
+    // Policy (audit `task-kill-signals-1`, 2026-10-08): towards a
+    // PROTECTED target, DENY EVERY signal except an explicit allowlist.
+    // The previous "only SIGKILL + SIGTERM" rule left the agent's own
+    // shutdown handlers reachable by any root shell: SIGINT / SIGHUP
+    // are graceful-stop signals in main.rs, SIGQUIT's default action
+    // terminates, SIGSTOP freezes the process (ptrace is denied, stop
+    // was not), SIGSEGV/SIGABRT/SIGBUS abort it. `kill -INT <agent>`
+    // from root stopped the agent cleanly — the exact "even root can't
+    // stop it" guarantee Tappa 7 promises. Note this hook only sees
+    // USERSPACE-originated signals (kill/tkill/rt_sigqueueinfo):
+    // kernel-generated SIGCHLD/SIGPIPE/faults never reach
+    // security_task_kill, so no allowlist entry is needed for them.
+    //
+    // Allowed regardless of target:
+    //   - sig 0: existence probe (the watchdog's `kill -0`, nn-admin).
+    // Allowed by CALLER (checked after the protected-target lookup):
+    //   - caller == target: the process signalling itself (raise,
+    //     tgkill between its own threads).
+    //   - caller is itself in PROTECTED_PIDS: the watchdog's
+    //     stuck-recovery SIGINT→SIGKILL and the agent↔watchdog pair.
+    //   - caller is PID 1 with the armed session nonce (below).
     let sig: c_int = ctx.arg(2);
-    if sig != SIGKILL && sig != SIGTERM {
+    if sig == 0 {
         return 0;
     }
 
@@ -143,6 +164,14 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
+    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // Self-signal, or one protected process signalling another (the
+    // watchdog's stuck recovery, the agent's own supervision of the
+    // watchdog). An attacker's shell is in neither set.
+    if caller_tgid == target_tgid || PROTECTED_PIDS.get(&caller_tgid).is_some() {
+        return 0;
+    }
+
     // BUG-010 (PHASE 15.1): PID-1 carve-out. systemd is the host's
     // legitimate process supervisor; without this `systemctl restart`
     // hangs forever (catalog §4). The carve-out fires ONLY when:
@@ -157,7 +186,6 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     // `caller_tgid != 1` and is still denied. A root attacker capable
     // of writing both BPF maps already has the kernel-side power to
     // unpin the LSM hook outright — out of scope for the V1 model.
-    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if caller_tgid == 1 {
         let override_val = match KILL_OVERRIDE.get(0) {
             Some(v) => *v,
