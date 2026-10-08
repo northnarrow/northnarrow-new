@@ -501,6 +501,47 @@ pub(crate) fn attach(
 /// info-log line.
 pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usize> {
     let mut registered = 0usize;
+    // Review `etc-dir-protect-1`: the DIRECTORY inode too. The files
+    // below are mutation-denied, but the directory that holds them was
+    // not, so `mv /etc/northnarrow /etc/x` (or rmdir after an unlink
+    // sweep by a process not in PROTECTED_PIDS) relocated the whole
+    // identity tree out from under the agent's hardcoded paths — the
+    // next boot would bootstrap fresh keys. MUTATE on the directory
+    // denies its unlink/rmdir/rename/setattr/chattr AND, through the
+    // old_dir/new_dir checks in inode_rename, every rename into or out
+    // of it by a non-protected pid. The agent's own rotate-keys rename
+    // is exempt via PROTECTED_PIDS; operator edits go through the signed
+    // FS_PROTECT_OVERRIDE window, exactly like /var/lib/northnarrow.
+    match std::fs::metadata(etc_dir) {
+        Ok(meta) if meta.is_dir() => {
+            let key = InodeKey {
+                dev: stat_dev_to_kernel_dev(meta.dev()),
+                ino: meta.ino(),
+            };
+            register_inode(ebpf, &key, FS_PROTECT_MUTATE).with_context(|| {
+                format!(
+                    "registering directory {} in {PROTECTED_INODES_MAP}",
+                    etc_dir.display()
+                )
+            })?;
+            info!(
+                path = %etc_dir.display(),
+                kernel_dev = key.dev,
+                ino = key.ino,
+                "anti-tamper FS: /etc/northnarrow directory inode registered in {PROTECTED_INODES_MAP}"
+            );
+            registered += 1;
+        }
+        Ok(_) => warn!(
+            path = %etc_dir.display(),
+            "anti-tamper FS: config dir path is not a directory — not registered"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            path = %etc_dir.display(),
+            "anti-tamper FS: config dir missing — directory inode not registered"
+        ),
+    }
     for name in ETC_PROTECTED_FILES {
         let path = etc_dir.join(name);
         let meta = match std::fs::metadata(&path) {
@@ -548,7 +589,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     info!(
         etc_dir = %etc_dir.display(),
         registered,
-        total = ETC_PROTECTED_FILES.len(),
+        total = ETC_PROTECTED_FILES.len() + 1, // + the directory inode
         "anti-tamper FS: /etc/northnarrow file registration complete"
     );
     Ok(registered)
