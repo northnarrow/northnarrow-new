@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- RAG release gates (golden ≥ 90 %, latency, e2e format) fail fast when
+  `target/kb` is missing instead of silently benchmarking the built-in
+  seed; the lab ships the corpus and reports 28/30 = 93.3 % on the real
+  ATT&CK + Sigma dumps (the earlier 36.7 % was the seed-only artefact).
 - `nn-admin rotate-keys add --new-roles` accepts every role keyword the
   agent understands (`canary-manage`, `fim-manage`, `net-read`,
   `triage`, …), not only the legacy five: least-privilege keys for

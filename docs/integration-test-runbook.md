@@ -85,6 +85,25 @@ membership, or `sudo chmod 666 /dev/kvm`). `NN_LAB_NIGHTLY_DOWN=1` powers
 the guest off at the end; `NN_LAB_NIGHTLY_SKIP="test-ignored"` skips a
 step (the ignored suite includes the 5-minute rate-limit test).
 
+### RAG release gates need the real corpus
+
+`rag::bench` holds three `#[ignore]` release gates (golden retrieval
+≥ 90 %, retrieve p95 ≤ 50 ms, end-to-end `RAG_CONTEXT:` shape). They
+index `target/kb/*.jsonl`, the pinned ATT&CK + SigmaHQ dumps produced by:
+
+```sh
+cargo xtask rag-kb            # fetches upstream (network), writes target/kb/
+cargo xtask rag-kb --mirror <dir>   # install-time: from a local mirror
+```
+
+Without the dumps the engine silently indexes only the built-in seed, so
+the gates now **fail fast** with that message instead of reporting a
+meaningless pass rate (the "36.7 %" seen on the first lab nightly was
+exactly this). `nn-lab.sh sync` ships `target/kb` to the guest when the
+host has it, and `test-ignored` skips the gates (and says so) when it
+does not. Reference result on the real corpus: golden 28/30 = 93.3 %,
+retrieve p95 ≈ 1.9 ms, cold open ≈ 0.4 s.
+
 ## Build
 
 ```sh

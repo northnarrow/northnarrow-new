@@ -164,8 +164,18 @@ cmd_sync() {
     log "building eBPF object on host (cargo xtask build-ebpf)"
     (cd "$REPO" && cargo xtask build-ebpf >/dev/null)
     [[ -f "$obj" && -f "$obj.buildhash" ]] || die "eBPF object/stamp missing after build: $obj"
-    log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included)"
+    # target/kb (cargo xtask rag-kb: pinned ATT&CK + Sigma dumps) rides
+    # along when present so the RAG release gates run against the real
+    # corpus on the guest instead of the built-in seed.
+    local kb_note="no target/kb — RAG gates will be skipped"
+    ls "$REPO"/target/kb/*.jsonl >/dev/null 2>&1 && kb_note="target/kb included"
+    log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included, $kb_note)"
     rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
+        --include='/target/' \
+        --include='/target/kb/' \
+        --include='/target/kb/*.jsonl' \
+        --exclude='/target/kb/*' \
+        --exclude='/target/*' \
         --include='/agent-ebpf/target/' \
         --include='/agent-ebpf/target/bpfel-unknown-none/' \
         --include='/agent-ebpf/target/bpfel-unknown-none/release/' \
@@ -212,12 +222,18 @@ cmd_test_ignored() {
     vm_running || die "guest is not running"
     # --no-fail-fast: one failing test binary must not skip the other
     # targets (the first run stopped at 11 of 56 ignored tests).
-    # NN_LAB_IGNORED_SKIP: substrings of test names to leave out. Default
-    # skips the RAG golden suite — a quality gate that ends in "STOP +
-    # owner ruling" by design (36.7% < 90% on the guest), not a lab
-    # signal; it would make every nightly red. Set it to "" to run it.
-    local skip_args="" t
-    for t in ${NN_LAB_IGNORED_SKIP-golden_suite_real_corpus}; do skip_args+=" --skip $t"; done
+    # NN_LAB_IGNORED_SKIP: substrings of test names to leave out. The RAG
+    # release gates (golden ≥ 90 %, latency, e2e format) need the real
+    # corpus (`cargo xtask rag-kb` → target/kb, shipped by `sync`); without
+    # it they used to run against the built-in seed and report a bogus
+    # 36.7 % — now they fail fast, so skip them when the corpus is absent
+    # and say why. Set NN_LAB_IGNORED_SKIP="" to force everything.
+    local skip_args="" t default_skip=""
+    if ! ls "$REPO"/target/kb/*.jsonl >/dev/null 2>&1; then
+        default_skip="rag::bench"
+        log "no target/kb on host — skipping the RAG release gates (run: cargo xtask rag-kb)"
+    fi
+    for t in ${NN_LAB_IGNORED_SKIP-$default_skip}; do skip_args+=" --skip $t"; done
     vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1$skip_args"
 }
 
