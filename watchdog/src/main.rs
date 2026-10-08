@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal::unix::{signal, Signal, SignalKind};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
@@ -37,11 +37,11 @@ use northnarrow_watchdog::{
 };
 use northnarrow_watchdog::{
     evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
-    ping_agent_status, read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready,
-    shutdown_was_authorised, stuck_recovery, wait_for_agent_death, wait_for_new_agent_pid,
-    write_pidfile_atomic, BackoffOutcome, Cli, PingOutcome, RestartBackoff, StatusPingTracker,
-    PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
-    STUCK_RECOVERY_HARDKILL_GRACE,
+    ping_agent_status, read_pid_from_file, register_self_pid, reinsert_new_agent_pid,
+    sd_notify_ready, shutdown_was_authorised, stuck_recovery, unregister_self_pid,
+    wait_for_agent_death, wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli,
+    PingOutcome, RestartBackoff, StatusPingTracker, PIDFD_OPEN_RETRY_DEADLINE,
+    STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
 };
 
 /// Path of the A8 shutdown-authorisation marker (Tappa 8 A7
@@ -122,6 +122,18 @@ async fn run(cli: Cli) -> Result<()> {
     let own_pid = std::process::id();
     write_pidfile_atomic(&cli.pidfile, own_pid)
         .with_context(|| format!("writing watchdog pidfile {}", cli.pidfile.display()))?;
+
+    // Self-protection + signalling rights (see register_self_pid): the
+    // task_kill hook only lets a PROTECTED caller signal the protected
+    // agent, so without this entry stuck recovery could not fire.
+    if let Err(e) = register_self_pid(&cli.bpffs_root, own_pid) {
+        warn!(
+            target: "watchdog",
+            error = %e,
+            "could not register the watchdog PID in PROTECTED_PIDS — no BPF-LSM on this host? \
+             stuck recovery will be refused by the task_kill hook until the agent registers us"
+        );
+    }
 
     sd_notify_ready().context("sd_notify(READY=1)")?;
 
@@ -344,6 +356,9 @@ async fn run(cli: Cli) -> Result<()> {
     // (cleaner shutdown for journald logs).
     ping_handle.abort();
 
+    if let Err(e) = unregister_self_pid(&cli.bpffs_root, own_pid) {
+        debug!(target: "watchdog", error = %e, "own PID not evicted from PROTECTED_PIDS (no pin?)");
+    }
     info!(target: "watchdog", "watchdog stopped");
     Ok(())
 }

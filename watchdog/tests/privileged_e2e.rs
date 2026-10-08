@@ -324,6 +324,11 @@ impl E2eFixture {
             // W6 watchdog-pidfile poll only catches the watchdog
             // AFTER it's already booted past this point. Production
             // systemd ExecStart pins the binary path the same way.
+            // Respawn v2 picks the systemd backend on a booted systemd
+            // host; this fixture's agent is NOT the installed unit, so
+            // force the fork-exec backend (the one the test exercises).
+            .arg("--respawn-backend")
+            .arg("exec")
             .arg("--agent-bin")
             .arg(self.agent_priv_path())
             .stdout(Stdio::inherit())
@@ -383,12 +388,55 @@ impl E2eFixture {
     }
 }
 
+/// Remove `pid` and every process below it from the pinned
+/// PROTECTED_PIDS map. Since `task-kill-signals-1` the task_kill hook
+/// refuses EVERY userspace signal towards a protected pid unless the
+/// caller is itself, another protected pid or PID 1 with the nonce; the
+/// test runner is none of those, and the fixtures spawn through `sudo`
+/// (so `Child::id()` is sudo and the agent is its child). Evicting the
+/// subtree first lets the SIGQUIT/SIGTERM below reach the processes.
+fn unprotect_tree(pid: u32) {
+    let mut todo = vec![pid];
+    let mut seen: Vec<u32> = Vec::new();
+    while let Some(p) = todo.pop() {
+        if seen.contains(&p) {
+            continue;
+        }
+        seen.push(p);
+        if let Ok(out) = Command::new("pgrep").args(["-P", &p.to_string()]).output() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(c) = line.trim().parse::<u32>() {
+                    todo.push(c);
+                }
+            }
+        }
+    }
+    for p in seen {
+        let key = [
+            p & 0xFF,
+            (p >> 8) & 0xFF,
+            (p >> 16) & 0xFF,
+            (p >> 24) & 0xFF,
+        ]
+        .map(|b| b.to_string());
+        let _ = Command::new("sudo")
+            .args(["bpftool", "map", "delete", "pinned"])
+            .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
+            .arg("key")
+            .args(key)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 impl Drop for E2eFixture {
     fn drop(&mut self) {
         // Stop watchdog first (so it doesn't try to respawn the
         // agent mid-cleanup). The watchdog's bindsTo is per-unit;
         // for ad-hoc test spawn we kill it directly.
         if let Some(mut w) = self.watchdog_child.take() {
+            unprotect_tree(w.id());
             let _ = Command::new("sudo")
                 .arg("kill")
                 .arg("-TERM")
@@ -399,6 +447,7 @@ impl Drop for E2eFixture {
         // Then the agent. SIGTERM is hook-blocked; use SIGQUIT
         // which is the documented escape hatch.
         if let Some(mut a) = self.agent_child.take() {
+            unprotect_tree(a.id());
             let _ = Command::new("sudo")
                 .arg("kill")
                 .arg("-QUIT")
@@ -416,6 +465,13 @@ impl Drop for E2eFixture {
         // when nothing matches.
         if let Some(install) = &self.agent_install {
             if let Some(basename) = install.path.file_name().and_then(|s| s.to_str()) {
+                if let Ok(out) = Command::new("pgrep").args(["-f", basename]).output() {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        if let Ok(p) = line.trim().parse::<u32>() {
+                            unprotect_tree(p);
+                        }
+                    }
+                }
                 let _ = Command::new("sudo")
                     .arg("pkill")
                     .arg("-QUIT")
@@ -652,11 +708,37 @@ fn stuck_recovery_kills_sigint_ignoring_subprocess_via_real_bpf() {
         .enable_all()
         .build()
         .unwrap();
+    // This test process plays the watchdog: since task-kill-signals-1
+    // only a PROTECTED caller may signal a protected pid, so register
+    // ourselves the way the real watchdog does at boot (and evict below).
+    let own = std::process::id();
+    let own_key = format!(
+        "{} {} {} {}",
+        own & 0xFF,
+        (own >> 8) & 0xFF,
+        (own >> 16) & 0xFF,
+        (own >> 24) & 0xFF
+    );
+    let st = Command::new("sudo")
+        .args(["bpftool", "map", "update", "pinned"])
+        .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
+        .arg("key")
+        .args(own_key.split_whitespace())
+        .args(["value", "1"])
+        .status()
+        .expect("spawn bpftool");
+    assert!(st.success(), "bpftool map update for own PID failed");
     let result = runtime.block_on(stuck_recovery(
         sleeper_pid,
         Path::new(BPFFS_ROOT),
         Duration::from_millis(200),
     ));
+    let _ = Command::new("sudo")
+        .args(["bpftool", "map", "delete", "pinned"])
+        .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
+        .arg("key")
+        .args(own_key.split_whitespace())
+        .status();
     assert!(
         result.is_ok(),
         "stuck_recovery failed: {:?}",

@@ -10,7 +10,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   towards a protected pid is refused (previously only SIGKILL/SIGTERM, so
   `kill -INT/-HUP/-QUIT/-STOP` from root stopped or froze the agent).
   Allowed: signal 0, self-signals, signals between protected pids
-  (watchdog ↔ agent) and PID 1 with the armed nonce.
+  (watchdog ↔ agent) and PID 1 with the armed nonce. The watchdog now
+  registers its own pid in PROTECTED_PIDS at boot (design §7.1; before,
+  it was protected only if its pidfile pre-dated the agent's start).
 - R004 (fileless exec) also matches `/dev/fd/N` (what glibc's `fexecve`
   really passes) and `/memfd:` pseudo-paths; previously a memfd exec on
   Ubuntu 24.04 was undetected.
