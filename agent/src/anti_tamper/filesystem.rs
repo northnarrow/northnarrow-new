@@ -194,6 +194,19 @@ pub const STATE_PROTECTED_FILES: &[&str] = &[
     "netflow_listeners.jsonl",
 ];
 
+/// Audit `chain-protect-1` / `at-authz-3`: chain logs that live in a
+/// SUB-directory of the state dir. `(subdir basename, file basenames)`;
+/// both halves are bare basenames (same path-traversal invariant as
+/// [`STATE_PROTECTED_FILES`]). The subdir inode itself is registered
+/// MUTATE (no rmdir/rename/chattr of the dir, no rename into or out of
+/// it), the files MUTATE|WRITE like every other chain log. Before this,
+/// `register_state_files` only did `state_dir.join(<basename>)` and the
+/// Tappa 9.0 detection chains — `detections.jsonl` and the triage
+/// `status_events.jsonl` — were deletable/truncatable by root with no
+/// denial (signed, so detectable after the fact, but not defended).
+pub const STATE_PROTECTED_SUBDIRS: &[(&str, &[&str])] =
+    &[("detections", &["detections.jsonl", "status_events.jsonl"])];
+
 /// Tappa 9.5 K7: subdirectory under [`CONFIG_DIR`] holding the
 /// K4 canary content templates the renderer reads at
 /// `canary deploy` time. The directory itself is created by
@@ -643,10 +656,75 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
         );
         registered += 1;
     }
+    // Sub-directory chains (chain-protect-1): the directory inode first,
+    // then its files. A missing dir/file is skipped like the entries
+    // above (the detection store creates them lazily on first write).
+    let mut subdir_total = 0usize;
+    for (sub, files) in STATE_PROTECTED_SUBDIRS {
+        subdir_total += 1 + files.len();
+        let dir = state_dir.join(sub);
+        match std::fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {
+                let key = InodeKey {
+                    dev: stat_dev_to_kernel_dev(meta.dev()),
+                    ino: meta.ino(),
+                };
+                register_inode(ebpf, &key, FS_PROTECT_MUTATE).with_context(|| {
+                    format!(
+                        "registering subdir {} in {PROTECTED_INODES_MAP}",
+                        dir.display()
+                    )
+                })?;
+                info!(
+                    path = %dir.display(),
+                    kernel_dev = key.dev,
+                    ino = key.ino,
+                    "anti-tamper FS: state sub-directory inode registered in {PROTECTED_INODES_MAP}"
+                );
+                registered += 1;
+            }
+            _ => {
+                warn!(
+                    path = %dir.display(),
+                    "anti-tamper FS: state sub-directory missing — its chain logs are unprotected \
+                     until the next agent restart with the directory present"
+                );
+                continue;
+            }
+        }
+        for name in files.iter() {
+            let path = dir.join(name);
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "anti-tamper FS: skip sub-directory chain log — missing/unreadable"
+                    );
+                    continue;
+                }
+            };
+            let key = InodeKey {
+                dev: stat_dev_to_kernel_dev(meta.dev()),
+                ino: meta.ino(),
+            };
+            register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE).with_context(
+                || format!("registering {} in {PROTECTED_INODES_MAP}", path.display()),
+            )?;
+            info!(
+                path = %path.display(),
+                kernel_dev = key.dev,
+                ino = key.ino,
+                "anti-tamper FS: sub-directory chain log registered in {PROTECTED_INODES_MAP}"
+            );
+            registered += 1;
+        }
+    }
     info!(
         state_dir = %state_dir.display(),
         registered,
-        total = STATE_PROTECTED_FILES.len(),
+        total = STATE_PROTECTED_FILES.len() + subdir_total,
         "anti-tamper FS: /var/lib/northnarrow FIM-log registration complete"
     );
     Ok(registered)
@@ -1797,6 +1875,20 @@ mod tests {
     /// a future operator-editable config where one of these
     /// names becomes `../something` and the join with
     /// CONFIG_DIR escapes to an unrelated inode.
+    #[test]
+    fn state_protected_subdirs_are_bare_basenames() {
+        for (sub, files) in STATE_PROTECTED_SUBDIRS {
+            assert!(!sub.contains('/') && !sub.starts_with('.'), "{sub}");
+            for f in files.iter() {
+                assert!(!f.contains('/') && !f.starts_with('.'), "{f}");
+            }
+        }
+        // The two Tappa 9.0 chains must stay covered.
+        let (sub, files) = STATE_PROTECTED_SUBDIRS[0];
+        assert_eq!(sub, "detections");
+        assert!(files.contains(&"detections.jsonl") && files.contains(&"status_events.jsonl"));
+    }
+
     #[test]
     fn etc_protected_files_have_no_path_traversal() {
         for name in ETC_PROTECTED_FILES {
