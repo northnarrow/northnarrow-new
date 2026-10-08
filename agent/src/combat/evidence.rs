@@ -109,7 +109,7 @@ impl LadderEvidence for AuditEvidence {
         if let Err(e) = guard.append(draft) {
             warn!(
                 target: "combat.audit",
-                error = %e,
+                error = format!("{e:#}"),
                 stage = %t.to,
                 "failed to append COMBAT stage transition to audit log"
             );

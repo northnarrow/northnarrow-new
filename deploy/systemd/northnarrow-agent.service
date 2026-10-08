@@ -138,7 +138,18 @@ ProtectSystem=strict
 # agent/src/fim/attach.rs (populate_watched_paths) WARNs if this is ever
 # masked again.
 ProtectHome=read-only
-ReadWritePaths=/run/northnarrow /var/lib/northnarrow
+# /etc/northnarrow MUST be writable for the agent (review
+# `etc-readonly-audit-1`, 2026-10-08): the signed audit log
+# (/etc/northnarrow/audit.log), agent_id and agent.sig.key bootstrap,
+# and the rename-based admin.pub rotation all live there. With the
+# directory read-only every COMBAT stage transition logged
+# "failed to append ... audit log" (EROFS, hidden behind the context
+# string) and the audit chain stopped at the last write made outside
+# the unit — silently, for months. Writes there are still restricted to
+# THIS process: the inode_protect write-deny hooks refuse every other
+# pid (at-authz-1/2), so widening the mount does not widen the attack
+# surface.
+ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
 # CapabilityBoundingSet — the agent runs as root (no User=), so this set is
 # the HARD CEILING on its effective caps: a cap not listed is dropped even
 # from root. It is the blast radius if the agent is ever compromised, so it
