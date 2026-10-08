@@ -1237,15 +1237,65 @@ async fn main() -> Result<()> {
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
             Ok(key) => {
                 match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
-                    Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
+                    // Boot write probe (etc-readonly-audit-1): a signed
+                    // `agent_boot` entry proves the chain is writable NOW
+                    // instead of failing silently at the first COMBAT
+                    // transition. Fail-closed in enforcement mode.
+                    Ok(mut log) => match log.boot_probe(detect_only) {
+                        Ok(entry) => {
+                            info!(
+                                path = %cli.audit_log_file.display(),
+                                entry_hash = %entry.entry_hash,
+                                "audit log writable — agent_boot entry appended"
+                            );
+                            Some(Arc::new(parking_lot::Mutex::new(log)))
+                        }
+                        Err(e) => {
+                            let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+                                detect_only,
+                                std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+                                    .ok()
+                                    .as_deref(),
+                            );
+                            error!(
+                                error = format!("{e:#}"),
+                                path = %cli.audit_log_file.display(),
+                                fatal,
+                                "audit log NOT writable — the signed audit chain would stop here \
+                                 (is the directory in the unit's ReadWritePaths?)"
+                            );
+                            if fatal {
+                                anyhow::bail!(
+                                    "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
+                                     set {}=1 to start anyway, or use --detect-only.",
+                                    cli.audit_log_file.display(),
+                                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                                );
+                            }
+                            None
+                        }
+                    },
                     Err(e) => {
-                        warn!(error = %e, "audit log open failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                        let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+                            detect_only,
+                            std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+                                .ok()
+                                .as_deref(),
+                        );
+                        error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
+                        if fatal {
+                            anyhow::bail!(
+                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway, or use --detect-only.",
+                                cli.audit_log_file.display(),
+                                northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                            );
+                        }
                         None
                     }
                 }
             }
             Err(e) => {
-                warn!(error = %e, "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                warn!(error = format!("{e:#}"), "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
                 None
             }
         };

@@ -6,6 +6,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- Boot-time audit self-check: a signed `agent_boot` entry is appended at
+  startup; an unwritable audit log is fatal in enforcement mode
+  (`NN_AUDIT_ALLOW_UNWRITABLE=1` to override, detect-only warns).
 - Posture corroboration ledger is scoped per login session (`loginuid`
   of the owning pid; host-level activity is its own scope): a weak
   ENGAGED-tier signal from one user/container no longer corroborates a
