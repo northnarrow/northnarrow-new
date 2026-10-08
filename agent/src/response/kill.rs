@@ -114,6 +114,22 @@ pub fn kill_process_tree(
     root_pid: u32,
     protected: &HashSet<u32>,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
+    kill_process_tree_guarded(root_pid, protected, &|_| None)
+}
+
+/// [`kill_process_tree`] with an extra per-pid guard consulted for EVERY
+/// pid the walk would kill (root and descendants). Audit
+/// `combat-avail-2`: the COMBAT ladder's `ProtectedProcs` guard (sshd,
+/// the watchdog, auth-session lineage) was only applied to the attributed
+/// offenders, never to the `/proc` descendants this walk reaps — a
+/// guarded sshd or watchdog *child* of an offender was killed. `guard`
+/// returns the reason a pid must be spared; spared pids are reported as
+/// `Refused` so the caller's audit sees them.
+pub fn kill_process_tree_guarded(
+    root_pid: u32,
+    protected: &HashSet<u32>,
+    guard: &dyn Fn(u32) -> Option<&'static str>,
+) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
     // Hard floor: PID 0 (the kernel's own parent in the /proc ppid map)
     // and PID 1 (init) can never be a tree root. `kill_process` already
     // refuses PID 0 and `protected` normally holds 1, but the /proc walk
@@ -134,11 +150,23 @@ pub fn kill_process_tree(
     let descendants = collect_descendants(root_pid).unwrap_or_default();
 
     // Kill the parent FIRST: stops a fork bomb from outpacing us.
-    let primary = kill_process(root_pid, protected);
+    let primary = match guard(root_pid) {
+        Some(reason) => ExecutionOutcome::Refused {
+            pid: root_pid,
+            reason,
+        },
+        None => kill_process(root_pid, protected),
+    };
 
     let mut outcomes = Vec::with_capacity(descendants.len());
     for child_pid in descendants {
-        outcomes.push(kill_process(child_pid, protected));
+        outcomes.push(match guard(child_pid) {
+            Some(reason) => ExecutionOutcome::Refused {
+                pid: child_pid,
+                reason,
+            },
+            None => kill_process(child_pid, protected),
+        });
     }
     (primary, outcomes)
 }
@@ -244,6 +272,52 @@ mod tests {
             out,
             ExecutionOutcome::AlreadyGone { pid: 999_999_999 }
         ));
+    }
+
+    /// combat-avail-2: a guarded descendant is spared and reported, the
+    /// unguarded siblings are still killed. Uses our own process tree:
+    /// two `sleep` children, one guarded by pid.
+    #[test]
+    fn kill_tree_guard_spares_descendants() {
+        use std::process::{Command, Stdio};
+        let mut a = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn sleep a");
+        let mut b = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn sleep b");
+        let (spared, killed) = (a.id(), b.id());
+        // Root = this test process, which the executor set protects.
+        let own = std::process::id();
+        let protected = protected_with(&[]);
+        let (primary, rest) = kill_process_tree_guarded(own, &protected, &|pid| {
+            if pid == spared {
+                Some("host-critical (test guard)")
+            } else {
+                None
+            }
+        });
+        assert!(matches!(primary, ExecutionOutcome::Refused { .. }));
+        assert!(
+            rest.iter().any(|o| matches!(o, ExecutionOutcome::Refused { pid, reason } if *pid == spared && reason.contains("test guard"))),
+            "spared child must be reported as Refused: {rest:?}"
+        );
+        assert!(
+            rest.iter().any(|o| matches!(o, ExecutionOutcome::Killed { pid } | ExecutionOutcome::AlreadyGone { pid } if *pid == killed)),
+            "unguarded child must be killed: {rest:?}"
+        );
+        // Cleanup: the spared sleeper is still alive; the killed one is not.
+        assert!(
+            a.try_wait().expect("try_wait").is_none(),
+            "spared child was killed"
+        );
+        let _ = a.kill();
+        let _ = a.wait();
+        let _ = b.wait();
     }
 
     #[test]

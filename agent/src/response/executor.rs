@@ -21,14 +21,32 @@ use super::{
 /// quirky early-PID malware than ever kill init.
 const PID_PROTECTION_FLOOR: u32 = 100;
 
+/// Per-pid guard consulted by KillProcessTree for every pid in the walk
+/// (audit `combat-avail-2`). Returns the reason a pid must be spared.
+pub type TreeGuard = Arc<dyn Fn(u32) -> Option<&'static str> + Send + Sync>;
+
 /// Reusable executor. Cheap to clone (Arc-wraps the read-only state),
 /// so tasks can grab their own copy and run kill syscalls on a
 /// blocking pool without contention.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Executor {
     own_pid: u32,
     protected: Arc<HashSet<u32>>,
     config: Arc<ExecutorConfig>,
+    /// Set once the COMBAT ladder's `ProtectedProcs` exists (it is built
+    /// after the executor, so this is a late-bound slot shared by clones).
+    tree_guard: Arc<parking_lot::RwLock<Option<TreeGuard>>>,
+}
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("own_pid", &self.own_pid)
+            .field("protected", &self.protected)
+            .field("config", &self.config)
+            .field("tree_guard", &self.tree_guard.read().is_some())
+            .finish()
+    }
 }
 
 impl Executor {
@@ -53,7 +71,15 @@ impl Executor {
             own_pid,
             protected: Arc::new(protected),
             config: Arc::new(config),
+            tree_guard: Arc::new(parking_lot::RwLock::new(None)),
         }
+    }
+
+    /// Install the host-critical guard consulted on every pid of a
+    /// KillProcessTree walk (root AND /proc descendants). Idempotent;
+    /// visible to every clone of this executor.
+    pub fn set_tree_guard(&self, guard: TreeGuard) {
+        *self.tree_guard.write() = Some(guard);
     }
 
     /// PID of the running agent. Exposed for telemetry; never killable.
@@ -116,7 +142,20 @@ impl Executor {
                 },
                 ResponseAction::KillProcess => kill::kill_process(target_pid, &self.protected),
                 ResponseAction::KillProcessTree => {
-                    let (p, kids) = kill::kill_process_tree(target_pid, &self.protected);
+                    // The protection floor + the ladder's host-critical
+                    // guard apply to every pid the walk reaps, not only to
+                    // the attributed root (combat-avail-2).
+                    let guard = self.tree_guard.read().clone();
+                    let combined = move |pid: u32| -> Option<&'static str> {
+                        if pid < PID_PROTECTION_FLOOR {
+                            return Some(
+                                "PID below protection floor (kernel thread / core service)",
+                            );
+                        }
+                        guard.as_ref().and_then(|g| g(pid))
+                    };
+                    let (p, kids) =
+                        kill::kill_process_tree_guarded(target_pid, &self.protected, &combined);
                     additional = kids;
                     p
                 }

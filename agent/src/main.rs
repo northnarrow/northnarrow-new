@@ -1283,6 +1283,22 @@ async fn main() -> Result<()> {
         )),
         northnarrow_agent::combat::LadderConfig::default(),
     ));
+    // combat-avail-2: the same host-critical knowledge the ladder uses to
+    // spare attributed offenders must also spare the /proc DESCENDANTS a
+    // KillProcessTree walk reaps (an sshd or the watchdog under an
+    // offender). The executor was built before the guard existed, so bind
+    // it late; ProtectedReason has a static name for the audit row.
+    {
+        let guard = northnarrow_agent::combat::SystemProtectedProcs::new(
+            executor.own_pid(),
+            exempt.clone(),
+            cli.watchdog_exe.clone(),
+        );
+        executor.set_tree_guard(Arc::new(move |pid: u32| {
+            use northnarrow_agent::combat::ProtectedProcs;
+            guard.protected_reason(pid).map(|r| r.as_str())
+        }));
+    }
     if ladder_slot.set(Arc::clone(&ladder)).is_err() {
         warn!("COMBAT ladder slot already set — unexpected double-init");
     }
