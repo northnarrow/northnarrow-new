@@ -32,11 +32,15 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
+    agent_argv_from_proc, respawn_agent, select_backend, systemd_is_booted, RespawnBackend,
+    SYSTEMD_RUNTIME_DIR,
+};
+use northnarrow_watchdog::{
     evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
     ping_agent_status, read_pid_from_file, reinsert_new_agent_pid, sd_notify_ready,
-    shutdown_was_authorised, spawn_agent, stuck_recovery, wait_for_agent_death,
-    wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, PingOutcome, RestartBackoff,
-    StatusPingTracker, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
+    shutdown_was_authorised, stuck_recovery, wait_for_agent_death, wait_for_new_agent_pid,
+    write_pidfile_atomic, BackoffOutcome, Cli, PingOutcome, RestartBackoff, StatusPingTracker,
+    PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
     STUCK_RECOVERY_HARDKILL_GRACE,
 };
 
@@ -101,14 +105,19 @@ async fn run(cli: Cli) -> Result<()> {
         .context("opening initial agent pidfd")?;
     let mut agent_pid = read_pid_from_file(&cli.agent_pidfile)
         .context("re-reading agent PID for layer-2 evict context")?;
-    let agent_argv = match cli.agent_bin.as_deref() {
-        Some(bin) => vec![
-            bin.to_string_lossy().into_owned(),
-            "--pid-file".to_string(),
-            cli.agent_pidfile.to_string_lossy().into_owned(),
-        ],
-        None => derive_agent_argv(agent_pid, &cli.agent_pidfile)?,
-    };
+    // Respawn v2 (docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md): on a
+    // systemd host the agent is brought back through ITS OWN unit, so
+    // it gets the unit's ExecStart argv, cgroup, caps and ProtectHome —
+    // not the watchdog's 64 MiB / 2-cap sandbox it used to inherit as a
+    // fork-exec child. The exec backend (non-systemd hosts) now persists
+    // the agent's FULL first-launch argv from /proc instead of a
+    // `--pid-file`-only reconstruction (combat-avail-1).
+    let backend = select_backend(
+        cli.respawn_backend,
+        systemd_is_booted(std::path::Path::new(SYSTEMD_RUNTIME_DIR)),
+        &cli.agent_unit,
+        || exec_argv(agent_pid, cli.agent_bin.as_deref(), &cli.agent_pidfile),
+    )?;
 
     let own_pid = std::process::id();
     write_pidfile_atomic(&cli.pidfile, own_pid)
@@ -121,8 +130,7 @@ async fn run(cli: Cli) -> Result<()> {
         own_pid,
         agent_pid,
         bpffs_root = %cli.bpffs_root.display(),
-        agent_bin = %agent_argv[0],
-        argc = agent_argv.len(),
+        respawn = %backend.describe(),
         "boot sequence complete — entering restart-backoff loop"
     );
 
@@ -287,8 +295,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // doesn't immediately read the dead PID.
                 let _ = std::fs::remove_file(&cli.agent_pidfile);
 
-                match respawn_cycle(&agent_argv, &cli.agent_pidfile, &cli.bpffs_root, attempt).await
-                {
+                match respawn_cycle(&backend, &cli.agent_pidfile, &cli.bpffs_root, attempt).await {
                     Ok((new_pid, new_fd)) => {
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
@@ -363,6 +370,38 @@ enum SelectOutcome {
 /// budget. Production systemd units pass `--agent-bin` to skip
 /// this path entirely; the retry is the safety net for dev /
 /// manual installs.
+/// Argv for the exec backend: the agent's full `/proc/<pid>/cmdline`
+/// (with `--agent-bin` overriding argv[0]); if /proc is unreadable
+/// (observer registration not yet arrived), fall back to the legacy
+/// minimal reconstruction so a non-systemd host still gets SOME
+/// respawn rather than none — logged loudly, because that argv drops
+/// every flag.
+fn exec_argv(
+    agent_pid: u32,
+    agent_bin: Option<&std::path::Path>,
+    pidfile: &std::path::Path,
+) -> Result<Vec<String>> {
+    match agent_argv_from_proc(agent_pid, agent_bin) {
+        Ok(argv) => Ok(argv),
+        Err(e) => {
+            warn!(
+                target: "watchdog.respawn",
+                error = %e,
+                "full argv capture from /proc failed — falling back to minimal argv \
+                 (flags such as --detect-only / --admin-pub will NOT survive a respawn)"
+            );
+            match agent_bin {
+                Some(bin) => Ok(vec![
+                    bin.to_string_lossy().into_owned(),
+                    "--pid-file".to_string(),
+                    pidfile.to_string_lossy().into_owned(),
+                ]),
+                None => derive_agent_argv(agent_pid, pidfile),
+            }
+        }
+    }
+}
+
 fn derive_agent_argv(agent_pid: u32, pidfile: &std::path::Path) -> Result<Vec<String>> {
     let exe_path = format!("/proc/{agent_pid}/exe");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -400,7 +439,7 @@ fn derive_agent_argv(agent_pid: u32, pidfile: &std::path::Path) -> Result<Vec<St
 /// into PROTECTED_PIDS. Returns the new PID + the new pidfd
 /// for the main loop's next select-arm.
 async fn respawn_cycle(
-    argv: &[String],
+    backend: &RespawnBackend,
     pidfile: &std::path::Path,
     bpffs_root: &std::path::Path,
     attempt: u8,
@@ -408,21 +447,15 @@ async fn respawn_cycle(
     info!(
         target: "watchdog.respawn",
         attempt,
-        bin = %argv[0],
-        "spawning agent"
+        backend = %backend.describe(),
+        "respawning agent"
     );
-    let child = spawn_agent(argv)?;
-    // We don't await `child.wait()` — the parent watchdog
-    // observes death via the new pidfd, NOT via waitpid. The
-    // `Child` handle drops at function end; that doesn't kill
-    // the spawned process (Rust's `Child::drop` is a no-op on
-    // Unix). systemd would normally reap, but with `Restart=no`
-    // on the agent unit + the agent being a forked subprocess
-    // of the watchdog, the watchdog inherits the role. For W4
-    // we accept that a child that exits BEFORE we open its
-    // pidfd will become a zombie; W5 (stuck-agent recovery)
-    // adds the reaping path.
-    std::mem::drop(child);
+    // systemd backend: the start job is queued (--no-block) and the
+    // agent boots under its own unit; exec backend: fork-exec, child
+    // handle dropped (death is observed via the new pidfd, never
+    // waitpid — Child::drop is a no-op on Unix). Either way readiness
+    // is the pidfile below, written after every LSM hook is attached.
+    respawn_agent(backend)?;
 
     let new_pid = wait_for_new_agent_pid(pidfile, NEW_AGENT_PIDFILE_DEADLINE).await?;
 
