@@ -63,6 +63,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `catchall-1`, unbounded memory growth on a long-lived agent).
 
 ### Fixed
+- Agent unit: `/etc/northnarrow` added to `ReadWritePaths` — under
+  `ProtectSystem=strict` the installed agent could not append its own
+  signed audit log (EROFS) nor bootstrap `agent_id`/`agent.sig.key`.
 - Agent unit: `RuntimeDirectoryPreserve=yes` — a respawn-v2 restart no
   longer wipes `/run/northnarrow` (watchdog pidfile, shutdown marker,
   honeypot baits).

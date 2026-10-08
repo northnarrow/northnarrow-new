@@ -198,6 +198,11 @@ cmd_test_e2e() {
     # Two crates ship a `privileged_e2e` target; run them as separate
     # invocations (each with ITS crate's feature gate) so a failure is
     # attributable and the watchdog suite starts from a settled host.
+    # The installed units must be DOWN: a running production agent sees
+    # the fixtures' /tmp helpers, iptables edits and canary trips as an
+    # intrusion, enters COMBAT and NEUTRALIZEs the test runner (observed:
+    # `cargo test` SIGKILLed mid-suite, 2026-10-08).
+    vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
     log "agent privileged_e2e done — running the watchdog suite"
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1 --nocapture'
