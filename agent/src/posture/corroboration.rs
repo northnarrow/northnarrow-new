@@ -40,10 +40,19 @@ const LEDGER_CAP: usize = 64;
 pub const SUSTAINED_SAME_TYPE_PROMOTES: bool = false;
 const SUSTAINED_SAME_TYPE_MIN: usize = 2;
 
+/// Which "actor" a signal belongs to, for corroboration purposes
+/// (review `posture-ledger-scope-1`). `Some(loginuid)` = a PAM login
+/// session; `None` = host-level (daemon/kernel activity with no login
+/// uid, or an event type with no owning pid). Signals corroborate each
+/// other only within the same scope: two weak signals from two unrelated
+/// users or containers no longer add up to a host-wide COMBAT.
+pub type Scope = Option<u32>;
+
 #[derive(Clone, Copy)]
 struct LedgerEntry {
     trigger: TriggerType,
     at: Instant,
+    scope: Scope,
 }
 
 /// Bounded, in-memory record of recent escalation signals (ENGAGED-tier
@@ -80,20 +89,21 @@ impl CorroborationLedger {
     /// sufficiently-repeated SAME signal also corroborates.
     ///
     /// Caller must [`prune`](Self::prune) first.
-    pub fn corroborated(&self, current: TriggerType) -> bool {
-        if self.entries.iter().any(|e| e.trigger != current) {
+    pub fn corroborated(&self, current: TriggerType, scope: Scope) -> bool {
+        // posture-ledger-scope-1: only same-scope entries count.
+        let same_scope = self.entries.iter().filter(|e| e.scope == scope);
+        if same_scope.clone().any(|e| e.trigger != current) {
             return true;
         }
         SUSTAINED_SAME_TYPE_PROMOTES
-            && self.entries.iter().filter(|e| e.trigger == current).count() + 1
-                >= SUSTAINED_SAME_TYPE_MIN
+            && same_scope.filter(|e| e.trigger == current).count() + 1 >= SUSTAINED_SAME_TYPE_MIN
     }
 
     /// Record an escalation signal. The caller records only signals
     /// whose `target_level() >= Engaged` (ALERTED-tier recon/DNS is too
     /// noisy to count as corroboration).
-    pub fn record(&mut self, trigger: TriggerType, at: Instant) {
-        self.entries.push_back(LedgerEntry { trigger, at });
+    pub fn record(&mut self, trigger: TriggerType, at: Instant, scope: Scope) {
+        self.entries.push_back(LedgerEntry { trigger, at, scope });
     }
 
     /// Forget every recorded signal. Called when an admin releases
@@ -125,16 +135,16 @@ mod tests {
     fn lone_signal_is_not_corroborated() {
         let l = CorroborationLedger::new();
         // empty ledger: nothing corroborates the first firing.
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 
     #[test]
     fn distinct_prior_signal_corroborates() {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::LateralMovement, now);
+        l.record(TriggerType::LateralMovement, now, None);
         // a DIFFERENT escalation signal is present → corroborated.
-        assert!(l.corroborated(TriggerType::ExfiltrationPattern));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 
     #[test]
@@ -143,21 +153,21 @@ mod tests {
         // signal does NOT promote (the documented single-vector limit).
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::ExfiltrationPattern, now);
+        l.record(TriggerType::ExfiltrationPattern, now, None);
         const _: () = assert!(!SUSTAINED_SAME_TYPE_PROMOTES, "guard: knob default");
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 
     #[test]
     fn prune_drops_out_of_window_entries() {
         let base = Instant::now();
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::LateralMovement, base);
+        l.record(TriggerType::LateralMovement, base, None);
         // Advance well past the window.
         let later = base + CORROBORATION_WINDOW + Duration::from_secs(1);
         l.prune(later);
         assert_eq!(l.len(), 0, "stale entry pruned");
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 
     #[test]
@@ -165,9 +175,23 @@ mod tests {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
         for _ in 0..(LEDGER_CAP + 50) {
-            l.record(TriggerType::ExfiltrationPattern, now);
+            l.record(TriggerType::ExfiltrationPattern, now, None);
         }
         l.prune(now);
         assert!(l.len() <= LEDGER_CAP, "size cap holds under a flood");
+    }
+
+    /// posture-ledger-scope-1: signals from different scopes (two login
+    /// sessions, or a session vs host-level) do not corroborate.
+    #[test]
+    fn different_scopes_do_not_corroborate() {
+        let now = Instant::now();
+        let mut l = CorroborationLedger::new();
+        l.record(TriggerType::LateralMovement, now, Some(1000));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, Some(1001)));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, Some(1000)));
+        l.record(TriggerType::LateralMovement, now, None);
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 }

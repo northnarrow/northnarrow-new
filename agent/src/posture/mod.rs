@@ -304,6 +304,10 @@ impl PostureMachine {
         if hits.is_empty() {
             return None;
         }
+        // Review `posture-ledger-scope-1`: corroboration is per actor
+        // scope (login session); a weak signal from one user/container
+        // never vouches for a blunt signal from another.
+        let scope = self.inner.triggers.session_scope(event);
 
         let mut guard = self.inner.state.write();
         let mut ledger = self.inner.corroboration.lock();
@@ -341,7 +345,7 @@ impl PostureMachine {
                 let level = if t.target_level() == PostureKind::Combat
                     && t.confidence() == Confidence::NeedsCorroboration
                 {
-                    if ledger.corroborated(t) {
+                    if ledger.corroborated(t, scope) {
                         PostureKind::Combat
                     } else {
                         PostureKind::Engaged
@@ -371,7 +375,7 @@ impl PostureMachine {
         // the current signal does not self-corroborate via the ledger
         // (same-round corroboration is handled by `escalation_now`).
         for t in &escalation_now {
-            ledger.record(*t, now);
+            ledger.record(*t, now, scope);
         }
         drop(ledger);
 
