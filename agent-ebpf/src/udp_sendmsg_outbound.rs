@@ -194,11 +194,27 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    let sport_host: u16 =
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_NUM_OFFSET) as *const u16) } {
+            Ok(v) => v,
+            Err(_) => 0,
+        };
+
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     let now = unsafe { bpf_ktime_get_ns() };
 
     if dst.unconnected {
+        // A DNS *server* answering its clients (systemd-resolved's
+        // stub on 127.0.0.53, bind, unbound) is an unconnected sendto
+        // FROM port 53 to a fresh client port per query: the (pid,
+        // dst) limiter cannot collapse it and every local lookup would
+        // cost a netflow row. Port 53 belongs to the DNS sensor in
+        // both directions; the listener side is the resolver's own
+        // business, not an outbound flow.
+        if sport_host == DNS_DST_PORT {
+            return Ok(());
+        }
         let key = UdpDstKey {
             pid,
             port_be: dst.port_host.to_be(),
@@ -224,12 +240,6 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
     unsafe {
         core::ptr::write_bytes(raw_ptr, 0u8, 1);
     }
-
-    let sport_host: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_NUM_OFFSET) as *const u16) } {
-            Ok(v) => v,
-            Err(_) => 0,
-        };
 
     let uid_gid = bpf_get_current_uid_gid();
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
