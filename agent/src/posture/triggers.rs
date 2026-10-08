@@ -266,6 +266,13 @@ impl TriggerDetector {
     /// The result is in escalation order (the strongest trigger
     /// last) so the caller can `iter().last()` for the dominant
     /// signal or fold them all into the audit log.
+    /// Corroboration scope of `event` (review `posture-ledger-scope-1`):
+    /// the login uid of the owning pid, or `None` for host-level
+    /// activity / events with no owning pid.
+    pub fn session_scope(&self, event: &Event) -> super::corroboration::Scope {
+        event_owner_pid(event).and_then(|pid| self.auth.loginuid_of(pid))
+    }
+
     pub fn detect(&self, event: &Event, recent: &[Event]) -> Vec<TriggerType> {
         // T7.13: ingest ProcessSpawn into the auth-lineage tracker
         // FIRST, so the focal spawn's own lineage is visible to the
