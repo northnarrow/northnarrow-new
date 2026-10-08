@@ -695,6 +695,28 @@ mod tests {
         f.write_all(b"#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n")
             .ok()?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
+        drop(f);
+        // ETXTBSY guard: the test harness runs tests on parallel threads.
+        // If ANOTHER thread fork()s (Command::spawn) while our write fd
+        // above is still open, the child inherits that fd until it
+        // exec()s — and the kernel refuses to exec a file that anyone
+        // holds open for writing ("Text file busy"). Probe-exec the
+        // (harmless) script until that transient window has closed so
+        // the real test spawn never trips over it.
+        for _ in 0..200 {
+            match Command::new(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(_) => break,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return None,
+            }
+        }
         Some(path)
     }
 
