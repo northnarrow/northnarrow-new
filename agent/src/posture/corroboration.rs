@@ -96,9 +96,24 @@ impl CorroborationLedger {
         self.entries.push_back(LedgerEntry { trigger, at });
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// Forget every recorded signal. Called when an admin releases
+    /// COMBAT: the signals that justified the lockdown have been
+    /// adjudicated by a human, so they must not keep corroborating
+    /// the NEXT blunt heuristic for another 15 minutes — otherwise a
+    /// single weak signal re-locks COMBAT right after a signed unlock
+    /// (audit `posture-2`).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Number of signals currently in the ledger.
+    pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// `true` when no signal is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

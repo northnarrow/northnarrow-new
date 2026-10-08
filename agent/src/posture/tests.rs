@@ -122,6 +122,26 @@ fn admin_release_authorized_drops_to_engaged() {
 }
 
 #[test]
+fn admin_release_clears_corroboration_ledger() {
+    // posture-2: the signals that justified COMBAT must not keep
+    // corroborating the next heuristic after an admin has released.
+    let m = PostureMachine::new();
+    let focal = fs_protect_denial(42, 1);
+    m.observe(&focal, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(
+        m.corroboration_len() > 0,
+        "the COMBAT-tier signal must have been recorded in the ledger"
+    );
+    m.admin_release_combat(true).expect("ok");
+    assert_eq!(
+        m.corroboration_len(),
+        0,
+        "ledger must be empty after release"
+    );
+}
+
+#[test]
 fn admin_release_when_not_in_combat_errors() {
     let m = PostureMachine::new();
     assert_eq!(
