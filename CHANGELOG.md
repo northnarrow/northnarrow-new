@@ -5,6 +5,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Security / safety
+- `CAP_KILL` added to the agent's `CapabilityBoundingSet`; without it
+  KillProcess could only signal root-owned targets. New boot preflight
+  (`response/caps_preflight.rs`) refuses to start in enforcement mode when
+  `CAP_KILL` is missing and logs any other missing capability.
+- `kill_process_tree` refuses PID 0/1 as a root before walking `/proc`
+  (PID 0's children are init + kthreadd, i.e. the whole host) and never
+  yields PID 1/2 as descendants.
+- Quarantine refuses to vault + unlink binaries under system prefixes
+  (`/usr/bin`, `/usr/lib`, `/etc`, `/boot`, …) and NorthNarrow's own paths.
+- Posture: the corroboration ledger is cleared on every COMBAT release
+  path (audit `posture-2`).
+- NN-L-NET-005 / NN-L-NET-013 stateful windows evict idle keys (audit
+  `catchall-1`, unbounded memory growth on a long-lived agent).
+
 ### Fixed
 - CI: `cargo fmt`, `cargo clippy -D warnings` and the `test` job are green
   again; `ade-build` no longer runs out of disk on the hosted runner;

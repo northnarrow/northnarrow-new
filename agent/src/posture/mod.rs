@@ -443,6 +443,7 @@ impl PostureMachine {
         };
         *guard = next.clone();
         drop(guard);
+        self.clear_corroboration_on_release();
         self.log_transition(
             PostureKind::Combat,
             PostureKind::Engaged,
@@ -502,6 +503,7 @@ impl PostureMachine {
         *guard = next.clone();
         drop(guard);
         *self.inner.last_admin_action.lock() = Some(now);
+        self.clear_corroboration_on_release();
         self.log_transition(
             PostureKind::Combat,
             PostureKind::Alerted,
@@ -524,6 +526,25 @@ impl PostureMachine {
 
     /// Seconds since the last successful admin release, or `None` if
     /// no admin action has occurred since the agent booted.
+    /// Audit `posture-2`: an admin release adjudicates the signals
+    /// that built up to COMBAT. Wipe the corroboration ledger so they
+    /// cannot vouch for the next blunt heuristic and re-lock COMBAT
+    /// minutes after a signed unlock.
+    fn clear_corroboration_on_release(&self) {
+        let mut ledger = self.inner.corroboration.lock();
+        let dropped = ledger.len();
+        ledger.clear();
+        drop(ledger);
+        if dropped > 0 {
+            tracing::info!(dropped, "corroboration ledger cleared on admin release");
+        }
+    }
+
+    /// Number of signals currently in the corroboration ledger.
+    pub fn corroboration_len(&self) -> usize {
+        self.inner.corroboration.lock().len()
+    }
+
     pub fn last_admin_action_secs_ago(&self) -> Option<u64> {
         self.inner
             .last_admin_action
@@ -608,7 +629,9 @@ impl PostureMachine {
             }
             let _ = token;
         } else if before == PostureKind::Combat && target != PostureKind::Combat {
-            // COMBAT → non-COMBAT: release hook consumes the token
+            // COMBAT → non-COMBAT: same ledger reset as the release verbs.
+            self.clear_corroboration_on_release();
+            // Release hook consumes the token
             // when present (identical to admin_release_combat_with_token).
             // When no hook is configured, the token binding falls
             // out of scope on return.

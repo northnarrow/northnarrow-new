@@ -156,13 +156,20 @@ ReadWritePaths=/run/northnarrow /var/lib/northnarrow
 #                    root for a cross-uid OR non-dumpable target without the
 #                    cap (BUG-042) — needed for auth-session lineage
 #                    correlation and quarantine target resolution.
+# CAP_KILL         — kill(2) towards processes of ANOTHER uid. Without it a
+#                    uid-0 sender may only signal uid-0 targets, so every
+#                    KillProcess/KillProcessTree verdict against a user-owned
+#                    process returns EPERM — the agent could never stop
+#                    malware run by a normal user. The agent's boot
+#                    preflight (response/caps_preflight.rs) refuses to start
+#                    in enforcement mode when this cap is absent.
 # CAP_DAC_OVERRIDE — quarantine reach ONLY: read + unlink a malicious binary
 #                    that lives in a non-root, restrictive-perm directory
 #                    (response/quarantine.rs). NOT for +i, NOT for FIM (all
 #                    125 watched paths are root-owned → read by ownership).
 #                    Owned limit: sticky dirs (/tmp) and the chmod-000
 #                    fallback also want CAP_FOWNER, not in this set.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL
 
 [Install]
 WantedBy=multi-user.target

@@ -18,6 +18,18 @@ The **load-bearing column is "Validate on the 6.8 VM"** — trigger / observe-co
 
 ---
 
+## Fix log (appended after the registry was written)
+
+| ID | Status | Where |
+|----|--------|-------|
+| `at-authz-1` | **fixed** 2026-06-10 | PR #142 — `file_open` FMODE_WRITE deny on `admin.pub` |
+| `posture-2` | **fixed** 2026-10-08 | `CorroborationLedger::clear()` on every COMBAT release path (`admin_release_combat`, `_with_token`, force-posture) |
+| `catchall-1` | **fixed** 2026-10-08 | `DnsBurstWindow` / `BeaconWindow` evict idle keys every 256 observes or above 4096 keys |
+
+Additional defects found in the 2026-10-08 review (not in this registry) are tracked in `NN_REVIEW_2026-10-08.md`.
+
+---
+
 ## Summary index
 
 | # | ID | Sev | RT-obs | File:line | One-line |

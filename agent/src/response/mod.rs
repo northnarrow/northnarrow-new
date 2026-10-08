@@ -10,6 +10,7 @@
 //! reversible (each module exposes a paired undo function).
 
 pub mod block_outbound;
+pub mod caps_preflight;
 pub mod config;
 pub mod executor;
 pub mod kill;

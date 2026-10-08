@@ -40,6 +40,50 @@ use zeroize::Zeroizing;
 use super::{config::ExecutorConfig, ExecutionOutcome};
 
 const KDF_SALT: &[u8] = b"northnarrow-quarantine-v1";
+
+/// Paths that are NEVER quarantined, whatever the verdict says.
+///
+/// `quarantine_file` unlinks the original after vaulting it. For a
+/// system binary (`/usr/bin/bash` abused by `bash -c`, `systemd`,
+/// `sshd`), a kernel image, a config tree, or NorthNarrow's own
+/// binaries/state, that unlink makes the host unbootable, locks the
+/// operator out, or disables the agent itself — a self-inflicted
+/// denial of service that a malformed event, an LLM verdict or an
+/// upstream bug can trigger. Malware living under these prefixes is
+/// still handled by KillProcess / KillProcessTree; it just cannot be
+/// removed from disk by the executor. A prefix ending in `/` matches
+/// a directory subtree; one without matches as a filename prefix
+/// (`/usr/local/bin/northnarrow-` covers agent + watchdog).
+const QUARANTINE_DENY_PREFIXES: &[&str] = &[
+    "/bin/",
+    "/sbin/",
+    "/lib/",
+    "/lib32/",
+    "/lib64/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/usr/lib/",
+    "/usr/lib32/",
+    "/usr/lib64/",
+    "/usr/libexec/",
+    "/etc/",
+    "/boot/",
+    "/proc/",
+    "/sys/",
+    "/dev/",
+    "/usr/local/bin/northnarrow-",
+    "/usr/local/bin/nn-admin",
+    "/var/lib/northnarrow/",
+    "/run/northnarrow/",
+];
+
+/// `true` when `path` must never be vaulted + unlinked. Lexical check
+/// on the path as resolved from `/proc/<pid>/exe` (already absolute
+/// and symlink-free, so `..`/symlink games cannot escape a prefix).
+pub fn is_quarantine_denied(path: &Path) -> bool {
+    let p = path.to_string_lossy();
+    QUARANTINE_DENY_PREFIXES.iter().any(|d| p.starts_with(d))
+}
 const NONCE_LEN: usize = 12;
 
 /// Public entry point: encrypt the binary backing `target_pid` and
@@ -101,6 +145,17 @@ pub fn quarantine_process_binary(
             ExecutionOutcome::Quarantined {
                 original_path: original_str,
                 vault_id,
+            }
+        }
+        Err(QuarantineError::ProtectedPath) => {
+            warn!(
+                pid = target_pid,
+                path = %original_str,
+                "binary lives under a protected system prefix; refusing to quarantine (kill-only)"
+            );
+            ExecutionOutcome::Refused {
+                pid: target_pid,
+                reason: "path is under a protected system prefix",
             }
         }
         Err(QuarantineError::TooLarge { size, max }) => {
@@ -181,7 +236,12 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
 
 #[derive(Debug)]
 enum QuarantineError {
-    TooLarge { size: u64, max: u64 },
+    /// Path is under [`QUARANTINE_DENY_PREFIXES`]; nothing was touched.
+    ProtectedPath,
+    TooLarge {
+        size: u64,
+        max: u64,
+    },
     Io(std::io::Error),
     Crypto(String),
 }
@@ -193,6 +253,9 @@ impl From<std::io::Error> for QuarantineError {
 }
 
 fn quarantine_file(original: &Path, cfg: &ExecutorConfig) -> Result<String, QuarantineError> {
+    if is_quarantine_denied(original) {
+        return Err(QuarantineError::ProtectedPath);
+    }
     let meta = fs::metadata(original)?;
     let size = meta.len();
     if size > cfg.quarantine_max_bytes {
@@ -393,6 +456,54 @@ mod tests {
         let restored_path = tmp.path().join("restored.bin");
         restore(&vault_id, &restored_path, &cfg).expect("restore");
         assert_eq!(fs::read(&restored_path).unwrap(), payload);
+    }
+
+    #[test]
+    fn denylist_covers_system_and_own_paths() {
+        for p in [
+            "/usr/bin/bash",
+            "/bin/sh",
+            "/usr/lib/systemd/systemd",
+            "/usr/sbin/sshd",
+            "/etc/northnarrow/admin.pub",
+            "/boot/vmlinuz",
+            "/usr/local/bin/northnarrow-agent",
+            "/usr/local/bin/northnarrow-watchdog",
+            "/usr/local/bin/nn-admin",
+            "/var/lib/northnarrow/quarantine/key",
+        ] {
+            assert!(is_quarantine_denied(Path::new(p)), "{p} must be denied");
+        }
+        for p in [
+            "/tmp/payload",
+            "/home/user/.cache/x",
+            "/usr/local/bin/evil",
+            "/opt/app/bin/tool",
+            "/var/tmp/dropper",
+        ] {
+            assert!(!is_quarantine_denied(Path::new(p)), "{p} must be allowed");
+        }
+    }
+
+    #[test]
+    fn refuses_to_quarantine_protected_path_without_touching_it() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        // A real system binary: the denylist must fire BEFORE any
+        // metadata/read/unlink, so the file is untouched afterwards.
+        let target = Path::new("/bin/sh");
+        let before = fs::metadata(target).expect("/bin/sh exists on a Linux test host");
+        match quarantine_file(target, &cfg) {
+            Err(QuarantineError::ProtectedPath) => {}
+            Ok(_) => panic!("expected ProtectedPath, got Ok"),
+            Err(_) => panic!("expected ProtectedPath, got a different error"),
+        }
+        let after = fs::metadata(target).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert!(
+            !tmp.path().join("vault").exists(),
+            "no vault must be created for a refused path"
+        );
     }
 
     #[test]

@@ -114,6 +114,21 @@ pub fn kill_process_tree(
     root_pid: u32,
     protected: &HashSet<u32>,
 ) -> (ExecutionOutcome, Vec<ExecutionOutcome>) {
+    // Hard floor: PID 0 (the kernel's own parent in the /proc ppid map)
+    // and PID 1 (init) can never be a tree root. `kill_process` already
+    // refuses PID 0 and `protected` normally holds 1, but the /proc walk
+    // below would STILL enumerate their descendants — for PID 0 that is
+    // init + kthreadd, i.e. every process on the host — and reap them
+    // one by one. Refuse before walking anything.
+    if root_pid <= 1 {
+        return (
+            ExecutionOutcome::Refused {
+                pid: root_pid,
+                reason: "PID <= 1 is never a kill-tree root",
+            },
+            Vec::new(),
+        );
+    }
     // Snapshot the proc tree once before we kill anything; new
     // children spawned after this point are out of scope of this run.
     let descendants = collect_descendants(root_pid).unwrap_or_default();
@@ -138,6 +153,12 @@ fn collect_descendants(root_pid: u32) -> std::io::Result<Vec<u32>> {
     while let Some(parent) = frontier.pop() {
         if let Some(children) = map.get(&parent) {
             for &child in children {
+                // init (1) and kthreadd (2) are never "descendants" of
+                // anything we are allowed to kill; skipping them here
+                // also prunes every kernel thread from the walk.
+                if child <= 2 {
+                    continue;
+                }
                 if out.len() >= MAX_DESCENDANTS {
                     return Ok(out);
                 }
@@ -223,6 +244,30 @@ mod tests {
             out,
             ExecutionOutcome::AlreadyGone { pid: 999_999_999 }
         ));
+    }
+
+    #[test]
+    fn kill_tree_refuses_pid_zero_without_walking() {
+        // PID 0's /proc "children" are init + kthreadd: walking them
+        // would enumerate the whole host. Must refuse with NO outcomes.
+        let (primary, rest) = kill_process_tree(0, &protected_with(&[]));
+        assert!(matches!(primary, ExecutionOutcome::Refused { pid: 0, .. }));
+        assert!(rest.is_empty(), "no descendant may be touched: {rest:?}");
+    }
+
+    #[test]
+    fn kill_tree_refuses_pid_one_without_walking() {
+        let (primary, rest) = kill_process_tree(1, &protected_with(&[]));
+        assert!(matches!(primary, ExecutionOutcome::Refused { pid: 1, .. }));
+        assert!(rest.is_empty(), "no descendant may be touched: {rest:?}");
+    }
+
+    #[test]
+    fn collect_descendants_never_yields_init_or_kthreadd() {
+        // Even when asked for PID 0's subtree directly, the walk must
+        // not surface PID 1 / PID 2 (and therefore none of their kids).
+        let kids = collect_descendants(0).expect("walk ok");
+        assert!(kids.is_empty(), "got {kids:?}");
     }
 
     #[test]

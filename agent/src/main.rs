@@ -914,6 +914,32 @@ async fn main() -> Result<()> {
              isolation will touch the system — verdicts are logged as \"would execute\" only"
         );
     }
+    // Capability preflight: the systemd CapabilityBoundingSet is the
+    // hard ceiling on what this root process can do. Without CAP_KILL,
+    // kill(2) only reaches uid-0 targets, so every KillProcess verdict
+    // against a user-owned process would EPERM — in enforcement mode
+    // that is a refuse-to-start, not a warning. The other caps only
+    // degrade a secondary surface and are reported for the journal.
+    match northnarrow_agent::response::caps_preflight::current_missing() {
+        Some(missing) if !missing.is_empty() => {
+            for name in &missing.names {
+                warn!(
+                    cap = name,
+                    breaks = northnarrow_agent::response::caps_preflight::impact_of(name),
+                    "capability missing from effective set"
+                );
+            }
+            if missing.kill_missing && !detect_only {
+                anyhow::bail!(
+                    "CAP_KILL missing from the effective capability set: KillProcess would \
+                     EPERM on every non-root target. Add CAP_KILL to CapabilityBoundingSet= \
+                     in northnarrow-agent.service, or start with --detect-only."
+                );
+            }
+        }
+        Some(_) => debug!("capability preflight: all required caps present"),
+        None => warn!("capability preflight: /proc/self/status unreadable; cannot verify caps"),
+    }
     info!(
         own_pid = executor.own_pid(),
         protected = executor.protected().len(),
