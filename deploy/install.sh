@@ -250,6 +250,24 @@ fi
 # are left untouched; only fresh installs receive the seed file.
 # The matching `.local` overlays are NOT shipped by install.sh
 # (operator-curated, deploy via configuration management).
+# COMBAT rulesets (iptables-restore bodies for the NORTHNARROW_COMBAT
+# chain, v4 + v6). Load-bearing beyond isolation: without a loadable
+# v4 ruleset the agent builds no NetworkIsolator, and the admin socket
+# (status / unlock / detections) is NOT started at all — the watchdog's
+# STATUS ping then fails every 30 s and its stuck-recovery restarts a
+# healthy agent forever (seen on the lab guest, 2026-10-08). Ship the
+# defaults from configs/ like every other v1 file; an operator copy is
+# never overwritten.
+for rules in combat-rules.v4 combat-rules.v6; do
+    if [[ -f "$ETC_DIR/$rules" ]]; then
+        echo "install.sh: $ETC_DIR/$rules already present — leaving operator copy untouched"
+    else
+        require_file "$REPO_ROOT/configs/$rules" "expected at $REPO_ROOT/configs/$rules (COMBAT ruleset)"
+        echo "install.sh: copying default COMBAT ruleset to $ETC_DIR/$rules"
+        install -m 0644 -o root -g root "$REPO_ROOT/configs/$rules" "$ETC_DIR/$rules"
+    fi
+done
+
 if [[ -f "$ETC_DIR/netflow-blocklist.v1" ]]; then
     echo "install.sh: $ETC_DIR/netflow-blocklist.v1 already present — leaving operator copy untouched"
 else
@@ -347,6 +365,18 @@ fi
 # closes a brief race window on first boot.
 echo "install.sh: ensuring $STATE_DIR (mode 0700, root:root)"
 install -d -m 0700 -o root -g root "$STATE_DIR"
+# Upgrade path: the agent applies chattr +i to $STATE_DIR at boot
+# (anti_tamper/filesystem.rs, belt-and-suspenders under the LSM deny
+# hooks). With the agent stopped the LSM hooks are gone but the
+# immutable flag persists, and every `install` below fails with
+# "Operation not permitted". Lift it here; the agent re-applies it on
+# its next start. (With the agent RUNNING the LSM hooks still deny
+# these writes — stop it first, or upgrade through the signed
+# FS_PROTECT_OVERRIDE window.)
+if command -v lsattr >/dev/null 2>&1 && lsattr -d "$STATE_DIR" 2>/dev/null | awk '{print $1}' | grep -q i; then
+    echo "install.sh: $STATE_DIR is immutable (chattr +i from a previous agent run) — lifting for the install"
+    chattr -i "$STATE_DIR"
+fi
 
 for fim_log in fim_baseline.jsonl fim_drift.jsonl; do
     if [[ -f "$STATE_DIR/$fim_log" ]]; then
