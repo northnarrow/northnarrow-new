@@ -39,6 +39,18 @@ impl R004ExecFromProcSelfFd {
     /// from a memfd or anonymous fd, which is a strong fileless-exec
     /// signal.
     fn is_proc_fd_path(path: &str) -> bool {
+        // `/dev/fd` is a symlink to `/proc/self/fd` and is what glibc's
+        // fexecve(3) actually passes to execve on a memfd (lab guest,
+        // Ubuntu 24.04 / glibc 2.39: the exec surfaced as
+        // `filename: "/dev/fd/4", comm: "memfd:nnx_memfd"` and R004
+        // stayed silent). `/memfd:` is what execveat(AT_EMPTY_PATH)
+        // reports. Both are the same fileless-exec signal.
+        if let Some(after) = path.strip_prefix("/dev/fd/") {
+            return !after.is_empty();
+        }
+        if path.starts_with("/memfd:") {
+            return true;
+        }
         let rest = match path.strip_prefix("/proc/") {
             Some(r) => r,
             None => return false,
@@ -237,6 +249,25 @@ mod tests {
     #[test]
     fn fires_on_memfd_fileless_exec() {
         let ev = spawn_exec("/proc/self/fd/3", 9001, "loader", &["/proc/self/fd/3"]);
+        assert!(R004ExecFromProcSelfFd.evaluate(&ev).is_some());
+    }
+
+    /// What glibc's fexecve(3) really passes on Ubuntu 24.04: the
+    /// `/dev/fd/N` symlink form (lab guest 2026-10-08, memfd exec seen as
+    /// `filename: "/dev/fd/4"`). Must fire like `/proc/self/fd/N`.
+    #[test]
+    fn fires_on_dev_fd_form() {
+        let ev = spawn_exec("/dev/fd/4", 9001, "loader", &["nnx_memfd"]);
+        assert!(R004ExecFromProcSelfFd.evaluate(&ev).is_some());
+        assert!(!R004ExecFromProcSelfFd::is_proc_fd_path("/dev/fd/"));
+        assert!(!R004ExecFromProcSelfFd::is_proc_fd_path("/dev/fdx/1"));
+    }
+
+    /// execveat(fd, "", AT_EMPTY_PATH) on a memfd surfaces as
+    /// `/memfd:<name> (deleted)`.
+    #[test]
+    fn fires_on_memfd_pseudo_path() {
+        let ev = spawn_exec("/memfd:payload (deleted)", 9001, "loader", &["payload"]);
         assert!(R004ExecFromProcSelfFd.evaluate(&ev).is_some());
     }
 
