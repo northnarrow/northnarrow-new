@@ -30,6 +30,34 @@ host.
 > If `admin.pub` does not exist, COMBAT is **unrecoverable** except by
 > reboot. Always provision an admin key.
 
+### 1.1 What the install key can do (roles)
+
+`admin.pub` holds one line per key: `<hex64-pubkey> [role,role,...]`.
+A line **without** a role list — which is what `nn-admin init` writes —
+gets the default allowlist **`unlock,audit-read`** only. So the key
+bootstrapped by `install.sh` releases COMBAT and reads the audit log,
+and nothing else: `nn-admin canary deploy|burn|refresh` (`canary-manage`),
+`fim baseline` (`fim-manage`), `force-posture`, `shutdown` and
+`rotate-keys` are refused with an authorisation error.
+
+Grant extra roles either by editing the line in `admin.pub` (the agent
+re-reads it at start; the file is write-protected by the agent's
+inode guard, so do it from a root shell **before** starting the unit,
+or through `rotate-keys add`), or by adding a dedicated key:
+
+```sh
+# dedicated canary-operator key, generated offline
+nn-admin init --priv-out canary-ops.key --pub-append /dev/null
+nn-admin rotate-keys add --new-pubkey <hex> --new-roles canary-manage,audit-read \
+    --key admin.key [--cosign-key ...]
+```
+
+Keep the principle of least privilege: the key that releases COMBAT
+does not need `canary-manage`, and a canary operator does not need
+`unlock`. The lab runbook's test fixtures grant the roles each suite
+needs explicitly, which is why `canary deploy` works there and not
+with an untouched install key.
+
 ---
 
 ## 2. Avoiding lockout: the management carve-out

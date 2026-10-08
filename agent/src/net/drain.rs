@@ -385,10 +385,30 @@ async fn process_close_record(
             match flow_tracker.lock().on_tcp_close(&info) {
                 Some(e) => e,
                 None => {
-                    // Orphan close — connect predated the agent
-                    // OR FLOW_SOCK_MAP got LRU-evicted between
-                    // connect + close. Drop on the floor.
-                    debug!("net drain: TCP close had no matching pending flow");
+                    // Orphan close — connect predated the agent, OR
+                    // FLOW_SOCK_MAP got LRU-evicted between connect +
+                    // close (corr_id all-zero = the kernel-side lookup
+                    // missed), OR the connect kprobe never fired for
+                    // this socket. Dropped on the floor, but at WARN
+                    // with the 5-tuple so an operator (and the lab
+                    // e2e, review entry 18) can see WHICH flow went
+                    // unrecorded instead of a silent gap.
+                    warn!(
+                        target: "net.drain",
+                        pid = raw.pid,
+                        comm = %String::from_utf8_lossy(&raw.comm).trim_end_matches('\0'),
+                        src = %format!("{}:{}", info.src_addr, info.src_port),
+                        dst = %format!(
+                            "{}:{}",
+                            decode_addr(raw.family, raw.dst_addr),
+                            raw.dst_port
+                        ),
+                        kernel_lookup_miss = raw.flow_id == [0u8; 16],
+                        close_reason = raw.close_reason,
+                        bytes_sent = raw.bytes_sent,
+                        bytes_recv = raw.bytes_recv,
+                        "net drain: TCP close had no matching pending flow — row NOT recorded"
+                    );
                     return;
                 }
             }

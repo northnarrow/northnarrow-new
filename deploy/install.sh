@@ -347,7 +347,9 @@ else
         echo "  #  store it offline, e.g.:                                                #"
         echo "  #      mv $ETC_DIR/admin.key  <secure-offline-location>"
         echo "  #  Keep ONLY the public half ($ETC_DIR/admin.pub) on the host.            #"
-        echo "  #  Recovery procedure: docs/operator/COMBAT_RECOVERY.md                   #"
+        echo "  #  Roles: this key gets unlock,audit-read ONLY. canary-manage /           #"
+        echo "  #  fim-manage / force-posture need a role list on its admin.pub line.     #"
+        echo "  #  Recovery procedure: docs/operator/COMBAT_RECOVERY.md (section 1.1)    #"
         echo "  ##########################################################################"
         echo ""
     else
