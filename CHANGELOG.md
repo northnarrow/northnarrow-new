@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- `/etc/northnarrow` directory inode is now in PROTECTED_INODES
+  (mutation-denied): the config tree can no longer be renamed or removed
+  from under the agent by a root process outside PROTECTED_PIDS.
+- Canary deploy enforces a path policy (no system trees, no `/run`, no
+  NorthNarrow state/config, no `..`, no symlink escape, `O_NOFOLLOW`
+  write): a leaked admin key can no longer write root-owned files at
+  arbitrary paths through `nn-admin canary deploy`.
 - Anti-tamper `task_kill` hook is deny-by-default: every userspace signal
   towards a protected pid is refused (previously only SIGKILL/SIGTERM, so
   `kill -INT/-HUP/-QUIT/-STOP` from root stopped or froze the agent).
