@@ -713,11 +713,16 @@ pub fn process_drift(
     // Integrity-changing ops (Modified / Created / Deleted / Renamed
     // / Linked) skip this block entirely and flow through unchanged.
     if matches!(op, FimOp::Opened) {
-        if !crate::fim::rules::is_credential_path(&path) {
+        // Two consumers of a read-open exist: the credential-read rules
+        // (NN-L-FIM-011..017, matched by path) and the K3 file-canary
+        // detector (matched by inode, published by the canary index
+        // rebuilds). Everything else is dropped as non-drift noise.
+        let is_canary = crate::canary::read_forward::contains(&key);
+        if !is_canary && !crate::fim::rules::is_credential_path(&path) {
             debug!(
                 target: "fim.drain",
                 path = %path,
-                "BUG-012 v2: dropping FimOp::Opened on non-credential watched path \
+                "BUG-012 v2: dropping FimOp::Opened on non-credential, non-canary watched path \
                  (a read is not integrity drift; no rule consumes it)"
             );
             return Ok(false);
@@ -732,7 +737,8 @@ pub fn process_drift(
             target: "fim.drain",
             path = %path,
             modifier_comm = %comm_to_string(&raw.modifier_comm),
-            "BUG-012 v2: forwarding FimOp::Opened on credential path to rule engine \
+            canary = is_canary,
+            "BUG-012 v2: forwarding FimOp::Opened on credential/canary path to rule engine \
              (silent — not recorded as drift)"
         );
         if let Some(tx) = event_tx {

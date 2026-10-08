@@ -155,6 +155,9 @@ impl CanaryIndexes {
                 }
             }
         }
+        // Publish the file-canary inodes so the FIM drain forwards
+        // their READ opens past the BUG-012 v2 gate (see read_forward).
+        crate::canary::read_forward::replace(self.inode_index.keys().copied());
     }
 
     /// Hot-path inode lookup. Returns the canary_id of the

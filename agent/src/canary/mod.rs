@@ -19,5 +19,6 @@
 
 pub mod access_log;
 pub mod detector;
+pub mod read_forward;
 pub mod registry;
 pub mod templates;
