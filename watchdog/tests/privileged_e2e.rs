@@ -607,9 +607,11 @@ fn watchdog_respawns_agent_3_cycles_with_backoff() {
         fx.unprotect_and_sigkill_agent(last_pid);
 
         // Wait for the watchdog to spawn a new agent + the new
-        // agent to publish its pidfile. Generous 15 s budget per
-        // cycle (agent BPF load is slow on cold cache).
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // agent to publish its pidfile. 30 s budget per cycle: the
+        // agent BPF load is slow on a cold cache, and the first cycle
+        // right after a release rebuild on the lab guest was seen to
+        // overrun the previous 15 s (watchdog backoff + BTF parse).
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut new_pid: Option<u32> = None;
         while Instant::now() < deadline {
             if let Ok(s) = fs::read_to_string(fx.agent_pidfile()) {
