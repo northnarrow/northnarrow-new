@@ -732,6 +732,56 @@ fn two_blunt_combat_signals_in_one_round_cap_at_engaged() {
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
+/// Audit `posture-3` — a PAM session writing into its OWN
+/// `/run/user/<loginuid>/` (session start plumbing) must not trip the
+/// mass-write arm; the same burst anywhere else, or into another uid's
+/// runtime dir, still escalates.
+#[test]
+fn own_runtime_dir_burst_is_not_mass_write_but_home_burst_is() {
+    let proc_root = tempfile::tempdir().expect("fake /proc");
+    let pid_dir = proc_root.path().join("900");
+    std::fs::create_dir_all(&pid_dir).unwrap();
+    std::fs::write(pid_dir.join("loginuid"), "1000\n").unwrap();
+    let mk = || {
+        let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+        let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+        PostureMachine::new_with_hooks_and_exempt_and_auth(
+            entry_hook,
+            release_hook,
+            ExemptPids::with_agent(4242),
+            AuthSessionTracker::new(proc_root.path()),
+        )
+    };
+    let burst = |prefix: &str| -> (Vec<Event>, Event) {
+        let recent: Vec<Event> = (0..25u64)
+            .map(|i| file_open(900, 1000, &format!("{prefix}/f-{i}"), 1, i + 100))
+            .collect();
+        (
+            recent,
+            file_open(900, 1000, &format!("{prefix}/f-99"), 1, 200),
+        )
+    };
+
+    // Own runtime dir: carved out.
+    let m = mk();
+    let (recent, focal) = burst("/run/user/1000");
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_none(), "own /run/user burst must not escalate: {r:?}");
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    // Another uid's runtime dir: still counted.
+    let m = mk();
+    let (recent, focal) = burst("/run/user/1001");
+    m.observe(&focal, &recent);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    // $HOME: a session's ransomware-shaped burst is still caught.
+    let m = mk();
+    let (recent, focal) = burst("/home/u");
+    m.observe(&focal, &recent);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
 /// Test #18 — agent's own writes still exempt (PR #123 regression
 /// guard). Validates that adding the auth-lineage gate did not
 /// break the pre-existing stack-PID exclusion.
