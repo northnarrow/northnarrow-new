@@ -1963,16 +1963,34 @@ pub fn run_detections(
 /// split these with a dedicated internal-error result.)
 #[derive(Debug)]
 pub enum DetectionSetStatusOutcome {
-    Success { id: u64, new_status: String },
+    Success {
+        id: u64,
+        new_status: String,
+    },
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
-    QuorumNotMet { required: u8, provided: u8 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    QuorumNotMet {
+        required: u8,
+        provided: u8,
+    },
     RoleDenied,
-    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
     AgentIdMismatch,
     NotFound,
-    ProtocolVersionUnsupported { server_version: u16 },
+    /// The request was valid but the agent could not append the
+    /// status-event (chain-persist-1): the change was NOT recorded.
+    PersistFailed {
+        id: u64,
+    },
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
     Transport,
 }
 
@@ -2004,6 +2022,7 @@ fn map_response_to_set_status(
         // persistence failure. The NotFound outcome is rendered as a
         // "not applied — not found / not persisted; retry" message so
         // a transient write failure isn't misreported as a gone id.
+        AdminResult::UnknownOperation if resp.persist_failed => O::PersistFailed { id: resp.id },
         AdminResult::UnknownOperation => O::NotFound,
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             O::ProtocolVersionUnsupported { server_version }
@@ -3079,5 +3098,31 @@ mod tests {
             msg.contains("64 hex chars"),
             "error must mention the 64-hex-char shape; got: {msg}"
         );
+    }
+    /// chain-persist-1: a persistence failure must not masquerade as
+    /// "detection not found" — the wire flag maps to its own outcome.
+    #[test]
+    fn set_status_persist_failure_is_distinguishable_from_not_found() {
+        use common::wire::admin_protocol::DetectionSetStatusResponse;
+        let not_found = DetectionSetStatusResponse {
+            result: AdminResult::UnknownOperation,
+            id: 7,
+            new_status: String::new(),
+            persist_failed: false,
+        };
+        assert!(matches!(
+            map_response_to_set_status(not_found),
+            DetectionSetStatusOutcome::NotFound
+        ));
+        let persist = DetectionSetStatusResponse {
+            result: AdminResult::UnknownOperation,
+            id: 7,
+            new_status: String::new(),
+            persist_failed: true,
+        };
+        assert!(matches!(
+            map_response_to_set_status(persist),
+            DetectionSetStatusOutcome::PersistFailed { id: 7 }
+        ));
     }
 }
