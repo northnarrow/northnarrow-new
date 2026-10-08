@@ -38,6 +38,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   0.9.21 (RUSTSEC-2026-0204).
 
 ### Added
+- `deploy/lab/nn-lab.sh`: QEMU/KVM Ubuntu 24.04 lab guest (kernel 6.8,
+  `lsm=…,bpf`) with sync/build/test-e2e/test-ignored/install/respawn-check
+  sub-commands; runs from WSL2 with nested virtualization.
 - `cargo audit` CI job, Dependabot (cargo + GitHub Actions), `SECURITY.md`.
 
 ## [0.0.1] — 2026-06-10

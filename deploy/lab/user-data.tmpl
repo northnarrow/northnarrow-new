@@ -1,0 +1,43 @@
+#cloud-config
+# NorthNarrow local lab guest (deploy/lab/nn-lab.sh). Rendered once per
+# `nn-lab.sh up`; __SSH_PUBKEY__ is substituted by the script.
+hostname: nn-lab
+manage_etc_hosts: true
+users:
+  - name: nn
+    groups: [sudo, adm]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+package_update: true
+package_upgrade: false
+packages:
+  - iptables
+  - bpftool
+  - linux-tools-common
+  - build-essential
+  - pkg-config
+  - git
+  - rsync
+  - jq
+  - strace
+  - curl
+write_files:
+  # BPF-LSM: Ubuntu 24.04 ships lockdown,capability,landlock,yama,apparmor;
+  # the Tappa 7 anti-tamper hooks need `bpf` in the list.
+  - path: /etc/default/grub.d/99-nn-bpf-lsm.cfg
+    permissions: "0644"
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=lockdown,capability,landlock,yama,apparmor,bpf"
+runcmd:
+  - update-grub
+  # rustup (stable, minimal) for the guest-side userland build.
+  - su - nn -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable'
+  - su - nn -c 'echo "source \$HOME/.cargo/env" >> ~/.bashrc'
+  - touch /var/lib/nn-lab-provisioned
+power_state:
+  mode: reboot
+  message: "nn-lab: rebooting with lsm=...,bpf"
+  condition: true
