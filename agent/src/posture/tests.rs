@@ -782,6 +782,61 @@ fn own_runtime_dir_burst_is_not_mass_write_but_home_burst_is() {
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 }
 
+/// Review `posture-ledger-scope-1` — a blunt COMBAT-tier burst in login
+/// session B is not corroborated by an earlier escalation signal from
+/// session A; the same two rounds inside ONE session still reach COMBAT.
+#[test]
+fn corroboration_is_scoped_to_the_login_session() {
+    let proc_root = tempfile::tempdir().expect("fake /proc");
+    for (pid, uid) in [(900u32, 1000u32), (901, 1001)] {
+        let d = proc_root.path().join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("loginuid"), format!("{uid}\n")).unwrap();
+    }
+    let mk = || {
+        let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+        let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+        PostureMachine::new_with_hooks_and_exempt_and_auth(
+            entry_hook,
+            release_hook,
+            ExemptPids::with_agent(4242),
+            AuthSessionTracker::new(proc_root.path()),
+        )
+    };
+    let burst = |pid: u32, prefix: &str, base: u64| -> (Vec<Event>, Event) {
+        let recent: Vec<Event> = (0..25u64)
+            .map(|i| file_open(pid, 1000, &format!("{prefix}/f-{i}"), 1, base + i))
+            .collect();
+        (
+            recent,
+            file_open(pid, 1000, &format!("{prefix}/f-99"), 1, base + 100),
+        )
+    };
+
+    // Session A (uid 1000): $HOME burst → ENGAGED, ledger entry scoped
+    // to 1000. Session B (uid 1001): persistence-prefix burst must NOT
+    // be vouched for by A's signal.
+    let m = mk();
+    let (recent, focal) = burst(900, "/home/a", 100);
+    m.observe(&focal, &recent);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (recent, focal) = burst(901, "/etc/systemd/system", 300);
+    m.observe(&focal, &recent);
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "a different login session must not corroborate into COMBAT"
+    );
+
+    // Same session for both rounds: legitimate corroboration → COMBAT.
+    let m = mk();
+    let (recent, focal) = burst(900, "/home/a", 100);
+    m.observe(&focal, &recent);
+    let (recent, focal) = burst(900, "/etc/systemd/system", 300);
+    m.observe(&focal, &recent);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
 /// Test #18 — agent's own writes still exempt (PR #123 regression
 /// guard). Validates that adding the auth-lineage gate did not
 /// break the pre-existing stack-PID exclusion.
