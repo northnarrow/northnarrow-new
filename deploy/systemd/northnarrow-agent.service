@@ -58,6 +58,14 @@ ExecStart=/usr/local/bin/northnarrow-agent \
 Restart=no
 RuntimeDirectory=northnarrow
 RuntimeDirectoryMode=0700
+# /run/northnarrow is SHARED with the watchdog (watchdog.pid, the A8
+# shutdown marker, honeypot control-surface baits). Without Preserve,
+# systemd wipes and recreates the directory every time THIS unit stops —
+# i.e. on every respawn-v2 restart — and the watchdog's pidfile vanishes
+# (seen on the lab guest: "cat: /run/northnarrow/watchdog.pid: No such
+# file" right after a respawn-check). Preserve keeps it across restarts;
+# it is still removed at shutdown (tmpfs).
+RuntimeDirectoryPreserve=yes
 
 # Resource ceilings (Beta Step 2a — confine an ADE runaway to the
 # agent's own cgroup instead of letting the kernel OOM-killer roam

@@ -56,6 +56,35 @@ and shipped with its provenance stamp; the guest only builds userland,
 so `agent/build.rs`'s staleness guard still holds. `respawn-check` is
 the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
 
+### Nightly, unattended
+
+`deploy/lab/nn-lab.sh nightly` runs check → sync → build → test-e2e →
+test-ignored → install → respawn-check without stopping at the first
+failure, writes `~/.cache/nn-lab/reports/<stamp>.md` (status, duration
+and every `test result:` line per step; `latest.md` points at the newest)
+and exits 1 if any step failed. The privileged tests only *compile* in
+GitHub CI, so this is the run that catches a test or a kernel-side
+behaviour drifting from the product — the 2026-10-08 lab rounds found
+two detection gaps and a dozen stale tests that CI had been green on
+for months.
+
+Schedule it from WSL2 with cron (the guest must be reachable; `up` is
+run automatically when it is not):
+
+```sh
+crontab -e
+# 02:30 every night; mail/notify on the report yourself, or just read latest.md
+30 2 * * * $HOME/northnarrow-new/deploy/lab/nn-lab.sh nightly >> $HOME/.cache/nn-lab/nightly.log 2>&1
+```
+
+`cron` inside WSL2 only ticks while the distro is running; on a desktop
+that sleeps, trigger it from Windows Task Scheduler instead:
+`wsl.exe -d Ubuntu -u <user> -- bash -lc '~/northnarrow-new/deploy/lab/nn-lab.sh nightly'`.
+After a WSL restart `/dev/kvm` must be writable again (`kvm` group
+membership, or `sudo chmod 666 /dev/kvm`). `NN_LAB_NIGHTLY_DOWN=1` powers
+the guest off at the end; `NN_LAB_NIGHTLY_SKIP="test-ignored"` skips a
+step (the ignored suite includes the 5-minute rate-limit test).
+
 ## Build
 
 ```sh

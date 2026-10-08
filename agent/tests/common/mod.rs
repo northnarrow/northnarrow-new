@@ -214,3 +214,59 @@ mod tests {
         );
     }
 }
+
+/// Remove `pid` AND every process below it from the pinned
+/// `PROTECTED_PIDS` map so a plain signal from the test runner reaches
+/// the agent. Since `task-kill-signals-1` the task_kill LSM hook denies
+/// EVERY userspace signal towards a protected pid unless the caller is
+/// the process itself, another protected pid or PID 1 with the armed
+/// nonce — the test runner is none of those. The fixtures spawn the
+/// agent through `sudo`, so `Child::id()` is sudo's pid and the agent is
+/// its child: sudo relays SIGQUIT to it, and that relay is what the hook
+/// would refuse (the first run after the policy change hung in wait4
+/// on sudo with the agent still protected). Walking the descendants
+/// covers both shapes. Best effort: a missing pin or bpftool means the
+/// agent was never protected.
+#[allow(dead_code)]
+pub fn unprotect_pid(pid: u32) {
+    let mut todo = vec![pid];
+    let mut seen = Vec::new();
+    while let Some(p) = todo.pop() {
+        if seen.contains(&p) {
+            continue;
+        }
+        seen.push(p);
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .args(["-P", &p.to_string()])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(c) = line.trim().parse::<u32>() {
+                    todo.push(c);
+                }
+            }
+        }
+    }
+    for p in seen {
+        let key_bytes = [
+            p & 0xFF,
+            (p >> 8) & 0xFF,
+            (p >> 16) & 0xFF,
+            (p >> 24) & 0xFF,
+        ]
+        .map(|b| b.to_string());
+        let _ = std::process::Command::new("sudo")
+            .args([
+                "bpftool",
+                "map",
+                "delete",
+                "pinned",
+                "/sys/fs/bpf/northnarrow/PROTECTED_PIDS",
+                "key",
+            ])
+            .args(key_bytes)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}

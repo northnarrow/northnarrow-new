@@ -857,6 +857,46 @@ pub async fn wait_for_new_agent_pid(pidfile: &Path, deadline: Duration) -> Resul
 /// `register_protected_pids` shortly anyway, so a failure here
 /// only widens the race window — it doesn't permanently lose
 /// PROTECTED_PIDS coverage.
+/// Register the watchdog's OWN pid in PROTECTED_PIDS (design §7.1 /
+/// §7.3 — "the new watchdog re-registers its own PID"). Two reasons it
+/// must be the watchdog itself and not only the agent: (1) ordering —
+/// the watchdog unit starts After= the agent, so at the first boot the
+/// agent finds no watchdog pidfile and registers nobody but itself;
+/// (2) since `task-kill-signals-1` the task_kill hook accepts a signal
+/// towards a protected pid only from another PROTECTED pid (or PID 1 /
+/// self), so an unregistered watchdog could not deliver its
+/// stuck-recovery SIGINT→SIGKILL. Best effort for the caller: no pinned
+/// map (agent without BPF-LSM) is a warn, not a fatal.
+pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
+    let mut handle = ProtectedPidsHandle::open(bpffs_root).with_context(|| {
+        format!(
+            "opening PROTECTED_PIDS handle at {} for self-registration",
+            bpffs_root.display()
+        )
+    })?;
+    handle
+        .insert(own_pid)
+        .with_context(|| format!("inserting watchdog PID {own_pid} into PROTECTED_PIDS"))?;
+    info!(
+        target: "watchdog",
+        pid = own_pid,
+        bpffs_root = %bpffs_root.display(),
+        "watchdog PID registered in PROTECTED_PIDS"
+    );
+    Ok(())
+}
+
+/// Counterpart of [`register_self_pid`] for a clean shutdown: leave no
+/// stale entry behind (the map holds 16 slots).
+pub fn unregister_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
+    let mut handle = ProtectedPidsHandle::open(bpffs_root)
+        .with_context(|| format!("opening PROTECTED_PIDS handle at {}", bpffs_root.display()))?;
+    handle
+        .evict(own_pid)
+        .with_context(|| format!("evicting watchdog PID {own_pid} from PROTECTED_PIDS"))?;
+    Ok(())
+}
+
 pub fn reinsert_new_agent_pid(bpffs_root: &Path, new_pid: u32) -> Result<()> {
     let mut handle = ProtectedPidsHandle::open(bpffs_root).with_context(|| {
         format!(

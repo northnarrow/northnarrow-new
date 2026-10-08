@@ -10,7 +10,12 @@ bootstrap all indistinguishable from attacks.
 
 The agent's PID is in `PROTECTED_PIDS`; the BPF-LSM `task_kill` and
 `ptrace_access_check` hooks deny any signal or `/proc/<pid>/*` read targeting
-that PID — even from `root`. That is correct against the V1 adversary
+that PID — even from `root`. (Until 2026-10-08 the `task_kill` hook actually
+policed only SIGKILL and SIGTERM, so `kill -INT`/`-HUP`/`-QUIT`/`-STOP` from a
+root shell stopped or froze the agent — `task-kill-signals-1`. The hook is now
+deny-by-default: every userspace signal towards a protected PID is refused
+unless it is signal 0, a self-signal, a signal from another protected PID
+(watchdog ↔ agent), or the PID-1 nonce carve-out below.) That is correct against the V1 adversary
 ("post-compromise root tries to silence the defender"), but it locks out
 three legitimate principals:
 
