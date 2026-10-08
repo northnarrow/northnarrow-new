@@ -231,6 +231,19 @@ cmd_install() {
     # stop the units (watchdog first) and drop the pin root: the hooks
     # detach with their links and the next agent boot re-pins fresh.
     vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; sudo rm -rf /sys/fs/bpf/northnarrow; true'
+    # Leftover e2e agents (a test that was still tearing down) keep their
+    # LSM programs attached through their own fds, and those deny the
+    # unlink of the installed binary: wait for the LSM set to drain,
+    # evicting + killing stragglers on the way.
+    vssh bash -s <<'REMOTE'
+for i in $(seq 1 20); do
+    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
+    [ "$n" = "0" ] && break
+    sudo pkill -9 -f "northnarrow-agent-e2etes[t]|northnarrow-watchdog-e2etes[t]" 2>/dev/null
+    sleep 1
+done
+echo "lsm programs still loaded before install: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
+REMOTE
     vcargo 'sudo ./deploy/install.sh && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
 }
 

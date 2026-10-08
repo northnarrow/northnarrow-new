@@ -77,6 +77,11 @@ fn agent_unit_keeps_restart_no_and_disables_start_rate_limit() {
         "systemd's start-rate limiter must not veto the watchdog's backoff"
     );
     assert_eq!(value(&d, "Type"), Some("notify"));
+    assert_eq!(
+        value(&d, "RuntimeDirectoryPreserve"),
+        Some("yes"),
+        "/run/northnarrow is shared with the watchdog; a respawn must not wipe it"
+    );
     let caps = value(&d, "CapabilityBoundingSet").expect("bounding set");
     assert!(caps.split_whitespace().any(|c| c == "CAP_KILL"), "{caps}");
 }
