@@ -26,13 +26,16 @@
 #   deploy/lab/nn-lab.sh status | down | destroy
 #
 # Env overrides: NN_LAB_DIR (~/.cache/nn-lab), NN_LAB_CPUS (4), NN_LAB_MEM (8192),
-#   NN_LAB_SSH_PORT (2222), NN_LAB_DISK (30G), NN_REPO (git toplevel of this script).
+#   NN_LAB_SSH_PORT (2222, remembered after `up`), NN_LAB_DISK (30G), NN_LAB_LTO (thin),
+#   NN_REPO (git toplevel of this script).
 set -euo pipefail
 
 LAB_DIR=${NN_LAB_DIR:-"$HOME/.cache/nn-lab"}
 CPUS=${NN_LAB_CPUS:-4}
 MEM=${NN_LAB_MEM:-8192}
-SSH_PORT=${NN_LAB_SSH_PORT:-2222}
+# The ssh port is remembered in $LAB_DIR/ssh_port after `up`, so every
+# later sub-command talks to the same guest without re-exporting it.
+SSH_PORT=${NN_LAB_SSH_PORT:-$(cat "${NN_LAB_DIR:-"$HOME/.cache/nn-lab"}/ssh_port" 2>/dev/null || echo 2222)}
 DISK_SIZE=${NN_LAB_DISK:-30G}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=${NN_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}
@@ -66,6 +69,15 @@ vm_running() {
 }
 
 vssh() { ssh "${SSH_OPTS[@]}" "$GUEST" "$@"; }
+# Guest shell with rustup's env loaded: `bash -l` does NOT reach the
+# `source ~/.cargo/env` line (~/.bashrc returns early when non-interactive).
+# ssh joins its arguments with spaces and hands the string to the remote
+# login shell, so the inner command must be re-quoted (printf %q) or the
+# `bash -c "…"` boundary is lost on the way.
+vcargo() {
+    local inner="source ~/.cargo/env 2>/dev/null; cd ~/northnarrow && $*"
+    vssh "bash -c $(printf '%q' "$inner")"
+}
 
 wait_ssh() {
     local deadline=$(( $(date +%s) + ${1:-600} ))
@@ -105,6 +117,10 @@ cmd_up() {
         printf 'instance-id: nn-lab-%s\nlocal-hostname: nn-lab\n' "$(date +%s)" > "$md"
         cloud-localds "$SEED" "$ud" "$md"
     fi
+    if ss -ltn 2>/dev/null | grep -qE "[:.]${SSH_PORT}\b"; then
+        die "127.0.0.1:$SSH_PORT is already in use on the host — pick another: NN_LAB_SSH_PORT=2322 $0 up"
+    fi
+    echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
     log "booting: ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
     qemu-system-x86_64 \
         -enable-kvm -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEM" \
@@ -157,23 +173,37 @@ cmd_sync() {
 
 cmd_build() {
     vm_running || die "guest is not running"
-    vssh bash -lc 'cd ~/northnarrow && cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | tail -3'
+    # LTO "fat" (Cargo.toml release profile) can peak 6-8 GiB at link;
+    # the guest has ~7 GiB, so default to thin here (NN_LAB_LTO=fat to
+    # mirror production exactly on a bigger guest).
+    local lto=${NN_LAB_LTO:-thin}
+    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 cmd_test_e2e() {
     vm_running || die "guest is not running"
     # docs/integration-test-runbook.md "Run": root + single-threaded (shared iptables chain).
-    vssh bash -lc 'cd ~/northnarrow && sudo -E env "PATH=$PATH" cargo test --release --features test-privileged --test privileged_e2e -- --test-threads=1 --nocapture'
+    # Both features: the test drives `nn-admin debug force-posture`, and
+    # cargo rebuilds the CARGO_BIN_EXE_* binaries with the features of
+    # THIS invocation — `test-privileged` alone yields an nn-admin without
+    # the `debug` subcommand (2 of 6 tests fail with "unrecognized
+    # subcommand 'debug'").
+    # Two crates ship a `privileged_e2e` target; run them as separate
+    # invocations (each with ITS crate's feature gate) so a failure is
+    # attributable and the watchdog suite starts from a settled host.
+    vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
+    log "agent privileged_e2e done — running the watchdog suite"
+    vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1 --nocapture'
 }
 
 cmd_test_ignored() {
     vm_running || die "guest is not running"
-    vssh bash -lc 'cd ~/northnarrow && sudo -E env "PATH=$PATH" cargo test --release --workspace --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1'
+    vcargo 'sudo -E env "PATH=$PATH" cargo test --release --workspace --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1'
 }
 
 cmd_install() {
     vm_running || die "guest is not running"
-    vssh bash -lc 'cd ~/northnarrow && sudo ./deploy/install.sh && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
+    vcargo 'sudo ./deploy/install.sh && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
 }
 
 cmd_respawn_check() {

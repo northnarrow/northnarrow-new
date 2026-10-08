@@ -76,12 +76,17 @@ sets `CARGO_BIN_EXE_*` env vars automatically at test-build time).
 ```sh
 sudo -E env "PATH=$PATH" \
   cargo test --release \
-    --features test-privileged \
+    --features test-privileged,debug-trigger \
     --test privileged_e2e \
     -- --test-threads=1 --nocapture
 ```
 
 Flags:
+- `--features test-privileged,debug-trigger` — BOTH, same as the build
+  step: cargo rebuilds `nn-admin` with the features of this invocation,
+  and without `debug-trigger` the `nn-admin debug force-posture` call
+  fails with `unrecognized subcommand 'debug'` (seen on the lab guest,
+  2026-10-08);
 
 - `sudo -E` preserves `$PATH` so cargo's own binary resolves;
   `--test-threads=1` is **mandatory** because iptables rules collide
@@ -90,7 +95,9 @@ Flags:
 - `--nocapture` is optional but very helpful — failures otherwise
   swallow the agent's stderr.
 
-Expected: **3 tests passing, 1 ignored** in ~30 s on a fast machine:
+Expected: **6 tests passing, 3 ignored** in ~90 s (the two COMBAT tests
+each wait for the graduated ladder to reach ISOLATE — ~30 s investigate
+window — before checking the iptables chain):
 
 ```
 running 4 tests
