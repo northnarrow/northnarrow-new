@@ -47,9 +47,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use common::ade_types::{AdeAction, AdeSeverity, AdeVerdict, MitreAttack};
-use common::{Event, ResponseAction, Severity, Verdict};
 use common::posture_types::PostureKind;
 use common::xai_types::XaiEvidenceChain;
+use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -214,10 +214,18 @@ impl Principal {
     pub fn from_event(event: &Event) -> Self {
         match event {
             Event::ProcessSpawn {
-                pid, ppid, uid, comm, ..
+                pid,
+                ppid,
+                uid,
+                comm,
+                ..
             }
             | Event::ExecCheck {
-                pid, ppid, uid, comm, ..
+                pid,
+                ppid,
+                uid,
+                comm,
+                ..
             } => Principal {
                 pid: *pid,
                 comm: comm.clone(),
@@ -653,7 +661,10 @@ pub fn open(
 /// (the only place fsync happens). Append failures are logged, not
 /// fatal — losing one detection must not take down the agent. Runs for
 /// the life of the process.
-fn spawn_writer(mut log: RotatingChainLog<DetectionRecord>, inner: Arc<SinkInner>) -> JoinHandle<()> {
+fn spawn_writer(
+    mut log: RotatingChainLog<DetectionRecord>,
+    inner: Arc<SinkInner>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut reported_dropped = 0u64;
         loop {
@@ -1357,7 +1368,10 @@ mod tests {
             "none".to_string(),
         );
         assert_eq!(file.sensor, Sensor::File);
-        assert_eq!(file.exe, None, "FileOpen.filename is the opened file, not an exe");
+        assert_eq!(
+            file.exe, None,
+            "FileOpen.filename is the opened file, not an exe"
+        );
         assert_eq!(file.principal.comm, "cat");
     }
 
@@ -1377,7 +1391,10 @@ mod tests {
         let mut v = serde_json::to_value(&rec).unwrap();
         v.as_object_mut().unwrap().remove("exe");
         let line = serde_json::to_string(&v).unwrap();
-        assert!(!line.contains("\"exe\""), "pre-9.0.a.1 line carries no exe key");
+        assert!(
+            !line.contains("\"exe\""),
+            "pre-9.0.a.1 line carries no exe key"
+        );
         let decoded: DetectionRecord = serde_json::from_str(&line).unwrap();
         assert_eq!(decoded.exe, None, "absent exe deserialises to None");
     }
@@ -1519,7 +1536,10 @@ mod tests {
         // signatures + linkage all check out).
         let report =
             verify_log_set::<DetectionRecord>(&path, &pubkey).expect("detection chain verifies");
-        assert_eq!(report.total_records, 5, "all five records in the verified chain");
+        assert_eq!(
+            report.total_records, 5,
+            "all five records in the verified chain"
+        );
     }
 
     fn count_data_lines(path: &Path) -> usize {
@@ -1642,10 +1662,38 @@ mod tests {
         write_records(
             &path,
             &[
-                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Low, DetectionStatus::Open, Sensor::Exec, "a"),
-                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "b"),
-                mk(3, "2026-06-09T12:00:03.000000Z", Severity::High, DetectionStatus::Open, Sensor::Exec, "c"),
-                mk(4, "2026-06-09T12:00:04.000000Z", Severity::Critical, DetectionStatus::Open, Sensor::Exec, "d"),
+                mk(
+                    1,
+                    "2026-06-09T12:00:01.000000Z",
+                    Severity::Low,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "a",
+                ),
+                mk(
+                    2,
+                    "2026-06-09T12:00:02.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "b",
+                ),
+                mk(
+                    3,
+                    "2026-06-09T12:00:03.000000Z",
+                    Severity::High,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "c",
+                ),
+                mk(
+                    4,
+                    "2026-06-09T12:00:04.000000Z",
+                    Severity::Critical,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "d",
+                ),
             ],
         );
         let filter = DetectionFilter {
@@ -1653,7 +1701,11 @@ mod tests {
             ..Default::default()
         };
         let got = read_last_n(&path, 10, &filter);
-        assert_eq!(ids(&got), vec![4, 3], "only High and Critical, newest-first");
+        assert_eq!(
+            ids(&got),
+            vec![4, 3],
+            "only High and Critical, newest-first"
+        );
     }
 
     #[test]
@@ -1663,9 +1715,30 @@ mod tests {
         write_records(
             &path,
             &[
-                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
-                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Resolved, Sensor::Exec, "b"),
-                mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "c"),
+                mk(
+                    1,
+                    "2026-06-09T12:00:01.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "a",
+                ),
+                mk(
+                    2,
+                    "2026-06-09T12:00:02.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Resolved,
+                    Sensor::Exec,
+                    "b",
+                ),
+                mk(
+                    3,
+                    "2026-06-09T12:00:03.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "c",
+                ),
             ],
         );
         let filter = DetectionFilter {
@@ -1683,9 +1756,30 @@ mod tests {
         write_records(
             &path,
             &[
-                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
-                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Network, "b"),
-                mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Network, "c"),
+                mk(
+                    1,
+                    "2026-06-09T12:00:01.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "a",
+                ),
+                mk(
+                    2,
+                    "2026-06-09T12:00:02.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Network,
+                    "b",
+                ),
+                mk(
+                    3,
+                    "2026-06-09T12:00:03.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Network,
+                    "c",
+                ),
             ],
         );
         let filter = DetectionFilter {
@@ -1703,9 +1797,30 @@ mod tests {
         write_records(
             &path,
             &[
-                mk(1, "2026-06-09T12:00:01.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "sshd"),
-                mk(2, "2026-06-09T12:00:02.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "curl"),
-                mk(3, "2026-06-09T12:00:03.000000Z", Severity::Medium, DetectionStatus::Open, Sensor::Exec, "curl-helper"),
+                mk(
+                    1,
+                    "2026-06-09T12:00:01.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "sshd",
+                ),
+                mk(
+                    2,
+                    "2026-06-09T12:00:02.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "curl",
+                ),
+                mk(
+                    3,
+                    "2026-06-09T12:00:03.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "curl-helper",
+                ),
             ],
         );
         let filter = DetectionFilter {
@@ -1726,9 +1841,30 @@ mod tests {
         write_records(
             &path,
             &[
-                mk(1, t1, Severity::Medium, DetectionStatus::Open, Sensor::Exec, "a"),
-                mk(2, t2, Severity::Medium, DetectionStatus::Open, Sensor::Exec, "b"),
-                mk(3, t3, Severity::Medium, DetectionStatus::Open, Sensor::Exec, "c"),
+                mk(
+                    1,
+                    t1,
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "a",
+                ),
+                mk(
+                    2,
+                    t2,
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "b",
+                ),
+                mk(
+                    3,
+                    t3,
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    Sensor::Exec,
+                    "c",
+                ),
             ],
         );
         // since = t2 ⇒ keep t2, t3 (inclusive lower bound).
@@ -1774,7 +1910,10 @@ mod tests {
     fn read_last_n_stops_at_active_when_limit_satisfied() {
         let dir = tempfile::tempdir().unwrap();
         let active = dir.path().join("detections.jsonl");
-        write_records(&active, &[mk_id(6), mk_id(7), mk_id(8), mk_id(9), mk_id(10)]);
+        write_records(
+            &active,
+            &[mk_id(6), mk_id(7), mk_id(8), mk_id(9), mk_id(10)],
+        );
         // White-box probe: the archive carries a SENTINEL id (999)
         // that would sort to the top IF the reader opened it. Because
         // the active file already satisfies limit=3, the archive must
@@ -1785,7 +1924,10 @@ mod tests {
         write_records(&dir.path().join("detections.jsonl.000001"), &[mk_id(999)]);
         let got = read_last_n(&active, 3, &DetectionFilter::default());
         assert_eq!(ids(&got), vec![10, 9, 8]);
-        assert!(!ids(&got).contains(&999), "archive must not be read once N is satisfied");
+        assert!(
+            !ids(&got).contains(&999),
+            "archive must not be read once N is satisfied"
+        );
     }
 
     #[test]
@@ -1795,8 +1937,14 @@ mod tests {
         // Active empty-ish (1 record); two archives — the higher seq
         // (.000002) is the more-recently-sealed, hence newer records.
         write_records(&active, &[mk_id(9)]);
-        write_records(&dir.path().join("detections.jsonl.000002"), &[mk_id(7), mk_id(8)]);
-        write_records(&dir.path().join("detections.jsonl.000001"), &[mk_id(1), mk_id(2)]);
+        write_records(
+            &dir.path().join("detections.jsonl.000002"),
+            &[mk_id(7), mk_id(8)],
+        );
+        write_records(
+            &dir.path().join("detections.jsonl.000001"),
+            &[mk_id(1), mk_id(2)],
+        );
         // limit 3 ⇒ active (9) + newest archive .000002 (8,7); the
         // older .000001 must not be needed.
         let got = read_last_n(&active, 3, &DetectionFilter::default());
@@ -1833,7 +1981,11 @@ mod tests {
         std::fs::write(&path, body).unwrap();
 
         let got = read_last_n(&path, 10, &DetectionFilter::default());
-        assert_eq!(ids(&got), vec![3, 2, 1], "payloads parsed, terminator skipped");
+        assert_eq!(
+            ids(&got),
+            vec![3, 2, 1],
+            "payloads parsed, terminator skipped"
+        );
     }
 
     #[test]
@@ -1841,10 +1993,19 @@ mod tests {
         assert_eq!(parse_severity_filter("HIGH"), Some(Severity::High));
         assert_eq!(parse_severity_filter("critical"), Some(Severity::Critical));
         assert_eq!(parse_severity_filter("nope"), None);
-        assert_eq!(Sensor::parse_filter("module-load"), Some(Sensor::ModuleLoad));
-        assert_eq!(Sensor::parse_filter("Anti-Tamper"), Some(Sensor::AntiTamper));
+        assert_eq!(
+            Sensor::parse_filter("module-load"),
+            Some(Sensor::ModuleLoad)
+        );
+        assert_eq!(
+            Sensor::parse_filter("Anti-Tamper"),
+            Some(Sensor::AntiTamper)
+        );
         assert_eq!(Sensor::parse_filter("nope"), None);
-        assert_eq!(DetectionStatus::parse_filter("Open"), Some(DetectionStatus::Open));
+        assert_eq!(
+            DetectionStatus::parse_filter("Open"),
+            Some(DetectionStatus::Open)
+        );
         assert_eq!(
             DetectionStatus::parse_filter("Investigating"),
             Some(DetectionStatus::Investigating)
@@ -1937,15 +2098,27 @@ mod tests {
         write_events(
             &evt,
             &[
-                mk_event(1, "2026-06-09T12:01:00.000000Z", DetectionStatus::Acknowledged),
+                mk_event(
+                    1,
+                    "2026-06-09T12:01:00.000000Z",
+                    DetectionStatus::Acknowledged,
+                ),
                 mk_event(3, "2026-06-09T12:01:01.000000Z", DetectionStatus::Resolved),
-                mk_event(1, "2026-06-09T12:01:02.000000Z", DetectionStatus::Investigating),
+                mk_event(
+                    1,
+                    "2026-06-09T12:01:02.000000Z",
+                    DetectionStatus::Investigating,
+                ),
             ],
         );
         let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
         let by_id: std::collections::HashMap<u64, DetectionStatus> =
             got.iter().map(|r| (r.id, r.status)).collect();
-        assert_eq!(by_id[&1], DetectionStatus::Investigating, "latest event wins");
+        assert_eq!(
+            by_id[&1],
+            DetectionStatus::Investigating,
+            "latest event wins"
+        );
         assert_eq!(by_id[&2], DetectionStatus::Open, "no event → initial Open");
         assert_eq!(by_id[&3], DetectionStatus::Resolved);
     }
@@ -1959,11 +2132,19 @@ mod tests {
         let before = std::fs::read(&det).unwrap();
         write_events(
             &evt,
-            &[mk_event(1, "2026-06-09T12:02:00.000000Z", DetectionStatus::Resolved)],
+            &[mk_event(
+                1,
+                "2026-06-09T12:02:00.000000Z",
+                DetectionStatus::Resolved,
+            )],
         );
         // Reading with overlay must not touch detections.jsonl.
         let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
-        assert_eq!(got[0].status, DetectionStatus::Resolved, "overlay applied to result");
+        assert_eq!(
+            got[0].status,
+            DetectionStatus::Resolved,
+            "overlay applied to result"
+        );
         let after = std::fs::read(&det).unwrap();
         assert_eq!(before, after, "detections.jsonl is byte-for-byte unchanged");
     }
@@ -1977,7 +2158,11 @@ mod tests {
         write_records(&det, &[mk_id(1), mk_id(2), mk_id(3)]);
         write_events(
             &evt,
-            &[mk_event(2, "2026-06-09T12:03:00.000000Z", DetectionStatus::Resolved)],
+            &[mk_event(
+                2,
+                "2026-06-09T12:03:00.000000Z",
+                DetectionStatus::Resolved,
+            )],
         );
         // Filter on CURRENT status = resolved → only id 2.
         let resolved = read_last_n_overlaid(
@@ -1989,7 +2174,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(ids(&resolved), vec![2], "only the currently-resolved detection");
+        assert_eq!(
+            ids(&resolved),
+            vec![2],
+            "only the currently-resolved detection"
+        );
         // Filter on current status = open → ids 1 and 3 (NOT 2, which
         // was resolved even though its on-disk line still says Open).
         let open = read_last_n_overlaid(
@@ -2012,19 +2201,39 @@ mod tests {
         // id-1 event (must be shadowed) + the only id-2 event.
         write_events(
             &active,
-            &[mk_event(1, "2026-06-09T12:05:00.000000Z", DetectionStatus::Resolved)],
+            &[mk_event(
+                1,
+                "2026-06-09T12:05:00.000000Z",
+                DetectionStatus::Resolved,
+            )],
         );
         write_events(
             &dir.path().join("status_events.jsonl.000001"),
             &[
-                mk_event(1, "2026-06-09T12:04:00.000000Z", DetectionStatus::Acknowledged),
-                mk_event(2, "2026-06-09T12:04:01.000000Z", DetectionStatus::Investigating),
+                mk_event(
+                    1,
+                    "2026-06-09T12:04:00.000000Z",
+                    DetectionStatus::Acknowledged,
+                ),
+                mk_event(
+                    2,
+                    "2026-06-09T12:04:01.000000Z",
+                    DetectionStatus::Investigating,
+                ),
             ],
         );
         let wanted: std::collections::HashSet<u64> = [1u64, 2].into_iter().collect();
         let map = latest_status_for_ids(&active, &wanted);
-        assert_eq!(map[&1], DetectionStatus::Resolved, "active shadows archive for id 1");
-        assert_eq!(map[&2], DetectionStatus::Investigating, "archive resolves id 2");
+        assert_eq!(
+            map[&1],
+            DetectionStatus::Resolved,
+            "active shadows archive for id 1"
+        );
+        assert_eq!(
+            map[&2],
+            DetectionStatus::Investigating,
+            "archive resolves id 2"
+        );
     }
 
     #[tokio::test]
@@ -2044,10 +2253,18 @@ mod tests {
                 Arc::new(NoProtection),
             )
             .expect("open status log");
-            log.append(mk_event(1, "2026-06-09T12:06:00.000000Z", DetectionStatus::Acknowledged))
-                .unwrap();
-            log.append(mk_event(1, "2026-06-09T12:06:01.000000Z", DetectionStatus::Resolved))
-                .unwrap();
+            log.append(mk_event(
+                1,
+                "2026-06-09T12:06:00.000000Z",
+                DetectionStatus::Acknowledged,
+            ))
+            .unwrap();
+            log.append(mk_event(
+                1,
+                "2026-06-09T12:06:01.000000Z",
+                DetectionStatus::Resolved,
+            ))
+            .unwrap();
         }
         // Each persisted line carries the envelope siblings.
         let body = std::fs::read_to_string(&path).unwrap();
@@ -2056,11 +2273,16 @@ mod tests {
             assert!(v.get("prev_hash").is_some(), "envelope prev_hash present");
             assert!(v.get("entry_hash").is_some(), "envelope entry_hash present");
             assert!(v.get("agent_sig").is_some(), "envelope agent_sig present");
-            assert!(v.get("detection_id").is_some(), "payload detection_id present");
+            assert!(
+                v.get("detection_id").is_some(),
+                "payload detection_id present"
+            );
         }
-        let report =
-            verify_log_set::<StatusEvent>(&path, &pubkey).expect("status chain verifies");
-        assert_eq!(report.total_records, 2, "both status events in the verified chain");
+        let report = verify_log_set::<StatusEvent>(&path, &pubkey).expect("status chain verifies");
+        assert_eq!(
+            report.total_records, 2,
+            "both status events in the verified chain"
+        );
     }
 
     #[test]
@@ -2081,10 +2303,18 @@ mod tests {
                 Arc::new(NoProtection),
             )
             .expect("open status log");
-            log.append(mk_event(1, "2026-06-09T12:07:00.000000Z", DetectionStatus::Acknowledged))
-                .unwrap();
-            log.append(mk_event(1, "2026-06-09T12:07:01.000000Z", DetectionStatus::Resolved))
-                .unwrap();
+            log.append(mk_event(
+                1,
+                "2026-06-09T12:07:00.000000Z",
+                DetectionStatus::Acknowledged,
+            ))
+            .unwrap();
+            log.append(mk_event(
+                1,
+                "2026-06-09T12:07:01.000000Z",
+                DetectionStatus::Resolved,
+            ))
+            .unwrap();
         }
         let got = read_last_n_overlaid(&det, &evt, 10, &DetectionFilter::default());
         assert_eq!(got.len(), 1);

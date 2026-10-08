@@ -89,11 +89,11 @@ use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
 // byte-compat gate can mint a real legacy line) are `#[cfg(test)]`, so
 // their imports are gated to test builds.
 #[cfg(test)]
+use crate::audit::GENESIS_PREV_HASH;
+#[cfg(test)]
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use crate::audit::GENESIS_PREV_HASH;
 
 /// Default location of the chained drift log. Lives alongside
 /// the baseline DB so the Tappa 7 task 5 FS-LSM protection +
@@ -473,9 +473,8 @@ impl FimDriftDb {
         protection: std::sync::Arc<dyn crate::chainlog::ProtectionManager>,
         cfg: crate::chainlog::RotationConfig,
     ) -> Result<Self> {
-        let inner = crate::chainlog::RotatingChainLog::<FimDriftPayload>::open(
-            path, key, cfg, protection,
-        )?;
+        let inner =
+            crate::chainlog::RotatingChainLog::<FimDriftPayload>::open(path, key, cfg, protection)?;
         Ok(Self { inner, agent_id })
     }
 
@@ -1075,7 +1074,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let signing = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            signing,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
 
         // A real watched DIRECTORY + a child dropped into it, so enroll
         // + re-hash operate on real inodes.
@@ -1087,7 +1093,10 @@ mod tests {
 
         // The pipeline shape: target is the DIR inode (arbitrary key
         // here), child leaf carried inline. NOT a pre-baked full path.
-        let dir_key = InodeKey { dev: 0x1234, ino: 99 };
+        let dir_key = InodeKey {
+            dev: 0x1234,
+            ino: 99,
+        };
         let path_map = InodePathMap::new();
         path_map.insert(dir_key, dir_str.clone());
 
@@ -1137,10 +1146,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let signing = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, signing, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            signing,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
 
         let dir_str = dir.path().to_string_lossy().into_owned();
-        let dir_key = InodeKey { dev: 0x1234, ino: 7 };
+        let dir_key = InodeKey {
+            dev: 0x1234,
+            ino: 7,
+        };
         let path_map = InodePathMap::new();
         path_map.insert(dir_key, dir_str.clone());
 
@@ -1422,7 +1441,11 @@ mod tests {
         // (2) end-to-end: the really-signed legacy line verifies via the
         // rotation-aware reader (same hash pre-image ⇒ same digest ⇒ sig OK).
         let log = dir.path().join("fim_drift.jsonl");
-        std::fs::write(&log, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+        std::fs::write(
+            &log,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
         let report = verify_log_set::<FimDriftPayload>(&log, &pk).unwrap();
         assert_eq!(report.total_records, 1);
     }
@@ -1434,7 +1457,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         let path_map = InodePathMap::new(); // empty
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
@@ -1467,7 +1497,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         let path_map = InodePathMap::new();
 
         // Create a real on-disk file with known content so
@@ -1529,7 +1566,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         let path_map = InodePathMap::new();
 
         let watched = dir.path().join("watched.bin");
@@ -1580,7 +1624,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         let path_map = InodePathMap::new();
 
         let watched = dir.path().join("watched.bin");
@@ -1682,7 +1733,14 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let key = fresh_signing_key(&dir);
             let drift_path = dir.path().join("drift.jsonl");
-            let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+            let mut drift_db = FimDriftDb::open(
+                &drift_path,
+                key,
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap();
             let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, path);
             let classifier = DriftClassifier::new();
             let rate_limiter = DriftRateLimiter::new();
@@ -1707,8 +1765,7 @@ mod tests {
                 "{path}: no Event::Fim → main.rs logs no 'FIM DRIFT' WARN"
             );
             assert!(
-                !drift_path.exists()
-                    || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
+                !drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
                 "{path}: read must NOT append to fim_drift.jsonl"
             );
         }
@@ -1731,9 +1788,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
-        let (_on_disk, key_ino, path_map) =
-            make_watched_alias(&dir, "/root/.aws/credentials");
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, "/root/.aws/credentials");
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
         let (tx, mut rx) = mpsc::channel::<Event>(8);
@@ -1756,12 +1819,13 @@ mod tests {
         assert!(emitted, "cred-path Opened MUST forward to the rule engine");
         // SILENT: forwarded but NOT recorded as drift.
         assert!(
-            !drift_path.exists()
-                || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
+            !drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty(),
             "cred-path read MUST NOT append to fim_drift.jsonl (no 'FIM DRIFT' noise)"
         );
 
-        let ev = rx.try_recv().expect("Event::Fim must be sent for cred-path read");
+        let ev = rx
+            .try_recv()
+            .expect("Event::Fim must be sent for cred-path read");
         let fe = match &ev {
             Event::Fim(fe) => {
                 assert_eq!(fe.path, "/root/.aws/credentials");
@@ -1787,7 +1851,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let drift_path = dir.path().join("drift.jsonl");
-        let mut drift_db = FimDriftDb::open(&drift_path, key, [0u8; 16], std::sync::Arc::new(crate::chainlog::NoProtection), crate::chainlog::RotationConfig::default()).unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
         let (on_disk, key_ino, path_map) = make_watched_alias(&dir, "/etc/passwd");
         // Mutate the file so a real-drift hash-diff is observed.
         std::fs::write(&on_disk, b"MUTATED content").unwrap();

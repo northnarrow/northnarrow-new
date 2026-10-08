@@ -481,11 +481,7 @@ impl AuthSessionTracker {
         if pid == 0 || pid == 1 {
             return false;
         }
-        let path = self
-            .inner
-            .proc_root
-            .join(pid.to_string())
-            .join("loginuid");
+        let path = self.inner.proc_root.join(pid.to_string()).join("loginuid");
         let raw = match fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => return false,
@@ -711,7 +707,13 @@ mod tests {
     fn node_running_npm_cli_is_npm_cli_writer() {
         let t = AuthSessionTracker::new("/proc");
         // node interpreter running npm's CLI entrypoint.
-        t.ingest_spawn_with_argv(7000, 50, "/usr/bin/node", &npm_argv(&["install", "-g", "x"]), 1);
+        t.ingest_spawn_with_argv(
+            7000,
+            50,
+            "/usr/bin/node",
+            &npm_argv(&["install", "-g", "x"]),
+            1,
+        );
         assert!(t.is_npm_cli_writer(7000));
         // It is NOT auth- or system-daemon-mediated (disjoint signals).
         assert!(!t.is_auth_mediated(7000));
@@ -904,7 +906,9 @@ mod tests {
         assert!(is_auth_binary(Path::new("/lib/systemd/systemd-logind")));
         assert!(is_auth_binary(Path::new("/usr/lib/polkit-1/polkitd")));
         assert!(is_auth_binary(Path::new("/usr/libexec/polkit-1/polkitd")));
-        assert!(is_auth_binary(Path::new("/usr/lib/gdm3/gdm-session-worker")));
+        assert!(is_auth_binary(Path::new(
+            "/usr/lib/gdm3/gdm-session-worker"
+        )));
         assert!(is_auth_binary(Path::new("/usr/libexec/gdm-session-worker")));
         assert!(is_auth_binary(Path::new("/usr/sbin/gdm3")));
         assert!(is_auth_binary(Path::new("/usr/sbin/lightdm")));

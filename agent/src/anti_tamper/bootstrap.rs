@@ -333,7 +333,8 @@ mod tests {
     #[test]
     fn evaluate_returns_armed_with_valid_sentinel_and_one_key() {
         let dir = TempDir::new().unwrap();
-        let admin_pub_content = "1111111111111111111111111111111111111111111111111111111111111111\n";
+        let admin_pub_content =
+            "1111111111111111111111111111111111111111111111111111111111111111\n";
         let (paths, nonce) = make_install(&dir, admin_pub_content, None);
         let expected = compute_sentinel_content(&nonce, admin_pub_content.as_bytes());
         fs::write(&paths.sentinel, &expected).unwrap();
@@ -375,7 +376,8 @@ mod tests {
     #[test]
     fn evaluate_refuses_armed_when_sentinel_content_wrong() {
         let dir = TempDir::new().unwrap();
-        let admin_pub_content = "1111111111111111111111111111111111111111111111111111111111111111\n";
+        let admin_pub_content =
+            "1111111111111111111111111111111111111111111111111111111111111111\n";
         // 64 hex chars but NOT the right hash — what an attacker
         // would write without knowing the install_nonce.
         let bogus = "0".repeat(64);
@@ -392,7 +394,8 @@ mod tests {
     #[test]
     fn evaluate_refuses_armed_when_sentinel_wrong_length() {
         let dir = TempDir::new().unwrap();
-        let admin_pub_content = "1111111111111111111111111111111111111111111111111111111111111111\n";
+        let admin_pub_content =
+            "1111111111111111111111111111111111111111111111111111111111111111\n";
         let (paths, _) = make_install(&dir, admin_pub_content, Some("short"));
         assert_eq!(evaluate(&paths), BootstrapGate::SentinelMismatch);
     }
@@ -432,7 +435,8 @@ mod tests {
     fn reactivation_attack_is_rejected_after_bootstrap_complete() {
         let dir = TempDir::new().unwrap();
         // Step 1: install state with 1 key + valid sentinel.
-        let admin_pub_content = "1111111111111111111111111111111111111111111111111111111111111111\n";
+        let admin_pub_content =
+            "1111111111111111111111111111111111111111111111111111111111111111\n";
         let (paths, nonce) = make_install(&dir, admin_pub_content, None);
         let expected = compute_sentinel_content(&nonce, admin_pub_content.as_bytes());
         fs::write(&paths.sentinel, &expected).unwrap();
@@ -440,7 +444,8 @@ mod tests {
 
         // Step 2: dispatcher completes the 1-of-N add. admin.pub
         // gains a second key, sentinel is removed.
-        let admin_pub_two_keys = "1111111111111111111111111111111111111111111111111111111111111111\n\
+        let admin_pub_two_keys =
+            "1111111111111111111111111111111111111111111111111111111111111111\n\
              2222222222222222222222222222222222222222222222222222222222222222\n";
         fs::write(&paths.admin_pub, admin_pub_two_keys).unwrap();
         complete(&paths).unwrap();

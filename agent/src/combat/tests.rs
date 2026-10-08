@@ -18,7 +18,9 @@ use common::Event;
 
 use super::actuator::{CombatActuator, NeutralizeOutcome};
 use super::evidence::{LadderEvidence, StageTransition};
-use super::{CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason};
+use super::{
+    CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
+};
 
 /// Shared ordered call log for the mocks + the test.
 #[derive(Clone)]
@@ -177,7 +179,11 @@ fn spawn(pid: u32, ppid: u32) -> Event {
 #[test]
 fn engage_enters_investigate_without_isolation() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(30));
-    l.engage(Some(4242), Some(TriggerType::ConfirmedIntrusion), Instant::now());
+    l.engage(
+        Some(4242),
+        Some(TriggerType::ConfirmedIntrusion),
+        Instant::now(),
+    );
     assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
     let log = rec.log();
     assert!(
@@ -265,9 +271,16 @@ fn jump_ahead_on_active_exfil_preempts_deadline() {
 
     // Offender opens an outbound connection to an external dst, long
     // before the 5-minute deadline → jump straight to NEUTRALIZE.
-    l.observe(&tcp_connect(555, [203, 0, 113, 9]), t0 + Duration::from_secs(2));
+    l.observe(
+        &tcp_connect(555, [203, 0, 113, 9]),
+        t0 + Duration::from_secs(2),
+    );
     assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
-    assert!(rec.log().iter().any(|e| e == "neutralize:[555]"), "{:?}", rec.log());
+    assert!(
+        rec.log().iter().any(|e| e == "neutralize:[555]"),
+        "{:?}",
+        rec.log()
+    );
 }
 
 #[test]
@@ -276,7 +289,10 @@ fn jump_ahead_ignores_loopback_connect() {
     let t0 = Instant::now();
     l.engage(Some(555), None, t0);
     // A connect to loopback is not exfil — stay in INVESTIGATE.
-    l.observe(&tcp_connect(555, [127, 0, 0, 1]), t0 + Duration::from_secs(2));
+    l.observe(
+        &tcp_connect(555, [127, 0, 0, 1]),
+        t0 + Duration::from_secs(2),
+    );
     assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
 }
 
@@ -352,7 +368,11 @@ fn tick_and_observe_are_noops_when_not_engaged() {
     l.tick(t0 + Duration::from_secs(10));
     l.observe(&tcp_connect(1, [8, 8, 8, 8]), t0);
     assert_eq!(l.current_stage(), None);
-    assert!(rec.log().is_empty(), "no actions while idle: {:?}", rec.log());
+    assert!(
+        rec.log().is_empty(),
+        "no actions while idle: {:?}",
+        rec.log()
+    );
 }
 
 // ── Two drivers (observe jump-ahead + tick) neutralize at most once ──
@@ -368,7 +388,10 @@ fn jump_ahead_then_deadline_tick_neutralizes_once() {
     let t0 = Instant::now();
     l.engage(Some(321), None, t0);
     // observe() jump-ahead advances to NEUTRALIZE before the deadline.
-    l.observe(&tcp_connect(321, [198, 51, 100, 7]), t0 + Duration::from_secs(2));
+    l.observe(
+        &tcp_connect(321, [198, 51, 100, 7]),
+        t0 + Duration::from_secs(2),
+    );
     assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
     // A later deadline tick must NOT re-neutralize (already past INVESTIGATE).
     l.tick(t0 + win + Duration::from_secs(1));
@@ -377,7 +400,10 @@ fn jump_ahead_then_deadline_tick_neutralizes_once() {
         .into_iter()
         .filter(|e| e.starts_with("neutralize"))
         .count();
-    assert_eq!(neutralizes, 1, "jump-ahead + deadline must neutralize exactly once");
+    assert_eq!(
+        neutralizes, 1,
+        "jump-ahead + deadline must neutralize exactly once"
+    );
 }
 
 // ── Neutralize runs exactly once even on repeated ticks ──
@@ -390,7 +416,11 @@ fn neutralize_runs_once_under_repeated_ticks() {
     l.tick(t0 + win + Duration::from_secs(1));
     l.tick(t0 + win + Duration::from_secs(2));
     l.tick(t0 + win + Duration::from_secs(3));
-    let neutralizes = rec.log().into_iter().filter(|e| e.starts_with("neutralize")).count();
+    let neutralizes = rec
+        .log()
+        .into_iter()
+        .filter(|e| e.starts_with("neutralize"))
+        .count();
     assert_eq!(neutralizes, 1, "neutralize must fire exactly once");
 }
 
@@ -432,7 +462,10 @@ fn neutralize_spares_protected_offender_and_escalates_to_isolate() {
         !log.iter().any(|e| e.contains("4242")),
         "the protected offender must NEVER reach the actuator: {log:?}"
     );
-    assert!(log.iter().any(|e| e == "isolate"), "must escalate to ISOLATE: {log:?}");
+    assert!(
+        log.iter().any(|e| e == "isolate"),
+        "must escalate to ISOLATE: {log:?}"
+    );
     // The ISOLATE audit reason names the spared SSH service.
     let r = reasons.lock();
     assert!(
@@ -487,7 +520,10 @@ fn neutralize_all_offenders_protected_isolates_without_killing() {
     // (even though no kill runs on this path).
     let neut_idx = r.iter().position(|(to, _)| to == "NEUTRALIZE");
     let iso_idx = r.iter().position(|(to, _)| to == "ISOLATE");
-    assert!(neut_idx.is_some(), "NEUTRALIZE dossier must still be recorded: {r:?}");
+    assert!(
+        neut_idx.is_some(),
+        "NEUTRALIZE dossier must still be recorded: {r:?}"
+    );
     assert!(
         neut_idx < iso_idx,
         "NEUTRALIZE record must precede ISOLATE on the all-spared path: {r:?}"
@@ -502,7 +538,11 @@ fn engage_skips_soft_egress_on_protected_offender_no_escalation() {
     prot.insert(1, ProtectedReason::Init);
     let (l, rec, _reasons) =
         ladder_protected(NeutralizeOutcome::Contained, Duration::from_secs(30), prot);
-    l.engage(Some(1), Some(TriggerType::ConfirmedIntrusion), Instant::now());
+    l.engage(
+        Some(1),
+        Some(TriggerType::ConfirmedIntrusion),
+        Instant::now(),
+    );
 
     assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
     let log = rec.log();
@@ -528,7 +568,10 @@ fn jump_ahead_on_protected_offender_escalates_to_isolate() {
     l.engage(Some(4242), Some(TriggerType::ExfiltrationPattern), t0);
     // sshd (protected) actively exfiltrates → jump-ahead → cannot kill it
     // → straight to ISOLATE.
-    l.observe(&tcp_connect(4242, [203, 0, 113, 9]), t0 + Duration::from_secs(2));
+    l.observe(
+        &tcp_connect(4242, [203, 0, 113, 9]),
+        t0 + Duration::from_secs(2),
+    );
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
     let log = rec.log();
     assert!(

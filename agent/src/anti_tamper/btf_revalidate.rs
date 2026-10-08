@@ -655,9 +655,24 @@ mod tests {
     fn revalidate_verified_when_specs_match() {
         let btf = parsed();
         let specs = &[
-            OffsetSpec { name: "OUTER_A", struct_name: "outer", field_path: &["a"], expected: 0 },
-            OffsetSpec { name: "INNER_X", struct_name: "inner", field_path: &["x"], expected: 8 },
-            OffsetSpec { name: "EMB_X", struct_name: "outer", field_path: &["emb", "x"], expected: 24 },
+            OffsetSpec {
+                name: "OUTER_A",
+                struct_name: "outer",
+                field_path: &["a"],
+                expected: 0,
+            },
+            OffsetSpec {
+                name: "INNER_X",
+                struct_name: "inner",
+                field_path: &["x"],
+                expected: 8,
+            },
+            OffsetSpec {
+                name: "EMB_X",
+                struct_name: "outer",
+                field_path: &["emb", "x"],
+                expected: 24,
+            },
         ];
         match revalidate_with(&btf, specs) {
             RevalidateOutcome::Verified { count } => assert_eq!(count, 3),
@@ -669,9 +684,24 @@ mod tests {
     fn revalidate_drift_collects_all_mismatches() {
         let btf = parsed();
         let specs = &[
-            OffsetSpec { name: "OUTER_A", struct_name: "outer", field_path: &["a"], expected: 0 }, // ok
-            OffsetSpec { name: "INNER_X_WRONG", struct_name: "inner", field_path: &["x"], expected: 99 }, // drift
-            OffsetSpec { name: "GHOST", struct_name: "ghost", field_path: &["x"], expected: 0 }, // missing
+            OffsetSpec {
+                name: "OUTER_A",
+                struct_name: "outer",
+                field_path: &["a"],
+                expected: 0,
+            }, // ok
+            OffsetSpec {
+                name: "INNER_X_WRONG",
+                struct_name: "inner",
+                field_path: &["x"],
+                expected: 99,
+            }, // drift
+            OffsetSpec {
+                name: "GHOST",
+                struct_name: "ghost",
+                field_path: &["x"],
+                expected: 0,
+            }, // missing
         ];
         match revalidate_with(&btf, specs) {
             RevalidateOutcome::Refuse(RefuseReason::Drift(ms)) => {
@@ -715,7 +745,10 @@ mod tests {
                         m.name, m.struct_name, m.actual, m.expected, m.detail
                     );
                 }
-                panic!("{} offset(s) drifted on the running kernel (see stderr)", ms.len());
+                panic!(
+                    "{} offset(s) drifted on the running kernel (see stderr)",
+                    ms.len()
+                );
             }
             RevalidateOutcome::Refuse(RefuseReason::ParseError(e)) => {
                 panic!("BTF parse error on the running kernel: {e}");

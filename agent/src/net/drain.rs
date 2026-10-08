@@ -674,7 +674,11 @@ mod tests {
 
         // (2) end-to-end.
         let log = dir.path().join("netflow.jsonl");
-        std::fs::write(&log, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+        std::fs::write(
+            &log,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
         let report = verify_log_set::<NetFlowPayload>(&log, &pk).unwrap();
         assert_eq!(report.total_records, 1);
     }
@@ -685,7 +689,9 @@ mod tests {
     /// produces.
     #[test]
     fn netflow_db_append_writes_one_chained_row() {
-        use crate::chainlog::{verify_log_set, ChainLine, CHAINLOG_FMT_V2, NoProtection, RotationConfig};
+        use crate::chainlog::{
+            verify_log_set, ChainLine, NoProtection, RotationConfig, CHAINLOG_FMT_V2,
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key = fresh_key();
@@ -711,7 +717,10 @@ mod tests {
         assert_eq!(line.payload.flow_id, "abc");
         assert_eq!(line.payload.dst_addr, "1.2.3.4");
         assert_eq!(line.payload.dst_port, 443);
-        assert_eq!(line.payload.resolved_hostname, Some("example.com".to_string()));
+        assert_eq!(
+            line.payload.resolved_hostname,
+            Some("example.com".to_string())
+        );
         assert_eq!(line.entry_hash, entry_hash);
         assert_eq!(line.prev_hash.len(), 64);
         assert_eq!(line.entry_hash.len(), 64);

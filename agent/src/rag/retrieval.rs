@@ -286,7 +286,10 @@ mod tests {
         // test-debt: was 36 when this bound last broke at ~30). Bound it
         // to a generous range that still catches a broken/empty seed
         // without re-breaking on every curated-doc addition.
-        assert!((28..=64).contains(&n), "expected a curated KB of ~30-60 docs, got {n}");
+        assert!(
+            (28..=64).contains(&n),
+            "expected a curated KB of ~30-60 docs, got {n}"
+        );
     }
 
     #[test]

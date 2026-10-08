@@ -135,10 +135,7 @@ pub enum WatchdogResolution {
 /// paths are taken as arguments) so the parse/compare logic is unit
 /// testable; the `proc_root` indirection lets tests point at a fixture
 /// tree instead of the live `/proc`.
-pub fn resolve_verified_watchdog_pid(
-    pidfile: &Path,
-    expected_exe: &Path,
-) -> WatchdogResolution {
+pub fn resolve_verified_watchdog_pid(pidfile: &Path, expected_exe: &Path) -> WatchdogResolution {
     resolve_with_proc_root(pidfile, expected_exe, Path::new("/proc"))
 }
 

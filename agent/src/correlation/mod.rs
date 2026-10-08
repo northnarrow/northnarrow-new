@@ -142,7 +142,9 @@ fn event_timestamp_ns(e: &Event) -> u64 {
 fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
     match e {
         // BUG-034: module load keys off (loader_pid, source path).
-        Event::ModuleLoad { loader_pid, path, .. } => (*loader_pid, None, path.as_deref()),
+        Event::ModuleLoad {
+            loader_pid, path, ..
+        } => (*loader_pid, None, path.as_deref()),
         Event::ProcessSpawn {
             pid,
             ppid,

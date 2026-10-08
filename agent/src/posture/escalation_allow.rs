@@ -205,13 +205,17 @@ fn parse_entry(line: &str) -> Result<AllowEntry, String> {
     let trig = it.next().ok_or_else(|| format!("empty entry `{line}`"))?;
     let trigger = AllowTrigger::parse(trig)
         .ok_or_else(|| format!("unknown trigger `{trig}` in `{line}` (expect exfil|lateral)"))?;
-    let comm_raw = it.next().ok_or_else(|| format!("missing comm in `{line}`"))?;
+    let comm_raw = it
+        .next()
+        .ok_or_else(|| format!("missing comm in `{line}`"))?;
     let comm = if let Some(pfx) = comm_raw.strip_suffix('*') {
         CommMatch::Prefix(pfx.to_string())
     } else {
         CommMatch::Exact(comm_raw.to_string())
     };
-    let cidr = it.next().ok_or_else(|| format!("missing cidr in `{line}`"))?;
+    let cidr = it
+        .next()
+        .ok_or_else(|| format!("missing cidr in `{line}`"))?;
     let (net, prefix) = parse_cidr(cidr).map_err(|e| format!("{e} in `{line}`"))?;
     let port = match it.next() {
         None | Some("*") => None,
@@ -240,9 +244,7 @@ fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
         }
         None => (s, None),
     };
-    let addr: IpAddr = addr_str
-        .parse()
-        .map_err(|_| format!("invalid IP `{s}`"))?;
+    let addr: IpAddr = addr_str.parse().map_err(|_| format!("invalid IP `{s}`"))?;
     let max = if addr.is_ipv6() { 128 } else { 32 };
     let prefix = prefix.unwrap_or(max);
     if prefix > max {
@@ -270,7 +272,11 @@ fn cidr_contains(net: &IpAddr, prefix: u8, addr: &IpAddr) -> bool {
             if prefix > 32 {
                 return false;
             }
-            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
             (u32::from(*n) & mask) == (u32::from(*a) & mask)
         }
         (IpAddr::V6(n), IpAddr::V6(a)) => {
@@ -313,7 +319,13 @@ mod tests {
         // same comm, a C2 outside the mirror CIDR: still counted.
         assert!(!list.excludes(AllowTrigger::Exfil, "apt", &v4(203, 0, 113, 5), 2, 443));
         // github range, any comm.
-        assert!(list.excludes(AllowTrigger::Exfil, "git-remote-https", &v4(140, 82, 121, 3), 2, 443));
+        assert!(list.excludes(
+            AllowTrigger::Exfil,
+            "git-remote-https",
+            &v4(140, 82, 121, 3),
+            2,
+            443
+        ));
     }
 
     #[test]
@@ -330,11 +342,23 @@ mod tests {
         let (list, _) = EscalationAllowList::parse("lateral ansible* 10.0.0.0/8 22\n");
         // "ansible-playbook" (>15) — the kernel truncates the real comm,
         // but the prefix form matches the truncated form regardless.
-        assert!(list.excludes(AllowTrigger::Lateral, "ansible-playbo", &v4(10, 1, 2, 3), 2, 22));
+        assert!(list.excludes(
+            AllowTrigger::Lateral,
+            "ansible-playbo",
+            &v4(10, 1, 2, 3),
+            2,
+            22
+        ));
         // An Exact entry for a >15-char name would never match a
         // truncated comm — documented in the file header.
         let (exact, _) = EscalationAllowList::parse("lateral systemd-resolved 10.0.0.0/8 53\n");
-        assert!(!exact.excludes(AllowTrigger::Lateral, "systemd-resolv", &v4(10, 0, 0, 1), 2, 53));
+        assert!(!exact.excludes(
+            AllowTrigger::Lateral,
+            "systemd-resolv",
+            &v4(10, 0, 0, 1),
+            2,
+            53
+        ));
     }
 
     #[test]

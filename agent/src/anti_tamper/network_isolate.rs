@@ -472,7 +472,9 @@ fn probe_chain(bin: &Path) -> Result<Option<usize>> {
     if !listed.status.success() {
         return Ok(None);
     }
-    Ok(Some(count_chain_rules(&String::from_utf8_lossy(&listed.stdout))))
+    Ok(Some(count_chain_rules(&String::from_utf8_lossy(
+        &listed.stdout,
+    ))))
 }
 
 /// BUG-041 — after an additive `-I … 1` engage, ensure exactly ONE
@@ -505,7 +507,10 @@ fn dedup_jumps(bin: &Path) -> Result<()> {
 /// Count `-j COMBAT_CHAIN` jump rules in `iptables -S <base>` output.
 fn count_jumps(iptables_s_output: &str) -> usize {
     let needle = format!("-j {COMBAT_CHAIN}");
-    iptables_s_output.lines().filter(|l| l.contains(&needle)).count()
+    iptables_s_output
+        .lines()
+        .filter(|l| l.contains(&needle))
+        .count()
 }
 
 /// Count the appended (`-A`) rules in `iptables -S CHAIN` output. The
@@ -620,7 +625,9 @@ mod tests {
         assert!(already_gone(
             "iptables: Bad rule (does a matching rule exist in that chain?)."
         ));
-        assert!(already_gone("iptables: No chain/target/match by that name."));
+        assert!(already_gone(
+            "iptables: No chain/target/match by that name."
+        ));
         assert!(already_gone(
             "iptables v1.8.10 (nf_tables): Chain 'NORTHNARROW_COMBAT' does not exist"
         ));
@@ -637,7 +644,11 @@ mod tests {
                    -A INPUT -j NORTHNARROW_COMBAT\n\
                    -A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n\
                    -A INPUT -j NORTHNARROW_COMBAT\n";
-        assert_eq!(count_jumps(two), 2, "two NN jumps; operator ACCEPT not counted");
+        assert_eq!(
+            count_jumps(two),
+            2,
+            "two NN jumps; operator ACCEPT not counted"
+        );
         assert_eq!(count_jumps("-A INPUT -j NORTHNARROW_COMBAT\n"), 1);
         assert_eq!(count_jumps("-P INPUT ACCEPT\n-A INPUT -j ACCEPT\n"), 0);
     }
@@ -681,7 +692,8 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let mut f = std::fs::File::create(&path).ok()?;
-        f.write_all(b"#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n").ok()?;
+        f.write_all(b"#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n")
+            .ok()?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
         Some(path)
     }
@@ -858,7 +870,11 @@ mod tests {
         std::fs::write(&tmp, "# mgmt\n10.10.0.0/16\n2001:db8::/32\n").unwrap();
         let iso = iso.with_allow_cidrs_path(tmp.clone());
         let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
-        assert_eq!(carved, vec!["10.10.0.0/16".to_string()], "only the v4 CIDR is carved");
+        assert_eq!(
+            carved,
+            vec!["10.10.0.0/16".to_string()],
+            "only the v4 CIDR is carved"
+        );
         assert!(ruleset.contains("-A NORTHNARROW_COMBAT -s 10.10.0.0/16 -j ACCEPT"));
         assert!(ruleset.contains("-A NORTHNARROW_COMBAT -d 10.10.0.0/16 -j ACCEPT"));
         // v6 entry must NOT produce an iptables (v4) rule.
@@ -880,11 +896,15 @@ mod tests {
         // clean dev box but failed on a deployed VM (where the live mgmt
         // carve-out file exists → `carved` non-empty). Mirrors the temp
         // allow-path pattern the sibling carve-out test already uses.
-        let absent = std::env::temp_dir().join(format!("nn-absent-allow-{}.cidrs", std::process::id()));
+        let absent =
+            std::env::temp_dir().join(format!("nn-absent-allow-{}.cidrs", std::process::id()));
         let _ = std::fs::remove_file(&absent);
         let iso = iso.with_allow_cidrs_path(absent);
         let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
-        assert!(carved.is_empty(), "absent allow file must yield empty carve-out, got {carved:?}");
+        assert!(
+            carved.is_empty(),
+            "absent allow file must yield empty carve-out, got {carved:?}"
+        );
         // Loopback-only isolation: the only ACCEPTs are the two lo rules
         // (the additive model uses `-i/-o lo -j ACCEPT`, NOT RETURN — see
         // configs/combat-rules.v4 header); NO management carve-out CIDR

@@ -81,12 +81,8 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///                    processes legitimately write (lock files, dbus
 ///                    sockets). Counted toward mass-write so a
 ///                    compromised user session is still detectable.
-pub(super) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] = &[
-    "/sys/",
-    "/proc/",
-    "/run/systemd/",
-    "/run/log/journal/",
-];
+pub(super) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
+    &["/sys/", "/proc/", "/run/systemd/", "/run/log/journal/"];
 
 /// Returns true if `filename` is in a path class the mass-write arm of
 /// `confirmed_intrusion` deliberately ignores (kernel-RPC / system
@@ -555,10 +551,7 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     //   - the binary signal is a tactical fix; the V2
     //     continuous-trust redesign (POSTURE_FSM_V2_REDESIGN.md §5.2)
     //     replaces it with a graded score.
-    if filename == "/etc/passwd"
-        && !is_write_open(*flags)
-        && auth.has_valid_loginuid(*pid)
-    {
+    if filename == "/etc/passwd" && !is_write_open(*flags) && auth.has_valid_loginuid(*pid) {
         return false;
     }
     SENSITIVE_FILES.iter().any(|f| filename == f)
@@ -1537,7 +1530,13 @@ mod tests {
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 10))
             .collect();
-        let focal = file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, MASS_WRITE_MIN as u64 + 11);
+        let focal = file_open(
+            1096,
+            0,
+            "/var/lib/snapd/state.json.tmp",
+            1,
+            MASS_WRITE_MIN as u64 + 11,
+        );
         let hits = det.detect(&focal, &recent);
         assert!(
             !hits.contains(&TriggerType::ConfirmedIntrusion),
@@ -1552,7 +1551,13 @@ mod tests {
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(3096, 0, "/var/cache/man/de/3096", 1, i + 10))
             .collect();
-        let focal = file_open(3096, 0, "/var/cache/man/de/3096", 1, MASS_WRITE_MIN as u64 + 11);
+        let focal = file_open(
+            3096,
+            0,
+            "/var/cache/man/de/3096",
+            1,
+            MASS_WRITE_MIN as u64 + 11,
+        );
         let hits = det.detect(&focal, &recent);
         assert!(
             !hits.contains(&TriggerType::ConfirmedIntrusion),
@@ -1612,7 +1617,13 @@ mod tests {
                 7000,
                 1,
                 "/usr/bin/node",
-                &["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "install", "-g", "left-pad"],
+                &[
+                    "node",
+                    "/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    "install",
+                    "-g",
+                    "left-pad",
+                ],
                 1,
             ),
             &[],
@@ -1675,17 +1686,30 @@ mod tests {
                 7200,
                 1,
                 "/usr/bin/node",
-                &["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "install"],
+                &[
+                    "node",
+                    "/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    "install",
+                ],
                 1,
             ),
             &[],
         );
         // postinstall: npm -> sh -> node build.js (pid 7201), mass-writes.
-        let _ = det.detect(&spawn_with_argv(7201, 7200, "/usr/bin/node", &["node", "build.js"], 2), &[]);
+        let _ = det.detect(
+            &spawn_with_argv(7201, 7200, "/usr/bin/node", &["node", "build.js"], 2),
+            &[],
+        );
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(7201, 1000, "/home/u/.cache/evil/f", 1, i + 10))
             .collect();
-        let focal = file_open(7201, 1000, "/home/u/.cache/evil/f", 1, MASS_WRITE_MIN as u64 + 11);
+        let focal = file_open(
+            7201,
+            1000,
+            "/home/u/.cache/evil/f",
+            1,
+            MASS_WRITE_MIN as u64 + 11,
+        );
         let hits = det.detect(&focal, &recent);
         assert!(
             hits.contains(&TriggerType::ConfirmedIntrusion),
@@ -2187,8 +2211,10 @@ mod tests {
         // dev host whose operator has populated the .local file.
         let det = TriggerDetector::with_self_pid(AGENT_PID)
             .with_mass_write_extras(vec!["/home/alice/.claude/".to_string()]);
-        let (focal, recent) =
-            write_burst_to(ATTACKER_PID, "/home/alice/.claude/projects/x/subagents/a.jsonl");
+        let (focal, recent) = write_burst_to(
+            ATTACKER_PID,
+            "/home/alice/.claude/projects/x/subagents/a.jsonl",
+        );
         let hits = det.detect(&focal, &recent);
         assert!(
             !hits.contains(&TriggerType::ConfirmedIntrusion),
@@ -2241,7 +2267,8 @@ mod tests {
         let bare = TriggerDetector::new();
         let (f, r) = mk([203, 0, 113, 9]);
         assert!(
-            bare.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
+            bare.detect(&f, &r)
+                .contains(&TriggerType::ExfiltrationPattern),
             "exfil shape must fire with no allowlist"
         );
 
@@ -2251,7 +2278,8 @@ mod tests {
         let det = TriggerDetector::new().with_escalation_allow(allow);
         let (f, r) = mk([203, 0, 113, 9]);
         assert!(
-            !det.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
+            !det.detect(&f, &r)
+                .contains(&TriggerType::ExfiltrationPattern),
             "allowlisted mirror traffic must be count-filtered out"
         );
 
@@ -2259,7 +2287,8 @@ mod tests {
         // fires — the mirror entry must not mask it.
         let (f, r) = mk([8, 8, 8, 8]);
         assert!(
-            det.detect(&f, &r).contains(&TriggerType::ExfiltrationPattern),
+            det.detect(&f, &r)
+                .contains(&TriggerType::ExfiltrationPattern),
             "non-allowlisted destination must still count + fire"
         );
     }
@@ -2277,7 +2306,10 @@ mod tests {
     fn is_internal_classifies_v6() {
         assert!(is_internal(&v6(0xfd00, 1), 10), "fd00::/8 ULA is internal");
         assert!(is_internal(&v6(0xfc00, 1), 10), "fc00::/7 ULA is internal");
-        assert!(is_internal(&v6(0xfe80, 1), 10), "fe80::/10 link-local is internal");
+        assert!(
+            is_internal(&v6(0xfe80, 1), 10),
+            "fe80::/10 link-local is internal"
+        );
         assert!(!is_internal(&v6(0x2606, 1), 10), "2606:: global is public");
         assert!(!is_internal(&v6(0x2001, 1), 10), "2001:: global is public");
     }

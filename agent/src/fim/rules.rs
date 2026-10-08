@@ -777,8 +777,7 @@ impl Rule for NnLFim009SystemdUnitDropped {
         // agent's OWN unit files is an authorised upgrade — downgrade to
         // an audit Log (recorded, not silenced). Tight scope: any other
         // unit, or our units with no open window, still trip the kill.
-        if OWN_SYSTEMD_UNITS.contains(&fe.path.as_str())
-            && self.installer_override.is_window_open()
+        if OWN_SYSTEMD_UNITS.contains(&fe.path.as_str()) && self.installer_override.is_window_open()
         {
             return Some(fim_verdict(
                 self,
@@ -1846,7 +1845,9 @@ mod tests {
         };
 
         assert!(NnLFim021PamModuleModified
-            .evaluate(&truncated("/usr/lib/x86_64-linux-gnu/security/loooong-no-suffix"))
+            .evaluate(&truncated(
+                "/usr/lib/x86_64-linux-gnu/security/loooong-no-suffix"
+            ))
             .is_some());
         assert!(NnLFim023SystemdTimerCreated
             .evaluate(&truncated("/etc/systemd/system/loooong-no-suffix"))
@@ -2110,7 +2111,10 @@ mod tests {
             Some(200),
             Some(100),
         );
-        assert!(r.evaluate(&ev).is_none(), "/sbin/rsyslogd alias must be exempt");
+        assert!(
+            r.evaluate(&ev).is_none(),
+            "/sbin/rsyslogd alias must be exempt"
+        );
     }
 
     /// (c) fails — rsyslogd-as-syslog but the file SHRANK → a
@@ -2146,7 +2150,13 @@ mod tests {
         );
         assert!(r.evaluate(&ev).is_some(), "non-rsyslogd writer must fire");
         // And an entirely unknown exe (writer already exited) fires too.
-        let ev_none = fim_log_modify("/var/log/syslog", None, TEST_SYSLOG_UID, Some(9000), Some(4096));
+        let ev_none = fim_log_modify(
+            "/var/log/syslog",
+            None,
+            TEST_SYSLOG_UID,
+            Some(9000),
+            Some(4096),
+        );
         assert!(r.evaluate(&ev_none).is_some(), "unknown exe must fire");
     }
 
@@ -2155,7 +2165,13 @@ mod tests {
     #[test]
     fn fim005_rsyslogd_exe_wrong_uid_still_fires() {
         let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
-        let ev = fim_log_modify("/var/log/syslog", Some(RSYSLOGD_EXE), 0, Some(8192), Some(4096));
+        let ev = fim_log_modify(
+            "/var/log/syslog",
+            Some(RSYSLOGD_EXE),
+            0,
+            Some(8192),
+            Some(4096),
+        );
         assert!(
             r.evaluate(&ev).is_some(),
             "rsyslogd exe as root (uid 0) must still fire"
@@ -2186,7 +2202,13 @@ mod tests {
     #[test]
     fn fim005_unknown_size_fails_append_check() {
         let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
-        let ev = fim_log_modify("/var/log/syslog", Some(RSYSLOGD_EXE), TEST_SYSLOG_UID, None, None);
+        let ev = fim_log_modify(
+            "/var/log/syslog",
+            Some(RSYSLOGD_EXE),
+            TEST_SYSLOG_UID,
+            None,
+            None,
+        );
         assert!(r.evaluate(&ev).is_some(), "unknown sizes must fire");
         // equal sizes are not a "grew" → also fire.
         let ev_eq = fim_log_modify(
@@ -2196,7 +2218,10 @@ mod tests {
             Some(4096),
             Some(4096),
         );
-        assert!(r.evaluate(&ev_eq).is_some(), "equal sizes are not an append");
+        assert!(
+            r.evaluate(&ev_eq).is_some(),
+            "equal sizes are not an append"
+        );
     }
 
     // ── NN-L-FIM-005 FP-6 — login-record logs deferred to -018/-019 ──
@@ -2352,12 +2377,12 @@ mod tests {
         let final_ = "/var/spool/cron/crontabs/root";
         let dir = "/var/spool/cron/crontabs";
         let burst = [
-            (FimOp::Created, tmp, base),                  // mkstemp
-            (FimOp::Modified, tmp, base + 1_000_000),     // +1 ms write content
-            (FimOp::Created, final_, base + 5_000_000),   // +5 ms rename → final
-            (FimOp::Modified, dir, base + 5_000_000),     // +5 ms dir entry changed
-            (FimOp::Modified, final_, base + 8_000_000),  // +8 ms setattr on final
-            (FimOp::Modified, dir, base + 10_000_000),    // +10 ms dir setattr
+            (FimOp::Created, tmp, base),                 // mkstemp
+            (FimOp::Modified, tmp, base + 1_000_000),    // +1 ms write content
+            (FimOp::Created, final_, base + 5_000_000),  // +5 ms rename → final
+            (FimOp::Modified, dir, base + 5_000_000),    // +5 ms dir entry changed
+            (FimOp::Modified, final_, base + 8_000_000), // +8 ms setattr on final
+            (FimOp::Modified, dir, base + 10_000_000),   // +10 ms dir setattr
         ];
         let fired = burst
             .iter()
@@ -2391,14 +2416,24 @@ mod tests {
         // a directory) → coalesced. The KillProcess verdict already targets
         // pid 5, so the shared actor is still neutralized.
         assert!(
-            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.d/job-b", 5, base + 5_000_000))
-                .is_none(),
+            r.evaluate(&cron_event(
+                FimOp::Created,
+                "/etc/cron.d/job-b",
+                5,
+                base + 5_000_000
+            ))
+            .is_none(),
             "a second path in the same cron dir + pid + window must coalesce"
         );
         // A DISTINCT cron directory (same pid + instant) → distinct key → fires.
         assert!(
-            r.evaluate(&cron_event(FimOp::Created, "/etc/cron.daily/job-c", 5, base))
-                .is_some(),
+            r.evaluate(&cron_event(
+                FimOp::Created,
+                "/etc/cron.daily/job-c",
+                5,
+                base
+            ))
+            .is_some(),
             "a distinct cron directory must still fire"
         );
         // Same cron dir, DIFFERENT pid → distinct key → fires.
@@ -2501,7 +2536,11 @@ mod tests {
                 "/etc/systemd/system/northnarrow-agent.service",
             ))
             .expect("own-unit write still produces a verdict");
-        assert_eq!(v.action, ResponseAction::Log, "downgraded to audit, not silenced");
+        assert_eq!(
+            v.action,
+            ResponseAction::Log,
+            "downgraded to audit, not silenced"
+        );
         assert_eq!(v.severity, Severity::Low);
         // The write is still attributed (pid carried for the audit row).
         assert_eq!(v.event_pid, 42);
@@ -2528,7 +2567,10 @@ mod tests {
     fn fim009_kills_foreign_unit_even_under_open_window() {
         let r = NnLFim009SystemdUnitDropped::new(armed_override());
         let v = r
-            .evaluate(&fim_event(FimOp::Created, "/etc/systemd/system/evil.service"))
+            .evaluate(&fim_event(
+                FimOp::Created,
+                "/etc/systemd/system/evil.service",
+            ))
             .unwrap();
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert_eq!(v.severity, Severity::High);

@@ -748,7 +748,13 @@ fn gdm_login_gshadow_read_e2e_stays_at_observing() {
         .is_none());
     assert!(m
         .observe(
-            &spawn(601, 600, "gdm-session-wor", "/usr/lib/gdm3/gdm-session-worker", 2),
+            &spawn(
+                601,
+                600,
+                "gdm-session-wor",
+                "/usr/lib/gdm3/gdm-session-worker",
+                2
+            ),
             &[],
         )
         .is_none());
@@ -791,12 +797,21 @@ fn screen_unlock_unix_chkpwd_e2e_stays_at_observing() {
     let m = machine_with_isolated_auth();
     assert!(m
         .observe(
-            &spawn(700, 1, "cinnamon-screen", "/usr/bin/cinnamon-screensaver", 1),
+            &spawn(
+                700,
+                1,
+                "cinnamon-screen",
+                "/usr/bin/cinnamon-screensaver",
+                1
+            ),
             &[],
         )
         .is_none());
     assert!(m
-        .observe(&spawn(701, 700, "unix_chkpwd", "/usr/sbin/unix_chkpwd", 2), &[])
+        .observe(
+            &spawn(701, 700, "unix_chkpwd", "/usr/sbin/unix_chkpwd", 2),
+            &[]
+        )
         .is_none());
     let shadow_read = file_open(701, 1000, "/etc/shadow", 0, 3);
     let r = m.observe(&shadow_read, &[]);
@@ -835,7 +850,13 @@ fn snapd_refresh_e2e_stays_at_observing() {
 
     // 2. snapd writes its mount unit (persistence arm) — the original
     //    corroborating signal that pushed ENGAGED → COMBAT.
-    let unit = file_open(1096, 0, "/etc/systemd/system/snap-snapd-26865.mount", 1, 300);
+    let unit = file_open(
+        1096,
+        0,
+        "/etc/systemd/system/snap-snapd-26865.mount",
+        1,
+        300,
+    );
     let r = m.observe(&unit, &[]);
     assert!(r.is_none(), "snapd unit write must NOT transition: {r:?}");
     assert_eq!(

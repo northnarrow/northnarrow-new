@@ -123,8 +123,13 @@ fn alloc_id(prefix: &str, rest: &str) -> String {
 /// Short human tag for a correlated event (variant + its key field).
 fn event_kind_label(e: &Event) -> String {
     match e {
-        Event::ModuleLoad { loader_comm, path, .. } => {
-            format!("ModuleLoad comm={loader_comm} path={}", path.as_deref().unwrap_or("?"))
+        Event::ModuleLoad {
+            loader_comm, path, ..
+        } => {
+            format!(
+                "ModuleLoad comm={loader_comm} path={}",
+                path.as_deref().unwrap_or("?")
+            )
         }
         Event::ProcessSpawn { comm, filename, .. } => {
             format!("ProcessSpawn comm={comm} file={filename}")

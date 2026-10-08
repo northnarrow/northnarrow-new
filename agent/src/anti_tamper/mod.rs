@@ -75,7 +75,7 @@ use tracing::{info, warn};
 // filesystem.rs, main.rs, tests) keeps compiling byte-identically.
 pub use antitamper_bpf::{
     attach_lsm, attach_transient, fresh_attach_and_pin, lsm_pin_paths, prepare_pin_root,
-    purge_stale_pin, reattach_fresh, read_proc_comm, read_self_comm, DEFAULT_BPFFS_ROOT,
+    purge_stale_pin, read_proc_comm, read_self_comm, reattach_fresh, DEFAULT_BPFFS_ROOT,
     PROTECTED_OBSERVERS_MAP_NAME, PROTECTED_PIDS_MAP_NAME,
 };
 
@@ -509,8 +509,8 @@ fn write_array_u32(ebpf: &mut Ebpf, map_name: &str, value: u32) -> Result<()> {
     let map = ebpf
         .map_mut(map_name)
         .ok_or_else(|| anyhow!("map {map_name} missing from eBPF object"))?;
-    let mut arr: AyaArray<_, u32> = AyaArray::try_from(map)
-        .with_context(|| format!("{map_name} is not an Array<u32>"))?;
+    let mut arr: AyaArray<_, u32> =
+        AyaArray::try_from(map).with_context(|| format!("{map_name} is not an Array<u32>"))?;
     arr.set(0, value, 0)
         .with_context(|| format!("setting {map_name}[0] = {value}"))?;
     Ok(())

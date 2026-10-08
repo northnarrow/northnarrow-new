@@ -442,8 +442,7 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
     if deny_hooks_attached == deny_hooks_expected {
         info!(
             deny_hooks_attached,
-            deny_hooks_expected,
-            "anti-tamper FS: all inode_protect deny hooks attached"
+            deny_hooks_expected, "anti-tamper FS: all inode_protect deny hooks attached"
         );
     } else {
         warn!(
@@ -1244,12 +1243,14 @@ impl ProtectedInodesHandle {
     }
 
     pub fn register(&mut self, key: InodeKey, flags: u8) -> Result<()> {
-        self.map.insert(AyaInodeKey(key), flags, 0).with_context(|| {
-            format!(
-                "registering (dev={}, ino={}) in {PROTECTED_INODES_MAP}",
-                key.dev, key.ino
-            )
-        })
+        self.map
+            .insert(AyaInodeKey(key), flags, 0)
+            .with_context(|| {
+                format!(
+                    "registering (dev={}, ino={}) in {PROTECTED_INODES_MAP}",
+                    key.dev, key.ino
+                )
+            })
     }
 
     /// Drop a stale inode key (best-effort at the call sites that use it):

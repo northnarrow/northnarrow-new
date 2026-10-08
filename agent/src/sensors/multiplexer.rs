@@ -382,7 +382,11 @@ struct RejectThrottle {
 
 impl RejectThrottle {
     fn new() -> Self {
-        Self { count: 0, last_log: None, last_got: 0 }
+        Self {
+            count: 0,
+            last_log: None,
+            last_got: 0,
+        }
     }
 
     /// Record one rejected entry; emit a coalesced WARN at most 1/sec.
@@ -501,9 +505,11 @@ async fn pump_tcp_connect(
                         return Ok(());
                     }
                 }
-                Err(_e) => {
-                    reject.record("tcp_connect", std::mem::size_of::<TcpConnectRaw>(), bytes.len())
-                }
+                Err(_e) => reject.record(
+                    "tcp_connect",
+                    std::mem::size_of::<TcpConnectRaw>(),
+                    bytes.len(),
+                ),
             }
         }
         guard.clear_ready();

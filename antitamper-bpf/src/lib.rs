@@ -469,7 +469,10 @@ pub fn reattach_fresh(
         .with_context(|| format!("taking ownership of fresh `{hook_name}` LSM link"))?;
     let fd_link: FdLink = link.into();
     let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
-        format!("pinning fresh LSM link `{hook_name}` to {}", link_path.display())
+        format!(
+            "pinning fresh LSM link `{hook_name}` to {}",
+            link_path.display()
+        )
     })?;
     info!(
         hook = hook_name,
@@ -693,12 +696,11 @@ impl<'a> ProtectedObserversHandle<&'a mut MapData> {
     /// Agent-facing constructor — borrow the `PROTECTED_OBSERVERS`
     /// map from an already-loaded `Ebpf` instance.
     pub fn from_ebpf(ebpf: &'a mut Ebpf) -> Result<Self> {
-        let map = ebpf
-            .map_mut(PROTECTED_OBSERVERS_MAP_NAME)
-            .ok_or_else(|| anyhow!("map {PROTECTED_OBSERVERS_MAP_NAME} missing from eBPF object"))?;
-        let map = AyaHashMap::try_from(map).with_context(|| {
-            format!("{PROTECTED_OBSERVERS_MAP_NAME} is not a HashMap<u32, u8>")
+        let map = ebpf.map_mut(PROTECTED_OBSERVERS_MAP_NAME).ok_or_else(|| {
+            anyhow!("map {PROTECTED_OBSERVERS_MAP_NAME} missing from eBPF object")
         })?;
+        let map = AyaHashMap::try_from(map)
+            .with_context(|| format!("{PROTECTED_OBSERVERS_MAP_NAME} is not a HashMap<u32, u8>"))?;
         Ok(Self { map })
     }
 }
