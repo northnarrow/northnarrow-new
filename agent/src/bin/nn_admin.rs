@@ -2529,10 +2529,19 @@ fn exit_from_detection_set_status(outcome: DetectionSetStatusOutcome) -> ExitCod
             // knows the change was NOT applied — check the store + the
             // agent log, then retry.
             eprintln!(
-                "{op}: change not applied — no detection with that id, or the server \
-                 could not persist it (check `nn-admin detections` and the agent log, then retry)"
+                "{op}: change not applied — no detection with that id (check `nn-admin detections`)"
             );
             ExitCode::from(9)
+        }
+        DetectionSetStatusOutcome::PersistFailed { id } => {
+            // chain-persist-1: machine-distinguishable from NotFound —
+            // the id exists and the request was authorised, but the
+            // status-event chain append failed on the agent.
+            eprintln!(
+                "{op}: change NOT recorded for detection {id} — the agent could not append the \
+                 status-event chain (disk full / I/O error?); see the agent log, then retry"
+            );
+            ExitCode::from(10)
         }
         DetectionSetStatusOutcome::ProtocolVersionUnsupported { server_version } => {
             eprintln!("{op}: server speaks protocol v{server_version}");

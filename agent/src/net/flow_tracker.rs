@@ -98,6 +98,13 @@ pub struct TcpConnectInfo {
 pub struct TcpCloseInfo {
     pub end_ns: u64,
     pub corr_id: CorrId,
+    /// Close-time local end (`skc_rcv_saddr` / `skc_num`). At
+    /// `tcp_v4_connect` entry the socket is still unbound, so the
+    /// pending flow carries `0.0.0.0:0`; the close hook is the first
+    /// (and only) point where the kernel-assigned source is known
+    /// (audit `abi-tcpconnect-srcport-1`).
+    pub src_addr: IpAddr,
+    pub src_port: u16,
     pub bytes_sent: u64,
     pub bytes_recv: u64,
     /// Low 8 bits of `sock->sk_err` at fexit. 0 = graceful
@@ -236,6 +243,15 @@ impl FlowTracker {
             return None;
         }
         let pending = self.pending.remove(&info.corr_id)?;
+        // TCP: the connect hook cannot know the local end; take it from
+        // the close observation so the emitted row AND the canonical
+        // flow_id carry the real 5-tuple (cross-host correlatable) instead
+        // of a zeroed source half.
+        let (src_addr, src_port) = if pending.src_port == 0 && pending.src_addr.is_unspecified() {
+            (info.src_addr, info.src_port)
+        } else {
+            (pending.src_addr, pending.src_port)
+        };
         // Pull the corr_id out of the eviction queue so it
         // doesn't carry a phantom slot. Linear scan but only
         // runs at close time + the queue is bounded by
@@ -244,8 +260,8 @@ impl FlowTracker {
         let flow_id = canonical_flow_id(
             pending.start_ns,
             pending.family,
-            pending.src_addr,
-            pending.src_port,
+            src_addr,
+            src_port,
             pending.dst_addr,
             pending.dst_port,
             pending.proto,
@@ -255,8 +271,8 @@ impl FlowTracker {
             start_ns: pending.start_ns,
             end_ns: info.end_ns,
             family: pending.family,
-            src_addr: pending.src_addr,
-            src_port: pending.src_port,
+            src_addr,
+            src_port,
             dst_addr: pending.dst_addr,
             dst_port: pending.dst_port,
             proto: pending.proto,
@@ -425,6 +441,8 @@ mod tests {
 
     fn close_fixture(end_ns: u64, corr: CorrId, sent: u64, recv: u64, reason: u8) -> TcpCloseInfo {
         TcpCloseInfo {
+            src_addr: "10.0.0.7".parse().unwrap(),
+            src_port: 51234,
             end_ns,
             corr_id: corr,
             bytes_sent: sent,
@@ -517,6 +535,37 @@ mod tests {
         assert_eq!(evt.dst_port, 443);
         assert_eq!(evt.flow_id.len(), 32);
         assert_eq!(t.pending_len(), 0, "pending entry must be drained on close");
+    }
+
+    /// Audit `abi-tcpconnect-srcport-1`: the connect hook never knows the
+    /// local end (unbound at tcp_v4_connect entry), so the emitted row and
+    /// the canonical flow_id must take it from the close observation.
+    #[test]
+    fn tcp_close_supplies_the_real_source_half() {
+        let mut t = FlowTracker::default();
+        let mut conn = connect_fixture(1_000_000, 0xC0FFEE, 4242, v4(203, 0, 113, 9), 8443);
+        // What the kernel really reports at tcp_v4_connect entry: unbound.
+        conn.src_addr = v4(0, 0, 0, 0);
+        conn.src_port = 0;
+        t.on_tcp_connect(&conn);
+        let corr = FlowTracker::corr_id(conn.start_ns, conn.sk_ptr);
+        let mut close = close_fixture(2_000_000, corr, 10, 20, 0);
+        close.src_addr = v4(10, 0, 0, 7);
+        close.src_port = 51234;
+        let evt = t.on_tcp_close(&close).expect("correlates");
+        assert_eq!(evt.src_addr, v4(10, 0, 0, 7));
+        assert_eq!(evt.src_port, 51234);
+        assert_ne!(evt.src_port, 0, "netflow rows must not carry 0.0.0.0:0");
+
+        // Same connect, different close-time source → different flow_id
+        // (the hash really covers the 5-tuple now).
+        let mut t2 = FlowTracker::default();
+        t2.on_tcp_connect(&conn);
+        let mut close2 = close_fixture(2_000_000, corr, 10, 20, 0);
+        close2.src_addr = v4(10, 0, 0, 8);
+        close2.src_port = 51234;
+        let evt2 = t2.on_tcp_close(&close2).expect("correlates");
+        assert_ne!(evt.flow_id, evt2.flow_id);
     }
 
     /// N3 test #6 — close with no matching pending entry

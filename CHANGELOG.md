@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- Audit Medium round: TCP netflow rows and `flow_id` carry the real
+  source address/port (close-time), not `0.0.0.0:0`; the COMBAT
+  kill-tree spares host-critical descendants (sshd, watchdog) via the
+  ladder guard; the `detections/` chain logs are in PROTECTED_INODES;
+  mass-write ignores a session's own `/run/user/<uid>/` writes only;
+  `nn-admin detection-set-status` reports a persistence failure (exit
+  10) distinctly from "not found" (exit 9).
 - `/etc/northnarrow` directory inode is now in PROTECTED_INODES
   (mutation-denied): the config tree can no longer be renamed or removed
   from under the agent by a root process outside PROTECTED_PIDS.
@@ -56,6 +63,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `catchall-1`, unbounded memory growth on a long-lived agent).
 
 ### Fixed
+- Agent unit: `/etc/northnarrow` added to `ReadWritePaths` — under
+  `ProtectSystem=strict` the installed agent could not append its own
+  signed audit log (EROFS) nor bootstrap `agent_id`/`agent.sig.key`.
 - Agent unit: `RuntimeDirectoryPreserve=yes` — a respawn-v2 restart no
   longer wipes `/run/northnarrow` (watchdog pidfile, shutdown marker,
   honeypot baits).

@@ -2979,6 +2979,7 @@ fn fail_set_status(result: AdminResult, id: u64) -> DetectionSetStatusResponse {
         result,
         id,
         new_status: String::new(),
+        persist_failed: false,
     }
 }
 
@@ -3086,7 +3087,11 @@ fn dispatch_detection_set_status(
                 id = extra.id,
                 "detection-set-status: status-event append failed (change not persisted)"
             );
-            return fail_set_status(AdminResult::UnknownOperation, extra.id);
+            // chain-persist-1: flag the persistence failure so the CLI
+            // can tell it apart from "not found" (same AdminResult).
+            let mut resp = fail_set_status(AdminResult::UnknownOperation, extra.id);
+            resp.persist_failed = true;
+            return resp;
         }
     }
     info!(
@@ -3100,6 +3105,7 @@ fn dispatch_detection_set_status(
         result: AdminResult::Success,
         id: extra.id,
         new_status: new_status.as_str().to_string(),
+        persist_failed: false,
     }
 }
 

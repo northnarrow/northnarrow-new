@@ -408,6 +408,14 @@ pub struct DetectionSetStatusResponse {
     /// The new status as a lowercase string on success; empty on
     /// failure.
     pub new_status: String,
+    /// Audit `chain-persist-1`: `true` when the request was valid and
+    /// authorised but the status-event APPEND failed (disk full, I/O
+    /// error, chain fsync) — the change was NOT recorded. Distinguishes
+    /// that case from "detection not found" on the wire, which both
+    /// report `result = UnknownOperation`. Additive: older agents omit
+    /// it (`false`).
+    #[serde(default)]
+    pub persist_failed: bool,
 }
 
 /// Tappa 9.5 commit K6 — signed canary deploy request. Carries
@@ -1354,6 +1362,7 @@ mod tests {
                 result: AdminResult::Success,
                 id: 42,
                 new_status: "resolved".to_string(),
+                persist_failed: false,
             },
         ));
         roundtrip(AdminMessage::DetectionSetStatusResponse(
@@ -1361,6 +1370,7 @@ mod tests {
                 result: AdminResult::RoleDenied,
                 id: 42,
                 new_status: String::new(),
+                persist_failed: false,
             },
         ));
     }

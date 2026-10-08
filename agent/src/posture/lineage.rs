@@ -478,17 +478,25 @@ impl AuthSessionTracker {
     /// (`docs/design/POSTURE_FSM_V2_REDESIGN.md` §5.2) replaces
     /// this binary signal with a graded score.
     pub fn has_valid_loginuid(&self, pid: u32) -> bool {
+        self.loginuid_of(pid).is_some()
+    }
+
+    /// The PAM-assigned login uid of `pid`, or `None` when unset
+    /// (`4294967295`), unreadable, or for PID 0/1. Audit `posture-3`
+    /// uses it ONLY to recognise a session writing into its OWN
+    /// `/run/user/<uid>/` runtime dir (PAM session start, `systemd
+    /// --user` helpers) — the mass-write arm stays armed for every
+    /// other path, so a ransomware inside an authenticated session is
+    /// still caught; the trust widening is bounded to that directory.
+    pub fn loginuid_of(&self, pid: u32) -> Option<u32> {
         if pid == 0 || pid == 1 {
-            return false;
+            return None;
         }
         let path = self.inner.proc_root.join(pid.to_string()).join("loginuid");
-        let raw = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
+        let raw = fs::read_to_string(&path).ok()?;
         match raw.trim().parse::<u32>() {
-            Ok(v) => v != LOGINUID_UNSET,
-            Err(_) => false,
+            Ok(v) if v != LOGINUID_UNSET => Some(v),
+            _ => None,
         }
     }
 

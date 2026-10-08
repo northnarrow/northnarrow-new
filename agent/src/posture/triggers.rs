@@ -682,6 +682,21 @@ fn confirmed_intrusion(
             {
                 return false;
             }
+            // Audit `posture-3`: a PAM session (valid loginuid) writing
+            // into ITS OWN `/run/user/<loginuid>/` is session plumbing —
+            // `systemd --user` creating runtime dirs/sockets at login —
+            // not a ransomware burst. Carve exactly that directory out
+            // for this writer; everything else (incl. `/run/user/` of
+            // another uid and `$HOME`) still counts, so the loginuid
+            // signal does not widen trust beyond the runtime dir.
+            let own_runtime_dir = auth
+                .loginuid_of(*focal_pid)
+                .map(|uid| format!("/run/user/{uid}/"));
+            let in_own_runtime =
+                |f: &str| own_runtime_dir.as_deref().is_some_and(|d| f.starts_with(d));
+            if in_own_runtime(focal_filename) {
+                return false;
+            }
             let mut count = 1usize;
             for e in recent {
                 if let Event::FileOpen {
@@ -695,6 +710,7 @@ fn confirmed_intrusion(
                     if *pid == *focal_pid
                         && is_write_open(*f)
                         && !is_mass_write_carveout(filename, mass_write_extras)
+                        && !in_own_runtime(filename)
                         && within(*focal_ts, *timestamp_ns, MASS_WRITE_WINDOW_NS)
                     {
                         count += 1;

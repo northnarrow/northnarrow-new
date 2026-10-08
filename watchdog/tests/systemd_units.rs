@@ -82,6 +82,11 @@ fn agent_unit_keeps_restart_no_and_disables_start_rate_limit() {
         Some("yes"),
         "/run/northnarrow is shared with the watchdog; a respawn must not wipe it"
     );
+    let rw = value(&d, "ReadWritePaths").expect("ReadWritePaths");
+    assert!(
+        rw.split_whitespace().any(|p| p == "/etc/northnarrow"),
+        "/etc/northnarrow must be writable or the audit chain / key bootstrap EROFS (etc-readonly-audit-1): {rw}"
+    );
     let caps = value(&d, "CapabilityBoundingSet").expect("bounding set");
     assert!(caps.split_whitespace().any(|c| c == "CAP_KILL"), "{caps}");
 }
