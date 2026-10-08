@@ -163,11 +163,30 @@ const DNS_QTYPE_NULL: u16 = 10;
 
 // ── NN-L-NET-005 burst-window state ──────────────────────────────────
 
+/// Sliding window for NN-L-NET-005.
+const DNS_BURST_WINDOW_NS: u64 = 60 * 1_000_000_000;
+
+/// Idle-key eviction cadence for the stateful windows below. The
+/// per-key `VecDeque`s are trimmed on every observe, but the OUTER
+/// map only ever gained keys (one per PID / per `(pid, dst)` flow):
+/// on a long-lived agent that is unbounded growth (audit
+/// `catchall-1`). Every N observes — or as soon as the map exceeds
+/// `STATEFUL_MAP_SOFT_CAP` keys — drop every key whose newest sample
+/// has already fallen out of its window. Amortised O(1) per observe.
+const STATEFUL_EVICT_EVERY: u32 = 256;
+const STATEFUL_MAP_SOFT_CAP: usize = 4096;
+
+/// Drop every key whose most recent sample is older than `cutoff`.
+fn evict_idle_keys<K>(map: &mut HashMap<K, VecDeque<u64>>, cutoff: u64) {
+    map.retain(|_, q| q.back().is_some_and(|&t| t >= cutoff));
+}
+
 /// 60-second per-PID TXT/NULL query counter. NN-L-NET-005 fires
 /// when `count > 50` for a given PID over a sliding 60s window.
 #[derive(Debug, Default)]
 pub struct DnsBurstWindow {
     per_pid: HashMap<u32, VecDeque<u64>>,
+    observes: u32,
 }
 
 impl DnsBurstWindow {
@@ -178,14 +197,22 @@ impl DnsBurstWindow {
     /// Observe one TXT/NULL query. Returns the count of queries
     /// from `pid` still within the 60s window AFTER this insert.
     pub fn observe(&mut self, pid: u32, ts_ns: u64) -> usize {
+        let cutoff = ts_ns.saturating_sub(DNS_BURST_WINDOW_NS);
+        self.observes = self.observes.wrapping_add(1);
+        if self.observes % STATEFUL_EVICT_EVERY == 0 || self.per_pid.len() > STATEFUL_MAP_SOFT_CAP {
+            evict_idle_keys(&mut self.per_pid, cutoff);
+        }
         let q = self.per_pid.entry(pid).or_default();
-        let window_ns: u64 = 60 * 1_000_000_000;
-        let cutoff = ts_ns.saturating_sub(window_ns);
         while q.front().is_some_and(|&t| t < cutoff) {
             q.pop_front();
         }
         q.push_back(ts_ns);
         q.len()
+    }
+
+    /// Number of PIDs currently tracked (test/metrics hook).
+    pub fn tracked_keys(&self) -> usize {
+        self.per_pid.len()
     }
 }
 
@@ -221,6 +248,7 @@ const BEACON_MAX_CV: f64 = 0.15;
 #[derive(Debug, Default)]
 pub struct BeaconWindow {
     per_flow: HashMap<(u32, IpAddr), VecDeque<u64>>,
+    observes: u32,
 }
 
 impl BeaconWindow {
@@ -233,8 +261,13 @@ impl BeaconWindow {
     /// pattern. Returns `false` until at least [`BEACON_MIN_SAMPLES`]
     /// flows have accumulated within [`BEACON_WINDOW_NS`].
     pub fn observe(&mut self, pid: u32, dst: IpAddr, ts_ns: u64) -> bool {
-        let q = self.per_flow.entry((pid, dst)).or_default();
         let cutoff = ts_ns.saturating_sub(BEACON_WINDOW_NS);
+        self.observes = self.observes.wrapping_add(1);
+        if self.observes % STATEFUL_EVICT_EVERY == 0 || self.per_flow.len() > STATEFUL_MAP_SOFT_CAP
+        {
+            evict_idle_keys(&mut self.per_flow, cutoff);
+        }
+        let q = self.per_flow.entry((pid, dst)).or_default();
         while q.front().is_some_and(|&t| t < cutoff) {
             q.pop_front();
         }
@@ -246,6 +279,11 @@ impl BeaconWindow {
             return false;
         }
         Self::is_periodic(q)
+    }
+
+    /// Number of `(pid, dst)` flows currently tracked (test/metrics hook).
+    pub fn tracked_keys(&self) -> usize {
+        self.per_flow.len()
     }
 
     /// Low-jitter test over consecutive inter-arrival intervals:
@@ -2610,5 +2648,53 @@ mod tests {
                 .evaluate(&flow_pid(4242, dst, 443, "chronyd", i * 60 * SEC))
                 .is_none());
         }
+    }
+    #[test]
+    fn dns_burst_window_evicts_idle_pids() {
+        let mut w = DnsBurstWindow::new();
+        let t0: u64 = 1_000 * 1_000_000_000;
+        // 5000 distinct PIDs, one query each, all at t0: the soft cap
+        // (4096) is exceeded, so the next observe at t0 + 61 s must
+        // sweep every one of them (their newest sample is outside the
+        // 60 s window).
+        for pid in 1..=5_000u32 {
+            w.observe(pid, t0);
+        }
+        assert!(w.tracked_keys() >= 4096);
+        let later = t0 + 61 * 1_000_000_000;
+        w.observe(7, later);
+        assert_eq!(w.tracked_keys(), 1, "only the live PID must remain");
+        assert_eq!(w.observe(7, later + 1), 2);
+    }
+
+    #[test]
+    fn dns_burst_window_periodic_sweep_without_cap() {
+        let mut w = DnsBurstWindow::new();
+        let t0: u64 = 1_000 * 1_000_000_000;
+        for pid in 1..=100u32 {
+            w.observe(pid, t0);
+        }
+        assert_eq!(w.tracked_keys(), 100);
+        // Drive the observe counter across a multiple of
+        // STATEFUL_EVICT_EVERY with a single live PID far in the future.
+        let later = t0 + 120 * 1_000_000_000;
+        for _ in 0..STATEFUL_EVICT_EVERY {
+            w.observe(42, later);
+        }
+        assert_eq!(w.tracked_keys(), 1);
+    }
+
+    #[test]
+    fn beacon_window_evicts_idle_flows() {
+        let mut w = BeaconWindow::new();
+        let t0: u64 = 10_000 * 1_000_000_000;
+        let dst: IpAddr = "203.0.113.9".parse().unwrap();
+        for pid in 1..=5_000u32 {
+            w.observe(pid, dst, t0);
+        }
+        assert!(w.tracked_keys() >= 4096);
+        let later = t0 + BEACON_WINDOW_NS + 1;
+        w.observe(1, dst, later);
+        assert_eq!(w.tracked_keys(), 1, "only the live flow must remain");
     }
 }
