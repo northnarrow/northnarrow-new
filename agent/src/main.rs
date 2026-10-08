@@ -1015,10 +1015,16 @@ async fn main() -> Result<()> {
                 .with_rules_v6(cli.combat_rules_v6.clone()),
         )),
         Err(e) => {
-            warn!(
+            // ERROR, not WARN: besides losing isolation, no isolator means
+            // the admin socket below is never started — nn-admin status /
+            // unlock / detections all fail and the watchdog's STATUS ping
+            // trips its stuck-recovery restart loop every 30 s.
+            error!(
                 error = %e,
                 path = %cli.combat_rules.display(),
-                "combat ruleset missing; COMBAT entry will not engage network isolation"
+                "combat ruleset missing or invalid: COMBAT entry will NOT engage network \
+                 isolation AND the admin socket will NOT be started (nn-admin unusable, \
+                 watchdog STATUS ping will fail) — install combat-rules.v4 (configs/) and restart"
             );
             None
         }
@@ -2083,6 +2089,12 @@ async fn main() -> Result<()> {
                 );
             }
         }
+    } else {
+        error!(
+            socket = %cli.admin_socket.display(),
+            "admin socket NOT started: no NetworkIsolator (combat ruleset missing, see above) — \
+             the watchdog STATUS ping will fail until the ruleset is installed and the agent restarted"
+        );
     }
 
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h

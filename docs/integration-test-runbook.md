@@ -30,6 +30,32 @@ CI compiles this module (bit-rot guard) but does **not** execute it
   there, and the iptables ruleset's stale state can otherwise persist
   across runs if a test crashes between create and cleanup.
 
+## Local lab (QEMU/KVM, also from WSL2)
+
+`deploy/lab/nn-lab.sh` turns the prerequisites above into a repeatable
+guest: Ubuntu 24.04 cloud image, kernel 6.8, `lsm=…,bpf` set through
+cloud-init (one automatic reboot), iptables + bpftool + rustup inside,
+SSH on `127.0.0.1:2222`. WSL2 needs nested virtualization (`/dev/kvm`
+present) and the user in the `kvm` group.
+
+```sh
+sudo apt install qemu-system-x86 qemu-utils cloud-image-utils   # host, once
+deploy/lab/nn-lab.sh up            # download + provision + boot (~5-10 min first time)
+deploy/lab/nn-lab.sh check         # kernel / lsm has bpf / bpffs / iptables / cargo
+deploy/lab/nn-lab.sh sync          # cargo xtask build-ebpf on host, rsync repo (+ eBPF object) into the guest
+deploy/lab/nn-lab.sh build         # guest-side cargo build --release --features test-privileged,debug-trigger
+deploy/lab/nn-lab.sh test-e2e      # the "Run" section below, as root, single-threaded
+deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test in the workspace
+deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
+deploy/lab/nn-lab.sh respawn-check # kill -9 the agent; asserts unit active, cgroup, CAP_KILL, watchdog alive
+deploy/lab/nn-lab.sh snapshot clean   # (guest down) revert point before an attack run
+```
+
+The eBPF object is built on the **host** (nightly + bpf-linker 0.10.3)
+and shipped with its provenance stamp; the guest only builds userland,
+so `agent/build.rs`'s staleness guard still holds. `respawn-check` is
+the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
+
 ## Build
 
 ```sh
@@ -50,12 +76,17 @@ sets `CARGO_BIN_EXE_*` env vars automatically at test-build time).
 ```sh
 sudo -E env "PATH=$PATH" \
   cargo test --release \
-    --features test-privileged \
+    --features test-privileged,debug-trigger \
     --test privileged_e2e \
     -- --test-threads=1 --nocapture
 ```
 
 Flags:
+- `--features test-privileged,debug-trigger` — BOTH, same as the build
+  step: cargo rebuilds `nn-admin` with the features of this invocation,
+  and without `debug-trigger` the `nn-admin debug force-posture` call
+  fails with `unrecognized subcommand 'debug'` (seen on the lab guest,
+  2026-10-08);
 
 - `sudo -E` preserves `$PATH` so cargo's own binary resolves;
   `--test-threads=1` is **mandatory** because iptables rules collide
@@ -64,7 +95,9 @@ Flags:
 - `--nocapture` is optional but very helpful — failures otherwise
   swallow the agent's stderr.
 
-Expected: **3 tests passing, 1 ignored** in ~30 s on a fast machine:
+Expected: **6 tests passing, 3 ignored** in ~90 s (the two COMBAT tests
+each wait for the graduated ladder to reach ISOLATE — ~30 s investigate
+window — before checking the iptables chain):
 
 ```
 running 4 tests

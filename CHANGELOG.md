@@ -36,6 +36,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `catchall-1`, unbounded memory growth on a long-lived agent).
 
 ### Fixed
+- `install.sh` now ships `combat-rules.v4/.v6` from `configs/` (missing
+  ruleset = no NetworkIsolator = admin socket silently absent = watchdog
+  stuck-recovery restart loop) and lifts `chattr +i` on the state dir
+  for upgrades. The agent logs an ERROR when the ruleset is missing.
 - CI: `cargo fmt`, `cargo clippy -D warnings` and the `test` job are green
   again; `ade-build` no longer runs out of disk on the hosted runner;
   `ebpf-build` pins `bpf-linker 0.10.3` (0.11 needs a system LLVM 21+).
@@ -45,6 +49,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   0.9.21 (RUSTSEC-2026-0204).
 
 ### Added
+- `deploy/lab/nn-lab.sh`: QEMU/KVM Ubuntu 24.04 lab guest (kernel 6.8,
+  `lsm=…,bpf`) with sync/build/test-e2e/test-ignored/install/respawn-check
+  sub-commands; runs from WSL2 with nested virtualization.
 - `cargo audit` CI job, Dependabot (cargo + GitHub Actions), `SECURITY.md`.
 
 ## [0.0.1] — 2026-06-10
