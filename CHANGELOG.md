@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- `nn-admin rotate-keys add --new-roles` accepts every role keyword the
+  agent understands (`canary-manage`, `fim-manage`, `net-read`,
+  `triage`, …), not only the legacy five: least-privilege keys for
+  canary/FIM operators can now be granted from the CLI instead of
+  hand-editing `admin.pub` or granting `all`. The install-bootstrapped
+  key's roles (`unlock,audit-read` only) are documented in
+  `docs/operator/COMBAT_RECOVERY.md` §1.1.
+- An orphan TCP close (no pending flow) is logged at WARN with the
+  5-tuple instead of silently dropped at debug.
 - The outbound UDP sensor now observes unconnected `sendto()` traffic
   (destination read from `msghdr->msg_name`), rate-limited kernel-side
   to one netflow row per `(pid, destination)` per second. Before, only

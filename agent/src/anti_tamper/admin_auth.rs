@@ -1052,7 +1052,7 @@ fn parse_admin_line(line: &str) -> Result<KeyEntry> {
 /// Duplicate roles inside the list are deduped before returning via
 /// linear scan (the list is at most 6 elements long, smaller than
 /// any reasonable hash table overhead).
-fn parse_role_list(s: &str) -> Result<Vec<Role>> {
+pub fn parse_role_list(s: &str) -> Result<Vec<Role>> {
     if s.is_empty() {
         return Err(anyhow!("role list is empty"));
     }
@@ -1082,7 +1082,7 @@ fn parse_role_list(s: &str) -> Result<Vec<Role>> {
 /// sync with [`role_keyword`] (the emit-side helper) — the
 /// `load_parses_every_role_keyword_in_design_spec_3_2` test
 /// anchors that invariant.
-fn parse_role_keyword(s: &str) -> Result<Role> {
+pub fn parse_role_keyword(s: &str) -> Result<Role> {
     match s {
         "unlock" => Ok(Role::Unlock),
         "shutdown" => Ok(Role::Shutdown),
@@ -1263,7 +1263,7 @@ fn format_role_list(roles: &[Role]) -> String {
     parts.join(",")
 }
 
-fn role_keyword(r: Role) -> &'static str {
+pub fn role_keyword(r: Role) -> &'static str {
     match r {
         Role::Unlock => "unlock",
         Role::Shutdown => "shutdown",

@@ -385,10 +385,47 @@ async fn process_close_record(
             match flow_tracker.lock().on_tcp_close(&info) {
                 Some(e) => e,
                 None => {
-                    // Orphan close — connect predated the agent
-                    // OR FLOW_SOCK_MAP got LRU-evicted between
-                    // connect + close. Drop on the floor.
-                    debug!("net drain: TCP close had no matching pending flow");
+                    // Orphan close. Two very different cases:
+                    //  * corr_id all-zero = the kernel-side FLOW_SOCK_MAP
+                    //    lookup missed. EXPECTED for every passive socket
+                    //    (listeners and accept()ed peers never pass the
+                    //    connect kprobe) and for connects that predate the
+                    //    agent — debug-level, or a busy server would log a
+                    //    WARN per inbound connection.
+                    //  * corr_id present = the connect kprobe recorded the
+                    //    flow but userland has no pending entry (FIFO
+                    //    eviction, ringbuf drop, drain restart). That is a
+                    //    genuine gap in netflow.jsonl: WARN with the
+                    //    5-tuple (review entry 18).
+                    let kernel_lookup_miss = raw.flow_id == [0u8; 16];
+                    let comm = String::from_utf8_lossy(&raw.comm)
+                        .trim_end_matches('\0')
+                        .to_string();
+                    let dst = format!("{}:{}", decode_addr(raw.family, raw.dst_addr), raw.dst_port);
+                    let src = format!("{}:{}", info.src_addr, info.src_port);
+                    if kernel_lookup_miss {
+                        debug!(
+                            target: "net.drain",
+                            pid = raw.pid,
+                            comm = %comm,
+                            src = %src,
+                            dst = %dst,
+                            "net drain: TCP close without a connect-side flow (passive or pre-agent socket) — not recorded"
+                        );
+                    } else {
+                        warn!(
+                            target: "net.drain",
+                            pid = raw.pid,
+                            comm = %comm,
+                            src = %src,
+                            dst = %dst,
+                            corr_id = %hex::encode(raw.flow_id),
+                            close_reason = raw.close_reason,
+                            bytes_sent = raw.bytes_sent,
+                            bytes_recv = raw.bytes_recv,
+                            "net drain: TCP close had a kernel flow id but no pending flow — row NOT recorded"
+                        );
+                    }
                     return;
                 }
             }
