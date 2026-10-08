@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- R004 (fileless exec) also matches `/dev/fd/N` (what glibc's `fexecve`
+  really passes) and `/memfd:` pseudo-paths; previously a memfd exec on
+  Ubuntu 24.04 was undetected.
+- File canaries deployed at arbitrary paths trip again on READ: the FIM
+  drain's BUG-012 v2 gate now forwards `Opened` events for canary inodes
+  (published by the K3 index rebuild) to the rule engine.
 - Watchdog respawn v2 (`docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md`): a
   crashed agent is restarted with `systemctl start` under its own unit
   (full ExecStart argv, own cgroup/caps/ProtectHome) instead of as a

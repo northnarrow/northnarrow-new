@@ -455,6 +455,69 @@ fn count_pins(prefix: &str) -> usize {
 /// (`Ebpf::load_from_bytes`) but the per-hook `load()`/`attach()`/
 /// `pin()` calls have not all completed yet. Same deadline/poll
 /// shape as [`wait_for_pin`].
+/// Hooks attached through the pinned-reuse path (`attach_lsm`): their
+/// kernel program AND link objects must survive an agent restart. The
+/// six `inode_protect` deny hooks and the two module-load observe hooks
+/// are deliberately re-attached FRESH every boot (BUG-024: a reused link
+/// kept producing into the previous boot's ring), and the FIM observe
+/// programs are transient, so their ids legitimately change.
+const PINNED_REUSE_HOOKS: &[&str] = &["task_kill", "ptrace_access_check"];
+
+/// Prog id of the loaded LSM program named `name`, if any.
+fn lsm_prog_id_by_name(name: &str) -> Option<u64> {
+    let text = bpftool_prog_show_all().ok()?;
+    parse_progs(&text)
+        .into_iter()
+        .find(|p| p.prog_type == "lsm" && p.name.as_deref() == Some(name))
+        .map(|p| p.id)
+}
+
+/// Link id whose header references `prog_id`, if any.
+fn link_id_for_prog(prog_id: u64) -> Option<u64> {
+    let text = bpftool_link_show_all().ok()?;
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let Some(&first) = toks.first() else { continue };
+        let Some(id_str) = first.strip_suffix(':') else {
+            continue;
+        };
+        let Ok(link_id) = id_str.parse::<u64>() else {
+            continue;
+        };
+        let pid = toks
+            .iter()
+            .position(|&t| t == "prog")
+            .and_then(|i| toks.get(i + 1))
+            .and_then(|s| s.parse::<u64>().ok());
+        if pid == Some(prog_id) {
+            return Some(link_id);
+        }
+    }
+    None
+}
+
+/// `(prog_id, link_id)` for every [`PINNED_REUSE_HOOKS`] entry, polling
+/// briefly: links show up in `bpftool link show` a moment after the
+/// programs do (a 0-links read right after attach was observed on the
+/// lab guest).
+fn pinned_hook_ids() -> Vec<(&'static str, u64, u64)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut out = Vec::new();
+        for name in PINNED_REUSE_HOOKS {
+            if let Some(pid) = lsm_prog_id_by_name(name) {
+                if let Some(lid) = link_id_for_prog(pid) {
+                    out.push((*name, pid, lid));
+                }
+            }
+        }
+        if out.len() == PINNED_REUSE_HOOKS.len() || Instant::now() >= deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn wait_for_full_lsm_attach(map_id: u64) -> Result<(), String> {
     let deadline = Instant::now() + LSM_ATTACH_TIMEOUT;
     let mut last = String::new();
@@ -521,16 +584,19 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
 
     // 2b: snapshot the kernel object id sets while boot-1 is live.
     let prog_ids1 = lsm_prog_ids();
-    let link_ids1 = lsm_link_ids();
+    let pinned1 = pinned_hook_ids();
     assert!(
         prog_ids1.len() >= EXPECTED_LSM_HOOKS,
         "boot-1: {} LSM programs visible, expected ≥{EXPECTED_LSM_HOOKS}: {prog_ids1:?}",
         prog_ids1.len()
     );
-    assert!(
-        link_ids1.len() >= EXPECTED_LSM_HOOKS,
-        "boot-1: {} LSM links visible, expected ≥{EXPECTED_LSM_HOOKS}: {link_ids1:?}",
-        link_ids1.len()
+    assert_eq!(
+        pinned1.len(),
+        PINNED_REUSE_HOOKS.len(),
+        "boot-1: pinned-reuse hooks not all attached with a link: {pinned1:?}
+--- bpftool link show ---
+{}",
+        bpftool_link_show_all().unwrap_or_else(|e| e)
     );
     let (p1, l1) = (count_pins("prog_"), count_pins("link_"));
     assert!(
@@ -579,22 +645,25 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
     });
 
     // 2b core invariant: pinned ⇒ the SAME kernel program and link
-    // objects are reused, not freshly created. Equal id *sets* ⇒
-    // every hook's prog and link survived the death→respawn gap.
+    // objects are reused, not freshly created — for the pinned-reuse
+    // hooks. The whole-set equality this test used to assert has been
+    // wrong since BUG-024: the inode_protect deny set and the
+    // module-load observe hooks re-attach FRESH every boot by design
+    // (new prog + link ids), and the FIM observe programs are
+    // transient. So: same (prog, link) ids for task_kill + ptrace, and
+    // the full hook complement present again after the restart.
     let prog_ids2 = lsm_prog_ids();
-    let link_ids2 = lsm_link_ids();
-    assert_eq!(
-        prog_ids1, prog_ids2,
-        "LSM program id set changed across restart ({prog_ids1:?} → \
-         {prog_ids2:?}): programs were re-created, not reused via the \
-         prog_<hook> pin — #2b program pinning broken"
+    assert!(
+        prog_ids2.len() >= EXPECTED_LSM_HOOKS,
+        "boot-2: {} LSM programs visible, expected ≥{EXPECTED_LSM_HOOKS}: {prog_ids2:?}",
+        prog_ids2.len()
     );
+    let pinned2 = pinned_hook_ids();
     assert_eq!(
-        link_ids1, link_ids2,
-        "LSM link id set changed across restart ({link_ids1:?} → \
-         {link_ids2:?}): links were re-created, not reused via the \
-         link_<hook> pin / PinnedLink::from_pin — the hook stopped \
-         firing across the gap; #2b link pinning broken"
+        pinned1, pinned2,
+        "pinned-reuse hook (prog, link) ids changed across restart ({pinned1:?} → \
+         {pinned2:?}): programs/links were re-created, not reused via the \
+         prog_<hook> / link_<hook> pins — #2b pinning broken (boot-1 set: {prog_ids1:?})"
     );
 
     agent2.stop();

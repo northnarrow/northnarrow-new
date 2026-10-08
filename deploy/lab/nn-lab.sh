@@ -198,7 +198,9 @@ cmd_test_e2e() {
 
 cmd_test_ignored() {
     vm_running || die "guest is not running"
-    vcargo 'sudo -E env "PATH=$PATH" cargo test --release --workspace --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1'
+    # --no-fail-fast: one failing test binary must not skip the other
+    # targets (the first run stopped at 11 of 56 ignored tests).
+    vcargo 'sudo -E env "PATH=$PATH" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1'
 }
 
 cmd_install() {
