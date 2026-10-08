@@ -378,8 +378,11 @@ enum Cmd {
 #[derive(Subcommand, Debug)]
 enum RotateKeysCmd {
     /// Install a new admin key. Requires --new-pubkey (64 hex
-    /// chars) and --new-roles (CSV of role keywords: unlock,
-    /// shutdown, force-posture, rotate-keys, audit-read, all).
+    /// chars) and --new-roles (CSV of role keywords, the same the
+    /// agent accepts in admin.pub: unlock, shutdown, force-posture,
+    /// rotate-keys, audit-read, fim-manage, fim-read, canary-read,
+    /// canary-manage, net-read, net-manage, trusted-installer,
+    /// telemetry-read, triage, all).
     Add {
         /// 64-hex-char Ed25519 verifying key to install.
         #[arg(long = "new-pubkey")]
@@ -1713,29 +1716,22 @@ fn colorize(s: &str, sgr: &str, tty: bool) -> String {
 /// [`common::wire::admin_signed_payload::Role`] enum. Empty input
 /// is rejected — A13's `add` flow requires at least one role.
 fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<common::wire::admin_signed_payload::Role>> {
-    use anyhow::{anyhow, bail};
-    use common::wire::admin_signed_payload::Role;
+    use anyhow::bail;
+    // Review `admin-cli-roles-1`: delegate to the agent's admin.pub
+    // keyword table so `rotate-keys add --new-roles` can grant EVERY
+    // role the agent understands (fim-*, canary-*, net-*, triage, …),
+    // not the five-keyword subset this CLI used to hard-code — which
+    // made canary-manage / fim-manage ungrantable from the CLI.
     let mut out = Vec::new();
     for raw in s.split(',') {
         let token = raw.trim();
         if token.is_empty() {
             continue;
         }
-        let role = match token {
-            "unlock" => Role::Unlock,
-            "shutdown" => Role::Shutdown,
-            "force-posture" => Role::ForcePosture,
-            "rotate-keys" => Role::RotateKeys,
-            "audit-read" => Role::AuditRead,
-            "all" => Role::All,
-            other => {
-                return Err(anyhow!(
-                    "unknown role keyword `{other}`; valid: unlock, shutdown, \
-                     force-posture, rotate-keys, audit-read, all"
-                ));
-            }
-        };
-        out.push(role);
+        let role = northnarrow_agent::anti_tamper::admin_auth::parse_role_keyword(token)?;
+        if !out.contains(&role) {
+            out.push(role);
+        }
     }
     if out.is_empty() {
         bail!("--new-roles must list at least one role keyword");
@@ -2618,5 +2614,42 @@ fn exit_from_net_resolve(outcome: NetResolveOutcome) -> ExitCode {
             eprintln!("net resolve: unexpected server reply");
             ExitCode::from(5)
         }
+    }
+}
+
+#[cfg(test)]
+mod roles_csv_tests {
+    use super::parse_roles_csv;
+    use common::wire::admin_signed_payload::Role;
+
+    /// Review `admin-cli-roles-1`: every keyword the agent accepts in
+    /// admin.pub is grantable from the CLI, not just the legacy five.
+    #[test]
+    fn grants_every_agent_role_keyword() {
+        let roles = parse_roles_csv("canary-manage, fim-manage,net-read,triage").unwrap();
+        assert_eq!(
+            roles,
+            vec![
+                Role::CanaryManage,
+                Role::FimManage,
+                Role::NetRead,
+                Role::Triage
+            ]
+        );
+        assert_eq!(
+            parse_roles_csv("unlock,audit-read").unwrap(),
+            vec![Role::Unlock, Role::AuditRead]
+        );
+        assert_eq!(parse_roles_csv("all").unwrap(), vec![Role::All]);
+    }
+
+    #[test]
+    fn rejects_unknown_empty_and_dedupes() {
+        assert!(parse_roles_csv("canary-admin").is_err());
+        assert!(parse_roles_csv(" , ").is_err());
+        assert_eq!(
+            parse_roles_csv("unlock,unlock").unwrap(),
+            vec![Role::Unlock]
+        );
     }
 }
