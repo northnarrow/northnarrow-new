@@ -3482,11 +3482,27 @@ mod tests {
         }
         assert!(socket.exists());
 
-        // Smoke check: a status round-trip works.
+        // Smoke check: a status round-trip works. The socket path
+        // appears at bind(2), a few instructions BEFORE listen(2): a
+        // connect in that window gets ECONNREFUSED, so retry briefly
+        // instead of unwrapping the first attempt (flake seen under
+        // parallel test load).
         let socket_c = socket.clone();
-        let out = tokio::task::spawn_blocking(move || run_status(&socket_c).unwrap())
-            .await
-            .unwrap();
+        let out = tokio::task::spawn_blocking(move || {
+            let mut last = None;
+            for _ in 0..50 {
+                match run_status(&socket_c) {
+                    Ok(out) => return out,
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            panic!("status round-trip never succeeded: {last:?}");
+        })
+        .await
+        .unwrap();
         assert_eq!(out.posture, PostureKind::Observing);
 
         task.abort();
