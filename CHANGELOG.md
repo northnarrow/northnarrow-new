@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- Watchdog respawn v2 (`docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md`): a
+  crashed agent is restarted with `systemctl start` under its own unit
+  (full ExecStart argv, own cgroup/caps/ProtectHome) instead of as a
+  fork-exec child of the watchdog's 64 MiB / 2-cap sandbox. `BindsTo=`
+  removed from the watchdog unit; `StartLimitIntervalSec=0` on the agent
+  unit. New flags `--respawn-backend {auto,systemd,exec}` and
+  `--agent-unit`. Closes `watchdog-respawn-1` and `combat-avail-1`.
 - Audit Beta-blockers closed: `abi-modpath-1` (module path sensor now
   keeps 16 components and flags truncation; R018 never auto-kills on an
   unverifiable prefix), `posture-1` (two blunt COMBAT-tier signals in one

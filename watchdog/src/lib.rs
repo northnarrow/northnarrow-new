@@ -108,6 +108,16 @@ pub struct Cli {
     /// to skip the race entirely.
     #[arg(long = "agent-bin", value_name = "PATH")]
     pub agent_bin: Option<PathBuf>,
+
+    /// How the agent is brought back after a crash (respawn v2,
+    /// docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md). `auto` picks
+    /// `systemd` when /run/systemd/system exists, else `exec`.
+    #[arg(long = "respawn-backend", value_enum, default_value_t = RespawnBackendChoice::Auto)]
+    pub respawn_backend: RespawnBackendChoice,
+
+    /// systemd unit started by the `systemd` respawn backend.
+    #[arg(long = "agent-unit", value_name = "UNIT", default_value = DEFAULT_AGENT_UNIT)]
+    pub agent_unit: String,
 }
 
 /// Apply the W2 process-hardening prctls per design §7.4:
@@ -611,6 +621,185 @@ pub fn spawn_agent(argv: &[String]) -> Result<Child> {
         "agent respawned"
     );
     Ok(child)
+}
+
+// ── Respawn v2 — backend selection (design: WATCHDOG_RESPAWN_V2_DESIGN) ──
+
+/// Directory systemd creates only when it is PID 1 of a booted system
+/// (`sd_booted(3)` checks the same path).
+pub const SYSTEMD_RUNTIME_DIR: &str = "/run/systemd/system";
+/// Agent unit the `systemd` backend starts.
+pub const DEFAULT_AGENT_UNIT: &str = "northnarrow-agent.service";
+/// `systemctl` locations tried in order (merged-/usr first).
+pub const SYSTEMCTL_CANDIDATES: &[&str] = &["/usr/bin/systemctl", "/bin/systemctl"];
+
+/// Operator choice for the respawn backend (`--respawn-backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RespawnBackendChoice {
+    /// `systemd` when [`SYSTEMD_RUNTIME_DIR`] exists, else `exec`.
+    Auto,
+    /// `systemctl start <unit>`: the agent returns under ITS OWN unit
+    /// (ExecStart argv, cgroup, caps, ProtectHome, journal namespace).
+    Systemd,
+    /// Fork-exec with the persisted first-launch argv (non-systemd hosts).
+    Exec,
+}
+
+/// How the watchdog brings the agent back. The watchdog still decides
+/// WHEN (backoff, ceiling, shutdown marker); this is only the HOW.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RespawnBackend {
+    SystemdUnit { unit: String },
+    ForkExec { argv: Vec<String> },
+}
+
+impl RespawnBackend {
+    /// One-line description for the boot log.
+    pub fn describe(&self) -> String {
+        match self {
+            RespawnBackend::SystemdUnit { unit } => format!("systemd:{unit}"),
+            RespawnBackend::ForkExec { argv } => {
+                format!(
+                    "exec:{} (argc={})",
+                    argv.first().map(String::as_str).unwrap_or("?"),
+                    argv.len()
+                )
+            }
+        }
+    }
+}
+
+/// `true` when systemd is the running init (same test as `sd_booted`).
+pub fn systemd_is_booted(runtime_dir: &Path) -> bool {
+    runtime_dir.is_dir()
+}
+
+/// Resolve the operator's choice into a concrete backend. `exec_argv`
+/// is only invoked when the exec backend is selected, so a systemd host
+/// never pays for (or fails on) the /proc argv reconstruction.
+pub fn select_backend(
+    choice: RespawnBackendChoice,
+    systemd_booted: bool,
+    unit: &str,
+    exec_argv: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<RespawnBackend> {
+    let use_systemd = match choice {
+        RespawnBackendChoice::Systemd => true,
+        RespawnBackendChoice::Exec => false,
+        RespawnBackendChoice::Auto => systemd_booted,
+    };
+    if use_systemd {
+        if !systemd_booted {
+            warn!(
+                target: "watchdog.respawn",
+                "--respawn-backend systemd requested but {SYSTEMD_RUNTIME_DIR} is absent; \
+                 systemctl calls will fail until systemd is the running init"
+            );
+        }
+        return Ok(RespawnBackend::SystemdUnit {
+            unit: unit.to_string(),
+        });
+    }
+    let argv = exec_argv().context("building the exec respawn argv")?;
+    if argv.is_empty() {
+        return Err(anyhow!("exec respawn backend needs a non-empty argv"));
+    }
+    Ok(RespawnBackend::ForkExec { argv })
+}
+
+/// Split a `/proc/<pid>/cmdline` body (NUL-separated, NUL-terminated)
+/// into argv. An empty body (zombie / kernel thread) yields an empty vec.
+pub fn parse_proc_cmdline(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+/// The agent's FULL first-launch argv from `/proc/<pid>/cmdline`, with
+/// `argv[0]` optionally replaced by `--agent-bin` (an installer may have
+/// moved the binary since the agent started). This is what §5.3 of the
+/// Tappa 7 design asked for and what closes `combat-avail-1`: every
+/// flag — `--combat-rules`, `--admin-pub`, `--detect-only`, … —
+/// survives the respawn.
+pub fn agent_argv_from_proc(pid: u32, agent_bin: Option<&Path>) -> Result<Vec<String>> {
+    let path = format!("/proc/{pid}/cmdline");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let mut argv = parse_proc_cmdline(&bytes);
+    if argv.is_empty() {
+        return Err(anyhow!(
+            "{path} is empty (agent exited before argv capture?)"
+        ));
+    }
+    if let Some(bin) = agent_bin {
+        argv[0] = bin.to_string_lossy().into_owned();
+    }
+    Ok(argv)
+}
+
+/// First existing `systemctl` from [`SYSTEMCTL_CANDIDATES`].
+pub fn find_systemctl() -> Option<PathBuf> {
+    SYSTEMCTL_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+/// `systemctl start --no-block <unit>`: queue the start job and return.
+/// Readiness is observed by the caller through the agent pidfile, exactly
+/// as for the exec backend, so `--no-block` loses nothing and keeps the
+/// watchdog's restart loop from blocking on a slow agent boot.
+pub fn systemctl_start_command(systemctl: &Path, unit: &str) -> Command {
+    let mut cmd = Command::new(systemctl);
+    cmd.arg("start").arg("--no-block").arg(unit);
+    cmd
+}
+
+/// Run [`systemctl_start_command`] and map the exit status.
+pub fn systemctl_start(unit: &str) -> Result<()> {
+    let systemctl = find_systemctl()
+        .ok_or_else(|| anyhow!("systemctl not found at any of {SYSTEMCTL_CANDIDATES:?}"))?;
+    let out = systemctl_start_command(&systemctl, unit)
+        .output()
+        .with_context(|| format!("spawning {} start {unit}", systemctl.display()))?;
+    if out.status.success() {
+        info!(
+            target: "watchdog.respawn",
+            unit,
+            systemctl = %systemctl.display(),
+            "systemctl start queued"
+        );
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let masked = stderr.contains("masked");
+    error!(
+        target: "watchdog.respawn",
+        unit,
+        status = ?out.status.code(),
+        unit_masked = masked,
+        stderr = %stderr,
+        "systemctl start FAILED"
+    );
+    Err(anyhow!(
+        "systemctl start {unit} failed (status {:?}): {stderr}",
+        out.status.code()
+    ))
+}
+
+/// Bring the agent back through `backend`. For the exec backend the
+/// child handle is dropped immediately (the agent is tracked by pidfd,
+/// never by `waitpid`, same as before).
+pub fn respawn_agent(backend: &RespawnBackend) -> Result<()> {
+    match backend {
+        RespawnBackend::SystemdUnit { unit } => systemctl_start(unit),
+        RespawnBackend::ForkExec { argv } => {
+            let child = spawn_agent(argv)?;
+            std::mem::drop(child);
+            Ok(())
+        }
+    }
 }
 
 /// Poll the new agent's pidfile until it contains a valid PID,
@@ -1609,6 +1798,114 @@ mod tests {
     /// a clear error before touching `Command::spawn`. Guards
     /// against a future caller forgetting the binary-path
     /// element.
+    // ── respawn v2 backend ─────────────────────────────────────────
+    #[test]
+    fn parse_proc_cmdline_splits_on_nul_and_ignores_trailing() {
+        let body = b"/usr/local/bin/northnarrow-agent\0--detect-only\0--admin-pub\0/etc/northnarrow/admin.pub\0";
+        assert_eq!(
+            parse_proc_cmdline(body),
+            vec![
+                "/usr/local/bin/northnarrow-agent",
+                "--detect-only",
+                "--admin-pub",
+                "/etc/northnarrow/admin.pub"
+            ]
+        );
+        assert!(parse_proc_cmdline(b"").is_empty());
+        assert!(parse_proc_cmdline(b"\0\0").is_empty());
+    }
+
+    #[test]
+    fn agent_argv_from_proc_reads_own_cmdline_and_overrides_bin() {
+        // Our own process is a valid /proc source.
+        let own = std::process::id();
+        let argv = agent_argv_from_proc(own, None).expect("own cmdline");
+        assert!(!argv.is_empty());
+        let over = agent_argv_from_proc(own, Some(Path::new("/opt/nn/agent"))).unwrap();
+        assert_eq!(over[0], "/opt/nn/agent");
+        assert_eq!(over[1..], argv[1..]);
+    }
+
+    #[test]
+    fn select_backend_auto_prefers_systemd_when_booted() {
+        let b = select_backend(RespawnBackendChoice::Auto, true, "nn.service", || {
+            panic!("exec argv must not be built on a systemd host")
+        })
+        .unwrap();
+        assert_eq!(
+            b,
+            RespawnBackend::SystemdUnit {
+                unit: "nn.service".into()
+            }
+        );
+        assert_eq!(b.describe(), "systemd:nn.service");
+    }
+
+    #[test]
+    fn select_backend_auto_falls_back_to_exec_without_systemd() {
+        let b = select_backend(RespawnBackendChoice::Auto, false, "nn.service", || {
+            Ok(vec!["/bin/agent".into(), "--detect-only".into()])
+        })
+        .unwrap();
+        assert_eq!(
+            b,
+            RespawnBackend::ForkExec {
+                argv: vec!["/bin/agent".into(), "--detect-only".into()]
+            }
+        );
+        assert_eq!(b.describe(), "exec:/bin/agent (argc=2)");
+    }
+
+    #[test]
+    fn select_backend_exec_rejects_empty_argv() {
+        let err = select_backend(RespawnBackendChoice::Exec, true, "nn.service", || {
+            Ok(vec![])
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("non-empty argv"), "{err}");
+    }
+
+    #[test]
+    fn select_backend_explicit_systemd_even_when_not_booted() {
+        let b = select_backend(RespawnBackendChoice::Systemd, false, "nn.service", || {
+            panic!("exec argv must not be built")
+        })
+        .unwrap();
+        assert!(matches!(b, RespawnBackend::SystemdUnit { .. }));
+    }
+
+    #[test]
+    fn systemctl_start_command_shape() {
+        let cmd =
+            systemctl_start_command(Path::new("/usr/bin/systemctl"), "northnarrow-agent.service");
+        assert_eq!(cmd.get_program(), "/usr/bin/systemctl");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["start", "--no-block", "northnarrow-agent.service"]
+        );
+    }
+
+    #[test]
+    fn cli_defaults_to_auto_backend_and_agent_unit() {
+        let cli = Cli::try_parse_from(["northnarrow-watchdog"]).unwrap();
+        assert_eq!(cli.respawn_backend, RespawnBackendChoice::Auto);
+        assert_eq!(cli.agent_unit, DEFAULT_AGENT_UNIT);
+        let cli = Cli::try_parse_from([
+            "northnarrow-watchdog",
+            "--respawn-backend",
+            "exec",
+            "--agent-unit",
+            "x.service",
+        ])
+        .unwrap();
+        assert_eq!(cli.respawn_backend, RespawnBackendChoice::Exec);
+        assert_eq!(cli.agent_unit, "x.service");
+    }
+
     #[test]
     fn spawn_agent_rejects_empty_argv() {
         let err = spawn_agent(&[]).unwrap_err();

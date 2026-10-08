@@ -21,6 +21,11 @@ Wants=network-online.target
 # usable, so an operator misconfig produces a clear systemd
 # "skipped" status instead of a startup crash.
 ConditionPathIsMountPoint=/sys/fs/bpf
+# Respawn v2: the watchdog restarts this unit with `systemctl start`
+# under its own 5-in-60 s backoff ceiling. systemd's default start-rate
+# limiter (5 starts / 10 s) must never veto that, so it is disabled
+# here; the ceiling lives in the watchdog, not in systemd.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -46,7 +51,10 @@ ExecStart=/usr/local/bin/northnarrow-agent \
 # watchdog's restart-backoff loop and double-spawn agents on
 # every death. Per design §2.3 "restart policy lives only in
 # the watchdog — the agent's systemd unit uses Restart=no and
-# delegates respawn to the watchdog."
+# delegates respawn to the watchdog." Respawn v2: the watchdog's
+# respawn IS `systemctl start northnarrow-agent.service`, so a
+# crash → backoff → fresh instance of THIS unit (same ExecStart,
+# caps, cgroup, ProtectHome) — never a child of the watchdog.
 Restart=no
 RuntimeDirectory=northnarrow
 RuntimeDirectoryMode=0700

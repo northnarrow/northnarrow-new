@@ -6,12 +6,15 @@ Documentation=https://github.com/northnarrow/northnarrow-new/blob/main/docs/desi
 # /run/northnarrow/agent.pid). systemd ordering guarantees the
 # agent unit's ExecStart fires first; the watchdog catches up.
 After=northnarrow-agent.service
-# BindsTo: if the agent unit is STOPPED (operator-invoked
-# `systemctl stop northnarrow-agent`), this watchdog stops too.
-# Avoids the watchdog endlessly respawning an agent the operator
-# wants down. Note: BindsTo does NOT trigger on agent CRASH —
-# that's the watchdog's own pidfd POLLIN → restart path (W4).
-BindsTo=northnarrow-agent.service
+# Respawn v2 (docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md): NO BindsTo=.
+# BindsTo stopped this unit whenever the agent unit went inactive —
+# which it does on a CRASH too (Restart=no), i.e. exactly when the
+# watchdog is needed. An operator-intended stop is recognised by the
+# A8 shutdown marker (/run/northnarrow/agent.shutdown_authorised,
+# written on a signed stop): marker present → the watchdog stands
+# down instead of respawning. Wants= pulls the agent in when the
+# watchdog is started on a cold host.
+Wants=northnarrow-agent.service
 # No Requires=sys-fs-bpf.mount: /sys/fs/bpf is an API VFS with no
 # materialisable mount unit (see northnarrow-agent.service). The
 # watchdog is ordered After= the agent, which has already validated
@@ -20,26 +23,27 @@ BindsTo=northnarrow-agent.service
 [Service]
 Type=notify
 # Logging footprint — same journal namespace as the agent (see agent unit).
-# REQUIRED here too, not cosmetic: on agent CRASH the watchdog fork-execs
-# the agent as its child, which INHERITS the watchdog's stdio (W4 respawn).
-# Without LogNamespace on the watchdog, a watchdog-respawned agent would log
-# to the DEFAULT journal → rsyslog → /var/log/syslog, re-opening the
-# amplification vector for exactly the crash-loop case. Namespacing the
-# watchdog routes both the watchdog AND the agent it respawns into the
-# capped northnarrow journal.
+# With the systemd respawn backend the agent logs through its own unit;
+# the namespace is kept here for the watchdog's own lines and for the
+# `exec` backend (non-systemd hosts), where a fork-exec'd agent inherits
+# this unit's stdio and must not reach the uncapped default journal.
 LogNamespace=northnarrow
 ExecStart=/usr/local/bin/northnarrow-watchdog \
     --agent-bin /usr/local/bin/northnarrow-agent \
     --agent-pidfile /run/northnarrow/agent.pid \
     --admin-socket /run/northnarrow/admin.sock \
     --pidfile /run/northnarrow/watchdog.pid \
-    --bpffs-root /sys/fs/bpf/northnarrow
-# --agent-bin is REQUIRED in production (not merely an escape hatch): without
-# it the watchdog reads /proc/<agent>/exe at boot to reconstruct argv, and
-# the agent's ptrace_access_check LSM hook denies that read until the
-# watchdog is registered in PROTECTED_OBSERVERS — a boot race that EACCES-es
-# for 60s and exits the watchdog (1). Passing the path skips that path
-# entirely. The dev workflow masked this by leaving the watchdog disabled.
+    --bpffs-root /sys/fs/bpf/northnarrow \
+    --agent-unit northnarrow-agent.service
+# Respawn v2: on a systemd host (the default, --respawn-backend auto) a
+# crashed agent is brought back with `systemctl start --no-block
+# northnarrow-agent.service`, so it returns under ITS OWN unit — the
+# ExecStart argv above (incl. --detect-only when configured), its own
+# cgroup/MemoryMax, CapabilityBoundingSet, ProtectHome=read-only and
+# journal namespace. It is no longer a fork-exec child of this unit's
+# 64 MiB / 2-cap sandbox. --agent-bin is only consulted by the `exec`
+# backend (non-systemd hosts), where it overrides argv[0] of the full
+# argv the watchdog captures from /proc/<agent>/cmdline at boot.
 # Watchdog owns ITS OWN restart policy via systemd: if the
 # watchdog crashes (which would be a bug — W2 process-hardening
 # minimises the surface), systemd brings it back after 2 s. The
@@ -61,7 +65,8 @@ RestartSec=2s
 #     100× over target — generous slack for restart-cycle bursts
 #     without giving an attacker headroom to mine cryptocurrency.
 #   TasksMax=8 — the watchdog spawns at most: main + ping-loop +
-#     a handful of tokio worker threads. 8 catches any thread leak
+#     a handful of tokio worker threads, plus one transient
+#     `systemctl` child during a respawn. 8 catches any thread leak
 #     well before it matters.
 MemoryMax=64M
 CPUQuota=10%
@@ -82,6 +87,10 @@ ProtectHome=true
 # remount, so the watchdog keeps write access without the entry, and
 # listing it would inject the unsatisfiable sys-fs-bpf.mount dependency
 # (see northnarrow-agent.service).
+# `systemctl start` is an exec of a read-only system binary plus a
+# connect() to /run/dbus/system_bus_socket; a read-only /run does not
+# block unix-socket connects (EROFS applies to regular files/dirs only).
+# If a host proves otherwise, add /run/dbus here (design §3.2 / §5.1).
 ReadWritePaths=/run/northnarrow
 # CAP_BPF        — open the pinned PROTECTED_PIDS map by path,
 #                  call bpf(BPF_MAP_DELETE_ELEM) on agent death
