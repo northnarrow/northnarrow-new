@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- The outbound UDP sensor now observes unconnected `sendto()` traffic
+  (destination read from `msghdr->msg_name`), rate-limited kernel-side
+  to one netflow row per `(pid, destination)` per second. Before, only
+  connected UDP sockets produced a row: QUIC-like beacons and raw-UDP
+  exfil through an unconnected socket were invisible.
 - Boot-time audit self-check: a signed `agent_boot` entry is appended at
   startup; an unwritable audit log is fatal in enforcement mode
   (`NN_AUDIT_ALLOW_UNWRITABLE=1` to override, detect-only warns).
