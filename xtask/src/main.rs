@@ -207,7 +207,7 @@ fn ensure_bpf_linker() -> Result<()> {
     if !ok {
         bail!(
             "bpf-linker not found on PATH. Install it with:\n    \
-             cargo install bpf-linker --locked\n\
+             cargo install bpf-linker --version 0.10.3 --locked\n\
              (Requires LLVM headers; on Ubuntu: apt install llvm-dev libpolly-18-dev)"
         );
     }

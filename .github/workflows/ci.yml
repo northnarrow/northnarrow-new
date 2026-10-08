@@ -227,19 +227,23 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h / | tail -1
 
-      - name: Install LLVM (bpf-linker dependency)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            llvm-dev libpolly-18-dev clang lld
-
+      # No system LLVM: bpf-linker 0.10.x links against rustc's own
+      # bundled LLVM through aya-rustc-llvm-proxy (default feature
+      # `rust-llvm-22`, `no-llvm-linking`), so the apt llvm-dev that
+      # used to be installed here was never used. Keep the version
+      # PINNED: 0.11.0 dropped the proxy and needs a system LLVM 21+
+      # (`-lLLVM` link failure on ubuntu-24.04, which ships LLVM 18).
+      # 0.10.3 is also the version the reference lab runs
+      # (docs/CLAUDE_BRIEFING.md).
       - name: Install nightly Rust + rust-src for build-std
+        # Same channel as agent-ebpf/rust-toolchain.toml, so rustup
+        # does not have to download it again at build time.
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src,rustfmt,clippy
+          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
           rustup default stable
 
-      - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+      - name: Install bpf-linker (pinned)
+        run: cargo install bpf-linker --version 0.10.3 --locked
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4

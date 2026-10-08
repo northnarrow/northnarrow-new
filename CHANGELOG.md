@@ -7,7 +7,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ### Fixed
 - CI: `cargo fmt`, `cargo clippy -D warnings` and the `test` job are green
-  again; `ade-build` no longer runs out of disk on the hosted runner.
+  again; `ade-build` no longer runs out of disk on the hosted runner;
+  `ebpf-build` pins `bpf-linker 0.10.3` (0.11 needs a system LLVM 21+).
 - Test flake `anti_tamper::network_isolate::release_is_idempotent`
   (ETXTBSY race on the mock `iptables-restore` script).
 - Dependencies: `rustls` 0.23.45 (RUSTSEC-2026-0285), `crossbeam-epoch`
