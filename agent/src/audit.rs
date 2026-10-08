@@ -433,6 +433,38 @@ impl AuditLog {
     pub fn last_hash(&self) -> &str {
         &self.last_hash
     }
+
+    /// Boot-time write probe (review `etc-readonly-audit-1`): append a
+    /// signed `agent_boot` entry so an unwritable audit log is found at
+    /// startup, not at the first COMBAT transition. The entry doubles
+    /// as a useful chain marker (boot pid, binary version, mode).
+    pub fn boot_probe(&mut self, detect_only: bool) -> Result<AuditEntry> {
+        self.append(AuditEntryDraft {
+            op: "agent_boot".to_string(),
+            extra: serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "detect_only": detect_only,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "success".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        })
+        .context("audit log boot probe (agent_boot entry)")
+    }
+}
+
+/// Escape hatch: run with an unwritable / unopenable audit log.
+pub const AUDIT_ALLOW_UNWRITABLE_ENV: &str = "NN_AUDIT_ALLOW_UNWRITABLE";
+
+/// Is an audit-log failure at boot fatal? Enforcement mode without the
+/// explicit override → yes: an audit chain that silently stops is a
+/// silently absent control (same posture as the LSM deny-hook
+/// shortfall, `ebpf-lsm-1`). Detect-only mode only warns.
+pub fn audit_failure_is_fatal(detect_only: bool, allow_env: Option<&str>) -> bool {
+    !detect_only && allow_env != Some("1")
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -795,5 +827,40 @@ mod tests {
             matches!(err, AuditVerifyError::SignatureInvalid { idx: 0 }),
             "expected SignatureInvalid on entry 0; got: {err:?}"
         );
+    }
+    #[test]
+    fn boot_probe_appends_signed_agent_boot_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
+        let e = log.boot_probe(false).expect("probe");
+        assert_eq!(e.op, "agent_boot");
+        assert_eq!(e.key_fp, "agent-self");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"agent_boot\""));
+        assert_eq!(body.lines().count(), 1);
+    }
+
+    #[test]
+    fn boot_probe_fails_on_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the "file" should be → open(O_CREAT|O_APPEND) fails.
+        let path = dir.path().join("audit.log");
+        std::fs::create_dir(&path).unwrap();
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let mut log = match AuditLog::open(&path, key, [7u8; 16]) {
+            Ok(l) => l,
+            Err(_) => return, // open itself refusing is the same signal
+        };
+        assert!(log.boot_probe(false).is_err());
+    }
+
+    #[test]
+    fn audit_failure_policy() {
+        assert!(audit_failure_is_fatal(false, None));
+        assert!(audit_failure_is_fatal(false, Some("0")));
+        assert!(!audit_failure_is_fatal(false, Some("1")));
+        assert!(!audit_failure_is_fatal(true, None));
     }
 }

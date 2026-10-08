@@ -6,6 +6,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- Boot-time audit self-check: a signed `agent_boot` entry is appended at
+  startup; an unwritable audit log is fatal in enforcement mode
+  (`NN_AUDIT_ALLOW_UNWRITABLE=1` to override, detect-only warns).
 - Audit Medium round: TCP netflow rows and `flow_id` carry the real
   source address/port (close-time), not `0.0.0.0:0`; the COMBAT
   kill-tree spares host-critical descendants (sshd, watchdog) via the
