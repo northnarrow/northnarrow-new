@@ -376,6 +376,8 @@ async fn process_close_record(
             let info = TcpCloseInfo {
                 end_ns: raw.timestamp_ns,
                 corr_id: raw.flow_id,
+                src_addr: decode_addr(raw.family, raw.src_addr),
+                src_port: raw.src_port,
                 bytes_sent: raw.bytes_sent,
                 bytes_recv: raw.bytes_recv,
                 close_reason: raw.close_reason,
