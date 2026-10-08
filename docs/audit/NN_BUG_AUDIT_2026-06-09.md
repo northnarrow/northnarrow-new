@@ -29,6 +29,11 @@ The **load-bearing column is "Validate on the 6.8 VM"** — trigger / observe-co
 | `abi-modpath-1` | **fixed** 2026-10-08 | `MODULE_PATH_SLOTS` 8→16 (`MODULE_PATH_LEN` 512); new wire flag `ModuleLoadRaw::path_truncated`; a truncated path reconstructs RELATIVE and R018 alerts (Medium/Log) instead of KillTree+COMBAT |
 | `posture-1` | **fixed** 2026-10-08 | same-round escalation signals no longer corroborate each other; only a prior ledger entry does (at most one tier of blunt escalation per `observe()`) |
 | `combat-avail-1` | **fixed** 2026-10-08 | respawn v2: systemd backend restarts the agent's own unit (ExecStart argv incl. `--detect-only`); exec backend persists the full `/proc/<pid>/cmdline` argv |
+| `abi-tcpconnect-srcport-1` | **fixed** 2026-10-08 | `TcpCloseInfo` carries the close-time `skc_rcv_saddr`/`skc_num`; `on_tcp_close` uses them for the netflow row and the canonical `flow_id` when the pending (connect-time) source is unbound |
+| `posture-3` | **fixed** 2026-10-08 | narrow carve-out: a writer with a valid loginuid gets `/run/user/<loginuid>/` excluded from the mass-write count (session plumbing); every other path, incl. `$HOME` and other uids' runtime dirs, still counts — no global loginuid exemption |
+| `combat-avail-2` | **fixed** 2026-10-08 | `Executor` late-binds the ladder's `SystemProtectedProcs` as a tree guard; `kill_process_tree_guarded` consults it (plus the PID floor) for the root AND every `/proc` descendant, reporting spared pids as `Refused` |
+| `chain-protect-1` / `at-authz-3` | **fixed** 2026-10-08 | `STATE_PROTECTED_SUBDIRS`: `detections/` dir inode (MUTATE) + `detections.jsonl` / `status_events.jsonl` (MUTATE\|WRITE) registered in PROTECTED_INODES |
+| `chain-persist-1` | **fixed** 2026-10-08 | `DetectionSetStatusResponse.persist_failed` (additive wire field) → CLI outcome `PersistFailed`, exit 10, distinct message; `NotFound` keeps exit 9 |
 | `ebpf-lsm-1` | **fixed** 2026-10-08 | one aggregate `anti-tamper: … LSM hooks attached` line; any DENY hook shortfall is fail-closed (refuse to start) unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; observe-hook shortfall is WARN only |
 
 Additional defects found in the 2026-10-08 review (not in this registry) are tracked in `NN_REVIEW_2026-10-08.md`.
