@@ -721,8 +721,8 @@ mod tests {
         assert!(Btf::parse(b"too short").is_err());
     }
 
-    /// VM-only: derive ALL 40 offsets against the *running* kernel's
-    /// real BTF and assert they match the compiled-in values.
+    /// VM-only: derive ALL compiled-in offsets against the *running*
+    /// kernel's real BTF and assert they match.
     /// `#[ignore]`d so it never runs on a dev box whose kernel differs
     /// from the supported 6.8.x (where the offsets legitimately
     /// differ); run on the target with
@@ -732,7 +732,11 @@ mod tests {
     fn revalidate_real_kernel_btf_all_40_match() {
         match revalidate_offsets() {
             RevalidateOutcome::Verified { count } => {
-                assert_eq!(count, 40, "expected all 40 offsets validated");
+                // Compare with the table, not a literal: the count was
+                // hardcoded at 40 and went stale when at-authz-1 added
+                // `file.f_mode` (41 on 6.8.0-142, lab guest 2026-10-08).
+                let expected = common::btf_offsets::REVALIDATE.len();
+                assert_eq!(count, expected, "expected all {expected} offsets validated");
                 eprintln!("OK: all {count} offsets match the running kernel's BTF");
             }
             RevalidateOutcome::SkippedNoBtf { reason } => {
