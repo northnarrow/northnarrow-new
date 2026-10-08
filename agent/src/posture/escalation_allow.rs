@@ -108,7 +108,7 @@ impl AllowEntry {
     fn matches(&self, trigger: AllowTrigger, comm: &str, addr: &IpAddr, port: u16) -> bool {
         self.trigger == trigger
             && self.comm.matches(comm)
-            && self.port.map_or(true, |p| p == port)
+            && self.port.is_none_or(|p| p == port)
             && cidr_contains(&self.net, self.prefix, addr)
     }
 }

@@ -408,7 +408,7 @@ impl RejectThrottle {
 
     fn due(&self) -> bool {
         self.last_log
-            .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1))
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
     }
 
     fn emit(&mut self, label: &str, expected: usize) {

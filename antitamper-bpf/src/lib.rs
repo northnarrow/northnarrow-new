@@ -413,6 +413,7 @@ pub fn attach_lsm(
 ///      instant.
 ///   3. pin the NEW program + link, so THIS boot's hook survives the next
 ///      death→respawn gap (persistence preserved).
+///
 /// If purge ever preceded attach, a tamper could slip through the gap — so
 /// the 1→2 order is load-bearing. It is also fail-safe: if the fresh attach
 /// errors, we return BEFORE purging, leaving the prior boot's pinned hook

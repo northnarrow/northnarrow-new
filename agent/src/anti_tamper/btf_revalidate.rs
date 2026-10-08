@@ -43,7 +43,7 @@ use common::btf_offsets::{OffsetSpec, REVALIDATE};
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 
 /// BTF magic in native byte order; used to detect endianness.
-const BTF_MAGIC: u16 = 0xeB9F;
+const BTF_MAGIC: u16 = 0xEB9F; // kernel docs write it `0xeB9F`
 
 /// Guard on anonymous-member recursion depth (real BTF nesting is
 /// shallow; this bounds against pathological/cyclic input).

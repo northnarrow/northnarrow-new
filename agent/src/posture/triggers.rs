@@ -59,28 +59,28 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 /// detection surface so suppression here does not blind the agent:
 ///
 /// - `/sys/`            — sysfs control files (cgroupfs writes during
-///                        service setup, kernel parameter writes).
-///                        Tampering is covered by anti-tamper LSM
-///                        hooks (kernel_param, etc.) and the R011
-///                        kernel-module tooling rule.
+///   service setup, kernel parameter writes).
+///   Tampering is covered by anti-tamper LSM
+///   hooks (kernel_param, etc.) and the R011
+///   kernel-module tooling rule.
 /// - `/proc/`           — procfs writes (sysctl-shaped kernel RPCs,
-///                        per-process control). Same anti-tamper
-///                        LSM surface; never a ransomware target.
+///   per-process control). Same anti-tamper
+///   LSM surface; never a ransomware target.
 /// - `/run/systemd/`    — systemd's own runtime state directory (cgroup
-///                        delegation files, unit transient state).
-///                        Not data; not a ransomware target.
+///   delegation files, unit transient state).
+///   Not data; not a ransomware target.
 /// - `/run/log/journal/` — systemd-journal binary log. Anti-forensic
-///                        journal manipulation is its own threat
-///                        category (future R-NN); the mass-write arm
-///                        of confirmed_intrusion would only ever
-///                        catch journald's normal append rhythm here.
+///   journal manipulation is its own threat
+///   category (future R-NN); the mass-write arm
+///   of confirmed_intrusion would only ever
+///   catch journald's normal append rhythm here.
 ///
 /// Deliberately **NOT** excluded:
 /// - `/dev/`        — includes `/dev/shm/`, a real ransomware staging tmpfs.
 /// - `/run/`        — broad, includes `/run/user/<uid>/` where user
-///                    processes legitimately write (lock files, dbus
-///                    sockets). Counted toward mass-write so a
-///                    compromised user session is still detectable.
+///   processes legitimately write (lock files, dbus
+///   sockets). Counted toward mass-write so a
+///   compromised user session is still detectable.
 pub(super) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
     &["/sys/", "/proc/", "/run/systemd/", "/run/log/journal/"];
 

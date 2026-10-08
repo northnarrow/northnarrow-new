@@ -129,7 +129,7 @@ mod tests {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
         l.record(TriggerType::ExfiltrationPattern, now);
-        assert_eq!(SUSTAINED_SAME_TYPE_PROMOTES, false, "guard: knob default");
+        const _: () = assert!(!SUSTAINED_SAME_TYPE_PROMOTES, "guard: knob default");
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern));
     }
 

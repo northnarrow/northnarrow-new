@@ -2386,7 +2386,7 @@ mod tests {
         ];
         let fired = burst
             .iter()
-            .filter(|(op, path, ts)| r.evaluate(&cron_event(*op, *path, pid, *ts)).is_some())
+            .filter(|(op, path, ts)| r.evaluate(&cron_event(*op, path, pid, *ts)).is_some())
             .count();
         assert_eq!(
             fired, 1,

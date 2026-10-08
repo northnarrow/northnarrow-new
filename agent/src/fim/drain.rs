@@ -635,6 +635,7 @@ fn enroll_child(
 /// `Ok(false)` if processing completed without emission (path
 /// unknown, no drift, or rate-limited). Errors are propagated
 /// for the drain loop to log + continue.
+#[allow(clippy::too_many_arguments)] // drain pipeline context; grouping into a struct is a Tappa-9 refactor
 pub fn process_drift(
     raw: &FimDriftRaw,
     path_map: &InodePathMap,
