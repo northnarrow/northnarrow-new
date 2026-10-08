@@ -506,8 +506,13 @@ pub const MODULE_LOAD_FINIT: u8 = 1;
 /// `ModuleLoadRaw.method` — `init_module(2)` via the `kernel_load_data`
 /// LSM hook (legacy userspace-buffer path; no file, so no path).
 pub const MODULE_LOAD_INIT: u8 = 2;
-/// Max source-path bytes captured for a finit_module load (stage 1b).
-pub const MODULE_PATH_LEN: usize = 256;
+/// Max source-path bytes captured for a finit_module load (stage 1b):
+/// 16 leaf→root components × 32-byte slots. Audit `abi-modpath-1`: with
+/// 8 slots, ~20% of the modules under `/usr/lib/modules/<ver>/kernel/…`
+/// (≥10 named components) lost the `/usr/lib/modules` prefix and R018
+/// SIGKILLed + COMBATed benign loads. 16 covers every path in a stock
+/// 6.8 tree; deeper paths are flagged via [`ModuleLoadRaw::path_truncated`].
+pub const MODULE_PATH_LEN: usize = 512;
 
 /// Kernel module-load observation (BUG-034). Emitted by the
 /// `kernel_read_file` / `kernel_load_data` BPF-LSM hooks
@@ -516,7 +521,7 @@ pub const MODULE_PATH_LEN: usize = 256;
 /// R011 (tool exec) both miss.
 ///
 /// Field order chosen for natural u64 alignment with no implicit
-/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 4 + 256 = 312 (8-aligned).
+/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 1 + 3 + 512 = 568 (8-aligned).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -534,7 +539,12 @@ pub struct ModuleLoadRaw {
     pub parent_is_kthread: u8,
     /// Bytes of `path` populated (`0` for init_module / stage 1).
     pub path_len: u16,
-    pub _pad: [u8; 4],
+    /// `1` when the dentry walk ran out of slots BEFORE reaching the
+    /// filesystem root: `path` then holds only the leaf-most components
+    /// and its prefix is unknown. Userland reconstructs such a path
+    /// WITHOUT a leading `/` so consumers can tell it apart.
+    pub path_truncated: u8,
+    pub _pad: [u8; 3],
     /// Source `.ko` path for a finit_module load (stage 1b); zeroed otherwise.
     pub path: [u8; MODULE_PATH_LEN],
 }
@@ -550,7 +560,8 @@ impl ModuleLoadRaw {
             method: 0,
             parent_is_kthread: 0,
             path_len: 0,
-            _pad: [0u8; 4],
+            path_truncated: 0,
+            _pad: [0u8; 3],
             path: [0u8; MODULE_PATH_LEN],
         }
     }

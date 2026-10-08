@@ -96,6 +96,29 @@ impl Rule for R018KernelModuleLoad {
         // autonomous-kill condition.
         if *method == ModuleLoadMethod::Finit {
             if let Some(p) = path {
+                // Audit `abi-modpath-1`: a RELATIVE path means the kernel
+                // walk ran out of slots before the root — the prefix is
+                // unknown, so it must not be classified as non-standard
+                // (that branch SIGKILLs + COMBATs). Surface it as a
+                // Medium alert unless the loader is allowlisted.
+                if common::module_path_is_truncated(p) {
+                    if self.loader_allowlist.contains(loader_comm)
+                        || self.loader_allowlist.contains(parent_comm)
+                    {
+                        return None;
+                    }
+                    return Some(build_verdict(
+                        self,
+                        event,
+                        ResponseAction::Log,
+                        Severity::Medium,
+                        &format!(
+                            "Kernel module loaded from a path deeper than the sensor's slot \
+                             budget (leaf components: {p}) by '{loader_comm}' (parent \
+                             '{parent_comm}') — origin unverifiable, NOT auto-killing. Alert."
+                        ),
+                    ));
+                }
                 if !is_standard_module_path(p) {
                     return Some(build_verdict(
                         self,
@@ -204,6 +227,9 @@ mod tests {
             slot += 1;
         }
         r.path_len = slot as u16;
+        // Mirrors the kernel walk: the root dentry ("/") is the last
+        // component written; a path that never reaches it is truncated.
+        r.path_truncated = u8::from(path_root_to_leaf.first() != Some(&"/"));
         r
     }
 
@@ -238,6 +264,73 @@ mod tests {
             }
             _ => panic!("not ModuleLoad"),
         }
+    }
+
+    /// Audit `abi-modpath-1`: a 12-component stock path
+    /// (`mcp251xfd.ko.zst`) must reconstruct WITH its prefix and be
+    /// classified standard — it used to lose `/usr/lib/modules`.
+    #[test]
+    fn deep_standard_path_keeps_prefix_and_is_not_critical() {
+        let deep = [
+            "/",
+            "usr",
+            "lib",
+            "modules",
+            "6.8.0-124-generic",
+            "kernel",
+            "drivers",
+            "net",
+            "can",
+            "spi",
+            "mcp251xfd",
+            "mcp251xfd.ko.zst",
+        ];
+        let e = ev(&raw(MODULE_LOAD_FINIT, "modprobe", "bash", 0, &deep));
+        match e {
+            Event::ModuleLoad { ref path, .. } => assert_eq!(
+                path.as_deref(),
+                Some("/usr/lib/modules/6.8.0-124-generic/kernel/drivers/net/can/spi/mcp251xfd/mcp251xfd.ko.zst")
+            ),
+            _ => panic!("not ModuleLoad"),
+        }
+        let v = rule()
+            .evaluate(&e)
+            .expect("non-allowlisted loader still alerts");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
+    }
+
+    /// A path deeper than the 16-slot budget comes back RELATIVE
+    /// (prefix unknown) and must never take the Critical/KillTree branch.
+    #[test]
+    fn truncated_path_is_medium_log_never_killtree() {
+        // No leading "/" component → raw() marks it truncated.
+        let tail = ["6.8.0-124-generic", "kernel", "drivers", "x", "deep.ko.zst"];
+        let e = ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &tail));
+        match e {
+            Event::ModuleLoad { ref path, .. } => {
+                let p = path.as_deref().unwrap();
+                assert!(
+                    !p.starts_with('/'),
+                    "truncated path must stay relative: {p}"
+                );
+                assert!(common::module_path_is_truncated(p));
+            }
+            _ => panic!("not ModuleLoad"),
+        }
+        let v = rule().evaluate(&e).expect("alert");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
+
+        // Allowlisted loader + truncated path: silent, like a standard path.
+        let e2 = ev(&raw(
+            MODULE_LOAD_FINIT,
+            "systemd-udevd",
+            "systemd",
+            0,
+            &tail,
+        ));
+        assert!(rule().evaluate(&e2).is_none());
     }
 
     // ── exempt conditions ──────────────────────────────────────────

@@ -25,6 +25,10 @@ The **load-bearing column is "Validate on the 6.8 VM"** — trigger / observe-co
 | `at-authz-1` | **fixed** 2026-06-10 | PR #142 — `file_open` FMODE_WRITE deny on `admin.pub` |
 | `posture-2` | **fixed** 2026-10-08 | `CorroborationLedger::clear()` on every COMBAT release path (`admin_release_combat`, `_with_token`, force-posture) |
 | `catchall-1` | **fixed** 2026-10-08 | `DnsBurstWindow` / `BeaconWindow` evict idle keys every 256 observes or above 4096 keys |
+| `at-authz-2` | **fixed** 2026-06-10 | already closed by PR #142: `agent.sig.key` is in `ETC_WRITE_DENY_FILES` (`file_open` FMODE_WRITE deny), the registry was written one commit earlier |
+| `abi-modpath-1` | **fixed** 2026-10-08 | `MODULE_PATH_SLOTS` 8→16 (`MODULE_PATH_LEN` 512); new wire flag `ModuleLoadRaw::path_truncated`; a truncated path reconstructs RELATIVE and R018 alerts (Medium/Log) instead of KillTree+COMBAT |
+| `posture-1` | **fixed** 2026-10-08 | same-round escalation signals no longer corroborate each other; only a prior ledger entry does (at most one tier of blunt escalation per `observe()`) |
+| `ebpf-lsm-1` | **fixed** 2026-10-08 | one aggregate `anti-tamper: … LSM hooks attached` line; any DENY hook shortfall is fail-closed (refuse to start) unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; observe-hook shortfall is WARN only |
 
 Additional defects found in the 2026-10-08 review (not in this registry) are tracked in `NN_REVIEW_2026-10-08.md`.
 

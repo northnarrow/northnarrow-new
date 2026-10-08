@@ -295,7 +295,25 @@ const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
     ("module_load_data_observe", "kernel_load_data"),
 ];
 
-pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Result<()> {
+/// Attach outcome of the FS deny + observe hook sets (audit
+/// `ebpf-lsm-1`): the caller aggregates it with task_kill/ptrace into one
+/// machine-readable health line and decides fail-closed vs degraded.
+#[derive(Debug, Default)]
+pub(crate) struct FsAttachHealth {
+    /// `(program, error)` for every inode_protect DENY hook that did not
+    /// attach. Non-empty = mutation / write-open protection partially OFF.
+    pub deny_failures: Vec<(&'static str, String)>,
+    /// Same for the module-load OBSERVE hooks (BUG-034). Non-empty =
+    /// R018 blind, but no deny is missing.
+    pub observe_failures: Vec<(&'static str, String)>,
+}
+
+pub(crate) fn attach(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<FsAttachHealth> {
+    let mut health = FsAttachHealth::default();
     let dir = Path::new(STATE_DIR);
 
     // Step 1: ensure dir exists, mode 0700, root-owned.
@@ -425,19 +443,19 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
     for (program, hook) in LSM_PROGRAMS {
         match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
             Ok(()) => deny_hooks_attached += 1,
-            Err(e) => warn!(
-                program, hook, error = %e,
-                "anti-tamper FS: LSM hook attach FAILED"
-            ),
+            Err(e) => {
+                warn!(
+                    program, hook, error = %e,
+                    "anti-tamper FS: LSM hook attach FAILED"
+                );
+                health.deny_failures.push((program, format!("{e:#}")));
+            }
         }
     }
-    // at-authz-1 verify-item 3: a machine-detectable attach-health signal.
-    // The attach path stays warn-and-continue (a benign failure must not
-    // self-DoS — refuse-to-start is rejected; holistic fail-closed is
-    // ebpf-lsm-1), but emit one structured line carrying the attached vs
-    // expected count so monitoring can alert when `deny_hooks_attached <
-    // deny_hooks_expected` (a silently-absent deny hook = at-authz-1 /
-    // mutation protection partially off while the agent reports healthy).
+    // at-authz-1 verify-item 3: a machine-detectable attach-health signal
+    // (attached vs expected). The fail-closed decision itself is the
+    // caller's (anti_tamper::attach, audit ebpf-lsm-1) — it sees this
+    // set together with task_kill / ptrace.
     let deny_hooks_expected = LSM_PROGRAMS.len();
     if deny_hooks_attached == deny_hooks_expected {
         info!(
@@ -463,10 +481,11 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Res
                 program, hook, error = %e,
                 "anti-tamper FS: module-load LSM hook attach FAILED (BUG-034)"
             );
+            health.observe_failures.push((program, format!("{e:#}")));
         }
     }
 
-    Ok(())
+    Ok(health)
 }
 
 /// Tappa 8 A14 (B4): register each of the four [`ETC_PROTECTED_FILES`]

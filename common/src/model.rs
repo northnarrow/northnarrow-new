@@ -389,7 +389,11 @@ impl From<&crate::wire::ModuleLoadRaw> for Event {
             loader_comm: crate::wire::cstr_lossy(&raw.loader_comm).into_owned(),
             parent_comm: crate::wire::cstr_lossy(&raw.parent_comm).into_owned(),
             parent_is_kthread: raw.parent_is_kthread != 0,
-            path: reconstruct_module_path(&raw.path, raw.path_len as usize),
+            path: reconstruct_module_path(
+                &raw.path,
+                raw.path_len as usize,
+                raw.path_truncated != 0,
+            ),
             timestamp_ns: raw.timestamp_ns,
         }
     }
@@ -399,9 +403,16 @@ impl From<&crate::wire::ModuleLoadRaw> for Event {
 /// wrote (each in a fixed 32-byte slot of [`crate::wire::ModuleLoadRaw::path`])
 /// into a forward path. `slots` = `path_len` (component count).
 /// Returns `None` when nothing resolved (init_module, or a failed walk).
+/// `truncated` (wire `path_truncated`) means the kernel walk ran out of
+/// slots before the filesystem root: the result is then RELATIVE (no
+/// leading `/`) so a consumer can tell "prefix unknown" from a real
+/// absolute path. Audit `abi-modpath-1`: the old code always prepended
+/// `/`, turning `…/<ver>/kernel/…/e1000e.ko.zst` into a bogus
+/// non-standard absolute path that R018 killed on.
 fn reconstruct_module_path(
     path: &[u8; crate::wire::MODULE_PATH_LEN],
     slots: usize,
+    truncated: bool,
 ) -> Option<String> {
     const SLOT: usize = 32;
     let n = slots.min(crate::wire::MODULE_PATH_LEN / SLOT);
@@ -421,6 +432,10 @@ fn reconstruct_module_path(
     }
     comps.reverse(); // kernel wrote leaf→root; flip to root→leaf
     let joined = comps.join("/");
+    if truncated {
+        // Prefix unknown: keep it relative, strip any stray leading '/'.
+        return Some(joined.trim_start_matches('/').to_string());
+    }
     Some(if joined.starts_with("//") {
         joined[1..].to_string()
     } else if joined.starts_with('/') {
@@ -428,6 +443,12 @@ fn reconstruct_module_path(
     } else {
         format!("/{joined}")
     })
+}
+
+/// `true` when a [`Event::ModuleLoad`] path came back truncated (see
+/// [`reconstruct_module_path`]): relative, i.e. no leading `/`.
+pub fn module_path_is_truncated(path: &str) -> bool {
+    !path.starts_with('/')
 }
 
 impl From<&TcpConnectRaw> for Event {

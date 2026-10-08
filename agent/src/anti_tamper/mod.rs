@@ -65,7 +65,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use aya::{maps::Array as AyaArray, Btf, Ebpf};
 use rand::RngCore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // ISSUE_002: bpffs root / pin / LSM-attach primitives were
 // extracted from this module into the `antitamper-bpf` workspace
@@ -365,6 +365,11 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     // On success `attach_lsm` logs the disposition (reused / freshly
     // attached / purged-then-attached) itself — the call sites only
     // escalate the *failure* case with its operator-facing severity.
+    // Audit `ebpf-lsm-1`: every deny-hook attach failure used to be a
+    // lone WARN while the agent kept reporting healthy. Collect them all,
+    // emit ONE aggregate health line, and fail closed by default.
+    let mut deny_failures: Vec<(&'static str, String)> = Vec::new();
+
     if let Err(e) = attach_lsm(ebpf, TASK_KILL_PROGRAM, TASK_KILL_HOOK, &btf, pin_root) {
         warn!(
             program = TASK_KILL_PROGRAM,
@@ -372,6 +377,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
             error = %e,
             "anti-tamper: LSM hook attach FAILED — agent killable by root"
         );
+        deny_failures.push((TASK_KILL_PROGRAM, format!("{e:#}")));
     }
 
     if let Err(e) = attach_lsm(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
@@ -381,18 +387,94 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
             error = %e,
             "anti-tamper: LSM hook attach FAILED — agent inspectable by root"
         );
+        deny_failures.push((PTRACE_PROGRAM, format!("{e:#}")));
     }
 
-    // Tappa 7 task 5: directory + inode protection. Failure to
-    // bootstrap (no /var/lib, read-only rootfs, permission denied
-    // even as root) is warn-and-continue: process-level anti-tamper
-    // already attached above, so the agent isn't worthless without
-    // FS protection.
-    if let Err(e) = filesystem::attach(ebpf, &btf, pin_root) {
-        warn!(error = %e, "anti-tamper FS: bootstrap failed, continuing without FS protection");
+    // Tappa 7 task 5: directory + inode protection. A bootstrap failure
+    // (no /var/lib, read-only rootfs, permission denied even as root)
+    // means EVERY FS deny hook is absent, so it is counted as a deny
+    // shortfall like a verifier reject of a single hook.
+    let mut observe_failures: Vec<(&'static str, String)> = Vec::new();
+    match filesystem::attach(ebpf, &btf, pin_root) {
+        Ok(fs) => {
+            deny_failures.extend(fs.deny_failures);
+            observe_failures.extend(fs.observe_failures);
+        }
+        Err(e) => {
+            warn!(error = %e, "anti-tamper FS: bootstrap failed — no FS deny hook attached");
+            deny_failures.push(("filesystem::attach", format!("{e:#}")));
+        }
     }
 
-    Ok(())
+    report_lsm_health(&deny_failures, &observe_failures)
+}
+
+/// Deny hooks expected on a healthy boot: task_kill + ptrace +
+/// the six `inode_protect` programs.
+const LSM_DENY_HOOKS_EXPECTED: usize = 2 + 6;
+
+/// Escape hatch for a host where a deny hook is known not to attach
+/// (e.g. a kernel the eBPF half has not been validated against) and the
+/// operator accepts running with partial anti-tamper. Logged at ERROR on
+/// every boot it is used.
+pub const ALLOW_DEGRADED_ENV: &str = "NN_ANTI_TAMPER_ALLOW_DEGRADED";
+
+/// One aggregate, machine-readable health line (audit `ebpf-lsm-1`), then
+/// the fail-closed decision: any missing DENY hook refuses to start unless
+/// [`ALLOW_DEGRADED_ENV`] is `1`. Missing OBSERVE hooks (module-load) are
+/// reported but never fatal — no protection is absent, only R018's input.
+fn report_lsm_health(
+    deny_failures: &[(&'static str, String)],
+    observe_failures: &[(&'static str, String)],
+) -> Result<()> {
+    let deny_attached = LSM_DENY_HOOKS_EXPECTED.saturating_sub(deny_failures.len());
+    if deny_failures.is_empty() && observe_failures.is_empty() {
+        info!(
+            deny_attached,
+            deny_expected = LSM_DENY_HOOKS_EXPECTED,
+            "anti-tamper: all LSM hooks attached"
+        );
+        return Ok(());
+    }
+    let failed: Vec<String> = deny_failures
+        .iter()
+        .chain(observe_failures.iter())
+        .map(|(p, e)| format!("{p}: {e}"))
+        .collect();
+    if deny_failures.is_empty() {
+        warn!(
+            deny_attached,
+            deny_expected = LSM_DENY_HOOKS_EXPECTED,
+            observe_failed = ?failed,
+            "anti-tamper: OBSERVE HOOK SHORTFALL — module-load telemetry absent (R018 blind)"
+        );
+        return Ok(());
+    }
+    let allow_degraded = std::env::var(ALLOW_DEGRADED_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    error!(
+        deny_attached,
+        deny_expected = LSM_DENY_HOOKS_EXPECTED,
+        failed = ?failed,
+        allow_degraded,
+        "anti-tamper: DENY HOOK SHORTFALL — a protection is silently absent"
+    );
+    if allow_degraded {
+        error!(
+            "anti-tamper: running DEGRADED because {ALLOW_DEGRADED_ENV}=1 — \
+             {} of {} deny hooks attached",
+            deny_attached, LSM_DENY_HOOKS_EXPECTED
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "anti-tamper deny hook shortfall: {} of {} attached ({}). Refusing to run with a \
+         silently-absent protection; set {ALLOW_DEGRADED_ENV}=1 to start degraded.",
+        deny_attached,
+        LSM_DENY_HOOKS_EXPECTED,
+        failed.join("; ")
+    )
 }
 
 /// BUG-010 (PHASE 15.1): arm the PID-1 carve-out by writing a fresh

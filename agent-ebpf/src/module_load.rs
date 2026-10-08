@@ -60,16 +60,18 @@ const READING_MODULE: c_int = 2;
 /// `enum kernel_load_data_id::LOADING_MODULE` (vmlinux BTF, 6.8).
 const LOADING_MODULE: c_int = 2;
 
-/// Path captured as up to 8 leaf→root components, each in a fixed
-/// 32-byte slot of `ModuleLoadRaw.path` (8 × 32 = 256 = MODULE_PATH_LEN).
-const MODULE_PATH_SLOTS: usize = 8;
+/// Path captured as up to 16 leaf→root components, each in a fixed
+/// 32-byte slot of `ModuleLoadRaw.path` (16 × 32 = 512 = MODULE_PATH_LEN).
+/// Audit `abi-modpath-1`: 8 slots dropped the `/usr/lib/modules` prefix
+/// of every module nested ≥10 deep (~20% of a stock 6.8 tree).
+const MODULE_PATH_SLOTS: usize = 16;
 const MODULE_PATH_SLOT_LEN: usize = 32;
 
 /// Kernel `comm` length — `ModuleLoadRaw.parent_comm` is `[u8; 16]`.
 const COMM_LEN: usize = 16;
 
 /// Module-load observations (see file-level docs for the no-pin /
-/// reattach-fresh rationale). 64 KiB ≈ ~200 [`ModuleLoadRaw`] (312 B).
+/// reattach-fresh rationale). 64 KiB ≈ ~115 [`ModuleLoadRaw`] (568 B).
 #[map]
 pub static MODULE_LOAD_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
@@ -134,7 +136,9 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
             (file as *const u8).add(FILE_F_PATH_OFFSET + PATH_DENTRY_OFFSET) as *const *const u8;
         if let Ok(leaf) = bpf_probe_read_kernel::<*const u8>(dentry_slot) {
             if !leaf.is_null() {
-                (*raw).path_len = walk_components(leaf, (*raw).path.as_mut_ptr()) as u16;
+                let (n, truncated) = walk_components(leaf, (*raw).path.as_mut_ptr());
+                (*raw).path_len = n as u16;
+                (*raw).path_truncated = truncated as u8;
             }
         }
     }
@@ -145,13 +149,16 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
 /// leaf→root into a FIXED 32-byte slot of `dst`. The slot offset comes
 /// from a `match` on the iteration index → a constant per iteration, so
 /// the verifier sees in-bounds writes into the 256-byte `path` field
-/// with no running-offset reasoning. Returns the slot count written;
-/// userland reverses the slots to rebuild the path. Fails SAFE — any
-/// failed probe stops the walk (short/empty path, never garbage).
+/// with no running-offset reasoning. Returns `(slots written, truncated)`
+/// where `truncated` is `true` when the slots ran out BEFORE the root
+/// dentry was reached (prefix unknown — userland must not classify the
+/// path's origin). Fails SAFE — any failed probe stops the walk
+/// (short/empty path, never garbage) and also counts as truncated.
 #[inline(always)]
-unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> usize {
+unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
     let mut dentry = leaf;
     let mut n: usize = 0;
+    let mut reached_root = false;
     for i in 0..MODULE_PATH_SLOTS {
         if dentry.is_null() {
             break;
@@ -165,6 +172,14 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> usize {
             5 => 160,
             6 => 192,
             7 => 224,
+            8 => 256,
+            9 => 288,
+            10 => 320,
+            11 => 352,
+            12 => 384,
+            13 => 416,
+            14 => 448,
+            15 => 480,
             _ => break,
         };
         // dentry->d_name.name (struct qstr → const u8*).
@@ -178,13 +193,18 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> usize {
         }
         n = i + 1;
         // Step to the parent; stop at the root (d_parent == self) or a
-        // failed/null read.
+        // failed/null read. Only `d_parent == self` means "root reached";
+        // a failed read counts as truncated too (prefix unknown).
         match bpf_probe_read_kernel::<*const u8>(dentry.add(DENTRY_D_PARENT_OFFSET) as *const *const u8) {
             Ok(p) if !p.is_null() && p != dentry => dentry = p,
+            Ok(p) if p == dentry => {
+                reached_root = true;
+                break;
+            }
             _ => break,
         }
     }
-    n
+    (n, !reached_root)
 }
 
 /// Read the loader's real-parent `comm` + `PF_KTHREAD` flag into `raw`.

@@ -310,8 +310,9 @@ impl PostureMachine {
         ledger.prune(now);
 
         // BUG-032 — escalation signals (ENGAGED-tier and above) this
-        // round. They corroborate each other and seed the ledger;
-        // ALERTED-tier recon/DNS is too noisy to count as corroboration.
+        // round. They seed the ledger for LATER rounds (never this one,
+        // see posture-1 below); ALERTED-tier recon/DNS is too noisy to
+        // count as corroboration.
         let escalation_now: Vec<TriggerType> = hits
             .iter()
             .copied()
@@ -319,11 +320,20 @@ impl PostureMachine {
             .collect();
 
         // Effective level: a blunt (NeedsCorroboration) COMBAT-tier
-        // signal is capped at ENGAGED unless a SECOND distinct
-        // escalation signal corroborates it (this round, or a distinct
-        // prior signal in the ledger). Decisive (kernel-adjudicated)
-        // signals reach COMBAT on their own. Computed up-front so the
-        // ledger's immutable read finishes before we record into it.
+        // signal is capped at ENGAGED unless a distinct PRIOR escalation
+        // signal in the ledger corroborates it. Decisive
+        // (kernel-adjudicated) signals reach COMBAT on their own.
+        //
+        // Audit `posture-1`: signals raised in the SAME `detect()` round
+        // deliberately do NOT corroborate each other. One `FileOpen`
+        // under `/etc/systemd/system/` can raise both the mass-write
+        // arm of ConfirmedIntrusion and PersistenceMechanism at once;
+        // letting them vouch for each other collapsed OBSERVING→COMBAT
+        // (locked, isolation ladder armed) in a single hop on a routine
+        // bulk unit install. The ledger — written AFTER this read — is
+        // the only corroboration source, so a blunt signal needs a
+        // second, earlier signal within the corroboration window:
+        // at most one tier of blunt escalation per round.
         let mut leveled: Vec<(TriggerType, PostureKind)> = hits
             .iter()
             .copied()
@@ -331,7 +341,7 @@ impl PostureMachine {
                 let level = if t.target_level() == PostureKind::Combat
                     && t.confidence() == Confidence::NeedsCorroboration
                 {
-                    if escalation_now.iter().any(|o| *o != t) || ledger.corroborated(t) {
+                    if ledger.corroborated(t) {
                         PostureKind::Combat
                     } else {
                         PostureKind::Engaged
