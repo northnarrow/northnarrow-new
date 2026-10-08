@@ -88,10 +88,13 @@ struct SockaddrIn6 {
 }
 
 /// Resolved destination of the datagram, address-family-tagged.
-struct Dest {
-    family: u8,             // 2 (AF_INET) or 10 (AF_INET6)
-    port_be: u16,           // network byte order
-    addr: [u8; ADDR_LEN],   // v4 in [0..4], v6 in [0..16]
+/// Shared with [`crate::udp_sendmsg_outbound`] (review
+/// `net-udp-blind-1`): the same `msg_name` walk resolves the
+/// destination of unconnected `sendto()` traffic there.
+pub(crate) struct Dest {
+    pub(crate) family: u8,           // 2 (AF_INET) or 10 (AF_INET6)
+    pub(crate) port_be: u16,         // network byte order
+    pub(crate) addr: [u8; ADDR_LEN], // v4 in [0..4], v6 in [0..16]
 }
 
 #[kprobe]
@@ -185,7 +188,7 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
 /// no usable address (NULL pointer or `namelen < 4`), signalling the
 /// caller to fall back to the socket.
 #[inline(always)]
-fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64> {
+pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64> {
     let name_ptr: *const u8 = match unsafe {
         bpf_probe_read_kernel::<*const u8>(msg_ptr.add(MSGHDR_NAME_OFFSET) as *const _)
     } {
@@ -257,7 +260,7 @@ fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64> {
 /// Bug 2 — read the destination from the socket's `__sk_common` for
 /// connected UDP (no `msg_name`). Uses the N2-validated `sock` offsets.
 #[inline(always)]
-fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
+pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
     if sk_ptr.is_null() {
         return Ok(None);
     }

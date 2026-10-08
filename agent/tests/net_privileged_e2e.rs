@@ -78,6 +78,10 @@ const DNS_ATTRIBUTION_HOST: &str = "foo.northnarrow-e2etest.invalid";
 /// random ephemeral-range port to avoid collisions with other
 /// services running on a developer's VM.
 const LISTENER_PORT: u16 = 41999;
+/// Test #3 — destination port of the unconnected UDP `sendto()`
+/// burst. Nothing listens there; the datagrams are dropped locally
+/// and ICMP-unreachable is irrelevant for the kprobe.
+const UDP_SENDTO_PORT: u16 = 34999;
 
 fn agent_bin() -> &'static str {
     env!("CARGO_BIN_EXE_northnarrow-agent")
@@ -668,4 +672,90 @@ fn net_listener_on_uncommon_port_records_event() {
     // The N6 unit tests (22 in `agent/src/decision/rules/net.rs`)
     // pin the rule's match logic against this exact port-shape;
     // priv-e2e here pins the END-TO-END kernel-to-rule wire.
+}
+
+// ── Test 3: unconnected UDP sendto() records a flow row ─────────────
+
+/// Review `net-udp-blind-1` — before the fix the
+/// `udp_sendmsg_outbound` kprobe skipped every send whose socket had
+/// no connected peer (`skc_dport == 0`), i.e. plain `sendto()`: a
+/// QUIC-like beacon or raw-UDP exfil through an unconnected socket
+/// produced no network event at all. The kprobe now resolves the
+/// destination from `msghdr->msg_name` and rate-limits emissions to
+/// one per `(pid, dst)` per second.
+///
+/// The helper sends a tight burst of 40 datagrams to a closed
+/// loopback port from one unconnected socket. Expect: at least one
+/// `netflow.jsonl` row with `proto = 17` and our destination, and
+/// FAR fewer rows than datagrams (the kernel-side rate limit).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_unconnected_udp_sendto_records_rate_limited_flow() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+
+    let helper = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for i in range(40):
+    try:
+        s.sendto(b"nn-udp-blind-1 " * 4, ("127.0.0.1", {port}))
+    except Exception:
+        pass
+s.close()
+"#,
+        port = UDP_SENDTO_PORT,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn python3 helper for net flow test #3");
+    assert!(
+        status.success(),
+        "python3 helper exited non-zero: {status:?}"
+    );
+
+    let is_ours = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(17)
+            && r["dst_port"].as_u64() == Some(UDP_SENDTO_PORT as u64)
+            && r["dst_addr"].as_str() == Some("127.0.0.1")
+    };
+    let rows = fx.wait_netflow_matching(1, is_ours);
+    let row = &rows[0];
+    assert_eq!(row["proto"].as_u64(), Some(17), "proto must be UDP (17)");
+    assert!(
+        row["bytes_sent"].as_u64().is_some_and(|b| b > 0),
+        "bytes_sent must carry the datagram length; got {:?}",
+        row["bytes_sent"]
+    );
+    assert!(
+        row["comm"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("python")),
+        "comm must be the python helper; got {:?}",
+        row["comm"]
+    );
+    assert_eq!(
+        row["entry_hash"].as_str().unwrap_or("").len(),
+        64,
+        "entry_hash should be 64 hex chars (SHA-256)"
+    );
+
+    // Rate limit: give the drain a moment to flush, then count. The
+    // burst takes well under a second, so the kernel-side limiter
+    // admits 1 row (2 if the burst straddles a second boundary) —
+    // never one per datagram.
+    std::thread::sleep(Duration::from_secs(2));
+    let ours = read_jsonl(&fx.netflow_log)
+        .into_iter()
+        .filter(is_ours)
+        .count();
+    assert!(
+        (1..=3).contains(&ours),
+        "unconnected sendto burst of 40 must be rate-limited to ~1 row/s per (pid, dst); got {ours} rows"
+    );
 }
