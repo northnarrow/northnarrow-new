@@ -2370,7 +2370,8 @@ fn dispatch_canary_deploy(
     if let Err(e) = materialise_canary_file(&extra.deployment, state, &primary_fp) {
         warn!(
             error = %e,
-            "canary-deploy: file materialisation failed"
+            signer_fp = %primary_fp,
+            "canary-deploy: REFUSED — file materialisation failed (path policy or I/O)"
         );
         return CanaryDeployResponse {
             result: AdminResult::UnknownOperation,
@@ -2446,8 +2447,11 @@ fn materialise_canary_file(
                  # Deployed by operator key fp {deployed_by_fp}.\n\
                  # Any access to this file triggers NN-L-CANARY-001.\n"
             );
-            ensure_parent_dir(std::path::Path::new(path))?;
-            std::fs::write(path, body)
+            // canary-path-1: a signed deploy must not become "write a
+            // root-owned file anywhere" — policy check + O_NOFOLLOW write.
+            let target = crate::canary::path_policy::check_canary_path(path)?;
+            ensure_parent_dir(&target)?;
+            crate::canary::path_policy::write_canary_file(&target, body.as_bytes())
                 .map_err(|e| anyhow::anyhow!("writing file canary {path}: {e}"))?;
             Ok(())
         }
@@ -2465,8 +2469,9 @@ fn materialise_canary_file(
             let seed = format!("{deployed_by_fp}:{path}");
             let body = render(family, &seed, state.template_dir.as_deref())
                 .map_err(|e| anyhow::anyhow!("rendering cred canary: {e}"))?;
-            ensure_parent_dir(std::path::Path::new(path))?;
-            std::fs::write(path, body)
+            let target = crate::canary::path_policy::check_canary_path(path)?;
+            ensure_parent_dir(&target)?;
+            crate::canary::path_policy::write_canary_file(&target, body.as_bytes())
                 .map_err(|e| anyhow::anyhow!("writing cred canary {path}: {e}"))?;
             Ok(())
         }
