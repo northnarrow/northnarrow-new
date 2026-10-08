@@ -740,14 +740,18 @@ async fn main() -> Result<()> {
         Some(wpid) => vec![agent_pid, wpid],
         None => vec![agent_pid],
     };
-    if let Err(e) = sensor.attach_anti_tamper(&pids, &allowed_comms) {
-        warn!(
-            error = %e,
-            agent_pid,
-            watchdog_pid = ?watchdog_pid,
-            "anti-tamper setup failed"
-        );
-    }
+    // Audit `ebpf-lsm-1`: a deny-hook shortfall is fail-closed (the
+    // escape hatch is NN_ANTI_TAMPER_ALLOW_DEGRADED=1, handled inside
+    // anti_tamper::attach). A kernel without BPF-LSM is NOT an error
+    // here — attach returns Ok after logging that anti-tamper is off.
+    sensor
+        .attach_anti_tamper(&pids, &allowed_comms)
+        .with_context(|| {
+            format!(
+                "anti-tamper setup failed (agent_pid={agent_pid}, watchdog_pid={watchdog_pid:?}) — \
+                 refusing to start with a silently-absent protection"
+            )
+        })?;
 
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
