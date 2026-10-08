@@ -28,12 +28,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal::unix::{signal, Signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    agent_argv_from_proc, respawn_agent, select_backend, systemd_is_booted, RespawnBackend,
-    SYSTEMD_RUNTIME_DIR,
+    agent_argv_from_proc, classify_ping_error, respawn_agent, select_backend, systemd_is_booted,
+    PingFailure, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER, SYSTEMD_RUNTIME_DIR,
 };
 use northnarrow_watchdog::{
     evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
@@ -526,19 +526,42 @@ async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender
         tick.tick().await;
         let outcome = match ping_agent_status(&socket_path, STATUS_PING_TIMEOUT).await {
             Ok(()) => tracker.record_ok(),
-            Err(e) => {
-                warn!(
-                    target: "watchdog.status_ping",
-                    error = %e,
-                    socket = %socket_path.display(),
-                    consecutive = tracker.consecutive_timeouts(),
-                    "STATUS ping failed"
-                );
-                tracker.record_timeout()
-            }
+            Err(e) => match classify_ping_error(&e) {
+                PingFailure::SocketAbsent => tracker.record_socket_absent(),
+                PingFailure::Unresponsive => {
+                    warn!(
+                        target: "watchdog.status_ping",
+                        error = %e,
+                        socket = %socket_path.display(),
+                        consecutive = tracker.consecutive_timeouts(),
+                        "STATUS ping failed"
+                    );
+                    tracker.record_timeout()
+                }
+            },
         };
         match outcome {
             PingOutcome::Ok | PingOutcome::TimeoutOnce => {}
+            PingOutcome::SocketAbsent { consecutive } => {
+                // Not a hang: never feed stuck recovery (it would SIGINT
+                // a healthy-but-misconfigured agent every 30 s forever).
+                if consecutive >= STATUS_PING_ABSENT_ERROR_AFTER {
+                    error!(
+                        target: "watchdog.status_ping",
+                        socket = %socket_path.display(),
+                        consecutive,
+                        "admin socket has NEVER come up — agent misconfigured (combat-rules.v4 / \
+                         admin.pub missing?), NOT treating as stuck; nn-admin will not work"
+                    );
+                } else {
+                    warn!(
+                        target: "watchdog.status_ping",
+                        socket = %socket_path.display(),
+                        consecutive,
+                        "admin socket absent (ENOENT) — not counted as stuck"
+                    );
+                }
+            }
             PingOutcome::StuckDetected => {
                 warn!(
                     target: "watchdog.status_ping",

@@ -1016,7 +1016,46 @@ pub enum PingOutcome {
     /// kick off the stuck-recovery sequence
     /// ([`stuck_recovery`]).
     StuckDetected,
+    /// The admin socket path does not exist (ENOENT on connect). The
+    /// agent is not *stuck* — it never opened the socket (or removed it
+    /// on a clean exit, which the pidfd path reports separately). This
+    /// never feeds the stuck threshold; `consecutive` counts how many
+    /// pings in a row saw the socket missing so the caller can escalate
+    /// the log level without ever SIGINT-ing a healthy agent.
+    SocketAbsent { consecutive: u32 },
 }
+
+/// Why a STATUS ping failed, as far as the stuck-recovery policy cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingFailure {
+    /// `connect(2)` → ENOENT: no socket file at the path. Misconfiguration
+    /// (the agent starts the admin socket only with a loadable COMBAT
+    /// ruleset and a valid admin.pub) or a clean agent exit — not a hang.
+    SocketAbsent,
+    /// Anything else: connect refused/reset, protocol error, or the
+    /// 2 s timeout — the agent is there but not answering.
+    Unresponsive,
+}
+
+/// Classify a [`ping_agent_status`] error by walking its source chain
+/// for an `io::Error` with `NotFound`.
+pub fn classify_ping_error(e: &anyhow::Error) -> PingFailure {
+    let not_found = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+            .unwrap_or(false)
+    });
+    if not_found {
+        PingFailure::SocketAbsent
+    } else {
+        PingFailure::Unresponsive
+    }
+}
+
+/// After this many consecutive absent-socket pings (30 s apart) the
+/// ping loop raises its log line to ERROR: the agent has been up for
+/// minutes without ever opening its admin socket.
+pub const STATUS_PING_ABSENT_ERROR_AFTER: u32 = 4;
 
 /// Sliding-counter state machine that tracks consecutive
 /// STATUS-ping timeouts. Reset on any successful ping. Threshold
@@ -1026,6 +1065,7 @@ pub enum PingOutcome {
 pub struct StatusPingTracker {
     consecutive_timeouts: u8,
     threshold: u8,
+    consecutive_absent: u32,
 }
 
 impl StatusPingTracker {
@@ -1040,14 +1080,27 @@ impl StatusPingTracker {
         Self {
             consecutive_timeouts: 0,
             threshold,
+            consecutive_absent: 0,
         }
     }
 
-    /// Record a successful ping. Resets the counter; returns
+    /// Record a successful ping. Resets the counters; returns
     /// [`PingOutcome::Ok`].
     pub fn record_ok(&mut self) -> PingOutcome {
         self.consecutive_timeouts = 0;
+        self.consecutive_absent = 0;
         PingOutcome::Ok
+    }
+
+    /// The socket file is missing. Does NOT touch the stuck counter:
+    /// an agent that never opened its admin socket is misconfigured,
+    /// not hung, and SIGINT-ing it only produces a restart loop (seen on
+    /// the lab guest with a missing combat-rules.v4, 2026-10-08).
+    pub fn record_socket_absent(&mut self) -> PingOutcome {
+        self.consecutive_absent = self.consecutive_absent.saturating_add(1);
+        PingOutcome::SocketAbsent {
+            consecutive: self.consecutive_absent,
+        }
     }
 
     /// Record a ping failure (reply timeout OR transport error
@@ -1056,6 +1109,7 @@ impl StatusPingTracker {
     /// the first failure in a row, [`PingOutcome::StuckDetected`]
     /// when the threshold is met.
     pub fn record_timeout(&mut self) -> PingOutcome {
+        self.consecutive_absent = 0;
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
         if self.consecutive_timeouts >= self.threshold {
             PingOutcome::StuckDetected
@@ -1904,6 +1958,58 @@ mod tests {
         .unwrap();
         assert_eq!(cli.respawn_backend, RespawnBackendChoice::Exec);
         assert_eq!(cli.agent_unit, "x.service");
+    }
+
+    // ── STATUS ping: absent socket is not "stuck" ─────────────────
+    #[test]
+    fn absent_socket_never_trips_stuck_threshold() {
+        let mut t = StatusPingTracker::with_threshold(2);
+        for i in 1..=10u32 {
+            assert_eq!(
+                t.record_socket_absent(),
+                PingOutcome::SocketAbsent { consecutive: i }
+            );
+        }
+        assert_eq!(t.consecutive_timeouts(), 0);
+        // A real unresponsive ping still counts from zero afterwards.
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+        assert_eq!(t.record_timeout(), PingOutcome::StuckDetected);
+    }
+
+    #[test]
+    fn ok_ping_resets_absent_counter() {
+        let mut t = StatusPingTracker::new();
+        t.record_socket_absent();
+        t.record_socket_absent();
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        assert_eq!(
+            t.record_socket_absent(),
+            PingOutcome::SocketAbsent { consecutive: 1 }
+        );
+    }
+
+    #[test]
+    fn classify_not_found_as_socket_absent() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
+        let e = anyhow::Error::from(io).context("connect /run/northnarrow/admin.sock");
+        assert_eq!(classify_ping_error(&e), PingFailure::SocketAbsent);
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nope");
+        let e = anyhow::Error::from(io).context("connect");
+        assert_eq!(classify_ping_error(&e), PingFailure::Unresponsive);
+        assert_eq!(
+            classify_ping_error(&anyhow!("reply body length exceeds")),
+            PingFailure::Unresponsive
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_socket_ping_error_classifies_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.sock");
+        let err = ping_agent_status(&path, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(classify_ping_error(&err), PingFailure::SocketAbsent);
     }
 
     #[test]
