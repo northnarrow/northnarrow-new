@@ -294,11 +294,30 @@ pub fn run_golden(engine: &RagEngine) -> GoldenReport {
 mod tests {
     use super::*;
 
+    /// `target/kb` as produced by `cargo xtask rag-kb`. Review entry 21
+    /// (`rag-golden-no-corpus-1`): `open_index` silently falls back to
+    /// the built-in seed when the dir is missing, so the release gates
+    /// used to run against ~30 seed docs and report a meaningless
+    /// 36.7 % "golden" rate. Fail fast with the fix instead.
     fn real_kb() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("target/kb")
+            .join("target/kb");
+        let jsonl = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert!(
+            jsonl > 0,
+            "RAG release gate needs the real corpus: {} has no *.jsonl — run `cargo xtask rag-kb` \
+             (pinned ATT&CK + SigmaHQ fetch) on the host first; the lab's `nn-lab.sh sync` ships it",
+            dir.display()
+        );
+        dir
     }
 
     #[test]
