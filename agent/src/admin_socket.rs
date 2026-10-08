@@ -32,12 +32,11 @@ use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
     DetectionSetStatusRequest, DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse,
-    FimBaselineRequest, FimReportRequest, FimReportResponse,
-    FimStatusRequest, FimStatusResponse, ForcePostureRequest, NetFingerprintRequest,
-    NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse, NetListenersRequest,
-    NetListenersResponse, NetResolveRequest, NetResolveResponse, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, TrustedInstallerGrantRequest,
-    UnlockResult, MAX_FRAME_BODY,
+    FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
+    ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
+    NetFlowsResponse, NetListenersRequest, NetListenersResponse, NetResolveRequest,
+    NetResolveResponse, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
+    StatusResponse, TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
@@ -49,9 +48,9 @@ use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::canary::detector::CanaryIndexes;
+use crate::canary::registry::{CanaryTokenDraft, Registry, RegistryError};
 use crate::chainlog::RotatingChainLog;
 use crate::detection_store::{Principal, StatusEvent};
-use crate::canary::registry::{CanaryTokenDraft, Registry, RegistryError};
 use crate::fim::drain::DriftRateLimiter;
 use crate::fim::recompute::{BaselineRecomputeSender, RecomputeReason};
 use crate::posture::{AdminReleaseError, PostureMachine};
@@ -1504,7 +1503,10 @@ fn dispatch_force_posture(
 /// until restart, NOT that the (already-committed-on-disk) rotation should
 /// be reported as failed. Called right after the rename(2), before the
 /// in-memory reload, so a reload failure cannot skip it.
-fn reregister_admin_pub_after_rotate(config_path: &Path, old_inode_key: Option<common::wire::InodeKey>) {
+fn reregister_admin_pub_after_rotate(
+    config_path: &Path,
+    old_inode_key: Option<common::wire::InodeKey>,
+) {
     if let Err(e) = crate::anti_tamper::filesystem::reregister_protected_file(
         crate::anti_tamper::prepare_pin_root(),
         config_path,
@@ -3015,9 +3017,7 @@ fn dispatch_detection_set_status(
         server_now,
     ) {
         Ok(t) => t,
-        Err(e) => {
-            return fail_set_status(map_admin_auth_error(e, "detection_set_status"), req_id)
-        }
+        Err(e) => return fail_set_status(map_admin_auth_error(e, "detection_set_status"), req_id),
     };
     *fps_out = matched_fps;
 
@@ -3051,7 +3051,10 @@ fn dispatch_detection_set_status(
     // as a clean "detection not found".
     let max_id = detection_store::max_detection_id(&state.detections_path);
     if extra.id == 0 || extra.id > max_id {
-        warn!(id = extra.id, max_id, "detection-set-status: id out of range (not found)");
+        warn!(
+            id = extra.id,
+            max_id, "detection-set-status: id out of range (not found)"
+        );
         return fail_set_status(AdminResult::UnknownOperation, extra.id);
     }
 
@@ -3479,11 +3482,27 @@ mod tests {
         }
         assert!(socket.exists());
 
-        // Smoke check: a status round-trip works.
+        // Smoke check: a status round-trip works. The socket path
+        // appears at bind(2), a few instructions BEFORE listen(2): a
+        // connect in that window gets ECONNREFUSED, so retry briefly
+        // instead of unwrapping the first attempt (flake seen under
+        // parallel test load).
         let socket_c = socket.clone();
-        let out = tokio::task::spawn_blocking(move || run_status(&socket_c).unwrap())
-            .await
-            .unwrap();
+        let out = tokio::task::spawn_blocking(move || {
+            let mut last = None;
+            for _ in 0..50 {
+                match run_status(&socket_c) {
+                    Ok(out) => return out,
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            panic!("status round-trip never succeeded: {last:?}");
+        })
+        .await
+        .unwrap();
         assert_eq!(out.posture, PostureKind::Observing);
 
         task.abort();
@@ -4857,8 +4876,7 @@ mod tests {
 
         // The status-event chain now resolves id 2 → Resolved (latest).
         let wanted: std::collections::HashSet<u64> = [2u64].into_iter().collect();
-        let map =
-            crate::detection_store::latest_status_for_ids(&state.status_events_path, &wanted);
+        let map = crate::detection_store::latest_status_for_ids(&state.status_events_path, &wanted);
         assert_eq!(
             map.get(&2),
             Some(&crate::detection_store::DetectionStatus::Resolved),
@@ -4996,8 +5014,15 @@ mod tests {
         let mut fps = Vec::new();
         let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
         assert!(matches!(resp, AdminResult::Success));
-        assert!(ov.is_window_open(), "a valid grant opens the override window");
-        assert_eq!(fps.len(), 1, "signer fingerprint captured for the audit chain");
+        assert!(
+            ov.is_window_open(),
+            "a valid grant opens the override window"
+        );
+        assert_eq!(
+            fps.len(),
+            1,
+            "signer fingerprint captured for the audit chain"
+        );
     }
 
     /// A signature from a key NOT in admin.pub is rejected; the override
@@ -5017,7 +5042,10 @@ mod tests {
         let mut fps = Vec::new();
         let resp = dispatch_trusted_installer_grant(req, &auth, Some(&ov), &mut fps);
         assert!(matches!(resp, AdminResult::InvalidSignature));
-        assert!(!ov.is_window_open(), "a bad signature never arms the override");
+        assert!(
+            !ov.is_window_open(),
+            "a bad signature never arms the override"
+        );
     }
 
     /// A grant whose `agent_id` doesn't match this install is rejected

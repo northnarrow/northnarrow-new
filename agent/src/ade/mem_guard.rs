@@ -103,10 +103,7 @@ mod tests {
     #[test]
     fn parse_mem_available_extracts_kb_as_bytes() {
         let meminfo = "MemTotal:       15998884 kB\nMemFree:  123456 kB\nMemAvailable:   13670000 kB\nBuffers: 1 kB\n";
-        assert_eq!(
-            parse_mem_available(meminfo),
-            Some(13_670_000 * 1024)
-        );
+        assert_eq!(parse_mem_available(meminfo), Some(13_670_000 * 1024));
     }
 
     #[test]

@@ -538,7 +538,9 @@ fn attribute_dns_query(
     match dns_cache.originator_for(query_name, now_ns, DNS_ORIGINATOR_WINDOW_NS, sender_pid) {
         Some(orig) => DnsAttribution::Act {
             pid: orig,
-            label: format!("pid {orig} (DNS originator of {query_name}, forwarded by {sender_comm})"),
+            label: format!(
+                "pid {orig} (DNS originator of {query_name}, forwarded by {sender_comm})"
+            ),
         },
         None => DnsAttribution::Downgrade {
             forwarder_pid: sender_pid,
@@ -1928,7 +1930,10 @@ mod tests {
             ResponseAction::Log,
             "no originator → Log, never kill the forwarder"
         );
-        assert_eq!(v.event_pid, 673, "logged against the forwarder, but only Log");
+        assert_eq!(
+            v.event_pid, 673,
+            "logged against the forwarder, but only Log"
+        );
     }
 
     /// FP-3 — same forwarder-aware downgrade applies to -014 (entropy):
@@ -2049,7 +2054,14 @@ mod tests {
         assert_eq!(v.event_pid, 1122);
         // Forwarded leg ~130 ms later (sender = resolver) → back-correlates
         // to 1122 → SAME (pid, qname) key → suppressed.
-        let fwd = dns_event_full(673, &long, 1, "systemd-resolved", Some(RESOLVER_EXE), 130_000_000);
+        let fwd = dns_event_full(
+            673,
+            &long,
+            1,
+            "systemd-resolved",
+            Some(RESOLVER_EXE),
+            130_000_000,
+        );
         assert!(
             rule.evaluate(&fwd).is_none(),
             "back-correlated forwarded leg collapses into the originator's verdict"

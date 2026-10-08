@@ -1,0 +1,33 @@
+# Dependabot — weekly, grouped, low-noise.
+# Security advisories (RustSEC / GHSA) still open a PR immediately,
+# regardless of the schedule below.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for all patch/minor bumps so the lockfile churn lands
+      # together and CI runs once.
+      rust-minor:
+        update-types: ["minor", "patch"]
+    # candle/tokenizers major bumps change the ADE model path — keep
+    # them as separate, reviewable PRs.
+    ignore:
+      - dependency-name: "candle-*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: cargo
+    directory: /agent-ebpf
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

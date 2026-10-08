@@ -37,10 +37,10 @@ pub const DEFAULT_MASS_WRITE_OVERLAY: &str = "/etc/northnarrow/mass-write-carveo
 /// Accepted line shapes (after stripping `#` comments and trimming):
 /// - `+/absolute/prefix`  — add prefix
 /// - `/absolute/prefix`   — add prefix (bare path is treated as add,
-///                           same convenience as fim-paths.local)
+///   same convenience as fim-paths.local)
 /// - `-…`                 — REJECTED here: there is no curated v1
-///                           list to disable from. A `-` line WARNs
-///                           and is dropped.
+///   list to disable from. A `-` line WARNs
+///   and is dropped.
 ///
 /// Invalid entries (relative paths, empty, `-` directive) are
 /// surfaced via WARN with `path:lineno`.

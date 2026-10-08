@@ -3,8 +3,8 @@
 //!
 //! ## Why this crate exists
 //!
-//! `agent-ebpf/` is a **separate cargo project** (nightly + `rust-src`
-//! + the `bpfel-unknown-none` target), deliberately excluded from the
+//! `agent-ebpf/` is a **separate cargo project** (nightly, `rust-src`
+//! and the `bpfel-unknown-none` target), deliberately excluded from the
 //! userland workspace (root `Cargo.toml` `exclude = ["agent-ebpf"]`).
 //! Only `cargo xtask build[-ebpf]` compiles it. `agent/build.rs` then
 //! `include_bytes!`-embeds whatever `.o` is sitting in
@@ -41,8 +41,7 @@
 //! copies of a walk-and-hash loop.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -170,7 +169,7 @@ pub fn write_stamp(repo_root: &Path, source_hash: &str) -> io::Result<()> {
     let stamp = ebpf_stamp_path(repo_root);
     let parent = stamp
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stamp path has no parent"))?;
+        .ok_or_else(|| io::Error::other("stamp path has no parent"))?;
     fs::create_dir_all(parent)?;
     let contents = format!("{STAMP_VERSION}\n{source_hash}\n");
     let tmp = stamp.with_extension("buildhash.tmp");

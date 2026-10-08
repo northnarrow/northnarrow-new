@@ -214,9 +214,18 @@ mod tests {
     // ── reconstruction sanity (the From impl) ──────────────────────
     #[test]
     fn from_reconstructs_paths() {
-        let tmp = ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &["/", "tmp", "evil.ko"]));
+        let tmp = ev(&raw(
+            MODULE_LOAD_FINIT,
+            "insmod",
+            "bash",
+            0,
+            &["/", "tmp", "evil.ko"],
+        ));
         let std = ev(&raw(
-            MODULE_LOAD_FINIT, "modprobe", "bash", 0,
+            MODULE_LOAD_FINIT,
+            "modprobe",
+            "bash",
+            0,
             &["/", "lib", "modules", "6.8.0", "kernel", "fs", "foo.ko"],
         ));
         match tmp {
@@ -236,17 +245,29 @@ mod tests {
     fn exempt_kthread() {
         // kernel-driven load — even from /tmp (impossible in practice,
         // but the non-forgeable signal is trusted first).
-        let v = rule().evaluate(&ev(&raw(MODULE_LOAD_FINIT, "modprobe", "kworker/0:1", 1, &["/", "tmp", "x.ko"])));
+        let v = rule().evaluate(&ev(&raw(
+            MODULE_LOAD_FINIT,
+            "modprobe",
+            "kworker/0:1",
+            1,
+            &["/", "tmp", "x.ko"],
+        )));
         assert!(v.is_none(), "kthread-driven load must be exempt");
     }
 
     #[test]
     fn exempt_allowlisted_loader() {
         let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT, "kmod", "systemd", 0,
+            MODULE_LOAD_FINIT,
+            "kmod",
+            "systemd",
+            0,
             &["/", "usr", "lib", "modules", "6.8.0", "kernel", "x.ko"],
         )));
-        assert!(v.is_none(), "allowlisted loader (kmod) on a standard path must not fire");
+        assert!(
+            v.is_none(),
+            "allowlisted loader (kmod) on a standard path must not fire"
+        );
     }
 
     #[test]
@@ -254,24 +275,39 @@ mod tests {
         // boot modprobe under systemd-udevd: loader=modprobe (not
         // allowlisted) but parent=systemd-udevd (allowlisted) → exempt.
         let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT, "modprobe", "systemd-udevd", 0,
+            MODULE_LOAD_FINIT,
+            "modprobe",
+            "systemd-udevd",
+            0,
             &["/", "lib", "modules", "6.8.0", "kernel", "snd.ko"],
         )));
-        assert!(v.is_none(), "load under an allowlisted auto-loader parent must not fire");
+        assert!(
+            v.is_none(),
+            "load under an allowlisted auto-loader parent must not fire"
+        );
     }
 
     // ── fire conditions ────────────────────────────────────────────
     #[test]
     fn fire_nonstandard_path_is_critical_killtree() {
         let v = rule()
-            .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &["/", "tmp", "evil.ko"])))
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "insmod",
+                "bash",
+                0,
+                &["/", "tmp", "evil.ko"],
+            )))
             .expect("non-standard path must fire");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert_eq!(v.rule_id, "R018_KernelModuleLoad");
         // The Critical kill must target the LOADER pid (build_verdict
         // ModuleLoad arm), not 0 — else it's refused at the PID floor.
-        assert_eq!(v.event_pid, 4242, "verdict must target the loader pid, not 0");
+        assert_eq!(
+            v.event_pid, 4242,
+            "verdict must target the loader pid, not 0"
+        );
     }
 
     /// SECURITY-CRITICAL: a load from /tmp must fire Critical EVEN when
@@ -280,7 +316,13 @@ mod tests {
     #[test]
     fn nonstandard_path_fires_even_with_allowlisted_loader() {
         let v = rule()
-            .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "kmod", "kmod", 0, &["/", "tmp", "evil.ko"])))
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "kmod",
+                "kmod",
+                0,
+                &["/", "tmp", "evil.ko"],
+            )))
             .expect("non-standard path must fire even for an allowlisted comm");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.action, ResponseAction::KillProcessTree);
@@ -299,7 +341,10 @@ mod tests {
     fn fire_stdpath_unexpected_loader_is_medium_log() {
         let v = rule()
             .evaluate(&ev(&raw(
-                MODULE_LOAD_FINIT, "dkms", "bash", 0,
+                MODULE_LOAD_FINIT,
+                "dkms",
+                "bash",
+                0,
                 &["/", "lib", "modules", "6.8.0", "updates", "nvidia.ko"],
             )))
             .expect("standard path + unexpected loader must fire");
@@ -311,15 +356,32 @@ mod tests {
     #[test]
     fn negative_stdpath_allowlisted_loader_does_not_fire() {
         let v = rule().evaluate(&ev(&raw(
-            MODULE_LOAD_FINIT, "kmod", "systemd-modules-load", 0,
-            &["/", "lib", "modules", "6.8.0", "kernel", "net", "tls", "tls.ko.zst"],
+            MODULE_LOAD_FINIT,
+            "kmod",
+            "systemd-modules-load",
+            0,
+            &[
+                "/",
+                "lib",
+                "modules",
+                "6.8.0",
+                "kernel",
+                "net",
+                "tls",
+                "tls.ko.zst",
+            ],
         )));
-        assert!(v.is_none(), "a legit /lib/modules load by an allowlisted loader must stay silent");
+        assert!(
+            v.is_none(),
+            "a legit /lib/modules load by an allowlisted loader must stay silent"
+        );
     }
 
     #[test]
     fn non_module_event_is_ignored() {
         use crate::decision::rules::testutil::spawn;
-        assert!(rule().evaluate(&spawn("insmod", "/usr/sbin/insmod")).is_none());
+        assert!(rule()
+            .evaluate(&spawn("insmod", "/usr/sbin/insmod"))
+            .is_none());
     }
 }

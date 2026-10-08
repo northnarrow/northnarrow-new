@@ -387,7 +387,10 @@ mod tests {
     #[test]
     fn starts_disarmed_boot_zero() {
         let ov = test_override(600);
-        assert!(!ov.is_active_at(Instant::now()), "fresh override is disarmed");
+        assert!(
+            !ov.is_active_at(Instant::now()),
+            "fresh override is disarmed"
+        );
         // close on a disarmed override is a harmless no-op.
         ov.close("noop");
         assert!(!ov.is_active_at(Instant::now()));

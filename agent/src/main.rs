@@ -34,15 +34,15 @@ use northnarrow_agent::ade::{
 use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
+use northnarrow_agent::anti_tamper::btf_revalidate::{
+    revalidate_offsets, RefuseReason, RevalidateOutcome,
+};
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::net::blocklist::{
     Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
     DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
-};
-use northnarrow_agent::anti_tamper::btf_revalidate::{
-    revalidate_offsets, RefuseReason, RevalidateOutcome,
 };
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
@@ -1069,18 +1069,21 @@ async fn main() -> Result<()> {
         // pseudo-FS prefixes. See SECURITY note in
         // mass_write_overlay.rs — DO NOT add /home, /var, /tmp
         // wholesale.
-        let mass_write_extras = northnarrow_agent::posture::mass_write_overlay::
-            load_mass_write_carveout_extras(std::path::Path::new(
-                northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
-            ));
+        let mass_write_extras =
+            northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
+                std::path::Path::new(
+                    northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+                ),
+            );
         // BUG-032 — escalation allowlist (count-filter for exfil/lateral).
         // Missing file = empty (fail-secure). Loaded once at boot;
         // reload-on-restart for beta.
-        let escalation_allow = northnarrow_agent::posture::escalation_allow::EscalationAllowList::load(
-            std::path::Path::new(
-                northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
-            ),
-        );
+        let escalation_allow =
+            northnarrow_agent::posture::escalation_allow::EscalationAllowList::load(
+                std::path::Path::new(
+                    northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
+                ),
+            );
         if !escalation_allow.is_empty() {
             info!(
                 entries = escalation_allow.len(),
@@ -1228,7 +1231,9 @@ async fn main() -> Result<()> {
             isolator.clone(),
             detect_only,
         )),
-        Box::new(northnarrow_agent::combat::AuditEvidence::new(audit_log.clone())),
+        Box::new(northnarrow_agent::combat::AuditEvidence::new(
+            audit_log.clone(),
+        )),
         // Never kill / net-cut PID 1, the agent, its watchdog, or sshd —
         // skip + escalate to ISOLATE instead. Reuses the same `exempt`
         // handle the posture machine holds (so the watchdog PID stays the
@@ -2845,7 +2850,10 @@ fn audit_combat_reconcile(rules_removed: usize) {
             .truncate(true)
             .open(PATH)
     } else {
-        std::fs::OpenOptions::new().create(true).append(true).open(PATH)
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(PATH)
     };
     let res = open_res.and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = res {

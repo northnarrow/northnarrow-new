@@ -1141,7 +1141,9 @@ impl SignedPayload {
             nonce,
             ts,
             agent_id,
-            extra: OperationExtra::TrustedInstallerGrant(TrustedInstallerGrantExtra { window_secs }),
+            extra: OperationExtra::TrustedInstallerGrant(TrustedInstallerGrantExtra {
+                window_secs,
+            }),
         }
     }
 

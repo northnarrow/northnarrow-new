@@ -177,7 +177,11 @@ fn event_kind_label(e: &Event) -> &'static str {
 
 fn push_pid_uid(buf: &mut String, e: &Event) {
     let (pid, uid) = match e {
-        Event::ModuleLoad { loader_pid, loader_uid, .. } => (*loader_pid, *loader_uid),
+        Event::ModuleLoad {
+            loader_pid,
+            loader_uid,
+            ..
+        } => (*loader_pid, *loader_uid),
         Event::ProcessSpawn { pid, uid, .. }
         | Event::FileOpen { pid, uid, .. }
         | Event::ExecCheck { pid, uid, .. }

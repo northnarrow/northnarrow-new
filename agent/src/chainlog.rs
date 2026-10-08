@@ -252,11 +252,7 @@ impl<P: Serialize> ChainLine<P> {
 }
 
 impl TerminatorLine {
-    fn sealed(
-        rotate: RotateTerminator,
-        key: &AgentSigningKey,
-        prev_hash: &str,
-    ) -> Result<Self> {
+    fn sealed(rotate: RotateTerminator, key: &AgentSigningKey, prev_hash: &str) -> Result<Self> {
         let mut line = TerminatorLine {
             rotate,
             ts: now_ts(),
@@ -288,7 +284,8 @@ impl ManifestLine {
 
 /// Serialise a line struct to a `\n`-terminated JSONL string.
 fn to_jsonl<T: Serialize>(line: &T) -> Result<String> {
-    let mut s = serde_json::to_string(line).map_err(|e| anyhow!("serialising chainlog line: {e}"))?;
+    let mut s =
+        serde_json::to_string(line).map_err(|e| anyhow!("serialising chainlog line: {e}"))?;
     s.push('\n');
     Ok(s)
 }
@@ -515,8 +512,7 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         // pre-existing over-cap active file — e.g. a legacy log inherited at
         // the BUG-026 migration — must rotate on its FIRST append, and an
         // empty fresh file (0 bytes) must NOT rotate its first line.
-        if self.active_bytes > 0
-            && self.active_bytes + bytes.len() as u64 > self.cfg.size_cap_bytes
+        if self.active_bytes > 0 && self.active_bytes + bytes.len() as u64 > self.cfg.size_cap_bytes
         {
             self.rotate()?;
             // After rotation the line was hashed off the OLD tail; rebuild
@@ -766,8 +762,7 @@ fn evict_excess_archives(active: &Path, max_archives: usize) -> Result<Vec<(u64,
     for &seq in seqs.iter().take(drop_n) {
         let path = archive_path(active, seq);
         let hash = read_terminator_hash(&path).unwrap_or_default();
-        fs::remove_file(&path)
-            .with_context(|| format!("evicting archive {}", path.display()))?;
+        fs::remove_file(&path).with_context(|| format!("evicting archive {}", path.display()))?;
         evicted.push((seq, hash));
     }
     Ok(evicted)
@@ -938,7 +933,11 @@ fn scan_back_for_tail(
                     sealed: v.get("rotate").is_some(),
                     torn,
                     dropped_bytes: dropped.len() as u64,
-                    dropped_sha256: if torn { sha256_hex(dropped) } else { String::new() },
+                    dropped_sha256: if torn {
+                        sha256_hex(dropped)
+                    } else {
+                        String::new()
+                    },
                 });
             }
             // Parsed but not a chain line (no entry_hash) → keep walking back.
@@ -1024,7 +1023,9 @@ pub enum LogSetError {
         got: String,
         expected: String,
     },
-    #[error("file {file}: entry {idx}: entry_hash mismatch (recomputed {recomputed}, stored {stored})")]
+    #[error(
+        "file {file}: entry {idx}: entry_hash mismatch (recomputed {recomputed}, stored {stored})"
+    )]
     EntryHashMismatch {
         file: String,
         idx: usize,
@@ -1081,12 +1082,11 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
                 return Err(LogSetError::UncorroboratedEviction { seq });
             }
         }
-        expected_prev = evicted
-            .get(&(earliest_retained_seq - 1))
-            .cloned()
-            .ok_or(LogSetError::UncorroboratedEviction {
+        expected_prev = evicted.get(&(earliest_retained_seq - 1)).cloned().ok_or(
+            LogSetError::UncorroboratedEviction {
                 seq: earliest_retained_seq - 1,
-            })?;
+            },
+        )?;
     }
 
     let mut total_records = 0u64;
@@ -1103,8 +1103,7 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
             }
         }
         let path = archive_path(active_path, seq);
-        let (term_hash, records) =
-            verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq))?;
+        let (term_hash, records) = verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq))?;
         total_records += records;
         expected_prev = term_hash.expect("sealed archive ends in a terminator");
         prev_seq = Some(seq);
@@ -1266,7 +1265,10 @@ fn check_entry(
     }
     let mut arr = [0u8; 64];
     arr.copy_from_slice(&sig_bytes);
-    if pubkey.verify(&digest, &Signature::from_bytes(&arr)).is_err() {
+    if pubkey
+        .verify(&digest, &Signature::from_bytes(&arr))
+        .is_err()
+    {
         return Err(LogSetError::SignatureInvalid {
             file: file.to_string(),
             idx,
@@ -1408,9 +1410,13 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
 
         for i in 0..40 {
             log.append(payload(i)).unwrap();
@@ -1450,9 +1456,13 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, k, cfg(300, 2), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(300, 2),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
 
         for i in 0..80 {
             log.append(payload(i)).unwrap();
@@ -1477,9 +1487,13 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
         for i in 0..40 {
             log.append(payload(i)).unwrap();
         }
@@ -1511,9 +1525,13 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
         for i in 0..40 {
             log.append(payload(i)).unwrap();
         }
@@ -1545,9 +1563,13 @@ mod tests {
 
         for round in [0u64, 25] {
             let k = AgentSigningKey::load_or_bootstrap(&kpath).unwrap();
-            let mut log =
-                RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
-                    .unwrap();
+            let mut log = RotatingChainLog::<TestPayload>::open(
+                &active,
+                k,
+                cfg(2000, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in round..round + 25 {
                 log.append(payload(i)).unwrap();
             }
@@ -1568,14 +1590,21 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 2), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 2),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
         for i in 0..60 {
             log.append(payload(i)).unwrap();
         }
         let earliest = *list_archive_seqs(&active).unwrap().first().unwrap();
-        assert!(earliest > 1, "seq 1 (the genesis-rooted file) must be evicted");
+        assert!(
+            earliest > 1,
+            "seq 1 (the genesis-rooted file) must be evicted"
+        );
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
         assert_eq!(report.earliest_retained_seq, earliest);
     }
@@ -1591,9 +1620,13 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, k, cfg(2000, 2), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 2),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
         for i in 0..60 {
             log.append(payload(i)).unwrap();
         }
@@ -1626,9 +1659,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("evil.jsonl");
         let k = key();
-        let mut log =
-            RotatingChainLog::<Evil>::open(&active, k, cfg(2000, 50), std::sync::Arc::new(NoProtection))
-                .unwrap();
+        let mut log = RotatingChainLog::<Evil>::open(
+            &active,
+            k,
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
         let err = log
             .append(Evil {
                 rotate: 1,
@@ -1680,21 +1717,32 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in 0..5 {
                 log.append(payload(i)).unwrap();
             }
         } // drop ⇒ simulate a restart
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             log.append(payload(5)).unwrap();
             log.append(payload(6)).unwrap();
         }
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        assert_eq!(report.total_records, 7, "chain must span the reopen boundary");
+        assert_eq!(
+            report.total_records, 7,
+            "chain must span the reopen boundary"
+        );
     }
 
     /// A torn final write (SIGKILL mid-append: trailing bytes with no
@@ -1710,8 +1758,12 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in 0..4 {
                 log.append(payload(i)).unwrap();
             }
@@ -1727,13 +1779,20 @@ mod tests {
         assert!(fs::metadata(&active).unwrap().len() > clean_len);
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             log.append(payload(4)).unwrap();
         }
         // Repair must have truncated the fragment before the new append.
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        assert_eq!(report.total_records, 5, "4 clean + 1 post-repair, fragment dropped");
+        assert_eq!(
+            report.total_records, 5,
+            "4 clean + 1 post-repair, fragment dropped"
+        );
     }
 
     /// A newline-terminated-but-unparseable final line is also discarded on
@@ -1746,8 +1805,12 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in 0..4 {
                 log.append(payload(i)).unwrap();
             }
@@ -1759,12 +1822,19 @@ mod tests {
         }
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             log.append(payload(4)).unwrap();
         }
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        assert_eq!(report.total_records, 5, "corrupt trailing line must be dropped");
+        assert_eq!(
+            report.total_records, 5,
+            "corrupt trailing line must be dropped"
+        );
     }
 
     /// THE legacy-migration case (BUG-026): a pre-existing **v1** active
@@ -1790,12 +1860,19 @@ mod tests {
             }
         }
         let v1_len = fs::metadata(&active).unwrap().len();
-        assert!(v1_len > 64, "the legacy file must exceed the tiny cap below");
+        assert!(
+            v1_len > 64,
+            "the legacy file must exceed the tiny cap below"
+        );
         // Reopen with a cap SMALLER than the existing file ⇒ over-cap at open.
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(64, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(64, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             log.append(payload(99)).unwrap(); // first append → must rotate
         }
         assert_eq!(
@@ -1822,8 +1899,12 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in 0..3 {
                 log.append(payload(i)).unwrap();
             }
@@ -1838,8 +1919,12 @@ mod tests {
         // Reopen → repair + attest.
         {
             let _ = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
         }
         let manifest = fs::read_to_string(manifest_path_for(&active)).unwrap();
         assert!(
@@ -1872,8 +1957,12 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         let mut log = RotatingChainLog::<TestPayload>::open(
-            &active, key_at(&kp), cfg(2000, 50), std::sync::Arc::new(NoProtection),
-        ).unwrap();
+            &active,
+            key_at(&kp),
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
         // One append first, so `open` saw a normal (absent) manifest; THEN
         // make the manifest path a DIRECTORY so every subsequent
         // manifest_append (a create) fails — the same shape as the +i EPERM.
@@ -1887,7 +1976,10 @@ mod tests {
         }
         // Archives are distinct + contiguous — no seq reuse, no overwrite.
         let seqs = list_archive_seqs(&active).unwrap();
-        assert!(seqs.len() >= 2, "~300 B payloads over a 2 KiB cap must rotate ≥2×");
+        assert!(
+            seqs.len() >= 2,
+            "~300 B payloads over a 2 KiB cap must rotate ≥2×"
+        );
         assert_eq!(
             seqs,
             (1..=seqs.len() as u64).collect::<Vec<_>>(),
@@ -1895,7 +1987,10 @@ mod tests {
         );
         // Every signed record survives across the archives + active.
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        assert_eq!(report.total_records, 40, "no signed records lost despite manifest failures");
+        assert_eq!(
+            report.total_records, 40,
+            "no signed records lost despite manifest failures"
+        );
     }
 
     /// Partial-rotation recovery (point #5): a crash AFTER the seal but BEFORE
@@ -1910,8 +2005,12 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         let tail = {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in 0..3 {
                 log.append(payload(i)).unwrap();
             }
@@ -1940,8 +2039,12 @@ mod tests {
         // Reopen → open() sees the sealed active → complete_interrupted_rotation.
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             log.append(payload(99)).unwrap();
         }
         assert_eq!(
@@ -1950,7 +2053,10 @@ mod tests {
             "interrupted rotation completed on open → seq-1 archived"
         );
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        assert_eq!(report.total_records, 4, "3 sealed + 1 post-recovery verify across the boundary");
+        assert_eq!(
+            report.total_records, 4,
+            "3 sealed + 1 post-recovery verify across the boundary"
+        );
     }
 
     /// Partial-rotation recovery, CASE 2 (point #5): a crash AFTER the rename
@@ -1967,8 +2073,12 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         let tail = {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
-            ).unwrap();
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
             for i in 0..3 {
                 log.append(payload(i)).unwrap();
             }
@@ -1991,7 +2101,10 @@ mod tests {
         // open #1 completes the interrupted rotation → archive seq-1 + EMPTY active.
         drop(
             RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
             )
             .unwrap(),
         );
@@ -2002,12 +2115,18 @@ mod tests {
         // open #2 must recover: active absent → chain off seq-1's terminator.
         {
             let mut log = RotatingChainLog::<TestPayload>::open(
-                &active, key_at(&kp), cfg(1 << 30, 50), std::sync::Arc::new(NoProtection),
+                &active,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
             )
             .unwrap();
             log.append(payload(99)).unwrap();
         }
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
-        assert_eq!(report.total_records, 4, "3 archived + 1 recovered off the prior terminator");
+        assert_eq!(
+            report.total_records, 4,
+            "3 archived + 1 recovered off the prior terminator"
+        );
     }
 }
