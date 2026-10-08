@@ -694,6 +694,44 @@ fn mass_write_alone_from_non_auth_pid_reaches_engaged() {
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 }
 
+/// Audit `posture-1` — a single round that raises TWO blunt
+/// COMBAT-tier signals (mass-write arm of ConfirmedIntrusion AND
+/// PersistenceMechanism, both from one write under
+/// `/etc/systemd/system/`) must NOT collapse OBSERVING→COMBAT. Same-round
+/// signals do not corroborate each other; only a prior ledger entry does.
+#[test]
+fn two_blunt_combat_signals_in_one_round_cap_at_engaged() {
+    let m = machine_with_isolated_auth();
+    let _ = m.observe(&spawn(900, 1, "zsh", "/usr/bin/zsh", 1), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    let recent: Vec<Event> = (0..25u64)
+        .map(|i| {
+            file_open(
+                900,
+                0,
+                &format!("/etc/systemd/system/nn-test-{i}.service"),
+                1,
+                i + 100,
+            )
+        })
+        .collect();
+    let focal = file_open(900, 0, "/etc/systemd/system/nn-test-99.service", 1, 200);
+    let r = m.observe(&focal, &recent);
+    assert!(r.is_some(), "the round must still escalate");
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "same-round blunt signals must not corroborate each other into COMBAT"
+    );
+
+    // A SECOND round, now with the first round's signals in the ledger,
+    // is the legitimate corroboration path and may reach COMBAT.
+    let focal2 = file_open(900, 0, "/etc/systemd/system/nn-test-100.service", 1, 300);
+    let _ = m.observe(&focal2, &recent);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
 /// Test #18 — agent's own writes still exempt (PR #123 regression
 /// guard). Validates that adding the auth-lineage gate did not
 /// break the pre-existing stack-PID exclusion.

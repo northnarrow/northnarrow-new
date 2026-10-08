@@ -6,6 +6,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Security / safety
+- Watchdog respawn v2 (`docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md`): a
+  crashed agent is restarted with `systemctl start` under its own unit
+  (full ExecStart argv, own cgroup/caps/ProtectHome) instead of as a
+  fork-exec child of the watchdog's 64 MiB / 2-cap sandbox. `BindsTo=`
+  removed from the watchdog unit; `StartLimitIntervalSec=0` on the agent
+  unit. New flags `--respawn-backend {auto,systemd,exec}` and
+  `--agent-unit`. Closes `watchdog-respawn-1` and `combat-avail-1`.
+- Audit Beta-blockers closed: `abi-modpath-1` (module path sensor now
+  keeps 16 components and flags truncation; R018 never auto-kills on an
+  unverifiable prefix), `posture-1` (two blunt COMBAT-tier signals in one
+  round cap at ENGAGED), `ebpf-lsm-1` (LSM deny-hook attach shortfall is
+  fail-closed: the agent refuses to start unless
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`). `at-authz-2` was already closed by #142.
+  **Wire change:** `ModuleLoadRaw` grows from 312 to 568 bytes (eBPF and
+  userland from the same `common` crate — rebuild both).
 - `CAP_KILL` added to the agent's `CapabilityBoundingSet`; without it
   KillProcess could only signal root-owned targets. New boot preflight
   (`response/caps_preflight.rs`) refuses to start in enforcement mode when
