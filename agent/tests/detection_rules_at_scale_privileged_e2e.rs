@@ -376,6 +376,14 @@ impl Fixture {
             .arg("--netflow-comm-allowlist-local")
             .arg(&netflow_comm_allowlist_local)
             .arg("--no-ade")
+            // Detection only: every assertion in this file is on the
+            // VERDICT log line / the jsonl rows, never on an executed
+            // response — and with enforcement on, R001/R009 SIGKILL the
+            // /tmp helpers ~10 ms after exec, before they can connect,
+            // so the chain / memfd triggers never happen (race seen on
+            // the 4-vCPU lab guest, 2026-10-08). Posture still moves;
+            // COMBAT isolation just logs "would execute".
+            .arg("--detect-only")
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
             .spawn()
