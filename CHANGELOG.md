@@ -36,6 +36,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `catchall-1`, unbounded memory growth on a long-lived agent).
 
 ### Fixed
+- `install.sh` now ships `combat-rules.v4/.v6` from `configs/` (missing
+  ruleset = no NetworkIsolator = admin socket silently absent = watchdog
+  stuck-recovery restart loop) and lifts `chattr +i` on the state dir
+  for upgrades. The agent logs an ERROR when the ruleset is missing.
 - CI: `cargo fmt`, `cargo clippy -D warnings` and the `test` job are green
   again; `ade-build` no longer runs out of disk on the hosted runner;
   `ebpf-build` pins `bpf-linker 0.10.3` (0.11 needs a system LLVM 21+).

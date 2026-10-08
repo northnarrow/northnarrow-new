@@ -203,6 +203,11 @@ cmd_test_ignored() {
 
 cmd_install() {
     vm_running || die "guest is not running"
+    # `sync` rewrites the eBPF provenance stamp, so an agent binary built
+    # before the last sync is "older than the stamp" and install.sh
+    # (require_fresh_ebpf) refuses it. An incremental build re-runs
+    # agent/build.rs and relinks the agent — seconds when nothing changed.
+    cmd_build
     vcargo 'sudo ./deploy/install.sh && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
 }
 
@@ -214,15 +219,25 @@ cmd_respawn_check() {
 set -e
 old=$(sudo cat /run/northnarrow/agent.pid)
 echo "agent pid before: $old"
-sudo kill -9 "$old"
+# A plain `kill -9` from a root shell is DENIED by the task_kill LSM
+# hook (the agent is in PROTECTED_PIDS — Tappa 7 working as designed).
+# systemd (PID 1) is carved out so `systemctl stop` works, so deliver
+# the SIGKILL through it: no shutdown marker is written (that is the
+# signed nn-admin path only), hence the watchdog treats it as a crash.
+if sudo kill -9 "$old" 2>/dev/null; then
+    echo "WARN: plain kill -9 from a root shell succeeded — task_kill deny hook NOT active?"
+else
+    echo "kill -9 from a root shell: denied (task_kill LSM hook OK) — using systemctl kill"
+    sudo systemctl kill --kill-whom=main -s SIGKILL northnarrow-agent.service
+fi
 deadline=$(( $(date +%s) + 60 ))
 new=""
 while (( $(date +%s) < deadline )); do
     sleep 2
-    if [[ -f /run/northnarrow/agent.pid ]]; then
-        new=$(sudo cat /run/northnarrow/agent.pid)
-        if [[ -n "$new" && "$new" != "$old" ]] && kill -0 "$new" 2>/dev/null; then break; fi
-    fi
+    # /run/northnarrow is 0700 root: every probe needs sudo (a plain
+    # `-f` / `kill -0` from the nn user silently fails forever).
+    new=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null || true)
+    if [[ -n "$new" && "$new" != "$old" ]] && sudo kill -0 "$new" 2>/dev/null; then break; fi
 done
 [[ -n "$new" && "$new" != "$old" ]] || { echo "FAIL: no new agent pid within 60s"; sudo journalctl --namespace=northnarrow -u northnarrow-watchdog --since '-2min' --no-pager | tail -20; exit 1; }
 echo "agent pid after : $new"
