@@ -554,13 +554,20 @@ s.close()
     });
     let row = &rows[0];
     assert_eq!(row["proto"].as_u64(), Some(6), "proto must be TCP (6)");
+    // Audit `net-src-1` (PR #164): the row carries the CLOSE-time
+    // source, read by the tcp_close fexit after the kernel bound the
+    // local end — not the connect-time wildcard the kprobe sees.
     assert_eq!(
         row["src_addr"].as_str(),
-        Some("0.0.0.0"),
-        "src_addr should be 0.0.0.0 (the connect kprobe runs before \
-         the kernel binds the local end — `sk->sk_rcv_saddr` is the \
-         wildcard at that point); got {:?}",
+        Some("127.0.0.1"),
+        "src_addr should be the close-time local address (loopback), \
+         not the connect-time 0.0.0.0 wildcard; got {:?}",
         row["src_addr"]
+    );
+    assert!(
+        row["src_port"].as_u64().is_some_and(|p| p > 0),
+        "src_port should be the close-time ephemeral port; got {:?}",
+        row["src_port"]
     );
     // The flow_id is the per-flow stable ID — 32 lowercase hex
     // chars of SHA-256(start_ns || five_tuple || pid)[..16].
