@@ -94,7 +94,7 @@ num_cpus = "1.16"
 candle-core = { version = "0.10", default-features = false }
 candle-transformers = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # Sub-tappa 6.6: ADE prompt-injection hardening (base64 encoding of
 # untrusted strings inside the structured prompt).
