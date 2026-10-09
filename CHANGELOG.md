@@ -5,6 +5,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Fixed
+- Short-lived TCP flows (connect and close within the pipeline latency:
+  loopback probes, scanners, reverse-shell attempts) produced no netflow
+  row and could silence CHAIN-007; the close now synthesises the row when
+  it overtakes its connect.
+- Debian-family hosts: the hardened agent unit could not attach its
+  tracepoint/kprobe sensors (`perf_event_open` EACCES: Debian's
+  `perf_event_paranoid=3` patch demands `CAP_SYS_ADMIN`); `install.sh`
+  adds a drop-in with that capability on those hosts only, and the attach
+  error explains the condition.
+
 ### Added
 - Multi-kernel, level 1: kernel struct offsets are resolved from the
   running kernel's BTF at boot and published to the eBPF programs through

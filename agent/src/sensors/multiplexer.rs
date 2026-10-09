@@ -324,8 +324,24 @@ fn attach_tracepoint(
     prog.load()
         .with_context(|| format!("verifier rejected `{program_name}`"))?;
     prog.attach(category, name)
-        .with_context(|| format!("attaching tracepoint {category}/{name}"))?;
+        .with_context(|| perf_attach_hint(&format!("attaching tracepoint {category}/{name}")))?;
     Ok(())
+}
+
+/// Context for a perf_event_open-based attach failure. EACCES under the
+/// systemd unit on a Debian-family kernel means its perf_event_paranoid=3
+/// patch wants CAP_SYS_ADMIN (CAP_PERFMON is not enough there): say so,
+/// with the fix, instead of a bare "Permission denied".
+fn perf_attach_hint(what: &str) -> String {
+    let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".into());
+    format!(
+        "{what} (kernel.perf_event_paranoid={paranoid}; if this is EACCES under the hardened \
+         unit on a Debian-family kernel, the unit needs CAP_SYS_ADMIN there — install.sh \
+         ships northnarrow-agent.service.d/10-debian-perf-paranoid.conf — or set \
+         kernel.perf_event_paranoid=2; see docs/operator/KERNEL_COMPATIBILITY.md)"
+    )
 }
 
 fn attach_kprobe(ebpf: &mut Ebpf, program_name: &str, symbol: &str) -> Result<()> {
@@ -337,7 +353,7 @@ fn attach_kprobe(ebpf: &mut Ebpf, program_name: &str, symbol: &str) -> Result<()
     prog.load()
         .with_context(|| format!("verifier rejected `{program_name}`"))?;
     prog.attach(symbol, 0)
-        .with_context(|| format!("attaching kprobe to {symbol}"))?;
+        .with_context(|| perf_attach_hint(&format!("attaching kprobe to {symbol}")))?;
     Ok(())
 }
 

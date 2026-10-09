@@ -94,6 +94,9 @@ pub struct TcpConnectInfo {
 /// Input describing a TCP close observation (N2
 /// `NetFlowCloseRaw` with `proto == IPPROTO_TCP`). `corr_id`
 /// is the 16-byte FLOW_SOCK_MAP lookup the fexit emits.
+/// How many close-synthesised corr_ids to remember for late connects.
+const RECENT_SYNTH_CAP: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct TcpCloseInfo {
     pub end_ns: u64,
@@ -110,6 +113,18 @@ pub struct TcpCloseInfo {
     /// Low 8 bits of `sock->sk_err` at fexit. 0 = graceful
     /// FIN; 104 = ECONNRESET; 110 = ETIMEDOUT.
     pub close_reason: u8,
+    /// Remote end + owner as seen by the close hook. Used to synthesise
+    /// the row when the close overtakes its own connect (short-lived
+    /// flows: the connect event rides the main event pipeline, the close
+    /// rides the netflow drain, and a loopback connect+close can finish
+    /// before the connect is registered). `dst_port == 0` and an
+    /// unspecified `dst_addr` mean "unknown" (test fixtures).
+    pub family: u8,
+    pub dst_addr: IpAddr,
+    pub dst_port: u16,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: String,
 }
 
 /// Input describing one UDP outbound send (N2 `NetFlowCloseRaw`
@@ -160,6 +175,10 @@ pub struct FlowTracker {
     /// [`Self::evict_to_capacity`].
     eviction: VecDeque<CorrId>,
     capacity: usize,
+    /// corr_ids whose row was synthesised at close time because no
+    /// pending connect existed yet; a connect arriving afterwards for
+    /// one of these must not open a pending entry that never closes.
+    recent_synth: VecDeque<CorrId>,
 }
 
 impl Default for FlowTracker {
@@ -173,6 +192,7 @@ impl FlowTracker {
         Self {
             pending: HashMap::new(),
             eviction: VecDeque::new(),
+            recent_synth: VecDeque::new(),
             capacity,
         }
     }
@@ -200,6 +220,12 @@ impl FlowTracker {
     /// stays in the map until a matching [`Self::on_tcp_close`]
     /// arrives (or FIFO eviction kicks in past `capacity`).
     pub fn on_tcp_connect(&mut self, info: &TcpConnectInfo) {
+        let key = Self::corr_id(info.start_ns, info.sk_ptr);
+        if self.recent_synth.contains(&key) {
+            // The close already produced this flow's row (see
+            // `on_tcp_close`): a pending entry now would never close.
+            return;
+        }
         let key = Self::corr_id(info.start_ns, info.sk_ptr);
         // If the same corr_id is re-inserted (kernel sk_ptr
         // re-use + same start_ns — extremely unlikely but
@@ -242,7 +268,9 @@ impl FlowTracker {
         if info.corr_id == [0u8; 16] {
             return None;
         }
-        let pending = self.pending.remove(&info.corr_id)?;
+        let Some(pending) = self.pending.remove(&info.corr_id) else {
+            return self.synthesise_from_close(info);
+        };
         // TCP: the connect hook cannot know the local end; take it from
         // the close observation so the emitted row AND the canonical
         // flow_id carry the real 5-tuple (cross-host correlatable) instead
@@ -280,6 +308,55 @@ impl FlowTracker {
             uid: pending.uid,
             comm: pending.comm,
             exe: pending.exe,
+            bytes_sent: info.bytes_sent,
+            bytes_recv: info.bytes_recv,
+            resolved_hostname: None,
+            tls_fingerprint: None,
+            flow_id,
+            close_reason: info.close_reason,
+        })
+    }
+
+    /// Close arrived with a kernel-side flow id but no pending connect:
+    /// the connect event has not reached the tracker yet (short-lived
+    /// flow, loopback connect+close in well under the pipeline latency).
+    /// Build the row from what the close hook carries — the full
+    /// 5-tuple, owner and byte counters — with `start_ns = end_ns`
+    /// (duration unknown) and no exe/hostname enrichment, and remember
+    /// the corr_id so the late connect is ignored. Without this every
+    /// connect-and-close-at-once flow (reverse-shell probes, scanners,
+    /// the CHAIN-007 egress leg) vanished from netflow.jsonl.
+    fn synthesise_from_close(&mut self, info: &TcpCloseInfo) -> Option<NetFlowEvent> {
+        if info.dst_port == 0 && info.dst_addr.is_unspecified() {
+            return None;
+        }
+        if self.recent_synth.len() >= RECENT_SYNTH_CAP {
+            self.recent_synth.pop_front();
+        }
+        self.recent_synth.push_back(info.corr_id);
+        let flow_id = canonical_flow_id(
+            info.end_ns,
+            info.family,
+            info.src_addr,
+            info.src_port,
+            info.dst_addr,
+            info.dst_port,
+            6,
+            info.pid,
+        );
+        Some(NetFlowEvent {
+            start_ns: info.end_ns,
+            end_ns: info.end_ns,
+            family: info.family,
+            src_addr: info.src_addr,
+            src_port: info.src_port,
+            dst_addr: info.dst_addr,
+            dst_port: info.dst_port,
+            proto: 6,
+            pid: info.pid,
+            uid: info.uid,
+            comm: info.comm.clone(),
+            exe: None,
             bytes_sent: info.bytes_sent,
             bytes_recv: info.bytes_recv,
             resolved_hostname: None,
@@ -441,6 +518,12 @@ mod tests {
 
     fn close_fixture(end_ns: u64, corr: CorrId, sent: u64, recv: u64, reason: u8) -> TcpCloseInfo {
         TcpCloseInfo {
+            family: 2,
+            dst_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            dst_port: 0,
+            pid: 0,
+            uid: 0,
+            comm: String::new(),
             src_addr: "10.0.0.7".parse().unwrap(),
             src_port: 51234,
             end_ns,
@@ -753,5 +836,37 @@ mod tests {
         assert_eq!(evt.dst_addr, v6);
         assert_eq!(evt.family, 10);
         assert_eq!(evt.flow_id.len(), 32);
+    }
+
+    /// Short-lived flow: the close reaches the tracker before its connect.
+    /// With a real destination on the close, the row is synthesised
+    /// (start == end, no exe) and the late connect is ignored.
+    #[test]
+    fn close_before_connect_synthesises_row_and_ignores_late_connect() {
+        let mut t = FlowTracker::default();
+        let conn = connect_fixture(1_000_000, 0x00C0_FFEE, 42, v4(10, 0, 0, 9), 4444);
+        let corr = FlowTracker::corr_id(conn.start_ns, conn.sk_ptr);
+        let mut close = close_fixture(1_000_500, corr, 64, 0, 0);
+        close.dst_addr = v4(10, 0, 0, 9);
+        close.dst_port = 4444;
+        close.pid = 42;
+        close.comm = "nnseq".into();
+        let evt = t.on_tcp_close(&close).expect("synthesised row");
+        assert_eq!(evt.dst_port, 4444);
+        assert_eq!(evt.start_ns, evt.end_ns);
+        assert_eq!(evt.pid, 42);
+        assert!(evt.exe.is_none());
+        assert_eq!(evt.bytes_sent, 64);
+        // The connect that arrives afterwards must not open a pending flow.
+        t.on_tcp_connect(&conn);
+        assert_eq!(
+            t.pending_len(),
+            0,
+            "late connect after a synthesised close must be ignored"
+        );
+        // Fixture closes without a destination still drop (no 5-tuple).
+        assert!(t
+            .on_tcp_close(&close_fixture(2, [0x55u8; 16], 0, 0, 0))
+            .is_none());
     }
 }
