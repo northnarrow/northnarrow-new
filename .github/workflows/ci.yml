@@ -21,7 +21,7 @@ jobs:
         task: [fmt, clippy, build, test]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -41,7 +41,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -77,7 +77,7 @@ jobs:
     # processes (need root or CAP_KILL). CI cannot run them, but it
     # still verifies they compile so they can never silently rot.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -97,7 +97,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -127,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -147,7 +147,7 @@ jobs:
           rustup component add clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -172,7 +172,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -191,7 +191,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -213,7 +213,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -246,7 +246,7 @@ jobs:
         run: cargo install bpf-linker --version 0.10.3 --locked
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -272,7 +272,7 @@ jobs:
     name: cargo audit (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
