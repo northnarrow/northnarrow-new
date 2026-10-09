@@ -1761,7 +1761,7 @@ dependencies = [
  "sha2",
  "tantivy",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokenizers 0.21.4",
  "tokio",
  "tracing",
