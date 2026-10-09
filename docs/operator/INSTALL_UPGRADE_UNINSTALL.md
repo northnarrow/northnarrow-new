@@ -92,3 +92,38 @@ LSM program, config, state or bait behind, then reinstalls
 - A kernel upgrade: the agent revalidates BTF offsets at boot and refuses
   to start on a mismatch rather than run with wrong offsets; the
   supported-kernel matrix is the next item on the reliability list.
+
+## 5. Release artefacts and how to verify them
+
+Every tag `v*` runs `.github/workflows/release.yml`, which builds with a
+locked lockfile and pinned toolchains, and attaches to the GitHub release:
+
+| File | What it is |
+|---|---|
+| `northnarrow-<ver>-x86_64-linux.tar.gz` | the release tree: binaries, eBPF object + provenance stamp, `deploy/` (install/uninstall/units), `configs/`, operator docs, licences. Extract and run `sudo ./deploy/install.sh` (or `--upgrade`) unchanged — every preflight still applies. |
+| `northnarrow-<ver>-x86_64-linux.{agent,watchdog}.sbom.cdx.json` | CycloneDX SBOMs of the two daemons (the agent one covers `nn-admin` too) |
+| `SHA256SUMS` | checksums of the files above |
+
+Each artefact carries a SLSA build-provenance attestation signed by
+GitHub's OIDC identity for this repository and workflow. Verify before
+installing:
+
+```sh
+sha256sum -c SHA256SUMS
+gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/northnarrow-new
+```
+
+The attestation binds the file digest to the exact commit, workflow and
+runner that produced it; a tarball rebuilt elsewhere, or modified after
+the fact, fails the check. Pull requests that touch `deploy/`, `xtask/`
+or the workflow run the same job as a dry run (artefacts on the workflow
+run only).
+
+Known limits: one architecture (x86_64) and no `.deb`/`.rpm` yet — the
+units and the anti-tamper inode list hard-code `/usr/local/bin`, which a
+distribution package must not use; moving the binaries to `/usr/bin`
+(and teaching the agent its own path) is the prerequisite, tracked in the
+review register. The tarball itself is not byte-reproducible (file mtimes
+are preserved because the staleness guard needs them); the provenance
+attestation is the integrity anchor instead.
+
