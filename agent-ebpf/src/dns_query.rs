@@ -332,11 +332,14 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
 /// `(0, 0)` (empty name) without faulting.
 #[inline(always)]
 fn extract_qname(msg_ptr: *const u8, raw_ptr: *mut DnsQueryRaw) -> (u16, u16) {
-    // iter_type discriminant.
+    // iter_type discriminant. `iov_iter.iter_type` and `enum iter_type`
+    // exist from 5.14: on older kernels the agent marks the slots
+    // absent and QNAME decoding is skipped (destination-only DNS events).
+    let Some(iter_type_off) = off_opt!(IOV_ITER_ITER_TYPE_OFFSET) else {
+        return (0, 0);
+    };
     let iter_type: u8 = match unsafe {
-        bpf_probe_read_kernel::<u8>(
-            msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_ITER_TYPE_OFFSET)) as *const _,
-        )
+        bpf_probe_read_kernel::<u8>(msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + iter_type_off) as *const _)
     } {
         Ok(v) => v,
         Err(_) => return (0, 0),
@@ -344,35 +347,45 @@ fn extract_qname(msg_ptr: *const u8, raw_ptr: *mut DnsQueryRaw) -> (u16, u16) {
     // `ITER_UBUF` moved from 6 (≤ 6.3) to 0 (6.4+): take the value the
     // agent resolved from this kernel's BTF, falling back to the compiled
     // constant while the map is unarmed.
-    let iter_ubuf = crate::btf_offsets::rt(
+    // Enumerator values resolved by name; `None` = the enumerator does
+    // not exist on this kernel (ITER_UBUF < 6.0), so that branch is off.
+    let iter_ubuf = crate::btf_offsets::rt_opt(
         northnarrow_common::btf_offsets::ITER_UBUF_VALUE_SLOT,
         ITER_UBUF as usize,
-    ) as u8;
-    let iter_iovec = crate::btf_offsets::rt(
+    )
+    .map(|v| v as u8);
+    let iter_iovec = crate::btf_offsets::rt_opt(
         northnarrow_common::btf_offsets::ITER_IOVEC_VALUE_SLOT,
         ITER_IOVEC as usize,
-    ) as u8;
-    let buf_ptr: *const u8 = if iter_type == iter_ubuf {
+    )
+    .map(|v| v as u8);
+    let buf_ptr: *const u8 = if iter_ubuf == Some(iter_type) {
         // ITER_UBUF: the inline iovec's iov_base sits at the union start
         // and is a *user* pointer to the datagram the caller is sending.
+        let Some(ubuf_off) = off_opt!(IOV_ITER_UBUF_BASE_OFFSET) else {
+            return (0, 0);
+        };
         match unsafe {
             bpf_probe_read_kernel::<*const u8>(
-                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_UBUF_BASE_OFFSET))
-                    as *const _,
+                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + ubuf_off) as *const _,
             )
         } {
             Ok(p) => p,
             Err(_) => return (0, 0),
         }
-    } else if iter_type == iter_iovec {
+    } else if iter_iovec == Some(iter_type) {
         // ITER_IOVEC with a single segment: what glibc's sendmmsg-based
         // resolver produces on kernels ≤ 6.3 (6.4+ folds one iovec into
         // ITER_UBUF). The iovec array was copied into kernel memory by
         // import_iovec; its first entry's iov_base is the user datagram.
+        let (Some(nr_segs_off), Some(iov_off)) =
+            (off_opt!(IOV_ITER_NR_SEGS_OFFSET), off_opt!(IOV_ITER_IOV_OFFSET))
+        else {
+            return (0, 0);
+        };
         let nr_segs: usize = match unsafe {
             bpf_probe_read_kernel::<usize>(
-                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_NR_SEGS_OFFSET))
-                    as *const _,
+                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + nr_segs_off) as *const _,
             )
         } {
             Ok(n) => n,
@@ -383,7 +396,7 @@ fn extract_qname(msg_ptr: *const u8, raw_ptr: *mut DnsQueryRaw) -> (u16, u16) {
         }
         let iov: *const u8 = match unsafe {
             bpf_probe_read_kernel::<*const u8>(
-                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_IOV_OFFSET)) as *const _,
+                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + iov_off) as *const _,
             )
         } {
             Ok(p) => p,

@@ -522,6 +522,15 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            for m in &r.absent {
+                warn!(
+                    offset = m.name,
+                    kernel_struct = m.struct_name,
+                    detail = %m.detail,
+                    "optional kernel field absent on this kernel — the dependent sensor path \
+                     is disabled (DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC)"
+                );
+            }
             publish_resolved(r);
         }
         ResolveOutcome::SkippedNoBtf { reason } => {
@@ -3070,11 +3079,23 @@ fn btf_check(path: &std::path::Path) -> i32 {
     match resolve_offsets_from(path) {
         ResolveOutcome::Resolved(r) => {
             println!(
-                "btf-check {}: SUPPORTED — {} slots resolved, {} differ from the build kernel",
+                "btf-check {}: {} — {} slots resolved, {} differ from the build kernel, {} absent",
                 path.display(),
+                if r.absent.is_empty() {
+                    "SUPPORTED"
+                } else {
+                    "SUPPORTED (degraded)"
+                },
                 r.values.len(),
-                r.drifted.len()
+                r.drifted.len(),
+                r.absent.len()
             );
+            for m in &r.absent {
+                println!(
+                    "  absent  {:<34} {:<12} {} — dependent sensor path disabled",
+                    m.name, m.struct_name, m.detail
+                );
+            }
             for m in &r.drifted {
                 println!(
                     "  drift   {:<34} {:<12} compiled={:<6} runtime={}",

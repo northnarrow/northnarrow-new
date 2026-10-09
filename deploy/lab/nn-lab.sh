@@ -65,7 +65,14 @@ case "$DISTRO" in
         BASE_IMG_NAME="bookworm-base.qcow2"; DEFAULT_SSH_PORT=2422
         USER_DATA_TMPL="$SCRIPT_DIR/user-data.debian12.tmpl"
         LAB_DIR="$ROOT_LAB_DIR/debian12" ;;
-    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12)" >&2; exit 2 ;;
+    ubuntu2204)
+        # Kernel 5.15: the first BPF-LSM-capable LTS still in wide use
+        # (same template as 24.04 — Ubuntu ships bpftool via linux-tools).
+        IMAGE_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+        BASE_IMG_NAME="jammy-base.img"; DEFAULT_SSH_PORT=2522
+        USER_DATA_TMPL="$SCRIPT_DIR/user-data.tmpl"
+        LAB_DIR="$ROOT_LAB_DIR/ubuntu2204" ;;
+    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12 | ubuntu2204)" >&2; exit 2 ;;
 esac
 # The ssh port is remembered in $LAB_DIR/ssh_port after `up`, so every
 # later sub-command talks to the same guest without re-exporting it.
