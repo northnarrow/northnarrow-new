@@ -360,7 +360,15 @@ impl E2eFixture {
     /// (race-free unprotect — without this the LSM hook denies
     /// the SIGKILL), then SIGKILL.
     fn unprotect_and_sigkill_agent(&self, agent_pid: u32) {
-        // Unprotect: bpftool map delete pinned <map> key <le_u32>
+        // Unprotect, then SIGKILL — and RETRY. The watchdog performs a
+        // "defensive PROTECTED_PIDS reinsert" right after it observes
+        // the new pidfile, i.e. at the very moment this test also sees
+        // the pid: a single `bpftool map delete` + `kill -9` raced that
+        // reinsert on the lab guest (`kill: Operation not permitted`,
+        // the respawned agent survived, "cycle 2: watchdog never
+        // respawned agent"). The watchdog reinserts once per respawn, so
+        // the second attempt wins; bound the loop so a genuine kill
+        // denial still fails the test loudly.
         let key_bytes = format!(
             "{} {} {} {}",
             agent_pid & 0xFF,
@@ -368,23 +376,41 @@ impl E2eFixture {
             (agent_pid >> 16) & 0xFF,
             (agent_pid >> 24) & 0xFF,
         );
-        let _ = Command::new("sudo")
-            .arg("bpftool")
-            .arg("map")
-            .arg("delete")
-            .arg("pinned")
-            .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
-            .arg("key")
-            .args(key_bytes.split_whitespace())
-            .status();
-        // SAFETY: kill(2) on a known PID with SIGKILL is a
-        // trivial syscall; we already have root (the test
-        // launched the agent under sudo).
-        let _ = Command::new("sudo")
-            .arg("kill")
-            .arg("-9")
-            .arg(agent_pid.to_string())
-            .status();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            // Unprotect: bpftool map delete pinned <map> key <le_u32>
+            let _ = Command::new("sudo")
+                .arg("bpftool")
+                .arg("map")
+                .arg("delete")
+                .arg("pinned")
+                .arg(format!("{BPFFS_ROOT}/PROTECTED_PIDS"))
+                .arg("key")
+                .args(key_bytes.split_whitespace())
+                .stderr(Stdio::null())
+                .status();
+            // SAFETY: kill(2) on a known PID with SIGKILL is a
+            // trivial syscall; we already have root (the test
+            // launched the agent under sudo).
+            let killed = Command::new("sudo")
+                .arg("kill")
+                .arg("-9")
+                .arg(agent_pid.to_string())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if killed {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "could not SIGKILL agent pid {agent_pid} after {attempts} attempts in 10 s: \
+                 the task_kill hook keeps denying it (PROTECTED_PIDS eviction not taking effect?)"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 
