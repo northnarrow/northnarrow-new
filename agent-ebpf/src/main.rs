@@ -30,6 +30,7 @@ mod task_kill;
 mod tcp_close;
 mod tcp_connect;
 mod udp_sendmsg_outbound;
+mod zero;
 
 use aya_ebpf::{
     helpers::{
@@ -106,7 +107,7 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
     unsafe {
         // SAFETY: ringbuf reservation gives us exclusive write access
         // to a properly aligned region of size_of::<ProcessSpawnRaw>.
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
     }
 
     let pid_tgid = bpf_get_current_pid_tgid();

@@ -267,7 +267,7 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest_key: Option<InodeKey>) {
         // FimDriftRaw. Zero first so the trailing _pad bytes
         // (and dest pair, when dest_key is None) stay
         // deterministic.
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         let pid_tgid = bpf_get_current_pid_tgid();
         (*raw_ptr).modifier_pid = (pid_tgid >> 32) as u32;
@@ -301,7 +301,7 @@ fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
     unsafe {
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         let pid_tgid = bpf_get_current_pid_tgid();
         (*raw_ptr).modifier_pid = (pid_tgid >> 32) as u32;
@@ -330,7 +330,7 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
     unsafe {
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         (*raw_ptr).modifier_pid = meta.pid;
         (*raw_ptr).modifier_uid = meta.uid;

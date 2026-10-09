@@ -223,7 +223,7 @@ fn emit_denial(operation: u8, key: InodeKey) {
         // access to a properly aligned region the size of
         // FsProtectDenialRaw; zero the slot before writing so any
         // padding stays deterministic.
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
 
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         let pid_tgid = bpf_get_current_pid_tgid();

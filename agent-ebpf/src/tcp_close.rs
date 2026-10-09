@@ -87,7 +87,7 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         None => return Ok(()),
     };
     let raw_ptr: *mut NetFlowCloseRaw = entry.as_mut_ptr();
-    core::ptr::write_bytes(raw_ptr, 0u8, 1);
+    crate::zero::zero(raw_ptr);
 
     // Byte counters from tcp_sock (sock is the prefix; sk_ptr
     // doubles as tcp_sock pointer).

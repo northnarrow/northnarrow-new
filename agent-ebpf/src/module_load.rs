@@ -121,7 +121,7 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
     let raw: *mut ModuleLoadRaw = entry.as_mut_ptr();
     // Zero the whole slot first so `_pad` + any unwritten path slots
     // stay deterministic (a `bytemuck::Pod` requirement userland-side).
-    core::ptr::write_bytes(raw, 0u8, 1);
+    crate::zero::zero(raw);
     (*raw).timestamp_ns = bpf_ktime_get_ns();
     (*raw).loader_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     (*raw).loader_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
