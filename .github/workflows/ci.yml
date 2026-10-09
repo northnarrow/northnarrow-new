@@ -271,6 +271,15 @@ jobs:
     # not fail the job (they are tracked by dependabot).
     name: cargo audit (ubuntu-latest)
     runs-on: ubuntu-latest
+    # rustsec/audit-check publishes its result as a check run and, on
+    # `push`, files an issue per advisory; with the default read-only
+    # GITHUB_TOKEN those API calls fail with "Resource not accessible by
+    # integration" and the job went red on every push to main (the PR
+    # runs were green because the action only annotates there).
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
