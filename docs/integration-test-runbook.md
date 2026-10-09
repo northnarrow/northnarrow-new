@@ -59,7 +59,10 @@ the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
 ### Nightly, unattended
 
 `deploy/lab/nn-lab.sh nightly` runs check → sync → build → test-e2e →
-test-ignored → install → respawn-check without stopping at the first
+test-ignored → install → respawn-check → upgrade-check → uninstall-check
+(the last two exercise `install.sh --upgrade` on the running install and
+`uninstall.sh --purge`, then reinstall — see
+`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) without stopping at the first
 failure, writes `~/.cache/nn-lab/reports/<stamp>.md` (status, duration
 and every `test result:` line per step; `latest.md` points at the newest)
 and exits 1 if any step failed. The privileged tests only *compile* in

@@ -5,6 +5,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Added
+- `install.sh --upgrade`: in-place upgrade of a running install (stops
+  watchdog → agent, drains the LSM programs, replaces, restarts; keys,
+  agent_id, audit chain and chain logs preserved). Without the flag the
+  script now refuses when the units are active instead of failing halfway
+  with `Operation not permitted`.
+- `deploy/uninstall.sh` (`--purge`, `--yes`): ordered removal that the
+  anti-tamper layer allows; keeps `/etc/northnarrow` and
+  `/var/lib/northnarrow` unless purged.
+- Lab: `nn-lab.sh upgrade-check` / `uninstall-check`, both in the nightly.
+- `docs/operator/INSTALL_UPGRADE_UNINSTALL.md`.
+
 ### Fixed
 - Lab/test only: `privileged_map_pin` and the watchdog 3-cycle respawn
   e2e evict the agent from PROTECTED_PIDS before signalling it (the

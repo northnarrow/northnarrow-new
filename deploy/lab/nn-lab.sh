@@ -19,6 +19,8 @@
 #   deploy/lab/nn-lab.sh build         # cargo build --release (+test-privileged,debug-trigger) in the guest
 #   deploy/lab/nn-lab.sh test-e2e      # docs/integration-test-runbook.md "Run" (privileged_e2e)
 #   deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test, as root, single-threaded
+#   deploy/lab/nn-lab.sh upgrade-check    # install.sh --upgrade on the running install (keys/chains kept)
+#   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -364,7 +366,86 @@ cmd_destroy() {
 # hide a red respawn-check), each step's output goes to its own log, and
 # the report carries status + duration + the `test result:` lines. The
 # exit code is 1 when any step failed, so a scheduler can alert on it.
-NIGHTLY_STEPS="check sync build test-e2e test-ignored install respawn-check"
+cmd_upgrade_check() {
+    vm_running || die "guest is not running"
+    # Operator path: `install.sh --upgrade` on a host whose units are
+    # ACTIVE (anti-tamper hooks up). Must stop watchdog→agent, drain the
+    # LSM set, replace everything, restart, and leave keys + chains
+    # intact with a fresh agent_boot audit entry.
+    # The install preflights also refuse a binary older than the eBPF
+    # stamp (`sync` refreshes the stamp): the step runs after `build` in
+    # the nightly, and stand-alone it needs a fresh build too.
+    vssh bash -s <<'REMOTE'
+set -e
+cd ~/northnarrow
+sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
+sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
+pid_before=$(sudo cat /run/northnarrow/agent.pid)
+audit_before=$(sudo wc -l < /etc/northnarrow/audit.log)
+fp_before=$(sudo sha256sum /etc/northnarrow/admin.pub /etc/northnarrow/agent.sig.key /etc/northnarrow/agent_id | sha256sum | cut -c1-16)
+echo "before: agent pid=$pid_before audit_lines=$audit_before identity=$fp_before"
+# Without --upgrade the script must refuse (units active) — exit 1, no change.
+if sudo ./deploy/install.sh >/tmp/nn-upgrade-refuse.log 2>&1; then
+    echo "FAIL: install.sh without --upgrade succeeded while the units were active"; exit 1
+fi
+grep -q "Re-run with --upgrade" /tmp/nn-upgrade-refuse.log || { echo "FAIL: refusal message missing"; cat /tmp/nn-upgrade-refuse.log; exit 1; }
+echo "install.sh without --upgrade: refused as expected"
+sudo ./deploy/install.sh --upgrade 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM" | cut -c1-140
+sleep 2
+pid_after=$(sudo cat /run/northnarrow/agent.pid)
+audit_after=$(sudo wc -l < /etc/northnarrow/audit.log)
+fp_after=$(sudo sha256sum /etc/northnarrow/admin.pub /etc/northnarrow/agent.sig.key /etc/northnarrow/agent_id | sha256sum | cut -c1-16)
+echo "after : agent pid=$pid_after audit_lines=$audit_after identity=$fp_after"
+fail=0
+[[ "$(systemctl is-active northnarrow-agent)" == active ]] || { echo "FAIL: agent unit not active after upgrade"; fail=1; }
+[[ "$(systemctl is-active northnarrow-watchdog)" == active ]] || { echo "FAIL: watchdog unit not active after upgrade"; fail=1; }
+[[ "$pid_after" != "$pid_before" ]] || { echo "FAIL: agent pid unchanged — binary not restarted"; fail=1; }
+(( audit_after > audit_before )) || { echo "FAIL: no new audit entry (agent_boot) after upgrade"; fail=1; }
+[[ "$fp_after" == "$fp_before" ]] || { echo "FAIL: admin.pub / agent.sig.key / agent_id changed across the upgrade"; fail=1; }
+n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+(( n >= 7 )) || { echo "FAIL: only $n LSM programs after upgrade"; fail=1; }
+sudo ls /sys/fs/bpf/northnarrow/PROTECTED_PIDS >/dev/null || { echo "FAIL: PROTECTED_PIDS not re-pinned"; fail=1; }
+(( fail == 0 )) && echo "upgrade-check: OK"
+exit $fail
+REMOTE
+}
+
+cmd_uninstall_check() {
+    vm_running || die "guest is not running"
+    # Operator path: `uninstall.sh --purge --yes` on a running install
+    # must leave NO binary, unit, pin, LSM program, config, state or bait
+    # behind — then the normal install path brings the guest back so the
+    # next step (and the next nightly) finds a working system.
+    vssh bash -s <<'REMOTE'
+set -e
+cd ~/northnarrow
+sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
+sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
+sudo ./deploy/uninstall.sh --purge --yes 2>&1 | grep -E "uninstall.sh:|FAIL" | cut -c1-140
+fail=0
+for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
+         /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
+         /etc/systemd/journald@northnarrow.conf /etc/northnarrow /var/lib/northnarrow /run/northnarrow /sys/fs/bpf/northnarrow; do
+    if sudo test -e "$f"; then echo "FAIL: $f still present"; fail=1; fi
+done
+n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+[[ "$n" == 0 ]] || { echo "FAIL: $n LSM programs still loaded"; fail=1; }
+for u in northnarrow-agent northnarrow-watchdog; do
+    st=$(systemctl is-active "$u" 2>/dev/null || true)
+    [[ "$st" == inactive || "$st" == "" ]] || { echo "FAIL: $u is $st"; fail=1; }
+done
+if pgrep -f "northnarrow-(agent|watchdog)" >/dev/null; then echo "FAIL: northnarrow process still running"; fail=1; fi
+(( fail == 0 )) && echo "uninstall-check: OK (host clean)"
+# Bring the guest back: fresh install (new keys — the purge removed them).
+sudo ./deploy/install.sh >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
+sudo systemctl daemon-reload && sudo systemctl enable --now northnarrow-agent >/dev/null 2>&1 && sleep 3 && sudo systemctl enable --now northnarrow-watchdog >/dev/null 2>&1
+echo "reinstalled: agent=$(systemctl is-active northnarrow-agent) watchdog=$(systemctl is-active northnarrow-watchdog)"
+[[ "$(systemctl is-active northnarrow-agent)" == active ]] || fail=1
+exit $fail
+REMOTE
+}
+
+NIGHTLY_STEPS="check sync build test-e2e test-ignored install respawn-check upgrade-check uninstall-check"
 
 nightly_run_step() {
     local step=$1 logf=$2 t0 rc
@@ -385,6 +466,8 @@ nightly_run_step() {
             cmd_test_ignored ;;
         install)       cmd_install ;;
         respawn-check) cmd_respawn_check ;;
+        upgrade-check) cmd_upgrade_check ;;
+        uninstall-check) cmd_uninstall_check ;;
         *)             echo "unknown step $step"; false ;;
     esac ) >"$logf" 2>&1
     rc=$?
@@ -466,6 +549,8 @@ case "${1:-help}" in
     test-ignored)  cmd_test_ignored ;;
     install)       cmd_install ;;
     respawn-check) cmd_respawn_check ;;
+    upgrade-check) cmd_upgrade_check ;;
+    uninstall-check) cmd_uninstall_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;
