@@ -7,6 +7,27 @@ Per la mappa completa di lungo termine (hypervisor Ring -1, anti-DMA,
 CET, PQC, honeypots, micro-segmentazione), vedi VISION_TECHNICAL.md.
 Quella è la stella polare. Questa è la marcia operativa.
 
+
+## Stato di avanzamento (aggiornato il 9 ottobre 2026)
+
+| Tappa | Stato | Riferimento |
+|---|---|---|
+| 0 – 5 | chiuse | workspace, sensori eBPF, decision engine, KillProcess, response engine |
+| 6 (6.1 → 6.9.7) | chiuse | ADE su Candle, posture adattiva, anti prompt-injection, RAG KB, performance |
+| 7 | chiusa | anti-tamper (task_kill, ptrace, inode_protect, watchdog respawn v2) |
+| 8 | chiusa | sblocco COMBAT con firma Ed25519, audit log firmato |
+| 9 (FIM) + 9.0.a/b/c | chiuse | File Integrity Monitoring, detections su chainlog firmato, triage |
+| 9.5 + 9.5.1 | chiuse | canary token e honeypot anti-tamper |
+| 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
+| 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
+| **10.8** | **in corso** | affidabilità: hardening 8–9 ott, upgrade/uninstall, release firmata, multi-kernel |
+| UI locale, Scout proattivo | non iniziate | slittate dopo la 10.8, numerazione da confermare dal founder |
+| 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
+
+Release taggata: `v0.0.1-tappa9.0` (9 ottobre 2026) — tutto fino alla Tappa 9.0 più il giro
+di hardening. Registri difetti: `docs/audit/NN_BUG_AUDIT_2026-06-09.md`,
+`docs/audit/NN_REVIEW_2026-10-08.md` (High e Medium tutti chiusi al 9 ottobre).
+
 ---
 
 ## Tappa 0 — Fondamenta del repo
@@ -418,7 +439,125 @@ firmato → rete torna su.
 
 ---
 
-## Tappa 9 — UI locale Rust nativa
+## Tappa 9 — File Integrity Monitoring (chiusa)
+
+Obiettivo: integrità del filesystem come segnale di prima classe.
+
+- Sensori LSM `inode_create/unlink/rename/link/setattr`, `file_open`,
+  `file_permission`, `file_free_security` (8 programmi observe)
+- Baseline firmata (`fim_baseline.jsonl`) + drift log a catena; TOFU
+  al primo avvio, `fim-paths.v1` + overlay `.local`
+- Ruoli `fim-manage` / `fim-read`; prompt ADE per eventi FIM critici
+- 9.0.a/b/c: detections persistite su chainlog firmato, lettura
+  `nn-admin detections` (ruolo `telemetry-read`), triage event-sourced
+  (`detection-set-status`, ruolo `triage`)
+
+Design: `docs/design/TAPPA9_FIM_DESIGN.md`,
+`docs/operator/TAPPA9_FIM_TRUST_MODEL.md`.
+
+---
+
+## Tappa 9.5 — Deception layer / canary token (chiusa)
+
+- Canary di credenziali (aws, azure, gcp, docker, generic) renderizzati
+  da template, registro a catena, scatto su READ e su exec
+- 9.5.1: honeypot anti-tamper — 10 file esca sulla superficie di
+  controllo (`/etc`, `/var/lib`, `/run`), regola NN-L-FIM-024
+- Ruoli `canary-manage` / `canary-read`; policy di percorso sul deploy
+
+Design: `docs/design/TAPPA9_5_DECEPTION_LAYER_DESIGN.md`,
+`docs/design/TAPPA9_5_1_ANTITAMPER_HONEYPOT_DESIGN.md`.
+
+---
+
+## Tappa 10 — Osservabilità di rete (chiusa)
+
+- kprobe `tcp_connect` v4/v6, fexit `tcp_close`, kprobe `udp_sendmsg`
+  (connesso e non connesso), `inet_csk_listen_start`
+- Flow tracker con `flow_id` stabile, cache DNS per PID, parser TLS
+  con JA3/JA4, blocklist IP/CIDR e JA3 con overlay `.local`
+- 9 regole NN-L-NET, `nn-admin net flows|listeners|resolve|fingerprint`
+  (ruoli `net-read` / `net-manage`), chain log `netflow.jsonl`
+
+Design: `docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md`.
+
+---
+
+## Tappa 10.5 — Detection rules at scale (chiusa)
+
+- Motore a 69 regole (R001–R018 di processo, NN-L-FIM, NN-L-NET, …),
+  allowlist di comm per famiglia con overlay `.local`
+- Correlazione per host, catene CHAIN-004..008
+
+Design: `docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md`.
+
+---
+
+## Tappa 10.6 — Detection depth refit (chiusa)
+
+- argv e contesto del parent nel tracepoint `sched_process_exec`,
+  seed RAG argv-aware, golden suite a 30 casi
+
+Design: `docs/design/TAPPA10_6_DETECTION_DEPTH_REFIT_DESIGN.md`.
+
+---
+
+## Tappa 10.7 — Validazione avversariale via Kali Linux (in corso)
+
+- Design chiuso con le 10 decisioni del founder; range VirtualBox
+  automatizzato (`deploy/adversarial/`), sweep Atomic Red Team v2
+  (`docs/adversarial/`)
+- Da fare: esecuzione sistematica delle catene e chiusura dei gap
+  trovati nel registro
+
+Design: `docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md`.
+
+---
+
+## Tappa 10.8 — Affidabilità, compatibilità multi-kernel, supply chain (in corso)
+
+Obiettivo: NorthNarrow installabile, aggiornabile e verificabile su un
+host vero, non solo sul kernel di sviluppo. Lavoro trasversale: non
+cambia l'ordine delle Tappe successive.
+
+Chiuso (8–9 ottobre 2026):
+- Giro di hardening: 27 rilievi dei registri di audit e review
+  (CAP_KILL, kill-tree, quarantena, task_kill deny-by-default, respawn
+  v2 del watchdog, audit chain scrivibile, UDP non connesso, ledger
+  COMBAT per sessione, …) — tutti verificati nel lab QEMU
+- Laboratorio `deploy/lab/nn-lab.sh`: guest Ubuntu 24.04 e Debian 12,
+  nightly con e2e, suite ignorate, install, upgrade, uninstall,
+  respawn-check; report in `~/.cache/nn-lab/reports/`
+- `install.sh --upgrade` e `uninstall.sh` (ordine imposto dall'anti-tamper)
+- Release su tag `v*`: tarball, SBOM CycloneDX, `SHA256SUMS`,
+  attestazione di provenienza SLSA (`gh attestation verify`)
+
+In corso:
+- Multi-kernel, livello 1: offset BTF risolti a runtime e pubblicati in
+  una mappa BPF (oggi l'agent gira solo su kernel 6.8: su Debian 12 /
+  6.1 20 offset su 41 differiscono e il gate fail-closed lo ferma —
+  rilievo 27, `docs/operator/KERNEL_COMPATIBILITY.md`)
+
+Pianificato, in quest'ordine:
+- Multi-kernel, livello 2: varianti per i campi instabili, matrice
+  calcolata su BTFHub in CI, BTF esterna per kernel senza BTF, terzo
+  guest Alma 9
+- Test di durata 24–72 h con traffico sintetico (memoria, chain log,
+  mappe LRU, timer)
+- Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
+  template canary, JSONL) con `cargo-fuzz`
+- Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
+  bpffs, cgroup freezer, bind mount su `/etc/northnarrow`, kexec)
+- Overhead misurato su host carico (`file_permission`/`file_open`)
+- Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,
+  rilievo 26)
+
+Demo: stesso tarball installato su Ubuntu 24.04 e Debian 12, nightly
+verde su entrambi, release verificabile con un comando.
+
+---
+
+## Tappa (ex 9) — UI locale Rust nativa (non iniziata, slittata dopo la 10.8)
 
 Obiettivo: interfaccia accattivante, 100% Rust, niente Electron.
 
@@ -427,13 +566,15 @@ Obiettivo: interfaccia accattivante, 100% Rust, niente Electron.
 - Implementazione: lista alert real-time, bottoni azione manuale,
   status agent, log filtrabili
 - Design: scuro, militare, leggibile. Niente UI da SaaS generico.
+- Ricognizione della superficie dati già fatta:
+  `docs/tappa9/UI_DATA_SURFACE_RECON.md`
 
 Demo: apri la GUI, vedi alert in tempo reale, clicchi "Quarantena"
 su un evento manuale, l'azione parte.
 
 ---
 
-## Tappa 10 — Scout proattivo (assessment + hardening)
+## Tappa (ex 10) — Scout proattivo: assessment + hardening (non iniziata, slittata dopo la 10.8)
 
 Obiettivo: all'installazione, NorthNarrow chiude le falle.
 
@@ -565,3 +706,10 @@ founder lo richieda esplicitamente, ha torto Claude.
 
 Modifiche a questa roadmap richiedono modifica esplicita del file da
 parte del founder. Non si modifica per consenso conversazionale.
+
+Aggiornamento del 9 ottobre 2026 richiesto esplicitamente dal founder:
+le Tappe 9 → 10.7 riflettono il lavoro eseguito (FIM, deception, rete,
+regole, profondità, avversariale), la 10.8 raccoglie il lavoro
+trasversale di affidabilità; "UI locale" e "Scout proattivo" restano in
+roadmap, slittate dopo la 10.8, con numerazione definitiva da assegnare
+dal founder.
