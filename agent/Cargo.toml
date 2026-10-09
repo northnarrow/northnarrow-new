@@ -98,7 +98,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 # Sub-tappa 6.6: ADE prompt-injection hardening (base64 encoding of
 # untrusted strings inside the structured prompt).
-base64 = "0.22"
+base64 = "0.23"
 
 # Tappa 7 task 7 / Tappa 8: nn-admin Ed25519 challenge-response.
 # `std` keeps the regular SignatureError type (no_std mode pares it
