@@ -758,7 +758,7 @@ impl AdminAuth {
     /// - Success → mint `UnlockToken`.
     ///
     /// Caller pattern (production dispatcher, A7):
-    /// ```ignore
+    /// ```text
     /// let now = SystemClock.now_unix_secs();
     /// auth.verify_signed_payload_quorum(
     ///     &req.payload,
@@ -1385,7 +1385,7 @@ impl Clock for SystemClock {
 /// no clock-reading. Designed so the wiring site in A7's verify
 /// path looks like
 ///
-/// ```ignore
+/// ```text
 /// check_timestamp_skew(
 ///     payload.ts,
 ///     clock.now_unix_secs(),
