@@ -284,6 +284,43 @@ install -m 755 -o root -g root "$NN_ADMIN_BIN" "$BIN_DIR/nn-admin"
 echo "install.sh: copying systemd unit files to $UNIT_DIR/"
 install -m 644 -o root -g root "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
 install -m 644 -o root -g root "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service"
+
+# Debian-family kernels carry a distro patch that makes
+# kernel.perf_event_paranoid=3 (their default) require CAP_SYS_ADMIN for
+# perf_event_open — CAP_PERFMON, which is all upstream (and Ubuntu's own
+# patch) ask for, is refused with EACCES. Every tracepoint and kprobe
+# attach goes through perf_event_open, so under the bounded unit the agent
+# cannot start there. Widen the bounding set ONLY on those hosts, via a
+# drop-in that the operator can see and remove (e.g. after setting
+# kernel.perf_event_paranoid=2 system-wide, which also restores the
+# narrower set). See docs/operator/KERNEL_COMPATIBILITY.md.
+DROPIN_DIR="$UNIT_DIR/northnarrow-agent.service.d"
+if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id=${ID:-}; os_like=${ID_LIKE:-}
+else
+    os_id=""; os_like=""
+fi
+if [[ "$os_id" == debian || ( "$os_like" == *debian* && "$os_id" != ubuntu && "$os_like" != *ubuntu* ) ]]; then
+    echo "install.sh: Debian-family kernel ($os_id) — adding CAP_SYS_ADMIN drop-in for perf_event_paranoid=3 semantics"
+    install -d -m 0755 -o root -g root "$DROPIN_DIR"
+    cat > "$DROPIN_DIR/10-debian-perf-paranoid.conf" <<'EOT'
+# Installed by NorthNarrow install.sh on a Debian-family host.
+# Debian's kernel patch makes kernel.perf_event_paranoid=3 (the default)
+# require CAP_SYS_ADMIN for perf_event_open; the agent's tracepoint and
+# kprobe sensors attach through it. CapabilityBoundingSet= lines merge,
+# so this ADDS the capability to the unit's minimal set.
+# Remove this file (and run `systemctl daemon-reload`) after setting
+# kernel.perf_event_paranoid=2 if you prefer the narrower set.
+[Service]
+CapabilityBoundingSet=CAP_SYS_ADMIN
+EOT
+    chmod 0644 "$DROPIN_DIR/10-debian-perf-paranoid.conf"
+elif [[ -e "$DROPIN_DIR/10-debian-perf-paranoid.conf" ]]; then
+    echo "install.sh: removing stale Debian perf drop-in (not a Debian-family host)"
+    rm -f "$DROPIN_DIR/10-debian-perf-paranoid.conf"
+fi
 # Journal-namespace config goes in /etc/systemd/ (read by the
 # systemd-journald@northnarrow instance), NOT the unit dir. NN-managed
 # (always refreshed); operators override via

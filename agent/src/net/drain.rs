@@ -381,6 +381,14 @@ async fn process_close_record(
                 bytes_sent: raw.bytes_sent,
                 bytes_recv: raw.bytes_recv,
                 close_reason: raw.close_reason,
+                family: raw.family,
+                dst_addr: decode_addr(raw.family, raw.dst_addr),
+                dst_port: raw.dst_port,
+                pid: raw.pid,
+                uid: raw.uid,
+                comm: String::from_utf8_lossy(&raw.comm)
+                    .trim_end_matches('\0')
+                    .to_string(),
             };
             match flow_tracker.lock().on_tcp_close(&info) {
                 Some(e) => e,

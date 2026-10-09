@@ -196,6 +196,9 @@ ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
 #                    125 watched paths are root-owned → read by ownership).
 #                    Owned limit: sticky dirs (/tmp) and the chmod-000
 #                    fallback also want CAP_FOWNER, not in this set.
+# Debian-family kernels: perf_event_paranoid=3 semantics need CAP_SYS_ADMIN
+# for the tracepoint/kprobe attach; install.sh adds it there through the
+# drop-in northnarrow-agent.service.d/10-debian-perf-paranoid.conf.
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL
 
 [Install]

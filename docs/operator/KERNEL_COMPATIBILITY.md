@@ -18,7 +18,7 @@ verifiable: either every read resolves, or the agent does not run.
 | Distribution | Kernel | BPF LSM | BTF | Status | Verified |
 |---|---|---|---|---|---|
 | Ubuntu 24.04 LTS | 6.8.0-142-generic | needs `lsm=…,bpf` (grub) | yes | **supported** — full nightly green (e2e, ignored suites, install, upgrade, uninstall, respawn); offsets match the build (41/41, 0 drift) | 2026-10-09 |
-| Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — e2e agent 6/6, watchdog 4/4 with 20 of 41 offsets resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6; ignored suites: see the nightly report | 2026-10-09 |
+| Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
 | Ubuntu 22.04 LTS | 5.15 | needs `lsm=…,bpf` | yes | untested — expected to resolve like Debian 12 (`iov_iter` has no `ubuf` before 6.0: the DNS QNAME copy would be refused unless a third variant is added) | — |
 | RHEL / Alma / Rocky 9 | 5.14 + backports | needs `lsm=…,bpf` | yes | untested — same note as 22.04 | — |
 
@@ -26,6 +26,20 @@ Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 `/sys/kernel/btf/vmlinux` file), `bpf` in `/sys/kernel/security/lsm`,
 bpffs mounted at `/sys/fs/bpf`, `iptables-restore` (nft backend is fine),
 x86_64. See `docs/TAPPA7_PREREQ.md` for the grub step.
+
+## Debian-family kernels and `perf_event_paranoid`
+
+Every tracepoint and kprobe sensor attaches through `perf_event_open`.
+Upstream (and Ubuntu's own patch, default value 4) accept `CAP_PERFMON`
+for that, which is what the hardened unit grants. Debian's kernel patch
+makes its default `kernel.perf_event_paranoid=3` demand `CAP_SYS_ADMIN`
+instead, so the bounded unit fails with `Permission denied` while the
+same binary works as plain root. `install.sh` detects a Debian-family
+host (`/etc/os-release`, not Ubuntu) and installs
+`northnarrow-agent.service.d/10-debian-perf-paranoid.conf` adding
+`CAP_SYS_ADMIN` to the bounding set; the agent's attach error names the
+condition and the two remedies (drop-in, or `perf_event_paranoid=2`
+system-wide plus removing the drop-in to keep the narrower set).
 
 ## How it works, and what still stops a kernel
 
