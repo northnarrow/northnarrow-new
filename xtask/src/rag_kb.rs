@@ -94,17 +94,23 @@ struct Provenance {
 // ── fetch / mirror ─────────────────────────────────────────────────────
 
 fn http_get(url: &str) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(600))
+    // ureq 3: configuration moved to `Agent::config_builder()`, the
+    // response body is read through `Body::with_config().limit(..)`
+    // (same MAX_FETCH_BYTES cap as the old `take`).
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(600)))
         .user_agent("northnarrow-xtask-rag-kb/0.0.1")
-        .build();
-    let resp = agent
+        .build()
+        .into();
+    let mut resp = agent
         .get(url)
         .call()
         .map_err(|e| anyhow!("HTTP GET {url}: {e}"))?;
     let mut buf = Vec::new();
-    resp.into_reader()
-        .take(MAX_FETCH_BYTES)
+    resp.body_mut()
+        .with_config()
+        .limit(MAX_FETCH_BYTES)
+        .reader()
         .read_to_end(&mut buf)
         .with_context(|| format!("reading body of {url}"))?;
     if buf.is_empty() {
