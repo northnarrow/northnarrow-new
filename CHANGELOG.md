@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lab: second guest Debian 12 (`NN_LAB_DISTRO=debian12`, kernel 6.1) with
+  its own disk, port and reports; `docs/operator/KERNEL_COMPATIBILITY.md`
+  records the verified matrix. Finding: the agent refuses to start on 6.1
+  (20 of 41 compiled-in BTF offsets differ — fail-closed as designed);
+  runtime offsets tracked as review entry 27.
 - Release workflow on tags `v*`: locked build, release tarball consumed by
   `install.sh` unchanged, CycloneDX SBOM, `SHA256SUMS`, SLSA build
   provenance attestation (`gh attestation verify`); dry run on packaging

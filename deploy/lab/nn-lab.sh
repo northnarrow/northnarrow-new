@@ -19,6 +19,8 @@
 #   deploy/lab/nn-lab.sh build         # cargo build --release (+test-privileged,debug-trigger) in the guest
 #   deploy/lab/nn-lab.sh test-e2e      # docs/integration-test-runbook.md "Run" (privileged_e2e)
 #   deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test, as root, single-threaded
+#   NN_LAB_DISTRO=debian12 deploy/lab/nn-lab.sh up   # second guest (Debian 12, kernel 6.1); every
+#                                                    # sub-command honours NN_LAB_DISTRO (default ubuntu2404)
 #   deploy/lab/nn-lab.sh upgrade-check    # install.sh --upgrade on the running install (keys/chains kept)
 #   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
@@ -39,21 +41,40 @@ set -euo pipefail
 # reachable regardless of how we were started.
 export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-LAB_DIR=${NN_LAB_DIR:-"$HOME/.cache/nn-lab"}
+ROOT_LAB_DIR=${NN_LAB_DIR:-"$HOME/.cache/nn-lab"}
 CPUS=${NN_LAB_CPUS:-4}
 MEM=${NN_LAB_MEM:-8192}
-# The ssh port is remembered in $LAB_DIR/ssh_port after `up`, so every
-# later sub-command talks to the same guest without re-exporting it.
-SSH_PORT=${NN_LAB_SSH_PORT:-$(cat "${NN_LAB_DIR:-"$HOME/.cache/nn-lab"}/ssh_port" 2>/dev/null || echo 2222)}
 DISK_SIZE=${NN_LAB_DISK:-30G}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=${NN_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}
 
-IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-BASE_IMG="$LAB_DIR/noble-base.img"
+# ── distro matrix ─────────────────────────────────────────────────────
+# NN_LAB_DISTRO selects the guest. Each distro gets its own disk, seed,
+# pid, serial log, ssh port and reports under $ROOT_LAB_DIR/<distro>/ —
+# except ubuntu2404, the original guest, which keeps the flat layout so
+# an existing lab keeps working. The ssh-key is shared.
+DISTRO=${NN_LAB_DISTRO:-ubuntu2404}
+case "$DISTRO" in
+    ubuntu2404)
+        IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+        BASE_IMG_NAME="noble-base.img"; DEFAULT_SSH_PORT=2222
+        USER_DATA_TMPL="$SCRIPT_DIR/user-data.tmpl"
+        LAB_DIR="$ROOT_LAB_DIR" ;;
+    debian12)
+        IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+        BASE_IMG_NAME="bookworm-base.qcow2"; DEFAULT_SSH_PORT=2422
+        USER_DATA_TMPL="$SCRIPT_DIR/user-data.debian12.tmpl"
+        LAB_DIR="$ROOT_LAB_DIR/debian12" ;;
+    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12)" >&2; exit 2 ;;
+esac
+# The ssh port is remembered in $LAB_DIR/ssh_port after `up`, so every
+# later sub-command talks to the same guest without re-exporting it.
+SSH_PORT=${NN_LAB_SSH_PORT:-$(cat "$LAB_DIR/ssh_port" 2>/dev/null || echo "$DEFAULT_SSH_PORT")}
+
+BASE_IMG="$LAB_DIR/$BASE_IMG_NAME"
 DISK="$LAB_DIR/disk.qcow2"
 SEED="$LAB_DIR/seed.iso"
-KEY="$LAB_DIR/id_ed25519"
+KEY="$ROOT_LAB_DIR/id_ed25519"
 PIDFILE="$LAB_DIR/qemu.pid"
 SERIAL="$LAB_DIR/serial.log"
 GUEST="nn@127.0.0.1"
@@ -84,7 +105,9 @@ vssh() { ssh "${SSH_OPTS[@]}" "$GUEST" "$@"; }
 # login shell, so the inner command must be re-quoted (printf %q) or the
 # `bash -c "…"` boundary is lost on the way.
 vcargo() {
-    local inner="source ~/.cargo/env 2>/dev/null; cd ~/northnarrow && $*"
+    # Debian's non-root PATH has no sbin dirs: the privileged tests spawn
+    # iptables-restore through `sudo -E env PATH=$PATH`, so add them here.
+    local inner="export PATH=\$PATH:/usr/sbin:/sbin; source ~/.cargo/env 2>/dev/null; cd ~/northnarrow && $*"
     vssh "bash -c $(printf '%q' "$inner")"
 }
 
@@ -122,15 +145,15 @@ cmd_up() {
     fi
     if [[ ! -f "$SEED" || $fresh == 1 ]]; then
         local ud="$LAB_DIR/user-data" md="$LAB_DIR/meta-data"
-        sed "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" "$SCRIPT_DIR/user-data.tmpl" > "$ud"
-        printf 'instance-id: nn-lab-%s\nlocal-hostname: nn-lab\n' "$(date +%s)" > "$md"
+        sed "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" "$USER_DATA_TMPL" > "$ud"
+        printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$DISTRO" "$(date +%s)" "$DISTRO" > "$md"
         cloud-localds "$SEED" "$ud" "$md"
     fi
     if ss -ltn 2>/dev/null | grep -qE "[:.]${SSH_PORT}\b"; then
         die "127.0.0.1:$SSH_PORT is already in use on the host — pick another: NN_LAB_SSH_PORT=2322 $0 up"
     fi
     echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
-    log "booting: ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
+    log "booting $DISTRO: ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
     qemu-system-x86_64 \
         -enable-kvm -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEM" \
         -drive "file=$DISK,if=virtio,format=qcow2" \
@@ -148,6 +171,7 @@ cmd_check() {
     vm_running || die "guest is not running (nn-lab.sh up)"
     vssh bash -s <<'REMOTE'
 set -e
+export PATH="$PATH:/usr/sbin:/sbin"
 echo "kernel      : $(uname -r)"
 echo "lsm         : $(cat /sys/kernel/security/lsm)"
 grep -q '\bbpf\b' /sys/kernel/security/lsm && echo "bpf-lsm     : OK" || { echo "bpf-lsm     : MISSING"; exit 1; }
@@ -517,6 +541,7 @@ cmd_nightly() {
     {
         printf '# nn-lab nightly %s\n\n' "$stamp"
         printf -- '- repo: `%s` @ `%s`\n' "$REPO" "$rev"
+        printf -- '- distro: `%s`\n' "$DISTRO"
         printf -- '- guest: `%s`\n\n' "$(vssh 'uname -r; cat /sys/kernel/security/lsm' 2>/dev/null | tr '\n' ' ')"
         printf '| step | status | seconds |\n|---|---|---|\n'
         for step in $NIGHTLY_STEPS; do

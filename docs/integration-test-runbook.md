@@ -56,6 +56,14 @@ and shipped with its provenance stamp; the guest only builds userland,
 so `agent/build.rs`'s staleness guard still holds. `respawn-check` is
 the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
 
+### Second guest: Debian 12 (kernel 6.1)
+
+`NN_LAB_DISTRO=debian12 deploy/lab/nn-lab.sh up` boots a separate Debian
+12 guest (ssh 127.0.0.1:2422, state under `~/.cache/nn-lab/debian12/`);
+prefix any sub-command with the variable to target it. The verified
+matrix and the current finding (agent refuses to start on 6.1: BTF offset
+drift) are in `docs/operator/KERNEL_COMPATIBILITY.md`.
+
 ### Nightly, unattended
 
 `deploy/lab/nn-lab.sh nightly` runs check → sync → build → test-e2e →

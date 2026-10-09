@@ -1,0 +1,49 @@
+#cloud-config
+# NorthNarrow local lab guest — Debian 12 "bookworm" (kernel 6.1) variant
+# of user-data.tmpl. Rendered once per `NN_LAB_DISTRO=debian12 nn-lab.sh
+# up`; __SSH_PUBKEY__ is substituted by the script.
+#
+# Differences from the Ubuntu 24.04 template:
+#   - bpftool is its own package (no linux-tools-common on Debian);
+#   - Debian's default LSM list is lockdown,capability,landlock,yama,
+#     apparmor,tomoyo,bpf — `bpf` is already there on most kernels, but
+#     the explicit lsm= line is kept so the lab guest matches the
+#     documented production prerequisite exactly (docs/TAPPA7_PREREQ.md).
+hostname: nn-lab-debian12
+manage_etc_hosts: true
+users:
+  - name: nn
+    groups: [sudo, adm]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+package_update: true
+package_upgrade: false
+packages:
+  - iptables
+  - bpftool
+  - build-essential
+  - pkg-config
+  - git
+  - rsync
+  - jq
+  - strace
+  - curl
+  - ca-certificates
+write_files:
+  - path: /etc/default/grub.d/99-nn-bpf-lsm.cfg
+    permissions: "0644"
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=lockdown,capability,landlock,yama,apparmor,bpf"
+runcmd:
+  - update-grub
+  # rustup (stable, minimal) for the guest-side userland build.
+  - su - nn -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable'
+  - su - nn -c 'echo "source \$HOME/.cargo/env" >> ~/.bashrc'
+  - touch /var/lib/nn-lab-provisioned
+power_state:
+  mode: reboot
+  message: "nn-lab: rebooting with lsm=...,bpf"
+  condition: true
