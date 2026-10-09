@@ -41,7 +41,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -97,7 +97,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -147,7 +147,7 @@ jobs:
           rustup component add clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -191,7 +191,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -246,7 +246,7 @@ jobs:
         run: cargo install bpf-linker --version 0.10.3 --locked
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
