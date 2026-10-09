@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200" role="img" aria-label="NorthNarrow">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e3a5f"/>
+      <stop offset="1" stop-color="#0b1a2e"/>
+    </linearGradient>
+    <linearGradient id="n" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9fd3ff"/>
+      <stop offset="1" stop-color="#4a90e2"/>
+    </linearGradient>
+  </defs>
+  <!-- shield -->
+  <path d="M100 8 L176 36 V96 C176 142 144 176 100 192 C56 176 24 142 24 96 V36 Z" fill="url(#g)" stroke="#4a90e2" stroke-width="4" stroke-linejoin="round"/>
+  <!-- north needle -->
+  <path d="M100 40 L116 100 L100 92 L84 100 Z" fill="url(#n)"/>
+  <path d="M100 160 L84 100 L100 108 L116 100 Z" fill="#27406a"/>
+  <!-- narrow pass: two ridges -->
+  <path d="M46 150 L72 112 L84 128" fill="none" stroke="#4a90e2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M154 150 L128 112 L116 128" fill="none" stroke="#4a90e2" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="100" cy="100" r="5" fill="#e74c3c"/>
+</svg>
