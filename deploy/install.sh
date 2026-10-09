@@ -58,6 +58,27 @@ STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
 
 AGENT_BIN="$TARGET_DIR/northnarrow-agent"
 WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
+
+# ── arguments ─────────────────────────────────────────────────────────
+# --upgrade: the host already runs NorthNarrow. With the units active the
+# anti-tamper layer denies every write this script makes (PROTECTED_INODES
+# covers the binaries, the units and /etc/northnarrow; task_kill denies
+# signals), so an in-place upgrade must: stop the watchdog FIRST (or it
+# respawns the agent), stop the agent, drop the bpffs pin root so the LSM
+# programs detach, wait for the kernel to report 0 LSM programs, install,
+# then start the units that were running. Keys, agent_id, the audit chain
+# and every chain log are preserved — install.sh never touches them.
+UPGRADE=0
+for arg in "$@"; do
+    case "$arg" in
+        --upgrade) UPGRADE=1 ;;
+        -h|--help)
+            echo "usage: sudo $0 [--upgrade]"
+            echo "  --upgrade   stop the running units, replace binaries/units/configs, restart them"
+            exit 0 ;;
+        *) echo "install.sh: unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 # Beta Step 4c: nn-admin is the operator's COMBAT-release / admin tool.
 # It must be on-host so an operator can unlock COMBAT, and install.sh
 # uses it below to bootstrap admin.pub on a fresh install (issue #124).
@@ -215,6 +236,46 @@ for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag 
 done
 
 # ── install ─────────────────────────────────────────────────────────
+# ── running install? ──────────────────────────────────────────────────
+UNITS_TO_RESTART=()
+for u in northnarrow-watchdog northnarrow-agent; do
+    if systemctl is-active --quiet "$u.service" 2>/dev/null; then
+        UNITS_TO_RESTART+=("$u")
+    fi
+done
+if (( ${#UNITS_TO_RESTART[@]} )); then
+    if (( ! UPGRADE )); then
+        echo "install.sh: NorthNarrow is RUNNING (${UNITS_TO_RESTART[*]}) — with the anti-tamper hooks" >&2
+        echo "install.sh: active every write below is denied. Re-run with --upgrade to stop, replace and" >&2
+        echo "install.sh: restart the units in the right order (keys, audit chain and state are kept)." >&2
+        exit 1
+    fi
+    old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
+    new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1 || echo "unknown")
+    echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
+    # Watchdog first: stopping the agent alone makes it respawn it.
+    for u in northnarrow-watchdog northnarrow-agent; do
+        if systemctl is-active --quiet "$u.service" 2>/dev/null; then
+            echo "install.sh: stopping $u"
+            systemctl stop "$u.service"
+        fi
+    done
+    if [[ -d /sys/fs/bpf/northnarrow ]]; then
+        echo "install.sh: dropping /sys/fs/bpf/northnarrow so the LSM programs detach (the new agent re-pins fresh)"
+        rm -rf /sys/fs/bpf/northnarrow
+    fi
+    if command -v bpftool >/dev/null 2>&1; then
+        for ((i = 0; i < 30; i++)); do
+            n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+            [[ "$n" == 0 ]] && break
+            (( i == 0 )) && echo "install.sh: waiting for $n LSM program(s) to detach"
+            sleep 1
+        done
+        n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+        [[ "$n" == 0 ]] || { echo "install.sh: $n LSM program(s) still loaded after 30s — another NorthNarrow process holds them; stop it and re-run" >&2; exit 1; }
+    fi
+fi
+
 echo "install.sh: copying binaries to $BIN_DIR/"
 install -m 755 -o root -g root "$AGENT_BIN"    "$BIN_DIR/northnarrow-agent"
 install -m 755 -o root -g root "$WATCHDOG_BIN" "$BIN_DIR/northnarrow-watchdog"
@@ -498,6 +559,26 @@ systemctl daemon-reload
 # namespace journald socket-activates fresh on the agent's first start, so
 # this is a no-op then). Best-effort — the instance may not be running yet.
 systemctl restart systemd-journald@northnarrow.service 2>/dev/null || true
+
+if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
+    # Agent first (it pins the maps the watchdog registers into), then the
+    # watchdog — the same order the operator uses on a fresh install.
+    for u in northnarrow-agent northnarrow-watchdog; do
+        for w in "${UNITS_TO_RESTART[@]}"; do
+            if [[ "$w" == "$u" ]]; then
+                echo "install.sh: starting $u"
+                systemctl start "$u.service"
+                [[ "$u" == northnarrow-agent ]] && sleep 3
+            fi
+        done
+    done
+    for u in "${UNITS_TO_RESTART[@]}"; do
+        echo "install.sh: $u is $(systemctl is-active "$u.service" || true)"
+    done
+    echo ""
+    echo "install.sh: UPGRADE complete — units restarted; the audit chain carries a new agent_boot entry."
+    exit 0
+fi
 
 echo ""
 echo "install.sh: install complete."
