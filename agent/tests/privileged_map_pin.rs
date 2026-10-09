@@ -79,6 +79,8 @@ use std::time::{Duration, Instant};
 
 use northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT;
 
+mod common;
+
 const PIN_APPEAR_TIMEOUT: Duration = Duration::from_secs(20);
 /// Aya's `Ebpf::load_from_bytes` only *creates* maps (which is when
 /// the `PROTECTED_PIDS` pin file appears); each LSM program is loaded
@@ -118,32 +120,56 @@ fn combat_rules_path() -> PathBuf {
 /// Shelling out keeps this test free of any new dev-dependency.
 struct AgentGuard(Option<Child>);
 
+/// How long `stop()` waits for the agent to exit before failing the
+/// test. Before this bound the test hung for hours on the lab guest
+/// when the signal was denied (see `stop_agent`).
+const AGENT_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
+
 impl AgentGuard {
     /// Stop the agent and block until it has actually exited.
     fn stop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            sigquit(c.id());
-            let _ = c.wait();
+        if let Some(c) = self.0.take() {
+            stop_agent(c, true);
         }
     }
 }
 
 impl Drop for AgentGuard {
     fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            sigquit(c.id());
-            let _ = c.wait();
+        if let Some(c) = self.0.take() {
+            stop_agent(c, false);
         }
     }
 }
 
-fn sigquit(pid: u32) {
-    // `kill` from coreutils/util-linux; SIGQUIT(3) is the documented
-    // anti-tamper escape hatch. Running as root on the verify box,
-    // so signalling the (self-protected) agent is permitted.
-    let _ = Command::new("kill")
+/// Evict the agent (and any children) from PROTECTED_PIDS, SIGQUIT it
+/// and wait — bounded. task-kill-signals-1 made the `task_kill` hook
+/// deny EVERY userspace signal towards a protected pid, SIGQUIT
+/// included, so a bare `kill -QUIT` from the (unprotected) test runner
+/// is refused with EPERM and the old unbounded `wait()` never returned:
+/// the first nightly after that change sat in this test for 6 h. Same
+/// recipe as `privileged_e2e::AgentGuard`.
+fn stop_agent(mut c: Child, must_exit: bool) {
+    let pid = c.id();
+    common::unprotect_pid(pid);
+    let status = Command::new("kill")
         .args(["-QUIT", &pid.to_string()])
         .status();
+    let deadline = Instant::now() + AGENT_EXIT_TIMEOUT;
+    while Instant::now() < deadline {
+        match c.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => return,
+        }
+    }
+    if must_exit {
+        panic!(
+            "agent pid {pid} did not exit within {AGENT_EXIT_TIMEOUT:?} after SIGQUIT \
+             (kill status {status:?}) — signal denied by the task_kill hook? \
+             (the pid must be evicted from PROTECTED_PIDS first)"
+        );
+    }
 }
 
 /// Spawn the real agent against per-test tempdir paths. Mirrors
