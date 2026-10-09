@@ -954,33 +954,42 @@ mod tests {
     #[test]
     #[ignore]
     fn revalidate_real_kernel_btf_all_40_match() {
-        match revalidate_offsets() {
-            RevalidateOutcome::Verified { count } => {
-                // Compare with the table, not a literal: the count was
-                // hardcoded at 40 and went stale when at-authz-1 added
-                // `file.f_mode` (41 on 6.8.0-142, lab guest 2026-10-08).
-                let expected = common::btf_offsets::REVALIDATE.len();
-                assert_eq!(count, expected, "expected all {expected} offsets validated");
-                eprintln!("OK: all {count} offsets match the running kernel's BTF");
-            }
-            RevalidateOutcome::SkippedNoBtf { reason } => {
-                panic!("no /sys/kernel/btf/vmlinux on this host — cannot run VM check: {reason}");
-            }
-            RevalidateOutcome::Refuse(RefuseReason::Drift(ms)) => {
-                for m in &ms {
+        // Since multi-kernel level 1 drift is allowed: every offset and
+        // enumerator must RESOLVE on the running kernel (values go into
+        // the BTF_OFFSETS map); only a missing field is a failure.
+        match resolve_offsets() {
+            ResolveOutcome::Resolved(r) => {
+                let expected = REVALIDATE.len() + ENUM_VALUES.len();
+                assert_eq!(
+                    r.values.len(),
+                    expected,
+                    "expected all {expected} slots resolved"
+                );
+                for m in &r.drifted {
                     eprintln!(
-                        "DRIFT {}: {}{:?} expected byte {} — {}",
-                        m.name, m.struct_name, m.actual, m.expected, m.detail
+                        "DRIFT {}: {} compiled {} → runtime {:?}",
+                        m.name, m.struct_name, m.expected, m.actual
                     );
                 }
+                eprintln!(
+                    "OK: {} slots resolved on the running kernel ({} differ from the build)",
+                    r.values.len(),
+                    r.drifted.len()
+                );
+            }
+            ResolveOutcome::SkippedNoBtf { reason } => {
+                panic!("no /sys/kernel/btf/vmlinux on this host — cannot run VM check: {reason}");
+            }
+            ResolveOutcome::Refuse(RefuseReason::Drift(ms)) => {
+                for m in &ms {
+                    eprintln!("MISSING {}: {} — {}", m.name, m.struct_name, m.detail);
+                }
                 panic!(
-                    "{} offset(s) drifted on the running kernel (see stderr)",
+                    "{} field(s) unresolvable on the running kernel (see stderr)",
                     ms.len()
                 );
             }
-            RevalidateOutcome::Refuse(RefuseReason::ParseError(e)) => {
-                panic!("BTF parse error on the running kernel: {e}");
-            }
+            ResolveOutcome::Refuse(RefuseReason::ParseError(e)) => panic!("BTF parse error: {e}"),
         }
     }
 
