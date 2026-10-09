@@ -136,7 +136,7 @@ development.
 | Detection rules | **~60+ curated rules across 9 detection families** |
 | MITRE ATT&CK coverage | **50+ techniques mapped** |
 | Test coverage | Comprehensive unit + integration suite |
-| Supported OS | Linux (modern kernels); Windows planned for a future release |
+| Supported OS | Linux x86_64 with BTF + BPF LSM — verified on Ubuntu 24.04 / kernel 6.8 (see `docs/operator/KERNEL_COMPATIBILITY.md`); Windows planned for a future release |
 | Detection latency | Sub-millisecond deterministic verdict path; AI tier on the order of seconds |
 | Deployment | Single static-link binary; no separate inference server |
 | Source code | Closed during Pre-Beta — open to design partners under NDA |
