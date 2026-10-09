@@ -27,6 +27,34 @@ Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 bpffs mounted at `/sys/fs/bpf`, `iptables-restore` (nft backend is fine),
 x86_64. See `docs/TAPPA7_PREREQ.md` for the grub step.
 
+## Computed matrix (`northnarrow-agent --btf-check <btf>`)
+
+The resolver runs offline against any BTF blob — no root, no eBPF
+loaded — and prints one of three verdicts:
+
+- **SUPPORTED**: every slot resolves (drift is fine, the map carries it);
+- **SUPPORTED (degraded)**: every *required* slot resolves; one or more
+  *optional* ones are absent and the dependent sensor path is off (today:
+  the `iov_iter` family → DNS events keep pid/comm/destination but carry
+  no QNAME);
+- **NOT SUPPORTED**: a required field or enumerator is missing — the
+  agent would refuse to start (exit 78).
+
+| Source | Kernel | Verdict | Notes |
+|---|---|---|---|
+| WSL2 (host) | 6.18 | SUPPORTED | 16 of 44 slots differ from the build kernel — handled at runtime |
+| lab guest | 6.8 (Ubuntu 24.04) | SUPPORTED | 0 drift (build kernel) |
+| lab guest | 6.1 (Debian 12) | SUPPORTED | 20 drift, `ubuf`/`count`, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` |
+| BTFHub | 5.8 (Ubuntu 20.04) | SUPPORTED (degraded) | no `iov_iter.iter_type` / `ITER_UBUF` → no QNAME; **BPF LSM needs 5.7+ and the distro kernel config — untested at runtime** |
+| BTFHub | 4.18 (RHEL/CentOS 8) | NOT SUPPORTED | `tcp_sock.bytes_sent` absent; no BPF LSM on 4.18 anyway |
+
+Runtime verification remains the lab's job (a verdict says the reads
+resolve, not that the verifier accepts every program on that kernel or
+that the hooks exist): the ubuntu2204 guest (5.15) is the next runtime
+row. BTFHub only archives kernels shipped *without* BTF, so for modern
+distro kernels the BTF comes from the running guest or from the kernel
+package.
+
 ## Debian-family kernels and `perf_event_paranoid`
 
 Every tracepoint and kprobe sensor attaches through `perf_event_open`.

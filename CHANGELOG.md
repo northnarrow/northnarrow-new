@@ -17,6 +17,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   error explains the condition.
 
 ### Added
+- `northnarrow-agent --btf-check <btf>`: offline compatibility verdict
+  (SUPPORTED / SUPPORTED (degraded) / NOT SUPPORTED) for any kernel BTF;
+  optional offsets (the `iov_iter` family behind DNS QNAME decoding)
+  degrade the sensor instead of refusing the boot. Lab: third guest
+  `ubuntu2204` (kernel 5.15).
 - Multi-kernel, level 1: kernel struct offsets are resolved from the
   running kernel's BTF at boot and published to the eBPF programs through
   the `BTF_OFFSETS` map before any hook attaches (compiled-in values are
