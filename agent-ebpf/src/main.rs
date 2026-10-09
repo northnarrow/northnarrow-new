@@ -16,6 +16,7 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
+#[macro_use]
 mod btf_offsets;
 mod dns_query;
 mod exec_check;
@@ -181,18 +182,18 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
         // start_time (PID-reuse key) + comm.
         if let Ok(parent) = unsafe {
             bpf_probe_read_kernel::<*const u8>(
-                task.add(TASK_STRUCT_REAL_PARENT_OFFSET) as *const _,
+                task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const _,
             )
         } {
             if !parent.is_null() {
                 if let Ok(ptgid) = unsafe {
-                    bpf_probe_read_kernel::<u32>(parent.add(TASK_STRUCT_TGID_OFFSET) as *const _)
+                    bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const _)
                 } {
                     unsafe { (*raw_ptr).ppid = ptgid };
                 }
                 if let Ok(pstart) = unsafe {
                     bpf_probe_read_kernel::<u64>(
-                        parent.add(TASK_STRUCT_START_TIME_OFFSET) as *const _,
+                        parent.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _,
                     )
                 } {
                     unsafe { (*raw_ptr).parent_start_ns = pstart };
@@ -203,7 +204,7 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                         TASK_COMM_LEN,
                     );
                     let _ = bpf_probe_read_kernel_buf(
-                        parent.add(TASK_STRUCT_COMM_OFFSET) as *const u8,
+                        parent.add(off!(TASK_STRUCT_COMM_OFFSET)) as *const u8,
                         dst,
                     );
                 }
@@ -224,7 +225,7 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                 // EXEMPTION is a successful read with the PF_KTHREAD
                 // bit set.
                 if let Ok(flags) = unsafe {
-                    bpf_probe_read_kernel::<u32>(parent.add(TASK_STRUCT_FLAGS_OFFSET) as *const _)
+                    bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const _)
                 } {
                     if flags & PF_KTHREAD != 0 {
                         unsafe { (*raw_ptr).parent_is_kthread = 1 };
@@ -236,15 +237,15 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
         // argv: task->mm, then [mm->arg_start, mm->arg_end) — a
         // contiguous NUL-separated user block. One bounded read.
         if let Ok(mm) =
-            unsafe { bpf_probe_read_kernel::<*const u8>(task.add(TASK_STRUCT_MM_OFFSET) as *const _) }
+            unsafe { bpf_probe_read_kernel::<*const u8>(task.add(off!(TASK_STRUCT_MM_OFFSET)) as *const _) }
         {
             if !mm.is_null() {
                 let arg_start = unsafe {
-                    bpf_probe_read_kernel::<usize>(mm.add(MM_STRUCT_ARG_START_OFFSET) as *const _)
+                    bpf_probe_read_kernel::<usize>(mm.add(off!(MM_STRUCT_ARG_START_OFFSET)) as *const _)
                 }
                 .unwrap_or(0);
                 let arg_end = unsafe {
-                    bpf_probe_read_kernel::<usize>(mm.add(MM_STRUCT_ARG_END_OFFSET) as *const _)
+                    bpf_probe_read_kernel::<usize>(mm.add(off!(MM_STRUCT_ARG_END_OFFSET)) as *const _)
                 }
                 .unwrap_or(0);
                 if arg_start != 0 && arg_end > arg_start {

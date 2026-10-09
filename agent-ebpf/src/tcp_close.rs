@@ -71,7 +71,7 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
     let sk_key: u64 = sk_ptr as u64;
 
     // Family — skip non-IPv4/v6 early.
-    let family: u16 = match bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_FAMILY_OFFSET) as *const u16)
+    let family: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16)
     {
         Ok(v) => v,
         Err(_) => return Ok(()),
@@ -92,30 +92,30 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
     // Byte counters from tcp_sock (sock is the prefix; sk_ptr
     // doubles as tcp_sock pointer).
     let bytes_sent: u64 =
-        match bpf_probe_read_kernel(sk_ptr.add(TCP_SOCK_BYTES_SENT_OFFSET) as *const u64) {
+        match bpf_probe_read_kernel(sk_ptr.add(off!(TCP_SOCK_BYTES_SENT_OFFSET)) as *const u64) {
             Ok(v) => v,
             Err(_) => 0,
         };
     let bytes_recv: u64 =
-        match bpf_probe_read_kernel(sk_ptr.add(TCP_SOCK_BYTES_RECEIVED_OFFSET) as *const u64) {
+        match bpf_probe_read_kernel(sk_ptr.add(off!(TCP_SOCK_BYTES_RECEIVED_OFFSET)) as *const u64) {
             Ok(v) => v,
             Err(_) => 0,
         };
 
     // Ports + addrs from sock_common.
-    let dport_be: u16 = match bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_DPORT_OFFSET) as *const u16)
+    let dport_be: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16)
     {
         Ok(v) => v,
         Err(_) => 0,
     };
-    let sport_host: u16 = match bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_NUM_OFFSET) as *const u16)
+    let sport_host: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16)
     {
         Ok(v) => v,
         Err(_) => 0,
     };
     // sk_err — sign-extended i32 stored in network code as positive
     // errno values; treat as u32 for bit math.
-    let sk_err_raw: u32 = match bpf_probe_read_kernel(sk_ptr.add(SOCK_SK_ERR_OFFSET) as *const u32)
+    let sk_err_raw: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SK_ERR_OFFSET)) as *const u32)
     {
         Ok(v) => v,
         Err(_) => 0,
@@ -150,11 +150,11 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
     let dst_dst = (*raw_ptr).dst_addr.as_mut_ptr();
     if family == AF_INET {
         let saddr: u32 =
-            match bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_RCV_SADDR_OFFSET) as *const u32) {
+            match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const u32) {
                 Ok(v) => v,
                 Err(_) => 0,
             };
-        let daddr: u32 = match bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_DADDR_OFFSET) as *const u32)
+        let daddr: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const u32)
         {
             Ok(v) => v,
             Err(_) => 0,
@@ -174,13 +174,13 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         }
     } else {
         let s6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-            sk_ptr.add(SOCK_SKC_V6_RCV_SADDR_OFFSET) as *const [u8; ADDR_LEN],
+            sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const [u8; ADDR_LEN],
         ) {
             Ok(v) => v,
             Err(_) => [0u8; ADDR_LEN],
         };
         let d6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-            sk_ptr.add(SOCK_SKC_V6_DADDR_OFFSET) as *const [u8; ADDR_LEN]
+            sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN]
         ) {
             Ok(v) => v,
             Err(_) => [0u8; ADDR_LEN],

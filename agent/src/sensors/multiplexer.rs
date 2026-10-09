@@ -155,6 +155,21 @@ impl SensorMultiplexer {
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
 
+        // Multi-kernel, level 1: hand the programs the offsets resolved
+        // from THIS kernel's BTF before anything attaches. 0 = nothing
+        // published (no BTF) → the map stays unarmed, compiled-in
+        // constants apply.
+        let armed = crate::anti_tamper::btf_revalidate::arm_btf_offsets(&mut ebpf)
+            .with_context(|| "arming the BTF_OFFSETS map")?;
+        if armed > 0 {
+            info!(
+                slots = armed,
+                "BTF_OFFSETS map armed with runtime-resolved kernel offsets"
+            );
+        } else {
+            warn!("BTF_OFFSETS map NOT armed — eBPF programs use compiled-in offsets");
+        }
+
         if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
             debug!(?e, "aya-log not initialised (no logger map exported)");
         }

@@ -246,6 +246,12 @@ cmd_test_e2e() {
 
 cmd_test_ignored() {
     vm_running || die "guest is not running"
+    # Installed units hold the bpffs pins + iptables chain the tests expect
+    # to own, and the enforcing agent kills `sudo cargo` (R009: root exec
+    # from ~/.cargo/bin). Stop them first — watchdog first, or it respawns
+    # the agent. (The nightly used to do this in its dispatcher only; a
+    # stand-alone run was SIGKILLed by the agent.)
+    vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
     # --no-fail-fast: one failing test binary must not skip the other
     # targets (the first run stopped at 11 of 56 ignored tests).
     # NN_LAB_IGNORED_SKIP: substrings of test names to leave out. The RAG
@@ -482,12 +488,7 @@ nightly_run_step() {
         sync)          cmd_sync ;;
         build)         cmd_build ;;
         test-e2e)      cmd_test_e2e ;;
-        test-ignored)
-            # Installed units hold the bpffs pins + iptables chain the
-            # tests expect to own: stop them first (watchdog first, or
-            # it respawns the agent).
-            vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
-            cmd_test_ignored ;;
+        test-ignored)  cmd_test_ignored ;;
         install)       cmd_install ;;
         respawn-check) cmd_respawn_check ;;
         upgrade-check) cmd_upgrade_check ;;

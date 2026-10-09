@@ -270,6 +270,11 @@ pub const IOV_ITER_UBUF_LEN_OFFSET: usize = 24;
 /// `iov_iter` bits_offset=256 = byte 32. Unused on the ITER_UBUF path
 /// but documented for the ITER_IOVEC follow-up.
 pub const IOV_ITER_NR_SEGS_OFFSET: usize = 32;
+/// `iov_iter.__iov` (6.4+; `iov` on ≤ 6.3): kernel pointer to the iovec
+/// array for `ITER_IOVEC` sends (what glibc's `sendmmsg` resolver path
+/// produces on kernels that do not fold a single iovec into
+/// `ITER_UBUF`, i.e. ≤ 6.3). Shares the union with `ubuf` on 6.4+.
+pub const IOV_ITER_IOV_OFFSET: usize = 16;
 
 /// `struct iovec.iov_base` — `void *` to the data. `[871] STRUCT
 /// 'iovec' size=16` → `'iov_base' bits_offset=0`. Byte 0.
@@ -325,7 +330,53 @@ pub struct OffsetSpec {
     /// kernel. References the const above so there is exactly one copy
     /// of every value.
     pub expected: usize,
+    /// Alternative field paths tried in order when `field_path` does not
+    /// exist on the running kernel (multi-kernel, level 2: a field that
+    /// was renamed or re-nested between kernel versions). Each must have
+    /// the same meaning for the eBPF reader.
+    pub alt_paths: &'static [&'static [&'static str]],
 }
+
+/// One enum value the eBPF programs compare against (`iov_iter.iter_type`
+/// discriminants move between kernel versions: `ITER_UBUF` is 6 on 6.1
+/// and 0 on 6.4+). Resolved by name from the kernel's BTF and published
+/// in the `BTF_OFFSETS` map like an offset.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumSpec {
+    /// Slot-table identifier.
+    pub name: &'static str,
+    /// BTF enum type name (`enum iter_type` → `"iter_type"`).
+    pub enum_name: &'static str,
+    /// Enumerator to look up.
+    pub value_name: &'static str,
+    /// Compiled-in value (the fallback for an unarmed map).
+    pub compiled: u32,
+}
+
+/// `iov_iter.iter_type == ITER_UBUF` — the single-inline-buffer shape the
+/// DNS sensor decodes. 0 on the build kernel (6.4+ reordered the enum).
+pub const ITER_UBUF_VALUE: u32 = 0;
+
+/// `iov_iter.iter_type == ITER_IOVEC` — scatter/gather `sendmsg`; 1 on
+/// the build kernel (0 on ≤ 6.3).
+pub const ITER_IOVEC_VALUE: u32 = 1;
+
+/// Enum values resolved at boot (slots follow the offsets in
+/// [`SLOT_TABLE`]).
+pub const ENUM_VALUES: &[EnumSpec] = &[
+    EnumSpec {
+        name: "ITER_UBUF_VALUE",
+        enum_name: "iter_type",
+        value_name: "ITER_UBUF",
+        compiled: ITER_UBUF_VALUE,
+    },
+    EnumSpec {
+        name: "ITER_IOVEC_VALUE",
+        enum_name: "iter_type",
+        value_name: "ITER_IOVEC",
+        compiled: ITER_IOVEC_VALUE,
+    },
+];
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
@@ -337,248 +388,422 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         struct_name: "task_struct",
         field_path: &["tgid"],
         expected: TASK_STRUCT_TGID_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TASK_STRUCT_FLAGS_OFFSET",
         struct_name: "task_struct",
         field_path: &["flags"],
         expected: TASK_STRUCT_FLAGS_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TASK_STRUCT_MM_OFFSET",
         struct_name: "task_struct",
         field_path: &["mm"],
         expected: TASK_STRUCT_MM_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TASK_STRUCT_REAL_PARENT_OFFSET",
         struct_name: "task_struct",
         field_path: &["real_parent"],
         expected: TASK_STRUCT_REAL_PARENT_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TASK_STRUCT_START_TIME_OFFSET",
         struct_name: "task_struct",
         field_path: &["start_time"],
         expected: TASK_STRUCT_START_TIME_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TASK_STRUCT_COMM_OFFSET",
         struct_name: "task_struct",
         field_path: &["comm"],
         expected: TASK_STRUCT_COMM_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "MM_STRUCT_ARG_START_OFFSET",
         struct_name: "mm_struct",
         field_path: &["arg_start"],
         expected: MM_STRUCT_ARG_START_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "MM_STRUCT_ARG_END_OFFSET",
         struct_name: "mm_struct",
         field_path: &["arg_end"],
         expected: MM_STRUCT_ARG_END_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "DENTRY_D_INODE_OFFSET",
         struct_name: "dentry",
         field_path: &["d_inode"],
         expected: DENTRY_D_INODE_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "DENTRY_D_PARENT_OFFSET",
         struct_name: "dentry",
         field_path: &["d_parent"],
         expected: DENTRY_D_PARENT_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "DENTRY_D_NAME_OFFSET",
         struct_name: "dentry",
         field_path: &["d_name"],
         expected: DENTRY_D_NAME_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "QSTR_NAME_OFFSET",
         struct_name: "qstr",
         field_path: &["name"],
         expected: QSTR_NAME_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "QSTR_LEN_OFFSET",
         struct_name: "qstr",
         field_path: &["len"],
         expected: QSTR_LEN_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "INODE_I_SB_OFFSET",
         struct_name: "inode",
         field_path: &["i_sb"],
         expected: INODE_I_SB_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "INODE_I_INO_OFFSET",
         struct_name: "inode",
         field_path: &["i_ino"],
         expected: INODE_I_INO_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SUPER_BLOCK_S_DEV_OFFSET",
         struct_name: "super_block",
         field_path: &["s_dev"],
         expected: SUPER_BLOCK_S_DEV_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "FILE_F_INODE_OFFSET",
         struct_name: "file",
         field_path: &["f_inode"],
         expected: FILE_F_INODE_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "FILE_F_PATH_OFFSET",
         struct_name: "file",
         field_path: &["f_path"],
         expected: FILE_F_PATH_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "PATH_DENTRY_OFFSET",
         struct_name: "path",
         field_path: &["dentry"],
         expected: PATH_DENTRY_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "FILE_F_FLAGS_OFFSET",
         struct_name: "file",
         field_path: &["f_flags"],
         expected: FILE_F_FLAGS_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "FILE_F_MODE_OFFSET",
         struct_name: "file",
         field_path: &["f_mode"],
         expected: FILE_F_MODE_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_DADDR_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_daddr"],
         expected: SOCK_SKC_DADDR_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_RCV_SADDR_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_rcv_saddr"],
         expected: SOCK_SKC_RCV_SADDR_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_DPORT_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_dport"],
         expected: SOCK_SKC_DPORT_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_NUM_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_num"],
         expected: SOCK_SKC_NUM_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_FAMILY_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_family"],
         expected: SOCK_SKC_FAMILY_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_V6_DADDR_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_v6_daddr"],
         expected: SOCK_SKC_V6_DADDR_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SKC_V6_RCV_SADDR_OFFSET",
         struct_name: "sock_common",
         field_path: &["skc_v6_rcv_saddr"],
         expected: SOCK_SKC_V6_RCV_SADDR_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SK_PROTOCOL_OFFSET",
         struct_name: "sock",
         field_path: &["sk_protocol"],
         expected: SOCK_SK_PROTOCOL_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "SOCK_SK_ERR_OFFSET",
         struct_name: "sock",
         field_path: &["sk_err"],
         expected: SOCK_SK_ERR_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TCP_SOCK_BYTES_SENT_OFFSET",
         struct_name: "tcp_sock",
         field_path: &["bytes_sent"],
         expected: TCP_SOCK_BYTES_SENT_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "TCP_SOCK_BYTES_RECEIVED_OFFSET",
         struct_name: "tcp_sock",
         field_path: &["bytes_received"],
         expected: TCP_SOCK_BYTES_RECEIVED_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "IOV_ITER_ITER_TYPE_OFFSET",
         struct_name: "iov_iter",
         field_path: &["iter_type"],
         expected: IOV_ITER_ITER_TYPE_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "IOV_ITER_UBUF_BASE_OFFSET",
         struct_name: "iov_iter",
         field_path: &["__ubuf_iovec"],
         expected: IOV_ITER_UBUF_BASE_OFFSET,
+        // 6.1–6.3: the user pointer is `ubuf` inside the union after
+        // `count`; 6.4+ overlays `__ubuf_iovec` on it.
+        alt_paths: &[&["ubuf"]],
     },
     OffsetSpec {
         name: "IOV_ITER_UBUF_LEN_OFFSET",
         struct_name: "iov_iter",
         field_path: &["__ubuf_iovec", "iov_len"],
         expected: IOV_ITER_UBUF_LEN_OFFSET,
+        // 6.1–6.3: the inline buffer length is `count`.
+        alt_paths: &[&["count"]],
     },
     OffsetSpec {
         name: "IOV_ITER_NR_SEGS_OFFSET",
         struct_name: "iov_iter",
         field_path: &["nr_segs"],
         expected: IOV_ITER_NR_SEGS_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "IOVEC_IOV_BASE_OFFSET",
         struct_name: "iovec",
         field_path: &["iov_base"],
         expected: IOVEC_IOV_BASE_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "IOVEC_IOV_LEN_OFFSET",
         struct_name: "iovec",
         field_path: &["iov_len"],
         expected: IOVEC_IOV_LEN_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "MSGHDR_MSG_ITER_OFFSET",
         struct_name: "msghdr",
         field_path: &["msg_iter"],
         expected: MSGHDR_MSG_ITER_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "MSGHDR_NAME_OFFSET",
         struct_name: "msghdr",
         field_path: &["msg_name"],
         expected: MSGHDR_NAME_OFFSET,
+        alt_paths: &[],
     },
     OffsetSpec {
         name: "MSGHDR_NAMELEN_OFFSET",
         struct_name: "msghdr",
         field_path: &["msg_namelen"],
         expected: MSGHDR_NAMELEN_OFFSET,
+        alt_paths: &[],
+    },
+    OffsetSpec {
+        name: "IOV_ITER_IOV_OFFSET",
+        struct_name: "iov_iter",
+        field_path: &["__iov"],
+        expected: IOV_ITER_IOV_OFFSET,
+        // ≤ 6.3: the pointer is plainly `iov`.
+        alt_paths: &[&["iov"]],
     },
 ];
+
+// ───────────────────────────────────────
+//  Runtime offsets — the BTF_OFFSETS map contract (multi-kernel, level 1).
+// ───────────────────────────────────────
+
+/// The agent resolves every [`REVALIDATE`] entry from the running kernel's
+/// BTF at boot and writes the values into the eBPF `BTF_OFFSETS` array map
+/// (one `u32` per slot, slot 0 = [`BTF_OFFSETS_MAGIC`] once populated).
+/// The eBPF programs read offsets through `off!(NAME)`, which falls back
+/// to the compiled-in constant until the map is armed — so a kernel whose
+/// layout matches the build runs identically with or without the map, and
+/// a kernel whose layout differs (Debian 12 / 6.1: 20 of 41 offsets) runs
+/// with the resolved values instead of being refused. A field that cannot
+/// be resolved at all still refuses the boot (fail-closed, BUG-036).
+///
+/// Slot numbers follow the [`REVALIDATE`] order (index + 1); the
+/// `slot_table_matches_revalidate` test pins the mapping. The consts keep
+/// the full `*_OFFSET` name so `off!(NAME)` can map a constant to its slot.
+pub mod slot {
+    pub const TASK_STRUCT_TGID_OFFSET: u32 = 1;
+    pub const TASK_STRUCT_FLAGS_OFFSET: u32 = 2;
+    pub const TASK_STRUCT_MM_OFFSET: u32 = 3;
+    pub const TASK_STRUCT_REAL_PARENT_OFFSET: u32 = 4;
+    pub const TASK_STRUCT_START_TIME_OFFSET: u32 = 5;
+    pub const TASK_STRUCT_COMM_OFFSET: u32 = 6;
+    pub const MM_STRUCT_ARG_START_OFFSET: u32 = 7;
+    pub const MM_STRUCT_ARG_END_OFFSET: u32 = 8;
+    pub const DENTRY_D_INODE_OFFSET: u32 = 9;
+    pub const DENTRY_D_PARENT_OFFSET: u32 = 10;
+    pub const DENTRY_D_NAME_OFFSET: u32 = 11;
+    pub const QSTR_NAME_OFFSET: u32 = 12;
+    pub const QSTR_LEN_OFFSET: u32 = 13;
+    pub const INODE_I_SB_OFFSET: u32 = 14;
+    pub const INODE_I_INO_OFFSET: u32 = 15;
+    pub const SUPER_BLOCK_S_DEV_OFFSET: u32 = 16;
+    pub const FILE_F_INODE_OFFSET: u32 = 17;
+    pub const FILE_F_PATH_OFFSET: u32 = 18;
+    pub const PATH_DENTRY_OFFSET: u32 = 19;
+    pub const FILE_F_FLAGS_OFFSET: u32 = 20;
+    pub const FILE_F_MODE_OFFSET: u32 = 21;
+    pub const SOCK_SKC_DADDR_OFFSET: u32 = 22;
+    pub const SOCK_SKC_RCV_SADDR_OFFSET: u32 = 23;
+    pub const SOCK_SKC_DPORT_OFFSET: u32 = 24;
+    pub const SOCK_SKC_NUM_OFFSET: u32 = 25;
+    pub const SOCK_SKC_FAMILY_OFFSET: u32 = 26;
+    pub const SOCK_SKC_V6_DADDR_OFFSET: u32 = 27;
+    pub const SOCK_SKC_V6_RCV_SADDR_OFFSET: u32 = 28;
+    pub const SOCK_SK_PROTOCOL_OFFSET: u32 = 29;
+    pub const SOCK_SK_ERR_OFFSET: u32 = 30;
+    pub const TCP_SOCK_BYTES_SENT_OFFSET: u32 = 31;
+    pub const TCP_SOCK_BYTES_RECEIVED_OFFSET: u32 = 32;
+    pub const IOV_ITER_ITER_TYPE_OFFSET: u32 = 33;
+    pub const IOV_ITER_UBUF_BASE_OFFSET: u32 = 34;
+    pub const IOV_ITER_UBUF_LEN_OFFSET: u32 = 35;
+    pub const IOV_ITER_NR_SEGS_OFFSET: u32 = 36;
+    pub const IOVEC_IOV_BASE_OFFSET: u32 = 37;
+    pub const IOVEC_IOV_LEN_OFFSET: u32 = 38;
+    pub const MSGHDR_MSG_ITER_OFFSET: u32 = 39;
+    pub const MSGHDR_NAME_OFFSET: u32 = 40;
+    pub const MSGHDR_NAMELEN_OFFSET: u32 = 41;
+    pub const IOV_ITER_IOV_OFFSET: u32 = 42;
+}
+
+/// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
+/// values into the map by slot.
+pub const SLOT_TABLE: &[(&str, u32)] = &[
+    ("TASK_STRUCT_TGID_OFFSET", 1),
+    ("TASK_STRUCT_FLAGS_OFFSET", 2),
+    ("TASK_STRUCT_MM_OFFSET", 3),
+    ("TASK_STRUCT_REAL_PARENT_OFFSET", 4),
+    ("TASK_STRUCT_START_TIME_OFFSET", 5),
+    ("TASK_STRUCT_COMM_OFFSET", 6),
+    ("MM_STRUCT_ARG_START_OFFSET", 7),
+    ("MM_STRUCT_ARG_END_OFFSET", 8),
+    ("DENTRY_D_INODE_OFFSET", 9),
+    ("DENTRY_D_PARENT_OFFSET", 10),
+    ("DENTRY_D_NAME_OFFSET", 11),
+    ("QSTR_NAME_OFFSET", 12),
+    ("QSTR_LEN_OFFSET", 13),
+    ("INODE_I_SB_OFFSET", 14),
+    ("INODE_I_INO_OFFSET", 15),
+    ("SUPER_BLOCK_S_DEV_OFFSET", 16),
+    ("FILE_F_INODE_OFFSET", 17),
+    ("FILE_F_PATH_OFFSET", 18),
+    ("PATH_DENTRY_OFFSET", 19),
+    ("FILE_F_FLAGS_OFFSET", 20),
+    ("FILE_F_MODE_OFFSET", 21),
+    ("SOCK_SKC_DADDR_OFFSET", 22),
+    ("SOCK_SKC_RCV_SADDR_OFFSET", 23),
+    ("SOCK_SKC_DPORT_OFFSET", 24),
+    ("SOCK_SKC_NUM_OFFSET", 25),
+    ("SOCK_SKC_FAMILY_OFFSET", 26),
+    ("SOCK_SKC_V6_DADDR_OFFSET", 27),
+    ("SOCK_SKC_V6_RCV_SADDR_OFFSET", 28),
+    ("SOCK_SK_PROTOCOL_OFFSET", 29),
+    ("SOCK_SK_ERR_OFFSET", 30),
+    ("TCP_SOCK_BYTES_SENT_OFFSET", 31),
+    ("TCP_SOCK_BYTES_RECEIVED_OFFSET", 32),
+    ("IOV_ITER_ITER_TYPE_OFFSET", 33),
+    ("IOV_ITER_UBUF_BASE_OFFSET", 34),
+    ("IOV_ITER_UBUF_LEN_OFFSET", 35),
+    ("IOV_ITER_NR_SEGS_OFFSET", 36),
+    ("IOVEC_IOV_BASE_OFFSET", 37),
+    ("IOVEC_IOV_LEN_OFFSET", 38),
+    ("MSGHDR_MSG_ITER_OFFSET", 39),
+    ("MSGHDR_NAME_OFFSET", 40),
+    ("MSGHDR_NAMELEN_OFFSET", 41),
+    ("IOV_ITER_IOV_OFFSET", 42),
+];
+
+/// Enum-value slots follow the offset slots.
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 43), ("ITER_IOVEC_VALUE", 44)];
+
+/// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
+pub const ITER_UBUF_VALUE_SLOT: u32 = 43;
+/// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 44;
+
+/// Slot 0 value once the agent has written every resolved offset.
+pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
+/// Map size: the magic slot plus one slot per revalidated offset.
+pub const BTF_OFFSETS_SLOTS: u32 = 1 + REVALIDATE.len() as u32 + ENUM_VALUES.len() as u32;
 
 #[cfg(test)]
 mod tests {
@@ -589,7 +814,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 41, "REVALIDATE must cover all 41 offsets");
+        assert_eq!(REVALIDATE.len(), 42, "REVALIDATE must cover all 42 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -600,5 +825,24 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate name in REVALIDATE");
+    }
+
+    #[test]
+    fn slot_table_matches_revalidate() {
+        assert_eq!(SLOT_TABLE.len(), REVALIDATE.len());
+        for (i, (spec, (name, slot))) in REVALIDATE.iter().zip(SLOT_TABLE).enumerate() {
+            assert_eq!(spec.name, *name, "slot table out of order at {i}");
+            assert_eq!(*slot, i as u32 + 1);
+        }
+        assert_eq!(BTF_OFFSETS_SLOTS, 45);
+        assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
+        assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
+        assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
+        assert_eq!(ENUM_SLOT_TABLE[1].0, ENUM_VALUES[1].name);
+        // enum slots must not collide with offset slots
+        assert!(ENUM_SLOT_TABLE
+            .iter()
+            .all(|(_, s)| *s > REVALIDATE.len() as u32));
+        assert_eq!(slot::TASK_STRUCT_TGID_OFFSET, 1);
     }
 }

@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Multi-kernel, level 1: kernel struct offsets are resolved from the
+  running kernel's BTF at boot and published to the eBPF programs through
+  the `BTF_OFFSETS` map before any hook attaches (compiled-in values are
+  only the fallback); `iov_iter` alternative paths (≤ 6.3) and the
+  `ITER_UBUF` enumerator resolved by name. Debian 12 / kernel 6.1 now
+  runs the full e2e suites (agent 6/6, watchdog 4/4); a field absent on
+  the running kernel still refuses the boot (BUG-036, exit 78).
 - Lab: second guest Debian 12 (`NN_LAB_DISTRO=debian12`, kernel 6.1) with
   its own disk, port and reports; `docs/operator/KERNEL_COMPATIBILITY.md`
   records the verified matrix. Finding: the agent refuses to start on 6.1

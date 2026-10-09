@@ -149,7 +149,7 @@ unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
     if dentry.is_null() {
         return None;
     }
-    let slot = (dentry as *const u8).add(DENTRY_D_INODE_OFFSET) as *const *const c_void;
+    let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
     match bpf_probe_read_kernel::<*const c_void>(slot) {
         Ok(p) if !p.is_null() => Some(p),
         _ => None,
@@ -162,15 +162,15 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
     if inode.is_null() {
         return None;
     }
-    let sb_slot = (inode as *const u8).add(INODE_I_SB_OFFSET) as *const *const c_void;
+    let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
     let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
     if sb_ptr.is_null() {
         return None;
     }
-    let dev_slot = (sb_ptr as *const u8).add(SUPER_BLOCK_S_DEV_OFFSET) as *const u32;
+    let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
     let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
 
-    let ino_slot = (inode as *const u8).add(INODE_I_INO_OFFSET) as *const u64;
+    let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
     let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
 
     Some(InodeKey {
@@ -504,7 +504,7 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
     }
     bpf_printk!(b"nn-diag-ioctl-file-ok");
 
-    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
         Err(_) => {
@@ -559,7 +559,7 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
     // Only write-intent opens can mutate the file. Read first so the
     // overwhelmingly-common read path early-returns before the map
     // lookup in `deny_if_protected`.
-    let mode_slot = (file as *const u8).add(FILE_F_MODE_OFFSET) as *const u32;
+    let mode_slot = (file as *const u8).add(off!(FILE_F_MODE_OFFSET)) as *const u32;
     let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
         Ok(m) => m,
         Err(_) => return 0,
@@ -569,7 +569,7 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
     }
     bpf_printk!(b"nn-diag-open-write-intent");
 
-    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
         Err(_) => return 0,

@@ -532,11 +532,12 @@ Chiuso (8–9 ottobre 2026):
 - Release su tag `v*`: tarball, SBOM CycloneDX, `SHA256SUMS`,
   attestazione di provenienza SLSA (`gh attestation verify`)
 
-In corso:
-- Multi-kernel, livello 1: offset BTF risolti a runtime e pubblicati in
-  una mappa BPF (oggi l'agent gira solo su kernel 6.8: su Debian 12 /
-  6.1 20 offset su 41 differiscono e il gate fail-closed lo ferma —
-  rilievo 27, `docs/operator/KERNEL_COMPATIBILITY.md`)
+- Multi-kernel, livello 1 (9 ottobre): offset BTF risolti a runtime
+  dalla BTF del kernel vivo e pubblicati nella mappa `BTF_OFFSETS` prima
+  dell'attach; varianti per `iov_iter` (≤ 6.3), enumeratori `ITER_UBUF`
+  e `ITER_IOVEC` risolti per nome, QNAME DNS anche su `ITER_IOVEC`.
+  Debian 12 / 6.1 esegue tutte le suite (e2e e ignorate) come Ubuntu
+  24.04 / 6.8 (rilievo 27 chiuso, `docs/operator/KERNEL_COMPATIBILITY.md`)
 
 Pianificato, in quest'ordine:
 - Multi-kernel, livello 2: varianti per i campi instabili, matrice

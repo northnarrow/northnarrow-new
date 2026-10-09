@@ -35,7 +35,7 @@ use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
 use northnarrow_agent::anti_tamper::btf_revalidate::{
-    revalidate_offsets, RefuseReason, RevalidateOutcome,
+    publish_resolved, resolve_offsets, RefuseReason, ResolveOutcome,
 };
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
@@ -485,51 +485,69 @@ async fn main() -> Result<()> {
     // CLOSED + LOUD rather than attach hooks that read garbage. Exit 78
     // (EX_CONFIG) so the Restart=no agent unit lands in a VISIBLE `failed`
     // state; the watchdog's 5/60s restart ceiling bounds any respawn.
-    match revalidate_offsets() {
-        RevalidateOutcome::Verified { count } => {
-            info!(
-                count,
-                "BTF offset revalidation passed — all offsets match the running kernel"
-            );
+    match resolve_offsets() {
+        ResolveOutcome::Resolved(r) => {
+            if r.drifted.is_empty() {
+                info!(
+                    count = r.values.len(),
+                    "BTF offsets resolved from the running kernel — all match the compiled-in values"
+                );
+            } else {
+                info!(
+                    count = r.values.len(),
+                    drifted = r.drifted.len(),
+                    "BTF offsets resolved from the running kernel — layout differs from the build \
+                     kernel; the eBPF programs will read the resolved values (multi-kernel, level 1)"
+                );
+                for m in &r.drifted {
+                    info!(
+                        offset = m.name,
+                        kernel_struct = m.struct_name,
+                        compiled = m.expected,
+                        runtime = ?m.actual,
+                        "  offset resolved"
+                    );
+                }
+            }
+            publish_resolved(r);
         }
-        RevalidateOutcome::SkippedNoBtf { reason } => {
+        ResolveOutcome::SkippedNoBtf { reason } => {
             warn!(
                 reason,
-                "BTF unavailable — offset revalidation SKIPPED. The LSM hooks require BTF \
-                 to attach, so they will not attach this boot (the offsets are never read)."
+                "BTF unavailable — offsets cannot be resolved. The LSM hooks require BTF \
+                 to attach, so they will not attach this boot; whatever attaches uses the \
+                 compiled-in offsets."
             );
         }
-        RevalidateOutcome::Refuse(reason) => {
+        ResolveOutcome::Refuse(reason) => {
             // sysexits.h EX_CONFIG: a non-zero code systemd surfaces as a
             // `failed` unit (Restart=no ⇒ no auto-restart loop).
             const EX_CONFIG: i32 = 78;
             match reason {
-                RefuseReason::Drift(mismatches) => {
+                RefuseReason::Drift(missing) => {
                     error!(
-                        count = mismatches.len(),
-                        "BTF offset revalidation FAILED — refusing to start. The running \
-                         kernel's struct layout does not match the compiled-in offsets; \
-                         attaching LSM hooks would read the wrong kernel memory (BUG-036)."
+                        count = missing.len(),
+                        "BTF offset resolution FAILED — refusing to start. The running \
+                         kernel does not expose a field the eBPF programs read; attaching \
+                         LSM hooks would read the wrong kernel memory (BUG-036)."
                     );
-                    for m in &mismatches {
+                    for m in &missing {
                         error!(
                             offset = m.name,
                             kernel_struct = m.struct_name,
-                            expected = m.expected,
-                            actual = ?m.actual,
                             detail = %m.detail,
-                            "  offset drift"
+                            "  field unresolvable"
                         );
                     }
                     error!(
-                        "Fail-closed safety gate (BUG-036): rebuild the eBPF half against \
-                         this kernel's BTF, or run on a supported kernel (6.8.x). Exiting {EX_CONFIG}."
+                        "Fail-closed safety gate (BUG-036): this kernel needs a field \
+                         variant in common::btf_offsets (multi-kernel, level 2). Exiting {EX_CONFIG}."
                     );
                 }
                 RefuseReason::ParseError(e) => {
                     error!(
                         error = %e,
-                        "BTF present but unparseable — refusing to start. Cannot verify \
+                        "BTF present but unparseable — refusing to start. Cannot resolve \
                          kernel offsets, and aya may still attach hooks with unverified \
                          offsets. Fail-closed (BUG-036). Exiting {EX_CONFIG}."
                     );

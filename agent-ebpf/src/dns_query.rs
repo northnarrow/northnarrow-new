@@ -52,6 +52,9 @@ use crate::btf_offsets::{
     IOV_ITER_ITER_TYPE_OFFSET, IOV_ITER_UBUF_BASE_OFFSET, MSGHDR_MSG_ITER_OFFSET,
     MSGHDR_NAME_OFFSET, MSGHDR_NAMELEN_OFFSET, SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET,
     SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_V6_DADDR_OFFSET,
+    IOV_ITER_IOV_OFFSET,
+    IOV_ITER_NR_SEGS_OFFSET,
+    IOVEC_IOV_BASE_OFFSET,
 };
 
 #[map]
@@ -64,6 +67,8 @@ const AF_INET6: u16 = 10;
 // `iov_iter.iter_type` discriminant value for a single inline user
 // buffer (the connected-UDP `send()` shape). See `btf_offsets.rs`.
 const ITER_UBUF: u8 = 0;
+// `ITER_IOVEC` discriminant on the build kernel (0 on ≤ 6.3).
+const ITER_IOVEC: u8 = 1;
 
 // DNS message header is a fixed 12 bytes; the QNAME starts right after.
 const DNS_HEADER_LEN: usize = 12;
@@ -190,7 +195,7 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
 #[inline(always)]
 pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64> {
     let name_ptr: *const u8 = match unsafe {
-        bpf_probe_read_kernel::<*const u8>(msg_ptr.add(MSGHDR_NAME_OFFSET) as *const _)
+        bpf_probe_read_kernel::<*const u8>(msg_ptr.add(off!(MSGHDR_NAME_OFFSET)) as *const _)
     } {
         Ok(p) => p,
         Err(_) => return Ok(None),
@@ -199,7 +204,7 @@ pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64
         return Ok(None);
     }
     let namelen: i32 = match unsafe {
-        bpf_probe_read_kernel::<i32>(msg_ptr.add(MSGHDR_NAMELEN_OFFSET) as *const _)
+        bpf_probe_read_kernel::<i32>(msg_ptr.add(off!(MSGHDR_NAMELEN_OFFSET)) as *const _)
     } {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -265,13 +270,13 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
         return Ok(None);
     }
     let family: u16 =
-        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(SOCK_SKC_FAMILY_OFFSET) as *const _) }
+        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const _) }
         {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
     let port_be: u16 =
-        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(SOCK_SKC_DPORT_OFFSET) as *const _) }
+        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const _) }
         {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -280,7 +285,7 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
     match family {
         AF_INET => {
             let daddr: u32 = match unsafe {
-                bpf_probe_read_kernel::<u32>(sk_ptr.add(SOCK_SKC_DADDR_OFFSET) as *const _)
+                bpf_probe_read_kernel::<u32>(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const _)
             } {
                 Ok(v) => v,
                 Err(_) => return Ok(None),
@@ -300,7 +305,7 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
         AF_INET6 => {
             let v6: [u8; ADDR_LEN] = match unsafe {
                 bpf_probe_read_kernel::<[u8; ADDR_LEN]>(
-                    sk_ptr.add(SOCK_SKC_V6_DADDR_OFFSET) as *const _
+                    sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const _
                 )
             } {
                 Ok(v) => v,
@@ -330,26 +335,72 @@ fn extract_qname(msg_ptr: *const u8, raw_ptr: *mut DnsQueryRaw) -> (u16, u16) {
     // iter_type discriminant.
     let iter_type: u8 = match unsafe {
         bpf_probe_read_kernel::<u8>(
-            msg_ptr.add(MSGHDR_MSG_ITER_OFFSET + IOV_ITER_ITER_TYPE_OFFSET) as *const _,
+            msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_ITER_TYPE_OFFSET)) as *const _,
         )
     } {
         Ok(v) => v,
         Err(_) => return (0, 0),
     };
-    if iter_type != ITER_UBUF {
-        // ITER_IOVEC / ITER_KVEC / ITER_BVEC — documented follow-up.
+    // `ITER_UBUF` moved from 6 (≤ 6.3) to 0 (6.4+): take the value the
+    // agent resolved from this kernel's BTF, falling back to the compiled
+    // constant while the map is unarmed.
+    let iter_ubuf = crate::btf_offsets::rt(
+        northnarrow_common::btf_offsets::ITER_UBUF_VALUE_SLOT,
+        ITER_UBUF as usize,
+    ) as u8;
+    let iter_iovec = crate::btf_offsets::rt(
+        northnarrow_common::btf_offsets::ITER_IOVEC_VALUE_SLOT,
+        ITER_IOVEC as usize,
+    ) as u8;
+    let buf_ptr: *const u8 = if iter_type == iter_ubuf {
+        // ITER_UBUF: the inline iovec's iov_base sits at the union start
+        // and is a *user* pointer to the datagram the caller is sending.
+        match unsafe {
+            bpf_probe_read_kernel::<*const u8>(
+                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_UBUF_BASE_OFFSET))
+                    as *const _,
+            )
+        } {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        }
+    } else if iter_type == iter_iovec {
+        // ITER_IOVEC with a single segment: what glibc's sendmmsg-based
+        // resolver produces on kernels ≤ 6.3 (6.4+ folds one iovec into
+        // ITER_UBUF). The iovec array was copied into kernel memory by
+        // import_iovec; its first entry's iov_base is the user datagram.
+        let nr_segs: usize = match unsafe {
+            bpf_probe_read_kernel::<usize>(
+                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_NR_SEGS_OFFSET))
+                    as *const _,
+            )
+        } {
+            Ok(n) => n,
+            Err(_) => return (0, 0),
+        };
+        if nr_segs != 1 {
+            return (0, 0);
+        }
+        let iov: *const u8 = match unsafe {
+            bpf_probe_read_kernel::<*const u8>(
+                msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_IOV_OFFSET)) as *const _,
+            )
+        } {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        };
+        if iov.is_null() {
+            return (0, 0);
+        }
+        match unsafe {
+            bpf_probe_read_kernel::<*const u8>(iov.add(off!(IOVEC_IOV_BASE_OFFSET)) as *const _)
+        } {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        }
+    } else {
+        // ITER_KVEC / ITER_BVEC / multi-segment — documented miss.
         return (0, 0);
-    }
-
-    // For ITER_UBUF the inline iovec's iov_base sits at the union start
-    // and is a *user* pointer to the datagram the caller is sending.
-    let buf_ptr: *const u8 = match unsafe {
-        bpf_probe_read_kernel::<*const u8>(
-            msg_ptr.add(MSGHDR_MSG_ITER_OFFSET + IOV_ITER_UBUF_BASE_OFFSET) as *const _,
-        )
-    } {
-        Ok(p) => p,
-        Err(_) => return (0, 0),
     };
     if buf_ptr.is_null() {
         return (0, 0);

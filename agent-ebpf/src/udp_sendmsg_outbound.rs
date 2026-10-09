@@ -126,7 +126,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
     };
 
     let sk_family: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_FAMILY_OFFSET) as *const u16) } {
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16) } {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
@@ -135,7 +135,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
     }
 
     let dport_be: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_DPORT_OFFSET) as *const u16) } {
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16) } {
             Ok(v) => v,
             Err(_) => 0,
         };
@@ -146,7 +146,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
         let mut addr = [0u8; ADDR_LEN];
         if sk_family == AF_INET {
             let daddr: u32 = match unsafe {
-                bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_DADDR_OFFSET) as *const u32)
+                bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const u32)
             } {
                 Ok(v) => v,
                 Err(_) => 0,
@@ -159,7 +159,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
             }
         } else {
             addr = match unsafe {
-                bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_V6_DADDR_OFFSET) as *const [u8; ADDR_LEN])
+                bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN])
             } {
                 Ok(v) => v,
                 Err(_) => [0u8; ADDR_LEN],
@@ -195,7 +195,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
     }
 
     let sport_host: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_NUM_OFFSET) as *const u16) } {
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16) } {
             Ok(v) => v,
             Err(_) => 0,
         };
@@ -270,7 +270,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
         if dst.family == sk_family {
             if sk_family == AF_INET {
                 let saddr: u32 = match bpf_probe_read_kernel(
-                    sk_ptr.add(SOCK_SKC_RCV_SADDR_OFFSET) as *const u32,
+                    sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const u32,
                 ) {
                     Ok(v) => v,
                     Err(_) => 0,
@@ -283,7 +283,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
                 }
             } else {
                 let s6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-                    sk_ptr.add(SOCK_SKC_V6_RCV_SADDR_OFFSET) as *const [u8; ADDR_LEN],
+                    sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const [u8; ADDR_LEN],
                 ) {
                     Ok(v) => v,
                     Err(_) => [0u8; ADDR_LEN],
