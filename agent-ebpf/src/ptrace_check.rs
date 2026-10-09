@@ -106,7 +106,7 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // CO-RE relocation we don't yet emit from Rust. Offset is
     // shared with `task_kill` and validated by userland at boot
     // against `/sys/kernel/btf/vmlinux`.
-    let tgid_ptr = (target as *const u8).add(TASK_STRUCT_TGID_OFFSET) as *const u32;
+    let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
     let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
         Ok(v) => v,
         Err(_) => return 0,

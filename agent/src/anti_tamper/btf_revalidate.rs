@@ -35,8 +35,11 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::sync::OnceLock;
 
-use common::btf_offsets::{OffsetSpec, REVALIDATE};
+use common::btf_offsets::{
+    EnumSpec, OffsetSpec, BTF_OFFSETS_MAGIC, ENUM_SLOT_TABLE, ENUM_VALUES, REVALIDATE, SLOT_TABLE,
+};
 
 /// The running kernel's BTF, exported by the kernel when built with
 /// `CONFIG_DEBUG_INFO_BTF=y` (every supported target kernel).
@@ -99,7 +102,7 @@ pub enum RefuseReason {
 }
 
 /// A single offset that failed revalidation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Mismatch {
     /// The const's identifier (from [`OffsetSpec::name`]).
     pub name: &'static str,
@@ -132,6 +135,176 @@ pub fn revalidate_offsets() -> RevalidateOutcome {
         Err(e) => return RevalidateOutcome::Refuse(RefuseReason::ParseError(e.to_string())),
     };
     revalidate_with(&btf, REVALIDATE)
+}
+
+// ── runtime offsets (multi-kernel, level 1) ───────────────────────────
+
+/// Every [`REVALIDATE`] offset resolved from the running kernel.
+#[derive(Debug, Clone)]
+pub struct ResolvedOffsets {
+    /// `(slot, byte offset)` ready to be written into the eBPF
+    /// `BTF_OFFSETS` map (slot numbers from [`SLOT_TABLE`]).
+    pub values: Vec<(u32, u32)>,
+    /// Offsets whose resolved value differs from the compiled-in
+    /// constant. Informational: the map carries the right value, the
+    /// constant is only the fallback for an unarmed map.
+    pub drifted: Vec<Mismatch>,
+}
+
+/// Outcome of [`resolve_offsets`].
+#[derive(Debug)]
+pub enum ResolveOutcome {
+    /// Every offset resolved (drift, if any, is listed inside).
+    Resolved(ResolvedOffsets),
+    /// `/sys/kernel/btf/vmlinux` is absent: nothing can be resolved and
+    /// the LSM hooks will not attach either; the compiled-in constants
+    /// stay in force for whatever does attach.
+    SkippedNoBtf { reason: String },
+    /// BTF unparseable, or at least one field does not exist on this
+    /// kernel — refuse to start (fail-closed, BUG-036).
+    Refuse(RefuseReason),
+}
+
+/// Resolve every offset from the running kernel's BTF. A kernel whose
+/// layout merely differs from the build is **supported** (the values go
+/// into the map); a kernel missing a field is refused.
+pub fn resolve_offsets() -> ResolveOutcome {
+    let data = match fs::read(VMLINUX_BTF) {
+        Ok(d) => d,
+        Err(e) => {
+            return ResolveOutcome::SkippedNoBtf {
+                reason: format!("{VMLINUX_BTF}: {e}"),
+            }
+        }
+    };
+    let btf = match Btf::parse(&data) {
+        Ok(b) => b,
+        Err(e) => return ResolveOutcome::Refuse(RefuseReason::ParseError(e.to_string())),
+    };
+    resolve_with(&btf, REVALIDATE, ENUM_VALUES)
+}
+
+fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveOutcome {
+    let mut values = Vec::with_capacity(specs.len());
+    let mut drifted = Vec::new();
+    let mut missing = Vec::new();
+    for spec in specs {
+        let slot = SLOT_TABLE
+            .iter()
+            .find(|(n, _)| *n == spec.name)
+            .map(|(_, s)| *s);
+        let mut resolved = btf.resolve_path(spec.struct_name, spec.field_path);
+        if resolved.is_err() {
+            for alt in spec.alt_paths {
+                if let Ok(v) = btf.resolve_path(spec.struct_name, alt) {
+                    resolved = Ok(v);
+                    break;
+                }
+            }
+        }
+        match (resolved, slot) {
+            (Ok(actual), Some(slot)) => {
+                if actual != spec.expected {
+                    drifted.push(Mismatch {
+                        name: spec.name,
+                        struct_name: spec.struct_name,
+                        expected: spec.expected,
+                        actual: Some(actual),
+                        detail: format!("compiled {} → runtime {actual}", spec.expected),
+                    });
+                }
+                values.push((slot, actual as u32));
+            }
+            (Ok(_), None) => missing.push(Mismatch {
+                name: spec.name,
+                struct_name: spec.struct_name,
+                expected: spec.expected,
+                actual: None,
+                detail: "no BTF_OFFSETS slot for this spec (SLOT_TABLE out of sync)".into(),
+            }),
+            (Err(e), _) => missing.push(Mismatch {
+                name: spec.name,
+                struct_name: spec.struct_name,
+                expected: spec.expected,
+                actual: None,
+                detail: e.to_string(),
+            }),
+        }
+    }
+    for e in enums {
+        let slot = ENUM_SLOT_TABLE
+            .iter()
+            .find(|(n, _)| *n == e.name)
+            .map(|(_, s)| *s);
+        match (btf.resolve_enum(e.enum_name, e.value_name), slot) {
+            (Ok(v), Some(slot)) => {
+                if v as u32 != e.compiled {
+                    drifted.push(Mismatch {
+                        name: e.name,
+                        struct_name: e.enum_name,
+                        expected: e.compiled as usize,
+                        actual: Some(v as usize),
+                        detail: format!("enum value compiled {} → runtime {v}", e.compiled),
+                    });
+                }
+                values.push((slot, v as u32));
+            }
+            (res, _) => missing.push(Mismatch {
+                name: e.name,
+                struct_name: e.enum_name,
+                expected: e.compiled as usize,
+                actual: None,
+                detail: match res {
+                    Err(err) => err.to_string(),
+                    Ok(_) => {
+                        "no BTF_OFFSETS slot for this enum (ENUM_SLOT_TABLE out of sync)".into()
+                    }
+                },
+            }),
+        }
+    }
+    if missing.is_empty() {
+        ResolveOutcome::Resolved(ResolvedOffsets { values, drifted })
+    } else {
+        ResolveOutcome::Refuse(RefuseReason::Drift(missing))
+    }
+}
+
+static RESOLVED: OnceLock<ResolvedOffsets> = OnceLock::new();
+
+/// Publish the boot-time resolution for [`arm_btf_offsets`]. Idempotent;
+/// the first value wins.
+pub fn publish_resolved(r: ResolvedOffsets) {
+    let _ = RESOLVED.set(r);
+}
+
+/// Resolution published at boot, if any.
+pub fn resolved() -> Option<&'static ResolvedOffsets> {
+    RESOLVED.get()
+}
+
+/// Write the published offsets into the loaded object's `BTF_OFFSETS`
+/// map and arm it (slot 0 = magic). Must run after `EbpfLoader::load`
+/// and BEFORE any program is attached. With nothing published (no BTF
+/// on this kernel) the map stays unarmed and the programs use their
+/// compiled-in constants, exactly as before runtime offsets existed.
+pub fn arm_btf_offsets(ebpf: &mut aya::Ebpf) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let Some(r) = resolved() else {
+        return Ok(0);
+    };
+    let map = ebpf
+        .map_mut("BTF_OFFSETS")
+        .context("BTF_OFFSETS map missing from the eBPF object")?;
+    let mut arr: aya::maps::Array<_, u32> =
+        aya::maps::Array::try_from(map).context("BTF_OFFSETS is not an Array<u32>")?;
+    for (slot, value) in &r.values {
+        arr.set(*slot, *value, 0)
+            .with_context(|| format!("BTF_OFFSETS slot {slot} write"))?;
+    }
+    arr.set(0, BTF_OFFSETS_MAGIC, 0)
+        .context("BTF_OFFSETS magic write")?;
+    Ok(r.values.len())
 }
 
 /// Core comparison, split out so tests can drive it with synthetic BTF
@@ -237,7 +410,10 @@ enum Ty {
     /// A type that transparently forwards to another (typedef / const /
     /// volatile / restrict) — followed during navigation.
     Forward { type_id: u32 },
-    /// Anything we don't navigate into (int, ptr, enum, array, …). A
+    /// A (32-bit) enum: `(name_off, value)` per enumerator — looked up
+    /// by name for the enum-value relocations (multi-kernel, level 2).
+    Enum { values: Vec<(u32, i32)> },
+    /// Anything we don't navigate into (int, ptr, array, …). A
     /// pointer is Opaque on purpose: field paths never cross a pointer.
     Opaque,
 }
@@ -354,7 +530,25 @@ impl Btf {
                     p += 12;
                     types.push(Ty::Opaque);
                 }
-                KIND_ENUM | KIND_FUNC_PROTO => {
+                KIND_ENUM => {
+                    let base0 = p;
+                    if base0 + vlen * 8 > data.len() {
+                        return Err(ParseError(format!("enum members OOB in type {id}")));
+                    }
+                    let mut values = Vec::with_capacity(vlen);
+                    for i in 0..vlen {
+                        let base = base0 + i * 8;
+                        values.push((r.u32(base)?, r.u32(base + 4)? as i32));
+                    }
+                    p += vlen * 8;
+                    if name_off != 0 {
+                        if let Ok(nm) = name_at(&strings, name_off) {
+                            name_to_id.entry(nm.to_string()).or_insert(id);
+                        }
+                    }
+                    types.push(Ty::Enum { values });
+                }
+                KIND_FUNC_PROTO => {
                     p += vlen * 8;
                     types.push(Ty::Opaque);
                 }
@@ -396,7 +590,7 @@ impl Btf {
             match self.types.get(id as usize)? {
                 Ty::Composite { .. } => return Some(id),
                 Ty::Forward { type_id } => id = *type_id,
-                Ty::Opaque => return None,
+                Ty::Enum { .. } | Ty::Opaque => return None,
             }
         }
         None
@@ -429,6 +623,30 @@ impl Btf {
     }
 
     /// Resolve a `(struct, field_path)` to a byte offset.
+    /// Value of enumerator `value_name` in the named enum `enum_name`.
+    fn resolve_enum(&self, enum_name: &str, value_name: &str) -> Result<i32, ResolveError> {
+        let id = *self
+            .name_to_id
+            .get(enum_name)
+            .ok_or_else(|| ResolveError::StructNotFound(enum_name.to_string()))?;
+        let Some(Ty::Enum { values }) = self.types.get(id as usize) else {
+            return Err(ResolveError::StructNotFound(format!(
+                "{enum_name} is not an enum"
+            )));
+        };
+        for (name_off, v) in values {
+            if name_at(&self.strings, *name_off)
+                .map(|n| n == value_name)
+                .unwrap_or(false)
+            {
+                return Ok(*v);
+            }
+        }
+        Err(ResolveError::FieldNotFound(format!(
+            "{enum_name}.{value_name}"
+        )))
+    }
+
     fn resolve_path(&self, struct_name: &str, field_path: &[&str]) -> Result<usize, ResolveError> {
         let id = *self
             .name_to_id
@@ -660,18 +878,21 @@ mod tests {
                 struct_name: "outer",
                 field_path: &["a"],
                 expected: 0,
+                alt_paths: &[],
             },
             OffsetSpec {
                 name: "INNER_X",
                 struct_name: "inner",
                 field_path: &["x"],
                 expected: 8,
+                alt_paths: &[],
             },
             OffsetSpec {
                 name: "EMB_X",
                 struct_name: "outer",
                 field_path: &["emb", "x"],
                 expected: 24,
+                alt_paths: &[],
             },
         ];
         match revalidate_with(&btf, specs) {
@@ -689,18 +910,21 @@ mod tests {
                 struct_name: "outer",
                 field_path: &["a"],
                 expected: 0,
+                alt_paths: &[],
             }, // ok
             OffsetSpec {
                 name: "INNER_X_WRONG",
                 struct_name: "inner",
                 field_path: &["x"],
                 expected: 99,
+                alt_paths: &[],
             }, // drift
             OffsetSpec {
                 name: "GHOST",
                 struct_name: "ghost",
                 field_path: &["x"],
                 expected: 0,
+                alt_paths: &[],
             }, // missing
         ];
         match revalidate_with(&btf, specs) {
@@ -757,6 +981,64 @@ mod tests {
             RevalidateOutcome::Refuse(RefuseReason::ParseError(e)) => {
                 panic!("BTF parse error on the running kernel: {e}");
             }
+        }
+    }
+
+    #[test]
+    fn resolve_with_reports_drift_but_resolves() {
+        let btf = parsed();
+        // Use real SLOT_TABLE names so slots resolve; outer.a is byte 0,
+        // inner.x is byte 8 in the fixture.
+        let specs = &[
+            OffsetSpec {
+                name: SLOT_TABLE[0].0,
+                struct_name: "outer",
+                field_path: &["a"],
+                expected: 0,
+                alt_paths: &[],
+            },
+            OffsetSpec {
+                name: SLOT_TABLE[1].0,
+                struct_name: "inner",
+                field_path: &["x"],
+                expected: 4, // compiled-in value "wrong" for this kernel
+                alt_paths: &[],
+            },
+        ];
+        match resolve_with(&btf, specs, &[]) {
+            ResolveOutcome::Resolved(r) => {
+                assert_eq!(r.values, vec![(SLOT_TABLE[0].1, 0), (SLOT_TABLE[1].1, 8)]);
+                assert_eq!(r.drifted.len(), 1);
+                assert_eq!(r.drifted[0].actual, Some(8));
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_with_refuses_on_missing_field() {
+        let btf = parsed();
+        let specs = &[OffsetSpec {
+            name: SLOT_TABLE[0].0,
+            struct_name: "outer",
+            field_path: &["zzz"],
+            expected: 0,
+            alt_paths: &[],
+        }];
+        assert!(matches!(
+            resolve_with(&btf, specs, &[]),
+            ResolveOutcome::Refuse(RefuseReason::Drift(m)) if m.len() == 1 && m[0].actual.is_none()
+        ));
+    }
+
+    #[test]
+    fn every_revalidate_spec_has_a_slot() {
+        for spec in REVALIDATE {
+            assert!(
+                SLOT_TABLE.iter().any(|(n, _)| *n == spec.name),
+                "{}",
+                spec.name
+            );
         }
     }
 }

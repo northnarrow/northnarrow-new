@@ -57,7 +57,7 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
     // bpf_probe_read_kernel + the validated offsets. Each read
     // is unsafe but bounded to a single primitive read.
     let family: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_FAMILY_OFFSET) as *const u16) } {
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16) } {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
@@ -68,12 +68,12 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
         return Ok(());
     }
     let proto: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SK_PROTOCOL_OFFSET) as *const u16) } {
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SK_PROTOCOL_OFFSET)) as *const u16) } {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
     let bind_port_host: u16 =
-        match unsafe { bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_NUM_OFFSET) as *const u16) } {
+        match unsafe { bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16) } {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
@@ -103,7 +103,7 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
         if family == AF_INET {
             // skc_rcv_saddr is u32; copy into first 4 bytes of slot.
             let saddr: u32 =
-                match bpf_probe_read_kernel(sk_ptr.add(SOCK_SKC_RCV_SADDR_OFFSET) as *const u32) {
+                match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const u32) {
                     Ok(v) => v,
                     Err(_) => 0,
                 };
@@ -120,7 +120,7 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
         } else {
             // AF_INET6 — 16 bytes from skc_v6_rcv_saddr.
             let v6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-                sk_ptr.add(SOCK_SKC_V6_RCV_SADDR_OFFSET) as *const [u8; ADDR_LEN],
+                sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const [u8; ADDR_LEN],
             ) {
                 Ok(v) => v,
                 Err(_) => [0u8; ADDR_LEN],

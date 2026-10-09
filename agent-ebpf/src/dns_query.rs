@@ -190,7 +190,7 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
 #[inline(always)]
 pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64> {
     let name_ptr: *const u8 = match unsafe {
-        bpf_probe_read_kernel::<*const u8>(msg_ptr.add(MSGHDR_NAME_OFFSET) as *const _)
+        bpf_probe_read_kernel::<*const u8>(msg_ptr.add(off!(MSGHDR_NAME_OFFSET)) as *const _)
     } {
         Ok(p) => p,
         Err(_) => return Ok(None),
@@ -199,7 +199,7 @@ pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64
         return Ok(None);
     }
     let namelen: i32 = match unsafe {
-        bpf_probe_read_kernel::<i32>(msg_ptr.add(MSGHDR_NAMELEN_OFFSET) as *const _)
+        bpf_probe_read_kernel::<i32>(msg_ptr.add(off!(MSGHDR_NAMELEN_OFFSET)) as *const _)
     } {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -265,13 +265,13 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
         return Ok(None);
     }
     let family: u16 =
-        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(SOCK_SKC_FAMILY_OFFSET) as *const _) }
+        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const _) }
         {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
     let port_be: u16 =
-        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(SOCK_SKC_DPORT_OFFSET) as *const _) }
+        match unsafe { bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const _) }
         {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -280,7 +280,7 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
     match family {
         AF_INET => {
             let daddr: u32 = match unsafe {
-                bpf_probe_read_kernel::<u32>(sk_ptr.add(SOCK_SKC_DADDR_OFFSET) as *const _)
+                bpf_probe_read_kernel::<u32>(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const _)
             } {
                 Ok(v) => v,
                 Err(_) => return Ok(None),
@@ -300,7 +300,7 @@ pub(crate) fn dest_from_sock(sk_ptr: *const u8) -> Result<Option<Dest>, i64> {
         AF_INET6 => {
             let v6: [u8; ADDR_LEN] = match unsafe {
                 bpf_probe_read_kernel::<[u8; ADDR_LEN]>(
-                    sk_ptr.add(SOCK_SKC_V6_DADDR_OFFSET) as *const _
+                    sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const _
                 )
             } {
                 Ok(v) => v,
@@ -330,13 +330,20 @@ fn extract_qname(msg_ptr: *const u8, raw_ptr: *mut DnsQueryRaw) -> (u16, u16) {
     // iter_type discriminant.
     let iter_type: u8 = match unsafe {
         bpf_probe_read_kernel::<u8>(
-            msg_ptr.add(MSGHDR_MSG_ITER_OFFSET + IOV_ITER_ITER_TYPE_OFFSET) as *const _,
+            msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_ITER_TYPE_OFFSET)) as *const _,
         )
     } {
         Ok(v) => v,
         Err(_) => return (0, 0),
     };
-    if iter_type != ITER_UBUF {
+    // `ITER_UBUF` moved from 6 (≤ 6.3) to 0 (6.4+): take the value the
+    // agent resolved from this kernel's BTF, falling back to the compiled
+    // constant while the map is unarmed.
+    let iter_ubuf = crate::btf_offsets::rt(
+        northnarrow_common::btf_offsets::ITER_UBUF_VALUE_SLOT,
+        ITER_UBUF as usize,
+    ) as u8;
+    if iter_type != iter_ubuf {
         // ITER_IOVEC / ITER_KVEC / ITER_BVEC — documented follow-up.
         return (0, 0);
     }
@@ -345,7 +352,7 @@ fn extract_qname(msg_ptr: *const u8, raw_ptr: *mut DnsQueryRaw) -> (u16, u16) {
     // and is a *user* pointer to the datagram the caller is sending.
     let buf_ptr: *const u8 = match unsafe {
         bpf_probe_read_kernel::<*const u8>(
-            msg_ptr.add(MSGHDR_MSG_ITER_OFFSET + IOV_ITER_UBUF_BASE_OFFSET) as *const _,
+            msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET) + off!(IOV_ITER_UBUF_BASE_OFFSET)) as *const _,
         )
     } {
         Ok(p) => p,

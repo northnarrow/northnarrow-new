@@ -133,7 +133,7 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
     if method == MODULE_LOAD_FINIT && !file.is_null() {
         // file → f_path.dentry (the source .ko's leaf dentry).
         let dentry_slot =
-            (file as *const u8).add(FILE_F_PATH_OFFSET + PATH_DENTRY_OFFSET) as *const *const u8;
+            (file as *const u8).add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const *const u8;
         if let Ok(leaf) = bpf_probe_read_kernel::<*const u8>(dentry_slot) {
             if !leaf.is_null() {
                 let (n, truncated) = walk_components(leaf, (*raw).path.as_mut_ptr());
@@ -184,7 +184,7 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
         };
         // dentry->d_name.name (struct qstr → const u8*).
         let name_pp =
-            dentry.add(DENTRY_D_NAME_OFFSET + QSTR_NAME_OFFSET) as *const *const u8;
+            dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)) as *const *const u8;
         if let Ok(name_ptr) = bpf_probe_read_kernel::<*const u8>(name_pp) {
             if !name_ptr.is_null() {
                 let slot = core::slice::from_raw_parts_mut(dst.add(off), MODULE_PATH_SLOT_LEN);
@@ -195,7 +195,7 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
         // Step to the parent; stop at the root (d_parent == self) or a
         // failed/null read. Only `d_parent == self` means "root reached";
         // a failed read counts as truncated too (prefix unknown).
-        match bpf_probe_read_kernel::<*const u8>(dentry.add(DENTRY_D_PARENT_OFFSET) as *const *const u8) {
+        match bpf_probe_read_kernel::<*const u8>(dentry.add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const u8) {
             Ok(p) if !p.is_null() && p != dentry => dentry = p,
             Ok(p) if p == dentry => {
                 reached_root = true;
@@ -220,15 +220,15 @@ unsafe fn fill_parent(raw: *mut ModuleLoadRaw) {
         return;
     }
     let parent = match bpf_probe_read_kernel::<*const u8>(
-        task.add(TASK_STRUCT_REAL_PARENT_OFFSET) as *const *const u8,
+        task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
     ) {
         Ok(p) if !p.is_null() => p,
         _ => return,
     };
     let comm_slot = core::slice::from_raw_parts_mut((*raw).parent_comm.as_mut_ptr(), COMM_LEN);
-    let _ = bpf_probe_read_kernel_str_bytes(parent.add(TASK_STRUCT_COMM_OFFSET), comm_slot);
+    let _ = bpf_probe_read_kernel_str_bytes(parent.add(off!(TASK_STRUCT_COMM_OFFSET)), comm_slot);
     if let Ok(flags) =
-        bpf_probe_read_kernel::<u32>(parent.add(TASK_STRUCT_FLAGS_OFFSET) as *const u32)
+        bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32)
     {
         if flags & PF_KTHREAD != 0 {
             (*raw).parent_is_kthread = 1;

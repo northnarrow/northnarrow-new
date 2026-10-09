@@ -147,7 +147,7 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     // pointer is a kernel-trusted `PTR_TO_BTF_ID`, but we use the
     // explicit helper so the verifier accepts the read without a
     // CO-RE relocation we don't yet emit from Rust.
-    let tgid_ptr = (target as *const u8).add(TASK_STRUCT_TGID_OFFSET) as *const u32;
+    let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
     let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
         Ok(v) => v,
         Err(_) => return 0,

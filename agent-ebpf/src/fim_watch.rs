@@ -186,7 +186,7 @@ unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
     if dentry.is_null() {
         return None;
     }
-    let slot = (dentry as *const u8).add(DENTRY_D_INODE_OFFSET) as *const *const c_void;
+    let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
     match bpf_probe_read_kernel::<*const c_void>(slot) {
         Ok(p) if !p.is_null() => Some(p),
         _ => None,
@@ -203,14 +203,14 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
     if inode.is_null() {
         return None;
     }
-    let sb_slot = (inode as *const u8).add(INODE_I_SB_OFFSET) as *const *const c_void;
+    let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
     let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
     if sb_ptr.is_null() {
         return None;
     }
-    let dev_slot = (sb_ptr as *const u8).add(SUPER_BLOCK_S_DEV_OFFSET) as *const u32;
+    let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
     let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
-    let ino_slot = (inode as *const u8).add(INODE_I_INO_OFFSET) as *const u64;
+    let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
     let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
     Some(InodeKey {
         dev: dev as u64,
@@ -369,7 +369,7 @@ unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
     if file.is_null() {
         return None;
     }
-    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) if !p.is_null() => Some(p),
         _ => None,
@@ -389,7 +389,7 @@ unsafe fn read_child_leaf(child_dentry: *const c_void, dst: &mut [u8; FIM_CHILD_
         return 0;
     }
     let name_ptr_slot = (child_dentry as *const u8)
-        .add(DENTRY_D_NAME_OFFSET + QSTR_NAME_OFFSET)
+        .add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))
         as *const *const u8;
     let name_ptr = match bpf_probe_read_kernel::<*const u8>(name_ptr_slot) {
         Ok(p) if !p.is_null() => p,
@@ -402,7 +402,7 @@ unsafe fn read_child_leaf(child_dentry: *const c_void, dst: &mut [u8; FIM_CHILD_
     // Truncation: a leaf whose true length (excl. NUL) doesn't fit the
     // buffer sets the flag so userland rules don't lose a suffix.
     let len_slot =
-        (child_dentry as *const u8).add(DENTRY_D_NAME_OFFSET + QSTR_LEN_OFFSET) as *const u32;
+        (child_dentry as *const u8).add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_LEN_OFFSET)) as *const u32;
     let true_len = bpf_probe_read_kernel::<u32>(len_slot).unwrap_or(0) as usize;
     if true_len >= FIM_CHILD_NAME_LEN {
         FIM_CHILD_TRUNCATED
@@ -619,7 +619,7 @@ unsafe fn try_fim_file_open_observe(ctx: &LsmContext) -> i32 {
     if file.is_null() {
         return 0;
     }
-    let inode_slot = (file as *const u8).add(FILE_F_INODE_OFFSET) as *const *const c_void;
+    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
         Err(_) => return 0,
