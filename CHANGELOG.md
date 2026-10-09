@@ -5,6 +5,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Fixed
+- Lab/test only: `privileged_map_pin` and the watchdog 3-cycle respawn
+  e2e evict the agent from PROTECTED_PIDS before signalling it (the
+  `task_kill` deny-by-default policy refuses a bare SIGQUIT/SIGKILL);
+  two illustrative doctests re-fenced as text.
+
+## [0.0.1] - 2026-10-09
+
+Tag `v0.0.1-tappa9.0`: everything up to Tappa 9.0 plus the 2026-10-08/09
+hardening round (PR #145, #155–#170). All High/Medium findings of
+`docs/audit/NN_BUG_AUDIT_2026-06-09.md` and
+`docs/audit/NN_REVIEW_2026-10-08.md` closed and verified on the QEMU lab
+guest (kernel 6.8, BPF-LSM).
+
 ### Security / safety
 - RAG release gates (golden ≥ 90 %, latency, e2e format) fail fast when
   `target/kb` is missing instead of silently benchmarking the built-in
