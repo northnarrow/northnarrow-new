@@ -78,6 +78,16 @@ struct Cli {
     #[arg(long = "detect-only", default_value_t = false)]
     detect_only: bool,
 
+    /// Compatibility check only: resolve every kernel struct offset and
+    /// enumerator the eBPF programs need against the given BTF file
+    /// (`/sys/kernel/btf/vmlinux` of this or another kernel, or a BTF
+    /// extracted from a distro kernel package), print the report and
+    /// exit — 0 when everything resolves, 2 when a field is missing
+    /// (that kernel would be refused at boot), 3 on unreadable/unparseable
+    /// BTF. No eBPF is loaded, no root needed. Multi-kernel level 2.
+    #[arg(long = "btf-check", value_name = "BTF_FILE")]
+    btf_check: Option<PathBuf>,
+
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
     ade_model: Option<PathBuf>,
@@ -456,6 +466,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(path) = &cli.btf_check {
+        std::process::exit(btf_check(path));
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -3047,5 +3060,55 @@ fn bump_memlock_rlimit() -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `--btf-check`: resolve the runtime offset table against a BTF file and
+/// print a one-line verdict plus every drifted or missing entry.
+fn btf_check(path: &std::path::Path) -> i32 {
+    use northnarrow_agent::anti_tamper::btf_revalidate::resolve_offsets_from;
+    match resolve_offsets_from(path) {
+        ResolveOutcome::Resolved(r) => {
+            println!(
+                "btf-check {}: SUPPORTED — {} slots resolved, {} differ from the build kernel",
+                path.display(),
+                r.values.len(),
+                r.drifted.len()
+            );
+            for m in &r.drifted {
+                println!(
+                    "  drift   {:<34} {:<12} compiled={:<6} runtime={}",
+                    m.name,
+                    m.struct_name,
+                    m.expected,
+                    m.actual
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".into())
+                );
+            }
+            0
+        }
+        ResolveOutcome::SkippedNoBtf { reason } => {
+            println!("btf-check {}: UNREADABLE — {reason}", path.display());
+            3
+        }
+        ResolveOutcome::Refuse(RefuseReason::Drift(missing)) => {
+            println!(
+                "btf-check {}: NOT SUPPORTED — {} field(s)/enumerator(s) missing (the agent would refuse to start)",
+                path.display(),
+                missing.len()
+            );
+            for m in &missing {
+                println!(
+                    "  missing {:<34} {:<12} {}",
+                    m.name, m.struct_name, m.detail
+                );
+            }
+            2
+        }
+        ResolveOutcome::Refuse(RefuseReason::ParseError(e)) => {
+            println!("btf-check {}: UNPARSEABLE — {e}", path.display());
+            3
+        }
     }
 }

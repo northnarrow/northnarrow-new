@@ -169,11 +169,19 @@ pub enum ResolveOutcome {
 /// layout merely differs from the build is **supported** (the values go
 /// into the map); a kernel missing a field is refused.
 pub fn resolve_offsets() -> ResolveOutcome {
-    let data = match fs::read(VMLINUX_BTF) {
+    resolve_offsets_from(std::path::Path::new(VMLINUX_BTF))
+}
+
+/// [`resolve_offsets`] against an arbitrary BTF blob (a `vmlinux` BTF
+/// extracted from a distro kernel, a BTFHub file, another host's
+/// `/sys/kernel/btf/vmlinux`). Powers `northnarrow-agent --btf-check`
+/// and the computed kernel matrix (multi-kernel, level 2).
+pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
+    let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
             return ResolveOutcome::SkippedNoBtf {
-                reason: format!("{VMLINUX_BTF}: {e}"),
+                reason: format!("{}: {e}", path.display()),
             }
         }
     };
