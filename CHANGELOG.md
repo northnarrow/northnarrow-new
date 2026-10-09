@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Release workflow on tags `v*`: locked build, release tarball consumed by
+  `install.sh` unchanged, CycloneDX SBOM, `SHA256SUMS`, SLSA build
+  provenance attestation (`gh attestation verify`); dry run on packaging
+  PRs. `deploy/release/mk-tarball.sh` builds the same tree locally.
 - `install.sh --upgrade`: in-place upgrade of a running install (stops
   watchdog → agent, drains the LSM programs, replaces, restarts; keys,
   agent_id, audit chain and chain logs preserved). Without the flag the

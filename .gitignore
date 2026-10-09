@@ -36,3 +36,4 @@ tarpaulin-report.html
 *.bak
 *.bak2
 *.bak.*
+dist/

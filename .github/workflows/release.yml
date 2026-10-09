@@ -1,0 +1,113 @@
+name: release
+
+# Builds the release tree (eBPF object + userland, `cargo xtask build
+# --release` with a locked lockfile), packs it as the tarball
+# deploy/install.sh consumes unchanged, emits a CycloneDX SBOM and
+# SHA256SUMS, attaches a SLSA build-provenance attestation to every
+# artefact (verify: `gh attestation verify <file> --repo <owner/repo>`)
+# and, on a tag push, uploads everything to the GitHub release.
+#
+# On pull requests that touch the packaging it runs as a DRY RUN: same
+# build, artefacts kept on the workflow run only, nothing published.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "deploy/**"
+      - "xtask/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (x86_64-linux)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # upload release assets on a tag
+      id-token: write        # sign the provenance attestation (OIDC)
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0     # git describe in README-RELEASE.md
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      # Same toolchain pins as ci.yml's ebpf-build job (bpf-linker 0.10.x
+      # links against rustc's bundled LLVM; 0.11 needs a system LLVM 21+).
+      - name: Install nightly Rust + rust-src for build-std
+        run: |
+          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup default stable
+
+      - name: Install bpf-linker (pinned) + cargo-cyclonedx
+        run: |
+          cargo install bpf-linker --version 0.10.3 --locked
+          cargo install cargo-cyclonedx --locked
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Lockfile is authoritative
+        run: cargo fetch --locked
+
+      - name: cargo xtask build --release
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: cargo xtask build --release
+
+      - name: Assemble tarball + SBOM + checksums
+        run: deploy/release/mk-tarball.sh dist
+
+      - name: Smoke-test the tree (install.sh preflights from the tarball)
+        run: |
+          set -e
+          tgz=$(ls dist/*.tar.gz)
+          tmp=$(mktemp -d) && tar -C "$tmp" -xzf "$tgz" && cd "$tmp"/northnarrow-*
+          # Not root and no systemd here: expect the root check to be the
+          # FIRST thing that fails, i.e. every path/stamp preflight before
+          # it is satisfied by the tree layout.
+          if out=$(./deploy/install.sh 2>&1); then echo "install.sh unexpectedly succeeded"; exit 1; fi
+          echo "$out" | tail -3
+          echo "$out" | grep -qi "root" || { echo "install.sh failed for a reason other than 'not root'"; exit 1; }
+          ./target/release/northnarrow-agent --version
+          ./target/release/nn-admin --version
+          ./target/release/northnarrow-watchdog --version
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.sbom.cdx.json
+
+      - name: Upload workflow artefacts (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: northnarrow-release-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish to the GitHub release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --generate-notes
+          gh release upload "$tag" dist/* --clobber
