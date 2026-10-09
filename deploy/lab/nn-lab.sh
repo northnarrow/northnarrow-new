@@ -337,6 +337,15 @@ while (( $(date +%s) < deadline )); do
 done
 [[ -n "$new" && "$new" != "$old" ]] || { echo "FAIL: no new agent pid within 60s"; sudo journalctl --namespace=northnarrow -u northnarrow-watchdog --since '-2min' --no-pager | tail -20; exit 1; }
 echo "agent pid after : $new"
+# The respawned agent is `activating` until it sends READY=1 (BPF load +
+# attach takes a few seconds): wait for `active` instead of sampling
+# once — the first nightly after #180 failed here with pid, cgroup and
+# caps all correct and the unit still activating.
+for i in $(seq 1 30); do
+    act=$(systemctl is-active northnarrow-agent || true)
+    [[ "$act" == active ]] && break
+    sleep 1
+done
 act=$(systemctl is-active northnarrow-agent || true)
 echo "unit active     : $act"
 cg=$(cat /proc/$new/cgroup)
