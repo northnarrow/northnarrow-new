@@ -1356,6 +1356,33 @@ async fn main() -> Result<()> {
                  override on a dev host; re-run install.sh to restore a verified install)",
                 outcome.label()
             );
+            // Leave the refusal in the signed audit chain before exiting.
+            let detail = match &outcome {
+                IntegrityOutcome::Mismatch { mismatches, .. } => mismatches
+                    .iter()
+                    .map(|m| format!("{}: expected {} got {}", m.name, m.expected, m.actual))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                IntegrityOutcome::Unreadable { reason, .. } => reason.clone(),
+                _ => String::new(),
+            };
+            if let Ok(key) =
+                northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
+            {
+                if let Ok(mut log) =
+                    northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id)
+                {
+                    match log.boot_refused(outcome.label(), outcome.provenance(), &detail) {
+                        Ok(e) => {
+                            info!(entry_hash = %e.entry_hash, "refused boot recorded in the audit chain")
+                        }
+                        Err(e) => error!(
+                            error = format!("{e:#}"),
+                            "could not record the refused boot in the audit chain"
+                        ),
+                    }
+                }
+            }
             std::process::exit(78);
         } else if matches!(
             outcome,

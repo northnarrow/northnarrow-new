@@ -434,6 +434,33 @@ impl AuditLog {
         &self.last_hash
     }
 
+    /// A boot the agent REFUSES because the install-manifest check
+    /// failed: the refusal is written into the signed chain before the
+    /// process exits, so a tampered binary leaves a trace that root
+    /// cannot quietly remove (lab PR 21). `result` is `refused`.
+    pub fn boot_refused(
+        &mut self,
+        integrity: &str,
+        provenance: &str,
+        detail: &str,
+    ) -> Result<AuditEntry> {
+        self.append(AuditEntryDraft {
+            op: "agent_boot".to_string(),
+            extra: serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "binary_integrity": integrity,
+                "install_provenance": provenance,
+                "detail": detail,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "refused".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        })
+    }
+
     /// Boot-time write probe (review `etc-readonly-audit-1`): append a
     /// signed `agent_boot` entry so an unwritable audit log is found at
     /// startup, not at the first COMBAT transition. The entry doubles
