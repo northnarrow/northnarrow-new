@@ -48,7 +48,7 @@ use northnarrow_common::wire::{ProcessSpawnRaw, ARGV_LEN, FILENAME_LEN, TASK_COM
 use crate::btf_offsets::{
     MM_STRUCT_ARG_END_OFFSET, MM_STRUCT_ARG_START_OFFSET, PF_KTHREAD, TASK_STRUCT_COMM_OFFSET,
     TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
-    TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
+    TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET, TP_SCHED_EXEC_FILENAME_OFFSET,
 };
 
 /// Ringbuffer carrying [`ProcessSpawnRaw`] events to userland.
@@ -72,9 +72,13 @@ static DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 //   field:pid_t          pid;                offset:12; size:4;
 //   field:pid_t          old_pid;            offset:16; size:4;
 //
+// That is the upstream layout. Vendor kernels extend the common header
+// (RHEL 9: `common_preempt_lazy_count` at 8, filename at 12), so the
+// data_loc offset is read through `off!(TP_SCHED_EXEC_FILENAME_OFFSET)` —
+// resolved by userland from the tracefs `format` file at boot.
+//
 // The `__data_loc` is a u32: low 16 bits = byte offset to the string
 // from the start of the event, high 16 bits = string length (incl NUL).
-const FILENAME_DATA_LOC_OFFSET: usize = 8;
 
 #[tracepoint]
 pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
@@ -137,7 +141,7 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
     }
 
     // filename (variable length via __data_loc)
-    let data_loc: u32 = match unsafe { ctx.read_at::<u32>(FILENAME_DATA_LOC_OFFSET) } {
+    let data_loc: u32 = match unsafe { ctx.read_at::<u32>(off!(TP_SCHED_EXEC_FILENAME_OFFSET)) } {
         Ok(v) => v,
         Err(_) => 0,
     };

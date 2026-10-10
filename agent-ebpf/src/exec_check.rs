@@ -28,7 +28,9 @@ static EXEC_CHECK_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 //   field:const char *   filename;      offset:16;
 //   field:const char *const * argv;     offset:24;
 //   field:const char *const * envp;     offset:32;
-const FILENAME_PTR_OFFSET: usize = 16;
+// `sys_enter_execve.filename` — resolved from tracefs at boot
+// (`off!(TP_SYS_ENTER_EXECVE_FILENAME_OFFSET)`, upstream 16).
+use crate::btf_offsets::TP_SYS_ENTER_EXECVE_FILENAME_OFFSET;
 
 #[tracepoint]
 pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
@@ -49,7 +51,7 @@ fn try_sys_enter_execve(ctx: &TracePointContext) -> Result<(), i64> {
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
-    let filename_ptr = unsafe { ctx.read_at::<u64>(FILENAME_PTR_OFFSET) }.unwrap_or(0);
+    let filename_ptr = unsafe { ctx.read_at::<u64>(off!(TP_SYS_ENTER_EXECVE_FILENAME_OFFSET)) }.unwrap_or(0);
 
     unsafe {
         (*raw_ptr).pid = (pid_tgid >> 32) as u32;

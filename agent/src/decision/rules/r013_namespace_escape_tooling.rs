@@ -57,6 +57,14 @@ impl Rule for R013NamespaceEscapeTooling {
         if !ESCAPE_TOOLS.contains(&comm.as_str()) {
             return None;
         }
+        // Fail-safe: an EMPTY filename means the sensor could not read
+        // the exec path (a tracepoint layout the agent did not expect —
+        // RHEL 9 shifted `sched_process_exec.filename` and this rule
+        // killed every `sh` on AlmaLinux 9). "Not under a standard
+        // prefix" must never be inferred from a missing attribute.
+        if filename.is_empty() {
+            return None;
+        }
         if STD_EXEC_PREFIXES.iter().any(|p| filename.starts_with(p)) {
             return None;
         }
@@ -101,6 +109,12 @@ mod tests {
 
     fn rule() -> R013NamespaceEscapeTooling {
         R013NamespaceEscapeTooling::new(Arc::new(CommAllowlist::default()))
+    }
+
+    /// Empty filename = sensor could not read the path; must not fire.
+    #[test]
+    fn empty_filename_never_fires() {
+        assert!(rule().evaluate(&spawn("nsenter", "")).is_none());
     }
 
     #[test]

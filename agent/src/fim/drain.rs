@@ -1011,7 +1011,7 @@ pub async fn drain_loop(
             ) {
                 warn!(
                     target: "fim.drain",
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "process_drift error — event dropped, drain continues"
                 );
             }
