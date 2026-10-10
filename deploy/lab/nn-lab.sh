@@ -29,6 +29,8 @@
 #   deploy/lab/nn-lab.sh snapshot NAME | restore NAME   (guest must be down)
 #   deploy/lab/nn-lab.sh status | down | destroy
 #   deploy/lab/nn-lab.sh nightly       # unattended full run → $LAB_DIR/reports/<stamp>.md (exit 1 on any failure)
+#   deploy/lab/nn-lab.sh soak start [HOURS] [INTERVAL_S] | status | stop | wait | report
+#                                      # hours of synthetic load + resource samples → $LAB_DIR/reports/soak-<stamp>.md
 #
 # Env overrides: NN_LAB_DIR (~/.cache/nn-lab), NN_LAB_CPUS (4), NN_LAB_MEM (8192),
 #   NN_LAB_SSH_PORT (2222, remembered after `up`), NN_LAB_DISK (30G), NN_LAB_LTO (thin),
@@ -418,6 +420,144 @@ cmd_destroy() {
     log "guest disk removed (base image + ssh key kept in $LAB_DIR)"
 }
 
+# ── soak: hours of synthetic load with periodic resource samples ─────
+# `soak start [HOURS] [INTERVAL_S]` installs the units if needed, ships
+# deploy/lab/soak/{generate,sample}.sh to ~/soak on the guest and starts
+# them detached (sampler as root, generator as nn); a timer touches
+# ~/soak/stop after HOURS. `soak status` prints the last sample,
+# `soak stop` ends it early, `soak wait` blocks until it ends, and
+# `soak report` pulls samples.csv + logs into $LAB_DIR/reports/soak-<stamp>/
+# and writes soak-<stamp>.md with the trend summary and a verdict:
+# FAIL on any agent/watchdog restart, any journal ERROR, an RSS slope above
+# NN_LAB_SOAK_MAX_RSS_MB_H (5 MB/h, judged only on runs ≥ 2 h) or an fd
+# count that grew by more than half (and by more than 100).
+SOAK_SCRIPTS="$SCRIPT_DIR/soak"
+cmd_soak() {
+    local sub=${1:-help}
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        start)
+            vm_running || die "guest is not running"
+            local hours=${1:-24} interval=${2:-60}
+            local secs
+            secs=$(awk -v h="$hours" 'BEGIN{printf "%d", h*3600}')
+            if ! vssh 'systemctl is-active --quiet northnarrow-agent && systemctl is-active --quiet northnarrow-watchdog'; then
+                log "units not active — installing first"
+                cmd_install
+            fi
+            if vssh 'test -f ~/soak/sample.pid && ! test -e ~/soak/stop' 2>/dev/null; then
+                die "a soak is already running on the guest (nn-lab.sh soak status | stop)"
+            fi
+            vssh 'rm -rf ~/soak && mkdir -p ~/soak'
+            scp -q -i "$KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+                "$SOAK_SCRIPTS/generate.sh" "$SOAK_SCRIPTS/sample.sh" "$GUEST:soak/"
+            vssh "chmod +x ~/soak/*.sh; echo '$hours' > ~/soak/hours; echo '$interval' > ~/soak/interval; date -u +%s > ~/soak/start_epoch; echo \"\$(uname -r) \$(cat /etc/os-release | sed -n 's/^PRETTY_NAME=//p' | tr -d '\"')\" > ~/soak/host"
+            # The sampler runs as root: it must NOT live under /home — the
+            # agent's R009 (root exec from a user-writable path) would kill it
+            # on the spot. Install it root-owned under /usr/local/sbin first.
+            vssh "sudo install -m 0755 -o root -g root \$HOME/soak/sample.sh /usr/local/sbin/nn-soak-sample"
+            vssh "sudo nohup env SOAK_DIR=\$HOME/soak SOAK_INTERVAL=$interval setsid /usr/local/sbin/nn-soak-sample > \$HOME/soak/sample.log 2>&1 < /dev/null & disown; sleep 2; test -f ~/soak/sample.pid && sudo kill -0 \$(cat ~/soak/sample.pid)"
+            vssh "nohup env SOAK_DIR=\$HOME/soak setsid \$HOME/soak/generate.sh > \$HOME/soak/generate.log 2>&1 < /dev/null & disown"
+            vssh "nohup setsid sh -c 'sleep $secs; touch \$HOME/soak/stop' > /dev/null 2>&1 < /dev/null & disown"
+            log "soak started on $DISTRO: ${hours} h, sample every ${interval} s (nn-lab.sh soak status | wait | stop | report)"
+            ;;
+        status)
+            vm_running || die "guest is not running"
+            vssh 'cd ~/soak 2>/dev/null || { echo "no soak on this guest"; exit 0; }
+                  echo "host     : $(cat host 2>/dev/null)"
+                  echo "started  : $(cat start 2>/dev/null) for $(cat hours 2>/dev/null) h"
+                  echo "elapsed  : $(( ($(date +%s) - $(cat start_epoch)) / 60 )) min"
+                  echo "state    : $([ -e stop ] && echo stopped || echo running)"
+                  echo "samples  : $(( $(wc -l < samples.csv 2>/dev/null || echo 1) - 1 ))"
+                  echo "generator: $(cat generate.iter 2>/dev/null || echo 0) iterations"
+                  echo "last     : $(head -1 samples.csv 2>/dev/null)"
+                  echo "           $(tail -1 samples.csv 2>/dev/null)"'
+            ;;
+        stop)
+            vm_running || die "guest is not running"
+            vssh 'touch ~/soak/stop; sleep 3; pkill -f "sleep [0-9]*; touch .*soak/stop" 2>/dev/null; true'
+            log "soak stopped (nn-lab.sh soak report)"
+            ;;
+        wait)
+            vm_running || die "guest is not running"
+            while ! vssh 'test -e ~/soak/stop' 2>/dev/null; do sleep 60; done
+            sleep 5
+            cmd_soak report
+            ;;
+        report)
+            vm_running || die "guest is not running"
+            local stamp dir report
+            stamp=$(date +%Y%m%d-%H%M%S)
+            dir="$LAB_DIR/reports/soak-$stamp"; report="$LAB_DIR/reports/soak-$stamp.md"
+            mkdir -p "$dir"
+            scp -q -i "$KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+                "$GUEST:soak/samples.csv" "$GUEST:soak/sample.log" "$GUEST:soak/generate.log" "$GUEST:soak/host" "$GUEST:soak/hours" "$dir/" 2>/dev/null || true
+            vssh 'sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null | tail -200' > "$dir/journal-warn-err.log" 2>/dev/null || true
+            [ -s "$dir/samples.csv" ] || die "no samples.csv on the guest — was the soak started?"
+            local max_rss_mb_h=${NN_LAB_SOAK_MAX_RSS_MB_H:-5}
+            local rc=0
+            set +e
+            awk -F, -v repo="$REPO" -v head="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)" -v distro="$DISTRO" \
+                -v host="$(cat "$dir/host" 2>/dev/null)" -v hours="$(cat "$dir/hours" 2>/dev/null)" -v maxslope="$max_rss_mb_h" -v logdir="$dir" '
+            NR == 1 { next }
+            {
+                n++; t[n]=$1; pid[n]=$2; rss[n]=$3; vsz[n]=$4; cpu[n]=$5; thr[n]=$6; fds[n]=$7; wd[n]=$8
+                ar[n]=$9; wr[n]=$10; jw[n]=$11; je[n]=$12; cb[n]=$13; det[n]=$14; sts[n]=$15; aud[n]=$16; fim[n]=$17
+                fs[n]=$18; us[n]=$19; fdm[n]=$20; pp[n]=$21; dr[n]=$22; gi[n]=$23
+                if (rss[n] > rssmax) rssmax = rss[n]; if (cpu[n] > cpumax) cpumax = cpu[n]; cpusum += cpu[n]
+                if (fds[n] > fdsmax) fdsmax = fds[n]; if (fs[n] > fsmax) fsmax = fs[n]; if (us[n] > usmax) usmax = us[n]; if (fdm[n] > fdmmax) fdmmax = fdm[n]
+                if (pid[n] != 0 && pid[n] != lastpid) { if (lastpid != 0) pidchanges++; lastpid = pid[n] }
+            }
+            END {
+                if (n < 2) { print "not enough samples (" n ")"; exit 2 }
+                dur_h = (t[n] - t[1]) / 3600.0
+                # least-squares slope of RSS over time (kB/s → MB/h)
+                for (i = 1; i <= n; i++) { x = t[i] - t[1]; sx += x; sy += rss[i]; sxx += x*x; sxy += x*rss[i] }
+                den = n*sxx - sx*sx; slope = (den > 0) ? (n*sxy - sx*sy)/den : 0
+                slope_mb_h = slope * 3600 / 1024
+                fail = ""; warn = ""
+                if (ar[n] - ar[1] > 0) fail = fail "; agent restarted " (ar[n]-ar[1]) "×"
+                if (wr[n] - wr[1] > 0) fail = fail "; watchdog restarted " (wr[n]-wr[1]) "×"
+                if (pidchanges > 0) fail = fail "; agent pid changed " pidchanges "×"
+                if (je[n] > 0) fail = fail "; " je[n] " journal ERROR line(s)"
+                if (dur_h >= 2 && slope_mb_h > maxslope) fail = fail "; RSS slope " sprintf("%.2f", slope_mb_h) " MB/h > " maxslope
+                if (dur_h < 2 && slope_mb_h > maxslope) warn = warn "; RSS slope " sprintf("%.2f", slope_mb_h) " MB/h (run < 2 h, not judged)"
+                if (fds[n] > fds[1]*1.5 && fds[n] - fds[1] > 100) fail = fail "; fds grew " fds[1] " → " fds[n]
+                if (dr[n] - dr[1] > 0) warn = warn "; ring-buffer drops +" (dr[n]-dr[1])
+                if (cb[n] > 0) warn = warn "; " cb[n] " COMBAT journal line(s)"
+                if (jw[n] > 0) warn = warn "; " jw[n] " journal WARN line(s)"
+                verdict = (fail == "") ? "PASS" : "FAIL"
+                printf "# nn-lab soak — %s — %s\n\n", distro, verdict
+                printf "- repo: `%s` @ `%s`\n- guest: `%s`\n- planned: %s h, measured: %.2f h, %d samples, %d generator iterations\n- logs: `%s`\n\n", repo, head, host, hours, dur_h, n, gi[n], logdir
+                printf "| metric | first | last | max | note |\n|---|---|---|---|---|\n"
+                printf "| agent RSS (MB) | %.1f | %.1f | %.1f | slope %.2f MB/h |\n", rss[1]/1024, rss[n]/1024, rssmax/1024, slope_mb_h
+                printf "| agent VSZ (MB) | %.0f | %.0f | — | |\n", vsz[1]/1024, vsz[n]/1024
+                printf "| agent CPU %% (per sample) | %d | %d | %d | avg %.1f |\n", cpu[1], cpu[n], cpumax, cpusum/n
+                printf "| agent threads / fds | %d / %d | %d / %d | fds max %d | |\n", thr[1], fds[1], thr[n], fds[n], fdsmax
+                printf "| watchdog RSS (MB) | %.1f | %.1f | — | |\n", wd[1]/1024, wd[n]/1024
+                printf "| restarts agent / watchdog | %d / %d | %d / %d | — | pid changes %d |\n", ar[1], wr[1], ar[n], wr[n], pidchanges
+                printf "| journal WARN / ERROR / COMBAT lines | — | %d / %d / %d | — | since start |\n", jw[n], je[n], cb[n]
+                printf "| detections.jsonl (KB) | %.0f | %.0f | — | +%.1f KB/h |\n", det[1]/1024, det[n]/1024, (det[n]-det[1])/1024/(dur_h>0?dur_h:1)
+                printf "| status_events.jsonl (KB) | %.0f | %.0f | — | |\n", sts[1]/1024, sts[n]/1024
+                printf "| audit.log (KB) | %.0f | %.0f | — | |\n", aud[1]/1024, aud[n]/1024
+                printf "| fim_drift.jsonl (KB) | %.0f | %.0f | — | |\n", fim[1]/1024, fim[n]/1024
+                printf "| map FLOW_SOCK_MAP / UDP_UNCONNECTED_SEEN / FIM_DIRTY_INODES | %d / %d / %d | %d / %d / %d | %d / %d / %d | PROTECTED_PIDS %d |\n", fs[1], us[1], fdm[1], fs[n], us[n], fdm[n], fsmax, usmax, fdmmax, pp[n]
+                printf "| ring-buffer drops (cumulative) | %d | %d | — | |\n\n", dr[1], dr[n]
+                if (fail != "") printf "**FAIL**: %s\n\n", substr(fail, 3)
+                if (warn != "") printf "Notes: %s\n\n", substr(warn, 3)
+                printf "Thresholds: 0 restarts, 0 journal ERROR, RSS slope ≤ %s MB/h on runs ≥ 2 h, fds growth < 50%%.\n", maxslope
+                exit (fail == "") ? 0 : 1
+            }' "$dir/samples.csv" > "$report"
+            rc=$?
+            set -e
+            ln -sfn "$report" "$LAB_DIR/reports/soak-latest.md"
+            cat "$report"
+            return $rc
+            ;;
+        *) die "usage: nn-lab.sh soak start [HOURS] [INTERVAL_S] | status | stop | wait | report" ;;
+    esac
+}
+
 # ── nightly: the whole runbook, unattended, with a markdown report ──
 #
 # Every step runs even if an earlier one failed (a red test-e2e must not
@@ -612,6 +752,7 @@ case "${1:-help}" in
     restore)       cmd_restore "${2:-}" ;;
     destroy)       cmd_destroy ;;
     nightly)       cmd_nightly ;;
+    soak)          shift; cmd_soak "$@" ;;
     help|-h|--help) cmd_help ;;
     *) die "unknown command '$1' (nn-lab.sh help)" ;;
 esac
