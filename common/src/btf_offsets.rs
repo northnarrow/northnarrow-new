@@ -802,6 +802,11 @@ pub mod slot {
     pub const MSGHDR_NAME_OFFSET: u32 = 40;
     pub const MSGHDR_NAMELEN_OFFSET: u32 = 41;
     pub const IOV_ITER_IOV_OFFSET: u32 = 42;
+    // enum slots 43–44 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 45;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 46;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 47;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 48;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -851,6 +856,78 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("IOV_ITER_IOV_OFFSET", 42),
 ];
 
+/// Tracepoint field offsets — the `read_at` positions inside a
+/// `TracePointContext`. They come from the tracefs `format` file, not from
+/// BTF, and the common header is NOT stable across vendor kernels: RHEL 9
+/// (5.14 el9) adds `common_preempt_lazy_count` at offset 8, which pushes
+/// `sched_process_exec.filename` from 8 to 12 (an exec sensor reading at 8
+/// then sees an empty filename — and "shell from a non-standard path"
+/// killed every `sh` on AlmaLinux 9). The agent resolves these from
+/// `/sys/kernel/tracing/events/<cat>/<event>/format` at boot and publishes
+/// them in the same `BTF_OFFSETS` map, after the enum slots.
+pub const TP_SCHED_EXEC_FILENAME_OFFSET: usize = 8;
+/// `syscalls/sys_enter_execve.filename` (the first syscall argument).
+pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: usize = 16;
+/// `syscalls/sys_enter_openat.filename` (second argument).
+pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: usize = 24;
+/// `syscalls/sys_enter_openat.flags` (third argument).
+pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: usize = 32;
+
+/// One tracepoint field whose offset is resolved from tracefs at boot.
+#[derive(Debug, Clone, Copy)]
+pub struct TracepointFieldSpec {
+    /// Slot-table identifier (the `TP_*_OFFSET` const name).
+    pub name: &'static str,
+    /// tracefs category (`sched`, `syscalls`).
+    pub category: &'static str,
+    /// tracefs event name (`sched_process_exec`).
+    pub event: &'static str,
+    /// `field:` name inside the `format` file.
+    pub field: &'static str,
+    /// Compiled-in offset (the fallback for an unarmed map or unreadable tracefs).
+    pub compiled: u32,
+}
+
+/// The tracepoint fields read with a fixed offset in `agent-ebpf`.
+pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
+    TracepointFieldSpec {
+        name: "TP_SCHED_EXEC_FILENAME_OFFSET",
+        category: "sched",
+        event: "sched_process_exec",
+        field: "filename",
+        compiled: TP_SCHED_EXEC_FILENAME_OFFSET as u32,
+    },
+    TracepointFieldSpec {
+        name: "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET",
+        category: "syscalls",
+        event: "sys_enter_execve",
+        field: "filename",
+        compiled: TP_SYS_ENTER_EXECVE_FILENAME_OFFSET as u32,
+    },
+    TracepointFieldSpec {
+        name: "TP_SYS_ENTER_OPENAT_FILENAME_OFFSET",
+        category: "syscalls",
+        event: "sys_enter_openat",
+        field: "filename",
+        compiled: TP_SYS_ENTER_OPENAT_FILENAME_OFFSET as u32,
+    },
+    TracepointFieldSpec {
+        name: "TP_SYS_ENTER_OPENAT_FLAGS_OFFSET",
+        category: "syscalls",
+        event: "sys_enter_openat",
+        field: "flags",
+        compiled: TP_SYS_ENTER_OPENAT_FLAGS_OFFSET as u32,
+    },
+];
+
+/// Tracepoint-field slots follow the enum slots.
+pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 45),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 46),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 47),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 48),
+];
+
 /// Enum-value slots follow the offset slots.
 pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 43), ("ITER_IOVEC_VALUE", 44)];
 
@@ -861,8 +938,10 @@ pub const ITER_IOVEC_VALUE_SLOT: u32 = 44;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
-/// Map size: the magic slot plus one slot per revalidated offset.
-pub const BTF_OFFSETS_SLOTS: u32 = 1 + REVALIDATE.len() as u32 + ENUM_VALUES.len() as u32;
+/// Map size: the magic slot, one slot per revalidated offset, one per enum
+/// value, one per tracepoint field.
+pub const BTF_OFFSETS_SLOTS: u32 =
+    1 + REVALIDATE.len() as u32 + ENUM_VALUES.len() as u32 + TRACEPOINT_FIELDS.len() as u32;
 
 #[cfg(test)]
 mod tests {
@@ -893,7 +972,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 45);
+        assert_eq!(BTF_OFFSETS_SLOTS, 49);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -903,5 +982,28 @@ mod tests {
             .iter()
             .all(|(_, s)| *s > REVALIDATE.len() as u32));
         assert_eq!(slot::TASK_STRUCT_TGID_OFFSET, 1);
+    }
+
+    /// Tracepoint slots follow the enum slots and match TRACEPOINT_FIELDS
+    /// one to one (name and order).
+    #[test]
+    fn tracepoint_slot_table_matches_fields() {
+        assert_eq!(TRACEPOINT_SLOT_TABLE.len(), TRACEPOINT_FIELDS.len());
+        let first = REVALIDATE.len() as u32 + ENUM_VALUES.len() as u32 + 1;
+        for (i, (spec, (name, slot))) in TRACEPOINT_FIELDS
+            .iter()
+            .zip(TRACEPOINT_SLOT_TABLE)
+            .enumerate()
+        {
+            assert_eq!(
+                spec.name, *name,
+                "tracepoint slot table out of order at {i}"
+            );
+            assert_eq!(*slot, first + i as u32);
+            assert!(*slot < BTF_OFFSETS_SLOTS);
+        }
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 45);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 48);
+        assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }

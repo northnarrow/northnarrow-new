@@ -1,0 +1,53 @@
+#cloud-config
+# NorthNarrow local lab guest — AlmaLinux 9 (kernel 5.14 + RHEL backports,
+# native BTF) variant of user-data.tmpl. Rendered once per
+# `NN_LAB_DISTRO=alma9 nn-lab.sh up`; __SSH_PUBKEY__ is substituted by
+# the script.
+#
+# Differences from the Ubuntu / Debian templates:
+#   - dnf package names (`iptables-nft` provides iptables, `bpftool` is a
+#     separate package, no build-essential meta-package);
+#   - the kernel command line is edited with grubby, not grub.d;
+#   - the el9 default LSM list is lockdown,yama,integrity,selinux,bpf —
+#     `bpf` is already there, the explicit lsm= line keeps the guest equal
+#     to the documented production prerequisite;
+#   - SELinux stays ENFORCING on purpose: a RHEL-family host runs it, and
+#     the lab must surface what it denies (bpffs, /etc/northnarrow,
+#     the hardened units) instead of hiding it.
+hostname: nn-lab-alma9
+manage_etc_hosts: true
+users:
+  - name: nn
+    groups: [wheel, adm]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+package_update: true
+package_upgrade: false
+packages:
+  - iptables-nft
+  - bpftool
+  - gcc
+  - make
+  - pkgconf-pkg-config
+  - git
+  - rsync
+  - jq
+  - strace
+  - curl
+  - tar
+  - xz
+  - e2fsprogs
+  - policycoreutils-python-utils
+runcmd:
+  - grubby --update-kernel=ALL --args="lsm=lockdown,capability,yama,integrity,selinux,bpf"
+  # rustup (stable, minimal) for the guest-side userland build.
+  - su - nn -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable'
+  - su - nn -c 'echo "source \$HOME/.cargo/env" >> ~/.bashrc'
+  - touch /var/lib/nn-lab-provisioned
+power_state:
+  mode: reboot
+  message: "nn-lab: rebooting with lsm=...,bpf"
+  condition: true

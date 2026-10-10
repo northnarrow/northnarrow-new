@@ -307,6 +307,103 @@ fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveO
     }
 }
 
+/// tracefs roots tried in order for the tracepoint `format` files.
+pub const TRACEFS_ROOTS: &[&str] = &["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
+
+/// Outcome of [`resolve_tracepoint_fields`]: one `(slot, offset)` per
+/// [`TRACEPOINT_FIELDS`] entry (the compiled value when tracefs could not
+/// answer), plus what differed and what could not be read.
+#[derive(Debug, Default, Clone)]
+pub struct TracepointOffsets {
+    pub values: Vec<(u32, u32)>,
+    /// `(name, compiled, runtime)` for fields whose offset differs.
+    pub drifted: Vec<(&'static str, u32, u32)>,
+    /// `(name, reason)` for fields left at the compiled value.
+    pub unresolved: Vec<(&'static str, String)>,
+}
+
+/// Resolve the tracepoint field offsets the eBPF programs read with
+/// `read_at` from the running kernel's tracefs `format` files. The
+/// common tracepoint header is not stable across vendor kernels (RHEL 9
+/// inserts `common_preempt_lazy_count`, shifting every field by 4), so a
+/// compiled-in offset silently reads the wrong bytes there — the exec
+/// sensor then reports an empty filename. A field that cannot be read
+/// keeps its compiled value and is reported in `unresolved` (the caller
+/// warns; the rules treat an empty filename as "unknown", never as
+/// "non-standard").
+pub fn resolve_tracepoint_fields() -> TracepointOffsets {
+    resolve_tracepoint_fields_from(TRACEFS_ROOTS)
+}
+
+/// [`resolve_tracepoint_fields`] over explicit tracefs roots (tests).
+pub fn resolve_tracepoint_fields_from(roots: &[&str]) -> TracepointOffsets {
+    use common::btf_offsets::{TRACEPOINT_FIELDS, TRACEPOINT_SLOT_TABLE};
+    let mut out = TracepointOffsets::default();
+    for (spec, (name, slot)) in TRACEPOINT_FIELDS.iter().zip(TRACEPOINT_SLOT_TABLE) {
+        debug_assert_eq!(spec.name, *name);
+        let mut found: Option<u32> = None;
+        let mut last_err = String::from("no tracefs root readable");
+        for root in roots {
+            let path = format!("{root}/events/{}/{}/format", spec.category, spec.event);
+            match fs::read_to_string(&path) {
+                Ok(text) => match parse_format_field_offset(&text, spec.field) {
+                    Some(off) => {
+                        found = Some(off);
+                        break;
+                    }
+                    None => {
+                        last_err = format!("{path}: field `{}` not in format", spec.field);
+                        break;
+                    }
+                },
+                Err(e) => last_err = format!("{path}: {e}"),
+            }
+        }
+        match found {
+            Some(off) => {
+                if off != spec.compiled {
+                    out.drifted.push((spec.name, spec.compiled, off));
+                }
+                out.values.push((*slot, off));
+            }
+            None => {
+                out.unresolved.push((spec.name, last_err));
+                out.values.push((*slot, spec.compiled));
+            }
+        }
+    }
+    out
+}
+
+/// `offset:` of `field` in a tracefs `format` file body. Field lines look
+/// like `\tfield:__data_loc char[] filename;\toffset:8;\tsize:4;\tsigned:1;`;
+/// the name is the last token of the declaration, with any `[…]` stripped
+/// (`char comm[TASK_COMM_LEN]`).
+pub fn parse_format_field_offset(text: &str, field: &str) -> Option<u32> {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("field:") else {
+            continue;
+        };
+        let mut parts = rest.split(';');
+        let decl = parts.next()?.trim();
+        let name = decl
+            .rsplit(|c: char| c.is_whitespace() || c == '*')
+            .next()?;
+        let name = name.split('[').next()?;
+        if name != field {
+            continue;
+        }
+        for part in parts {
+            if let Some(v) = part.trim().strip_prefix("offset:") {
+                return v.trim().parse::<u32>().ok();
+            }
+        }
+        return None;
+    }
+    None
+}
+
 static RESOLVED: OnceLock<ResolvedOffsets> = OnceLock::new();
 
 /// Publish the boot-time resolution for [`arm_btf_offsets`]. Idempotent;
@@ -735,6 +832,85 @@ fn name_at(strings: &[u8], off: u32) -> Result<&str, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UPSTREAM_EXEC_FORMAT: &str = "name: sched_process_exec\nID: 310\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\n\tfield:__data_loc char[] filename;\toffset:8;\tsize:4;\tsigned:1;\n\tfield:pid_t pid;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:16;\tsize:4;\tsigned:1;\n";
+    const RHEL9_EXEC_FORMAT: &str = "name: sched_process_exec\nID: 295\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\tfield:unsigned char common_preempt_lazy_count;\toffset:8;\tsize:1;\tsigned:0;\n\n\tfield:__data_loc char[] filename;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t pid;\toffset:16;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:20;\tsize:4;\tsigned:1;\n";
+    const RHEL9_OPENAT_FORMAT: &str = "format:\n\tfield:unsigned char common_preempt_lazy_count;\toffset:8;\tsize:1;\tsigned:0;\n\tfield:int __syscall_nr;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:int dfd;\toffset:16;\tsize:8;\tsigned:0;\n\tfield:const char * filename;\toffset:24;\tsize:8;\tsigned:0;\n\tfield:int flags;\toffset:32;\tsize:8;\tsigned:0;\n\tfield:umode_t mode;\toffset:40;\tsize:8;\tsigned:0;\n";
+
+    #[test]
+    fn format_parser_reads_upstream_and_rhel9_layouts() {
+        assert_eq!(
+            parse_format_field_offset(UPSTREAM_EXEC_FORMAT, "filename"),
+            Some(8)
+        );
+        assert_eq!(
+            parse_format_field_offset(RHEL9_EXEC_FORMAT, "filename"),
+            Some(12)
+        );
+        assert_eq!(
+            parse_format_field_offset(RHEL9_EXEC_FORMAT, "old_pid"),
+            Some(20)
+        );
+        // pointer declarations (`const char * filename`) and array names
+        assert_eq!(
+            parse_format_field_offset(RHEL9_OPENAT_FORMAT, "filename"),
+            Some(24)
+        );
+        assert_eq!(
+            parse_format_field_offset(RHEL9_OPENAT_FORMAT, "flags"),
+            Some(32)
+        );
+        assert_eq!(
+            parse_format_field_offset(
+                "\tfield:char comm[TASK_COMM_LEN];\toffset:12;\tsize:16;\tsigned:1;\n",
+                "comm"
+            ),
+            Some(12)
+        );
+        assert_eq!(parse_format_field_offset(RHEL9_EXEC_FORMAT, "nope"), None);
+    }
+
+    /// A synthetic tracefs tree with the RHEL 9 layout: the exec filename
+    /// slot drifts to 12, the syscall fields stay put, and a missing
+    /// event falls back to the compiled value and is reported.
+    #[test]
+    fn tracepoint_fields_resolve_from_tracefs_tree() {
+        use common::btf_offsets::{slot, TP_SCHED_EXEC_FILENAME_OFFSET};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let exec = root.join("events/sched/sched_process_exec");
+        fs::create_dir_all(&exec).unwrap();
+        fs::write(exec.join("format"), RHEL9_EXEC_FORMAT).unwrap();
+        let openat = root.join("events/syscalls/sys_enter_openat");
+        fs::create_dir_all(&openat).unwrap();
+        fs::write(openat.join("format"), RHEL9_OPENAT_FORMAT).unwrap();
+        // sys_enter_execve deliberately absent
+        let r = resolve_tracepoint_fields_from(&[root.to_str().unwrap()]);
+        assert_eq!(r.values.len(), common::btf_offsets::TRACEPOINT_FIELDS.len());
+        assert!(r
+            .values
+            .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 12)));
+        assert!(r
+            .values
+            .contains(&(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 32)));
+        assert_eq!(
+            r.drifted,
+            vec![(
+                "TP_SCHED_EXEC_FILENAME_OFFSET",
+                TP_SCHED_EXEC_FILENAME_OFFSET as u32,
+                12
+            )]
+        );
+        assert_eq!(r.unresolved.len(), 1);
+        assert_eq!(r.unresolved[0].0, "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET");
+        assert!(r
+            .values
+            .contains(&(slot::TP_SYS_ENTER_EXECVE_FILENAME_OFFSET, 16)));
+        // no readable root at all: every slot keeps its compiled value
+        let none = resolve_tracepoint_fields_from(&["/nonexistent/tracefs"]);
+        assert_eq!(none.unresolved.len(), none.values.len());
+        assert!(none.drifted.is_empty());
+    }
 
     /// Minimal BTF encoder for hermetic, kernel-independent tests.
     /// Lays out `[header(24)][types][strings]`; ids are 1-based to

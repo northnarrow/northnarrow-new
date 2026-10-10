@@ -35,7 +35,7 @@ use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
 use northnarrow_agent::anti_tamper::btf_revalidate::{
-    publish_resolved, resolve_offsets, RefuseReason, ResolveOutcome,
+    publish_resolved, resolve_offsets, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
 };
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
@@ -531,6 +531,28 @@ async fn main() -> Result<()> {
                      is disabled (DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC)"
                 );
             }
+            // Tracepoint field offsets come from tracefs, not BTF: the
+            // common header differs on vendor kernels (RHEL 9 shifts every
+            // field by 4 — the exec sensor read an empty filename there).
+            let mut r = r;
+            let tp = resolve_tracepoint_fields();
+            for (name, compiled, runtime) in &tp.drifted {
+                info!(
+                    offset = name,
+                    compiled,
+                    runtime,
+                    "tracepoint field offset resolved from tracefs — differs from the build kernel"
+                );
+            }
+            for (name, reason) in &tp.unresolved {
+                warn!(
+                    offset = name,
+                    reason = %reason,
+                    "tracepoint field offset NOT resolved — compiled-in value in use; on a kernel \
+                     with a different tracepoint header the exec/open sensors read wrong bytes"
+                );
+            }
+            r.values.extend(tp.values);
             publish_resolved(r);
         }
         ResolveOutcome::SkippedNoBtf { reason } => {

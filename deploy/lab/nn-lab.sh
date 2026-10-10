@@ -72,7 +72,14 @@ case "$DISTRO" in
         BASE_IMG_NAME="jammy-base.img"; DEFAULT_SSH_PORT=2522
         USER_DATA_TMPL="$SCRIPT_DIR/user-data.tmpl"
         LAB_DIR="$ROOT_LAB_DIR/ubuntu2204" ;;
-    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12 | ubuntu2204)" >&2; exit 2 ;;
+    alma9)
+        # RHEL 9 family: kernel 5.14 + backports with native BTF (not in
+        # BTFHub — only a guest can tell), SELinux enforcing, dnf.
+        IMAGE_URL="https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
+        BASE_IMG_NAME="alma9-base.qcow2"; DEFAULT_SSH_PORT=2622
+        USER_DATA_TMPL="$SCRIPT_DIR/user-data.alma9.tmpl"
+        LAB_DIR="$ROOT_LAB_DIR/alma9" ;;
+    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12 | ubuntu2204 | alma9)" >&2; exit 2 ;;
 esac
 # The ssh port is remembered in $LAB_DIR/ssh_port after `up`, so every
 # later sub-command talks to the same guest without re-exporting it.

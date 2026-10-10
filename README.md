@@ -135,7 +135,7 @@ test lab anyone with KVM can rerun (`deploy/lab/nn-lab.sh`), not by a slide:
 | Tests | ~1.4k unit/integration tests in CI, plus privileged e2e suites (agent, watchdog, detection, canary, network, map pinning, honeypots) run nightly on a real kernel |
 | Lifecycle | fresh install, in-place upgrade and clean uninstall exercised on every nightly |
 | Resilience | `kill -9` from root denied by the kernel; agent respawned by the watchdog in its own unit |
-| Kernels | **Ubuntu 24.04 / 6.8 — supported.** Debian 12 / 6.1 — not yet: the agent refuses to start because 20 of 41 kernel struct offsets differ (fail-closed by design). Runtime offsets are the work in progress. Matrix: [`docs/operator/KERNEL_COMPATIBILITY.md`](docs/operator/KERNEL_COMPATIBILITY.md) |
+| Kernels | **Ubuntu 24.04 / 6.8, Debian 12 / 6.1, AlmaLinux 9 / 5.14 — supported; Ubuntu 22.04 / 5.15 — supported (degraded: no DNS QNAME).** One binary: kernel struct offsets are resolved from the live BTF at boot, tracepoint layouts from tracefs; `northnarrow-agent --btf-check <btf>` gives an offline verdict for any kernel, and a weekly CI job recomputes the matrix over BTFHub — see `docs/operator/KERNEL_COMPATIBILITY.md` |
 | Known issues | tracked in the open: [`docs/audit/NN_REVIEW_2026-10-08.md`](docs/audit/NN_REVIEW_2026-10-08.md) (27 entries, all High/Medium closed) |
 
 What is **not** verified yet, said plainly: long-running soak behaviour, parser fuzzing,

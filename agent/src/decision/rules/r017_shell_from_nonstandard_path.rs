@@ -64,6 +64,14 @@ impl Rule for R017ShellFromNonstandardPath {
         if !SHELL_COMMS.contains(&comm.as_str()) {
             return None;
         }
+        // Fail-safe: an EMPTY filename means the sensor could not read
+        // the exec path (a tracepoint layout the agent did not expect —
+        // RHEL 9 shifted `sched_process_exec.filename` and this rule
+        // killed every `sh` on AlmaLinux 9). "Not under a standard
+        // prefix" must never be inferred from a missing attribute.
+        if filename.is_empty() {
+            return None;
+        }
         if SHELL_STD_PREFIXES.iter().any(|p| filename.starts_with(p)) {
             return None;
         }
@@ -105,6 +113,15 @@ mod tests {
 
     fn rule() -> R017ShellFromNonstandardPath {
         R017ShellFromNonstandardPath::new(Arc::new(CommAllowlist::default()))
+    }
+
+    /// An empty filename is "unknown", never "non-standard": the exec
+    /// sensor reported it on RHEL 9 before the tracepoint header shift
+    /// was handled, and this rule killed every `sh`.
+    #[test]
+    fn empty_filename_never_fires() {
+        assert!(rule().evaluate(&spawn("sh", "")).is_none());
+        assert!(rule().evaluate(&spawn("bash", "")).is_none());
     }
 
     #[test]

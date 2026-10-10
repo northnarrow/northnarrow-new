@@ -34,8 +34,9 @@ static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 //   field:const char *   filename;      offset:24; size:8;
 //   field:int            flags;         offset:32; size:8;  (long)
 //   field:umode_t        mode;          offset:40; size:8;
-const FILENAME_PTR_OFFSET: usize = 24;
-const FLAGS_OFFSET: usize = 32;
+// `sys_enter_openat.filename` / `.flags` — resolved from tracefs at boot
+// (`off!(…)`, upstream 24 / 32).
+use crate::btf_offsets::{TP_SYS_ENTER_OPENAT_FILENAME_OFFSET, TP_SYS_ENTER_OPENAT_FLAGS_OFFSET};
 
 #[tracepoint]
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
@@ -56,8 +57,8 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i64> {
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
-    let flags = unsafe { ctx.read_at::<u64>(FLAGS_OFFSET) }.unwrap_or(0) as u32;
-    let filename_ptr = unsafe { ctx.read_at::<u64>(FILENAME_PTR_OFFSET) }.unwrap_or(0);
+    let flags = unsafe { ctx.read_at::<u64>(off!(TP_SYS_ENTER_OPENAT_FLAGS_OFFSET)) }.unwrap_or(0) as u32;
+    let filename_ptr = unsafe { ctx.read_at::<u64>(off!(TP_SYS_ENTER_OPENAT_FILENAME_OFFSET)) }.unwrap_or(0);
 
     unsafe {
         (*raw_ptr).pid = (pid_tgid >> 32) as u32;
