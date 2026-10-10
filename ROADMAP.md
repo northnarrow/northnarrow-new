@@ -556,7 +556,16 @@ Pianificato, in quest'ordine:
   24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
 - Verifica della provenienza all'installazione: `install.sh` controlla
   `SHA256SUMS` e l'attestazione SLSA del tarball e rifiuta un upgrade
-  non verificabile; esito registrato nell'audit log
+  non verificabile; esito registrato nell'audit log; all'avvio l'agent
+  confronta l'hash del proprio binario, del watchdog e dell'oggetto eBPF
+  con il manifest firmato dell'installazione (ri-verifica continua, non
+  solo al deploy)
+- Controlli di hardening dell'host in `install.sh` e `nn-admin status`:
+  modalità `lockdown` del kernel, `kernel.unprivileged_bpf_disabled`,
+  `module.sig_enforce`, Secure Boot (efivars), IMA/EVM attivi, bpffs
+  montato una sola volta; ogni assenza è un WARN con la riga di fix,
+  perché l'anti-tamper dell'agent vale finché root non può riscrivere il
+  kernel a caldo (kexec, moduli non firmati, livepatch)
 - Contatori di perdita del ring buffer letti dall'agent ed esposti in
   `nn-admin status` (oggi li conta solo il kernel)
 - Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
@@ -576,9 +585,11 @@ Pianificato, in quest'ordine:
   "telemetry gap" nel chain log, non solo un WARN (prova di copertura
   come funzione di prodotto, non solo come test di laboratorio)
 - Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
-  bpffs, cgroup freezer, bind mount su `/etc/northnarrow`, kexec,
+  bpffs e secondo mount di bpffs, cgroup freezer, bind mount su
+  `/etc/northnarrow`, kexec, modulo non firmato, livepatch,
   mascheramento e override delle unit systemd, `bpftool`/`bpftrace` da
-  root, io_uring come canale cieco)
+  root, io_uring come canale cieco; ogni caso deve finire in un evento
+  nel chain log, non solo in un rifiuto)
 - Overhead misurato su host carico (`file_permission`/`file_open`; dato
   grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,
@@ -622,7 +633,9 @@ cambia l'ordine delle Tappe successive.
   oggi copriamo solo l'exec da memfd/`/proc/self/fd`, R004);
   `socket_bind`/`socket_accept` e `inet_sock_set_state` (bind e accept
   oggi non visti; connect, listen e close sì); tracepoint
-  `sched_process_fork` per la lineage completa
+  `sched_process_fork` per la lineage completa; `kernel_load_data` e
+  `kernel_read_file` (kexec, firmware, moduli e livepatch caricati da
+  userland: oggi vediamo solo `module_load`)
 - Operazioni di namespace viste dalla syscall (`unshare`, `setns`,
   `clone` con `CLONE_NEW*`), non dal nome del tool (R013 oggi guarda
   `nsenter`/`unshare` per comm)
@@ -663,6 +676,12 @@ Obiettivo: all'installazione, NorthNarrow chiude le falle.
   - SELinux/AppArmor status
   - Servizi esposti su rete
   - CVE noti del kernel installato
+  - Catena di fiducia del boot e del kernel (revisione del 10 ottobre
+    2026): Secure Boot e UKI con measured boot, `lockdown=integrity`,
+    firma dei moduli, kexec e livepatch limitati, IMA/EVM in appraisal
+    sui binari e sulle unit, `/usr` immutabile (dm-verity, sysext
+    firmate), bpffs dedicato — ciò che rende l'anti-tamper dell'agent
+    non aggirabile da root
 - LLM ragiona su priorità + propone fix
 - Modalità auto-fix (con conferma admin la prima volta)
   vs solo-report
@@ -715,6 +734,12 @@ Obiettivo: flotta multi-agent coordinata, EU-sovereign.
 - VictoriaMetrics per metriche
 - Storage object: Garage (sovereignty tier)
 - Deployable on-prem o cloud EU only
+- Watchdog esterno all'host (revisione del 10 ottobre 2026): heartbeat
+  firmato dall'agent con versione, hash dei programmi BPF, stato di
+  bpffs e, dove c'è TPM, quote dei PCR; il backend distingue heartbeat
+  mancante, firma invalida, baseline BPF divergente e PCR divergenti, e
+  mette in quarantena l'host; chain log inoltrati append-only perché i
+  log locali non bastano contro root
 
 Demo: 3 agent (2 Linux + 1 Windows) connessi al C2. Dashboard
 mostra flotta in tempo reale.
