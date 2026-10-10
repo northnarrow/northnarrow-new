@@ -407,7 +407,7 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
     # Watchdog first: stopping the agent alone makes it respawn it.
     for u in northnarrow-watchdog northnarrow-agent; do
-        echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null | tr -d '\n' || echo unknown))"
+        echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null | tr -d '\n'))"
         systemctl stop "$u.service" 2>/dev/null || true
         systemctl reset-failed "$u.service" 2>/dev/null || true
     done
