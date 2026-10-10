@@ -244,18 +244,30 @@ fn caller_is_in_family() -> bool {
 /// so we're emitting an event we definitely want.
 #[inline(always)]
 fn emit_drift(op: u8, key: InodeKey) {
-    emit_drift_with_dest(op, key, None);
+    emit_drift_with_dest(op, key, NO_DEST);
 }
+
+/// "No destination" marker for [`emit_drift_with_dest`]: dev 0 / ino 0
+/// is what the zeroed entry carried before, so userland needs no new
+/// case.
+const NO_DEST: InodeKey = InodeKey { dev: 0, ino: 0 };
 
 /// Polish #3 — variant of [`emit_drift`] that also writes the
 /// rename DEST `(dev, ino)` pair. Userland's drain resolves
 /// `(dest_dev, dest_ino)` against the `InodePathMap` and
 /// populates `FimEvent::dest_path` on success; the NN-L-FIM-010
 /// rule then matches the ransomware extension on EITHER side.
-/// `dest_key: None` writes zeroes (matches the C8 behaviour
-/// for non-Rename ops).
+/// `NO_DEST` writes zeroes (matches the C8 behaviour for
+/// non-Rename ops).
+///
+/// `dest` is a plain, always-initialised value on purpose: passed as
+/// an `Option<InodeKey>`, the compiler spilled it to the stack and
+/// hoisted the payload loads above the discriminant check, and the
+/// 5.15 verifier rejected the whole program with `invalid read from
+/// stack` (uninitialised slot on the `None` path). Newer verifiers
+/// tolerate that read for privileged loaders; 5.15 does not.
 #[inline(always)]
-fn emit_drift_with_dest(op: u8, key: InodeKey, dest_key: Option<InodeKey>) {
+fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
         None => return,
@@ -279,10 +291,8 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest_key: Option<InodeKey>) {
         if let Ok(comm) = bpf_get_current_comm() {
             (*raw_ptr).modifier_comm = comm;
         }
-        if let Some(dest) = dest_key {
-            (*raw_ptr).dest_dev = dest.dev;
-            (*raw_ptr).dest_ino = dest.ino;
-        }
+        (*raw_ptr).dest_dev = dest.dev;
+        (*raw_ptr).dest_ino = dest.ino;
     }
     entry.submit(0);
 }
@@ -522,7 +532,7 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     // (target_dev, target_ino, timestamp_ns) in userland.
     let old_dentry: *const c_void = ctx.arg(1);
     let new_dir: *const c_void = ctx.arg(2);
-    let new_dir_key = inode_key(new_dir);
+    let new_dir_key = inode_key(new_dir).unwrap_or(NO_DEST);
     let old_inode_opt = inode_from_dentry(old_dentry);
     let mut combined_emitted_for_old_inode = false;
     if let Some(old_inode) = old_inode_opt {
