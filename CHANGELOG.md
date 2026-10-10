@@ -28,6 +28,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signalled, with a bounded wait. The map-pin test accepts the 15-byte
   kernel program name printed by older bpftool.
 
+- FIM e2e suite: the credential-read test asserted a drift row that
+  BUG-012 v2 deliberately never writes; it now asserts the
+  `NN-L-FIM-011_AwsCredsRead` detection record and the empty drift log.
+  The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
+
 ### Added
 - `northnarrow-agent --btf-check <btf>`: offline compatibility verdict
   (SUPPORTED / SUPPORTED (degraded) / NOT SUPPORTED) for any kernel BTF;
