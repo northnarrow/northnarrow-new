@@ -56,13 +56,24 @@ and shipped with its provenance stamp; the guest only builds userland,
 so `agent/build.rs`'s staleness guard still holds. `respawn-check` is
 the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
 
-### Second guest: Debian 12 (kernel 6.1)
+### Other guests: Debian 12, Ubuntu 22.04, AlmaLinux 9
 
-`NN_LAB_DISTRO=debian12 deploy/lab/nn-lab.sh up` boots a separate Debian
-12 guest (ssh 127.0.0.1:2422, state under `~/.cache/nn-lab/debian12/`);
-prefix any sub-command with the variable to target it. The verified
-matrix and the current finding (agent refuses to start on 6.1: BTF offset
-drift) are in `docs/operator/KERNEL_COMPATIBILITY.md`.
+`NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh up` boots a separate guest;
+prefix any sub-command with the variable to target it. Each guest has its
+own disk, seed, ssh port and reports under `~/.cache/nn-lab/<distro>/`
+(the original `ubuntu2404` keeps the flat layout):
+
+| `NN_LAB_DISTRO` | kernel | ssh port | notes |
+|---|---|---|---|
+| `ubuntu2404` (default) | 6.8 | 2222 (2322 on this host) | build kernel |
+| `debian12` | 6.1 | 2422 | `perf_event_paranoid=3` drop-in |
+| `ubuntu2204` | 5.15 | 2522 | older verifier, sudo 1.9.9, systemd 249 |
+| `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header |
+
+The verified matrix and the per-kernel findings are in
+`docs/operator/KERNEL_COMPATIBILITY.md`. Memory: each guest takes
+`NN_LAB_MEM` (8 GiB); on a 32 GiB host keep at most two guests up during
+long runs — four at once starved the host (2026-10-10).
 
 ### Nightly, unattended
 
@@ -95,6 +106,34 @@ After a WSL restart `/dev/kvm` must be writable again (`kvm` group
 membership, or `sudo chmod 666 /dev/kvm`). `NN_LAB_NIGHTLY_DOWN=1` powers
 the guest off at the end; `NN_LAB_NIGHTLY_SKIP="test-ignored"` skips a
 step (the ignored suite includes the 5-minute rate-limit test).
+
+### Soak test (hours of synthetic load)
+
+```
+NN_LAB_DISTRO=alma9 deploy/lab/nn-lab.sh soak start 24      # hours; sample every 60 s
+deploy/lab/nn-lab.sh soak status                            # last sample, generator iterations
+deploy/lab/nn-lab.sh soak wait                              # block until the end, then report
+deploy/lab/nn-lab.sh soak report                            # ~/.cache/nn-lab/<distro>/reports/soak-<stamp>.md
+deploy/lab/nn-lab.sh soak stop                              # end early
+```
+
+`soak start` installs the units if they are not active, ships
+`deploy/lab/soak/{generate,sample}.sh` to `~/soak` on the guest and runs
+them detached: the generator (as `nn`) keeps a steady, benign load on
+every sensor — execs of standard-path binaries, create/append/rename/
+delete in `/var/tmp/nn-soak`, reads of a watched system file, HTTP
+requests to a local listener, UDP datagrams, DNS lookups of a fixed set
+(rates via `SOAK_*_PER_S`); the sampler (as root, installed under
+`/usr/local/sbin` because the agent kills root execs from `/home`) appends
+one CSV row per interval: agent/watchdog RSS, VSZ, CPU, threads, fds,
+systemd restart counters, journal WARN/ERROR/COMBAT counts, chain-log
+sizes, occupancy of the growable eBPF maps (`FLOW_SOCK_MAP`,
+`UDP_UNCONNECTED_SEEN`, `FIM_DIRTY_INODES`) and the ring-buffer drop
+counter. The report fits a least-squares slope to the RSS series and
+fails on any restart, any journal ERROR, an RSS slope above
+`NN_LAB_SOAK_MAX_RSS_MB_H` (5 MB/h, judged on runs of at least 2 h) or an
+fd count that grew by more than half. Planned use: 24 h on each guest
+before a release, 72 h once before `0.1.0`.
 
 ### RAG release gates need the real corpus
 
