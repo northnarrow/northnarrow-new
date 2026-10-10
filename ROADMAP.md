@@ -555,8 +555,11 @@ Pianificato, in quest'ordine:
   mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
   24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
 - Verifica della provenienza all'installazione: `install.sh` controlla
-  `SHA256SUMS` e l'attestazione SLSA del tarball e rifiuta un upgrade
-  non verificabile; esito registrato nell'audit log; all'avvio l'agent
+  `SHA256SUMS` e l'attestazione SLSA del tarball (builder atteso: il
+  workflow di release di questo repository, nessun altro) e rifiuta un
+  upgrade non verificabile; esito registrato nell'audit log; `cargo audit`
+  anche a calendario settimanale, non solo sui push, perché la SBOM è un
+  inventario e va riconfrontata con gli advisory; all'avvio l'agent
   confronta l'hash del proprio binario, del watchdog e dell'oggetto eBPF
   con il manifest firmato dell'installazione (ri-verifica continua, non
   solo al deploy)
@@ -625,6 +628,16 @@ cambia l'ordine delle Tappe successive.
 - DNS cifrato e tunnel: DoH/DoT verso resolver non configurati, volumi
   anomali su DNS e ICMP, beacon con jitter verso CDN legittime
 - Caso d'uso dei canary estesi agli account (chiavi SSH e token esca)
+- Persistence correlata, non solo osservata: catena scrittura di unit,
+  timer o cron → `systemctl enable/start` o `crontab` → esecuzione del
+  binario da PID 1 o da cron, con severità che sale a ogni anello
+  (oggi FIM-007/009/023 vedono la scrittura, non l'esecuzione)
+- Masquerading generico (T1036): un binario con il nome di uno strumento
+  di sistema eseguito fuori dai percorsi gestiti dal package manager, o
+  con hash diverso dal pacchetto installato (`dpkg -V`/`rpm -V` come
+  oracolo); account (T1136): `useradd`/`usermod`/`passwd`, nuovi UID 0,
+  modifiche a `shadow` e `sudoers` come evento di account e non solo
+  come drift di file
 - Hook LSM mancanti rispetto allo stato dell'arte 2024–2026, in ordine:
   `sb_mount`/`move_mount`/`sb_umount` (mount, bind mount, overlay,
   pivot_root, chroot); `task_fix_setuid` e `capable` (cambi di uid/gid e
