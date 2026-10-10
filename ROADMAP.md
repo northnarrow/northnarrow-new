@@ -570,6 +570,11 @@ Pianificato, in quest'ordine:
   che nega carico, attach, detach, enumerazione e scrittura di mappe a
   chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
   self-check periodico che i link dell'agent siano ancora attaccati
+- Sonda di telemetria continua: l'agent genera a intervalli eventi noti
+  e innocui su ogni sensore (exec, file, rete, DNS, FIM) e verifica di
+  vederli entro pochi secondi; evento mancante o hook assente = alert
+  "telemetry gap" nel chain log, non solo un WARN (prova di copertura
+  come funzione di prodotto, non solo come test di laboratorio)
 - Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
   bpffs, cgroup freezer, bind mount su `/etc/northnarrow`, kexec,
   mascheramento e override delle unit systemd, `bpftool`/`bpftrace` da
@@ -609,6 +614,21 @@ cambia l'ordine delle Tappe successive.
 - DNS cifrato e tunnel: DoH/DoT verso resolver non configurati, volumi
   anomali su DNS e ICMP, beacon con jitter verso CDN legittime
 - Caso d'uso dei canary estesi agli account (chiavi SSH e token esca)
+- Hook LSM mancanti rispetto allo stato dell'arte 2024–2026, in ordine:
+  `sb_mount`/`move_mount`/`sb_umount` (mount, bind mount, overlay,
+  pivot_root, chroot); `task_fix_setuid` e `capable` (cambi di uid/gid e
+  uso di capability nella lineage, oggi visti solo all'exec);
+  `mmap_file`/`file_mprotect` (memoria eseguibile dopo scrittura, W^X —
+  oggi copriamo solo l'exec da memfd/`/proc/self/fd`, R004);
+  `socket_bind`/`socket_accept` e `inet_sock_set_state` (bind e accept
+  oggi non visti; connect, listen e close sì); tracepoint
+  `sched_process_fork` per la lineage completa
+- Operazioni di namespace viste dalla syscall (`unshare`, `setns`,
+  `clone` con `CLONE_NEW*`), non dal nome del tool (R013 oggi guarda
+  `nsenter`/`unshare` per comm)
+- Identità del carico di lavoro su Kubernetes (SPIFFE/SVID e token di
+  service account osservati al punto d'uso, correlati a processo, cgroup
+  e connessione): prerequisito delle Tappe 13–14, non del nucleo
 
 Demo: lo stesso attacco eseguito da un container, da uno script passato
 a `python3 -c` e via `io_uring` produce la stessa catena di detection
