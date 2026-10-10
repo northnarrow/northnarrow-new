@@ -20,7 +20,7 @@ verifiable: either every read resolves, or the agent does not run.
 | Ubuntu 24.04 LTS | 6.8.0-142-generic | needs `lsm=…,bpf` (grub) | yes | **supported** — full nightly green (e2e, ignored suites, install, upgrade, uninstall, respawn); offsets match the build (41/41, 0 drift) | 2026-10-09 |
 | Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
 | Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs and the 8 FIM observe hooks load and attach after three rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
-| RHEL / Alma / Rocky 9 | 5.14 + backports | needs `lsm=…,bpf` | yes | untested — same note as 22.04 | — |
+| AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-687 el9_8 | yes (default list includes `bpf`) | yes | **supported** — e2e agent 6/6, FIM 4/4, watchdog 4/4 with SELinux **enforcing** (no AVC denial); `--btf-check` = SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-10-10 (lab PR 20) |
 
 Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 `/sys/kernel/btf/vmlinux` file), `bpf` in `/sys/kernel/security/lsm`,
@@ -95,8 +95,30 @@ system-wide plus removing the drop-in to keep the narrower set).
 
 Level 2 so far: optional fields (degrade instead of refuse), the
 `--btf-check` verdict, the computed BTFHub matrix in CI with a baseline,
-a third lab guest (Ubuntu 22.04 / 5.15). Still planned: external BTF for
-kernels shipped without it, an Alma 9 guest.
+a third lab guest (Ubuntu 22.04 / 5.15), a fourth (AlmaLinux 9 / 5.14,
+SELinux enforcing) with tracepoint layouts resolved from tracefs. Still
+planned: external BTF for kernels shipped without it.
+
+## Tracepoint layouts on vendor kernels (RHEL 9)
+
+Tracepoint programs read their arguments at fixed byte offsets inside the
+`TracePointContext`, and those offsets come from tracefs
+(`/sys/kernel/tracing/events/<category>/<event>/format`), not from BTF.
+The common header is not stable across vendor kernels: RHEL 9 (5.14 el9)
+inserts `common_preempt_lazy_count` at offset 8, which moves
+`sched_process_exec.filename` from 8 to 12 (syscall tracepoints keep their
+argument offsets thanks to 8-byte alignment). With a compiled-in 8 the exec
+sensor reported an **empty filename for every exec**, and R017 ("shell
+from a non-standard path") killed every `sh` on AlmaLinux 9.
+
+Since lab PR 20 the agent resolves the tracepoint fields it reads
+(`TRACEPOINT_FIELDS` in `common/src/btf_offsets.rs`) from tracefs at boot
+and publishes them in the same `BTF_OFFSETS` map (slots after the enum
+values); drift is logged at INFO (`tracepoint field offset resolved from
+tracefs — differs from the build kernel`). If tracefs is unreadable the
+compiled value stays and a WARN names the field. Independently, the rules
+that match on "not under a standard prefix" (R017, R013) treat an empty
+filename as unknown and never fire on it.
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
@@ -136,6 +158,9 @@ Lab notes for 22.04-era userland:
   bash starts background jobs with SIGINT and SIGQUIT ignored.
 - systemd 249 (22.04) knows `systemctl kill --kill-who=`, not the newer
   `--kill-whom=` spelling; the lab uses the old one, accepted by both.
+- RHEL-family sudo sets `HOME=/root` (`always_set_home`), so `sudo -E cargo`
+  resolves root's own rustup and downloads a second toolchain on first
+  use; harmless, just slow once.
 
 ## Adding a distro to the lab
 

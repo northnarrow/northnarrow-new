@@ -544,8 +544,9 @@ Pianificato, in quest'ordine:
   opzionali (degrado invece di rifiuto), `--btf-check`, terzo guest
   Ubuntu 22.04 / 5.15 verificato end-to-end (tre costrutti riscritti per
   il verifier vecchio), matrice calcolata su BTFHub in CI con baseline
-  (`deploy/btf-matrix/`); restano BTF esterna per kernel senza BTF e il
-  guest Alma 9
+  (`deploy/btf-matrix/`), quarto guest AlmaLinux 9 / 5.14 con SELinux
+  enforcing (layout dei tracepoint risolto da tracefs: il kernel RHEL
+  sposta i campi di 4 byte); resta la BTF esterna per kernel senza BTF
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
   mappe LRU, timer)
 - Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,

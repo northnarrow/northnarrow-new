@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- RHEL 9 family (AlmaLinux 9 / 5.14 el9): the vendor tracepoint header
+  shifts `sched_process_exec.filename` by 4 bytes; the exec sensor read an
+  empty filename on every exec and R017 killed every shell. Tracepoint
+  field offsets are now resolved from tracefs at boot (4 new `BTF_OFFSETS`
+  slots), and the "non-standard path" rules (R017, R013) never fire on an
+  empty filename.
 - Short-lived TCP flows (connect and close within the pipeline latency:
   loopback probes, scanners, reverse-shell attempts) produced no netflow
   row and could silence CHAIN-007; the close now synthesises the row when
@@ -34,6 +40,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Lab: fourth guest AlmaLinux 9 (`NN_LAB_DISTRO=alma9`, kernel 5.14 el9,
+  SELinux enforcing, port 2622) — verified end to end; the compatibility
+  matrix records it.
 - `BTF matrix` workflow + `deploy/btf-matrix/run.sh`: computed
   kernel-compatibility matrix over the BTFHub archive (newest non-cloud
   kernel per distro/version, `--btf-check` verdicts, BPF LSM floor),
