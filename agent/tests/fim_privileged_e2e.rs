@@ -442,10 +442,14 @@ fn fim_subprocess_unlink_records_deleted_event() {
 /// the `/.aws/credentials` substring the NN-L-FIM-011 path
 /// matcher uses, then `cat`s it from a subprocess. Comm is
 /// `cat`, not in the `AWS_CLI_COMMS` allow-list, so a fully
-/// wired rule engine would fire `NN-L-FIM-011_AwsCredsRead` on
-/// the resulting `Event::Fim`. This test only asserts the drift
-/// entry is recorded — rule-firing assertions belong in a
-/// separate test that doesn't need a sacrificial subprocess.
+/// wired rule engine fires `NN-L-FIM-011_AwsCredsRead` on the
+/// resulting `Event::Fim`. Since BUG-012 v2 a read is NEVER an
+/// integrity drift: the drain forwards the credential-path `Opened`
+/// to the rule engine silently and writes no `fim_drift.jsonl`
+/// row, so this test asserts the two observable halves of that
+/// contract — the detection record lands in `--detections-file`
+/// and the drift log stays empty. (Before 2026-10-10 it waited for
+/// a drift row and failed on every kernel; the lab never ran it.)
 ///
 /// **Why a separate tempdir layout:** the watched path needs to
 /// look like `<...>/.aws/credentials` so the NN-L-FIM-011
@@ -498,6 +502,11 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     let agent_id = dir.join("agent_id");
     let admin_socket = dir.join("admin.sock");
     let marker = dir.join("agent.shutdown_authorised");
+    // Per-test detection store: the credential-read verdict is the
+    // artefact this test waits for, and the default path is the
+    // production chain under /var/lib/northnarrow.
+    let detections_log = dir.join("detections.jsonl");
+    let status_events_log = dir.join("status_events.jsonl");
 
     let child = Command::new(agent_bin())
         .arg("--combat-rules")
@@ -514,6 +523,10 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
         .arg(&signing_key)
         .arg("--shutdown-marker-file")
         .arg(&marker)
+        .arg("--detections-file")
+        .arg(&detections_log)
+        .arg("--status-events-file")
+        .arg(&status_events_log)
         .arg("--fim-paths-v1")
         .arg(&fim_paths_v1)
         .arg("--fim-paths-local")
@@ -545,38 +558,48 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     // comm is `cat` (not in AWS_CLI_COMMS — exactly what the
     // NN-L-FIM-011 rule treats as "suspicious read").
     let watched_str = watched_file.to_string_lossy().into_owned();
-    let status = Command::new("cat")
-        .arg(&watched_file)
-        .stdout(Stdio::null())
-        .status()
-        .expect("spawn cat");
-    assert!(status.success(), "cat subprocess failed");
-
-    let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
-    while Instant::now() < deadline && jsonl_row_count(&drift_log) < 1 {
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    let rows = read_jsonl(&drift_log);
-    assert!(
-        !rows.is_empty(),
-        "drift log {} never populated within {:?}; cat may have been processed \
-         before TOFU finished — increase BASELINE_POLL_TIMEOUT if this flakes",
-        drift_log.display(),
-        DRIFT_POLL_TIMEOUT
-    );
-    let row = &rows[0];
-    assert_eq!(row["path"], serde_json::json!(watched_str));
-    let op = row["op"].as_u64().unwrap_or(0);
-    assert!(
-        op == OP_OPENED || op == OP_MODIFIED,
-        "expected OPENED({OP_OPENED}) or MODIFIED({OP_MODIFIED}) for cat of \
-         creds file, got {op}"
-    );
-    // Path satisfies the NN-L-FIM-011 substring matcher.
     assert!(
         watched_str.contains("/.aws/credentials"),
         "watched path `{watched_str}` should match NN-L-FIM-011's substring \
          predicate"
+    );
+    // The verdict is KillProcess on `cat`; it has normally exited by
+    // the time the event is drained, so its exit status is not
+    // asserted — only that it ran.
+    let _ = Command::new("cat")
+        .arg(&watched_file)
+        .stdout(Stdio::null())
+        .status()
+        .expect("spawn cat");
+    let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
+    let mut hit: Option<serde_json::Value> = None;
+    while Instant::now() < deadline && hit.is_none() {
+        hit = read_jsonl(&detections_log)
+            .into_iter()
+            .find(|r| r["rule_id"] == serde_json::json!("NN-L-FIM-011_AwsCredsRead"));
+        if hit.is_none() {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+    let hit = hit.unwrap_or_else(|| {
+        panic!(
+            "no NN-L-FIM-011_AwsCredsRead record in {} within {:?}; records seen: {:?}",
+            detections_log.display(),
+            DRIFT_POLL_TIMEOUT,
+            read_jsonl(&detections_log)
+                .iter()
+                .map(|r| r["rule_id"].clone())
+                .collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(hit["severity"], serde_json::json!("High"), "record: {hit}");
+    // BUG-012 v2: a read is not integrity drift — the drift log must
+    // still be empty after the detection was recorded.
+    assert_eq!(
+        jsonl_row_count(&drift_log),
+        0,
+        "a credential read must not produce a drift row (BUG-012 v2): {:?}",
+        read_jsonl(&drift_log)
     );
 }
 

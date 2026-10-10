@@ -247,7 +247,12 @@ cmd_test_e2e() {
     # `cargo test` SIGKILLed mid-suite, 2026-10-08).
     vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
-    log "agent privileged_e2e done — running the watchdog suite"
+    # The four FIM e2e tests are plain `#[test]` (not ignored), so neither
+    # `test-ignored` nor the privileged_e2e run above covered them — the
+    # lab never executed them before 2026-10-10 (review entry 33).
+    log "agent privileged_e2e done — running the FIM suite"
+    vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test fim_privileged_e2e -- --test-threads=1 --nocapture'
+    log "FIM suite done — running the watchdog suite"
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1 --nocapture'
 }
 
