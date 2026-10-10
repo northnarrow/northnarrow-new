@@ -54,6 +54,9 @@ Build:     \$(git describe --always --dirty 2>/dev/null || echo unknown) — $(d
 EOT
 sed -i "s|\\\$(git describe --always --dirty 2>/dev/null \|\| echo unknown)|$(git describe --always --dirty 2>/dev/null || echo unknown)|" "$tree/README-RELEASE.md"
 
+# Every file of the tree hashed into MANIFEST.sha256 (install.sh verifies
+# the extracted tree against it before touching the host).
+( cd "$tree" && find . -type f ! -name MANIFEST.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > MANIFEST.sha256 )
 tar -C "$OUT" -czf "$OUT/$name.tar.gz" "$name"
 echo "mk-tarball: $OUT/$name.tar.gz ($(du -h "$OUT/$name.tar.gz" | cut -f1))"
 

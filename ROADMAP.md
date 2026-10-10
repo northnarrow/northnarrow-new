@@ -554,7 +554,8 @@ Pianificato, in quest'ordine:
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
   mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
   24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
-- Verifica della provenienza all'installazione: `install.sh` controlla
+- Verifica della provenienza all'installazione (fatta il 10 ottobre, lab
+  PR 21): `install.sh` controlla
   `SHA256SUMS` e l'attestazione SLSA del tarball (builder atteso: il
   workflow di release di questo repository, nessun altro) e rifiuta un
   upgrade non verificabile; esito registrato nell'audit log; `cargo audit`

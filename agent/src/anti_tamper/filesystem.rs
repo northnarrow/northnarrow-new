@@ -127,6 +127,8 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "process-comm-allowlist.local",
     "netflow-comm-allowlist.v1",
     "netflow-comm-allowlist.local",
+    // lab PR 21: written by install.sh, re-verified by the agent at boot
+    "install-manifest.json",
 ];
 
 /// at-authz-1: the subset of [`ETC_PROTECTED_FILES`] that is also
@@ -140,7 +142,16 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
 /// them would turn a routine live edit into an enforce-mode COMBAT
 /// (NIC-isolation) trip. Every entry MUST also appear in
 /// [`ETC_PROTECTED_FILES`].
-pub const ETC_WRITE_DENY_FILES: &[&str] = &["admin.pub", "agent_id", "audit.log", "agent.sig.key"];
+pub const ETC_WRITE_DENY_FILES: &[&str] = &[
+    "admin.pub",
+    "agent_id",
+    "audit.log",
+    "agent.sig.key",
+    // written only by install.sh with the units stopped; an append at
+    // runtime corrupts the boot-time integrity check (observed on the
+    // lab guest: `echo x >>` went through while MUTATE-only).
+    "install-manifest.json",
+];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
 /// PROTECTED_INODES covers. The directory itself is already
@@ -1526,7 +1537,7 @@ mod tests {
     // ── Tappa 8 A14 (B4) — /etc/northnarrow registration tests ─────
 
     /// A14 + C7 + N8 + Tappa 10.5 D1 test: `ETC_PROTECTED_FILES` is
-    /// a stable, ordered list of the fourteen file basenames. The
+    /// a stable, ordered list of the fifteen file basenames. The
     /// ordering matters for the operator-visible audit-log entries;
     /// anchor it explicitly. A14 originally specified four files;
     /// Tappa 9 C7 appended `fim-paths.v1` + `fim-paths.local`,
@@ -1553,6 +1564,7 @@ mod tests {
                 "process-comm-allowlist.local",
                 "netflow-comm-allowlist.v1",
                 "netflow-comm-allowlist.local",
+                "install-manifest.json",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

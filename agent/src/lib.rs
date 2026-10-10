@@ -22,6 +22,7 @@ pub mod correlation;
 pub mod decision;
 pub mod detection_store;
 pub mod fim;
+pub mod install_manifest;
 pub mod net;
 pub mod posture;
 pub mod rag;

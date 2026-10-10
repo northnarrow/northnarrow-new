@@ -225,6 +225,15 @@ struct Cli {
         default_value = northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH,
     )]
     audit_log_file: PathBuf,
+    /// Install manifest written by `install.sh` (provenance level + hashes
+    /// of the installed binaries and eBPF object); the agent re-verifies
+    /// itself against it at every boot. Absent = source-tree install.
+    #[arg(
+        long = "install-manifest",
+        value_name = "PATH",
+        default_value = northnarrow_agent::install_manifest::DEFAULT_INSTALL_MANIFEST_PATH,
+    )]
+    install_manifest: PathBuf,
 
     /// PHASE_D_003: configurable path of the
     /// shutdown-authorisation marker (Tappa 8 A8). Default is
@@ -1288,6 +1297,105 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Supply chain, runtime half: the binaries running now must be the
+    // ones install.sh verified and recorded. Checked before the audit
+    // log opens so the agent_boot entry carries the result.
+    let integrity = {
+        use northnarrow_agent::install_manifest::{self, IntegrityOutcome, ALLOW_UNVERIFIED_ENV};
+        let own_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+        let outcome = install_manifest::check(
+            &cli.install_manifest,
+            &own_exe,
+            northnarrow_agent::sensors::ebpf_object::OBJECT_SHA,
+        );
+        match &outcome {
+            IntegrityOutcome::Verified {
+                provenance,
+                checked,
+            } => info!(
+                provenance,
+                checked,
+                manifest = %cli.install_manifest.display(),
+                "binary integrity verified against the install manifest"
+            ),
+            IntegrityOutcome::NoManifest { path } => info!(
+                path = %path.display(),
+                "no install manifest — source-tree install, binaries not re-verified at boot"
+            ),
+            IntegrityOutcome::NotApplicable { own_exe, bin_dir } => info!(
+                own_exe = %own_exe.display(),
+                bin_dir,
+                "install manifest describes another copy (this binary runs outside bin_dir) — \
+                 not compared"
+            ),
+            IntegrityOutcome::Unreadable { path, reason } => error!(
+                path = %path.display(),
+                reason,
+                "install manifest unreadable — it sits under inode_protect, a broken one is a signal"
+            ),
+            IntegrityOutcome::Mismatch {
+                provenance,
+                mismatches,
+            } => {
+                for m in mismatches {
+                    error!(
+                        file = %m.name,
+                        expected = %m.expected,
+                        actual = %m.actual,
+                        provenance,
+                        "binary integrity MISMATCH — the running file is not the one install.sh \
+                         verified and recorded"
+                    );
+                }
+            }
+        }
+        let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
+        if outcome.is_fatal(allow.as_deref()) {
+            error!(
+                "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
+                 override on a dev host; re-run install.sh to restore a verified install)",
+                outcome.label()
+            );
+            // Leave the refusal in the signed audit chain before exiting.
+            let detail = match &outcome {
+                IntegrityOutcome::Mismatch { mismatches, .. } => mismatches
+                    .iter()
+                    .map(|m| format!("{}: expected {} got {}", m.name, m.expected, m.actual))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                IntegrityOutcome::Unreadable { reason, .. } => reason.clone(),
+                _ => String::new(),
+            };
+            if let Ok(key) =
+                northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
+            {
+                if let Ok(mut log) =
+                    northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id)
+                {
+                    match log.boot_refused(outcome.label(), outcome.provenance(), &detail) {
+                        Ok(e) => {
+                            info!(entry_hash = %e.entry_hash, "refused boot recorded in the audit chain")
+                        }
+                        Err(e) => error!(
+                            error = format!("{e:#}"),
+                            "could not record the refused boot in the audit chain"
+                        ),
+                    }
+                }
+            }
+            std::process::exit(78);
+        } else if matches!(
+            outcome,
+            IntegrityOutcome::Mismatch { .. } | IntegrityOutcome::Unreadable { .. }
+        ) {
+            warn!(
+                "install-manifest check = {} but {ALLOW_UNVERIFIED_ENV}=1 — continuing (dev override)",
+                outcome.label()
+            );
+        }
+        outcome
+    };
+
     // ── Shared audit log + COMBAT graduated-response ladder ─────────
     //
     // The signed, hash-chained audit log is opened ONCE here (now that
@@ -1303,40 +1411,45 @@ async fn main() -> Result<()> {
                     // `agent_boot` entry proves the chain is writable NOW
                     // instead of failing silently at the first COMBAT
                     // transition. Fail-closed in enforcement mode.
-                    Ok(mut log) => match log.boot_probe(detect_only) {
-                        Ok(entry) => {
-                            info!(
-                                path = %cli.audit_log_file.display(),
-                                entry_hash = %entry.entry_hash,
-                                "audit log writable — agent_boot entry appended"
-                            );
-                            Some(Arc::new(parking_lot::Mutex::new(log)))
-                        }
-                        Err(e) => {
-                            let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                                detect_only,
-                                std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+                    Ok(mut log) => {
+                        match log.boot_probe(detect_only, integrity.label(), integrity.provenance())
+                        {
+                            Ok(entry) => {
+                                info!(
+                                    path = %cli.audit_log_file.display(),
+                                    entry_hash = %entry.entry_hash,
+                                    "audit log writable — agent_boot entry appended"
+                                );
+                                Some(Arc::new(parking_lot::Mutex::new(log)))
+                            }
+                            Err(e) => {
+                                let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+                                    detect_only,
+                                    std::env::var(
+                                        northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV,
+                                    )
                                     .ok()
                                     .as_deref(),
-                            );
-                            error!(
-                                error = format!("{e:#}"),
-                                path = %cli.audit_log_file.display(),
-                                fatal,
-                                "audit log NOT writable — the signed audit chain would stop here \
-                                 (is the directory in the unit's ReadWritePaths?)"
-                            );
-                            if fatal {
-                                anyhow::bail!(
+                                );
+                                error!(
+                                    error = format!("{e:#}"),
+                                    path = %cli.audit_log_file.display(),
+                                    fatal,
+                                    "audit log NOT writable — the signed audit chain would stop here \
+                                     (is the directory in the unit's ReadWritePaths?)"
+                                );
+                                if fatal {
+                                    anyhow::bail!(
                                     "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
                                      set {}=1 to start anyway, or use --detect-only.",
                                     cli.audit_log_file.display(),
                                     northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
                                 );
+                                }
+                                None
                             }
-                            None
                         }
-                    },
+                    }
                     Err(e) => {
                         let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
                             detect_only,

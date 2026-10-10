@@ -69,15 +69,31 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 # then start the units that were running. Keys, agent_id, the audit chain
 # and every chain log are preserved — install.sh never touches them.
 UPGRADE=0
-for arg in "$@"; do
-    case "$arg" in
+VERIFY=1
+REQUIRE_ATTESTATION=0
+TARBALL=""
+SUMS=""
+ATTEST_BUNDLE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --upgrade) UPGRADE=1 ;;
+        --tarball) TARBALL=$2; shift ;;
+        --sums) SUMS=$2; shift ;;
+        --attestation) ATTEST_BUNDLE=$2; shift ;;
+        --require-attestation) REQUIRE_ATTESTATION=1 ;;
+        --no-verify) VERIFY=0 ;;
         -h|--help)
-            echo "usage: sudo $0 [--upgrade]"
-            echo "  --upgrade   stop the running units, replace binaries/units/configs, restart them"
+            echo "usage: sudo $0 [--upgrade] [--tarball FILE] [--sums FILE] [--attestation BUNDLE] [--require-attestation] [--no-verify]"
+            echo "  --upgrade              stop the running units, replace binaries/units/configs, restart them"
+            echo "  --tarball FILE         the release tarball this tree was extracted from (default: ../<tree>.tar.gz)"
+            echo "  --sums FILE            SHA256SUMS of the release (default: next to the tarball)"
+            echo "  --attestation BUNDLE   offline Sigstore bundle for the tarball (gh attestation download)"
+            echo "  --require-attestation  fail unless the SLSA provenance attestation verifies"
+            echo "  --no-verify            skip every release check (dev only; recorded as 'unverified')"
             exit 0 ;;
-        *) echo "install.sh: unknown argument: $arg" >&2; exit 2 ;;
+        *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
+    shift
 done
 # Beta Step 4c: nn-admin is the operator's COMBAT-release / admin tool.
 # It must be on-host so an operator can unlock COMBAT, and install.sh
@@ -151,6 +167,133 @@ NETFLOW_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/netflow-comm-allowlist.v1"
 COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 
 # ── pre-flight ──────────────────────────────────────────────────────
+# ── release verification (supply chain, install-time half) ───────────
+# What the operator downloaded must be what CI built and attested:
+#   1. MANIFEST.sha256 inside the tree (every file hashed by mk-tarball)
+#      — catches a corrupted or edited tree;
+#   2. SHA256SUMS of the release against the tarball — catches a
+#      swapped tarball;
+#   3. the SLSA provenance attestation of the tarball, verified with
+#      `gh attestation verify` (online or with an offline --attestation
+#      bundle) or cosign, bound to THIS repository's release workflow —
+#      catches a tarball built elsewhere.
+# The strongest level reached is recorded in the install manifest and
+# the agent re-checks the installed hashes at every boot. A source tree
+# (no MANIFEST.sha256: the lab, a developer build) is "source-tree".
+REPO_SLUG="northnarrow/northnarrow-new"
+SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
+PROVENANCE="source-tree"
+TARBALL_SHA256=""
+ATTEST_METHOD="none"
+ATTEST_VERIFIED=0
+verify_release() {
+    if (( ! VERIFY )); then
+        PROVENANCE="unverified"
+        echo "install.sh: WARNING: --no-verify — release checks skipped, provenance recorded as 'unverified'" >&2
+        return 0
+    fi
+    if [[ -f "$REPO_ROOT/MANIFEST.sha256" ]]; then
+        echo "install.sh: verifying the extracted tree against MANIFEST.sha256"
+        if ! (cd "$REPO_ROOT" && sha256sum -c --quiet MANIFEST.sha256); then
+            echo "install.sh: REFUSED — the extracted tree does not match MANIFEST.sha256 (corrupted or edited release)" >&2
+            exit 1
+        fi
+        PROVENANCE="manifest"
+    else
+        echo "install.sh: no MANIFEST.sha256 — source tree, release checks not applicable (provenance: source-tree)"
+        return 0
+    fi
+    local tree_name tgz sums
+    tree_name=$(basename "$REPO_ROOT")
+    tgz=${TARBALL:-"$REPO_ROOT/../$tree_name.tar.gz"}
+    if [[ ! -f "$tgz" ]]; then
+        echo "install.sh: tarball not found ($tgz) — pass --tarball to also verify SHA256SUMS and the attestation" >&2
+        return 0
+    fi
+    TARBALL_SHA256=$(sha256sum "$tgz" | cut -d' ' -f1)
+    sums=${SUMS:-"$(dirname "$tgz")/SHA256SUMS"}
+    if [[ -f "$sums" ]]; then
+        local expected
+        expected=$(grep -E " \*?$(basename "$tgz")\$" "$sums" | head -1 | cut -d' ' -f1 || true)
+        if [[ -z "$expected" ]]; then
+            echo "install.sh: REFUSED — $(basename "$tgz") is not listed in $sums" >&2
+            exit 1
+        fi
+        if [[ "$expected" != "$TARBALL_SHA256" ]]; then
+            echo "install.sh: REFUSED — tarball sha256 $TARBALL_SHA256 does not match SHA256SUMS ($expected)" >&2
+            exit 1
+        fi
+        echo "install.sh: tarball matches SHA256SUMS ($TARBALL_SHA256)"
+        PROVENANCE="checksums"
+    else
+        echo "install.sh: SHA256SUMS not found next to the tarball — pass --sums to verify it" >&2
+    fi
+    # attestation: gh (2.49+) online or with an offline bundle, else cosign
+    if command -v gh >/dev/null 2>&1 && gh attestation --help >/dev/null 2>&1; then
+        local -a args=(attestation verify "$tgz" --repo "$REPO_SLUG" --signer-workflow "$SIGNER_WORKFLOW")
+        [[ -n "$ATTEST_BUNDLE" ]] && args+=(--bundle "$ATTEST_BUNDLE")
+        if gh "${args[@]}" >/dev/null 2>&1; then
+            ATTEST_VERIFIED=1; ATTEST_METHOD=$([[ -n "$ATTEST_BUNDLE" ]] && echo gh-bundle || echo gh)
+        else
+            echo "install.sh: gh attestation verify FAILED for $(basename "$tgz") (signer $SIGNER_WORKFLOW)" >&2
+            (( REQUIRE_ATTESTATION )) && exit 1
+        fi
+    elif command -v cosign >/dev/null 2>&1 && [[ -n "$ATTEST_BUNDLE" ]]; then
+        if cosign verify-blob-attestation --bundle "$ATTEST_BUNDLE" --new-bundle-format \
+            --certificate-identity-regexp "^https://github.com/$SIGNER_WORKFLOW" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$tgz" >/dev/null 2>&1; then
+            ATTEST_VERIFIED=1; ATTEST_METHOD=cosign
+        else
+            echo "install.sh: cosign attestation verification FAILED for $(basename "$tgz")" >&2
+            (( REQUIRE_ATTESTATION )) && exit 1
+        fi
+    else
+        echo "install.sh: no attestation verifier available (gh ≥ 2.49 or cosign + --attestation bundle) — provenance stays at '$PROVENANCE'" >&2
+        (( REQUIRE_ATTESTATION )) && { echo "install.sh: REFUSED — --require-attestation set" >&2; exit 1; }
+    fi
+    if (( ATTEST_VERIFIED )); then
+        echo "install.sh: SLSA provenance attestation verified ($ATTEST_METHOD, signer $SIGNER_WORKFLOW)"
+        PROVENANCE="attested"
+    fi
+}
+
+# Record what was installed: provenance level + sha256 of every installed
+# binary and of the eBPF object. The agent compares its own binary, the
+# watchdog, nn-admin and the embedded object hash against this file at
+# every boot (agent/src/install_manifest.rs) and refuses to start on a
+# mismatch; the file sits under the inode_protect hook with the rest of
+# /etc/northnarrow.
+write_install_manifest() {
+    local manifest="$ETC_DIR/install-manifest.json" version
+    version=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | awk '{print $NF}')
+    local sha_agent sha_wd sha_admin sha_ebpf
+    sha_agent=$(sha256sum "$BIN_DIR/northnarrow-agent" | cut -d' ' -f1)
+    sha_wd=$(sha256sum "$BIN_DIR/northnarrow-watchdog" | cut -d' ' -f1)
+    sha_admin=$(sha256sum "$BIN_DIR/nn-admin" | cut -d' ' -f1)
+    sha_ebpf=$(sha256sum "$EBPF_ARTIFACT" | cut -d' ' -f1)
+    local tmp
+    tmp=$(mktemp)
+    cat > "$tmp" <<EOT
+{
+  "version": "${version:-unknown}",
+  "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "provenance": "$PROVENANCE",
+  "bin_dir": "$BIN_DIR",
+  "files": {
+    "northnarrow-agent": "$sha_agent",
+    "northnarrow-watchdog": "$sha_wd",
+    "nn-admin": "$sha_admin",
+    "ebpf_object": "$sha_ebpf"
+  },
+  "tarball_sha256": $([[ -n "$TARBALL_SHA256" ]] && echo "\"$TARBALL_SHA256\"" || echo null),
+  "attestation": {"verified": $([[ $ATTEST_VERIFIED == 1 ]] && echo true || echo false), "method": "$ATTEST_METHOD", "signer_workflow": "$SIGNER_WORKFLOW"}
+}
+EOT
+    install -m 0644 -o root -g root "$tmp" "$manifest"
+    rm -f "$tmp"
+    echo "install.sh: install manifest written to $manifest (provenance: $PROVENANCE)"
+}
+
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "install.sh: must run as root (use sudo)" >&2
@@ -203,6 +346,7 @@ require_fresh_ebpf() {
 }
 
 require_root
+verify_release
 require_file "$AGENT_BIN"    "run \`cargo xtask build --release\` first (xtask builds the eBPF object + userland atomically; a plain \`cargo build\` cannot produce an installable agent — agent/build.rs refuses a stale/unstamped eBPF object)"
 require_file "$WATCHDOG_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-watchdog\`)"
 require_file "$NN_ADMIN_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-agent --bin nn-admin\`)"
@@ -237,9 +381,17 @@ done
 
 # ── install ─────────────────────────────────────────────────────────
 # ── running install? ──────────────────────────────────────────────────
+# A unit counts as "running" in ANY state but inactive: `activating`
+# (the watchdog restart loop after a failed agent boot) and `failed`
+# still own or re-create the LSM pins, and an agent respawned mid-copy
+# re-protects /usr/local/bin — the first verified-upgrade test hit
+# exactly that (`install: cannot remove '/usr/local/bin/northnarrow-agent':
+# Operation not permitted`). Those units are stopped, reset and, after
+# the upgrade, restarted like active ones.
 UNITS_TO_RESTART=()
 for u in northnarrow-watchdog northnarrow-agent; do
-    if systemctl is-active --quiet "$u.service" 2>/dev/null; then
+    state=$(systemctl is-active "$u.service" 2>/dev/null || true)
+    if [[ -n "$state" && "$state" != inactive ]]; then
         UNITS_TO_RESTART+=("$u")
     fi
 done
@@ -255,10 +407,9 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
     # Watchdog first: stopping the agent alone makes it respawn it.
     for u in northnarrow-watchdog northnarrow-agent; do
-        if systemctl is-active --quiet "$u.service" 2>/dev/null; then
-            echo "install.sh: stopping $u"
-            systemctl stop "$u.service"
-        fi
+        echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null | tr -d '\n'))"
+        systemctl stop "$u.service" 2>/dev/null || true
+        systemctl reset-failed "$u.service" 2>/dev/null || true
     done
     if [[ -d /sys/fs/bpf/northnarrow ]]; then
         echo "install.sh: dropping /sys/fs/bpf/northnarrow so the LSM programs detach (the new agent re-pins fresh)"
@@ -591,6 +742,7 @@ done
 #   docs/operator/TAPPA9_FIM_TRUST_MODEL.md
 
 echo "install.sh: reloading systemd unit catalogue"
+write_install_manifest
 systemctl daemon-reload
 # Pick up journald@northnarrow.conf on REINSTALL (on a first install the
 # namespace journald socket-activates fresh on the agent's first start, so

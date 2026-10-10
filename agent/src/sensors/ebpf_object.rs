@@ -36,7 +36,9 @@ pub static EBPF_BYTES: &[u8] =
 /// `"1"` iff `build.rs` embedded a real, staleness-verified object.
 const EMBEDDED: &str = env!("NN_EBPF_EMBEDDED");
 /// SHA-256 (hex) of the embedded object bytes, as recorded at build.
-const OBJECT_SHA: &str = env!("NN_EBPF_OBJECT_SHA");
+/// SHA-256 (hex) of the embedded eBPF object — compared with the install
+/// manifest at boot (`crate::install_manifest`).
+pub const OBJECT_SHA: &str = env!("NN_EBPF_OBJECT_SHA");
 /// eBPF source-closure provenance hash the object was built from.
 const BUILD_HASH: &str = env!("NN_EBPF_BUILD_HASH");
 

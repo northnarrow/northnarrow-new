@@ -40,6 +40,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Supply chain, install-time and runtime halves: `install.sh` verifies the
+  extracted tree (`MANIFEST.sha256`, now shipped in the tarball), the
+  tarball against `SHA256SUMS` and the SLSA provenance attestation (gh or
+  cosign, bound to this repository's release workflow;
+  `--require-attestation`, `--no-verify`), and records the level reached
+  plus the hashes of every installed binary and of the eBPF object in
+  `/etc/northnarrow/install-manifest.json`. The agent re-verifies those
+  hashes at every boot and refuses to start on a mismatch
+  (`NN_ALLOW_UNVERIFIED_BINARY=1` to override); the `agent_boot` audit
+  entry carries `binary_integrity` and `install_provenance`.
 - Lab: fourth guest AlmaLinux 9 (`NN_LAB_DISTRO=alma9`, kernel 5.14 el9,
   SELinux enforcing, port 2622) — verified end to end; the compatibility
   matrix records it.
