@@ -335,6 +335,11 @@ pub struct OffsetSpec {
     /// was renamed or re-nested between kernel versions). Each must have
     /// the same meaning for the eBPF reader.
     pub alt_paths: &'static [&'static [&'static str]],
+    /// `true` = the eBPF reader can do without this field (a feature
+    /// degrades, nothing reads the wrong memory): a kernel lacking it is
+    /// still supported, the slot carries [`BTF_OFFSETS_ABSENT`] and the
+    /// program takes its no-op path. `false` = refuse to start.
+    pub optional: bool,
 }
 
 /// One enum value the eBPF programs compare against (`iov_iter.iter_type`
@@ -351,7 +356,13 @@ pub struct EnumSpec {
     pub value_name: &'static str,
     /// Compiled-in value (the fallback for an unarmed map).
     pub compiled: u32,
+    /// See [`OffsetSpec::optional`].
+    pub optional: bool,
 }
+
+/// Slot value meaning "this field/enumerator does not exist on the
+/// running kernel" (only ever written for `optional` entries).
+pub const BTF_OFFSETS_ABSENT: u32 = u32::MAX;
 
 /// `iov_iter.iter_type == ITER_UBUF` — the single-inline-buffer shape the
 /// DNS sensor decodes. 0 on the build kernel (6.4+ reordered the enum).
@@ -369,12 +380,18 @@ pub const ENUM_VALUES: &[EnumSpec] = &[
         enum_name: "iter_type",
         value_name: "ITER_UBUF",
         compiled: ITER_UBUF_VALUE,
+        // < 6.0: no ITER_UBUF at all — the DNS sensor then decodes the
+        // QNAME only through the ITER_IOVEC path.
+        optional: true,
     },
     EnumSpec {
         name: "ITER_IOVEC_VALUE",
         enum_name: "iter_type",
         value_name: "ITER_IOVEC",
         compiled: ITER_IOVEC_VALUE,
+        // < 5.14: `enum iter_type` does not exist (the type lived in
+        // `iov_iter.type` with flag bits) — QNAME decoding is skipped.
+        optional: true,
     },
 ];
 
@@ -389,6 +406,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["tgid"],
         expected: TASK_STRUCT_TGID_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TASK_STRUCT_FLAGS_OFFSET",
@@ -396,6 +414,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["flags"],
         expected: TASK_STRUCT_FLAGS_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TASK_STRUCT_MM_OFFSET",
@@ -403,6 +422,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["mm"],
         expected: TASK_STRUCT_MM_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TASK_STRUCT_REAL_PARENT_OFFSET",
@@ -410,6 +430,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["real_parent"],
         expected: TASK_STRUCT_REAL_PARENT_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TASK_STRUCT_START_TIME_OFFSET",
@@ -417,6 +438,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["start_time"],
         expected: TASK_STRUCT_START_TIME_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TASK_STRUCT_COMM_OFFSET",
@@ -424,6 +446,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["comm"],
         expected: TASK_STRUCT_COMM_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "MM_STRUCT_ARG_START_OFFSET",
@@ -431,6 +454,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["arg_start"],
         expected: MM_STRUCT_ARG_START_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "MM_STRUCT_ARG_END_OFFSET",
@@ -438,6 +462,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["arg_end"],
         expected: MM_STRUCT_ARG_END_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "DENTRY_D_INODE_OFFSET",
@@ -445,6 +470,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["d_inode"],
         expected: DENTRY_D_INODE_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "DENTRY_D_PARENT_OFFSET",
@@ -452,6 +478,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["d_parent"],
         expected: DENTRY_D_PARENT_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "DENTRY_D_NAME_OFFSET",
@@ -459,6 +486,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["d_name"],
         expected: DENTRY_D_NAME_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "QSTR_NAME_OFFSET",
@@ -466,6 +494,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["name"],
         expected: QSTR_NAME_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "QSTR_LEN_OFFSET",
@@ -473,6 +502,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["len"],
         expected: QSTR_LEN_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "INODE_I_SB_OFFSET",
@@ -480,6 +510,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["i_sb"],
         expected: INODE_I_SB_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "INODE_I_INO_OFFSET",
@@ -487,6 +518,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["i_ino"],
         expected: INODE_I_INO_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SUPER_BLOCK_S_DEV_OFFSET",
@@ -494,6 +526,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["s_dev"],
         expected: SUPER_BLOCK_S_DEV_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "FILE_F_INODE_OFFSET",
@@ -501,6 +534,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["f_inode"],
         expected: FILE_F_INODE_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "FILE_F_PATH_OFFSET",
@@ -508,6 +542,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["f_path"],
         expected: FILE_F_PATH_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "PATH_DENTRY_OFFSET",
@@ -515,6 +550,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["dentry"],
         expected: PATH_DENTRY_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "FILE_F_FLAGS_OFFSET",
@@ -522,6 +558,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["f_flags"],
         expected: FILE_F_FLAGS_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "FILE_F_MODE_OFFSET",
@@ -529,6 +566,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["f_mode"],
         expected: FILE_F_MODE_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_DADDR_OFFSET",
@@ -536,6 +574,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_daddr"],
         expected: SOCK_SKC_DADDR_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_RCV_SADDR_OFFSET",
@@ -543,6 +582,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_rcv_saddr"],
         expected: SOCK_SKC_RCV_SADDR_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_DPORT_OFFSET",
@@ -550,6 +590,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_dport"],
         expected: SOCK_SKC_DPORT_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_NUM_OFFSET",
@@ -557,6 +598,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_num"],
         expected: SOCK_SKC_NUM_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_FAMILY_OFFSET",
@@ -564,6 +606,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_family"],
         expected: SOCK_SKC_FAMILY_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_V6_DADDR_OFFSET",
@@ -571,6 +614,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_v6_daddr"],
         expected: SOCK_SKC_V6_DADDR_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SKC_V6_RCV_SADDR_OFFSET",
@@ -578,6 +622,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["skc_v6_rcv_saddr"],
         expected: SOCK_SKC_V6_RCV_SADDR_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SK_PROTOCOL_OFFSET",
@@ -585,6 +630,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["sk_protocol"],
         expected: SOCK_SK_PROTOCOL_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "SOCK_SK_ERR_OFFSET",
@@ -592,6 +638,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["sk_err"],
         expected: SOCK_SK_ERR_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TCP_SOCK_BYTES_SENT_OFFSET",
@@ -599,6 +646,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["bytes_sent"],
         expected: TCP_SOCK_BYTES_SENT_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "TCP_SOCK_BYTES_RECEIVED_OFFSET",
@@ -606,6 +654,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["bytes_received"],
         expected: TCP_SOCK_BYTES_RECEIVED_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "IOV_ITER_ITER_TYPE_OFFSET",
@@ -613,6 +662,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["iter_type"],
         expected: IOV_ITER_ITER_TYPE_OFFSET,
         alt_paths: &[],
+        optional: true,
     },
     OffsetSpec {
         name: "IOV_ITER_UBUF_BASE_OFFSET",
@@ -622,6 +672,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         // 6.1–6.3: the user pointer is `ubuf` inside the union after
         // `count`; 6.4+ overlays `__ubuf_iovec` on it.
         alt_paths: &[&["ubuf"]],
+        optional: true,
     },
     OffsetSpec {
         name: "IOV_ITER_UBUF_LEN_OFFSET",
@@ -630,6 +681,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         expected: IOV_ITER_UBUF_LEN_OFFSET,
         // 6.1–6.3: the inline buffer length is `count`.
         alt_paths: &[&["count"]],
+        optional: true,
     },
     OffsetSpec {
         name: "IOV_ITER_NR_SEGS_OFFSET",
@@ -637,6 +689,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["nr_segs"],
         expected: IOV_ITER_NR_SEGS_OFFSET,
         alt_paths: &[],
+        optional: true,
     },
     OffsetSpec {
         name: "IOVEC_IOV_BASE_OFFSET",
@@ -644,6 +697,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["iov_base"],
         expected: IOVEC_IOV_BASE_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "IOVEC_IOV_LEN_OFFSET",
@@ -651,6 +705,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["iov_len"],
         expected: IOVEC_IOV_LEN_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "MSGHDR_MSG_ITER_OFFSET",
@@ -658,6 +713,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["msg_iter"],
         expected: MSGHDR_MSG_ITER_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "MSGHDR_NAME_OFFSET",
@@ -665,6 +721,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["msg_name"],
         expected: MSGHDR_NAME_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "MSGHDR_NAMELEN_OFFSET",
@@ -672,6 +729,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         field_path: &["msg_namelen"],
         expected: MSGHDR_NAMELEN_OFFSET,
         alt_paths: &[],
+        optional: false,
     },
     OffsetSpec {
         name: "IOV_ITER_IOV_OFFSET",
@@ -680,6 +738,7 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         expected: IOV_ITER_IOV_OFFSET,
         // ≤ 6.3: the pointer is plainly `iov`.
         alt_paths: &[&["iov"]],
+        optional: true,
     },
 ];
 

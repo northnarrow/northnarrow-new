@@ -421,7 +421,7 @@ impl E2eFixture {
 /// test runner is none of those, and the fixtures spawn through `sudo`
 /// (so `Child::id()` is sudo and the agent is its child). Evicting the
 /// subtree first lets the SIGQUIT/SIGTERM below reach the processes.
-fn unprotect_tree(pid: u32) {
+fn unprotect_tree(pid: u32) -> Vec<u32> {
     let mut todo = vec![pid];
     let mut seen: Vec<u32> = Vec::new();
     while let Some(p) = todo.pop() {
@@ -437,7 +437,7 @@ fn unprotect_tree(pid: u32) {
             }
         }
     }
-    for p in seen {
+    for &p in &seen {
         let key = [
             p & 0xFF,
             (p >> 8) & 0xFF,
@@ -454,6 +454,7 @@ fn unprotect_tree(pid: u32) {
             .stderr(Stdio::null())
             .status();
     }
+    seen
 }
 
 impl Drop for E2eFixture {
@@ -461,25 +462,66 @@ impl Drop for E2eFixture {
         // Stop watchdog first (so it doesn't try to respawn the
         // agent mid-cleanup). The watchdog's bindsTo is per-unit;
         // for ad-hoc test spawn we kill it directly.
+        // `w.id()` is the sudo pid and sudo 1.9.9 does not relay our
+        // signal (see the agent branch below), so every pid of the
+        // subtree is signalled directly, leaves first: the agent the
+        // watchdog respawned (SIGTERM reaches it once unprotected),
+        // then the watchdog. The agent re-registers the watchdog in
+        // PROTECTED_PIDS while alive, so unprotect + kill is retried
+        // until the kill is accepted, within a 10 s budget.
         if let Some(mut w) = self.watchdog_child.take() {
-            unprotect_tree(w.id());
-            let _ = Command::new("sudo")
-                .arg("kill")
-                .arg("-TERM")
-                .arg(w.id().to_string())
-                .status();
-            let _ = w.wait();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for p in unprotect_tree(w.id()).iter().rev() {
+                    let _ = Command::new("sudo")
+                        .arg("kill")
+                        .arg("-TERM")
+                        .arg(p.to_string())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                if matches!(w.try_wait(), Ok(Some(_))) || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Ok(None) = w.try_wait() {
+                eprintln!(
+                    "E2eFixture: watchdog sudo pid {} still alive 10 s after SIGTERM — leaving it",
+                    w.id()
+                );
+            }
         }
         // Then the agent. SIGTERM is hook-blocked; use SIGQUIT
-        // which is the documented escape hatch.
+        // which is the documented escape hatch. `a.id()` is the sudo
+        // pid: signal every pid of its subtree ourselves (leaves
+        // first) because sudo 1.9.9 (Ubuntu 22.04) does not relay a
+        // signal sent from its own process group, and bound the wait
+        // so a teardown problem fails loudly instead of wedging the
+        // suite (it hung every teardown on the 5.15 lab guest).
         if let Some(mut a) = self.agent_child.take() {
-            unprotect_tree(a.id());
-            let _ = Command::new("sudo")
-                .arg("kill")
-                .arg("-QUIT")
-                .arg(a.id().to_string())
-                .status();
-            let _ = a.wait();
+            let tree = unprotect_tree(a.id());
+            for p in tree.iter().rev() {
+                let _ = Command::new("sudo")
+                    .arg("kill")
+                    .arg("-QUIT")
+                    .arg(p.to_string())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Ok(Some(_)) = a.try_wait() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if let Ok(None) = a.try_wait() {
+                eprintln!(
+                    "E2eFixture: sudo pid {} still alive 10 s after SIGQUIT — leaving it",
+                    a.id()
+                );
+            }
         }
         // Kill any watchdog-respawned agent we never tracked as
         // a Child (W4 cycles): match on the install basename

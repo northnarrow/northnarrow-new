@@ -15,8 +15,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `perf_event_paranoid=3` patch demands `CAP_SYS_ADMIN`); `install.sh`
   adds a drop-in with that capability on those hosts only, and the attach
   error explains the condition.
+- Kernel 5.15 (Ubuntu 22.04): the eBPF object was rejected by the older
+  verifier (`memset` subprogram call on ring-buffer entries; variable-length
+  read into uninitialised stack; `Option` payload read before its
+  discriminant in the FIM rename hook). Entries are zeroed inline, such
+  reads land in the ring-buffer entry, the rename destination is a plain
+  key; the agent now loads on 5.15 with every program and all 8 FIM hooks
+  attached (DNS QNAME via `ITER_IOVEC` only — degraded, not refused).
+- e2e fixtures (agent and watchdog): teardown signalled only the `sudo`
+  pid and relied on the relay; sudo 1.9.9 does not relay from its own
+  process group, so suites hung on 22.04. The whole subtree is now
+  signalled, with a bounded wait. The map-pin test accepts the 15-byte
+  kernel program name printed by older bpftool.
 
 ### Added
+- `northnarrow-agent --btf-check <btf>`: offline compatibility verdict
+  (SUPPORTED / SUPPORTED (degraded) / NOT SUPPORTED) for any kernel BTF;
+  optional offsets (the `iov_iter` family behind DNS QNAME decoding)
+  degrade the sensor instead of refusing the boot. Lab: third guest
+  `ubuntu2204` (kernel 5.15), verified end to end.
 - Multi-kernel, level 1: kernel struct offsets are resolved from the
   running kernel's BTF at boot and published to the eBPF programs through
   the `BTF_OFFSETS` map before any hook attaches (compiled-in values are

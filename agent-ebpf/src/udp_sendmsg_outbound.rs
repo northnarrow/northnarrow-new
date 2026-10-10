@@ -238,7 +238,7 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
     };
     let raw_ptr: *mut NetFlowCloseRaw = entry.as_mut_ptr();
     unsafe {
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
     }
 
     let uid_gid = bpf_get_current_uid_gid();

@@ -15,7 +15,7 @@
 pub(crate) use northnarrow_common::btf_offsets::*;
 
 use aya_ebpf::{macros::map, maps::Array};
-use northnarrow_common::btf_offsets::{BTF_OFFSETS_MAGIC, BTF_OFFSETS_SLOTS};
+use northnarrow_common::btf_offsets::{BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, BTF_OFFSETS_SLOTS};
 
 /// Runtime offset table, written by the agent before any program is
 /// attached (multi-kernel, level 1). Slot 0 carries
@@ -37,6 +37,28 @@ pub fn rt(slot: u32, default: usize) -> usize {
         },
         _ => default,
     }
+}
+
+/// Like [`rt`] for `optional` entries: `None` when the agent marked the
+/// slot [`BTF_OFFSETS_ABSENT`] (field missing on this kernel). Unarmed
+/// map → `Some(default)`, as before.
+#[inline(always)]
+pub fn rt_opt(slot: u32, default: usize) -> Option<usize> {
+    match BTF_OFFSETS.get(0) {
+        Some(magic) if *magic == BTF_OFFSETS_MAGIC => match BTF_OFFSETS.get(slot) {
+            Some(v) if *v == BTF_OFFSETS_ABSENT => None,
+            Some(v) => Some(*v as usize),
+            None => Some(default),
+        },
+        _ => Some(default),
+    }
+}
+
+/// `off_opt!(FOO_OFFSET)` → `Option<usize>` (see [`rt_opt`]).
+macro_rules! off_opt {
+    ($name:ident) => {
+        $crate::btf_offsets::rt_opt($crate::btf_offsets::slot::$name, $name)
+    };
 }
 
 /// `off!(FOO_OFFSET)` → the runtime value of that offset (see [`rt`]).

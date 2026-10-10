@@ -215,20 +215,9 @@ mod tests {
     }
 }
 
-/// Remove `pid` AND every process below it from the pinned
-/// `PROTECTED_PIDS` map so a plain signal from the test runner reaches
-/// the agent. Since `task-kill-signals-1` the task_kill LSM hook denies
-/// EVERY userspace signal towards a protected pid unless the caller is
-/// the process itself, another protected pid or PID 1 with the armed
-/// nonce — the test runner is none of those. The fixtures spawn the
-/// agent through `sudo`, so `Child::id()` is sudo's pid and the agent is
-/// its child: sudo relays SIGQUIT to it, and that relay is what the hook
-/// would refuse (the first run after the policy change hung in wait4
-/// on sudo with the agent still protected). Walking the descendants
-/// covers both shapes. Best effort: a missing pin or bpftool means the
-/// agent was never protected.
-#[allow(dead_code)]
-pub fn unprotect_pid(pid: u32) {
+/// `pid` plus every process below it (`pgrep -P`, breadth first), the
+/// root first. Best effort: a pid that exits mid-walk is simply skipped.
+fn process_tree(pid: u32) -> Vec<u32> {
     let mut todo = vec![pid];
     let mut seen = Vec::new();
     while let Some(p) = todo.pop() {
@@ -236,10 +225,7 @@ pub fn unprotect_pid(pid: u32) {
             continue;
         }
         seen.push(p);
-        if let Ok(out) = std::process::Command::new("pgrep")
-            .args(["-P", &p.to_string()])
-            .output()
-        {
+        if let Ok(out) = Command::new("pgrep").args(["-P", &p.to_string()]).output() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Ok(c) = line.trim().parse::<u32>() {
                     todo.push(c);
@@ -247,7 +233,21 @@ pub fn unprotect_pid(pid: u32) {
             }
         }
     }
-    for p in seen {
+    seen
+}
+
+/// Remove `pid` AND every process below it from the pinned
+/// `PROTECTED_PIDS` map so a plain signal from the test runner reaches
+/// the agent. Since `task-kill-signals-1` the task_kill LSM hook denies
+/// EVERY userspace signal towards a protected pid unless the caller is
+/// the process itself, another protected pid or PID 1 with the armed
+/// nonce — the test runner is none of those. The fixtures spawn the
+/// agent through `sudo`, so `Child::id()` is sudo's pid and the agent is
+/// its child. Walking the descendants covers both shapes. Best effort:
+/// a missing pin or bpftool means the agent was never protected.
+#[allow(dead_code)]
+pub fn unprotect_pid(pid: u32) {
+    for p in process_tree(pid) {
         let key_bytes = [
             p & 0xFF,
             (p >> 8) & 0xFF,
@@ -255,7 +255,7 @@ pub fn unprotect_pid(pid: u32) {
             (p >> 24) & 0xFF,
         ]
         .map(|b| b.to_string());
-        let _ = std::process::Command::new("sudo")
+        let _ = Command::new("sudo")
             .args([
                 "bpftool",
                 "map",
@@ -265,8 +265,50 @@ pub fn unprotect_pid(pid: u32) {
                 "key",
             ])
             .args(key_bytes)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// Stop an agent the fixture spawned through `sudo` and reap it.
+///
+/// SIGQUIT is the supported shutdown (the LSM hook denies SIGKILL and
+/// SIGTERM from userland). The signal is delivered to EVERY process in
+/// the `sudo` subtree, agent included, not only to `Child::id()` (the
+/// sudo pid): sudo 1.9.9 (Ubuntu 22.04) does not relay a signal sent
+/// by a process in its own process group — the test runner — while
+/// 1.9.15 (Ubuntu 24.04) does, so relying on the relay hung every
+/// fixture teardown in `wait4` on the 22.04 / 5.15 lab guest. The
+/// wait is bounded (10 s) so a teardown problem fails the test loudly
+/// instead of wedging the whole suite.
+#[allow(dead_code)]
+pub fn quit_agent(child: &mut std::process::Child) {
+    let root = child.id();
+    unprotect_pid(root);
+    // Leaves first, then sudo itself, so nothing is left to re-spawn.
+    for p in process_tree(root).into_iter().rev() {
+        unsafe {
+            libc::kill(p as i32, libc::SIGQUIT);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "quit_agent: sudo pid {root} still alive 10 s after SIGQUIT — leaving it"
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("quit_agent: try_wait on pid {root} failed: {e}");
+                return;
+            }
+        }
     }
 }

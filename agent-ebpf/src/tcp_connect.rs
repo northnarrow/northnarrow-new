@@ -157,7 +157,7 @@ fn try_tcp_connect_v4(ctx: &ProbeContext) -> Result<(), i64> {
     };
     let raw_ptr: *mut TcpConnectRaw = entry.as_mut_ptr();
     unsafe {
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
     }
     populate_common(raw_ptr);
     let ts = unsafe { (*raw_ptr).timestamp_ns };
@@ -216,7 +216,7 @@ fn try_tcp_connect_v6(ctx: &ProbeContext) -> Result<(), i64> {
     };
     let raw_ptr: *mut TcpConnectRaw = entry.as_mut_ptr();
     unsafe {
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
     }
     populate_common(raw_ptr);
     let ts = unsafe { (*raw_ptr).timestamp_ns };

@@ -30,6 +30,7 @@ mod task_kill;
 mod tcp_close;
 mod tcp_connect;
 mod udp_sendmsg_outbound;
+mod zero;
 
 use aya_ebpf::{
     helpers::{
@@ -42,7 +43,6 @@ use aya_ebpf::{
     programs::TracePointContext,
     EbpfContext,
 };
-use core::mem::MaybeUninit;
 use northnarrow_common::wire::{ProcessSpawnRaw, ARGV_LEN, FILENAME_LEN, TASK_COMM_LEN};
 
 use crate::btf_offsets::{
@@ -106,7 +106,7 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
     unsafe {
         // SAFETY: ringbuf reservation gives us exclusive write access
         // to a properly aligned region of size_of::<ProcessSpawnRaw>.
-        core::ptr::write_bytes(raw_ptr, 0u8, 1);
+        crate::zero::zero(raw_ptr);
     }
 
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -152,23 +152,15 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
         // is the verified way to read from it.
         let base = ctx.as_ptr() as *const u8;
         let src = unsafe { base.add(f_off) };
-        let mut tmp: MaybeUninit<[u8; FILENAME_LEN]> = MaybeUninit::uninit();
-        let dst_slice =
-            unsafe { core::slice::from_raw_parts_mut(tmp.as_mut_ptr() as *mut u8, FILENAME_LEN) };
-        // Read the actual length we computed; fall back to nothing on err.
-        let _ = unsafe { bpf_probe_read_kernel_buf(src, &mut dst_slice[..f_len]) };
-        unsafe {
-            let dst = (*raw_ptr).filename.as_mut_ptr();
-            let mut i = 0usize;
-            while i < FILENAME_LEN {
-                if i < f_len {
-                    *dst.add(i) = *(tmp.as_ptr() as *const u8).add(i);
-                } else {
-                    *dst.add(i) = 0;
-                }
-                i += 1;
-            }
-        }
+        // Read straight into the (already zeroed) ring-buffer entry: a
+        // stack temporary read with a *variable* length is "invalid
+        // indirect read from stack" on verifiers before 5.17 (Ubuntu
+        // 22.04 / 5.15); ring-buffer memory is a valid helper destination
+        // on every supported kernel and the clamp above bounds `f_len`.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut((*raw_ptr).filename.as_mut_ptr(), FILENAME_LEN)
+        };
+        let _ = unsafe { bpf_probe_read_kernel_buf(src, &mut dst[..f_len]) };
     }
 
     // ── Tappa 10.6 D2 — parent context + argv ──────────────────────

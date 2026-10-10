@@ -38,7 +38,8 @@ use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
-    EnumSpec, OffsetSpec, BTF_OFFSETS_MAGIC, ENUM_SLOT_TABLE, ENUM_VALUES, REVALIDATE, SLOT_TABLE,
+    EnumSpec, OffsetSpec, BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, ENUM_SLOT_TABLE, ENUM_VALUES,
+    REVALIDATE, SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -149,6 +150,9 @@ pub struct ResolvedOffsets {
     /// constant. Informational: the map carries the right value, the
     /// constant is only the fallback for an unarmed map.
     pub drifted: Vec<Mismatch>,
+    /// Optional entries this kernel does not have (slot written as
+    /// [`BTF_OFFSETS_ABSENT`]): the dependent feature degrades.
+    pub absent: Vec<Mismatch>,
 }
 
 /// Outcome of [`resolve_offsets`].
@@ -169,11 +173,19 @@ pub enum ResolveOutcome {
 /// layout merely differs from the build is **supported** (the values go
 /// into the map); a kernel missing a field is refused.
 pub fn resolve_offsets() -> ResolveOutcome {
-    let data = match fs::read(VMLINUX_BTF) {
+    resolve_offsets_from(std::path::Path::new(VMLINUX_BTF))
+}
+
+/// [`resolve_offsets`] against an arbitrary BTF blob (a `vmlinux` BTF
+/// extracted from a distro kernel, a BTFHub file, another host's
+/// `/sys/kernel/btf/vmlinux`). Powers `northnarrow-agent --btf-check`
+/// and the computed kernel matrix (multi-kernel, level 2).
+pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
+    let data = match fs::read(path) {
         Ok(d) => d,
         Err(e) => {
             return ResolveOutcome::SkippedNoBtf {
-                reason: format!("{VMLINUX_BTF}: {e}"),
+                reason: format!("{}: {e}", path.display()),
             }
         }
     };
@@ -188,6 +200,7 @@ fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveO
     let mut values = Vec::with_capacity(specs.len());
     let mut drifted = Vec::new();
     let mut missing = Vec::new();
+    let mut absent = Vec::new();
     for spec in specs {
         let slot = SLOT_TABLE
             .iter()
@@ -222,6 +235,16 @@ fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveO
                 actual: None,
                 detail: "no BTF_OFFSETS slot for this spec (SLOT_TABLE out of sync)".into(),
             }),
+            (Err(e), Some(slot)) if spec.optional => {
+                values.push((slot, BTF_OFFSETS_ABSENT));
+                absent.push(Mismatch {
+                    name: spec.name,
+                    struct_name: spec.struct_name,
+                    expected: spec.expected,
+                    actual: None,
+                    detail: e.to_string(),
+                });
+            }
             (Err(e), _) => missing.push(Mismatch {
                 name: spec.name,
                 struct_name: spec.struct_name,
@@ -249,6 +272,16 @@ fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveO
                 }
                 values.push((slot, v as u32));
             }
+            (Err(err), Some(slot)) if e.optional => {
+                values.push((slot, BTF_OFFSETS_ABSENT));
+                absent.push(Mismatch {
+                    name: e.name,
+                    struct_name: e.enum_name,
+                    expected: e.compiled as usize,
+                    actual: None,
+                    detail: err.to_string(),
+                });
+            }
             (res, _) => missing.push(Mismatch {
                 name: e.name,
                 struct_name: e.enum_name,
@@ -264,7 +297,11 @@ fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveO
         }
     }
     if missing.is_empty() {
-        ResolveOutcome::Resolved(ResolvedOffsets { values, drifted })
+        ResolveOutcome::Resolved(ResolvedOffsets {
+            values,
+            drifted,
+            absent,
+        })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
     }
@@ -879,6 +916,7 @@ mod tests {
                 field_path: &["a"],
                 expected: 0,
                 alt_paths: &[],
+                optional: false,
             },
             OffsetSpec {
                 name: "INNER_X",
@@ -886,6 +924,7 @@ mod tests {
                 field_path: &["x"],
                 expected: 8,
                 alt_paths: &[],
+                optional: false,
             },
             OffsetSpec {
                 name: "EMB_X",
@@ -893,6 +932,7 @@ mod tests {
                 field_path: &["emb", "x"],
                 expected: 24,
                 alt_paths: &[],
+                optional: false,
             },
         ];
         match revalidate_with(&btf, specs) {
@@ -911,6 +951,7 @@ mod tests {
                 field_path: &["a"],
                 expected: 0,
                 alt_paths: &[],
+                optional: false,
             }, // ok
             OffsetSpec {
                 name: "INNER_X_WRONG",
@@ -918,6 +959,7 @@ mod tests {
                 field_path: &["x"],
                 expected: 99,
                 alt_paths: &[],
+                optional: false,
             }, // drift
             OffsetSpec {
                 name: "GHOST",
@@ -925,6 +967,7 @@ mod tests {
                 field_path: &["x"],
                 expected: 0,
                 alt_paths: &[],
+                optional: false,
             }, // missing
         ];
         match revalidate_with(&btf, specs) {
@@ -1005,6 +1048,7 @@ mod tests {
                 field_path: &["a"],
                 expected: 0,
                 alt_paths: &[],
+                optional: false,
             },
             OffsetSpec {
                 name: SLOT_TABLE[1].0,
@@ -1012,6 +1056,7 @@ mod tests {
                 field_path: &["x"],
                 expected: 4, // compiled-in value "wrong" for this kernel
                 alt_paths: &[],
+                optional: false,
             },
         ];
         match resolve_with(&btf, specs, &[]) {
@@ -1033,6 +1078,7 @@ mod tests {
             field_path: &["zzz"],
             expected: 0,
             alt_paths: &[],
+            optional: false,
         }];
         assert!(matches!(
             resolve_with(&btf, specs, &[]),
@@ -1048,6 +1094,26 @@ mod tests {
                 "{}",
                 spec.name
             );
+        }
+    }
+
+    #[test]
+    fn optional_missing_field_is_absent_not_refused() {
+        let btf = parsed();
+        let specs = &[OffsetSpec {
+            name: SLOT_TABLE[0].0,
+            struct_name: "outer",
+            field_path: &["zzz"],
+            expected: 0,
+            alt_paths: &[],
+            optional: true,
+        }];
+        match resolve_with(&btf, specs, &[]) {
+            ResolveOutcome::Resolved(r) => {
+                assert_eq!(r.values, vec![(SLOT_TABLE[0].1, BTF_OFFSETS_ABSENT)]);
+                assert_eq!(r.absent.len(), 1);
+            }
+            other => panic!("expected Resolved with an absent slot, got {other:?}"),
         }
     }
 }

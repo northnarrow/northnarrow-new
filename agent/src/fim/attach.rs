@@ -97,6 +97,24 @@ struct AyaInodeKey(InodeKey);
 // AyaInodeKey is `#[repr(transparent)]` over it.
 unsafe impl aya::Pod for AyaInodeKey {}
 
+/// The whole error chain, with a long verifier log trimmed to its last
+/// lines: the rejection reason is always at the end, and a soft WARN
+/// that showed only the outer context ("verifier rejected `…`") left
+/// the 5.15 lab guest without any way to see why.
+fn chain_tail(e: &anyhow::Error) -> String {
+    const KEEP: usize = 30;
+    let full = format!("{e:#}");
+    let lines: Vec<&str> = full.lines().collect();
+    if lines.len() <= KEEP {
+        return full;
+    }
+    let skipped = lines.len() - KEEP;
+    format!(
+        "… [{skipped} verifier lines elided]\n{}",
+        lines[skipped..].join("\n")
+    )
+}
+
 /// Attach the six FIM observe programs via [`attach_transient`].
 /// Each program is loaded against its hook (the BTF lookup
 /// produces the verifier-required type info) and attached;
@@ -119,7 +137,7 @@ pub fn attach_observe_programs(ebpf: &mut Ebpf, btf: &Btf) -> Result<usize> {
             }
             Err(e) => {
                 warn!(
-                    error = %e,
+                    error = %chain_tail(&e),
                     program,
                     hook,
                     "fim: LSM observe program attach FAILED — this hook will not fire"
