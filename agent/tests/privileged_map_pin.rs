@@ -490,11 +490,18 @@ fn count_pins(prefix: &str) -> usize {
 const PINNED_REUSE_HOOKS: &[&str] = &["task_kill", "ptrace_access_check"];
 
 /// Prog id of the loaded LSM program named `name`, if any.
+/// The kernel caps program names at 15 bytes (`BPF_OBJ_NAME_LEN - 1`).
+/// Recent bpftool prints the full function name taken from BTF func_info;
+/// the 5.15-era bpftool (Ubuntu 22.04 `linux-tools`) prints the truncated
+/// kernel name (`ptrace_access_c`). Accept both spellings.
 fn lsm_prog_id_by_name(name: &str) -> Option<u64> {
+    let short: String = name.chars().take(15).collect();
     let text = bpftool_prog_show_all().ok()?;
     parse_progs(&text)
         .into_iter()
-        .find(|p| p.prog_type == "lsm" && p.name.as_deref() == Some(name))
+        .find(|p| {
+            p.prog_type == "lsm" && p.name.as_deref().is_some_and(|n| n == name || n == short)
+        })
         .map(|p| p.id)
 }
 
