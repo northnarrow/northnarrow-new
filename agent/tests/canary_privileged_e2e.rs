@@ -87,12 +87,9 @@ struct AgentGuard(Option<Child>);
 impl Drop for AgentGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.0.take() {
-            // task-kill-signals-1: SIGQUIT is denied towards a protected pid.
-            common::unprotect_pid(c.id());
-            unsafe {
-                libc::kill(c.id() as i32, libc::SIGQUIT);
-            }
-            let _ = c.wait();
+            // Unprotect + SIGQUIT the whole sudo subtree, bounded wait
+            // (sudo 1.9.9 does not relay our signal, see common::quit_agent).
+            common::quit_agent(&mut c);
         }
     }
 }
