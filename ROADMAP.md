@@ -8,7 +8,7 @@ CET, PQC, honeypots, micro-segmentazione), vedi VISION_TECHNICAL.md.
 Quella è la stella polare. Questa è la marcia operativa.
 
 
-## Stato di avanzamento (aggiornato il 9 ottobre 2026)
+## Stato di avanzamento (aggiornato il 10 ottobre 2026)
 
 | Tappa | Stato | Riferimento |
 |---|---|---|
@@ -20,8 +20,9 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 9.5 + 9.5.1 | chiuse | canary token e honeypot anti-tamper |
 | 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
-| **10.8** | **in corso** | affidabilità: hardening 8–9 ott, upgrade/uninstall, release firmata, multi-kernel |
-| UI locale, Scout proattivo | non iniziate | slittate dopo la 10.8, numerazione da confermare dal founder |
+| **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
+| 10.9 | non iniziata | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna) |
+| UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 
 Release taggata: `v0.0.1-tappa9.0` (9 ottobre 2026) — tutto fino alla Tappa 9.0 più il giro
@@ -525,9 +526,12 @@ Chiuso (8–9 ottobre 2026):
   (CAP_KILL, kill-tree, quarantena, task_kill deny-by-default, respawn
   v2 del watchdog, audit chain scrivibile, UDP non connesso, ledger
   COMBAT per sessione, …) — tutti verificati nel lab QEMU
-- Laboratorio `deploy/lab/nn-lab.sh`: guest Ubuntu 24.04 e Debian 12,
-  nightly con e2e, suite ignorate, install, upgrade, uninstall,
-  respawn-check; report in `~/.cache/nn-lab/reports/`
+- Laboratorio `deploy/lab/nn-lab.sh`: quattro guest (Ubuntu 24.04 / 6.8,
+  Debian 12 / 6.1, Ubuntu 22.04 / 5.15, AlmaLinux 9 / 5.14 con SELinux
+  enforcing), nightly con e2e (agent, FIM, watchdog), suite ignorate,
+  install, upgrade, uninstall, respawn-check; report in
+  `~/.cache/nn-lab/<distro>/reports/`; `soak start|wait|report` per i
+  test di durata (10 ottobre)
 - `install.sh --upgrade` e `uninstall.sh` (ordine imposto dall'anti-tamper)
 - Release su tag `v*`: tarball, SBOM CycloneDX, `SHA256SUMS`,
   attestazione di provenienza SLSA (`gh attestation verify`)
@@ -548,21 +552,71 @@ Pianificato, in quest'ordine:
   enforcing (layout dei tracepoint risolto da tracefs: il kernel RHEL
   sposta i campi di 4 byte); resta la BTF esterna per kernel senza BTF
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
-  mappe LRU, timer)
+  mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
+  24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
+- Verifica della provenienza all'installazione: `install.sh` controlla
+  `SHA256SUMS` e l'attestazione SLSA del tarball e rifiuta un upgrade
+  non verificabile; esito registrato nell'audit log
+- Contatori di perdita del ring buffer letti dall'agent ed esposti in
+  `nn-admin status` (oggi li conta solo il kernel)
 - Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
-  template canary, JSONL) con `cargo-fuzz`
+  template canary, JSONL, file `format` di tracefs, BTF) con `cargo-fuzz`
+- Sensore `io_uring`: tracepoint su `io_uring_setup/enter/register`,
+  opcode delle SQE (open, read/write, connect, send/recv, unlink,
+  rename) correlati a processo e file; regole su ring usati subito dopo
+  un exec da path volatile e su I/O senza syscall corrispondenti (il
+  bypass EDR più concreto del 2025–2026: RingReaper)
+- Autodifesa dell'ecosistema BPF: hook LSM `bpf`/`bpf_prog`/`bpf_map`
+  che nega carico, attach, detach, enumerazione e scrittura di mappe a
+  chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
+  self-check periodico che i link dell'agent siano ancora attaccati
 - Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
-  bpffs, cgroup freezer, bind mount su `/etc/northnarrow`, kexec)
-- Overhead misurato su host carico (`file_permission`/`file_open`)
+  bpffs, cgroup freezer, bind mount su `/etc/northnarrow`, kexec,
+  mascheramento e override delle unit systemd, `bpftool`/`bpftrace` da
+  root, io_uring come canale cieco)
+- Overhead misurato su host carico (`file_permission`/`file_open`; dato
+  grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,
   rilievo 26)
+- BTF esterna per kernel senza BTF nativa
 
-Demo: stesso tarball installato su Ubuntu 24.04 e Debian 12, nightly
-verde su entrambi, release verificabile con un comando.
+Demo: stesso tarball installato e verificato su quattro distribuzioni,
+nightly verde su tutte, release verificabile con un comando, soak da
+24 h senza crescita di memoria.
 
 ---
 
-## Tappa (ex 9) — UI locale Rust nativa (non iniziata, slittata dopo la 10.8)
+## Tappa 10.9 — Copertura delle evasioni (non iniziata)
+
+Obiettivo: le regole smettono di dipendere dal solo percorso del binario
+e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
+2026 dopo una revisione esterna dell'inventario (confronto con Falcon,
+Elastic Defend, Tetragon, Tracee, Falco e letteratura 2024–2026); non
+cambia l'ordine delle Tappe successive.
+
+- Contesto del carico di lavoro: cgroup id, namespace (pid/mnt/net) e,
+  dove presenti, container id, immagine, pod e unit systemd negli eventi
+  di processo, file e rete; allowlist e regole per identità (cgroup,
+  unit, utente) oltre che per percorso
+- Injection a runtime: `process_vm_writev`/`readv`, scritture su
+  `/proc/<pid>/mem`, `LD_PRELOAD` e `LD_LIBRARY_PATH` dall'ambiente del
+  processo (oggi solo il file `ld.so.preload`), caricamento di shared
+  object da path volatili, uprobe sugli interpreti (python, perl, node,
+  bash) per attribuire gli script eseguiti da stdin o `-c`
+- Living off the land: exec indiretto (`fexecve`, script da stdin,
+  `systemd-run`, copia di binari legittimi in path consentiti) coperto
+  per identità e per comportamento, non per nome
+- DNS cifrato e tunnel: DoH/DoT verso resolver non configurati, volumi
+  anomali su DNS e ICMP, beacon con jitter verso CDN legittime
+- Caso d'uso dei canary estesi agli account (chiavi SSH e token esca)
+
+Demo: lo stesso attacco eseguito da un container, da uno script passato
+a `python3 -c` e via `io_uring` produce la stessa catena di detection
+di quello eseguito da una shell in `/tmp`.
+
+---
+
+## Tappa (ex 9) — UI locale Rust nativa (non iniziata, slittata dopo la 10.9)
 
 Obiettivo: interfaccia accattivante, 100% Rust, niente Electron.
 
@@ -579,7 +633,7 @@ su un evento manuale, l'azione parte.
 
 ---
 
-## Tappa (ex 10) — Scout proattivo: assessment + hardening (non iniziata, slittata dopo la 10.8)
+## Tappa (ex 10) — Scout proattivo: assessment + hardening (non iniziata, slittata dopo la 10.9)
 
 Obiettivo: all'installazione, NorthNarrow chiude le falle.
 
@@ -664,6 +718,16 @@ azione di massa "isola tutti gli host con verdict=High".
 ## Tappa 15 — Hardening avanzato selettivo (da v3 di Gemini)
 
 Obiettivo: innesti delle feature avanzate dove hanno ROI massimo.
+
+Candidati emersi dalla revisione esterna del 10 ottobre 2026 (funzioni
+da prodotto maturo, non difetti del nucleo): enforcement di rete per
+flusso con TC/XDP o `cgroup/connect` (policy per uid, cgroup, container
+e destinazione, non solo kill del processo); reputazione dei binari,
+similarity e regole YARA; esposizione alle vulnerabilità (CVE dei
+pacchetti collegate alla telemetria runtime); chiavi admin e dell'agent
+protette da TPM con attestazione dell'host; integrazione SIEM, syslog e
+OpenTelemetry; "SBOM a runtime" (inventario dei binari eseguiti con hash
+e provenienza).
 
 Selezione a quel punto in base a:
 - Threat landscape attuale
