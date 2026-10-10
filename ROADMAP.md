@@ -8,7 +8,7 @@ CET, PQC, honeypots, micro-segmentazione), vedi VISION_TECHNICAL.md.
 Quella è la stella polare. Questa è la marcia operativa.
 
 
-## Stato di avanzamento (aggiornato il 9 ottobre 2026)
+## Stato di avanzamento (aggiornato il 10 ottobre 2026)
 
 | Tappa | Stato | Riferimento |
 |---|---|---|
@@ -20,8 +20,9 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 9.5 + 9.5.1 | chiuse | canary token e honeypot anti-tamper |
 | 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
-| **10.8** | **in corso** | affidabilità: hardening 8–9 ott, upgrade/uninstall, release firmata, multi-kernel |
-| UI locale, Scout proattivo | non iniziate | slittate dopo la 10.8, numerazione da confermare dal founder |
+| **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
+| 10.9 | non iniziata | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna) |
+| UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 
 Release taggata: `v0.0.1-tappa9.0` (9 ottobre 2026) — tutto fino alla Tappa 9.0 più il giro
@@ -525,9 +526,12 @@ Chiuso (8–9 ottobre 2026):
   (CAP_KILL, kill-tree, quarantena, task_kill deny-by-default, respawn
   v2 del watchdog, audit chain scrivibile, UDP non connesso, ledger
   COMBAT per sessione, …) — tutti verificati nel lab QEMU
-- Laboratorio `deploy/lab/nn-lab.sh`: guest Ubuntu 24.04 e Debian 12,
-  nightly con e2e, suite ignorate, install, upgrade, uninstall,
-  respawn-check; report in `~/.cache/nn-lab/reports/`
+- Laboratorio `deploy/lab/nn-lab.sh`: quattro guest (Ubuntu 24.04 / 6.8,
+  Debian 12 / 6.1, Ubuntu 22.04 / 5.15, AlmaLinux 9 / 5.14 con SELinux
+  enforcing), nightly con e2e (agent, FIM, watchdog), suite ignorate,
+  install, upgrade, uninstall, respawn-check; report in
+  `~/.cache/nn-lab/<distro>/reports/`; `soak start|wait|report` per i
+  test di durata (10 ottobre)
 - `install.sh --upgrade` e `uninstall.sh` (ordine imposto dall'anti-tamper)
 - Release su tag `v*`: tarball, SBOM CycloneDX, `SHA256SUMS`,
   attestazione di provenienza SLSA (`gh attestation verify`)
@@ -548,21 +552,117 @@ Pianificato, in quest'ordine:
   enforcing (layout dei tracepoint risolto da tracefs: il kernel RHEL
   sposta i campi di 4 byte); resta la BTF esterna per kernel senza BTF
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
-  mappe LRU, timer)
+  mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
+  24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
+- Verifica della provenienza all'installazione: `install.sh` controlla
+  `SHA256SUMS` e l'attestazione SLSA del tarball (builder atteso: il
+  workflow di release di questo repository, nessun altro) e rifiuta un
+  upgrade non verificabile; esito registrato nell'audit log; `cargo audit`
+  anche a calendario settimanale, non solo sui push, perché la SBOM è un
+  inventario e va riconfrontata con gli advisory; all'avvio l'agent
+  confronta l'hash del proprio binario, del watchdog e dell'oggetto eBPF
+  con il manifest firmato dell'installazione (ri-verifica continua, non
+  solo al deploy)
+- Controlli di hardening dell'host in `install.sh` e `nn-admin status`:
+  modalità `lockdown` del kernel, `kernel.unprivileged_bpf_disabled`,
+  `module.sig_enforce`, Secure Boot (efivars), IMA/EVM attivi, bpffs
+  montato una sola volta; ogni assenza è un WARN con la riga di fix,
+  perché l'anti-tamper dell'agent vale finché root non può riscrivere il
+  kernel a caldo (kexec, moduli non firmati, livepatch)
+- Contatori di perdita del ring buffer letti dall'agent ed esposti in
+  `nn-admin status` (oggi li conta solo il kernel)
 - Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
-  template canary, JSONL) con `cargo-fuzz`
+  template canary, JSONL, file `format` di tracefs, BTF) con `cargo-fuzz`
+- Sensore `io_uring`: tracepoint su `io_uring_setup/enter/register`,
+  opcode delle SQE (open, read/write, connect, send/recv, unlink,
+  rename) correlati a processo e file; regole su ring usati subito dopo
+  un exec da path volatile e su I/O senza syscall corrispondenti (il
+  bypass EDR più concreto del 2025–2026: RingReaper)
+- Autodifesa dell'ecosistema BPF: hook LSM `bpf`/`bpf_prog`/`bpf_map`
+  che nega carico, attach, detach, enumerazione e scrittura di mappe a
+  chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
+  self-check periodico che i link dell'agent siano ancora attaccati
+- Sonda di telemetria continua: l'agent genera a intervalli eventi noti
+  e innocui su ogni sensore (exec, file, rete, DNS, FIM) e verifica di
+  vederli entro pochi secondi; evento mancante o hook assente = alert
+  "telemetry gap" nel chain log, non solo un WARN (prova di copertura
+  come funzione di prodotto, non solo come test di laboratorio)
 - Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
-  bpffs, cgroup freezer, bind mount su `/etc/northnarrow`, kexec)
-- Overhead misurato su host carico (`file_permission`/`file_open`)
+  bpffs e secondo mount di bpffs, cgroup freezer, bind mount su
+  `/etc/northnarrow`, kexec, modulo non firmato, livepatch,
+  mascheramento e override delle unit systemd, `bpftool`/`bpftrace` da
+  root, io_uring come canale cieco; ogni caso deve finire in un evento
+  nel chain log, non solo in un rifiuto)
+- Overhead misurato su host carico (`file_permission`/`file_open`; dato
+  grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,
   rilievo 26)
+- BTF esterna per kernel senza BTF nativa
 
-Demo: stesso tarball installato su Ubuntu 24.04 e Debian 12, nightly
-verde su entrambi, release verificabile con un comando.
+Demo: stesso tarball installato e verificato su quattro distribuzioni,
+nightly verde su tutte, release verificabile con un comando, soak da
+24 h senza crescita di memoria.
 
 ---
 
-## Tappa (ex 9) — UI locale Rust nativa (non iniziata, slittata dopo la 10.8)
+## Tappa 10.9 — Copertura delle evasioni (non iniziata)
+
+Obiettivo: le regole smettono di dipendere dal solo percorso del binario
+e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
+2026 dopo una revisione esterna dell'inventario (confronto con Falcon,
+Elastic Defend, Tetragon, Tracee, Falco e letteratura 2024–2026); non
+cambia l'ordine delle Tappe successive.
+
+- Contesto del carico di lavoro: cgroup id, namespace (pid/mnt/net) e,
+  dove presenti, container id, immagine, pod e unit systemd negli eventi
+  di processo, file e rete; allowlist e regole per identità (cgroup,
+  unit, utente) oltre che per percorso
+- Injection a runtime: `process_vm_writev`/`readv`, scritture su
+  `/proc/<pid>/mem`, `LD_PRELOAD` e `LD_LIBRARY_PATH` dall'ambiente del
+  processo (oggi solo il file `ld.so.preload`), caricamento di shared
+  object da path volatili, uprobe sugli interpreti (python, perl, node,
+  bash) per attribuire gli script eseguiti da stdin o `-c`
+- Living off the land: exec indiretto (`fexecve`, script da stdin,
+  `systemd-run`, copia di binari legittimi in path consentiti) coperto
+  per identità e per comportamento, non per nome
+- DNS cifrato e tunnel: DoH/DoT verso resolver non configurati, volumi
+  anomali su DNS e ICMP, beacon con jitter verso CDN legittime
+- Caso d'uso dei canary estesi agli account (chiavi SSH e token esca)
+- Persistence correlata, non solo osservata: catena scrittura di unit,
+  timer o cron → `systemctl enable/start` o `crontab` → esecuzione del
+  binario da PID 1 o da cron, con severità che sale a ogni anello
+  (oggi FIM-007/009/023 vedono la scrittura, non l'esecuzione)
+- Masquerading generico (T1036): un binario con il nome di uno strumento
+  di sistema eseguito fuori dai percorsi gestiti dal package manager, o
+  con hash diverso dal pacchetto installato (`dpkg -V`/`rpm -V` come
+  oracolo); account (T1136): `useradd`/`usermod`/`passwd`, nuovi UID 0,
+  modifiche a `shadow` e `sudoers` come evento di account e non solo
+  come drift di file
+- Hook LSM mancanti rispetto allo stato dell'arte 2024–2026, in ordine:
+  `sb_mount`/`move_mount`/`sb_umount` (mount, bind mount, overlay,
+  pivot_root, chroot); `task_fix_setuid` e `capable` (cambi di uid/gid e
+  uso di capability nella lineage, oggi visti solo all'exec);
+  `mmap_file`/`file_mprotect` (memoria eseguibile dopo scrittura, W^X —
+  oggi copriamo solo l'exec da memfd/`/proc/self/fd`, R004);
+  `socket_bind`/`socket_accept` e `inet_sock_set_state` (bind e accept
+  oggi non visti; connect, listen e close sì); tracepoint
+  `sched_process_fork` per la lineage completa; `kernel_load_data` e
+  `kernel_read_file` (kexec, firmware, moduli e livepatch caricati da
+  userland: oggi vediamo solo `module_load`)
+- Operazioni di namespace viste dalla syscall (`unshare`, `setns`,
+  `clone` con `CLONE_NEW*`), non dal nome del tool (R013 oggi guarda
+  `nsenter`/`unshare` per comm)
+- Identità del carico di lavoro su Kubernetes (SPIFFE/SVID e token di
+  service account osservati al punto d'uso, correlati a processo, cgroup
+  e connessione): prerequisito delle Tappe 13–14, non del nucleo
+
+Demo: lo stesso attacco eseguito da un container, da uno script passato
+a `python3 -c` e via `io_uring` produce la stessa catena di detection
+di quello eseguito da una shell in `/tmp`.
+
+---
+
+## Tappa (ex 9) — UI locale Rust nativa (non iniziata, slittata dopo la 10.9)
 
 Obiettivo: interfaccia accattivante, 100% Rust, niente Electron.
 
@@ -579,7 +679,7 @@ su un evento manuale, l'azione parte.
 
 ---
 
-## Tappa (ex 10) — Scout proattivo: assessment + hardening (non iniziata, slittata dopo la 10.8)
+## Tappa (ex 10) — Scout proattivo: assessment + hardening (non iniziata, slittata dopo la 10.9)
 
 Obiettivo: all'installazione, NorthNarrow chiude le falle.
 
@@ -589,6 +689,12 @@ Obiettivo: all'installazione, NorthNarrow chiude le falle.
   - SELinux/AppArmor status
   - Servizi esposti su rete
   - CVE noti del kernel installato
+  - Catena di fiducia del boot e del kernel (revisione del 10 ottobre
+    2026): Secure Boot e UKI con measured boot, `lockdown=integrity`,
+    firma dei moduli, kexec e livepatch limitati, IMA/EVM in appraisal
+    sui binari e sulle unit, `/usr` immutabile (dm-verity, sysext
+    firmate), bpffs dedicato — ciò che rende l'anti-tamper dell'agent
+    non aggirabile da root
 - LLM ragiona su priorità + propone fix
 - Modalità auto-fix (con conferma admin la prima volta)
   vs solo-report
@@ -641,6 +747,12 @@ Obiettivo: flotta multi-agent coordinata, EU-sovereign.
 - VictoriaMetrics per metriche
 - Storage object: Garage (sovereignty tier)
 - Deployable on-prem o cloud EU only
+- Watchdog esterno all'host (revisione del 10 ottobre 2026): heartbeat
+  firmato dall'agent con versione, hash dei programmi BPF, stato di
+  bpffs e, dove c'è TPM, quote dei PCR; il backend distingue heartbeat
+  mancante, firma invalida, baseline BPF divergente e PCR divergenti, e
+  mette in quarantena l'host; chain log inoltrati append-only perché i
+  log locali non bastano contro root
 
 Demo: 3 agent (2 Linux + 1 Windows) connessi al C2. Dashboard
 mostra flotta in tempo reale.
@@ -664,6 +776,16 @@ azione di massa "isola tutti gli host con verdict=High".
 ## Tappa 15 — Hardening avanzato selettivo (da v3 di Gemini)
 
 Obiettivo: innesti delle feature avanzate dove hanno ROI massimo.
+
+Candidati emersi dalla revisione esterna del 10 ottobre 2026 (funzioni
+da prodotto maturo, non difetti del nucleo): enforcement di rete per
+flusso con TC/XDP o `cgroup/connect` (policy per uid, cgroup, container
+e destinazione, non solo kill del processo); reputazione dei binari,
+similarity e regole YARA; esposizione alle vulnerabilità (CVE dei
+pacchetti collegate alla telemetria runtime); chiavi admin e dell'agent
+protette da TPM con attestazione dell'host; integrazione SIEM, syslog e
+OpenTelemetry; "SBOM a runtime" (inventario dei binari eseguiti con hash
+e provenienza).
 
 Selezione a quel punto in base a:
 - Threat landscape attuale
