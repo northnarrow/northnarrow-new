@@ -17,9 +17,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   error explains the condition.
 - Kernel 5.15 (Ubuntu 22.04): the eBPF object was rejected by the older
   verifier (`memset` subprogram call on ring-buffer entries; variable-length
-  read into uninitialised stack). Entries are zeroed inline and such reads
-  land in the ring-buffer entry; the agent now loads on 5.15 with every
-  program attached (DNS QNAME via `ITER_IOVEC` only — degraded, not refused).
+  read into uninitialised stack; `Option` payload read before its
+  discriminant in the FIM rename hook). Entries are zeroed inline, such
+  reads land in the ring-buffer entry, the rename destination is a plain
+  key; the agent now loads on 5.15 with every program and all 8 FIM hooks
+  attached (DNS QNAME via `ITER_IOVEC` only — degraded, not refused).
 - e2e fixtures (agent and watchdog): teardown signalled only the `sudo`
   pid and relied on the relay; sudo 1.9.9 does not relay from its own
   process group, so suites hung on 22.04. The whole subtree is now

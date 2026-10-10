@@ -19,7 +19,7 @@ verifiable: either every read resolves, or the agent does not run.
 |---|---|---|---|---|---|
 | Ubuntu 24.04 LTS | 6.8.0-142-generic | needs `lsm=…,bpf` (grub) | yes | **supported** — full nightly green (e2e, ignored suites, install, upgrade, uninstall, respawn); offsets match the build (41/41, 0 drift) | 2026-10-09 |
 | Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
-| Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs load and attach (LSM hooks included) after two rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
+| Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs and the 8 FIM observe hooks load and attach after three rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
 | RHEL / Alma / Rocky 9 | 5.14 + backports | needs `lsm=…,bpf` | yes | untested — same note as 22.04 | — |
 
 Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
@@ -93,7 +93,7 @@ BTF for kernels shipped without it, a third lab guest (Alma 9).
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
-The 5.15 verifier rejected two constructs that 6.1 and 6.8 accept. Both
+The 5.15 verifier rejected three constructs that 6.1 and 6.8 accept. Both
 are now avoided everywhere, and any new eBPF program must keep to the
 same rules or the 22.04 guest will refuse to load it:
 
@@ -108,6 +108,13 @@ same rules or the 22.04 guest will refuse to load it:
    stack buffer fails with `invalid indirect read from stack`. Such reads
    go straight into the ring-buffer entry (the `sched_process_exec`
    filename) or into stack that was zeroed first.
+3. **No stack slot that may be read before it is written.** An
+   `Option<struct>` argument to an inlined helper was spilled to the
+   stack and its payload loads hoisted above the discriminant check;
+   5.15 rejects the `None` path with `invalid read from stack` (newer
+   verifiers tolerate the read for privileged loaders). `fim_rename_observe`
+   now passes an always-initialised `InodeKey` (dev 0 / ino 0 = no
+   destination). Prefer plain values over `Option` across inlined calls.
 
 Lab notes for 22.04-era userland:
 
