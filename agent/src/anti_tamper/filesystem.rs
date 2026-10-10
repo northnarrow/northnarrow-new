@@ -114,6 +114,7 @@ pub const CONFIG_DIR: &str = "/etc/northnarrow";
 /// keeps existing slots stable.
 pub const ETC_PROTECTED_FILES: &[&str] = &[
     "admin.pub",
+    "install-manifest.json",
     "agent_id",
     "audit.log",
     "agent.sig.key",
