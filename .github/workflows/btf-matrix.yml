@@ -1,0 +1,87 @@
+# Computed kernel-compatibility matrix (multi-kernel, level 2).
+#
+# `deploy/btf-matrix/run.sh` downloads the newest non-cloud BTF blob of
+# each distro/version in the BTFHub archive and asks
+# `northnarrow-agent --btf-check` for a verdict — no root, no eBPF load,
+# so it runs on the hosted runner. The run fails when a verdict is worse
+# than `deploy/btf-matrix/expected.tsv` (a struct-offset regression) or a
+# BTF cannot be parsed (a parser regression). The agent is built WITHOUT
+# the eBPF object (build.rs placeholder): --btf-check never needs it.
+#
+# Kernels with native BTF (5.15 / 6.1 / 6.8) are not in BTFHub; the lab
+# guests cover them (docs/operator/KERNEL_COMPATIBILITY.md).
+name: BTF matrix
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - common/src/btf_offsets.rs
+      - agent/src/anti_tamper/btf_revalidate.rs
+      - agent/src/main.rs
+      - deploy/btf-matrix/**
+      - .github/workflows/btf-matrix.yml
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC — the archive grows, the baseline must keep holding
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  matrix:
+    name: btf-matrix (BTFHub)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-btf-matrix-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-btf-matrix-
+
+      - name: Build the agent (no eBPF object needed for --btf-check)
+        run: cargo build --release -p northnarrow-agent
+
+      - name: Cache BTFHub blobs
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/nn-btf-matrix
+          key: btfhub-blobs-${{ hashFiles('deploy/btf-matrix/run.sh') }}
+          restore-keys: btfhub-blobs-
+
+      - name: Compute the matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: deploy/btf-matrix/run.sh --out target/btf-matrix/matrix.md
+
+      - name: Publish the matrix in the job summary
+        if: always()
+        run: |
+          if [ -f target/btf-matrix/matrix.md ]; then
+            cat target/btf-matrix/matrix.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "matrix not produced (see the step log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btf-matrix
+          path: target/btf-matrix/matrix.md
+          if-no-files-found: ignore

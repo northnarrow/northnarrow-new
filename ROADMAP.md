@@ -540,8 +540,11 @@ Chiuso (8–9 ottobre 2026):
   24.04 / 6.8 (rilievo 27 chiuso, `docs/operator/KERNEL_COMPATIBILITY.md`)
 
 Pianificato, in quest'ordine:
-- Multi-kernel, livello 2: varianti per i campi instabili, matrice
-  calcolata su BTFHub in CI, BTF esterna per kernel senza BTF, terzo
+- Multi-kernel, livello 2 (in corso): fatto il 10 ottobre — campi
+  opzionali (degrado invece di rifiuto), `--btf-check`, terzo guest
+  Ubuntu 22.04 / 5.15 verificato end-to-end (tre costrutti riscritti per
+  il verifier vecchio), matrice calcolata su BTFHub in CI con baseline
+  (`deploy/btf-matrix/`); restano BTF esterna per kernel senza BTF e il
   guest Alma 9
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
   mappe LRU, timer)
