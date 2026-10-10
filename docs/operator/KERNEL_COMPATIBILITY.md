@@ -29,32 +29,39 @@ x86_64. See `docs/TAPPA7_PREREQ.md` for the grub step.
 
 ## Computed matrix (`northnarrow-agent --btf-check <btf>`)
 
-The resolver runs offline against any BTF blob — no root, no eBPF
-loaded — and prints one of three verdicts:
+`northnarrow-agent --btf-check <btf>` gives the compatibility verdict for
+any kernel BTF (the live `/sys/kernel/btf/vmlinux`, a blob from another
+host, one extracted from a kernel package, a BTFHub archive entry)
+without root and without loading any eBPF program. Exit 0 = SUPPORTED
+(also when degraded), 2 = NOT SUPPORTED, 3 = unreadable or unparseable.
 
-- **SUPPORTED**: every slot resolves (drift is fine, the map carries it);
-- **SUPPORTED (degraded)**: every *required* slot resolves; one or more
-  *optional* ones are absent and the dependent sensor path is off (today:
-  the `iov_iter` family → DNS events keep pid/comm/destination but carry
-  no QNAME);
-- **NOT SUPPORTED**: a required field or enumerator is missing — the
-  agent would refuse to start (exit 78).
+`deploy/btf-matrix/run.sh` computes the matrix below over the BTFHub
+archive (newest non-cloud kernel per distro/version) and compares it with
+`deploy/btf-matrix/expected.tsv`; the `BTF matrix` workflow runs it on
+every PR touching the offset tables or the resolver, weekly, and on
+demand, and fails on a verdict worse than the baseline or on a BTF the
+parser cannot read. BTFHub archives only kernels shipped **without**
+native BTF, so the lab guests (table above) cover 5.15, 6.1 and 6.8.
 
-| Source | Kernel | Verdict | Notes |
-|---|---|---|---|
-| WSL2 (host) | 6.18 | SUPPORTED | 16 of 44 slots differ from the build kernel — handled at runtime |
-| lab guest | 6.8 (Ubuntu 24.04) | SUPPORTED | 0 drift (build kernel) |
-| lab guest | 6.1 (Debian 12) | SUPPORTED | 20 drift, `ubuf`/`count`, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` |
-| lab guest | 5.15 (Ubuntu 22.04) | SUPPORTED (degraded) | 20 drift, 2 absent; no `iov_iter.ubuf` and no `ITER_UBUF` enumerator (both optional) → QNAME via `ITER_IOVEC` only |
-| BTFHub | 5.8 (Ubuntu 20.04) | SUPPORTED (degraded) | no `iov_iter.iter_type` / `ITER_UBUF` → no QNAME; **BPF LSM needs 5.7+ and the distro kernel config — untested at runtime** |
-| BTFHub | 4.18 (RHEL/CentOS 8) | NOT SUPPORTED | `tcp_sock.bytes_sent` absent; no BPF LSM on 4.18 anyway |
+| Source | Kernel | BPF LSM | Verdict | Notes |
+|---|---|---|---|---|
+| WSL2 (host) | 6.18 | — | SUPPORTED | 16 of 44 slots differ from the build kernel — handled at runtime |
+| lab guest | 6.8 (Ubuntu 24.04) | yes | SUPPORTED | 0 drift (build kernel) |
+| lab guest | 6.1 (Debian 12) | yes | SUPPORTED | 20 drift, `ubuf`/`count`, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` |
+| lab guest | 5.15 (Ubuntu 22.04) | yes | SUPPORTED (degraded) | 20 drift, 2 absent; no `iov_iter.ubuf` and no `ITER_UBUF` enumerator (both optional) → QNAME via `ITER_IOVEC` only |
+| BTFHub | 5.8 (Ubuntu 20.04) | yes | SUPPORTED (degraded) | 21 drift, 3 absent: no `iov_iter.iter_type` / `ubuf` / `ITER_UBUF` → no DNS QNAME; **the distro kernel config must enable BPF LSM — untested on a guest** |
+| BTFHub | 5.4 (Ubuntu 18.04 HWE, CentOS 7 ELRepo) | no (needs 5.7+) | SUPPORTED (degraded) | same 3 absent fields; informational — no BPF LSM before 5.7 |
+| BTFHub | 5.4 UEK (Oracle Linux 8) | no | SUPPORTED (degraded) | same |
+| BTFHub | 5.3 (Fedora 31, SLES 15.3) | no | SUPPORTED (degraded) | same |
+| BTFHub | 4.18 (RHEL / CentOS 8) | no | NOT SUPPORTED | `tcp_sock.bytes_sent` absent; no BPF LSM on 4.18 anyway |
+| BTFHub | 4.14 (Amazon Linux 2) | no | NOT SUPPORTED | same field; no BPF LSM |
 
-Runtime verification remains the lab's job (a verdict says the reads
-resolve, not that the verifier accepts every program on that kernel or
-that the hooks exist): the ubuntu2204 guest (5.15) is the next runtime
-row. BTFHub only archives kernels shipped *without* BTF, so for modern
-distro kernels the BTF comes from the running guest or from the kernel
-package.
+Reading it: every kernel from 5.3 up resolves all required fields, and
+the only degradation before 6.0 is DNS QNAME decoding. The practical
+floor is therefore **BPF LSM (5.7+) plus a distro kernel built with
+`CONFIG_BPF_LSM`**, not the struct layout. `tcp_sock.bytes_sent` (4.18 /
+4.14) could become optional too, but no 4.x kernel can run the
+anti-tamper hooks, so it is not worth a variant.
 
 ## Debian-family kernels and `perf_event_paranoid`
 
@@ -86,10 +93,10 @@ system-wide plus removing the drop-in to keep the narrower set).
    fix is a new alternative path in `REVALIDATE` (level 2 work), never a
    guess.
 
-What level 2 adds, in order: a computed matrix over BTFHub's archive of
-distribution kernels in CI (which fields resolve where, before any guest
-boots), further alternatives for the fields the matrix flags, external
-BTF for kernels shipped without it, a third lab guest (Alma 9).
+Level 2 so far: optional fields (degrade instead of refuse), the
+`--btf-check` verdict, the computed BTFHub matrix in CI with a baseline,
+a third lab guest (Ubuntu 22.04 / 5.15). Still planned: external BTF for
+kernels shipped without it, an Alma 9 guest.
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 

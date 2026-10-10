@@ -34,6 +34,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- `BTF matrix` workflow + `deploy/btf-matrix/run.sh`: computed
+  kernel-compatibility matrix over the BTFHub archive (newest non-cloud
+  kernel per distro/version, `--btf-check` verdicts, BPF LSM floor),
+  compared with a baseline (`expected.tsv`); on PRs touching the offset
+  tables, weekly, and on demand. Verdicts recorded in
+  `KERNEL_COMPATIBILITY.md`.
 - `northnarrow-agent --btf-check <btf>`: offline compatibility verdict
   (SUPPORTED / SUPPORTED (degraded) / NOT SUPPORTED) for any kernel BTF;
   optional offsets (the `iov_iter` family behind DNS QNAME decoding)

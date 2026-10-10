@@ -1,0 +1,15 @@
+# Baseline for deploy/btf-matrix/run.sh — one `<distro/version>\t<verdict>` per
+# line. A run whose verdict is WORSE than this fails; a better one asks
+# you to raise the line. Verdicts: SUPPORTED, DEGRADED (optional fields
+# absent — DNS QNAME decoding off), NOT_SUPPORTED (a required field is
+# missing; on 4.x there is no BPF LSM anyway).
+ubuntu/20.04	DEGRADED
+ubuntu/18.04	DEGRADED
+centos/8	NOT_SUPPORTED
+rhel/8	NOT_SUPPORTED
+ol/8	DEGRADED
+amzn/2	NOT_SUPPORTED
+fedora/31	DEGRADED
+sles/15.3	DEGRADED
+centos/7	DEGRADED
+host	SUPPORTED
