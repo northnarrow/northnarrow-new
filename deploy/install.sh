@@ -381,9 +381,17 @@ done
 
 # ── install ─────────────────────────────────────────────────────────
 # ── running install? ──────────────────────────────────────────────────
+# A unit counts as "running" in ANY state but inactive: `activating`
+# (the watchdog restart loop after a failed agent boot) and `failed`
+# still own or re-create the LSM pins, and an agent respawned mid-copy
+# re-protects /usr/local/bin — the first verified-upgrade test hit
+# exactly that (`install: cannot remove '/usr/local/bin/northnarrow-agent':
+# Operation not permitted`). Those units are stopped, reset and, after
+# the upgrade, restarted like active ones.
 UNITS_TO_RESTART=()
 for u in northnarrow-watchdog northnarrow-agent; do
-    if systemctl is-active --quiet "$u.service" 2>/dev/null; then
+    state=$(systemctl is-active "$u.service" 2>/dev/null || true)
+    if [[ -n "$state" && "$state" != inactive ]]; then
         UNITS_TO_RESTART+=("$u")
     fi
 done
@@ -399,10 +407,9 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
     # Watchdog first: stopping the agent alone makes it respawn it.
     for u in northnarrow-watchdog northnarrow-agent; do
-        if systemctl is-active --quiet "$u.service" 2>/dev/null; then
-            echo "install.sh: stopping $u"
-            systemctl stop "$u.service"
-        fi
+        echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null || echo unknown))"
+        systemctl stop "$u.service" 2>/dev/null || true
+        systemctl reset-failed "$u.service" 2>/dev/null || true
     done
     if [[ -d /sys/fs/bpf/northnarrow ]]; then
         echo "install.sh: dropping /sys/fs/bpf/northnarrow so the LSM programs detach (the new agent re-pins fresh)"
