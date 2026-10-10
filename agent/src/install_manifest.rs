@@ -165,15 +165,19 @@ pub fn check_with(
     own_exe: &Path,
     ebpf_object_sha: &str,
 ) -> IntegrityOutcome {
+    // Only the installed agent itself is compared: a copy with another
+    // name — even inside bin_dir, like the e2e fixtures'
+    // `northnarrow-agent-e2etest-<ts>-<pid>` — describes a different
+    // build and must not be judged by this manifest.
     let bin_dir = Path::new(&manifest.bin_dir);
-    let own_dir = own_exe
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
     let bin_dir_canon = bin_dir
         .canonicalize()
         .unwrap_or_else(|_| bin_dir.to_path_buf());
-    if own_dir.as_deref() != Some(bin_dir_canon.as_path()) {
+    let installed_agent = bin_dir_canon.join("northnarrow-agent");
+    let own_canon = own_exe
+        .canonicalize()
+        .unwrap_or_else(|_| own_exe.to_path_buf());
+    if own_canon != installed_agent {
         return IntegrityOutcome::NotApplicable {
             own_exe: own_exe.to_path_buf(),
             bin_dir: manifest.bin_dir.clone(),
@@ -311,6 +315,13 @@ mod tests {
         );
         assert!(!out.is_fatal(None));
         assert_eq!(out.label(), "not-applicable");
+        // same directory, different name (an e2e fixture copy): not compared either
+        let fixture = write(dir.path(), "northnarrow-agent-e2etest-1-2", b"fixture");
+        let out = check(&mp, &fixture, "33");
+        assert!(
+            matches!(out, IntegrityOutcome::NotApplicable { .. }),
+            "{out:?}"
+        );
     }
 
     #[test]
