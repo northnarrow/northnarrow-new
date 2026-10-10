@@ -119,6 +119,48 @@ the fact, fails the check. Pull requests that touch `deploy/`, `xtask/`
 or the workflow run the same job as a dry run (artefacts on the workflow
 run only).
 
+### 5.1 `install.sh` verifies the release itself
+
+The manual commands above stay valid, but since lab PR 21 the installer
+performs the checks and refuses to touch the host when one fails:
+
+1. **Tree manifest** — the tarball ships `MANIFEST.sha256` (every file
+   hashed by `mk-tarball`); `install.sh` runs `sha256sum -c` on the
+   extracted tree. A corrupted or edited tree is refused.
+2. **SHA256SUMS** — if the tarball is next to the tree (`../<tree>.tar.gz`,
+   or `--tarball FILE`) and `SHA256SUMS` is next to it (or `--sums FILE`),
+   the tarball hash is checked against it.
+3. **SLSA attestation** — with `gh` 2.49+ (online, or offline with
+   `--attestation BUNDLE` from `gh attestation download`) or `cosign`
+   plus a bundle, the provenance is verified and bound to this
+   repository's release workflow (`--signer-workflow`). Without a
+   verifier the installer says so; `--require-attestation` turns that
+   into a refusal.
+
+The strongest level reached — `attested`, `checksums`, `manifest`,
+`source-tree` (no `MANIFEST.sha256`: a developer tree, the lab) or
+`unverified` (`--no-verify`) — is written with the SHA-256 of every
+installed binary and of the eBPF object to
+`/etc/northnarrow/install-manifest.json`, which the anti-tamper hook
+protects like the rest of `/etc/northnarrow`.
+
+**At every boot the agent closes the loop**: it hashes its own executable,
+the watchdog and `nn-admin` under the recorded `bin_dir` and compares the
+embedded eBPF object hash with the manifest. The result is written in the
+signed `agent_boot` audit entry (`binary_integrity`, `install_provenance`).
+A mismatch — the running file is not the one the installer verified — or
+an unreadable manifest refuses the boot (exit 78); `NN_ALLOW_UNVERIFIED_BINARY=1`
+turns that into a WARN on a development host. A binary started from
+outside `bin_dir` (a test fixture) is not compared.
+
+```sh
+tar xzf northnarrow-<ver>-x86_64-linux.tar.gz && cd northnarrow-<ver>-x86_64-linux
+sudo ./deploy/install.sh --require-attestation          # tarball + SHA256SUMS found in ..
+sudo ./deploy/install.sh --upgrade --tarball /path/to/northnarrow-<ver>-x86_64-linux.tar.gz \
+    --sums /path/to/SHA256SUMS --attestation /path/to/bundle.jsonl
+nn-admin audit verify --from /etc/northnarrow/audit.log --agent-sig-key /etc/northnarrow/agent.sig.key
+```
+
 Known limits: one architecture (x86_64) and no `.deb`/`.rpm` yet — the
 units and the anti-tamper inode list hard-code `/usr/local/bin`, which a
 distribution package must not use; moving the binaries to `/usr/bin`
