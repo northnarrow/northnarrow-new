@@ -329,7 +329,7 @@ if sudo kill -9 "$old" 2>/dev/null; then
     echo "WARN: plain kill -9 from a root shell succeeded — task_kill deny hook NOT active?"
 else
     echo "kill -9 from a root shell: denied (task_kill LSM hook OK) — using systemctl kill"
-    sudo systemctl kill --kill-whom=main -s SIGKILL northnarrow-agent.service
+    sudo systemctl kill --kill-who=main  -s SIGKILL northnarrow-agent.service
 fi
 deadline=$(( $(date +%s) + 60 ))
 new=""

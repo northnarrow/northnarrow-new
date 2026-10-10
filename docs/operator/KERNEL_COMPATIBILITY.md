@@ -127,6 +127,8 @@ Lab notes for 22.04-era userland:
   that look programs up by name accept both.
 - never probe signal behaviour with `cmd &` in a non-interactive shell:
   bash starts background jobs with SIGINT and SIGQUIT ignored.
+- systemd 249 (22.04) knows `systemctl kill --kill-who=`, not the newer
+  `--kill-whom=` spelling; the lab uses the old one, accepted by both.
 
 ## Adding a distro to the lab
 
