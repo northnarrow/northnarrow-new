@@ -214,6 +214,9 @@ cmd_sync() {
     ls "$REPO"/target/kb/*.jsonl >/dev/null 2>&1 && kb_note="target/kb included"
     log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included, $kb_note)"
     rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
+        --exclude='/fuzz/artifacts/' \
+        --exclude='/fuzz/corpus/' \
+        --exclude='/fuzz/target/' \
         --include='/target/' \
         --include='/target/kb/' \
         --include='/target/kb/*.jsonl' \
@@ -260,7 +263,8 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
         sudo systemctl start northnarrow-agent 2>/dev/null && sleep 5
     fi
     if systemctl is-active --quiet northnarrow-agent && sudo test -r /etc/northnarrow/admin.key; then
-        if ! sudo nn-admin trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
+        # absolute path: RHEL's sudo secure_path has no /usr/local/bin
+        if ! sudo /usr/local/bin/nn-admin trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
             echo "grant refused: $(tail -1 /tmp/nn-grant.log)"
         elif ! sudo grep -q "config-manage" /etc/northnarrow/admin.pub; then
             # Tappa 10.8: the lab key signs overlays too; the window lets
@@ -517,11 +521,16 @@ cmd_soak() {
             # agent's R009 (root exec from a user-writable path) would kill it
             # on the spot. Install it root-owned under /usr/local/sbin first.
             vssh "sudo install -m 0755 -o root -g root \$HOME/soak/sample.sh /usr/local/sbin/nn-soak-sample"
-            vssh "sudo nohup env SOAK_DIR=\$HOME/soak SOAK_INTERVAL=$interval setsid /usr/local/sbin/nn-soak-sample > \$HOME/soak/sample.log 2>&1 < /dev/null & disown; sleep 2; test -f ~/soak/sample.pid && sudo kill -0 \$(cat ~/soak/sample.pid)"
+            # the sampler writes its pid when it starts: wait up to 15 s (2 s
+            # was not enough on AlmaLinux with a freshly started agent)
+            vssh "sudo nohup env SOAK_DIR=\$HOME/soak SOAK_INTERVAL=$interval setsid /usr/local/sbin/nn-soak-sample > \$HOME/soak/sample.log 2>&1 < /dev/null & disown; for i in \$(seq 1 15); do test -f ~/soak/sample.pid && break; sleep 1; done; test -f ~/soak/sample.pid && sudo kill -0 \$(cat ~/soak/sample.pid)"
             # SOAK_*_PER_S set on the host side travel to the generator, so a
             # targeted run (e.g. SOAK_DNS_PER_S=20) needs no script edit.
             local rates
-            rates=$(env | grep -E '^SOAK_[A-Z_]+_PER_S=[0-9]+$' | tr '\n' ' ')
+            # no SOAK_*_PER_S set is the normal case: grep exits 1, and under
+            # `set -o pipefail` that used to end the start before the
+            # generator was launched (sampler running, generator never)
+            rates=$(env | { grep -E '^SOAK_[A-Z_]+_PER_S=[0-9]+$' || true; } | tr '\n' ' ')
             vssh "nohup env SOAK_DIR=\$HOME/soak $rates setsid \$HOME/soak/generate.sh > \$HOME/soak/generate.log 2>&1 < /dev/null & disown"
             vssh "nohup setsid sh -c 'sleep $secs; touch \$HOME/soak/stop' > /dev/null 2>&1 < /dev/null & disown"
             log "soak started on $DISTRO: ${hours} h, sample every ${interval} s (nn-lab.sh soak status | wait | stop | report)"
