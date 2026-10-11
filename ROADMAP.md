@@ -688,6 +688,12 @@ Pianificato, in quest'ordine:
 Demo: stesso tarball installato e verificato su quattro distribuzioni,
 nightly verde su tutte, release verificabile con un comando, soak da
 24 h senza crescita di memoria.
+Stato all'11 ottobre (lab PR 45): lo stesso tarball prodotto e attestato
+dalla CI supera `nn-lab.sh release-check` su Ubuntu 24.04, Ubuntu 22.04 e
+Debian 12 (checksum, binari eseguibili sulla glibc del guest, verifica di
+`install.sh` con provenienza `checksums`, integrità al boot, hook, sonda,
+una detection); AlmaLinux 9 dopo il soak di 24 h in corso fino al 12
+ottobre.
 
 ---
 

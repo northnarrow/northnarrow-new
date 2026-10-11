@@ -27,6 +27,7 @@
 #   deploy/lab/nn-lab.sh overhead [ROUNDS] # agent off/on throughput of the hooked operations (idle host!)
 #   deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent: probe package install/remove + real reinstall
 #   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
+#   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -560,6 +561,32 @@ cmd_pkg_check() {
     return "$rc"
 }
 
+cmd_release_check() {
+    # Tappa 10.8 demo — the SAME release tarball, built and attested by CI,
+    # installed and verified on this guest (deploy/lab/release/release-check.sh):
+    # SHA256SUMS, the binaries run on this glibc, install.sh's own tree and
+    # tarball verification (provenance "checksums"), boot integrity, hooks,
+    # telemetry probe, one detection end to end. DIR holds the tarball and
+    # SHA256SUMS, e.g. `gh run download <release run id> -D DIR`. The lab's
+    # source install is put back at the end.
+    vm_running || die "guest is not running"
+    local dir=${1:?usage: nn-lab.sh release-check DIR (release tarball + SHA256SUMS)}
+    local tgz
+    tgz=$(find "$dir" -name 'northnarrow-*-x86_64-linux.tar.gz' | head -1)
+    local sums
+    sums=$(find "$dir" -name SHA256SUMS | head -1)
+    [[ -n "$tgz" && -n "$sums" ]] || die "no release tarball + SHA256SUMS under $dir"
+    vssh 'rm -rf /tmp/nn-release && mkdir -p /tmp/nn-release'
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$tgz" "$sums" "$GUEST:/tmp/nn-release/"
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/release/release-check.sh" "$GUEST:/tmp/nn-release-check.sh"
+    lab_purge_pins >/dev/null
+    local rc=0
+    vssh 'bash /tmp/nn-release-check.sh' || rc=$?
+    log "restoring the lab's source install (nn-lab.sh install)"
+    cmd_install >/dev/null 2>&1 || { log "restore failed — run nn-lab.sh install"; rc=1; }
+    return "$rc"
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -947,6 +974,7 @@ case "${1:-help}" in
     overhead)      shift; cmd_overhead "$@" ;;
     pkgmgr-check)  cmd_pkgmgr_check ;;
     pkg-check)     cmd_pkg_check ;;
+    release-check) shift; cmd_release_check "$@" ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;
