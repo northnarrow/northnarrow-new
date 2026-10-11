@@ -61,6 +61,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-btf-matrix-v2-
 
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
+
       - name: Build the agent (no eBPF object needed for --btf-check)
         run: cargo build --release -p northnarrow-agent
 

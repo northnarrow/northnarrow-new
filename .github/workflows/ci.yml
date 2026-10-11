@@ -52,6 +52,10 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.task }}-
             ${{ runner.os }}-cargo-
 
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
+
       - name: cargo fmt --all --check
         if: matrix.task == 'fmt'
         run: cargo fmt --all --check
@@ -108,6 +112,10 @@ jobs:
             ${{ runner.os }}-cargo-test-privileged-
             ${{ runner.os }}-cargo-
 
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
+
       - name: Compile workspace tests (including ignored)
         run: cargo test --workspace --no-run --verbose
 
@@ -158,6 +166,10 @@ jobs:
             ${{ runner.os }}-cargo-ade-build-
             ${{ runner.os }}-cargo-
 
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
+
       - name: cargo build (ADE module)
         run: cargo build -p northnarrow-agent --lib --verbose
 
@@ -201,6 +213,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-ade-test-
             ${{ runner.os }}-cargo-
+
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
 
       - name: cargo test (ADE + correlation + ade_types)
         run: |
@@ -257,6 +273,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-ebpf-
 
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
+          (cd agent-ebpf && ../.github/scripts/prune-workspace-cache.sh target)
+
       - name: cargo xtask build-ebpf
         run: cargo xtask build-ebpf
 
@@ -297,6 +318,11 @@ jobs:
           key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-fuzz-
+
+      - name: Prune workspace crates from the restored cache
+        run: |
+          .github/scripts/prune-workspace-cache.sh target
+          (cd fuzz && ../.github/scripts/prune-workspace-cache.sh target)
 
       # Every target must build; each then runs a short smoke so a
       # trivially reachable panic fails the PR. Long campaigns run from a
