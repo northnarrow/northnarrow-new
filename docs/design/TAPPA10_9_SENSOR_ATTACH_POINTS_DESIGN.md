@@ -360,5 +360,5 @@ Notes for the next steps:
   from `stat()` on the top level, `0x2f` in a subvolume). No inode-keyed
   table can match there: not these probes' `PROBE_DIRS`, and not the
   production `WATCHED_PATHS`, `PROTECTED_INODES` and `OWN_EXE_INODES`
-  either (review 55). Step 1 builds on that fix: the kernel side reports
-  the device `stat()` reports.
+  either (review 55). Fixed right after step 0 (lab PR 48): the kernel
+  side now reports the device `stat()` reports, and step 1 builds on it.

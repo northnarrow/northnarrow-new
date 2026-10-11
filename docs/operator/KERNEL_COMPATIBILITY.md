@@ -124,6 +124,35 @@ telemetry from such legacy kernels is ever needed, it should be an
 explicit, separately named mode with its own guarantees, not a quiet
 fallback.
 
+## btrfs: inode identity follows `stat()` (review 55)
+
+FIM watches files and the anti-tamper protects them by `(dev, ino)`.
+Userland computes the key with `stat()`, and the eBPF hooks look it up
+from the kernel's inode. On every filesystem but btrfs, `stat()` reports
+the superblock's `s_dev`. On btrfs it reports the device of the inode's
+subvolume (`btrfs_getattr`), and inode numbers restart in every
+subvolume. Until review 55 the eBPF side used `s_dev` everywhere, so on a
+host whose files live on btrfs no key ever matched and nothing warned:
+FIM missed every file, the deny hooks protected none, and the
+executable-inode exemption of the BPF guard never applied.
+
+The eBPF side now computes the key as `stat()` does
+(`agent-ebpf/src/inode_dev.rs`). For an inode whose superblock magic is
+`BTRFS_SUPER_MAGIC`, it reads `BTRFS_I(inode)->root->anon_dev`. The three
+btrfs offsets (`btrfs_inode.root`, `btrfs_inode.vfs_inode`,
+`btrfs_root.anon_dev`) come from vmlinux when btrfs is built in (Debian's
+cloud kernel). Otherwise they come from the module's split BTF,
+`/sys/kernel/btf/btrfs` (Ubuntu), which the resolver reads on top of
+vmlinux. When the module is not loaded, nothing
+on the host is btrfs: the offsets stay unset, and the verdict is not
+degraded (`--btf-check` prints a `module` line).
+
+`deploy/lab/nn-lab.sh btrfs-check` is the regression check. It reads a
+watched credential file twice, once on the root filesystem as a control
+and once on a btrfs subvolume, and requires NN-L-FIM-011 both times.
+Limit: a btrfs filesystem first mounted after the agent started
+(module loaded later) keeps the old keys until the agent restarts.
+
 ## Tracepoint layouts on vendor kernels (RHEL 9)
 
 Tracepoint programs read their arguments at fixed byte offsets inside the
@@ -205,6 +234,14 @@ same rules or the 22.04 guest will refuse to load it:
    verifier busy for minutes (the agent looked hung at boot). Keep loops
    short, constant-bounded and few per program. Test builds write a
    rejected program's verifier log to `/run/northnarrow/verifier-<program>.log`.
+7. **Bound any offset added to or subtracted from a hook argument** (all
+   kernels, 6.8 included). An LSM hook's `struct inode *` argument is a
+   BTF-typed pointer. `inode - off` with `off` read from `BTF_OFFSETS` (a
+   full `u32`) fails with `value -4294967295 makes trusted_ptr_ pointer be
+   out of bounds`. Mask the offset first (`off & 0xffff`, as
+   `inode_dev::stat_dev` does for btrfs' `container_of`) or work on a
+   pointer obtained through `bpf_probe_read_kernel`, which is a plain
+   scalar.
 
 Lab notes for 22.04-era userland:
 

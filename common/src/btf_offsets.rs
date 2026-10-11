@@ -397,7 +397,7 @@ pub const ENUM_VALUES: &[EnumSpec] = &[
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
-/// layout offset). 41 entries — kept in lockstep with the consts above
+/// layout offset). 53 entries — kept in lockstep with the consts above
 /// by `revalidate_table_is_complete` (test).
 pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec {
@@ -797,7 +797,48 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: false,
     },
+    OffsetSpec {
+        name: "SUPER_BLOCK_S_MAGIC_OFFSET",
+        struct_name: "super_block",
+        field_path: &["s_magic"],
+        expected: SUPER_BLOCK_S_MAGIC_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    // Review 55: btrfs types, resolved from the btrfs module's BTF when
+    // vmlinux does not carry them (see `BTF_MODULE_STRUCTS`).
+    OffsetSpec {
+        name: "BTRFS_INODE_ROOT_OFFSET",
+        struct_name: "btrfs_inode",
+        field_path: &["root"],
+        expected: BTRFS_INODE_ROOT_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "BTRFS_INODE_VFS_INODE_OFFSET",
+        struct_name: "btrfs_inode",
+        field_path: &["vfs_inode"],
+        expected: BTRFS_INODE_VFS_INODE_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "BTRFS_ROOT_ANON_DEV_OFFSET",
+        struct_name: "btrfs_root",
+        field_path: &["anon_dev"],
+        expected: BTRFS_ROOT_ANON_DEV_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
+
+/// Structs defined by a kernel module rather than vmlinux, and the module
+/// whose BTF (`/sys/kernel/btf/<module>`, split on vmlinux) carries them
+/// when it is not built in. Only optional [`REVALIDATE`] entries may use
+/// them: a host without the module has nothing of that type to read.
+pub const BTF_MODULE_STRUCTS: &[(&str, &str)] =
+    &[("btrfs_inode", "btrfs"), ("btrfs_root", "btrfs")];
 
 // ───────────────────────────────────────
 //  Runtime offsets — the BTF_OFFSETS map contract (multi-kernel, level 1).
@@ -866,16 +907,20 @@ pub mod slot {
     pub const BPF_PROG_AUX_OFFSET: u32 = 47;
     pub const BPF_PROG_AUX_ID_OFFSET: u32 = 48;
     pub const MM_STRUCT_EXE_FILE_OFFSET: u32 = 49;
-    // enum slots 50–51 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 52;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 53;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 54;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 55;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 56;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 57;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 58;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 59;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 60;
+    pub const SUPER_BLOCK_S_MAGIC_OFFSET: u32 = 50;
+    pub const BTRFS_INODE_ROOT_OFFSET: u32 = 51;
+    pub const BTRFS_INODE_VFS_INODE_OFFSET: u32 = 52;
+    pub const BTRFS_ROOT_ANON_DEV_OFFSET: u32 = 53;
+    // enum slots 54–55 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 56;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 57;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 58;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 59;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 60;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 61;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 62;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 63;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 64;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -930,6 +975,10 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("BPF_PROG_AUX_OFFSET", 47),
     ("BPF_PROG_AUX_ID_OFFSET", 48),
     ("MM_STRUCT_EXE_FILE_OFFSET", 49),
+    ("SUPER_BLOCK_S_MAGIC_OFFSET", 50),
+    ("BTRFS_INODE_ROOT_OFFSET", 51),
+    ("BTRFS_INODE_VFS_INODE_OFFSET", 52),
+    ("BTRFS_ROOT_ANON_DEV_OFFSET", 53),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -947,6 +996,24 @@ pub const BPF_PROG_AUX_ID_OFFSET: usize = 32;
 /// can exempt the agent's own binaries (the watchdog registers itself in
 /// PROTECTED_PIDS before it is a member). Compiled value: 6.8 build kernel.
 pub const MM_STRUCT_EXE_FILE_OFFSET: usize = 1168;
+
+/// `super_block.s_magic`: the filesystem type, read to recognise btrfs
+/// inodes (review 55). Byte 96 on 6.8, 6.1 and 5.15.
+pub const SUPER_BLOCK_S_MAGIC_OFFSET: usize = 96;
+/// btrfs (review 55): `stat()` on btrfs reports the device of the inode's
+/// subvolume (`BTRFS_I(inode)->root->anon_dev`), not the superblock's
+/// `s_dev` that every other filesystem reports, so an inode key built by
+/// userland with `stat()` never matched the kernel's. The eBPF inode
+/// identity (`agent-ebpf/src/inode_dev.rs`) follows these three fields for
+/// btrfs inodes. They come from the btrfs module's BTF
+/// (`/sys/kernel/btf/btrfs`, split on vmlinux) or from vmlinux when btrfs
+/// is built in, and are optional: without btrfs there is nothing to
+/// adjust. Compiled values: the 6.8 build kernel's module.
+pub const BTRFS_INODE_ROOT_OFFSET: usize = 0;
+/// `btrfs_inode.vfs_inode`: the VFS inode embedded in the btrfs one.
+pub const BTRFS_INODE_VFS_INODE_OFFSET: usize = 448;
+/// `btrfs_root.anon_dev`: the subvolume's anonymous device.
+pub const BTRFS_ROOT_ANON_DEV_OFFSET: usize = 888;
 
 /// Tracepoint field offsets — the `read_at` positions inside a
 /// `TracePointContext`. They come from the tracefs `format` file, not from
@@ -1077,24 +1144,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 52),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 53),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 54),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 55),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 56),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 57),
-    ("TP_IOURING_CREATE_FD_OFFSET", 58),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 59),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 60),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 56),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 57),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 58),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 59),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 60),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 61),
+    ("TP_IOURING_CREATE_FD_OFFSET", 62),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 63),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 64),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 50), ("ITER_IOVEC_VALUE", 51)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 54), ("ITER_IOVEC_VALUE", 55)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 50;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 54;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 51;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 55;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -1112,7 +1179,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 49, "REVALIDATE must cover all 49 offsets");
+        assert_eq!(REVALIDATE.len(), 53, "REVALIDATE must cover all 53 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1132,7 +1199,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 61);
+        assert_eq!(BTF_OFFSETS_SLOTS, 65);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1162,8 +1229,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 52);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 55);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 56);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 59);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }

@@ -108,7 +108,15 @@ pub fn run() -> i32 {
             .unwrap_or_else(|_| "unknown".into()),
         ..Report::default()
     };
-    let outcome = execute(&mut rep, &work);
+    // A BASE that does not exist would silently put the fixtures on the
+    // root filesystem instead of the one being tested.
+    let outcome = match work.parent() {
+        Some(base) if !base.is_dir() => Err(anyhow!(
+            "NN_FEASIBILITY_BASE {} is not a directory",
+            base.display()
+        )),
+        _ => execute(&mut rep, &work),
+    };
     let _ = fs::remove_dir_all(PIN_DIR);
     let _ = fs::remove_dir_all(&work);
     let _ = fs::remove_file(SHM_COPY);

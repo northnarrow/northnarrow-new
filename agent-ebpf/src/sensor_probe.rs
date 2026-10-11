@@ -128,7 +128,7 @@ unsafe fn inode_key(inode: *const u8) -> InodeKey {
     let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
     if !sb.is_null() {
         if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
-            key.dev = dev as u64;
+            key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
         }
     }
     if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {

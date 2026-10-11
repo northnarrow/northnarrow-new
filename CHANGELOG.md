@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- On btrfs, FIM and the anti-tamper file protection saw nothing (review
+  55). Userland keys watched and protected files by `(dev, ino)` from
+  `stat()`, which on btrfs reports the subvolume's device. The eBPF hooks
+  looked them up with the superblock's device, so no key ever matched.
+  FIM missed every file on btrfs, the deny hooks protected none of them,
+  the BPF guard's exemption for the agent's own executables never applied,
+  and nothing warned. The eBPF side now reports the device as `stat()` does
+  (`BTRFS_I(inode)->root->anon_dev` for btrfs inodes). The offsets come
+  from the btrfs module's BTF, which the resolver now reads as split BTF
+  on top of vmlinux. `nn-lab.sh btrfs-check` reads a watched credential
+  file on the root filesystem and on a btrfs subvolume; NN-L-FIM-011 must
+  fire both times. Before the fix it fired only for the root filesystem.
 - Without the kernel BTF (`/sys/kernel/btf/vmlinux`) the anti-tamper
   attach only logged a WARN and skipped every LSM hook, outside the
   fail-closed check that refuses to start on a missing deny hook. Only the

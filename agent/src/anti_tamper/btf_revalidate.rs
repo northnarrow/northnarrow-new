@@ -38,8 +38,8 @@ use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
-    EnumSpec, OffsetSpec, BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, ENUM_SLOT_TABLE, ENUM_VALUES,
-    REVALIDATE, SLOT_TABLE,
+    EnumSpec, OffsetSpec, BTF_MODULE_STRUCTS, BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC,
+    ENUM_SLOT_TABLE, ENUM_VALUES, REVALIDATE, SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -153,6 +153,12 @@ pub struct ResolvedOffsets {
     /// Optional entries this kernel does not have (slot written as
     /// [`BTF_OFFSETS_ABSENT`]): the dependent feature degrades.
     pub absent: Vec<Mismatch>,
+    /// Kernel modules whose BTF was not found next to the vmlinux BTF
+    /// (`/sys/kernel/btf/<module>`): their entries are written as
+    /// [`BTF_OFFSETS_ABSENT`] without counting as a degradation. Without
+    /// the module there is nothing of its types to read (review 55:
+    /// btrfs).
+    pub modules_not_loaded: Vec<&'static str>,
 }
 
 /// Outcome of [`resolve_offsets`].
@@ -210,25 +216,79 @@ pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
         Ok(b) => b,
         Err(e) => return ResolveOutcome::Refuse(RefuseReason::ParseError(e.to_string())),
     };
-    resolve_with(&btf, REVALIDATE, ENUM_VALUES)
+    // Module BTFs sit next to the kernel's in the sysfs layout
+    // (`/sys/kernel/btf/btrfs`); a copied pair keeps the same names.
+    let dir = (path.file_name() == Some(std::ffi::OsStr::new("vmlinux")))
+        .then(|| path.parent())
+        .flatten();
+    let modules = |m: &str| dir.and_then(|d| fs::read(d.join(m)).ok());
+    resolve_with(&btf, REVALIDATE, ENUM_VALUES, &modules)
 }
 
-fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveOutcome {
+/// `spec` against `t`, trying the alternative paths in order.
+fn resolve_spec<T: TypeTable>(t: &T, spec: &OffsetSpec) -> Result<usize, ResolveError> {
+    let mut resolved = t.resolve_path(spec.struct_name, spec.field_path);
+    if resolved.is_err() {
+        for alt in spec.alt_paths {
+            if let Ok(v) = t.resolve_path(spec.struct_name, alt) {
+                resolved = Ok(v);
+                break;
+            }
+        }
+    }
+    resolved
+}
+
+/// `modules(name)`: the BTF of kernel module `name`, `None` when it is not
+/// loaded. Consulted only for the structs [`BTF_MODULE_STRUCTS`] lists,
+/// when vmlinux does not carry them (module not built in).
+fn resolve_with(
+    btf: &Btf,
+    specs: &[OffsetSpec],
+    enums: &[EnumSpec],
+    modules: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> ResolveOutcome {
     let mut values = Vec::with_capacity(specs.len());
     let mut drifted = Vec::new();
     let mut missing = Vec::new();
     let mut absent = Vec::new();
+    let mut modules_not_loaded: Vec<&'static str> = Vec::new();
+    // Each module's BTF parsed once: Err(None) = not loaded here,
+    // Err(Some(reason)) = unparseable.
+    let mut split: HashMap<&'static str, Result<SplitBtf<'_>, Option<String>>> = HashMap::new();
     for spec in specs {
         let slot = SLOT_TABLE
             .iter()
             .find(|(n, _)| *n == spec.name)
             .map(|(_, s)| *s);
-        let mut resolved = btf.resolve_path(spec.struct_name, spec.field_path);
-        if resolved.is_err() {
-            for alt in spec.alt_paths {
-                if let Ok(v) = btf.resolve_path(spec.struct_name, alt) {
-                    resolved = Ok(v);
-                    break;
+        let mut resolved = resolve_spec(btf, spec);
+        let module = BTF_MODULE_STRUCTS
+            .iter()
+            .find(|(st, _)| *st == spec.struct_name)
+            .map(|(_, m)| *m);
+        if let (Err(_), Some(module)) = (&resolved, module) {
+            let entry = split
+                .entry(module)
+                .or_insert_with(|| match modules(module) {
+                    None => Err(None),
+                    Some(data) => SplitBtf::parse(btf, &data).map_err(|e| Some(e.to_string())),
+                });
+            match entry {
+                Ok(sb) => resolved = resolve_spec(sb, spec),
+                Err(Some(reason)) => {
+                    resolved = Err(ResolveError::ModuleBtf(format!("{module}: {reason}")))
+                }
+                Err(None) => {
+                    if let (true, Some(slot)) = (spec.optional, slot) {
+                        values.push((slot, BTF_OFFSETS_ABSENT));
+                        if !modules_not_loaded.contains(&module) {
+                            modules_not_loaded.push(module);
+                        }
+                        continue;
+                    }
+                    resolved = Err(ResolveError::ModuleBtf(format!(
+                        "{module} module BTF not found"
+                    )));
                 }
             }
         }
@@ -318,6 +378,7 @@ fn resolve_with(btf: &Btf, specs: &[OffsetSpec], enums: &[EnumSpec]) -> ResolveO
             values,
             drifted,
             absent,
+            modules_not_loaded,
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
@@ -433,7 +494,7 @@ pub fn parse_format_field_offset(text: &str, field: &str) -> Option<u32> {
 pub fn fuzz_parse_and_resolve(data: &[u8]) -> bool {
     match Btf::parse(data) {
         Ok(btf) => {
-            let _ = resolve_with(&btf, REVALIDATE, ENUM_VALUES);
+            let _ = resolve_with(&btf, REVALIDATE, ENUM_VALUES, &|_| None);
             let _ = revalidate_with(&btf, REVALIDATE);
             true
         }
@@ -482,7 +543,15 @@ pub fn arm_btf_offsets(ebpf: &mut aya::Ebpf) -> anyhow::Result<usize> {
 /// + specs (no real `/sys/kernel/btf/vmlinux` needed).
 fn revalidate_with(btf: &Btf, specs: &[OffsetSpec]) -> RevalidateOutcome {
     let mut mismatches = Vec::new();
-    for spec in specs {
+    // A module's structs are not in vmlinux; `resolve_offsets` reads them
+    // from the module's BTF.
+    let in_vmlinux = |s: &&OffsetSpec| {
+        !BTF_MODULE_STRUCTS
+            .iter()
+            .any(|(st, _)| *st == s.struct_name)
+    };
+    let specs: Vec<&OffsetSpec> = specs.iter().filter(in_vmlinux).collect();
+    for spec in &specs {
         match btf.resolve_path(spec.struct_name, spec.field_path) {
             Ok(actual) if actual == spec.expected => {}
             Ok(actual) => mismatches.push(Mismatch {
@@ -528,6 +597,8 @@ enum ResolveError {
     NotAStruct(String),
     FieldNotFound(String),
     BitfieldNotByteAligned(String),
+    /// A module's BTF was needed but is missing or unparseable.
+    ModuleBtf(String),
 }
 
 impl fmt::Display for ResolveError {
@@ -539,6 +610,7 @@ impl fmt::Display for ResolveError {
             ResolveError::BitfieldNotByteAligned(s) => {
                 write!(f, "field is bit-packed, not byte-aligned ({s})")
             }
+            ResolveError::ModuleBtf(s) => write!(f, "module BTF: {s}"),
         }
     }
 }
@@ -599,6 +671,17 @@ struct Btf {
 
 impl Btf {
     fn parse(data: &[u8]) -> Result<Btf, ParseError> {
+        Self::parse_on(data, None)
+    }
+
+    /// Parse `data`, or — with `base` — a module's split BTF on top of the
+    /// kernel's: its type ids start at the base's count and its string
+    /// offsets at the base's string-section length, so names and member
+    /// types may live in the base. The result holds only the module's own
+    /// types and strings; [`SplitBtf`] joins the two.
+    fn parse_on(data: &[u8], base: Option<&Btf>) -> Result<Btf, ParseError> {
+        let (first_id, first_str) =
+            base.map_or((0, 0), |b| (b.types.len() as u32, b.strings.len() as u32));
         if data.len() < 24 {
             return Err(ParseError("shorter than BTF header".into()));
         }
@@ -632,9 +715,22 @@ impl Btf {
             return Err(ParseError("type/str section out of bounds".into()));
         }
         let strings = data[sstart..send].to_vec();
+        let name_of = |off: u32| -> Option<String> {
+            if off < first_str {
+                base.and_then(|b| name_at(&b.strings, off).ok())
+                    .map(str::to_string)
+            } else {
+                name_at(&strings, off - first_str).ok().map(str::to_string)
+            }
+        };
 
-        // id 0 is void; real types are 1-based.
-        let mut types = vec![Ty::Opaque];
+        // id 0 is void; real types are 1-based. A split BTF's first type
+        // continues the base's ids.
+        let mut types = if base.is_some() {
+            Vec::new()
+        } else {
+            vec![Ty::Opaque]
+        };
         let mut name_to_id: HashMap<String, u32> = HashMap::new();
 
         let mut p = tstart;
@@ -647,7 +743,7 @@ impl Btf {
             let kind = (info >> 24) & 0x1f;
             let vlen = (info & 0xffff) as usize;
             let kind_flag = (info >> 31) & 1 == 1;
-            let id = types.len() as u32;
+            let id = first_id + types.len() as u32;
 
             match kind {
                 KIND_STRUCT | KIND_UNION => {
@@ -675,10 +771,10 @@ impl Btf {
                     }
                     p += vlen * 12;
                     if name_off != 0 {
-                        if let Ok(nm) = name_at(&strings, name_off) {
+                        if let Some(nm) = name_of(name_off) {
                             // First definition wins (BTF defines each
                             // struct once; FWDs are a distinct kind).
-                            name_to_id.entry(nm.to_string()).or_insert(id);
+                            name_to_id.entry(nm).or_insert(id);
                         }
                     }
                     types.push(Ty::Composite { members });
@@ -713,8 +809,8 @@ impl Btf {
                     }
                     p += vlen * 8;
                     if name_off != 0 {
-                        if let Ok(nm) = name_at(&strings, name_off) {
-                            name_to_id.entry(nm.to_string()).or_insert(id);
+                        if let Some(nm) = name_of(name_off) {
+                            name_to_id.entry(nm).or_insert(id);
                         }
                     }
                     types.push(Ty::Enum { values });
@@ -753,47 +849,6 @@ impl Btf {
         })
     }
 
-    /// Follow `Forward` (typedef/cv-qual) chains to the underlying
-    /// struct/union id. Returns `None` if the chain doesn't end in a
-    /// composite (e.g. it's a pointer/int).
-    fn resolve_navigable(&self, mut id: u32) -> Option<u32> {
-        for _ in 0..64 {
-            match self.types.get(id as usize)? {
-                Ty::Composite { .. } => return Some(id),
-                Ty::Forward { type_id } => id = *type_id,
-                Ty::Enum { .. } | Ty::Opaque => return None,
-            }
-        }
-        None
-    }
-
-    /// Find `name` within `struct_id`, descending anonymous members.
-    /// Returns `(bit_offset_within_struct, member_type_id)`.
-    fn field_offset(&self, struct_id: u32, name: &str, depth: u8) -> Option<(u32, u32)> {
-        if depth > MAX_DESCENT {
-            return None;
-        }
-        let Ty::Composite { members } = self.types.get(struct_id as usize)? else {
-            return None;
-        };
-        for m in members {
-            let mname = name_at(&self.strings, m.name_off).unwrap_or("");
-            if !mname.is_empty() && mname == name {
-                return Some((m.bit_offset, m.type_id));
-            }
-            if m.name_off == 0 {
-                // Anonymous member — descend into its composite.
-                if let Some(nav) = self.resolve_navigable(m.type_id) {
-                    if let Some((inner, tid)) = self.field_offset(nav, name, depth + 1) {
-                        return Some((m.bit_offset + inner, tid));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve a `(struct, field_path)` to a byte offset.
     /// Value of enumerator `value_name` in the named enum `enum_name`.
     fn resolve_enum(&self, enum_name: &str, value_name: &str) -> Result<i32, ResolveError> {
         let id = *self
@@ -817,11 +872,59 @@ impl Btf {
             "{enum_name}.{value_name}"
         )))
     }
+}
 
+/// Type and name lookups the offset navigation needs: a plain BTF, or a
+/// module's split BTF joined to the kernel's ([`SplitBtf`]).
+trait TypeTable {
+    fn ty(&self, id: u32) -> Option<&Ty>;
+    fn name(&self, off: u32) -> Result<&str, ParseError>;
+    fn id_of(&self, name: &str) -> Option<u32>;
+
+    /// Follow `Forward` (typedef/cv-qual) chains to the underlying
+    /// struct/union id. Returns `None` if the chain doesn't end in a
+    /// composite (e.g. it's a pointer/int).
+    fn resolve_navigable(&self, mut id: u32) -> Option<u32> {
+        for _ in 0..64 {
+            match self.ty(id)? {
+                Ty::Composite { .. } => return Some(id),
+                Ty::Forward { type_id } => id = *type_id,
+                Ty::Enum { .. } | Ty::Opaque => return None,
+            }
+        }
+        None
+    }
+
+    /// Find `name` within `struct_id`, descending anonymous members.
+    /// Returns `(bit_offset_within_struct, member_type_id)`.
+    fn field_offset(&self, struct_id: u32, name: &str, depth: u8) -> Option<(u32, u32)> {
+        if depth > MAX_DESCENT {
+            return None;
+        }
+        let Ty::Composite { members } = self.ty(struct_id)? else {
+            return None;
+        };
+        for m in members {
+            let mname = self.name(m.name_off).unwrap_or("");
+            if !mname.is_empty() && mname == name {
+                return Some((m.bit_offset, m.type_id));
+            }
+            if m.name_off == 0 {
+                // Anonymous member — descend into its composite.
+                if let Some(nav) = self.resolve_navigable(m.type_id) {
+                    if let Some((inner, tid)) = self.field_offset(nav, name, depth + 1) {
+                        return Some((m.bit_offset + inner, tid));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a `(struct, field_path)` to a byte offset.
     fn resolve_path(&self, struct_name: &str, field_path: &[&str]) -> Result<usize, ResolveError> {
-        let id = *self
-            .name_to_id
-            .get(struct_name)
+        let id = self
+            .id_of(struct_name)
             .ok_or_else(|| ResolveError::StructNotFound(struct_name.to_string()))?;
         let mut cur = self
             .resolve_navigable(id)
@@ -844,6 +947,64 @@ impl Btf {
             )));
         }
         Ok((total_bits / 8) as usize)
+    }
+}
+
+impl TypeTable for Btf {
+    fn ty(&self, id: u32) -> Option<&Ty> {
+        self.types.get(id as usize)
+    }
+    fn name(&self, off: u32) -> Result<&str, ParseError> {
+        name_at(&self.strings, off)
+    }
+    fn id_of(&self, name: &str) -> Option<u32> {
+        self.name_to_id.get(name).copied()
+    }
+}
+
+/// A kernel module's BTF (`/sys/kernel/btf/<module>`) on top of the
+/// kernel's: ids below `first_id` and string offsets below `first_str`
+/// are the base's. Review 55: `btrfs_inode` and `btrfs_root` live in the
+/// btrfs module's BTF when btrfs is not built in.
+struct SplitBtf<'a> {
+    base: &'a Btf,
+    own: Btf,
+    first_id: u32,
+    first_str: u32,
+}
+
+impl<'a> SplitBtf<'a> {
+    fn parse(base: &'a Btf, data: &[u8]) -> Result<Self, ParseError> {
+        Ok(SplitBtf {
+            base,
+            own: Btf::parse_on(data, Some(base))?,
+            first_id: base.types.len() as u32,
+            first_str: base.strings.len() as u32,
+        })
+    }
+}
+
+impl TypeTable for SplitBtf<'_> {
+    fn ty(&self, id: u32) -> Option<&Ty> {
+        if id < self.first_id {
+            self.base.ty(id)
+        } else {
+            self.own.types.get((id - self.first_id) as usize)
+        }
+    }
+    fn name(&self, off: u32) -> Result<&str, ParseError> {
+        if off < self.first_str {
+            self.base.name(off)
+        } else {
+            name_at(&self.own.strings, off - self.first_str)
+        }
+    }
+    fn id_of(&self, name: &str) -> Option<u32> {
+        self.own
+            .name_to_id
+            .get(name)
+            .copied()
+            .or_else(|| self.base.id_of(name))
     }
 }
 
@@ -981,6 +1142,8 @@ mod tests {
         types: Vec<u8>,
         strings: Vec<u8>,
         next_id: u32,
+        /// String offset of `strings[0]`: 0, or a split BTF's base length.
+        str_base: u32,
     }
 
     impl BtfBuilder {
@@ -990,11 +1153,23 @@ mod tests {
                 types: Vec::new(),
                 strings: vec![0],
                 next_id: 1,
+                str_base: 0,
+            }
+        }
+
+        /// A module's split BTF over a base of `base_types` types (void
+        /// included) and a `base_str_len`-byte string section.
+        fn split_on(base_types: u32, base_str_len: u32) -> Self {
+            BtfBuilder {
+                types: Vec::new(),
+                strings: Vec::new(),
+                next_id: base_types,
+                str_base: base_str_len,
             }
         }
 
         fn str(&mut self, s: &str) -> u32 {
-            let off = self.strings.len() as u32;
+            let off = self.str_base + self.strings.len() as u32;
             self.strings.extend_from_slice(s.as_bytes());
             self.strings.push(0);
             off
@@ -1297,7 +1472,7 @@ mod tests {
                 optional: false,
             },
         ];
-        match resolve_with(&btf, specs, &[]) {
+        match resolve_with(&btf, specs, &[], &|_| None) {
             ResolveOutcome::Resolved(r) => {
                 assert_eq!(r.values, vec![(SLOT_TABLE[0].1, 0), (SLOT_TABLE[1].1, 8)]);
                 assert_eq!(r.drifted.len(), 1);
@@ -1319,7 +1494,7 @@ mod tests {
             optional: false,
         }];
         assert!(matches!(
-            resolve_with(&btf, specs, &[]),
+            resolve_with(&btf, specs, &[], &|_| None),
             ResolveOutcome::Refuse(RefuseReason::Drift(m)) if m.len() == 1 && m[0].actual.is_none()
         ));
     }
@@ -1346,12 +1521,119 @@ mod tests {
             alt_paths: &[],
             optional: true,
         }];
-        match resolve_with(&btf, specs, &[]) {
+        match resolve_with(&btf, specs, &[], &|_| None) {
             ResolveOutcome::Resolved(r) => {
                 assert_eq!(r.values, vec![(SLOT_TABLE[0].1, BTF_OFFSETS_ABSENT)]);
                 assert_eq!(r.absent.len(), 1);
             }
             other => panic!("expected Resolved with an absent slot, got {other:?}"),
+        }
+    }
+
+    /// A module struct whose members use the module's own names, the
+    /// base's names (deduplicated strings) and the base's types.
+    fn base_and_module() -> (Vec<u8>, Vec<u8>) {
+        let mut b = BtfBuilder::new();
+        let u32_id = b.int("u32");
+        let x_off = b.str("x");
+        let inner = b.composite(Some("inner"), false, false, &[(x_off, u32_id, 64)]);
+        let (base_types, base_strs) = (b.next_id, b.strings.len() as u32);
+        let base = b.build();
+        let mut m = BtfBuilder::split_on(base_types, base_strs);
+        let root_off = m.str("root");
+        let vfs_off = m.str("vfs_inode");
+        let anon_off = m.str("anon_dev");
+        let root_ty = m.composite(Some("btrfs_root"), false, false, &[(anon_off, u32_id, 64)]);
+        let _bi = m.composite(
+            Some("btrfs_inode"),
+            false,
+            false,
+            &[
+                (root_off, root_ty, 0),
+                (x_off, u32_id, 32),
+                (vfs_off, inner, 128),
+            ],
+        );
+        (base, m.build())
+    }
+
+    #[test]
+    fn split_btf_resolves_module_structs_over_the_base() {
+        let (base, module) = base_and_module();
+        let base = Btf::parse(&base).expect("base parses");
+        let split = SplitBtf::parse(&base, &module).expect("module parses");
+        assert_eq!(split.resolve_path("btrfs_inode", &["root"]).unwrap(), 0);
+        // member name from the base's strings
+        assert_eq!(split.resolve_path("btrfs_inode", &["x"]).unwrap(), 4);
+        // member type from the base: vfs_inode is the base's `inner`
+        assert_eq!(
+            split
+                .resolve_path("btrfs_inode", &["vfs_inode", "x"])
+                .unwrap(),
+            24
+        );
+        assert_eq!(split.resolve_path("btrfs_root", &["anon_dev"]).unwrap(), 8);
+        // the base's own structs stay reachable through the module view
+        assert_eq!(split.resolve_path("inner", &["x"]).unwrap(), 8);
+        assert!(base.resolve_path("btrfs_inode", &["root"]).is_err());
+    }
+
+    fn btrfs_specs() -> Vec<OffsetSpec> {
+        REVALIDATE
+            .iter()
+            .filter(|s| s.struct_name.starts_with("btrfs_"))
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn module_structs_resolve_from_the_module_btf() {
+        let (base, module) = base_and_module();
+        let base = Btf::parse(&base).expect("base parses");
+        let specs = btrfs_specs();
+        assert_eq!(specs.len(), 3);
+        let loaded = |m: &str| (m == "btrfs").then(|| module.clone());
+        match resolve_with(&base, &specs, &[], &loaded) {
+            ResolveOutcome::Resolved(r) => {
+                let slot = |n: &str| SLOT_TABLE.iter().find(|(s, _)| *s == n).unwrap().1;
+                assert!(r.values.contains(&(slot("BTRFS_INODE_ROOT_OFFSET"), 0)));
+                assert!(r
+                    .values
+                    .contains(&(slot("BTRFS_INODE_VFS_INODE_OFFSET"), 16)));
+                assert!(r.values.contains(&(slot("BTRFS_ROOT_ANON_DEV_OFFSET"), 8)));
+                assert!(r.absent.is_empty() && r.modules_not_loaded.is_empty());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_not_loaded_is_unset_not_degraded() {
+        let (base, _) = base_and_module();
+        let base = Btf::parse(&base).expect("base parses");
+        match resolve_with(&base, &btrfs_specs(), &[], &|_| None) {
+            ResolveOutcome::Resolved(r) => {
+                assert_eq!(r.values.len(), 3);
+                assert!(r.values.iter().all(|(_, v)| *v == BTF_OFFSETS_ABSENT));
+                assert!(r.absent.is_empty(), "a missing module is not a degradation");
+                assert_eq!(r.modules_not_loaded, vec!["btrfs"]);
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparseable_module_btf_is_a_degradation() {
+        let (base, _) = base_and_module();
+        let base = Btf::parse(&base).expect("base parses");
+        let garbage = |_: &str| Some(vec![0u8; 8]);
+        match resolve_with(&base, &btrfs_specs(), &[], &garbage) {
+            ResolveOutcome::Resolved(r) => {
+                assert_eq!(r.absent.len(), 3);
+                assert!(r.absent[0].detail.contains("module BTF: btrfs"));
+                assert!(r.modules_not_loaded.is_empty());
+            }
+            other => panic!("expected Resolved with absent entries, got {other:?}"),
         }
     }
 }

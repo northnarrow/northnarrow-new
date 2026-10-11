@@ -714,9 +714,11 @@ cambia l'ordine delle Tappe successive.
   `file_open` e `bprm_check_security`, `kretprobe` su `ip_make_skb` /
   `ip6_make_skb` e `kprobe` su `udp_send_skb`, caricate ed esercitate da
   `nn-lab.sh sensor-feasibility`, 18/18 proprietà su 6.8, 6.1 e 5.15
-  (AlmaLinux 9 dopo il soak); trovato il rilievo 55: su btrfs le chiavi
-  `(dev, ino)` dello userland non corrispondono a quelle del kernel, e
-  FIM e protezione dei file non vedono nulla. Nessuna regola legge gli
+  (AlmaLinux 9 dopo il soak); trovato e corretto il rilievo 55: su btrfs
+  le chiavi `(dev, ino)` dello userland non corrispondevano a quelle del
+  kernel, e FIM e protezione dei file non vedevano nulla (ora il kernel
+  usa il device del sottovolume, come `stat()`; `nn-lab.sh btrfs-check`).
+  Nessuna regola legge gli
   eventi `openat`, che servono solo alla postura, e l'unico uso che
   richiede tutte le aperture è il conteggio delle scritture di massa,
   quindi il sensore può filtrare e contare nel kernel; trovato il
