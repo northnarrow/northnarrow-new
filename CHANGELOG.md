@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The mass-write posture trigger logged its WARN on every event while a
+  steady writer kept the threshold crossed (one line per second for 24 h
+  on the first soak); the line is now emitted once per pid per window.
+  Detection and posture behaviour are unchanged.
 - Memory leak in the DNS attribution cache: the per-pid map was never
   pruned of dead pids, so every short-lived process that resolved a name
   grew the agent by a few hundred bytes for the life of the process
