@@ -57,3 +57,8 @@ serde_json = "1"
 # pinned at 0.10 to match the agent's environment_hash usage. The
 # xai_types canonical_bytes byte-lock test uses it through the std
 # feature path.)
+
+# Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
+# builds with -D warnings do not flag it as an unexpected cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

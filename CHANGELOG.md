@@ -59,6 +59,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
   the host settings that keep root from rewriting the kernel at runtime,
   which is the only way around the anti-tamper.
+- Kani model checking (`.github/workflows/kani.yml`, weekly): the TLS
+  ClientHello `Cursor` and the DNS name walk (`QnameLabels`, split out of
+  `decode_dns_qname` without behaviour change) are proved in bounds for
+  every input of a bounded size. The first proof found the cursor's bound
+  check `pos + n > len` wrapping for a huge `n` in release builds; it is
+  now saturating.
 - Signed operator overlays: the agent loads a `*.local` overlay
   (allowlists, blocklists, FIM paths, posture carve-outs) only if
   `<overlay>.sig` proves that a key with the new `config-manage` role signed

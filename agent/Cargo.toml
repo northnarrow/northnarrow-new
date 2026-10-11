@@ -136,3 +136,8 @@ ebpf-guard = { path = "../ebpf-guard" }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+
+# Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
+# builds with -D warnings do not flag it as an unexpected cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
