@@ -29,6 +29,7 @@ mod inode_protect;
 mod io_uring;
 mod module_load;
 mod ptrace_check;
+mod sensor_probe;
 mod task_kill;
 mod tcp_close;
 mod tcp_connect;

@@ -28,6 +28,7 @@
 #   deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent: probe package install/remove + real reinstall
 #   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
+#   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -587,6 +588,28 @@ cmd_release_check() {
     return "$rc"
 }
 
+cmd_sensor_feasibility() {
+    # Tappa 10.9 step 0 — load the throw-away probes of
+    # agent-ebpf/src/sensor_probe.rs on this guest's kernel and exercise them
+    # (northnarrow-agent --sensor-feasibility, from the lab build: run
+    # `build` first). The installed agent is stopped and its pin root purged
+    # first, then started again; the report lands under $LAB_DIR/reports.
+    # BASE (a directory in the guest) runs the file checks on another
+    # filesystem: the fixtures go in BASE/nn-feasibility.
+    vm_running || die "guest is not running"
+    local base=${1:-}
+    local out
+    out="$LAB_DIR/reports/sensor-feasibility-$DISTRO-$(date -u +%Y%m%d-%H%M%S).md"
+    mkdir -p "$LAB_DIR/reports"
+    lab_purge_pins >/dev/null
+    local rc=0
+    vssh "sudo ${base:+NN_FEASIBILITY_BASE=$(printf %q "$base") }\$HOME/northnarrow/target/release/northnarrow-agent --sensor-feasibility" | tee "$out" || rc=$?
+    vssh 'sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog' \
+        || { log "agent restart failed — run nn-lab.sh install"; rc=1; }
+    log "sensor-feasibility report: $out"
+    return "$rc"
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -975,6 +998,7 @@ case "${1:-help}" in
     pkgmgr-check)  cmd_pkgmgr_check ;;
     pkg-check)     cmd_pkg_check ;;
     release-check) shift; cmd_release_check "$@" ;;
+    sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;

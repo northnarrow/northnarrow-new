@@ -176,6 +176,23 @@ pub fn resolve_offsets() -> ResolveOutcome {
     resolve_offsets_from(std::path::Path::new(VMLINUX_BTF))
 }
 
+/// Byte offsets of arbitrary `struct.field.path` queries against a BTF
+/// blob — for the Tappa 10.9 sensor-feasibility probes, whose fields the
+/// production [`REVALIDATE`] table does not carry yet. One entry per query:
+/// `Ok(offset)` or the resolver's reason. `Err` when the blob cannot be read
+/// or parsed.
+pub fn resolve_fields_from(
+    path: &std::path::Path,
+    queries: &[(&str, &[&str])],
+) -> Result<Vec<Result<usize, String>>, String> {
+    let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let btf = Btf::parse(&data).map_err(|e| e.to_string())?;
+    Ok(queries
+        .iter()
+        .map(|(st, fp)| btf.resolve_path(st, fp).map_err(|e| e.to_string()))
+        .collect())
+}
+
 /// [`resolve_offsets`] against an arbitrary BTF blob (a `vmlinux` BTF
 /// extracted from a distro kernel, a BTFHub file, another host's
 /// `/sys/kernel/btf/vmlinux`). Powers `northnarrow-agent --btf-check`
