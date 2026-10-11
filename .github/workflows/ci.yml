@@ -265,6 +265,59 @@ jobs:
           test -f agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
           file agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
 
+  fuzz:
+    name: fuzz (smoke, nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      # libFuzzer needs nightly (-Zsanitizer); the same channel as the eBPF
+      # build so one toolchain download serves both.
+      - name: Install nightly toolchain + cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2025-12-01 --profile minimal
+          cargo install cargo-fuzz --locked
+
+      - name: Cache cargo registry and fuzz target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-
+
+      # Every target must build; each then runs a short smoke so a
+      # trivially reachable panic fails the PR. Long campaigns run from a
+      # developer host (fuzz/README.md).
+      - name: Build and smoke every fuzz target
+        run: |
+          set -euo pipefail
+          cargo +nightly-2025-12-01 fuzz build
+          # Run the built binaries directly: `cargo fuzz run` re-invokes
+          # cargo, and agent/build.rs re-runs whenever .git/refs changes.
+          for t in $(cargo +nightly-2025-12-01 fuzz list); do
+            echo "::group::$t"
+            mkdir -p "fuzz/corpus/$t" "fuzz/artifacts/$t"
+            "fuzz/target/x86_64-unknown-linux-gnu/release/$t" -max_total_time=20 -max_len=8192 \
+              -artifact_prefix="fuzz/artifacts/$t/" "fuzz/corpus/$t" 2>&1 | tail -3
+            echo "::endgroup::"
+          done
+          if ls fuzz/artifacts/*/crash-* >/dev/null 2>&1; then
+            echo "fuzz: crash artefacts found"; ls -la fuzz/artifacts/*; exit 1
+          fi
+
   audit:
     # RustSEC advisory gate. Fails on a vulnerability with a fix
     # available; `unmaintained`/`unsound` warnings are reported but do

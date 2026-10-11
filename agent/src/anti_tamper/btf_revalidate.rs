@@ -411,6 +411,19 @@ pub fn parse_format_field_offset(text: &str, field: &str) -> Option<u32> {
     None
 }
 
+/// Fuzzing entry (see `crate::fuzz_api`): parse + resolve, never panic.
+#[doc(hidden)]
+pub fn fuzz_parse_and_resolve(data: &[u8]) -> bool {
+    match Btf::parse(data) {
+        Ok(btf) => {
+            let _ = resolve_with(&btf, REVALIDATE, ENUM_VALUES);
+            let _ = revalidate_with(&btf, REVALIDATE);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 static RESOLVED: OnceLock<ResolvedOffsets> = OnceLock::new();
 
 /// Publish the boot-time resolution for [`arm_btf_offsets`]. Idempotent;

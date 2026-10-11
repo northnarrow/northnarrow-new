@@ -574,8 +574,10 @@ Pianificato, in quest'ordine:
 - Contatori di perdita del ring buffer (fatti l'11 ottobre, lab PR 25): un
   contatore per ring in eBPF, letti dall'agent ogni 10 s, WARN a ogni
   aumento, totale e dettaglio in `nn-admin status`
-- Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
-  template canary, JSONL, file `format` di tracefs, BTF) con `cargo-fuzz`
+- Fuzzing dei parser (fatto l'11 ottobre, lab PR 26): otto target cargo-fuzz
+  (frame admin, TLS ClientHello, DNS, BTF, `format` di tracefs, ruoli,
+  righe del chain log, install manifest) con job CI di smoke; restano da
+  coprire regole COMBAT/template canary (parser su file, non su byte)
 - Sensore `io_uring` (fatto l'11 ottobre, lab PR 27 — prima parte: osservazione
   e regole Log; le correlazioni con le catene e il carve-out per identità
   restano in 10.9): tracepoint su `io_uring_create` e `io_uring_submit`,
