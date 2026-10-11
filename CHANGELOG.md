@@ -49,6 +49,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Host hardening checks (`nn-admin host-check [--json]`, summary in
+  `nn-admin status`, one WARN per gap at agent boot, table at the end of
+  `install.sh`): BPF LSM, kernel lockdown, unprivileged BPF, module
+  signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
+  the host settings that keep root from rewriting the kernel at runtime,
+  which is the only way around the anti-tamper.
 - Supply chain, install-time and runtime halves: `install.sh` verifies the
   extracted tree (`MANIFEST.sha256`, now shipped in the tarball), the
   tarball against `SHA256SUMS` and the SLSA provenance attestation (gh or
