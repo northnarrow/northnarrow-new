@@ -48,7 +48,7 @@ const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 /// Marker line in `configs/combat-rules.v4` that [`NetworkIsolator::engage`]
 /// replaces with the management carve-out ACCEPT rules (Beta Step 4b).
 /// Placed inside the chain, immediately before its catch-all DROP.
-const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
+pub(crate) const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
 
 /// Capability token proving that an Ed25519-signed admin unlock has
 /// been verified. The only way to construct one is via
@@ -529,7 +529,7 @@ fn count_chain_rules(iptables_s_output: &str) -> usize {
 /// inserting before the chain's catch-all DROP, then before `COMMIT`,
 /// so the carve-out is never silently dropped on the floor. An empty
 /// block removes the marker line and changes nothing else.
-fn splice_carveout(base: &str, accept_block: &str) -> String {
+pub(crate) fn splice_carveout(base: &str, accept_block: &str) -> String {
     let accept_lines: Vec<&str> = accept_block.lines().collect();
 
     // Primary: marker replacement.

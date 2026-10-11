@@ -76,3 +76,17 @@ path = "fuzz_targets/install_manifest.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "combat_allow"
+path = "fuzz_targets/combat_allow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canary_template"
+path = "fuzz_targets/canary_template.rs"
+test = false
+doc = false
+bench = false
