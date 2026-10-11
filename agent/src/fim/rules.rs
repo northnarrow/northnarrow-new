@@ -1195,10 +1195,22 @@ const WTMP_BTMP_PATHS: &[&str] = &["/var/log/wtmp", "/var/log/btmp"];
 /// The login-session machinery that legitimately appends to the
 /// `utmp`-family records (via the libc utmp API). A Modified op
 /// from any other comm is the tamper shape NN-L-FIM-018/019 catch.
+///
+/// Matched after [`systemd_preexec_name`] strips systemd's pre-exec
+/// `(name)` form, so a getty unit's `UtmpIdentifier=` record written
+/// as `(agetty)` is covered by `agetty` (review item 38).
 const LOGIN_RECORD_LEGIT_COMMS: &[&str] = &[
     "login",
     "sshd",
+    // OpenSSH >= 9.8 moved the per-session monitor (which records
+    // the wtmp login and the btmp failed login) into `sshd-session`
+    // (Debian 13, Ubuntu 24.10+, RHEL 10).
+    "sshd-session",
     "systemd-logind",
+    // `systemd-update-utmp` (boot, shutdown and runlevel records), as
+    // the kernel's 15-character comm truncates it. Seen in the lab
+    // writing the boot runlevel record to wtmp (review item 38).
+    "systemd-update-",
     "init",
     "systemd",
     "getty",
@@ -1287,10 +1299,8 @@ fn evaluate_login_record_tamper(
     if !exact_paths.iter().any(|p| fe.path == *p) {
         return None;
     }
-    if LOGIN_RECORD_LEGIT_COMMS
-        .iter()
-        .any(|c| fe.modifier_comm == *c)
-    {
+    let comm = systemd_preexec_name(&fe.modifier_comm);
+    if LOGIN_RECORD_LEGIT_COMMS.contains(&comm) {
         return None;
     }
     Some(fim_verdict(
@@ -1300,6 +1310,25 @@ fn evaluate_login_record_tamper(
         Severity::High,
         reasoning,
     ))
+}
+
+/// systemd renames a unit's forked child to `(<ExecStart basename>)`
+/// (the last 8 characters when longer) between fork and exec, and that
+/// pre-exec child is the one that writes the unit's `UtmpIdentifier=`
+/// INIT_PROCESS record into utmp/wtmp. On systemd >= 255 it is the
+/// `systemd-executor` process carrying that name. Every getty start
+/// therefore writes `/var/log/wtmp` as `(agetty)` before the same PID
+/// writes again as `agetty` after exec.
+///
+/// Strips exactly one surrounding pair of parentheses so the
+/// login-record allowlist matches the real program name. Anything else
+/// in parentheses (`(sed)`, `((agetty))`) still has to match the list
+/// after stripping, so the exemption grants nothing beyond what the
+/// bare comm already would.
+fn systemd_preexec_name(comm: &str) -> &str {
+    comm.strip_prefix('(')
+        .and_then(|c| c.strip_suffix(')'))
+        .unwrap_or(comm)
 }
 
 // ── NN-L-FIM-015 — browser stored credentials accessed ─────────────
@@ -3308,6 +3337,61 @@ mod tests {
                 "/var/log/btmp",
                 "sshd",
                 NoFire, // legitimate failed-login writer
+            ),
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/btmp",
+                "sshd-session",
+                NoFire, // OpenSSH >= 9.8 per-session monitor
+            ),
+            // Review item 38: systemd's pre-exec child of a getty unit
+            // writes the UtmpIdentifier= record as `(agetty)`.
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/wtmp",
+                "(agetty)",
+                NoFire,
+            ),
+            (
+                Box::new(NnLFim018LastlogTampered),
+                Modified,
+                "/var/log/lastlog",
+                "(login)",
+                NoFire,
+            ),
+            // systemd-update-utmp's boot runlevel record, under its
+            // truncated 15-character comm.
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/wtmp",
+                "systemd-update-",
+                NoFire,
+            ),
+            // The parenthesized form only unwraps to a legit name: a
+            // foreign tool stays detected, and one layer is stripped.
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/wtmp",
+                "(sed)",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/wtmp",
+                "((agetty))",
+                Fire(Severity::High, KillProcess),
+            ),
+            (
+                Box::new(NnLFim019WtmpBtmpTampered),
+                Modified,
+                "/var/log/wtmp",
+                "(agetty",
+                Fire(Severity::High, KillProcess),
             ),
             // FIM-020 shell history cleared — Delete/Rename fires;
             // Modified (normal append) does not.

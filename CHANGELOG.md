@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- NN-L-CHAIN-008 (sudo/su, then network) killed legitimate admin work: any
+  network flow of a descendant of `sudo` or `su` within 5 minutes drew a
+  Critical `KillProcessTree`, `sudo apt-get update` and loopback traffic
+  included. The rule is now informational (Medium, log only), ignores
+  loopback destinations and is evaluated after every other rule, so it
+  never hides a blocking verdict on the same flow.
+- NN-L-FIM-019 killed systemd's getty start-up child, which writes the
+  login record under the name `(agetty)`: after a reboot both console
+  gettys hit their start limit and the host had no console login. The
+  login-record rules (FIM-018/019) now accept systemd's pre-exec name and
+  the `systemd-update-utmp` and `sshd-session` writers.
 - The mass-write posture trigger logged its WARN on every event while a
   steady writer kept the threshold crossed (one line per second for 24 h
   on the first soak); the line is now emitted once per pid per window.

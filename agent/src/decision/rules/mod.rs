@@ -74,7 +74,8 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // firing rule) before a first-match short-circuits the scan, and
     // so a correlated flow surfaces the Critical chain verdict ahead
     // of any lower-severity net rule. See `chain.rs` module docs.
-    let mut rules: Vec<Box<dyn Rule>> = chain::chain_rules();
+    let chains = chain::chain_rule_set();
+    let mut rules: Vec<Box<dyn Rule>> = chains.head;
     let tappa2: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
         Box::new(R007CryptoMiner),
@@ -108,6 +109,9 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // its engine via [`default_rules_with_net`] instead, threading
     // operator-loaded blocklists in.
     rules.extend(net::net_rules_empty());
+    // Informational chains (NN-L-CHAIN-008) go LAST so their Log
+    // verdict never shadows a blocking rule on the same event.
+    rules.extend(chains.tail);
     rules
 }
 
@@ -134,7 +138,8 @@ pub fn default_rules_with_net(
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
-    let mut rules: Vec<Box<dyn Rule>> = chain::chain_rules();
+    let chains = chain::chain_rule_set();
+    let mut rules: Vec<Box<dyn Rule>> = chains.head;
     let tappa2: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd),
         Box::new(R007CryptoMiner),
@@ -165,6 +170,9 @@ pub fn default_rules_with_net(
         beacon_window,
         dns_cache,
     ));
+    // Informational chains (NN-L-CHAIN-008) go LAST so their Log
+    // verdict never shadows a blocking rule on the same event.
+    rules.extend(chains.tail);
     rules
 }
 
