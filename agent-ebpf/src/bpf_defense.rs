@@ -315,6 +315,7 @@ unsafe fn caller_exe_key() -> Option<InodeKey> {
         return None;
     }
     let dev = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32).ok()?;
+    let dev = crate::inode_dev::stat_dev(inode, sb, dev);
     let ino = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64).ok()?;
     Some(InodeKey {
         dev: dev as u64,

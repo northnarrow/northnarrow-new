@@ -193,11 +193,12 @@ unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
     }
 }
 
-/// Read `(super_block->s_dev, inode->i_ino)` for the given
-/// inode. Same shape userland builds via `stat(2)` + the
+/// Read `(device, inode->i_ino)` for the given inode, the device as
+/// `stat(2)` reports it ([`crate::inode_dev::stat_dev`]: `s_dev`, or the
+/// subvolume's on btrfs). Same shape userland builds via `stat(2)` + the
 /// kernel-form conversion in
 /// `agent/src/anti_tamper/filesystem.rs::stat_dev_to_kernel_dev`
-/// — both sides agree on the `(dev, ino)` key bytes.
+/// — both sides agree on the `(dev, ino)` key bytes (review 55).
 #[inline(always)]
 unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
     if inode.is_null() {
@@ -210,6 +211,7 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
     }
     let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
     let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
+    let dev = crate::inode_dev::stat_dev(inode as *const u8, sb_ptr as *const u8, dev);
     let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
     let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
     Some(InodeKey {

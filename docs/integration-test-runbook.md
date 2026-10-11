@@ -224,6 +224,18 @@ and exits 1 if a required property fails. The installed agent is stopped
 for the run and started again at the end. Results and their meaning:
 `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md` §9.
 
+### btrfs inode keys (review 55)
+
+```
+deploy/lab/nn-lab.sh btrfs-check      # SKIP on kernels without btrfs (RHEL 9)
+```
+
+Reads `/root/.aws/credentials` (a watched file) after an agent restart,
+first on the root filesystem as a control, then from a btrfs subvolume
+(loop filesystem bind-mounted on `/root/.aws`). Both reads must draw
+NN-L-FIM-011, or the kernel's inode keys do not match the ones userland
+computed with `stat()`. The guest is put back as it was.
+
 ### RAG release gates need the real corpus
 
 `rag::bench` holds three `#[ignore]` release gates (golden retrieval

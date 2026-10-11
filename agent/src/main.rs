@@ -566,12 +566,26 @@ async fn main() -> Result<()> {
                 }
             }
             for m in &r.absent {
+                let effect = if m.struct_name.starts_with("btrfs_") {
+                    "files on btrfs keep the superblock's device in their inode keys, so FIM \
+                     and file protection do not match them (review 55)"
+                } else {
+                    "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC"
+                };
                 warn!(
                     offset = m.name,
                     kernel_struct = m.struct_name,
                     detail = %m.detail,
+                    effect,
                     "optional kernel field absent on this kernel — the dependent sensor path \
-                     is disabled (DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC)"
+                     is disabled"
+                );
+            }
+            for module in &r.modules_not_loaded {
+                info!(
+                    module,
+                    "kernel module not loaded: no file on this host uses it, its offsets stay \
+                     unset (btrfs: inode keys need no subvolume device, review 55)"
                 );
             }
             // Tracepoint field offsets come from tracefs, not BTF: the
@@ -3435,6 +3449,11 @@ fn btf_check(path: &std::path::Path) -> i32 {
                 println!(
                     "  absent  {:<34} {:<12} {} — dependent sensor path disabled",
                     m.name, m.struct_name, m.detail
+                );
+            }
+            for module in &r.modules_not_loaded {
+                println!(
+                    "  module  {module:<34} no BTF next to the vmlinux file — its types' offsets stay unset (not a degradation)"
                 );
             }
             for m in &r.drifted {

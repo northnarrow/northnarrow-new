@@ -25,6 +25,7 @@ mod exec_check;
 mod file_open;
 mod fim_watch;
 mod inet_csk_listen;
+mod inode_dev;
 mod inode_protect;
 mod io_uring;
 mod module_load;

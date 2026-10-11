@@ -29,6 +29,7 @@
 #   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
 #   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
+#   deploy/lab/nn-lab.sh btrfs-check      # review 55: a watched file on a btrfs subvolume is still detected
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -610,6 +611,16 @@ cmd_sensor_feasibility() {
     return "$rc"
 }
 
+cmd_btrfs_check() {
+    # Review 55 regression check (deploy/lab/btrfs/btrfs-check.sh): a watched
+    # credential file on a btrfs subvolume (loop filesystem bind-mounted on
+    # /root/.aws) must draw NN-L-FIM-011 when read. SKIP on kernels without
+    # btrfs. The guest is put back as it was.
+    vm_running || die "guest is not running"
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/btrfs/btrfs-check.sh" "$GUEST:/tmp/nn-btrfs-check.sh"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; bash /tmp/nn-btrfs-check.sh'
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -999,6 +1010,7 @@ case "${1:-help}" in
     pkg-check)     cmd_pkg_check ;;
     release-check) shift; cmd_release_check "$@" ;;
     sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
+    btrfs-check)   cmd_btrfs_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;
