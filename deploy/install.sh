@@ -772,6 +772,9 @@ fi
 echo ""
 echo "install.sh: install complete."
 echo ""
+echo "Host hardening (nn-admin host-check — the anti-tamper holds only while root cannot rewrite the kernel at runtime):"
+"$BIN_DIR/nn-admin" host-check 2>/dev/null | sed 's/^/  /' || true
+echo ""
 echo "Next steps (operator runs explicitly — install.sh does NOT auto-start):"
 echo ""
 echo "  1. Verify the install layout:"
