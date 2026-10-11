@@ -412,6 +412,10 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         cfg: RotationConfig,
         protection: std::sync::Arc<dyn ProtectionManager>,
     ) -> Result<Self> {
+        // Review entry 44: every later open/rename goes through a directory
+        // fd taken now, so a mount over the directory cannot divert the log.
+        let anchored = crate::anchored::anchor(active_path);
+        let active_path = anchored.as_path();
         let manifest_path = manifest_path_for(active_path);
         let next_seq = scan_max_archive_seq(active_path)?.map_or(1, |m| m + 1);
         // Recover the manifest tail O(1). If a prior crash tore its last

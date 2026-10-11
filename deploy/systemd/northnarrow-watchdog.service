@@ -71,6 +71,9 @@ RestartSec=2s
 MemoryMax=64M
 CPUQuota=10%
 TasksMax=8
+# OOMScoreAdjust — 64 MiB at most, and the process that brings the agent
+# back: the last thing the OOM killer should pick.
+OOMScoreAdjust=-900
 
 # Hardening — same shape as the agent's unit. The watchdog is a
 # smaller target but the same posture (no new privileges, no

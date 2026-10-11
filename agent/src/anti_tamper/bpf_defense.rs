@@ -40,6 +40,12 @@ const MODE_MAP: &str = "BPF_DEFENSE_MODE";
 const KIND_MAP: u8 = 1;
 const KIND_PROG: u8 = 2;
 const KIND_LINK: u8 = 3;
+
+/// Key of `OWN_BPF_IDS`: `(kind << 32) | id` — map, program and link ids
+/// are independent kernel id spaces (mirrors `own_key` in the eBPF crate).
+pub(crate) fn own_key(kind: u8, id: u32) -> u64 {
+    ((kind as u64) << 32) | id as u64
+}
 const PIN_NAMES_MAP: &str = "OWN_PIN_NAMES";
 /// Width of an `OWN_PIN_NAMES` key (mirrors `PIN_NAME_LEN` in the eBPF crate).
 const PIN_NAME_LEN: usize = 32;
@@ -163,14 +169,14 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
     let own = ebpf
         .map_mut(OWN_IDS_MAP)
         .with_context(|| format!("{OWN_IDS_MAP} missing from the eBPF object"))?;
-    let mut own: HashMap<&mut MapData, u32, u8> =
-        HashMap::try_from(own).context("OWN_BPF_IDS is not a HashMap<u32, u8>")?;
+    let mut own: HashMap<&mut MapData, u64, u8> =
+        HashMap::try_from(own).context("OWN_BPF_IDS is not a HashMap<u64, u8>")?;
     for id in &map_ids {
-        own.insert(id, KIND_MAP, 0)
+        own.insert(own_key(KIND_MAP, *id), KIND_MAP, 0)
             .with_context(|| format!("registering own map id {id}"))?;
     }
     for id in &prog_ids {
-        own.insert(id, KIND_PROG, 0)
+        own.insert(own_key(KIND_PROG, *id), KIND_PROG, 0)
             .with_context(|| format!("registering own program id {id}"))?;
     }
     // Links: every loaded link whose program is ours (the LSM hooks, the
@@ -178,7 +184,7 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
     // ids in three separate spaces, hence the kind in the value.
     let link_ids = own_link_ids(&prog_ids, pin_root);
     for id in &link_ids {
-        own.insert(id, KIND_LINK, 0)
+        own.insert(own_key(KIND_LINK, *id), KIND_LINK, 0)
             .with_context(|| format!("registering own link id {id}"))?;
     }
     let _ = OWN_LINKS.set(OwnLinks {
@@ -446,7 +452,10 @@ pub fn spawn_link_self_check(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>
     tokio::spawn(async move {
         let mut reported: HashSet<u32> = HashSet::new();
         loop {
-            tokio::time::sleep(Duration::from_secs(LINK_CHECK_SECS)).await;
+            tokio::time::sleep(crate::self_integrity::jittered(Duration::from_secs(
+                LINK_CHECK_SECS,
+            )))
+            .await;
             let live: HashSet<u32> = live_links(own.pin_root.as_deref())
                 .into_iter()
                 .filter(|(_, prog)| *prog != 0)
@@ -527,6 +536,19 @@ mod tests {
         );
         // not a link
         assert_eq!(parse_link_fdinfo("pos:\t0\nflags:\t02\n"), None);
+    }
+
+    #[test]
+    fn own_key_separates_the_three_id_spaces() {
+        // the lab collision: map 357, program 357, link 357 are three objects
+        let keys = [
+            own_key(KIND_MAP, 357),
+            own_key(KIND_PROG, 357),
+            own_key(KIND_LINK, 357),
+        ];
+        assert_eq!(keys.iter().collect::<HashSet<_>>().len(), 3);
+        assert_eq!(own_key(KIND_MAP, 357) & 0xFFFF_FFFF, 357);
+        assert_eq!(own_key(KIND_LINK, u32::MAX) >> 32, KIND_LINK as u64);
     }
 
     #[test]

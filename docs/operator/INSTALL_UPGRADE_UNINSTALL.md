@@ -237,6 +237,39 @@ events trips a rule (root-owned binary from its install path, a dedicated
 probe directory, a reserved `.invalid` name). `NN_TELEMETRY_PROBE_SECS`
 in the unit environment changes the period; `0` disables the probe.
 
+### 3.5 What root can still change, and how the agent proves it
+
+Some things root can do to the agent cannot be denied without breaking
+systemd: write a drop-in for the unit (`ExecStart=`, `Environment=`),
+`systemctl set-property` (MemoryMax, TasksMax, CPUQuota), raise the
+agent's `oom_score_adj`, bind-mount something over `/etc/northnarrow`,
+mount a second bpffs, drop a `.local` overlay that exempts a comm at the
+next restart, freeze the agent's cgroup. Every 30 s (±20 %) the agent
+compares these with what it saw at boot and with what `install.sh` laid
+down, and every new finding is an `INTEGRITY DRIFT` ERROR and a signed
+audit entry:
+
+```sh
+sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarrow/audit.log
+```
+
+| `kind` | Meaning |
+|---|---|
+| `unit_dropin` | a `.conf` drop-in for one of the two units that `install.sh` did not create (also `system.control`, `service.d`) |
+| `limit_changed` | `oom_score_adj`, `memory.max`, `pids.max`, `cpu.max` or `cgroup.freeze` differs from boot |
+| `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view) |
+| `bpffs_mount` | a bpffs outside `/sys/fs/bpf` (WARN: Cilium does this legitimately) |
+| `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |
+| `weakening_env` | the agent started with a variable that turns a protection off (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, …) |
+| `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
+
+Refused attempts — signals to the agent or the watchdog, a ptrace attach,
+writes to protected files and pins, BPF map writes and link handles — are
+recorded as detection `NN-L-AT-001_AntiTamperDenial` in
+`detections.jsonl`, and every ring buffer that loses events is a
+`ringbuf_drop` audit entry. The lab exercises all of this with
+`nn-lab.sh tamper-check`.
+
 ## 4. What still needs a reboot
 
 - Enabling the `bpf` LSM (`lsm=…,bpf` on the kernel command line) the
