@@ -87,6 +87,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Kani proof of the admin multi-signature rule. `verify_quorum` and
+  `verify_signed_payload_quorum` now share `quorum_decision`, the tally of
+  distinct keys, threshold and role check separated from the signature
+  checks, and Kani proves it accepts only when enough distinct keys matched
+  and every required role is carried by one of them (weekly job). A
+  threshold of 0 was refused only by a `debug_assert`; the rule now uses
+  `max(threshold, 1)` in every build.
 - Fuzz targets `combat_allow` and `canary_template`: the COMBAT management
   carve-out (allow-file text, generated ACCEPT lines, splice into the
   operator ruleset) and the operator canary templates. Besides "never

@@ -44,3 +44,9 @@ jobs:
           cargo kani -p northnarrow-agent
           --harness cursor_operations_never_panic_and_keep_pos_in_bounds
           -Z unstable-options --ignore-global-asm
+
+      - name: Prove the admin quorum rule (agent)
+        run: >
+          cargo kani -p northnarrow-agent
+          --harness quorum_accepts_only_enough_distinct_keys_carrying_every_role
+          -Z unstable-options --ignore-global-asm

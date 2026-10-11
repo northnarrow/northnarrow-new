@@ -636,10 +636,15 @@ Pianificato, in quest'ordine:
 - Verifica formale con Kani dopo il fuzzing (prima parte fatta l'11
   ottobre, lab PR 35: cursore del ClientHello TLS e scansione del QNAME DNS
   dimostrati per ogni input di dimensione limitata, job CI settimanale; la
-  prima prova ha trovato un controllo dei limiti che andava in overflow);
-  restano i blocchi `unsafe` (record dei ring buffer, FFI di Candle), gli
-  altri parser binari e la verifica di firme e quorum (ricerca dell'11
-  ottobre, HACMS / s2n-quic)
+  prima prova ha trovato un controllo dei limiti che andava in overflow;
+  seconda parte fatta l'11 ottobre, lab PR 44: la regola del quorum delle
+  firme amministrative, separata dalla crittografia e dimostrata — accetta
+  solo con abbastanza chiavi distinte che portano ogni ruolo richiesto, e
+  una soglia 0 non conia più un token senza firma nelle build di release.
+  Valutati i blocchi `unsafe`: nell'agent sono chiamate di sistema via
+  libc, i record dei ring buffer passano dall'API controllata di bytemuck
+  e l'FFI di Candle è codice di terzi, quindi non c'è un nucleo nostro da
+  dimostrare; restano gli altri parser binari)
 - Overhead misurato su host carico (strumento fatto l'11 ottobre, lab PR
   37: `nn-lab.sh overhead` alterna agent spento e acceso su quattro
   micro-carichi — open, scrittura, exec, connect su loopback — e riporta la

@@ -176,6 +176,81 @@ impl KeyEntry {
     }
 }
 
+/// Outcome of [`quorum_decision`]: the distinct-key tally, threshold and
+/// role check of a multi-signature submission, with the cryptography
+/// already done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuorumDecision {
+    Accept,
+    /// A non-empty submission in which no signature matched any key —
+    /// the attack signal (rate-limited by the caller).
+    NoValidSignature,
+    QuorumNotMet {
+        required: u8,
+        provided: u8,
+    },
+    /// `role` is carried by no matched key; `first` is the first matched
+    /// key in submission order (the audit breadcrumb).
+    RoleDenied {
+        role: Role,
+        first: usize,
+    },
+}
+
+/// The quorum rule shared by [`AdminAuth::verify_quorum`] and
+/// [`AdminAuth::verify_signed_payload_quorum`], separated from the
+/// signature checks so it can be proved (Kani, `kani_proofs` below).
+///
+/// `per_signature[i]` is the index of the key the i-th signature verified
+/// against (`None`: no key). A key counts once however many of its
+/// signatures were submitted. Accepts only when at least
+/// `max(min_distinct, 1)` distinct keys matched and every role in
+/// `role_requirements` is carried by one of them: a `min_distinct` of 0
+/// never mints a token without a signature, in a release build as well.
+/// Allocation-free.
+pub(crate) fn quorum_decision(
+    per_signature: &[Option<usize>],
+    authorizes: impl Fn(usize, Role) -> bool,
+    min_distinct: u8,
+    role_requirements: &[Role],
+) -> QuorumDecision {
+    let first_seen = |i: usize| match per_signature[i] {
+        Some(key) => !per_signature[..i].contains(&Some(key)),
+        None => false,
+    };
+    let distinct = (0..per_signature.len()).filter(|&i| first_seen(i)).count();
+    if distinct == 0 && !per_signature.is_empty() {
+        return QuorumDecision::NoValidSignature;
+    }
+    let provided = distinct.min(u8::MAX as usize) as u8;
+    let required = min_distinct.max(1);
+    if provided < required {
+        return QuorumDecision::QuorumNotMet { required, provided };
+    }
+    for &role in role_requirements {
+        if !per_signature
+            .iter()
+            .flatten()
+            .any(|&key| authorizes(key, role))
+        {
+            let first = per_signature.iter().flatten().next().copied().unwrap_or(0);
+            return QuorumDecision::RoleDenied { role, first };
+        }
+    }
+    QuorumDecision::Accept
+}
+
+/// Distinct matched key indices in first-seen order (audit fingerprints).
+fn distinct_matches(per_signature: &[Option<usize>]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for key in per_signature.iter().flatten() {
+        if !out.contains(key) {
+            out.push(*key);
+        }
+    }
+    out
+}
+
 /// Server-side admin authenticator.
 ///
 /// `pub_keys` is read-only after construction so we never need a
@@ -624,82 +699,68 @@ impl AdminAuth {
         // rationale.
         let pub_keys = self.pub_keys.read();
 
-        // Tally distinct matched pubkey indices across every
-        // submitted signature.
-        let mut matched: Vec<usize> = Vec::new();
-        for sig_bytes in signatures {
-            let sig = Signature::from_bytes(sig_bytes);
-            let mut this_match: Option<usize> = None;
-            for (idx, entry) in pub_keys.iter().enumerate() {
-                if entry.key.verify_strict(&nonce, &sig).is_ok() {
-                    this_match = Some(idx);
-                    // intentionally no break — preserve constant-time
+        // Which key each submitted signature verified against (the
+        // constant-time scan keeps the last match, no early break), then
+        // the shared quorum rule (`quorum_decision`, proved with Kani).
+        let per_signature: Vec<Option<usize>> = signatures
+            .iter()
+            .map(|sig_bytes| {
+                let sig = Signature::from_bytes(sig_bytes);
+                let mut this_match: Option<usize> = None;
+                for (idx, entry) in pub_keys.iter().enumerate() {
+                    if entry.key.verify_strict(&nonce, &sig).is_ok() {
+                        this_match = Some(idx);
+                    }
                 }
+                this_match
+            })
+            .collect();
+        let distinct = distinct_matches(&per_signature).len().min(u8::MAX as usize) as u8;
+        match quorum_decision(
+            &per_signature,
+            |idx, role| pub_keys[idx].authorizes(role),
+            min_distinct,
+            role_requirements,
+        ) {
+            QuorumDecision::Accept => {}
+            // Zero matches + non-empty submission = attack signal. Zero
+            // matches + empty submission = operator UX (no rate-limit).
+            QuorumDecision::NoValidSignature => {
+                self.failure_count.fetch_add(1, Ordering::SeqCst);
+                *self.last_failure.lock() = Some(Instant::now());
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "invalid_sig",
+                    submitted = signatures.len(),
+                    "admin quorum verify: zero valid signatures in non-empty submission"
+                );
+                return Err(AdminAuthError::InvalidSignature);
             }
-            if let Some(idx) = this_match {
-                if !matched.contains(&idx) {
-                    matched.push(idx);
-                }
+            QuorumDecision::QuorumNotMet { required, provided } => {
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "quorum_not_met",
+                    required,
+                    provided,
+                    "admin quorum verify: insufficient distinct valid signatures"
+                );
+                return Err(AdminAuthError::QuorumNotMet { required, provided });
             }
-        }
-
-        // Zero matches + non-empty submission = attack signal. Zero
-        // matches + empty submission = operator UX (no rate-limit).
-        if matched.is_empty() && !signatures.is_empty() {
-            self.failure_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_failure.lock() = Some(Instant::now());
-            warn!(
-                target: "anti_tamper.admin_auth.verify_failure",
-                reason = "invalid_sig",
-                submitted = signatures.len(),
-                "admin quorum verify: zero valid signatures in non-empty submission"
-            );
-            return Err(AdminAuthError::InvalidSignature);
-        }
-
-        // Cap at u8::MAX — a realistic admin install ships with
-        // single-digit admin keys, so this saturating cast never
-        // bites in practice.
-        let distinct: u8 = matched.len().min(u8::MAX as usize) as u8;
-        if distinct < min_distinct {
-            warn!(
-                target: "anti_tamper.admin_auth.verify_failure",
-                reason = "quorum_not_met",
-                required = min_distinct,
-                provided = distinct,
-                "admin quorum verify: insufficient distinct valid signatures"
-            );
-            return Err(AdminAuthError::QuorumNotMet {
-                required: min_distinct,
-                provided: distinct,
-            });
-        }
-
-        // Role check: every required role must be carried by AT
-        // LEAST ONE matched key. Order of role_requirements is
-        // irrelevant — the loop short-circuits on the first
-        // missing role and returns its fingerprint; tests assert
-        // this is the FIRST missing role, locked semantics.
-        for &required in role_requirements {
-            let satisfied = matched
-                .iter()
-                .any(|&idx| pub_keys[idx].authorizes(required));
-            if !satisfied {
-                // Surface the first matched key's fingerprint —
-                // it's the most useful audit-log breadcrumb when
-                // the operator sees "RoleDenied: which key?"
-                let fp = fingerprint(&pub_keys[matched[0]].key);
+            // The first missing role, with the first matched key's
+            // fingerprint as the audit breadcrumb (locked semantics).
+            QuorumDecision::RoleDenied { role, first } => {
+                let fp = fingerprint(&pub_keys[first].key);
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "role_denied",
-                    required_role = ?required,
+                    required_role = ?role,
                     matched_count = distinct,
                     first_matched_fingerprint = %fp,
                     "admin quorum verify: required role not carried by any matched key"
                 );
                 return Err(AdminAuthError::RoleDenied {
                     key_fingerprint: fp,
-                    required_role: required,
+                    required_role: role,
                 });
             }
         }
@@ -958,74 +1019,66 @@ impl AdminAuth {
         // duration of the per-signature scan.
         let pub_keys = self.pub_keys.read();
 
-        // Per-signature constant-time scan, distinct-key tally
-        // (same machinery as verify_quorum, except the message
-        // bytes are the SignedPayload digest instead of the raw
-        // nonce — that's the parameter swap A6's forward note
-        // promised).
-        let mut matched: Vec<usize> = Vec::new();
-        for sig_bytes in signatures {
-            let sig = Signature::from_bytes(sig_bytes);
-            let mut this_match: Option<usize> = None;
-            for (idx, entry) in pub_keys.iter().enumerate() {
-                if entry.key.verify_strict(&digest, &sig).is_ok() {
-                    this_match = Some(idx);
-                    // intentionally no break — constant-time
+        // Per-signature constant-time scan (same machinery as
+        // verify_quorum, except the message bytes are the SignedPayload
+        // digest instead of the raw nonce), then the shared quorum rule.
+        let per_signature: Vec<Option<usize>> = signatures
+            .iter()
+            .map(|sig_bytes| {
+                let sig = Signature::from_bytes(sig_bytes);
+                let mut this_match: Option<usize> = None;
+                for (idx, entry) in pub_keys.iter().enumerate() {
+                    if entry.key.verify_strict(&digest, &sig).is_ok() {
+                        this_match = Some(idx);
+                    }
                 }
+                this_match
+            })
+            .collect();
+        let matched = distinct_matches(&per_signature);
+        let distinct = matched.len().min(u8::MAX as usize) as u8;
+        match quorum_decision(
+            &per_signature,
+            |idx, role| pub_keys[idx].authorizes(role),
+            min_distinct,
+            role_requirements,
+        ) {
+            QuorumDecision::Accept => {}
+            // Zero matches + non-empty submission = attack signal.
+            QuorumDecision::NoValidSignature => {
+                self.failure_count.fetch_add(1, Ordering::SeqCst);
+                *self.last_failure.lock() = Some(Instant::now());
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "invalid_sig",
+                    submitted = signatures.len(),
+                    "signed-payload quorum verify: zero valid signatures"
+                );
+                return Err(AdminAuthError::InvalidSignature);
             }
-            if let Some(idx) = this_match {
-                if !matched.contains(&idx) {
-                    matched.push(idx);
-                }
+            QuorumDecision::QuorumNotMet { required, provided } => {
+                warn!(
+                    target: "anti_tamper.admin_auth.verify_failure",
+                    reason = "quorum_not_met",
+                    required,
+                    provided,
+                    "signed-payload quorum verify: insufficient distinct valid signatures"
+                );
+                return Err(AdminAuthError::QuorumNotMet { required, provided });
             }
-        }
-
-        // Zero matches + non-empty submission = attack signal.
-        if matched.is_empty() && !signatures.is_empty() {
-            self.failure_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_failure.lock() = Some(Instant::now());
-            warn!(
-                target: "anti_tamper.admin_auth.verify_failure",
-                reason = "invalid_sig",
-                submitted = signatures.len(),
-                "signed-payload quorum verify: zero valid signatures"
-            );
-            return Err(AdminAuthError::InvalidSignature);
-        }
-
-        let distinct: u8 = matched.len().min(u8::MAX as usize) as u8;
-        if distinct < min_distinct {
-            warn!(
-                target: "anti_tamper.admin_auth.verify_failure",
-                reason = "quorum_not_met",
-                required = min_distinct,
-                provided = distinct,
-                "signed-payload quorum verify: insufficient distinct valid signatures"
-            );
-            return Err(AdminAuthError::QuorumNotMet {
-                required: min_distinct,
-                provided: distinct,
-            });
-        }
-
-        // Role check (same as verify_quorum).
-        for &required in role_requirements {
-            let satisfied = matched
-                .iter()
-                .any(|&idx| pub_keys[idx].authorizes(required));
-            if !satisfied {
-                let fp = fingerprint(&pub_keys[matched[0]].key);
+            QuorumDecision::RoleDenied { role, first } => {
+                let fp = fingerprint(&pub_keys[first].key);
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "role_denied",
-                    required_role = ?required,
+                    required_role = ?role,
                     matched_count = distinct,
                     first_matched_fingerprint = %fp,
                     "signed-payload quorum verify: required role not carried by any matched key"
                 );
                 return Err(AdminAuthError::RoleDenied {
                     key_fingerprint: fp,
-                    required_role: required,
+                    required_role: role,
                 });
             }
         }
@@ -1502,6 +1555,67 @@ pub fn check_timestamp_skew(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    // ── quorum_decision (the rule; proved by Kani in kani_proofs) ─────
+
+    fn carries(roles: &'static [&'static [Role]]) -> impl Fn(usize, Role) -> bool {
+        move |k, r| roles[k].contains(&r)
+    }
+
+    #[test]
+    fn quorum_threshold_zero_never_accepts_without_a_signature() {
+        let d = quorum_decision(&[], carries(&[]), 0, &[]);
+        assert_eq!(
+            d,
+            QuorumDecision::QuorumNotMet {
+                required: 1,
+                provided: 0
+            }
+        );
+    }
+
+    #[test]
+    fn quorum_counts_a_key_once_however_many_signatures() {
+        let roles: &[&[Role]] = &[&[Role::Unlock], &[Role::Unlock]];
+        let same_key_twice = [Some(0), Some(0)];
+        assert_eq!(
+            quorum_decision(&same_key_twice, carries(roles), 2, &[Role::Unlock]),
+            QuorumDecision::QuorumNotMet {
+                required: 2,
+                provided: 1
+            }
+        );
+        let two_keys = [Some(1), None, Some(0)];
+        assert_eq!(
+            quorum_decision(&two_keys, carries(roles), 2, &[Role::Unlock]),
+            QuorumDecision::Accept
+        );
+    }
+
+    #[test]
+    fn quorum_reports_no_valid_signature_only_for_a_non_empty_submission() {
+        assert_eq!(
+            quorum_decision(&[None, None], carries(&[]), 1, &[]),
+            QuorumDecision::NoValidSignature
+        );
+    }
+
+    #[test]
+    fn quorum_role_denied_names_the_missing_role_and_the_first_match() {
+        let roles: &[&[Role]] = &[&[Role::Unlock], &[Role::Shutdown]];
+        assert_eq!(
+            quorum_decision(
+                &[None, Some(1), Some(0)],
+                carries(roles),
+                2,
+                &[Role::Unlock, Role::TrustedInstaller]
+            ),
+            QuorumDecision::RoleDenied {
+                role: Role::TrustedInstaller,
+                first: 1
+            }
+        );
+    }
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -2683,6 +2797,73 @@ mod tests {
                 expected.contains(fp),
                 "fp {fp} not in expected set {expected:?}"
             );
+        }
+    }
+}
+
+/// Kani proof of the quorum rule (`.github/workflows/kani.yml`). The
+/// signature checks are abstracted away: any key index (or none) for each
+/// submitted signature, any role assignment for each key.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const SIGS: usize = 4;
+    const KEYS: usize = 3;
+    const ROLES: [Role; 2] = [Role::Unlock, Role::TrustedInstaller];
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn quorum_accepts_only_enough_distinct_keys_carrying_every_role() {
+        let n: usize = kani::any();
+        kani::assume(n <= SIGS);
+        let mut per_sig = [None; SIGS];
+        for slot in per_sig.iter_mut() {
+            let m: Option<u8> = kani::any();
+            *slot = m.map(|k| (k as usize) % KEYS);
+        }
+        let per_sig = &per_sig[..n];
+        let carries: [[bool; 2]; KEYS] = kani::any();
+        let role_index = |r: Role| if r == ROLES[0] { 0 } else { 1 };
+        let min_distinct: u8 = kani::any();
+        let req_n: usize = kani::any();
+        kani::assume(req_n <= 2);
+        let reqs = &ROLES[..req_n];
+
+        let decision = quorum_decision(
+            per_sig,
+            |k, r| carries[k][role_index(r)],
+            min_distinct,
+            reqs,
+        );
+
+        // Ground truth, computed per key rather than per signature.
+        let mut distinct = 0u8;
+        let mut matched = [false; KEYS];
+        for (k, m) in matched.iter_mut().enumerate() {
+            *m = per_sig.contains(&Some(k));
+            if *m {
+                distinct += 1;
+            }
+        }
+        match decision {
+            QuorumDecision::Accept => {
+                assert!(distinct >= min_distinct.max(1));
+                for &r in reqs {
+                    assert!((0..KEYS).any(|k| matched[k] && carries[k][role_index(r)]));
+                }
+            }
+            QuorumDecision::NoValidSignature => {
+                assert!(n > 0 && distinct == 0);
+            }
+            QuorumDecision::QuorumNotMet { required, provided } => {
+                assert!(provided == distinct && provided < required);
+                assert!(required == min_distinct.max(1));
+            }
+            QuorumDecision::RoleDenied { role, first } => {
+                assert!(matched[first]);
+                assert!(!(0..KEYS).any(|k| matched[k] && carries[k][role_index(role)]));
+            }
         }
     }
 }

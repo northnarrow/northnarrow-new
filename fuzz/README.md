@@ -43,6 +43,12 @@ bounded size (`.github/workflows/kani.yml`, weekly + on demand):
 |---|---|
 | `net::tls_parser::kani_proofs::cursor_operations_never_panic_and_keep_pos_in_bounds` | every `Cursor` read (`u8`, `u16`, `u24`, `bytes(n)` with any `n`) on any buffer ≤ 8 bytes from any position: no panic, the position never leaves the buffer — so any sequence of reads, i.e. the whole ClientHello parser, is in bounds |
 | `model::kani_proofs::qname_label_walk_is_in_bounds_and_terminates` | the DNS name walk behind `decode_dns_qname` on any buffer ≤ 16 bytes: every label inside the buffer, at most `len` steps |
+| `anti_tamper::admin_auth::kani_proofs::quorum_accepts_only_enough_distinct_keys_carrying_every_role` | the admin multi-signature rule behind `verify_quorum` and `verify_signed_payload_quorum`, with the signature checks abstracted (any key or none per signature, any role set per key; up to 4 signatures, 3 keys, 2 roles, any threshold): it accepts only when at least `max(threshold, 1)` **distinct** keys matched and every required role is carried by one of them, and each refusal reports the truth |
+
+Separating the quorum rule from the cryptography also closed a release-build
+gap: a threshold of 0 was rejected only by a `debug_assert`, so a caller
+passing 0 would have minted a token with no signature; the rule now uses
+`max(threshold, 1)`. No caller passes 0 today.
 
 The first run found a real (if unreachable today) bug: the cursor's bound
 check `pos + n > len` wraps for a huge `n` in a release build and passes;
