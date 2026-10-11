@@ -2654,6 +2654,19 @@ async fn process_event(
             sq_thread = *sq_thread,
             "io_uring activity"
         ),
+        Event::BpfSyscall {
+            pid,
+            comm,
+            cmd,
+            arg,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %comm,
+            cmd = common::wire::bpf_cmd_name(*cmd),
+            arg = *arg,
+            "bpf() syscall by a non-protected process"
+        ),
         Event::FileOpen {
             filename,
             comm,

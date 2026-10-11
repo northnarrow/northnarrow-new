@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 12;
+pub const RING_DROP_SLOTS: u32 = 13;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -29,6 +29,7 @@ pub mod ring_slot {
     pub const UDP: u32 = 9;
     pub const DNS: u32 = 10;
     pub const IOURING: u32 = 11;
+    pub const BPF: u32 = 12;
 }
 
 /// Human names, indexed by slot.
@@ -45,6 +46,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "udp",
     "dns",
     "io_uring",
+    "bpf",
 ];
 
 #[cfg(test)]
@@ -57,6 +59,7 @@ mod tests {
         assert_eq!(RING_DROP_NAMES[ring_slot::EXEC as usize], "exec");
         assert_eq!(RING_DROP_NAMES[ring_slot::DNS as usize], "dns");
         assert_eq!(RING_DROP_NAMES[ring_slot::IOURING as usize], "io_uring");
-        assert_eq!(ring_slot::IOURING + 1, RING_DROP_SLOTS);
+        assert_eq!(RING_DROP_NAMES[ring_slot::BPF as usize], "bpf");
+        assert_eq!(ring_slot::BPF + 1, RING_DROP_SLOTS);
     }
 }

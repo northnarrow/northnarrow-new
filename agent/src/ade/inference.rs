@@ -226,7 +226,7 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             filename_for_pkg = path.clone().unwrap_or_default();
             category = MockCategory::Unknown;
         }
-        Event::IoUring { pid, .. } => {
+        Event::IoUring { pid, .. } | Event::BpfSyscall { pid, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = String::new();
             category = MockCategory::Unknown;

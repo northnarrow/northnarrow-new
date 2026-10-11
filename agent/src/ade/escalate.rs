@@ -50,7 +50,9 @@ pub fn transform_to_escalate(
             *loader_pid,
             path.clone().unwrap_or_else(|| loader_comm.clone()),
         ),
-        Event::IoUring { pid, comm, .. } => (*pid, comm.clone()),
+        Event::IoUring { pid, comm, .. } | Event::BpfSyscall { pid, comm, .. } => {
+            (*pid, comm.clone())
+        }
         Event::ProcessSpawn { pid, filename, .. }
         | Event::FileOpen { pid, filename, .. }
         | Event::ExecCheck { pid, filename, .. } => (*pid, filename.clone()),

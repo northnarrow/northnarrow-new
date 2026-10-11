@@ -18,6 +18,7 @@
 
 #[macro_use]
 mod btf_offsets;
+mod bpf_defense;
 mod dns_query;
 mod drops;
 mod exec_check;

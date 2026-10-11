@@ -43,7 +43,7 @@ use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
 /// transparently — same bytes, just an agent-local nominal type.
 #[repr(transparent)]
 #[derive(Copy, Clone)]
-struct AyaInodeKey(InodeKey);
+pub(crate) struct AyaInodeKey(pub(crate) InodeKey);
 
 // SAFETY: `InodeKey` is `#[repr(C)]` over two `u64`s, has no
 // padding gaps, and `AyaInodeKey` is `#[repr(transparent)]` over
@@ -1215,7 +1215,7 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
 /// respectively. The eBPF inode-protection hooks read the raw
 /// `s_dev` directly, so the BPF map key MUST be in the kernel form.
 /// See docs/TAPPA7_TASK5_DEEP_DEBUG.md §7 for the full diagnosis.
-fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
+pub(crate) fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
     let major = libc::major(st_dev) as u64;
     let minor = libc::minor(st_dev) as u64;
     (major << 20) | minor

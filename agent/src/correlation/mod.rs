@@ -118,7 +118,9 @@ impl Default for CorrelationBuffer {
 fn event_timestamp_ns(e: &Event) -> u64 {
     match e {
         Event::ModuleLoad { timestamp_ns, .. } => *timestamp_ns,
-        Event::IoUring { timestamp_ns, .. } => *timestamp_ns,
+        Event::IoUring { timestamp_ns, .. } | Event::BpfSyscall { timestamp_ns, .. } => {
+            *timestamp_ns
+        }
         Event::ProcessSpawn { timestamp_ns, .. }
         | Event::FileOpen { timestamp_ns, .. }
         | Event::ExecCheck { timestamp_ns, .. }
@@ -146,7 +148,7 @@ fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
         Event::ModuleLoad {
             loader_pid, path, ..
         } => (*loader_pid, None, path.as_deref()),
-        Event::IoUring { pid, .. } => (*pid, None, None),
+        Event::IoUring { pid, .. } | Event::BpfSyscall { pid, .. } => (*pid, None, None),
         Event::ProcessSpawn {
             pid,
             ppid,

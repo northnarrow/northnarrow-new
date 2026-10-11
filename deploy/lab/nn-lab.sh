@@ -255,6 +255,20 @@ cmd_test_e2e() {
     # intrusion, enters COMBAT and NEUTRALIZEs the test runner (observed:
     # `cargo test` SIGKILLed mid-suite, 2026-10-08).
     vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
+    # The anti-tamper hooks outlive the agent on purpose (pinned links), and
+    # since the BPF self-defence a stopped agent's map guard keeps denying
+    # foreign writers of PROTECTED_PIDS — the e2e fixtures' agents are
+    # foreign (another binary). Purge the pin root like install.sh --upgrade
+    # does and wait for the LSM programs to detach before the fixtures run.
+    vssh bash -s <<'REMOTE'
+sudo rm -rf /sys/fs/bpf/northnarrow
+for i in $(seq 1 20); do
+    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
+    [ "$n" = "0" ] && break
+    sleep 1
+done
+echo "lsm programs still loaded before e2e: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
+REMOTE
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
     # The four FIM e2e tests are plain `#[test]` (not ignored), so neither
     # `test-ignored` nor the privileged_e2e run above covered them — the

@@ -740,6 +740,63 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[&["iov"]],
         optional: true,
     },
+    // BPF self-defence: the agent's own maps/programs recognised by id.
+    OffsetSpec {
+        name: "BPF_MAP_ID_OFFSET",
+        struct_name: "bpf_map",
+        field_path: &["id"],
+        expected: BPF_MAP_ID_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    OffsetSpec {
+        name: "BPF_MAP_MAP_TYPE_OFFSET",
+        struct_name: "bpf_map",
+        field_path: &["map_type"],
+        expected: BPF_MAP_MAP_TYPE_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    OffsetSpec {
+        name: "BPF_MAP_NAME_OFFSET",
+        struct_name: "bpf_map",
+        field_path: &["name"],
+        expected: BPF_MAP_NAME_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    OffsetSpec {
+        name: "BPF_PROG_TYPE_OFFSET",
+        struct_name: "bpf_prog",
+        field_path: &["type"],
+        expected: BPF_PROG_TYPE_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    OffsetSpec {
+        name: "BPF_PROG_AUX_OFFSET",
+        struct_name: "bpf_prog",
+        field_path: &["aux"],
+        expected: BPF_PROG_AUX_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    OffsetSpec {
+        name: "BPF_PROG_AUX_ID_OFFSET",
+        struct_name: "bpf_prog_aux",
+        field_path: &["id"],
+        expected: BPF_PROG_AUX_ID_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
+    OffsetSpec {
+        name: "MM_STRUCT_EXE_FILE_OFFSET",
+        struct_name: "mm_struct",
+        field_path: &["exe_file"],
+        expected: MM_STRUCT_EXE_FILE_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
 ];
 
 // ───────────────────────────────────────
@@ -802,16 +859,23 @@ pub mod slot {
     pub const MSGHDR_NAME_OFFSET: u32 = 40;
     pub const MSGHDR_NAMELEN_OFFSET: u32 = 41;
     pub const IOV_ITER_IOV_OFFSET: u32 = 42;
-    // enum slots 43–44 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 45;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 46;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 47;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 48;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 49;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 50;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 51;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 52;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 53;
+    pub const BPF_MAP_ID_OFFSET: u32 = 43;
+    pub const BPF_MAP_MAP_TYPE_OFFSET: u32 = 44;
+    pub const BPF_MAP_NAME_OFFSET: u32 = 45;
+    pub const BPF_PROG_TYPE_OFFSET: u32 = 46;
+    pub const BPF_PROG_AUX_OFFSET: u32 = 47;
+    pub const BPF_PROG_AUX_ID_OFFSET: u32 = 48;
+    pub const MM_STRUCT_EXE_FILE_OFFSET: u32 = 49;
+    // enum slots 50–51 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 52;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 53;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 54;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 55;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 56;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 57;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 58;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 59;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 60;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -859,7 +923,30 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("MSGHDR_NAME_OFFSET", 40),
     ("MSGHDR_NAMELEN_OFFSET", 41),
     ("IOV_ITER_IOV_OFFSET", 42),
+    ("BPF_MAP_ID_OFFSET", 43),
+    ("BPF_MAP_MAP_TYPE_OFFSET", 44),
+    ("BPF_MAP_NAME_OFFSET", 45),
+    ("BPF_PROG_TYPE_OFFSET", 46),
+    ("BPF_PROG_AUX_OFFSET", 47),
+    ("BPF_PROG_AUX_ID_OFFSET", 48),
+    ("MM_STRUCT_EXE_FILE_OFFSET", 49),
 ];
+
+/// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
+/// `struct bpf_prog_aux` fields read by the `bpf_map` / `bpf` LSM hooks to
+/// recognise the agent's own objects. Compiled values from the build kernel
+/// (Ubuntu 24.04 / 6.8); the resolver places them per kernel (5.15 differs
+/// only in `bpf_map.name`: 88).
+pub const BPF_MAP_ID_OFFSET: usize = 52;
+pub const BPF_MAP_MAP_TYPE_OFFSET: usize = 24;
+pub const BPF_MAP_NAME_OFFSET: usize = 96;
+pub const BPF_PROG_TYPE_OFFSET: usize = 4;
+pub const BPF_PROG_AUX_OFFSET: usize = 56;
+pub const BPF_PROG_AUX_ID_OFFSET: usize = 32;
+/// `mm_struct.exe_file` — the caller's executable, so the `bpf_map` guard
+/// can exempt the agent's own binaries (the watchdog registers itself in
+/// PROTECTED_PIDS before it is a member). Compiled value: 6.8 build kernel.
+pub const MM_STRUCT_EXE_FILE_OFFSET: usize = 1168;
 
 /// Tracepoint field offsets — the `read_at` positions inside a
 /// `TracePointContext`. They come from the tracefs `format` file, not from
@@ -990,24 +1077,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 45),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 46),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 47),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 48),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 49),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 50),
-    ("TP_IOURING_CREATE_FD_OFFSET", 51),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 52),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 53),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 52),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 53),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 54),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 55),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 56),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 57),
+    ("TP_IOURING_CREATE_FD_OFFSET", 58),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 59),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 60),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 43), ("ITER_IOVEC_VALUE", 44)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 50), ("ITER_IOVEC_VALUE", 51)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 43;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 50;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 44;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 51;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -1025,7 +1112,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 42, "REVALIDATE must cover all 42 offsets");
+        assert_eq!(REVALIDATE.len(), 49, "REVALIDATE must cover all 49 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1045,7 +1132,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 54);
+        assert_eq!(BTF_OFFSETS_SLOTS, 61);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1075,8 +1162,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 45);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 48);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 52);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 55);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }
