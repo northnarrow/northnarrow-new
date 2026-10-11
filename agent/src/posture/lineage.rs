@@ -147,11 +147,19 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
 ///
 /// Deliberately excluded: `/usr/bin/snap` (the *daemon*
 /// `/usr/lib/snapd/snapd` does the writes; the CLI talks over a socket),
-/// `/usr/bin/unattended-upgrade` (a Python *script* → `/proc/<pid>/exe`
-/// is the interpreter, so an exact entry would never fire; its package
-/// writes go through `dpkg`/`apt` children, covered by the ancestry
-/// walk), and the apt transport methods (`/usr/lib/apt/methods/*`,
-/// children of `apt`/`apt-get`).
+/// `/usr/bin/unattended-upgrade` (a Python script whose package writes
+/// go through `dpkg`/`apt` children, covered by the ancestry walk), and
+/// the apt transport methods (`/usr/lib/apt/methods/*`, children of
+/// `apt`/`apt-get`).
+///
+/// RHEL family (review 49): `rpm` and `microdnf` are ELF binaries.
+/// `dnf` and `yum` are Python scripts that run the rpm transaction
+/// in-process, so their writes come from the interpreter. They match
+/// through the spawn cache, which records the script path the kernel
+/// exec event carries (`/usr/bin/dnf`); the `/proc` fallback sees only
+/// the interpreter and never matches them. [`DAEMON_CACHE_CAP`] keeps
+/// those entries out of the regular FIFO eviction so a long transaction
+/// does not lose its root. `packagekitd` drives libdnf in-process too.
 ///
 /// SECURITY: a lineage match suppresses the mass-write arm of
 /// [`super::triggers::confirmed_intrusion`] AND
@@ -163,9 +171,15 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
 pub const SYSTEM_DAEMON_EXES: &[&str] = &[
     "/usr/bin/apt",
     "/usr/bin/apt-get",
+    "/usr/bin/dnf",
+    "/usr/bin/dnf-3",
     "/usr/bin/dpkg",
     "/usr/bin/mandb",
+    "/usr/bin/microdnf",
+    "/usr/bin/rpm",
+    "/usr/bin/yum",
     "/usr/lib/snapd/snapd",
+    "/usr/libexec/packagekitd",
 ];
 
 /// Kernel-resolved exec paths of the Node.js interpreter. `npm` is a
@@ -199,6 +213,16 @@ const NPM_CLI_SUFFIX: &str = "/npm/bin/npm-cli.js";
 /// `/proc/<pid>/exe`+`/proc/<pid>/status` walk so a miss is never
 /// fatal — just one extra `read_link` + small file read.
 const TRACKER_CAP: usize = 2048;
+
+/// Side cache for spawns whose exe is a [`SYSTEM_DAEMON_EXES`] entry.
+/// A large package transaction spawns thousands of maintainer-script
+/// processes, enough to push the package manager's own entry out of the
+/// [`TRACKER_CAP`] FIFO while it is still writing. For `dpkg`/`rpm` the
+/// `/proc` fallback recovers it, but `dnf`/`yum` are Python scripts whose
+/// `/proc/<pid>/exe` is the interpreter, so only the cache can name them
+/// (review 49). These entries live here instead, FIFO-capped on their
+/// own; a later spawn reusing the pid drops them.
+const DAEMON_CACHE_CAP: usize = 64;
 
 /// Hard ceiling on the per-`is_auth_mediated` lineage walk. A
 /// pathological cycle in `/proc` (or a fabricated chain that never
@@ -255,6 +279,10 @@ struct Entry {
 #[derive(Debug)]
 struct InnerState {
     map: HashMap<u32, Entry>,
+    /// [`DAEMON_CACHE_CAP`]-bounded copies of package-manager spawns,
+    /// immune to the main FIFO eviction, with their own insertion order.
+    daemons: HashMap<u32, Entry>,
+    daemon_order: VecDeque<u32>,
     /// Insertion order — pushed on first insert, popped on
     /// eviction. We deliberately do NOT re-promote on overwrite:
     /// strict LRU would cost O(N) per overwrite without buying
@@ -290,6 +318,8 @@ impl AuthSessionTracker {
                 state: RwLock::new(InnerState {
                     map: HashMap::with_capacity(TRACKER_CAP),
                     order: VecDeque::with_capacity(TRACKER_CAP),
+                    daemons: HashMap::new(),
+                    daemon_order: VecDeque::new(),
                 }),
                 proc_root: proc_root.into(),
             }),
@@ -334,19 +364,28 @@ impl AuthSessionTracker {
         if pid == 0 {
             return;
         }
+        let entry = Entry {
+            ppid,
+            exe: PathBuf::from(exe),
+            spawn_ns,
+            argv_npm_cli,
+        };
         let mut s = self.inner.state.write();
-        let had_prior = s
-            .map
-            .insert(
-                pid,
-                Entry {
-                    ppid,
-                    exe: PathBuf::from(exe),
-                    spawn_ns,
-                    argv_npm_cli,
-                },
-            )
-            .is_some();
+        // Review 49: package-manager spawns also go to the side cache;
+        // any other spawn reusing the pid invalidates a stale copy there.
+        if is_system_daemon_binary(&entry.exe) {
+            if s.daemons.insert(pid, entry.clone()).is_none() {
+                s.daemon_order.push_back(pid);
+                while s.daemon_order.len() > DAEMON_CACHE_CAP {
+                    if let Some(evict) = s.daemon_order.pop_front() {
+                        s.daemons.remove(&evict);
+                    }
+                }
+            }
+        } else if s.daemons.remove(&pid).is_some() {
+            s.daemon_order.retain(|p| *p != pid);
+        }
+        let had_prior = s.map.insert(pid, entry).is_some();
         if !had_prior {
             s.order.push_back(pid);
             while s.order.len() > TRACKER_CAP {
@@ -502,7 +541,10 @@ impl AuthSessionTracker {
 
     fn lookup_cache(&self, pid: u32) -> Option<(u32, PathBuf)> {
         let s = self.inner.state.read();
-        s.map.get(&pid).map(|e| (e.ppid, e.exe.clone()))
+        s.map
+            .get(&pid)
+            .or_else(|| s.daemons.get(&pid))
+            .map(|e| (e.ppid, e.exe.clone()))
     }
 
     fn lookup_proc(&self, pid: u32) -> Option<(u32, PathBuf)> {
@@ -685,6 +727,78 @@ mod tests {
         t.ingest_spawn(100, 50, "/usr/bin/sudo", 1);
         assert!(t.is_auth_mediated(100));
         assert!(!t.is_system_daemon_mediated(100));
+    }
+
+    // ── review 49 — RHEL package managers + eviction-proof daemon cache ──
+
+    #[test]
+    fn rpm_and_dnf_scriptlets_are_system_daemon_mediated() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // `rpm -i`: an ELF, its %post scriptlet runs under /bin/sh.
+        t.ingest_spawn(500, 1, "/usr/bin/rpm", 1);
+        t.ingest_spawn(501, 500, "/bin/sh", 2);
+        assert!(t.is_system_daemon_mediated(501));
+        // `dnf install`: the exec event carries the script path, so the
+        // cache names dnf even though /proc/<pid>/exe is the interpreter.
+        t.ingest_spawn(600, 1, "/usr/bin/dnf", 3);
+        t.ingest_spawn(601, 600, "/usr/bin/systemctl", 4);
+        assert!(t.is_system_daemon_mediated(600));
+        assert!(t.is_system_daemon_mediated(601));
+    }
+
+    #[test]
+    fn dnf_seen_only_through_proc_is_not_trusted() {
+        // Without the spawn, /proc shows the interpreter: no match, and
+        // cmdline is never consulted (a process can rewrite its own).
+        let tmp = TempDir::new().unwrap();
+        write_exe(tmp.path(), 700, "/usr/bin/python3.9");
+        write_status(tmp.path(), 700, 1);
+        let t = AuthSessionTracker::new(tmp.path());
+        assert!(!t.is_system_daemon_mediated(700));
+    }
+
+    #[test]
+    fn package_manager_entry_survives_main_cache_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(600, 1, "/usr/bin/dnf", 1);
+        // A long transaction: more scriptlet spawns than the main FIFO
+        // holds, all children of dnf.
+        for i in 0..(TRACKER_CAP as u32 + 100) {
+            t.ingest_spawn(10_000 + i, 600, "/bin/sh", 2);
+        }
+        assert!(
+            t.is_system_daemon_mediated(600),
+            "dnf evicted from the side cache"
+        );
+        assert!(t.is_system_daemon_mediated(10_000 + TRACKER_CAP as u32 + 99));
+    }
+
+    #[test]
+    fn pid_reuse_by_another_program_drops_the_daemon_copy() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(800, 1, "/usr/bin/dpkg", 1);
+        assert!(t.is_system_daemon_mediated(800));
+        t.ingest_spawn(800, 1, "/usr/bin/bash", 2);
+        assert!(!t.is_system_daemon_mediated(800));
+    }
+
+    #[test]
+    fn daemon_side_cache_is_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        for i in 0..(DAEMON_CACHE_CAP as u32 + 10) {
+            t.ingest_spawn(20_000 + i, 1, "/usr/bin/dpkg", 1);
+        }
+        let s = t.inner.state.read();
+        assert_eq!(s.daemons.len(), DAEMON_CACHE_CAP);
+        assert_eq!(s.daemon_order.len(), DAEMON_CACHE_CAP);
+        assert!(
+            !s.daemons.contains_key(&20_000),
+            "oldest copy evicted first"
+        );
     }
 
     #[test]

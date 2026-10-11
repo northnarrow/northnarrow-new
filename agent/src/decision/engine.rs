@@ -53,6 +53,9 @@ impl RuleEngine {
         // FIM-009 self-upgrade (§15.1): the trusted-installer override
         // the NN-L-FIM-009 rule reads (armed by the admin dispatcher).
         installer_override: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+        // Review 49: the shared process-lineage cache the FIM rules'
+        // package-manager carve-out reads.
+        lineage: crate::posture::lineage::AuthSessionTracker,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -64,6 +67,7 @@ impl RuleEngine {
             beacon_window,
             dns_cache,
             installer_override,
+            lineage,
         ) {
             e.add_rule(r);
         }

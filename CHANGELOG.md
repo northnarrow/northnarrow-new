@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The FIM rules killed the package manager. dpkg was killed while it
+  installed or removed any package that ships a systemd unit or timer, a
+  cron drop-in, a PAM module or a setuid binary, which left packages
+  half-installed (`apt-get install --reinstall rsync` failed). Writes made
+  by dpkg, rpm, dnf/yum, microdnf or PackageKit, or by the maintainer
+  scripts they run, are now recorded as Low log-only detections instead of
+  killed. The package manager is recognised by the kernel-resolved
+  executable of the writer's lineage, never by process name.
 - NN-L-CHAIN-008 (sudo/su, then network) killed legitimate admin work: any
   network flow of a descendant of `sudo` or `su` within 5 minutes drew a
   Critical `KillProcessTree`, `sudo apt-get update` and loopback traffic

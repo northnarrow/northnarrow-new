@@ -135,6 +135,9 @@ pub fn default_rules_with_net(
     // FIM-009 self-upgrade (§15.1): the live trusted-installer override
     // the NN-L-FIM-009 rule reads (armed by the admin dispatcher).
     installer_override: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+    // Review 49: the shared process-lineage cache — package-manager
+    // writes are recorded, not killed, by the wrapped FIM rules.
+    lineage: crate::posture::lineage::AuthSessionTracker,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -160,7 +163,10 @@ pub fn default_rules_with_net(
         &process_allowlist_for_iouring,
     )));
     rules.extend(bpf::bpf_rules(Arc::clone(&process_allowlist_for_iouring)));
-    rules.extend(crate::fim::rules::fim_rules(installer_override));
+    rules.extend(crate::fim::rules::fim_rules_with_lineage(
+        installer_override,
+        lineage,
+    ));
     rules.extend(canary::canary_rules());
     rules.extend(net::net_rules(
         blocklist,

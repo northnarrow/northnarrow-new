@@ -25,6 +25,7 @@
 #   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
 #   deploy/lab/nn-lab.sh tamper-check     # adversarial anti-tamper cases: outcome + chain-log evidence per case
 #   deploy/lab/nn-lab.sh overhead [ROUNDS] # agent off/on throughput of the hooked operations (idle host!)
+#   deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent: probe package install/remove + real reinstall
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -489,6 +490,53 @@ PY
     log "overhead report: $out/overhead.md"
 }
 
+cmd_pkgmgr_check() {
+    # Review 49 — the package manager must survive the agent. Installs and
+    # removes a probe package carrying every persistence shape the FIM rules
+    # watch (deploy/lab/pkgmgr/mk-probe-{deb,rpm}.sh), then reinstalls a
+    # real package that ships a systemd unit. Pass = every transaction exits
+    # 0, the package database is consistent, and no destructive verdict was
+    # issued while it ran (the writes must show up as Low log-only ones).
+    vm_running || die "guest is not running"
+    vssh 'systemctl is-active --quiet northnarrow-agent' || die "agent not running on the guest (nn-lab.sh install)"
+    vssh 'bash -s' <<'REMOTE'
+set -u
+fail=0
+log=/tmp/nn-pkgmgr-check.log; : > "$log"
+since=$(date -u +%FT%T)
+step() { local what=$1; shift; if "$@" >>"$log" 2>&1; then echo "ok    $what"; else echo "FAIL  $what (rc=$?, see $log)"; fail=1; fi; }
+if command -v dpkg >/dev/null 2>&1; then
+    deb=$(~/northnarrow/deploy/lab/pkgmgr/mk-probe-deb.sh /tmp/nn-pkgprobe) || exit 1
+    step "dpkg -i probe package"          sudo dpkg -i "$deb"
+    step "dpkg --purge probe package"     sudo dpkg --purge nn-pkgprobe
+    step "apt-get install --reinstall rsync (ships rsync.service)" \
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y rsync
+    if [ -n "$(sudo dpkg --audit 2>&1)" ]; then echo "FAIL  dpkg --audit reports broken packages"; fail=1; else echo "ok    dpkg --audit clean"; fi
+else
+    command -v rpmbuild >/dev/null 2>&1 || step "dnf install rpm-build" sudo dnf install -y rpm-build
+    rpm=$(~/northnarrow/deploy/lab/pkgmgr/mk-probe-rpm.sh /tmp/nn-pkgprobe) || exit 1
+    step "dnf install probe package"      sudo dnf install -y "$rpm"
+    step "dnf remove probe package"       sudo dnf remove -y nn-pkgprobe
+    step "dnf reinstall cronie (ships crond.service)" sudo dnf reinstall -y cronie
+    if sudo rpm -q nn-pkgprobe >/dev/null 2>&1; then echo "FAIL  probe package still installed"; fail=1; else echo "ok    probe package removed"; fi
+fi
+sleep 5
+det=/var/lib/northnarrow/detections/detections.jsonl
+window=$(sudo awk -v t="$since" 'index($0, "\"ts\":\"") { s = substr($0, index($0, "\"ts\":\"") + 6, 19); if (s >= t) print }' "$det")
+killers=$(printf '%s\n' "$window" | grep -E '"response":"(Kill|Quarantine|Block|Full|Throttle)' || true)
+if [ -n "$killers" ]; then
+    echo "FAIL  destructive verdicts during the transactions:"
+    printf '%s\n' "$killers" | grep -o '"rule_id":"[^"]*"\|"comm":"[^"]*"\|"response":"[^"]*"' | paste - - - | sort | uniq -c
+    fail=1
+else
+    echo "ok    no destructive verdict"
+fi
+printf '%s\n' "$window" | grep '"severity":"Low"' | grep -o '"rule_id":"NN-L-FIM-[^"]*"' | sort | uniq -c | sed 's/^/      recorded: /'
+[ "$fail" = 0 ] && echo "pkgmgr-check: PASS" || echo "pkgmgr-check: FAIL"
+exit $fail
+REMOTE
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -874,6 +922,7 @@ case "${1:-help}" in
     uninstall-check) cmd_uninstall_check ;;
     tamper-check)  cmd_tamper_check ;;
     overhead)      shift; cmd_overhead "$@" ;;
+    pkgmgr-check)  cmd_pkgmgr_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;
