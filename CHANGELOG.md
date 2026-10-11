@@ -59,6 +59,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
   the host settings that keep root from rewriting the kernel at runtime,
   which is the only way around the anti-tamper.
+- Adversarial anti-tamper check, second part: `cgroup.kill` on the agent's
+  unit (C20), an exec flood hiding an exec from `/tmp` (C21) and an
+  io_uring probe that opens, reads and connects through a ring with no
+  openat/connect syscall (C22, `deploy/lab/adversarial/iouring-probe.c`, raw
+  syscalls) — 23 cases, all with signed evidence on 6.8 and 5.15. Kills that
+  nothing can refuse are now evidence: every run writes `agent_stop` with the
+  reason it left its event loop, and every `agent_boot` says how the previous
+  run ended (`previous_run`: none / clean / abrupt; review 46). The four
+  remaining append-by-path logs (FIM baseline, canary registry and access
+  log, listener log) also write through a directory fd (review 44).
 - Adversarial anti-tamper check (`nn-lab.sh tamper-check`,
   `deploy/lab/adversarial/anti-tamper.sh`): 20 cases (signals, ptrace,
   protected files and pins, BPF maps/links/programs, unit drop-ins,

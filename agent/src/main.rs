@@ -1447,6 +1447,19 @@ async fn main() -> Result<()> {
                                     entry_hash = %entry.entry_hash,
                                     "audit log writable — agent_boot entry appended"
                                 );
+                                if let northnarrow_agent::audit::PreviousRun::Abrupt {
+                                    booted_at,
+                                    last_entry_at,
+                                } = log.previous_run()
+                                {
+                                    warn!(
+                                        booted_at = %booted_at,
+                                        last_entry_at = %last_entry_at,
+                                        "PREVIOUS RUN ENDED ABRUPTLY — the agent that booted then never \
+                                         wrote agent_stop: SIGKILL (systemctl kill, cgroup.kill), OOM, \
+                                         crash or power loss; recorded in this boot's audit entry"
+                                    );
+                                }
                                 Some(Arc::new(parking_lot::Mutex::new(log)))
                             }
                             Err(e) => {
@@ -2420,6 +2433,11 @@ async fn main() -> Result<()> {
         warn!(error = %e, "sd_notify(READY=1) failed; systemd may report the unit as not-ready");
     }
 
+    // Why the event loop ended — written as the signed `agent_stop` entry
+    // below; a run that never writes it is reported by the next boot.
+    let loop_started = std::time::Instant::now();
+    #[allow(unused_assignments)]
+    let mut stop_reason = "unknown";
     loop {
         tokio::select! {
             evt = sensor.next_event() => match evt {
@@ -2451,19 +2469,23 @@ async fn main() -> Result<()> {
                 }
                 None => {
                     warn!("sensor pump exited; shutting down");
+                    stop_reason = "sensor_pump_exited";
                     break;
                 }
             },
             _ = sigint.recv() => {
                 info!("SIGINT received; shutting down");
+                stop_reason = "sigint";
                 break;
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received; shutting down");
+                stop_reason = "sigterm";
                 break;
             }
             _ = sighup.recv() => {
                 info!("SIGHUP received; shutting down");
+                stop_reason = "sighup";
                 break;
             }
             // Tappa 8 A8: admin-authorised graceful shutdown. The
@@ -2492,11 +2514,23 @@ async fn main() -> Result<()> {
                      beginning graceful exit (COMBAT state preserved \
                      across restart per design §10.3 step 4)"
                 );
+                stop_reason = "admin_shutdown";
                 break;
             }
         }
     }
 
+    if let Some(log) = &audit_log {
+        let uptime = loop_started.elapsed().as_secs();
+        match log.lock().stop_entry(stop_reason, uptime) {
+            Ok(_) => info!(
+                reason = stop_reason,
+                uptime_secs = uptime,
+                "audit: agent_stop entry appended"
+            ),
+            Err(e) => warn!(error = format!("{e:#}"), "audit: agent_stop entry failed"),
+        }
+    }
     if let Some(ade) = &ade_engine {
         let snap = ade.stats();
         info!(
