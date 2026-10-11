@@ -64,6 +64,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Overhead benchmark (`nn-lab.sh overhead [ROUNDS]`): the agent off and on,
+  alternated, over four worst-case micro-workloads (open, open + write,
+  exec, loopback connect); the report gives the median throughput lost and
+  the agent's own CPU per workload. Runbook section "Overhead (agent off
+  vs on)".
 - Host hardening checks (`nn-admin host-check [--json]`, summary in
   `nn-admin status`, one WARN per gap at agent boot, table at the end of
   `install.sh`): BPF LSM, kernel lockdown, unprivileged BPF, module
