@@ -572,8 +572,10 @@ Pianificato, in quest'ordine:
   kernel a caldo (kexec, moduli non firmati, livepatch)
 - Contatori di perdita del ring buffer letti dall'agent ed esposti in
   `nn-admin status` (oggi li conta solo il kernel)
-- Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
-  template canary, JSONL, file `format` di tracefs, BTF) con `cargo-fuzz`
+- Fuzzing dei parser (fatto l'11 ottobre, lab PR 26): otto target cargo-fuzz
+  (frame admin, TLS ClientHello, DNS, BTF, `format` di tracefs, ruoli,
+  righe del chain log, install manifest) con job CI di smoke; restano da
+  coprire regole COMBAT/template canary (parser su file, non su byte)
 - Sensore `io_uring`: tracepoint su `io_uring_setup/enter/register`,
   opcode delle SQE (open, read/write, connect, send/recv, unlink,
   rename) correlati a processo e file; regole su ring usati subito dopo

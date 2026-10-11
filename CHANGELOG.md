@@ -49,6 +49,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Fuzzing (`fuzz/`, cargo-fuzz): eight libFuzzer targets over every
+  parser that consumes attacker-shaped bytes — admin socket frames, TLS
+  ClientHello and DNS payloads from the kernel rings, the BTF blob,
+  tracefs `format` files, role lists, chain-log lines, the install
+  manifest. The `fuzz` CI job builds every target and runs each for a
+  short smoke on every PR; a crash artefact fails the job.
 - Supply chain, install-time and runtime halves: `install.sh` verifies the
   extracted tree (`MANIFEST.sha256`, now shipped in the tarball), the
   tarball against `SHA256SUMS` and the SLSA provenance attestation (gh or
