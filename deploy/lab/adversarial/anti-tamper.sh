@@ -182,10 +182,51 @@ PID=$(agent_pid)
 printf '+backupd\n' > /tmp/nn-ovl-allow
 WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && systemctl restart northnarrow-agent"
 PID=$(agent_pid)
+# Kernel lockdown (integrity or confidentiality) is the host setting that
+# closes kexec and unsigned modules; without it they are known gaps, with it
+# a missing refusal is a deviation. The agent itself runs unchanged under
+# lockdown=integrity (verified on Ubuntu 22.04 / 5.15).
+LOCKDOWN=$(grep -o '\[[a-z]*\]' /sys/kernel/security/lockdown 2>/dev/null | tr -d '[]')
+KGAP=1
+[[ "$LOCKDOWN" == integrity || "$LOCKDOWN" == confidentiality ]] && KGAP=0
 if command -v kexec >/dev/null 2>&1; then
-    run_case C17 "kexec -l of the running kernel" denied "" 1 -- kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) --reuse-cmdline
+    run_case C17 "kexec -l of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "" "$KGAP" -- kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) --reuse-cmdline
     kexec -u 2>/dev/null || true
 fi
+# An unsigned module (dummy.ko with its signature stripped), loaded with a
+# bare finit_module() so the refusal is the kernel's, not R011 killing a
+# module tool. Only under lockdown: without it the load would succeed and
+# taint the kernel. Livepatches are modules too and take the same check.
+ko=$(modinfo -n dummy 2>/dev/null)
+case "$ko" in
+    *.ko)     cp "$ko" /tmp/nn_signed_dummy.ko 2>/dev/null ;;
+    *.ko.zst) zstd -qdc "$ko" > /tmp/nn_signed_dummy.ko 2>/dev/null ;;
+    *.ko.xz)  xz -dc "$ko" > /tmp/nn_signed_dummy.ko 2>/dev/null ;;
+    *)        rm -f /tmp/nn_signed_dummy.ko ;;
+esac
+if (( ! KGAP )) && [[ -s /tmp/nn_signed_dummy.ko ]]; then
+    python3 - /tmp/nn_signed_dummy.ko /tmp/nn_unsigned_dummy.ko <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+magic = b"~Module signature appended~\n"
+if data.endswith(magic):
+    sig_len = int.from_bytes(data[-len(magic) - 4:-len(magic)], "big")
+    data = data[:-len(magic) - 12 - sig_len]
+open(sys.argv[2], "wb").write(data)
+PY
+    rmmod dummy 2>/dev/null
+    run_case C27 "load an unsigned module (finit_module, lockdown: $LOCKDOWN)" denied "" 0 -- python3 -c '
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+fd = os.open("/tmp/nn_unsigned_dummy.ko", os.O_RDONLY)
+if libc.syscall(313, fd, b"", 0) != 0:
+    print(os.strerror(ctypes.get_errno()))
+else:
+    print("loaded")
+'
+    rmmod dummy 2>/dev/null
+fi
+rm -f /tmp/nn_signed_dummy.ko /tmp/nn_unsigned_dummy.ko
 
 echo
 echo "| case | action | outcome | evidence | verdict |"

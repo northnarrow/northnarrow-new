@@ -150,9 +150,28 @@ fn unprivileged_bpf(root: &Path) -> Check {
 }
 
 fn module_sig_enforce(root: &Path) -> Check {
+    // Lockdown in integrity (or confidentiality) mode refuses an unsigned
+    // module whatever `sig_enforce` says (LOCKDOWN_MODULE_SIGNATURE) —
+    // checked on Ubuntu 22.04 with sig_enforce=N: "Lockdown: unsigned
+    // module loading is restricted".
+    let lockdown_mode = read(root, "/sys/kernel/security/lockdown").and_then(|s| {
+        if s.contains("[integrity]") {
+            Some("integrity")
+        } else if s.contains("[confidentiality]") {
+            Some("confidentiality")
+        } else {
+            None
+        }
+    });
     let (status, value) = match read(root, "/sys/module/module/parameters/sig_enforce") {
         Some(v) if v == "Y" => (Status::Ok, v),
-        Some(v) => (Status::Warn, v),
+        Some(v) => match lockdown_mode {
+            Some(mode) => (
+                Status::Ok,
+                format!("{v} (unsigned modules refused by lockdown={mode})"),
+            ),
+            None => (Status::Warn, v),
+        },
         None => (
             Status::Unknown,
             "parameter absent (CONFIG_MODULE_SIG off?)".to_string(),
@@ -365,5 +384,29 @@ mod tests {
                 assert_eq!(c.status, Status::Unknown, "{}", c.id);
             }
         }
+    }
+
+    /// Lockdown in integrity mode refuses unsigned modules whatever
+    /// `sig_enforce` says: the check reports it as enforced (lab: Ubuntu
+    /// 22.04 with `lockdown=integrity`, sig_enforce=N).
+    #[test]
+    fn lockdown_integrity_counts_as_module_signature_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        w(
+            r,
+            "sys/kernel/security/lockdown",
+            b"none [integrity] confidentiality\n",
+        );
+        w(r, "sys/module/module/parameters/sig_enforce", b"N\n");
+        let c = module_sig_enforce(r);
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.value.contains("lockdown=integrity"), "{}", c.value);
+        w(
+            r,
+            "sys/kernel/security/lockdown",
+            b"[none] integrity confidentiality\n",
+        );
+        assert_eq!(module_sig_enforce(r).status, Status::Warn);
     }
 }

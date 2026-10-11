@@ -619,9 +619,13 @@ Pianificato, in quest'ordine:
   `cgroup.kill`, saturazione con un exec nascosto in un flood, io_uring come
   canale cieco — 23 casi, rilievo 46 chiuso (ogni run firma `agent_stop`, il
   boot successivo dichiara se il precedente è finito in modo pulito);
-  resta kexec/livepatch/modulo non firmato con `lockdown` attivo, che
-  richiede un guest con lockdown; ogni caso deve finire in un evento nel
-  chain log, non solo in un rifiuto)
+  kexec/livepatch/modulo non firmato con `lockdown` attivo fatto l'11
+  ottobre, lab PR 43, su Ubuntu 22.04 con `lockdown=integrity`: l'agent
+  gira invariato, kexec (C17) e un modulo con la firma tolta caricato con
+  `finit_module` (C27, livepatch compresi) sono rifiutati dal kernel e il
+  tentativo resta registrato da R018 — 28 casi; `host-check` conta il
+  lockdown come firma dei moduli imposta; ogni caso deve finire in un
+  evento nel chain log, non solo in un rifiuto)
 - Overlay `.local` solo via `nn-admin` firmato (fatto l'11 ottobre, lab
   PR 33): l'agent carica un overlay solo se `<overlay>.sig` dimostra che
   una chiave con il ruolo `config-manage` ne ha firmato il contenuto
