@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use aya::maps::{Array, HashMap, MapData, RingBuf};
@@ -110,6 +111,7 @@ pub fn run() -> i32 {
     };
     // A BASE that does not exist would silently put the fixtures on the
     // root filesystem instead of the one being tested.
+    let bench = bench_opens_requested().map(|n| (n, work.join("unwatched/bench")));
     let outcome = match work.parent() {
         Some(base) if !base.is_dir() => Err(anyhow!(
             "NN_FEASIBILITY_BASE {} is not a directory",
@@ -118,6 +120,10 @@ pub fn run() -> i32 {
         _ => execute(&mut rep, &work),
     };
     let _ = fs::remove_dir_all(PIN_DIR);
+    // The programs are gone with the object: the baseline.
+    if let Some((n, path)) = bench.filter(|(_, p)| p.exists()) {
+        p_bench(&mut rep, "no program", &path, n);
+    }
     let _ = fs::remove_dir_all(&work);
     let _ = fs::remove_file(SHM_COPY);
     if let Err(e) = outcome {
@@ -318,6 +324,42 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
         exercise_exec(&mut probes, rep, &fx)?;
     }
     exercise_dns(&mut probes, rep, &ret4, &ret6, &send)?;
+
+    // Step 1 sizing: what the observer costs a non-matching open (every
+    // check runs, the ancestor walk up to the root included).
+    if let (Some(n), true) = (bench_opens_requested(), file_open) {
+        let path = fx.path("unwatched/bench");
+        fs::write(&path, b"x")?;
+        probes.cache_dir(&fx.path("unwatched"))?;
+        p_bench(
+            rep,
+            "full filter (open matches nothing; parent, name and 5-level ancestor checks)",
+            &path,
+            n,
+        );
+        probes.set_mode(2)?;
+        p_bench(
+            rep,
+            "step 1 fast path: file key + lookup, parent key + cache hit",
+            &path,
+            n,
+        );
+        probes.set_mode(1)?;
+        p_bench(
+            rep,
+            "file key + one lookup (today's FIM observer)",
+            &path,
+            n,
+        );
+        probes.set_mode(0)?;
+        probes.disarm()?;
+        p_bench(
+            rep,
+            "program attached, returns at once (not the target)",
+            &path,
+            n,
+        );
+    }
 
     probes.disarm()?;
     let stray = probes.drain();
@@ -608,6 +650,35 @@ impl Probes {
 
     fn disarm(&mut self) -> Result<()> {
         self.set_target(0)
+    }
+
+    fn set_mode(&mut self, mode: u32) -> Result<()> {
+        let mut m: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("PROBE_MODE")
+                .context("PROBE_MODE missing")?,
+        )?;
+        m.set(0, mode, 0)?;
+        Ok(())
+    }
+
+    /// Put `dir` in the step 1 classification cache (bench: a cache hit).
+    fn cache_dir(&mut self, dir: &Path) -> Result<()> {
+        let m = fs::metadata(dir)?;
+        let mut c: HashMap<_, AyaInodeKey, u32> = HashMap::try_from(
+            self.ebpf
+                .map_mut("PROBE_DIR_CACHE")
+                .context("PROBE_DIR_CACHE missing")?,
+        )?;
+        c.insert(
+            AyaInodeKey(InodeKey {
+                dev: stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+            }),
+            0,
+            0,
+        )?;
+        Ok(())
     }
 
     /// Forget this process's write-open window.
@@ -1210,6 +1281,49 @@ fn exercise_dns(
     Ok(())
 }
 
+/// `NN_FEASIBILITY_BENCH=<opens>`: measure the cost per open (step 1
+/// sizing). Off by default.
+fn bench_opens_requested() -> Option<u32> {
+    std::env::var("NN_FEASIBILITY_BENCH")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n >= 1000)
+}
+
+/// Median open+close rate over 5 rounds of `n / 5`, read-only and
+/// write-only (no write, no truncation: the open path only).
+fn bench_rates(path: &Path, n: u32) -> (f64, f64) {
+    let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return (0.0, 0.0);
+    };
+    let rate = |flags: libc::c_int| {
+        let per = n / 5;
+        let mut rounds: Vec<f64> = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                for _ in 0..per {
+                    let fd = unsafe { libc::open(c.as_ptr(), flags) };
+                    if fd >= 0 {
+                        unsafe { libc::close(fd) };
+                    }
+                }
+                f64::from(per) / start.elapsed().as_secs_f64()
+            })
+            .collect();
+        rounds.sort_by(f64::total_cmp);
+        rounds[2]
+    };
+    (
+        rate(libc::O_RDONLY | libc::O_CLOEXEC),
+        rate(libc::O_WRONLY | libc::O_CLOEXEC),
+    )
+}
+
+fn p_bench(rep: &mut Report, phase: &str, path: &Path, n: u32) {
+    let (read, write) = bench_rates(path, n);
+    rep.bench.push((phase.to_string(), read, write));
+}
+
 // ───────────────────────────── report ─────────────────────────────
 
 struct ProgRow {
@@ -1237,6 +1351,8 @@ struct Report {
     checks: Vec<Check>,
     /// (program, tail of the verifier output) for rejected programs.
     logs: Vec<(&'static str, String)>,
+    /// `NN_FEASIBILITY_BENCH`: (phase, read-only opens/s, write opens/s).
+    bench: Vec<(String, f64, f64)>,
 }
 
 impl Report {
@@ -1363,6 +1479,31 @@ impl Report {
                 c.property,
                 c.evidence.replace('|', "/")
             );
+        }
+        if let Some((_, base_r, base_w)) = self.bench.iter().find(|(p, _, _)| p == "no program") {
+            println!("\n## Cost per open (NN_FEASIBILITY_BENCH)\n");
+            println!(
+                "| phase | read-only opens/s | added per open | write opens/s | added per open |"
+            );
+            println!("|---|---|---|---|---|");
+            let added = |rate: f64, base: f64| {
+                if rate > 0.0 && base > 0.0 {
+                    format!(
+                        "{:+.0} ns ({:+.1} %)",
+                        (1.0 / rate - 1.0 / base) * 1e9,
+                        (base - rate) / base * -100.0
+                    )
+                } else {
+                    "n/a".to_string()
+                }
+            };
+            for (phase, r, w) in self.bench.iter().rev() {
+                println!(
+                    "| {phase} | {r:.0} | {} | {w:.0} | {} |",
+                    added(*r, *base_r),
+                    added(*w, *base_w)
+                );
+            }
         }
         for (program, log) in &self.logs {
             println!("\n### Verifier output, `{program}` (last lines)\n\n```\n{log}\n```");

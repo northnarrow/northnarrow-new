@@ -223,6 +223,10 @@ instruction count where the kernel reports it, attach) and per property,
 and exits 1 if a required property fails. The installed agent is stopped
 for the run and started again at the end. Results and their meaning:
 `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md` §9.
+`NN_FEASIBILITY_BENCH=500000 deploy/lab/nn-lab.sh sensor-feasibility`
+adds a cost-per-open table (§9.1): open + close of an unwatched file
+with no program, an LSM program that returns at once, the open's key plus
+one lookup, the step 1 fast path, and the full observer.
 
 ### btrfs inode keys (review 55)
 

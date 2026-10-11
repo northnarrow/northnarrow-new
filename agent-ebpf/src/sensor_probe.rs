@@ -80,6 +80,16 @@ static PROBE_WRITES: LruHashMap<u32, ProbeWriteWindow> = LruHashMap::with_max_en
 /// Name keys are built in map memory, never on the stack (5.15 rule 4).
 #[map]
 static PROBE_SCRATCH: PerCpuArray<[u8; 64]> = PerCpuArray::with_max_entries(1, 0);
+/// Step 1 sizing (runner's `NN_FEASIBILITY_BENCH`): 0 = the full observer;
+/// 1 = the open's inode key and one table lookup (what the FIM observer
+/// does today); 2 = that plus the parent directory's key and a lookup in
+/// [`PROBE_DIR_CACHE`] (the cache-hit path proposed for step 1).
+#[map]
+static PROBE_MODE: Array<u32> = Array::with_max_entries(1, 0);
+/// Per-directory classification cache of the step 1 proposal, filled by
+/// the runner for the bench directory.
+#[map]
+static PROBE_DIR_CACHE: LruHashMap<InodeKey, u32> = LruHashMap::with_max_entries(64, 0);
 /// 64 KiB: about 90 records; the runner drains after every exercise.
 #[map]
 pub static PROBE_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
@@ -171,8 +181,25 @@ unsafe fn try_probe_file_open(ctx: &LsmContext) {
         return;
     }
     let inode = read_ptr(file.add(off!(FILE_F_INODE_OFFSET)));
+    let mode = match PROBE_MODE.get(0) {
+        Some(m) => *m,
+        None => 0,
+    };
+    if mode == 1 {
+        let _ = PROBE_DIRS.get(&inode_key(inode));
+        return;
+    }
     let dentry = read_ptr(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)));
     if inode.is_null() || dentry.is_null() {
+        return;
+    }
+    if mode == 2 {
+        let _ = PROBE_DIRS.get(&inode_key(inode));
+        let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+        if !parent.is_null() {
+            let pkey = inode_key(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
+            let _ = PROBE_DIR_CACHE.get(&pkey);
+        }
         return;
     }
     let f_mode = match bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32) {
