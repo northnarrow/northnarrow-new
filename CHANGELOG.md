@@ -49,6 +49,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Ring-buffer drop accounting: every eBPF producer bumps a per-ring
+  counter (`RING_DROPS` per-CPU map, 11 rings) when its reservation
+  fails; the agent samples it every 10 s, logs each increase at WARN with
+  the ring's name, and `nn-admin status` shows the total and the per-ring
+  breakdown (`ringbuf_drops_total`, `ringbuf_drops` in `--json`). Before,
+  only the exec ring counted and nothing read it.
 - Supply chain, install-time and runtime halves: `install.sh` verifies the
   extracted tree (`MANIFEST.sha256`, now shipped in the tarball), the
   tarball against `SHA256SUMS` and the SLSA provenance attestation (gh or

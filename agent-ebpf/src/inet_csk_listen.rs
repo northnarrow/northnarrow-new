@@ -81,7 +81,10 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
     // Reserve + populate.
     let mut entry = match NET_LISTEN_EVENTS.reserve::<NetListenRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::LISTEN);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut NetListenRaw = entry.as_mut_ptr();
     unsafe {

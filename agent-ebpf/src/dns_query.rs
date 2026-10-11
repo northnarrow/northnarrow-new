@@ -141,7 +141,10 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
 
     let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut DnsQueryRaw = entry.as_mut_ptr();
     unsafe {

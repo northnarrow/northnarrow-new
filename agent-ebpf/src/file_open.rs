@@ -48,7 +48,10 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i64> {
     let mut entry = match FILE_OPEN_EVENTS.reserve::<FileOpenRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FILE_OPEN);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut FileOpenRaw = entry.as_mut_ptr();
     unsafe {

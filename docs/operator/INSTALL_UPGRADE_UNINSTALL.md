@@ -85,6 +85,17 @@ The lab verifies `uninstall.sh --purge --yes` leaves no binary, unit, pin,
 LSM program, config, state or bait behind, then reinstalls
 (`nn-lab.sh uninstall-check`).
 
+### 3.2 Lost events are visible (`ringbuf drops`)
+
+Every kernel sensor hands events to the agent through a ring buffer; when
+the agent falls behind the producer cannot reserve an entry and the event
+is lost. Each of the eleven rings now counts its own losses; the agent
+reads the counters every 10 s, logs every increase at WARN naming the
+ring, and `nn-admin status` prints the running total with the per-ring
+breakdown (`ringbuf drops : 0` is the healthy line). A non-zero counter
+is a coverage gap, not a cosmetic number: the lab soak treats it as a
+note and a production host should alert on it.
+
 ## 4. What still needs a reboot
 
 - Enabling the `bpf` LSM (`lsm=…,bpf` on the kernel command line) the

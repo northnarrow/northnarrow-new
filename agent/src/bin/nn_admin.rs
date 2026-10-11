@@ -1664,14 +1664,24 @@ fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
         // surface; the fields are stable and trivially escapable.
+        let drops: Vec<String> = out
+            .ringbuf_drops
+            .iter()
+            .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
+            .collect();
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
                 Some(s) => s.to_string(),
                 None => "null".to_string(),
-            }
+            },
+            match out.ringbuf_drops_total {
+                Some(t) => t.to_string(),
+                None => "null".to_string(),
+            },
+            drops.join(",")
         );
         return;
     }
@@ -1686,6 +1696,22 @@ fn print_status(out: &StatusOutcome, json: bool) {
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
         None => println!("last admin action : (none since agent start)"),
+    }
+    match out.ringbuf_drops_total {
+        None => println!("ringbuf drops     : (agent predates the counter)"),
+        Some(0) => println!("ringbuf drops     : {}", colorize("0", "32", tty)),
+        Some(t) => {
+            let per: Vec<String> = out
+                .ringbuf_drops
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect();
+            println!(
+                "ringbuf drops     : {} ({}) — events lost since boot, see the agent WARNs",
+                colorize(&t.to_string(), "31", tty),
+                per.join(", ")
+            );
+        }
     }
 }
 

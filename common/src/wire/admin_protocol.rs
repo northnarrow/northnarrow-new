@@ -619,11 +619,18 @@ pub struct StatusRequest {}
 /// `status` reply payload — posture + network state + a rough
 /// "last admin action" timer for the operator. `None` means no
 /// admin action has been observed since the agent started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub posture: PostureKind,
     pub network_isolation_engaged: bool,
     pub last_admin_action_secs_ago: Option<u64>,
+    /// Ring-buffer events dropped since boot, all rings (Tappa 10.8).
+    /// `None` from an agent older than the field.
+    #[serde(default)]
+    pub ringbuf_drops_total: Option<u64>,
+    /// `(ring name, dropped)` for the rings that dropped something.
+    #[serde(default)]
+    pub ringbuf_drops: Option<Vec<(String, u64)>>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -1129,6 +1136,8 @@ mod tests {
             posture: PostureKind::Combat,
             network_isolation_engaged: true,
             last_admin_action_secs_ago: Some(42),
+            ringbuf_drops_total: None,
+            ringbuf_drops: None,
         }));
     }
 
@@ -1138,6 +1147,8 @@ mod tests {
             posture: PostureKind::Observing,
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
+            ringbuf_drops_total: None,
+            ringbuf_drops: None,
         }));
     }
 

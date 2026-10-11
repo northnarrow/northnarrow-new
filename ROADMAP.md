@@ -570,8 +570,9 @@ Pianificato, in quest'ordine:
   montato una sola volta; ogni assenza è un WARN con la riga di fix,
   perché l'anti-tamper dell'agent vale finché root non può riscrivere il
   kernel a caldo (kexec, moduli non firmati, livepatch)
-- Contatori di perdita del ring buffer letti dall'agent ed esposti in
-  `nn-admin status` (oggi li conta solo il kernel)
+- Contatori di perdita del ring buffer (fatti l'11 ottobre, lab PR 25): un
+  contatore per ring in eBPF, letti dall'agent ogni 10 s, WARN a ogni
+  aumento, totale e dettaglio in `nn-admin status`
 - Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
   template canary, JSONL, file `format` di tracefs, BTF) con `cargo-fuzz`
 - Sensore `io_uring`: tracepoint su `io_uring_setup/enter/register`,

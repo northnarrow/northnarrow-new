@@ -234,7 +234,10 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
 
     let mut entry = match NET_FLOW_CLOSE_EVENTS.reserve::<NetFlowCloseRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::UDP);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut NetFlowCloseRaw = entry.as_mut_ptr();
     unsafe {
