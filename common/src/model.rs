@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_UNLINK, FS_OP_WRITE,
+    ADDR_LEN, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_UNLINK,
+    FS_OP_WRITE,
 };
 
 /// Canonical event emitted by a sensor.
@@ -90,6 +91,22 @@ pub enum Event {
         /// Reconstructed source `.ko` path (finit_module). `None` for
         /// init_module (legacy buffer load — no file).
         path: Option<String>,
+        timestamp_ns: u64,
+    },
+    /// A `bpf()` syscall of interest by a process that is not the agent or
+    /// the watchdog (LSM hook `bpf`): program load, attach, link create /
+    /// detach, handle-by-id on the agent's own objects. The BPF ecosystem is
+    /// both the agent's tool and an attacker's (rootkits, map tampering);
+    /// scored by NN-L-BPF-001/002. Denials of writes to the agent's maps
+    /// travel as `FsProtectDenial` with `FS_OP_BPF_MAP`.
+    BpfSyscall {
+        pid: u32,
+        uid: u32,
+        comm: String,
+        /// uapi `bpf_cmd` or a synthetic `BPF_CMD_*` value.
+        cmd: u32,
+        /// Command-specific argument (see `BpfSyscallRaw::arg`).
+        arg: u32,
         timestamp_ns: u64,
     },
     /// io_uring ring created or used (tracepoints `io_uring_create`,
@@ -284,6 +301,8 @@ pub enum FsProtectOperation {
     Write,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
+    /// Write handle on one of the agent's own BPF maps (BPF self-defence).
+    BpfMap,
     Unknown(u8),
 }
 
@@ -296,6 +315,7 @@ impl FsProtectOperation {
             FS_OP_SETATTR => Self::Setattr,
             FS_OP_IOCTL => Self::Ioctl,
             FS_OP_WRITE => Self::Write,
+            FS_OP_BPF_MAP => Self::BpfMap,
             other => Self::Unknown(other),
         }
     }
@@ -307,6 +327,7 @@ impl FsProtectOperation {
             Self::Rename => "rename",
             Self::Setattr => "setattr",
             Self::Ioctl => "ioctl",
+            Self::BpfMap => "bpf_map",
             Self::Write => "write",
             Self::Unknown(_) => "unknown",
         }
@@ -395,6 +416,19 @@ pub enum ModuleLoadMethod {
     Init,
     /// Unrecognised method byte (forward-compat).
     Unknown,
+}
+
+impl From<&crate::wire::BpfSyscallRaw> for Event {
+    fn from(raw: &crate::wire::BpfSyscallRaw) -> Self {
+        Event::BpfSyscall {
+            pid: raw.pid,
+            uid: raw.uid,
+            comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
+            cmd: raw.cmd,
+            arg: raw.arg,
+            timestamp_ns: raw.timestamp_ns,
+        }
+    }
 }
 
 impl From<&crate::wire::IoUringRaw> for Event {

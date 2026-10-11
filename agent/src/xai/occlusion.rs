@@ -137,6 +137,12 @@ fn event_kind_label(e: &Event) -> String {
                 common::io_uring_class_names(*classes)
             )
         }
+        Event::BpfSyscall { comm, cmd, .. } => {
+            format!(
+                "BpfSyscall comm={comm} cmd={}",
+                common::wire::bpf_cmd_name(*cmd)
+            )
+        }
         Event::ProcessSpawn { comm, filename, .. } => {
             format!("ProcessSpawn comm={comm} file={filename}")
         }
@@ -196,7 +202,7 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
     match focal {
         // BUG-034: module-load events are not perturbed by XAI occlusion in v1
         // (R018's verdict is path-based; no occludable focal units here).
-        Event::ModuleLoad { .. } | Event::IoUring { .. } => {}
+        Event::ModuleLoad { .. } | Event::IoUring { .. } | Event::BpfSyscall { .. } => {}
         Event::ProcessSpawn { .. } => {
             units.push(focal_unit(
                 F::Comm,
@@ -615,7 +621,7 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
     use FocalField as F;
     match e {
         // BUG-034: no occludable focal fields enumerated for module loads (see above).
-        Event::ModuleLoad { .. } | Event::IoUring { .. } => {}
+        Event::ModuleLoad { .. } | Event::IoUring { .. } | Event::BpfSyscall { .. } => {}
         Event::ProcessSpawn {
             pid,
             ppid,

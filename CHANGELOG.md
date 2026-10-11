@@ -49,6 +49,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- BPF self-defence, first half: LSM hook `bpf_map` denies any write handle Trade-off: `bpftool map show/dump` take RDWR handles, so in enforce mode they are denied on the agent's maps (use `nn-admin status`).
+  on the agent's own maps (ids registered after load) to processes that
+  are not the agent or the watchdog — `bpftool map update/delete` against
+  `PROTECTED_PIDS` now fails with EPERM and lands in the audit chain as an
+  anti-tamper denial (`bpf_map`); read handles stay allowed. LSM hook `bpf`
+  observes program loads, attaches, link create/update/detach, BTF loads
+  and handles-by-id on the agent's maps/links by foreign processes
+  (`Event::BpfSyscall`, one record per pid per command per second); rules
+  `NN-L-BPF-001_BpfProgramLoaded` (Medium, Log; known tooling exempt) and
+  `NN-L-BPF-002_BpfForeignHandleOrDetach` (High, Log). Observe mode (no
+  deny) in `debug-trigger` builds and with `NN_BPF_DEFENSE_OBSERVE=1`; the
+  guard counts as a ninth deny hook in the fail-closed LSM health. Six new
+  BTF offset slots (`bpf_map`, `bpf_prog`, `bpf_prog_aux`).
 - io_uring sensor — the asynchronous I/O channel syscall-centric sensors
   miss: tracepoints `io_uring_create` and `io_uring_submit_{req,sqe}`
   (name resolved per kernel), submissions aggregated per pid in kernel by

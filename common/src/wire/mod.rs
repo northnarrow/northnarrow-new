@@ -447,6 +447,10 @@ pub const FS_OP_IOCTL: u8 = 5;
 /// `inode_setattr` never fires) cannot mutate admin.pub / agent.sig.key /
 /// the integrity chains.
 pub const FS_OP_WRITE: u8 = 6;
+/// BPF self-defence (Tappa 10.8): a foreign process opened one of the
+/// agent's own BPF maps for writing (`bpf_map` LSM hook). `target_ino`
+/// carries the map id, `target_dev` is 0.
+pub const FS_OP_BPF_MAP: u8 = 7;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -496,6 +500,55 @@ impl FsProtectDenialRaw {
             operation: 0,
             _pad: [0u8; 7],
         }
+    }
+}
+
+// ── bpf() syscall observation (Tappa 10.8, BPF self-defence) ────────────
+/// Synthetic `cmd` values for [`BpfSyscallRaw`] beyond the uapi `bpf_cmd`
+/// numbers: emitted by the `bpf_map` hook in observe mode when a foreign
+/// process opens one of the agent's maps for writing (would be denied in
+/// enforce mode).
+pub const BPF_CMD_FOREIGN_MAP_WRITE: u32 = 0xFFFF_0001;
+/// A foreign process obtained a handle to one of the agent's own objects
+/// by id (`BPF_*_GET_FD_BY_ID`) — observe-mode counterpart of the deny.
+pub const BPF_CMD_FOREIGN_GET_FD: u32 = 0xFFFF_0002;
+
+/// Kernel→userland record of the `bpf()` syscall observer (40 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct BpfSyscallRaw {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+    /// uapi `enum bpf_cmd` value, or a `BPF_CMD_*` synthetic value.
+    pub cmd: u32,
+    /// Command-specific argument: `prog_type` (PROG_LOAD), `map_type`
+    /// (MAP_CREATE), `attach_type` (PROG_ATTACH / LINK_CREATE), object id
+    /// (`*_GET_FD_BY_ID`, synthetic cmds), 0 otherwise.
+    pub arg: u32,
+}
+
+/// Name of a uapi `bpf_cmd` value (the ones the observer reports).
+pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
+    match cmd {
+        0 => "map_create",
+        5 => "prog_load",
+        6 => "obj_pin",
+        7 => "obj_get",
+        8 => "prog_attach",
+        9 => "prog_detach",
+        13 => "prog_get_fd_by_id",
+        14 => "map_get_fd_by_id",
+        18 => "btf_load",
+        28 => "link_create",
+        29 => "link_update",
+        31 => "link_get_fd_by_id",
+        34 => "link_detach",
+        BPF_CMD_FOREIGN_MAP_WRITE => "foreign_map_write",
+        BPF_CMD_FOREIGN_GET_FD => "foreign_get_fd",
+        _ => "other",
     }
 }
 
