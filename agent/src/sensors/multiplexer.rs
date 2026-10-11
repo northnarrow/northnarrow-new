@@ -28,8 +28,8 @@ use aya::{
 };
 use bytemuck::Pod;
 use common::wire::{
-    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ModuleLoadRaw, ProcessSpawnRaw,
-    TcpConnectRaw,
+    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, IoUringRaw, ModuleLoadRaw,
+    ProcessSpawnRaw, TcpConnectRaw,
 };
 use common::Event;
 use parking_lot::Mutex;
@@ -193,6 +193,31 @@ impl SensorMultiplexer {
             "syscalls",
             "sys_enter_execve",
         )?;
+        // io_uring (Tappa 10.8): soft attach — a kernel built without
+        // CONFIG_IO_URING has no such tracepoints and nothing to observe.
+        // The submit tracepoint was renamed across kernels; try both.
+        match attach_tracepoint(&mut ebpf, "io_uring_create", "io_uring", "io_uring_create") {
+            Ok(()) => {
+                let submit = attach_tracepoint(
+                    &mut ebpf,
+                    "io_uring_submit",
+                    "io_uring",
+                    "io_uring_submit_req",
+                )
+                .or_else(|e| {
+                    debug!(error = %e, "io_uring_submit_req absent — trying io_uring_submit_sqe");
+                    attach_tracepoint(&mut ebpf, "io_uring_submit", "io_uring", "io_uring_submit_sqe")
+                });
+                match submit {
+                    Ok(()) => info!("io_uring sensor attached (create + submit tracepoints)"),
+                    Err(e) => warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed"),
+                }
+            }
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "io_uring tracepoints not available (CONFIG_IO_URING off?) — the asynchronous I/O channel is NOT observed on this kernel"
+            ),
+        }
         attach_kprobe(&mut ebpf, "tcp_v4_connect", "tcp_v4_connect")?;
         attach_kprobe(&mut ebpf, "tcp_v6_connect", "tcp_v6_connect")?;
         attach_kprobe(&mut ebpf, "udp_sendmsg", "udp_sendmsg")?;
@@ -231,6 +256,7 @@ impl SensorMultiplexer {
         // BUG-034: module-load observations → Event::ModuleLoad → R018.
         // Maps exist at load time (before attach), so taking it here is safe.
         let module_load_rb = take_ringbuf(&mut ebpf, "MODULE_LOAD_EVENTS")?;
+        let iouring_rb = take_ringbuf(&mut ebpf, "IOURING_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
         let flow_tracker_for_tcp = net.as_ref().map(|w| Arc::clone(&w.flow_tracker));
@@ -244,6 +270,7 @@ impl SensorMultiplexer {
             spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
             spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
             spawn_pump::<ModuleLoadRaw>("module_load", module_load_rb, tx.clone()),
+            spawn_pump::<IoUringRaw>("io_uring", iouring_rb, tx.clone()),
         ];
 
         Ok((

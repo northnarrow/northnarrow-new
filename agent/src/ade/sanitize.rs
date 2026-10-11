@@ -402,6 +402,7 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
             loader_comm.clone(),
             String::new(),
         ),
+        Event::IoUring { comm, .. } => (String::new(), comm.clone(), String::new()),
         Event::ProcessSpawn { filename, comm, .. }
         | Event::ExecCheck { filename, comm, .. }
         | Event::FileOpen { filename, comm, .. } => (filename.clone(), comm.clone(), String::new()),
@@ -452,6 +453,7 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
         } => {
             vec![loader_comm.clone(), path.clone().unwrap_or_default()]
         }
+        Event::IoUring { comm, .. } => vec![comm.clone()],
         Event::ProcessSpawn { filename, comm, .. } | Event::ExecCheck { filename, comm, .. } => {
             vec![filename.clone(), comm.clone()]
         }

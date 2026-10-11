@@ -123,6 +123,8 @@ pub enum Sensor {
     AntiTamper,
     /// Canary token trip.
     Canary,
+    /// io_uring ring creation / activity (asynchronous I/O channel).
+    IoUring,
 }
 
 impl Sensor {
@@ -134,6 +136,7 @@ impl Sensor {
             Event::ProcessSpawn { .. } | Event::ExecCheck { .. } => Sensor::Exec,
             Event::FileOpen { .. } | Event::Fim(_) => Sensor::File,
             Event::ModuleLoad { .. } => Sensor::ModuleLoad,
+            Event::IoUring { .. } => Sensor::IoUring,
             Event::TcpConnect { .. }
             | Event::DnsQuery { .. }
             | Event::NetFlow(_)
@@ -252,6 +255,12 @@ impl Principal {
                 uid: *loader_uid,
                 ppid: None,
             },
+            Event::IoUring { pid, uid, comm, .. } => Principal {
+                pid: *pid,
+                comm: comm.clone(),
+                uid: *uid,
+                ppid: None,
+            },
             Event::CanaryTripped {
                 accessor_pid,
                 accessor_uid,
@@ -302,6 +311,7 @@ fn exe_from_event(event: &Event) -> Option<String> {
         }
         Event::FileOpen { .. }
         | Event::ModuleLoad { .. }
+        | Event::IoUring { .. }
         | Event::TcpConnect { .. }
         | Event::DnsQuery { .. }
         | Event::FsProtectDenial { .. }
@@ -834,6 +844,7 @@ impl Sensor {
             "network" => Some(Sensor::Network),
             "anti-tamper" | "antitamper" => Some(Sensor::AntiTamper),
             "canary" => Some(Sensor::Canary),
+            "io-uring" | "iouring" | "io_uring" => Some(Sensor::IoUring),
             _ => None,
         }
     }
