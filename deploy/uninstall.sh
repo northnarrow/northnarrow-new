@@ -24,6 +24,10 @@
 #   sudo ./deploy/uninstall.sh --purge    # also /etc/northnarrow, /var/lib/northnarrow,
 #                                         # the namespace journal — NOTHING is kept
 #   sudo ./deploy/uninstall.sh --yes      # no confirmation prompt
+#   --package   run from a package's post-removal hook: the package manager
+#               already removed binaries and units and the pre-removal hook
+#               stopped the agent; a pin root that is still protected is
+#               reported instead of failing the package operation
 #
 # Same BIN_DIR / UNIT_DIR / ETC_DIR / STATE_DIR overrides as install.sh.
 
@@ -41,6 +45,7 @@ LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
 
 PURGE=0
 YES=0
+PACKAGE=0
 GRANT_KEY=
 expect_key=0
 for arg in "$@"; do
@@ -48,6 +53,7 @@ for arg in "$@"; do
     case "$arg" in
         --purge) PURGE=1 ;;
         --yes|-y) YES=1 ;;
+        --package) PACKAGE=1 ;;
         --grant-key) expect_key=1 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "uninstall.sh: unknown argument: $arg" >&2; exit 2 ;;
@@ -97,7 +103,8 @@ if [[ -d "$BPFFS_ROOT" ]]; then
         echo "uninstall.sh: $BPFFS_ROOT is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
         echo "uninstall.sh: (review entry 39). Start the agent again (systemctl start northnarrow-agent) and re-run" >&2
         echo "uninstall.sh: with --grant-key <admin.key carrying the trusted-installer role>." >&2
-        exit 1
+        (( PACKAGE )) || exit 1
+        echo "uninstall.sh: package removal continues; the pins detach at the next reboot" >&2
     fi
 fi
 if command -v bpftool >/dev/null 2>&1; then
@@ -111,7 +118,7 @@ if command -v bpftool >/dev/null 2>&1; then
     if [[ "$n" != 0 ]]; then
         echo "uninstall.sh: $n LSM program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s — a NorthNarrow process" >&2
         echo "uninstall.sh: still holds them (ps aux | grep northnarrow). Stop it and re-run." >&2
-        exit 1
+        (( PACKAGE )) || exit 1
     fi
 else
     log "bpftool not found — cannot confirm the LSM programs detached; continuing"

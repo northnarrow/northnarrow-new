@@ -2,10 +2,11 @@ name: release
 
 # Builds the release tree (eBPF object + userland, `cargo xtask build
 # --release` with a locked lockfile), packs it as the tarball
-# deploy/install.sh consumes unchanged, emits a CycloneDX SBOM and
-# SHA256SUMS, attaches a SLSA build-provenance attestation to every
-# artefact (verify: `gh attestation verify <file> --repo <owner/repo>`)
-# and, on a tag push, uploads everything to the GitHub release.
+# deploy/install.sh consumes unchanged and as .deb / .rpm packages
+# (deploy/release/mk-packages.sh), emits a CycloneDX SBOM and SHA256SUMS,
+# attaches a SLSA build-provenance attestation to every artefact (verify:
+# `gh attestation verify <file> --repo <owner/repo>`) and, on a tag push,
+# uploads everything to the GitHub release.
 #
 # On pull requests that touch the packaging it runs as a DRY RUN: same
 # build, artefacts kept on the workflow run only, nothing published.
@@ -74,6 +75,34 @@ jobs:
       - name: Assemble tarball + SBOM + checksums
         run: deploy/release/mk-tarball.sh dist
 
+      - name: Build the .deb and .rpm packages
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends rpm >/dev/null
+          deploy/release/mk-packages.sh dist
+          (cd dist && sha256sum northnarrow_*.deb northnarrow-*.rpm >> SHA256SUMS && cat SHA256SUMS)
+
+      - name: Smoke-test the packages
+        run: |
+          set -e
+          deb=$(ls dist/northnarrow_*_amd64.deb) rpm=$(ls dist/northnarrow-*.x86_64.rpm)
+          dpkg-deb --info "$deb" | grep -E "^ (Package|Version|Depends):"
+          tmp=$(mktemp -d) && dpkg-deb -x "$deb" "$tmp" && dpkg-deb -e "$deb" "$tmp/DEBIAN"
+          for f in usr/bin/northnarrow-agent usr/bin/northnarrow-watchdog usr/bin/nn-admin \
+                   usr/lib/systemd/system/northnarrow-agent.service usr/share/northnarrow/deploy/install.sh; do
+            test -e "$tmp/$f" || { echo "missing in the .deb: $f"; exit 1; }
+          done
+          grep -q '^ExecStart=/usr/bin/northnarrow-agent' "$tmp/usr/lib/systemd/system/northnarrow-agent.service"
+          grep -q -- '--agent-bin /usr/bin/northnarrow-agent' "$tmp/usr/lib/systemd/system/northnarrow-watchdog.service"
+          # the pre-unpack and post-removal hooks carry their own scripts
+          grep -q -- '--package-stop' "$tmp/DEBIAN/preinst"
+          grep -q -- 'PACKAGE=0' "$tmp/DEBIAN/postrm"
+          for s in preinst postinst prerm postrm; do sh -n "$tmp/DEBIAN/$s"; done
+          rpm -qpi "$rpm" | grep -E "^(Name|Version|Release)"
+          rpm -qpR "$rpm" | grep -qx 'glibc >= 2.34'
+          test "$(rpm -qp --scripts "$rpm" | grep -c 'scriptlet (using /bin/sh)')" = 4
+          "$tmp/usr/bin/northnarrow-agent" --version
+
       - name: Smoke-test the tree (install.sh preflights from the tarball)
         run: |
           set -e
@@ -94,6 +123,8 @@ jobs:
         with:
           subject-path: |
             dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
             dist/*.sbom.cdx.json
 
       - name: Upload workflow artefacts (always)
