@@ -457,7 +457,11 @@ cmd_soak() {
             # on the spot. Install it root-owned under /usr/local/sbin first.
             vssh "sudo install -m 0755 -o root -g root \$HOME/soak/sample.sh /usr/local/sbin/nn-soak-sample"
             vssh "sudo nohup env SOAK_DIR=\$HOME/soak SOAK_INTERVAL=$interval setsid /usr/local/sbin/nn-soak-sample > \$HOME/soak/sample.log 2>&1 < /dev/null & disown; sleep 2; test -f ~/soak/sample.pid && sudo kill -0 \$(cat ~/soak/sample.pid)"
-            vssh "nohup env SOAK_DIR=\$HOME/soak setsid \$HOME/soak/generate.sh > \$HOME/soak/generate.log 2>&1 < /dev/null & disown"
+            # SOAK_*_PER_S set on the host side travel to the generator, so a
+            # targeted run (e.g. SOAK_DNS_PER_S=20) needs no script edit.
+            local rates
+            rates=$(env | grep -E '^SOAK_[A-Z_]+_PER_S=[0-9]+$' | tr '\n' ' ')
+            vssh "nohup env SOAK_DIR=\$HOME/soak $rates setsid \$HOME/soak/generate.sh > \$HOME/soak/generate.log 2>&1 < /dev/null & disown"
             vssh "nohup setsid sh -c 'sleep $secs; touch \$HOME/soak/stop' > /dev/null 2>&1 < /dev/null & disown"
             log "soak started on $DISTRO: ${hours} h, sample every ${interval} s (nn-lab.sh soak status | wait | stop | report)"
             ;;

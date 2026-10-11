@@ -58,6 +58,19 @@ pub const REVERSE_RETAIN_SECS: u64 = 30;
 /// back-correlation actually reads) are always retained. ~16 K entries
 /// × ~64 B ≈ 1 MiB worst case.
 const REVERSE_MAX_ENTRIES: usize = 16_384;
+/// Hard cap on DISTINCT pids retained in the forward map (soak 2026-10-11).
+/// `by_pid` was only ever trimmed per pid, inside `lookup_for_connect`,
+/// so every short-lived process that resolved a name — one `getent` per
+/// second in the soak generator; cron jobs, `curl`, `ssh`, package
+/// managers on a real host — left a key behind for the life of the agent
+/// (~1 MB/h on the AlmaLinux 9 soak). Pids past the TTL are now pruned
+/// opportunistically every [`PRUNE_EVERY`] inserts, and when the map is
+/// still above this cap the pid with the oldest newest-query is evicted.
+/// 4096 pids × ≤ `max_per_pid` queries is the worst case an attribution
+/// window of 300 s can legitimately hold on a busy host.
+pub const DEFAULT_MAX_PIDS: usize = 4096;
+/// Insert interval between full-map stale-pid prunes (an O(pids) scan).
+const PRUNE_EVERY: u32 = 256;
 
 /// One observed DNS query (PRE-response, V1.0). The same PID
 /// might issue many queries within the TTL window; we keep the
@@ -80,6 +93,8 @@ struct RecentQuery {
 struct DnsCacheInner {
     /// PID → recent queries, oldest at the front.
     by_pid: HashMap<u32, VecDeque<RecentQuery>>,
+    /// Inserts since the last stale-pid prune (see [`PRUNE_EVERY`]).
+    inserts_since_prune: u32,
     /// FP-3 reverse index: recent `(qname, pid, ts_ns)` observations in
     /// insertion order (≈ monotonic `ts_ns`, single-writer drain),
     /// pruned to [`REVERSE_RETAIN_SECS`] / [`REVERSE_MAX_ENTRIES`].
@@ -147,6 +162,11 @@ impl DnsCache {
         // FP-3 reverse index: record (qname, pid, ts) for forwarder-aware
         // originator back-correlation, then prune by the short retention
         // window + the hard size cap so unique DGA qnames can't grow it.
+        g.inserts_since_prune += 1;
+        if g.inserts_since_prune >= PRUNE_EVERY || g.by_pid.len() > DEFAULT_MAX_PIDS {
+            g.inserts_since_prune = 0;
+            Self::prune_pids(&mut g, ts_ns, self.ttl_ns);
+        }
         g.recent_by_time.push_back((qname, pid, ts_ns));
         let cutoff = ts_ns.saturating_sub(self.reverse_retain_ns);
         while g
@@ -228,6 +248,31 @@ impl DnsCache {
     ///
     /// Also opportunistically prunes expired entries for this
     /// PID — keeps memory bounded under long-lived agent runs.
+    /// Drop every pid whose NEWEST query is older than the TTL (its
+    /// entries could never attribute a connect again), then, if the map
+    /// is still above [`DEFAULT_MAX_PIDS`], evict the pids with the
+    /// oldest newest-query until it fits. Called from `on_dns_query`
+    /// every [`PRUNE_EVERY`] inserts, so the amortised cost per query is
+    /// a fraction of a scan.
+    fn prune_pids(g: &mut DnsCacheInner, now_ns: u64, ttl_ns: u64) {
+        let cutoff = now_ns.saturating_sub(ttl_ns);
+        g.by_pid
+            .retain(|_, q| q.back().is_some_and(|e| e.ts_ns >= cutoff));
+        while g.by_pid.len() > DEFAULT_MAX_PIDS {
+            let oldest = g
+                .by_pid
+                .iter()
+                .min_by_key(|(_, q)| q.back().map(|e| e.ts_ns).unwrap_or(0))
+                .map(|(pid, _)| *pid);
+            match oldest {
+                Some(pid) => {
+                    g.by_pid.remove(&pid);
+                }
+                None => break,
+            }
+        }
+    }
+
     pub fn lookup_for_connect(&self, pid: u32, now_ns: u64) -> Option<String> {
         let mut g = self.inner.lock();
         let q = g.by_pid.get_mut(&pid)?;
@@ -466,6 +511,49 @@ fn try_parse_answers(packet: &[u8]) -> Option<Vec<DnsAnswer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Soak 2026-10-11 regression: one short-lived pid per query must not
+    /// grow the forward map forever. After the TTL every dead pid is
+    /// gone; the live one survives.
+    #[test]
+    fn stale_pids_are_pruned_after_ttl() {
+        let c = DnsCache::new(300, 1024);
+        let sec = 1_000_000_000u64;
+        // 2000 distinct pids, one query each, 1 s apart (~33 min span)
+        for i in 0..2000u64 {
+            c.on_dns_query(10_000 + i as u32, format!("h{i}.example"), 1, i * sec);
+        }
+        // every pid older than 300 s is prunable; the opportunistic prune
+        // runs every PRUNE_EVERY inserts, so the map is bounded by
+        // ~300 live pids + one prune interval
+        assert!(
+            c.tracked_pids() <= 300 + PRUNE_EVERY as usize,
+            "{}",
+            c.tracked_pids()
+        );
+        // a pid whose newest query is within the TTL is still served
+        assert_eq!(
+            c.lookup_for_connect(10_000 + 1999, 1999 * sec + sec),
+            Some("h1999.example".to_string())
+        );
+        // one well inside the TTL window but pruned by age is gone
+        assert_eq!(c.entries_for(10_000), 0);
+    }
+
+    /// Many live pids inside the TTL: the hard cap holds and the newest
+    /// pids are the survivors.
+    #[test]
+    fn distinct_pid_cap_evicts_the_oldest() {
+        let c = DnsCache::new(300, 1024);
+        let ms = 1_000_000u64;
+        for i in 0..(DEFAULT_MAX_PIDS as u64 + 1000) {
+            c.on_dns_query(20_000 + i as u32, "same.example".to_string(), 1, i * ms);
+        }
+        assert!(c.tracked_pids() <= DEFAULT_MAX_PIDS, "{}", c.tracked_pids());
+        let newest = 20_000 + DEFAULT_MAX_PIDS as u32 + 999;
+        assert_eq!(c.entries_for(newest), 1);
+        assert_eq!(c.entries_for(20_000), 0);
+    }
     use std::sync::Arc;
     use std::thread;
 
