@@ -3,8 +3,16 @@
 `cargo-fuzz` (libFuzzer) targets for every parser that consumes bytes an
 attacker can shape: admin socket frames, TLS ClientHello and DNS payloads
 from the kernel ring buffers, the BTF blob, tracefs `format` files, role
-lists from `admin.pub` / the CLI, chain-log lines, the install manifest.
-The property is always the same: **never panic** — reject or report.
+lists from `admin.pub` / the CLI, chain-log lines, the install manifest,
+the COMBAT management carve-out (`combat-allow.cidrs` spliced into
+`combat-rules`) and the operator canary templates. The base property is
+always the same: **never panic** — reject or report. Some targets also
+assert a security property:
+
+| Target | Extra property |
+|---|---|
+| `combat_allow` | every generated `iptables-restore` line is exactly `-A NORTHNARROW_COMBAT -s\|-d <validated address> -j ACCEPT`, so no allow-file content can inject a rule; the splice keeps every line of the operator's base ruleset |
+| `canary_template` | a template that renders never leaves a `{{placeholder}}` in the canary file |
 
 ```sh
 cargo install cargo-fuzz --locked          # once

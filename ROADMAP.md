@@ -579,8 +579,10 @@ Pianificato, in quest'ordine:
   aumento, totale e dettaglio in `nn-admin status`
 - Fuzzing dei parser (fatto l'11 ottobre, lab PR 26): otto target cargo-fuzz
   (frame admin, TLS ClientHello, DNS, BTF, `format` di tracefs, ruoli,
-  righe del chain log, install manifest) con job CI di smoke; restano da
-  coprire regole COMBAT/template canary (parser su file, non su byte)
+  righe del chain log, install manifest) con job CI di smoke; coperti l'11
+  ottobre anche l'innesto delle eccezioni di gestione nelle regole COMBAT e
+  i template canary (lab PR 42), con proprietà di sicurezza oltre al «nessun
+  panico»: nessun contenuto del file delle eccezioni può iniettare una regola
 - Sensore `io_uring` (fatto l'11 ottobre, lab PR 27 — prima parte: osservazione
   e regole Log; le correlazioni con le catene e il carve-out per identità
   restano in 10.9): tracepoint su `io_uring_create` e `io_uring_submit`,
@@ -664,8 +666,7 @@ Pianificato, in quest'ordine:
   un'installazione con `install.sh`, aggiornamento e rimozione solo con la
   finestra trusted-installer, nessun avvio alla prima installazione);
   `nn-lab.sh pkg-check` verifica l'intero ciclo di vita, superato su Ubuntu
-  24.04 e Debian 12. Restano la verifica su Ubuntu 22.04 e quella dell'RPM
-  su AlmaLinux 9
+  24.04, Debian 12 e Ubuntu 22.04. Resta quella dell'RPM su AlmaLinux 9
 - BTF esterna per kernel senza BTF nativa (valutata l'11 ottobre, lab PR
   41, decisione del founder: i programmi LSM, fentry/fexit e `tp_btf` si
   agganciano tramite la BTF interna del kernel, che nessun file esterno

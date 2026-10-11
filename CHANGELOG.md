@@ -87,6 +87,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Fuzz targets `combat_allow` and `canary_template`: the COMBAT management
+  carve-out (allow-file text, generated ACCEPT lines, splice into the
+  operator ruleset) and the operator canary templates. Besides "never
+  panics", `combat_allow` asserts that no allow-file content can inject an
+  `iptables-restore` line other than an ACCEPT for one validated address.
 - Distribution packages: `northnarrow_<ver>-<rel>_amd64.deb` and
   `northnarrow-<ver>-<rel>.x86_64.rpm`, built by
   `deploy/release/mk-packages.sh` with dpkg-deb and rpmbuild only, and
