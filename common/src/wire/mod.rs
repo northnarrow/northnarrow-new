@@ -457,6 +457,16 @@ pub const FS_OP_BPF_MAP: u8 = 7;
 /// link's pin (`target_ino` = 0). Emitted by the `bpf` LSM observer in
 /// enforce mode (Tappa 10.8 BPF self-defence, second half).
 pub const FS_OP_BPF_LINK: u8 = 8;
+/// A signal to a protected pid refused by the `task_kill` LSM hook
+/// (`target_ino` = target tgid, `target_dev` = signal number). Rate-limited
+/// in the kernel (per caller and globally): evidence, not a flood channel.
+pub const FS_OP_SIGNAL: u8 = 9;
+/// A ptrace ATTACH-mode access to a protected pid refused by the
+/// `ptrace_access_check` hook — debugger attach, `/proc/<pid>/mem`,
+/// `process_vm_readv/writev` (`target_ino` = target tgid, `target_dev` = the
+/// ptrace mode bits). READ-mode and NOAUDIT checks (`ps`, `lsof`, journald
+/// reading `/proc/<pid>/exe`) are denied silently, as before.
+pub const FS_OP_PTRACE: u8 = 10;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to

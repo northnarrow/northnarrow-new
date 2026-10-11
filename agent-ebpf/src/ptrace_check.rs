@@ -41,6 +41,7 @@ use aya_ebpf::{
 
 use crate::btf_offsets::TASK_STRUCT_TGID_OFFSET;
 use crate::task_kill::PROTECTED_PIDS;
+use northnarrow_common::wire::FS_OP_PTRACE;
 
 /// BUG-011 (PHASE 15.1): trusted local-observer set. PIDs in this
 /// map are permitted to `ptrace_access_check` PROTECTED_PIDS targets
@@ -168,5 +169,17 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
+    // Evidence for ATTACH-mode accesses only (debugger attach,
+    // /proc/<pid>/mem, process_vm_readv/writev). READ-mode checks are what
+    // `ps`, `lsof` and journald (/proc/<pid>/exe) trigger all day, and
+    // NOAUDIT asks LSMs explicitly not to report: those stay silent denials.
+    let mode: u32 = ctx.arg(1);
+    if mode & PTRACE_MODE_ATTACH != 0 && mode & PTRACE_MODE_NOAUDIT == 0 {
+        crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
+    }
     -EPERM
 }
+
+/// `include/linux/ptrace.h`.
+const PTRACE_MODE_ATTACH: u32 = 0x02;
+const PTRACE_MODE_NOAUDIT: u32 = 0x04;

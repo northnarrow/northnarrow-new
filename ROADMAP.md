@@ -608,12 +608,15 @@ Pianificato, in quest'ordine:
   hook assente = voce `telemetry_gap` nell'audit firmato e ERROR nel
   journal, `telemetry_restored` al ritorno (prova di copertura come
   funzione di prodotto, non solo come test di laboratorio)
-- Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
-  bpffs e secondo mount di bpffs, cgroup freezer, bind mount su
-  `/etc/northnarrow`, kexec, modulo non firmato, livepatch,
-  mascheramento e override delle unit systemd, `bpftool`/`bpftrace` da
-  root, io_uring come canale cieco; ogni caso deve finire in un evento
-  nel chain log, non solo in un rifiuto)
+- Test avversariale strutturato dell'anti-tamper (prima parte fatta l'11
+  ottobre, lab PR 31: `nn-lab.sh tamper-check`, 20 casi con esito atteso ed
+  evidenza nei chain log firmati — segnali, ptrace, file e pin protetti,
+  mappe/link/programmi BPF, drop-in e `set-property`, bpffs e bind mount,
+  cgroup freezer, moduli, `oom_score_adj`, overlay `.local`; trovati e
+  chiusi i rilievi 40–44; restano kexec/livepatch/modulo non firmato con
+  `lockdown` attivo, `cgroup.kill`, saturazione avversa degli eventi e
+  io_uring come canale cieco; ogni caso deve finire in un evento nel chain
+  log, non solo in un rifiuto)
 - Overlay `.local` (allowlist dei comm, path FIM, blocklist) solo via
   `nn-admin` firmato: oggi un file creato da root in `/etc/northnarrow`
   vale dal riavvio successivo senza autenticazione (il controllo di

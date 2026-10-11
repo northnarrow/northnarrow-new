@@ -92,6 +92,14 @@ struct State {
 static TRACKER: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
 static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Round nonce: 40 low bits of the clock and the pid, hex, at most 16
+/// characters. It is the first DNS label of the probed name, and a label of
+/// 20+ alphanumerics is what NN-L-NET-004 calls a base64 payload (the first
+/// lab run tripped it with a 4-digit pid) — the probe must never fire a rule.
+pub fn make_nonce(nanos: u64, pid: u32) -> String {
+    format!("{:x}{:x}", nanos & 0xFF_FFFF_FFFF, pid & 0xFF_FFFF)
+}
+
 /// Probe file of a round.
 pub fn probe_file(nonce: &str) -> PathBuf {
     PathBuf::from(PROBE_DIR).join(nonce)
@@ -188,19 +196,19 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) {
         tokio::time::sleep(Duration::from_secs(FIRST_ROUND_SECS)).await;
         loop {
             run_round(&tracker, audit_log.as_ref()).await;
-            tokio::time::sleep(every).await;
+            // ±20 %: a round cannot be predicted and dodged.
+            tokio::time::sleep(crate::self_integrity::jittered(every)).await;
         }
     });
 }
 
 async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<AuditLog>>>) {
-    let nonce = format!(
-        "{:x}{:x}",
+    let nonce = make_nonce(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0),
-        std::process::id()
+        std::process::id(),
     );
     let file = probe_file(&nonce);
     if let Err(e) = std::fs::write(&file, b"nn-telemetry-probe\n") {
@@ -418,6 +426,19 @@ mod tests {
             timestamp_ns: 0,
         };
         assert_eq!(matches(&dns, n), Some(Sensor::Dns));
+    }
+
+    #[test]
+    fn probe_name_stays_below_the_dns_tunnel_rule() {
+        // worst case: all 40 clock bits and a 24-bit pid set
+        let n = make_nonce(u64::MAX, u32::MAX);
+        assert!(n.len() <= 16, "{n}");
+        let name = dns_name(&n);
+        assert!(
+            name.split('.').next().unwrap().len() < 20,
+            "NN-L-NET-004 base64 shape"
+        );
+        assert!(name.len() <= 60, "NN-L-NET-004 length");
     }
 
     #[test]

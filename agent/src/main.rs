@@ -1506,6 +1506,9 @@ async fn main() -> Result<()> {
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
     northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
+    // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.
+    northnarrow_agent::self_integrity::spawn(audit_log.clone(), cli.watchdog_pidfile.clone());
+    northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.
@@ -2754,7 +2757,30 @@ async fn process_event(
             );
             // Short-circuit: a kernel deny is not something the
             // rule engine or ADE LLM should re-evaluate. The
-            // posture trigger above is the response; we are done.
+            // posture trigger above is the response. The attempt itself
+            // is persisted as a signed detection (NN-L-AT-001, Log only:
+            // the kernel already refused it) — the adversarial check found
+            // refused attempts that left no record in the chain logs.
+            use northnarrow_agent::decision::Rule as _;
+            if let Some(verdict) =
+                northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial
+                    .evaluate(&event)
+            {
+                warn!(
+                    rule = %verdict.rule_id,
+                    severity = ?verdict.severity,
+                    reasoning = %verdict.reasoning,
+                    "VERDICT (rule)"
+                );
+                if let Some(sink) = detection_sink {
+                    sink.record_rule(
+                        &event,
+                        &verdict,
+                        posture.current_kind(),
+                        "denied in kernel (anti-tamper LSM hook)".to_string(),
+                    );
+                }
+            }
             return;
         }
         // Tappa 9 (C4): FIM drift events. The drain loop in

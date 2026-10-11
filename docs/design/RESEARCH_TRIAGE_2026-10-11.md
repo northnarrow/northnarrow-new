@@ -7,8 +7,8 @@ Ogni voce è stata confrontata con il codice di `main` dopo le PR #197 e #198;
 dove la ricerca dice «non verificato» la verifica è stata fatta in lab
 (ubuntu 24.04 / 6.8) e il risultato è riportato.
 
-Legenda: **fatto** = già nel codice; **applicato** = fatto nella PR del test
-avversariale (Tappa 10.8); **roadmap** = aggiunto alla Tappa indicata in
+Legenda: **fatto** = già nel codice; **applicato** = fatto nella PR #200 del
+test avversariale (Tappa 10.8, mergiata); **roadmap** = aggiunto alla Tappa indicata in
 questa PR, senza cambiare l'ordine delle Tappe; **da collocare** = proposta
 per il founder; **no** = non applicare, con il motivo.
 
@@ -26,7 +26,7 @@ per il founder; **no** = non applicare, con il motivo.
 | exec da memfd, PAM, `ld.so.preload` | fatto | R004, FIM-021, FIM-022 |
 | Hash di binari e oggetto eBPF all'avvio, SLSA all'install | fatto | PR #187 |
 
-## 2. Applicato ora (Tappa 10.8, test avversariale dell'anti-tamper)
+## 2. Applicato (PR #200, Tappa 10.8, test avversariale dell'anti-tamper)
 
 Il check `nn-lab.sh tamper-check` (20 casi, esito + evidenza nei chain log
 firmati) ha confermato in lab i punti SQ4 della ricerca e ne ha trovati altri.
@@ -43,6 +43,8 @@ firmati) ha confermato in lab i punti SQ4 della ricerca e ne ha trovati altri.
 | M4.3 Unpredictability (NIST 800-160v2) | jitter ±20 % su sonda di telemetria, self-check dei link e controllo di integrità |
 | (nuovo, dal check) overlay `.local` | un `process-comm-allowlist.local` in `/etc/northnarrow` esenta un comm al riavvio successivo senza autenticazione: ora è riportato con hash; la versione firmata va in roadmap |
 | variabili d'ambiente che indeboliscono | `NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE`, `NN_TELEMETRY_PROBE_SECS=0`, … → `integrity_drift` al boot |
+| (nuovo, dal check) log firmati dirottabili | un bind mount sopra `/etc/northnarrow` faceva scrivere all'agent l'audit nel file dell'attaccante, compresa la voce che denunciava il mount: ogni log ora scrive tramite un fd della directory preso all'apertura (rilievo 44) |
+| (nuovo, dall'audit `ringbuf_drop`) | sul 5.15 un `daemon-reload` fa perdere eventi al ring `file_open` (rilievo 45, aperto): conferma la priorità dello spostamento del sensore su LSM in 10.9 |
 
 ## 3. Aggiunto alla roadmap (questa PR)
 

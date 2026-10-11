@@ -26,6 +26,7 @@
 //! Ed25519 verifier in userland that flips slot 0 to a non-zero
 //! capability token after admin-signed approval.
 
+use northnarrow_common::wire::FS_OP_SIGNAL;
 use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel},
@@ -200,5 +201,7 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         }
     }
 
+    // Evidence: a refused signal is an attempt on the agent (rate-limited).
+    crate::inode_protect::emit_task_denial(FS_OP_SIGNAL, sig as u64, target_tgid);
     -EPERM
 }

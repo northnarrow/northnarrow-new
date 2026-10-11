@@ -34,7 +34,7 @@ use aya_ebpf::{
         bpf_printk, bpf_probe_read_kernel,
     },
     macros::{lsm, map},
-    maps::{Array, HashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
 };
 
@@ -206,6 +206,64 @@ fn override_active() -> bool {
         None => 0,
     };
     ov == session
+}
+
+/// `(caller tgid << 8) | op` → monotonic ns of the last task-denial record
+/// for that caller and operation (1 s dedup: a `while true; kill` loop
+/// from one shell is one record per second).
+#[map]
+static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(1024, 0);
+
+/// Global budget for task-denial records: slot 0 = window start (ns),
+/// slot 1 = records in the window. A loop of fresh `/bin/kill` processes
+/// defeats the per-caller dedup; this caps it at [`TASK_DENIAL_PER_SEC`]
+/// so the denial ring cannot be used to bury other evidence.
+#[map]
+static TASK_DENIAL_RATE: Array<u64> = Array::with_max_entries(2, 0);
+
+const TASK_DENIAL_PER_SEC: u64 = 50;
+const TASK_DENIAL_DEDUP_NS: u64 = 1_000_000_000;
+
+/// Evidence for a refused signal or ptrace attach on a protected pid
+/// (`FS_OP_SIGNAL` / `FS_OP_PTRACE`): same ring and record as the inode
+/// denials, `target_ino` = target tgid, `target_dev` = signal or ptrace
+/// mode. The deny itself never depends on this record.
+#[inline(always)]
+pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u64;
+    let key = (caller << 8) | operation as u64;
+    match TASK_DENIAL_SEEN.get_ptr_mut(&key) {
+        Some(last) => unsafe {
+            if now.wrapping_sub(*last) < TASK_DENIAL_DEDUP_NS {
+                return;
+            }
+            *last = now;
+        },
+        None => {
+            let _ = TASK_DENIAL_SEEN.insert(&key, &now, 0);
+        }
+    }
+    let (Some(start), Some(count)) = (TASK_DENIAL_RATE.get_ptr_mut(0), TASK_DENIAL_RATE.get_ptr_mut(1)) else {
+        return;
+    };
+    unsafe {
+        if now.wrapping_sub(*start) >= TASK_DENIAL_DEDUP_NS {
+            *start = now;
+            *count = 0;
+        }
+        if *count >= TASK_DENIAL_PER_SEC {
+            return;
+        }
+        *count += 1;
+    }
+    emit_denial(
+        operation,
+        InodeKey {
+            dev: detail,
+            ino: target_tgid as u64,
+        },
+    );
 }
 
 /// Best-effort audit record. Silently drops if the ringbuffer is
