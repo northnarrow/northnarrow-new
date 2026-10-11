@@ -564,7 +564,8 @@ Pianificato, in quest'ordine:
   confronta l'hash del proprio binario, del watchdog e dell'oggetto eBPF
   con il manifest firmato dell'installazione (ri-verifica continua, non
   solo al deploy)
-- Controlli di hardening dell'host in `install.sh` e `nn-admin status`:
+- Controlli di hardening dell'host (fatti l'11 ottobre, lab PR 24) in
+  `install.sh`, `nn-admin host-check`/`status` e al boot dell'agent:
   modalità `lockdown` del kernel, `kernel.unprivileged_bpf_disabled`,
   `module.sig_enforce`, Secure Boot (efivars), IMA/EVM attivi, bpffs
   montato una sola volta; ogni assenza è un WARN con la riga di fix,

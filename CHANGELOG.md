@@ -53,6 +53,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Host hardening checks (`nn-admin host-check [--json]`, summary in
+  `nn-admin status`, one WARN per gap at agent boot, table at the end of
+  `install.sh`): BPF LSM, kernel lockdown, unprivileged BPF, module
+  signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
+  the host settings that keep root from rewriting the kernel at runtime,
+  which is the only way around the anti-tamper.
+
 - Ring-buffer drop accounting: every eBPF producer bumps a per-ring
   counter (`RING_DROPS` per-CPU map, 11 rings) when its reservation
   fails; the agent samples it every 10 s, logs each increase at WARN with
