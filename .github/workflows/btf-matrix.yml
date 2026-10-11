@@ -36,6 +36,14 @@ jobs:
     name: btf-matrix (BTFHub)
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      # .cargo/config.toml builds with target-cpu=native (candle kernels on the
+      # deployment host). On a hosted runner that poisons the cached target
+      # dir: a proc-macro dylib (bytemuck_derive) built on a newer CPU is
+      # restored on an older one and rustc dies with SIGILL on every run until
+      # the cache key rotates. RUSTFLAGS overrides the config value; v2 is the
+      # floor of every GitHub runner.
+      RUSTFLAGS: -C target-cpu=x86-64-v2
     steps:
       - uses: actions/checkout@v7
 
@@ -49,9 +57,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-btf-matrix-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-btf-matrix-v2-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-btf-matrix-
+            ${{ runner.os }}-cargo-btf-matrix-v2-
 
       - name: Build the agent (no eBPF object needed for --btf-check)
         run: cargo build --release -p northnarrow-agent

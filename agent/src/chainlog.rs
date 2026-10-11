@@ -965,6 +965,12 @@ fn truncate_file(path: &Path, len: u64) -> Result<()> {
 }
 
 /// If `line` is a terminator, return its `entry_hash`.
+/// Fuzzing entry (see `crate::fuzz_api`).
+#[doc(hidden)]
+pub fn fuzz_terminator_entry_hash(line: &str) -> Option<String> {
+    terminator_entry_hash(line)
+}
+
 fn terminator_entry_hash(line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("rotate").is_some() {

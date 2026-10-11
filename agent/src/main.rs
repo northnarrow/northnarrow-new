@@ -1015,6 +1015,24 @@ async fn main() -> Result<()> {
         Some(_) => debug!("capability preflight: all required caps present"),
         None => warn!("capability preflight: /proc/self/status unreadable; cannot verify caps"),
     }
+
+    // Host hardening (Tappa 10.8): the anti-tamper holds only while root
+    // cannot rewrite the kernel at runtime. One WARN per missing setting,
+    // with the fix; `nn-admin host-check` prints the same table.
+    {
+        let checks = northnarrow_agent::host_hardening::run();
+        let warns = northnarrow_agent::host_hardening::warn_count(&checks);
+        for c in &checks {
+            if c.status == northnarrow_agent::host_hardening::Status::Warn {
+                warn!(check = c.id, value = %c.value, fix = c.fix, "host hardening: {}", c.name);
+            }
+        }
+        info!(
+            checks = checks.len(),
+            warnings = warns,
+            "host hardening checks done (nn-admin host-check for the table)"
+        );
+    }
     info!(
         own_pid = executor.own_pid(),
         protected = executor.protected().len(),

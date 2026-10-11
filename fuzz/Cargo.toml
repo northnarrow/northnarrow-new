@@ -1,0 +1,78 @@
+# cargo-fuzz targets for the agent's parsers (ROADMAP Tappa 10.8).
+# Standalone package (excluded from the root workspace: libFuzzer needs
+# nightly and -Zsanitizer). Run: `cargo +nightly fuzz run <target>` from
+# the repository root; see fuzz/README.md.
+[package]
+name = "northnarrow-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+northnarrow-agent = { path = "../agent" }
+northnarrow-common = { path = "../common" }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "admin_frame"
+path = "fuzz_targets/admin_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_client_hello"
+path = "fuzz_targets/tls_client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_records"
+path = "fuzz_targets/dns_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btf_parse"
+path = "fuzz_targets/btf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracefs_format"
+path = "fuzz_targets/tracefs_format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "role_list"
+path = "fuzz_targets/role_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chainlog_line"
+path = "fuzz_targets/chainlog_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "install_manifest"
+path = "fuzz_targets/install_manifest.rs"
+test = false
+doc = false
+bench = false

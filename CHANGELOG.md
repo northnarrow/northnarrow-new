@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The mass-write posture trigger logged its WARN on every event while a
+  steady writer kept the threshold crossed (one line per second for 24 h
+  on the first soak); the line is now emitted once per pid per window.
+  Detection and posture behaviour are unchanged.
 - Memory leak in the DNS attribution cache: the per-pid map was never
   pruned of dead pids, so every short-lived process that resolved a name
   grew the agent by a few hundred bytes for the life of the process
@@ -49,19 +53,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
-- BPF self-defence, first half: LSM hook `bpf_map` denies any write handle Trade-off: `bpftool map show/dump` take RDWR handles, so in enforce mode they are denied on the agent's maps (use `nn-admin status`).
+- Host hardening checks (`nn-admin host-check [--json]`, summary in
+  `nn-admin status`, one WARN per gap at agent boot, table at the end of
+  `install.sh`): BPF LSM, kernel lockdown, unprivileged BPF, module
+  signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
+  the host settings that keep root from rewriting the kernel at runtime,
+  which is the only way around the anti-tamper.
+- BPF self-defence, first half: LSM hook `bpf_map` denies any write handle
   on the agent's own maps (ids registered after load) to processes that
   are not the agent or the watchdog — `bpftool map update/delete` against
   `PROTECTED_PIDS` now fails with EPERM and lands in the audit chain as an
-  anti-tamper denial (`bpf_map`); read handles stay allowed. LSM hook `bpf`
+  anti-tamper denial (`bpf_map`); read-only handles stay allowed, but
+  `bpftool` always asks for RDWR, so in enforce mode `map show/dump` on the
+  agent's maps fail too (read the state with `nn-admin status`). LSM hook
+  `bpf`
   observes program loads, attaches, link create/update/detach, BTF loads
   and handles-by-id on the agent's maps/links by foreign processes
   (`Event::BpfSyscall`, one record per pid per command per second); rules
   `NN-L-BPF-001_BpfProgramLoaded` (Medium, Log; known tooling exempt) and
   `NN-L-BPF-002_BpfForeignHandleOrDetach` (High, Log). Observe mode (no
   deny) in `debug-trigger` builds and with `NN_BPF_DEFENSE_OBSERVE=1`; the
-  guard counts as a ninth deny hook in the fail-closed LSM health. Six new
-  BTF offset slots (`bpf_map`, `bpf_prog`, `bpf_prog_aux`).
+  guard counts as a ninth deny hook in the fail-closed LSM health. Seven new
+  BTF offset slots (`bpf_map`, `bpf_prog`, `bpf_prog_aux`, `mm_struct.exe_file`
+  for the exe-inode exemption that lets a restarting watchdog register itself).
 - io_uring sensor — the asynchronous I/O channel syscall-centric sensors
   miss: tracepoints `io_uring_create` and `io_uring_submit_{req,sqe}`
   (name resolved per kernel), submissions aggregated per pid in kernel by
@@ -81,6 +95,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the ring's name, and `nn-admin status` shows the total and the per-ring
   breakdown (`ringbuf_drops_total`, `ringbuf_drops` in `--json`). Before,
   only the exec ring counted and nothing read it.
+- Fuzzing (`fuzz/`, cargo-fuzz): eight libFuzzer targets over every
+  parser that consumes attacker-shaped bytes — admin socket frames, TLS
+  ClientHello and DNS payloads from the kernel rings, the BTF blob,
+  tracefs `format` files, role lists, chain-log lines, the install
+  manifest. The `fuzz` CI job builds every target and runs each for a
+  short smoke on every PR; a crash artefact fails the job.
 - Supply chain, install-time and runtime halves: `install.sh` verifies the
   extracted tree (`MANIFEST.sha256`, now shipped in the tarball), the
   tarball against `SHA256SUMS` and the SLSA provenance attestation (gh or
