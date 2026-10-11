@@ -91,6 +91,9 @@ const PROTECTED_MOUNT_PREFIXES: &[&str] = &[
     "/etc/systemd/system/northnarrow-",
     // Review 26: the units of a distro package.
     "/usr/lib/systemd/system/northnarrow-",
+    // Review 53: hiding the kernel BTF keeps every LSM hook from
+    // attaching at the agent's next start.
+    "/sys/kernel/btf",
 ];
 
 /// The canonical bpffs; any other bpf mount is reported.

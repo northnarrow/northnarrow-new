@@ -664,9 +664,16 @@ Pianificato, in quest'ordine:
   un'installazione con `install.sh`, aggiornamento e rimozione solo con la
   finestra trusted-installer, nessun avvio alla prima installazione);
   `nn-lab.sh pkg-check` verifica l'intero ciclo di vita, superato su Ubuntu
-  24.04. Restano la verifica su Ubuntu 22.04 e Debian 12 e quella dell'RPM
+  24.04 e Debian 12. Restano la verifica su Ubuntu 22.04 e quella dell'RPM
   su AlmaLinux 9
-- BTF esterna per kernel senza BTF nativa
+- BTF esterna per kernel senza BTF nativa (valutata l'11 ottobre, lab PR
+  41, decisione del founder: i programmi LSM, fentry/fexit e `tp_btf` si
+  agganciano tramite la BTF interna del kernel, che nessun file esterno
+  può fornire, quindi la BTF esterna servirebbe solo a una modalità di
+  sola telemetria senza anti-tamper, oggi rifiutata dalla politica
+  fail-closed; la valutazione ha trovato e chiuso il rilievo 53: senza
+  BTF l'aggancio anti-tamper degradava con un WARN invece di rifiutare
+  l'avvio. Dettagli in `docs/operator/KERNEL_COMPATIBILITY.md`)
 
 Demo: stesso tarball installato e verificato su quattro distribuzioni,
 nightly verde su tutte, release verificabile con un comando, soak da

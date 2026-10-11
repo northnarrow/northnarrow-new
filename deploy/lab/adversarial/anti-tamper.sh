@@ -128,6 +128,10 @@ umount /mnt/nn-bpf2 2>/dev/null || true
 # mounted, held for one check, unmounted BEFORE the evidence is read: while
 # it is mounted the host's /etc/northnarrow/audit.log is the fake one
 run_case C14 "bind mount over /etc/northnarrow for 40 s" allowed "integrity_drift" 0 -- bash -c "mount --bind /tmp/nn-fake-etc $ETC && sleep 40; umount $ETC"
+# Review 53: hiding the kernel BTF keeps every LSM hook from attaching at
+# the agent's next start (which now refuses to start); the mount itself is
+# reported while the agent runs.
+run_case C26 "tmpfs over /sys/kernel/btf for 40 s" allowed "integrity_drift" 0 -- bash -c "mount -t tmpfs tmpfs /sys/kernel/btf && sleep 40; umount /sys/kernel/btf"
 # ── cgroup freezer ────────────────────────────────────────────────────────
 CG=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.freeze
 if [[ -w "$CG" ]]; then

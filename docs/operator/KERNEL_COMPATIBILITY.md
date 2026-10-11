@@ -96,8 +96,33 @@ system-wide plus removing the drop-in to keep the narrower set).
 Level 2 so far: optional fields (degrade instead of refuse), the
 `--btf-check` verdict, the computed BTFHub matrix in CI with a baseline,
 a third lab guest (Ubuntu 22.04 / 5.15), a fourth (AlmaLinux 9 / 5.14,
-SELinux enforcing) with tracepoint layouts resolved from tracefs. Still
-planned: external BTF for kernels shipped without it.
+SELinux enforcing) with tracepoint layouts resolved from tracefs.
+
+### Kernel BTF is a hard prerequisite
+
+The BPF LSM programs (the anti-tamper deny hooks, the FIM observers), the
+`tcp_close` fexit and every other BTF-typed program attach through the
+**kernel's own** BTF object: the kernel resolves their `attach_btf_id`
+against `btf_vmlinux`, which exists only when the kernel was built with
+`CONFIG_DEBUG_INFO_BTF=y`. Without `/sys/kernel/btf/vmlinux` the agent
+refuses to start (review 53). The anti-tamper attach reports it as a
+deny-hook shortfall, and only `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` starts a
+degraded agent. A mount that hides `/sys/kernel/btf` while the agent runs
+is reported as `integrity_drift` (`tamper-check` C26).
+
+**External BTF (BTFHub) — assessed 2026-10-11, not pursued without a
+decision.** A BTF file from outside the kernel can feed the userland
+offset resolution (`--btf-check` already reads one), but it cannot give
+the kernel a `btf_vmlinux`. On a kernel shipped without BTF, no LSM,
+fentry/fexit or `tp_btf` program can load, whatever file the agent reads.
+External BTF would only serve a **sensor-only** mode: tracepoint and
+kprobe telemetry with userland rules, and no anti-tamper. The fail-closed
+policy refuses that mode today. The kernels it would add are the BTFHub
+entries, kernels shipped without BTF that are mostly older than BPF LSM
+(5.7) anyway; every BPF-LSM kernel in the lab matrix ships BTF. If
+telemetry from such legacy kernels is ever needed, it should be an
+explicit, separately named mode with its own guarantees, not a quiet
+fallback.
 
 ## Tracepoint layouts on vendor kernels (RHEL 9)
 
