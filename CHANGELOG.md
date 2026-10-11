@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Memory leak in the DNS attribution cache: the per-pid map was never
+  pruned of dead pids, so every short-lived process that resolved a name
+  grew the agent by a few hundred bytes for the life of the process
+  (~1 MB/h on the first 24 h soak). Stale pids are pruned by TTL and the
+  map is capped at 4096 distinct pids.
+- Lab soak sampler counts WARN/ERROR lines by text in the `northnarrow`
+  journal namespace (tracing output has journald priority 6, so the
+  priority filter counted nothing); `soak start` passes `SOAK_*_PER_S`
+  rates through to the generator.
 - RHEL 9 family (AlmaLinux 9 / 5.14 el9): the vendor tracepoint header
   shifts `sched_process_exec.filename` by 4 bytes; the exec sensor read an
   empty filename on every exec and R017 killed every shell. Tracepoint

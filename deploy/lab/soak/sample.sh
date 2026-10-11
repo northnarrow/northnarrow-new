@@ -40,9 +40,13 @@ while [ ! -e "$SOAK_DIR/stop" ]; do
     wdrss=0; [ "$wdpid" != 0 ] && wdrss=$(awk '/^VmRSS/{print $2}' "/proc/$wdpid/status" 2>/dev/null || echo 0)
     ar=$(systemctl show -p NRestarts --value northnarrow-agent 2>/dev/null || echo 0)
     wr=$(systemctl show -p NRestarts --value northnarrow-watchdog 2>/dev/null || echo 0)
-    jw=$(journalctl -u northnarrow-agent --since "$START" -p 4 -q --no-pager 2>/dev/null | wc -l)
-    je=$(journalctl -u northnarrow-agent --since "$START" -p 3 -q --no-pager 2>/dev/null | wc -l)
-    cb=$(journalctl -u northnarrow-agent --since "$START" -q --no-pager 2>/dev/null | grep -c "COMBAT" || true)
+    # The agent logs through tracing on stdout in its own journal
+    # namespace, so every line has journald priority 6: count the
+    # tracing levels by text, in the `northnarrow` namespace.
+    jlog=$(journalctl --namespace=northnarrow -u northnarrow-agent --since "$START" -q --no-pager 2>/dev/null)
+    jw=$(printf '%s\n' "$jlog" | grep -c " WARN " || true)
+    je=$(printf '%s\n' "$jlog" | grep -c " ERROR " || true)
+    cb=$(printf '%s\n' "$jlog" | grep -c "COMBAT" || true)
     sz() { stat -c %s "$1" 2>/dev/null || echo 0; }
     det=$(sz /var/lib/northnarrow/detections/detections.jsonl)
     sts=$(sz /var/lib/northnarrow/detections/status_events.jsonl)
