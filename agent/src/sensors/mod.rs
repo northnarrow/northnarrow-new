@@ -12,6 +12,7 @@
 pub mod ebpf_object;
 pub mod exec;
 pub mod multiplexer;
+pub mod ring_drops;
 
 pub use ebpf_object::EBPF_BYTES;
 pub use exec::ExecSensor;

@@ -106,6 +106,9 @@ pub struct StatusOutcome {
     pub posture: common::posture_types::PostureKind,
     pub network_isolation_engaged: bool,
     pub last_admin_action_secs_ago: Option<u64>,
+    /// Ring-buffer drops since boot (`None`: agent predates the field).
+    pub ringbuf_drops_total: Option<u64>,
+    pub ringbuf_drops: Vec<(String, u64)>,
 }
 
 #[derive(Debug)]
@@ -217,6 +220,8 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         posture: resp.posture,
         network_isolation_engaged: resp.network_isolation_engaged,
         last_admin_action_secs_ago: resp.last_admin_action_secs_ago,
+        ringbuf_drops_total: resp.ringbuf_drops_total,
+        ringbuf_drops: resp.ringbuf_drops.unwrap_or_default(),
     })
 }
 
@@ -2695,6 +2700,8 @@ mod tests {
                     posture: PostureKind::Combat,
                     network_isolation_engaged: true,
                     last_admin_action_secs_ago: Some(123),
+                    ringbuf_drops_total: None,
+                    ringbuf_drops: None,
                 }),
             );
         });
