@@ -31,6 +31,7 @@ set -euo pipefail
 
 BIN_DIR=${BIN_DIR:-/usr/local/bin}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
+DROPIN_ROOT=${DROPIN_ROOT:-/etc/systemd/system}
 ETC_DIR=${ETC_DIR:-/etc/northnarrow}
 STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
 RUN_DIR=${RUN_DIR:-/run/northnarrow}
@@ -130,7 +131,7 @@ done
 for u in northnarrow-agent northnarrow-watchdog; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done
-rm -rf "$UNIT_DIR/northnarrow-agent.service.d" "$UNIT_DIR/northnarrow-watchdog.service.d" 2>/dev/null || true
+rm -rf "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watchdog.service.d" 2>/dev/null || true
 if [[ -e "$JOURNALD_NS_CONF" ]]; then
     log "removing $JOURNALD_NS_CONF"
     rm -f "$JOURNALD_NS_CONF"

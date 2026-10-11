@@ -396,11 +396,31 @@ sudo ./deploy/install.sh --upgrade --tarball /path/to/northnarrow-<ver>-x86_64-l
 nn-admin audit verify --from /etc/northnarrow/audit.log --agent-sig-key /etc/northnarrow/agent.sig.key
 ```
 
-Known limits: one architecture (x86_64) and no `.deb`/`.rpm` yet — the
-units and the anti-tamper inode list hard-code `/usr/local/bin`, which a
-distribution package must not use; moving the binaries to `/usr/bin`
-(and teaching the agent its own path) is the prerequisite, tracked in the
-review register. The tarball itself is not byte-reproducible (file mtimes
-are preserved because the staleness guard needs them); the provenance
-attestation is the integrity anchor instead.
+Known limits: one architecture (x86_64) and no `.deb`/`.rpm` yet. The
+tarball itself is not byte-reproducible (file mtimes are preserved because
+the staleness guard needs them); the provenance attestation is the
+integrity anchor instead.
+
+### Install layout
+
+`install.sh` defaults to the local-software layout: binaries in
+`/usr/local/bin`, units in `/etc/systemd/system`. The distribution-package
+layout is the same install with two overrides, and `uninstall.sh` takes
+the same ones:
+
+```sh
+sudo BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system ./deploy/install.sh
+sudo BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system ./deploy/uninstall.sh --grant-key <admin.key>
+```
+
+The units are rewritten for `BIN_DIR` (`ExecStart=`, the watchdog's
+`--agent-bin`). Operator drop-ins, including the Debian
+`perf_event_paranoid` one, always go to `/etc/systemd/system/<unit>.d/`.
+The agent protects both layouts' binaries and units and finds the watchdog
+next to its own executable, so neither layout needs extra flags. A copy of
+a unit anywhere earlier in systemd's load path — `/etc/systemd/system`
+over a package's unit, or the tmpfs `/run/systemd/transient` and
+`system.control` over either — would replace it at the next
+`daemon-reload`; the agent reports it as an `integrity_drift` audit entry
+of kind `unit_shadowed`, `systemctl mask` included.
 

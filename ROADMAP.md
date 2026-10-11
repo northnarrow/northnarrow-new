@@ -647,12 +647,19 @@ Pianificato, in quest'ordine:
   processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Restano i
   numeri ufficiali a tre giri, su host a riposo, per ogni guest. Dato
   grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
-- Pacchetti `.deb`/`.rpm` (prerequisiti: binari fuori da `/usr/local/bin`,
-  rilievo 26; il gestore di pacchetti deve sopravvivere all'agent, fatto
-  l'11 ottobre, lab PR 38: le regole FIM uccidevano `dpkg` su unit, timer,
-  cron, moduli PAM e binari setuid e lasciavano pacchetti a metà, rilievo
-  49; ora le scritture di dpkg/rpm/dnf e dei loro script restano registrate
-  come Low senza kill, e `nn-lab.sh pkgmgr-check` lo verifica)
+- Pacchetti `.deb`/`.rpm`. Prerequisiti fatti l'11 ottobre:
+  - binari fuori da `/usr/local/bin` (lab PR 39, rilievi 26 e 51): l'agent
+    protegge e riconosce sia il layout di `install.sh` sia `/usr/bin` +
+    `/usr/lib/systemd/system`, che `install.sh` accetta con
+    `BIN_DIR`/`UNIT_DIR`; chiusa anche una copia della unit nelle
+    directory runtime di systemd che la sostituiva senza lasciare traccia;
+  - il gestore di pacchetti sopravvive all'agent (lab PR 38, rilievo 49):
+    le regole FIM uccidevano `dpkg` su unit, timer, cron, moduli PAM e
+    binari setuid e lasciavano pacchetti a metà; ora le scritture di
+    dpkg/rpm/dnf e dei loro script restano registrate come Low senza kill,
+    e `nn-lab.sh pkgmgr-check` lo verifica.
+  Restano i pacchetti veri e propri: script del manutentore, namespace
+  journald, file esca, aggiornamento con la finestra trusted-installer
 - BTF esterna per kernel senza BTF nativa
 
 Demo: stesso tarball installato e verificato su quattro distribuzioni,

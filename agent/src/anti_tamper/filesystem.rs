@@ -49,7 +49,7 @@ pub(crate) struct AyaInodeKey(pub(crate) InodeKey);
 // padding gaps, and `AyaInodeKey` is `#[repr(transparent)]` over
 // it. Every bit pattern is a valid `AyaInodeKey`.
 unsafe impl aya::Pod for AyaInodeKey {}
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// State directory that the agent owns. Kept in sync with future
 /// Tappa 8 paths that will live here (signed isolation state, audit
@@ -271,11 +271,17 @@ pub const ETC_PROTECTED_TEMPLATES: &[&str] = &[
 /// reports it "running".
 ///
 /// Unlike the other protected-path consts (bare basenames under one
-/// directory), these are ABSOLUTE paths — the set spans
-/// `/usr/local/bin` and `/etc/systemd/system`, so there is no single
-/// parent dir to join. The two `.service` files are the same units
-/// the in-flight FIM-009 trusted-installer override is built to
-/// govern; the two binaries are the new coverage.
+/// directory), these are ABSOLUTE paths — the set spans the binary and
+/// unit directories, so there is no single parent dir to join. The
+/// `.service` files are the same units the FIM-009 trusted-installer
+/// override governs ([`super::trusted_installer::OWN_SYSTEMD_UNITS`]).
+///
+/// Review 26: both install layouts are listed. `install.sh` puts the
+/// binaries in `/usr/local/bin` and the units in `/etc/systemd/system`;
+/// a distro package puts them in `/usr/bin` and the vendor unit
+/// directory `/usr/lib/systemd/system`. Registration skips the paths
+/// that do not exist, so each host protects the layout it has (both,
+/// during a migration from one to the other).
 ///
 /// eBPF-only, NO `chattr +i`: the `+i` belt-and-suspenders stays the
 /// state dir's. These use the file-LSM mechanism for consistency with
@@ -288,6 +294,10 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     "/usr/local/bin/northnarrow-watchdog",
     "/etc/systemd/system/northnarrow-agent.service",
     "/etc/systemd/system/northnarrow-watchdog.service",
+    "/usr/bin/northnarrow-agent",
+    "/usr/bin/northnarrow-watchdog",
+    "/usr/lib/systemd/system/northnarrow-agent.service",
+    "/usr/lib/systemd/system/northnarrow-watchdog.service",
 ];
 
 /// Permission bits applied at create time and re-asserted on every
@@ -833,10 +843,12 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
+                // Review 26: the list spans both install layouts, so the
+                // other layout's paths are absent by design. A host with
+                // neither copy is reported once by the caller.
+                debug!(
                     path = %path.display(),
-                    "anti-tamper FS: skip register_binary_and_units entry — file missing \
-                     (will be unprotected until next agent restart with the file present)"
+                    "anti-tamper FS: binary/unit path not present (other install layout)"
                 );
                 continue;
             }
@@ -923,7 +935,16 @@ pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<us
 
 pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
     let mut registered = 0usize;
-    for (path, key) in resolve_protected_paths(BINARY_AND_UNIT_PATHS) {
+    let resolved = resolve_protected_paths(BINARY_AND_UNIT_PATHS);
+    let present = |name: &str| resolved.iter().any(|(p, _)| p.ends_with(name));
+    if !present("northnarrow-agent") || !present("northnarrow-agent.service") {
+        warn!(
+            candidates = %BINARY_AND_UNIT_PATHS.join(", "),
+            "anti-tamper FS: the agent binary or unit is in neither install layout — \
+             unprotected until the next agent restart with it present"
+        );
+    }
+    for (path, key) in resolved {
         // at-authz-1: the agent/watchdog images + units are agent-written
         // (signed self-upgrade, exempt via FS_PROTECT_OVERRIDE) — WRITE+MUTATE.
         register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
@@ -2006,14 +2027,16 @@ mod tests {
 
     // ── Anti-tamper binary/unit pin — registration tests ───────────
 
-    /// The binary/unit pin set is exactly the four absolute paths: the
-    /// agent + watchdog executables under `/usr/local/bin` and their
-    /// two systemd units under `/etc/systemd/system`. Anchored
-    /// explicitly so a refactor that drops or moves one fails fast —
-    /// this is the authoritative "these four are in PROTECTED_INODES"
-    /// assertion for the binaries + units.
+    /// The binary/unit pin set is exactly these absolute paths: the
+    /// agent + watchdog executables and their two systemd units in both
+    /// install layouts (`install.sh`: `/usr/local/bin` +
+    /// `/etc/systemd/system`; a package: `/usr/bin` +
+    /// `/usr/lib/systemd/system`, review 26). Anchored explicitly so a
+    /// refactor that drops or moves one fails fast — this is the
+    /// authoritative "these are in PROTECTED_INODES" assertion for the
+    /// binaries + units.
     #[test]
-    fn binary_and_unit_paths_lists_the_four_targets() {
+    fn binary_and_unit_paths_lists_both_layouts() {
         assert_eq!(
             BINARY_AND_UNIT_PATHS,
             &[
@@ -2021,6 +2044,10 @@ mod tests {
                 "/usr/local/bin/northnarrow-watchdog",
                 "/etc/systemd/system/northnarrow-agent.service",
                 "/etc/systemd/system/northnarrow-watchdog.service",
+                "/usr/bin/northnarrow-agent",
+                "/usr/bin/northnarrow-watchdog",
+                "/usr/lib/systemd/system/northnarrow-agent.service",
+                "/usr/lib/systemd/system/northnarrow-watchdog.service",
             ],
             "the agent + watchdog binaries and their two systemd units \
              are the anti-tamper binary/unit pin set"

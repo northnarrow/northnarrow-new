@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A copy of the agent's unit in an earlier directory of systemd's load
+  path replaced the installed unit at the next `daemon-reload` without any
+  evidence. The tmpfs `/run/systemd/transient` and `system.control`
+  outrank even `/etc/systemd/system`, and both are outside the FIM watch.
+  The integrity check now reports every second copy of the units as an
+  `integrity_drift` entry of kind `unit_shadowed`, `systemctl mask`
+  included.
 - The FIM rules killed the package manager. dpkg was killed while it
   installed or removed any package that ships a systemd unit or timer, a
   cron drop-in, a PAM module or a setuid binary, which left packages
@@ -72,6 +79,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Package install layout: `install.sh` and `uninstall.sh` accept
+  `BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system` and rewrite the units
+  for `BIN_DIR`. The agent protects the binaries and units of both layouts
+  and finds the watchdog next to its own executable, so `--watchdog-exe`
+  is now optional. Prerequisite for `.deb`/`.rpm` packages (review 26).
 - Overhead benchmark (`nn-lab.sh overhead [ROUNDS]`): the agent off and on,
   alternated, over four worst-case micro-workloads (open, open + write,
   exec, loopback connect); the report gives the median throughput lost and

@@ -23,6 +23,14 @@ fail=0
 rows=()
 
 agent_pid() { cat /run/northnarrow/agent.pid 2>/dev/null; }
+# Review 26: the layout the agent was installed with (install.sh puts the
+# binaries in /usr/local/bin and the units in /etc/systemd/system; a
+# package uses /usr/bin and /usr/lib/systemd/system).
+# (from the unit's ExecStart: /proc/<agent>/exe is ptrace-protected, C04b)
+AGENT_EXE=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
+NNADMIN=$(dirname "${AGENT_EXE:-/usr/local/bin/northnarrow-agent}")/nn-admin
+UNIT=$(systemctl show -p FragmentPath --value northnarrow-agent 2>/dev/null)
+UNIT=${UNIT:-/etc/systemd/system/northnarrow-agent.service}
 jlines() { journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$1" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -v "process spawn detected"; }
 audit_count() { wc -l < "$AUDIT" 2>/dev/null || echo 0; }
 dets_count() { wc -l < "$DETS" 2>/dev/null || echo 0; }
@@ -44,6 +52,9 @@ evidence() {
     # Tappa 10.8: an overlay refused at boot / a signed one accepted
     if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"kind":"unauthorized_overlay"'; then
         audit="${audit}unauthorized_overlay "
+    fi
+    if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"kind":"unit_shadowed"'; then
+        audit="${audit}unit_shadowed "
     fi
     if echo "$j" | grep -q "signed overlay accepted"; then
         denials="${denials}overlay_accepted "
@@ -91,7 +102,7 @@ run_case C04b "ptrace read-mode: /proc/<agent>/environ (silent by design)" denie
 # ── protected files and pins ──────────────────────────────────────────────
 run_case C04 "append to /etc/northnarrow/admin.pub" denied "op=write" 0 -- bash -c "echo x >> $ETC/admin.pub"
 run_case C05 "chattr -i on the state dir" denied "op=ioctl" 0 -- chattr -i "$STATE"
-run_case C06 "unlink the agent unit (systemctl mask)" denied "op=unlink" 0 -- bash -c "rm -f /etc/systemd/system/northnarrow-agent.service"
+run_case C06 "unlink the agent unit (systemctl mask)" denied "op=unlink" 0 -- bash -c "rm -f $UNIT"
 run_case C07 "rm -rf the bpffs pin root" denied "op=unlink" 0 -- bash -c "rm -rf $PINS"
 run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
 run_case C09 "bpftool link show pinned (link handle)" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- bpftool link show pinned "$PINS/link_task_kill"
@@ -103,6 +114,12 @@ rm -rf /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf; systemctl
 WAIT=40 run_case C12 "systemctl set-property --runtime MemoryMax (OOM path)" allowed "integrity_drift" 0 -- systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G
 # resetting the property still leaves an (empty) runtime drop-in behind
 rm -f /run/systemd/system.control/northnarrow-agent.service.d/50-MemoryMax.conf
+# Review 26: a copy of the unit in a higher-precedence directory of the
+# systemd load path (tmpfs, outside the FIM watch) replaces the installed
+# unit at the next daemon-reload, for either install layout.
+SHADOW=/run/systemd/transient/northnarrow-agent.service
+WAIT=40 run_case C25 "shadow the agent unit from /run/systemd/transient" allowed "unit_shadowed" 0 -- bash -c "mkdir -p /run/systemd/transient && cp $UNIT $SHADOW && systemctl daemon-reload && systemctl show -p FragmentPath --value northnarrow-agent"
+rm -f "$SHADOW"; systemctl daemon-reload
 systemctl daemon-reload
 # ── mounts ────────────────────────────────────────────────────────────────
 mkdir -p /mnt/nn-bpf2 /tmp/nn-fake-etc
@@ -159,7 +176,7 @@ PID=$(agent_pid)
 # The same overlay stored the authorised way (lab key, config-manage),
 # then a restart: stored with its signature, accepted at boot.
 printf '+backupd\n' > /tmp/nn-ovl-allow
-WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "/usr/local/bin/nn-admin config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && systemctl restart northnarrow-agent"
+WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && systemctl restart northnarrow-agent"
 PID=$(agent_pid)
 if command -v kexec >/dev/null 2>&1; then
     run_case C17 "kexec -l of the running kernel" denied "" 1 -- kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) --reuse-cmdline
