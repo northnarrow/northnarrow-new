@@ -760,15 +760,28 @@ async fn main() -> Result<()> {
     // present in PROTECTED_INODES from boot. The post-attach
     // re-read at line ~360 stays for the SignedPayload wiring path
     // (it just sees the same value we minted here).
-    let _ = agent_id::load_or_bootstrap(&cli.agent_id_file).map_err(|e| {
-        warn!(
-            error = %e,
-            path = %cli.agent_id_file.display(),
-            "pre-attach agent_id bootstrap failed — post-attach re-read will \
-             surface the same error and fall back to zero UUID"
-        );
-        e
-    });
+    let boot_agent_id = agent_id::load_or_bootstrap(&cli.agent_id_file)
+        .map_err(|e| {
+            warn!(
+                error = %e,
+                path = %cli.agent_id_file.display(),
+                "pre-attach agent_id bootstrap failed — post-attach re-read will \
+                 surface the same error and fall back to zero UUID"
+            );
+            e
+        })
+        .unwrap_or([0u8; 16]);
+
+    // Tappa 10.8 — signed operator overlays: every `*.local` below is read
+    // only if an admin key with `config-manage` signed its exact content
+    // (`<overlay>.sig`); otherwise the shipped defaults are used for that
+    // list and the refusal is recorded once the audit log is open.
+    let overlay_gate = Arc::new(northnarrow_agent::config::overlay_auth::OverlayGate::new(
+        &cli.admin_pub,
+        boot_agent_id,
+        &cli.audit_log_file,
+    ));
+    use common::wire::admin_signed_payload::OverlayKind;
 
     // Tappa 10 N9 — build the shared net state BEFORE starting the
     // sensor multiplexer so the TcpConnect + DnsQuery pumps can
@@ -841,22 +854,27 @@ async fn main() -> Result<()> {
     // defaults; missing .local overlay is the normal case for a
     // host without operator-specific block additions.
     let netflow_blocklist = Arc::new(
-        NetBlocklist::load(&cli.netflow_blocklist_v1, &cli.netflow_blocklist_local).unwrap_or_else(
-            |e| {
-                warn!(
-                    error = %e,
-                    v1 = %cli.netflow_blocklist_v1.display(),
-                    local = %cli.netflow_blocklist_local.display(),
-                    "netflow blocklist load failed — booting with empty blocklist"
-                );
-                NetBlocklist::empty()
-            },
-        ),
+        NetBlocklist::load(
+            &cli.netflow_blocklist_v1,
+            &overlay_gate.effective(OverlayKind::NetflowBlocklist, &cli.netflow_blocklist_local),
+        )
+        .unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                v1 = %cli.netflow_blocklist_v1.display(),
+                local = %cli.netflow_blocklist_local.display(),
+                "netflow blocklist load failed — booting with empty blocklist"
+            );
+            NetBlocklist::empty()
+        }),
     );
     let ja3_blocklist = Arc::new(
         Ja3Blocklist::load(
             &cli.netflow_ja3_blocklist_v1,
-            &cli.netflow_ja3_blocklist_local,
+            &overlay_gate.effective(
+                OverlayKind::NetflowJa3Blocklist,
+                &cli.netflow_ja3_blocklist_local,
+            ),
         )
         .unwrap_or_else(|e| {
             warn!(
@@ -881,7 +899,10 @@ async fn main() -> Result<()> {
         northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
             "netflow-comm-allowlist",
             &cli.netflow_comm_allowlist_v1,
-            &cli.netflow_comm_allowlist_local,
+            &overlay_gate.effective(
+                OverlayKind::NetflowCommAllowlist,
+                &cli.netflow_comm_allowlist_local,
+            ),
         )
         .unwrap_or_else(|e| {
             warn!(
@@ -905,7 +926,10 @@ async fn main() -> Result<()> {
         northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
             "process-comm-allowlist",
             &cli.process_comm_allowlist_v1,
-            &cli.process_comm_allowlist_local,
+            &overlay_gate.effective(
+                OverlayKind::ProcessCommAllowlist,
+                &cli.process_comm_allowlist_local,
+            ),
         )
         .unwrap_or_else(|e| {
             warn!(
@@ -1205,8 +1229,11 @@ async fn main() -> Result<()> {
         // wholesale.
         let mass_write_extras =
             northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
-                std::path::Path::new(
-                    northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+                &overlay_gate.effective(
+                    OverlayKind::MassWriteCarveout,
+                    std::path::Path::new(
+                        northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+                    ),
                 ),
             );
         // BUG-032 — escalation allowlist (count-filter for exfil/lateral).
@@ -1214,8 +1241,11 @@ async fn main() -> Result<()> {
         // reload-on-restart for beta.
         let escalation_allow =
             northnarrow_agent::posture::escalation_allow::EscalationAllowList::load(
-                std::path::Path::new(
-                    northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
+                &overlay_gate.effective(
+                    OverlayKind::EscalationAllow,
+                    std::path::Path::new(
+                        northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
+                    ),
                 ),
             );
         if !escalation_allow.is_empty() {
@@ -1517,10 +1547,16 @@ async fn main() -> Result<()> {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
+    // Tappa 10.8 — overlay decisions taken before the audit log existed.
+    overlay_gate.attach_audit_log(audit_log.clone());
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
     northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
     // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.
-    northnarrow_agent::self_integrity::spawn(audit_log.clone(), cli.watchdog_pidfile.clone());
+    northnarrow_agent::self_integrity::spawn(
+        audit_log.clone(),
+        cli.watchdog_pidfile.clone(),
+        Some(Arc::clone(&overlay_gate)),
+    );
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
@@ -1623,7 +1659,7 @@ async fn main() -> Result<()> {
     //     in-process snapshot.
     let watched_paths_load = match northnarrow_agent::fim::paths_config::load_watched_paths(
         &cli.fim_paths_v1,
-        &cli.fim_paths_local,
+        &overlay_gate.effective(OverlayKind::FimPaths, &cli.fim_paths_local),
     ) {
         Ok(load) => load,
         Err(e) => {
@@ -1955,6 +1991,7 @@ async fn main() -> Result<()> {
                     .expect("freshly-constructed channel has a receiver");
                 let v1_for_snapshot = cli.fim_paths_v1.clone();
                 let local_for_snapshot = cli.fim_paths_local.clone();
+                let gate_for_snapshot = Arc::clone(&overlay_gate);
                 tokio::spawn(run_recompute_task(
                     receiver,
                     Arc::clone(&baseline_db),
@@ -1963,7 +2000,10 @@ async fn main() -> Result<()> {
                     move || {
                         northnarrow_agent::fim::paths_config::load_watched_paths(
                             &v1_for_snapshot,
-                            &local_for_snapshot,
+                            // a signed `fim baseline` re-reads the overlay:
+                            // same signature check as at boot
+                            &gate_for_snapshot
+                                .effective(OverlayKind::FimPaths, &local_for_snapshot),
                         )
                         .map(|l| l.effective)
                         .unwrap_or_default()

@@ -58,6 +58,7 @@ pub const WEAKENING_ENV: &[(&str, Option<&str>)] = &[
     ("NN_TELEMETRY_PROBE_SECS", Some("0")),
     ("NN_DETECT_ONLY", Some("1")),
     ("NORTHNARROW_DRY_RUN", Some("1")),
+    ("NN_OVERLAY_ALLOW_UNSIGNED", Some("1")),
 ];
 
 /// Host paths a mount must not cover (prefix match on the mount point).
@@ -276,6 +277,8 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
 
 struct Checker {
     seen: HashSet<Finding>,
+    /// Signed overlays are configuration, not drift (Tappa 10.8).
+    overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
     baseline: Vec<(String, String)>,
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
@@ -313,12 +316,35 @@ impl Checker {
         }
     }
 
+    /// A `config_overlay` finding for a known overlay whose content carries
+    /// a valid signature (a `nn-admin config overlay set`) is not drift.
+    fn overlay_is_signed(&self, f: &Finding) -> bool {
+        let Some(gate) = &self.overlay_gate else {
+            return false;
+        };
+        let Some(path) = f.detail.split(" (").next() else {
+            return false;
+        };
+        let path = Path::new(path);
+        let Some(kind) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(common::wire::admin_signed_payload::OverlayKind::from_keyword)
+        else {
+            return false;
+        };
+        gate.is_signed(kind, path)
+    }
+
     fn round(&mut self, at_boot: bool) {
         let roots: Vec<&Path> = DROPIN_ROOTS.iter().map(Path::new).collect();
         for f in unit_dropins(&roots) {
             self.report(f, at_boot);
         }
         for f in config_overlays(Path::new(CONFIG_DIR)) {
+            if self.overlay_is_signed(&f) {
+                continue;
+            }
             self.report(f, at_boot);
         }
         if let Ok(mi) = std::fs::read_to_string("/proc/1/mountinfo") {
@@ -351,7 +377,11 @@ impl Checker {
 }
 
 /// Start the check (from `main`, once the audit log exists).
-pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>, watchdog_pidfile: PathBuf) {
+pub fn spawn(
+    audit_log: Option<Arc<Mutex<AuditLog>>>,
+    watchdog_pidfile: PathBuf,
+    overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
+) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let mut own_files = Vec::new();
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
@@ -363,6 +393,7 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>, watchdog_pidfile: PathBuf)
     }
     let mut checker = Checker {
         seen: HashSet::new(),
+        overlay_gate,
         baseline: Vec::new(),
         watchdog_pidfile,
         own_files,

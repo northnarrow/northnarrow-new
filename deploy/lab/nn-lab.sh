@@ -262,6 +262,11 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
     if systemctl is-active --quiet northnarrow-agent && sudo test -r /etc/northnarrow/admin.key; then
         if ! sudo nn-admin trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
             echo "grant refused: $(tail -1 /tmp/nn-grant.log)"
+        elif ! sudo grep -q "config-manage" /etc/northnarrow/admin.pub; then
+            # Tappa 10.8: the lab key signs overlays too; the window lets
+            # the protected admin.pub be edited (picked up at agent start)
+            sudo sed -i -E 's/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,config-manage/' /etc/northnarrow/admin.pub \
+                && echo "admin.pub: config-manage added for the lab key"
         fi
     fi
     sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null
@@ -270,6 +275,9 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
     # tamper-check leftovers (protected while an agent ran; the window is open now)
     sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
+    sudo rm -rf /run/systemd/system.control/northnarrow-agent.service.d 2>/dev/null
+    sudo grep -q "evil-implant" /etc/northnarrow/process-comm-allowlist.local 2>/dev/null \
+        && sudo rm -f /etc/northnarrow/process-comm-allowlist.local /etc/northnarrow/process-comm-allowlist.local.sig
 fi
 for i in $(seq 1 20); do
     n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
@@ -289,6 +297,7 @@ REMOTE
 sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
 if sudo test -f /etc/northnarrow/admin.pub && ! sudo grep -q "trusted-installer" /etc/northnarrow/admin.pub; then
     sudo sed -i -E '/trusted-installer/! { s/^([0-9a-fA-F]{64})[[:space:]]*$/\1 unlock,audit-read,trusted-installer/; t; s/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,trusted-installer/ }' /etc/northnarrow/admin.pub
+    sudo sed -i -E '/config-manage/! s/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,config-manage/' /etc/northnarrow/admin.pub
     echo "admin.pub roles now: $(sudo sed -E 's/^[0-9a-fA-F]{64}//' /etc/northnarrow/admin.pub | tr -d '\n')"
 fi
 sudo systemctl enable northnarrow-agent northnarrow-watchdog 2>/dev/null; true

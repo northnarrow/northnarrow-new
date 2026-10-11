@@ -718,6 +718,83 @@ impl AdminAuth {
         Ok(mint_unlock_token())
     }
 
+    /// Verify a payload that was signed earlier and STORED (Tappa 10.8:
+    /// the `.sig` next to an operator overlay), at agent boot.
+    ///
+    /// Same signature, quorum, role, op and `agent_id` checks as
+    /// [`Self::verify_signed_payload_quorum`], without the parts that only
+    /// make sense for a live request: no challenge nonce is consumed, no
+    /// timestamp skew window applies (the caller orders stored signatures
+    /// by `ts` to refuse a rollback), and no rate-limit / failure counter
+    /// is touched (a bad file at boot is not a brute-force attempt).
+    /// Returns the fingerprints of the matched keys.
+    pub fn verify_stored_payload(
+        &self,
+        payload: &SignedPayload,
+        signatures: &[[u8; 64]],
+        min_distinct: u8,
+        role_requirements: &[Role],
+        expected_op: admin_signed_payload::OperationCode,
+    ) -> std::result::Result<Vec<String>, AdminAuthError> {
+        if min_distinct == 0 {
+            return Err(AdminAuthError::QuorumNotMet {
+                required: 0,
+                provided: 0,
+            });
+        }
+        if payload.op != expected_op || payload.extra.op_code() != expected_op {
+            return Err(AdminAuthError::UnknownOperation {
+                expected: expected_op,
+                got: payload.op,
+            });
+        }
+        if payload.agent_id != self.agent_id {
+            return Err(AdminAuthError::AgentIdMismatch);
+        }
+        let digest = admin_signed_payload::signing_digest(payload)?;
+        let pub_keys = self.pub_keys.read();
+        let mut matched: Vec<usize> = Vec::new();
+        for sig_bytes in signatures {
+            let sig = Signature::from_bytes(sig_bytes);
+            let mut this_match: Option<usize> = None;
+            for (idx, entry) in pub_keys.iter().enumerate() {
+                if entry.key.verify_strict(&digest, &sig).is_ok() {
+                    this_match = Some(idx);
+                }
+            }
+            if let Some(idx) = this_match {
+                if !matched.contains(&idx) {
+                    matched.push(idx);
+                }
+            }
+        }
+        if matched.is_empty() {
+            return Err(AdminAuthError::InvalidSignature);
+        }
+        let distinct: u8 = matched.len().min(u8::MAX as usize) as u8;
+        if distinct < min_distinct {
+            return Err(AdminAuthError::QuorumNotMet {
+                required: min_distinct,
+                provided: distinct,
+            });
+        }
+        for &required in role_requirements {
+            if !matched
+                .iter()
+                .any(|&idx| pub_keys[idx].authorizes(required))
+            {
+                return Err(AdminAuthError::RoleDenied {
+                    key_fingerprint: fingerprint(&pub_keys[matched[0]].key),
+                    required_role: required,
+                });
+            }
+        }
+        Ok(matched
+            .iter()
+            .map(|&idx| fingerprint(&pub_keys[idx].key))
+            .collect())
+    }
+
     /// Tappa 8 A7 — full signed-payload quorum verify, integrating
     /// every prior A-sprint commit:
     /// - A2: signatures are over `signing_digest(payload)` (not
@@ -1102,13 +1179,15 @@ pub fn parse_role_keyword(s: &str) -> Result<Role> {
         "telemetry-read" => Ok(Role::TelemetryRead),
         // Tappa 9.0.c — triage role (subsumes telemetry-read).
         "triage" => Ok(Role::Triage),
+        // Tappa 10.8 — signed operator overlays.
+        "config-manage" => Ok(Role::ConfigManage),
         "all" => Ok(Role::All),
         other => Err(anyhow!(
             "unknown role `{other}` — expected one of: \
              unlock, shutdown, force-posture, rotate-keys, audit-read, \
              fim-manage, fim-read, canary-read, canary-manage, \
              net-read, net-manage, trusted-installer, telemetry-read, \
-             triage, all"
+             triage, config-manage, all"
         )),
     }
 }
@@ -1286,6 +1365,8 @@ pub fn role_keyword(r: Role) -> &'static str {
         Role::TelemetryRead => "telemetry-read",
         // Tappa 9.0.c — triage role (subsumes telemetry-read).
         Role::Triage => "triage",
+        // Tappa 10.8 — signed operator overlays.
+        Role::ConfigManage => "config-manage",
         Role::All => "all",
     }
 }
@@ -1934,6 +2015,7 @@ mod tests {
             ("telemetry-read", Role::TelemetryRead),
             // Tappa 9.0.c — triage role (subsumes telemetry-read).
             ("triage", Role::Triage),
+            ("config-manage", Role::ConfigManage),
             ("all", Role::All),
         ];
         for (keyword, expected) in cases {

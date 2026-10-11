@@ -129,6 +129,19 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "netflow-comm-allowlist.local",
     // lab PR 21: written by install.sh, re-verified by the agent at boot
     "install-manifest.json",
+    // Tappa 10.8: the posture overlays (were unprotected) and every
+    // overlay's signature file. Overlays stay MUTATE-only on purpose: an
+    // in-place edit cannot take effect without a new signature, and the
+    // integrity check reports it.
+    "mass-write-carveout.local",
+    "escalation-allow.local",
+    "fim-paths.local.sig",
+    "netflow-blocklist.local.sig",
+    "netflow-ja3-blocklist.local.sig",
+    "process-comm-allowlist.local.sig",
+    "netflow-comm-allowlist.local.sig",
+    "mass-write-carveout.local.sig",
+    "escalation-allow.local.sig",
 ];
 
 /// at-authz-1: the subset of [`ETC_PROTECTED_FILES`] that is also
@@ -1612,6 +1625,16 @@ mod tests {
                 "netflow-comm-allowlist.v1",
                 "netflow-comm-allowlist.local",
                 "install-manifest.json",
+                // Tappa 10.8 — APPENDED: posture overlays + signature files.
+                "mass-write-carveout.local",
+                "escalation-allow.local",
+                "fim-paths.local.sig",
+                "netflow-blocklist.local.sig",
+                "netflow-ja3-blocklist.local.sig",
+                "process-comm-allowlist.local.sig",
+                "netflow-comm-allowlist.local.sig",
+                "mass-write-carveout.local.sig",
+                "escalation-allow.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

@@ -2344,6 +2344,140 @@ pub fn run_trusted_installer_grant(
     Ok(map_admin_result_to_trusted_installer(result))
 }
 
+// ── Tappa 10.8 — signed operator overlays ──────────────────────────────
+
+/// Outcome of `nn-admin config overlay set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOverlaySetOutcome {
+    pub result: AdminResult,
+    pub stored: bool,
+    pub message: String,
+}
+
+/// Read and check an overlay before signing it: size, the loader's own
+/// parse rules, SHA-256 and length of the exact bytes.
+fn read_overlay_for_signing(
+    kind: common::wire::admin_signed_payload::OverlayKind,
+    file: &Path,
+) -> Result<(String, [u8; 32], u32)> {
+    let content = std::fs::read_to_string(file)
+        .with_context(|| format!("reading overlay {}", file.display()))?;
+    if content.len() > common::wire::admin_protocol::MAX_OVERLAY_BYTES {
+        bail!(
+            "{} is {} bytes; overlays are limited to {} bytes",
+            file.display(),
+            content.len(),
+            common::wire::admin_protocol::MAX_OVERLAY_BYTES
+        );
+    }
+    crate::config::overlay_auth::validate_content(kind, &content).with_context(|| {
+        format!(
+            "{} does not parse as a {} overlay",
+            file.display(),
+            kind.keyword()
+        )
+    })?;
+    let sha = crate::config::overlay_auth::content_sha256(content.as_bytes());
+    let len = content.len() as u32;
+    Ok((content, sha, len))
+}
+
+fn sign_all(payload: &SignedPayload, key: &Path, cosign: Option<&Path>) -> Result<Vec<[u8; 64]>> {
+    let mut out =
+        vec![sign(payload, &read_priv_key(key)?)
+            .map_err(|e| anyhow!("signing overlay payload: {e}"))?];
+    if let Some(c) = cosign {
+        out.push(
+            sign(payload, &read_priv_key(c)?)
+                .map_err(|e| anyhow!("co-signing overlay payload: {e}"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// `nn-admin config overlay set`: sign the overlay over the agent's
+/// challenge and hand it to the running agent, which writes it (and its
+/// `.sig`) where it reads overlays at boot.
+pub fn run_config_overlay_set(
+    socket: &Path,
+    key_path: &Path,
+    cosign_path: Option<&Path>,
+    agent_id_path: &Path,
+    kind: common::wire::admin_signed_payload::OverlayKind,
+    file: &Path,
+) -> Result<ConfigOverlaySetOutcome> {
+    use common::wire::admin_protocol::ConfigOverlaySetRequest;
+    let (content, sha, len) = read_overlay_for_signing(kind, file)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_config_overlay_set(nonce, now, agent_id_arr, kind, sha, len);
+    let sigs = sign_all(&payload, key_path, cosign_path)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ConfigOverlaySetRequest(ConfigOverlaySetRequest {
+            payload,
+            signatures: sigs
+                .into_iter()
+                .map(|signature| KeyedSignature { signature })
+                .collect(),
+            content,
+        }),
+    )?;
+    match read_frame(&mut stream)? {
+        AdminMessage::ConfigOverlaySetResponse(r) => Ok(ConfigOverlaySetOutcome {
+            result: r.result,
+            stored: r.stored,
+            message: r.message,
+        }),
+        other => bail!("unexpected reply to ConfigOverlaySetRequest: {other:?}"),
+    }
+}
+
+/// `nn-admin config overlay sign`: sign an overlay offline (no agent
+/// needed) and write `<file>.sig` or `out`. The nonce is random: a stored
+/// signature is ordered by its timestamp, not by a server challenge.
+pub fn run_config_overlay_sign(
+    key_path: &Path,
+    cosign_path: Option<&Path>,
+    agent_id_path: &Path,
+    kind: common::wire::admin_signed_payload::OverlayKind,
+    file: &Path,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    use rand::RngCore;
+    let (_content, sha, len) = read_overlay_for_signing(kind, file)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = SignedPayload::new_config_overlay_set(nonce, now, agent_id_arr, kind, sha, len);
+    let sigs = sign_all(&payload, key_path, cosign_path)?;
+    let sig = crate::config::overlay_auth::OverlaySignature::new(payload, &sigs)?;
+    let target = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::config::overlay_auth::sig_path(file));
+    std::fs::write(&target, sig.to_json()?)
+        .with_context(|| format!("writing {}", target.display()))?;
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -61,7 +61,12 @@ TOFU + this disclosure is the deliberate tradeoff.
 ## Operator overlay (§13 Q7)
 
 `/etc/northnarrow/fim-paths.local` is the **optional** operator
-overlay. Format:
+overlay. Since Tappa 10.8 the agent reads it (at boot and on every signed
+`fim baseline`) only when `fim-paths.local.sig` proves that a key with the
+`config-manage` role signed this exact content: store it with
+`nn-admin config overlay set fim-paths --file <file> --key <key>`; an
+unsigned or edited file is ignored (shipped watch set) and recorded as an
+`unauthorized_overlay` integrity finding. Format:
 
 ```text
 # Comments and blanks are ignored. Lines are absolute paths
@@ -131,8 +136,8 @@ path — the disable directive is for *defaults only*.
 - The `fim-paths.v1` + `fim-paths.local` files are likewise in
   `PROTECTED_INODES` (`ETC_PROTECTED_FILES`) so an attacker can't
   silently widen or narrow the watch set between agent restarts.
-  Operator edits go through `sudo $EDITOR` with the agent
-  temporarily stopped — same workflow as `admin.pub`.
+  Operator changes go through `nn-admin config overlay set fim-paths`
+  (signed, stored by the running agent, applied at its next start).
 
 ## See also
 

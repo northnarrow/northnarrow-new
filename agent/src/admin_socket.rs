@@ -31,12 +31,13 @@ use tracing::{info, warn};
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
-    DetectionSetStatusRequest, DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse,
-    FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse,
-    ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
-    NetFlowsResponse, NetListenersRequest, NetListenersResponse, NetResolveRequest,
-    NetResolveResponse, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
-    StatusResponse, TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
+    ConfigOverlaySetRequest, ConfigOverlaySetResponse, DetectionSetStatusRequest,
+    DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse, FimBaselineRequest,
+    FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
+    NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
+    NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
+    RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest, StatusResponse,
+    TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
@@ -855,6 +856,42 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // Tappa 10.8 — signed overlay store. `result` is `success` only when
+        // the overlay and its signature were written: the boot check reads
+        // these rows as the newest accepted signature per kind (rollback
+        // guard), so a verified-but-refused request must not count.
+        (AdminMessage::ConfigOverlaySetRequest(req), AdminMessage::ConfigOverlaySetResponse(r)) => {
+            let (kind, sha, len) = match &req.payload.extra {
+                OperationExtra::ConfigOverlaySet(e) => (
+                    e.kind.keyword(),
+                    e.sha256
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    e.len,
+                ),
+                _ => ("unknown", String::new(), 0),
+            };
+            let result = if r.stored {
+                "success".to_string()
+            } else if r.result == AdminResult::Success {
+                format!("failure: rejected ({})", r.message)
+            } else {
+                audit_result_str(r.result)
+            };
+            (
+                crate::config::overlay_auth::AUDIT_OP_SET,
+                serde_json::json!({
+                    "kind": kind,
+                    "sha256": sha,
+                    "signed_ts": req.payload.ts,
+                    "bytes": len,
+                    "detail": r.message,
+                }),
+                result,
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Tappa 9.0.b — detections read. The extra captures the
         // operator's filters + the response counters so an off-host
         // audit reader sees exactly what was asked for and how much
@@ -1169,6 +1206,9 @@ fn dispatch(
                 fps_out,
             ))
         }
+        AdminMessage::ConfigOverlaySetRequest(req) => {
+            AdminMessage::ConfigOverlaySetResponse(dispatch_config_overlay_set(req, auth, fps_out))
+        }
 
         // Tappa 9.0.b — signed detections read (read-only,
         // Role::TelemetryRead, or Triage via subsumption). Overlays the
@@ -1208,7 +1248,8 @@ fn dispatch(
         | AdminMessage::NetFingerprintResponse(_)
         | AdminMessage::TrustedInstallerGrantResult(_)
         | AdminMessage::DetectionsResponse(_)
-        | AdminMessage::DetectionSetStatusResponse(_) => {
+        | AdminMessage::DetectionSetStatusResponse(_)
+        | AdminMessage::ConfigOverlaySetResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -1520,6 +1561,104 @@ fn reregister_admin_pub_after_rotate(
             "rotate-keys: re-registering rotated admin.pub inode in PROTECTED_INODES \
              FAILED — admin.pub is UNPROTECTED against tamper until the next agent restart"
         );
+    }
+}
+
+/// Tappa 10.8 — handle one [`ConfigOverlaySetRequest`]: verify the
+/// 1-of-N quorum carrying `Role::ConfigManage` (single-use challenge, skew,
+/// agent_id), check that `content` is exactly what was signed and parses as
+/// that overlay kind, then write the overlay and its `.sig` where the agent
+/// reads it at boot. Takes effect at the next agent start.
+fn dispatch_config_overlay_set(
+    req: ConfigOverlaySetRequest,
+    auth: &AdminAuth,
+    fps_out: &mut Vec<String>,
+) -> ConfigOverlaySetResponse {
+    use crate::config::overlay_auth;
+    const CONFIG_OVERLAY_QUORUM: u8 = 1;
+    let refuse = |result: AdminResult, message: String| ConfigOverlaySetResponse {
+        result,
+        stored: false,
+        message,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        CONFIG_OVERLAY_QUORUM,
+        &[Role::ConfigManage],
+        OperationCode::ConfigOverlaySet,
+        now_unix_secs(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let r = map_admin_auth_error(e, "config-overlay-set");
+            return refuse(r, "signature verification failed".to_string());
+        }
+    };
+    *fps_out = matched_fps;
+    let OperationExtra::ConfigOverlaySet(extra) = &req.payload.extra else {
+        return refuse(
+            AdminResult::UnknownOperation,
+            "not a config-overlay payload".to_string(),
+        );
+    };
+    if req.content.len() > common::wire::admin_protocol::MAX_OVERLAY_BYTES {
+        return refuse(
+            AdminResult::Success,
+            format!(
+                "content larger than {} bytes",
+                common::wire::admin_protocol::MAX_OVERLAY_BYTES
+            ),
+        );
+    }
+    if overlay_auth::content_sha256(req.content.as_bytes()) != extra.sha256
+        || req.content.len() != extra.len as usize
+    {
+        return refuse(
+            AdminResult::Success,
+            "content does not match the signed hash".to_string(),
+        );
+    }
+    if let Err(e) = overlay_auth::validate_content(extra.kind, &req.content) {
+        return refuse(
+            AdminResult::Success,
+            format!("content does not parse: {e:#}"),
+        );
+    }
+    let config_dir = auth
+        .config_path()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/etc/northnarrow"));
+    let target = overlay_auth::configured_path(extra.kind, &config_dir);
+    let sig = match overlay_auth::OverlaySignature::new(req.payload.clone(), &sigs) {
+        Ok(s) => s,
+        Err(e) => return refuse(AdminResult::Success, format!("{e:#}")),
+    };
+    match overlay_auth::store(&target, &req.content, &sig) {
+        Ok(sig_file) => {
+            info!(
+                target: "admin.config_overlay",
+                kind = extra.kind.keyword(),
+                path = %target.display(),
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                "signed overlay stored — takes effect at the next agent start"
+            );
+            ConfigOverlaySetResponse {
+                result: AdminResult::Success,
+                stored: true,
+                message: format!(
+                    "{} and {} written; restart the agent to apply (systemctl restart northnarrow-agent)",
+                    target.display(),
+                    sig_file.display()
+                ),
+            }
+        }
+        Err(e) => refuse(
+            AdminResult::Success,
+            format!("writing the overlay failed: {e:#}"),
+        ),
     }
 }
 

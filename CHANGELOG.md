@@ -59,6 +59,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
   the host settings that keep root from rewriting the kernel at runtime,
   which is the only way around the anti-tamper.
+- Signed operator overlays: the agent loads a `*.local` overlay
+  (allowlists, blocklists, FIM paths, posture carve-outs) only if
+  `<overlay>.sig` proves that a key with the new `config-manage` role signed
+  its exact content, for this `agent_id`, and not earlier than the last
+  accepted signature (rollback guard from the audit chain); otherwise it
+  boots on the shipped defaults for that list and records an
+  `unauthorized_overlay` integrity finding. `nn-admin config overlay
+  set|sign|status`; `install.sh` bootstraps the key with `config-manage`
+  and `--upgrade` adopts existing overlays with `--grant-key`; the posture
+  overlays and the `.sig` files join the protected set; escape hatch
+  `NN_OVERLAY_ALLOW_UNSIGNED=1` (reported). Closes the gap found by
+  tamper-check C19.
 - Adversarial anti-tamper check, second part: `cgroup.kill` on the agent's
   unit (C20), an exec flood hiding an exec from `/tmp` (C21) and an
   io_uring probe that opens, reads and connects through a ring with no

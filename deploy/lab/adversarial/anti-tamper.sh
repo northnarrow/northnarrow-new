@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Structured adversarial check of the anti-tamper (Tappa 10.8).
 #
-# Runs ON THE GUEST as root against the installed agent (23 cases), one case per
+# Runs ON THE GUEST as root against the installed agent (25 cases), one case per
 # documented way of neutralising a Linux EDR, and answers two questions for
 # each: was the action denied, and did it leave EVIDENCE in the signed chain
 # logs (audit.log ops, detections.jsonl rule ids) or at least in the journal?
@@ -40,6 +40,13 @@ evidence() {
     # a boot that reports its predecessor died without agent_stop
     if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"ended":"abrupt"'; then
         audit="${audit}prev_run_abrupt "
+    fi
+    # Tappa 10.8: an overlay refused at boot / a signed one accepted
+    if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"kind":"unauthorized_overlay"'; then
+        audit="${audit}unauthorized_overlay "
+    fi
+    if echo "$j" | grep -q "signed overlay accepted"; then
+        denials="${denials}overlay_accepted "
     fi
     echo "journal:[${denials:-}${verdicts:-}errors=${errors}] audit:[${audit:-}] detections:[${dets:-}]"
 }
@@ -94,7 +101,9 @@ run_case C10 "bpftool feature probe (loads test programs)" allowed "NN-L-BPF-001
 WAIT=40 run_case C11 "unit drop-in with a hostile Environment=" allowed "integrity_drift" 0 -- bash -c "mkdir -p /etc/systemd/system/northnarrow-agent.service.d && printf '[Service]\nEnvironment=NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n' > /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf"
 rm -rf /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf; systemctl daemon-reload
 WAIT=40 run_case C12 "systemctl set-property --runtime MemoryMax (OOM path)" allowed "integrity_drift" 0 -- systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G
-systemctl set-property --runtime northnarrow-agent.service MemoryMax= 2>/dev/null || true
+# resetting the property still leaves an (empty) runtime drop-in behind
+rm -f /run/systemd/system.control/northnarrow-agent.service.d/50-MemoryMax.conf
+systemctl daemon-reload
 # ── mounts ────────────────────────────────────────────────────────────────
 mkdir -p /mnt/nn-bpf2 /tmp/nn-fake-etc
 WAIT=40 run_case C13 "second bpffs mount" allowed "integrity_drift" 0 -- mount -t bpf bpf /mnt/nn-bpf2
@@ -142,6 +151,16 @@ if [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BI
 else
     echo "C22 skipped: cannot build the io_uring probe ($(head -1 /tmp/nn-iou-cc.log 2>/dev/null))" >&2
 fi
+# ── signed overlays (Tappa 10.8) ──────────────────────────────────────────
+# An unsigned exemption appended to the allowlist overlay, then a restart:
+# the agent must boot on the shipped defaults and record the refusal.
+WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unauthorized_overlay" 0 -- bash -c "echo '+evil-implant' >> $ETC/process-comm-allowlist.local && systemctl restart northnarrow-agent"
+PID=$(agent_pid)
+# The same overlay stored the authorised way (lab key, config-manage),
+# then a restart: stored with its signature, accepted at boot.
+printf '+backupd\n' > /tmp/nn-ovl-allow
+WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "nn-admin config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && systemctl restart northnarrow-agent"
+PID=$(agent_pid)
 if command -v kexec >/dev/null 2>&1; then
     run_case C17 "kexec -l of the running kernel" denied "" 1 -- kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) --reuse-cmdline
     kexec -u 2>/dev/null || true

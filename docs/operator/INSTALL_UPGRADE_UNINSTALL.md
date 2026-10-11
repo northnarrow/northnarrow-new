@@ -58,7 +58,12 @@ What it does, in order:
    needs the window of step 2 (or a reboot); waits until `bpftool prog
    show` reports 0 LSM programs (30 s budget, fails loudly otherwise);
 4. runs the normal install (binaries, units, configs; `chattr +i` on the
-   state dir is lifted and re-applied by the new agent at boot);
+   state dir is lifted and re-applied by the new agent at boot), then
+   adopts the `*.local` overlays already present: each one without a valid
+   signature is signed with `--grant-key` (`nn-admin config overlay
+   sign`); one that cannot be — the key lacks `config-manage` — is listed
+   with the command to sign it, and the new agent boots on the shipped
+   defaults for that list until it is (§3.6);
 5. starts the agent, waits 3 s, starts the watchdog, prints their state.
 
 Preserved across the upgrade: `admin.pub`, `agent.sig.key`, `agent_id`,
@@ -283,6 +288,37 @@ recorded as detection `NN-L-AT-001_AntiTamperDenial` in
 `detections.jsonl`, and every ring buffer that loses events is a
 `ringbuf_drop` audit entry. The lab exercises all of this with
 `nn-lab.sh tamper-check`.
+
+### 3.6 Overlays are signed (`nn-admin config overlay`)
+
+The `*.local` overlays in `/etc/northnarrow` change what the agent detects
+— an allowlist overlay exempts a comm, a FIM overlay stops watching a
+path, a posture overlay carves writers out of the mass-write arm — and
+used to be read at boot as plain files: root could add `+evil-implant` and
+the next restart applied it. Since Tappa 10.8 the agent loads an overlay
+only if `<overlay>.sig` proves that a key with the **`config-manage`**
+role signed its exact content (SHA-256 and length), for this agent
+(`agent_id`), and not earlier than the last signature the audit chain
+accepted for that list (no rollback to a retired exemption). Otherwise it
+boots on the shipped defaults (`.v1`) for that list, logs `UNAUTHORIZED
+OVERLAY` and records a signed `integrity_drift` (`unauthorized_overlay`).
+
+| Command | Use |
+|---|---|
+| `nn-admin config overlay set <kind> --file F --key K` | sign over the agent's challenge and store through the running agent (it writes the overlay and its `.sig`); applies at its next start |
+| `nn-admin config overlay sign <kind> --file F --key K` | sign offline and write `F.sig` (upgrades, stopped agent) |
+| `nn-admin config overlay status` | which overlays are present and whether the next start loads them (exit 1 if one does not) |
+
+Kinds: `fim-paths`, `process-comm-allowlist`, `netflow-comm-allowlist`,
+`netflow-blocklist`, `netflow-ja3-blocklist`, `mass-write-carveout`,
+`escalation-allow`. Content is checked with the loader's own rules before
+it is signed or stored (a malformed line is refused, not silently dropped).
+Every accepted new content is a `config_overlay_accepted` audit entry,
+every stored one a `config_overlay_set` entry. The two posture overlays and
+every `.sig` are now protected against unlink and rename like the other
+overlays. Escape hatch for a migration: `NN_OVERLAY_ALLOW_UNSIGNED=1` loads
+unsigned overlays anyway, still reported, and is itself reported as a
+weakening environment variable.
 
 ## 4. What still needs a reboot
 

@@ -674,6 +674,36 @@ pub struct TrustedInstallerGrantRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Largest overlay `nn-admin config overlay set` carries (fits the frame
+/// with the payload and two signatures). Overlays are short lists.
+pub const MAX_OVERLAY_BYTES: usize = 32 * 1024;
+
+/// Tappa 10.8 — store a signed operator overlay. `payload` is a
+/// `ConfigOverlaySet` payload (kind + SHA-256 + length of `content`) signed
+/// over the server challenge; `content` is the overlay text. The agent
+/// verifies the quorum (role `config-manage`, 1-of-N), checks that
+/// `content` matches the signed hash and parses as that overlay kind, then
+/// writes the overlay and its signature file itself. It takes effect at the
+/// next agent start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOverlaySetRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+    pub content: String,
+}
+
+/// Reply to [`ConfigOverlaySetRequest`]. `result` is the authentication
+/// outcome; `stored` says whether the overlay and its signature were
+/// written (a verified request can still be refused: content that does not
+/// match the signed hash or does not parse as that overlay kind);
+/// `message` names the files written, or why nothing was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOverlaySetResponse {
+    pub result: AdminResult,
+    pub stored: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
@@ -810,6 +840,11 @@ pub enum AdminMessage {
     /// Reply to [`AdminMessage::DetectionSetStatusRequest`] — the ack
     /// (id + new status) on success.
     DetectionSetStatusResponse(DetectionSetStatusResponse),
+    /// Tappa 10.8 — signed overlay store request. Triggers
+    /// [`AdminMessage::ConfigOverlaySetResult`].
+    ConfigOverlaySetRequest(ConfigOverlaySetRequest),
+    /// Reply to [`AdminMessage::ConfigOverlaySetRequest`].
+    ConfigOverlaySetResponse(ConfigOverlaySetResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -1282,7 +1317,9 @@ mod tests {
                 | AdminMessage::DetectionsRequest(_)
                 | AdminMessage::DetectionsResponse(_)
                 | AdminMessage::DetectionSetStatusRequest(_)
-                | AdminMessage::DetectionSetStatusResponse(_) => {}
+                | AdminMessage::DetectionSetStatusResponse(_)
+                | AdminMessage::ConfigOverlaySetRequest(_)
+                | AdminMessage::ConfigOverlaySetResponse(_) => {}
             }
         }
     }

@@ -376,6 +376,13 @@ enum Cmd {
         socket: PathBuf,
     },
 
+    /// Tappa 10.8 — operator configuration the agent loads only when an
+    /// admin key signed it (`config overlay set|sign|status`).
+    Config {
+        #[command(subcommand)]
+        sub: ConfigCmd,
+    },
+
     /// Debug-only: force the agent's posture state machine into a
     /// chosen state. Only compiled when the `debug-trigger` Cargo
     /// feature is on.
@@ -383,6 +390,72 @@ enum Cmd {
     Debug {
         #[command(subcommand)]
         sub: DebugCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    /// Operator overlays (`/etc/northnarrow/*.local`): allowlists,
+    /// blocklists, FIM paths, posture carve-outs. The agent loads one only
+    /// if a key with the `config-manage` role signed its exact content
+    /// (`<overlay>.sig`); otherwise it boots on the shipped defaults for
+    /// that list and records the refusal.
+    Overlay {
+        #[command(subcommand)]
+        sub: OverlayCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OverlayCmd {
+    /// Sign an overlay and store it through the running agent (role
+    /// `config-manage`). The agent writes the overlay and its signature;
+    /// it takes effect at the next agent start.
+    Set {
+        /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
+        /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
+        /// escalation-allow.
+        kind: String,
+        /// The overlay content to store.
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        /// Optional second signer.
+        #[arg(long = "cosign-key")]
+        cosign_key: Option<PathBuf>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Sign an overlay offline and write `<file>.sig` (or `--out`). For
+    /// upgrades and hosts where the agent is stopped; with the agent
+    /// running, use `set`.
+    Sign {
+        kind: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "cosign-key")]
+        cosign_key: Option<PathBuf>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Which overlays are present and whether each one would be loaded at
+    /// the next agent start (exit 1 if any present overlay is not).
+    Status {
+        #[arg(long, default_value = "/etc/northnarrow")]
+        dir: PathBuf,
+        #[arg(long = "admin-pub", default_value = DEFAULT_PUB_PATH)]
+        admin_pub: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long = "audit-log", default_value = DEFAULT_AUDIT_LOG_PATH)]
+        audit_log: PathBuf,
     },
 }
 
@@ -1306,6 +1379,9 @@ fn main() -> ExitCode {
             }
         },
 
+        Cmd::Config {
+            sub: ConfigCmd::Overlay { sub },
+        } => run_overlay_cmd(sub),
         Cmd::TrustedInstallerGrant {
             key,
             window_secs,
@@ -1938,6 +2014,144 @@ fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
 /// to a stable exit code — same contract as [`exit_from_fim_baseline`]
 /// (0 success; 2 bad-sig; 3 no-challenge; 4 rate-limited; 5 transport/
 /// skew/agent-id/unknown-op/version; 6 quorum; 7 role-denied).
+fn overlay_kind_arg(kind: &str) -> Option<common::wire::admin_signed_payload::OverlayKind> {
+    let k = common::wire::admin_signed_payload::OverlayKind::from_keyword(kind);
+    if k.is_none() {
+        let all: Vec<&str> = common::wire::admin_signed_payload::OverlayKind::ALL
+            .iter()
+            .map(|k| k.keyword())
+            .collect();
+        eprintln!(
+            "config overlay: unknown overlay `{kind}` — one of: {}",
+            all.join(", ")
+        );
+    }
+    k
+}
+
+fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
+    use northnarrow_agent::admin_cli::{run_config_overlay_set, run_config_overlay_sign};
+    use northnarrow_agent::config::overlay_auth::{Decision, OverlayGate};
+    match sub {
+        OverlayCmd::Set {
+            kind,
+            file,
+            key,
+            cosign_key,
+            agent_id_file,
+            socket,
+        } => {
+            let Some(kind) = overlay_kind_arg(&kind) else {
+                return ExitCode::from(2);
+            };
+            match run_config_overlay_set(
+                &socket,
+                &key,
+                cosign_key.as_deref(),
+                &agent_id_file,
+                kind,
+                &file,
+            ) {
+                Ok(o) if o.stored => {
+                    println!("config overlay set: {}", o.message);
+                    ExitCode::SUCCESS
+                }
+                Ok(o) if o.result == common::wire::admin_protocol::AdminResult::Success => {
+                    eprintln!("config overlay set: refused by the agent: {}", o.message);
+                    ExitCode::from(6)
+                }
+                Ok(o) => {
+                    eprintln!("config overlay set: {:?} ({})", o.result, o.message);
+                    ExitCode::from(match o.result {
+                        common::wire::admin_protocol::AdminResult::RoleDenied => 7,
+                        common::wire::admin_protocol::AdminResult::InvalidSignature => 2,
+                        _ => 5,
+                    })
+                }
+                Err(e) => {
+                    eprintln!("config overlay set: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
+        OverlayCmd::Sign {
+            kind,
+            file,
+            key,
+            cosign_key,
+            agent_id_file,
+            out,
+        } => {
+            let Some(kind) = overlay_kind_arg(&kind) else {
+                return ExitCode::from(2);
+            };
+            match run_config_overlay_sign(
+                &key,
+                cosign_key.as_deref(),
+                &agent_id_file,
+                kind,
+                &file,
+                out.as_deref(),
+            ) {
+                Ok(p) => {
+                    println!(
+                        "config overlay sign: {} written (the agent verifies it at its next start)",
+                        p.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("config overlay sign: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
+        OverlayCmd::Status {
+            dir,
+            admin_pub,
+            agent_id_file,
+            audit_log,
+        } => {
+            let agent_id = match northnarrow_agent::agent_id::load_or_bootstrap(&agent_id_file) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("config overlay status: {e:#}");
+                    return ExitCode::from(5);
+                }
+            };
+            let gate = OverlayGate::new(&admin_pub, agent_id, &audit_log);
+            let mut unsigned = 0;
+            for kind in common::wire::admin_signed_payload::OverlayKind::ALL {
+                let path = dir.join(kind.file_name());
+                match gate.check(kind, &path) {
+                    Decision::Absent => println!("{:<24} absent", kind.keyword()),
+                    Decision::Accepted {
+                        signed_ts, key_fps, ..
+                    } => {
+                        println!(
+                            "{:<24} signed (ts {signed_ts}, keys {})",
+                            kind.keyword(),
+                            key_fps.join(",")
+                        )
+                    }
+                    Decision::Refused { reason, .. } => {
+                        unsigned += 1;
+                        println!(
+                            "{:<24} NOT LOADED at the next start: {reason}",
+                            kind.keyword()
+                        )
+                    }
+                }
+            }
+            if unsigned > 0 {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+    }
+}
+
 fn exit_from_trusted_installer_grant(
     outcome: TrustedInstallerGrantOutcome,
     window_secs: u32,
