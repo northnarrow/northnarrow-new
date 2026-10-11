@@ -255,18 +255,23 @@ cmd_build() {
 lab_purge_pins() {
     local out
     out=$(vssh bash -s <<'REMOTE'
+# Review 26: the installed layout (install.sh: /usr/local/bin; package
+# layout: /usr/bin), read from the unit — an absolute path also sidesteps
+# RHEL's sudo secure_path, which has no /usr/local/bin.
+agent_exe=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)
+agent_exe=${agent_exe:-/usr/local/bin/northnarrow-agent}
+nn_admin=$(dirname "$agent_exe")/nn-admin
 if sudo test -d /sys/fs/bpf/northnarrow; then
     # The window can only be opened through a running agent. After an e2e
     # run the fixtures' pins are still there (protected) and the installed
     # agent is stopped: start it — as a protected pid it purges the stale
     # pins at boot — and open the window through it.
-    if ! systemctl is-active --quiet northnarrow-agent && [ -x /usr/local/bin/northnarrow-agent ] \
+    if ! systemctl is-active --quiet northnarrow-agent && [ -x "$agent_exe" ] \
        && systemctl list-unit-files northnarrow-agent.service >/dev/null 2>&1; then
         sudo systemctl start northnarrow-agent 2>/dev/null && sleep 5
     fi
     if systemctl is-active --quiet northnarrow-agent && sudo test -r /etc/northnarrow/admin.key; then
-        # absolute path: RHEL's sudo secure_path has no /usr/local/bin
-        if ! sudo /usr/local/bin/nn-admin trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
+        if ! sudo "$nn_admin" trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
             echo "grant refused: $(tail -1 /tmp/nn-grant.log)"
         elif ! sudo grep -q "config-manage" /etc/northnarrow/admin.pub; then
             # Tappa 10.8: the lab key signs overlays too; the window lets
@@ -282,6 +287,7 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
     # tamper-check leftovers (protected while an agent ran; the window is open now)
     sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
     sudo rm -rf /run/systemd/system.control/northnarrow-agent.service.d 2>/dev/null
+    sudo rm -f /run/systemd/transient/northnarrow-agent.service 2>/dev/null
     sudo grep -q "evil-implant" /etc/northnarrow/process-comm-allowlist.local 2>/dev/null \
         && sudo rm -f /etc/northnarrow/process-comm-allowlist.local /etc/northnarrow/process-comm-allowlist.local.sig
 fi

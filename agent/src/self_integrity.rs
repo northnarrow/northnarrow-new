@@ -44,6 +44,27 @@ const DROPIN_ROOTS: &[&str] = &[
     "/lib/systemd/system",
 ];
 
+/// systemd's system unit load path, highest precedence first
+/// (`systemd.unit(5)`, "Unit File Load Path"). A unit file in an earlier
+/// directory replaces one with the same name in a later directory — the
+/// runtime ones (`/run/systemd/transient`, `system.control`, the
+/// generator outputs) outrank even `/etc/systemd/system`.
+const UNIT_SEARCH_PATH: &[&str] = &[
+    "/etc/systemd/system.control",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
+    "/run/systemd/generator.early",
+    "/etc/systemd/system",
+    "/etc/systemd/system.attached",
+    "/run/systemd/system",
+    "/run/systemd/system.attached",
+    "/run/systemd/generator",
+    "/usr/local/lib/systemd/system",
+    "/usr/lib/systemd/system",
+    "/lib/systemd/system",
+    "/run/systemd/generator.late",
+];
+
 /// Drop-ins `install.sh` lays down itself.
 const KNOWN_DROPINS: &[&str] =
     &["/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf"];
@@ -68,6 +89,8 @@ const PROTECTED_MOUNT_PREFIXES: &[&str] = &[
     "/run/northnarrow",
     "/sys/fs/bpf/northnarrow",
     "/etc/systemd/system/northnarrow-",
+    // Review 26: the units of a distro package.
+    "/usr/lib/systemd/system/northnarrow-",
 ];
 
 /// The canonical bpffs; any other bpf mount is reported.
@@ -158,6 +181,51 @@ pub fn unit_dropins(roots: &[&Path]) -> Vec<Finding> {
                     detail: format!("{shown} (mtime {stamp})"),
                 });
             }
+        }
+    }
+    out
+}
+
+/// Review 26: more than one copy of one of our units across the unit
+/// search path (`roots`, highest precedence first, [`UNIT_SEARCH_PATH`]
+/// in production). A copy in a higher-precedence directory replaces the
+/// installed unit at the next `daemon-reload`: `/etc/systemd/system`
+/// over a package's `/usr/lib/systemd/system` (nothing existed there to
+/// protect at boot), and the tmpfs runtime directories
+/// (`/run/systemd/transient`, `system.control`) over either layout;
+/// `systemctl mask` is the same shape (a symlink to `/dev/null`). Copies
+/// are deduplicated by canonical path, so the merged-`/usr` spellings
+/// `/lib/systemd/system` and `/usr/lib/systemd/system` count once.
+pub fn unit_shadows(roots: &[&Path]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for unit in UNITS {
+        let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for root in roots {
+            let path = root.join(unit);
+            if std::fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            let target = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if copies.iter().any(|(_, t)| *t == target) {
+                continue;
+            }
+            copies.push((path, target));
+        }
+        if copies.len() > 1 {
+            let chain: Vec<String> = copies
+                .iter()
+                .map(|(p, t)| {
+                    if p == t {
+                        p.display().to_string()
+                    } else {
+                        format!("{} -> {}", p.display(), t.display())
+                    }
+                })
+                .collect();
+            out.push(Finding {
+                kind: "unit_shadowed",
+                detail: format!("{unit}: {} (the first one wins)", chain.join(" shadows ")),
+            });
         }
     }
     out
@@ -341,6 +409,10 @@ impl Checker {
         for f in unit_dropins(&roots) {
             self.report(f, at_boot);
         }
+        let search: Vec<&Path> = UNIT_SEARCH_PATH.iter().map(Path::new).collect();
+        for f in unit_shadows(&search) {
+            self.report(f, at_boot);
+        }
         for f in config_overlays(Path::new(CONFIG_DIR)) {
             if self.overlay_is_signed(&f) {
                 continue;
@@ -510,6 +582,47 @@ mod tests {
             f[0],
             "a change is a new finding"
         );
+    }
+
+    #[test]
+    fn unit_shadows_report_a_second_copy_and_a_mask() {
+        let hi = tempfile::tempdir().unwrap();
+        let lo = tempfile::tempdir().unwrap();
+        std::fs::write(lo.path().join("northnarrow-agent.service"), "[Service]\n").unwrap();
+        // One copy: the normal case for either install layout.
+        assert!(unit_shadows(&[hi.path(), lo.path()]).is_empty());
+        // A higher-precedence copy shadows it.
+        std::fs::write(hi.path().join("northnarrow-agent.service"), "[Service]\n").unwrap();
+        let f = unit_shadows(&[hi.path(), lo.path()]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "unit_shadowed");
+        assert!(
+            f[0].detail.starts_with("northnarrow-agent.service: "),
+            "{}",
+            f[0].detail
+        );
+        // `systemctl mask` is a symlink to /dev/null: reported with its target.
+        std::fs::remove_file(hi.path().join("northnarrow-agent.service")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", hi.path().join("northnarrow-agent.service"))
+            .unwrap();
+        let f = unit_shadows(&[hi.path(), lo.path()]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].detail.contains("-> /dev/null"), "{}", f[0].detail);
+    }
+
+    #[test]
+    fn unit_shadows_count_one_directory_reached_twice_once() {
+        // Merged /usr: /lib/systemd/system is a symlink to the vendor dir.
+        let usr = tempfile::tempdir().unwrap();
+        std::fs::write(
+            usr.path().join("northnarrow-watchdog.service"),
+            "[Service]\n",
+        )
+        .unwrap();
+        let alias = tempfile::tempdir().unwrap();
+        let lib = alias.path().join("lib-systemd-system");
+        std::os::unix::fs::symlink(usr.path(), &lib).unwrap();
+        assert!(unit_shadows(&[usr.path(), lib.as_path()]).is_empty());
     }
 
     #[test]

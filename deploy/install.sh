@@ -53,6 +53,9 @@ REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 TARGET_DIR=${TARGET_DIR:-"$REPO_ROOT/target/release"}
 BIN_DIR=${BIN_DIR:-/usr/local/bin}
 UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
+# Operator drop-ins always live in /etc, whatever directory holds the unit
+# files themselves (a package ships them in /usr/lib/systemd/system).
+DROPIN_ROOT=${DROPIN_ROOT:-/etc/systemd/system}
 ETC_DIR=${ETC_DIR:-/etc/northnarrow}
 STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
 
@@ -484,8 +487,22 @@ install -m 755 -o root -g root "$WATCHDOG_BIN" "$BIN_DIR/northnarrow-watchdog"
 install -m 755 -o root -g root "$NN_ADMIN_BIN" "$BIN_DIR/nn-admin"
 
 echo "install.sh: copying systemd unit files to $UNIT_DIR/"
-install -m 644 -o root -g root "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
-install -m 644 -o root -g root "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service"
+# Review 26: the shipped units name /usr/local/bin. With another BIN_DIR
+# (a package layout uses /usr/bin) their ExecStart and the watchdog's
+# --agent-bin must point at the binaries that were actually installed.
+install_unit() {
+    local src=$1 dst=$2 tmp
+    if [[ "$BIN_DIR" == /usr/local/bin ]]; then
+        install -m 644 -o root -g root "$src" "$dst"
+        return
+    fi
+    tmp=$(mktemp)
+    sed "s#/usr/local/bin/#${BIN_DIR%/}/#g" "$src" > "$tmp"
+    install -m 644 -o root -g root "$tmp" "$dst"
+    rm -f "$tmp"
+}
+install_unit "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
+install_unit "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service"
 
 # Debian-family kernels carry a distro patch that makes
 # kernel.perf_event_paranoid=3 (their default) require CAP_SYS_ADMIN for
@@ -496,7 +513,7 @@ install -m 644 -o root -g root "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watch
 # drop-in that the operator can see and remove (e.g. after setting
 # kernel.perf_event_paranoid=2 system-wide, which also restores the
 # narrower set). See docs/operator/KERNEL_COMPATIBILITY.md.
-DROPIN_DIR="$UNIT_DIR/northnarrow-agent.service.d"
+DROPIN_DIR="$DROPIN_ROOT/northnarrow-agent.service.d"
 if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release

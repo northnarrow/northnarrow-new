@@ -80,6 +80,13 @@ pub const MAX_TRUSTED_INSTALLER_WINDOW_SECS: u32 = 600;
 pub const OWN_SYSTEMD_UNITS: &[&str] = &[
     "/etc/systemd/system/northnarrow-agent.service",
     "/etc/systemd/system/northnarrow-watchdog.service",
+    // Review 26: a distro package ships the units in the vendor
+    // directory. On a merged-/usr host the FIM sensor may report that
+    // directory through either spelling.
+    "/usr/lib/systemd/system/northnarrow-agent.service",
+    "/usr/lib/systemd/system/northnarrow-watchdog.service",
+    "/lib/systemd/system/northnarrow-agent.service",
+    "/lib/systemd/system/northnarrow-watchdog.service",
 ];
 
 /// Userland state of the trusted-installer override. Shared via `Arc`

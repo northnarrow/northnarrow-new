@@ -58,8 +58,8 @@ use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
 
 pub use exempt::{
-    resolve_verified_watchdog_pid, ExemptPids, WatchdogResolution, DEFAULT_WATCHDOG_EXE,
-    DEFAULT_WATCHDOG_PIDFILE,
+    resolve_verified_watchdog_pid, sibling_watchdog_exe, ExemptPids, WatchdogResolution,
+    DEFAULT_WATCHDOG_EXE, DEFAULT_WATCHDOG_PIDFILE,
 };
 pub use lineage::{AuthSessionTracker, AUTH_BINARY_EXES};
 pub use state::PostureState;

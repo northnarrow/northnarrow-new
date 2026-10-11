@@ -160,14 +160,11 @@ struct Cli {
 
     /// Beta Step 3: expected install path of the watchdog binary, used
     /// to verify a candidate watchdog PID's `/proc/<pid>/exe` (a
-    /// kernel-resolved symlink, not forgeable). Override only for
-    /// non-standard install layouts.
-    #[arg(
-        long = "watchdog-exe",
-        value_name = "PATH",
-        default_value = northnarrow_agent::posture::DEFAULT_WATCHDOG_EXE
-    )]
-    watchdog_exe: PathBuf,
+    /// kernel-resolved symlink, not forgeable). Default (review 26): the
+    /// `northnarrow-watchdog` next to this agent's own executable —
+    /// `/usr/local/bin` for `install.sh`, `/usr/bin` for a package.
+    #[arg(long = "watchdog-exe", value_name = "PATH")]
+    watchdog_exe: Option<PathBuf>,
 
     /// Tappa 8 A3 + A8: per-install agent identity file. The agent
     /// reads (or, on first boot, mints) a 16-byte UUID at this
@@ -476,6 +473,16 @@ struct Cli {
     /// exactly as before, no PID file is touched.
     #[arg(long = "pid-file", value_name = "PATH")]
     pid_file: Option<PathBuf>,
+}
+
+impl Cli {
+    /// `--watchdog-exe`, or the watchdog next to this agent (review 26).
+    fn resolved_watchdog_exe(&self) -> PathBuf {
+        self.watchdog_exe.clone().unwrap_or_else(|| {
+            let own = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+            northnarrow_agent::posture::sibling_watchdog_exe(own.as_deref())
+        })
+    }
 }
 
 #[tokio::main]
@@ -1306,7 +1313,7 @@ async fn main() -> Result<()> {
         spawn_watchdog_exempt_refresh(
             exempt.clone(),
             cli.watchdog_pidfile.clone(),
-            cli.watchdog_exe.clone(),
+            cli.resolved_watchdog_exe(),
         );
     }
 
@@ -1602,7 +1609,7 @@ async fn main() -> Result<()> {
         Box::new(northnarrow_agent::combat::SystemProtectedProcs::new(
             executor.own_pid(),
             exempt.clone(),
-            cli.watchdog_exe.clone(),
+            cli.resolved_watchdog_exe(),
         )),
         northnarrow_agent::combat::LadderConfig::default(),
     ));
@@ -1615,7 +1622,7 @@ async fn main() -> Result<()> {
         let guard = northnarrow_agent::combat::SystemProtectedProcs::new(
             executor.own_pid(),
             exempt.clone(),
-            cli.watchdog_exe.clone(),
+            cli.resolved_watchdog_exe(),
         );
         executor.set_tree_guard(Arc::new(move |pid: u32| {
             use northnarrow_agent::combat::ProtectedProcs;

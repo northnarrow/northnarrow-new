@@ -35,10 +35,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Default install path of the watchdog binary, used to verify a
-/// candidate PID's `/proc/<pid>/exe`. Overridable (non-standard
-/// install layouts) via the agent's `--watchdog-exe` flag.
+/// Fallback install path of the watchdog binary, used to verify a
+/// candidate PID's `/proc/<pid>/exe` when [`sibling_watchdog_exe`]
+/// finds no watchdog next to the agent. Overridable via the agent's
+/// `--watchdog-exe` flag.
 pub const DEFAULT_WATCHDOG_EXE: &str = "/usr/local/bin/northnarrow-watchdog";
+
+/// Review 26: the watchdog is installed next to the agent — in
+/// `/usr/local/bin` by `install.sh`, in `/usr/bin` by a distro package.
+/// Resolve it from the agent's own (canonical) executable path; fall
+/// back to [`DEFAULT_WATCHDOG_EXE`] when that sibling does not exist.
+pub fn sibling_watchdog_exe(own_exe: Option<&Path>) -> PathBuf {
+    own_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join("northnarrow-watchdog"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WATCHDOG_EXE))
+}
 
 /// Default path of the watchdog's PID file (written by the watchdog
 /// into its root-only RuntimeDirectory). Overridable via
@@ -288,5 +301,26 @@ mod tests {
             WatchdogResolution::Unverifiable { pid: 0, .. }
         ));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Review 26: the watchdog is resolved next to the agent, whatever the
+    /// install layout; without a sibling the fixed default applies.
+    #[test]
+    fn sibling_watchdog_exe_follows_the_agent_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("northnarrow-agent");
+        fs::write(&agent, b"").unwrap();
+        assert_eq!(
+            sibling_watchdog_exe(Some(&agent)),
+            PathBuf::from(DEFAULT_WATCHDOG_EXE),
+            "no sibling yet: fixed default"
+        );
+        let wd = dir.path().join("northnarrow-watchdog");
+        fs::write(&wd, b"").unwrap();
+        assert_eq!(sibling_watchdog_exe(Some(&agent)), wd);
+        assert_eq!(
+            sibling_watchdog_exe(None),
+            PathBuf::from(DEFAULT_WATCHDOG_EXE)
+        );
     }
 }
