@@ -510,6 +510,9 @@ Design: `docs/design/TAPPA10_6_DETECTION_DEPTH_REFIT_DESIGN.md`.
   (`docs/adversarial/`)
 - Da fare: esecuzione sistematica delle catene e chiusura dei gap
   trovati nel registro
+- Suite di regressione PANIX (persistenza) e FENIX (esecuzione fileless)
+  di Elastic accanto ad Atomic Red Team (ricerca esterna dell'11 ottobre,
+  `docs/design/RESEARCH_TRIAGE_2026-10-11.md`)
 
 Design: `docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md`.
 
@@ -611,6 +614,13 @@ Pianificato, in quest'ordine:
   mascheramento e override delle unit systemd, `bpftool`/`bpftrace` da
   root, io_uring come canale cieco; ogni caso deve finire in un evento
   nel chain log, non solo in un rifiuto)
+- Overlay `.local` (allowlist dei comm, path FIM, blocklist) solo via
+  `nn-admin` firmato: oggi un file creato da root in `/etc/northnarrow`
+  vale dal riavvio successivo senza autenticazione (il controllo di
+  integrità lo segnala con l'hash, ma non lo impedisce)
+- Verifica formale con Kani dopo il fuzzing: harness sui blocchi `unsafe`
+  (record dei ring buffer, FFI di Candle), sui parser binari e sulla
+  verifica di firme e quorum (ricerca dell'11 ottobre, HACMS / s2n-quic)
 - Overhead misurato su host carico (`file_permission`/`file_open`; dato
   grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,
@@ -631,6 +641,14 @@ e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
 Elastic Defend, Tetragon, Tracee, Falco e letteratura 2024–2026); non
 cambia l'ordine delle Tappe successive.
 
+- Punto di aggancio dei sensori (ricerca dell'11 ottobre: TOCTOU «Phantom»
+  di Guo/Zeng e canale io_uring): `sys_enter_openat` → LSM `file_open`
+  (path dal `struct file`, `bpf_path_d_path` dove esiste); QNAME DNS letto
+  dopo la copia nel kernel, non dall'iov utente all'ingresso di
+  `udp_sendmsg`; `sys_enter_execve` → LSM `bprm_check_security` con deny
+  opzionale per R001–R004 e per gli hash in quarantena (il limite di
+  toolchain citato in `exec_check.rs` non vale più: l'agent attacca già
+  più di venti programmi LSM con la stessa toolchain)
 - Contesto del carico di lavoro: cgroup id, namespace (pid/mnt/net) e,
   dove presenti, container id, immagine, pod e unit systemd negli eventi
   di processo, file e rete; allowlist e regole per identità (cgroup,
@@ -667,6 +685,25 @@ cambia l'ordine delle Tappe successive.
   `sched_process_fork` per la lineage completa; `kernel_load_data` e
   `kernel_read_file` (kexec, firmware, moduli e livepatch caricati da
   userland: oggi vediamo solo `module_load`)
+- Exec per proprietà dell'inode, non per path: tmpfs, memfd,
+  `O_TMPFILE`, `nlink == 0`, `execveat(AT_EMPTY_PATH)`, loader dinamico
+  come argv[0] (Elastic FENIX 2026); identità del processo per hash
+  calcolato nel kernel (`bpf_ima_file_hash`, dove IMA è attivo)
+- Ecosistema BPF, seconda fase: hook `bpf_prog` e helper rari rilevati al
+  caricamento (`bpf_probe_write_user`, `bpf_override_return`,
+  `bpf_send_signal` — Datadog 2026, rootkit LinkPro e VoidLink), attach
+  XDP/TC osservati
+- Integrità del kernel: `init_module` da buffer distinto da `finit_module`
+  (con cattura del blob), controllo periodico di syscall table, operazioni
+  ftrace e lista moduli (moduli nascosti), credenziali cambiate senza
+  setuid legittimo (copia ombra alla LKRG), viste incrociate per processi
+  e socket nascosti (PUMAKIT, VoidLink)
+- JA4 nella blocklist accanto a JA3 (oggi JA4 è calcolato ma nessuna
+  regola lo usa)
+- Enforcement inline (LSM `-EPERM`) per un sottoinsieme deterministico
+  delle regole: exec da tmpfs/memfd, lettura di credenziali da binari
+  fuori allowlist, connect verso blocklist; l'LLM e la scala di posture
+  restano in userland
 - Operazioni di namespace viste dalla syscall (`unshare`, `setns`,
   `clone` con `CLONE_NEW*`), non dal nome del tool (R013 oggi guarda
   `nsenter`/`unshare` per comm)
@@ -713,6 +750,11 @@ Obiettivo: all'installazione, NorthNarrow chiude le falle.
     sui binari e sulle unit, `/usr` immutabile (dm-verity, sysext
     firmate), bpffs dedicato — ciò che rende l'anti-tamper dell'agent
     non aggirabile da root
+- Base dei controlli: ANSSI-BP-028 v2.0 (contenuto SCAP/ComplianceAsCode,
+  Licence Ouverte 2.0) invece di una lista proprietaria, con il livello
+  raggiunto (Minimal → High) nel report; profilo «appliance» opzionale con
+  IPE + dm-verity (6.12+), in cui il binario dell'agent non è sostituibile
+  nemmeno da root offline
 - LLM ragiona su priorità + propone fix
 - Modalità auto-fix (con conferma admin la prima volta)
   vs solo-report
