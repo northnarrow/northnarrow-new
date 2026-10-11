@@ -78,6 +78,12 @@ struct Cli {
     #[arg(long = "detect-only", default_value_t = false)]
     detect_only: bool,
 
+    /// Internal: run as the telemetry-probe child (one file open, one DNS
+    /// packet, exit). Spawned by the agent itself every
+    /// `NN_TELEMETRY_PROBE_SECS`; never meant for operators.
+    #[arg(long = "telemetry-probe", hide = true, value_name = "NONCE")]
+    telemetry_probe: Option<String>,
+
     /// Compatibility check only: resolve every kernel struct offset and
     /// enumerator the eBPF programs need against the given BTF file
     /// (`/sys/kernel/btf/vmlinux` of this or another kernel, or a BTF
@@ -475,6 +481,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(nonce) = cli.telemetry_probe.as_deref() {
+        std::process::exit(northnarrow_agent::telemetry_probe::run_child(nonce));
+    }
     if let Some(path) = &cli.btf_check {
         std::process::exit(btf_check(path));
     }
@@ -1495,6 +1504,8 @@ async fn main() -> Result<()> {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
+    // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
+    northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.
@@ -2409,7 +2420,11 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             evt = sensor.next_event() => match evt {
-                Some(e) => process_event(
+                Some(e) => {
+                    // Tappa 10.8 telemetry probe: every event is offered to
+                    // the probe tracker before the decision engine.
+                    northnarrow_agent::telemetry_probe::observe(&e);
+                    process_event(
                     &engine,
                     &executor,
                     ade_engine.as_deref(),
@@ -2429,7 +2444,8 @@ async fn main() -> Result<()> {
                     // Tappa 9.0.a: detection-persistence sink (off the hot path).
                     detection_sink.as_ref(),
                     e,
-                ).await,
+                ).await
+                }
                 None => {
                     warn!("sensor pump exited; shutting down");
                     break;

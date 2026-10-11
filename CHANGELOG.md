@@ -59,6 +59,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
   the host settings that keep root from rewriting the kernel at runtime,
   which is the only way around the anti-tamper.
+- Telemetry probe: every 60 s the agent runs a child of its own binary
+  (`--telemetry-probe <nonce>`, hidden) that produces one known event per
+  probed sensor — exec, file open of `/run/northnarrow/probe/<nonce>`, DNS
+  query for `<nonce>.probe.northnarrow.invalid` to 127.0.0.1:53 — and
+  checks each reaches the pipeline within 5 s; a silent sensor is an
+  `ERROR TELEMETRY GAP` and a signed audit entry (`telemetry_gap`, then
+  `telemetry_restored`), coverage as a product function.
+  `NN_TELEMETRY_PROBE_SECS=0` disables it.
 - BPF self-defence, second half: the `bpf` LSM hook now DENIES (enforce
   mode) a handle to one of the agent's own links to a foreign process, by id
   (`LINK_GET_FD_BY_ID`) and through the pin (`OBJ_GET` whose final path

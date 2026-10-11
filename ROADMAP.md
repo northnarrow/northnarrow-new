@@ -596,11 +596,15 @@ Pianificato, in quest'ordine:
   che nega carico, attach, detach, enumerazione e scrittura di mappe a
   chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
   self-check periodico che i link dell'agent siano ancora attaccati
-- Sonda di telemetria continua: l'agent genera a intervalli eventi noti
-  e innocui su ogni sensore (exec, file, rete, DNS, FIM) e verifica di
-  vederli entro pochi secondi; evento mancante o hook assente = alert
-  "telemetry gap" nel chain log, non solo un WARN (prova di copertura
-  come funzione di prodotto, non solo come test di laboratorio)
+- Sonda di telemetria continua (fatta l'11 ottobre, lab PR 30 — prima
+  parte: exec, apertura file, DNS; rete TCP e FIM restano, perché una
+  connessione periodica e una modifica a un path sorvegliato farebbero
+  scattare regole legittime e servono prima le esenzioni per identità di
+  10.9): l'agent genera a intervalli eventi noti e innocui su ogni
+  sensore e verifica di vederli entro pochi secondi; evento mancante o
+  hook assente = voce `telemetry_gap` nell'audit firmato e ERROR nel
+  journal, `telemetry_restored` al ritorno (prova di copertura come
+  funzione di prodotto, non solo come test di laboratorio)
 - Test avversariale strutturato dell'anti-tamper (detach dei link BPF,
   bpffs e secondo mount di bpffs, cgroup freezer, bind mount su
   `/etc/northnarrow`, kexec, modulo non firmato, livepatch,
