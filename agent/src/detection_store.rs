@@ -137,6 +137,7 @@ impl Sensor {
             Event::FileOpen { .. } | Event::Fim(_) => Sensor::File,
             Event::ModuleLoad { .. } => Sensor::ModuleLoad,
             Event::IoUring { .. } => Sensor::IoUring,
+            Event::BpfSyscall { .. } => Sensor::AntiTamper,
             Event::TcpConnect { .. }
             | Event::DnsQuery { .. }
             | Event::NetFlow(_)
@@ -255,12 +256,14 @@ impl Principal {
                 uid: *loader_uid,
                 ppid: None,
             },
-            Event::IoUring { pid, uid, comm, .. } => Principal {
-                pid: *pid,
-                comm: comm.clone(),
-                uid: *uid,
-                ppid: None,
-            },
+            Event::IoUring { pid, uid, comm, .. } | Event::BpfSyscall { pid, uid, comm, .. } => {
+                Principal {
+                    pid: *pid,
+                    comm: comm.clone(),
+                    uid: *uid,
+                    ppid: None,
+                }
+            }
             Event::CanaryTripped {
                 accessor_pid,
                 accessor_uid,
@@ -312,6 +315,7 @@ fn exe_from_event(event: &Event) -> Option<String> {
         Event::FileOpen { .. }
         | Event::ModuleLoad { .. }
         | Event::IoUring { .. }
+        | Event::BpfSyscall { .. }
         | Event::TcpConnect { .. }
         | Event::DnsQuery { .. }
         | Event::FsProtectDenial { .. }

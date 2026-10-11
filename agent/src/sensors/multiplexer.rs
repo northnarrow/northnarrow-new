@@ -28,8 +28,8 @@ use aya::{
 };
 use bytemuck::Pod;
 use common::wire::{
-    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, IoUringRaw, ModuleLoadRaw,
-    ProcessSpawnRaw, TcpConnectRaw,
+    BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, IoUringRaw,
+    ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw,
 };
 use common::Event;
 use parking_lot::Mutex;
@@ -251,6 +251,7 @@ impl SensorMultiplexer {
         // Maps exist at load time (before attach), so taking it here is safe.
         let module_load_rb = take_ringbuf(&mut ebpf, "MODULE_LOAD_EVENTS")?;
         let iouring_rb = take_ringbuf(&mut ebpf, "IOURING_EVENTS")?;
+        let bpf_syscall_rb = take_ringbuf(&mut ebpf, "BPF_SYSCALL_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
         let flow_tracker_for_tcp = net.as_ref().map(|w| Arc::clone(&w.flow_tracker));
@@ -265,6 +266,7 @@ impl SensorMultiplexer {
             spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
             spawn_pump::<ModuleLoadRaw>("module_load", module_load_rb, tx.clone()),
             spawn_pump::<IoUringRaw>("io_uring", iouring_rb, tx.clone()),
+            spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
         ];
 
         Ok((

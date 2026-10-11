@@ -124,6 +124,47 @@ breakdown (`ringbuf drops : 0` is the healthy line). A non-zero counter
 is a coverage gap, not a cosmetic number: the lab soak treats it as a
 note and a production host should alert on it.
 
+### 3.3 The agent's BPF objects are guarded (`bpf_map`)
+
+Root with `bpftool` could rewrite the maps the anti-tamper reads
+(`PROTECTED_PIDS`, the override tokens) and unprotect the agent without
+touching a file. Since lab PR 28 the `bpf_map` LSM hook denies any
+**write** handle on one of the agent's own maps to a process that is not
+the agent or the watchdog: `bpftool map update/delete` fails with
+`Operation not permitted`, and the attempt is an anti-tamper denial
+(`operation=bpf_map`, map id as the target) in the audit chain and the
+posture ladder, like an unlink attempt on `/etc/northnarrow`. Read-only
+handles are allowed in principle, but `bpftool` opens every map read-write,
+so `bpftool map dump` on the agent's maps fails too: use `nn-admin status`
+and the agent's own telemetry instead. The agent's own binaries (watchdog,
+`nn-admin`, matched by executable inode) are exempt. The `bpf` hook also records who
+drives BPF on the host — program loads, attaches, link create/detach,
+handles-by-id on the agent's maps — as `NN-L-BPF-001/002` alerts (Log).
+
+**Operator visibility trade-off.** `bpftool` takes read-write handles even
+when it only reads (`map show`, `map dump`, `map show pinned …`), so in
+enforce mode `bpftool map show` fails at the first NorthNarrow map it
+enumerates (bpftool stops at the first error) and each attempt is an
+anti-tamper denial → posture COMBAT (INVESTIGATE stage, no isolation).
+Read the agent's state with `nn-admin status` / `nn-admin host-check`;
+inspect foreign maps with `bpftool map show id <n>`; for a debugging
+session set `NN_BPF_DEFENSE_OBSERVE=1` (restart required).
+
+Like every anti-tamper hook the guard is pinned and **outlives the agent**:
+stopping the unit does not lift it, and a replacement agent binary (another
+inode) would be denied its own registration — which is why `install.sh
+--upgrade` purges the pin root and waits for the LSM programs to detach
+before copying binaries. Do the same if you ever replace the binaries by
+hand: `rm -rf /sys/fs/bpf/northnarrow`.
+
+Diagnosis mode: `NN_BPF_DEFENSE_OBSERVE=1` in the unit environment turns
+the guard into an observer (nothing denied, a `foreign_map_write` record
+instead); test builds (`debug-trigger`) run in that mode because the e2e
+fixtures unprotect pids with `bpftool`; `NN_BPF_DEFENSE_ENFORCE=1` forces
+the deny in a test build (lab checks of the deny path). The guard counts in the LSM
+health: if it does not attach the agent refuses to start like for any
+other deny hook (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` to override).
+
 ## 4. What still needs a reboot
 
 - Enabling the `bpf` LSM (`lsm=…,bpf` on the kernel command line) the

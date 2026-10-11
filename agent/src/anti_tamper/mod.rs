@@ -38,6 +38,7 @@
 
 pub mod admin_auth;
 pub mod bootstrap;
+pub mod bpf_defense;
 /// BUG-036: boot-time revalidation of the compiled-in kernel struct
 /// offsets against the running kernel's BTF (refuse-to-start on drift).
 pub mod btf_revalidate;
@@ -65,7 +66,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use aya::{maps::Array as AyaArray, Btf, Ebpf};
 use rand::RngCore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ISSUE_002: bpffs root / pin / LSM-attach primitives were
 // extracted from this module into the `antitamper-bpf` workspace
@@ -406,12 +407,26 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
         }
     }
 
+    // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
+    let bd = bpf_defense::attach(ebpf, &btf, pin_root);
+    deny_failures.extend(bd.deny_failures);
+    observe_failures.extend(bd.observe_failures);
+    // Every program is loaded now: register the agent's own object ids
+    // and arm the mode. A failure leaves the guard with an empty set
+    // (nothing denied) and counts as a deny-hook failure.
+    match bpf_defense::register_own_objects(ebpf) {
+        Ok((maps, programs, enforce)) => debug!(maps, programs, enforce, "BPF self-defence armed"),
+        Err(e) => {
+            warn!(error = format!("{e:#}"), "BPF self-defence: own-object registration FAILED — the map guard has nothing to protect");
+            deny_failures.push(("bpf_defense::register_own_objects", format!("{e:#}")));
+        }
+    }
     report_lsm_health(&deny_failures, &observe_failures)
 }
 
 /// Deny hooks expected on a healthy boot: task_kill + ptrace +
 /// the six `inode_protect` programs.
-const LSM_DENY_HOOKS_EXPECTED: usize = 2 + 6;
+const LSM_DENY_HOOKS_EXPECTED: usize = 2 + 6 + 1;
 
 /// Escape hatch for a host where a deny hook is known not to attach
 /// (e.g. a kernel the eBPF half has not been validated against) and the

@@ -585,7 +585,10 @@ Pianificato, in quest'ordine:
   rename) correlati a processo e file; regole su ring usati subito dopo
   un exec da path volatile e su I/O senza syscall corrispondenti (il
   bypass EDR più concreto del 2025–2026: RingReaper)
-- Autodifesa dell'ecosistema BPF: hook LSM `bpf`/`bpf_prog`/`bpf_map`
+- Autodifesa dell'ecosistema BPF (prima metà fatta l'11 ottobre, lab PR 28:
+  guardia `bpf_map` in deny sulle mappe proprie, osservatore `bpf()` con
+  regole Log, modalità observe nei build di test; restano la protezione
+  dei link/detach e la sonda di telemetria): hook LSM `bpf`/`bpf_prog`/`bpf_map`
   che nega carico, attach, detach, enumerazione e scrittura di mappe a
   chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
   self-check periodico che i link dell'agent siano ancora attaccati

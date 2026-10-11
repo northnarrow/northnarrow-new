@@ -10,6 +10,7 @@ use super::Rule;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
+pub mod bpf;
 pub mod canary;
 pub mod chain;
 pub mod iouring;
@@ -152,6 +153,7 @@ pub fn default_rules_with_net(
     rules.extend(iouring::iouring_rules(Arc::clone(
         &process_allowlist_for_iouring,
     )));
+    rules.extend(bpf::bpf_rules(Arc::clone(&process_allowlist_for_iouring)));
     rules.extend(crate::fim::rules::fim_rules(installer_override));
     rules.extend(canary::canary_rules());
     rules.extend(net::net_rules(
@@ -258,6 +260,12 @@ pub(crate) fn build_verdict(
             ..
         } => (*loader_pid, path.clone().unwrap_or_default(), *timestamp_ns),
         Event::IoUring {
+            pid,
+            comm,
+            timestamp_ns,
+            ..
+        }
+        | Event::BpfSyscall {
             pid,
             comm,
             timestamp_ns,

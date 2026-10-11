@@ -148,6 +148,10 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             "- io_uring created={created} pid={pid} comm={comm} classes={:?} count={count}",
             common::io_uring_class_names(*classes)
         ),
+        Event::BpfSyscall { pid, comm, cmd, arg, .. } => format!(
+            "- bpf_syscall pid={pid} comm={comm} cmd={} arg={arg}",
+            common::wire::bpf_cmd_name(*cmd)
+        ),
         Event::ProcessSpawn {
             pid,
             ppid,
