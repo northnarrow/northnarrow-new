@@ -965,6 +965,9 @@ pub mod admin_protocol;
 #[cfg(feature = "std")]
 pub mod admin_signed_payload;
 
+/// Tappa 10.9 step 0 — sensor-feasibility probe records.
+pub mod sensor_probe;
+
 /// Decode a fixed-size, possibly NUL-terminated byte buffer into a
 /// borrowed `&str`, stopping at the first NUL or at the end of the
 /// buffer. Invalid UTF-8 is replaced lossily by the caller.

@@ -33,6 +33,9 @@ pub mod rag;
 pub mod response;
 pub mod sd_notify;
 pub mod self_integrity;
+/// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
+#[cfg(feature = "test-privileged")]
+pub mod sensor_feasibility;
 pub mod sensors;
 pub mod shutdown_marker;
 pub mod telemetry_probe;

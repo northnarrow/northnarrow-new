@@ -94,6 +94,13 @@ struct Cli {
     #[arg(long = "btf-check", value_name = "BTF_FILE")]
     btf_check: Option<PathBuf>,
 
+    /// Lab only (Tappa 10.9 step 0): load the sensor-feasibility probes on
+    /// this kernel, exercise them, print the report and exit — 0 when every
+    /// required property holds. Root, a `test-privileged` build, and the
+    /// installed agent stopped (`deploy/lab/nn-lab.sh sensor-feasibility`).
+    #[arg(long = "sensor-feasibility", hide = true)]
+    sensor_feasibility: bool,
+
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
     ade_model: Option<PathBuf>,
@@ -493,6 +500,17 @@ async fn main() -> Result<()> {
     }
     if let Some(path) = &cli.btf_check {
         std::process::exit(btf_check(path));
+    }
+    if cli.sensor_feasibility {
+        #[cfg(feature = "test-privileged")]
+        {
+            std::process::exit(northnarrow_agent::sensor_feasibility::run());
+        }
+        #[cfg(not(feature = "test-privileged"))]
+        {
+            eprintln!("--sensor-feasibility exists only in lab builds (feature test-privileged)");
+            std::process::exit(2);
+        }
     }
 
     tracing_subscriber::fmt()

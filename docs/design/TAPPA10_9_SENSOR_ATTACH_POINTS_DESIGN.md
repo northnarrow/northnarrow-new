@@ -1,7 +1,9 @@
 # Tappa 10.9 — Sensor attach points (file open, exec, DNS) Design
 
-**Status:** RFC — proposal for owner review. Nothing implemented. §8 lists
-the decisions the owner is asked to take before the first commit.
+**Status:** Accepted — merged on 2026-10-11 at the owner's request. The
+options §8 proposes are taken as decided unless the owner says otherwise;
+Q5 is restated after step 0 (§9), which refused `fexit` below 6.5. Step 0
+is done (§9); nothing in the agent changed yet.
 **Author:** Claude Code (architecture), 2026-10-11.
 **Scope:** the first item of Tappa 10.9 ("Punto di aggancio dei sensori").
 The other 10.9 items (workload identity, runtime injection, persistence
@@ -203,14 +205,19 @@ New slots: `linux_binprm.file`, `linux_binprm.filename`, plus §4.1's.
 ### 4.3 DNS: read the query after the kernel copied it
 
 Read the UDP payload from the socket buffer the send path built, instead of
-the user `iov`: `fexit` on `ip_make_skb` and `ip6_make_skb` (global
+the user `iov`: a `kretprobe` on `ip_make_skb` and `ip6_make_skb` (global
 functions; the returned skb holds the copied payload, in the sending task's
 context), or `kprobe` on `udp_send_skb` / `udp_v6_send_skb` where those
-static functions are not inlined. The QNAME walk then runs on kernel memory
+static functions are not inlined. (`fexit` would read the same return
+value, but the two functions take 10 and 9 arguments and x86-64 BPF
+trampolines take more than 6 only from 6.5: step 0 saw it refused on the
+older kernels, §9.) The QNAME walk then runs on kernel memory
 (`bpf_probe_read_kernel`), and the `iov_iter` enum handling disappears.
 IPv6 resolvers are covered by the same change.
 
-New slots: `sk_buff.data`, `sk_buff.len`, and the transport-header offset.
+New slots: `sk_buff.head`, `sk_buff.transport_header` (an offset from
+`head` on 64-bit kernels; the payload starts 8 bytes after it) and
+`sk_buff.len`.
 
 ## 5. Facts noted while writing this
 
@@ -237,7 +244,7 @@ New slots: `sk_buff.data`, `sk_buff.len`, and the transport-header offset.
 the 8-level ancestor walk and the LRU counter inside the 5.15 verifier
 budget; `bprm_check_security` reading `linux_binprm`; the DNS attach
 candidates; resolve every new `BTF_OFFSETS` slot (RHEL alternatives
-included). Nothing changes in the agent until this passes.
+included). Nothing changes in the agent until this passes. Results: §9.
 
 Then one PR per sensor, in this order: file opens (largest gain), exec,
 DNS. Each keeps the old program behind a configuration switch for one
@@ -272,6 +279,86 @@ suites, the telemetry probe, plus:
   deny plumbing (mode map, default off) in the same PR.
 - **Q5 — DNS attach point.** `fexit` on `ip_make_skb` / `ip6_make_skb`
   (proposed if step 0 confirms it on all four kernels) vs `kprobe` on
-  `udp_send_skb` / `udp_v6_send_skb`.
+  `udp_send_skb` / `udp_v6_send_skb`. *Step 0 did not confirm it:* the
+  trampoline refuses functions of more than 6 arguments before 6.5 (§9).
+  Restated proposal, for the owner to confirm before the DNS PR: a
+  `kretprobe` on the same two functions, which reads the same returned
+  socket buffer on all four kernels; the `udp_send_skb` kprobe stays the
+  fallback (static functions: attached by name on the lab kernels, but a
+  compiler is free to inline or rename them).
 - **Q6 — Transition.** Old programs kept behind a switch for one soak
   cycle and then deleted (proposed), or a direct switch.
+
+## 9. Step 0 results (2026-10-11)
+
+The runner is `northnarrow-agent --sensor-feasibility`, built only into lab
+binaries (feature `test-privileged`) and driven by
+`deploy/lab/nn-lab.sh sensor-feasibility [BASE]`; the probes are
+`agent-ebpf/src/sensor_probe.rs`. The installed agent is stopped for the
+run. The probes look only at the runner and its children, and the runner
+exercises every property itself. Each run prints a Markdown report;
+`BASE` moves the file fixtures to another filesystem.
+
+| | Ubuntu 24.04, 6.8 | Debian 12, 6.1 | Ubuntu 22.04, 5.15 (lockdown) | AlmaLinux 9, 5.14 |
+|---|---|---|---|---|
+| required properties | 18/18 | 18/18 | 18/18 | after the soak |
+| `file_open` observer, verified insns | 11 220 | 66 802 | not reported (< 5.16), accepted | |
+| `bprm_check_security`, verified insns | 7 443 | 7 470 | not reported, accepted | |
+| kretprobe `ip_make_skb` / `ip6_make_skb` | QNAME read (IPv4, IPv6) | QNAME read (IPv4, IPv6) | QNAME read (IPv4, IPv6) | |
+| kprobe `udp_send_skb` / `udp_v6_send_skb` | attached by name, QNAME read | attached by name, QNAME read | attached by name, QNAME read | |
+| fexit `ip_make_skb` / `ip6_make_skb` | loads and attaches | loads; attach refused (errno 524, `ENOTSUPP`) | loads; attach refused (`ENOTSUPP`) | |
+
+The same runner with the fixtures on a btrfs loop filesystem (Ubuntu
+24.04, `BASE` on the top level and in a subvolume) holds 14/18: the four
+properties that compare a record's `(dev, ino)` with `stat()` fail (see
+the notes).
+
+What each run checks, all from the runner's own process:
+
+- the eight new offsets resolve from the live BTF;
+- a file in a watched directory (parent inode in the table) gives exactly
+  one record, with the `(dev, ino)` of the file opened and its
+  mount-relative path; a file outside the tables gives none;
+- the record's `(dev, ino)` is the identity userland computes with
+  `stat()` (checked on a record produced by the name table, which does
+  not depend on any key userland computed);
+- the name table (`credentials` under `.aws`, `key4.db` under any parent)
+  and the ancestor table (`.gnupg`, up to 8 levels) match, and the same
+  names under other directories do not;
+- time of check vs time of use: 200 opens of one name while a second
+  thread swaps it with another file (`renameat2(RENAME_EXCHANGE)`); every
+  record carries the inode the open returned, and both inodes were opened;
+- the in-kernel write counter emits one record at the 20th write-open of
+  the window, none before or after;
+- exec of `/usr/bin/true`, of a copy in `/dev/shm`, of a deleted file and
+  of a memfd, the memfd both through `/proc/<pid>/fd` and through
+  `execveat(fd, "", AT_EMPTY_PATH)` (what glibc's `fexecve` does; today's
+  `sys_enter_execve` sensor does not see that call). The record carries
+  the kernel's filename (`/dev/fd/<n>` for `execveat`), the `(dev, ino)`,
+  `i_nlink` (0 for the deleted file and the memfd), `i_mode`, and the
+  superblock magic (tmpfs for `/dev/shm` and the memfd);
+- a DNS query over IPv4 and over IPv6: the bytes read from the socket
+  buffer are the query sent, byte for byte.
+
+Notes for the next steps:
+
+- The verifier budget is not a constraint: the whole `file_open` observer
+  (parent lookup, name table, 8-level ancestor walk, LRU counter, 16-slot
+  path walk) is about 11 000 verified instructions on 6.8, against the
+  1 000 000 limit (about 67 000 on 6.1, whose verifier walks more states
+  for the same program), and it loads on 5.15.
+- `fexit` on the two `*_make_skb` functions loads everywhere but attaches
+  only from 6.5, as x86-64 trampolines took at most 6 arguments before
+  that; the `kretprobe` reads the same return value on every kernel (Q5).
+- `udp_send_skb` and `udp_v6_send_skb` attached by their plain names on
+  every lab kernel; the runner also tries the compiler's renamed copies
+  (`.isra.0`, `.constprop.0`) from `/proc/kallsyms`, and did not need them.
+- Paths are mount-relative, as Q3 accepted: the `/dev/shm` copy is recorded
+  as `/nn-feasibility-true` and the memfd as `/memfd:nn-feasibility`.
+- On btrfs the kernel side reads the superblock's device number, while
+  `stat()` gives each subvolume its own (lab: `0x2c` in the record, `0x2e`
+  from `stat()` on the top level, `0x2f` in a subvolume). No inode-keyed
+  table can match there: not these probes' `PROBE_DIRS`, and not the
+  production `WATCHED_PATHS`, `PROTECTED_INODES` and `OWN_EXE_INODES`
+  either (review 55). Step 1 builds on that fix: the kernel side reports
+  the device `stat()` reports.

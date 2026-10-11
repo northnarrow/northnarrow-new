@@ -87,6 +87,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- `nn-lab.sh sensor-feasibility [BASE]`, step 0 of the Tappa 10.9 sensor
+  attach points. A lab build of the agent (`--sensor-feasibility`, feature
+  `test-privileged`) loads throw-away probes on the attach points the
+  design proposes and exercises them from its own process. The probes are
+  LSM `file_open` with the parent-directory, name and ancestor tables and
+  the in-kernel write counter; LSM `bprm_check_security`; and the DNS
+  payload read from the socket buffer by a `kretprobe` on
+  `ip_make_skb`/`ip6_make_skb` and a `kprobe` on `udp_send_skb`. All 18
+  properties hold on 6.8, 6.1 and 5.15. Among them: every record names the
+  inode the open returned while another thread swaps the name, and an
+  `execveat` of a memfd is seen. The run on btrfs found review 55. The
+  probes ship in the shared eBPF object but the agent never loads them;
+  their maps take about 70 KiB until step 1 replaces them.
 - Kani proof of the admin multi-signature rule. `verify_quorum` and
   `verify_signed_payload_quorum` now share `quorum_decision`, the tally of
   distinct keys, threshold and role check separated from the signature

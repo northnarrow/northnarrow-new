@@ -204,6 +204,26 @@ drift, not a neighbour's load. The benchmark binary is built under
 `/usr/local/libexec/nn-lab` and runs as root, because the agent kills a
 root exec from a user-writable path (R009).
 
+### Sensor feasibility (Tappa 10.9 step 0)
+
+```
+deploy/lab/nn-lab.sh build                          # the runner is in the lab build only
+deploy/lab/nn-lab.sh sensor-feasibility             # ~/.cache/nn-lab/<distro>/reports/sensor-feasibility-<distro>-<stamp>.md
+deploy/lab/nn-lab.sh sensor-feasibility /mnt/other  # the file checks on another filesystem (fixtures in /mnt/other/nn-feasibility)
+```
+
+Loads the throw-away probes of `agent-ebpf/src/sensor_probe.rs` on the
+guest's kernel with `northnarrow-agent --sensor-feasibility` (feature
+`test-privileged`) and exercises them from the runner's own process: the
+LSM `file_open` observer (watched directory, name and ancestor tables,
+write counter, a concurrent rename race), LSM `bprm_check_security` on
+five kinds of exec, and the DNS payload read from the socket buffer over
+IPv4 and IPv6. It prints one line per program (verifier verdict,
+instruction count where the kernel reports it, attach) and per property,
+and exits 1 if a required property fails. The installed agent is stopped
+for the run and started again at the end. Results and their meaning:
+`docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md` §9.
+
 ### RAG release gates need the real corpus
 
 `rag::bench` holds three `#[ignore]` release gates (golden retrieval

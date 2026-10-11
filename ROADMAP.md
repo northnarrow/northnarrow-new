@@ -21,7 +21,7 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
 | **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
-| 10.9 | non iniziata | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna) |
+| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15 |
 | UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 
@@ -697,7 +697,7 @@ ottobre.
 
 ---
 
-## Tappa 10.9 — Copertura delle evasioni (non iniziata)
+## Tappa 10.9 — Copertura delle evasioni (in corso)
 
 Obiettivo: le regole smettono di dipendere dal solo percorso del binario
 e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
@@ -705,14 +705,23 @@ e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
 Elastic Defend, Tetragon, Tracee, Falco e letteratura 2024–2026); non
 cambia l'ordine delle Tappe successive.
 
-- Punto di aggancio dei sensori (progetto proposto l'11 ottobre,
-  `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md`, sei decisioni
-  aperte per il founder; nessuna regola legge gli eventi `openat`, che
-  servono solo alla postura, e l'unico uso che richiede tutte le aperture è
-  il conteggio delle scritture di massa, quindi il sensore può filtrare e
-  contare nel kernel; trovato il rilievo 54: con la
-  lista FIM di base le credenziali nelle home degli utenti non sono
-  sorvegliate) (ricerca dell'11 ottobre: TOCTOU «Phantom»
+- Punto di aggancio dei sensori (progetto dell'11 ottobre,
+  `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md`, unito su
+  richiesta del founder: le opzioni proposte per le sei decisioni valgono
+  salvo diversa indicazione; la Q5 è riformulata dopo il passo 0, perché
+  `fexit` su `ip_make_skb` si aggancia solo da 6.5 e resta il
+  `kretprobe`. Passo 0 fatto l'11 ottobre: sonde usa e getta su LSM
+  `file_open` e `bprm_check_security`, `kretprobe` su `ip_make_skb` /
+  `ip6_make_skb` e `kprobe` su `udp_send_skb`, caricate ed esercitate da
+  `nn-lab.sh sensor-feasibility`, 18/18 proprietà su 6.8, 6.1 e 5.15
+  (AlmaLinux 9 dopo il soak); trovato il rilievo 55: su btrfs le chiavi
+  `(dev, ino)` dello userland non corrispondono a quelle del kernel, e
+  FIM e protezione dei file non vedono nulla. Nessuna regola legge gli
+  eventi `openat`, che servono solo alla postura, e l'unico uso che
+  richiede tutte le aperture è il conteggio delle scritture di massa,
+  quindi il sensore può filtrare e contare nel kernel; trovato il
+  rilievo 54: con la lista FIM di base le credenziali nelle home degli
+  utenti non sono sorvegliate) (ricerca dell'11 ottobre: TOCTOU «Phantom»
   di Guo/Zeng e canale io_uring): `sys_enter_openat` → LSM `file_open`
   (path dal `struct file`, `bpf_path_d_path` dove esiste); QNAME DNS letto
   dopo la copia nel kernel, non dall'iov utente all'ingresso di
