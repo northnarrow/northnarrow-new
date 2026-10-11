@@ -22,6 +22,10 @@ map_count() { # elements of the first map named $1 (0 when absent)
     bpftool map dump name "$1" 2>/dev/null | grep -c '^key' || true
 }
 prev_ticks=0; prev_time=0; hz=$(getconf CLK_TCK)
+# map sizes are sampled every MAP_EVERY samples (see the loop)
+MAP_EVERY=${SOAK_MAP_EVERY:-15}
+MAP_N=0
+fs=0; us=0; fd=0; pp=0
 while [ ! -e "$SOAK_DIR/stop" ]; do
     pid=$(cat /run/northnarrow/agent.pid 2>/dev/null || pgrep -o -f '^/usr/local/bin/northnarrow-agent' || echo 0)
     now=$(date +%s)
@@ -55,10 +59,17 @@ while [ ! -e "$SOAK_DIR/stop" ]; do
     sts=$(sz /var/lib/northnarrow/detections/status_events.jsonl)
     aud=$(sz /etc/northnarrow/audit.log)
     fim=$(sz /var/lib/northnarrow/fim_drift.jsonl)
-    fs=$(map_count FLOW_SOCK_MAP); us=$(map_count UDP_UNCONNECTED_SEEN); fd=$(map_count FIM_DIRTY_INODES); pp=$(map_count PROTECTED_PIDS)
-    # per-CPU u64 counter: bpftool prints one `value (cpu N): 0x…` or
-    # decimal line per CPU; sum them without gawk-only builtins.
-    drops=$(bpftool map dump name RING_DROPS 2>/dev/null | grep -i 'value' | grep -oE '(0x[0-9a-f]+|[0-9]+)$' | while read -r v; do printf '%d\n' "$v"; done | awk '{s+=$1} END{print s+0}')
+    # The agent's own maps: every `bpftool map dump` takes a handle on
+    # them, which the BPF self-defence records (NN-L-BPF-002, observe
+    # builds) or denies (enforce builds). Read their sizes only every
+    # MAP_EVERY samples; the ring-drop total comes from `nn-admin status`,
+    # which does not touch the maps at all.
+    if (( MAP_N % MAP_EVERY == 0 )); then
+        fs=$(map_count FLOW_SOCK_MAP); us=$(map_count UDP_UNCONNECTED_SEEN); fd=$(map_count FIM_DIRTY_INODES); pp=$(map_count PROTECTED_PIDS)
+    fi
+    MAP_N=$((MAP_N + 1))
+    drops=$(/usr/local/bin/nn-admin status --json 2>/dev/null | grep -oE '"ringbuf_drops_total": *[0-9]+' | grep -oE '[0-9]+$' || echo 0)
+    drops=${drops:-0}
     gi=$(cat "$SOAK_DIR/generate.iter" 2>/dev/null || echo 0)
     echo "$now,$pid,$rss,$vsz,$cpu,$thr,$fds,$wdrss,$ar,$wr,$jw,$je,$cb,$det,$sts,$aud,$fim,$fs,$us,$fd,$pp,$drops,$gi" >> "$OUT"
     sleep "$INTERVAL"
