@@ -118,11 +118,17 @@ what is missing and how to fix it:
 | BPF LSM in the LSM list | `bpf` present | the deny hooks cannot attach otherwise |
 | Kernel lockdown | `[integrity]` or stronger | blocks unsigned modules, kexec of unsigned kernels, `/dev/mem` |
 | Unprivileged BPF | `kernel.unprivileged_bpf_disabled` = 1 or 2 | only privileged processes load BPF |
-| Module signature | `module.sig_enforce` = Y | an unsigned module is the classic way to blind a kernel sensor |
+| Module signature | `module.sig_enforce` = Y, or lockdown `[integrity]`/`[confidentiality]` (refuses unsigned modules whatever the parameter says) | an unsigned module is the classic way to blind a kernel sensor |
 | UEFI Secure Boot | enabled | anchors the boot chain; turns on lockdown and module signing on most distros |
 | IMA | measurements > 0 | a replaced binary fails before it runs (appraise) or is at least measured |
-| kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot |
+| kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot; lockdown alone still lets a signed vendor kernel in through `kexec_file_load`, with any command line (one without `bpf` in `lsm=`, for instance) |
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
+
+The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
+22.04 / 5.15: every deny hook attached, and `tamper-check` saw kexec and
+an unsigned module refused by the kernel). `confidentiality` mode is not
+verified: it restricts BPF reads of kernel memory, which the sensors rely
+on.
 
 `install.sh` prints the table after installing; the agent logs one WARN
 per missing setting at boot; `nn-admin status` shows the count and

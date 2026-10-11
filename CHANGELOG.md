@@ -92,6 +92,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   operator ruleset) and the operator canary templates. Besides "never
   panics", `combat_allow` asserts that no allow-file content can inject an
   `iptables-restore` line other than an ACCEPT for one validated address.
+- `tamper-check` with kernel lockdown: kexec (C17) is a required refusal
+  when lockdown is active instead of a known gap, and C27 loads a module
+  whose signature was stripped through a bare `finit_module`. Verified on
+  Ubuntu 22.04 with `lockdown=integrity`: the agent runs unchanged, both
+  are refused by the kernel, and R018 still records the module attempt.
+  `nn-admin host-check` reports module signing as enforced when lockdown
+  is in integrity or confidentiality mode, which refuses unsigned modules
+  whatever `module.sig_enforce` says.
 - Distribution packages: `northnarrow_<ver>-<rel>_amd64.deb` and
   `northnarrow-<ver>-<rel>.x86_64.rpm`, built by
   `deploy/release/mk-packages.sh` with dpkg-deb and rpmbuild only, and
