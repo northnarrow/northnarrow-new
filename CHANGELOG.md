@@ -53,6 +53,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Host hardening checks (`nn-admin host-check [--json]`, summary in
+  `nn-admin status`, one WARN per gap at agent boot, table at the end of
+  `install.sh`): BPF LSM, kernel lockdown, unprivileged BPF, module
+  signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
+  the host settings that keep root from rewriting the kernel at runtime,
+  which is the only way around the anti-tamper.
+- io_uring sensor — the asynchronous I/O channel syscall-centric sensors
+  miss: tracepoints `io_uring_create` and `io_uring_submit_{req,sqe}`
+  (name resolved per kernel), submissions aggregated per pid in kernel by
+  opcode class (file open, file read/write, network connect, network
+  send/recv, filesystem mutation) and emitted on a new class or once per
+  second; `Event::IoUring`; rules `NN-L-IOU-001_IoUringRingCreated` (Low,
+  Log: baseline of ring creators outside the allowlist) and
+  `NN-L-IOU-002_IoUringFileAndNetwork` (High, Log: file and network I/O
+  through rings from the same unlisted process — the RingReaper shape).
+  Known io_uring servers (qemu, nginx, postgres, mariadb, mysql, redis,
+  node, fio, systemd-journal) and the process comm allowlist are exempt.
+  Five new `BTF_OFFSETS` tracepoint slots; a kernel without
+  `CONFIG_IO_URING` degrades with a WARN.
+- Ring-buffer drop accounting: every eBPF producer bumps a per-ring
+  counter (`RING_DROPS` per-CPU map, 11 rings) when its reservation
+  fails; the agent samples it every 10 s, logs each increase at WARN with
+  the ring's name, and `nn-admin status` shows the total and the per-ring
+  breakdown (`ringbuf_drops_total`, `ringbuf_drops` in `--json`). Before,
+  only the exec ring counted and nothing read it.
 - Fuzzing (`fuzz/`, cargo-fuzz): eight libFuzzer targets over every
   parser that consumes attacker-shaped bytes — admin socket frames, TLS
   ClientHello and DNS payloads from the kernel rings, the BTF blob,

@@ -26,6 +26,8 @@ pub mod wire;
 /// revalidates against. NOT `std`-gated — the eBPF half needs it with
 /// `default-features = false`.
 pub mod btf_offsets;
+/// Ring-buffer drop slots shared by eBPF producers and the agent.
+pub mod ring_drops;
 
 #[cfg(feature = "std")]
 mod model;

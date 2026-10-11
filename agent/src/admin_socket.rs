@@ -1094,6 +1094,8 @@ fn dispatch(
             posture: posture.current_kind(),
             network_isolation_engaged: isolator.is_engaged(),
             last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
+            ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
+            ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
         }),
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
@@ -4028,6 +4030,8 @@ mod tests {
             posture: common::posture_types::PostureKind::Observing,
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
+            ringbuf_drops_total: None,
+            ringbuf_drops: None,
         });
         emit_audit_for(
             &status_req,

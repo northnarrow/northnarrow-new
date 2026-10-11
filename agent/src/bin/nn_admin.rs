@@ -114,6 +114,17 @@ enum Cmd {
         json: bool,
     },
 
+    /// Host hardening checks (Tappa 10.8): kernel lockdown, module
+    /// signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA,
+    /// BPF LSM, single bpffs mount — the settings that keep root from
+    /// rewriting the kernel at runtime, which is the only way around the
+    /// agent's anti-tamper. Reads /sys and /proc only; no socket needed.
+    /// Exit 0 with no warnings, 2 with warnings (`--json` for scripting).
+    HostCheck {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Tappa 9.0.b — read the last N persisted detections
     /// (newest-first) over the admin socket. Requires a key carrying
     /// the low-privilege `telemetry-read` role — read-only telemetry,
@@ -933,9 +944,41 @@ fn main() -> ExitCode {
                 ExitCode::from(5)
             }
         },
+        Cmd::HostCheck { json } => {
+            let checks = northnarrow_agent::host_hardening::run();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&checks).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else {
+                print!(
+                    "{}",
+                    northnarrow_agent::host_hardening::render_table(&checks)
+                );
+            }
+            if northnarrow_agent::host_hardening::warn_count(&checks) == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            }
+        }
         Cmd::Status { socket, json } => match run_status(&socket) {
             Ok(out) => {
                 print_status(&out, json);
+                if !json {
+                    let checks = northnarrow_agent::host_hardening::run();
+                    let warns = northnarrow_agent::host_hardening::warn_count(&checks);
+                    println!(
+                        "host hardening : {} check(s), {warns} warning(s){}",
+                        checks.len(),
+                        if warns > 0 {
+                            " — see `nn-admin host-check`"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -1664,14 +1707,24 @@ fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
         // surface; the fields are stable and trivially escapable.
+        let drops: Vec<String> = out
+            .ringbuf_drops
+            .iter()
+            .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
+            .collect();
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
                 Some(s) => s.to_string(),
                 None => "null".to_string(),
-            }
+            },
+            match out.ringbuf_drops_total {
+                Some(t) => t.to_string(),
+                None => "null".to_string(),
+            },
+            drops.join(",")
         );
         return;
     }
@@ -1686,6 +1739,22 @@ fn print_status(out: &StatusOutcome, json: bool) {
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
         None => println!("last admin action : (none since agent start)"),
+    }
+    match out.ringbuf_drops_total {
+        None => println!("ringbuf drops     : (agent predates the counter)"),
+        Some(0) => println!("ringbuf drops     : {}", colorize("0", "32", tty)),
+        Some(t) => {
+            let per: Vec<String> = out
+                .ringbuf_drops
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect();
+            println!(
+                "ringbuf drops     : {} ({}) — events lost since boot, see the agent WARNs",
+                colorize(&t.to_string(), "31", tty),
+                per.join(", ")
+            );
+        }
     }
 }
 

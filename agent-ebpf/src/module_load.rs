@@ -116,7 +116,10 @@ unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
 unsafe fn emit_module_load(method: u8, file: *const c_void) {
     let mut entry = match MODULE_LOAD_EVENTS.reserve::<ModuleLoadRaw>(0) {
         Some(e) => e,
-        None => return,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::MODULE_LOAD);
+            return;
+        }
     };
     let raw: *mut ModuleLoadRaw = entry.as_mut_ptr();
     // Zero the whole slot first so `_pad` + any unwritten path slots

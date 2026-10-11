@@ -24,6 +24,7 @@ pub mod detection_store;
 pub mod fim;
 #[doc(hidden)]
 pub mod fuzz_api;
+pub mod host_hardening;
 pub mod install_manifest;
 pub mod net;
 pub mod posture;

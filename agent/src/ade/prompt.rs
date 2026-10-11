@@ -137,6 +137,17 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             "- module_load method={method:?} loader_pid={loader_pid} loader_comm={loader_comm} path={}",
             path.as_deref().unwrap_or("none")
         ),
+        Event::IoUring {
+            created,
+            pid,
+            comm,
+            classes,
+            count,
+            ..
+        } => format!(
+            "- io_uring created={created} pid={pid} comm={comm} classes={:?} count={count}",
+            common::io_uring_class_names(*classes)
+        ),
         Event::ProcessSpawn {
             pid,
             ppid,

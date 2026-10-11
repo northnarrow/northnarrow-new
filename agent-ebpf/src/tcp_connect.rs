@@ -153,7 +153,10 @@ fn try_tcp_connect_v4(ctx: &ProbeContext) -> Result<(), i64> {
 
     let mut entry = match TCP_CONNECT_EVENTS.reserve::<TcpConnectRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TCP_CONNECT);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut TcpConnectRaw = entry.as_mut_ptr();
     unsafe {
@@ -212,7 +215,10 @@ fn try_tcp_connect_v6(ctx: &ProbeContext) -> Result<(), i64> {
 
     let mut entry = match TCP_CONNECT_EVENTS.reserve::<TcpConnectRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TCP_CONNECT);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut TcpConnectRaw = entry.as_mut_ptr();
     unsafe {

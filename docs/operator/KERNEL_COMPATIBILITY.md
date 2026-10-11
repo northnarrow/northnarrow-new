@@ -120,6 +120,23 @@ compiled value stays and a WARN names the field. Independently, the rules
 that match on "not under a standard prefix" (R017, R013) treat an empty
 filename as unknown and never fire on it.
 
+## io_uring tracepoints per kernel
+
+The io_uring sensor attaches `io_uring/io_uring_create` and the submit
+tracepoint, whose name and layout changed across kernels — resolved at
+boot like every other tracepoint field (`TRACEPOINT_FIELDS`, alternative
+event name):
+
+| Kernel | submit event | `opcode` offset | `sq_thread` offset |
+|---|---|---|---|
+| Ubuntu 22.04 / 5.15 | `io_uring_submit_sqe` | 24 | 45 |
+| Debian 12 / 6.1 | `io_uring_submit_sqe` | 32 | 41 |
+| Ubuntu 24.04 / 6.8 | `io_uring_submit_req` | 32 | 48 |
+| AlmaLinux 9 / 5.14 el9 | `io_uring_submit_req` (backported) | 40 | 56 |
+
+A kernel built without `CONFIG_IO_URING` has no such tracepoints: the
+agent logs a WARN and runs without the sensor (nothing to observe there).
+
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
 The 5.15 verifier rejected three constructs that 6.1 and 6.8 accept. Both

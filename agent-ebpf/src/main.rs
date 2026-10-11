@@ -19,11 +19,13 @@
 #[macro_use]
 mod btf_offsets;
 mod dns_query;
+mod drops;
 mod exec_check;
 mod file_open;
 mod fim_watch;
 mod inet_csk_listen;
 mod inode_protect;
+mod io_uring;
 mod module_load;
 mod ptrace_check;
 mod task_kill;
@@ -39,7 +41,7 @@ use aya_ebpf::{
         bpf_probe_read_user_buf,
     },
     macros::{map, tracepoint},
-    maps::{PerCpuArray, RingBuf},
+    maps::{RingBuf},
     programs::TracePointContext,
     EbpfContext,
 };
@@ -56,10 +58,6 @@ use crate::btf_offsets::{
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
-/// Per-CPU drop counter, incremented when the ringbuf is full.
-/// Userland may inspect it for telemetry; not consumed yet.
-#[map]
-static DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 // `sched_process_exec` event format (see
 // /sys/kernel/debug/tracing/events/sched/sched_process_exec/format):
@@ -95,9 +93,7 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
         None => {
             // Ringbuf full — bump the per-CPU drop counter and return
             // success so the verifier doesn't see this as an error path.
-            if let Some(c) = DROPPED.get_ptr_mut(0) {
-                unsafe { *c = (*c).wrapping_add(1) };
-            }
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXEC);
             return Ok(());
         }
     };

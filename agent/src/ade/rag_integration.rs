@@ -37,6 +37,10 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
                 path.as_deref().unwrap_or("buffer")
             )
         }
+        Event::IoUring { comm, classes, .. } => format!(
+            "io_uring asynchronous I/O by {comm}: {}",
+            common::io_uring_class_names(*classes).join(", ")
+        ),
         Event::ProcessSpawn { comm, filename, .. } => format!("process {comm} from {filename}"),
         Event::FileOpen { filename, .. } => format!("file open {filename}"),
         Event::ExecCheck { filename, .. } => format!("exec check {filename}"),

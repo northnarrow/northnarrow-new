@@ -42,7 +42,10 @@ pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
 fn try_sys_enter_execve(ctx: &TracePointContext) -> Result<(), i64> {
     let mut entry = match EXEC_CHECK_EVENTS.reserve::<ExecCheckRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXEC_CHECK);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut ExecCheckRaw = entry.as_mut_ptr();
     unsafe {

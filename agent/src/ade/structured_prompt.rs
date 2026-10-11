@@ -157,6 +157,7 @@ fn push_untrusted_block(buf: &mut String, s: &SanitizedEvent) {
 fn event_kind_label(e: &Event) -> &'static str {
     match e {
         Event::ModuleLoad { .. } => "module_load",
+        Event::IoUring { .. } => "io_uring",
         Event::ProcessSpawn { .. } => "process_spawn",
         Event::FileOpen { .. } => "file_open",
         Event::ExecCheck { .. } => "exec_check",
@@ -182,6 +183,7 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
             loader_uid,
             ..
         } => (*loader_pid, *loader_uid),
+        Event::IoUring { pid, uid, .. } => (*pid, *uid),
         Event::ProcessSpawn { pid, uid, .. }
         | Event::FileOpen { pid, uid, .. }
         | Event::ExecCheck { pid, uid, .. }

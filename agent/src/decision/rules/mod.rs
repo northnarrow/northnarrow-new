@@ -12,6 +12,7 @@ use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 pub mod canary;
 pub mod chain;
+pub mod iouring;
 pub mod net;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
@@ -145,8 +146,12 @@ pub fn default_rules_with_net(
         Box::new(R008HiddenHomeBinary),
     ];
     rules.extend(tappa2);
+    let process_allowlist_for_iouring = Arc::clone(&process_allowlist);
     rules.extend(process_rules(process_allowlist));
     rules.extend(module_load_rules());
+    rules.extend(iouring::iouring_rules(Arc::clone(
+        &process_allowlist_for_iouring,
+    )));
     rules.extend(crate::fim::rules::fim_rules(installer_override));
     rules.extend(canary::canary_rules());
     rules.extend(net::net_rules(
@@ -252,6 +257,12 @@ pub(crate) fn build_verdict(
             timestamp_ns,
             ..
         } => (*loader_pid, path.clone().unwrap_or_default(), *timestamp_ns),
+        Event::IoUring {
+            pid,
+            comm,
+            timestamp_ns,
+            ..
+        } => (*pid, comm.clone(), *timestamp_ns),
         _ => (0, String::new(), 0),
     };
     Verdict {
