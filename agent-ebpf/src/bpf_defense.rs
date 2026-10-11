@@ -99,10 +99,21 @@ static OBJ_GET_PATH_SCRATCH: PerCpuArray<[u8; PATH_BUF_LEN]> = PerCpuArray::with
 #[map]
 pub static OWN_PIN_NAMES: HashMap<[u8; PIN_NAME_LEN], u8> = HashMap::with_max_entries(64, 0);
 
-/// Ids of the agent's own maps, programs and links (value = kind). Filled
-/// by userland right after load/attach; per boot, not pinned.
+/// The agent's own maps, programs and links. Key = `(kind << 32) | id`
+/// ([`own_key`]): map, program and link ids are three independent kernel
+/// id spaces, so the same number routinely names one map AND one program
+/// AND one link — keyed by id alone, the later registration overwrote the
+/// earlier and some own maps were not recognised (lab: 66 registrations,
+/// 48 entries). Value = kind (kept for bpftool readability). Filled by
+/// userland right after load/attach; per boot, not pinned.
 #[map]
-pub static OWN_BPF_IDS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
+pub static OWN_BPF_IDS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+
+/// Key of [`OWN_BPF_IDS`] (mirrored in userland `anti_tamper::bpf_defense`).
+#[inline(always)]
+pub fn own_key(kind: u8, id: u32) -> u64 {
+    ((kind as u64) << 32) | id as u64
+}
 
 /// Slot 0: 1 = enforce (deny), 0 = observe.
 #[map]
@@ -182,10 +193,7 @@ fn caller_is_protected() -> bool {
 /// our program ids is not ours.
 #[inline(always)]
 fn is_own_kind(id: u32, kind: u8) -> bool {
-    match unsafe { OWN_BPF_IDS.get(&id) } {
-        Some(k) => *k == kind,
-        None => false,
-    }
+    unsafe { OWN_BPF_IDS.get(&own_key(kind, id)).is_some() }
 }
 
 /// `OBJ_GET` whose pathname's final component is one of the agent's own

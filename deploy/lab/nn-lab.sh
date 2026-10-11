@@ -23,6 +23,7 @@
 #                                                    # sub-command honours NN_LAB_DISTRO (default ubuntu2404)
 #   deploy/lab/nn-lab.sh upgrade-check    # install.sh --upgrade on the running install (keys/chains kept)
 #   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
+#   deploy/lab/nn-lab.sh tamper-check     # adversarial anti-tamper cases: outcome + chain-log evidence per case
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -267,6 +268,8 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
     sudo pkill -9 -f "northnarrow-agent-e2etes[t]|northnarrow-watchdog-e2etes[t]" 2>/dev/null
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
+    # tamper-check leftovers (protected while an agent ran; the window is open now)
+    sudo rm -f /etc/northnarrow/zz-tamper-*.local 2>/dev/null
 fi
 for i in $(seq 1 20); do
     n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
@@ -418,6 +421,13 @@ fail=0
 (( fail == 0 )) && echo "respawn-check: OK"
 exit $fail
 REMOTE
+}
+
+cmd_tamper_check() {
+    # Structured adversarial check of the anti-tamper (Tappa 10.8): every
+    # documented neutralisation attempt, with expected outcome and evidence.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; cd ~/northnarrow && sudo bash deploy/lab/adversarial/anti-tamper.sh'
 }
 
 cmd_ssh() {
@@ -791,6 +801,7 @@ case "${1:-help}" in
     respawn-check) cmd_respawn_check ;;
     upgrade-check) cmd_upgrade_check ;;
     uninstall-check) cmd_uninstall_check ;;
+    tamper-check)  cmd_tamper_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;

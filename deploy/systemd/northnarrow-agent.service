@@ -102,6 +102,14 @@ RuntimeDirectoryPreserve=yes
 MemoryHigh=9G
 MemoryMax=11G
 TasksMax=512
+# OOMScoreAdjust — on a host under global memory pressure the kernel kills
+# the process with the largest footprint first, and with the ADE model
+# loaded that is the agent. -500 halves its badness against the rest of
+# the host without making it unkillable (-1000 would turn a leak inside
+# MemoryMax into a memcg livelock). Root can still raise it through
+# /proc/<pid>/oom_score_adj: the self-integrity check reports that as
+# `integrity_drift` (limit_changed).
+OOMScoreAdjust=-500
 
 # Hardening — `ProtectSystem=strict` makes the entire filesystem
 # read-only EXCEPT the ReadWritePaths whitelist below. NoNewPrivileges

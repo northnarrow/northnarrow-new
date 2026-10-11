@@ -363,6 +363,9 @@ pub struct AuditEntryDraft {
 /// records without taking a lock.
 pub struct AuditLog {
     path: PathBuf,
+    /// `path` anchored to the directory fd taken at open (review entry 44):
+    /// appends cannot be diverted by a later mount over the directory.
+    io_path: PathBuf,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -396,6 +399,7 @@ impl AuditLog {
         }
         Ok(Self {
             path: path.to_path_buf(),
+            io_path: crate::anchored::anchor(path),
             key,
             agent_id,
             last_hash,
@@ -418,7 +422,7 @@ impl AuditLog {
             .create(true)
             .append(true)
             .mode(AUDIT_LOG_FILE_MODE)
-            .open(&self.path)
+            .open(&self.io_path)
             .with_context(|| format!("opening audit log {} for append", self.path.display()))?;
         f.write_all(line.as_bytes())
             .with_context(|| format!("appending audit entry to {}", self.path.display()))?;

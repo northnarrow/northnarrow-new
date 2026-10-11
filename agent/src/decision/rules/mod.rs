@@ -10,6 +10,7 @@ use super::Rule;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
+pub mod anti_tamper;
 pub mod bpf;
 pub mod canary;
 pub mod chain;

@@ -59,6 +59,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
   the host settings that keep root from rewriting the kernel at runtime,
   which is the only way around the anti-tamper.
+- Adversarial anti-tamper check (`nn-lab.sh tamper-check`,
+  `deploy/lab/adversarial/anti-tamper.sh`): 20 cases (signals, ptrace,
+  protected files and pins, BPF maps/links/programs, unit drop-ins,
+  `set-property`, bpffs and bind mounts, cgroup freeze, module load,
+  `oom_score_adj`, config overlays), each with expected outcome and the
+  evidence it must leave in the signed chain logs. Found and fixed:
+  `OWN_BPF_IDS` collisions between map/program/link ids (review 40),
+  silent signal/ptrace denials — now `op=signal`/`op=ptrace` records and
+  detection NN-L-AT-001 for every anti-tamper denial (41), silent
+  systemd/kernel tampering — now a self-integrity check every 30 s ±20 %
+  with `integrity_drift` audit entries, `OOMScoreAdjust` in both units
+  (42), the telemetry probe tripping NN-L-NET-004 (43), and the signed
+  logs being divertible by a bind mount over their directory — every log now
+  writes through a directory fd taken when it is opened (44). Ring-buffer
+  losses are signed audit entries (`ringbuf_drop`); the telemetry probe
+  and the link self-check run with ±20 % jitter.
 - Telemetry probe: every 60 s the agent runs a child of its own binary
   (`--telemetry-probe <nonce>`, hidden) that produces one known event per
   probed sensor — exec, file open of `/run/northnarrow/probe/<nonce>`, DNS
