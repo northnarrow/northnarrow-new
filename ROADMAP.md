@@ -658,8 +658,14 @@ Pianificato, in quest'ordine:
     binari setuid e lasciavano pacchetti a metà; ora le scritture di
     dpkg/rpm/dnf e dei loro script restano registrate come Low senza kill,
     e `nn-lab.sh pkgmgr-check` lo verifica.
-  Restano i pacchetti veri e propri: script del manutentore, namespace
-  journald, file esca, aggiornamento con la finestra trusted-installer
+  Pacchetti fatti l'11 ottobre, lab PR 40: `.deb` e `.rpm` costruiti con
+  dpkg-deb e rpmbuild, pubblicati e attestati con il tarball; gli script del
+  pacchetto riusano `install.sh`/`uninstall.sh` (migrazione da
+  un'installazione con `install.sh`, aggiornamento e rimozione solo con la
+  finestra trusted-installer, nessun avvio alla prima installazione);
+  `nn-lab.sh pkg-check` verifica l'intero ciclo di vita, superato su Ubuntu
+  24.04. Restano la verifica su Ubuntu 22.04 e Debian 12 e quella dell'RPM
+  su AlmaLinux 9
 - BTF esterna per kernel senza BTF nativa
 
 Demo: stesso tarball installato e verificato su quattro distribuzioni,

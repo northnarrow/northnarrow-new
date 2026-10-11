@@ -79,6 +79,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Distribution packages: `northnarrow_<ver>-<rel>_amd64.deb` and
+  `northnarrow-<ver>-<rel>.x86_64.rpm`, built by
+  `deploy/release/mk-packages.sh` with dpkg-deb and rpmbuild only, and
+  published, checksummed and attested with the tarball. Their scripts run
+  `install.sh` / `uninstall.sh` in new package modes (`--package-stop`,
+  `--package-configure`, `--package`). Installing over an `install.sh`
+  install migrates it; upgrade and removal go through the
+  trusted-installer window (`NN_GRANT_KEY`) and stop cleanly without it;
+  the first install starts nothing. Lab: `nn-lab.sh pkg-check`.
 - Package install layout: `install.sh` and `uninstall.sh` accept
   `BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system` and rewrite the units
   for `BIN_DIR`. The agent protects the binaries and units of both layouts

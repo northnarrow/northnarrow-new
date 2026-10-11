@@ -18,6 +18,8 @@ with `rm -f` or `kill -9`, they are denied by design.
 
 All three assume `cargo xtask build --release` (or the release tarball)
 produced `target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}`.
+The `.deb` / `.rpm` packages wrap the same steps for the package manager:
+see section 6.
 
 ## 1. Fresh install
 
@@ -336,6 +338,7 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 | File | What it is |
 |---|---|
 | `northnarrow-<ver>-x86_64-linux.tar.gz` | the release tree: binaries, eBPF object + provenance stamp, `deploy/` (install/uninstall/units), `configs/`, operator docs, licences. Extract and run `sudo ./deploy/install.sh` (or `--upgrade`) unchanged — every preflight still applies. |
+| `northnarrow_<ver>-<rel>_amd64.deb`, `northnarrow-<ver>-<rel>.x86_64.rpm` | the same binaries as distribution packages (section 6) |
 | `northnarrow-<ver>-x86_64-linux.{agent,watchdog}.sbom.cdx.json` | CycloneDX SBOMs of the two daemons (the agent one covers `nn-admin` too) |
 | `SHA256SUMS` | checksums of the files above |
 
@@ -423,4 +426,49 @@ over a package's unit, or the tmpfs `/run/systemd/transient` and
 `system.control` over either — would replace it at the next
 `daemon-reload`; the agent reports it as an `integrity_drift` audit entry
 of kind `unit_shadowed`, `systemctl mask` included.
+
+## 6. Distribution packages (`.deb` / `.rpm`)
+
+The packages install the package layout: binaries in `/usr/bin`, units in
+`/usr/lib/systemd/system`, and in `/usr/share/northnarrow` the data tree
+`install.sh` needs (configs, unit sources, the eBPF object). Nothing under
+`/etc` belongs to the package. The first install seeds `/etc/northnarrow`
+exactly as `install.sh` does, and an operator copy is never overwritten.
+The package scripts run `install.sh` / `uninstall.sh` in their package
+modes, so every step and every refusal is the one described above.
+
+| Operation | Debian / Ubuntu | RHEL / AlmaLinux | Keeps keys / audit chain / state |
+|---|---|---|---|
+| Install | `sudo dpkg -i northnarrow_<ver>-<rel>_amd64.deb` | `sudo rpm -U northnarrow-<ver>-<rel>.x86_64.rpm` | n/a (bootstraps them) |
+| Upgrade | the same command with the newer package | the same | **yes** |
+| Remove | `sudo dpkg -r northnarrow` | `sudo rpm -e northnarrow` | **yes** |
+| Retire the host | `sudo dpkg -P northnarrow` | `rpm -e`, then `uninstall.sh --package --purge` from the tree | no |
+
+A first install starts nothing: enable the units as in section 1. An
+installation made with `install.sh` is migrated when the package is
+installed over it. The running units are stopped and restarted, the
+`/usr/local/bin` binaries and the `/etc/systemd/system` units are
+removed, and units that were enabled stay enabled. Keys, `agent_id`, the
+audit chain and the chain logs are kept. The install manifest records
+`"provenance": "package"`; the integrity of the files is the package
+manager's to verify (`dpkg --verify northnarrow`, `rpm -V northnarrow`).
+
+**Upgrade and removal need the trusted-installer window.** The running
+agent protects its binaries, units and pin root, so the package's hooks
+stop it the way `install.sh --upgrade` does. They open the window with the
+key in `NN_GRANT_KEY`, or with `/etc/northnarrow/admin.key` while that
+bootstrap key is still on the host. Without a usable key the operation
+stops before any file changes, the running version keeps running, and the
+package stays at its current version:
+
+```sh
+sudo NN_GRANT_KEY=/path/to/admin.key apt-get install ./northnarrow_<ver>-<rel>_amd64.deb
+# or open the window first, then use the package manager as usual
+sudo nn-admin trusted-installer-grant --key /path/to/admin.key --window-secs 600
+```
+
+This applies to unattended upgrades too: without the key they fail
+cleanly and leave the agent running. Neither an attacker nor an
+automatic job can replace or remove the agent through the package manager
+without a key that carries the `trusted-installer` role.
 

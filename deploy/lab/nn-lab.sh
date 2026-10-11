@@ -26,6 +26,7 @@
 #   deploy/lab/nn-lab.sh tamper-check     # adversarial anti-tamper cases: outcome + chain-log evidence per case
 #   deploy/lab/nn-lab.sh overhead [ROUNDS] # agent off/on throughput of the hooked operations (idle host!)
 #   deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent: probe package install/remove + real reinstall
+#   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -543,6 +544,22 @@ exit $fail
 REMOTE
 }
 
+cmd_pkg_check() {
+    # Tappa 10.8 — .deb/.rpm lifecycle in the guest's native format
+    # (deploy/lab/pkg/pkg-check.sh): migration from the install.sh layout,
+    # upgrade, upgrade refused without the trusted-installer key, remove,
+    # purge, fresh install with a "package" install manifest. The packages
+    # are built on the guest from the synced tree; the lab's install.sh
+    # layout is put back at the end.
+    vm_running || die "guest is not running"
+    cmd_build | tail -3
+    local rc=0
+    vssh 'cd ~/northnarrow && bash deploy/lab/pkg/pkg-check.sh' || rc=$?
+    log "restoring the lab layout (nn-lab.sh install)"
+    cmd_install >/dev/null 2>&1 || { log "restore failed — run nn-lab.sh install"; rc=1; }
+    return "$rc"
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -929,6 +946,7 @@ case "${1:-help}" in
     tamper-check)  cmd_tamper_check ;;
     overhead)      shift; cmd_overhead "$@" ;;
     pkgmgr-check)  cmd_pkgmgr_check ;;
+    pkg-check)     cmd_pkg_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;

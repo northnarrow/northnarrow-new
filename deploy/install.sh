@@ -73,6 +73,15 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 # and every chain log are preserved — install.sh never touches them.
 UPGRADE=0
 GRANT_KEY=
+# Package maintainer scripts (deploy/release/mk-packages.sh) drive this
+# script in two halves around the package manager's own file copy:
+#   --package-stop       before unpack/removal: stop the units, drop the pin
+#                        root, remember which units ran (/run/northnarrow-pkg-restart)
+#   --package-configure  after unpack: configure the host, restart them
+# Both run with BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system and
+# REPO_ROOT=/usr/share/northnarrow (the package's data tree).
+MODE=full
+PKG_RESTART_FILE=${PKG_RESTART_FILE:-/run/northnarrow-pkg-restart}
 VERIFY=1
 REQUIRE_ATTESTATION=0
 TARBALL=""
@@ -82,6 +91,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
         --grant-key) GRANT_KEY=$2; shift ;;
+        --package-stop) MODE=stop ;;
+        --package-configure) MODE=configure ;;
         --tarball) TARBALL=$2; shift ;;
         --sums) SUMS=$2; shift ;;
         --attestation) ATTEST_BUNDLE=$2; shift ;;
@@ -100,6 +111,17 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+if [[ $MODE != full ]]; then
+    # The package manager verified and placed the files; there is no tree
+    # to verify and nothing to copy. The trusted-installer key comes from
+    # --grant-key, NN_GRANT_KEY, or the bootstrap key if it is still on
+    # the host (the operator is told to move it offline).
+    VERIFY=0
+    GRANT_KEY=${GRANT_KEY:-${NN_GRANT_KEY:-}}
+    if [[ -z "$GRANT_KEY" && -r /etc/northnarrow/admin.key ]]; then
+        GRANT_KEY=/etc/northnarrow/admin.key
+    fi
+fi
 # Beta Step 4c: nn-admin is the operator's COMBAT-release / admin tool.
 # It must be on-host so an operator can unlock COMBAT, and install.sh
 # uses it below to bootstrap admin.pub on a fresh install (issue #124).
@@ -351,12 +373,20 @@ require_fresh_ebpf() {
 }
 
 require_root
+if [[ $MODE != full ]]; then
+    PROVENANCE="package"
+else
 verify_release
 require_file "$AGENT_BIN"    "run \`cargo xtask build --release\` first (xtask builds the eBPF object + userland atomically; a plain \`cargo build\` cannot produce an installable agent — agent/build.rs refuses a stale/unstamped eBPF object)"
 require_file "$WATCHDOG_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-watchdog\`)"
 require_file "$NN_ADMIN_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-agent --bin nn-admin\`)"
 # Refuse a stale agent binary BEFORE we touch the live system.
 require_fresh_ebpf
+fi
+# --package-stop runs from the package's pre-unpack hook, before any file of
+# the new package exists (on a first install not even the data tree): it
+# needs nothing but the installed nn-admin, so it skips the tree checks.
+if [[ $MODE != stop ]]; then
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
 require_file "$JOURNALD_NS_CONF_SRC" "expected at $JOURNALD_NS_CONF_SRC (NN journal-namespace cap; the LogNamespace=northnarrow journald config)"
@@ -383,6 +413,7 @@ require_dir "$HONEYPOT_BAITS_SRC_DIR" "expected at $HONEYPOT_BAITS_SRC_DIR (Tapp
 for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag agent.legacy.conf shutdown.signal disable.token override.config pause.flag unload.signal; do
     require_file "$HONEYPOT_BAITS_SRC_DIR/$bait" "expected at $HONEYPOT_BAITS_SRC_DIR/$bait (Tappa 9.5.1 control-surface file)"
 done
+fi
 
 # ── install ─────────────────────────────────────────────────────────
 # ── running install? ──────────────────────────────────────────────────
@@ -430,12 +461,29 @@ purge_pin_root() {
 }
 
 UNITS_TO_RESTART=()
+if [[ $MODE == configure ]]; then
+    # The package's pre-unpack hook already stopped the units and dropped
+    # the pins; it left the list of units to start again.
+    if [[ -s "$PKG_RESTART_FILE" ]]; then
+        mapfile -t UNITS_TO_RESTART < "$PKG_RESTART_FILE"
+        UPGRADE=1
+    fi
+else
 for u in northnarrow-watchdog northnarrow-agent; do
     state=$(systemctl is-active "$u.service" 2>/dev/null || true)
     if [[ -n "$state" && "$state" != inactive ]]; then
         UNITS_TO_RESTART+=("$u")
     fi
 done
+if [[ $MODE == stop ]]; then
+    # Written before anything is stopped: if a later step fails, the
+    # package's abort hook still knows what to start again.
+    rm -f "$PKG_RESTART_FILE"
+    if (( ${#UNITS_TO_RESTART[@]} )); then
+        printf '%s\n' "${UNITS_TO_RESTART[@]}" > "$PKG_RESTART_FILE"
+        UPGRADE=1
+    fi
+fi
 if (( ${#UNITS_TO_RESTART[@]} )); then
     if (( ! UPGRADE )); then
         echo "install.sh: NorthNarrow is RUNNING (${UNITS_TO_RESTART[*]}) — with the anti-tamper hooks" >&2
@@ -444,8 +492,12 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
         exit 1
     fi
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
-    new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1 || echo "unknown")
-    echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
+    if [[ $MODE == full ]]; then
+        new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1 || echo "unknown")
+        echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
+    else
+        echo "install.sh: stopping $old_ver for the package manager"
+    fi
     # The pin root is in the agent's protected-inode set (review entry 39):
     # only a protected pid or an open trusted-installer window may remove it.
     # Open the window now, while the agent still answers on its socket.
@@ -480,7 +532,38 @@ if (( ! ${#UNITS_TO_RESTART[@]} )) && [[ -d /sys/fs/bpf/northnarrow ]]; then
     fi
     purge_pin_root || exit 1
 fi
+fi
 
+if [[ $MODE == stop ]]; then
+    # $PKG_RESTART_FILE hands the list to --package-configure, or to the
+    # abort hook that restarts the old version if the operation fails.
+    echo "install.sh: units stopped and pins dropped for the package manager${UNITS_TO_RESTART[*]:+ (to restart: ${UNITS_TO_RESTART[*]})}"
+    exit 0
+fi
+
+if [[ $MODE == configure ]]; then
+    # Migration from the install.sh layout: its units in /etc/systemd/system
+    # would shadow the package's (review 51) and run the old binaries. The
+    # pins were dropped before unpack, so nothing protects them now.
+    if [[ "$BIN_DIR" != /usr/local/bin ]]; then
+        was_enabled=()
+        for u in northnarrow-agent northnarrow-watchdog; do
+            if [[ -e "/etc/systemd/system/$u.service" ]] && systemctl is-enabled --quiet "$u.service" 2>/dev/null; then
+                was_enabled+=("$u.service")
+            fi
+        done
+        for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
+                 /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service; do
+            [[ -e "$f" ]] && { echo "install.sh: removing $f (install.sh layout, replaced by the package)"; rm -f "$f"; }
+        done
+        if (( ${#was_enabled[@]} )); then
+            # the old enablement links named the removed files: re-create them
+            systemctl daemon-reload
+            systemctl enable "${was_enabled[@]}" 2>/dev/null || true
+            echo "install.sh: kept enabled: ${was_enabled[*]}"
+        fi
+    fi
+else
 echo "install.sh: copying binaries to $BIN_DIR/"
 install -m 755 -o root -g root "$AGENT_BIN"    "$BIN_DIR/northnarrow-agent"
 install -m 755 -o root -g root "$WATCHDOG_BIN" "$BIN_DIR/northnarrow-watchdog"
@@ -503,6 +586,7 @@ install_unit() {
 }
 install_unit "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
 install_unit "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service"
+fi
 
 # Debian-family kernels carry a distro patch that makes
 # kernel.perf_event_paranoid=3 (their default) require CAP_SYS_ADMIN for
@@ -867,6 +951,7 @@ if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
     for u in "${UNITS_TO_RESTART[@]}"; do
         echo "install.sh: $u is $(systemctl is-active "$u.service" || true)"
     done
+    rm -f "$PKG_RESTART_FILE"
     echo ""
     echo "install.sh: UPGRADE complete — units restarted; the audit chain carries a new agent_boot entry."
     exit 0

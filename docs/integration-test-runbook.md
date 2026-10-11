@@ -135,6 +135,27 @@ fails on any restart, any journal ERROR, an RSS slope above
 fd count that grew by more than half. Planned use: 24 h on each guest
 before a release, 72 h once before `0.1.0`.
 
+### Packages and the package manager
+
+```
+deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent (probe package + a real reinstall)
+deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm through their whole lifecycle
+```
+
+`pkgmgr-check` installs and removes a probe package that carries every
+persistence shape the FIM rules watch (unit, timer, cron drop-in, setuid
+binary, PAM and kernel module paths), then reinstalls a real package that
+ships a unit. It fails on any destructive verdict or on a broken package
+database; the writes must show up as Low log-only detections (review 49).
+
+`pkg-check` builds the packages on the guest from the synced tree in the
+guest's native format, then installs them over the lab's `install.sh`
+layout (migration), upgrades, checks that an upgrade without a usable
+trusted-installer key is refused with the agent untouched, removes,
+purges, and does a fresh install whose install manifest says
+`"provenance": "package"`. It puts the lab layout back with `install` at
+the end.
+
 ### Overhead (agent off vs on)
 
 ```
