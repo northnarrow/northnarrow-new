@@ -270,7 +270,10 @@ const NO_DEST: InodeKey = InodeKey { dev: 0, ino: 0 };
 fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
-        None => return,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
+            return;
+        }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
     unsafe {
@@ -307,7 +310,10 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey) {
 fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
-        None => return,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
+            return;
+        }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
     unsafe {
@@ -336,7 +342,10 @@ fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
 fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
-        None => return,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
+            return;
+        }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
     unsafe {

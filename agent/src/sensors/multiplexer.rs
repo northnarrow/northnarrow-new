@@ -173,6 +173,7 @@ impl SensorMultiplexer {
         if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
             debug!(?e, "aya-log not initialised (no logger map exported)");
         }
+        crate::sensors::ring_drops::install(&mut ebpf);
 
         attach_tracepoint(
             &mut ebpf,

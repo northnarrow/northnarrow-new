@@ -44,9 +44,12 @@ while [ ! -e "$SOAK_DIR/stop" ]; do
     # namespace, so every line has journald priority 6: count the
     # tracing levels by text, in the `northnarrow` namespace.
     jlog=$(journalctl --namespace=northnarrow -u northnarrow-agent --since "$START" -q --no-pager 2>/dev/null)
-    jw=$(printf '%s\n' "$jlog" | grep -c " WARN " || true)
-    je=$(printf '%s\n' "$jlog" | grep -c " ERROR " || true)
-    cb=$(printf '%s\n' "$jlog" | grep -c "COMBAT" || true)
+    # Match the tracing level right after the timestamp (`…Z  WARN `),
+    # not anywhere in the line: process-spawn events echo argv, and the
+    # sampler's own `grep ERROR` used to count itself.
+    jw=$(printf '%s\n' "$jlog" | grep -cE 'Z +WARN ' || true)
+    je=$(printf '%s\n' "$jlog" | grep -cE 'Z +ERROR ' || true)
+    cb=$(printf '%s\n' "$jlog" | grep -cE 'POSTURE TRANSITION state=COMBAT|combat_stage' || true)
     sz() { stat -c %s "$1" 2>/dev/null || echo 0; }
     det=$(sz /var/lib/northnarrow/detections/detections.jsonl)
     sts=$(sz /var/lib/northnarrow/detections/status_events.jsonl)
@@ -55,7 +58,7 @@ while [ ! -e "$SOAK_DIR/stop" ]; do
     fs=$(map_count FLOW_SOCK_MAP); us=$(map_count UDP_UNCONNECTED_SEEN); fd=$(map_count FIM_DIRTY_INODES); pp=$(map_count PROTECTED_PIDS)
     # per-CPU u64 counter: bpftool prints one `value (cpu N): 0x…` or
     # decimal line per CPU; sum them without gawk-only builtins.
-    drops=$(bpftool map dump name DROPPED 2>/dev/null | grep -i 'value' | grep -oE '(0x[0-9a-f]+|[0-9]+)$' | while read -r v; do printf '%d\n' "$v"; done | awk '{s+=$1} END{print s+0}')
+    drops=$(bpftool map dump name RING_DROPS 2>/dev/null | grep -i 'value' | grep -oE '(0x[0-9a-f]+|[0-9]+)$' | while read -r v; do printf '%d\n' "$v"; done | awk '{s+=$1} END{print s+0}')
     gi=$(cat "$SOAK_DIR/generate.iter" 2>/dev/null || echo 0)
     echo "$now,$pid,$rss,$vsz,$cpu,$thr,$fds,$wdrss,$ar,$wr,$jw,$je,$cb,$det,$sts,$aud,$fim,$fs,$us,$fd,$pp,$drops,$gi" >> "$OUT"
     sleep "$INTERVAL"

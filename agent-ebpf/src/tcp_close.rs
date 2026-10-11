@@ -84,7 +84,10 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
     // ringbuf is full we drop the event cheaply.
     let mut entry = match NET_FLOW_CLOSE_EVENTS.reserve::<NetFlowCloseRaw>(0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TCP_CLOSE);
+            return Ok(());
+        }
     };
     let raw_ptr: *mut NetFlowCloseRaw = entry.as_mut_ptr();
     crate::zero::zero(raw_ptr);

@@ -214,7 +214,10 @@ fn override_active() -> bool {
 fn emit_denial(operation: u8, key: InodeKey) {
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
-        None => return,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FS_PROTECT);
+            return;
+        }
     };
 
     let raw_ptr: *mut FsProtectDenialRaw = entry.as_mut_ptr();
