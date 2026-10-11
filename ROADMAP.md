@@ -620,10 +620,13 @@ Pianificato, in quest'ordine:
   resta kexec/livepatch/modulo non firmato con `lockdown` attivo, che
   richiede un guest con lockdown; ogni caso deve finire in un evento nel
   chain log, non solo in un rifiuto)
-- Overlay `.local` (allowlist dei comm, path FIM, blocklist) solo via
-  `nn-admin` firmato: oggi un file creato da root in `/etc/northnarrow`
-  vale dal riavvio successivo senza autenticazione (il controllo di
-  integrità lo segnala con l'hash, ma non lo impedisce)
+- Overlay `.local` solo via `nn-admin` firmato (fatto l'11 ottobre, lab
+  PR 33): l'agent carica un overlay solo se `<overlay>.sig` dimostra che
+  una chiave con il ruolo `config-manage` ne ha firmato il contenuto
+  esatto, per questo agent e non prima dell'ultima firma accettata (niente
+  rollback); altrimenti usa i default di quella lista e registra
+  `unauthorized_overlay`; `nn-admin config overlay set|sign|status`,
+  adozione degli overlay esistenti in `install.sh --upgrade`
 - Verifica formale con Kani dopo il fuzzing: harness sui blocchi `unsafe`
   (record dei ring buffer, FFI di Candle), sui parser binari e sulla
   verifica di firme e quorum (ricerca dell'11 ottobre, HACMS / s2n-quic)

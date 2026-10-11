@@ -98,7 +98,7 @@ pub fn load_watched_paths(v1_path: &Path, local_path: &Path) -> Result<WatchedPa
 }
 
 /// FIM entry shape rule: watched paths must be absolute.
-fn validate_absolute_path(entry: &str) -> Result<()> {
+pub(crate) fn validate_absolute_path(entry: &str) -> Result<()> {
     if !entry.starts_with('/') {
         return Err(anyhow!(
             "paths must be absolute (start with `/`), got `{entry}`"

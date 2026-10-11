@@ -640,7 +640,7 @@ else
         # Explicit role list: the defaults (unlock, audit-read) plus
         # trusted-installer, which `install.sh --upgrade --grant-key` and
         # `uninstall.sh --grant-key` need to purge the protected pin root.
-        sed -i '$ s/[[:space:]]*$/ unlock,audit-read,trusted-installer/' "$ETC_DIR/admin.pub"
+        sed -i '$ s/[[:space:]]*$/ unlock,audit-read,trusted-installer,config-manage/' "$ETC_DIR/admin.pub"
         echo ""
         echo "  ##########################################################################"
         echo "  #  SECURITY — an admin PRIVATE key was just written to this host:         #"
@@ -651,9 +651,9 @@ else
         echo "  #  store it offline, e.g.:                                                #"
         echo "  #      mv $ETC_DIR/admin.key  <secure-offline-location>"
         echo "  #  Keep ONLY the public half ($ETC_DIR/admin.pub) on the host.            #"
-        echo "  #  Roles: unlock, audit-read, trusted-installer (the last one is what    #"
-        echo "  #  install.sh --upgrade --grant-key and uninstall.sh --grant-key use to   #"
-        echo "  #  purge the protected pin root). canary-manage / fim-manage /           #"
+        echo "  #  Roles: unlock, audit-read, trusted-installer (what --upgrade and       #"
+        echo "  #  uninstall.sh --grant-key use to purge the protected pin root) and      #"
+        echo "  #  config-manage (signs *.local overlays). canary-manage / fim-manage /  #"
         echo "  #  force-posture need a role list on its admin.pub line.                  #"
         echo "  #  Recovery procedure: docs/operator/COMBAT_RECOVERY.md (section 1.1)    #"
         echo "  ##########################################################################"
@@ -806,6 +806,35 @@ systemctl daemon-reload
 # this is a no-op then). Best-effort — the instance may not be running yet.
 systemctl restart systemd-journald@northnarrow.service 2>/dev/null || true
 
+# Tappa 10.8 — the agent loads a *.local overlay only with a valid
+# signature (<overlay>.sig, key with the config-manage role). On an upgrade
+# from a release that read overlays unsigned, adopt the ones present now
+# with the operator's key, while nothing protects /etc/northnarrow; an
+# overlay that cannot be signed is listed, and the agent will boot on the
+# shipped defaults for that list until it is signed.
+if (( UPGRADE )) && [[ -s "$ETC_DIR/agent_id" ]]; then
+    ovl_status() {
+        "$BIN_DIR/nn-admin" config overlay status --dir "$ETC_DIR" --admin-pub "$ETC_DIR/admin.pub" \
+            --agent-id-file "$ETC_DIR/agent_id" --audit-log "$ETC_DIR/audit.log" 2>/dev/null
+    }
+    # status exits 1 when an overlay is not loadable: not an install failure
+    unsigned=$( { ovl_status || true; } | awk '/NOT LOADED/ {printf "%s ", $1}')
+    if [[ -n "$unsigned" && -n "$GRANT_KEY" ]]; then
+        for kind in $unsigned; do
+            "$BIN_DIR/nn-admin" config overlay sign "$kind" --file "$ETC_DIR/$kind.local" --key "$GRANT_KEY" \
+                --agent-id-file "$ETC_DIR/agent_id" >/dev/null 2>&1 || true
+        done
+    fi
+    # what the new agent will actually load (sign does not know admin.pub roles)
+    while read -r kind state rest; do
+        case "$state" in
+            signed) if [[ " $unsigned " == *" $kind "* ]]; then echo "install.sh: adopted overlay $ETC_DIR/$kind.local — signed with $GRANT_KEY"; fi ;;
+            NOT) echo "install.sh: WARNING — overlay $ETC_DIR/$kind.local will NOT be loaded (shipped defaults for that list):${rest#*start:}" >&2
+                 echo "install.sh:   sign it with a key that carries config-manage: nn-admin config overlay sign $kind --file $ETC_DIR/$kind.local --key <key>" >&2 ;;
+        esac
+    done < <(ovl_status || true)
+fi
+
 if (( UPGRADE )) && (( ${#UNITS_TO_RESTART[@]} )); then
     # Agent first (it pins the maps the watchdog registers into), then the
     # watchdog — the same order the operator uses on a fresh install.
@@ -853,6 +882,10 @@ echo "     {process,netflow}-comm-allowlist.v1 were just installed above)."
 echo "     Optional: add management CIDRs to combat-allow.cidrs to keep an"
 echo "     SSH path open during COMBAT (anti-lockout — empty by default;"
 echo "     see docs/operator/COMBAT_RECOVERY.md §2)."
+echo "     Overlays (*.local) are loaded only when signed by a key with the"
+echo "     config-manage role: write the overlay to a file, then"
+echo "       nn-admin config overlay set <kind> --file <file> --key <key>"
+echo "     (stored by the running agent; applies at its next start)."
 echo "     Optional: drop /etc/northnarrow/fim-paths.local to customise"
 echo "     the FIM watched-paths set (\`+/path\` add, \`-/path\` disable —"
 echo "     see docs/operator/TAPPA9_FIM_TRUST_MODEL.md §13 Q7)."
@@ -866,8 +899,8 @@ echo "     /etc/northnarrow/netflow-comm-allowlist.local to tune the"
 echo "     Tappa 10.5 detection-rule comm exemptions (\`+comm\` add,"
 echo "     \`-comm\` re-enable detection on a default — same schema; see"
 echo "     docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md §13 Q3)."
-echo "     CONTAINER HOSTS: cp process-comm-allowlist.local.example to"
-echo "     .local to exempt container-runtime comms (\`runc\` etc.). This"
+echo "     CONTAINER HOSTS: set process-comm-allowlist.local.example as the"
+echo "     process-comm-allowlist overlay to exempt container-runtime comms (\`runc\` etc.). This"
 echo "     weakens R013 escape-to-host detection — read the security note"
 echo "     in docs/operator/CONTAINER_HOST_DEPLOY.md before enabling."
 echo "     Deploy canaries with \`nn-admin canary deploy <type> --path ...\`"

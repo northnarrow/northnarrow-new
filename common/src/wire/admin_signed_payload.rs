@@ -176,6 +176,11 @@ pub enum OperationCode {
     /// implicitly get set-status). The target id + new status + note
     /// live in [`DetectionSetStatusExtra`] inside the signed scope.
     DetectionSetStatus = 20,
+    /// Tappa 10.8 — store an operator overlay (`*.local`) in
+    /// `/etc/northnarrow` together with its signature. The agent loads an
+    /// overlay at boot only if a key carrying [`Role::ConfigManage`] signed
+    /// its exact content. Authorised by `Role::ConfigManage`, 1-of-N.
+    ConfigOverlaySet = 21,
 }
 
 impl From<OperationCode> for u8 {
@@ -208,6 +213,7 @@ impl TryFrom<u8> for OperationCode {
             18 => Ok(Self::TrustedInstallerGrant),
             19 => Ok(Self::Detections),
             20 => Ok(Self::DetectionSetStatus),
+            21 => Ok(Self::ConfigOverlaySet),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -298,6 +304,13 @@ pub enum Role {
     /// NOT confer triage — set-status requires this role explicitly.
     /// Never in a key's default allowlist; operators add it explicitly.
     Triage = 14,
+    /// Tappa 10.8 — authorises [`OperationCode::ConfigOverlaySet`] and
+    /// is the role the agent requires in an overlay's signature at boot
+    /// (`*.local` allowlists, blocklists, FIM paths, posture carve-outs).
+    /// An overlay changes what the agent detects, so it is a control
+    /// role: never in a key's default allowlist; `install.sh` grants it to
+    /// the key it bootstraps.
+    ConfigManage = 15,
     All = 255,
 }
 
@@ -325,6 +338,7 @@ impl TryFrom<u8> for Role {
             12 => Ok(Self::TrustedInstaller),
             13 => Ok(Self::TelemetryRead),
             14 => Ok(Self::Triage),
+            15 => Ok(Self::ConfigManage),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -643,6 +657,96 @@ pub enum CanaryDeploymentWire {
 /// whose `op` and `extra` variants disagree is well-formed at the
 /// CBOR layer but considered semantically invalid by [`verify`] (see
 /// `verify_rejects_op_extra_mismatch` for the regression test).
+/// The operator overlays (`/etc/northnarrow/*.local`) the agent reads at
+/// boot, as signed on the wire. Append-only discriminants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
+#[repr(u8)]
+pub enum OverlayKind {
+    /// `fim-paths.local` — `+path` watches more, `-path` stops watching.
+    FimPaths = 1,
+    /// `process-comm-allowlist.local` — comms exempt from process rules.
+    ProcessCommAllowlist = 2,
+    /// `netflow-comm-allowlist.local` — comms exempt from network rules.
+    NetflowCommAllowlist = 3,
+    /// `netflow-blocklist.local` — IPs / CIDRs / domains to block.
+    NetflowBlocklist = 4,
+    /// `netflow-ja3-blocklist.local` — TLS fingerprints to block.
+    NetflowJa3Blocklist = 5,
+    /// `mass-write-carveout.local` — writers exempt from the mass-write arm.
+    MassWriteCarveout = 6,
+    /// `escalation-allow.local` — escalations the posture ladder accepts.
+    EscalationAllow = 7,
+}
+
+impl OverlayKind {
+    pub const ALL: [OverlayKind; 7] = [
+        OverlayKind::FimPaths,
+        OverlayKind::ProcessCommAllowlist,
+        OverlayKind::NetflowCommAllowlist,
+        OverlayKind::NetflowBlocklist,
+        OverlayKind::NetflowJa3Blocklist,
+        OverlayKind::MassWriteCarveout,
+        OverlayKind::EscalationAllow,
+    ];
+
+    /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            OverlayKind::FimPaths => "fim-paths",
+            OverlayKind::ProcessCommAllowlist => "process-comm-allowlist",
+            OverlayKind::NetflowCommAllowlist => "netflow-comm-allowlist",
+            OverlayKind::NetflowBlocklist => "netflow-blocklist",
+            OverlayKind::NetflowJa3Blocklist => "netflow-ja3-blocklist",
+            OverlayKind::MassWriteCarveout => "mass-write-carveout",
+            OverlayKind::EscalationAllow => "escalation-allow",
+        }
+    }
+
+    /// Default file name in `/etc/northnarrow`.
+    pub fn file_name(self) -> String {
+        format!("{}.local", self.keyword())
+    }
+
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        let s = s.trim().trim_end_matches(".local");
+        OverlayKind::ALL.into_iter().find(|k| k.keyword() == s)
+    }
+}
+
+impl From<OverlayKind> for u8 {
+    fn from(k: OverlayKind) -> Self {
+        k as u8
+    }
+}
+
+impl TryFrom<u8> for OverlayKind {
+    type Error = SignedPayloadError;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::FimPaths),
+            2 => Ok(Self::ProcessCommAllowlist),
+            3 => Ok(Self::NetflowCommAllowlist),
+            4 => Ok(Self::NetflowBlocklist),
+            5 => Ok(Self::NetflowJa3Blocklist),
+            6 => Ok(Self::MassWriteCarveout),
+            7 => Ok(Self::EscalationAllow),
+            other => Err(SignedPayloadError::UnknownOverlayKind(other)),
+        }
+    }
+}
+
+/// Op-specific signed-scope fields for [`OperationCode::ConfigOverlaySet`]:
+/// which overlay, and the SHA-256 and length of its exact content. The
+/// content itself travels next to the payload (online request) or sits in
+/// the overlay file (stored signature); both are bound by `sha256`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOverlaySetExtra {
+    pub kind: OverlayKind,
+    pub sha256: [u8; 32],
+    pub len: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationExtra {
     Unlock(UnlockExtra),
@@ -680,6 +784,7 @@ pub enum OperationExtra {
     Detections(DetectionsExtra),
     /// Tappa 9.0.c. Pairs with [`OperationCode::DetectionSetStatus`].
     DetectionSetStatus(DetectionSetStatusExtra),
+    ConfigOverlaySet(ConfigOverlaySetExtra),
 }
 
 impl OperationExtra {
@@ -708,6 +813,7 @@ impl OperationExtra {
             OperationExtra::TrustedInstallerGrant(_) => OperationCode::TrustedInstallerGrant,
             OperationExtra::Detections(_) => OperationCode::Detections,
             OperationExtra::DetectionSetStatus(_) => OperationCode::DetectionSetStatus,
+            OperationExtra::ConfigOverlaySet(_) => OperationCode::ConfigOverlaySet,
         }
     }
 }
@@ -756,6 +862,8 @@ pub enum SignedPayloadError {
     /// [`CanaryTypeWire`] discriminant. Bubbles up out of
     /// `CanaryTypeWire::try_from` during `serde` deserialisation.
     UnknownCanaryType(u8),
+    /// A peer wire byte did not match any known [`OverlayKind`].
+    UnknownOverlayKind(u8),
 }
 
 impl core::fmt::Display for SignedPayloadError {
@@ -770,6 +878,7 @@ impl core::fmt::Display for SignedPayloadError {
             Self::UnknownOperationCode(v) => write!(f, "unknown operation code {v}"),
             Self::UnknownRole(v) => write!(f, "unknown role {v}"),
             Self::UnknownCanaryType(v) => write!(f, "unknown canary type {v}"),
+            Self::UnknownOverlayKind(v) => write!(f, "unknown overlay kind {v}"),
         }
     }
 }
@@ -1147,6 +1256,27 @@ impl SignedPayload {
         }
     }
 
+    /// Tappa 10.8 — `config overlay` signed payload: binds the overlay
+    /// kind to the SHA-256 and length of its content. The nonce is the
+    /// server challenge for the online `set`, or random for an offline
+    /// `sign` (the boot check orders signatures by `ts`, not by nonce).
+    pub fn new_config_overlay_set(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        kind: OverlayKind,
+        sha256: [u8; 32],
+        len: u32,
+    ) -> Self {
+        Self {
+            op: OperationCode::ConfigOverlaySet,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::ConfigOverlaySet(ConfigOverlaySetExtra { kind, sha256, len }),
+        }
+    }
+
     /// Tappa 9.0.b — `detections` signed payload constructor. `limit`
     /// is the bounded "last N" cap (`0` ⇒ server default); the other
     /// arguments are optional filters (time bounds, severity floor,
@@ -1499,6 +1629,8 @@ mod tests {
             (OperationCode::Detections, 19),
             // Tappa 9.0.c — APPENDED, never renumber.
             (OperationCode::DetectionSetStatus, 20),
+            // Tappa 10.8 — APPENDED, never renumber.
+            (OperationCode::ConfigOverlaySet, 21),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -1513,6 +1645,64 @@ mod tests {
             Err(SignedPayloadError::UnknownOperationCode(99)) => {}
             other => panic!("expected UnknownOperationCode(99), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_overlay_payload_signs_verifies_and_binds_the_hash() {
+        let signing = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying = signing.verifying_key();
+        let p = SignedPayload::new_config_overlay_set(
+            [7; 32],
+            1_700_000_000,
+            [1; 16],
+            OverlayKind::ProcessCommAllowlist,
+            [0xAB; 32],
+            12,
+        );
+        let sig = sign(&p, &signing).unwrap();
+        verify(&p, &sig, &verifying).unwrap();
+        let mut tampered = p.clone();
+        if let OperationExtra::ConfigOverlaySet(e) = &mut tampered.extra {
+            e.sha256[0] ^= 1;
+        }
+        assert!(
+            verify(&tampered, &sig, &verifying).is_err(),
+            "hash is signed"
+        );
+        // CBOR roundtrip keeps the kind as a bare u8
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&p, &mut buf).unwrap();
+        let back: SignedPayload = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn overlay_kind_keywords_and_wire_bytes_are_stable() {
+        for (k, byte, kw) in [
+            (OverlayKind::FimPaths, 1u8, "fim-paths"),
+            (
+                OverlayKind::ProcessCommAllowlist,
+                2,
+                "process-comm-allowlist",
+            ),
+            (
+                OverlayKind::NetflowCommAllowlist,
+                3,
+                "netflow-comm-allowlist",
+            ),
+            (OverlayKind::NetflowBlocklist, 4, "netflow-blocklist"),
+            (OverlayKind::NetflowJa3Blocklist, 5, "netflow-ja3-blocklist"),
+            (OverlayKind::MassWriteCarveout, 6, "mass-write-carveout"),
+            (OverlayKind::EscalationAllow, 7, "escalation-allow"),
+        ] {
+            assert_eq!(u8::from(k), byte);
+            assert_eq!(OverlayKind::try_from(byte).unwrap(), k);
+            assert_eq!(k.keyword(), kw);
+            assert_eq!(OverlayKind::from_keyword(kw), Some(k));
+            assert_eq!(OverlayKind::from_keyword(&k.file_name()), Some(k));
+        }
+        assert!(OverlayKind::try_from(0u8).is_err());
+        assert_eq!(OverlayKind::from_keyword("nope"), None);
     }
 
     /// Same discriminant-freeze guard for [`Role`], including the
@@ -1541,6 +1731,8 @@ mod tests {
             (Role::TelemetryRead, 13),
             // Tappa 9.0.c — APPENDED, never renumber.
             (Role::Triage, 14),
+            // Tappa 10.8 — APPENDED, never renumber.
+            (Role::ConfigManage, 15),
             (Role::All, 255),
         ];
         for (r, expected) in cases {

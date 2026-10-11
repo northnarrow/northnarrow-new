@@ -9,3 +9,4 @@
 
 pub mod comm_allowlist;
 pub mod overlay;
+pub mod overlay_auth;

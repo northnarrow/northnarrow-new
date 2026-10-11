@@ -186,6 +186,17 @@ fn parse_local_overlay(
             return Err(anyhow!(e).context(format!("reading operator overlay {}", path.display())))
         }
     };
+    parse_overlay_text(&path.display().to_string(), &body, validate)
+}
+
+/// Text form of [`parse_local_overlay`] (Tappa 10.8: the same rules
+/// validate an overlay before it is signed or stored). `label` prefixes
+/// the line number in errors.
+pub fn parse_overlay_text(
+    label: &str,
+    body: &str,
+    validate: EntryValidator<'_>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let mut adds = BTreeSet::new();
     let mut disables = BTreeSet::new();
     for (lineno, raw) in body.lines().enumerate() {
@@ -194,7 +205,7 @@ fn parse_local_overlay(
             continue;
         }
         let (directive, rest) = split_directive(trimmed);
-        validate(rest).map_err(|e| anyhow!("{}:{}: {}", path.display(), lineno + 1, e))?;
+        validate(rest).map_err(|e| anyhow!("{}:{}: {}", label, lineno + 1, e))?;
         let entry = rest.to_string();
         match directive {
             Directive::Add => {

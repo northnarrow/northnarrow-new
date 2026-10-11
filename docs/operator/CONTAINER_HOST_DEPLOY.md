@@ -41,15 +41,21 @@ the rest of the rule engine remain in force regardless.
 ## How to enable
 
 The installer drops a documented template at
-`/etc/northnarrow/process-comm-allowlist.local.example`. Copy it to the
-live overlay path and uncomment the runtimes you run:
+`/etc/northnarrow/process-comm-allowlist.local.example`. Since the agent
+loads an overlay only when a key with the `config-manage` role signed it,
+edit a copy, store it signed through the agent, and restart:
 
 ```sh
-sudo cp /etc/northnarrow/process-comm-allowlist.local.example \
-        /etc/northnarrow/process-comm-allowlist.local
-sudoedit /etc/northnarrow/process-comm-allowlist.local   # uncomment +runc, etc.
+cp /etc/northnarrow/process-comm-allowlist.local.example /tmp/allow
+$EDITOR /tmp/allow                                         # uncomment +runc, etc.
+sudo nn-admin config overlay set process-comm-allowlist --file /tmp/allow --key <config-manage key>
 sudo systemctl restart northnarrow-agent
+sudo nn-admin config overlay status                        # process-comm-allowlist  signed
 ```
+
+A file copied into `/etc/northnarrow` by hand without a signature is
+ignored at the next start (the agent boots on the shipped allowlist) and
+recorded as an `unauthorized_overlay` integrity finding.
 
 Overlay entries are prefixed:
 
@@ -75,10 +81,10 @@ journalctl --namespace=northnarrow -u northnarrow-agent --since "5 min ago" | gr
 
 ## Re-tightening
 
-If the host stops running containers, remove the entries from
-`/etc/northnarrow/process-comm-allowlist.local` (or delete the file)
-and restart the agent. R013 escape-to-host detection on `runc` is
-restored immediately.
+If the host stops running containers, store an overlay without the
+entries (`nn-admin config overlay set process-comm-allowlist --file <empty
+file> …`) and restart the agent. R013 escape-to-host detection on `runc`
+is restored at that start.
 
 ## Related
 

@@ -110,7 +110,7 @@ pub fn load_netflow_comm_allowlist() -> Result<CommAllowlist> {
 
 /// Entry shape rule for a comm allowlist: a bare process basename —
 /// non-empty, no path separator, a single whitespace-free token.
-fn validate_comm(entry: &str) -> Result<()> {
+pub(crate) fn validate_comm(entry: &str) -> Result<()> {
     if entry.is_empty() {
         return Err(anyhow!("comm entries must be non-empty"));
     }

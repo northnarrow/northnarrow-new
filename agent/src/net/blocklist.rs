@@ -235,6 +235,16 @@ fn read_local(path: &Path) -> Result<(BTreeSet<NetBlocklistEntry>, BTreeSet<NetB
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     };
+    parse_blocklist_overlay_text(&path.display().to_string(), &body)
+}
+
+/// Text form of the `netflow-blocklist.local` parser (Tappa 10.8: the same
+/// rules validate an overlay before it is signed or stored).
+pub(crate) fn parse_blocklist_overlay_text(
+    label: &str,
+    body: &str,
+) -> Result<(BTreeSet<NetBlocklistEntry>, BTreeSet<NetBlocklistEntry>)> {
+    let path = label;
     let mut adds = BTreeSet::new();
     let mut disables = BTreeSet::new();
     for (lineno, raw) in body.lines().enumerate() {
@@ -249,9 +259,8 @@ fn read_local(path: &Path) -> Result<(BTreeSet<NetBlocklistEntry>, BTreeSet<NetB
         } else {
             (false, trimmed)
         };
-        let entry = NetBlocklistEntry::parse(rest).with_context(|| {
-            format!("{}:{}: malformed overlay entry", path.display(), lineno + 1)
-        })?;
+        let entry = NetBlocklistEntry::parse(rest)
+            .with_context(|| format!("{}:{}: malformed overlay entry", path, lineno + 1))?;
         if is_disable {
             disables.insert(entry);
         } else {
@@ -368,6 +377,15 @@ fn read_ja3_local(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     };
+    parse_ja3_overlay_text(&path.display().to_string(), &body)
+}
+
+/// Text form of the `netflow-ja3-blocklist.local` parser (Tappa 10.8).
+pub(crate) fn parse_ja3_overlay_text(
+    label: &str,
+    body: &str,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let path = label;
     let mut adds = BTreeSet::new();
     let mut disables = BTreeSet::new();
     for (lineno, raw) in body.lines().enumerate() {
@@ -382,13 +400,8 @@ fn read_ja3_local(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         } else {
             (false, trimmed)
         };
-        let h = parse_ja3_hash(rest).with_context(|| {
-            format!(
-                "{}:{}: malformed JA3 overlay entry",
-                path.display(),
-                lineno + 1
-            )
-        })?;
+        let h = parse_ja3_hash(rest)
+            .with_context(|| format!("{}:{}: malformed JA3 overlay entry", path, lineno + 1))?;
         if is_disable {
             disables.insert(h);
         } else {
