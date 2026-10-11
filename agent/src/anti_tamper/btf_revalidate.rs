@@ -343,20 +343,27 @@ pub fn resolve_tracepoint_fields_from(roots: &[&str]) -> TracepointOffsets {
         debug_assert_eq!(spec.name, *name);
         let mut found: Option<u32> = None;
         let mut last_err = String::from("no tracefs root readable");
-        for root in roots {
-            let path = format!("{root}/events/{}/{}/format", spec.category, spec.event);
-            match fs::read_to_string(&path) {
-                Ok(text) => match parse_format_field_offset(&text, spec.field) {
-                    Some(off) => {
-                        found = Some(off);
-                        break;
-                    }
-                    None => {
-                        last_err = format!("{path}: field `{}` not in format", spec.field);
-                        break;
-                    }
-                },
-                Err(e) => last_err = format!("{path}: {e}"),
+        let events: &[&str] = if spec.alt_event.is_empty() {
+            &[spec.event]
+        } else {
+            &[spec.event, spec.alt_event]
+        };
+        'roots: for root in roots {
+            for event in events {
+                let path = format!("{root}/events/{}/{event}/format", spec.category);
+                match fs::read_to_string(&path) {
+                    Ok(text) => match parse_format_field_offset(&text, spec.field) {
+                        Some(off) => {
+                            found = Some(off);
+                            break 'roots;
+                        }
+                        None => {
+                            last_err = format!("{path}: field `{}` not in format", spec.field);
+                            break 'roots;
+                        }
+                    },
+                    Err(e) => last_err = format!("{path}: {e}"),
+                }
             }
         }
         match found {
@@ -870,6 +877,30 @@ mod tests {
         assert_eq!(parse_format_field_offset(RHEL9_EXEC_FORMAT, "nope"), None);
     }
 
+    /// The io_uring submit tracepoint is `io_uring_submit_sqe` on 5.15 /
+    /// 6.1 and `io_uring_submit_req` on 6.8 / RHEL 9: the resolver tries
+    /// the alternative name and places `opcode` wherever that kernel has it.
+    #[test]
+    fn io_uring_submit_resolves_through_the_alternative_event_name() {
+        use common::btf_offsets::slot;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sqe = root.join("events/io_uring/io_uring_submit_sqe");
+        fs::create_dir_all(&sqe).unwrap();
+        fs::write(sqe.join("format"), "format:\n\tfield:void * ctx;\toffset:8;\tsize:8;\tsigned:0;\n\tfield:void * req;\toffset:16;\tsize:8;\tsigned:0;\n\tfield:u8 opcode;\toffset:24;\tsize:1;\tsigned:0;\n\tfield:u64 user_data;\toffset:32;\tsize:8;\tsigned:0;\n\tfield:u32 flags;\toffset:40;\tsize:4;\tsigned:0;\n\tfield:bool force_nonblock;\toffset:44;\tsize:1;\tsigned:0;\n\tfield:bool sq_thread;\toffset:45;\tsize:1;\tsigned:0;\n").unwrap();
+        let r = resolve_tracepoint_fields_from(&[root.to_str().unwrap()]);
+        assert!(r
+            .values
+            .contains(&(slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24)));
+        assert!(r
+            .values
+            .contains(&(slot::TP_IOURING_SUBMIT_SQ_THREAD_OFFSET, 45)));
+        assert!(r
+            .drifted
+            .iter()
+            .any(|(n, _, rt)| *n == "TP_IOURING_SUBMIT_OPCODE_OFFSET" && *rt == 24));
+    }
+
     /// A synthetic tracefs tree with the RHEL 9 layout: the exec filename
     /// slot drifts to 12, the syscall fields stay put, and a missing
     /// event falls back to the compiled value and is reported.
@@ -901,7 +932,8 @@ mod tests {
                 12
             )]
         );
-        assert_eq!(r.unresolved.len(), 1);
+        // sys_enter_execve and the five io_uring fields are absent from the tree
+        assert_eq!(r.unresolved.len(), 6);
         assert_eq!(r.unresolved[0].0, "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET");
         assert!(r
             .values

@@ -499,6 +499,62 @@ impl FsProtectDenialRaw {
     }
 }
 
+// ── io_uring sensor (Tappa 10.8, the blind channel) ────────────────────
+/// `IoUringRaw.kind`: a ring was created (`io_uring_setup`).
+pub const IOURING_KIND_CREATE: u8 = 1;
+/// `IoUringRaw.kind`: submissions on an existing ring, aggregated per pid
+/// in kernel (emitted when a new opcode class appears or once per second).
+pub const IOURING_KIND_ACTIVITY: u8 = 2;
+/// Opcode classes (`IoUringRaw.classes` bitmap), one bit per `IORING_OP_*` family.
+pub const IOURING_CLASS_FILE_OPEN: u32 = 1 << 0;
+pub const IOURING_CLASS_FILE_RW: u32 = 1 << 1;
+pub const IOURING_CLASS_NET_CONNECT: u32 = 1 << 2;
+pub const IOURING_CLASS_NET_SENDRECV: u32 = 1 << 3;
+pub const IOURING_CLASS_FS_MUTATE: u32 = 1 << 4;
+pub const IOURING_CLASS_OTHER: u32 = 1 << 5;
+
+/// Map an `IORING_OP_*` number (uapi/linux/io_uring.h, ABI-stable) to its class bit.
+pub const fn io_uring_opcode_class(op: u8) -> u32 {
+    match op {
+        // OPENAT, OPENAT2
+        18 | 28 => IOURING_CLASS_FILE_OPEN,
+        // READV WRITEV READ_FIXED WRITE_FIXED READ WRITE SPLICE TEE READ_MULTISHOT
+        1 | 2 | 4 | 5 | 22 | 23 | 30 | 33 | 49 => IOURING_CLASS_FILE_RW,
+        // ACCEPT CONNECT SOCKET BIND LISTEN
+        13 | 16 | 45 | 56 | 57 => IOURING_CLASS_NET_CONNECT,
+        // SENDMSG RECVMSG SEND RECV SEND_ZC SENDMSG_ZC
+        9 | 10 | 26 | 27 | 47 | 48 => IOURING_CLASS_NET_SENDRECV,
+        // FALLOCATE RENAMEAT UNLINKAT MKDIRAT SYMLINKAT LINKAT FSETXATTR SETXATTR FTRUNCATE
+        17 | 35 | 36 | 37 | 38 | 39 | 41 | 42 | 55 => IOURING_CLASS_FS_MUTATE,
+        _ => IOURING_CLASS_OTHER,
+    }
+}
+
+/// Kernel→userland record of the io_uring sensor (48 bytes, no implicit padding).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct IoUringRaw {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub comm: [u8; TASK_COMM_LEN],
+    /// [`IOURING_KIND_CREATE`] | [`IOURING_KIND_ACTIVITY`].
+    pub kind: u8,
+    /// Last `IORING_OP_*` seen (ACTIVITY); 0 for CREATE.
+    pub last_opcode: u8,
+    /// `sq_thread` of the last submission (SQPOLL kernel thread submitting).
+    pub sq_thread: u8,
+    pub _pad: u8,
+    /// Classes seen by this pid since its first submission (ACTIVITY), or
+    /// the ring `flags` (CREATE).
+    pub classes: u32,
+    /// Submissions since the previous ACTIVITY record, or `sq_entries` (CREATE).
+    pub count: u32,
+    /// Explicit tail padding: 44 → 48 bytes so `Pod` holds (8-byte alignment).
+    pub _pad2: u32,
+}
+
 /// `ModuleLoadRaw.method` — `finit_module(2)` via the `kernel_read_file`
 /// LSM hook (modern path; carries the source `.ko` path, filled in
 /// stage 1b).

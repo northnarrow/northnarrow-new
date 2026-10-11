@@ -2637,6 +2637,23 @@ async fn process_event(
             path = path.as_deref().unwrap_or("none"),
             "kernel module load detected (BUG-034)"
         ),
+        Event::IoUring {
+            created,
+            pid,
+            comm,
+            classes,
+            count,
+            sq_thread,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %comm,
+            created = *created,
+            classes = ?common::io_uring_class_names(*classes),
+            count = *count,
+            sq_thread = *sq_thread,
+            "io_uring activity"
+        ),
         Event::FileOpen {
             filename,
             comm,

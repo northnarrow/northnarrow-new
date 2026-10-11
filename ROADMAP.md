@@ -576,7 +576,9 @@ Pianificato, in quest'ordine:
   aumento, totale e dettaglio in `nn-admin status`
 - Fuzzing dei parser (protocollo admin, `admin.pub`, regole COMBAT,
   template canary, JSONL, file `format` di tracefs, BTF) con `cargo-fuzz`
-- Sensore `io_uring`: tracepoint su `io_uring_setup/enter/register`,
+- Sensore `io_uring` (fatto l'11 ottobre, lab PR 27 — prima parte: osservazione
+  e regole Log; le correlazioni con le catene e il carve-out per identità
+  restano in 10.9): tracepoint su `io_uring_create` e `io_uring_submit`,
   opcode delle SQE (open, read/write, connect, send/recv, unlink,
   rename) correlati a processo e file; regole su ring usati subito dopo
   un exec da path volatile e su I/O senza syscall corrispondenti (il

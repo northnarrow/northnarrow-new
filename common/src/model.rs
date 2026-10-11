@@ -92,6 +92,28 @@ pub enum Event {
         path: Option<String>,
         timestamp_ns: u64,
     },
+    /// io_uring ring created or used (tracepoints `io_uring_create`,
+    /// `io_uring_submit_{req,sqe}`), aggregated per pid in kernel: the
+    /// asynchronous I/O channel syscall-centric sensors miss — file and
+    /// network operations queued through a ring never pass through
+    /// `openat`/`connect`/`sendto`. Scored by NN-L-IOU-001/002.
+    IoUring {
+        /// `true` = ring creation; `false` = activity on an existing ring.
+        created: bool,
+        pid: u32,
+        uid: u32,
+        comm: String,
+        /// Opcode classes seen since the pid's first submission
+        /// (`IOURING_CLASS_*` bitmap); ring `flags` for a creation.
+        classes: u32,
+        /// Submissions since the previous record; `sq_entries` for a creation.
+        count: u32,
+        /// Last `IORING_OP_*` number.
+        last_opcode: u8,
+        /// Submitted by the SQPOLL kernel thread on behalf of the process.
+        sq_thread: bool,
+        timestamp_ns: u64,
+    },
     /// Outbound TCP connect attempt (kprobe `tcp_v[46]_connect`).
     TcpConnect {
         pid: u32,
@@ -373,6 +395,39 @@ pub enum ModuleLoadMethod {
     Init,
     /// Unrecognised method byte (forward-compat).
     Unknown,
+}
+
+impl From<&crate::wire::IoUringRaw> for Event {
+    fn from(raw: &crate::wire::IoUringRaw) -> Self {
+        Event::IoUring {
+            created: raw.kind == crate::wire::IOURING_KIND_CREATE,
+            pid: raw.pid,
+            uid: raw.uid,
+            comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
+            classes: raw.classes,
+            count: raw.count,
+            last_opcode: raw.last_opcode,
+            sq_thread: raw.sq_thread != 0,
+            timestamp_ns: raw.timestamp_ns,
+        }
+    }
+}
+
+/// Human names of the classes set in an `IoUring` bitmap, in bit order.
+pub fn io_uring_class_names(classes: u32) -> alloc::vec::Vec<&'static str> {
+    let table = [
+        (crate::wire::IOURING_CLASS_FILE_OPEN, "file_open"),
+        (crate::wire::IOURING_CLASS_FILE_RW, "file_rw"),
+        (crate::wire::IOURING_CLASS_NET_CONNECT, "net_connect"),
+        (crate::wire::IOURING_CLASS_NET_SENDRECV, "net_sendrecv"),
+        (crate::wire::IOURING_CLASS_FS_MUTATE, "fs_mutate"),
+        (crate::wire::IOURING_CLASS_OTHER, "other"),
+    ];
+    table
+        .iter()
+        .filter(|(bit, _)| classes & bit != 0)
+        .map(|(_, n)| *n)
+        .collect()
 }
 
 impl From<&crate::wire::ModuleLoadRaw> for Event {

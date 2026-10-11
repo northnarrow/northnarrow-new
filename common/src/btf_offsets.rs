@@ -807,6 +807,11 @@ pub mod slot {
     pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 46;
     pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 47;
     pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 48;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 49;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 50;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 51;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 52;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 53;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -872,6 +877,16 @@ pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: usize = 16;
 pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: usize = 24;
 /// `syscalls/sys_enter_openat.flags` (third argument).
 pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: usize = 32;
+/// `io_uring/io_uring_submit_req.opcode` (6.8 layout; `io_uring_submit_sqe` on ≤ 6.1).
+pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: usize = 32;
+/// `io_uring/io_uring_submit_req.sq_thread`.
+pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: usize = 48;
+/// `io_uring/io_uring_create.fd`.
+pub const TP_IOURING_CREATE_FD_OFFSET: usize = 8;
+/// `io_uring/io_uring_create.sq_entries`.
+pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: usize = 24;
+/// `io_uring/io_uring_create.flags`.
+pub const TP_IOURING_CREATE_FLAGS_OFFSET: usize = 32;
 
 /// One tracepoint field whose offset is resolved from tracefs at boot.
 #[derive(Debug, Clone, Copy)]
@@ -886,6 +901,11 @@ pub struct TracepointFieldSpec {
     pub field: &'static str,
     /// Compiled-in offset (the fallback for an unarmed map or unreadable tracefs).
     pub compiled: u32,
+    /// Alternative event name tried when `event` does not exist on the
+    /// running kernel (`""` = none). io_uring renamed its submit
+    /// tracepoint `io_uring_submit_sqe` → `io_uring_submit_req`; RHEL 9
+    /// backported the new name onto 5.14.
+    pub alt_event: &'static str,
 }
 
 /// The tracepoint fields read with a fixed offset in `agent-ebpf`.
@@ -896,6 +916,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         event: "sched_process_exec",
         field: "filename",
         compiled: TP_SCHED_EXEC_FILENAME_OFFSET as u32,
+        alt_event: "",
     },
     TracepointFieldSpec {
         name: "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET",
@@ -903,6 +924,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         event: "sys_enter_execve",
         field: "filename",
         compiled: TP_SYS_ENTER_EXECVE_FILENAME_OFFSET as u32,
+        alt_event: "",
     },
     TracepointFieldSpec {
         name: "TP_SYS_ENTER_OPENAT_FILENAME_OFFSET",
@@ -910,6 +932,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         event: "sys_enter_openat",
         field: "filename",
         compiled: TP_SYS_ENTER_OPENAT_FILENAME_OFFSET as u32,
+        alt_event: "",
     },
     TracepointFieldSpec {
         name: "TP_SYS_ENTER_OPENAT_FLAGS_OFFSET",
@@ -917,6 +940,51 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         event: "sys_enter_openat",
         field: "flags",
         compiled: TP_SYS_ENTER_OPENAT_FLAGS_OFFSET as u32,
+        alt_event: "",
+    },
+    // io_uring (Tappa 10.8, the blind channel): opcode and sq_thread of a
+    // submission, fd / sq_entries / flags of a ring creation. Compiled
+    // values are the 6.8 layout; 5.15 has opcode at 24, 6.1 at 32, RHEL 9
+    // at 40 — the tracefs resolver places them.
+    TracepointFieldSpec {
+        name: "TP_IOURING_SUBMIT_OPCODE_OFFSET",
+        category: "io_uring",
+        event: "io_uring_submit_req",
+        field: "opcode",
+        compiled: TP_IOURING_SUBMIT_OPCODE_OFFSET as u32,
+        alt_event: "io_uring_submit_sqe",
+    },
+    TracepointFieldSpec {
+        name: "TP_IOURING_SUBMIT_SQ_THREAD_OFFSET",
+        category: "io_uring",
+        event: "io_uring_submit_req",
+        field: "sq_thread",
+        compiled: TP_IOURING_SUBMIT_SQ_THREAD_OFFSET as u32,
+        alt_event: "io_uring_submit_sqe",
+    },
+    TracepointFieldSpec {
+        name: "TP_IOURING_CREATE_FD_OFFSET",
+        category: "io_uring",
+        event: "io_uring_create",
+        field: "fd",
+        compiled: TP_IOURING_CREATE_FD_OFFSET as u32,
+        alt_event: "",
+    },
+    TracepointFieldSpec {
+        name: "TP_IOURING_CREATE_SQ_ENTRIES_OFFSET",
+        category: "io_uring",
+        event: "io_uring_create",
+        field: "sq_entries",
+        compiled: TP_IOURING_CREATE_SQ_ENTRIES_OFFSET as u32,
+        alt_event: "",
+    },
+    TracepointFieldSpec {
+        name: "TP_IOURING_CREATE_FLAGS_OFFSET",
+        category: "io_uring",
+        event: "io_uring_create",
+        field: "flags",
+        compiled: TP_IOURING_CREATE_FLAGS_OFFSET as u32,
+        alt_event: "",
     },
 ];
 
@@ -926,6 +994,11 @@ pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
     ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 46),
     ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 47),
     ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 48),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 49),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 50),
+    ("TP_IOURING_CREATE_FD_OFFSET", 51),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 52),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 53),
 ];
 
 /// Enum-value slots follow the offset slots.
@@ -972,7 +1045,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 49);
+        assert_eq!(BTF_OFFSETS_SLOTS, 54);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
