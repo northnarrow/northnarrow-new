@@ -135,6 +135,34 @@ fails on any restart, any journal ERROR, an RSS slope above
 fd count that grew by more than half. Planned use: 24 h on each guest
 before a release, 72 h once before `0.1.0`.
 
+### Overhead (agent off vs on)
+
+```
+deploy/lab/nn-lab.sh overhead          # 3 rounds; ~/.cache/nn-lab/<distro>/reports/overhead-<stamp>/overhead.md
+deploy/lab/nn-lab.sh overhead 5        # more rounds, steadier medians
+```
+
+Measures what the agent costs the operations it hooks. Each round runs
+`deploy/lab/overhead/nn-bench.c` twice, once with the agent off (units
+stopped and pin root purged, so no hook is attached) and once with it on
+(units started, 20 s to settle), on four workloads:
+
+| workload | what one operation is | hooks it crosses |
+|---|---|---|
+| `open` | open + read 64 bytes + close, cycling over 64 files | `sys_enter_openat` tracepoint, LSM `file_open` and `file_permission` |
+| `wopen` | open `O_WRONLY` + 4 KiB `pwrite` + close of one file | the same, on the write path |
+| `exec` | fork + `execve(/bin/true)` + wait | `sys_enter_execve` and `sched_process_exec` tracepoints |
+| `connect` | TCP connect + accept + close on `127.0.0.1` | `tcp_v4_connect` kprobe, `tcp_close` fexit |
+
+The report gives the median throughput off and on, the throughput lost
+and the agent's own CPU time while each workload ran (utime + stime of
+its pid). These are worst-case microbenchmarks: every iteration is a
+hooked operation, so real services lose far less. Run it on an otherwise
+idle host, with no other guest busy: the off/on alternation cancels slow
+drift, not a neighbour's load. The benchmark binary is built under
+`/usr/local/libexec/nn-lab` and runs as root, because the agent kills a
+root exec from a user-writable path (R009).
+
 ### RAG release gates need the real corpus
 
 `rag::bench` holds three `#[ignore]` release gates (golden retrieval

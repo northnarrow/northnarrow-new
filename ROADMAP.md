@@ -634,7 +634,18 @@ Pianificato, in quest'ordine:
   restano i blocchi `unsafe` (record dei ring buffer, FFI di Candle), gli
   altri parser binari e la verifica di firme e quorum (ricerca dell'11
   ottobre, HACMS / s2n-quic)
-- Overhead misurato su host carico (`file_permission`/`file_open`; dato
+- Overhead misurato su host carico (strumento fatto l'11 ottobre, lab PR
+  37: `nn-lab.sh overhead` alterna agent spento e acceso su quattro
+  micro-carichi — open, scrittura, exec, connect su loopback — e riporta la
+  mediana del throughput perso e la CPU dell'agent. Primo giro su 6.8, con
+  l'host non a riposo: open −37 %, scrittura −47 %, exec −11 %, connect
+  −31 %. Il costo sui file nasce dal sensore `sys_enter_openat`, che manda
+  in userland ogni open dell'host anche quando l'agent poi lo scarta: va
+  filtrato nel kernel insieme allo spostamento su LSM di 10.9 (rilievo 45).
+  Il log INFO di ogni exec vale circa il 5 % della CPU dell'agent sugli
+  exec. Lo stesso giro ha trovato due falsi positivi che uccidevano
+  processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Restano i
+  numeri ufficiali a tre giri, su host a riposo, per ogni guest. Dato
   grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,
   rilievo 26)

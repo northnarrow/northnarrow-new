@@ -24,6 +24,7 @@
 #   deploy/lab/nn-lab.sh upgrade-check    # install.sh --upgrade on the running install (keys/chains kept)
 #   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
 #   deploy/lab/nn-lab.sh tamper-check     # adversarial anti-tamper cases: outcome + chain-log evidence per case
+#   deploy/lab/nn-lab.sh overhead [ROUNDS] # agent off/on throughput of the hooked operations (idle host!)
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -436,6 +437,58 @@ exit $fail
 REMOTE
 }
 
+cmd_overhead() {
+    # Tappa 10.8 — overhead of the agent on the operations it hooks. Alternates
+    # agent OFF (units stopped, pin root purged: no hook attached) and agent
+    # ON, ROUNDS times, runs deploy/lab/overhead/nn-bench.c on four workloads
+    # and reports the medians (plus the agent's own CPU time per workload).
+    # Run it on an otherwise idle host: other guests' load is noise.
+    vm_running || die "guest is not running"
+    local rounds=${1:-3}
+    local out
+    out="$LAB_DIR/reports/overhead-$(date -u +%Y%m%d-%H%M%S)"
+    mkdir -p "$out"
+    # root-owned outside /home: as root from a user-writable path the
+    # agent's R009 would kill the benchmark in the ON phase
+    vssh 'cd ~/northnarrow && sudo mkdir -p /usr/local/libexec/nn-lab && sudo cc -O2 -o /usr/local/libexec/nn-lab/nn-bench deploy/lab/overhead/nn-bench.c && sudo install -m 0755 deploy/lab/overhead/run.sh /usr/local/libexec/nn-lab/nn-bench-run'
+    local r phase
+    for r in $(seq 1 "$rounds"); do
+        for phase in off on; do
+            if [[ $phase == off ]]; then
+                lab_purge_pins >/dev/null
+            else
+                vssh 'sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && sleep 20'
+            fi
+            vssh 'sudo /usr/local/libexec/nn-lab/nn-bench-run /usr/local/libexec/nn-lab/nn-bench' \
+                | sed "s/^/$phase $r /" | tee -a "$out/raw.txt"
+        done
+    done
+    python3 - "$out/raw.txt" "$DISTRO" "$(vssh 'uname -r')" > "$out/overhead.md" <<'PY'
+import statistics, sys
+raw, distro, kernel = sys.argv[1], sys.argv[2], sys.argv[3]
+rows = {}
+for line in open(raw):
+    phase, _round, wl, ops, cpu = line.split()
+    rows.setdefault(wl, {"off": [], "on": [], "cpu": []})
+    rows[wl][phase].append(float(ops))
+    if phase == "on":
+        rows[wl]["cpu"].append(float(cpu))
+print(f"# Agent overhead — {distro} ({kernel})\n")
+print("| workload | agent off (ops/s) | agent on (ops/s) | overhead | agent CPU during the run |")
+print("|---|---|---|---|---|")
+for wl in ("open", "wopen", "exec", "connect"):
+    if wl not in rows:
+        continue
+    off, on = statistics.median(rows[wl]["off"]), statistics.median(rows[wl]["on"])
+    cpu = statistics.median(rows[wl]["cpu"]) if rows[wl]["cpu"] else 0
+    print(f"| {wl} | {off:,.0f} | {on:,.0f} | {(off - on) / off * 100:+.1f} % | {cpu:,.0f} ms |")
+n = len(rows["open"]["off"])
+print(f"\nMedians of {n} round{'s' if n != 1 else ''}; overhead = throughput lost with the agent running.")
+PY
+    cat "$out/overhead.md"
+    log "overhead report: $out/overhead.md"
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -820,6 +873,7 @@ case "${1:-help}" in
     upgrade-check) cmd_upgrade_check ;;
     uninstall-check) cmd_uninstall_check ;;
     tamper-check)  cmd_tamper_check ;;
+    overhead)      shift; cmd_overhead "$@" ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;
