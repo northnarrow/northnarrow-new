@@ -61,7 +61,13 @@
 //! `KillProcessTree` unconditionally — never throttled. They carry a
 //! `chain_*` category (not a `net_*` tier), so the future §6.5
 //! NetFlow rate-limit bucket does not even scope them.
+//!
+//! The one exception is NN-L-CHAIN-008 (sudo/su then egress): it is
+//! informational (`Medium` + `Log`) and is registered LAST in the
+//! engine through [`ChainRuleSet::tail`], so its Log verdict never
+//! shadows a blocking rule on the same flow. See its docs.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use common::{Event, ResponseAction, Severity, Verdict};
@@ -77,16 +83,55 @@ use crate::fim::rules::is_credential_store_access;
 
 /// Build a Critical chain Verdict from the triggering `NetFlowEvent`.
 fn chain_verdict(rule: &dyn Rule, nf: &common::wire::NetFlowEvent, reasoning: &str) -> Verdict {
+    chain_verdict_with(
+        rule,
+        nf,
+        ResponseAction::KillProcessTree,
+        Severity::Critical,
+        reasoning,
+    )
+}
+
+/// Chain Verdict with an explicit action and severity (the
+/// informational NN-L-CHAIN-008 uses `Log` + `Medium`).
+fn chain_verdict_with(
+    rule: &dyn Rule,
+    nf: &common::wire::NetFlowEvent,
+    action: ResponseAction,
+    severity: Severity,
+    reasoning: &str,
+) -> Verdict {
     Verdict {
         rule_id: rule.id().to_string(),
         rule_name: rule.name().to_string(),
         category: rule.category().to_string(),
-        action: ResponseAction::KillProcessTree,
-        severity: Severity::Critical,
+        action,
+        severity,
         reasoning: reasoning.to_string(),
         event_pid: nf.pid,
         event_filename: nf.comm.clone(),
         timestamp_ns: nf.start_ns,
+    }
+}
+
+/// `true` when a flow's destination never leaves the host: loopback
+/// (`127.0.0.0/8`, `::1`, IPv4-mapped `::ffff:127.0.0.0/104`) or the
+/// unspecified address. Such a flow is local IPC, not egress.
+///
+/// Only NN-L-CHAIN-008 applies it. The other chains keep loopback
+/// triggers on purpose: their precursors (credential read, `/tmp`
+/// exec, canary trip) are rare and high-confidence, and handing data
+/// to a local proxy (`127.0.0.1:9050`) is a real exfiltration path.
+fn is_on_host(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
     }
 }
 
@@ -512,11 +557,33 @@ impl Rule for NnLChain007TmpCredExfilSequence {
     }
 }
 
-/// NN-L-CHAIN-008 — `sudo`/`su` privilege escalation by an **ancestor**,
-/// then a descendant egresses (T1548 → T1041): a privesc'd shell whose
-/// child calls out. Records the `PrivEsc` precursor on the sudo/su spawn
-/// itself (returns None — falls through to any process rule), and
-/// triggers cross-PID on a later descendant flow.
+/// NN-L-CHAIN-008 — `sudo`/`su` by an **ancestor**, then a descendant
+/// opens an off-host flow (T1548 → T1041). Records the `PrivEsc`
+/// precursor on the sudo/su spawn itself (returns None — falls through
+/// to any process rule), and triggers cross-PID on a later descendant
+/// flow.
+///
+/// **Informational: `Medium` + `Log`, registered LAST.** Running sudo
+/// or su and then reaching the network is the routine admin workflow.
+/// In the lab (2026-10-11) `sudo apt-get update` drew this verdict on
+/// apt's `http` method, and a loopback benchmark run under sudo drew
+/// 499 of them. As a Critical `KillProcessTree` it killed package
+/// updates, configuration management (`become: sudo`) and any sudo'd
+/// tool that touched the network for the whole correlation window,
+/// while an attacker who already holds sudo sidesteps it trivially
+/// (wait out the window, `systemd-run`). So it stays a correlation
+/// signal only:
+///
+/// - loopback and unspecified destinations are ignored
+///   ([`is_on_host`]);
+/// - the verdict is `Medium` + `Log`;
+/// - the rule sits at the END of the engine ([`ChainRuleSet::tail`]),
+///   so its Log verdict never shadows a blocking rule on the same flow
+///   (a sudo'd shell calling port 4444 still gets NN-L-NET-010's kill).
+///
+/// A sharper trigger (sudo/su invoked from a service context rather
+/// than a login session, or the design's module-load → outbound
+/// sequence) is an open review item.
 pub struct NnLChain008CrossPidPrivEscExfil {
     buf: Arc<Mutex<CorrelationStore>>,
 }
@@ -551,8 +618,9 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
                     .record_for_pid(*pid, PrecursorKind::PrivEsc, *timestamp_ns);
                 None
             }
-            // Trigger: a descendant of the privesc process egresses.
-            Event::NetFlow(nf) => {
+            // Trigger: a descendant of the sudo/su process leaves the
+            // host. Loopback is local IPC, not egress.
+            Event::NetFlow(nf) if !is_on_host(&nf.dst_addr) => {
                 if !self.buf.lock().has_recent_in_ancestors(
                     nf.pid,
                     PrecursorKind::PrivEsc,
@@ -561,13 +629,16 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
                 ) {
                     return None;
                 }
-                Some(chain_verdict(
+                Some(chain_verdict_with(
                     self,
                     nf,
-                    "A descendant of a sudo/su privilege-escalation process \
-                     opened an outbound flow — cross-PID privesc → \
-                     exfiltration (T1548 → T1041); kill the process tree + \
-                     posture → COMBAT",
+                    ResponseAction::Log,
+                    Severity::Medium,
+                    "A descendant of a sudo/su process opened an off-host \
+                     flow within the correlation window — privilege use → \
+                     network (T1548 → T1041). Routine for admin tooling, so \
+                     logged for correlation only; blocking rules on the \
+                     same flow are evaluated first",
                 ))
             }
             _ => None,
@@ -577,7 +648,19 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
 
 // ── Factory ──────────────────────────────────────────────────────────
 
-/// Build the 3 NN-L-CHAIN rules over **one shared** [`CorrelationStore`]
+/// The NN-L-CHAIN rules over **one shared** [`CorrelationStore`], split
+/// by the engine position each one needs.
+pub struct ChainRuleSet {
+    /// Registered FIRST: they record precursors before a first-match
+    /// short-circuit, and their Critical verdicts win over lower net
+    /// rules on the same flow (module docs).
+    pub head: Vec<Box<dyn Rule>>,
+    /// Registered LAST: informational chains whose `Log` verdict must
+    /// never shadow a blocking rule on the same event (NN-L-CHAIN-008).
+    pub tail: Vec<Box<dyn Rule>>,
+}
+
+/// Build the NN-L-CHAIN rules over **one shared** [`CorrelationStore`]
 /// (Tappa 10.6 D3). Unlike the net blocklists / comm allowlists, the
 /// store is PRIVATE runtime state (not operator config), so it's
 /// constructed here rather than threaded from `main.rs` — the
@@ -585,24 +668,37 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
 /// rule. Sharing (vs the old per-rule buffers) is what lets D6's
 /// multi-precursor chains correlate across rule kinds; per-rule
 /// isolation is preserved by the typed [`PrecursorKind`]. The engine
-/// MUST register these FIRST (see the module docs); the `default_rules*`
-/// builders prepend them.
-pub fn chain_rules() -> Vec<Box<dyn Rule>> {
+/// MUST register [`ChainRuleSet::head`] FIRST and
+/// [`ChainRuleSet::tail`] LAST (see the module docs); the
+/// `default_rules*` builders do both.
+pub fn chain_rule_set() -> ChainRuleSet {
     let store = Arc::new(Mutex::new(CorrelationStore::new()));
-    vec![
-        // CHAIN-007 (3-step same-PID) first: the richest verdict wins
-        // first-match over the 2-step CHAIN-001/002 for the same flow.
-        Box::new(NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))),
-        // Same-PID 2-step originals.
-        Box::new(NnLChain001CredReadThenEgress::new(Arc::clone(&store))),
-        Box::new(NnLChain002TmpExecThenEgress::new(Arc::clone(&store))),
-        Box::new(NnLChain003CanaryThenEgress::new(Arc::clone(&store))),
-        // Cross-PID variants (strict ancestor — never shadow the above).
-        Box::new(NnLChain004CrossPidCredExfil::new(Arc::clone(&store))),
-        Box::new(NnLChain005CrossPidTmpC2::new(Arc::clone(&store))),
-        Box::new(NnLChain006CrossPidCanaryExfil::new(Arc::clone(&store))),
-        Box::new(NnLChain008CrossPidPrivEscExfil::new(Arc::clone(&store))),
-    ]
+    ChainRuleSet {
+        head: vec![
+            // CHAIN-007 (3-step same-PID) first: the richest verdict wins
+            // first-match over the 2-step CHAIN-001/002 for the same flow.
+            Box::new(NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))),
+            // Same-PID 2-step originals.
+            Box::new(NnLChain001CredReadThenEgress::new(Arc::clone(&store))),
+            Box::new(NnLChain002TmpExecThenEgress::new(Arc::clone(&store))),
+            Box::new(NnLChain003CanaryThenEgress::new(Arc::clone(&store))),
+            // Cross-PID variants (strict ancestor — never shadow the above).
+            Box::new(NnLChain004CrossPidCredExfil::new(Arc::clone(&store))),
+            Box::new(NnLChain005CrossPidTmpC2::new(Arc::clone(&store))),
+            Box::new(NnLChain006CrossPidCanaryExfil::new(Arc::clone(&store))),
+        ],
+        tail: vec![Box::new(NnLChain008CrossPidPrivEscExfil::new(Arc::clone(
+            &store,
+        )))],
+    }
+}
+
+/// Every chain rule in engine order (head, then tail) over one shared
+/// store — the flat view the unit tests use.
+pub fn chain_rules() -> Vec<Box<dyn Rule>> {
+    let ChainRuleSet { mut head, tail } = chain_rule_set();
+    head.extend(tail);
+    head
 }
 
 #[cfg(test)]
@@ -1042,6 +1138,137 @@ mod tests {
             fired.contains(&"NN-L-CHAIN-008_CrossPidPrivEscExfil".to_string()),
             "{fired:?}"
         );
+    }
+
+    /// Flow helper with an explicit destination address.
+    fn flow_to(pid: u32, dst: IpAddr, dst_port: u16, ts_ns: u64) -> Event {
+        let Event::NetFlow(mut nf) = flow(pid, dst_port, ts_ns) else {
+            unreachable!()
+        };
+        nf.family = if dst.is_ipv4() { 2 } else { 10 };
+        nf.dst_addr = dst;
+        Event::NetFlow(nf)
+    }
+
+    /// sudo (100) → apt (200) → apt's `http` method (300), the shape the
+    /// lab saw on `sudo apt-get update`.
+    fn sudo_tree(rules: &[Box<dyn Rule>]) {
+        fire_ids(
+            rules,
+            &proc_spawn(100, 1, "sudo", "/usr/bin/sudo", 10 * SEC),
+        );
+        fire_ids(
+            rules,
+            &proc_spawn(200, 100, "apt-get", "/usr/bin/apt-get", 11 * SEC),
+        );
+        fire_ids(
+            rules,
+            &proc_spawn(300, 200, "http", "/usr/lib/apt/methods/http", 12 * SEC),
+        );
+    }
+
+    /// Lab finding 2026-10-11: CHAIN-008 killed `sudo apt-get update`.
+    /// It is now informational — Medium + Log, never a kill.
+    #[test]
+    fn chain008_is_informational_log_not_kill() {
+        let rules = chain_rules();
+        sudo_tree(&rules);
+        let v = rules
+            .iter()
+            .filter_map(|r| r.evaluate(&flow(300, 80, 13 * SEC)))
+            .find(|v| v.rule_id == "NN-L-CHAIN-008_CrossPidPrivEscExfil")
+            .expect("off-host flow under sudo still correlates");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
+        assert_eq!(v.event_pid, 300);
+    }
+
+    /// Lab finding 2026-10-11: a loopback benchmark under sudo drew 499
+    /// CHAIN-008 kills. A flow that never leaves the host is not egress.
+    #[test]
+    fn chain008_ignores_on_host_destinations() {
+        use std::net::Ipv6Addr;
+        let rules = chain_rules();
+        sudo_tree(&rules);
+        for dst in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()),
+        ] {
+            let fired = fire_ids(&rules, &flow_to(300, dst, 5432, 13 * SEC));
+            assert!(
+                !fired.contains(&"NN-L-CHAIN-008_CrossPidPrivEscExfil".to_string()),
+                "{dst} is on-host: {fired:?}"
+            );
+        }
+        // Off-host neighbours of those addresses still correlate.
+        for dst in [
+            IpAddr::V4(Ipv4Addr::new(128, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V6(Ipv4Addr::new(203, 0, 113, 9).to_ipv6_mapped()),
+            IpAddr::V6("2001:db8::1".parse().unwrap()),
+        ] {
+            let fired = fire_ids(&rules, &flow_to(300, dst, 443, 13 * SEC));
+            assert!(
+                fired.contains(&"NN-L-CHAIN-008_CrossPidPrivEscExfil".to_string()),
+                "{dst} is off-host: {fired:?}"
+            );
+        }
+    }
+
+    /// The other chains keep loopback triggers (rare, high-confidence
+    /// precursors; local-proxy exfiltration is a real path).
+    #[test]
+    fn critical_chains_still_fire_on_loopback() {
+        let rules = chain_rules();
+        fire_ids(&rules, &cred_fim(42, 10 * SEC));
+        let fired = fire_ids(
+            &rules,
+            &flow_to(42, IpAddr::V4(Ipv4Addr::LOCALHOST), 9050, 11 * SEC),
+        );
+        assert!(
+            fired.contains(&"NN-L-CHAIN-001_CredReadThenEgress".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    #[test]
+    fn chain_rule_set_puts_only_chain008_in_the_tail() {
+        let set = chain_rule_set();
+        assert_eq!(set.head.len(), 7);
+        assert!(set
+            .head
+            .iter()
+            .all(|r| r.id() != "NN-L-CHAIN-008_CrossPidPrivEscExfil"));
+        let tail: Vec<&str> = set.tail.iter().map(|r| r.id()).collect();
+        assert_eq!(tail, vec!["NN-L-CHAIN-008_CrossPidPrivEscExfil"]);
+    }
+
+    /// Engine-level: CHAIN-008 is the LAST rule, so a sudo'd process that
+    /// calls a high-risk C2 port still gets NN-L-NET-010's kill instead of
+    /// CHAIN-008's Log; an ordinary off-host flow falls through to the
+    /// informational verdict.
+    #[test]
+    fn engine_evaluates_chain008_after_every_blocking_rule() {
+        use crate::decision::RuleEngine;
+        let engine = RuleEngine::with_default_rules();
+        engine.evaluate(&proc_spawn(100, 1, "sudo", "/usr/bin/sudo", 10 * SEC));
+        engine.evaluate(&proc_spawn(200, 100, "bash", "/bin/bash", 11 * SEC));
+
+        let c2 = engine
+            .evaluate(&flow(200, 4444, 12 * SEC))
+            .expect("port 4444 fires a net rule");
+        assert_eq!(c2.rule_id, "NN-L-NET-010_OutboundToHighRiskC2Port");
+        assert_eq!(c2.action, ResponseAction::KillProcess);
+
+        let https = engine
+            .evaluate(&flow(200, 443, 13 * SEC))
+            .expect("off-host flow under sudo correlates");
+        assert_eq!(https.rule_id, "NN-L-CHAIN-008_CrossPidPrivEscExfil");
+        assert_eq!(https.action, ResponseAction::Log);
     }
 
     #[test]
