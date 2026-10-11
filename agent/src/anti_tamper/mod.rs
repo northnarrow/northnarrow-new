@@ -339,18 +339,22 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
 
     // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
     // loader resolves `bpf_lsm_<hook>` against it to set the
-    // `attach_btf_id` the kernel expects. If we can't read vmlinux
-    // BTF, neither hook can attach — log once and skip both rather
-    // than warning twice for the same root cause.
+    // `attach_btf_id` the kernel expects, so without it no deny hook can
+    // attach. Review 53: that is the same state as every deny hook
+    // failing, so it goes through the same fail-closed decision — it used
+    // to be a WARN and an early `Ok`, and only the net sensor's own BTF
+    // load kept such an agent from running (a tmpfs over /sys/kernel/btf
+    // before a restart is enough to hide the file).
     let btf = match Btf::from_sys_fs() {
         Ok(b) => b,
         Err(e) => {
-            warn!(
-                error = %e,
-                "anti-tamper: vmlinux BTF unavailable, skipping LSM attach \
-                 (kernel BPF-LSM disabled or CONFIG_DEBUG_INFO_BTF=n)"
+            return deny_shortfall(
+                0,
+                &[format!(
+                    "vmlinux BTF unavailable ({e:#}) — no LSM hook can attach: kernel built \
+                     without CONFIG_DEBUG_INFO_BTF, or /sys/kernel/btf hidden"
+                )],
             );
-            return Ok(());
         }
     };
 
@@ -484,6 +488,13 @@ fn report_lsm_health(
         );
         return Ok(());
     }
+    deny_shortfall(deny_attached, &failed)
+}
+
+/// The fail-closed decision on a deny-hook shortfall, shared by the
+/// per-hook report and the no-BTF path (review 53): refuse to start
+/// unless [`ALLOW_DEGRADED_ENV`] is `1`.
+fn deny_shortfall(deny_attached: usize, failed: &[String]) -> Result<()> {
     let allow_degraded = std::env::var(ALLOW_DEGRADED_ENV)
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -778,6 +789,22 @@ pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Review 53: the no-BTF path and a per-hook shortfall share one
+    /// decision — refuse to start without the explicit degraded opt-in,
+    /// naming the cause.
+    #[test]
+    fn deny_shortfall_refuses_without_the_degraded_opt_in() {
+        if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
+            return; // a dev shell that opted in; nothing to assert here
+        }
+        let err = deny_shortfall(0, &["vmlinux BTF unavailable (test)".to_string()])
+            .expect_err("a deny-hook shortfall must refuse to start");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("0 of"), "{msg}");
+        assert!(msg.contains("vmlinux BTF unavailable"), "{msg}");
+        assert!(msg.contains(ALLOW_DEGRADED_ENV), "{msg}");
+    }
 
     // ── Watchdog W6: pidfile reader + comm constant ────────────────
 

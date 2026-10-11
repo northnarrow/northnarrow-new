@@ -223,8 +223,9 @@ impl SensorMultiplexer {
         // start() lean for the existing exec_sensor_live test.
         let net_bufs = if net.is_some() {
             // `tcp_close` is fexit — needs vmlinux BTF for the
-            // function signature. The dev kernel (6.8.x) ships
-            // BTF unconditionally; the load is degrade-not-fail.
+            // function signature. Without BTF this fails the start, like
+            // the anti-tamper deny hooks do (review 53): BTF is a hard
+            // prerequisite, see docs/operator/KERNEL_COMPATIBILITY.md.
             let btf =
                 Btf::from_sys_fs().with_context(|| "loading vmlinux BTF for net fexit programs")?;
             attach_kprobe(&mut ebpf, "inet_csk_listen_start", "inet_csk_listen_start")?;

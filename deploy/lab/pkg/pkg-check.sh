@@ -48,7 +48,8 @@ echo "== $fmt lifecycle (units before: $(units))"
 before=$(units)
 check "1 install release 1 over the install.sh layout" quiet pinstall "$(pkg 1)"
 check "  units unchanged ($before)" test "$(units)" = "$before"
-check "  unit loaded from /usr/lib/systemd/system" test "$(systemctl show -p FragmentPath --value northnarrow-agent)" = /usr/lib/systemd/system/northnarrow-agent.service
+# canonical path: Debian's systemd reports the merged-/usr unit dir as /lib/systemd/system
+check "  unit loaded from /usr/lib/systemd/system" test "$(readlink -f "$(systemctl show -p FragmentPath --value northnarrow-agent)")" = /usr/lib/systemd/system/northnarrow-agent.service
 check "  install.sh layout removed" test ! -e /usr/local/bin/northnarrow-agent -a ! -e /etc/systemd/system/northnarrow-agent.service
 check "  install manifest provenance=package" sudo grep -q '"provenance": "package"' /etc/northnarrow/install-manifest.json
 [ "$(units)" = "active active" ] || { sudo systemctl start northnarrow-agent; sleep 3; sudo systemctl start northnarrow-watchdog; sleep 15; }

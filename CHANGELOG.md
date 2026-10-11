@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Without the kernel BTF (`/sys/kernel/btf/vmlinux`) the anti-tamper
+  attach only logged a WARN and skipped every LSM hook, outside the
+  fail-closed check that refuses to start on a missing deny hook. Only the
+  network sensor's own BTF load kept such an agent from running. The
+  no-BTF case now takes the same fail-closed path
+  (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` is the only way to start degraded),
+  and a mount that hides `/sys/kernel/btf` while the agent runs is
+  reported as `integrity_drift` (review 53).
 - A copy of the agent's unit in an earlier directory of systemd's load
   path replaced the installed unit at the next `daemon-reload` without any
   evidence. The tmpfs `/run/systemd/transient` and `system.control`
