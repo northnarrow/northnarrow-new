@@ -116,8 +116,15 @@ impl<'a> Cursor<'a> {
         Some(v)
     }
 
+    /// Bytes left after `pos`. Every bound check is `need > remaining()`:
+    /// `pos + need` could wrap for a huge `need` and pass the check (Kani,
+    /// Tappa 10.8 — unreachable with today's u16/u24 lengths, but a
+    /// release build wraps silently).
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     fn read_u16(&mut self) -> Option<u16> {
-        if self.pos + 2 > self.buf.len() {
+        if 2 > self.remaining() {
             return None;
         }
         let v = u16::from_be_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
@@ -126,7 +133,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_u24(&mut self) -> Option<u32> {
-        if self.pos + 3 > self.buf.len() {
+        if 3 > self.remaining() {
             return None;
         }
         let v = ((self.buf[self.pos] as u32) << 16)
@@ -137,7 +144,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos + n > self.buf.len() {
+        if n > self.remaining() {
             return None;
         }
         let b = &self.buf[self.pos..self.pos + n];
@@ -1010,5 +1017,48 @@ mod tests {
         assert!(parse_client_hello(&[0u8; 200]).is_none());
         // Empty buffer.
         assert!(parse_client_hello(&[]).is_none());
+    }
+}
+
+/// Kani proofs (Tappa 10.8, "verifica formale dopo il fuzzing"). Every byte
+/// the ClientHello parser reads goes through [`Cursor`]; if each cursor
+/// operation is panic-free and keeps `pos <= buf.len()`, any sequence of
+/// them is — so the parser cannot index out of bounds on any input, which
+/// the fuzzer can only sample.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const N: usize = 8;
+
+    #[kani::proof]
+    fn cursor_operations_never_panic_and_keep_pos_in_bounds() {
+        let backing: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        let pos: usize = kani::any();
+        kani::assume(pos <= len);
+        let mut c = Cursor {
+            buf: &backing[..len],
+            pos,
+        };
+        let n: usize = kani::any(); // any length an attacker-controlled field can carry
+        match kani::any::<u8>() % 4 {
+            0 => {
+                let _ = c.read_u8();
+            }
+            1 => {
+                let _ = c.read_u16();
+            }
+            2 => {
+                let _ = c.read_u24();
+            }
+            _ => {
+                if let Some(b) = c.read_bytes(n) {
+                    assert!(b.len() == n);
+                }
+            }
+        }
+        assert!(c.pos <= len);
     }
 }

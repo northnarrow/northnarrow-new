@@ -627,9 +627,13 @@ Pianificato, in quest'ordine:
   rollback); altrimenti usa i default di quella lista e registra
   `unauthorized_overlay`; `nn-admin config overlay set|sign|status`,
   adozione degli overlay esistenti in `install.sh --upgrade`
-- Verifica formale con Kani dopo il fuzzing: harness sui blocchi `unsafe`
-  (record dei ring buffer, FFI di Candle), sui parser binari e sulla
-  verifica di firme e quorum (ricerca dell'11 ottobre, HACMS / s2n-quic)
+- Verifica formale con Kani dopo il fuzzing (prima parte fatta l'11
+  ottobre, lab PR 35: cursore del ClientHello TLS e scansione del QNAME DNS
+  dimostrati per ogni input di dimensione limitata, job CI settimanale; la
+  prima prova ha trovato un controllo dei limiti che andava in overflow);
+  restano i blocchi `unsafe` (record dei ring buffer, FFI di Candle), gli
+  altri parser binari e la verifica di firme e quorum (ricerca dell'11
+  ottobre, HACMS / s2n-quic)
 - Overhead misurato su host carico (`file_permission`/`file_open`; dato
   grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm` (prerequisito: binari fuori da `/usr/local/bin`,

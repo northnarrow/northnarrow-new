@@ -1,0 +1,46 @@
+# Kani model checking (Tappa 10.8, "verifica formale dopo il fuzzing").
+#
+# The fuzz job samples the input space of the parsers that read
+# attacker-written bytes; these proofs cover all of it for the
+# bounds-checking cores those parsers are built on:
+#   - net::tls_parser::Cursor — every ClientHello read goes through it
+#     (any buffer ≤ 8 bytes, any position, any length: no panic, the
+#     position never leaves the buffer; by induction any read sequence);
+#   - model::QnameLabels — the DNS name walk behind decode_dns_qname
+#     (any buffer ≤ 16 bytes: in bounds, terminates).
+# Weekly + on demand: the Kani toolchain setup alone takes minutes.
+name: kani
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml asks for target-cpu=native; irrelevant for proofs.
+  RUSTFLAGS: -C target-cpu=x86-64-v2
+
+jobs:
+  proofs:
+    name: kani (model checking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Kani (pinned)
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+
+      - name: Prove the DNS label walk (common)
+        run: cargo kani -p northnarrow-common --harness qname_label_walk_is_in_bounds_and_terminates
+
+      - name: Prove the TLS cursor (agent)
+        # A Candle dependency (pulp) carries global asm, which Kani cannot
+        # model; the proved code never reaches it.
+        run: >
+          cargo kani -p northnarrow-agent
+          --harness cursor_operations_never_panic_and_keep_pos_in_bounds
+          -Z unstable-options --ignore-global-asm

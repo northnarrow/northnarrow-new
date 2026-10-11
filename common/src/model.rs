@@ -616,35 +616,81 @@ impl From<&DnsQueryRaw> for Event {
 /// Tappa 4 telemetry.
 pub fn decode_dns_qname(buf: &[u8]) -> String {
     let mut out = String::new();
-    let mut i = 0usize;
-    while i < buf.len() {
-        let len = buf[i] as usize;
+    for label in QnameLabels::new(buf) {
+        match label {
+            QnameLabel::Pointer => out.push('…'),
+            QnameLabel::Data(bytes) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                for &b in bytes {
+                    out.push(if (32..127).contains(&b) {
+                        b as char
+                    } else {
+                        '?'
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One label of a DNS label-encoded name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QnameLabel<'a> {
+    /// Label bytes (possibly cut short by the end of the buffer).
+    Data(&'a [u8]),
+    /// A compression pointer: decoding stops here.
+    Pointer,
+}
+
+/// Allocation-free walk over the labels of a DNS name — the index
+/// arithmetic of [`decode_dns_qname`], separated from the string building
+/// so it can be model-checked (Kani, Tappa 10.8). Stops at the root label,
+/// at a compression pointer, or at the end of the buffer.
+pub struct QnameLabels<'a> {
+    buf: &'a [u8],
+    i: usize,
+    done: bool,
+}
+
+impl<'a> QnameLabels<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self {
+            buf,
+            i: 0,
+            done: false,
+        }
+    }
+}
+
+impl<'a> Iterator for QnameLabels<'a> {
+    type Item = QnameLabel<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || self.i >= self.buf.len() {
+            return None;
+        }
+        let len = self.buf[self.i] as usize;
         if len == 0 {
-            break;
+            self.done = true;
+            return None;
         }
         if len & 0xC0 != 0 {
             // compression pointer — give up cleanly
-            out.push('…');
-            break;
+            self.done = true;
+            return Some(QnameLabel::Pointer);
         }
-        i += 1;
-        let end = core::cmp::min(i + len, buf.len());
-        if !out.is_empty() {
-            out.push('.');
+        let start = self.i + 1;
+        let end = core::cmp::min(start + len, self.buf.len());
+        let label = &self.buf[start..end];
+        if end == self.buf.len() {
+            self.done = true;
         }
-        for &b in &buf[i..end] {
-            out.push(if (32..127).contains(&b) {
-                b as char
-            } else {
-                '?'
-            });
-        }
-        if end == buf.len() {
-            break;
-        }
-        i = end;
+        self.i = end;
+        Some(QnameLabel::Data(label))
     }
-    out
 }
 
 /// Severity assigned to a verdict.
@@ -953,6 +999,38 @@ mod tests {
                 assert_eq!(parent_start_ns, 0);
             }
             _ => panic!("expected ProcessSpawn"),
+        }
+    }
+}
+
+/// Kani proofs (Tappa 10.8, "verifica formale dopo il fuzzing"): the
+/// decoders that turn kernel-written bytes into events never panic, for
+/// every possible input of the bounded size — fuzzing samples the input
+/// space, these cover all of it.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const N: usize = 16;
+
+    /// The label walk behind `decode_dns_qname` (kernel-copied, attacker-
+    /// written bytes) on any buffer of up to 16 bytes: no out-of-bounds
+    /// index, every label inside the buffer, and it terminates — each step
+    /// consumes at least one byte, so there are at most `len` labels.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn qname_label_walk_is_in_bounds_and_terminates() {
+        let backing: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        let buf = &backing[..len];
+        let mut steps = 0usize;
+        for label in QnameLabels::new(buf) {
+            if let QnameLabel::Data(bytes) = label {
+                assert!(bytes.len() <= len);
+            }
+            steps += 1;
+            assert!(steps <= len);
         }
     }
 }
