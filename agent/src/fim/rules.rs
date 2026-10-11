@@ -46,6 +46,7 @@ use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::{TrustedInstallerOverride, OWN_SYSTEMD_UNITS};
 use crate::decision::Rule;
+use crate::posture::lineage::AuthSessionTracker;
 
 // ── shared path-prefix sets ────────────────────────────────────────
 
@@ -1731,7 +1732,93 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
 /// the front of the Critical tier — ransomware is the
 /// canonical kill-the-tree-immediately signal so it gets first
 /// pass.
+/// Review 49 — a persistence-shaped write made by the package manager is
+/// recorded, not killed.
+///
+/// dpkg, rpm and dnf write unit files, timers, cron drop-ins, PAM and
+/// kernel modules and setuid binaries as a matter of course, and their
+/// maintainer scripts edit the sensitive configs. In the lab
+/// (2026-10-11, Ubuntu 24.04) NN-L-FIM-007/009/021 killed `dpkg` while it
+/// installed and removed a package, and `apt-get install --reinstall
+/// rsync` failed with `dpkg exited unexpectedly`. Killing the
+/// transaction does not undo the write: it only leaves a half-installed
+/// package behind, and it would break every unattended upgrade.
+///
+/// When the writer is, or descends from, a package manager in
+/// [`crate::posture::lineage::SYSTEM_DAEMON_EXES`] (kernel-resolved exe,
+/// never `comm`), a destructive verdict of the wrapped rule becomes
+/// `Log` + `Low`. Rule id, category and reasoning are kept, so the write
+/// stays in the signed detection chain.
+///
+/// Trust boundary: root can always install a malicious package through
+/// the real package manager, and that path is now logged instead of
+/// killed. The posture machine already applies the same boundary to
+/// these binaries. NN-L-FIM-022 (`/etc/ld.so.preload`), the bait and the
+/// credential rules are deliberately not wrapped.
+pub struct PackageManaged {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker,
+}
+
+impl PackageManaged {
+    pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker) -> Self {
+        Self { inner, lineage }
+    }
+}
+
+impl Rule for PackageManaged {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        if verdict.action == ResponseAction::Log {
+            return Some(verdict);
+        }
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        if !self.lineage.is_system_daemon_mediated(fe.modifier_pid) {
+            return Some(verdict);
+        }
+        Some(Verdict {
+            action: ResponseAction::Log,
+            severity: Severity::Low,
+            reasoning: format!(
+                "{} [written by the package manager (dpkg/rpm/dnf lineage): recorded, not \
+                 killed — killing the transaction would leave a half-installed package]",
+                verdict.reasoning
+            ),
+            ..verdict
+        })
+    }
+}
+
+/// The FIM rule set with a live `/proc`-backed lineage tracker for the
+/// package-manager carve-out ([`PackageManaged`]). Production threads the
+/// agent's shared tracker through [`fim_rules_with_lineage`] instead, so
+/// spawn events feed the cache the carve-out reads.
 pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<dyn Rule>> {
+    fim_rules_with_lineage(installer_override, AuthSessionTracker::with_proc())
+}
+
+/// The FIM rule set. The rules a package transaction legitimately trips
+/// (system binaries, setuid binaries, kernel and PAM modules, sensitive
+/// configs, cron drop-ins, systemd units and timers) are wrapped in
+/// [`PackageManaged`] over `lineage`; order and ids are unchanged.
+pub fn fim_rules_with_lineage(
+    installer_override: Arc<TrustedInstallerOverride>,
+    lineage: AuthSessionTracker,
+) -> Vec<Box<dyn Rule>> {
+    let pkg = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
+        Box::new(PackageManaged::new(rule, lineage.clone()))
+    };
     // NN-L-FIM-005's rsyslogd-append carve-out (FP-1) needs the host's
     // `syslog` uid. Resolve it once here (a /etc/passwd parse) instead
     // of per-event; `None` on a host without the user → the carve-out
@@ -1741,15 +1828,17 @@ pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<d
         // Critical first — fire on the worst-case signals
         // before any High/Medium rule has a chance to match.
         Box::new(NnLFim010RansomwareExtensionRename),
-        Box::new(NnLFim001SystemBinaryModified),
-        Box::new(NnLFim002NewSuidBinary),
-        Box::new(NnLFim008KernelModuleModified),
+        pkg(Box::new(NnLFim001SystemBinaryModified)),
+        pkg(Box::new(NnLFim002NewSuidBinary)),
+        pkg(Box::new(NnLFim008KernelModuleModified)),
         // High next.
-        Box::new(NnLFim003SensitiveConfigModified),
+        pkg(Box::new(NnLFim003SensitiveConfigModified)),
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
-        Box::new(NnLFim007CronDropInCreated::with_fresh_window()),
-        Box::new(NnLFim009SystemdUnitDropped::new(installer_override)),
+        pkg(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
+        pkg(Box::new(NnLFim009SystemdUnitDropped::new(
+            installer_override,
+        ))),
         // C5.3 — cloud credential read family. Same High
         // tier as the rest of the credential-access bucket
         // (NN-L-FIM-003 sensitive config / NN-L-FIM-004
@@ -1759,7 +1848,7 @@ pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<d
         Box::new(NnLFim013GcpCredsRead),
         Box::new(NnLFim014DockerCredsRead),
         // Tappa 10.5 D3 — Critical first.
-        Box::new(NnLFim021PamModuleModified),
+        pkg(Box::new(NnLFim021PamModuleModified)),
         Box::new(NnLFim022LdSoPreloadModified),
         // Tappa 9.5.1 — anti-tamper bait, Critical.
         Box::new(NnLFim024AntiTamperHoneypotModified::with_self_pid()),
@@ -1769,7 +1858,7 @@ pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<d
         Box::new(NnLFim017GpgKeyringAccessed),
         Box::new(NnLFim018LastlogTampered),
         Box::new(NnLFim019WtmpBtmpTampered),
-        Box::new(NnLFim023SystemdTimerCreated),
+        pkg(Box::new(NnLFim023SystemdTimerCreated)),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
         Box::new(NnLFim020ShellHistoryCleared),
@@ -3482,5 +3571,188 @@ mod tests {
         for (rule, op, path, comm, expect) in cases {
             run_d3_case(rule.as_ref(), op, path, comm, expect);
         }
+    }
+
+    // ── review 49 — package-manager writes are recorded, not killed ──
+
+    /// A FIM event written by `pid`, against a lineage tracker whose
+    /// `/proc` is an empty temp dir (only the spawn cache answers).
+    fn pkg_fixture() -> (tempfile::TempDir, AuthSessionTracker) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // apt-get (100) → dpkg (200) → postinst sh (300) → systemctl (400)
+        t.ingest_spawn(100, 1, "/usr/bin/apt-get", 1);
+        t.ingest_spawn(200, 100, "/usr/bin/dpkg", 2);
+        t.ingest_spawn(300, 200, "/bin/sh", 3);
+        t.ingest_spawn(400, 300, "/usr/bin/systemctl", 4);
+        // an unrelated root shell (500) → cp (600)
+        t.ingest_spawn(500, 1, "/usr/bin/bash", 5);
+        t.ingest_spawn(600, 500, "/usr/bin/cp", 6);
+        (tmp, t)
+    }
+
+    fn written_by(op: FimOp, path: &str, pid: u32, comm: &str) -> Event {
+        let Event::Fim(mut fe) = fim_event_with_comm(op, path, comm) else {
+            unreachable!()
+        };
+        fe.modifier_pid = pid;
+        Event::Fim(fe)
+    }
+
+    fn rules_by_id(lineage: &AuthSessionTracker) -> HashMap<&'static str, Box<dyn Rule>> {
+        fim_rules_with_lineage(TrustedInstallerOverride::inert_arc(), lineage.clone())
+            .into_iter()
+            .map(|r| (r.id(), r))
+            .collect()
+    }
+
+    /// The shapes the lab saw dpkg killed for (FIM-007/009/021), plus the
+    /// other wrapped rules, each written by dpkg or one of its children.
+    #[test]
+    fn package_manager_writes_are_logged_not_killed() {
+        let (_tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        let cases: &[(&str, FimOp, &str, u32, &str)] = &[
+            (
+                "NN-L-FIM-009_SystemdUnitDropped",
+                FimOp::Created,
+                "/usr/lib/systemd/system/rsync.service.dpkg-new",
+                200,
+                "dpkg",
+            ),
+            (
+                "NN-L-FIM-009_SystemdUnitDropped",
+                FimOp::Created,
+                "/etc/systemd/system/multi-user.target.wants/x.service",
+                400,
+                "systemctl",
+            ),
+            (
+                "NN-L-FIM-007_CronDropInCreated",
+                FimOp::Created,
+                "/etc/cron.d/e2scrub_all",
+                200,
+                "dpkg",
+            ),
+            (
+                "NN-L-FIM-021_PamModuleModified",
+                FimOp::Created,
+                "/usr/lib/x86_64-linux-gnu/security/pam_unix.so",
+                200,
+                "dpkg",
+            ),
+            (
+                "NN-L-FIM-008_KernelModuleModified",
+                FimOp::Created,
+                "/lib/modules/6.8.0-146-generic/kernel/fs/x.ko",
+                200,
+                "dpkg",
+            ),
+            (
+                "NN-L-FIM-003_SensitiveConfigModified",
+                FimOp::Modified,
+                "/etc/passwd",
+                300,
+                "useradd",
+            ),
+            (
+                "NN-L-FIM-001_SystemBinaryModified",
+                FimOp::Modified,
+                "/usr/bin/rsync",
+                200,
+                "dpkg",
+            ),
+        ];
+        for (id, op, path, pid, comm) in cases {
+            let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));
+            let killer = rule
+                .evaluate(&written_by(*op, path, 600, "cp"))
+                .unwrap_or_else(|| panic!("{id} must fire on {path}"));
+            assert_ne!(
+                killer.action,
+                ResponseAction::Log,
+                "{id}: foreign writer keeps its response"
+            );
+            let v = rule
+                .evaluate(&written_by(*op, path, *pid, comm))
+                .unwrap_or_else(|| panic!("{id} must still record {path}"));
+            assert_eq!(v.rule_id, *id);
+            assert_eq!(v.action, ResponseAction::Log, "{id} on {path}");
+            assert_eq!(v.severity, Severity::Low, "{id} on {path}");
+            assert!(v.reasoning.contains("package manager"), "{}", v.reasoning);
+        }
+    }
+
+    /// The carve-out reads the kernel-resolved lineage, never comm: a
+    /// process merely NAMED dpkg is still killed.
+    #[test]
+    fn comm_named_dpkg_is_not_trusted() {
+        let (_tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        let v = rules["NN-L-FIM-009_SystemdUnitDropped"]
+            .evaluate(&written_by(
+                FimOp::Created,
+                "/etc/systemd/system/evil.service",
+                600,
+                "dpkg",
+            ))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// `/etc/ld.so.preload` stays a kill even for dpkg: no mainstream
+    /// package ships it, and it is the LD_PRELOAD-rootkit signature.
+    #[test]
+    fn ld_so_preload_is_not_carved_out() {
+        let (_tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        let v = rules["NN-L-FIM-022_LdSoPreloadModified"]
+            .evaluate(&written_by(
+                FimOp::Created,
+                "/etc/ld.so.preload",
+                200,
+                "dpkg",
+            ))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// A rule's own Log verdict passes through untouched, and the wrapper
+    /// keeps id / name / category of the rule it wraps.
+    #[test]
+    fn package_managed_wrapper_is_transparent_otherwise() {
+        struct AlwaysLog;
+        impl Rule for AlwaysLog {
+            fn id(&self) -> &'static str {
+                "TEST-LOG"
+            }
+            fn name(&self) -> &'static str {
+                "always log"
+            }
+            fn category(&self) -> &'static str {
+                "test"
+            }
+            fn evaluate(&self, event: &Event) -> Option<Verdict> {
+                let fe = as_fim(event)?;
+                Some(fim_verdict(
+                    self,
+                    fe,
+                    ResponseAction::Log,
+                    Severity::High,
+                    "own reasoning",
+                ))
+            }
+        }
+        let (_tmp, lineage) = pkg_fixture();
+        let w = PackageManaged::new(Box::new(AlwaysLog), lineage);
+        assert_eq!(
+            (w.id(), w.name(), w.category()),
+            ("TEST-LOG", "always log", "test")
+        );
+        let v = w
+            .evaluate(&written_by(FimOp::Modified, "/etc/passwd", 200, "dpkg"))
+            .unwrap();
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.reasoning, "own reasoning");
     }
 }

@@ -953,6 +953,12 @@ async fn main() -> Result<()> {
             None,
         );
 
+    // Process-lineage cache shared by the posture triggers and the FIM
+    // rules' package-manager carve-out (review 49): "does this writer
+    // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the
+    // posture trigger detector; reads /proc on a cache miss.
+    let lineage = AuthSessionTracker::with_proc();
+
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
     #[cfg(not(feature = "demo-tappa5"))]
@@ -970,6 +976,7 @@ async fn main() -> Result<()> {
         // FIM-009 self-upgrade (§15.1): the NN-L-FIM-009 rule reads this
         // override; the admin dispatcher arms it on a signed grant.
         Arc::clone(&installer_override),
+        lineage.clone(),
     );
     info!(
         rules = engine.rule_count(),
@@ -1187,7 +1194,7 @@ async fn main() -> Result<()> {
         // TriggerDetector::detect. The dev (no-iptables) branch uses
         // PostureMachine::new() which already constructs a default
         // tracker internally, so this clone is only needed here.
-        let auth_tracker = AuthSessionTracker::with_proc();
+        let auth_tracker = lineage.clone();
         let iso_release = Arc::clone(iso);
         let ladder_for_release = Arc::clone(&ladder_slot);
         let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
@@ -1276,7 +1283,14 @@ async fn main() -> Result<()> {
             // No isolator to release in this build; consume the token.
             let _ = token;
         });
-        PostureMachine::new_with_hooks(engage_hook, release_hook)
+        // Same defaults as `new_with_hooks`, but on the shared lineage
+        // cache so the FIM package-manager carve-out is fed here too.
+        PostureMachine::new_with_hooks_and_exempt_and_auth(
+            engage_hook,
+            release_hook,
+            ExemptPids::default(),
+            lineage.clone(),
+        )
     };
     info!("posture state machine initialized (state: OBSERVING)");
 
