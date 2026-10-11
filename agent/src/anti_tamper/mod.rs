@@ -414,13 +414,32 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     // Every program is loaded now: register the agent's own object ids
     // and arm the mode. A failure leaves the guard with an empty set
     // (nothing denied) and counts as a deny-hook failure.
-    match bpf_defense::register_own_objects(ebpf) {
-        Ok((maps, programs, enforce)) => debug!(maps, programs, enforce, "BPF self-defence armed"),
+    match bpf_defense::register_own_objects(ebpf, pin_root) {
+        Ok(o) => debug!(
+            maps = o.maps,
+            programs = o.programs,
+            links = o.links,
+            pin_names = o.pin_names,
+            enforce = o.enforce,
+            "BPF self-defence armed"
+        ),
         Err(e) => {
             warn!(error = format!("{e:#}"), "BPF self-defence: own-object registration FAILED — the map guard has nothing to protect");
             deny_failures.push(("bpf_defense::register_own_objects", format!("{e:#}")));
         }
     }
+    // Review entry 39: now that every pin of this boot exists, protect the
+    // pin root against unlink/rename by foreign callers.
+    if let Some(root) = pin_root {
+        if let Err(e) = filesystem::register_bpffs_pins(ebpf, root) {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper FS: bpffs pins NOT registered — the pin root stays removable by root"
+            );
+            deny_failures.push(("filesystem::register_bpffs_pins", format!("{e:#}")));
+        }
+    }
+
     report_lsm_health(&deny_failures, &observe_failures)
 }
 

@@ -139,7 +139,7 @@ agent logs a WARN and runs without the sensor (nothing to observe there).
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
-The 5.15 verifier rejected three constructs that 6.1 and 6.8 accept. Both
+The 5.15 verifier rejected the constructs below, which 6.1 and 6.8 accept. All
 are now avoided everywhere, and any new eBPF program must keep to the
 same rules or the 22.04 guest will refuse to load it:
 
@@ -161,6 +161,25 @@ same rules or the 22.04 guest will refuse to load it:
    verifiers tolerate the read for privileged loaders). `fim_rename_observe`
    now passes an always-initialised `InodeKey` (dev 0 / ino 0 = no
    destination). Prefer plain values over `Option` across inlined calls.
+4. **No large stack array, even zero-initialised.** `[0u8; 256]` lowers to
+   the same `memset` subprogram as rule 1 (`R1 type=ctx expected=fp` from
+   a `frame1` that only stores zeroes). String scratch lives in a
+   `PerCpuArray<[u8; N]>` map (no zeroing needed: only the bytes a helper
+   wrote are read); a small key that must be zero is written with
+   volatile stores into a `MaybeUninit` (`bpf_defense::obj_get_names_own_link`).
+5. **No subtraction on a value that then indexes map memory.** `n - 32`
+   with `n` from a helper gives `R4 min value is negative` even behind an
+   `if n > 32` (the compiler emits a select, the verifier keeps the
+   unconditional range). Index with loop counters bounded by constants and
+   move the arithmetic to a user pointer (a second `bpf_probe_read_user_str`
+   from `ptr + n - 32` is a plain scalar add).
+6. **Mind the state budget.** A loop of 17 helper reads accumulating a
+   length, followed by two 32-step loops, exceeded the 1M-instruction
+   verification limit on 5.15 (`BPF program is too large`, 29k states) where
+   6.8 converges; and a 256-step byte scan over a stack buffer kept the 5.15
+   verifier busy for minutes (the agent looked hung at boot). Keep loops
+   short, constant-bounded and few per program. Test builds write a
+   rejected program's verifier log to `/run/northnarrow/verifier-<program>.log`.
 
 Lab notes for 22.04-era userland:
 

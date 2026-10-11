@@ -861,6 +861,53 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
 /// skipped (not fatal) via [`resolve_protected_paths`].
 ///
 /// Returns the number actually registered, for the info-log line.
+/// Review entry 39 — the pin root and every pin under it (maps, LSM
+/// programs and links) join the protected-inode set with `FS_PROTECT_MUTATE`:
+/// unlink, rmdir, rename and setattr are denied to any caller that is not
+/// a protected pid, unless the trusted-installer override window is open.
+/// Before this, `systemctl stop` of both units (the PID-1 carve-out allows
+/// it) followed by `rm -rf /sys/fs/bpf/northnarrow` dropped every hook.
+/// Called once all pins of this boot exist; the next boot's agent is a
+/// protected pid when it purges the stale pins, so the fresh re-attach is
+/// unaffected. `install.sh --upgrade` / `uninstall.sh` open the window
+/// (`--grant-key`) before they purge.
+pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<usize> {
+    let mut registered = 0usize;
+    let mut paths: Vec<PathBuf> = vec![pin_root.to_path_buf()];
+    let entries = std::fs::read_dir(pin_root)
+        .with_context(|| format!("listing the pin root {}", pin_root.display()))?;
+    for entry in entries.flatten() {
+        paths.push(entry.path());
+    }
+    for path in &paths {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "anti-tamper FS: cannot stat a bpffs pin — not protected");
+                continue;
+            }
+        };
+        let key = InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        };
+        register_inode(ebpf, &key, FS_PROTECT_MUTATE).with_context(|| {
+            format!(
+                "registering pin {} in {PROTECTED_INODES_MAP}",
+                path.display()
+            )
+        })?;
+        registered += 1;
+    }
+    info!(
+        registered,
+        root = %pin_root.display(),
+        "anti-tamper FS: bpffs pin root and pins registered in {PROTECTED_INODES_MAP} — unlink/rename denied \
+         to foreign callers (trusted-installer window to purge)"
+    );
+    Ok(registered)
+}
+
 pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
     let mut registered = 0usize;
     for (path, key) in resolve_protected_paths(BINARY_AND_UNIT_PATHS) {

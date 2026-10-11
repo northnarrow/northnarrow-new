@@ -239,6 +239,61 @@ cmd_build() {
     vcargo "CARGO_PROFILE_RELEASE_LTO=$lto cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
+# Purge the pin root on the guest the way an operator must now do it (review
+# entry 39 — the running agent protects /sys/fs/bpf/northnarrow): open the
+# trusted-installer window with the lab's admin key, stop the units, remove
+# the pins, wait for the LSM programs to detach. A guest installed before the
+# key carried the `trusted-installer` role cannot open the window: that guest
+# is migrated once — units disabled, VM restarted (bpffs does not survive a
+# reboot), role added to admin.pub while nothing protects it, units enabled.
+lab_purge_pins() {
+    local out
+    out=$(vssh bash -s <<'REMOTE'
+if sudo test -d /sys/fs/bpf/northnarrow; then
+    # The window can only be opened through a running agent. After an e2e
+    # run the fixtures' pins are still there (protected) and the installed
+    # agent is stopped: start it — as a protected pid it purges the stale
+    # pins at boot — and open the window through it.
+    if ! systemctl is-active --quiet northnarrow-agent && [ -x /usr/local/bin/northnarrow-agent ] \
+       && systemctl list-unit-files northnarrow-agent.service >/dev/null 2>&1; then
+        sudo systemctl start northnarrow-agent 2>/dev/null && sleep 5
+    fi
+    if systemctl is-active --quiet northnarrow-agent && sudo test -r /etc/northnarrow/admin.key; then
+        if ! sudo nn-admin trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
+            echo "grant refused: $(tail -1 /tmp/nn-grant.log)"
+        fi
+    fi
+    sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null
+    sudo pkill -9 -f "northnarrow-agent-e2etes[t]|northnarrow-watchdog-e2etes[t]" 2>/dev/null
+    sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
+    sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
+fi
+for i in $(seq 1 20); do
+    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
+    [ "$n" = "0" ] && break
+    sleep 1
+done
+echo "lsm programs still loaded: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
+REMOTE
+)
+    echo "$out" | grep -vE "^PINS_PROTECTED$"
+    if echo "$out" | grep -q "^PINS_PROTECTED$"; then
+        echo "nn-lab: pin root protected and no trusted-installer window — migrating the guest (disable units, restart VM, add the role)"
+        vssh 'sudo systemctl disable northnarrow-agent northnarrow-watchdog 2>/dev/null; true'
+        cmd_down
+        cmd_up
+        vssh bash -s <<'REMOTE'
+sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
+if sudo test -f /etc/northnarrow/admin.pub && ! sudo grep -q "trusted-installer" /etc/northnarrow/admin.pub; then
+    sudo sed -i -E '/trusted-installer/! { s/^([0-9a-fA-F]{64})[[:space:]]*$/\1 unlock,audit-read,trusted-installer/; t; s/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,trusted-installer/ }' /etc/northnarrow/admin.pub
+    echo "admin.pub roles now: $(sudo sed -E 's/^[0-9a-fA-F]{64}//' /etc/northnarrow/admin.pub | tr -d '\n')"
+fi
+sudo systemctl enable northnarrow-agent northnarrow-watchdog 2>/dev/null; true
+echo "lsm programs after restart: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
+REMOTE
+    fi
+}
+
 cmd_test_e2e() {
     vm_running || die "guest is not running"
     # docs/integration-test-runbook.md "Run": root + single-threaded (shared iptables chain).
@@ -254,21 +309,10 @@ cmd_test_e2e() {
     # the fixtures' /tmp helpers, iptables edits and canary trips as an
     # intrusion, enters COMBAT and NEUTRALIZEs the test runner (observed:
     # `cargo test` SIGKILLed mid-suite, 2026-10-08).
-    vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
-    # The anti-tamper hooks outlive the agent on purpose (pinned links), and
-    # since the BPF self-defence a stopped agent's map guard keeps denying
-    # foreign writers of PROTECTED_PIDS — the e2e fixtures' agents are
-    # foreign (another binary). Purge the pin root like install.sh --upgrade
-    # does and wait for the LSM programs to detach before the fixtures run.
-    vssh bash -s <<'REMOTE'
-sudo rm -rf /sys/fs/bpf/northnarrow
-for i in $(seq 1 20); do
-    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
-    [ "$n" = "0" ] && break
-    sleep 1
-done
-echo "lsm programs still loaded before e2e: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
-REMOTE
+    # The anti-tamper hooks outlive the agent on purpose (pinned links) and
+    # the e2e fixtures' agents are foreign to a stopped enforce agent's map
+    # guard: purge the pin root first, the operator way (see lab_purge_pins).
+    lab_purge_pins
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
     # The four FIM e2e tests are plain `#[test]` (not ignored), so neither
     # `test-ignored` nor the privileged_e2e run above covered them — the
@@ -311,27 +355,11 @@ cmd_install() {
     # (require_fresh_ebpf) refuses it. An incremental build re-runs
     # agent/build.rs and relinks the agent — seconds when nothing changed.
     cmd_build
-    # Re-install on a host where an agent already ran: its binaries and
-    # unit files are in PROTECTED_INODES and the inode_unlink/rename deny
-    # hooks stay attached through the bpffs pins even after the agent
-    # exits (by design — production upgrades go through the signed
-    # FS_PROTECT_OVERRIDE window). The lab has no signed installer, so
-    # stop the units (watchdog first) and drop the pin root: the hooks
-    # detach with their links and the next agent boot re-pins fresh.
-    vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; sudo rm -rf /sys/fs/bpf/northnarrow; true'
-    # Leftover e2e agents (a test that was still tearing down) keep their
-    # LSM programs attached through their own fds, and those deny the
-    # unlink of the installed binary: wait for the LSM set to drain,
-    # evicting + killing stragglers on the way.
-    vssh bash -s <<'REMOTE'
-for i in $(seq 1 20); do
-    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
-    [ "$n" = "0" ] && break
-    sudo pkill -9 -f "northnarrow-agent-e2etes[t]|northnarrow-watchdog-e2etes[t]" 2>/dev/null
-    sleep 1
-done
-echo "lsm programs still loaded before install: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
-REMOTE
+    # Re-install on a host where an agent already ran: its binaries, unit
+    # files and now the pin root itself are in PROTECTED_INODES, and the deny
+    # hooks stay attached through the bpffs pins after the agent exits (by
+    # design). Purge the operator way: trusted-installer window, stop, rm.
+    lab_purge_pins
     vcargo 'sudo ./deploy/install.sh && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
 }
 
@@ -606,7 +634,7 @@ if sudo ./deploy/install.sh >/tmp/nn-upgrade-refuse.log 2>&1; then
 fi
 grep -q "Re-run with --upgrade" /tmp/nn-upgrade-refuse.log || { echo "FAIL: refusal message missing"; cat /tmp/nn-upgrade-refuse.log; exit 1; }
 echo "install.sh without --upgrade: refused as expected"
-sudo ./deploy/install.sh --upgrade 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM" | cut -c1-140
+sudo ./deploy/install.sh --upgrade --grant-key /etc/northnarrow/admin.key 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|window|PROTECTED|grant" | cut -c1-140
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
 audit_after=$(sudo wc -l < /etc/northnarrow/audit.log)
@@ -637,7 +665,7 @@ set -e
 cd ~/northnarrow
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
-sudo ./deploy/uninstall.sh --purge --yes 2>&1 | grep -E "uninstall.sh:|FAIL" | cut -c1-140
+sudo ./deploy/uninstall.sh --purge --yes --grant-key /etc/northnarrow/admin.key 2>&1 | grep -E "uninstall.sh:|FAIL" | cut -c1-140
 fail=0
 for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
          /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \

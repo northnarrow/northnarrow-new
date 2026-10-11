@@ -31,15 +31,15 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
     macros::{lsm, map},
-    maps::{Array, HashMap, LruHashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, RingBuf, PerCpuArray},
     programs::LsmContext,
 };
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::{
-    BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE,
+    BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_LINK,
     FS_OP_BPF_MAP,
 };
 
@@ -70,12 +70,34 @@ const BPF_LINK_DETACH: c_int = 34;
 
 /// Object kinds in [`OWN_BPF_IDS`] values (written by userland: 1 = map,
 /// 2 = program, 3 = link). The hooks only test membership.
-#[allow(dead_code)]
 pub const OWN_KIND_MAP: u8 = 1;
 #[allow(dead_code)]
 pub const OWN_KIND_PROG: u8 = 2;
-#[allow(dead_code)]
 pub const OWN_KIND_LINK: u8 = 3;
+
+/// Fixed-width key of [`OWN_PIN_NAMES`]: the final path component of a
+/// pin, NUL-padded. Our link pins are `link_<hook>` (≤ 25 bytes).
+pub const PIN_NAME_LEN: usize = 32;
+
+/// Pathname buffer for `OBJ_GET` (power of two: indexes are masked).
+const PATH_BUF_LEN: usize = 256;
+
+
+/// Per-CPU scratch for the `OBJ_GET` pathname. A 256-byte stack array
+/// lowers to a `memset` subprogram, which the 5.15 verifier rejects (see
+/// `zero.rs`); map memory needs no zeroing — only the first `n` bytes the
+/// helper wrote are ever read.
+#[map]
+static OBJ_GET_PATH_SCRATCH: PerCpuArray<[u8; PATH_BUF_LEN]> = PerCpuArray::with_max_entries(1, 0);
+
+/// Final path components of the agent's own LINK pins (value =
+/// [`OWN_KIND_LINK`]), written by userland after the pins exist. `OBJ_GET`
+/// on one of them by a foreign process is the pinned-path route to
+/// `bpftool link detach`; the id route is [`OWN_BPF_IDS`]. Matching the
+/// last component (not a prefix) also covers relative paths, symlinks and
+/// `..` — bpffs has no hard links and the pins cannot be renamed.
+#[map]
+pub static OWN_PIN_NAMES: HashMap<[u8; PIN_NAME_LEN], u8> = HashMap::with_max_entries(64, 0);
 
 /// Ids of the agent's own maps, programs and links (value = kind). Filled
 /// by userland right after load/attach; per boot, not pinned.
@@ -155,12 +177,113 @@ fn caller_is_protected() -> bool {
     unsafe { crate::task_kill::PROTECTED_PIDS.get(&tgid).is_some() }
 }
 
+/// Map, program and link ids live in three separate kernel id spaces, so
+/// the kind MUST be part of the test: a foreign map whose id equals one of
+/// our program ids is not ours.
 #[inline(always)]
-fn is_own(id: u32) -> bool {
-    unsafe { OWN_BPF_IDS.get(&id).is_some() }
+fn is_own_kind(id: u32, kind: u8) -> bool {
+    match unsafe { OWN_BPF_IDS.get(&id) } {
+        Some(k) => *k == kind,
+        None => false,
+    }
 }
 
-/// `(dev, ino)` of the current task's executable (`current->mm->exe_file->f_inode`).
+/// `OBJ_GET` whose pathname's final component is one of the agent's own
+/// LINK pins. `attr` is the kernel copy of `bpf_attr`; the first field of
+/// the `OBJ_GET` variant is the user pointer to the pathname.
+///
+/// Verifier budget (5.15): the string is read once only to learn its
+/// length `n`, then the LAST [`PIN_NAME_LEN`] bytes are read again from
+/// user memory into the head of the scratch buffer — our pin names are
+/// shorter than that, so a final component that is ours lies entirely in
+/// the window. Every map index is then a loop counter in `0..32`: no
+/// subtraction reaches a map access (`n - 32` gave "R4 min value is
+/// negative" on 5.15), no 256-byte scan (minutes of verification), no
+/// stack array (memset subprogram).
+#[inline(always)]
+unsafe fn obj_get_names_own_link(attr: *const c_void) -> bool {
+    let user_ptr = match bpf_probe_read_kernel::<u64>(attr as *const u64) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if user_ptr == 0 {
+        return false;
+    }
+    let buf: *mut [u8; PATH_BUF_LEN] = match OBJ_GET_PATH_SCRATCH.get_ptr_mut(0) {
+        Some(p) => p,
+        None => return false,
+    };
+    // pass 1: length only. A path that does not fit the buffer (truncated
+    // read: PATH_BUF_LEN - 1 bytes, the NUL takes the last slot) is not
+    // matched: scanning PATH_MAX in chunks blew the 5.15 state budget
+    // ("BPF program is too large"), and a link fd cannot detach or update
+    // an LSM link anyway — this check is defence in depth behind the pin
+    // protection (review entry 39).
+    let n = match bpf_probe_read_user_str_bytes(user_ptr as *const u8, &mut *buf) {
+        Ok(s) => s.len(),
+        Err(_) => return false,
+    };
+    if n == 0 || n >= PATH_BUF_LEN - 1 {
+        return false;
+    }
+    // pass 2: the last PIN_NAME_LEN bytes plus the terminator (user-pointer
+    // arithmetic is a plain scalar add for the verifier)
+    let win_ptr: u64 = if n > PIN_NAME_LEN {
+        user_ptr + (n - PIN_NAME_LEN) as u64
+    } else {
+        user_ptr
+    };
+    let win: &mut [u8] = core::slice::from_raw_parts_mut(buf as *mut u8, PIN_NAME_LEN + 1);
+    let m = match bpf_probe_read_user_str_bytes(win_ptr as *const u8, win) {
+        Ok(s) => s.len(),
+        Err(_) => return false,
+    };
+    if m == 0 || m > PIN_NAME_LEN {
+        return false;
+    }
+    // last '/' inside the window → the final component starts after it
+    let mut start: usize = 0;
+    let mut j: usize = 0;
+    while j < PIN_NAME_LEN {
+        if j >= m {
+            break;
+        }
+        if (*buf)[j] == b'/' {
+            start = j + 1;
+        }
+        j += 1;
+    }
+    // `[0u8; 32]` would lower to a memset subprogram: zero with volatile
+    // stores (see zero.rs), then fill.
+    let mut key = core::mem::MaybeUninit::<[u8; PIN_NAME_LEN]>::uninit();
+    let kp = key.as_mut_ptr() as *mut u8;
+    let mut z: usize = 0;
+    while z < PIN_NAME_LEN {
+        core::ptr::write_volatile(kp.add(z), 0u8);
+        z += 1;
+    }
+    let mut len: usize = 0;
+    let mut k: usize = 0;
+    while k < PIN_NAME_LEN {
+        let idx = start + k;
+        if idx >= m || idx >= PIN_NAME_LEN {
+            break;
+        }
+        core::ptr::write_volatile(kp.add(k), (*buf)[idx]);
+        len += 1;
+        k += 1;
+    }
+    // empty (trailing '/') or as long as the key: not one of ours
+    if len == 0 || len >= PIN_NAME_LEN {
+        return false;
+    }
+    let key = key.assume_init();
+    match OWN_PIN_NAMES.get(&key) {
+        Some(kind) => *kind == OWN_KIND_LINK,
+        None => false,
+    }
+}
+
 #[inline(always)]
 unsafe fn caller_exe_key() -> Option<InodeKey> {
     let task = bpf_get_current_task() as *const u8;
@@ -219,11 +342,11 @@ unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    if !is_own(id) || caller_is_protected() || caller_exe_is_own() {
+    if !is_own_kind(id, OWN_KIND_MAP) || caller_is_protected() || caller_exe_is_own() {
         return 0;
     }
     if enforce() {
-        emit_denial(id);
+        emit_denial(FS_OP_BPF_MAP, id);
         return -EPERM;
     }
     emit_syscall(BPF_CMD_FOREIGN_MAP_WRITE, id);
@@ -279,8 +402,20 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // Program handles are not reported (`bpftool prog list` takes one per
     // program and a prog fd cannot modify the agent); the map hook decides
     // the deny on the write path.
-    let foreign_handle =
-        matches!(cmd, BPF_MAP_GET_FD_BY_ID | BPF_LINK_GET_FD_BY_ID) && is_own(arg);
+    let own_map_handle = cmd == BPF_MAP_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_MAP);
+    let own_link_handle = cmd == BPF_LINK_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_LINK);
+    let own_link_pin = cmd == BPF_OBJ_GET && !attr.is_null() && obj_get_names_own_link(attr);
+    // Second half of the self-defence: a link handle is the only thing
+    // that can DETACH or UPDATE one of our LSM hooks (`bpftool link detach
+    // id N` / `… pinned <path>`), so in enforce mode a foreign process
+    // never gets one — by id or through the pin. Map handles are decided
+    // on the write path by the `bpf_map` guard; program handles are
+    // harmless and stay allowed (`bpftool prog show` keeps working).
+    if (own_link_handle || own_link_pin) && enforce() && !caller_exe_is_own() {
+        emit_denial(FS_OP_BPF_LINK, if own_link_handle { arg } else { 0 });
+        return -EPERM;
+    }
+    let foreign_handle = own_map_handle || own_link_handle || own_link_pin;
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let report_cmd = if foreign_handle {
         BPF_CMD_FOREIGN_GET_FD
@@ -322,7 +457,7 @@ fn emit_syscall(cmd: u32, arg: u32) {
 /// userland treats it like any other denial (`FS_OP_BPF_MAP`, map id in
 /// `target_ino`).
 #[inline(always)]
-fn emit_denial(map_id: u32) {
+fn emit_denial(operation: u8, object_id: u32) {
     let mut entry = match crate::inode_protect::FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0)
     {
         Some(e) => e,
@@ -339,8 +474,8 @@ fn emit_denial(map_id: u32) {
         (*raw_ptr).attacker_pid = (pid_tgid >> 32) as u32;
         (*raw_ptr).attacker_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
         (*raw_ptr).target_dev = 0;
-        (*raw_ptr).target_ino = map_id as u64;
-        (*raw_ptr).operation = FS_OP_BPF_MAP;
+        (*raw_ptr).target_ino = object_id as u64;
+        (*raw_ptr).operation = operation;
         if let Ok(comm) = bpf_get_current_comm() {
             (*raw_ptr).attacker_comm = comm;
         }

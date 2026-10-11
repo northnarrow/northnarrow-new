@@ -12,9 +12,9 @@ with `rm -f` or `kill -9`, they are denied by design.
 | Operation | Command | Keeps keys / audit chain / state |
 |---|---|---|
 | Fresh install | `sudo ./deploy/install.sh` then `systemctl enable --now …` | n/a (bootstraps them) |
-| Upgrade in place | `sudo ./deploy/install.sh --upgrade` | **yes** |
+| Upgrade in place | `sudo ./deploy/install.sh --upgrade --grant-key <admin.key>` | **yes** |
 | Uninstall | `sudo ./deploy/uninstall.sh` | **yes** (`/etc/northnarrow`, `/var/lib/northnarrow`) |
-| Retire the host | `sudo ./deploy/uninstall.sh --purge` | no — everything removed |
+| Retire the host | `sudo ./deploy/uninstall.sh --purge --grant-key <admin.key>` | no — everything removed |
 
 All three assume `cargo xtask build --release` (or the release tarball)
 produced `target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}`.
@@ -35,18 +35,28 @@ with `Operation not permitted` halfway through.
 ## 2. Upgrade in place
 
 ```sh
-sudo ./deploy/install.sh --upgrade
+sudo ./deploy/install.sh --upgrade --grant-key /path/to/admin.key
 ```
+
+The key must carry the `trusted-installer` role (the one `install.sh`
+bootstraps does; see `COMBAT_RECOVERY.md` §1.1 for older keys). Without
+`--grant-key` the upgrade stops at step 3 with the recovery line, because
+the pin root is protected (review entry 39).
 
 What it does, in order:
 
 1. records which units are active and prints installed → new version;
-2. stops the **watchdog first** (stopping the agent alone makes the
-   watchdog respawn it), then the agent;
+2. opens the **trusted-installer window** (300 s) through the running
+   agent's socket with `--grant-key` — a signed, audited grant that lets
+   the next steps touch what the anti-tamper protects (binaries, units,
+   `/etc/northnarrow`, the pin root); then stops the **watchdog first**
+   (stopping the agent alone makes the watchdog respawn it), then the
+   agent;
 3. removes `/sys/fs/bpf/northnarrow`: the LSM programs survive agent
    restarts only through their pinned links, so dropping the pin root
-   detaches them; waits until `bpftool prog show` reports 0 LSM programs
-   (30 s budget, fails loudly otherwise);
+   detaches them; the pin root is in the protected-inode set, so this
+   needs the window of step 2 (or a reboot); waits until `bpftool prog
+   show` reports 0 LSM programs (30 s budget, fails loudly otherwise);
 4. runs the normal install (binaries, units, configs; `chattr +i` on the
    state dir is lifted and re-applied by the new agent at boot);
 5. starts the agent, waits 3 s, starts the watchdog, prints their state.
@@ -65,11 +75,14 @@ unchanged, ≥ 7 LSM programs and `PROTECTED_PIDS` re-pinned afterwards.
 ## 3. Uninstall
 
 ```sh
-sudo ./deploy/uninstall.sh            # keep /etc/northnarrow + /var/lib/northnarrow
-sudo ./deploy/uninstall.sh --purge    # remove them too (and the namespace journal)
+sudo ./deploy/uninstall.sh --grant-key /path/to/admin.key            # keep /etc/northnarrow + /var/lib/northnarrow
+sudo ./deploy/uninstall.sh --purge --grant-key /path/to/admin.key    # remove them too (and the namespace journal)
 ```
 
-Order: disable + stop watchdog then agent → drop the pin root and wait for
+Order: open the trusted-installer window (`--grant-key`, same key and
+role as the upgrade; without it the pin root cannot be removed and the
+script stops with the recovery line) → disable + stop watchdog then agent
+→ drop the pin root and wait for
 the LSM set to drain → `chattr -R -i` on state and config → remove
 binaries, units, `journald@northnarrow.conf`, `/run/northnarrow` and the
 ten bait files → `daemon-reload`. Without `--purge` the admin key, the
@@ -150,12 +163,54 @@ Read the agent's state with `nn-admin status` / `nn-admin host-check`;
 inspect foreign maps with `bpftool map show id <n>`; for a debugging
 session set `NN_BPF_DEFENSE_OBSERVE=1` (restart required).
 
+**Links (second half).** The only object that can *detach* one of the
+agent's LSM hooks is a handle to its BPF link, and there are two ways to
+get one: `LINK_GET_FD_BY_ID` (`bpftool link detach id N`) and `OBJ_GET` on
+the link's pin (`bpftool link detach pinned /sys/fs/bpf/northnarrow/link_*`).
+In enforce mode the `bpf` hook refuses both to a foreign process
+(`EPERM`, anti-tamper denial `operation=bpf_link`, link id as the target or
+0 for the pinned route). The ids of maps, programs and links are kept with
+their kind, since the kernel numbers the three spaces independently.
+Program handles stay allowed (`bpftool prog show` keeps working; a program
+fd cannot detach anything). Every `LINK_GET_FD_BY_ID` on one of our links
+is refused, so `bpftool link show` stops at the first NorthNarrow link, like
+`map show` above. (For the record: the kernel refuses `LINK_DETACH` on
+LSM and tracepoint links anyway — `bpftool link detach` answers "Operation
+not supported" — so the handle deny is defence in depth; the route that
+actually dropped the hooks was the pin, below.) The pin-name check is
+name-based on purpose (no path walk in the kernel): a path longer than
+255 bytes or a symlink elsewhere that points at a pin is not recognised —
+acceptable for a handle that cannot detach or update anything, while the
+pin files themselves are protected by inode. Independently of the mode,
+the agent re-checks every registered link every 10 s through its own fd or
+its pin (no `CAP_SYS_ADMIN` needed, the unit does not have it) and, if one
+is gone or has no program any more, logs an ERROR and appends a signed
+audit entry (`op=bpf_link_missing`): a detached hook is an alert even when
+the deny path is off (observe mode, tests).
+
+**The pin root is protected (review entry 39).** The hooks survive the
+agent's death only through their pins, and `systemctl stop` of both units
+is allowed (the PID-1 carve-out), so `rm -rf /sys/fs/bpf/northnarrow`
+afterwards used to drop every hook — the two-command disable. The agent
+now registers the pin root and every pin in the protected-inode set:
+unlink, rmdir, rename and setattr are denied to any process that is not
+the agent or the watchdog, unless the **trusted-installer window** is open.
+That window is the authorised way to purge: `nn-admin
+trusted-installer-grant --key <key with the trusted-installer role>
+--window-secs 300` while the agent runs (the grant is signed, single-use
+and audited, and lives in a pinned map, so it outlasts the agent's stop),
+then stop the units and remove the pin root. `install.sh --upgrade
+--grant-key` and `uninstall.sh --grant-key` do exactly this. A reboot also
+clears bpffs. The key `install.sh` bootstraps carries the role; a key
+created earlier needs `trusted-installer` added to its `admin.pub` line
+(the file is itself protected: edit it with the units disabled across a
+reboot, or through `rotate-keys add`).
+
 Like every anti-tamper hook the guard is pinned and **outlives the agent**:
 stopping the unit does not lift it, and a replacement agent binary (another
 inode) would be denied its own registration — which is why `install.sh
---upgrade` purges the pin root and waits for the LSM programs to detach
-before copying binaries. Do the same if you ever replace the binaries by
-hand: `rm -rf /sys/fs/bpf/northnarrow`.
+--upgrade` purges the pin root (inside the window) and waits for the LSM
+programs to detach before copying binaries.
 
 Diagnosis mode: `NN_BPF_DEFENSE_OBSERVE=1` in the unit environment turns
 the guard into an observer (nothing denied, a `foreign_map_write` record

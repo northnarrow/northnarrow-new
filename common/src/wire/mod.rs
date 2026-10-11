@@ -451,6 +451,12 @@ pub const FS_OP_WRITE: u8 = 6;
 /// agent's own BPF maps for writing (`bpf_map` LSM hook). `target_ino`
 /// carries the map id, `target_dev` is 0.
 pub const FS_OP_BPF_MAP: u8 = 7;
+/// A handle to one of the agent's own BPF *links* refused to a foreign
+/// process (`bpftool link detach id N` / `… pinned <path>`): by id through
+/// `LINK_GET_FD_BY_ID` (`target_ino` = link id) or through `OBJ_GET` on the
+/// link's pin (`target_ino` = 0). Emitted by the `bpf` LSM observer in
+/// enforce mode (Tappa 10.8 BPF self-defence, second half).
+pub const FS_OP_BPF_LINK: u8 = 8;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to

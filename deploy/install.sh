@@ -69,6 +69,7 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 # then start the units that were running. Keys, agent_id, the audit chain
 # and every chain log are preserved — install.sh never touches them.
 UPGRADE=0
+GRANT_KEY=
 VERIFY=1
 REQUIRE_ATTESTATION=0
 TARBALL=""
@@ -77,6 +78,7 @@ ATTEST_BUNDLE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
+        --grant-key) GRANT_KEY=$2; shift ;;
         --tarball) TARBALL=$2; shift ;;
         --sums) SUMS=$2; shift ;;
         --attestation) ATTEST_BUNDLE=$2; shift ;;
@@ -388,6 +390,42 @@ done
 # exactly that (`install: cannot remove '/usr/local/bin/northnarrow-agent':
 # Operation not permitted`). Those units are stopped, reset and, after
 # the upgrade, restarted like active ones.
+
+# ── pin root purge under the anti-tamper (review entry 39) ─────────────────
+# /sys/fs/bpf/northnarrow holds the pinned maps, LSM programs and links; the
+# running agent registers it in its protected-inode set, so `rm -rf` by root
+# is denied unless a trusted-installer window is open. The window is opened
+# through the agent's admin socket with a key carrying the `trusted-installer`
+# role (the key install.sh bootstraps has it) and survives the agent's stop
+# long enough for the purge (the override lives in a pinned map).
+open_trusted_installer_window() {
+    local key=$1
+    [[ -r "$key" ]] || { echo "install.sh: --grant-key $key is not readable" >&2; return 1; }
+    if ! systemctl is-active --quiet northnarrow-agent.service; then
+        echo "install.sh: the agent is not running — the trusted-installer window can only be opened" >&2
+        echo "install.sh: through its socket. Start it (systemctl start northnarrow-agent) and re-run." >&2
+        return 1
+    fi
+    echo "install.sh: opening the trusted-installer window (300 s) with $key"
+    if ! "$BIN_DIR/nn-admin" trusted-installer-grant --key "$key" --window-secs 300; then
+        echo "install.sh: trusted-installer grant REFUSED — the key needs the trusted-installer role on its" >&2
+        echo "install.sh: admin.pub line (docs/operator/COMBAT_RECOVERY.md section 1.1)." >&2
+        return 1
+    fi
+}
+purge_pin_root() {
+    [[ -d /sys/fs/bpf/northnarrow ]] || return 0
+    echo "install.sh: dropping /sys/fs/bpf/northnarrow so the LSM programs detach (the new agent re-pins fresh)"
+    rm -rf /sys/fs/bpf/northnarrow 2>/dev/null || true
+    if [[ -d /sys/fs/bpf/northnarrow ]]; then
+        echo "install.sh: /sys/fs/bpf/northnarrow is PROTECTED by the anti-tamper and no trusted-installer window" >&2
+        echo "install.sh: is open (review entry 39). Start the agent again (systemctl start northnarrow-agent)" >&2
+        echo "install.sh: and re-run with --grant-key <admin.key carrying the trusted-installer role>, or open" >&2
+        echo "install.sh: the window yourself: nn-admin trusted-installer-grant --key <key> --window-secs 300" >&2
+        return 1
+    fi
+}
+
 UNITS_TO_RESTART=()
 for u in northnarrow-watchdog northnarrow-agent; do
     state=$(systemctl is-active "$u.service" 2>/dev/null || true)
@@ -405,16 +443,19 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
     new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1 || echo "unknown")
     echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
+    # The pin root is in the agent's protected-inode set (review entry 39):
+    # only a protected pid or an open trusted-installer window may remove it.
+    # Open the window now, while the agent still answers on its socket.
+    if [[ -n "$GRANT_KEY" ]]; then
+        open_trusted_installer_window "$GRANT_KEY" || exit 1
+    fi
     # Watchdog first: stopping the agent alone makes it respawn it.
     for u in northnarrow-watchdog northnarrow-agent; do
         echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null | tr -d '\n'))"
         systemctl stop "$u.service" 2>/dev/null || true
         systemctl reset-failed "$u.service" 2>/dev/null || true
     done
-    if [[ -d /sys/fs/bpf/northnarrow ]]; then
-        echo "install.sh: dropping /sys/fs/bpf/northnarrow so the LSM programs detach (the new agent re-pins fresh)"
-        rm -rf /sys/fs/bpf/northnarrow
-    fi
+    purge_pin_root || exit 1
     if command -v bpftool >/dev/null 2>&1; then
         for ((i = 0; i < 30; i++)); do
             n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
@@ -425,6 +466,16 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
         n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
         [[ "$n" == 0 ]] || { echo "install.sh: $n LSM program(s) still loaded after 30s — another NorthNarrow process holds them; stop it and re-run" >&2; exit 1; }
     fi
+fi
+
+if (( ! ${#UNITS_TO_RESTART[@]} )) && [[ -d /sys/fs/bpf/northnarrow ]]; then
+    # Units inactive but the previous install's hooks are still pinned: they
+    # deny the binary copy below. Same purge path (window needed if protected).
+    echo "install.sh: units inactive but /sys/fs/bpf/northnarrow exists — purging the stale pins first"
+    if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.service; then
+        open_trusted_installer_window "$GRANT_KEY" || exit 1
+    fi
+    purge_pin_root || exit 1
 fi
 
 echo "install.sh: copying binaries to $BIN_DIR/"
@@ -586,6 +637,10 @@ else
     echo "install.sh: no admin.pub found — bootstrapping an Ed25519 admin keypair (nn-admin init)"
     if "$BIN_DIR/nn-admin" init --priv-out "$ETC_DIR/admin.key" --pub-append "$ETC_DIR/admin.pub"; then
         chmod 0600 "$ETC_DIR/admin.key" 2>/dev/null || true
+        # Explicit role list: the defaults (unlock, audit-read) plus
+        # trusted-installer, which `install.sh --upgrade --grant-key` and
+        # `uninstall.sh --grant-key` need to purge the protected pin root.
+        sed -i '$ s/[[:space:]]*$/ unlock,audit-read,trusted-installer/' "$ETC_DIR/admin.pub"
         echo ""
         echo "  ##########################################################################"
         echo "  #  SECURITY — an admin PRIVATE key was just written to this host:         #"
@@ -596,8 +651,10 @@ else
         echo "  #  store it offline, e.g.:                                                #"
         echo "  #      mv $ETC_DIR/admin.key  <secure-offline-location>"
         echo "  #  Keep ONLY the public half ($ETC_DIR/admin.pub) on the host.            #"
-        echo "  #  Roles: this key gets unlock,audit-read ONLY. canary-manage /           #"
-        echo "  #  fim-manage / force-posture need a role list on its admin.pub line.     #"
+        echo "  #  Roles: unlock, audit-read, trusted-installer (the last one is what    #"
+        echo "  #  install.sh --upgrade --grant-key and uninstall.sh --grant-key use to   #"
+        echo "  #  purge the protected pin root). canary-manage / fim-manage /           #"
+        echo "  #  force-posture need a role list on its admin.pub line.                  #"
         echo "  #  Recovery procedure: docs/operator/COMBAT_RECOVERY.md (section 1.1)    #"
         echo "  ##########################################################################"
         echo ""

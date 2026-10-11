@@ -40,10 +40,14 @@ LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
 
 PURGE=0
 YES=0
+GRANT_KEY=
+expect_key=0
 for arg in "$@"; do
+    if (( expect_key )); then GRANT_KEY=$arg; expect_key=0; continue; fi
     case "$arg" in
         --purge) PURGE=1 ;;
         --yes|-y) YES=1 ;;
+        --grant-key) expect_key=1 ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "uninstall.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -70,6 +74,13 @@ if (( ! YES )); then
 fi
 
 # ── 1. units ──────────────────────────────────────────────────────────
+# The pin root is protected by the running agent (review entry 39): open the
+# trusted-installer window first, while the agent still answers.
+if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.service; then
+    log "opening the trusted-installer window (300 s) with $GRANT_KEY"
+    "$BIN_DIR/nn-admin" trusted-installer-grant --key "$GRANT_KEY" --window-secs 300 || {
+        echo "uninstall.sh: trusted-installer grant REFUSED (key without the trusted-installer role?)" >&2; exit 1; }
+fi
 for u in northnarrow-watchdog northnarrow-agent; do
     if systemctl list-unit-files "$u.service" >/dev/null 2>&1; then
         log "stopping + disabling $u"
@@ -80,7 +91,13 @@ done
 # ── 2. LSM programs ───────────────────────────────────────────────────
 if [[ -d "$BPFFS_ROOT" ]]; then
     log "removing pinned maps/programs/links under $BPFFS_ROOT"
-    rm -rf "$BPFFS_ROOT"
+    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    if [[ -d "$BPFFS_ROOT" ]]; then
+        echo "uninstall.sh: $BPFFS_ROOT is PROTECTED by the anti-tamper and no trusted-installer window is open" >&2
+        echo "uninstall.sh: (review entry 39). Start the agent again (systemctl start northnarrow-agent) and re-run" >&2
+        echo "uninstall.sh: with --grant-key <admin.key carrying the trusted-installer role>." >&2
+        exit 1
+    fi
 fi
 if command -v bpftool >/dev/null 2>&1; then
     for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
