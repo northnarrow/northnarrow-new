@@ -705,7 +705,14 @@ e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
 Elastic Defend, Tetragon, Tracee, Falco e letteratura 2024–2026); non
 cambia l'ordine delle Tappe successive.
 
-- Punto di aggancio dei sensori (ricerca dell'11 ottobre: TOCTOU «Phantom»
+- Punto di aggancio dei sensori (progetto proposto l'11 ottobre,
+  `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md`, sei decisioni
+  aperte per il founder; nessuna regola legge gli eventi `openat`, che
+  servono solo alla postura, e l'unico uso che richiede tutte le aperture è
+  il conteggio delle scritture di massa, quindi il sensore può filtrare e
+  contare nel kernel; trovato il rilievo 54: con la
+  lista FIM di base le credenziali nelle home degli utenti non sono
+  sorvegliate) (ricerca dell'11 ottobre: TOCTOU «Phantom»
   di Guo/Zeng e canale io_uring): `sys_enter_openat` → LSM `file_open`
   (path dal `struct file`, `bpf_path_d_path` dove esiste); QNAME DNS letto
   dopo la copia nel kernel, non dall'iov utente all'ingresso di
