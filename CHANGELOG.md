@@ -94,6 +94,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   and every required role is carried by one of them (weekly job). A
   threshold of 0 was refused only by a `debug_assert`; the rule now uses
   `max(threshold, 1)` in every build.
+- `nn-lab.sh release-check DIR`: the release tarball CI built and attested
+  (`gh run download`), installed and verified on a guest. It checks
+  SHA256SUMS, that the binaries run on the guest's glibc, `install.sh`'s
+  tree and tarball verification (provenance `checksums`), the boot-time
+  binary integrity check, every deny hook, the telemetry probe and one
+  detection. It passes on Ubuntu 24.04, Ubuntu 22.04 and Debian 12.
 - Fuzz targets `combat_allow` and `canary_template`: the COMBAT management
   carve-out (allow-file text, generated ACCEPT lines, splice into the
   operator ruleset) and the operator canary templates. Besides "never

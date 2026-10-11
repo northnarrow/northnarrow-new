@@ -135,6 +135,26 @@ fails on any restart, any journal ERROR, an RSS slope above
 fd count that grew by more than half. Planned use: 24 h on each guest
 before a release, 72 h once before `0.1.0`.
 
+### Release check (the CI tarball on every guest)
+
+```
+gh run download <release workflow run id> -D /tmp/nn-release   # tarball, packages, SBOMs, SHA256SUMS
+deploy/lab/nn-lab.sh release-check /tmp/nn-release             # per guest (NN_LAB_DISTRO=…)
+```
+
+The Tappa 10.8 demo is the *same* tarball, built and attested by CI,
+installed and verified on every distribution. `release-check` copies the
+tarball and `SHA256SUMS` to the guest, stops the lab's source install and
+then checks, in order: the tarball against `SHA256SUMS`; that the release
+binaries run on the guest's glibc (CI builds on Ubuntu 24.04; the only
+newer glibc symbols are weak); that `install.sh --tarball --sums` verifies
+the tree and records `"provenance": "checksums"`; that the agent boots,
+verifies its binaries against that manifest, attaches every deny hook and
+arms the telemetry probe; and that an exec from `/tmp` fires R001. The
+lab's source install is put back at the end. The attestation itself is
+checked off the guest with `gh attestation verify <file> --repo
+northnarrow/northnarrow-new` (gh ≥ 2.49) or cosign.
+
 ### Packages and the package manager
 
 ```
