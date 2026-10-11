@@ -111,7 +111,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   inode the open returned while another thread swaps the name, and an
   `execveat` of a memfd is seen. The run on btrfs found review 55. The
   probes ship in the shared eBPF object but the agent never loads them;
-  their maps take about 70 KiB until step 1 replaces them.
+  their maps take about 70 KiB until step 1 replaces them. With
+  `NN_FEASIBILITY_BENCH=<opens>` it also measures the cost per open. On
+  6.8, an empty LSM program adds 147 ns, today's FIM observer 427 ns, and
+  the full observer 1 587 ns (−34 %). The full checks cannot therefore run
+  on every open: step 1 caches the classification per directory.
 - Kani proof of the admin multi-signature rule. `verify_quorum` and
   `verify_signed_payload_quorum` now share `quorum_decision`, the tally of
   distinct keys, threshold and role check separated from the signature

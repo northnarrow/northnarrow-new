@@ -254,7 +254,7 @@ suites, the telemetry probe, plus:
 
 | Gate | Target |
 |---|---|
-| `nn-lab.sh overhead` (3 rounds, idle host) | open and write-open throughput loss < 5 % |
+| `nn-lab.sh overhead` (3 rounds, idle host) | open and write-open throughput loss < 5 % (unreachable on the lab, §9.1: restated in Q7) |
 | ring drops on `daemon-reload` and an install burst (5.15) | 0 |
 | a "Phantom" reproducer: a second thread rewrites the path after `openat` entry | the record names the file actually opened |
 | `io_uring` openat of a credential file | credential-read detection, not only the ring events |
@@ -288,6 +288,13 @@ suites, the telemetry probe, plus:
   compiler is free to inline or rename them).
 - **Q6 — Transition.** Old programs kept behind a switch for one soak
   cycle and then deleted (proposed), or a direct switch.
+- **Q7 — Overhead gate (added after step 0).** On the lab, an empty BPF
+  LSM program on `file_open` already costs 4.6 % of open throughput
+  (§9.1), so §7's "< 5 % loss" cannot be met by any design on this hook.
+  Proposed instead: step 1 at least halves today's loss in
+  `nn-lab.sh overhead` (3 rounds, idle host, same guest) and reports the
+  nanoseconds added per open. The agent's own CPU per open must also fall,
+  since no per-open record reaches userland any more.
 
 ## 9. Step 0 results (2026-10-11)
 
@@ -362,3 +369,35 @@ Notes for the next steps:
   production `WATCHED_PATHS`, `PROTECTED_INODES` and `OWN_EXE_INODES`
   either (review 55). Fixed right after step 0 (lab PR 48): the kernel
   side now reports the device `stat()` reports, and step 1 builds on it.
+
+### 9.1 Cost per open (sizing for step 1)
+
+`NN_FEASIBILITY_BENCH=500000 nn-lab.sh sensor-feasibility` measures open +
+close of an unwatched file five levels below the root. The run was on
+Ubuntu 24.04 (6.8, 4 vCPU, nested virtualisation), agent stopped, median of
+five rounds. Times are added per open, against no program:
+
+| what runs on `file_open` | read-only | write |
+|---|---|---|
+| nothing | 327 k/s | 310 k/s |
+| an LSM program that returns at once | +147 ns (−4.6 %) | +139 ns (−4.1 %) |
+| the open's inode key + one lookup (what today's FIM observer does) | +427 ns (−12.3 %) | +451 ns (−12.3 %) |
+| the same + the parent directory's key + a cache lookup | +875 ns (−22.2 %) | +847 ns (−20.8 %) |
+| the full step 0 observer (name reads, 5-level ancestor walk) | +1 587 ns (−34.2 %) | +1 596 ns (−33.1 %) |
+
+What this means for step 1:
+
+- **The full observer cannot run on every open.** Name reads plus the
+  ancestor walk cost about as much as today's sensor (open −37 %,
+  write-open −47 % in the one-round benchmark of lab PR 37). Directory
+  classification must therefore be cached: computed once per directory,
+  with the parent's key mapped to class bits in an LRU map, and
+  invalidated by a generation counter that directory renames bump. A
+  regular open then pays two inode keys and two lookups.
+- **Kernel reads dominate the cost.** One `bpf_probe_read_kernel` costs
+  about 70 ns here. Step 1 therefore puts the new checks into the FIM
+  `file_open` observer, so there is one program and the open's key is
+  computed once. Where the layout allows, it reads adjacent fields in a
+  single call.
+- **The < 5 % gate cannot be met here.** An empty program already costs
+  4.6 %, so Q7 asks for a restated gate.

@@ -604,7 +604,9 @@ cmd_sensor_feasibility() {
     mkdir -p "$LAB_DIR/reports"
     lab_purge_pins >/dev/null
     local rc=0
-    vssh "sudo ${base:+NN_FEASIBILITY_BASE=$(printf %q "$base") }\$HOME/northnarrow/target/release/northnarrow-agent --sensor-feasibility" | tee "$out" || rc=$?
+    # NN_FEASIBILITY_BENCH=<opens> (host env) adds the cost-per-open table.
+    local bench=${NN_FEASIBILITY_BENCH:-}
+    vssh "sudo ${base:+NN_FEASIBILITY_BASE=$(printf %q "$base") }${bench:+NN_FEASIBILITY_BENCH=$(printf %q "$bench") }\$HOME/northnarrow/target/release/northnarrow-agent --sensor-feasibility" | tee "$out" || rc=$?
     vssh 'sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog' \
         || { log "agent restart failed — run nn-lab.sh install"; rc=1; }
     log "sensor-feasibility report: $out"
