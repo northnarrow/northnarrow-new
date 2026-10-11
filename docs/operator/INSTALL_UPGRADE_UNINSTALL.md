@@ -85,6 +85,34 @@ The lab verifies `uninstall.sh --purge --yes` leaves no binary, unit, pin,
 LSM program, config, state or bait behind, then reinstalls
 (`nn-lab.sh uninstall-check`).
 
+### 3.1 Host hardening checks (`nn-admin host-check`)
+
+The agent's anti-tamper (signals, ptrace, inode mutations denied to root
+by BPF LSM) holds only while root cannot rewrite the kernel at runtime.
+Those doors are closed by the host, not by the agent, so the installer,
+the agent at boot and `nn-admin` read the same eight settings and say
+what is missing and how to fix it:
+
+| Check | Expected | Why |
+|---|---|---|
+| BPF LSM in the LSM list | `bpf` present | the deny hooks cannot attach otherwise |
+| Kernel lockdown | `[integrity]` or stronger | blocks unsigned modules, kexec of unsigned kernels, `/dev/mem` |
+| Unprivileged BPF | `kernel.unprivileged_bpf_disabled` = 1 or 2 | only privileged processes load BPF |
+| Module signature | `module.sig_enforce` = Y | an unsigned module is the classic way to blind a kernel sensor |
+| UEFI Secure Boot | enabled | anchors the boot chain; turns on lockdown and module signing on most distros |
+| IMA | measurements > 0 | a replaced binary fails before it runs (appraise) or is at least measured |
+| kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot |
+| bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
+
+`install.sh` prints the table after installing; the agent logs one WARN
+per missing setting at boot; `nn-admin status` shows the count and
+`nn-admin host-check [--json]` the full table (exit 2 when something is
+missing). A check that cannot be determined (no EFI, IMA not compiled in)
+is reported as `n/a`, not as a warning. The lab guests show the expected
+gaps of a cloud image (no Secure Boot, lockdown off, kexec allowed); a
+production host should clear them — the Scout Tappa will automate the
+fixes, this is the measurement.
+
 ### 3.2 Lost events are visible (`ringbuf drops`)
 
 Every kernel sensor hands events to the agent through a ring buffer; when

@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The mass-write posture trigger logged its WARN on every event while a
+  steady writer kept the threshold crossed (one line per second for 24 h
+  on the first soak); the line is now emitted once per pid per window.
+  Detection and posture behaviour are unchanged.
 - Memory leak in the DNS attribution cache: the per-pid map was never
   pruned of dead pids, so every short-lived process that resolved a name
   grew the agent by a few hundred bytes for the life of the process
@@ -49,6 +53,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Host hardening checks (`nn-admin host-check [--json]`, summary in
+  `nn-admin status`, one WARN per gap at agent boot, table at the end of
+  `install.sh`): BPF LSM, kernel lockdown, unprivileged BPF, module
+  signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
+  the host settings that keep root from rewriting the kernel at runtime,
+  which is the only way around the anti-tamper.
 - io_uring sensor — the asynchronous I/O channel syscall-centric sensors
   miss: tracepoints `io_uring_create` and `io_uring_submit_{req,sqe}`
   (name resolved per kernel), submissions aggregated per pid in kernel by

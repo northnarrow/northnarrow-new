@@ -24,7 +24,7 @@
 //!   on the parent/child comm pair (`curl` → `bash`) and not on
 //!   pipeline syntax.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use common::posture_types::TriggerType;
@@ -194,6 +194,12 @@ pub struct TriggerDetector {
     /// Loaded from `/etc/northnarrow/mass-write-carveout.local` at
     /// agent boot. Cheap to clone (`Arc`); empty by default.
     mass_write_extras: Arc<Vec<String>>,
+    /// pid → monotonic ns of the last mass-write WARN for that pid.
+    /// Review entry 37: a steady benign writer keeps the arm crossed on
+    /// every event, and the WARN was logged once per second for 24 h on
+    /// the first soak. The trigger still fires (posture logic unchanged);
+    /// the log line is emitted once per [`MASS_WRITE_WINDOW_NS`] per pid.
+    mass_write_warned: Arc<parking_lot::Mutex<HashMap<u32, u64>>>,
     /// BUG-032 — escalation allowlist: process×destination tuples whose
     /// connections are excluded from the `exfiltration_pattern` /
     /// `lateral_movement` threshold counts (count-filter, not suppress).
@@ -215,6 +221,7 @@ impl TriggerDetector {
             exempt: ExemptPids::with_agent(pid),
             auth: AuthSessionTracker::default(),
             mass_write_extras: Arc::new(Vec::new()),
+            mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
         }
     }
@@ -227,6 +234,7 @@ impl TriggerDetector {
             exempt,
             auth: AuthSessionTracker::default(),
             mass_write_extras: Arc::new(Vec::new()),
+            mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
         }
     }
@@ -240,6 +248,7 @@ impl TriggerDetector {
             exempt,
             auth,
             mass_write_extras: Arc::new(Vec::new()),
+            mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
         }
     }
@@ -344,7 +353,13 @@ impl TriggerDetector {
         if matches!(event, Event::FsProtectDenial { .. }) {
             hits.push(TriggerType::AntiTamperDenial);
         }
-        if confirmed_intrusion(event, recent, &self.auth, &self.mass_write_extras) {
+        if confirmed_intrusion(
+            event,
+            recent,
+            &self.auth,
+            &self.mass_write_extras,
+            &self.mass_write_warned,
+        ) {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event, &self.auth) {
@@ -613,6 +628,7 @@ fn confirmed_intrusion(
     recent: &[Event],
     auth: &AuthSessionTracker,
     mass_write_extras: &[String],
+    warned: &parking_lot::Mutex<HashMap<u32, u64>>,
 ) -> bool {
     // BUG-032: the FsProtectDenial arm moved OUT to the Decisive
     // `AntiTamperDenial` trigger (raised directly in `detect`) — a
@@ -732,26 +748,52 @@ fn confirmed_intrusion(
                 // trigger=ConfirmedIntrusion` to go on). Single line
                 // per fire — not in any hot loop, the rule engine
                 // visits at most once per Event::FileOpen.
-                tracing::warn!(
-                    trigger = "ConfirmedIntrusion_MassWrite",
-                    focal_pid = *focal_pid,
-                    focal_comm = %focal_comm,
-                    focal_filename = %focal_filename,
-                    count_within_window = count,
-                    threshold = MASS_WRITE_MIN,
-                    window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
-                    // BUG-032: this raises ConfirmedIntrusion (COMBAT-tier),
-                    // but as a NeedsCorroboration signal it escalates to
-                    // ENGAGED on its own — COMBAT (auto-isolation) needs a
-                    // second distinct signal. (Pure single-vector ransomware
-                    // tops at ENGAGED unless the sustained knob is on.)
-                    "mass-write threshold crossed — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
-                );
+                // Review entry 37: once per window per pid — a steady writer
+                // re-crosses the threshold on every event.
+                if mass_write_warn_due(warned, *focal_pid, *focal_ts) {
+                    tracing::warn!(
+                        trigger = "ConfirmedIntrusion_MassWrite",
+                        focal_pid = *focal_pid,
+                        focal_comm = %focal_comm,
+                        focal_filename = %focal_filename,
+                        count_within_window = count,
+                        threshold = MASS_WRITE_MIN,
+                        window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
+                        // BUG-032: this raises ConfirmedIntrusion (COMBAT-tier),
+                        // but as a NeedsCorroboration signal it escalates to
+                        // ENGAGED on its own — COMBAT (auto-isolation) needs a
+                        // second distinct signal. (Pure single-vector ransomware
+                        // tops at ENGAGED unless the sustained knob is on.)
+                        "mass-write threshold crossed — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration); further hits of this pid are logged once per window"
+                    );
+                }
                 return true;
             }
         }
     }
     false
+}
+
+/// One mass-write WARN per pid per window (review entry 37). Returns true
+/// when the line should be logged and records `ts_ns`; the map is pruned
+/// of pids older than a window whenever it exceeds 1024 entries.
+fn mass_write_warn_due(
+    warned: &parking_lot::Mutex<HashMap<u32, u64>>,
+    pid: u32,
+    ts_ns: u64,
+) -> bool {
+    let mut g = warned.lock();
+    if let Some(last) = g.get(&pid) {
+        if ts_ns.saturating_sub(*last) < MASS_WRITE_WINDOW_NS {
+            return false;
+        }
+    }
+    if g.len() > 1024 {
+        let cutoff = ts_ns.saturating_sub(MASS_WRITE_WINDOW_NS);
+        g.retain(|_, t| *t >= cutoff);
+    }
+    g.insert(pid, ts_ns);
+    true
 }
 
 fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
@@ -1047,6 +1089,25 @@ pub(super) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::testutil::*;
+
+    /// Review entry 37: the trigger keeps firing on every hit (posture
+    /// logic unchanged) but the WARN is due once per window per pid.
+    #[test]
+    fn mass_write_warn_is_once_per_window_per_pid() {
+        let warned = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let w = super::MASS_WRITE_WINDOW_NS;
+        let due = super::mass_write_warn_due;
+        assert!(due(&warned, 100, 10 * w));
+        assert!(!due(&warned, 100, 10 * w + 1_000_000_000));
+        assert!(!due(&warned, 100, 11 * w - 1));
+        assert!(due(&warned, 100, 11 * w));
+        assert!(due(&warned, 101, 10 * w + 5));
+        for p in 1000..3000u32 {
+            assert!(due(&warned, p, 20 * w));
+        }
+        assert!(due(&warned, 5, 30 * w));
+        assert!(warned.lock().len() <= 2, "{}", warned.lock().len());
+    }
     use super::*;
 
     #[test]
