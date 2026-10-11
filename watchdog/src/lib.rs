@@ -2253,6 +2253,8 @@ mod tests {
                 posture: PostureKind::Observing,
                 network_isolation_engaged: false,
                 last_admin_action_secs_ago: None,
+            ringbuf_drops_total: None,
+            ringbuf_drops: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");
