@@ -613,10 +613,13 @@ Pianificato, in quest'ordine:
   evidenza nei chain log firmati — segnali, ptrace, file e pin protetti,
   mappe/link/programmi BPF, drop-in e `set-property`, bpffs e bind mount,
   cgroup freezer, moduli, `oom_score_adj`, overlay `.local`; trovati e
-  chiusi i rilievi 40–44; restano kexec/livepatch/modulo non firmato con
-  `lockdown` attivo, `cgroup.kill`, saturazione avversa degli eventi e
-  io_uring come canale cieco; ogni caso deve finire in un evento nel chain
-  log, non solo in un rifiuto)
+  chiusi i rilievi 40–44; seconda parte fatta l'11 ottobre, lab PR 32:
+  `cgroup.kill`, saturazione con un exec nascosto in un flood, io_uring come
+  canale cieco — 23 casi, rilievo 46 chiuso (ogni run firma `agent_stop`, il
+  boot successivo dichiara se il precedente è finito in modo pulito);
+  resta kexec/livepatch/modulo non firmato con `lockdown` attivo, che
+  richiede un guest con lockdown; ogni caso deve finire in un evento nel
+  chain log, non solo in un rifiuto)
 - Overlay `.local` (allowlist dei comm, path FIM, blocklist) solo via
   `nn-admin` firmato: oggi un file creato da root in `/etc/northnarrow`
   vale dal riavvio successivo senza autenticazione (il controllo di

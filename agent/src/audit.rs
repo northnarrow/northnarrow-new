@@ -361,11 +361,55 @@ pub struct AuditEntryDraft {
 /// open for the lifetime of the agent — the underlying file is
 /// `O_APPEND`, so a concurrent reader (auditor) sees consistent
 /// records without taking a lock.
+/// How the previous agent run ended, read from the audit chain at open.
+///
+/// Every run writes `agent_boot` when it starts and `agent_stop` when it
+/// leaves its event loop (SIGTERM from systemd, SIGINT/SIGHUP, signed admin
+/// shutdown, sensor exit). A boot with no stop after it means the process
+/// was not allowed to finish: SIGKILL (including `systemctl kill` and a
+/// write to the unit's `cgroup.kill`, which bypass the `task_kill` hook),
+/// the OOM killer, a crash or a power loss. The next boot says so in its
+/// own `agent_boot` entry (`previous_run`), so the death is signed evidence
+/// even when nothing could refuse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviousRun {
+    /// No earlier `agent_boot` in this chain.
+    None,
+    /// The last lifecycle entry is an `agent_stop`.
+    Clean { stopped_at: String, reason: String },
+    /// The last lifecycle entry is an `agent_boot` with no `agent_stop`.
+    Abrupt {
+        booted_at: String,
+        last_entry_at: String,
+    },
+}
+
+impl PreviousRun {
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            PreviousRun::None => serde_json::json!({ "ended": "none" }),
+            PreviousRun::Clean { stopped_at, reason } => {
+                serde_json::json!({ "ended": "clean", "stopped_at": stopped_at, "reason": reason })
+            }
+            PreviousRun::Abrupt {
+                booted_at,
+                last_entry_at,
+            } => serde_json::json!({
+                "ended": "abrupt",
+                "booted_at": booted_at,
+                "last_entry_at": last_entry_at,
+            }),
+        }
+    }
+}
+
 pub struct AuditLog {
     path: PathBuf,
     /// `path` anchored to the directory fd taken at open (review entry 44):
     /// appends cannot be diverted by a later mount over the directory.
     io_path: PathBuf,
+    /// How the run before this one ended (from the chain at open).
+    previous_run: PreviousRun,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -382,7 +426,7 @@ impl AuditLog {
     /// `nn-admin audit verify` (later commit) is the
     /// signature-checking reader.
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let last_hash = read_tail_hash(path)?;
+        let (last_hash, previous_run) = read_tail(path)?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
         // `/etc/northnarrow/` install.
@@ -403,7 +447,29 @@ impl AuditLog {
             key,
             agent_id,
             last_hash,
+            previous_run,
         })
+    }
+
+    /// How the previous run ended (see [`PreviousRun`]).
+    pub fn previous_run(&self) -> &PreviousRun {
+        &self.previous_run
+    }
+
+    /// `agent_stop` entry: the event loop is over and the process is about
+    /// to exit on its own terms. `reason` is the path out of the loop.
+    pub fn stop_entry(&mut self, reason: &str, uptime_secs: u64) -> Result<AuditEntry> {
+        self.append(AuditEntryDraft {
+            op: "agent_stop".to_string(),
+            extra: serde_json::json!({ "reason": reason, "uptime_secs": uptime_secs }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "success".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        })
+        .context("audit log stop entry (agent_stop)")
     }
 
     /// Append one record. Computes timestamp + chain hash +
@@ -486,6 +552,7 @@ impl AuditLog {
                 "detect_only": detect_only,
                 "binary_integrity": integrity,
                 "install_provenance": provenance,
+                "previous_run": self.previous_run.to_json(),
             }),
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
@@ -515,16 +582,18 @@ pub fn audit_failure_is_fatal(detect_only: bool, allow_env: Option<&str>) -> boo
 /// signal A12's verify-on-read flow surfaces, but for the
 /// agent's write path the early failure is preferable to
 /// chaining off garbage.
-fn read_tail_hash(path: &Path) -> Result<String> {
+fn read_tail(path: &Path) -> Result<(String, PreviousRun)> {
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GENESIS_PREV_HASH.to_string());
+            return Ok((GENESIS_PREV_HASH.to_string(), PreviousRun::None));
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
     let reader = BufReader::new(f);
     let mut last: Option<String> = None;
+    let mut last_ts = String::new();
+    let mut previous = PreviousRun::None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -532,9 +601,36 @@ fn read_tail_hash(path: &Path) -> Result<String> {
         }
         let entry: AuditEntry = serde_json::from_str(&line)
             .with_context(|| format!("parsing audit-log line: {line}"))?;
+        match entry.op.as_str() {
+            "agent_boot" => {
+                previous = PreviousRun::Abrupt {
+                    booted_at: entry.ts.clone(),
+                    last_entry_at: entry.ts.clone(),
+                }
+            }
+            "agent_stop" => {
+                previous = PreviousRun::Clean {
+                    stopped_at: entry.ts.clone(),
+                    reason: entry
+                        .extra
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                }
+            }
+            _ => {}
+        }
+        last_ts = entry.ts.clone();
         last = Some(entry.entry_hash);
     }
-    Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
+    if let PreviousRun::Abrupt { last_entry_at, .. } = &mut previous {
+        *last_entry_at = last_ts;
+    }
+    Ok((
+        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+        previous,
+    ))
 }
 
 /// Pure helper: compute `entry_hash` + signature for a draft
@@ -692,6 +788,48 @@ mod tests {
         let key_path = dir.path().join("agent.sig.key");
         let log_path = dir.path().join("audit.log");
         (dir, key_path, log_path)
+    }
+
+    #[test]
+    fn previous_run_none_abrupt_clean() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        // first boot: nothing before it
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert_eq!(log.previous_run(), &PreviousRun::None);
+        let boot = log.boot_probe(false, "verified", "source-tree").unwrap();
+        assert_eq!(boot.extra["previous_run"]["ended"], "none");
+        log.append(sample_draft(1)).unwrap();
+        // killed: reopen without a stop entry
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        match log.previous_run() {
+            PreviousRun::Abrupt {
+                booted_at,
+                last_entry_at,
+            } => {
+                assert_eq!(booted_at, &boot.ts);
+                assert!(last_entry_at >= booted_at);
+            }
+            other => panic!("expected Abrupt, got {other:?}"),
+        }
+        let boot2 = log.boot_probe(false, "verified", "source-tree").unwrap();
+        assert_eq!(boot2.extra["previous_run"]["ended"], "abrupt");
+        log.stop_entry("sigterm", 42).unwrap();
+        // clean stop
+        let log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        match log.previous_run() {
+            PreviousRun::Clean { reason, .. } => assert_eq!(reason, "sigterm"),
+            other => panic!("expected Clean, got {other:?}"),
+        }
+        assert!(verify_chain_ok(&log_path));
+    }
+
+    fn verify_chain_ok(path: &Path) -> bool {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .all(|l| serde_json::from_str::<AuditEntry>(l).is_ok())
     }
 
     fn sample_draft(seq: u32) -> AuditEntryDraft {

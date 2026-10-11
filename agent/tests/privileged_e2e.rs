@@ -885,15 +885,24 @@ fn shutdown_signed_round_trip() {
         !lines.is_empty(),
         "audit log should have ≥ 1 entry after shutdown"
     );
-    let last = lines.last().unwrap();
-    assert!(
-        last.contains("\"op\":\"shutdown\""),
-        "last audit entry should be op=shutdown: {last}"
-    );
+    // The admin op is the last entry before the agent's own `agent_stop`
+    // (written when the event loop ends, reason `admin_shutdown`); the test
+    // may read the file before or after that final write.
+    let shutdown_idx = lines
+        .iter()
+        .rposition(|l| l.contains("\"op\":\"shutdown\""))
+        .unwrap_or_else(|| panic!("no op=shutdown entry in the audit log: {audit_body}"));
+    let last = lines[shutdown_idx];
     assert!(
         last.contains("\"result\":\"success\""),
-        "last audit entry should be result=success: {last}"
+        "op=shutdown entry should be result=success: {last}"
     );
+    for after in &lines[shutdown_idx + 1..] {
+        assert!(
+            after.contains("\"op\":\"agent_stop\"") && after.contains("\"reason\":\"admin_shutdown\""),
+            "only the agent's own agent_stop (reason admin_shutdown) may follow op=shutdown: {after}"
+        );
+    }
     let _ = (priv_a, priv_b);
 }
 

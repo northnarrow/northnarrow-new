@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Structured adversarial check of the anti-tamper (Tappa 10.8).
 #
-# Runs ON THE GUEST as root against the installed agent, one case per
+# Runs ON THE GUEST as root against the installed agent (23 cases), one case per
 # documented way of neutralising a Linux EDR, and answers two questions for
 # each: was the action denied, and did it leave EVIDENCE in the signed chain
 # logs (audit.log ops, detections.jsonl rule ids) or at least in the journal?
@@ -37,6 +37,10 @@ evidence() {
     errors=$(echo "$j" | grep -cE " ERROR ")
     audit=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -oE '"op":"[a-z_]+"' | cut -d'"' -f4 | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
     dets=$(tail -n +"$((d0 + 1))" "$DETS" 2>/dev/null | grep -oE '"rule_id":"[A-Za-z0-9_-]+"' | cut -d'"' -f4 | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
+    # a boot that reports its predecessor died without agent_stop
+    if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"ended":"abrupt"'; then
+        audit="${audit}prev_run_abrupt "
+    fi
     echo "journal:[${denials:-}${verdicts:-}errors=${errors}] audit:[${audit:-}] detections:[${dets:-}]"
 }
 
@@ -105,7 +109,9 @@ if [[ -w "$CG" ]]; then
 fi
 # ── kernel modules / kexec ────────────────────────────────────────────────
 if modinfo dummy >/dev/null 2>&1; then
-    run_case C16 "modprobe dummy (in-tree module load)" allowed "R018_KernelModuleLoad" 0 -- bash -c "rmmod dummy 2>/dev/null; modprobe dummy && rmmod dummy"
+    # R011 kills modprobe within ~10 ms: either the load is prevented (R011)
+# or it lands first and is recorded (R018) — both are evidence
+run_case C16 "modprobe dummy (in-tree module load)" allowed "R011_KernelModuleTooling|R018_KernelModuleLoad" 0 -- bash -c "rmmod dummy 2>/dev/null; modprobe dummy && rmmod dummy"
 fi
 # ── OOM and configuration overlays ────────────────────────────────────────
 PID=$(agent_pid)   # the watchdog may have recycled a frozen agent
@@ -115,6 +121,27 @@ echo -500 > /proc/$PID/oom_score_adj 2>/dev/null || true
 # so a leftover cannot be removed until the lab purges the pins
 OVL="$ETC/zz-tamper-$(date +%s).local"
 WAIT=40 run_case C19 "drop a .local overlay in /etc/northnarrow" allowed "integrity_drift" 0 -- bash -c "echo '+evil-implant' > $OVL"
+# ── kills nothing can refuse, saturation, io_uring ────────────────────────
+CGK=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.kill
+if [[ -w "$CGK" ]]; then
+    # kernel-generated SIGKILL: no task_kill hook on this path. The watchdog
+    # brings the agent back; the new boot must say its predecessor died
+    # without agent_stop.
+    WAIT=25 run_case C20 "cgroup.kill on the agent's unit" allowed "prev_run_abrupt" 0 -- bash -c "echo 1 > $CGK"
+    PID=$(agent_pid)
+fi
+# 20k execs to overflow the exec ring, one exec from /tmp hidden inside:
+# either the exec is caught (R001) or the loss itself is signed evidence.
+WAIT=12 run_case C21 "exec flood (20k) hiding an exec from /tmp" allowed "R001_ExecFromTmp|R009_RootExecFromUserPath|ringbuf_drop" 0 -- bash -c 'cp /bin/true /tmp/nn-sat-$$ && { for i in $(seq 1 20000); do /bin/true; done & sleep 2; /tmp/nn-sat-$$; wait; rm -f /tmp/nn-sat-$$; }'
+# open + read + connect through an io_uring ring: no openat/connect syscall
+# from userland (the openat tracepoint is blind to it by construction).
+IOU_SRC="$(dirname "$0")/iouring-probe.c"
+IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
+if [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>/tmp/nn-iou-cc.log; then
+    WAIT=8 run_case C22 "io_uring: openat + read + connect through a ring" allowed "NN-L-IOU-00[12]" 0 -- "$IOU_BIN" /etc/hostname 127.0.0.1 9
+else
+    echo "C22 skipped: cannot build the io_uring probe ($(head -1 /tmp/nn-iou-cc.log 2>/dev/null))" >&2
+fi
 if command -v kexec >/dev/null 2>&1; then
     run_case C17 "kexec -l of the running kernel" denied "" 1 -- kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) --reuse-cmdline
     kexec -u 2>/dev/null || true

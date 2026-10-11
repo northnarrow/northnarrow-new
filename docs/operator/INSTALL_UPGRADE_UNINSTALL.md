@@ -263,6 +263,20 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `weakening_env` | the agent started with a variable that turns a protection off (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, …) |
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
 
+**How the previous run ended.** Some kills cannot be refused at all: a write
+to the unit's `cgroup.kill`, `systemctl kill -s KILL`, the OOM killer — and a
+crash or a power loss look the same. The watchdog brings the agent back; the
+evidence is in the chain: every run writes `agent_stop` (with the reason it
+left its event loop: `sigterm`, `sigint`, `sighup`, `admin_shutdown`,
+`sensor_pump_exited`) and every `agent_boot` carries `previous_run`:
+
+```sh
+sudo grep '"op":"agent_boot"' /etc/northnarrow/audit.log | tail -1 | grep -o '"previous_run":{[^}]*}'
+# {"ended":"abrupt","booted_at":"…","last_entry_at":"…"}   ← killed, OOM, crash
+```
+
+An abrupt end is also a `PREVIOUS RUN ENDED ABRUPTLY` WARN at boot.
+
 Refused attempts — signals to the agent or the watchdog, a ptrace attach,
 writes to protected files and pins, BPF map writes and link handles — are
 recorded as detection `NN-L-AT-001_AntiTamperDenial` in

@@ -137,7 +137,8 @@ impl CanaryAccessDb {
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
         let last_hash = read_tail_hash(path)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            // review 44: appends go through a directory fd taken now
+            path: crate::anchored::anchor(path),
             key,
             agent_id,
             last_hash,
