@@ -195,24 +195,18 @@ impl SensorMultiplexer {
         )?;
         // io_uring (Tappa 10.8): soft attach — a kernel built without
         // CONFIG_IO_URING has no such tracepoints and nothing to observe.
-        // The submit tracepoint was renamed across kernels; try both.
+        // The submit tracepoint was renamed across kernels (`_sqe` ≤ 6.1,
+        // `_req` on 6.8 and RHEL 9): load once, try both names.
         match attach_tracepoint(&mut ebpf, "io_uring_create", "io_uring", "io_uring_create") {
-            Ok(()) => {
-                let submit = attach_tracepoint(
-                    &mut ebpf,
-                    "io_uring_submit",
-                    "io_uring",
-                    "io_uring_submit_req",
-                )
-                .or_else(|e| {
-                    debug!(error = %e, "io_uring_submit_req absent — trying io_uring_submit_sqe");
-                    attach_tracepoint(&mut ebpf, "io_uring_submit", "io_uring", "io_uring_submit_sqe")
-                });
-                match submit {
-                    Ok(()) => info!("io_uring sensor attached (create + submit tracepoints)"),
-                    Err(e) => warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed"),
-                }
-            }
+            Ok(()) => match attach_tracepoint_any(
+                &mut ebpf,
+                "io_uring_submit",
+                "io_uring",
+                &["io_uring_submit_req", "io_uring_submit_sqe"],
+            ) {
+                Ok(name) => info!(submit_event = name, "io_uring sensor attached (create + submit tracepoints)"),
+                Err(e) => warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed"),
+            },
             Err(e) => warn!(
                 error = format!("{e:#}"),
                 "io_uring tracepoints not available (CONFIG_IO_URING off?) — the asynchronous I/O channel is NOT observed on this kernel"
@@ -336,6 +330,41 @@ impl Drop for SensorMultiplexer {
             h.abort();
         }
     }
+}
+
+/// Load `program_name` once and attach it to the first of `names` that
+/// exists under `category`; returns the name that took. A tracepoint
+/// renamed across kernels must not be retried with a second `load()`
+/// (aya: "the program is already loaded").
+fn attach_tracepoint_any(
+    ebpf: &mut Ebpf,
+    program_name: &str,
+    category: &str,
+    names: &[&'static str],
+) -> Result<&'static str> {
+    let prog: &mut TracePoint = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program_name} is not a tracepoint"))?;
+    prog.load()
+        .with_context(|| format!("verifier rejected `{program_name}`"))?;
+    let mut last: Option<anyhow::Error> = None;
+    for name in names {
+        match prog.attach(category, name) {
+            Ok(_) => return Ok(name),
+            Err(e) => {
+                debug!(program = program_name, event = %name, error = %e, "tracepoint name not attachable — trying the next");
+                last = Some(anyhow!(e));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("no tracepoint name given"))).with_context(|| {
+        perf_attach_hint(&format!(
+            "attaching tracepoint {category}/{{{}}}",
+            names.join("|")
+        ))
+    })
 }
 
 fn attach_tracepoint(
