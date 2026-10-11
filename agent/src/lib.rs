@@ -33,4 +33,5 @@ pub mod response;
 pub mod sd_notify;
 pub mod sensors;
 pub mod shutdown_marker;
+pub mod telemetry_probe;
 pub mod xai;

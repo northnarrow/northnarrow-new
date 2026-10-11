@@ -220,6 +220,23 @@ the deny in a test build (lab checks of the deny path). The guard counts in the 
 health: if it does not attach the agent refuses to start like for any
 other deny hook (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` to override).
 
+### 3.4 The agent proves its own coverage (`telemetry probe`)
+
+A sensor that stops delivering is worse than one that was never there:
+the host looks quiet. Every 60 s the agent runs a child of its own binary
+(`northnarrow-agent --telemetry-probe <nonce>`, hidden flag) that produces
+one known, harmless event per probed sensor — the exec itself, a read of
+`/run/northnarrow/probe/<nonce>` and a DNS query for
+`<nonce>.probe.northnarrow.invalid` sent to `127.0.0.1:53` (the sensor
+hooks the send, no resolver needed) — and checks that each one reaches
+its own pipeline within 5 s. A silent sensor is a **telemetry gap**:
+`ERROR TELEMETRY GAP` in the journal and a signed audit entry
+(`op=telemetry_gap`, sensor and nonce in `extra`), once per gap, with
+`op=telemetry_restored` when the sensor delivers again. None of the three
+events trips a rule (root-owned binary from its install path, a dedicated
+probe directory, a reserved `.invalid` name). `NN_TELEMETRY_PROBE_SECS`
+in the unit environment changes the period; `0` disables the probe.
+
 ## 4. What still needs a reboot
 
 - Enabling the `bpf` LSM (`lsm=…,bpf` on the kernel command line) the
