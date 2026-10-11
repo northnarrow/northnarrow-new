@@ -34,9 +34,15 @@ host.
 
 `admin.pub` holds one line per key: `<hex64-pubkey> [role,role,...]`.
 A line **without** a role list — which is what `nn-admin init` writes —
-gets the default allowlist **`unlock,audit-read`** only. So the key
-bootstrapped by `install.sh` releases COMBAT and reads the audit log,
-and nothing else: `nn-admin canary deploy|burn|refresh` (`canary-manage`),
+gets the default allowlist **`unlock,audit-read`** only. `install.sh`
+appends an explicit list to the line it bootstraps,
+`unlock,audit-read,trusted-installer`: the last role is what `install.sh
+--upgrade --grant-key` and `uninstall.sh --grant-key` use to open the
+window that lets them purge the protected pin root (review entry 39). A
+key bootstrapped before that change has no role list; add
+`trusted-installer` to its line before the next upgrade. The key releases
+COMBAT, reads the audit log and opens the installer window, and nothing
+else: `nn-admin canary deploy|burn|refresh` (`canary-manage`),
 `fim baseline` (`fim-manage`), `force-posture`, `shutdown` and
 `rotate-keys` are refused with an authorisation error.
 

@@ -587,8 +587,12 @@ Pianificato, in quest'ordine:
   bypass EDR più concreto del 2025–2026: RingReaper)
 - Autodifesa dell'ecosistema BPF (prima metà fatta l'11 ottobre, lab PR 28:
   guardia `bpf_map` in deny sulle mappe proprie, osservatore `bpf()` con
-  regole Log, modalità observe nei build di test; restano la protezione
-  dei link/detach e la sonda di telemetria): hook LSM `bpf`/`bpf_prog`/`bpf_map`
+  regole Log, modalità observe nei build di test; seconda metà fatta l'11
+  ottobre, lab PR 29: handle ai link negati per id e per pin, id distinti per
+  tipo, self-check dei link ogni 10 s con voce di audit, pin root protetto
+  dall'unlink con purge autorizzato via finestra trusted-installer —
+  rilievo 39 — in `install.sh --upgrade --grant-key` e `uninstall.sh`;
+  resta la sonda di telemetria): hook LSM `bpf`/`bpf_prog`/`bpf_map`
   che nega carico, attach, detach, enumerazione e scrittura di mappe a
   chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
   self-check periodico che i link dell'agent siano ancora attaccati

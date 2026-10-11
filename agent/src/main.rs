@@ -1492,6 +1492,9 @@ async fn main() -> Result<()> {
                 None
             }
         };
+    // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
+    // which did not exist when the hooks attached.
+    northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.

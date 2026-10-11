@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_UNLINK,
-    FS_OP_WRITE,
+    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
+    FS_OP_UNLINK, FS_OP_WRITE,
 };
 
 /// Canonical event emitted by a sensor.
@@ -303,6 +303,9 @@ pub enum FsProtectOperation {
     /// safety net).
     /// Write handle on one of the agent's own BPF maps (BPF self-defence).
     BpfMap,
+    /// A handle to one of the agent's own BPF links (by id or by pin)
+    /// refused to a foreign process: the shape of `bpftool link detach`.
+    BpfLink,
     Unknown(u8),
 }
 
@@ -316,6 +319,7 @@ impl FsProtectOperation {
             FS_OP_IOCTL => Self::Ioctl,
             FS_OP_WRITE => Self::Write,
             FS_OP_BPF_MAP => Self::BpfMap,
+            FS_OP_BPF_LINK => Self::BpfLink,
             other => Self::Unknown(other),
         }
     }
@@ -328,6 +332,7 @@ impl FsProtectOperation {
             Self::Setattr => "setattr",
             Self::Ioctl => "ioctl",
             Self::BpfMap => "bpf_map",
+            Self::BpfLink => "bpf_link",
             Self::Write => "write",
             Self::Unknown(_) => "unknown",
         }

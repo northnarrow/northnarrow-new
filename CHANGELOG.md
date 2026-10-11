@@ -59,6 +59,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   signature enforcement, Secure Boot, IMA, kexec, single bpffs mount —
   the host settings that keep root from rewriting the kernel at runtime,
   which is the only way around the anti-tamper.
+- BPF self-defence, second half: the `bpf` LSM hook now DENIES (enforce
+  mode) a handle to one of the agent's own links to a foreign process, by id
+  (`LINK_GET_FD_BY_ID`) and through the pin (`OBJ_GET` whose final path
+  component is one of our `link_*` pins) — the two routes to `bpftool link
+  detach`; denial `operation=bpf_link` in the audit chain and the posture
+  ladder. Own ids are kept with their kind (map / program / link live in
+  separate kernel id spaces; before, a foreign map with the id of one of our
+  programs would have been write-denied). Link self-check every 10 s: a
+  registered link missing — checked through the agent's own fds and pins,
+  no `CAP_SYS_ADMIN` — is an ERROR and a signed audit entry
+  (`bpf_link_missing`), in every mode. Review entry 39 (High): the pin root
+  `/sys/fs/bpf/northnarrow` and every pin are now in the protected-inode
+  set, so `systemctl stop` + `rm -rf` of the pins no longer drops the
+  hooks; the trusted-installer window is the authorised purge —
+  `install.sh --upgrade --grant-key <key>` / `uninstall.sh --grant-key
+  <key>` open it, the bootstrapped admin key carries the role
+  (`unlock,audit-read,trusted-installer`), and the lab migrates guests
+  installed with an older key once (units disabled across a VM restart).
 - BPF self-defence, first half: LSM hook `bpf_map` denies any write handle
   on the agent's own maps (ids registered after load) to processes that
   are not the agent or the watchdog — `bpftool map update/delete` against
