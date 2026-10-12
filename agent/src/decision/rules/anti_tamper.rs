@@ -98,8 +98,14 @@ mod tests {
     #[test]
     fn kexec_wire_byte_decodes_and_unknown_stays_unknown() {
         use common::wire::FS_OP_KEXEC;
-        assert_eq!(FsProtectOperation::from_wire(FS_OP_KEXEC), FsProtectOperation::Kexec);
-        assert_eq!(FsProtectOperation::from_wire(200), FsProtectOperation::Unknown(200));
+        assert_eq!(
+            FsProtectOperation::from_wire(FS_OP_KEXEC),
+            FsProtectOperation::Kexec
+        );
+        assert_eq!(
+            FsProtectOperation::from_wire(200),
+            FsProtectOperation::Unknown(200)
+        );
     }
 
     #[test]
