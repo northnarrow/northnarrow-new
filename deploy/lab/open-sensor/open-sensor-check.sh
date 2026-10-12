@@ -54,8 +54,11 @@ if [[ $(fim011 "$b" cat) -ge 1 && $v -ge 1 && $rc -eq 0 ]]; then
 else
     bad "NN-L-FIM-011 for $H/.aws/credentials: records=$(fim011 "$b" cat) journal=$v cat rc=$rc"
 fi
-# ... and through an io_uring ring (no openat syscall at all)
-if [[ -x $IOU_BIN ]] || { sudo mkdir -p "$(dirname "$IOU_BIN")" && sudo cc -O2 -o "$IOU_BIN" "$(dirname "$0")/../adversarial/iouring-probe.c" 2>/dev/null; }; then
+# ... and through an io_uring ring (no openat syscall at all). RHEL 9 ships
+# kernel.io_uring_disabled=2: no ring can be created, not even by root.
+if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
+    printf 'SKIP  io_uring disabled on this host (kernel.io_uring_disabled=2)\n'
+elif [[ -x $IOU_BIN ]] || { sudo mkdir -p "$(dirname "$IOU_BIN")" && sudo cc -O2 -o "$IOU_BIN" "$(dirname "$0")/../adversarial/iouring-probe.c" 2>/dev/null; }; then
     b=$(det_count); sudo "$IOU_BIN" "$H/.aws/credentials" 127.0.0.1 9 >/dev/null 2>&1; sleep 3
     [[ $(fim011 "$b" nn-iou-probe) -ge 1 ]] && pass "NN-L-FIM-011 for the same file opened through io_uring" \
                                            || bad "no NN-L-FIM-011 for the io_uring open"

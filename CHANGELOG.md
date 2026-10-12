@@ -6,6 +6,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Sealed chain-log archives and their manifests could be altered by root
+  after an agent restart (review 81, High): only the active files were
+  protected again at start, and the manifest never was. The agent now
+  protects every retained archive and manifest at start and the manifest
+  at each rotation.
+- An evicted log archive left its inode protected until the next agent
+  start (review 80): when the filesystem reused the number for an
+  unrelated file, that file could not be written or removed and each try
+  was an anti-tamper detection. The agent now releases an archive's inode
+  before evicting it.
+- The TCP close sensor sent a record for every passive socket (listeners,
+  accepted peers) that the agent then dropped, so inbound connections
+  could fill the ring the outbound flow closes need; and a close lost to a
+  full ring left a stale entry that misattributed a later socket's close
+  (review 79, part). Only sockets the connect sensor recorded are reported
+  now. Still open: a loop of outbound connects can still overflow the flow
+  rings (design pending).
+- Detections held back by the per-rule budget (review 75) were reported
+  only as a count, so a flood of one rule could hide which file another
+  detection of that rule was about. The held report (journal and signed
+  audit entry) now names up to eight distinct subjects per rule and uid.
 - An unprivileged loop of DNS queries could hide a DNS tunnel (review 78,
   High). The DNS sensor recorded every datagram into one ring: a loop of
   benign queries lost half of the records and took more than a CPU of the

@@ -642,6 +642,37 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     Ok(registered)
 }
 
+/// Review 81: register the sealed archives and the manifest of the chain
+/// log whose active file is `active`, like the active file (WRITE+MUTATE).
+/// Without it, a restart left every archive sealed by an earlier boot, and
+/// every manifest, writable by root: the evidence the chain verification
+/// exists to keep could be altered, and only found out afterwards. The
+/// number of files registered.
+fn register_sealed(ebpf: &mut Ebpf, active: &Path) -> Result<usize> {
+    let mut n = 0usize;
+    for path in crate::chainlog::sealed_files(active) {
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let key = InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        };
+        register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
+            .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        n += 1;
+    }
+    if n > 0 {
+        info!(
+            active = %active.display(),
+            sealed = n,
+            "anti-tamper FS: sealed archives and manifest registered in {PROTECTED_INODES_MAP}"
+        );
+    }
+    Ok(n)
+}
+
 /// Tappa 9 C7: register each of the two [`STATE_PROTECTED_FILES`]
 /// in `PROTECTED_INODES` so the same LSM hooks that defend
 /// `/var/lib/northnarrow/` itself also defend the chained
@@ -688,7 +719,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
             ino = key.ino,
             "anti-tamper FS: /var/lib/northnarrow FIM log registered in {PROTECTED_INODES_MAP}"
         );
-        registered += 1;
+        registered += 1 + register_sealed(ebpf, &path)?;
     }
     // Sub-directory chains (chain-protect-1): the directory inode first,
     // then its files. A missing dir/file is skipped like the entries
@@ -752,7 +783,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
                 ino = key.ino,
                 "anti-tamper FS: sub-directory chain log registered in {PROTECTED_INODES_MAP}"
             );
-            registered += 1;
+            registered += 1 + register_sealed(ebpf, &path)?;
         }
     }
     info!(
@@ -1538,6 +1569,11 @@ impl ProtectedInodesHandle {
     /// Drop a stale inode key (best-effort at the call sites that use it):
     /// after a rename-replace the old inode is freed and its dev/ino could
     /// later be reused by an unrelated, non-protected file.
+    /// `key` is in the map.
+    pub fn contains(&self, key: InodeKey) -> bool {
+        self.map.get(&AyaInodeKey(key), 0).is_ok()
+    }
+
     pub fn remove(&mut self, key: InodeKey) -> Result<()> {
         self.map.remove(&AyaInodeKey(key)).with_context(|| {
             format!(
@@ -1640,6 +1676,16 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
         self.inodes
             .lock()
             .register(key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
+    }
+
+    fn release(&self, path: &Path) -> Result<()> {
+        let key = crate::fim::attach::key_for_path(path)?;
+        let mut inodes = self.inodes.lock();
+        // An archive sealed before review 81 may have no key: nothing to drop.
+        if inodes.contains(key) {
+            inodes.remove(key)?;
+        }
+        Ok(())
     }
 }
 
