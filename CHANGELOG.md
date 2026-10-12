@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A file detection did not say which file it was about (review 77). The
+  record of a cron drop-in named the writer but not the drop-in; records
+  carried a path only for exec detections. Detection records now have a
+  `file` field for the file sensors (FIM drift, file open, mass write,
+  module load).
 - Root could switch off the FIM kill rules for a minute at a time (review
   76, High). The drift events handed to the rules were paced by host-wide
   buckets (50 created and 100 modified files per minute, whoever wrote
