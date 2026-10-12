@@ -365,7 +365,10 @@ cmd_test_ignored() {
     # from ~/.cargo/bin). Stop them first — watchdog first, or it respawns
     # the agent. (The nightly used to do this in its dispatcher only; a
     # stand-alone run was SIGKILLed by the agent.)
-    vssh 'sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null; true'
+    # Purge the pins too (`lab_purge_pins` stops the units first): the
+    # map-pin restart test refuses a bpffs root that still holds the
+    # installed agent's pins, so with a plain stop it never ran.
+    lab_purge_pins >/dev/null
     # --no-fail-fast: one failing test binary must not skip the other
     # targets (the first run stopped at 11 of 56 ignored tests).
     # NN_LAB_IGNORED_SKIP: substrings of test names to leave out. The RAG
@@ -380,7 +383,14 @@ cmd_test_ignored() {
         log "no target/kb on host — skipping the RAG release gates (run: cargo xtask rag-kb)"
     fi
     for t in ${NN_LAB_IGNORED_SKIP-$default_skip}; do skip_args+=" --skip $t"; done
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1$skip_args"
+    # The map-pin restart test needs a pin root no earlier test agent has
+    # left behind: their pins stay protected, so its own purge is refused.
+    # It runs first, alone, then the pins are purged again for the rest.
+    local pin_test=protected_pids_kernel_id_is_stable_across_agent_restart rc=0
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_map_pin $pin_test -- --ignored --test-threads=1" || rc=1
+    lab_purge_pins >/dev/null
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1 --skip $pin_test$skip_args" || rc=1
+    return "$rc"
 }
 
 cmd_install() {

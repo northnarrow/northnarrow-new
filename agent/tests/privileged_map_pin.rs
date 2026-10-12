@@ -481,13 +481,15 @@ fn count_pins(prefix: &str) -> usize {
 /// (`Ebpf::load_from_bytes`) but the per-hook `load()`/`attach()`/
 /// `pin()` calls have not all completed yet. Same deadline/poll
 /// shape as [`wait_for_pin`].
-/// Hooks attached through the pinned-reuse path (`attach_lsm`): their
-/// kernel program AND link objects must survive an agent restart. The
-/// six `inode_protect` deny hooks and the two module-load observe hooks
-/// are deliberately re-attached FRESH every boot (BUG-024: a reused link
-/// kept producing into the previous boot's ring), and the FIM observe
-/// programs are transient, so their ids legitimately change.
-const PINNED_REUSE_HOOKS: &[&str] = &["task_kill", "ptrace_access_check"];
+/// The task deny hooks. Like the six `inode_protect` deny hooks and the
+/// two module-load observe hooks they are re-attached FRESH every boot
+/// (review 62, as BUG-024 for the inode hooks): they emit on the
+/// FS_PROTECT_EVENTS ring, and a reused link kept the previous boot's
+/// program producing into the previous boot's ring, so a restarted
+/// agent never saw a kill or ptrace attempt again. Their ids must change
+/// across a restart while they stay attached; the PROTECTED_PIDS map they
+/// read is the one object that must be reused.
+const TASK_DENY_HOOKS: &[&str] = &["task_kill", "ptrace_access_check"];
 
 /// Prog id of the loaded LSM program named `name`, if any.
 /// The kernel caps program names at 15 bytes (`BPF_OBJ_NAME_LEN - 1`).
@@ -529,22 +531,22 @@ fn link_id_for_prog(prog_id: u64) -> Option<u64> {
     None
 }
 
-/// `(prog_id, link_id)` for every [`PINNED_REUSE_HOOKS`] entry, polling
+/// `(prog_id, link_id)` for every [`TASK_DENY_HOOKS`] entry, polling
 /// briefly: links show up in `bpftool link show` a moment after the
 /// programs do (a 0-links read right after attach was observed on the
 /// lab guest).
-fn pinned_hook_ids() -> Vec<(&'static str, u64, u64)> {
+fn task_hook_ids() -> Vec<(&'static str, u64, u64)> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let mut out = Vec::new();
-        for name in PINNED_REUSE_HOOKS {
+        for name in TASK_DENY_HOOKS {
             if let Some(pid) = lsm_prog_id_by_name(name) {
                 if let Some(lid) = link_id_for_prog(pid) {
                     out.push((*name, pid, lid));
                 }
             }
         }
-        if out.len() == PINNED_REUSE_HOOKS.len() || Instant::now() >= deadline {
+        if out.len() == TASK_DENY_HOOKS.len() || Instant::now() >= deadline {
             return out;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -617,16 +619,16 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
 
     // 2b: snapshot the kernel object id sets while boot-1 is live.
     let prog_ids1 = lsm_prog_ids();
-    let pinned1 = pinned_hook_ids();
+    let task1 = task_hook_ids();
     assert!(
         prog_ids1.len() >= EXPECTED_LSM_HOOKS,
         "boot-1: {} LSM programs visible, expected ≥{EXPECTED_LSM_HOOKS}: {prog_ids1:?}",
         prog_ids1.len()
     );
     assert_eq!(
-        pinned1.len(),
-        PINNED_REUSE_HOOKS.len(),
-        "boot-1: pinned-reuse hooks not all attached with a link: {pinned1:?}
+        task1.len(),
+        TASK_DENY_HOOKS.len(),
+        "boot-1: task deny hooks not all attached with a link: {task1:?}
 --- bpftool link show ---
 {}",
         bpftool_link_show_all().unwrap_or_else(|e| e)
@@ -677,27 +679,44 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
         )
     });
 
-    // 2b core invariant: pinned ⇒ the SAME kernel program and link
-    // objects are reused, not freshly created — for the pinned-reuse
-    // hooks. The whole-set equality this test used to assert has been
-    // wrong since BUG-024: the inode_protect deny set and the
-    // module-load observe hooks re-attach FRESH every boot by design
-    // (new prog + link ids), and the FIM observe programs are
-    // transient. So: same (prog, link) ids for task_kill + ptrace, and
-    // the full hook complement present again after the restart.
+    // The shared state map is reused (asserted above); every deny hook
+    // is attached again, FRESH (BUG-024, review 62): task_kill and ptrace
+    // get new (prog, link) ids bound to this boot's ring, and the full
+    // hook complement is present after the restart.
     let prog_ids2 = lsm_prog_ids();
     assert!(
         prog_ids2.len() >= EXPECTED_LSM_HOOKS,
         "boot-2: {} LSM programs visible, expected ≥{EXPECTED_LSM_HOOKS}: {prog_ids2:?}",
         prog_ids2.len()
     );
-    let pinned2 = pinned_hook_ids();
+    // Boot 1's pinned programs still satisfy the full-attach wait above
+    // until boot 2 reattaches its own and purges their pins, and the
+    // lookup by name returns the oldest program first: wait for the new
+    // ones (bounded) before comparing.
+    let deadline = Instant::now() + LSM_ATTACH_TIMEOUT;
+    let task2 = loop {
+        let t = task_hook_ids();
+        let fresh = t.len() == TASK_DENY_HOOKS.len()
+            && t.iter()
+                .zip(&task1)
+                .all(|((_, p2, _), (_, p1, _))| p2 != p1);
+        if fresh || Instant::now() >= deadline {
+            break t;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     assert_eq!(
-        pinned1, pinned2,
-        "pinned-reuse hook (prog, link) ids changed across restart ({pinned1:?} → \
-         {pinned2:?}): programs/links were re-created, not reused via the \
-         prog_<hook> / link_<hook> pins — #2b pinning broken (boot-1 set: {prog_ids1:?})"
+        task2.len(),
+        TASK_DENY_HOOKS.len(),
+        "boot-2: task deny hooks not all attached with a link: {task2:?}"
     );
+    for ((name, p1, _), (_, p2, _)) in task1.iter().zip(&task2) {
+        assert_ne!(
+            p1, p2,
+            "boot-2: {name} kept the previous boot's program {p1}: a reused link \
+             produces into the previous boot's ring (review 62)"
+        );
+    }
 
     agent2.stop();
     // Leave the pins in place: the verify protocol's subsequent

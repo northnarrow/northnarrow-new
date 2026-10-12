@@ -484,8 +484,8 @@ pub(crate) fn attach(
     // old pinned ring and desynced the new consumer → ~1.6k/sec stale-denial
     // replay that DoS'd observability). `reattach_fresh` attaches this boot's
     // program BEFORE purging the old pin, so a deny program is attached at
-    // every instant (zero-window). task_kill/ptrace (anti_tamper/mod.rs) keep
-    // the pinned-reuse path — they emit no ring, so they don't desync.
+    // every instant (zero-window). task_kill/ptrace (anti_tamper/mod.rs) emit
+    // on the same ring and are reattached fresh too (review 62).
     let mut deny_hooks_attached: usize = 0;
     for (program, hook) in LSM_PROGRAMS {
         match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
@@ -1302,24 +1302,76 @@ pub(crate) fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
     (major << 20) | minor
 }
 
+/// Review 63: the keys this boot registered, for [`prune_stale_inodes`].
+static BOOT_KEYS: parking_lot::Mutex<Option<std::collections::HashSet<(u64, u64)>>> =
+    parking_lot::Mutex::new(None);
+
 /// Insert `key` into `PROTECTED_INODES` with the at-authz-1 `flags`
 /// mask (`FS_PROTECT_MUTATE` and/or `FS_PROTECT_WRITE`). The map value
 /// records which deny classes apply to this inode so the eBPF
 /// `deny_if_protected` can be op-aware (the write-open deny covers only
 /// the `FS_PROTECT_WRITE` subset). An existing entry is overwritten.
+///
+/// A full map (earlier boots' keys, review 63) is pruned of everything
+/// this boot has not registered yet, then the insert is retried once:
+/// a key the rest of the boot re-registers goes unprotected for a few
+/// milliseconds, instead of the agent refusing to start.
 fn register_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
+    if insert_inode(ebpf, key, flags).is_err() {
+        let pruned = prune_stale_inodes(ebpf)?;
+        warn!(
+            pruned,
+            "anti-tamper FS: {PROTECTED_INODES_MAP} full — keys of earlier boots pruned \
+             before this boot finished registering"
+        );
+        insert_inode(ebpf, key, flags).with_context(|| {
+            format!(
+                "inserting (dev={}, ino={}) into {PROTECTED_INODES_MAP}",
+                key.dev, key.ino
+            )
+        })?;
+    }
+    BOOT_KEYS
+        .lock()
+        .get_or_insert_with(Default::default)
+        .insert((key.dev, key.ino));
+    Ok(())
+}
+
+fn insert_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     let map = ebpf
         .map_mut(PROTECTED_INODES_MAP)
         .ok_or_else(|| anyhow!("map {PROTECTED_INODES_MAP} missing from eBPF object"))?;
     let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
         .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
-    map.insert(AyaInodeKey(*key), flags, 0).with_context(|| {
-        format!(
-            "inserting (dev={}, ino={}) into {PROTECTED_INODES_MAP}",
-            key.dev, key.ino
-        )
-    })?;
+    map.insert(AyaInodeKey(*key), flags, 0)?;
     Ok(())
+}
+
+/// Review 63: remove every `PROTECTED_INODES` key this boot has not
+/// registered. The map is pinned, so it outlives the agent, and every
+/// boot brings new inodes: the bpffs pins of the hooks reattached fresh,
+/// rotated logs, replaced files. Without this the earlier boots' keys
+/// piled up (23 per restart on the lab) until an insert failed at 1024,
+/// some 41 restarts into one uptime, and the agent refused to start.
+/// Called once every registration is done (the pins last), so new keys
+/// are in before stale ones go: no window. The number of keys removed.
+pub(crate) fn prune_stale_inodes(ebpf: &mut Ebpf) -> Result<usize> {
+    let keep = BOOT_KEYS.lock().clone().unwrap_or_default();
+    let map = ebpf
+        .map_mut(PROTECTED_INODES_MAP)
+        .ok_or_else(|| anyhow!("map {PROTECTED_INODES_MAP} missing from eBPF object"))?;
+    let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
+        .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
+    let stale: Vec<AyaInodeKey> = map
+        .keys()
+        .filter_map(|k| k.ok())
+        .filter(|k| !keep.contains(&(k.0.dev, k.0.ino)))
+        .collect();
+    for k in &stale {
+        let _ = map.remove(k);
+    }
+    Ok(stale.len())
 }
 
 /// Add `FS_IMMUTABLE_FL` to the file's inode flags via `ioctl`. Pure
