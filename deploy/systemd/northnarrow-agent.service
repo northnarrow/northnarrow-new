@@ -14,6 +14,9 @@ Documentation=https://github.com/northnarrow/northnarrow-new
 # present by the time this unit runs; the ConditionPathIsMountPoint
 # guard below is the real safety check.
 After=network-online.target
+# Review 82: the agent refuses kexec images; kdump loads its crash kernel
+# first (ignored where kdump is not installed).
+After=kdump.service
 Wants=network-online.target
 # ConditionPathIsMountPoint is a soft pre-flight — units skip
 # their ExecStart if the condition is unmet rather than failing.

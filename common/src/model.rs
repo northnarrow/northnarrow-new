@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_PTRACE, FS_OP_RENAME, FS_OP_RMDIR,
-    FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_UNLINK, FS_OP_WRITE,
+    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_PTRACE, FS_OP_RENAME,
+    FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_UNLINK, FS_OP_WRITE,
 };
 
 /// Canonical event emitted by a sensor.
@@ -361,6 +361,8 @@ pub enum FsProtectOperation {
     Signal,
     /// A ptrace ATTACH-mode access to a protected pid refused.
     Ptrace,
+    /// A kexec kernel image load refused (review 82).
+    Kexec,
     Unknown(u8),
 }
 
@@ -377,6 +379,7 @@ impl FsProtectOperation {
             FS_OP_BPF_LINK => Self::BpfLink,
             FS_OP_SIGNAL => Self::Signal,
             FS_OP_PTRACE => Self::Ptrace,
+            FS_OP_KEXEC => Self::Kexec,
             other => Self::Unknown(other),
         }
     }
@@ -392,6 +395,7 @@ impl FsProtectOperation {
             Self::BpfLink => "bpf_link",
             Self::Signal => "signal",
             Self::Ptrace => "ptrace",
+            Self::Kexec => "kexec",
             Self::Write => "write",
             Self::Unknown(_) => "unknown",
         }
