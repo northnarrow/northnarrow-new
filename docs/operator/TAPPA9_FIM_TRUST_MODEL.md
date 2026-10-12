@@ -114,8 +114,8 @@ broke legitimate work, so the rule records the write instead.
 
 | Writer | Rules | Recorded as |
 |---|---|---|
-| The package manager: `dpkg`, `rpm`, `apt`, `dnf`, `yum`, `snapd`, `packagekitd` and their children (kernel-resolved lineage) | system binaries, setuid binaries, kernel and PAM modules, sensitive configs, cron drop-ins, units, timers | Log, Low |
-| An interactive administrator session: `sudo` or `su` in the lineage, a login uid and a terminal | sensitive configs (NN-L-FIM-003), cron drop-ins (-007), units (-009), timers (-023) | Log, at the rule's severity |
+| The package manager: `dpkg`, `rpm`, `apt`, `dnf`, `yum`, `snapd`, `packagekitd` and their children (kernel-resolved lineage) | system binaries, setuid binaries, kernel and PAM modules, sensitive configs, cron drop-ins, units, timers, file capabilities | Log, Low |
+| An interactive administrator session: `sudo` or `su` in the lineage, a login uid and a terminal | sensitive configs (NN-L-FIM-003), cron drop-ins (-007), units (-009), timers (-023), file capabilities (-025) | Log, at the rule's severity |
 | An account tool (`passwd`, `useradd`, `usermod`, `chpasswd`, `systemd-sysusers`, libuser's `l*` tools…), told by its exe | `/etc/passwd` and `/etc/shadow` (NN-L-FIM-003), `/var/log/lastlog` (-018) | Log: Low when a user other than root ran it, else the rule's severity |
 
 Everything else keeps the rule's response. That includes:
@@ -151,6 +151,22 @@ what the kernel executed, never by the name a process gives itself:
 An inline program (`python3 -c …`), a module run from the caller's path,
 or a copy outside a system tree is not a client. A client reading another
 user's credentials is acted on like any other reader.
+
+## File capabilities (review 86)
+
+A file capability (`security.capability`) gives whoever runs the file the
+capabilities it names: `cap_setuid` on a copy of an interpreter is a root
+shell for every user. The agent sees every capability set, by any route
+(`setcap`, a direct `setxattr`, `cp --preserve=xattr`, `tar --xattrs`),
+and NN-L-FIM-025 strips it again. It is Critical when the set holds a
+root-equivalent capability, else High. A namespaced capability (one that
+applies only inside a user namespace, e.g. a rootless container build) is
+only recorded.
+
+Capabilities installed by the package manager, and those an administrator
+grants from an interactive sudo session, are recorded and kept. To grant
+one any other way (from a script, or a configuration-management run), open
+the trusted-installer window first, or expect the capability to be removed.
 
 ## What FIM does not protect against
 

@@ -27,6 +27,7 @@ const CAP_NET_ADMIN: u32 = 12;
 const CAP_SYS_PTRACE: u32 = 19;
 const CAP_PERFMON: u32 = 38;
 const CAP_BPF: u32 = 39;
+const CAP_SETFCAP: u32 = 31;
 
 /// Every capability the enforcement path relies on, with the action
 /// that breaks without it (for the boot log).
@@ -57,6 +58,11 @@ const REQUIRED: &[(u32, &str, &str)] = &[
         "chattr +i on /var/lib/northnarrow",
     ),
     (CAP_BPF, "CAP_BPF", "eBPF map/program load"),
+    (
+        CAP_SETFCAP,
+        "CAP_SETFCAP",
+        "StripFileCapability: undoing a granted file capability",
+    ),
     (CAP_PERFMON, "CAP_PERFMON", "BPF-LSM / tracing attach"),
 ];
 
@@ -147,16 +153,22 @@ mod tests {
     }
 
     #[test]
-    fn old_unit_set_is_missing_exactly_cap_kill() {
+    fn old_unit_set_is_missing_cap_kill_and_cap_setfcap() {
         let m = missing_from_mask(OLD_UNIT);
-        assert_eq!(m.names, vec!["CAP_KILL"]);
+        assert_eq!(m.names, vec!["CAP_KILL", "CAP_SETFCAP"]);
         assert!(m.kill_missing);
     }
 
+    /// The deploy unit's set: the old one plus CAP_KILL and (review 86)
+    /// CAP_SETFCAP.
     #[test]
-    fn unit_set_with_cap_kill_passes() {
-        let m = missing_from_mask(OLD_UNIT | (1 << CAP_KILL));
+    fn unit_set_passes() {
+        let m = missing_from_mask(OLD_UNIT | (1 << CAP_KILL) | (1 << CAP_SETFCAP));
         assert!(m.is_empty(), "{m}");
+        assert!(!m.kill_missing);
+        // without CAP_SETFCAP: a warning, not a refusal to start.
+        let m = missing_from_mask(OLD_UNIT | (1 << CAP_KILL));
+        assert_eq!(m.names, vec!["CAP_SETFCAP"]);
         assert!(!m.kill_missing);
     }
 

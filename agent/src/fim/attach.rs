@@ -45,7 +45,7 @@ use tracing::{info, warn};
 
 use crate::fim::drain::InodePathMap;
 
-/// The eight FIM observe programs, paired with their LSM hook
+/// The FIM observe programs, paired with their LSM hook
 /// names. Names match the `#[lsm(hook = "...")]` attributes in
 /// `agent-ebpf/src/fim_watch.rs`. Order is the operator-visible
 /// boot-log order; rearranging would scramble the journald
@@ -65,6 +65,9 @@ pub const FIM_OBSERVE_PROGRAMS: &[(&str, &str)] = &[
     // Tappa 10.9 step 1: invalidates the file-open sensor's directory
     // cache (agent-ebpf/src/open_sensor.rs); idle until the sensor is armed.
     ("open_sensor_rmdir", "inode_rmdir"),
+    // Review 86: a file capability set (`security.capability`), reported
+    // through the file-open sensor; idle until the sensor is armed.
+    ("fim_file_cap_observe", "inode_post_setxattr"),
 ];
 
 /// The `file_open` observer variant that also runs the Tappa 10.9 file-open
@@ -472,6 +475,7 @@ mod tests {
             ("fim_write_intent_observe", "file_permission"),
             ("fim_close_emit_observe", "file_free_security"),
             ("open_sensor_rmdir", "inode_rmdir"),
+            ("fim_file_cap_observe", "inode_post_setxattr"),
         ];
         assert_eq!(FIM_OBSERVE_PROGRAMS, expected);
     }

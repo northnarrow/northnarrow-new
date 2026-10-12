@@ -13,6 +13,7 @@ pub mod block_outbound;
 pub mod caps_preflight;
 pub mod config;
 pub mod executor;
+pub mod file_caps;
 pub mod kill;
 pub mod network_isolation;
 pub mod quarantine;
@@ -82,6 +83,9 @@ pub enum ExecutionOutcome {
         cpu_max_pct: u8,
         io_weight: u16,
     },
+    /// Review 86, `StripFileCapability`: the file no longer carries a
+    /// `security.capability` xattr.
+    CapabilityStripped { path: String },
 }
 
 /// Aggregate report for one verdict execution.
@@ -94,6 +98,35 @@ pub struct ExecutionReport {
     pub primary: ExecutionOutcome,
     pub additional: Vec<ExecutionOutcome>,
     pub elapsed: Duration,
+}
+
+/// Reviews 86 and 87: the host's view of `path`, for a response that
+/// changes a file. The agent's unit runs with `ProtectSystem=strict`
+/// (deploy/systemd/northnarrow-agent.service): in its own mount namespace
+/// everything but its state directories is read-only, so removing a
+/// binary or an xattr failed with `EROFS`. Through `/proc/1/root` the path
+/// resolves in PID 1's mount namespace, the host's, where the file is
+/// writable; traversing it needs `CAP_SYS_PTRACE`, which the unit grants.
+/// The sandbox still covers everything else the agent does.
+pub fn host_path(path: &std::path::Path) -> std::path::PathBuf {
+    let rel = path.strip_prefix("/").unwrap_or(path);
+    std::path::Path::new("/proc/1/root").join(rel)
+}
+
+/// Run `op` on [`host_path`]`(path)`, or on `path` itself when the host's
+/// view cannot be reached at all (no `CAP_SYS_PTRACE`, as in tests). When
+/// it can, its error is the answer: a fallback to the read-only path would
+/// only turn it into `EROFS`.
+pub fn on_host_path<T>(
+    path: &std::path::Path,
+    op: impl Fn(&std::path::Path) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *REACHABLE.get_or_init(|| std::fs::metadata("/proc/1/root/").is_ok()) {
+        op(&host_path(path))
+    } else {
+        op(path)
+    }
 }
 
 #[cfg(test)]

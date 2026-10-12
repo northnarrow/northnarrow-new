@@ -804,6 +804,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 
@@ -924,6 +925,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

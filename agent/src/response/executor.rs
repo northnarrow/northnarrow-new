@@ -97,6 +97,44 @@ impl Executor {
         &self.config
     }
 
+    /// Run a verdict's `action`: [`Self::execute`], except the actions
+    /// that act on the verdict's file rather than on its process
+    /// (review 86: [`ResponseAction::StripFileCapability`]).
+    pub fn execute_for(
+        &self,
+        action: ResponseAction,
+        target_pid: u32,
+        filename: &str,
+    ) -> ExecutionReport {
+        if !matches!(action, ResponseAction::StripFileCapability) || self.config.dry_run {
+            return self.execute(action, target_pid);
+        }
+        let start = Instant::now();
+        ExecutionReport {
+            action,
+            primary: super::file_caps::strip(filename, target_pid),
+            additional: Vec::new(),
+            elapsed: clamp_elapsed(start.elapsed()),
+        }
+    }
+
+    /// Review 87: quarantine the binary at `path`, which backed `pid`
+    /// (already killed). Detect-only reports `WouldExecute`.
+    pub fn quarantine_path(&self, path: &std::path::Path, pid: u32) -> ExecutionReport {
+        let start = Instant::now();
+        let primary = if self.config.dry_run {
+            ExecutionOutcome::WouldExecute { pid }
+        } else {
+            quarantine::quarantine_binary(path, pid, &self.config)
+        };
+        ExecutionReport {
+            action: ResponseAction::Quarantine,
+            primary,
+            additional: Vec::new(),
+            elapsed: clamp_elapsed(start.elapsed()),
+        }
+    }
+
     /// Run `action` against `target_pid`. Always returns; never panics.
     pub fn execute(&self, action: ResponseAction, target_pid: u32) -> ExecutionReport {
         let start = Instant::now();
@@ -175,6 +213,11 @@ impl Executor {
                 ResponseAction::ThrottleProcess => {
                     throttle::throttle_pid(target_pid, &self.protected, &self.config)
                 }
+                // Acts on a file: only through `execute_for`.
+                ResponseAction::StripFileCapability => ExecutionOutcome::Refused {
+                    pid: target_pid,
+                    reason: "StripFileCapability needs the verdict's file (execute_for)",
+                },
             }
         };
 

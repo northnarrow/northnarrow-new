@@ -762,6 +762,10 @@ pub const FIM_OP_LINKED: u8 = 5;
 /// downstream — the BPF layer doesn't filter by access mode
 /// since the WATCHED_PATHS set is already operator-curated.
 pub const FIM_OP_OPENED: u8 = 6;
+/// Review 86: a file capability (`security.capability`) was set on the
+/// file, by any route. Built in userland from the file-open sensor's
+/// `inode_post_setxattr` record; never sent by the FIM watch.
+pub const FIM_OP_CAPABILITY_SET: u8 = 7;
 
 /// Tappa 9 (BUG-022) — max bytes of a created/renamed-in child's
 /// leaf name carried inline in [`FimDriftRaw::child_name`]. A NUL
@@ -947,6 +951,23 @@ pub struct FimEvent {
     /// the capability instead of root), so Q8 treats it as root.
     #[serde(default)]
     pub reader_dac_capable: bool,
+    /// Review 86: the capability set on the file, for
+    /// [`FimOp::CapabilitySet`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<FileCapability>,
+}
+
+/// Review 86: a file capability as the kernel stored it.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileCapability {
+    /// The permitted set: bit N is capability N.
+    pub permitted: u64,
+    /// The effective flag: the permitted set is raised at exec.
+    pub effective: bool,
+    /// A namespaced (revision 3) capability: it applies only inside a
+    /// user namespace whose root is not the host's.
+    pub namespaced: bool,
 }
 
 /// Tappa 9 (C1) — typed inflation of [`FimDriftRaw::op`]. Wire
@@ -972,6 +993,8 @@ pub enum FimOp {
     /// on every open of a watched inode. Drives C5.3
     /// cloud-credentials-read detection (NN-L-FIM-011..014).
     Opened = FIM_OP_OPENED,
+    /// Review 86: a file capability set on the file.
+    CapabilitySet = FIM_OP_CAPABILITY_SET,
 }
 
 #[cfg(feature = "std")]
@@ -992,6 +1015,7 @@ impl core::convert::TryFrom<u8> for FimOp {
             FIM_OP_RENAMED => Ok(Self::Renamed),
             FIM_OP_LINKED => Ok(Self::Linked),
             FIM_OP_OPENED => Ok(Self::Opened),
+            FIM_OP_CAPABILITY_SET => Ok(Self::CapabilitySet),
             other => Err(FimOpDecodeError::UnknownByte(other)),
         }
     }
@@ -1375,6 +1399,8 @@ mod tests {
         assert_eq!(FimOp::Linked as u8, FIM_OP_LINKED);
         // C5.2 addition (APPENDED, byte 6).
         assert_eq!(FimOp::Opened as u8, FIM_OP_OPENED);
+        // Review 86 addition (APPENDED, byte 7).
+        assert_eq!(FimOp::CapabilitySet as u8, FIM_OP_CAPABILITY_SET);
         // Discriminant values are STABLE wire bytes — never
         // renumber. Anchor literal values.
         assert_eq!(FIM_OP_MODIFIED, 1);
@@ -1383,6 +1409,7 @@ mod tests {
         assert_eq!(FIM_OP_RENAMED, 4);
         assert_eq!(FIM_OP_LINKED, 5);
         assert_eq!(FIM_OP_OPENED, 6);
+        assert_eq!(FIM_OP_CAPABILITY_SET, 7);
     }
 
     /// C1 test #4: [`FimOp`] try_from round-trip + unknown-byte
@@ -1399,6 +1426,7 @@ mod tests {
             FimOp::Renamed,
             FimOp::Linked,
             FimOp::Opened,
+            FimOp::CapabilitySet,
         ] {
             let byte: u8 = op.into();
             let round: FimOp = FimOp::try_from(byte).expect("known byte must decode");
@@ -1439,6 +1467,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1503,6 +1532,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

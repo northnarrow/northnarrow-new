@@ -65,6 +65,11 @@ pub mod open_reason {
     pub const PROBE: u32 = 1 << 3;
     pub const CRED: u32 = 1 << 4;
     pub const MASS_WRITE: u32 = 1 << 5;
+    /// Review 86: a file capability was set (`security.capability`). The
+    /// record's `count` carries the permitted set's low 32 bits, `flags`
+    /// the high 32, and `mode` the xattr's `magic_etc` (revision in the
+    /// top byte, the effective flag in bit 0).
+    pub const FILE_CAP: u32 = 1 << 6;
 }
 
 /// Names in the rule maps: NUL-padded, at most 31 bytes kept.

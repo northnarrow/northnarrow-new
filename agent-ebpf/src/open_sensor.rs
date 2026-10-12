@@ -33,6 +33,7 @@ use aya_ebpf::{
     macros::{lsm, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::LsmContext,
+    EbpfContext,
 };
 use northnarrow_common::wire::open_sensor::{
     open_class::{
@@ -757,4 +758,67 @@ unsafe fn try_open_sensor_rmdir(ctx: &LsmContext) -> i32 {
         let _ = DIR_CLASS.remove(&key);
     }
     0
+}
+
+/// Review 86: a file capability set by any route — `setcap`, a direct
+/// `setxattr(2)`, `cp --preserve=xattr`, `tar --xattrs`, io_uring. On
+/// `inode_post_setxattr`, so only a grant the kernel stored is reported,
+/// and with the value after `cap_convert_nscap()`: a revision-3 value is a
+/// capability namespaced to a user namespace whose root is not the
+/// host's. The hook's signature, `(dentry, name, value, size, flags)`,
+/// is the same on every supported kernel.
+#[lsm(hook = "inode_post_setxattr")]
+pub fn fim_file_cap_observe(ctx: LsmContext) -> i32 {
+    if armed() {
+        unsafe { try_file_cap(&ctx) };
+    }
+    0
+}
+
+/// `security.capability` with its NUL.
+const XATTR_NAME_CAPS: [u8; 20] = *b"security.capability\0";
+
+/// Argument `i` of the hook, read from the context's argument array
+/// without the verifier's BTF typing: before 6.x it refuses a typed load
+/// of a `void *` argument (`arg2 type UNKNOWN is not a struct`, AlmaLinux
+/// 9's 5.14), and `value` is one.
+#[inline(always)]
+unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
+    let args = ctx.as_ptr() as *const u64;
+    bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
+}
+
+#[inline(always)]
+unsafe fn try_file_cap(ctx: &LsmContext) {
+    let dentry: *const u8 = ctx.arg(0);
+    let name = raw_arg(ctx, 1) as *const u8;
+    let value = raw_arg(ctx, 2) as *const u8;
+    let size = raw_arg(ctx, 3) as usize;
+    if dentry.is_null() || name.is_null() || value.is_null() || size < 12 {
+        return;
+    }
+    let mut n = [0u8; 20];
+    if bpf_probe_read_kernel_str_bytes(name, &mut n).is_err() || n != XATTR_NAME_CAPS {
+        return;
+    }
+    // struct vfs_cap_data: magic_etc, then {permitted, inheritable} for
+    // the low and (revision >= 2) the high 32 capabilities.
+    let mut head = [0u32; 3];
+    if bpf_probe_read_kernel_buf(value, core::slice::from_raw_parts_mut(head.as_mut_ptr() as *mut u8, 12))
+        .is_err()
+    {
+        return;
+    }
+    let mut high = 0u32;
+    if size >= 16 {
+        if let Ok(h) = bpf_probe_read_kernel::<u32>(value.add(12) as *const u32) {
+            high = h;
+        }
+    }
+    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+    if inode.is_null() {
+        return;
+    }
+    let key = key_of(inode);
+    emit(open_reason::FILE_CAP, &key, dentry, high, head[0], head[1]);
 }

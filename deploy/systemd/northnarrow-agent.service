@@ -205,12 +205,19 @@ ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
 #                    that lives in a non-root, restrictive-perm directory
 #                    (response/quarantine.rs). NOT for +i, NOT for FIM (all
 #                    125 watched paths are root-owned → read by ownership).
-#                    Owned limit: sticky dirs (/tmp) and the chmod-000
-#                    fallback also want CAP_FOWNER, not in this set.
+#                    The sticky dirs (/tmp, /var/tmp, /dev/shm) are owned by
+#                    root, so the sticky check lets root unlink there without
+#                    CAP_FOWNER (lab, review 87).
+# CAP_SETFCAP      — StripFileCapability (review 86): removing a
+#                    `security.capability` xattr a process granted needs it.
+# Responses that change a file (quarantine's unlink, the strip) reach it
+# through /proc/1/root (response/mod.rs: host_path), the host's mount
+# namespace, because ProtectSystem=strict leaves this unit's own view
+# read-only outside ReadWritePaths; CAP_SYS_PTRACE covers that traversal.
 # Debian-family kernels: perf_event_paranoid=3 semantics need CAP_SYS_ADMIN
 # for the tracepoint/kprobe attach; install.sh adds it there through the
 # drop-in northnarrow-agent.service.d/10-debian-perf-paranoid.conf.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL CAP_SETFCAP
 
 [Install]
 WantedBy=multi-user.target

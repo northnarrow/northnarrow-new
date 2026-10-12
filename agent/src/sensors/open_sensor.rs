@@ -33,7 +33,7 @@ use common::wire::open_sensor::{
     open_reason, ChildRuleKey, OpenRecordRaw, OPEN_NAME_LEN, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN,
     OPEN_SENSOR_ARMED,
 };
-use common::wire::{FimEvent, FimOp, InodeKey};
+use common::wire::{FileCapability, FimEvent, FimOp, InodeKey};
 use common::Event;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -583,6 +583,18 @@ fn reader_dac_capable(pid: u32) -> bool {
     }
 }
 
+/// Review 86: the capability a `FILE_CAP` record carries (see
+/// [`open_reason::FILE_CAP`]): `VFS_CAP_FLAGS_EFFECTIVE` is bit 0 of
+/// `magic_etc`, and revision 3 (`0x03`) in its top byte is a namespaced
+/// capability.
+fn file_capability(r: &OpenRecordRaw) -> FileCapability {
+    FileCapability {
+        permitted: u64::from(r.count) | (u64::from(r.flags) << 32),
+        effective: r.mode & 1 != 0,
+        namespaced: r.mode >> 24 == 3,
+    }
+}
+
 /// The events one record stands for.
 pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
     let rel = relative_path(r);
@@ -630,6 +642,28 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
                 },
             ),
             reader_dac_capable: r.uid != 0 && reader_dac_capable(r.pid),
+            capability: None,
+        }));
+    }
+    if r.reason & open_reason::FILE_CAP != 0 {
+        out.push(Event::Fim(FimEvent {
+            timestamp_ns: r.timestamp_ns,
+            path: filename.clone(),
+            op: FimOp::CapabilitySet,
+            new_sha256: None,
+            baseline_sha256: None,
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: None,
+            modifier_pid: r.pid,
+            modifier_uid: r.uid,
+            modifier_comm: comm.clone(),
+            dest_path: None,
+            child_truncated: false,
+            wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
+            capability: Some(file_capability(r)),
         }));
     }
     if r.reason & open_reason::MASS_WRITE != 0 {
@@ -886,5 +920,44 @@ mod tests {
         assert!(
             matches!(&events_of(&r, &mut mounts)[0], Event::Fim(fe) if fe.path == "/.aws/credentials")
         );
+    }
+
+    /// Review 86: a FILE_CAP record is one capability grant: the permitted
+    /// set from `count` (low) and `flags` (high), the effective flag and
+    /// the revision from `magic_etc` in `mode`.
+    #[test]
+    fn a_file_cap_record_is_a_capability_grant() {
+        let mut mounts = MountTable::default();
+        mounts.roots.insert((7, 2), "/".into());
+        mounts.loaded = Some(Instant::now());
+        let mut r = record(
+            open_reason::FILE_CAP,
+            &["catcap", "lab48", "opt", "/"],
+            (7, 2),
+        );
+        r.count = 1 << 2; // cap_dac_read_search
+        r.flags = 1 << (39 - 32); // cap_bpf
+        r.mode = 0x0200_0001; // revision 2, effective
+        let ev = events_of(&r, &mut mounts);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        let Event::Fim(fe) = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(fe.op, FimOp::CapabilitySet);
+        assert_eq!(fe.path, "/opt/lab48/catcap");
+        assert_eq!(
+            fe.capability,
+            Some(FileCapability {
+                permitted: (1 << 2) | (1 << 39),
+                effective: true,
+                namespaced: false,
+            })
+        );
+        r.mode = 0x0300_0000; // revision 3: namespaced, not effective
+        let Event::Fim(fe) = &events_of(&r, &mut mounts)[0] else {
+            panic!()
+        };
+        let cap = fe.capability.unwrap();
+        assert!(cap.namespaced && !cap.effective);
     }
 }
