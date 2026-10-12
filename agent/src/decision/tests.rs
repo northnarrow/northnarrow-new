@@ -129,7 +129,7 @@ fn rules_share_consistent_metadata() {
         Box::new(R001ExecFromTmp),
         Box::new(R002ExecFromDevShm),
         Box::new(R003ExecFromVarTmp),
-        Box::new(R004ExecFromProcSelfFd),
+        Box::new(R004ExecFromProcSelfFd::default()),
         Box::new(R005NetcatExec),
         Box::new(R006ReverseShellTooling),
         Box::new(R007CryptoMiner),
@@ -174,7 +174,10 @@ fn rule_ids_are_pinned() {
     assert_eq!(R001ExecFromTmp.id(), "R001_ExecFromTmp");
     assert_eq!(R002ExecFromDevShm.id(), "R002_ExecFromDevShm");
     assert_eq!(R003ExecFromVarTmp.id(), "R003_ExecFromVarTmp");
-    assert_eq!(R004ExecFromProcSelfFd.id(), "R004_ExecFromProcSelfFd");
+    assert_eq!(
+        R004ExecFromProcSelfFd::default().id(),
+        "R004_ExecFromProcSelfFd"
+    );
     assert_eq!(R005NetcatExec.id(), "R005_NetcatExec");
     assert_eq!(R006ReverseShellTooling.id(), "R006_ReverseShellTooling");
     assert_eq!(R007CryptoMiner.id(), "R007_CryptoMiner");

@@ -944,22 +944,37 @@ fn process_systemd_executor_launch_exempt_from_r004() {
     fx.assert_no_verdict("R004_ExecFromProcSelfFd", Duration::from_secs(4));
 }
 
-/// R004 still fires on a `/proc/self/fd` exec from a non-systemd parent
-/// with a forged argv[0] (`bash exec -a <name> /proc/self/fd/<n>`) — the
-/// classic "exec from an open fd" evasion.
+/// External audit PROC-001: R004 judges the file the kernel executed, not
+/// the path it was reached by. The classic "exec from an open fd" evasion
+/// — a payload opened, deleted, then run through `/proc/self/fd/<n>` with
+/// a forged argv[0] — fires. The same exec of a program still on disk does
+/// not: the kernel names the real file, which the other rules judge, and
+/// systemd 255 starts every service this way.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn process_user_shell_proc_self_fd_trips_r004() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
 
-    // Open fd 3 onto a real executable, then exec it through its
-    // /proc/self/fd path with a spoofed argv[0]. The parent is this bash
-    // (not systemd), so the exemption does not apply. R004 fires
-    // KillProcessTree on the subprocess; ignore its exit status.
+    // A program on disk, through its fd: not fileless.
     let _ = Command::new("bash")
         .arg("-c")
         .arg("exec 3< /bin/true; exec -a evilname /proc/self/fd/3")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    fx.assert_no_verdict("R004_ExecFromProcSelfFd", Duration::from_secs(3));
+
+    // A payload deleted once open, through its fd: fileless. Root-owned,
+    // outside /tmp, so R001..R003 do not match first. R004 fires
+    // KillProcessTree on the subprocess; ignore its exit status.
+    let payload = install_to_priv_bin(Path::new("/bin/true"));
+    let _ = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "exec 3< {p}; rm -f {p}; exec -a evilname /proc/self/fd/3",
+            p = payload.path.display()
+        ))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
