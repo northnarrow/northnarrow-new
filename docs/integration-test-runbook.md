@@ -68,7 +68,13 @@ own disk, seed, ssh port and reports under `~/.cache/nn-lab/<distro>/`
 | `ubuntu2404` (default) | 6.8 | 2222 (2322 on this host) | build kernel |
 | `debian12` | 6.1 | 2422 | `perf_event_paranoid=3` drop-in |
 | `ubuntu2204` | 5.15 | 2522 | older verifier, sudo 1.9.9, systemd 249 |
-| `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header |
+| `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header; `kernel.io_uring_disabled=2` (no ring, not even for root); sudo's `secure_path` has no `/usr/local/bin`, so call `/usr/local/bin/nn-admin` |
+
+`install` builds the tree already on the guest: run `sync` first
+(`sync && install`), or the guest builds what it had. On a guest whose
+agent ran for a long time, `sync` can be refused on a file whose inode
+number an earlier, deleted protected file had (candidate review 80): the
+next `install` purges the pins, and a second `sync` goes through.
 
 The verified matrix and the per-kernel findings are in
 `docs/operator/KERNEL_COMPATIBILITY.md`. Memory: each guest takes
@@ -135,6 +141,13 @@ fails on any restart, any journal ERROR, an RSS slope above
 fd count that grew by more than half. Planned use: 24 h on each guest
 before a release, 72 h once before `0.1.0`.
 
+First run, AlmaLinux 9.8 (5.14), 24 h to 2026-10-12: PASS. RSS slope
+0.04 MB/h (34.6 → 37.7 MB), no restart, no journal ERROR, fds 100 (max
+102). The only ring drops (22,025) were on the old `file_open` tracepoint
+ring of the build under test, which predates the LSM file-open sensor.
+The ~216 NN-L-BPF-002 detections per hour came from the sampler's own
+`bpftool` calls, not from the workload.
+
 ### Release check (the CI tarball on every guest)
 
 ```
@@ -186,21 +199,30 @@ deploy/lab/nn-lab.sh overhead 5        # more rounds, steadier medians
 Measures what the agent costs the operations it hooks. Each round runs
 `deploy/lab/overhead/nn-bench.c` twice, once with the agent off (units
 stopped and pin root purged, so no hook is attached) and once with it on
-(units started, 20 s to settle), on four workloads:
+(units started, 20 s to settle), on six workloads:
 
 | workload | what one operation is | hooks it crosses |
 |---|---|---|
-| `open` | open + read 64 bytes + close, cycling over 64 files | `sys_enter_openat` tracepoint, LSM `file_open` and `file_permission` |
+| `open` | open + read 64 bytes + close, cycling over 64 files | LSM `file_open` (FIM watch and file-open sensor), `file_permission`, `file_free_security` |
 | `wopen` | open `O_WRONLY` + 4 KiB `pwrite` + close of one file | the same, on the write path |
-| `exec` | fork + `execve(/bin/true)` + wait | `sys_enter_execve` and `sched_process_exec` tracepoints |
+| `exec` | fork + `execve(/bin/true)` + wait | LSM `bprm_check_security`, `sched_process_exec` tracepoint |
 | `connect` | TCP connect + accept + close on `127.0.0.1` | `tcp_v4_connect` kprobe, `tcp_close` fexit |
+| `udp` | connected UDP `send()` to `127.0.0.1` | `udp_sendmsg` kprobe (per-destination aggregation, review 73), `udp_send_skb` kprobe |
+| `dns` | one DNS query to `127.0.0.1:53` | `udp_send_skb` kprobe (the DNS sensor and its per-process budget, review 78) |
 
 The report gives the median throughput off and on, the throughput lost
 and the agent's own CPU time while each workload ran (utime + stime of
 its pid). These are worst-case microbenchmarks: every iteration is a
 hooked operation, so real services lose far less. Run it on an otherwise
 idle host, with no other guest busy: the off/on alternation cancels slow
-drift, not a neighbour's load. The benchmark binary is built under
+drift, not a neighbour's load.
+
+Official numbers, Ubuntu 24.04 (6.8), idle host, 3 rounds, `main` 1777e6f
+(2026-10-12): open +25.4 %, wopen +29.1 %, exec +8.6 %, connect +34.1 %,
+udp +25.2 %, dns +14.2 %. The agent's own CPU was 0 ms for open and wopen
+(the cost is in the kernel hooks, review 59), 220 ms for exec, 240 ms for
+connect, 120 ms for udp and 20 ms for dns. The dns workload is one process,
+so beyond its budget its queries are counted, not recorded. The benchmark binary is built under
 `/usr/local/libexec/nn-lab` and runs as root, because the agent kills a
 root exec from a user-writable path (R009).
 
