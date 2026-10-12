@@ -77,7 +77,11 @@ run_case() {
     if echo "$out" | grep -qE "Operation not permitted|Permission denied"; then status=denied; else status=allowed; fi
     ev=$(evidence "$t0" "$a0" "$d0")
     local verdict="OK"
-    if [[ "$status" != "$exp_out" ]]; then verdict="DEVIATION (expected $exp_out)"; fail=1; fi
+    # A known gap (e.g. kexec without kernel lockdown, closed by host
+    # hardening, not by the agent: `nn-admin host-check`) is reported, not failed.
+    if [[ "$status" != "$exp_out" ]]; then
+        if (( gap )); then verdict="KNOWN GAP"; else verdict="DEVIATION (expected $exp_out)"; fail=1; fi
+    fi
     if [[ -n "$exp_ev" ]] && ! echo "$ev" | grep -qE "$exp_ev"; then
         if (( gap )); then verdict="KNOWN GAP"; else verdict="DEVIATION (evidence /$exp_ev/ missing)"; fail=1; fi
     fi
