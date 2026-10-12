@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- NN-L-NET-009 (more than 100 MiB sent) never fired for UDP (review 74,
+  High). The flow tracker emits one UDP row per kernel record, at most
+  about 1 MiB, so no row reached the threshold: 150 MB sent over UDP in
+  0.6 s went unflagged. NET-009 now sums the UDP rows of a (process,
+  destination) over 10 minutes.
 - An unprivileged UDP burst could erase every network flow record (review
   73, High). A connected UDP socket emitted one record per `send()` into the
   ring the TCP closes share. One process sending 146k datagrams/s lost 1.45
