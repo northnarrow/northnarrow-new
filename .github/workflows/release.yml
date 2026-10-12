@@ -35,7 +35,8 @@ jobs:
       # on a CPU without it (the lab guests; many servers). Releases target
       # x86-64-v2, the baseline btf-matrix and kani already use. Only the
       # x86_64 target: RUSTFLAGS would also replace the eBPF build's flags
-      # (debuginfo, --btf).
+      # (debuginfo, --btf). Review 65: xtask passes this variable on to the
+      # nested cargo build; the qemu step below checks the result.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v2"
     permissions:
       contents: write        # upload release assets on a tag
@@ -126,6 +127,20 @@ jobs:
           ./target/release/northnarrow-agent --version
           ./target/release/nn-admin --version
           ./target/release/northnarrow-watchdog --version
+
+      # Review 65: the binaries must start on an x86-64-v2 CPU, not only on
+      # the runner's. `-cpu Nehalem` has SSE4.2 and POPCNT but no AVX, so an
+      # instruction the runner has and the baseline does not ends in SIGILL
+      # here. The x86-64-v2 override (env above) once never reached the
+      # build (xtask scrubbed it), and the release died at start on the lab.
+      - name: Release binaries start on an x86-64-v2 CPU (qemu -cpu Nehalem)
+        run: |
+          set -e
+          sudo apt-get install -y --no-install-recommends qemu-user >/dev/null
+          tmp=$(mktemp -d) && tar -C "$tmp" -xzf "$(ls dist/*.tar.gz)"
+          for b in northnarrow-agent nn-admin northnarrow-watchdog; do
+            qemu-x86_64 -cpu Nehalem "$tmp"/northnarrow-*/target/release/$b --version
+          done
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
