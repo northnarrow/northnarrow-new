@@ -240,6 +240,19 @@ first on the root filesystem as a control, then from a btrfs subvolume
 NN-L-FIM-011, or the kernel's inode keys do not match the ones userland
 computed with `stat()`. The guest is put back as it was.
 
+### FIM: a deleted watched file's inode (reviews 57, 58)
+
+```
+deploy/lab/nn-lab.sh fim-reuse-check
+```
+
+Moves a file into `/etc/cron.d`, which the drain must enroll by inode
+(review 58), and deletes it. It then creates files in `/tmp` until one
+reuses that inode number and appends to it. The write must not reach the
+FIM rules as a modification of the deleted cron file (review 57: it did,
+and NN-L-FIM-007 killed the writer). SKIP when the number is not reused
+within 2000 files.
+
 ### RAG release gates need the real corpus
 
 `rag::bench` holds three `#[ignore]` release gates (golden retrieval

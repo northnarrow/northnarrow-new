@@ -148,6 +148,11 @@ impl InodePathMap {
         self.inner.read().get(key).cloned()
     }
 
+    /// Forget an inode whose file is gone (review 57).
+    pub fn remove(&self, key: &InodeKey) {
+        self.inner.write().remove(key);
+    }
+
     /// Number of mapped inodes. Useful for `nn-admin fim
     /// status` (C6) summary output.
     pub fn len(&self) -> usize {
@@ -579,22 +584,45 @@ fn reconstruct_child_path(dir: &str, raw: &FimDriftRaw) -> Option<String> {
     Some(format!("{}/{}", dir.trim_end_matches('/'), leaf))
 }
 
+/// Review 58: children whose create or rename event was handled before
+/// the file existed at its final path. The LSM hooks fire before the
+/// operation, and a fast drain used to `stat` too early and skip the
+/// enrollment for good, so the dropped file's later in-place edits went
+/// unseen. The drain loop retries them for [`ENROLL_RETRY_FOR`].
+static PENDING_ENROLL: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+const ENROLL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Retry the pending enrollments; `true` while some are still waiting.
+fn retry_pending_enrollments(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> bool {
+    let Ok(mut pending) = PENDING_ENROLL.lock() else {
+        return false;
+    };
+    pending.retain(|(path, since)| {
+        !enroll_child(path, path_map, watched_paths) && since.elapsed() < ENROLL_RETRY_FOR
+    });
+    !pending.is_empty()
+}
+
 /// BUG-022 — enroll a freshly-dropped child of a watched directory
 /// into the userland [`InodePathMap`] AND (when a handle is wired) the
 /// kernel `WATCHED_PATHS` map, so a later in-place edit of the dropped
 /// file is observed directly by the BUG-023 write-then-close hook. The
-/// child is stat'd for its kernel-form `(dev,ino)`; a vanished child
-/// (created-then-immediately-removed) is silently skipped. A full
+/// child is stat'd for its kernel-form `(dev,ino)`; `false` when it is
+/// not there (yet: the caller queues it for a retry, review 58). A full
 /// `WATCHED_PATHS` (8192 cap) is logged LOUD — a silently-dropped
 /// enroll must not masquerade as coverage.
 fn enroll_child(
     child_path: &str,
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
-) {
+) -> bool {
     let key = match key_for_path(Path::new(child_path)) {
         Ok(k) => k,
-        Err(_) => return,
+        Err(_) => return false,
     };
     path_map.insert(key, child_path.to_string());
     if let Some(wp) = watched_paths {
@@ -606,6 +634,27 @@ fn enroll_child(
                  its later in-place edits stay unobserved until a re-baseline"
             );
         }
+    }
+    true
+}
+
+/// Review 57: once a watched file is deleted its inode number is free, and
+/// the filesystem reuses it for unrelated files (ext4 does so at once). If
+/// the path no longer resolves to `key` (gone, or replaced by another
+/// inode), stop watching `key`; if it still does (the unlink was refused,
+/// or another hard link remains), keep it.
+fn forget_if_gone(
+    key: &InodeKey,
+    path: &str,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) {
+    if matches!(key_for_path(Path::new(path)), Ok(k) if k == *key) {
+        return;
+    }
+    path_map.remove(key);
+    if let Some(wp) = watched_paths {
+        wp.lock().unenroll(*key);
     }
 }
 
@@ -678,7 +727,11 @@ pub fn process_drift(
             match reconstruct_child_path(&path, raw) {
                 Some(child) => {
                     let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
-                    enroll_child(&child, path_map, watched_paths);
+                    if !enroll_child(&child, path_map, watched_paths) {
+                        if let Ok(mut pending) = PENDING_ENROLL.lock() {
+                            pending.push((child.clone(), std::time::Instant::now()));
+                        }
+                    }
                     // A rename INTO a watched dir is a drop → present as Created
                     // (single userland normalization point; the dir-class rules
                     // keep their Created|Modified op-sets unchanged).
@@ -689,6 +742,9 @@ pub fn process_drift(
         } else {
             (path, op, false)
         };
+    if op == FimOp::Deleted {
+        forget_if_gone(&key, &path, path_map, watched_paths);
+    }
 
     // BUG-012 (v2): a read (`FimOp::Opened`) is NEVER an integrity
     // drift. It must produce zero FIM-DRIFT rows — no drift_db
@@ -967,7 +1023,19 @@ pub async fn drain_loop(
         "fim drain loop: ready"
     );
     loop {
-        let mut guard = async_fd.readable_mut().await?;
+        // Review 58: while children wait for their file to appear, wake up
+        // every few milliseconds to retry them.
+        let waiting = retry_pending_enrollments(inode_map.as_ref(), watched_paths.as_deref());
+        let mut guard = if waiting {
+            match tokio::time::timeout(std::time::Duration::from_millis(5), async_fd.readable_mut())
+                .await
+            {
+                Ok(g) => g?,
+                Err(_) => continue,
+            }
+        } else {
+            async_fd.readable_mut().await?
+        };
         let inner = guard.get_inner_mut();
         let mut drained = 0u32;
         while let Some(item) = inner.next() {
@@ -1140,6 +1208,106 @@ mod tests {
         assert!(
             path_map.lookup(&child_key).is_some(),
             "dropped child must be enrolled into the InodePathMap"
+        );
+    }
+
+    /// Review 58: the create event of a dropped child can be handled before
+    /// the file exists at its final path; the child waits and is enrolled
+    /// once it appears.
+    #[test]
+    fn child_handled_before_it_exists_is_enrolled_when_it_appears() {
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            signing,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let watched_dir = dir.path().join("cron.d");
+        std::fs::create_dir(&watched_dir).unwrap();
+        let dir_key = InodeKey { dev: 0x77, ino: 7 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, watched_dir.to_string_lossy().into_owned());
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        let leaf = b"late-drop";
+        raw.child_name[..leaf.len()].copy_from_slice(leaf);
+        process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        // The file appears only now: the retry enrolls it.
+        let child = watched_dir.join("late-drop");
+        std::fs::write(&child, b"* * * * * root true\n").unwrap();
+        let key = key_for_path(&child).unwrap();
+        assert!(path_map.lookup(&key).is_none());
+        retry_pending_enrollments(&path_map, None);
+        assert_eq!(
+            path_map.lookup(&key).as_deref(),
+            Some(child.to_string_lossy().as_ref()),
+            "the late child must be enrolled by the retry"
+        );
+    }
+
+    /// Review 57: a Deleted event for a file that is gone forgets its inode
+    /// (the filesystem reuses the number for unrelated files); one for a
+    /// file still in place (refused unlink, another hard link) keeps it.
+    #[test]
+    fn deleted_watched_file_forgets_its_inode_only_when_gone() {
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            signing,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let path_map = InodePathMap::new();
+
+        let kept = dir.path().join("still-here.conf");
+        std::fs::write(&kept, b"x").unwrap();
+        let kept_key = key_for_path(&kept).unwrap();
+        path_map.insert(kept_key, kept.to_string_lossy().into_owned());
+        let gone = dir.path().join("dropped.conf");
+        std::fs::write(&gone, b"y").unwrap();
+        let gone_key = key_for_path(&gone).unwrap();
+        path_map.insert(gone_key, gone.to_string_lossy().into_owned());
+        std::fs::remove_file(&gone).unwrap();
+
+        for key in [kept_key, gone_key] {
+            let raw = fake_raw(key.dev, key.ino, FimOp::Deleted as u8);
+            process_drift(
+                &raw,
+                &path_map,
+                None,
+                &mut drift_db,
+                &classifier,
+                &rate_limiter,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(
+            path_map.lookup(&kept_key).is_some(),
+            "a file still in place stays watched"
+        );
+        assert!(
+            path_map.lookup(&gone_key).is_none(),
+            "a deleted file's inode is forgotten"
         );
     }
 

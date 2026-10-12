@@ -15,6 +15,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   production" banner appeared on every agent host. All are removed.
   Overhead benchmark on Ubuntu 24.04, 3 rounds: open throughput loss
   falls from 38.5 % to 31.9 %, write-open from 48.8 % to 25.6 %.
+- FIM killed unrelated processes after a watched file was deleted
+  (review 57). A file dropped in a watched directory is watched by its
+  inode, and deleting the file left the inode number watched, even across
+  agent restarts. ext4 hands that number to the next new file, so a
+  compiler's temporary file in `/tmp` was killed as a "cron drop-in". A
+  deleted file's inode is now forgotten, and stale keys are cleared at
+  boot. The enrollment of dropped files itself often failed (review 58):
+  it ran before the file existed at its final path. It is now retried
+  for two seconds. `nn-lab.sh fim-reuse-check` covers both.
 - On btrfs, FIM and the anti-tamper file protection saw nothing (review
   55). Userland keys watched and protected files by `(dev, ino)` from
   `stat()`, which on btrfs reports the subvolume's device. The eBPF hooks
