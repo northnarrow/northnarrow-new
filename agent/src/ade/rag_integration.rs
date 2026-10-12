@@ -336,6 +336,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         });
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("fim drift"));

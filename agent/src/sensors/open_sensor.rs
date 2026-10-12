@@ -547,6 +547,42 @@ fn comm_of(r: &OpenRecordRaw) -> String {
     String::from_utf8_lossy(&r.comm[..end]).into_owned()
 }
 
+/// Q8 (decided 2026-10-12): the uid that owns the credential file a record
+/// opened, read by path. Only when the path still names the opened inode:
+/// a replaced or vanished file yields `None`, and the rule only reports.
+fn owner_of(path: &str, opened: InodeKey) -> Option<u32> {
+    let meta = std::fs::metadata(path).ok()?;
+    let found = InodeKey {
+        dev: stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    };
+    (found == opened).then(|| meta.uid())
+}
+
+/// Q8: whether the reader reads every file as root does — it holds
+/// `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` in the initial user
+/// namespace. A capability held only inside a user namespace
+/// (`unshare -r`, a rootless container) grants nothing on the host's
+/// files and does not count. Read when the record is drained: a reader
+/// that has already exited counts as not capable.
+fn reader_dac_capable(pid: u32) -> bool {
+    const DAC_CAPS: u64 = (1 << 1) | (1 << 2); // CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    let caps = crate::response::caps_preflight::parse_cap_eff(&status).unwrap_or(0);
+    if caps & DAC_CAPS == 0 {
+        return false;
+    }
+    match (
+        std::fs::read_link(format!("/proc/{pid}/ns/user")),
+        std::fs::read_link("/proc/1/ns/user"),
+    ) {
+        (Ok(reader), Ok(init)) => reader == init,
+        _ => false,
+    }
+}
+
 /// The events one record stands for.
 pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
     let rel = relative_path(r);
@@ -586,6 +622,14 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             dest_path: None,
             child_truncated: false,
             wide_coverage: true,
+            owner_uid: owner_of(
+                &filename,
+                InodeKey {
+                    dev: r.dev,
+                    ino: r.ino,
+                },
+            ),
+            reader_dac_capable: r.uid != 0 && reader_dac_capable(r.pid),
         }));
     }
     if r.reason & open_reason::MASS_WRITE != 0 {

@@ -309,7 +309,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   Paths are rebuilt from the mount table.
   `--file-open-sensor tracepoint` (or `NN_FILE_OPEN_SENSOR`) keeps the old
   sensor for one soak cycle. Credential-store opens in homes outside the
-  watch list are reported without killing the reader (design Q8).
+  watch list are reported; the reader is killed only when it is a non-root
+  user other than the file's owner and holds no DAC capability on the host
+  (design Q8): the owner's own tools and root's backups are not.
   The posture's path lists are prefixes and the kernel classifies by
   directory, so `/etc/ssh/sshd_config.d/` is now listed: the
   `/etc/ssh/sshd_config` prefix used to cover sshd's drop-ins.

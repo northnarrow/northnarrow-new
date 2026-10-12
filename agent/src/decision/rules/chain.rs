@@ -802,6 +802,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         })
     }
 
@@ -920,6 +922,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

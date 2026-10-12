@@ -148,12 +148,26 @@ fn fim_verdict(
     reasoning: &str,
 ) -> Verdict {
     // Tappa 10.9 step 1: opens found by the file-open sensor's credential
-    // names (every home) are reported, not acted on, until the owner
-    // decides (design Q8) — the owner's own editor or SDK opens them too.
-    let action = if fe.wide_coverage {
-        ResponseAction::Log
+    // names (every home) are reported: the owner's own editor or SDK opens
+    // them too. Q8, decided 2026-10-12: another user's read is acted on —
+    // not root's, which is how backups read every home, nor a reader that
+    // reads as root does (a backup tool given CAP_DAC_READ_SEARCH).
+    let foreign = fe.owner_uid.is_some_and(|owner| {
+        fe.modifier_uid != 0 && fe.modifier_uid != owner && !fe.reader_dac_capable
+    });
+    let (action, reasoning) = if fe.wide_coverage && !foreign {
+        (ResponseAction::Log, reasoning.to_string())
+    } else if foreign {
+        (
+            action,
+            format!(
+                "{reasoning} [uid {} read a file owned by uid {}]",
+                fe.modifier_uid,
+                fe.owner_uid.unwrap_or_default()
+            ),
+        )
     } else {
-        action
+        (action, reasoning.to_string())
     };
     Verdict {
         rule_id: rule.id().to_string(),
@@ -161,7 +175,7 @@ fn fim_verdict(
         category: rule.category().to_string(),
         action,
         severity,
-        reasoning: reasoning.to_string(),
+        reasoning,
         event_pid: fe.modifier_pid,
         event_filename: fe.path.clone(),
         timestamp_ns: fe.timestamp_ns,
@@ -1896,6 +1910,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         })
     }
 
@@ -1925,6 +1941,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         })
     }
 
@@ -1947,6 +1965,8 @@ mod tests {
             dest_path: Some(dest.to_string()),
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         })
     }
 
@@ -2485,6 +2505,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         })
     }
 
@@ -2943,6 +2965,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         })
     }
 
@@ -3792,5 +3816,46 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         assert_eq!(v.severity, Severity::High);
         assert_eq!(v.event_filename, "/home/alice/.aws/credentials");
+    }
+
+    /// Q8, decided 2026-10-12: a wide-coverage credential read by another,
+    /// non-root user is acted on; the owner's own read and root's (backups)
+    /// are only reported, and so is a read whose owner is unknown.
+    #[test]
+    fn foreign_non_root_cred_read_is_acted_on() {
+        let read = |reader: u32, owner: Option<u32>| {
+            let mut e = fim_event_with_comm(FimOp::Opened, "/home/alice/.aws/credentials", "cat");
+            if let Event::Fim(fe) = &mut e {
+                fe.wide_coverage = true;
+                fe.modifier_uid = reader;
+                fe.owner_uid = owner;
+            }
+            NnLFim011AwsCredsRead.evaluate(&e).expect("fires")
+        };
+        let v = read(1001, Some(1000));
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert!(v
+            .reasoning
+            .contains("uid 1001 read a file owned by uid 1000"));
+        assert_eq!(read(1000, Some(1000)).action, ResponseAction::Log);
+        assert_eq!(read(0, Some(1000)).action, ResponseAction::Log);
+        assert_eq!(read(1001, None).action, ResponseAction::Log);
+    }
+
+    /// Q8: a non-root reader that holds a DAC capability on the host reads
+    /// as root does (restic run as its own user with CAP_DAC_READ_SEARCH):
+    /// reported, not acted on.
+    #[test]
+    fn dac_capable_reader_is_treated_as_root() {
+        let mut e = fim_event_with_comm(FimOp::Opened, "/home/alice/.aws/credentials", "restic");
+        if let Event::Fim(fe) = &mut e {
+            fe.wide_coverage = true;
+            fe.modifier_uid = 998;
+            fe.owner_uid = Some(1000);
+            fe.reader_dac_capable = true;
+        }
+        let v = NnLFim011AwsCredsRead.evaluate(&e).expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(!v.reasoning.contains("read a file owned by"));
     }
 }

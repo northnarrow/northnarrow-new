@@ -324,6 +324,15 @@ suites, the telemetry probe, plus:
   (`/root` by default) keep the kill, and the chain rules that use a
   credential read as a precursor are unchanged. Proposed: keep it this
   way, or kill only when the opener's uid differs from the file's owner.
+  **Decided (2026-10-12, lab PR 73):** the second. A read by a non-root
+  uid other than the file's owner gets the rule's own response. The
+  owner's read, root's (backups read every home) and a reader holding
+  `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` in the initial user
+  namespace (a backup tool given the capability instead of root) are
+  reported only; a capability held only inside a user namespace
+  (`unshare -r`) does not count. The owner is the `stat` of the path when
+  the record is drained, used only if it still names the opened inode; an
+  unknown owner reports only.
 
 ## 9. Step 0 results (2026-10-11)
 
@@ -542,7 +551,8 @@ consumer keeps `Event::FileOpen { filename, flags, … }` as it is today.
 
 Credential-class opens are also given to the FIM rules as
 `FimEvent { op: Opened, path, wide_coverage: true }`, so NN-L-FIM-011..017
-now fire for every home. They report without acting (Q8).
+now fire for every home. They report, and act only on another non-root
+user's read (Q8).
 
 A mass-write crossing becomes `Event::MassWrite { pid, uid, comm, count,
 path }`. The posture's mass-write arm reads that event (lineage gates

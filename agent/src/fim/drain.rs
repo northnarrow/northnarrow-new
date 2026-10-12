@@ -828,6 +828,8 @@ pub fn process_drift(
                 dest_path: None,
                 child_truncated,
                 wide_coverage: false,
+                owner_uid: None,
+                reader_dac_capable: false,
             }));
             return Ok(true);
         }
@@ -966,6 +968,8 @@ pub fn process_drift(
             dest_path,
             child_truncated,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         }));
     }
     Ok(true)
