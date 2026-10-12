@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- `nn-lab.sh tamper-check` left its overlays in `/etc/northnarrow`, and
+  C24's was signed, so its `+backupd` exemption stayed in force on the
+  lab guest. The e2e fixtures' agents then logged it as an unauthorised
+  overlay, and `audit_verify_e2e` failed on its entry count (Ubuntu
+  22.04). The check now purges the pins, removes the overlays and
+  restarts the units.
+- `nn-lab.sh sync` could leave the lab guest building stale code. rsync
+  kept the host's file times, so sources synced from another checkout or
+  worktree could be older than the guest's last build. cargo then kept
+  the old crate: the build failed, or linked the previous code. Files are
+  now compared by content, and a changed file takes the guest's clock.
 - Every file operation on the host went through a global kernel lock
   (review 56). 45 `bpf_printk` diagnostic markers from a 2026-05
   investigation were still in the anti-tamper LSM programs: one per
@@ -117,6 +128,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- File-open sensor on LSM `file_open` (Tappa 10.9 step 1). The FIM
+  `file_open` observer now also classifies every open in the kernel, and
+  only the opens a rule reads reach userland:
+  - sensitive files, and writes to critical or persistence files and trees;
+  - the telemetry probe directory;
+  - credential stores found by name in every home (review 54);
+  - one `Event::MassWrite` per process crossing 20 write-opens in 60 s,
+    instead of every open.
+
+  `sys_enter_openat` is detached once the sensor is armed, so the path is
+  the one the kernel opened (no time-of-check gap) and opens through
+  `io_uring` are seen. A relative path, a directory fd or a symlink no
+  longer slips past the posture's file triggers (review 60, High). Directory classes are cached; a directory rename
+  invalidates the cache and `rmdir` drops the removed directory's entry.
+  Paths are rebuilt from the mount table.
+  `--file-open-sensor tracepoint` (or `NN_FILE_OPEN_SENSOR`) keeps the old
+  sensor for one soak cycle. Credential-store opens in homes outside the
+  watch list are reported without killing the reader (design Q8).
+  The posture's path lists are prefixes and the kernel classifies by
+  directory, so `/etc/ssh/sshd_config.d/` is now listed: the
+  `/etc/ssh/sshd_config` prefix used to cover sshd's drop-ins.
+  Mass-write carve-outs are directory trees, with or without the final
+  `/`. If the verifier refuses the sensor, FIM keeps its plain observer
+  and the agent stays on `sys_enter_openat`.
+  `nn-lab.sh open-sensor-check` verifies it end to end on Ubuntu 24.04
+  (6.8), Ubuntu 22.04 (5.15) and Debian 12 (6.1). On the 6.8 lab guest
+  the open benchmark loses 28.2 % instead of 31.9 %, and the agent's own
+  CPU per open drops from 6.4 µs to almost nothing (design §10.6, Q7).
 - `nn-lab.sh sensor-feasibility [BASE]`, step 0 of the Tappa 10.9 sensor
   attach points. A lab build of the agent (`--sensor-feasibility`, feature
   `test-privileged`) loads throw-away probes on the attach points the

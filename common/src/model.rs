@@ -65,6 +65,22 @@ pub enum Event {
         flags: u32,
         timestamp_ns: u64,
     },
+    /// Tappa 10.9 step 1: one process crossed the mass-write threshold
+    /// (`OPEN_MASS_WRITE_MIN` write-opens within the window), counted in
+    /// the kernel by the file-open sensor on LSM `file_open`. Replaces
+    /// counting every write `FileOpen` in userland; carve-outs (sysfs,
+    /// procfs, …, `/run/systemd`, the writer's own runtime dir) are
+    /// applied in the kernel.
+    MassWrite {
+        pid: u32,
+        uid: u32,
+        comm: String,
+        /// Write-opens in the window when the threshold was crossed.
+        count: u32,
+        /// The write-open that crossed it (absolute path when resolved).
+        filename: String,
+        timestamp_ns: u64,
+    },
     /// Pre-exec validation event (LSM `bprm_check_security`).
     ExecCheck {
         pid: u32,

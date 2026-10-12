@@ -29,14 +29,22 @@ pub unsafe fn stat_dev(inode: *const u8, sb: *const u8, s_dev: u32) -> u32 {
     // Bounded to 16 bits (the real values are below 1 KiB): `inode` is a
     // BTF-typed pointer in the hooks that receive one, and the verifier
     // refuses arithmetic on it with an unbounded offset ("value -4294967295
-    // makes trusted_ptr_ pointer be out of bounds").
-    let (root_off, vfs_off, anon_off) = match (
-        off_opt!(BTRFS_INODE_ROOT_OFFSET),
-        off_opt!(BTRFS_INODE_VFS_INODE_OFFSET),
-        off_opt!(BTRFS_ROOT_ANON_DEV_OFFSET),
-    ) {
-        (Some(a), Some(b), Some(c)) => (a & 0xffff, b & 0xffff, c & 0xffff),
-        _ => return s_dev,
+    // makes trusted_ptr_ pointer be out of bounds"). One offset at a time,
+    // each consumed at once: a tuple of three `Option`s was spilled and
+    // read back on a path that never wrote it, which the 5.15 verifier
+    // refuses ("invalid read from stack", 5.15 rule 3) once the caller is
+    // large enough (the file-open sensor of Tappa 10.9).
+    let root_off = match off_opt!(BTRFS_INODE_ROOT_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return s_dev,
+    };
+    let vfs_off = match off_opt!(BTRFS_INODE_VFS_INODE_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return s_dev,
+    };
+    let anon_off = match off_opt!(BTRFS_ROOT_ANON_DEV_OFFSET) {
+        Some(o) => o & 0xffff,
+        None => return s_dev,
     };
     let magic = match bpf_probe_read_kernel::<u64>(
         sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64,

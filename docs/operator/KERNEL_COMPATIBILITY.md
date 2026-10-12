@@ -215,6 +215,10 @@ same rules or the 22.04 guest will refuse to load it:
    verifiers tolerate the read for privileged loaders). `fim_rename_observe`
    now passes an always-initialised `InodeKey` (dev 0 / ino 0 = no
    destination). Prefer plain values over `Option` across inlined calls.
+   A tuple of `Option`s matched at once is spilled the same way:
+   `inode_dev::stat_dev` read its three btrfs offsets as one tuple, which
+   the larger file-open sensor (Tappa 10.9) turned into the same error.
+   Consume each optional value with its own `match` and an early return.
 4. **No large stack array, even zero-initialised.** `[0u8; 256]` lowers to
    the same `memset` subprogram as rule 1 (`R1 type=ctx expected=fp` from
    a `frame1` that only stores zeroes). String scratch lives in a
@@ -234,6 +238,14 @@ same rules or the 22.04 guest will refuse to load it:
    verifier busy for minutes (the agent looked hung at boot). Keep loops
    short, constant-bounded and few per program. Test builds write a
    rejected program's verifier log to `/run/northnarrow/verifier-<program>.log`.
+   When a loop must stay, move it into a global BPF function: an
+   `#[no_mangle] #[inline(never)] pub extern "C" fn` with integer
+   arguments only, which bpf-linker keeps as `linkage=global` in the BTF.
+   The verifier checks it once, on its own, and the caller sees one
+   unknown return value. The file-open sensor's eight-level ancestor walk
+   (`open_sensor::nn_open_walk`) took `fim_file_open_sensor` from over 1M
+   instructions to loading on 5.15. Rule 1 still applies: kernel
+   addresses go in as `u64`, never as pointers.
 7. **Bound any offset added to or subtracted from a hook argument** (all
    kernels, 6.8 included). An LSM hook's `struct inode *` argument is a
    BTF-typed pointer. `inode - off` with `off` read from `BTF_OFFSETS` (a

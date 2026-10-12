@@ -161,6 +161,7 @@ fn event_kind_label(e: &Event) -> &'static str {
         Event::BpfSyscall { .. } => "bpf_syscall",
         Event::ProcessSpawn { .. } => "process_spawn",
         Event::FileOpen { .. } => "file_open",
+        Event::MassWrite { .. } => "mass_write",
         Event::ExecCheck { .. } => "exec_check",
         Event::TcpConnect { .. } => "tcp_connect",
         Event::DnsQuery { .. } => "dns_query",
@@ -187,6 +188,7 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
         Event::IoUring { pid, uid, .. } | Event::BpfSyscall { pid, uid, .. } => (*pid, *uid),
         Event::ProcessSpawn { pid, uid, .. }
         | Event::FileOpen { pid, uid, .. }
+        | Event::MassWrite { pid, uid, .. }
         | Event::ExecCheck { pid, uid, .. }
         | Event::TcpConnect { pid, uid, .. }
         | Event::DnsQuery { pid, uid, .. }

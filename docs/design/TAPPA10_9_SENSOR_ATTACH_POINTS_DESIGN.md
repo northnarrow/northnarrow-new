@@ -294,7 +294,25 @@ suites, the telemetry probe, plus:
   Proposed instead: step 1 at least halves today's loss in
   `nn-lab.sh overhead` (3 rounds, idle host, same guest) and reports the
   nanoseconds added per open. The agent's own CPU per open must also fall,
-  since no per-open record reaches userland any more.
+  since no per-open record reaches userland any more. **Measured in step 1
+  (§10.6):** the open loss falls from 31.9 % to 28.2 % and the agent's
+  CPU per open from 6.4 µs to almost zero; the sensor's own kernel time on a
+  read-only open is lower than the tracepoint's it replaces. Halving the
+  total loss needs FIM's close and write-intent hooks reworked too
+  (review 59). Two gates are therefore on the table: (a) the sensor costs
+  no more kernel time per open than the tracepoint it replaces and no
+  userland time (met for read-only opens, +154 ns for write-opens), or
+  (b) the halving, which then waits for review 59.
+- **Q8 — Credential-store opens in every home (added in step 1).** The
+  kernel name table (Q1) now finds them in every home. NN-L-FIM-011..017
+  kill any opener that is not the store's own CLI. But an owner's editor,
+  or an SDK such as boto3 or terraform, opens these files too, so killing
+  across every home would turn routine work into kills. Step 1 therefore
+  reports these opens at the rule's severity without acting on them
+  (`FimEvent::wide_coverage`). Files in the operator's watch list
+  (`/root` by default) keep the kill, and the chain rules that use a
+  credential read as a precursor are unchanged. Proposed: keep it this
+  way, or kill only when the opener's uid differs from the file's owner.
 
 ## 9. Step 0 results (2026-10-11)
 
@@ -401,3 +419,231 @@ What this means for step 1:
   single call.
 - **The < 5 % gate cannot be met here.** An empty program already costs
   4.6 %, so Q7 asks for a restated gate.
+
+## 10. Step 1 — file opens: implementation design
+
+§9.1 fixes the shape: one program, and per-directory work cached, because
+every kernel read costs about 70 ns on the lab.
+
+### 10.1 One program, two modes
+
+The FIM `file_open` observer (`fim_file_open_observe`) already computes the
+open's inode key and looks it up in `WATCHED_PATHS`. The sensor runs in
+the same program, after that lookup: `fim_file_open_sensor` is that
+observer plus the sensor, and userland attaches it in its place. If a
+kernel's verifier refuses it, the plain observer is attached and
+`sys_enter_openat` stays, so FIM never depends on the sensor. When
+userland arms `OPEN_SENSOR` (LSM mode, the default), `sys_enter_openat`
+is detached. With `--file-open-sensor tracepoint` (or
+`NN_FILE_OPEN_SENSOR=tracepoint` in the unit's environment), the old
+tracepoint is attached as before and the new checks stay off. This is
+Q6's switch, kept for one soak cycle.
+
+### 10.2 What makes an open interesting
+
+| class | rule source | which opens |
+|---|---|---|
+| sensitive file | `SENSITIVE_FILES` (`/etc/shadow`, …), by inode | any |
+| critical / persistence file | the file entries of `CRITICAL_FILES_PREFIXES` / `PERSISTENCE_PREFIXES` (`/etc/crontab`, `/root/.bashrc`, …), by inode | write |
+| critical / persistence tree | their directory entries (`/etc/pam.d/`, `/etc/systemd/system/`, `/root/.ssh/`, …), subtree | write |
+| telemetry probe | `/run/northnarrow/probe` (direct children) | any |
+| credential store (Q1, review 54) | names: `.aws/{credentials,config}`, `.docker/config.json`, `gcloud/{credentials.db,access_tokens.db,application_default_credentials.json}`, trees under `.azure`, `.gnupg`, `.password-store`, `gcloud/legacy_credentials`; in home trees also `Login Data`, `logins.json`, `key4.db`, `key3.db`, `signons.sqlite`, `*.kdbx` | any |
+| mass write (Q2) | per-tgid counter, 20 write-opens in 60 s | write |
+
+Rules come in three kinds, all keyed the way §4.1 and review 55 require
+(`(dev, ino)` as `stat()` reports it):
+
+- `OPEN_RULES[inode]`: a file's own class, or a directory's class bits
+  for its children or its whole subtree.
+- `CHILD_RULES[(parent inode, name)]`: the same, for a path that does not
+  exist yet when userland registers the rules (`/root/.ssh`, `/root/.bashrc`
+  on a fresh host). A directory created later is classified by name under
+  its registered parent.
+- `NAME_RULES[name]` (and `(name, parent name)`): the credential names,
+  which need no registration per home.
+
+Home trees are the registered home roots: `/root` and the home of every
+`/etc/passwd` account with a uid of 1000 or more.
+
+The posture's lists are path prefixes (`filename.starts_with(entry)`),
+while the kernel classifies by inode and directory. An entry that ends
+in `/` or names an existing directory is therefore a tree. Any other
+entry is that one file, so the lists spell out the directories a name
+prefix used to cover: `/etc/ssh/sshd_config` also matched sshd's
+drop-ins, and `/etc/ssh/sshd_config.d/` is now listed. The mass-write
+carve-outs have no file entries, so each one is a tree, with or without
+the final `/`. An entry the kernel cannot express (a carve-out naming a
+file, a file two missing levels down) is logged at start as skipped.
+
+### 10.3 Directory classification, cached
+
+`DIR_CLASS` is an LRU map, keyed by the parent directory's inode key, that
+holds `{class bits, owner uid, generation}`. An open does the following:
+
+1. reads its parent key and looks it up;
+2. on a hit with the current generation, uses the cached bits;
+3. otherwise walks at most 8 ancestors, combining `OPEN_RULES` subtree
+   bits, `CHILD_RULES` and the credential tree names, and caches the
+   result.
+
+The leaf name is read only when the bits say leaves matter: a
+credential-name parent, or a home tree for the browser and KeePass names.
+The generation (`DIR_CLASS_GEN[0]`) is bumped on every directory rename
+(the FIM rename observer already runs there) and by userland when the
+rules change. `rmdir` removes only the entry of the directory it deletes,
+whose inode number a new directory may reuse: a directory being removed
+is empty, so no other entry depends on it, and an `rm -rf` of a large
+tree does not empty the cache once per directory. A stale entry is
+therefore never used, at the price of re-walks after a rename. One case
+is left to the LRU: a filesystem mounted after another was unmounted can
+reuse its device number (anonymous devices are reused lowest first), and
+its directories then hit the old entries until they age out. The bits
+such an entry can carry come from name rules only, since every inode
+rule is a host path registered by userland; bumping the generation on
+every mount change would re-walk the whole cache at each container
+start.
+
+Mass-write carve-outs are part of the class:
+
+- filesystems by superblock magic: sysfs, procfs, cgroup and cgroup2,
+  bpffs, debugfs, tracefs, securityfs, configfs, pstore and efivarfs (the
+  old `/sys/` and `/proc/` prefixes);
+- the `/run/systemd` and `/run/log/journal` subtrees, and the operator's
+  `mass-write-carveout.local` entries;
+- the writer's own runtime directory. Each `/run/user/<uid>` mount root is
+  registered with its uid (re-read with the rules every 60 s) and
+  compared with the writer's `loginuid`.
+
+### 10.4 Records and events
+
+An interesting open emits one record. It carries:
+
+- pid, uid and comm;
+- `f_flags` and `f_mode`;
+- the `(dev, ino)` key and the class bits;
+- the mount root's key (the top of the walk);
+- the 16 × 32-byte mount-relative path.
+
+Userland maps the mount root key to a mount point: it stats every mount
+point listed in `/proc/self/mountinfo`, again on a miss and when the
+mount table changes. From that it rebuilds the absolute path, so every
+consumer keeps `Event::FileOpen { filename, flags, … }` as it is today.
+
+Credential-class opens are also given to the FIM rules as
+`FimEvent { op: Opened, path, wide_coverage: true }`, so NN-L-FIM-011..017
+now fire for every home. They report without acting (Q8).
+
+A mass-write crossing becomes `Event::MassWrite { pid, uid, comm, count,
+path }`. The posture's mass-write arm reads that event (lineage gates
+unchanged) instead of counting `FileOpen` events.
+
+### 10.5 Verification
+
+The gates of §7 apply, with Q7 for the overhead. On every guest, the lab
+adds:
+
+- the rename race of §9 against the production program;
+- an `io_uring` open of a credential file;
+- a non-owner reading `/home/<user>/.aws/credentials`;
+- `daemon-reload` and an install burst with zero ring drops;
+- the telemetry probe and `tamper-check` unchanged.
+
+### 10.6 Implementation status
+
+Implemented in lab PR 52:
+
+- **Kernel** (`agent-ebpf/src/open_sensor.rs`). `observe()` runs inside
+  `fim_file_open_sensor` and is armed by userland. Directory renames
+  invalidate the cache; `open_sensor_rmdir` drops the removed directory's
+  entry. The ancestor walk of a cache miss is a global BPF function
+  (`nn_open_walk`), which the verifier checks once on its own. Inlined,
+  it took the program past the 5.15 verifier's million-instruction
+  budget (KERNEL_COMPATIBILITY, 5.15 rule 6). `struct file` and the
+  inode are read in two bulk windows. If a window cannot be read, the
+  open still reaches FIM through the plain observer's field reads, and
+  only the sensor skips it.
+- **Userland** (`agent/src/sensors/open_sensor.rs`): the rule builder, the
+  mount table, record decoding and a rule refresh every 60 s.
+- **Events.** `Event::MassWrite` is new. In LSM mode the posture's
+  mass-write arm reads it, and the userland count is off.
+- **New offset slots.** `inode.i_mode`, and `task_struct.loginuid`
+  (optional).
+- **Switch.** `--file-open-sensor lsm|tracepoint` or
+  `NN_FILE_OPEN_SENSOR`. The agent stays on `sys_enter_openat` whenever the
+  FIM observer, the maps or the ring are unavailable. When it arms, it
+  retires the tracepoint's link in the BPF self-check before unloading it.
+
+`deploy/lab/nn-lab.sh open-sensor-check` covers end to end:
+
+- the sensor is armed and the tracepoint retired without a missing-link
+  report;
+- `~/.aws/credentials` of a user in `/home` gets NN-L-FIM-011 (Log), also
+  when opened through `io_uring`;
+- 25 write-opens give exactly one `MassWrite`;
+- a write under `/etc/cron.d` raises `PersistenceMechanism`;
+- a write under `/etc/ssh/sshd_config.d` raises
+  `CriticalFileModification`;
+- a write-open of `/etc/crontab` through a symlink with an innocuous
+  name raises `CriticalFileModification`. This is §7's "Phantom" gate in
+  deterministic form: the record names the file the kernel opened, while
+  `sys_enter_openat` read only the caller's string, and in tracepoint
+  mode the same case fails;
+- the telemetry probe never goes silent.
+
+The §7 gates, on Ubuntu 24.04 (6.8), Ubuntu 22.04 (5.15,
+`lockdown=integrity`) and Debian 12 (6.1):
+
+- all nine checks pass, and `tamper-check` is OK;
+- `pkgmgr-check` and the e2e suites (agent, FIM, watchdog) pass;
+- `ringbuf_drops_total` stays 0 across five `daemon-reload`s and a
+  package reinstall burst;
+- on 6.8, `pkg-check` and `release-check` (the CI tarball of this
+  change) also pass.
+
+AlmaLinux 9 (5.14) follows its soak. With the sensor refused (as on 5.15 before
+`nn_open_walk`), the same check shows the fallback: the plain observer
+and `sys_enter_openat`, with the cron and sshd cases still passing, and
+`tamper-check` still OK.
+
+#### Measured
+
+`nn-lab.sh overhead 3` in each mode, on Ubuntu 24.04 (6.8, 4 vCPU, nested
+virtualisation) and the same guest. The AlmaLinux 9 soak ran on the same
+host, so the table compares the two modes. It does not replace the
+official figures of §7.
+
+| workload | tracepoint mode (before) | LSM mode (step 1) |
+|---|---|---|
+| open | −31.9 %, agent CPU 1,290 ms | −28.2 %, agent CPU 0 ms |
+| write-open | −31.0 %, 400 ms | −30.3 %, 0 ms |
+| exec | −11.0 % | −8.7 % |
+| connect | −34.3 % | −35.4 % |
+
+Per operation, from the kernel's BPF statistics (`bpftool prog show`
+with `kernel.bpf_stats_enabled=1`, which itself adds a few ns per
+program):
+
+| program (hook) | open, LSM | open, tracepoint | write-open, LSM | write-open, tracepoint |
+|---|---|---|---|---|
+| FIM observer, with the sensor in LSM mode (`file_open`) | 517 ns | 294 ns | 661 ns | 308 ns |
+| `sys_enter_openat` | — | 342 ns | — | 199 ns |
+| FIM close emit (`file_free_security`) | 288 ns | 291 ns | 302 ns | 298 ns |
+| anti-tamper open deny (`file_open`) | 100 ns | 102 ns | 319 ns | 318 ns |
+| FIM write intent (`file_permission`) | 66 ns | 92 ns | 291 ns | 331 ns |
+
+What the numbers say:
+
+- **Read-only open.** The sensor adds 223 ns to the FIM observer. It
+  removes the tracepoint (342 ns) and the agent's work per open: 1.29 s
+  of CPU per 200,000 opens, about 6.4 µs each on another core.
+- **Write-open.** The sensor adds 353 ns, most of it the per-process
+  count, and removes 199 ns plus about 8 µs of agent CPU. The lookup of
+  the agent's own pids runs only when an open would emit.
+- **The rest of the loss** comes from hooks that step 1 does not touch,
+  plus about 100 ns of dispatch per attached LSM program (§9.1). These
+  are FIM's close and write-intent hooks (review 59) and the anti-tamper
+  open hook.
+
+Q7's proposed gate, halving the open loss, is therefore not met by step 1
+alone. The open loss falls by 3.7 points, and the agent's CPU per open
+goes to almost zero.

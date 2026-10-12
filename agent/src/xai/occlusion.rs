@@ -149,6 +149,9 @@ fn event_kind_label(e: &Event) -> String {
         Event::FileOpen { comm, filename, .. } => {
             format!("FileOpen comm={comm} file={filename}")
         }
+        Event::MassWrite { comm, count, .. } => {
+            format!("MassWrite comm={comm} count={count}")
+        }
         Event::ExecCheck { comm, filename, .. } => {
             format!("ExecCheck comm={comm} file={filename}")
         }
@@ -249,6 +252,28 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
             units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
             units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
             units.push(focal_unit(F::Gid, "gid", "focal gid".into(), Identifier));
+            units.push(focal_unit(
+                F::Timestamp,
+                "ts",
+                "focal timestamp".into(),
+                Temporal,
+            ));
+        }
+        Event::MassWrite { .. } => {
+            units.push(focal_unit(
+                F::Comm,
+                "comm",
+                "focal process comm".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(
+                F::Filename,
+                "filename",
+                "focal last written path".into(),
+                Semantic,
+            ));
+            units.push(focal_unit(F::Pid, "pid", "focal pid".into(), Identifier));
+            units.push(focal_unit(F::Uid, "uid", "focal uid".into(), Identifier));
             units.push(focal_unit(
                 F::Timestamp,
                 "ts",
@@ -656,6 +681,21 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Pid => *pid = 0,
             F::Uid => *uid = 0,
             F::Gid => *gid = 0,
+            F::Timestamp => *timestamp_ns = 0,
+            _ => {}
+        },
+        Event::MassWrite {
+            pid,
+            uid,
+            comm,
+            filename,
+            timestamp_ns,
+            ..
+        } => match field {
+            F::Comm => comm.clear(),
+            F::Filename => filename.clear(),
+            F::Pid => *pid = 0,
+            F::Uid => *uid = 0,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },

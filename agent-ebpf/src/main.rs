@@ -29,6 +29,7 @@ mod inode_dev;
 mod inode_protect;
 mod io_uring;
 mod module_load;
+mod open_sensor;
 mod ptrace_check;
 mod sensor_probe;
 mod task_kill;

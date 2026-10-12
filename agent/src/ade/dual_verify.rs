@@ -149,6 +149,7 @@ fn pid_of(e: &Event) -> u32 {
         Event::IoUring { pid, .. } | Event::BpfSyscall { pid, .. } => *pid,
         Event::ProcessSpawn { pid, .. }
         | Event::FileOpen { pid, .. }
+        | Event::MassWrite { pid, .. }
         | Event::ExecCheck { pid, .. }
         | Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }

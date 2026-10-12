@@ -241,7 +241,7 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             filename_for_pkg = filename.clone();
             category = classify_process(comm, filename);
         }
-        Event::FileOpen { pid, filename, .. } => {
+        Event::FileOpen { pid, filename, .. } | Event::MassWrite { pid, filename, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = filename.clone();
             category = MockCategory::Unknown;

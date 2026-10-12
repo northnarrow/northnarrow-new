@@ -46,6 +46,7 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
         }
         Event::ProcessSpawn { comm, filename, .. } => format!("process {comm} from {filename}"),
         Event::FileOpen { filename, .. } => format!("file open {filename}"),
+        Event::MassWrite { comm, count, .. } => format!("mass write by {comm} ({count} files)"),
         Event::ExecCheck { filename, .. } => format!("exec check {filename}"),
         Event::TcpConnect {
             comm,
@@ -324,6 +325,7 @@ mod tests {
             modifier_comm: "attacker".into(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         });
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("fim drift"));

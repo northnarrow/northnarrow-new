@@ -234,7 +234,7 @@ unsafe fn is_watched(key: &InodeKey) -> bool {
 /// generate spurious drift events. Every other root caller
 /// (including a malicious one) is observed normally.
 #[inline(always)]
-fn caller_is_in_family() -> bool {
+pub(crate) fn caller_is_in_family() -> bool {
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     unsafe { crate::task_kill::PROTECTED_PIDS.get(&caller_tgid).is_some() }
 }
@@ -245,7 +245,7 @@ fn caller_is_in_family() -> bool {
 /// established `is_watched(key)` and `!caller_is_in_family()`,
 /// so we're emitting an event we definitely want.
 #[inline(always)]
-fn emit_drift(op: u8, key: InodeKey) {
+pub(crate) fn emit_drift(op: u8, key: InodeKey) {
     emit_drift_with_dest(op, key, NO_DEST);
 }
 
@@ -382,9 +382,9 @@ unsafe fn should_emit(target: *const c_void) -> Option<InodeKey> {
 }
 
 /// Dereference a `*file` and return its `f_inode` pointer (the
-/// resolved target inode). Mirrors the read in
-/// [`try_fim_file_open_observe`]; factored out for the BUG-023
-/// write-intent + close hooks. `None` on null / probe failure.
+/// resolved target inode), for the plain `file_open` observer
+/// ([`observe_open_plain`]) and the BUG-023 write-intent + close
+/// hooks. `None` on null / probe failure.
 #[inline(always)]
 unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
     if file.is_null() {
@@ -545,6 +545,11 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     let new_dir: *const c_void = ctx.arg(2);
     let new_dir_key = inode_key(new_dir).unwrap_or(NO_DEST);
     let old_inode_opt = inode_from_dentry(old_dentry);
+    // Tappa 10.9 step 1: a moved directory invalidates the file-open
+    // sensor's directory-class cache.
+    if let Some(moved) = old_inode_opt {
+        crate::open_sensor::on_rename(moved as *const u8);
+    }
     let mut combined_emitted_for_old_inode = false;
     if let Some(old_inode) = old_inode_opt {
         if let Some(key) = should_emit(old_inode) {
@@ -630,25 +635,43 @@ unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
 /// constant remains checked in for future read/write-tier rules.
 #[lsm(hook = "file_open")]
 pub fn fim_file_open_observe(ctx: LsmContext) -> i32 {
-    unsafe { try_fim_file_open_observe(&ctx) }
+    unsafe { try_fim_file_open(&ctx) }
+}
+
+/// Tappa 10.9 step 1: the same observer plus the file-open sensor
+/// (`crate::open_sensor`). Userland attaches this variant instead of
+/// [`fim_file_open_observe`] when the LSM file-open sensor is wanted. If a
+/// kernel's verifier refuses it, the plain observer is attached and
+/// `sys_enter_openat` stays: FIM never depends on the sensor loading.
+#[lsm(hook = "file_open")]
+pub fn fim_file_open_sensor(ctx: LsmContext) -> i32 {
+    unsafe {
+        let file: *const c_void = ctx.arg(0);
+        if !file.is_null() {
+            crate::open_sensor::on_open(file as *const u8);
+        }
+    }
+    0
 }
 
 #[inline(always)]
-unsafe fn try_fim_file_open_observe(ctx: &LsmContext) -> i32 {
+unsafe fn try_fim_file_open(ctx: &LsmContext) -> i32 {
     // Kernel signature: (file).
-    let file: *const c_void = ctx.arg(0);
-    if file.is_null() {
-        return 0;
-    }
-    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
-    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-    if let Some(key) = should_emit(inode) {
-        emit_drift(FIM_OP_OPENED, key);
-    }
+    let file: *const u8 = ctx.arg(0);
+    observe_open_plain(file);
     0
+}
+
+/// The plain observer's work on `file`: its inode key, the watch lookup
+/// and the drift event, each field read on its own. The sensor variant
+/// falls back to it when it cannot read its windows.
+#[inline(always)]
+pub(crate) unsafe fn observe_open_plain(file: *const u8) {
+    if let Some(inode) = inode_from_file(file as *const c_void) {
+        if let Some(key) = should_emit(inode) {
+            emit_drift(FIM_OP_OPENED, key);
+        }
+    }
 }
 
 /// `file_permission` (BUG-023 write-intent) — fires on every file

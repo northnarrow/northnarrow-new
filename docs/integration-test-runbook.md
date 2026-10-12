@@ -228,6 +228,32 @@ adds a cost-per-open table (§9.1): open + close of an unwatched file
 with no program, an LSM program that returns at once, the open's key plus
 one lookup, the step 1 fast path, and the full observer.
 
+### File-open sensor (Tappa 10.9 step 1)
+
+```
+deploy/lab/nn-lab.sh open-sensor-check   # after sync + install
+```
+
+Checks the default (LSM) mode end to end on the running agent:
+
+- the sensor is armed and `sys_enter_openat` retired, with no
+  missing-link report from the BPF self-check;
+- `~/.aws/credentials` of the lab user, read by root's `cat` and through
+  `io_uring`, gives NN-L-FIM-011 with the Log action (design Q8);
+- 25 write-opens give exactly one `MassWrite`;
+- a write under `/etc/cron.d` from the `observing` posture raises
+  `PersistenceMechanism`;
+- a write under `/etc/ssh/sshd_config.d` raises
+  `CriticalFileModification` (the posture list is a path prefix, and the
+  kernel classifies by directory);
+- a write-open of `/etc/crontab` through a symlink raises
+  `CriticalFileModification`: the record names the file the kernel
+  opened, not the caller's path (in tracepoint mode this case fails);
+- the telemetry probe never went silent.
+
+Put a unit drop-in with `Environment=NN_FILE_OPEN_SENSOR=tracepoint` to
+compare with the old sensor, for example under `nn-lab.sh overhead`.
+
 ### btrfs inode keys (review 55)
 
 ```

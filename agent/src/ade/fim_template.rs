@@ -488,6 +488,7 @@ mod tests {
             modifier_comm: "ransomware".to_string(),
             dest_path: dest.map(String::from),
             child_truncated: false,
+            wide_coverage: false,
         }
     }
 

@@ -62,7 +62,14 @@ pub const FIM_OBSERVE_PROGRAMS: &[(&str, &str)] = &[
     ("fim_file_open_observe", "file_open"),
     ("fim_write_intent_observe", "file_permission"),
     ("fim_close_emit_observe", "file_free_security"),
+    // Tappa 10.9 step 1: invalidates the file-open sensor's directory
+    // cache (agent-ebpf/src/open_sensor.rs); idle until the sensor is armed.
+    ("open_sensor_rmdir", "inode_rmdir"),
 ];
+
+/// The `file_open` observer variant that also runs the Tappa 10.9 file-open
+/// sensor (`agent-ebpf/src/fim_watch.rs`).
+pub const OPEN_SENSOR_PROGRAM: &str = "fim_file_open_sensor";
 
 /// BPF map name for the pinned `WATCHED_PATHS` HashMap. Matches
 /// the `agent-ebpf/src/fim_watch.rs::WATCHED_PATHS` static.
@@ -124,16 +131,40 @@ fn chain_tail(e: &anyhow::Error) -> String {
 /// disabled but the agent still runs (paths watched but no
 /// kernel events to drain). Mirrors the
 /// `anti_tamper::attach`'s degrade-not-fail posture.
-pub fn attach_observe_programs(ebpf: &mut Ebpf, btf: &Btf) -> Result<usize> {
-    let mut attached = 0usize;
+pub fn attach_observe_programs(
+    ebpf: &mut Ebpf,
+    btf: &Btf,
+    open_sensor: bool,
+) -> Result<Vec<&'static str>> {
+    let mut attached = Vec::new();
     for (program, hook) in FIM_OBSERVE_PROGRAMS {
+        // Tappa 10.9 step 1: the file_open observer with the file-open
+        // sensor, when wanted; the plain observer if the verifier refuses
+        // it, so FIM never depends on the sensor.
+        if open_sensor && *program == "fim_file_open_observe" {
+            match attach_transient(ebpf, OPEN_SENSOR_PROGRAM, hook, btf) {
+                Ok(()) => {
+                    info!(
+                        program = OPEN_SENSOR_PROGRAM,
+                        hook, "fim: file_open observer with the file-open sensor attached"
+                    );
+                    attached.push(OPEN_SENSOR_PROGRAM);
+                    continue;
+                }
+                Err(e) => warn!(
+                    error = %chain_tail(&e),
+                    "fim: the file_open observer with the file-open sensor was refused — \
+                     attaching the plain observer (the agent stays on sys_enter_openat)"
+                ),
+            }
+        }
         match attach_transient(ebpf, program, hook, btf) {
             Ok(()) => {
                 info!(
                     program,
                     hook, "fim: LSM observe program attached (transient — re-attaches on restart)"
                 );
-                attached += 1;
+                attached.push(*program);
             }
             Err(e) => {
                 warn!(
@@ -146,7 +177,7 @@ pub fn attach_observe_programs(ebpf: &mut Ebpf, btf: &Btf) -> Result<usize> {
         }
     }
     info!(
-        attached,
+        attached = attached.len(),
         total = FIM_OBSERVE_PROGRAMS.len(),
         "fim: LSM observe-program attach complete"
     );
@@ -440,6 +471,7 @@ mod tests {
             ("fim_file_open_observe", "file_open"),
             ("fim_write_intent_observe", "file_permission"),
             ("fim_close_emit_observe", "file_free_security"),
+            ("open_sensor_rmdir", "inode_rmdir"),
         ];
         assert_eq!(FIM_OBSERVE_PROGRAMS, expected);
     }
