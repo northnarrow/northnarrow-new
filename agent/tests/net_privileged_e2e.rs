@@ -82,6 +82,10 @@ const LISTENER_PORT: u16 = 41999;
 /// burst. Nothing listens there; the datagrams are dropped locally
 /// and ICMP-unreachable is irrelevant for the kprobe.
 const UDP_SENDTO_PORT: u16 = 34999;
+/// Review 68: the IPv6 datagram's destination port, and the port of the
+/// IPv4-mapped one sent from the same IPv6 socket. Nothing listens.
+const UDP6_SENDTO_PORT: u16 = 35997;
+const UDP6_MAPPED_PORT: u16 = 35998;
 
 fn agent_bin() -> &'static str {
     env!("CARGO_BIN_EXE_northnarrow-agent")
@@ -761,5 +765,70 @@ s.close()
     assert!(
         (1..=3).contains(&ours),
         "unconnected sendto burst of 40 must be rate-limited to ~1 row/s per (pid, dst); got {ours} rows"
+    );
+}
+
+/// Review 68: the N2 UDP program was attached to `udp_sendmsg` only, so a
+/// datagram to an IPv6 destination left no flow row. It is now attached to
+/// `udpv6_sendmsg` too. An IPv4-mapped destination, which `udpv6_sendmsg`
+/// hands to `udp_sendmsg`, must still give exactly one row.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_ipv6_udp_sendto_records_one_flow() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+
+    let helper = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+for dst in (("::1", {p6}), ("::ffff:127.0.0.1", {pm})):
+    try:
+        s.sendto(b"nn-udp-v6 " * 4, dst)
+    except Exception:
+        pass
+s.close()
+"#,
+        p6 = UDP6_SENDTO_PORT,
+        pm = UDP6_MAPPED_PORT,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn python3 helper for the IPv6 UDP flow test");
+    assert!(
+        status.success(),
+        "python3 helper exited non-zero: {status:?}"
+    );
+
+    let v6 = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(17)
+            && r["dst_port"].as_u64() == Some(UDP6_SENDTO_PORT as u64)
+            && r["dst_addr"].as_str() == Some("::1")
+    };
+    let rows = fx.wait_netflow_matching(1, v6);
+    assert!(
+        rows[0]["comm"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("python")),
+        "comm must be the python helper; got {:?}",
+        rows[0]["comm"]
+    );
+
+    let mapped = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(17) && r["dst_port"].as_u64() == Some(UDP6_MAPPED_PORT as u64)
+    };
+    fx.wait_netflow_matching(1, mapped);
+    std::thread::sleep(Duration::from_secs(2));
+    let n = read_jsonl(&fx.netflow_log)
+        .into_iter()
+        .filter(mapped)
+        .count();
+    assert_eq!(
+        n, 1,
+        "an IPv4-mapped destination must give one row (udp_sendmsg), not one per hook"
     );
 }

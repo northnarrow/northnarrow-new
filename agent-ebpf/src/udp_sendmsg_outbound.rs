@@ -1,7 +1,9 @@
 //! Tappa 10 (N2) — outbound UDP flow observation kprobe.
 //!
 //! Hooked at the entry of `udp_sendmsg(struct sock *sk, struct
-//! msghdr *msg, size_t len)`. Fires on every UDP send. Emits a
+//! msghdr *msg, size_t len)`, and of `udpv6_sendmsg` (same signature;
+//! review 68: IPv6 destinations left no flow row before). Fires on every
+//! UDP send. Emits a
 //! [`NetFlowCloseRaw`] (proto=IPPROTO_UDP) into the shared
 //! [`crate::tcp_close::NET_FLOW_CLOSE_EVENTS`] ringbuf — design
 //! §13 Q3 LOCK-IN: UDP "flow close" is conceptually equivalent
@@ -100,12 +102,35 @@ struct Dst {
 
 #[kprobe]
 pub fn udp_sendmsg_outbound(ctx: ProbeContext) -> u32 {
-    let _ = try_udp_sendmsg_outbound(&ctx);
+    let _ = try_udp_sendmsg_outbound(&ctx, false);
     0
 }
 
+/// Review 68: the same program on `udpv6_sendmsg` (same signature), so a
+/// datagram to an IPv6 destination gives a flow row too. An IPv4-mapped
+/// destination (`::ffff:a.b.c.d`) is skipped here: `udpv6_sendmsg` hands
+/// it to `udp_sendmsg`, where [`udp_sendmsg_outbound`] records it once.
+#[kprobe]
+pub fn udpv6_sendmsg_outbound(ctx: ProbeContext) -> u32 {
+    let _ = try_udp_sendmsg_outbound(&ctx, true);
+    0
+}
+
+/// `::ffff:0:0/96`, an IPv4 address carried in an IPv6 one.
 #[inline(always)]
-fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
+fn v4_mapped(addr: &[u8; ADDR_LEN]) -> bool {
+    let mut i = 0usize;
+    while i < 10 {
+        if addr[i] != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    addr[10] == 0xff && addr[11] == 0xff
+}
+
+#[inline(always)]
+fn try_udp_sendmsg_outbound(ctx: &ProbeContext, v6: bool) -> Result<(), i64> {
     let sk_ptr: *const u8 = match ctx.arg(0) {
         Some(p) => p,
         None => return Ok(()),
@@ -191,6 +216,10 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext) -> Result<(), i64> {
     // Filter DNS to dst port 53 — the existing dns_query kprobe
     // owns those events (connected AND unconnected shapes).
     if dst.port_host == DNS_DST_PORT {
+        return Ok(());
+    }
+    // Review 68: `udp_sendmsg` records the IPv4-mapped destinations.
+    if v6 && dst.family == AF_INET6 && v4_mapped(&dst.addr) {
         return Ok(());
     }
 

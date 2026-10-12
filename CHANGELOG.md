@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- UDP datagrams to IPv6 destinations left no flow row (review 68, High).
+  The N2 UDP program was attached to `udp_sendmsg` only, so a QUIC-like
+  beacon or raw-UDP exfiltration over IPv6 was invisible to the flow
+  rules. It is now attached to `udpv6_sendmsg` too. An IPv4-mapped
+  destination still gives one row, not two.
 - DNS tunnelling could escape NET-004/-005/-014 (reviews 66, 67, High).
   The DNS sensor read the query name from user memory before the kernel
   copied it, and saw IPv4 only. On the lab, a tunnelling-shaped name ran
