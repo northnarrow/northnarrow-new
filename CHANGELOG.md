@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The TCP close sensor sent a record for every passive socket (listeners,
+  accepted peers) that the agent then dropped, so inbound connections
+  could fill the ring the outbound flow closes need; and a close lost to a
+  full ring left a stale entry that misattributed a later socket's close
+  (review 79, part). Only sockets the connect sensor recorded are reported
+  now. Still open: a loop of outbound connects can still overflow the flow
+  rings (design pending).
 - Detections held back by the per-rule budget (review 75) were reported
   only as a count, so a flood of one rule could hide which file another
   detection of that rule was about. The held report (journal and signed
