@@ -69,6 +69,12 @@ impl CorrelationBuffer {
         self.inner.capacity
     }
 
+    /// Run `f` over the buffered events, borrowed under the read lock
+    /// (review 72: `snapshot` cloned up to 1,000 events per event).
+    pub fn with_recent<R>(&self, f: impl FnOnce(&VecDeque<Event>) -> R) -> R {
+        f(&self.inner.queue.read())
+    }
+
     /// Snapshot of all currently buffered events (cloned).
     pub fn snapshot(&self) -> Vec<Event> {
         self.inner.queue.read().iter().cloned().collect()

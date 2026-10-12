@@ -255,7 +255,11 @@ cmd_build() {
     # the guest has ~7 GiB, so default to thin here (NN_LAB_LTO=fat to
     # mirror production exactly on a bigger guest).
     local lto=${NN_LAB_LTO:-thin}
-    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
+    # NN_LAB_CARGO_ENV: extra variables for this build, e.g. a profiling
+    # build with symbols ('CARGO_PROFILE_RELEASE_STRIP=none
+    # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only'); perf can then name the
+    # agent's functions (the release profile strips them).
+    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 # Purge the pin root on the guest the way an operator must now do it (review

@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An unprivileged shell loop could blind the exec rules (review 72, High).
+  For every event, the agent cloned its ring of up to 1,000 recent events to
+  hand the posture triggers a slice. Under an exec burst (four `cat` loops,
+  about 2,000 execs/s) that was a full CPU on Ubuntu 24.04. On Ubuntu 22.04
+  and Debian 12 the exec rings overflowed, so the execs in the burst,
+  including a hidden payload, reached no rule. The triggers now read the
+  ring in place: the agent's CPU per exec drops from about 520 µs to 80 µs.
 - A credential theft could be reported only as a `/tmp` C2 connection
   (review 70). CHAIN-007 (`/tmp` exec → credential read → egress) and
   CHAIN-001 checked their precursors only when the egress arrived. A

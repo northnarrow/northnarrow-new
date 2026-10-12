@@ -294,10 +294,10 @@ impl PostureMachine {
     ///
     /// `recent_events` should be the correlated context the agent
     /// already maintains (the same slice that ADE consumes).
-    pub fn observe(
+    pub fn observe<'a>(
         &self,
         event: &Event,
-        recent_events: &[Event],
+        recent_events: impl Into<triggers::Recent<'a>>,
     ) -> Option<(PostureState, Option<TriggerType>)> {
         let now = Instant::now();
         let hits = self.inner.triggers.detect(event, recent_events);

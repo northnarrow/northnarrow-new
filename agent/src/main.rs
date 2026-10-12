@@ -2950,8 +2950,12 @@ async fn process_event(
     // correlation buffer — the trigger detector counts the focal as
     // a fresh +1 on top of `recent`, and `recent` already containing
     // the focal would double-count it.
-    let recent_for_posture = correlation.snapshot();
-    if let Some((new_state, firing_trigger)) = posture.observe(&event, &recent_for_posture) {
+    // Review 72: borrowed under the buffer's read lock, not cloned (up to
+    // 1,000 events, for every event, was most of the agent's CPU under an
+    // exec burst). Nothing pushes to the buffer until this returns.
+    if let Some((new_state, firing_trigger)) =
+        correlation.with_recent(|recent| posture.observe(&event, recent))
+    {
         // BUG-015 observability: include the firing TriggerType so
         // operators can see in the journal what caused a transition.
         // `firing_trigger` is `Some` for any upward crossing and `None`
