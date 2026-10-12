@@ -469,12 +469,43 @@ impl AuthSessionTracker {
         self.loginuid_of(self.nearest_running(pid)?)
     }
 
-    /// Review 52: [`Self::is_interactive_admin`], or `None` while nothing
-    /// can be said: `pid` has exited and its exec event has not reached
-    /// the spawn cache yet.
+    /// Review 52: [`Self::is_interactive_admin`] for the posture's
+    /// corroboration ledger, or `None` while it cannot be told. That is
+    /// the case when the lineage walk loses the chain before it ends (a
+    /// process that is exiting and whose `exe` is gone, or a parent that
+    /// has exited with no exec event in the cache: sudo's monitor is a
+    /// fork without exec), or when sudo/su is found but nothing of the
+    /// session runs any more to show a login uid and a terminal.
     pub fn interactive_admin_status(&self, pid: u32) -> Option<bool> {
-        let placed = self.lookup_cache(pid).is_some() || self.is_running(pid);
-        placed.then(|| self.is_interactive_admin(pid))
+        if !self.lineage_exe_matches_known(pid, is_elevation_binary)? {
+            return Some(false);
+        }
+        let live = self.nearest_running(pid)?;
+        Some(self.has_valid_loginuid(live) && self.has_controlling_tty(live))
+    }
+
+    /// [`Self::lineage_exe_matches`], but `None` when a hop can be read
+    /// neither from the spawn cache nor from `/proc` before the walk ends.
+    fn lineage_exe_matches_known(
+        &self,
+        pid: u32,
+        is_match: impl Fn(&Path) -> bool,
+    ) -> Option<bool> {
+        if pid == 0 || pid == 1 {
+            return Some(false);
+        }
+        let mut cur = pid;
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            let (ppid, exe) = self.lookup_cache(cur).or_else(|| self.lookup_proc(cur))?;
+            if is_match(&exe) {
+                return Some(true);
+            }
+            if ppid == 0 || ppid == 1 || ppid == cur {
+                return Some(false);
+            }
+            cur = ppid;
+        }
+        Some(false)
     }
 
     /// `/proc/<pid>` exists and is not a zombie. A zombie (`Z`: exited, not
@@ -1331,6 +1362,30 @@ mod tests {
         write_loginuid(tmp.path(), 200, 1000);
         write_stat(tmp.path(), 200, 100, 0);
         assert!(!t.is_interactive_admin(200));
+    }
+
+    /// The ledger's view: unknown while a hop of the chain is lost (sudo's
+    /// monitor, a fork without exec, has exited) or nothing of the session
+    /// runs; known once the chain reads to its end.
+    #[test]
+    fn interactive_admin_status_is_unknown_until_the_chain_reads() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
+        t.ingest_spawn(100, 50, "/usr/bin/sudo", 2);
+        // tee (300) ran under sudo's monitor (200), never exec'd, gone.
+        t.ingest_spawn(300, 200, "/usr/bin/tee", 3);
+        assert_eq!(t.interactive_admin_status(300), None, "monitor lost");
+        // sudo → tee directly, but nothing of the session runs any more.
+        t.ingest_spawn(400, 100, "/usr/bin/tee", 4);
+        assert_eq!(t.interactive_admin_status(400), None, "session gone");
+        // The shell still runs with a terminal and a login uid.
+        write_loginuid(tmp.path(), 50, 1000);
+        write_stat(tmp.path(), 50, 40, 34816);
+        assert_eq!(t.interactive_admin_status(400), Some(true));
+        // A chain that reads to PID 1 with no sudo is known: not an admin.
+        t.ingest_spawn(500, 1, "/usr/bin/sh", 5);
+        assert_eq!(t.interactive_admin_status(500), Some(false));
     }
 
     /// Login daemons and job runners authenticate, they do not elevate: a
