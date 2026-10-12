@@ -74,7 +74,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::decision::correlation::{
-    CorrelationStore, PrecursorKind, ProcKey, CORRELATION_WINDOW_NS,
+    CorrelationStore, EgressNote, PrecursorKind, ProcKey, CORRELATION_WINDOW_NS,
 };
 use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
@@ -90,6 +90,31 @@ fn chain_verdict(rule: &dyn Rule, nf: &common::wire::NetFlowEvent, reasoning: &s
         Severity::Critical,
         reasoning,
     )
+}
+
+/// Review 70: the verdict of a chain completed by a precursor processed
+/// after the egress it preceded; it names the egress, as the in-order
+/// verdict does.
+fn late_chain_verdict(rule: &dyn Rule, egress: &EgressNote, reasoning: &str) -> Verdict {
+    Verdict {
+        rule_id: rule.id().to_string(),
+        rule_name: rule.name().to_string(),
+        category: rule.category().to_string(),
+        action: ResponseAction::KillProcessTree,
+        severity: Severity::Critical,
+        reasoning: reasoning.to_string(),
+        event_pid: egress.pid,
+        event_filename: egress.comm.clone(),
+        timestamp_ns: egress.start_ns,
+    }
+}
+
+fn egress_note(nf: &common::wire::NetFlowEvent) -> EgressNote {
+    EgressNote {
+        pid: nf.pid,
+        comm: nf.comm.clone(),
+        start_ns: nf.start_ns,
+    }
 }
 
 /// Chain Verdict with an explicit action and severity (the
@@ -165,16 +190,29 @@ impl Rule for NnLChain001CredReadThenEgress {
         match event {
             // Precursor: record + fall through (FIM-015/016/017 fires).
             Event::Fim(fe) if is_credential_store_access(fe) => {
-                self.buf.lock().record_for_pid(
-                    fe.modifier_pid,
-                    PrecursorKind::CredRead,
+                let mut store = self.buf.lock();
+                store.record_for_pid(fe.modifier_pid, PrecursorKind::CredRead, fe.timestamp_ns);
+                // Review 70: the read happened before an egress of the same
+                // process that was processed first (another ring).
+                let egress = store.take_egress_after(
+                    ProcKey::unresolved(fe.modifier_pid),
                     fe.timestamp_ns,
-                );
-                None
+                    CORRELATION_WINDOW_NS,
+                )?;
+                Some(late_chain_verdict(
+                    self,
+                    &egress,
+                    "Process accessed a credential store and then opened an \
+                     outbound flow within the correlation window (the read was \
+                     processed after the flow, in kernel order before it) — \
+                     credential exfiltration (T1555 → T1041); kill the process \
+                     tree + posture → COMBAT",
+                ))
             }
             // Trigger: same-PID egress after a recorded cred access.
             Event::NetFlow(nf) => {
-                if !self.buf.lock().has_recent_for_pid(
+                let mut store = self.buf.lock();
+                if !store.has_recent_for_pid(
                     nf.pid,
                     PrecursorKind::CredRead,
                     nf.start_ns,
@@ -182,6 +220,8 @@ impl Rule for NnLChain001CredReadThenEgress {
                 ) {
                     return None;
                 }
+                // Review 70: completed in order; no late read may reuse it.
+                store.claim_egress(ProcKey::unresolved(nf.pid), nf.start_ns);
                 Some(chain_verdict(
                     self,
                     nf,
@@ -537,25 +577,60 @@ impl Rule for NnLChain007TmpCredExfilSequence {
         "chain_exfiltration"
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::NetFlow(nf) = event else {
-            return None;
-        };
-        if !self.buf.lock().has_sequence(
-            ProcKey::unresolved(nf.pid),
-            &[PrecursorKind::TmpExec, PrecursorKind::CredRead],
-            nf.start_ns,
-            CORRELATION_WINDOW_NS,
-        ) {
-            return None;
+        match event {
+            Event::NetFlow(nf) => {
+                let key = ProcKey::unresolved(nf.pid);
+                let mut store = self.buf.lock();
+                if !store.has_sequence(
+                    key,
+                    &[PrecursorKind::TmpExec, PrecursorKind::CredRead],
+                    nf.start_ns,
+                    CORRELATION_WINDOW_NS,
+                ) {
+                    // Review 70: this rule sees every flow first; keep it
+                    // for a credential read processed after it.
+                    store.note_egress(key, egress_note(nf));
+                    return None;
+                }
+                Some(chain_verdict(
+                    self,
+                    nf,
+                    "Process executed from /tmp/, then read a credential store, \
+                     then opened an outbound flow — three-step dropper → \
+                     credential-access → exfil chain (T1059 → T1555 → T1041); \
+                     kill the process tree + posture → COMBAT",
+                ))
+            }
+            // Review 70: the credential read of the chain was processed after
+            // the egress (the open sensor's or FIM's ring, behind the
+            // network drain), though it happened before it. Recorded here
+            // too: this verdict ends the rule pass before CHAIN-001 runs.
+            Event::Fim(fe) if is_credential_store_access(fe) => {
+                let key = ProcKey::unresolved(fe.modifier_pid);
+                let mut store = self.buf.lock();
+                if !store.has_recent(
+                    key,
+                    PrecursorKind::TmpExec,
+                    fe.timestamp_ns,
+                    CORRELATION_WINDOW_NS,
+                ) {
+                    return None;
+                }
+                let egress =
+                    store.take_egress_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
+                store.record(key, PrecursorKind::CredRead, fe.timestamp_ns);
+                Some(late_chain_verdict(
+                    self,
+                    &egress,
+                    "Process executed from /tmp/, then read a credential store, \
+                     then opened an outbound flow (the read was processed after \
+                     the flow, in kernel order before it) — three-step dropper → \
+                     credential-access → exfil chain (T1059 → T1555 → T1041); \
+                     kill the process tree + posture → COMBAT",
+                ))
+            }
+            _ => None,
         }
-        Some(chain_verdict(
-            self,
-            nf,
-            "Process executed from /tmp/, then read a credential store, \
-             then opened an outbound flow — three-step dropper → \
-             credential-access → exfil chain (T1059 → T1555 → T1041); \
-             kill the process tree + posture → COMBAT",
-        ))
     }
 }
 
@@ -1129,6 +1204,82 @@ mod tests {
         let fired = fire_ids(&rules, &flow(42, 443, 11 * SEC));
         assert!(!fired.contains(&"NN-L-CHAIN-007_TmpCredExfilSequence".to_string()));
         assert!(fired.contains(&"NN-L-CHAIN-001_CredReadThenEgress".to_string()));
+    }
+
+    const C007: &str = "NN-L-CHAIN-007_TmpCredExfilSequence";
+    const C001: &str = "NN-L-CHAIN-001_CredReadThenEgress";
+    const C002: &str = "NN-L-CHAIN-002_TmpExecThenEgress";
+
+    /// The verdict the engine keeps for `event`: the first rule that fires.
+    fn first_verdict(rules: &[Box<dyn Rule>], event: &Event) -> Option<Verdict> {
+        rules.iter().find_map(|r| r.evaluate(event))
+    }
+
+    /// Review 70: the credential read went through the open sensor's ring
+    /// and was processed after the egress it preceded (lab, Ubuntu 22.04:
+    /// CHAIN-002 fired and CHAIN-007 never did). The read now completes
+    /// CHAIN-007, naming the egress, and only once.
+    #[test]
+    fn chain007_completes_when_the_read_is_processed_after_the_egress() {
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_spawn(42, 10 * SEC));
+        let on_flow = first_verdict(&rules, &flow(42, 443, 12 * SEC)).expect("CHAIN-002");
+        assert_eq!(on_flow.rule_id, C002);
+        let on_read = first_verdict(&rules, &cred_fim(42, 11 * SEC)).expect("late CHAIN-007");
+        assert_eq!(on_read.rule_id, C007);
+        assert_eq!(
+            (on_read.event_pid, on_read.timestamp_ns),
+            (42, 12 * SEC),
+            "the verdict names the egress"
+        );
+        assert_eq!(on_read.action, ResponseAction::KillProcessTree);
+        let again = fire_ids(&rules, &cred_fim(42, 11 * SEC + 5));
+        assert!(
+            !again.iter().any(|id| id == C007 || id == C001),
+            "{again:?}"
+        );
+    }
+
+    /// Review 70 without the `/tmp` exec: the late read completes CHAIN-001.
+    #[test]
+    fn chain001_completes_when_the_read_is_processed_after_the_egress() {
+        let rules = chain_rules();
+        assert!(first_verdict(&rules, &flow(42, 443, 12 * SEC)).is_none());
+        let on_read = first_verdict(&rules, &cred_fim(42, 11 * SEC)).expect("late CHAIN-001");
+        assert_eq!(on_read.rule_id, C001);
+        assert_eq!(on_read.timestamp_ns, 12 * SEC);
+    }
+
+    /// An egress a chain completed in order is claimed: a read that also
+    /// preceded it but is processed later completes nothing more.
+    #[test]
+    fn an_egress_completed_in_order_is_not_completed_again() {
+        let rules = chain_rules();
+        fire_ids(&rules, &cred_fim(42, 10 * SEC));
+        assert_eq!(
+            first_verdict(&rules, &flow(42, 443, 12 * SEC)).map(|v| v.rule_id),
+            Some(C001.to_string())
+        );
+        let late = fire_ids(&rules, &cred_fim(42, 11 * SEC));
+        assert!(!late.iter().any(|id| id == C007 || id == C001), "{late:?}");
+    }
+
+    /// A read that happened after the egress (kernel time) completes no
+    /// chain with it; nor does another process's read.
+    #[test]
+    fn a_read_after_the_egress_or_by_another_process_completes_nothing() {
+        let rules = chain_rules();
+        fire_ids(&rules, &flow(42, 443, 12 * SEC));
+        let after = fire_ids(&rules, &cred_fim(42, 13 * SEC));
+        assert!(
+            !after.iter().any(|id| id == C007 || id == C001),
+            "{after:?}"
+        );
+        let other = fire_ids(&rules, &cred_fim(43, 11 * SEC));
+        assert!(
+            !other.iter().any(|id| id == C007 || id == C001),
+            "{other:?}"
+        );
     }
 
     #[test]

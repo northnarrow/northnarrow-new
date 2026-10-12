@@ -13,4 +13,4 @@ pub mod ancestry;
 pub mod store;
 
 pub use ancestry::AncestryTree;
-pub use store::{CorrelationStore, PrecursorKind, ProcKey, CORRELATION_WINDOW_NS};
+pub use store::{CorrelationStore, EgressNote, PrecursorKind, ProcKey, CORRELATION_WINDOW_NS};
