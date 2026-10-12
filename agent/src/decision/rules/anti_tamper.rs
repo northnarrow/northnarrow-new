@@ -54,6 +54,12 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::BpfLink => {
                 format!("handle to the agent's BPF link (id {target_ino}, 0 = through the pin)")
             }
+            // Review 82: a loaded image lets root reboot at once into a
+            // kernel without the agent.
+            FsProtectOperation::Kexec => "to load a kexec kernel image (kexec -l / -p / \
+                 systemctl kexec) outside the trusted-installer window: a loaded image \
+                 boots a kernel without the agent"
+                .to_string(),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -86,6 +92,22 @@ mod tests {
         }
     }
 
+    /// Review 82: the kexec wire byte decodes to `Kexec`, and an unknown
+    /// byte stays unknown (a missing import once turned the arm into a
+    /// catch-all binding).
+    #[test]
+    fn kexec_wire_byte_decodes_and_unknown_stays_unknown() {
+        use common::wire::FS_OP_KEXEC;
+        assert_eq!(
+            FsProtectOperation::from_wire(FS_OP_KEXEC),
+            FsProtectOperation::Kexec
+        );
+        assert_eq!(
+            FsProtectOperation::from_wire(200),
+            FsProtectOperation::Unknown(200)
+        );
+    }
+
     #[test]
     fn every_denial_kind_is_a_high_log_verdict() {
         for op in [
@@ -94,6 +116,7 @@ mod tests {
             FsProtectOperation::Unlink,
             FsProtectOperation::BpfMap,
             FsProtectOperation::BpfLink,
+            FsProtectOperation::Kexec,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))

@@ -207,9 +207,10 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C30,"* ]]; then
     echo "C30 PROTECTED_INODES across an agent restart → $n1 → $n2 entries; $v" >&2
 fi
 # Kernel lockdown (integrity or confidentiality) is the host setting that
-# closes kexec and unsigned modules; without it they are known gaps, with it
-# a missing refusal is a deviation. The agent itself runs unchanged under
-# lockdown=integrity (verified on Ubuntu 22.04 / 5.15).
+# closes unsigned modules; without it that is a known gap, with it a missing
+# refusal is a deviation. The agent itself runs unchanged under
+# lockdown=integrity (verified on Ubuntu 22.04 / 5.15). kexec is refused by
+# the agent itself since review 82, lockdown or not.
 LOCKDOWN=$(grep -o '\[[a-z]*\]' /sys/kernel/security/lockdown 2>/dev/null | tr -d '[]')
 KGAP=1
 [[ "$LOCKDOWN" == integrity || "$LOCKDOWN" == confidentiality ]] && KGAP=0
@@ -218,7 +219,7 @@ KGAP=1
 KINITRD=/boot/initrd.img-$(uname -r)
 [[ -f $KINITRD ]] || KINITRD=/boot/initramfs-$(uname -r).img
 if command -v kexec >/dev/null 2>&1; then
-    run_case C17 "kexec -l of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "" "$KGAP" -- kexec -l /boot/vmlinuz-$(uname -r) --initrd="$KINITRD" --reuse-cmdline
+    run_case C17 "kexec -l of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "NN-L-AT-001" 0 -- kexec -l /boot/vmlinuz-$(uname -r) --initrd="$KINITRD" --reuse-cmdline
     kexec -u 2>/dev/null || true
 fi
 # An unsigned module (dummy.ko with its signature stripped), loaded with a

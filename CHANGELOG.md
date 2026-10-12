@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Root could boot a kernel without the agent through kexec (review 82,
+  High): on AlmaLinux 9, `kexec -l` succeeded with the agent running. The
+  agent now refuses every kexec image load outside the trusted-installer
+  window and records it as an anti-tamper denial; its unit starts after
+  `kdump.service`, so kdump keeps loading its crash kernel at boot.
 - Sealed chain-log archives and their manifests could be altered by root
   after an agent restart (review 81, High): only the active files were
   protected again at start, and the manifest never was. The agent now

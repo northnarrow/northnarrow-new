@@ -512,6 +512,12 @@ pub const FS_OP_SIGNAL: u8 = 9;
 /// ptrace mode bits). READ-mode and NOAUDIT checks (`ps`, `lsof`, journald
 /// reading `/proc/<pid>/exe`) are denied silently, as before.
 pub const FS_OP_PTRACE: u8 = 10;
+/// Review 82: a kexec kernel image load refused by the `kernel_read_file`
+/// (`kexec_file_load`) or `kernel_load_data` (`kexec_load`) hook outside
+/// the trusted-installer window (`target_dev` = the kernel's read/load id,
+/// `target_ino` = 0). A loaded image lets root reboot straight into a
+/// kernel without the agent.
+pub const FS_OP_KEXEC: u8 = 11;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
