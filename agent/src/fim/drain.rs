@@ -16,7 +16,9 @@
 //!    and diff against the BaselineDb's last entry for the
 //!    path.
 //! 5. If the SHA actually differs, the drift is REAL. Apply
-//!    the §6.5 hierarchical token-bucket rate-limiter, then:
+//!    the §6.5 hierarchical token-bucket rate-limiter to drift
+//!    written by a package manager (review 76: only there; any
+//!    other writer always reaches the rules), then:
 //!    - **Always** append a [`FimDriftEntry`] to
 //!      `/var/lib/northnarrow/fim_drift.jsonl` (evidence
 //!      preservation is non-negotiable — Q4 lock-in).
@@ -78,6 +80,8 @@ use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_TRUNCATED};
 use common::Event;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+use crate::posture::lineage::AuthSessionTracker;
 use tracing::{debug, info, warn};
 
 use crate::audit::AgentSigningKey;
@@ -258,6 +262,8 @@ fn is_user_writable_prefix(path: &str) -> bool {
 /// Hierarchical token-bucket per `DriftSeverity` tier. Critical
 /// is never throttled (per Q4 lock-in). High + Medium have
 /// independent buckets that refill linearly over a 60s window.
+/// [`process_drift`] spends them only on drift written by a package
+/// manager (review 76).
 ///
 /// Thread-safety: a single `Mutex` wraps the bucket state. The
 /// async drain loop holds the lock for microseconds per drift
@@ -675,7 +681,11 @@ fn forget_if_gone(
 ///    Equal → no real drift; skip silently (kernel hook fires
 ///    on every setattr including no-op touches).
 /// 4. Apply rate limiter → record `decision_engine_skipped` +
-///    `skip_reason` on the persisted entry.
+///    `skip_reason` on the persisted entry. Only drift whose writer
+///    descends from a package manager (`lineage`) is throttled: the
+///    buckets are host-wide, so a writer that could spend them could
+///    also skip the rules for its own next write (review 76). With no
+///    `lineage`, nothing is throttled.
 /// 5. Append to drift DB (always, evidence preservation).
 /// 6. Push `Event::Fim` onto `outbox` ONLY if rate limiter
 ///    allowed. The drain loop forwards the outbox to the engine
@@ -695,6 +705,7 @@ pub fn process_drift(
     classifier: &DriftClassifier,
     rate_limiter: &DriftRateLimiter,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+    lineage: Option<&AuthSessionTracker>,
     outbox: Option<&mut Vec<Event>>,
 ) -> Result<bool> {
     let key = InodeKey {
@@ -877,9 +888,21 @@ pub fn process_drift(
     }
 
     let severity = classifier.classify(op, &path);
-    let (skipped, skip_reason) = match rate_limiter.try_consume(severity) {
-        Ok(()) => (false, String::new()),
-        Err(reason) => (true, reason),
+    // Review 76: the §6.5 buckets are host-wide. Spent by anyone, they
+    // made the next writer's drift skip the rules: 60 throwaway files in
+    // /etc/cron.d, then a real drop-in, and NN-L-FIM-007 never ran. They
+    // now pace only the burst source they were sized for, a package
+    // transaction (whose writes the rules log, not kill, anyway); every
+    // other write reaches the rules. The journal and the detection store
+    // have their own per-rule budget (`detection_budget`).
+    let package_managed = lineage.is_some_and(|l| l.is_system_daemon_mediated(raw.modifier_pid));
+    let (skipped, skip_reason) = if package_managed {
+        match rate_limiter.try_consume(severity) {
+            Ok(()) => (false, String::new()),
+            Err(reason) => (true, reason),
+        }
+    } else {
+        (false, String::new())
     };
 
     let draft = FimDriftDraft {
@@ -1003,6 +1026,7 @@ pub async fn drain_loop(
     classifier: std::sync::Arc<DriftClassifier>,
     rate_limiter: std::sync::Arc<DriftRateLimiter>,
     watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
+    lineage: AuthSessionTracker,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
@@ -1071,6 +1095,7 @@ pub async fn drain_loop(
                 classifier.as_ref(),
                 rate_limiter.as_ref(),
                 watched_paths.as_deref(),
+                Some(&lineage),
                 Some(&mut outbox),
             ) {
                 warn!(
@@ -1206,6 +1231,7 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
+            None,
             Some(&mut out),
         )
         .unwrap();
@@ -1257,6 +1283,7 @@ mod tests {
             &mut drift_db,
             &DriftClassifier::new(),
             &DriftRateLimiter::new(),
+            None,
             None,
             None,
         )
@@ -1312,6 +1339,7 @@ mod tests {
                 &mut drift_db,
                 &classifier,
                 &rate_limiter,
+                None,
                 None,
                 None,
             )
@@ -1370,6 +1398,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             None,
             Some(&mut out),
         )
@@ -1669,6 +1698,7 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
+            None,
             Some(&mut out),
         )
         .unwrap();
@@ -1731,6 +1761,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             None,
             Some(&mut out),
         )
@@ -1799,6 +1830,7 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
+            None,
             Some(&mut out),
         )
         .unwrap();
@@ -1845,6 +1877,10 @@ mod tests {
             watched_meta.ino(),
             FimOp::Modified as u8,
         );
+        // The writer descends from dpkg: the only drift the buckets pace
+        // (review 76).
+        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        lineage.ingest_spawn(raw.modifier_pid, 1, "/usr/bin/dpkg", 0);
         let emitted = process_drift(
             &raw,
             &path_map,
@@ -1853,6 +1889,7 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
+            Some(&lineage),
             Some(&mut out),
         )
         .unwrap();
@@ -1864,6 +1901,68 @@ mod tests {
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(row.decision_engine_skipped, "audit chain MUST record");
         assert_eq!(row.skip_reason, "rate_limit:tier_medium");
+    }
+
+    /// Review 76: spent buckets no longer let any other writer skip the
+    /// rules. Root wrote 60 throwaway files in /etc/cron.d, and the real
+    /// drop-in after them never reached NN-L-FIM-007.
+    #[test]
+    fn process_drift_never_throttles_a_writer_outside_the_package_manager() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("watched.bin");
+        std::fs::write(&watched, b"new content").unwrap();
+        let watched_meta = std::fs::metadata(&watched).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        path_map.insert(
+            InodeKey {
+                dev: watched_meta.dev(),
+                ino: watched_meta.ino(),
+            },
+            watched.to_string_lossy().to_string(),
+        );
+        let stale_baseline = dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
+        // Both buckets empty, as after a burst of throwaway writes.
+        let rate_limiter = DriftRateLimiter::with_caps(0, 0);
+        // The writer is a shell under sshd, not a package manager.
+        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        let mut raw = fake_raw(
+            watched_meta.dev(),
+            watched_meta.ino(),
+            FimOp::Modified as u8,
+        );
+        raw.modifier_comm = *b"sh\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        lineage.ingest_spawn(raw.modifier_pid, 4000, "/usr/bin/dash", 0);
+        lineage.ingest_spawn(4000, 1, "/usr/sbin/sshd", 0);
+        let mut out: Vec<Event> = Vec::new();
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            Some(&stale_baseline),
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &rate_limiter,
+            None,
+            Some(&lineage),
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(emitted, "the drift must reach the rules");
+        assert_eq!(out.len(), 1);
+        let body = std::fs::read_to_string(&drift_path).unwrap();
+        let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
+        assert!(!row.decision_engine_skipped);
+        assert!(row.skip_reason.is_empty());
     }
 
     // ─── BUG-012 (v2) — op-level FimOp::Opened handling ─────────────
@@ -1946,6 +2045,7 @@ mod tests {
                 &classifier,
                 &rate_limiter,
                 None,
+                None,
                 Some(&mut out),
             )
             .unwrap();
@@ -2002,6 +2102,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             None,
             Some(&mut out),
         )
@@ -2066,6 +2167,7 @@ mod tests {
             &mut drift_db,
             &classifier,
             &rate_limiter,
+            None,
             None,
             Some(&mut out),
         )
