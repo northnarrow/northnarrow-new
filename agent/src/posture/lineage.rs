@@ -286,6 +286,19 @@ struct Entry {
     /// when `exe` ∈ [`NODE_EXES`] — that exe gate is applied at read
     /// time in [`AuthSessionTracker::is_npm_cli_writer`].
     argv_npm_cli: bool,
+    /// Review 85: what an interpreter `exe` runs ([`script_of`]): a script
+    /// path or a `-m` module. `None` for a binary, or an inline program.
+    script: Option<Box<str>>,
+}
+
+/// Review 85: what the kernel executed for a process — its exe and, for
+/// an interpreter, the script or module it runs. Read from the spawn
+/// cache, else from `/proc`. Never from `comm`, which a process sets for
+/// itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecIdentity {
+    pub exe: PathBuf,
+    pub script: Option<String>,
 }
 
 /// Mutex-shielded state. A single lock guards both the map and the
@@ -354,7 +367,7 @@ impl AuthSessionTracker {
     /// PID 0 is the kernel "no process" sentinel and is never
     /// recorded.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
-        self.ingest_inner(pid, ppid, exe, false, spawn_ns);
+        self.ingest_inner(pid, ppid, exe, false, None, spawn_ns);
     }
 
     /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
@@ -372,10 +385,19 @@ impl AuthSessionTracker {
         spawn_ns: u64,
     ) {
         let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
-        self.ingest_inner(pid, ppid, exe, argv_npm_cli, spawn_ns);
+        let script = script_of(Path::new(exe), argv);
+        self.ingest_inner(pid, ppid, exe, argv_npm_cli, script, spawn_ns);
     }
 
-    fn ingest_inner(&self, pid: u32, ppid: u32, exe: &str, argv_npm_cli: bool, spawn_ns: u64) {
+    fn ingest_inner(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
+        argv_npm_cli: bool,
+        script: Option<Box<str>>,
+        spawn_ns: u64,
+    ) {
         if pid == 0 {
             return;
         }
@@ -384,6 +406,7 @@ impl AuthSessionTracker {
             exe: PathBuf::from(exe),
             spawn_ns,
             argv_npm_cli,
+            script,
         };
         let mut s = self.inner.state.write();
         // Review 49: package-manager spawns also go to the side cache;
@@ -678,6 +701,38 @@ impl AuthSessionTracker {
         }
     }
 
+    /// Review 85: what the kernel executed for `pid` ([`ExecIdentity`]):
+    /// the spawn cache, else `/proc/<pid>/exe` and `cmdline`. `None` when
+    /// neither knows it (exited before its exec event was read), or when
+    /// its exe was deleted or replaced.
+    pub fn exec_identity(&self, pid: u32) -> Option<ExecIdentity> {
+        if pid == 0 {
+            return None;
+        }
+        {
+            let s = self.inner.state.read();
+            if let Some(e) = s.map.get(&pid).or_else(|| s.daemons.get(&pid)) {
+                return Some(ExecIdentity {
+                    exe: e.exe.clone(),
+                    script: e.script.as_deref().map(str::to_string),
+                });
+            }
+        }
+        let dir = self.inner.proc_root.join(pid.to_string());
+        let exe = fs::read_link(dir.join("exe")).ok()?;
+        if exe.to_string_lossy().ends_with(" (deleted)") {
+            return None;
+        }
+        let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
+        let argv: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let script = script_of(&exe, &argv).map(String::from);
+        Some(ExecIdentity { exe, script })
+    }
+
     fn lookup_cache(&self, pid: u32) -> Option<(u32, PathBuf)> {
         let s = self.inner.state.read();
         s.map
@@ -738,6 +793,53 @@ fn is_elevation_binary(exe: &Path) -> bool {
 fn is_node_exe(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     NODE_EXES.iter().any(|p| s == *p)
+}
+
+/// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
+/// what they run is named by their arguments, not by their exe.
+fn is_interpreter(exe: &Path) -> bool {
+    let base = exe
+        .file_name()
+        .map(|b| b.to_string_lossy())
+        .unwrap_or_default();
+    [
+        "python", "perl", "ruby", "node", "nodejs", "bash", "sh", "dash", "zsh", "ksh", "mono",
+    ]
+    .iter()
+    .any(|i| {
+        base.strip_prefix(i)
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    })
+}
+
+/// Review 85: the script or module an interpreter runs, from its argv:
+/// the first argument that is not an option, or the module after `-m`
+/// (also `-Im`, `-Em`). An inline program (`-c`, `-e`, `--eval`) runs
+/// nothing named, and neither does an interpreter with no argument.
+fn script_of(exe: &Path, argv: &[String]) -> Option<Box<str>> {
+    if !is_interpreter(exe) {
+        return None;
+    }
+    let mut args = argv.iter().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-c" | "-e" | "--eval" | "-p" | "--print" => return None,
+            "-W" | "-X" | "-O" => {
+                args.next();
+            }
+            _ if a.starts_with("--") => {}
+            _ if a.starts_with('-') && a.len() > 1 => {
+                if a.ends_with('m') {
+                    return args.next().map(|m| m.as_str().into());
+                }
+                if a.contains('c') || a.contains('e') {
+                    return None;
+                }
+            }
+            _ => return Some(a.as_str().into()),
+        }
+    }
+    None
 }
 
 /// Extract the `PPid: <n>` value from a `/proc/<pid>/status` body.
@@ -1410,6 +1512,84 @@ mod tests {
         assert!(t.is_interactive_admin(500));
         assert!(!is_elevation_binary(Path::new("/usr/bin/pkexec")));
         assert!(!is_elevation_binary(Path::new("/tmp/sudo")));
+    }
+
+    // ── Review 85: exec identity ───────────────────────────────────
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn script_of_reads_the_script_or_module_an_interpreter_runs() {
+        let py = Path::new("/usr/bin/python3.12");
+        let s = |a: &[&str]| script_of(py, &argv(a)).map(|b| b.to_string());
+        assert_eq!(
+            s(&["python3", "/usr/bin/aws", "s3", "ls"]).as_deref(),
+            Some("/usr/bin/aws")
+        );
+        assert_eq!(
+            s(&[
+                "python3",
+                "-S",
+                "-W",
+                "ignore",
+                "/usr/lib/google-cloud-sdk/lib/gcloud.py"
+            ])
+            .as_deref(),
+            Some("/usr/lib/google-cloud-sdk/lib/gcloud.py")
+        );
+        assert_eq!(
+            s(&["python3", "-Im", "azure.cli", "login"]).as_deref(),
+            Some("azure.cli")
+        );
+        assert_eq!(
+            s(&["python3", "-c", "open('/root/.aws/credentials')"]),
+            None
+        );
+        assert_eq!(s(&["python3", "-Sc", "print(1)"]), None);
+        assert_eq!(s(&["python3"]), None);
+        assert_eq!(
+            script_of(Path::new("/usr/bin/cat"), &argv(&["cat", "/x"])),
+            None
+        );
+        assert!(is_interpreter(Path::new("/usr/bin/bash")));
+        assert!(is_interpreter(Path::new("/usr/bin/perl5.36")));
+        assert!(!is_interpreter(Path::new("/usr/bin/shred")));
+        assert!(!is_interpreter(Path::new("/usr/bin/pythonista")));
+    }
+
+    #[test]
+    fn exec_identity_comes_from_the_cache_then_proc() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn_with_argv(
+            100,
+            1,
+            "/usr/bin/python3.12",
+            &argv(&["python3", "/usr/bin/aws", "s3", "ls"]),
+            1,
+        );
+        assert_eq!(
+            t.exec_identity(100),
+            Some(ExecIdentity {
+                exe: "/usr/bin/python3.12".into(),
+                script: Some("/usr/bin/aws".into()),
+            })
+        );
+        // Not cached: /proc/<pid>/exe and cmdline.
+        let d = tmp.path().join("200");
+        fs::create_dir_all(&d).unwrap();
+        symlink("/usr/bin/perl", d.join("exe")).unwrap();
+        fs::write(d.join("cmdline"), b"perl\0-e\0print 1\0").unwrap();
+        assert_eq!(
+            t.exec_identity(200),
+            Some(ExecIdentity {
+                exe: "/usr/bin/perl".into(),
+                script: None,
+            })
+        );
+        assert_eq!(t.exec_identity(300), None, "unknown pid");
     }
 
     #[test]

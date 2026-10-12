@@ -131,6 +131,26 @@ An administrator session's configuration changes still raise the posture to ENGA
 
 Whoever holds an administrator's session and sudo password is that administrator to these rules.
 
+## A store's own client (review 85)
+
+The credential rules (cloud CLIs, browsers, password managers, GnuPG) and
+the login-record rules (`wtmp`, `btmp`, `lastlog`) do not act on a
+store's own client, or on the login machinery. The agent tells them by
+what the kernel executed, never by the name a process gives itself:
+
+- a binary client: its exe, inside a root-owned system tree (`/usr`,
+  `/opt`, `/snap`, …), named like the client (`aws`, `firefox`, `gpg`,
+  `sshd-session`);
+- a client written in a scripting language: the interpreter's exe and
+  the script it runs, both in such a tree (`/usr/bin/python3` running
+  `/usr/lib/google-cloud-sdk/lib/gcloud.py`);
+- a client that bundles its runtime: its exe under that tree
+  (`/opt/az/`).
+
+An inline program (`python3 -c …`), a module run from the caller's path,
+or a copy outside a system tree is not a client. A client reading another
+user's credentials is acted on like any other reader.
+
 ## What FIM does not protect against
 
 - **Host already compromised at install time** (TOFU window —

@@ -134,6 +134,16 @@ fn as_fim(e: &Event) -> Option<&FimEvent> {
     }
 }
 
+/// Q8, decided 2026-10-12: a credential file read by a non-root user
+/// other than its owner. Not root's read (backups read every home), nor a
+/// reader that reads as root does (a backup tool given
+/// CAP_DAC_READ_SEARCH), nor a read whose owner is unknown.
+fn is_foreign_read(fe: &FimEvent) -> bool {
+    fe.owner_uid.is_some_and(|owner| {
+        fe.modifier_uid != 0 && fe.modifier_uid != owner && !fe.reader_dac_capable
+    })
+}
+
 /// Build a Verdict from a FimEvent. The agent's existing
 /// `decision::rules::build_verdict` extracts ProcessSpawn
 /// fields — we duplicate the shape here for FimEvent so the
@@ -149,12 +159,8 @@ fn fim_verdict(
 ) -> Verdict {
     // Tappa 10.9 step 1: opens found by the file-open sensor's credential
     // names (every home) are reported: the owner's own editor or SDK opens
-    // them too. Q8, decided 2026-10-12: another user's read is acted on —
-    // not root's, which is how backups read every home, nor a reader that
-    // reads as root does (a backup tool given CAP_DAC_READ_SEARCH).
-    let foreign = fe.owner_uid.is_some_and(|owner| {
-        fe.modifier_uid != 0 && fe.modifier_uid != owner && !fe.reader_dac_capable
-    });
+    // them too. Q8: another user's read is acted on ([`is_foreign_read`]).
+    let foreign = is_foreign_read(fe);
     let (action, reasoning) = if fe.wide_coverage && !foreign {
         (ResponseAction::Log, reasoning.to_string())
     } else if foreign {
@@ -950,15 +956,15 @@ const GCP_CRED_FRAGMENTS: &[&str] = &[
 const DOCKER_CRED_FRAGMENTS: &[&str] =
     &["/.docker/config.json", "/var/lib/docker/credentials.json"];
 
-/// Process basenames that legitimately read the cloud-cred
-/// files for each family. Comm field is `TASK_COMM_LEN`
-/// (15 chars + NUL) so all entries fit without truncation.
-/// Operator-tunable in a future V1.1 commit; the V1.0 list
-/// covers the most-common official CLIs per cloud.
-const AWS_CLI_COMMS: &[&str] = &["aws", "aws-cli"];
-const AZURE_CLI_COMMS: &[&str] = &["az"];
-const GCP_CLI_COMMS: &[&str] = &["gcloud", "gsutil", "bq"];
-const DOCKER_CLI_COMMS: &[&str] = &["docker", "dockerd", "containerd"];
+/// Review 85: each cloud's own client, as [`OwnClient`] names it: an exe
+/// or script basename (`.py` dropped), or a runtime tree that only the
+/// client installs (`/opt/az/`, the Azure CLI's bundled Python). Matched
+/// on what the kernel executed, inside a root-owned system tree, never
+/// on `comm`.
+const AWS_CLIENTS: &[&str] = &["aws", "aws-cli"];
+const AZURE_CLIENTS: &[&str] = &["az", "/opt/az/"];
+const GCP_CLIENTS: &[&str] = &["gcloud", "gsutil", "bq"];
+const DOCKER_CLIENTS: &[&str] = &["docker", "dockerd", "containerd"];
 
 /// Common shape for the 4 cred-read rules — every rule
 /// follows the same `FimOp::Opened` + path-fragment +
@@ -968,7 +974,6 @@ fn evaluate_cred_read(
     rule: &dyn Rule,
     event: &Event,
     path_fragments: &[&str],
-    legit_cli_comms: &[&str],
     reasoning: &str,
 ) -> Option<Verdict> {
     let fe = as_fim(event)?;
@@ -978,15 +983,8 @@ fn evaluate_cred_read(
     if !path_fragments.iter().any(|f| fe.path.contains(f)) {
         return None;
     }
-    // FP guard: the legitimate CLI for this cloud reading its
-    // own creds is the dominant traffic pattern. Skip when the
-    // modifier_comm matches. The audit chain still captures
-    // the event regardless (decision_engine_skipped path in C4
-    // does not apply here — we drop the verdict outright at
-    // the rule layer so the engine doesn't kill the legit CLI).
-    if legit_cli_comms.iter().any(|c| fe.modifier_comm == *c) {
-        return None;
-    }
+    // Review 85: the cloud's own CLI is exempted by [`OwnClient`], which
+    // reads what the kernel executed; this rule fires for every reader.
     Some(fim_verdict(
         rule,
         fe,
@@ -1015,7 +1013,6 @@ impl Rule for NnLFim011AwsCredsRead {
             self,
             event,
             AWS_CRED_FRAGMENTS,
-            AWS_CLI_COMMS,
             "AWS credentials read by a process other than aws-cli — \
              MITRE T1552.001 indicator",
         )
@@ -1041,7 +1038,6 @@ impl Rule for NnLFim012AzureCredsRead {
             self,
             event,
             AZURE_CRED_FRAGMENTS,
-            AZURE_CLI_COMMS,
             "Azure credentials read by a process other than az — \
              MITRE T1552.001 indicator",
         )
@@ -1068,7 +1064,6 @@ impl Rule for NnLFim013GcpCredsRead {
             self,
             event,
             GCP_CRED_FRAGMENTS,
-            GCP_CLI_COMMS,
             "GCP credentials read by a process other than gcloud/gsutil/bq — \
              MITRE T1552.001 indicator",
         )
@@ -1097,7 +1092,6 @@ impl Rule for NnLFim014DockerCredsRead {
             self,
             event,
             DOCKER_CRED_FRAGMENTS,
-            DOCKER_CLI_COMMS,
             "Docker registry creds read by a process other than docker/dockerd/containerd — \
              MITRE T1552.001 indicator",
         )
@@ -1130,31 +1124,52 @@ const BROWSER_CRED_FRAGMENTS: &[&str] = &[
 ];
 
 /// The browsers that legitimately read their own credential store —
-/// exempted so the rule fires on a NON-browser process touching the
-/// file (the exfil shape).
-const BROWSER_COMMS: &[&str] = &[
+/// exempted by [`OwnClient`] so the rule fires on any other process
+/// touching the file (the exfil shape).
+const BROWSER_CLIENTS: &[&str] = &[
     "chrome",
     "chromium",
     "firefox",
     "firefox-bin",
+    "firefox-esr",
     "brave",
     "msedge",
     "opera",
     "vivaldi",
+    "vivaldi-bin",
 ];
 
 /// NN-L-FIM-016: password-manager database fragments — KeePass
 /// `*.kdbx` + the `pass` store directory.
 const PASSWORD_MANAGER_FRAGMENTS: &[&str] = &[".kdbx", "/.password-store/"];
 
-/// Password managers that legitimately read their own store.
-const PASSWORD_MANAGER_COMMS: &[&str] = &["keepassxc", "keepass", "keepass2", "pass", "gopass"];
+/// Password managers that legitimately read their own store (KeePass 2
+/// runs as `KeePass.exe` under mono; `pass` is a shell script).
+const PASSWORD_MANAGER_CLIENTS: &[&str] = &[
+    "keepassxc",
+    "keepassxc-cli",
+    "keepass",
+    "keepass2",
+    "KeePass.exe",
+    "pass",
+    "gopass",
+];
 
 /// NN-L-FIM-017: GPG keyring directory fragment.
 const GPG_KEYRING_FRAGMENTS: &[&str] = &["/.gnupg/"];
 
 /// The GnuPG toolchain that legitimately reads the keyring.
-const GPG_COMMS: &[&str] = &["gpg", "gpg2", "gpg-agent", "gpgconf", "gpgsm", "dirmngr"];
+const GPG_CLIENTS: &[&str] = &[
+    "gpg",
+    "gpg2",
+    "gpg-agent",
+    "gpgconf",
+    "gpgsm",
+    "dirmngr",
+    "keyboxd",
+    "scdaemon",
+    "gpg-connect-agent",
+];
 
 /// `true` if this FIM event is an access (read or write) of any
 /// credential-store path that NN-L-FIM-015/016/017 watch (browser
@@ -1216,34 +1231,39 @@ const LASTLOG_PATHS: &[&str] = &["/var/log/lastlog"];
 const WTMP_BTMP_PATHS: &[&str] = &["/var/log/wtmp", "/var/log/btmp"];
 
 /// The login-session machinery that legitimately appends to the
-/// `utmp`-family records (via the libc utmp API). A Modified op
-/// from any other comm is the tamper shape NN-L-FIM-018/019 catch.
+/// `utmp`-family records (via the libc utmp API), by the exe basename
+/// [`OwnClient`] reads. A write by any other program is the tamper shape
+/// NN-L-FIM-018/019 catch.
 ///
-/// Matched after [`systemd_preexec_name`] strips systemd's pre-exec
-/// `(name)` form, so a getty unit's `UtmpIdentifier=` record written
-/// as `(agetty)` is covered by `agetty` (review item 38).
-const LOGIN_RECORD_LEGIT_COMMS: &[&str] = &[
+/// - `sshd-session`: OpenSSH >= 9.8 moved the per-session monitor (which
+///   records the wtmp login and the btmp failed login) into it (Debian
+///   13, Ubuntu 24.10+, RHEL 10).
+/// - `systemd-update-utmp`: boot, shutdown and runlevel records (review
+///   item 38).
+/// - `systemd-executor`, `systemd`: a unit's `UtmpIdentifier=` record is
+///   written by the forked child before it execs the unit's program (as
+///   `systemd-executor` on systemd >= 255, else still as PID 1's exe);
+///   its `comm` then reads `(agetty)` (review item 38).
+const LOGIN_RECORD_WRITERS: &[&str] = &[
     "login",
     "sshd",
-    // OpenSSH >= 9.8 moved the per-session monitor (which records
-    // the wtmp login and the btmp failed login) into `sshd-session`
-    // (Debian 13, Ubuntu 24.10+, RHEL 10).
     "sshd-session",
     "systemd-logind",
-    // `systemd-update-utmp` (boot, shutdown and runlevel records), as
-    // the kernel's 15-character comm truncates it. Seen in the lab
-    // writing the boot runlevel record to wtmp (review item 38).
-    "systemd-update-",
+    "systemd-update-utmp",
+    "systemd-executor",
     "init",
     "systemd",
     "getty",
     "agetty",
+    "mingetty",
     "lightdm",
     "gdm",
-    "gdm-session-wor",
+    "gdm3",
+    "gdm-session-worker",
     "su",
     "sudo",
     "lastlog",
+    "lastlog2",
 ];
 
 /// NN-L-FIM-020: shell-history file fragments. The clear-history
@@ -1280,7 +1300,6 @@ fn evaluate_cred_store_access(
     rule: &dyn Rule,
     event: &Event,
     path_fragments: &[&str],
-    legit_comms: &[&str],
     reasoning: &str,
 ) -> Option<Verdict> {
     let fe = as_fim(event)?;
@@ -1290,12 +1309,8 @@ fn evaluate_cred_store_access(
     if !path_fragments.iter().any(|f| fe.path.contains(f)) {
         return None;
     }
-    // FP guard: the application that owns the store is the dominant
-    // traffic; skip when the modifier comm matches. The audit chain
-    // still captures the event.
-    if legit_comms.iter().any(|c| fe.modifier_comm == *c) {
-        return None;
-    }
+    // Review 85: the application that owns the store is exempted by
+    // [`OwnClient`], which reads what the kernel executed.
     Some(fim_verdict(
         rule,
         fe,
@@ -1307,8 +1322,8 @@ fn evaluate_cred_store_access(
 
 /// Shared shape for the login-record tamper rules
 /// (NN-L-FIM-018/019): a `Modified` op on an exact `utmp`-family
-/// path by a comm NOT in [`LOGIN_RECORD_LEGIT_COMMS`]. High +
-/// KillProcess.
+/// path. High + KillProcess, unless [`OwnClient`] finds the writer is
+/// one of [`LOGIN_RECORD_WRITERS`].
 fn evaluate_login_record_tamper(
     rule: &dyn Rule,
     event: &Event,
@@ -1322,10 +1337,8 @@ fn evaluate_login_record_tamper(
     if !exact_paths.iter().any(|p| fe.path == *p) {
         return None;
     }
-    let comm = systemd_preexec_name(&fe.modifier_comm);
-    if LOGIN_RECORD_LEGIT_COMMS.contains(&comm) {
-        return None;
-    }
+    // Review 85: the login machinery is exempted by [`OwnClient`], which
+    // reads what the kernel executed.
     Some(fim_verdict(
         rule,
         fe,
@@ -1375,7 +1388,6 @@ impl Rule for NnLFim015BrowserCredsAccessed {
             self,
             event,
             BROWSER_CRED_FRAGMENTS,
-            BROWSER_COMMS,
             "Browser stored-credential file accessed by a non-browser \
              process — MITRE T1555.003; posture → ENGAGED",
         )
@@ -1404,7 +1416,6 @@ impl Rule for NnLFim016PasswordManagerDbAccessed {
             self,
             event,
             PASSWORD_MANAGER_FRAGMENTS,
-            PASSWORD_MANAGER_COMMS,
             "Password-manager database accessed by a process other than a \
              known password manager — MITRE T1555.005; posture → ENGAGED",
         )
@@ -1432,7 +1443,6 @@ impl Rule for NnLFim017GpgKeyringAccessed {
             self,
             event,
             GPG_KEYRING_FRAGMENTS,
-            GPG_COMMS,
             "GPG keyring accessed by a process outside the GnuPG toolchain \
              — MITRE T1552.004; posture → ENGAGED",
         )
@@ -1895,6 +1905,146 @@ impl Rule for InteractiveAdmin {
     }
 }
 
+/// Review 85 — a credential store's own client, or the login machinery
+/// writing the login records, told by what the kernel executed.
+///
+/// The credential-read, credential-store and login-record rules used to
+/// return no verdict at all when the process's `comm` was on a list
+/// (`aws`, `firefox`, `gpg`, `sshd`, …). A process sets its own `comm`
+/// (`prctl(PR_SET_NAME)`), so in the lab (2026-10-12, Ubuntu 24.04)
+/// python renamed to `aws` read `/root/.aws/credentials`, and renamed to
+/// `sshd` appended to `/var/log/wtmp`, with no detection. The rules now
+/// fire for every process, and this wrapper drops the verdict only for a
+/// process whose exec identity ([`AuthSessionTracker::exec_identity`]:
+/// the spawn cache, else `/proc`) is one of `clients` ([`is_own_client`]).
+/// Python-based clients (gcloud, the Azure CLI, AWS CLI v1), whose `comm`
+/// is `python3`, are now recognised too.
+///
+/// A process whose exec identity cannot be read (it exited before its
+/// exec event was) is not exempted. A `comm` that names a client without
+/// the identity to match is reported in the reasoning.
+pub struct OwnClient {
+    inner: Box<dyn Rule>,
+    clients: &'static [&'static str],
+    lineage: AuthSessionTracker,
+}
+
+impl OwnClient {
+    pub fn new(
+        inner: Box<dyn Rule>,
+        clients: &'static [&'static str],
+        lineage: AuthSessionTracker,
+    ) -> Self {
+        Self {
+            inner,
+            clients,
+            lineage,
+        }
+    }
+}
+
+impl Rule for OwnClient {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        let identity = self.lineage.exec_identity(fe.modifier_pid);
+        // A client reading another user's store (`aws` pointed at their
+        // credentials file) is theft with the right tool: Q8 still acts.
+        if !is_foreign_read(fe)
+            && identity
+                .as_ref()
+                .is_some_and(|id| is_own_client(id, self.clients))
+        {
+            return None;
+        }
+        let comm = systemd_preexec_name(&fe.modifier_comm);
+        let claimed = self.clients.iter().any(|c| {
+            !c.starts_with('/') && (*c == comm || (comm.len() == 15 && c.starts_with(comm)))
+        });
+        if !claimed {
+            return Some(verdict);
+        }
+        let ran = identity.map_or_else(
+            || "a process whose exec could not be read".to_string(),
+            |id| match id.script {
+                Some(script) => format!("{} {}", id.exe.display(), script),
+                None => id.exe.display().to_string(),
+            },
+        );
+        Some(Verdict {
+            reasoning: format!(
+                "{} [named '{}' but the kernel ran {ran}]",
+                verdict.reasoning, fe.modifier_comm
+            ),
+            ..verdict
+        })
+    }
+}
+
+/// Review 85: `path` lies in a root-owned system tree, which a process
+/// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
+/// memfd, and not a binary deleted or replaced while it runs.
+fn in_system_tree(path: &str) -> bool {
+    const TREES: &[&str] = &[
+        "/usr/",
+        "/opt/",
+        "/snap/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/var/lib/snapd/snap/",
+        "/nix/store/",
+    ];
+    TREES.iter().any(|t| path.starts_with(t))
+        && !path.contains("/../")
+        && !path.ends_with(" (deleted)")
+}
+
+/// Review 85: is `id` one of `clients`? An entry ending in `/` is a tree
+/// only that client installs (its bundled runtime): the exe must lie in
+/// it. Any other entry is a basename: the exe's for a binary, else the
+/// script's (`.py` dropped) an interpreter runs. The exe, and a script,
+/// must lie in a root-owned system tree ([`in_system_tree`]); an
+/// interpreter running an inline program (`python3 -c …`), a module
+/// (`-m`) or nothing is never a client by name.
+fn is_own_client(id: &crate::posture::lineage::ExecIdentity, clients: &[&str]) -> bool {
+    let exe = id.exe.to_string_lossy();
+    if !in_system_tree(&exe) {
+        return false;
+    }
+    if clients
+        .iter()
+        .any(|c| c.ends_with('/') && exe.starts_with(c))
+    {
+        return true;
+    }
+    let named = |p: &str| {
+        let base = p.rsplit('/').next().unwrap_or(p);
+        let base = base.strip_suffix(".py").unwrap_or(base);
+        clients.iter().any(|c| !c.ends_with('/') && *c == base)
+    };
+    match &id.script {
+        None => named(&exe),
+        Some(script) if script.starts_with('/') => in_system_tree(script) && named(script),
+        // A module run with `-m` resolves through the working directory
+        // and PYTHONPATH, both the caller's: only a client's own runtime
+        // tree (above) vouches for it.
+        Some(_) => false,
+    }
+}
+
 /// The FIM rule set with a live `/proc`-backed lineage tracker for the
 /// package-manager carve-out ([`PackageManaged`]). Production threads the
 /// agent's shared tracker through [`fim_rules_with_lineage`] instead, so
@@ -1907,13 +2057,17 @@ pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<d
 /// (system binaries, setuid binaries, kernel and PAM modules, sensitive
 /// configs, cron drop-ins, systemd units and timers) are wrapped in
 /// [`PackageManaged`] over `lineage`, and the configuration and scheduling
-/// ones also in [`InteractiveAdmin`]; order and ids are unchanged.
+/// ones also in [`InteractiveAdmin`]. The credential and login-record rules
+/// are wrapped in [`OwnClient`]. Order and ids are unchanged.
 pub fn fim_rules_with_lineage(
     installer_override: Arc<TrustedInstallerOverride>,
     lineage: AuthSessionTracker,
 ) -> Vec<Box<dyn Rule>> {
     let pkg = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
         Box::new(PackageManaged::new(rule, lineage.clone()))
+    };
+    let own = |rule: Box<dyn Rule>, clients: &'static [&'static str]| -> Box<dyn Rule> {
+        Box::new(OwnClient::new(rule, clients, lineage.clone()))
     };
     // Outside the package carve-out, so `sudo apt install` keeps its Log +
     // Low (an inner Log passes through unchanged).
@@ -1944,21 +2098,24 @@ pub fn fim_rules_with_lineage(
         // tier as the rest of the credential-access bucket
         // (NN-L-FIM-003 sensitive config / NN-L-FIM-004
         // authorized_keys).
-        Box::new(NnLFim011AwsCredsRead),
-        Box::new(NnLFim012AzureCredsRead),
-        Box::new(NnLFim013GcpCredsRead),
-        Box::new(NnLFim014DockerCredsRead),
+        own(Box::new(NnLFim011AwsCredsRead), AWS_CLIENTS),
+        own(Box::new(NnLFim012AzureCredsRead), AZURE_CLIENTS),
+        own(Box::new(NnLFim013GcpCredsRead), GCP_CLIENTS),
+        own(Box::new(NnLFim014DockerCredsRead), DOCKER_CLIENTS),
         // Tappa 10.5 D3 — Critical first.
         pkg(Box::new(NnLFim021PamModuleModified)),
         Box::new(NnLFim022LdSoPreloadModified),
         // Tappa 9.5.1 — anti-tamper bait, Critical.
         Box::new(NnLFim024AntiTamperHoneypotModified::with_self_pid()),
         // D3 High tier.
-        Box::new(NnLFim015BrowserCredsAccessed),
-        Box::new(NnLFim016PasswordManagerDbAccessed),
-        Box::new(NnLFim017GpgKeyringAccessed),
-        Box::new(NnLFim018LastlogTampered),
-        Box::new(NnLFim019WtmpBtmpTampered),
+        own(Box::new(NnLFim015BrowserCredsAccessed), BROWSER_CLIENTS),
+        own(
+            Box::new(NnLFim016PasswordManagerDbAccessed),
+            PASSWORD_MANAGER_CLIENTS,
+        ),
+        own(Box::new(NnLFim017GpgKeyringAccessed), GPG_CLIENTS),
+        own(Box::new(NnLFim018LastlogTampered), LOGIN_RECORD_WRITERS),
+        own(Box::new(NnLFim019WtmpBtmpTampered), LOGIN_RECORD_WRITERS),
         admin(Box::new(NnLFim023SystemdTimerCreated)),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
@@ -3115,22 +3272,6 @@ mod tests {
     }
 
     #[test]
-    fn fim011_does_not_fire_on_aws_cli_reading_own_creds() {
-        let r = NnLFim011AwsCredsRead;
-        for comm in &["aws", "aws-cli"] {
-            assert!(
-                r.evaluate(&fim_event_with_comm(
-                    FimOp::Opened,
-                    "/root/.aws/credentials",
-                    comm
-                ))
-                .is_none(),
-                "legit {comm} reading its own creds must not fire"
-            );
-        }
-    }
-
-    #[test]
     fn fim011_does_not_fire_on_non_opened_op_or_non_aws_path() {
         let r = NnLFim011AwsCredsRead;
         // Modified op of AWS creds is interesting (rare, but
@@ -3169,18 +3310,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fim012_does_not_fire_on_az_cli_reading_own_creds() {
-        let r = NnLFim012AzureCredsRead;
-        assert!(r
-            .evaluate(&fim_event_with_comm(
-                FimOp::Opened,
-                "/root/.azure/azureProfile.json",
-                "az"
-            ))
-            .is_none());
-    }
-
     // ── NN-L-FIM-013 (GCP) ──────────────────────────────────────
 
     #[test]
@@ -3199,22 +3328,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fim013_does_not_fire_on_gcloud_or_gsutil_or_bq() {
-        let r = NnLFim013GcpCredsRead;
-        for comm in &["gcloud", "gsutil", "bq"] {
-            assert!(
-                r.evaluate(&fim_event_with_comm(
-                    FimOp::Opened,
-                    "/root/.config/gcloud/credentials.db",
-                    comm
-                ))
-                .is_none(),
-                "legit {comm} reading its own creds must not fire"
-            );
-        }
-    }
-
     // ── NN-L-FIM-014 (Docker) ───────────────────────────────────
 
     #[test]
@@ -3229,22 +3342,6 @@ mod tests {
                 .evaluate(&fim_event_with_comm(FimOp::Opened, path, "evil"))
                 .unwrap_or_else(|| panic!("expected fire on {path}"));
             assert_eq!(v.severity, Severity::High);
-        }
-    }
-
-    #[test]
-    fn fim014_does_not_fire_on_docker_daemon_or_containerd() {
-        let r = NnLFim014DockerCredsRead;
-        for comm in &["docker", "dockerd", "containerd"] {
-            assert!(
-                r.evaluate(&fim_event_with_comm(
-                    FimOp::Opened,
-                    "/root/.docker/config.json",
-                    comm
-                ))
-                .is_none(),
-                "legit {comm} reading its own creds must not fire"
-            );
         }
     }
 
@@ -3391,7 +3488,9 @@ mod tests {
     // `(rule, op, path, comm, expect)` table rather than 27
     // near-identical bespoke pairs. Each row asserts either a fired
     // verdict (severity + action) or no fire. Positive, negative
-    // (wrong path / wrong op), and comm-exemption cases are all rows.
+    // (wrong path / wrong op) cases are all rows. Since review 85 a
+    // client's own access is exempted by [`OwnClient`] on what the kernel
+    // executed, so these rows fire whatever the comm.
 
     /// Expected outcome of a table row.
     enum Expect {
@@ -3453,7 +3552,7 @@ mod tests {
                 Opened,
                 "/home/u/.mozilla/firefox/p.default/key4.db",
                 "firefox",
-                NoFire, // browser reading its own store
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             (
                 Box::new(NnLFim015BrowserCredsAccessed),
@@ -3489,7 +3588,7 @@ mod tests {
                 Opened,
                 "/home/u/secrets.kdbx",
                 "keepassxc",
-                NoFire, // PM reading its own DB
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             // FIM-017 GPG keyring.
             (
@@ -3504,7 +3603,7 @@ mod tests {
                 Opened,
                 "/home/u/.gnupg/pubring.kbx",
                 "gpg",
-                NoFire, // gpg reading its own keyring
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             // FIM-018 lastlog tamper — Modified by non-login fires;
             // login-session comm exempt.
@@ -3520,7 +3619,7 @@ mod tests {
                 Modified,
                 "/var/log/lastlog",
                 "login",
-                NoFire, // legitimate login writer
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             (
                 Box::new(NnLFim018LastlogTampered),
@@ -3542,14 +3641,14 @@ mod tests {
                 Modified,
                 "/var/log/btmp",
                 "sshd",
-                NoFire, // legitimate failed-login writer
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             (
                 Box::new(NnLFim019WtmpBtmpTampered),
                 Modified,
                 "/var/log/btmp",
                 "sshd-session",
-                NoFire, // OpenSSH >= 9.8 per-session monitor
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             // Review item 38: systemd's pre-exec child of a getty unit
             // writes the UtmpIdentifier= record as `(agetty)`.
@@ -3558,14 +3657,14 @@ mod tests {
                 Modified,
                 "/var/log/wtmp",
                 "(agetty)",
-                NoFire,
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             (
                 Box::new(NnLFim018LastlogTampered),
                 Modified,
                 "/var/log/lastlog",
                 "(login)",
-                NoFire,
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             // systemd-update-utmp's boot runlevel record, under its
             // truncated 15-character comm.
@@ -3574,7 +3673,7 @@ mod tests {
                 Modified,
                 "/var/log/wtmp",
                 "systemd-update-",
-                NoFire,
+                Fire(Severity::High, KillProcess), // review 85: exempted by OwnClient, not by comm
             ),
             // The parenthesized form only unwraps to a legit name: a
             // foreign tool stays detected, and one layer is stripped.
@@ -4048,6 +4147,241 @@ mod tests {
                 .evaluate(&written_by(FimOp::Modified, path, 720, "cp"))
                 .unwrap_or_else(|| panic!("{id} must fire on {path}"));
             assert_ne!(v.action, ResponseAction::Log, "{id} is not wrapped");
+        }
+    }
+
+    // ── review 85 — clients told by what the kernel executed ──────────
+
+    /// A lineage tracker whose `/proc` is an empty temp dir, with `exec`
+    /// ingested for `pid` as the exec sensor would (exe, argv).
+    fn exec_fixture(execs: &[(u32, &str, &[&str])]) -> (tempfile::TempDir, AuthSessionTracker) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        for (pid, exe, argv) in execs {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            t.ingest_spawn_with_argv(*pid, 1, exe, &argv, 1);
+        }
+        (tmp, t)
+    }
+
+    fn read_by(path: &str, pid: u32, comm: &str) -> Event {
+        written_by(FimOp::Opened, path, pid, comm)
+    }
+
+    /// Each store's own client — a binary, a script run by an
+    /// interpreter, or a client's bundled runtime — reads its store
+    /// without a verdict.
+    #[test]
+    fn own_clients_are_told_by_their_exec() {
+        let (_tmp, lineage) = exec_fixture(&[
+            (
+                100,
+                "/usr/local/aws-cli/v2/2.17.0/dist/aws",
+                &["aws", "s3", "ls"],
+            ),
+            (
+                101,
+                "/usr/bin/python3.12",
+                &["/usr/bin/python3", "/usr/bin/aws", "s3"],
+            ),
+            (
+                102,
+                "/usr/bin/python3.12",
+                &[
+                    "python3",
+                    "-S",
+                    "/usr/lib/google-cloud-sdk/lib/gcloud.py",
+                    "auth",
+                ],
+            ),
+            (
+                103,
+                "/opt/az/bin/python3",
+                &["/opt/az/bin/python3", "-Im", "azure.cli"],
+            ),
+            (104, "/usr/bin/dockerd", &["dockerd"]),
+            (
+                105,
+                "/snap/firefox/4793/usr/lib/firefox/firefox",
+                &["firefox"],
+            ),
+            (106, "/usr/bin/gpg", &["gpg", "--decrypt"]),
+            (107, "/usr/bin/bash", &["bash", "/usr/bin/pass", "show"]),
+            (108, "/usr/lib/openssh/sshd-session", &["sshd-session"]),
+            (
+                109,
+                "/usr/lib/systemd/systemd-executor",
+                &["systemd-executor"],
+            ),
+        ]);
+        let rules = rules_by_id(&lineage);
+        let cases: &[(&str, Event)] = &[
+            (
+                "NN-L-FIM-011_AwsCredsRead",
+                read_by("/root/.aws/credentials", 100, "aws"),
+            ),
+            (
+                "NN-L-FIM-011_AwsCredsRead",
+                read_by("/root/.aws/credentials", 101, "aws"),
+            ),
+            (
+                "NN-L-FIM-013_GcpCredsRead",
+                read_by("/root/.config/gcloud/credentials.db", 102, "python3"),
+            ),
+            (
+                "NN-L-FIM-012_AzureCredsRead",
+                read_by("/root/.azure/msal_token_cache.json", 103, "python3"),
+            ),
+            (
+                "NN-L-FIM-014_DockerCredsRead",
+                read_by("/root/.docker/config.json", 104, "dockerd"),
+            ),
+            (
+                "NN-L-FIM-015_BrowserCredsAccessed",
+                read_by(
+                    "/home/u/snap/firefox/common/.mozilla/firefox/p/key4.db",
+                    105,
+                    "firefox",
+                ),
+            ),
+            (
+                "NN-L-FIM-017_GpgKeyringAccessed",
+                read_by("/home/u/.gnupg/pubring.kbx", 106, "gpg"),
+            ),
+            (
+                "NN-L-FIM-016_PasswordManagerDbAccessed",
+                read_by("/home/u/.password-store/x.gpg", 107, "pass"),
+            ),
+            (
+                "NN-L-FIM-019_WtmpBtmpTampered",
+                written_by(FimOp::Modified, "/var/log/btmp", 108, "sshd-session"),
+            ),
+            (
+                "NN-L-FIM-019_WtmpBtmpTampered",
+                written_by(FimOp::Modified, "/var/log/wtmp", 109, "(agetty)"),
+            ),
+        ];
+        for (id, ev) in cases {
+            let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));
+            assert!(
+                rule.evaluate(ev).is_none(),
+                "{id}: own client must pass: {ev:?}"
+            );
+        }
+    }
+
+    /// The lab's spoofs: a process that only names itself a client is
+    /// acted on, and the reasoning says what the kernel ran.
+    #[test]
+    fn a_comm_alone_never_makes_a_client() {
+        let (_tmp, lineage) = exec_fixture(&[
+            // python renamed with prctl(PR_SET_NAME): an inline program.
+            (
+                200,
+                "/usr/bin/python3.12",
+                &["python3", "-c", "open('/root/.aws/credentials')"],
+            ),
+            // a copy named like the client, outside a system tree.
+            (201, "/tmp/aws", &["/tmp/aws", "/root/.aws/credentials"]),
+            // a script named like the client, outside a system tree.
+            (
+                202,
+                "/usr/bin/python3.12",
+                &["python3", "/home/u/.cache/aws", "x"],
+            ),
+            // a module named like the client's, from the caller's path.
+            (203, "/usr/bin/python3.12", &["python3", "-m", "azure.cli"]),
+            // python renamed to sshd, appending to wtmp.
+            (
+                204,
+                "/usr/bin/python3.12",
+                &["python3", "-c", "open('/var/log/wtmp','ab')"],
+            ),
+        ]);
+        let rules = rules_by_id(&lineage);
+        let cases: &[(&str, Event)] = &[
+            (
+                "NN-L-FIM-011_AwsCredsRead",
+                read_by("/root/.aws/credentials", 200, "aws"),
+            ),
+            (
+                "NN-L-FIM-011_AwsCredsRead",
+                read_by("/root/.aws/credentials", 201, "aws"),
+            ),
+            (
+                "NN-L-FIM-011_AwsCredsRead",
+                read_by("/root/.aws/credentials", 202, "aws"),
+            ),
+            (
+                "NN-L-FIM-012_AzureCredsRead",
+                read_by("/root/.azure/msal_token_cache.json", 203, "az"),
+            ),
+            (
+                "NN-L-FIM-019_WtmpBtmpTampered",
+                written_by(FimOp::Modified, "/var/log/wtmp", 204, "sshd"),
+            ),
+            // never seen: no exec identity, not exempted.
+            (
+                "NN-L-FIM-011_AwsCredsRead",
+                read_by("/root/.aws/credentials", 299, "aws"),
+            ),
+        ];
+        for (id, ev) in cases {
+            let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));
+            let v = rule
+                .evaluate(ev)
+                .unwrap_or_else(|| panic!("{id}: a named impostor must be acted on: {ev:?}"));
+            assert_ne!(v.action, ResponseAction::Log, "{id}");
+            assert!(v.reasoning.contains("[named '"), "{}", v.reasoning);
+        }
+    }
+
+    /// Q8: the real `aws` CLI run by another user against someone else's
+    /// credentials file is not the owner's client at work.
+    #[test]
+    fn own_client_reading_another_users_store_is_still_foreign() {
+        let (_tmp, lineage) = exec_fixture(&[(
+            100,
+            "/usr/local/aws-cli/v2/2.17.0/dist/aws",
+            &["aws", "s3", "ls"],
+        )]);
+        let rules = rules_by_id(&lineage);
+        let mut ev = read_by("/home/alice/.aws/credentials", 100, "aws");
+        if let Event::Fim(fe) = &mut ev {
+            fe.wide_coverage = true;
+            fe.modifier_uid = 1001;
+            fe.owner_uid = Some(1000);
+        }
+        let v = rules["NN-L-FIM-011_AwsCredsRead"]
+            .evaluate(&ev)
+            .expect("a foreign read is acted on");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        // The owner's own CLI: no verdict.
+        if let Event::Fim(fe) = &mut ev {
+            fe.modifier_uid = 1000;
+        }
+        assert!(rules["NN-L-FIM-011_AwsCredsRead"].evaluate(&ev).is_none());
+    }
+
+    #[test]
+    fn system_trees_exclude_what_a_user_can_write() {
+        for p in [
+            "/usr/bin/aws",
+            "/opt/google/chrome/chrome",
+            "/snap/firefox/1/usr/lib/firefox/firefox",
+        ] {
+            assert!(in_system_tree(p), "{p}");
+        }
+        for p in [
+            "/tmp/aws",
+            "/home/u/bin/aws",
+            "/root/aws",
+            "/dev/shm/aws",
+            "/memfd:aws (deleted)",
+            "/usr/bin/aws (deleted)",
+            "/usr/../tmp/aws",
+        ] {
+            assert!(!in_system_tree(p), "{p}");
         }
     }
 }
