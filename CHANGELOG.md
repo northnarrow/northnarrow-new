@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Root could switch off the FIM kill rules for a minute at a time (review
+  76, High). The drift events handed to the rules were paced by host-wide
+  buckets (50 created and 100 modified files per minute, whoever wrote
+  them). After 60 throwaway files in `/etc/cron.d`, a real cron drop-in
+  was only logged: NN-L-FIM-007 never ran and its writer was not killed.
+  The buckets now pace only package-manager writes, the upgrade noise they
+  were meant for; every other write reaches the rules.
 - An unprivileged loop of reads disabled the FIM kill rules and erased
   detection records (review 75, High). Every open of the user's own
   credential file, or of a world-readable sensitive file such as

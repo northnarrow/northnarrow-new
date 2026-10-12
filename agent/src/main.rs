@@ -2310,6 +2310,8 @@ async fn main() -> Result<()> {
                             let inode_map_for_drain = Arc::clone(&inode_map);
                             let baseline_cache_for_drain = Arc::clone(&baseline_cache);
                             let watched_paths_for_drain = watched_paths_handle.clone();
+                            // Review 76: only package-manager drift is paced.
+                            let lineage_for_drain = lineage.clone();
                             let event_tx = sensor.event_tx();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = drain_loop(
@@ -2320,6 +2322,7 @@ async fn main() -> Result<()> {
                                     classifier,
                                     rate_limiter_clone,
                                     watched_paths_for_drain,
+                                    lineage_for_drain,
                                     event_tx,
                                 )
                                 .await
@@ -3187,7 +3190,10 @@ async fn process_event(
                     modifier_comm = %fe.modifier_comm,
                     "fim credential-path read forwarded to rule engine (not drift)"
                 );
-            } else {
+            } else if budget_admit("FIM-DRIFT", fe.modifier_uid).record() {
+                // Review 76: every drift now reaches the rules; its journal
+                // line has the per-uid budget (the signed fim_drift.jsonl
+                // row is always written).
                 warn!(
                     path = %fe.path,
                     op = ?fe.op,
