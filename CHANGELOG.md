@@ -6,6 +6,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- DNS tunnelling could escape NET-004/-005/-014 (reviews 66, 67, High).
+  The DNS sensor read the query name from user memory before the kernel
+  copied it, and saw IPv4 only. On the lab, a tunnelling-shaped name ran
+  untouched when it was sent in any of these ways:
+  - to an IPv6 resolver (`[::1]:53`);
+  - from a page the process had not touched yet (the name read as empty);
+  - with a zero byte inside its first label (the name was cut there).
+  The sensor now reads the kernel's copy, IPv4 and IPv6, and all three are
+  killed. A query whose name does not end in the copy's linear data (sent
+  in pieces, with UDP GSO or zero copy) is recorded by NET-004 (Log).
 - The exec kill rules could be evaded with a relative path (review 61,
   High). They matched the string the caller passed to `execve`, so
   `cd /tmp && ./payload` ran with no detection while `/tmp/payload` was
@@ -163,6 +173,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- DNS sensor on the socket buffer (Tappa 10.9 step 3). Kprobes on
+  `udp_send_skb` and `udp_v6_send_skb` read the query from the buffer the
+  kernel sends: the destination from the flow, and the name from the
+  kernel's copy of the payload. Userland walks the labels, so a zero byte
+  inside a label no longer cuts the name. `udp_sendmsg` is no longer
+  attached for DNS; `--dns-sensor sendmsg` (or `NN_DNS_SENSOR`) keeps it
+  for one soak cycle. `DnsQuery` gains `qname_partial`. Eight optional BTF
+  slots (`sk_buff.{head,tail,transport_header,data_len}`,
+  `flowi4.{daddr,uli}`, `flowi6.{daddr,uli}`). `nn-lab.sh
+  dns-sensor-check` verifies it end to end.
 - Exec sensor on LSM `bprm_check_security` (Tappa 10.9 step 2). For each
   binfmt pass (a `#!` script: the script, then its interpreter) it reads
   the file the kernel opened. It records `(dev, ino)`, whether the file is

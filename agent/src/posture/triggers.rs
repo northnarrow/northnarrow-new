@@ -1103,6 +1103,7 @@ pub(super) mod testutil {
             dns_server: [0u8; 16],
             family: 2,
             timestamp_ns: ts,
+            qname_partial: false,
         }
     }
 

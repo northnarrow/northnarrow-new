@@ -191,6 +191,23 @@ event name):
 A kernel built without `CONFIG_IO_URING` has no such tracepoints: the
 agent logs a WARN and runs without the sensor (nothing to observe there).
 
+## DNS sensor: two static kernel functions (Tappa 10.9 step 3)
+
+The DNS sensor hooks `udp_send_skb` and `udp_v6_send_skb`, where the kernel
+sends the socket buffer holding its copy of the query. Both are `static`. A
+compiler may inline them, or emit a renamed copy (`.isra.0`,
+`.constprop.0`) whose arguments differ, so the agent attaches only the
+plain names.
+
+Both plain names are present on 5.15, 6.1 and 6.8. To check a kernel:
+`grep -E ' udp(_v6)?_send_skb$' /proc/kallsyms`.
+
+- **No `udp_send_skb`:** the agent falls back to the `udp_sendmsg`
+  program. That one reads user memory, sees IPv4 only, and is the same as
+  `--dns-sensor sendmsg`. The fallback is logged at WARN.
+- **No `udp_v6_send_skb`:** IPv4 stays on the socket buffer. Queries to
+  IPv6 resolvers are not observed, and a WARN says so.
+
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
 The 5.15 verifier rejected the constructs below, which 6.1 and 6.8 accept. All

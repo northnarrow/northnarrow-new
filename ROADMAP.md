@@ -21,7 +21,7 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
 | **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
-| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passo 1 (aperture file su LSM) fatto il 12 ottobre |
+| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passi 1 (aperture file su LSM) e 2 (exec su LSM) fatti il 12 ottobre, passo 3 (DNS letto dal buffer del socket, anche IPv6) in verifica |
 | UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 
@@ -731,7 +731,19 @@ cambia l'ordine delle Tappe successive.
   6.8: perdita sulle aperture dal 31,9 % al 28,2 %, CPU dell'agente per
   apertura da 6,4 µs a quasi zero; il dimezzamento proposto in Q7 non è
   raggiunto, perché il resto viene dagli hook FIM di chiusura e di
-  scrittura (nuovo rilievo 59, decisione per il founder). Trovato
+  scrittura (nuovo rilievo 59, decisione per il founder). Passo 2 (exec)
+  fatto il 12 ottobre (lab PR 53): sensore su LSM `bprm_check_security`,
+  le regole di exec leggono il file eseguito dal kernel (rilievo 61:
+  `cd /tmp && ./x`, un symlink o `..` eludevano R001–R010);
+  `nn-lab.sh exec-sensor-check` 8/8 su 6.8, 6.1 e 5.15. Passo 3 (DNS) il
+  12 ottobre (lab PR 57): kprobe su `udp_send_skb` / `udp_v6_send_skb`, il
+  QNAME si legge dalla copia del kernel, anche verso resolver IPv6
+  (rilievi 66 e 67: un resolver IPv6, una pagina non ancora caricata o un
+  byte zero in una label eludevano NET-004); la Q5 è rivista perché il
+  `kretprobe` su `ip_make_skb` non vede la porta di destinazione;
+  `nn-lab.sh dns-sensor-check`. Trovati nel frattempo i rilievi 65 (il fix
+  della build di release per x86-64-v2 non arrivava alla build, corretto)
+  e 68 (flussi UDP verso IPv6 senza riga netflow). Trovato
   e corretto il rilievo 55: su btrfs
   le chiavi `(dev, ino)` dello userland non corrispondevano a quelle del
   kernel, e FIM e protezione dei file non vedevano nulla (ora il kernel

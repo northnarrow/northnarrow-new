@@ -1016,6 +1016,7 @@ mod tests {
             dns_server: [0u8; 16],
             family: 2,
             timestamp_ns: 0,
+            qname_partial: false,
         }
     }
 

@@ -648,6 +648,7 @@ mod tests {
             dns_server: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             family: 2,
             timestamp_ns: 0,
+            qname_partial: false,
         };
         assert!(detector.process_event(&dns_event).is_none());
     }

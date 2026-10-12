@@ -20,6 +20,7 @@
 mod btf_offsets;
 mod bpf_defense;
 mod dns_query;
+mod dns_skb;
 mod drops;
 mod exec_check;
 mod exec_lsm;

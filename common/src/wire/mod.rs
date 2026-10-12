@@ -17,6 +17,25 @@ pub const FILENAME_LEN: usize = 256;
 /// Maximum length of a DNS QNAME we record (RFC 1035 §2.3.4).
 pub const QNAME_LEN: usize = 253;
 
+/// Bytes of a DNS query the socket-buffer sensor copies, from the start
+/// of the name (Tappa 10.9 step 3): the longest legal name in wire form
+/// (255 bytes, RFC 1035 §3.1), its type and its class fit.
+pub const QNAME_WIRE_LEN: usize = 288;
+const _: () = assert!(QNAME_WIRE_LEN >= 255 + 4);
+
+/// `DnsQueryRaw::flags` (Tappa 10.9 step 3).
+pub mod dns_flags {
+    /// Read from the socket buffer the kernel built (`udp_send_skb` /
+    /// `udp_v6_send_skb`): `query_name` holds `qname_len` wire bytes from
+    /// the start of the name, and userland finds the name's end and the
+    /// type. Without it the record comes from the `udp_sendmsg` kprobe: a
+    /// string read from user memory, with `qtype` filled in the kernel.
+    pub const SKB: u8 = 1 << 0;
+    /// Part of the payload is in page fragments (`skb->data_len != 0`): a
+    /// corked send, UDP GSO or zero copy. Only the linear part is read.
+    pub const NONLINEAR: u8 = 1 << 1;
+}
+
 /// IPv6 / padded-IPv4 address byte length.
 pub const ADDR_LEN: usize = 16;
 
@@ -387,12 +406,15 @@ impl NetFlowCloseRaw {
     }
 }
 
-/// DNS query (kprobe `udp_sendmsg` filtered to dest port 53).
+/// DNS query: one per UDP datagram to port 53. From the kprobes on
+/// `udp_send_skb` / `udp_v6_send_skb` (the kernel's copy, IPv4 and IPv6;
+/// [`dns_flags::SKB`]) or, in `--dns-sensor sendmsg` mode, the kprobe on
+/// `udp_sendmsg` (user memory, IPv4).
 ///
 /// `query_name` is the **raw label-encoded QNAME** copied from the
 /// UDP payload — the userland sensor decodes it to dotted notation.
 /// Doing the decoding outside eBPF keeps the verifier happy and the
-/// hot path bounded.
+/// hot path bounded. 344 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -403,10 +425,10 @@ pub struct DnsQueryRaw {
     pub _pad0: [u8; 2],
     pub dns_server: [u8; ADDR_LEN],
     pub family: u8,
-    pub _pad1: [u8; 1],
+    /// [`dns_flags`].
+    pub flags: u8,
     pub qname_len: u16,
-    pub query_name: [u8; QNAME_LEN],
-    pub _pad2: [u8; 3],
+    pub query_name: [u8; QNAME_WIRE_LEN],
     pub comm: [u8; TASK_COMM_LEN],
     pub timestamp_ns: u64,
 }
@@ -420,10 +442,9 @@ impl DnsQueryRaw {
             _pad0: [0; 2],
             dns_server: [0; ADDR_LEN],
             family: 0,
-            _pad1: [0; 1],
+            flags: 0,
             qname_len: 0,
-            query_name: [0u8; QNAME_LEN],
-            _pad2: [0; 3],
+            query_name: [0u8; QNAME_WIRE_LEN],
             comm: [0u8; TASK_COMM_LEN],
             timestamp_ns: 0,
         }
@@ -1170,6 +1191,21 @@ mod tests {
         assert_eq!(size_of::<ExecCheckRaw>(), 848);
         assert_eq!(align_of::<ExecCheckRaw>(), 8);
         assert_eq!(core::mem::offset_of!(ExecCheckRaw, exe), 296);
+    }
+
+    /// Tappa 10.9 step 3: the pad byte after `family` became `flags`, and
+    /// `query_name` grew from 253 bytes (+3 pad) to 288, so the longest
+    /// wire name, its type and its class fit. Nothing before it moved.
+    #[test]
+    fn dns_query_raw_layout_is_stable() {
+        assert_eq!(size_of::<DnsQueryRaw>(), 344);
+        assert_eq!(align_of::<DnsQueryRaw>(), 8);
+        assert_eq!(core::mem::offset_of!(DnsQueryRaw, family), 28);
+        assert_eq!(core::mem::offset_of!(DnsQueryRaw, flags), 29);
+        assert_eq!(core::mem::offset_of!(DnsQueryRaw, qname_len), 30);
+        assert_eq!(core::mem::offset_of!(DnsQueryRaw, query_name), 32);
+        assert_eq!(core::mem::offset_of!(DnsQueryRaw, comm), 320);
+        assert_eq!(core::mem::offset_of!(DnsQueryRaw, timestamp_ns), 336);
     }
 
     #[test]

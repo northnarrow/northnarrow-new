@@ -215,7 +215,8 @@ impl SensorMultiplexer {
         }
         attach_kprobe(&mut ebpf, "tcp_v4_connect", "tcp_v4_connect")?;
         attach_kprobe(&mut ebpf, "tcp_v6_connect", "tcp_v6_connect")?;
-        attach_kprobe(&mut ebpf, "udp_sendmsg", "udp_sendmsg")?;
+        // Tappa 10.9 step 3: the socket-buffer DNS sensor, or `udp_sendmsg`.
+        crate::sensors::dns_sensor::attach(&mut ebpf, attach_kprobe)?;
 
         // Tappa 10 N9 — attach the three N2 network programs only
         // when the caller passed `NetWiring`. Without a drain task

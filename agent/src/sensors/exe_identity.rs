@@ -112,7 +112,7 @@ fn attach_lsm(ebpf: &mut Ebpf) -> Result<()> {
 
 /// The error chain with a long verifier log cut to its last lines (the
 /// reason is at the end).
-fn verifier_tail(e: &anyhow::Error) -> String {
+pub(crate) fn verifier_tail(e: &anyhow::Error) -> String {
     const KEEP: usize = 30;
     let full = format!("{e:#}");
     let lines: Vec<&str> = full.lines().collect();

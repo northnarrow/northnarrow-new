@@ -286,6 +286,7 @@ mod tests {
             dns_server: [0u8; 16],
             family: 2,
             timestamp_ns: 0,
+            qname_partial: false,
         };
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("evil.example.org"));

@@ -191,6 +191,14 @@ pub enum Event {
         dns_server: [u8; ADDR_LEN],
         family: u8,
         timestamp_ns: u64,
+        /// Tappa 10.9 step 3: the name does not end inside the bytes the
+        /// socket-buffer sensor could read — the rest is in page fragments
+        /// (a corked send, UDP GSO, zero copy) or the datagram is not a DNS
+        /// query. `query_name` holds the part that was read. Resolvers send
+        /// a query in one piece; NET-004 records it. Always `false` in
+        /// `--dns-sensor sendmsg` mode.
+        #[serde(default)]
+        qname_partial: bool,
     },
     /// Tappa 7 inode-protection LSM hook denied a modification of a
     /// protected filesystem object. By construction this means
@@ -670,11 +678,26 @@ impl From<&FsProtectDenialRaw> for Event {
 
 impl From<&DnsQueryRaw> for Event {
     fn from(raw: &DnsQueryRaw) -> Self {
-        let mut len = raw.qname_len as usize;
-        if len > raw.query_name.len() {
-            len = raw.query_name.len();
-        }
-        let query_name = decode_dns_qname(&raw.query_name[..len]);
+        let len = (raw.qname_len as usize).min(raw.query_name.len());
+        let bytes = &raw.query_name[..len];
+        let query_name = decode_dns_qname(bytes);
+        // Tappa 10.9 step 3: the socket-buffer sensor copies wire bytes from
+        // the start of the name; its end, and the type after it, are found
+        // here (a zero byte inside a label does not end the name). The
+        // `udp_sendmsg` sensor fills `qtype` in the kernel.
+        let (query_type, qname_partial) = if raw.flags & crate::wire::dns_flags::SKB != 0 {
+            match qname_wire_end(bytes) {
+                Some(end) => (
+                    bytes
+                        .get(end..end + 2)
+                        .map_or(0, |t| u16::from_be_bytes([t[0], t[1]])),
+                    false,
+                ),
+                None => (0, true),
+            }
+        } else {
+            (raw.qtype, false)
+        };
         Event::DnsQuery {
             pid: raw.pid,
             uid: raw.uid,
@@ -684,10 +707,11 @@ impl From<&DnsQueryRaw> for Event {
             // best-effort in `pump_dns_query` right after this `From`.
             exe: None,
             query_name,
-            query_type: raw.qtype,
+            query_type,
             dns_server: raw.dns_server,
             family: raw.family,
             timestamp_ns: raw.timestamp_ns,
+            qname_partial,
         }
     }
 }
@@ -776,6 +800,21 @@ impl<'a> Iterator for QnameLabels<'a> {
         self.i = end;
         Some(QnameLabel::Data(label))
     }
+}
+
+/// Where a name ends in a wire buffer: the index just past its root label.
+/// `None` when the buffer ends first (the name continues past what was
+/// read) or a compression pointer stops the walk (a query's own name never
+/// needs one). Tappa 10.9 step 3: the type follows at this index.
+pub fn qname_wire_end(buf: &[u8]) -> Option<usize> {
+    let mut labels = QnameLabels::new(buf);
+    for label in labels.by_ref() {
+        if label == QnameLabel::Pointer {
+            return None;
+        }
+    }
+    // The walk stopped at a root label (inside the buffer) or at its end.
+    (labels.i < buf.len() && buf[labels.i] == 0).then_some(labels.i + 1)
 }
 
 /// Severity assigned to a verdict.
@@ -925,6 +964,83 @@ mod tests {
         }
         // Sanity: the size constant is honoured.
         assert_eq!(QNAME_LEN, 253);
+    }
+
+    /// A record from the socket-buffer sensor (Tappa 10.9 step 3): wire
+    /// bytes from the start of the name; the type comes after the root label.
+    fn skb_raw(wire: &[u8]) -> DnsQueryRaw {
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.flags = crate::wire::dns_flags::SKB;
+        raw.qtype = 0xffff; // ignored in this mode
+        raw.qname_len = wire.len() as u16;
+        raw.query_name[..wire.len()].copy_from_slice(wire);
+        raw
+    }
+
+    fn dns_fields(ev: Event) -> (String, u16, bool) {
+        match ev {
+            Event::DnsQuery {
+                query_name,
+                query_type,
+                qname_partial,
+                ..
+            } => (query_name, query_type, qname_partial),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn skb_record_takes_the_type_after_the_root_label() {
+        // example.com, TXT (16), class IN
+        let raw = skb_raw(b"\x07example\x03com\x00\x00\x10\x00\x01");
+        assert_eq!(
+            dns_fields(Event::from(&raw)),
+            ("example.com".into(), 16, false)
+        );
+    }
+
+    /// The `udp_sendmsg` sensor stopped at the first zero byte, so a zero
+    /// inside a label cut the name; the label walk does not.
+    #[test]
+    fn skb_record_keeps_a_label_with_a_zero_byte() {
+        let raw = skb_raw(b"\x05ab\x00cd\x04evil\x00\x00\x01\x00\x01");
+        assert_eq!(
+            dns_fields(Event::from(&raw)),
+            ("ab?cd.evil".into(), 1, false)
+        );
+    }
+
+    /// The name runs past the bytes read (a corked send: the rest is in a
+    /// page fragment): partial, no type.
+    #[test]
+    fn skb_record_without_a_root_label_is_partial() {
+        let raw = skb_raw(b"\x10aaaaaaaaaaaaaaaa\x06bbb");
+        let (name, qtype, partial) = dns_fields(Event::from(&raw));
+        assert_eq!(name, "aaaaaaaaaaaaaaaa.bbb");
+        assert_eq!((qtype, partial), (0, true));
+        // Nothing read at all is partial too.
+        assert!(dns_fields(Event::from(&skb_raw(b""))).2);
+        // A compression pointer in a query's own name.
+        assert!(dns_fields(Event::from(&skb_raw(b"\x03abc\xc0\x0c"))).2);
+    }
+
+    #[test]
+    fn sendmsg_record_keeps_the_kernel_type() {
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.qtype = 28;
+        let qname = b"\x04host\x00";
+        raw.qname_len = 5; // the string read does not count the root label
+        raw.query_name[..qname.len()].copy_from_slice(qname);
+        assert_eq!(dns_fields(Event::from(&raw)), ("host".into(), 28, false));
+    }
+
+    #[test]
+    fn qname_wire_end_finds_the_root_label() {
+        assert_eq!(qname_wire_end(b"\x01a\x00\x00\x01"), Some(3));
+        assert_eq!(qname_wire_end(b"\x00"), Some(1)); // the root name
+        assert_eq!(qname_wire_end(b"\x01a"), None);
+        assert_eq!(qname_wire_end(b""), None);
+        assert_eq!(qname_wire_end(b"\x05ab"), None); // label cut by the end
     }
 
     #[test]
@@ -1116,6 +1232,22 @@ mod kani_proofs {
             }
             steps += 1;
             assert!(steps <= len);
+        }
+    }
+
+    /// `qname_wire_end` on any buffer of up to 16 bytes: the end it reports
+    /// is inside the buffer and just past a root label, so the type read
+    /// after it (`From<&DnsQueryRaw>`) starts in bounds.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn qname_wire_end_is_past_a_root_label() {
+        let backing: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        let buf = &backing[..len];
+        if let Some(end) = qname_wire_end(buf) {
+            assert!(end >= 1 && end <= len);
+            assert!(buf[end - 1] == 0);
         }
     }
 }
