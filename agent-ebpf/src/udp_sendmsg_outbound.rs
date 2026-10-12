@@ -143,6 +143,33 @@ pub fn udpv6_sendmsg_outbound(ctx: ProbeContext) -> u32 {
     0
 }
 
+/// `127.0.0.0/8`, `::1`, or `::ffff:127.x.y.z`.
+#[inline(always)]
+fn loopback_dst(dst: &Dst) -> bool {
+    if dst.family == AF_INET {
+        return dst.addr[0] == 127;
+    }
+    let mut zeros = true;
+    let mut i = 0usize;
+    while i < 10 {
+        if dst.addr[i] != 0 {
+            zeros = false;
+        }
+        i += 1;
+    }
+    if !zeros {
+        return false;
+    }
+    let one = dst.addr[10] == 0
+        && dst.addr[11] == 0
+        && dst.addr[12] == 0
+        && dst.addr[13] == 0
+        && dst.addr[14] == 0
+        && dst.addr[15] == 1;
+    let mapped_lo = dst.addr[10] == 0xff && dst.addr[11] == 0xff && dst.addr[12] == 127;
+    one || mapped_lo
+}
+
 /// `::ffff:0:0/96`, an IPv4 address carried in an IPv6 one.
 #[inline(always)]
 fn v4_mapped(addr: &[u8; ADDR_LEN]) -> bool {
@@ -260,13 +287,17 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext, v6: bool) -> Result<(), i64> {
     let pid = (pid_tgid >> 32) as u32;
     let now = unsafe { bpf_ktime_get_ns() };
 
-    // A DNS *server* answering its clients (systemd-resolved's stub on
-    // 127.0.0.53, bind, unbound) is an unconnected sendto FROM port 53 to
-    // a fresh client port per query: the (pid, dst) aggregate cannot
-    // collapse it and every local lookup would cost a netflow row. Port 53
-    // belongs to the DNS sensor in both directions; the listener side is
-    // the resolver's own business, not an outbound flow.
-    if dst.unconnected && sport_host == DNS_DST_PORT {
+    // A DNS *server* answering its clients is an unconnected sendto FROM
+    // port 53 to a fresh client port per query. External audit EBPF-007
+    // (NN-AUD-018): only the answers to a local client are left out
+    // (systemd-resolved's stub on 127.0.0.53 answering every local lookup).
+    // Everything else sent from port 53 is a flow: a socket bound to :53
+    // sending to any host and port used to be invisible to this sensor
+    // and to the DNS one (which watches destination port 53). Answers to
+    // remote clients are aggregated per client address, whatever its
+    // port, so a busy server costs one row per client per interval.
+    let dns_server_send = dst.unconnected && sport_host == DNS_DST_PORT;
+    if dns_server_send && loopback_dst(&dst) {
         return Ok(());
     }
     // Review 73: aggregate per (pid, dst), connected or not. The first
@@ -275,7 +306,11 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext, v6: bool) -> Result<(), i64> {
     // or as soon as UDP_EMIT_MAX_PENDING bytes are pending.
     let key = UdpDstKey {
         pid,
-        port_be: dst.port_host.to_be(),
+        port_be: if dns_server_send {
+            0
+        } else {
+            dst.port_host.to_be()
+        },
         family: dst.family as u8,
         _pad: 0,
         addr: dst.addr,

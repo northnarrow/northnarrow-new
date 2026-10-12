@@ -3461,11 +3461,9 @@ fn budget_admit(rule: &str, uid: u32, event: &Event) -> Admit {
 /// Render a 16-byte address according to family (`2` = AF_INET → first
 /// 4 bytes; `10` = AF_INET6 → full v6).
 fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    if family == 2 {
-        Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()
-    } else if family == 10 {
-        Ipv6Addr::from(*bytes).to_string()
+    // External audit NET-001: one form in the logs, IPv4-mapped folded.
+    if family == 2 || family == 10 {
+        common::netaddr::canonical_ip(family, bytes).to_string()
     } else {
         format!("family={family}")
     }

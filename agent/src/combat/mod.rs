@@ -674,15 +674,16 @@ fn fmt_protected(spared: &[(u32, ProtectedReason)]) -> String {
 /// True if `addr` (interpreted per `family`: 2 = AF_INET, 10 = AF_INET6)
 /// is a loopback address. Outbound connects to loopback are not exfil and
 /// must not trigger the jump-ahead.
+///
+/// External audit NET-001: `::ffff:127.0.0.1` (a dual-stack socket) is
+/// loopback too.
 fn is_loopback(family: u8, addr: &[u8]) -> bool {
-    const AF_INET: u8 = 2;
-    const AF_INET6: u8 = 10;
-    match family {
-        AF_INET => addr.first().copied() == Some(127),
-        AF_INET6 => {
-            // ::1 — fifteen zero bytes then 0x01.
-            addr.len() >= 16 && addr[..15].iter().all(|b| *b == 0) && addr[15] == 1
-        }
-        _ => false,
+    use common::netaddr::{canonical_ip, AF_INET, AF_INET6};
+    if family != AF_INET && family != AF_INET6 {
+        return false;
     }
+    let mut b = [0u8; 16];
+    let n = addr.len().min(16);
+    b[..n].copy_from_slice(&addr[..n]);
+    canonical_ip(family, &b).is_loopback()
 }

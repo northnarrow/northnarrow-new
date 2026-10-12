@@ -37,11 +37,13 @@
 # ── RFC 3849 — IPv6 documentation prefix ──────────────────────────────
 2001:db8::/32
 
-# ── RFC 6598 — shared CGN space (no public Internet egress should hit) ─
-100.64.0.0/10
-
-# ── RFC 2544 — IETF benchmarking range (no public routing) ─────────────
-198.18.0.0/15
+# Not listed (external audit NET-011, NN-AUD-060): RFC 6598 shared CGN
+# space (100.64.0.0/10) and the RFC 2544 benchmarking range (198.18.0.0/15).
+# Real hosts use both every day — Tailscale's whole tailnet, AWS EKS pod
+# subnets, CNI overlays and ISP customer space for the first; several
+# VPN and SD-WAN clients for the second — and this list feeds a rule that
+# kills the process tree. An operator who wants them flagged adds them in
+# the `.local` overlay.
 
 # ── RFC 7526 — deprecated 6to4 relay anycast (no current Internet use) ──
 192.88.99.0/24

@@ -274,18 +274,23 @@ impl DnsCache {
     }
 
     pub fn lookup_for_connect(&self, pid: u32, now_ns: u64) -> Option<String> {
-        let mut g = self.inner.lock();
-        let q = g.by_pid.get_mut(&pid)?;
-        // Prune anything older than `now_ns - ttl_ns`. Saturate
-        // on underflow (can happen on the dev-VM if monotonic
-        // clock jitter pushes `now_ns < ttl_ns`).
+        let g = self.inner.lock();
+        let q = g.by_pid.get(&pid)?;
+        // Saturate on underflow (monotonic clock jitter on the dev VM can
+        // push `now_ns < ttl_ns`).
         let cutoff = now_ns.saturating_sub(self.ttl_ns);
-        while q.front().is_some_and(|e| e.ts_ns < cutoff) {
-            q.pop_front();
-        }
-        // Most-recent = back of the deque.
-        q.back()
-            .filter(|e| e.ts_ns <= now_ns)
+        // External audit NET-005 (NN-AUD-059): the newest query at or
+        // before the connect, walking back. The caller passes the
+        // connect's time and looks up when the flow CLOSES, so a query
+        // the pid issued meanwhile is newer than the connect; reading
+        // only the back of the queue returned nothing then. No pruning
+        // here either: `now_ns` is in the past, and a cut from it could
+        // drop what an older flow still needs (`prune_pids` runs on
+        // inserts).
+        q.iter()
+            .rev()
+            .find(|e| e.ts_ns <= now_ns)
+            .filter(|e| e.ts_ns >= cutoff)
             .map(|e| e.qname.clone())
     }
 
@@ -512,6 +517,24 @@ fn try_parse_answers(packet: &[u8]) -> Option<Vec<DnsAnswer>> {
 mod tests {
     use super::*;
 
+    /// External audit NET-005 (NN-AUD-059): a query the pid issued after
+    /// the connect must not hide the one before it.
+    #[test]
+    fn lookup_ignores_queries_issued_after_the_connect() {
+        let c = DnsCache::default();
+        c.on_dns_query(42, "c2.example".into(), 1, 10 * ONE_SEC_NS);
+        c.on_dns_query(42, "noise.example".into(), 1, 30 * ONE_SEC_NS);
+        assert_eq!(
+            c.lookup_for_connect(42, 20 * ONE_SEC_NS).as_deref(),
+            Some("c2.example")
+        );
+        assert_eq!(
+            c.lookup_for_connect(42, 31 * ONE_SEC_NS).as_deref(),
+            Some("noise.example")
+        );
+        assert_eq!(c.lookup_for_connect(42, 5 * ONE_SEC_NS), None);
+    }
+
     /// Soak 2026-10-11 regression: one short-lived pid per query must not
     /// grow the forward map forever. After the TTL every dead pid is
     /// gone; the live one survives.
@@ -573,16 +596,20 @@ mod tests {
     }
 
     /// N4 test #2 — TTL expiry. Query at T, connect at T + 301 s
-    /// (1 s past window) → cache miss + expired entry pruned.
+    /// (1 s past window) → cache miss. The lookup no longer prunes
+    /// (external audit NET-005: its `now` is the connect's, in the past);
+    /// `prune_pids` does, on inserts.
     #[test]
     fn dns_cache_misses_after_5min_ttl_expiry() {
         let c = DnsCache::default();
         c.on_dns_query(1234, "example.com".into(), 1, 0);
         let now = (DEFAULT_TTL_SECS + 1) * ONE_SEC_NS;
         assert!(c.lookup_for_connect(1234, now).is_none());
-        // Pruning happened on the read — the per-pid deque is
-        // now empty.
-        assert_eq!(c.entries_for(1234), 0);
+        // a connect inside the window still finds it: the read kept it
+        assert_eq!(
+            c.lookup_for_connect(1234, ONE_SEC_NS).as_deref(),
+            Some("example.com")
+        );
     }
 
     /// N4 test #3 — per-PID FIFO eviction. With cap=3,

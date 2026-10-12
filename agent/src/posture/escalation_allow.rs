@@ -253,15 +253,11 @@ fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
     Ok((addr, prefix))
 }
 
-/// Build an `IpAddr` from the wire `[u8; 16]` dst + family (AF_INET=2 →
-/// the first 4 bytes; else treat as IPv6).
+/// Build an `IpAddr` from the wire `[u8; 16]` dst + family, canonical
+/// (external audit NET-001: an IPv4-mapped IPv6 address is the IPv4
+/// address it maps).
 fn to_ipaddr(dst: &[u8; 16], family: u8) -> IpAddr {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    if family == 2 {
-        IpAddr::V4(Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]))
-    } else {
-        IpAddr::V6(Ipv6Addr::from(*dst))
-    }
+    common::netaddr::canonical_ip(family, dst)
 }
 
 /// v4/v6 CIDR containment (same masking as `net::blocklist`). Cross-

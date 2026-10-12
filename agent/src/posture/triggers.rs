@@ -1092,13 +1092,23 @@ fn is_inet_family(family: u8) -> bool {
 /// v4: RFC1918. v6: ULA (`fc00::/7`) or link-local (`fe80::/10`).
 /// (BUG-039 — the v6 sibling of `is_rfc1918`; exfil's "public dst" and
 /// lateral's "internal dst" both need the v6 notion.)
+///
+/// External audit NET-001: an IPv4-mapped IPv6 address (a dual-stack
+/// socket reaching an IPv4 peer) is judged as the IPv4 address it maps.
 fn is_internal(addr: &[u8; 16], family: u8) -> bool {
     match family {
         2 => is_rfc1918(addr),
-        10 => {
-            (addr[0] & 0xfe) == 0xfc // fc00::/7 — unique-local (ULA)
-                || (addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80) // fe80::/10 — link-local
-        }
+        10 => match common::netaddr::canonical_ip(family, addr) {
+            std::net::IpAddr::V4(v4) => {
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(&v4.octets());
+                is_rfc1918(&b)
+            }
+            std::net::IpAddr::V6(_) => {
+                (addr[0] & 0xfe) == 0xfc // fc00::/7 — unique-local (ULA)
+                    || (addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80) // fe80::/10 — link-local
+            }
+        },
         _ => false,
     }
 }
@@ -2522,6 +2532,18 @@ mod tests {
         a[1] = (prefix & 0xff) as u8;
         a[15] = last;
         a
+    }
+
+    #[test]
+    fn is_internal_folds_ipv4_mapped() {
+        // External audit NET-001: ::ffff:10.0.0.5 is RFC 1918, ::ffff:8.8.8.8 is not.
+        let mut b = [0u8; 16];
+        b[10] = 0xff;
+        b[11] = 0xff;
+        b[12..].copy_from_slice(&[10, 0, 0, 5]);
+        assert!(is_internal(&b, 10));
+        b[12..].copy_from_slice(&[8, 8, 8, 8]);
+        assert!(!is_internal(&b, 10));
     }
 
     #[test]
