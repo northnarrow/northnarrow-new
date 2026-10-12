@@ -1,14 +1,14 @@
-//! File-open sensor.
+//! File-open sensor on the `syscalls/sys_enter_openat` tracepoint: one
+//! record per `openat` of the host, read from user memory.
 //!
-//! **Deviation from spec:** this hooks the `syscalls/sys_enter_openat`
-//! tracepoint instead of the LSM `file_open` hook. Rationale:
-//! `bpf-linker` 0.10 does not emit a `.BTF` section for Rust eBPF
-//! programs, and Aya's LSM loader needs CO-RE relocations against
-//! kernel structs (`struct file`, `f_path.dentry`) that fail without
-//! it. The tracepoint gives the same userland telemetry (pid, uid,
-//! gid, filename, flags) and is portable across kernels. When eBPF
-//! BTF lands properly, we'll switch the hook for Tappa 7
-//! enforcement.
+//! Since Tappa 10.9 step 1 the default sensor is the LSM `file_open`
+//! observer (`open_sensor.rs`), which filters in the kernel. This program
+//! stays for `--file-open-sensor tracepoint` and as the fallback when the
+//! LSM sensor cannot be armed. Review 69: it is attached at start either
+//! way, but emits only once userland turns [`FILE_OPEN_TP_ON`] on. In LSM
+//! mode it stays inert until the LSM sensor takes over and it is detached;
+//! before, its records filled the ring and the agent's event channel while
+//! the agent booted, and the events of every sensor waited behind them.
 
 use aya_ebpf::{
     helpers::{
@@ -16,7 +16,7 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{Array, RingBuf},
     programs::TracePointContext,
 };
 use northnarrow_common::wire::{FileOpenRaw, FILENAME_LEN, TASK_COMM_LEN};
@@ -24,6 +24,11 @@ use northnarrow_common::wire::{FileOpenRaw, FILENAME_LEN, TASK_COMM_LEN};
 /// Ringbuffer dedicated to FileOpen events.
 #[map]
 static FILE_OPEN_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Slot 0: non-zero = emit (tracepoint mode, or the LSM sensor could not be
+/// armed). Zero, the map's initial value, keeps the program inert.
+#[map]
+static FILE_OPEN_TP_ON: Array<u32> = Array::with_max_entries(1, 0);
 
 // `sys_enter_openat` event format (offsets confirmed against
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_openat/format
@@ -46,6 +51,10 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i64> {
+    match FILE_OPEN_TP_ON.get(0) {
+        Some(on) if *on != 0 => {}
+        _ => return Ok(()),
+    }
     let mut entry = match FILE_OPEN_EVENTS.reserve::<FileOpenRaw>(0) {
         Some(e) => e,
         None => {

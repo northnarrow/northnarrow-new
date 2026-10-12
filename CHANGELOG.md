@@ -6,6 +6,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The agent wrote every exec and every network flow to the journal at INFO
+  (review 71). On a busy host journald then rate-limited the agent, which
+  lost other lines too, and every command line on the host (with any
+  secret in its arguments) was copied into the journal. Both lines are now
+  DEBUG; the records stay in the detection store and the signed netflow
+  log.
+- An agent start could lose events in its first seconds (review 69). Until
+  the LSM file-open sensor took over, the `sys_enter_openat` tracepoint sent
+  every open of the host to the agent's event channel, which nothing reads
+  before the boot sequence ends. The channel filled, every sensor waited
+  behind it, and the file-open ring overflowed: up to 1,018 records lost on
+  the lab. The tracepoint now stays inert in the default mode until it is
+  needed (`--file-open-sensor tracepoint`, or as the fallback).
+- UDP datagrams to IPv6 destinations left no flow row (review 68, High).
+  The N2 UDP program was attached to `udp_sendmsg` only, so a QUIC-like
+  beacon or raw-UDP exfiltration over IPv6 was invisible to the flow
+  rules. It is now attached to `udpv6_sendmsg` too. An IPv4-mapped
+  destination still gives one row, not two.
 - DNS tunnelling could escape NET-004/-005/-014 (reviews 66, 67, High).
   The DNS sensor read the query name from user memory before the kernel
   copied it, and saw IPv4 only. On the lab, a tunnelling-shaped name ran

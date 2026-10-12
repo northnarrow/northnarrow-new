@@ -556,6 +556,19 @@ enum DnsSensor {
     Sendmsg,
 }
 
+/// Review 69: the LSM file-open sensor could not be armed, so
+/// `sys_enter_openat` (attached, inert until now) starts emitting.
+fn open_tracepoint_fallback(sensor: &mut SensorMultiplexer) {
+    if let Err(e) =
+        northnarrow_agent::sensors::open_sensor::set_tracepoint_emitting(sensor.ebpf_mut(), true)
+    {
+        error!(
+            error = %e,
+            "file-open sensor: sys_enter_openat could not be turned on — file opens are NOT observed"
+        );
+    }
+}
+
 /// Tappa 10.9 step 1: switch the file-open sensor to LSM `file_open`, once
 /// the FIM observer that hosts it is attached; otherwise (or on
 /// `--file-open-sensor tracepoint`) `sys_enter_openat` stays in charge.
@@ -576,6 +589,7 @@ fn start_open_sensor(
         warn!(
             "file-open sensor: its file_open observer is not attached — keeping sys_enter_openat"
         );
+        open_tracepoint_fallback(sensor);
         return;
     }
     let rules = RuleSet::build(&RuleInputs::from_host(carveout));
@@ -583,17 +597,20 @@ fn start_open_sensor(
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "file-open sensor: rule maps unavailable — keeping sys_enter_openat");
+            open_tracepoint_fallback(sensor);
             return;
         }
     };
     if let Err(e) = maps.apply(&rules, None) {
         warn!(error = %e, "file-open sensor: writing the rules failed — keeping sys_enter_openat");
+        open_tracepoint_fallback(sensor);
         return;
     }
     let ring = match take_ringbuf(sensor.ebpf_mut()) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "file-open sensor: ring unavailable — keeping sys_enter_openat");
+            open_tracepoint_fallback(sensor);
             return;
         }
     };
@@ -601,6 +618,7 @@ fn start_open_sensor(
     sensor.register_pump_handle(handle);
     if let Err(e) = maps.arm(true) {
         warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
+        open_tracepoint_fallback(sensor);
         return;
     }
     northnarrow_agent::posture::triggers::set_kernel_mass_write(true);
@@ -990,6 +1008,11 @@ async fn main() -> Result<()> {
     };
     // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
     northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
+    // Review 69: `sys_enter_openat` emits from the start only in tracepoint
+    // mode; otherwise `start_open_sensor` decides.
+    northnarrow_agent::sensors::open_sensor::want_tracepoint(
+        cli.file_open_sensor == FileOpenSensor::Tracepoint,
+    );
     // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
     northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
     let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
@@ -2340,7 +2363,11 @@ async fn main() -> Result<()> {
                     drift_log_path: cli.fim_drift_file.clone(),
                 }))
             }
-            None => None,
+            None => {
+                // Review 69: no FIM, so no LSM file-open sensor either.
+                open_tracepoint_fallback(&mut sensor);
+                None
+            }
         }
     };
 
@@ -2957,8 +2984,14 @@ async fn process_event(
     }
     correlation.push(event.clone());
 
+    // Review 71: per-event lines for the frequent events (every exec,
+    // every flow, every open) are DEBUG. At INFO, an exec burst made
+    // journald rate-limit the agent and drop its other lines (boot, sensor
+    // arming, verdict context), and every command line on the host, with
+    // any secret in its arguments, was copied into the journal. Exec and
+    // flow records live in the detection store and the signed netflow log.
     match &event {
-        Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
+        Event::ProcessSpawn { .. } => debug!(event = ?event, "process spawn detected"),
         Event::ModuleLoad {
             method,
             loader_pid,
@@ -3179,7 +3212,7 @@ async fn process_event(
         // tracker + N2 listener kprobe feed these into the rule
         // engine below. Full drain wiring is a follow-up commit.
         Event::NetFlow(nf) => {
-            info!(
+            debug!(
                 pid = %nf.pid,
                 comm = %nf.comm,
                 dst_addr = %nf.dst_addr,

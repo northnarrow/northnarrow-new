@@ -825,7 +825,8 @@ tell a DNS query from any other datagram (§12.1).
     4-CPU host when created through perf), and a call that finds the pool
     empty is not seen.
 - **The N2 UDP flow sensor has the same IPv6 gap** (`udp_sendmsg_outbound`
-  is attached to `udp_sendmsg` only). It is outside this step: review 68.
+  is attached to `udp_sendmsg` only). It is outside this step: review 68,
+  fixed separately in lab PR 58.
 
 ### 12.2 One kprobe per family, where the buffer is sent
 

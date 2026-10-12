@@ -187,6 +187,11 @@ impl SensorMultiplexer {
             "syscalls",
             "sys_enter_openat",
         )?;
+        // Review 69: inert in LSM mode until the LSM sensor takes over (or
+        // its fallback turns it on, `main::start_open_sensor`).
+        if crate::sensors::open_sensor::tracepoint_wanted() {
+            crate::sensors::open_sensor::set_tracepoint_emitting(&mut ebpf, true)?;
+        }
         // Tappa 10.9 step 2: the exec sensor on LSM `bprm_check_security`
         // (`--exec-sensor`), or `sys_enter_execve` when the LSM program
         // is not wanted, lacks an offset or is refused. Attached here, so
@@ -233,9 +238,17 @@ impl SensorMultiplexer {
             attach_kprobe(&mut ebpf, "inet_csk_listen_start", "inet_csk_listen_start")?;
             attach_fexit(&mut ebpf, "tcp_close", &btf)?;
             attach_kprobe(&mut ebpf, "udp_sendmsg_outbound", "udp_sendmsg")?;
+            // Review 68: datagrams to IPv6 destinations. Soft: a kernel
+            // without IPv6 has nothing to observe there.
+            if let Err(e) = attach_kprobe(&mut ebpf, "udpv6_sendmsg_outbound", "udpv6_sendmsg") {
+                warn!(
+                    error = format!("{e:#}"),
+                    "net: udpv6_sendmsg not attached — UDP flows to IPv6 destinations are NOT observed"
+                );
+            }
             let close_rb = take_ringbuf(&mut ebpf, "NET_FLOW_CLOSE_EVENTS")?;
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
-            info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobe)");
+            info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)");
             Some(NetRingBufs {
                 close_rb,
                 listen_rb,
