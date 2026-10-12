@@ -222,6 +222,7 @@ pub fn populate_watched_paths(
 
     let mut inserted = 0usize;
     let mut skipped = 0usize;
+    let mut registered: std::collections::HashSet<InodeKey> = std::collections::HashSet::new();
     // Credential-coverage accounting for the regression guard below.
     // `cred_*` count ONLY paths under a ProtectHome-maskable home root
     // (/root, /home, /run/user) — i.e. the credential set (NN-L-FIM-011..)
@@ -283,6 +284,7 @@ pub fn populate_watched_paths(
         match hmap.insert(AyaInodeKey(key), 1u8, 0) {
             Ok(()) => {
                 inserted += 1;
+                registered.insert(key);
                 if mask_root.is_some() {
                     cred_watched += 1;
                 }
@@ -298,9 +300,24 @@ pub fn populate_watched_paths(
             }
         }
     }
+    // Review 57: WATCHED_PATHS is pinned and outlives the agent. A child a
+    // previous run enrolled (BUG-022) and that was deleted since keeps its
+    // inode number watched, and the filesystem hands that number to
+    // unrelated files: their writes reached the FIM rules under the deleted
+    // path (a compiler's temporary file was killed as a "cron drop-in").
+    // Keep only what this boot registers.
+    let stale: Vec<AyaInodeKey> = hmap
+        .keys()
+        .filter_map(|k| k.ok())
+        .filter(|k| !registered.contains(&k.0))
+        .collect();
+    for k in &stale {
+        let _ = hmap.remove(k);
+    }
     info!(
         inserted,
         skipped,
+        stale_removed = stale.len(),
         configured = paths.len(),
         credentials_watched = cred_watched,
         credentials_total = cred_total,
@@ -367,6 +384,11 @@ impl WatchedPathsHandle {
     /// [`populate_watched_paths`]).
     pub fn enroll(&mut self, key: InodeKey) -> bool {
         self.map.insert(AyaInodeKey(key), 1u8, 0).is_ok()
+    }
+
+    /// Stop watching an inode whose file is gone (review 57).
+    pub fn unenroll(&mut self, key: InodeKey) {
+        let _ = self.map.remove(&AyaInodeKey(key));
     }
 }
 

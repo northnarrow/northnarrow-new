@@ -30,6 +30,7 @@
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
 #   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
 #   deploy/lab/nn-lab.sh btrfs-check      # review 55: a watched file on a btrfs subvolume is still detected
+#   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
@@ -613,6 +614,14 @@ cmd_sensor_feasibility() {
     return "$rc"
 }
 
+cmd_fim_reuse_check() {
+    # Review 57 (deploy/lab/fim/inode-reuse-check.sh): a file dropped in a
+    # watched directory and deleted gives its inode number back; a write to
+    # the unrelated file that reuses it must not reach the FIM rules.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/fim/inode-reuse-check.sh'
+}
+
 cmd_btrfs_check() {
     # Review 55 regression check (deploy/lab/btrfs/btrfs-check.sh): a watched
     # credential file on a btrfs subvolume (loop filesystem bind-mounted on
@@ -1013,6 +1022,7 @@ case "${1:-help}" in
     release-check) shift; cmd_release_check "$@" ;;
     sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
     btrfs-check)   cmd_btrfs_check ;;
+    fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
     down)          cmd_down ;;
