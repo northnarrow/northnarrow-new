@@ -34,6 +34,13 @@ pub mod dns_flags {
     /// Part of the payload is in page fragments (`skb->data_len != 0`): a
     /// corked send, UDP GSO or zero copy. Only the linear part is read.
     pub const NONLINEAR: u8 = 1 << 1;
+    /// Review 78: `held` counts queries of this process the kernel held
+    /// back since its previous record (its own DNS budget ran out).
+    pub const RATE_HELD: u8 = 1 << 2;
+    /// Review 78: `held` includes queries of this process's user held back
+    /// because the user's DNS budget ran out (counted on whichever of its
+    /// processes records next).
+    pub const RATE_HELD_UID: u8 = 1 << 3;
 }
 
 /// IPv6 / padded-IPv4 address byte length.
@@ -422,7 +429,11 @@ pub struct DnsQueryRaw {
     pub pid: u32,
     pub uid: u32,
     pub qtype: u16,
-    pub _pad0: [u8; 2],
+    /// Review 78: queries held back by the kernel's DNS budgets since the
+    /// previous record ([`dns_flags::RATE_HELD`],
+    /// [`dns_flags::RATE_HELD_UID`]); saturates at `u16::MAX`. The bytes
+    /// were padding, so the layout is unchanged.
+    pub held: u16,
     pub dns_server: [u8; ADDR_LEN],
     pub family: u8,
     /// [`dns_flags`].
@@ -439,7 +450,7 @@ impl DnsQueryRaw {
             pid: 0,
             uid: 0,
             qtype: 0,
-            _pad0: [0; 2],
+            held: 0,
             dns_server: [0; ADDR_LEN],
             family: 0,
             flags: 0,

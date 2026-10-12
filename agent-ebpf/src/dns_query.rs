@@ -46,10 +46,10 @@ use aya_ebpf::{
         bpf_probe_read_kernel, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, map},
-    maps::RingBuf,
+    maps::{HashMap, LruHashMap, RingBuf},
     programs::ProbeContext,
 };
-use northnarrow_common::wire::{DnsQueryRaw, ADDR_LEN, QNAME_LEN, TASK_COMM_LEN};
+use northnarrow_common::wire::{dns_flags, DnsQueryRaw, ADDR_LEN, QNAME_LEN, TASK_COMM_LEN};
 
 use crate::btf_offsets::{
     IOV_ITER_ITER_TYPE_OFFSET, IOV_ITER_UBUF_BASE_OFFSET, MSGHDR_MSG_ITER_OFFSET,
@@ -64,6 +64,136 @@ use crate::btf_offsets::{
 /// step 3): one ring, whichever program `--dns-sensor` attaches.
 #[map]
 pub(crate) static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Review 78: DNS record budgets. One process sending benign queries in a
+/// loop (6 million in 10 s, unprivileged) overflowed the ring above: most
+/// records were lost, a tunnelling-shaped query in the middle evaded
+/// NN-L-NET-004 one time in three, and the agent took more than a CPU.
+///
+/// Each process has a token bucket ([`TASK_BURST`] records, then one per
+/// [`TASK_REFILL_NS`]) and so does each user ([`UID_BURST`], then one per
+/// [`UID_REFILL_NS`]), which bounds a loop of `fork()`s. A query over
+/// either budget is not recorded, but it is never silent: the process's
+/// next record carries the count (`held`, with [`dns_flags::RATE_HELD`] or
+/// [`dns_flags::RATE_HELD_UID`]) and the agent flags the flood
+/// (NN-L-NET-020). A process that floods DNS to keep its own tunnel
+/// queries out of the records is flagged for it; one that stays within
+/// its budget is recorded in full. The local resolvers' users
+/// ([`DNS_EXEMPT_UIDS`], filled by the agent) have no budget.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DnsBudget {
+    last_ns: u64,
+    tokens: u64,
+    held: u64,
+}
+
+#[map]
+static DNS_TASK_BUDGET: LruHashMap<u32, DnsBudget> = LruHashMap::with_max_entries(8192, 0);
+#[map]
+static DNS_UID_BUDGET: LruHashMap<u32, DnsBudget> = LruHashMap::with_max_entries(1024, 0);
+/// Uids of the local resolvers (systemd-resolved, unbound, named, …),
+/// written by the agent at start: their forwarded queries are not paced.
+#[map]
+pub static DNS_EXEMPT_UIDS: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
+
+/// Records a process may send in a burst (also its first ones).
+const TASK_BURST: u64 = 64;
+/// After a burst, one record per interval (128 per second).
+const TASK_REFILL_NS: u64 = 1_000_000_000 / 128;
+/// Records a user may send in a burst, across its processes.
+const UID_BURST: u64 = 2048;
+/// After a burst, one record per interval (1024 per second).
+const UID_REFILL_NS: u64 = 1_000_000_000 / 1024;
+
+/// What an admitted query's record carries ([`DnsQueryRaw::held`]).
+pub(crate) struct Admitted {
+    pub held: u16,
+    pub flags: u8,
+}
+
+#[inline(always)]
+unsafe fn refill(b: *mut DnsBudget, now: u64, burst: u64, refill_ns: u64) {
+    let steps = now.wrapping_sub((*b).last_ns) / refill_ns;
+    if steps == 0 {
+        return;
+    }
+    if (*b).tokens + steps >= burst {
+        (*b).tokens = burst;
+        (*b).last_ns = now;
+    } else {
+        (*b).tokens += steps;
+        (*b).last_ns += steps * refill_ns;
+    }
+}
+
+/// The budget entry of `key` in `map`, created full on first use; `None`
+/// when the map refuses it (the query is then recorded, unpaced).
+#[inline(always)]
+unsafe fn budget(map: &LruHashMap<u32, DnsBudget>, key: u32, now: u64, burst: u64) -> Option<*mut DnsBudget> {
+    if let Some(b) = map.get_ptr_mut(&key) {
+        return Some(b);
+    }
+    let fresh = DnsBudget {
+        last_ns: now,
+        tokens: burst,
+        held: 0,
+    };
+    let _ = map.insert(&key, &fresh, 0);
+    map.get_ptr_mut(&key)
+}
+
+/// `Some` when the current process may record one more DNS query (with the
+/// count of its queries held back since its previous record); `None` when
+/// the query is held back, counted in the `dns_rate` slot and in the
+/// process's or the user's budget.
+#[inline(always)]
+pub(crate) unsafe fn dns_admit() -> Option<Admitted> {
+    let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+    if DNS_EXEMPT_UIDS.get(&uid).is_some() {
+        return Some(Admitted { held: 0, flags: 0 });
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let now = bpf_ktime_get_ns();
+    let task = match budget(&DNS_TASK_BUDGET, tgid, now, TASK_BURST) {
+        Some(b) => b,
+        None => return Some(Admitted { held: 0, flags: 0 }),
+    };
+    let user = match budget(&DNS_UID_BUDGET, uid, now, UID_BURST) {
+        Some(b) => b,
+        None => return Some(Admitted { held: 0, flags: 0 }),
+    };
+    refill(task, now, TASK_BURST, TASK_REFILL_NS);
+    refill(user, now, UID_BURST, UID_REFILL_NS);
+    if (*task).tokens == 0 {
+        (*task).held += 1;
+        crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_RATE);
+        return None;
+    }
+    if (*user).tokens == 0 {
+        (*user).held += 1;
+        crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_RATE);
+        return None;
+    }
+    (*task).tokens -= 1;
+    (*user).tokens -= 1;
+    let task_held = (*task).held;
+    let user_held = (*user).held;
+    (*task).held = 0;
+    (*user).held = 0;
+    let mut flags = 0u8;
+    if task_held != 0 {
+        flags |= dns_flags::RATE_HELD;
+    }
+    if user_held != 0 {
+        flags |= dns_flags::RATE_HELD_UID;
+    }
+    let total = task_held + user_held;
+    Some(Admitted {
+        held: if total > 0xFFFF { 0xFFFF } else { total as u16 },
+        flags,
+    })
+}
 
 const DNS_PORT_BE: u16 = 0x3500; // 53 in network byte order
 const AF_INET: u16 = 2;
@@ -143,6 +273,11 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
     if dest.port_be != DNS_PORT_BE {
         return Ok(());
     }
+    // Review 78: the DNS record budgets.
+    let admitted = match unsafe { dns_admit() } {
+        Some(a) => a,
+        None => return Ok(()),
+    };
 
     let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
         Some(e) => e,
@@ -161,6 +296,8 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
     unsafe {
         (*raw_ptr).pid = (pid_tgid >> 32) as u32;
         (*raw_ptr).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        (*raw_ptr).held = admitted.held;
+        (*raw_ptr).flags = admitted.flags;
         (*raw_ptr).family = dest.family;
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         let dst = (*raw_ptr).dns_server.as_mut_ptr();

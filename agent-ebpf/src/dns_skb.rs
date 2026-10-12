@@ -130,6 +130,11 @@ unsafe fn try_dns_send_skb(ctx: &ProbeContext, v6: bool) {
         Some(o) => o & 0xffff,
         None => return,
     };
+    // Review 78: the DNS record budgets.
+    let admitted = match crate::dns_query::dns_admit() {
+        Some(a) => a,
+        None => return,
+    };
 
     let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
         Some(e) => e,
@@ -163,11 +168,12 @@ unsafe fn try_dns_send_skb(ctx: &ProbeContext, v6: bool) {
     let head = peek_u64(skb.add(o_head)) as *const u8;
     let tail = peek_u32(skb.add(o_tail)) as usize;
     let th = peek_u16(skb.add(o_th)) as usize;
-    let mut flags = dns_flags::SKB;
+    let mut flags = dns_flags::SKB | admitted.flags;
     if peek_u32(skb.add(o_dlen)) != 0 {
         flags |= dns_flags::NONLINEAR;
     }
     (*raw).flags = flags;
+    (*raw).held = admitted.held;
     if !head.is_null() && th != HEADER_UNSET {
         let start = (th & 0xffff) + UDP_HDR_LEN + DNS_HDR_LEN;
         let avail = if tail > start { tail - start } else { 0 };

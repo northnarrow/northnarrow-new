@@ -161,6 +161,7 @@ fn event_kind_label(e: &Event) -> String {
         Event::DnsQuery {
             comm, query_name, ..
         } => format!("DnsQuery comm={comm} q={query_name}"),
+        Event::DnsFlood { comm, held, .. } => format!("DnsFlood comm={comm} held={held}"),
         Event::FsProtectDenial {
             comm, operation, ..
         } => format!("FsProtectDenial comm={comm} op={operation:?}"),
@@ -488,7 +489,7 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
         // enumeration. XAI on NetFlow events is a future N10+
         // commit; arm exhaustive coverage with a minimal field
         // set (comm + pid + ts).
-        Event::NetFlow(_) | Event::NetListener(_) => {
+        Event::NetFlow(_) | Event::NetListener(_) | Event::DnsFlood { .. } => {
             units.push(focal_unit(
                 F::Comm,
                 "comm",
@@ -837,6 +838,19 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Pid => nl.pid = 0,
             F::Uid => nl.uid = 0,
             F::Timestamp => nl.timestamp_ns = 0,
+            _ => {}
+        },
+        Event::DnsFlood {
+            pid,
+            uid,
+            comm,
+            timestamp_ns,
+            ..
+        } => match field {
+            F::Comm => comm.clear(),
+            F::Pid => *pid = 0,
+            F::Uid => *uid = 0,
+            F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
     }

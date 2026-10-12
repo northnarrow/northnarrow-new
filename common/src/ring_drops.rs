@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 14;
+pub const RING_DROP_SLOTS: u32 = 15;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -32,6 +32,9 @@ pub mod ring_slot {
     pub const BPF: u32 = 12;
     /// Tappa 10.9 step 1: the file-open sensor on LSM `file_open`.
     pub const OPEN_SENSOR: u32 = 13;
+    /// Review 78: DNS queries over a process's budget, not recorded (not
+    /// a ring overflow: the kernel holds them back before the ring).
+    pub const DNS_RATE: u32 = 14;
 }
 
 /// Human names, indexed by slot.
@@ -50,6 +53,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "io_uring",
     "bpf",
     "open_sensor",
+    "dns_rate",
 ];
 
 #[cfg(test)]
@@ -67,6 +71,7 @@ mod tests {
             RING_DROP_NAMES[ring_slot::OPEN_SENSOR as usize],
             "open_sensor"
         );
-        assert_eq!(ring_slot::OPEN_SENSOR + 1, RING_DROP_SLOTS);
+        assert_eq!(RING_DROP_NAMES[ring_slot::DNS_RATE as usize], "dns_rate");
+        assert_eq!(ring_slot::DNS_RATE + 1, RING_DROP_SLOTS);
     }
 }

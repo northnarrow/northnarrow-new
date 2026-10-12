@@ -279,6 +279,24 @@ pub enum Event {
     /// (NN-L-NET-006) applies the operator-tunable comm + port
     /// allowlist filter.
     NetListener(crate::wire::NetListenerEvent),
+    /// Review 78: DNS queries the kernel held back from one process (its
+    /// DNS budget ran out) or from its user (`uid_level`: the user's
+    /// budget ran out, across processes). Carried by the process's next
+    /// DNS record, so it is attributed and never silent: a process that
+    /// floods DNS to keep its own tunnel queries out of the records is
+    /// itself flagged (NN-L-NET-020).
+    DnsFlood {
+        pid: u32,
+        uid: u32,
+        comm: String,
+        /// Kernel-resolved `/proc/<pid>/exe` (best-effort), as for
+        /// `DnsQuery`.
+        #[serde(default)]
+        exe: Option<String>,
+        held: u32,
+        uid_level: bool,
+        timestamp_ns: u64,
+    },
 }
 
 /// Std-side mirror of [`crate::wire::admin_signed_payload::

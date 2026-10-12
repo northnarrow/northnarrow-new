@@ -85,6 +85,7 @@ pub fn attach(
     ebpf: &mut Ebpf,
     attach_kprobe: impl Fn(&mut Ebpf, &str, &str) -> Result<()>,
 ) -> Result<&'static str> {
+    exempt_resolvers(ebpf);
     let sendmsg = |ebpf: &mut Ebpf| -> Result<&'static str> {
         attach_kprobe(ebpf, SENDMSG_PROGRAM, SENDMSG_PROGRAM)?;
         Ok(SENDMSG_PROGRAM)
@@ -129,9 +130,71 @@ pub fn attach(
     Ok(SKB4_PROGRAM)
 }
 
+/// Review 78: users of the local resolvers, whose forwarded queries the
+/// kernel's DNS budgets (`agent-ebpf/src/dns_query.rs`) do not pace.
+/// Dedicated service users only: a generic one (`nobody`) would exempt
+/// anything that runs as it, and root is never exempt.
+pub const RESOLVER_USERS: &[&str] = &[
+    "systemd-resolve",
+    "systemd-resolved",
+    "unbound",
+    "bind",
+    "named",
+    "dnsmasq",
+    "pdns",
+    "pdns-recursor",
+    "knot-resolver",
+];
+
+/// The uids of [`RESOLVER_USERS`] in a `/etc/passwd` body.
+fn resolver_uids(passwd: &str) -> Vec<u32> {
+    passwd
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(':');
+            let name = f.next()?;
+            let uid: u32 = f.nth(1)?.parse().ok()?;
+            (uid != 0 && RESOLVER_USERS.contains(&name)).then_some(uid)
+        })
+        .collect()
+}
+
+/// Write the resolvers' uids into the kernel's `DNS_EXEMPT_UIDS`.
+fn exempt_resolvers(ebpf: &mut Ebpf) {
+    let uids = resolver_uids(&std::fs::read_to_string("/etc/passwd").unwrap_or_default());
+    let Some(map) = ebpf.map_mut("DNS_EXEMPT_UIDS") else {
+        warn!("DNS budget: no DNS_EXEMPT_UIDS map — local resolvers are paced too");
+        return;
+    };
+    let mut exempt = match aya::maps::HashMap::<_, u32, u8>::try_from(map) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "DNS budget: DNS_EXEMPT_UIDS unusable — local resolvers are paced too");
+            return;
+        }
+    };
+    for uid in &uids {
+        if let Err(e) = exempt.insert(uid, 1, 0) {
+            warn!(uid, error = %e, "DNS budget: could not exempt a resolver user");
+        }
+    }
+    info!(uids = ?uids, "DNS budget: local resolver users exempt (review 78)");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolver_uids_takes_dedicated_users_only() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
+                      systemd-resolve:x:991:991:systemd Resolver:/:/usr/sbin/nologin\n\
+                      unbound:x:120:127::/var/lib/unbound:/usr/sbin/nologin\n\
+                      named:x:0:0:bad:/:/bin/sh\n\
+                      alice:x:1000:1000::/home/alice:/bin/bash\n";
+        assert_eq!(resolver_uids(passwd), vec![991, 120]);
+    }
 
     /// The program names are the eBPF object's (`agent-ebpf/src/dns_skb.rs`,
     /// `dns_query.rs`): a rename there must fail here, not at attach time.
