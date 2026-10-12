@@ -2984,8 +2984,14 @@ async fn process_event(
     }
     correlation.push(event.clone());
 
+    // Review 71: per-event lines for the frequent events (every exec,
+    // every flow, every open) are DEBUG. At INFO, an exec burst made
+    // journald rate-limit the agent and drop its other lines (boot, sensor
+    // arming, verdict context), and every command line on the host, with
+    // any secret in its arguments, was copied into the journal. Exec and
+    // flow records live in the detection store and the signed netflow log.
     match &event {
-        Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
+        Event::ProcessSpawn { .. } => debug!(event = ?event, "process spawn detected"),
         Event::ModuleLoad {
             method,
             loader_pid,
@@ -3206,7 +3212,7 @@ async fn process_event(
         // tracker + N2 listener kprobe feed these into the rule
         // engine below. Full drain wiring is a follow-up commit.
         Event::NetFlow(nf) => {
-            info!(
+            debug!(
                 pid = %nf.pid,
                 comm = %nf.comm,
                 dst_addr = %nf.dst_addr,

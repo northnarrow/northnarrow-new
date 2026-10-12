@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The agent wrote every exec and every network flow to the journal at INFO
+  (review 71). On a busy host journald then rate-limited the agent, which
+  lost other lines too, and every command line on the host (with any
+  secret in its arguments) was copied into the journal. Both lines are now
+  DEBUG; the records stay in the detection store and the signed netflow
+  log.
 - An agent start could lose events in its first seconds (review 69). Until
   the LSM file-open sensor took over, the `sys_enter_openat` tracepoint sent
   every open of the host to the agent's event channel, which nothing reads
