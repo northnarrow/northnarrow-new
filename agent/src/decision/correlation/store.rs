@@ -47,6 +47,22 @@ const MAX_EVENTS_PER_PROC: usize = 16;
 /// processes are pruned first.
 const MAX_TRACKED_PROCS: usize = 4096;
 
+/// Review 70: egresses kept per process for a late precursor.
+const MAX_EGRESS_PER_PROC: usize = 4;
+
+/// Review 70 — an egress a chain rule evaluated before a precursor that
+/// happened earlier in kernel time. The precursor travels through another
+/// ring and pump (a credential read through the open sensor or FIM, the
+/// egress through the network drain), so it can be processed after the
+/// egress it precedes; the chain then completes on the precursor. Only
+/// what the verdict needs is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EgressNote {
+    pub pid: u32,
+    pub comm: String,
+    pub start_ns: u64,
+}
+
 /// PID-reuse-safe process identity (§13 Q2). `start_ns` is the task's
 /// `start_time` (CLOCK_MONOTONIC ns, captured by the D2 BPF refit);
 /// `start_ns == 0` means "incarnation unknown" (the D3 pid-based API,
@@ -96,6 +112,8 @@ pub struct CorrelationStore {
     eviction: VecDeque<ProcKey>,
     /// D4 — parent→child lineage for cross-PID correlation.
     tree: AncestryTree,
+    /// Review 70 — egresses no chain has claimed yet, per process.
+    egress: HashMap<ProcKey, VecDeque<EgressNote>>,
 }
 
 impl CorrelationStore {
@@ -125,6 +143,61 @@ impl CorrelationStore {
     /// D4 overrides the resolution to consult the ancestry tree.
     pub fn record_for_pid(&mut self, pid: u32, kind: PrecursorKind, ts_ns: u64) {
         self.record(ProcKey::unresolved(pid), kind, ts_ns);
+    }
+
+    /// Review 70: keep an egress that completed no same-process chain, for
+    /// a precursor that arrives after it but happened before it.
+    pub fn note_egress(&mut self, key: ProcKey, note: EgressNote) {
+        if self.egress.len() >= MAX_TRACKED_PROCS && !self.egress.contains_key(&key) {
+            let oldest = self
+                .egress
+                .iter()
+                .min_by_key(|(_, q)| q.back().map_or(0, |n| n.start_ns))
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                self.egress.remove(&k);
+            }
+        }
+        let q = self.egress.entry(key).or_default();
+        q.push_back(note);
+        while q.len() > MAX_EGRESS_PER_PROC {
+            q.pop_front();
+        }
+    }
+
+    /// Review 70: take the earliest noted egress of `key` that happened
+    /// after `after_ns`, within `window_ns` of it — the one a precursor
+    /// stamped `after_ns` completes. It is taken: an egress completes one
+    /// late chain only.
+    pub fn take_egress_after(
+        &mut self,
+        key: ProcKey,
+        after_ns: u64,
+        window_ns: u64,
+    ) -> Option<EgressNote> {
+        let q = self.egress.get_mut(&key)?;
+        let idx = q
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.start_ns > after_ns && n.start_ns - after_ns <= window_ns)
+            .min_by_key(|(_, n)| n.start_ns)
+            .map(|(i, _)| i);
+        let note = idx.and_then(|i| q.remove(i));
+        if q.is_empty() {
+            self.egress.remove(&key);
+        }
+        note
+    }
+
+    /// Review 70: a chain fired on this egress in order, so no late
+    /// precursor may complete a chain with it again.
+    pub fn claim_egress(&mut self, key: ProcKey, start_ns: u64) {
+        if let Some(q) = self.egress.get_mut(&key) {
+            q.retain(|n| n.start_ns != start_ns);
+            if q.is_empty() {
+                self.egress.remove(&key);
+            }
+        }
     }
 
     // ── querying ─────────────────────────────────────────────────────
@@ -262,6 +335,7 @@ impl CorrelationStore {
     fn forget_pid(&mut self, pid: u32) {
         self.per_proc.retain(|k, _| k.pid != pid);
         self.eviction.retain(|k| k.pid != pid);
+        self.egress.retain(|k, _| k.pid != pid);
     }
 
     // ── internals ────────────────────────────────────────────────────

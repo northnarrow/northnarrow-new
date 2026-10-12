@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A credential theft could be reported only as a `/tmp` C2 connection
+  (review 70). CHAIN-007 (`/tmp` exec → credential read → egress) and
+  CHAIN-001 checked their precursors only when the egress arrived. A
+  credential read processed after the connect it preceded (it comes
+  through another ring) left both silent: CHAIN-002 killed the tree but
+  did not name the theft (lab, Ubuntu 22.04). A late read now completes
+  the chain with the egress it preceded.
 - The agent wrote every exec and every network flow to the journal at INFO
   (review 71). On a busy host journald then rate-limited the agent, which
   lost other lines too, and every command line on the host (with any
