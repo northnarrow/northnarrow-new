@@ -333,6 +333,28 @@ fn exe_from_event(event: &Event) -> Option<String> {
     }
 }
 
+/// The file a detection is about ([`DetectionRecord::file`]). Exhaustive
+/// on purpose, like [`exe_from_event`].
+fn file_from_event(event: &Event) -> Option<String> {
+    match event {
+        Event::Fim(fe) => Some(fe.path.clone()),
+        Event::FileOpen { filename, .. } | Event::MassWrite { filename, .. } => {
+            (!filename.is_empty()).then(|| filename.clone())
+        }
+        Event::ModuleLoad { path, .. } => path.clone(),
+        Event::ProcessSpawn { .. }
+        | Event::ExecCheck { .. }
+        | Event::IoUring { .. }
+        | Event::BpfSyscall { .. }
+        | Event::TcpConnect { .. }
+        | Event::DnsQuery { .. }
+        | Event::FsProtectDenial { .. }
+        | Event::CanaryTripped { .. }
+        | Event::NetFlow(_)
+        | Event::NetListener(_) => None,
+    }
+}
+
 /// One persisted detection. Serialised as a flattened JSONL line inside
 /// the [`RotatingChainLog`] (the chain envelope adds `fmt_ver` /
 /// `prev_hash` / `entry_hash` / `agent_sig`). No field collides with the
@@ -404,6 +426,14 @@ pub struct DetectionRecord {
     /// budget ([`crate::detection_budget`], review 75). Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed_before: Option<u64>,
+    /// The file the detection is about, for the file sensors: the path
+    /// of a FIM drift or of a file-open detection, the write that crossed
+    /// a mass-write threshold, the `.ko` of a module load. Review 77: a
+    /// record of NN-L-FIM-007 named the writer but not the cron drop-in
+    /// it created, so a record could not be read without the drift log.
+    /// Mapped from the event by [`file_from_event`]; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl DetectionRecord {
@@ -442,6 +472,7 @@ impl DetectionRecord {
             status: DetectionStatus::Open,
             explanation: None,
             suppressed_before: None,
+            file: file_from_event(event),
         }
     }
 
@@ -479,6 +510,7 @@ impl DetectionRecord {
             status: DetectionStatus::Open,
             explanation: None,
             suppressed_before: None,
+            file: file_from_event(event),
         }
     }
 }
@@ -1340,6 +1372,7 @@ mod tests {
             status: DetectionStatus::Open,
             explanation: None,
             suppressed_before: None,
+            file: None,
         };
         assert_roundtrip(&record);
     }
@@ -1394,6 +1427,56 @@ mod tests {
             flags: 0,
             timestamp_ns: 789,
         }
+    }
+
+    /// Review 77: a file detection names its file; an exec detection
+    /// does not carry the field at all (pre-field byte shape).
+    #[test]
+    fn file_detection_records_its_file() {
+        let r = DetectionRecord::from_rule(
+            1,
+            now_ts(),
+            &sample_file_open(),
+            &sample_verdict(),
+            PostureKind::Observing,
+            "none".to_string(),
+        );
+        assert_eq!(r.file.as_deref(), Some("/etc/shadow"));
+        let drift = Event::Fim(common::wire::FimEvent {
+            timestamp_ns: 1,
+            path: "/etc/cron.d/backdoor".to_string(),
+            op: common::wire::FimOp::Created,
+            new_sha256: None,
+            baseline_sha256: None,
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: None,
+            modifier_pid: 4242,
+            modifier_uid: 0,
+            modifier_comm: "sh".to_string(),
+            dest_path: None,
+            child_truncated: false,
+            wide_coverage: false,
+        });
+        let r = DetectionRecord::from_rule(
+            2,
+            now_ts(),
+            &drift,
+            &sample_verdict(),
+            PostureKind::Observing,
+            "KillProcess".to_string(),
+        );
+        assert_eq!(r.file.as_deref(), Some("/etc/cron.d/backdoor"));
+        let r = DetectionRecord::from_rule(
+            3,
+            now_ts(),
+            &sample_event(),
+            &sample_verdict(),
+            PostureKind::Observing,
+            "KillProcess".to_string(),
+        );
+        assert_eq!(r.file, None);
+        assert!(!serde_json::to_string(&r).unwrap().contains("\"file\""));
     }
 
     #[test]
@@ -1755,6 +1838,7 @@ mod tests {
             status,
             explanation: None,
             suppressed_before: None,
+            file: None,
         }
     }
 
