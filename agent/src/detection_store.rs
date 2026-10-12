@@ -359,6 +359,24 @@ fn file_from_event(event: &Event) -> Option<String> {
     }
 }
 
+/// The subject of a detection for the per-rule budget's held report
+/// ([`crate::detection_budget`]): `(key, text)`. The key is what the
+/// detection is about — its file, else its executable, else the acting
+/// `comm` — so a flood cannot crowd the report out by renaming itself.
+pub fn held_sample(event: &Event) -> (String, String) {
+    let p = Principal::from_event(event);
+    match file_from_event(event).or_else(|| exe_from_event(event)) {
+        Some(t) => {
+            let text = format!("{} (pid {}) {}", p.comm, p.pid, t);
+            (t, text)
+        }
+        None => {
+            let text = format!("{} (pid {})", p.comm, p.pid);
+            (p.comm, text)
+        }
+    }
+}
+
 /// One persisted detection. Serialised as a flattened JSONL line inside
 /// the [`RotatingChainLog`] (the chain envelope adds `fmt_ver` /
 /// `prev_hash` / `entry_hash` / `agent_sig`). No field collides with the

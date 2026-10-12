@@ -3140,7 +3140,7 @@ async fn process_event(
             // Review 75: a loop of denied attempts is logged and stored
             // within the rule's budget for that uid.
             let admit = match &verdict {
-                Some(v) => budget_admit(&v.rule_id, *uid),
+                Some(v) => budget_admit(&v.rule_id, *uid, &event),
                 None => Admit::Record {
                     suppressed_before: 0,
                 },
@@ -3198,7 +3198,7 @@ async fn process_event(
                     modifier_comm = %fe.modifier_comm,
                     "fim credential-path read forwarded to rule engine (not drift)"
                 );
-            } else if budget_admit("FIM-DRIFT", fe.modifier_uid).record() {
+            } else if budget_admit("FIM-DRIFT", fe.modifier_uid, &event).record() {
                 // Review 76: every drift now reaches the rules; its journal
                 // line has the per-uid budget (the signed fim_drift.jsonl
                 // row is always written).
@@ -3272,7 +3272,7 @@ async fn process_event(
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the rule's budget for the acting uid.
         let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-        let admit = budget_admit(&verdict.rule_id, uid);
+        let admit = budget_admit(&verdict.rule_id, uid, &event);
         if admit.record() {
             warn!(
                 rule = %verdict.rule_id,
@@ -3385,7 +3385,7 @@ async fn process_event(
         if let Some(sink) = detection_sink {
             if verdict.verdict != common::ade_types::AdeAction::Allow {
                 let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-                if let Admit::Record { suppressed_before } = budget_admit("ADE", uid) {
+                if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
                     sink.record_ade(
                         &event,
                         &verdict,
@@ -3422,7 +3422,7 @@ async fn process_event(
     // Tappa 9.0.a: persist the ADE detection (a response ran ⇒ non-benign).
     if let Some(sink) = detection_sink {
         let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-        if let Admit::Record { suppressed_before } = budget_admit("ADE", uid) {
+        if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
             sink.record_ade(
                 &event,
                 &verdict,
@@ -3437,8 +3437,10 @@ async fn process_event(
 /// [`detection_budget::admit`], plus one WARN when a (rule, uid) runs out
 /// of budget (review 75). The counts of what it held back reach the
 /// journal and the audit log through the budget's reporter task.
-fn budget_admit(rule: &str, uid: u32) -> Admit {
-    let admit = detection_budget::admit(rule, uid);
+fn budget_admit(rule: &str, uid: u32, event: &Event) -> Admit {
+    let admit = detection_budget::admit(rule, uid, || {
+        northnarrow_agent::detection_store::held_sample(event)
+    });
     if admit == (Admit::Hold { first: true }) {
         warn!(
             rule,
