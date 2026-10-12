@@ -321,16 +321,30 @@ fn build_userland(release: bool, features: &[String]) -> Result<()> {
 fn scrub_cargo_env(cmd: &mut Command) {
     let to_drop: Vec<String> = std::env::vars()
         .map(|(k, _)| k)
-        .filter(|k| {
-            k.starts_with("CARGO_")
-                || k == "CARGO"
-                || k.starts_with("RUSTC")
-                || k == "RUSTUP_TOOLCHAIN"
-        })
+        .filter(|k| scrubbed(k))
         .collect();
     for k in to_drop {
         cmd.env_remove(k);
     }
+}
+
+/// Whether [`scrub_cargo_env`] drops `name`.
+///
+/// Review 65: per-target configuration (`CARGO_TARGET_<TRIPLE>_RUSTFLAGS`,
+/// `_LINKER`, `_RUNNER`) is kept. It applies to one triple only and a
+/// caller sets it on purpose: the release workflow builds for x86-64-v2
+/// with it instead of the runner's CPU (review 64). Scrubbing it left
+/// `.cargo/config.toml`'s `target-cpu=native` in force, so a release built
+/// on a runner with AVX-512 died with SIGILL on CPUs without it.
+fn scrubbed(name: &str) -> bool {
+    let cargo_or_rustc = name.starts_with("CARGO_")
+        || name == "CARGO"
+        || name.starts_with("RUSTC")
+        || name == "RUSTUP_TOOLCHAIN";
+    let per_target = name.starts_with("CARGO_TARGET_")
+        && name != "CARGO_TARGET_DIR"
+        && name != "CARGO_TARGET_TMPDIR";
+    cargo_or_rustc && !per_target
 }
 
 fn run_agent(release: bool, no_sudo: bool, extra: &[String]) -> Result<()> {
@@ -357,4 +371,30 @@ fn run_agent(release: bool, no_sudo: bool, extra: &[String]) -> Result<()> {
         bail!("agent exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scrubbed;
+
+    #[test]
+    fn per_target_configuration_reaches_the_nested_build() {
+        // review 65: the release workflow's x86-64-v2 override
+        assert!(!scrubbed("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"));
+        assert!(!scrubbed("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"));
+        // what the parent cargo or rustup chose stays out
+        for name in [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_PKG_NAME",
+            "CARGO",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTUP_TOOLCHAIN",
+        ] {
+            assert!(scrubbed(name), "{name}");
+        }
+        assert!(!scrubbed("RUSTFLAGS") && !scrubbed("PATH"));
+    }
 }

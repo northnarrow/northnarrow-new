@@ -9,7 +9,8 @@ xtask = "run --quiet --package xtask --release --"
 # that runs it, never for a binary shipped elsewhere. The release workflow
 # (.github/workflows/release.yml) therefore overrides it with x86-64-v2
 # (review 64: a runner with AVX-512 produced releases that died with
-# SIGILL on CPUs without it).
+# SIGILL on CPUs without it). `cargo xtask build` passes that per-target
+# override on to the nested build (review 65).
 #
 # `lld` would shave a few seconds off link time but is not available
 # on the production host (Hetzner CCX23, May 2026); leaving the

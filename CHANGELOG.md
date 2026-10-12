@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Review 64's fix had no effect (review 65, High). `cargo xtask build`
+  dropped every `CARGO_*` variable before building, including the release
+  job's `x86-64-v2` override. A release built on a runner with AVX-512 still
+  died with SIGILL on CPUs without it (seen on PR #223's tarball). xtask now
+  passes per-target settings on to the nested build. The release job also
+  starts the binaries on an emulated `x86-64-v2` CPU
+  (`qemu-x86_64 -cpu Nehalem`).
 - Release binaries could die with SIGILL at start (review 64, High). The
   workspace builds with `target-cpu=native`, and the release workflow did
   not override it, so a release built on a GitHub runner with AVX-512 used
