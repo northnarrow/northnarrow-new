@@ -306,6 +306,7 @@ impl NetListenerDb {
 pub async fn drain_loop(
     close_rb: RingBuf<MapData>,
     listen_rb: RingBuf<MapData>,
+    udp_rb: RingBuf<MapData>,
     flow_tracker: Arc<Mutex<FlowTracker>>,
     dns_cache: Arc<DnsCache>,
     netflow_db: Arc<Mutex<NetFlowDb>>,
@@ -314,8 +315,31 @@ pub async fn drain_loop(
 ) -> std::io::Result<()> {
     let mut close_fd = AsyncFd::new(close_rb)?;
     let mut listen_fd = AsyncFd::new(listen_rb)?;
+    // Review 73: the UDP flow records have their own ring, so a UDP flood
+    // cannot erase the TCP closes; they are processed the same way.
+    let mut udp_fd = AsyncFd::new(udp_rb)?;
     loop {
         tokio::select! {
+            r = udp_fd.readable_mut() => {
+                let mut guard = r?;
+                let inner = guard.get_inner_mut();
+                let mut drained = 0u32;
+                while let Some(item) = inner.next() {
+                    drained += 1;
+                    process_close_record(
+                        item.as_ref(),
+                        &flow_tracker,
+                        &dns_cache,
+                        &netflow_db,
+                        &event_tx,
+                    )
+                    .await;
+                }
+                guard.clear_ready();
+                if drained == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
             r = close_fd.readable_mut() => {
                 let mut guard = r?;
                 let inner = guard.get_inner_mut();

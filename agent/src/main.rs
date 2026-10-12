@@ -2602,10 +2602,12 @@ async fn main() -> Result<()> {
             let event_tx = sensor.event_tx();
             let close_rb = net_bufs.close_rb;
             let listen_rb = net_bufs.listen_rb;
+            let udp_rb = net_bufs.udp_rb;
             let handle = tokio::spawn(async move {
                 if let Err(e) = drain_loop(
                     close_rb,
                     listen_rb,
+                    udp_rb,
                     flow_tracker_for_drain,
                     dns_cache_for_drain,
                     netflow_db,
