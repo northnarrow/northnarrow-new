@@ -59,6 +59,11 @@ use crate::btf_offsets::{
 const READING_MODULE: c_int = 2;
 /// `enum kernel_load_data_id::LOADING_MODULE` (vmlinux BTF, 6.8).
 const LOADING_MODULE: c_int = 2;
+/// `READING_KEXEC_IMAGE` / `LOADING_KEXEC_IMAGE`: the same value in both
+/// enums, on every kernel the agent supports (include/linux/kernel_read_file.h).
+const KEXEC_IMAGE: c_int = 3;
+/// Linux `EPERM`.
+const EPERM: c_int = 1;
 
 /// Path captured as up to 16 leaf→root components, each in a fixed
 /// 32-byte slot of `ModuleLoadRaw.path` (16 × 32 = 512 = MODULE_PATH_LEN).
@@ -84,6 +89,9 @@ pub fn module_read_file_observe(ctx: LsmContext) -> i32 {
 unsafe fn try_read_file(ctx: &LsmContext) -> i32 {
     // kernel_read_file(struct file *file, enum kernel_read_file_id id, bool contents)
     let id: c_int = ctx.arg(1);
+    if id == KEXEC_IMAGE {
+        return deny_kexec(id);
+    }
     if id != READING_MODULE {
         return 0;
     }
@@ -101,6 +109,9 @@ pub fn module_load_data_observe(ctx: LsmContext) -> i32 {
 unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
     // kernel_load_data(enum kernel_load_data_id id, bool contents)
     let id: c_int = ctx.arg(0);
+    if id == KEXEC_IMAGE {
+        return deny_kexec(id);
+    }
     if id != LOADING_MODULE {
         return 0;
     }
@@ -108,6 +119,23 @@ unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
     // firing is the signal (legacy interface is rarely used legitimately).
     emit_module_load(MODULE_LOAD_INIT, core::ptr::null());
     0
+}
+
+/// Review 82: refuse a kexec kernel image (`kexec_file_load` reads it
+/// through `kernel_read_file`, `kexec_load` passes it through
+/// `kernel_load_data`) unless the trusted-installer window is open. A
+/// loaded image let root reboot at once into a kernel without the agent
+/// (AlmaLinux 9: `kexec -l` succeeded with the agent running). The refusal
+/// is an anti-tamper denial (NN-L-AT-001). kdump's crash kernel is loaded
+/// at boot, before the agent starts (its unit is ordered after
+/// `kdump.service`); a later reload needs the window.
+#[inline(always)]
+unsafe fn deny_kexec(id: c_int) -> i32 {
+    if crate::inode_protect::override_active() {
+        return 0;
+    }
+    crate::inode_protect::emit_task_denial(northnarrow_common::wire::FS_OP_KEXEC, id as u64, 0);
+    -EPERM
 }
 
 /// Best-effort observation record. Drops silently if the ring is full

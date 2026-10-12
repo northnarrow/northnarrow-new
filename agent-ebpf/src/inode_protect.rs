@@ -194,7 +194,7 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
 /// (A bare `!= 0` check would honour such a stale value — the original
 /// stub's documented "must be zeroed on boot" caveat, now closed.)
 #[inline(always)]
-fn override_active() -> bool {
+pub(crate) fn override_active() -> bool {
     let ov = match FS_PROTECT_OVERRIDE.get(0) {
         Some(v) => *v,
         None => 0,
