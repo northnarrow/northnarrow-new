@@ -55,7 +55,7 @@
 #![cfg(feature = "test-privileged")]
 
 use std::io::Write;
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -552,6 +552,18 @@ const CHILD_SETTLE_US: u32 = 1_000_000;
 /// must beat the R001 kill, so no startup delay); pass [`CHILD_SETTLE_US`]
 /// for a cross-PID connect child (see that const). Returns the binary path.
 fn compile_connect_helper(dir: &Path, name: &str, port: u16, connect_delay_us: u32) -> PathBuf {
+    compile_connect_helper_to(dir, name, Ipv4Addr::LOCALHOST, port, connect_delay_us)
+}
+
+/// [`compile_connect_helper`] towards `addr` instead of loopback.
+fn compile_connect_helper_to(
+    dir: &Path,
+    name: &str,
+    addr: Ipv4Addr,
+    port: u16,
+    connect_delay_us: u32,
+) -> PathBuf {
+    let addr_hex = u32::from(addr);
     let src = dir.join(format!("{name}.c"));
     let bin = dir.join(name);
     std::fs::write(
@@ -569,7 +581,7 @@ int main(void) {{
     struct sockaddr_in a;
     a.sin_family = AF_INET;
     a.sin_port = htons({port});
-    a.sin_addr.s_addr = htonl(0x7f000001); /* 127.0.0.1 */
+    a.sin_addr.s_addr = htonl({addr_hex:#010x}); /* {addr} */
     connect(fd, (struct sockaddr *)&a, sizeof(a));
     close(fd);
     return 0;
@@ -602,6 +614,37 @@ int main(void) {{
 /// would short-circuit the cross-PID rule and the chain under test would
 /// never fire. Running the child from `/usr/local/bin` keeps its exec
 /// off both the `/tmp` (TmpExec) and user-writable (R009) predicates.
+/// A TEST-NET-2 address on `lo` for the life of a test: a destination
+/// that looks off-host (not loopback, which CHAIN-008 ignores since
+/// 3ab1b46, and not RFC 1918, which NET-007 reads) but is delivered
+/// locally, so the acceptor gets the connection.
+struct EgressAddr(Ipv4Addr);
+
+impl EgressAddr {
+    const CIDR: &'static str = "198.51.100.74/32";
+
+    fn add() -> Self {
+        let _ = Command::new("ip")
+            .args(["addr", "add", Self::CIDR, "dev", "lo"])
+            .status()
+            .expect("spawn ip addr add");
+        EgressAddr(Ipv4Addr::new(198, 51, 100, 74))
+    }
+}
+
+impl Drop for EgressAddr {
+    fn drop(&mut self) {
+        let _ = Command::new("ip")
+            .args(["addr", "del", Self::CIDR, "dev", "lo"])
+            .status();
+    }
+}
+
+/// A port no blocking net rule reads (NET-010's C2 list, NET-018's
+/// lateral ports, the plaintext-credential ports): CHAIN-008 is an
+/// informational chain evaluated last, so any of them would shadow it.
+const CHAIN_008_PORT: u16 = 18484;
+
 fn install_connect_child(compile_dir: &Path) -> InstalledBin {
     install_to_priv_bin(&compile_connect_helper(
         compile_dir,
@@ -621,7 +664,16 @@ fn install_connect_child(compile_dir: &Path) -> InstalledBin {
 /// (on a connection or at the deadline), so the next sequential test can
 /// rebind the port.
 fn spawn_oneshot_acceptor(port: u16, timeout: Duration) -> std::thread::JoinHandle<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind receiver");
+    spawn_oneshot_acceptor_on(Ipv4Addr::LOCALHOST, port, timeout)
+}
+
+/// [`spawn_oneshot_acceptor`] bound to `addr`.
+fn spawn_oneshot_acceptor_on(
+    addr: Ipv4Addr,
+    port: u16,
+    timeout: Duration,
+) -> std::thread::JoinHandle<()> {
+    let listener = TcpListener::bind((addr, port)).expect("bind receiver");
     listener
         .set_nonblocking(true)
         .expect("set listener non-blocking");
@@ -1267,11 +1319,21 @@ int main(int argc, char **argv) {{
 fn chain_privesc_then_descendant_egress_trips_chain_008() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
-    let accept = spawn_oneshot_acceptor(C2_PORT, ACCEPT_TIMEOUT);
+    // CHAIN-008 ignores loopback (local IPC is not egress, since 3ab1b46)
+    // and runs after the blocking net rules: an off-host-looking address
+    // and a port no blocking rule reads.
+    let egress = EgressAddr::add();
+    let accept = spawn_oneshot_acceptor_on(egress.0, CHAIN_008_PORT, ACCEPT_TIMEOUT);
 
     // Connect child OUTSIDE /tmp (no TmpExec on the child).
     let childdir = tempfile::tempdir().expect("child tempdir");
-    let connect_child = install_connect_child(childdir.path());
+    let connect_child = install_to_priv_bin(&compile_connect_helper_to(
+        childdir.path(),
+        "nnx_connect",
+        egress.0,
+        CHAIN_008_PORT,
+        CHILD_SETTLE_US,
+    ));
     // Parent installed as a binary named exactly "sudo" → comm == sudo.
     let parent = install_named_to_priv_bin(&compile_xpid_helper(childdir.path(), "xpid"), "sudo");
     let _ = Command::new(&parent.path)
