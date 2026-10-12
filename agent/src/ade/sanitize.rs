@@ -405,10 +405,24 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
         Event::IoUring { comm, .. } | Event::BpfSyscall { comm, .. } => {
             (String::new(), comm.clone(), String::new())
         }
-        Event::ProcessSpawn { filename, comm, .. }
-        | Event::ExecCheck { filename, comm, .. }
-        | Event::FileOpen { filename, comm, .. }
-        | Event::MassWrite { filename, comm, .. } => {
+        // The executed file, as the prompt shows it (review 61).
+        Event::ProcessSpawn {
+            filename,
+            comm,
+            exe,
+            ..
+        }
+        | Event::ExecCheck {
+            filename,
+            comm,
+            exe,
+            ..
+        } => (
+            exe.path_or(filename).to_string(),
+            comm.clone(),
+            String::new(),
+        ),
+        Event::FileOpen { filename, comm, .. } | Event::MassWrite { filename, comm, .. } => {
             (filename.clone(), comm.clone(), String::new())
         }
         Event::TcpConnect { comm, .. } => (String::new(), comm.clone(), String::new()),
@@ -459,8 +473,19 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
             vec![loader_comm.clone(), path.clone().unwrap_or_default()]
         }
         Event::IoUring { comm, .. } | Event::BpfSyscall { comm, .. } => vec![comm.clone()],
-        Event::ProcessSpawn { filename, comm, .. } | Event::ExecCheck { filename, comm, .. } => {
-            vec![filename.clone(), comm.clone()]
+        Event::ProcessSpawn {
+            filename,
+            comm,
+            exe,
+            ..
+        }
+        | Event::ExecCheck {
+            filename,
+            comm,
+            exe,
+            ..
+        } => {
+            vec![exe.path_or(filename).to_string(), comm.clone()]
         }
         Event::FileOpen { filename, comm, .. } | Event::MassWrite { filename, comm, .. } => {
             vec![comm.clone(), filename.clone()]
@@ -888,6 +913,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 

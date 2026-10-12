@@ -51,9 +51,11 @@ impl Rule for R008HiddenHomeBinary {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { filename, .. } = event else {
+        let Event::ProcessSpawn { filename, exe, .. } = event else {
             return None;
         };
+        // Review 61: the file the kernel executed, not the caller's string.
+        let filename = exe.path_or(filename);
         let rel = Self::user_relative(filename)?;
         if !rel.starts_with('.') {
             return None;

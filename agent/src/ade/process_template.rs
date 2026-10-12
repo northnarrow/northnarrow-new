@@ -216,6 +216,7 @@ mod tests {
             parent_comm: parent_comm.to_string(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 

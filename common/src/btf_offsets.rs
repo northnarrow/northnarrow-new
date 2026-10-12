@@ -847,6 +847,54 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    OffsetSpec {
+        name: "LINUX_BINPRM_FILE_OFFSET",
+        struct_name: "linux_binprm",
+        field_path: &["file"],
+        expected: LINUX_BINPRM_FILE_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "LINUX_BINPRM_FILENAME_OFFSET",
+        struct_name: "linux_binprm",
+        field_path: &["filename"],
+        expected: LINUX_BINPRM_FILENAME_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "LINUX_BINPRM_INTERP_OFFSET",
+        struct_name: "linux_binprm",
+        field_path: &["interp"],
+        expected: LINUX_BINPRM_INTERP_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "INODE_I_NLINK_OFFSET",
+        struct_name: "inode",
+        field_path: &["i_nlink"],
+        expected: INODE_I_NLINK_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "TASK_STRUCT_FS_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["fs"],
+        expected: TASK_STRUCT_FS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "FS_STRUCT_ROOT_OFFSET",
+        struct_name: "fs_struct",
+        field_path: &["root"],
+        expected: FS_STRUCT_ROOT_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -929,16 +977,22 @@ pub mod slot {
     pub const BTRFS_ROOT_ANON_DEV_OFFSET: u32 = 53;
     pub const INODE_I_MODE_OFFSET: u32 = 54;
     pub const TASK_STRUCT_LOGINUID_OFFSET: u32 = 55;
-    // enum slots 56–57 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 58;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 59;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 60;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 61;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 62;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 63;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 64;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 65;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 66;
+    pub const LINUX_BINPRM_FILE_OFFSET: u32 = 56;
+    pub const LINUX_BINPRM_FILENAME_OFFSET: u32 = 57;
+    pub const LINUX_BINPRM_INTERP_OFFSET: u32 = 58;
+    pub const INODE_I_NLINK_OFFSET: u32 = 59;
+    pub const TASK_STRUCT_FS_OFFSET: u32 = 60;
+    pub const FS_STRUCT_ROOT_OFFSET: u32 = 61;
+    // enum slots 62–63 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 64;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 65;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 66;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 67;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 68;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 69;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 70;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 71;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 72;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -999,6 +1053,12 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("BTRFS_ROOT_ANON_DEV_OFFSET", 53),
     ("INODE_I_MODE_OFFSET", 54),
     ("TASK_STRUCT_LOGINUID_OFFSET", 55),
+    ("LINUX_BINPRM_FILE_OFFSET", 56),
+    ("LINUX_BINPRM_FILENAME_OFFSET", 57),
+    ("LINUX_BINPRM_INTERP_OFFSET", 58),
+    ("INODE_I_NLINK_OFFSET", 59),
+    ("TASK_STRUCT_FS_OFFSET", 60),
+    ("FS_STRUCT_ROOT_OFFSET", 61),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1044,6 +1104,23 @@ pub const INODE_I_MODE_OFFSET: usize = 0;
 /// Optional: a kernel without `CONFIG_AUDIT` has no login uid, and that
 /// carve-out is then off. 6.8 build kernel: byte 3232.
 pub const TASK_STRUCT_LOGINUID_OFFSET: usize = 3232;
+
+/// Tappa 10.9 step 2 — the exec sensor on LSM `bprm_check_security`
+/// (`agent-ebpf/src/exec_lsm.rs`). All optional: without one of them the
+/// agent stays on the `sys_enter_execve` tracepoint. `linux_binprm.file`
+/// is the file the kernel opened for this binfmt pass, `.filename` the
+/// caller's string and `.interp` the interpreter's (equal to `.filename`
+/// on pass 0). Compiled values: the 6.8 build kernel.
+pub const LINUX_BINPRM_FILE_OFFSET: usize = 64;
+pub const LINUX_BINPRM_FILENAME_OFFSET: usize = 96;
+pub const LINUX_BINPRM_INTERP_OFFSET: usize = 104;
+/// `inode.i_nlink` (in an anonymous union): 0 for an unlinked file or an
+/// `O_TMPFILE`.
+pub const INODE_I_NLINK_OFFSET: usize = 72;
+/// `task_struct.fs` and `fs_struct.root`: the exec'ing task's root, where
+/// the path walk stops (a container or a chroot keeps its own view).
+pub const TASK_STRUCT_FS_OFFSET: usize = 3040;
+pub const FS_STRUCT_ROOT_OFFSET: usize = 24;
 
 /// Tracepoint field offsets — the `read_at` positions inside a
 /// `TracePointContext`. They come from the tracefs `format` file, not from
@@ -1174,24 +1251,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 58),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 59),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 60),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 61),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 62),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 63),
-    ("TP_IOURING_CREATE_FD_OFFSET", 64),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 65),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 66),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 64),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 65),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 66),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 67),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 68),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 69),
+    ("TP_IOURING_CREATE_FD_OFFSET", 70),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 71),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 72),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 56), ("ITER_IOVEC_VALUE", 57)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 62), ("ITER_IOVEC_VALUE", 63)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 56;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 62;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 57;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 63;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -1209,7 +1286,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 55, "REVALIDATE must cover all 55 offsets");
+        assert_eq!(REVALIDATE.len(), 61, "REVALIDATE must cover all 61 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1229,7 +1306,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 67);
+        assert_eq!(BTF_OFFSETS_SLOTS, 73);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1259,8 +1336,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 58);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 61);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 64);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 67);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }

@@ -83,6 +83,12 @@ pub struct ProcessSpawnRaw {
     /// align 8). Shrunk from 6 → 5 bytes when `parent_is_kthread`
     /// was added (cluster 15.3); total size unchanged.
     pub _pad: [u8; 5],
+    // ── Tappa 10.9 step 2 APPENDED (never reorder the above) ──
+    /// The file the caller named, as the LSM `bprm_check_security`
+    /// program found it (pass 0, handed over through `EXEC_HANDOFF`):
+    /// the canonical path the exec rules match (review 61). Zero in
+    /// tracepoint mode.
+    pub exe: exe::ExeIdentityRaw,
 }
 
 impl ProcessSpawnRaw {
@@ -103,6 +109,7 @@ impl ProcessSpawnRaw {
             argv_len: 0,
             parent_is_kthread: 0,
             _pad: [0u8; 5],
+            exe: exe::ExeIdentityRaw::zeroed(),
         }
     }
 }
@@ -139,12 +146,13 @@ impl FileOpenRaw {
     }
 }
 
-/// Pre-exec validation event (LSM `bprm_check_security`).
+/// Pre-exec event: one per binfmt pass of LSM `bprm_check_security`
+/// (Tappa 10.9 step 2), or one per `execve` from `sys_enter_execve` in
+/// tracepoint mode (the old sensor: user-memory filename, `exe` zero).
 ///
 /// Distinct from `ProcessSpawnRaw` (post-exec tracepoint): this fires
 /// before the new image runs, which is the kernel's last opportunity
-/// to refuse the exec. Tappa 4 only emits telemetry; Tappa 7 will
-/// turn this hook into an enforcement point.
+/// to refuse the exec (the 10.9 inline-enforcement item).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -152,10 +160,14 @@ pub struct ExecCheckRaw {
     pub pid: u32,
     pub ppid: u32,
     pub uid: u32,
-    pub _pad0: u32,
+    pub gid: u32,
+    /// The caller's `comm` (the hook runs before the exec takes effect).
     pub comm: [u8; TASK_COMM_LEN],
+    /// `bprm->filename`: the caller's string, as the kernel copied it.
     pub filename: [u8; FILENAME_LEN],
     pub timestamp_ns: u64,
+    /// The file this pass examines.
+    pub exe: exe::ExeIdentityRaw,
 }
 
 impl ExecCheckRaw {
@@ -164,10 +176,11 @@ impl ExecCheckRaw {
             pid: 0,
             ppid: 0,
             uid: 0,
-            _pad0: 0,
+            gid: 0,
             comm: [0u8; TASK_COMM_LEN],
             filename: [0u8; FILENAME_LEN],
             timestamp_ns: 0,
+            exe: exe::ExeIdentityRaw::zeroed(),
         }
     }
 }
@@ -973,6 +986,7 @@ pub mod admin_protocol;
 pub mod admin_signed_payload;
 
 /// Tappa 10.9 step 0 — sensor-feasibility probe records.
+pub mod exe;
 pub mod open_sensor;
 pub mod sensor_probe;
 
@@ -1143,10 +1157,19 @@ mod tests {
         // T10.6 APPEND). Appended: parent_comm 16 + parent_start_ns 8 +
         // argv 512 + argv_len 2 + _pad 6 = 544. Total 840, align 8.
         // The trailing _pad keeps the Pod free of implicit padding.
-        assert_eq!(size_of::<ProcessSpawnRaw>(), 840);
+        // Tappa 10.9 step 2 appended `exe` (552) at 840: 1,392.
+        assert_eq!(size_of::<ProcessSpawnRaw>(), 1392);
         assert_eq!(align_of::<ProcessSpawnRaw>(), 8);
         // The existing-field prefix must not have shifted (strict APPEND).
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_comm), 296);
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, exe), 840);
+    }
+
+    #[test]
+    fn exec_check_raw_layout_is_stable() {
+        assert_eq!(size_of::<ExecCheckRaw>(), 848);
+        assert_eq!(align_of::<ExecCheckRaw>(), 8);
+        assert_eq!(core::mem::offset_of!(ExecCheckRaw, exe), 296);
     }
 
     #[test]
@@ -1173,6 +1196,7 @@ mod tests {
             argv_len: 7,
             parent_is_kthread: 0,
             _pad: [0u8; 5],
+            exe: exe::ExeIdentityRaw::zeroed(),
         };
 
         let bytes: &[u8] = bytemuck::bytes_of(&original);

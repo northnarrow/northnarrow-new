@@ -10,6 +10,7 @@
 //! existing live integration test keeps working.
 
 pub mod ebpf_object;
+pub mod exe_identity;
 pub mod exec;
 pub mod multiplexer;
 pub mod open_sensor;

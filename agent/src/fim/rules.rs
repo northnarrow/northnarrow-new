@@ -2016,6 +2016,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         for rule in fim_rules(TrustedInstallerOverride::inert_arc()) {
             assert!(

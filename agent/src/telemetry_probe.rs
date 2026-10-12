@@ -389,6 +389,7 @@ mod tests {
             parent_comm: "northnarrow-age".into(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 

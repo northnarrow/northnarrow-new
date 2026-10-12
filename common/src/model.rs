@@ -54,6 +54,10 @@ pub enum Event {
         /// records (they decode as `false` → fail-secure).
         #[serde(default)]
         parent_is_kthread: bool,
+        /// Tappa 10.9 step 2: the file the caller named, as the kernel
+        /// opened it (review 61). Empty in tracepoint mode.
+        #[serde(default)]
+        exe: ExeIdentity,
     },
     /// File open event (LSM `file_open`).
     FileOpen {
@@ -81,14 +85,19 @@ pub enum Event {
         filename: String,
         timestamp_ns: u64,
     },
-    /// Pre-exec validation event (LSM `bprm_check_security`).
+    /// Pre-exec event: one per binfmt pass of LSM `bprm_check_security`
+    /// (Tappa 10.9 step 2), or one per `execve` in tracepoint mode.
     ExecCheck {
         pid: u32,
         ppid: u32,
         uid: u32,
         comm: String,
+        /// The caller's string (`bprm->filename`).
         filename: String,
         timestamp_ns: u64,
+        /// The file this pass examines (empty in tracepoint mode).
+        #[serde(default)]
+        exe: ExeIdentity,
     },
     /// Kernel module load (BUG-034) — BPF-LSM `kernel_read_file`
     /// (finit_module) / `kernel_load_data` (init_module). The LOAD is
@@ -404,6 +413,7 @@ impl From<&ProcessSpawnRaw> for Event {
             // read failure OR an older BPF that doesn't set this
             // field) decodes to `false` → R011 fail-secure path.
             parent_is_kthread: raw.parent_is_kthread != 0,
+            exe: ExeIdentity::from_raw(&raw.exe),
         }
     }
 }
@@ -431,7 +441,66 @@ impl From<&ExecCheckRaw> for Event {
             comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
             filename: crate::wire::cstr_lossy(&raw.filename).into_owned(),
             timestamp_ns: raw.timestamp_ns,
+            exe: ExeIdentity::from_raw(&raw.exe),
         }
+    }
+}
+
+/// Tappa 10.9 step 2: what the kernel executed (`wire::exe`), decoded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExeIdentity {
+    /// Canonical path of the executed file, rebuilt from its dentry:
+    /// the exec'ing task's own view, or absolute once userland mapped the
+    /// filesystem root to its mount point. Empty when unknown.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub dev: u64,
+    #[serde(default)]
+    pub ino: u64,
+    /// `wire::exe::exe_flags`.
+    #[serde(default)]
+    pub flags: u32,
+    /// binfmt pass: 0 = the file the caller named, 1+ = interpreters.
+    #[serde(default)]
+    pub pass: u8,
+    /// Filesystem root `path` is relative to, until userland maps it to
+    /// a mount point; `(0, 0)` once `path` is the task's view or absolute.
+    #[serde(skip)]
+    pub root: (u64, u64),
+}
+
+impl ExeIdentity {
+    pub fn from_raw(raw: &crate::wire::exe::ExeIdentityRaw) -> Self {
+        use crate::wire::exe::exe_flags;
+        let path = crate::wire::exe::relative_path(raw);
+        let root = if path.is_empty() || raw.flags & exe_flags::TASK_ROOT != 0 {
+            (0, 0)
+        } else {
+            (raw.root_dev, raw.root_ino)
+        };
+        ExeIdentity {
+            path,
+            dev: raw.dev,
+            ino: raw.ino,
+            flags: raw.flags,
+            pass: raw.pass,
+            root,
+        }
+    }
+
+    /// The canonical path, or `fallback` (the caller's string) when it is
+    /// unknown or not yet mapped to a mount point.
+    pub fn path_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.path.is_empty() || self.root != (0, 0) {
+            fallback
+        } else {
+            &self.path
+        }
+    }
+
+    pub fn has(&self, flag: u32) -> bool {
+        self.flags & flag != 0
     }
 }
 

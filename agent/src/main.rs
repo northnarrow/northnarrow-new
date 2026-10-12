@@ -115,6 +115,20 @@ struct Cli {
     )]
     file_open_sensor: FileOpenSensor,
 
+    /// Exec sensor (Tappa 10.9 step 2). `lsm` (default): LSM
+    /// `bprm_check_security` reads the file the kernel opened, and the exec
+    /// rules match its canonical path (review 61). `tracepoint`: the
+    /// previous `sys_enter_execve` sensor, whose rules matched the caller's
+    /// string; kept for one soak cycle as a fallback (also
+    /// `NN_EXEC_SENSOR=tracepoint` in a unit drop-in).
+    #[arg(
+        long = "exec-sensor",
+        env = "NN_EXEC_SENSOR",
+        value_enum,
+        default_value_t = ExecSensor::Lsm
+    )]
+    exec_sensor: ExecSensor,
+
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
     ade_model: Option<PathBuf>,
@@ -509,6 +523,13 @@ impl Cli {
 /// `--file-open-sensor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum FileOpenSensor {
+    Lsm,
+    Tracepoint,
+}
+
+/// `--exec-sensor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ExecSensor {
     Lsm,
     Tracepoint,
 }
@@ -945,6 +966,8 @@ async fn main() -> Result<()> {
         flow_tracker: Arc::clone(&flow_tracker),
         dns_cache: Arc::clone(&dns_cache),
     };
+    // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
+    northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
     let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
@@ -2842,6 +2865,10 @@ async fn process_event(
     detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
     event: Event,
 ) {
+    // Tappa 10.9 step 2: an exec event's path made absolute before any
+    // consumer reads it (review 61).
+    let mut event = event;
+    northnarrow_agent::sensors::exe_identity::resolve(&mut event);
     // FIM-009 self-upgrade (§15.1): lazy TTL expiry on the event path —
     // if a trusted-installer window has passed its deadline, close it
     // (re-engage the FS pin + audit) before handling this event. A cheap

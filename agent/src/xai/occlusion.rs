@@ -655,10 +655,16 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             comm,
             filename,
             timestamp_ns,
+            exe,
             ..
         } => match field {
             F::Comm => comm.clear(),
-            F::Filename => filename.clear(),
+            // The rules read the canonical path first (review 61): the
+            // file's identity is masked as a whole.
+            F::Filename => {
+                filename.clear();
+                exe.path.clear();
+            }
             F::Pid => *pid = 0,
             F::Ppid => *ppid = 0,
             F::Uid => *uid = 0,
@@ -706,9 +712,13 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             comm,
             filename,
             timestamp_ns,
+            exe,
         } => match field {
             F::Comm => comm.clear(),
-            F::Filename => filename.clear(),
+            F::Filename => {
+                filename.clear();
+                exe.path.clear();
+            }
             F::Pid => *pid = 0,
             F::Ppid => *ppid = 0,
             F::Uid => *uid = 0,
@@ -881,6 +891,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
     fn dns(q: &str) -> Event {

@@ -246,6 +246,7 @@ impl Rule for NnLChain002TmpExecThenEgress {
                 filename,
                 timestamp_ns,
                 parent_start_ns,
+                exe,
                 ..
             } => {
                 let mut store = self.buf.lock();
@@ -256,7 +257,8 @@ impl Rule for NnLChain002TmpExecThenEgress {
                         start_ns: *parent_start_ns,
                     },
                 );
-                if filename.starts_with("/tmp/") {
+                // Review 61: the file the kernel executed.
+                if exe.path_or(filename).starts_with("/tmp/") {
                     store.record_for_pid(*pid, PrecursorKind::TmpExec, *timestamp_ns);
                 }
                 None
@@ -741,6 +743,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 
@@ -891,6 +894,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         r.evaluate(&non_tmp);
         assert!(r.evaluate(&flow(42, 4444, 10 * SEC + SEC)).is_none());
@@ -1008,6 +1012,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 

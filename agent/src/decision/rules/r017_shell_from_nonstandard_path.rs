@@ -56,6 +56,7 @@ impl Rule for R017ShellFromNonstandardPath {
             filename,
             argv,
             parent_comm,
+            exe,
             ..
         } = event
         else {
@@ -64,6 +65,9 @@ impl Rule for R017ShellFromNonstandardPath {
         if !SHELL_COMMS.contains(&comm.as_str()) {
             return None;
         }
+        // Review 61: the file the kernel executed (`/usr/bin/../../tmp/sh`
+        // is not under /usr/bin; a symlink to /usr/bin/bash is).
+        let filename = exe.path_or(filename);
         // Fail-safe: an EMPTY filename means the sensor could not read
         // the exec path (a tracepoint layout the agent did not expect —
         // RHEL 9 shifted `sched_process_exec.filename` and this rule
@@ -122,6 +126,18 @@ mod tests {
     fn empty_filename_never_fires() {
         assert!(rule().evaluate(&spawn("sh", "")).is_none());
         assert!(rule().evaluate(&spawn("bash", "")).is_none());
+    }
+
+    /// Review 61: the exemption applies to the file the kernel executed —
+    /// `/usr/bin/../../dev/shm/sh` is not under /usr/bin, a symlink in
+    /// /usr/local/bin to /usr/bin/bash is.
+    #[test]
+    fn exemption_reads_the_executed_file() {
+        use crate::decision::rules::testutil::spawn_exe;
+        let evasion = spawn_exe("sh", "/usr/bin/../../dev/shm/sh", "/dev/shm/sh", 0);
+        assert!(rule().evaluate(&evasion).is_some());
+        let symlink = spawn_exe("bash", "/usr/local/bin/bash", "/usr/bin/bash", 0);
+        assert!(rule().evaluate(&symlink).is_none());
     }
 
     #[test]

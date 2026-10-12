@@ -63,6 +63,7 @@ async fn main() -> ExitCode {
         parent_comm: String::new(),
         parent_start_ns: 0,
         parent_is_kthread: false,
+        exe: Default::default(),
     };
 
     println!("\nrunning a 4-token decode on a 5-word prompt...");

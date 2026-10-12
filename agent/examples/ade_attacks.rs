@@ -204,6 +204,7 @@ fn spawn(comm: &str, filename: &str) -> Event {
         parent_comm: String::new(),
         parent_start_ns: 0,
         parent_is_kthread: false,
+        exe: Default::default(),
     }
 }
 

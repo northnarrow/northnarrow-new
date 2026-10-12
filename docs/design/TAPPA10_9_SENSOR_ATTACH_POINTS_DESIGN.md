@@ -647,3 +647,135 @@ What the numbers say:
 Q7's proposed gate, halving the open loss, is therefore not met by step 1
 alone. The open loss falls by 3.7 points, and the agent's CPU per open
 goes to almost zero.
+
+## 11. Step 2 — exec: implementation design
+
+Step 0 loaded `bprm_check_security` and read `linux_binprm` on all four
+kernels (§9, 7.4k instructions). This section is the implementation plan.
+
+### 11.1 What the code survey found (review 61)
+
+- **The exec rules match the caller's string.** `ProcessSpawn.filename`
+  is `bprm->filename`: the kernel's copy of the string the caller passed.
+  It is free of races, but not resolved. The kill rules match prefixes on
+  it: R001 `/tmp/`, R002 `/dev/shm/`, R003 `/var/tmp/`, R009, R010; also
+  R008, CHAIN-002's precursor, posture's `/tmp` and `/dev/shm` arm, and
+  R013's and R017's exemptions. Process canaries and the auth-lineage
+  tracker compare the exact string. So `cd /tmp && ./payload`, a symlink,
+  `..`, `//` or `execveat` with a directory fd escape all of them. In the
+  lab (Debian 12), `/tmp/x` is killed by R001; `cd /tmp && ./x` runs with
+  no detection at all.
+- **`ExecCheck` is weak and little used.** `sys_enter_execve` reads the
+  filename from user memory, fires on failed attempts (`execvp` walking
+  `PATH`) and never for `execveat`/`fexecve`, and leaves `ppid` 0. No rule
+  reads it; posture's `/tmp`/`/dev/shm` arm reads it as well as
+  `ProcessSpawn` (it fires twice), and ADE takes it as a focal event.
+- **Out of reach of this step:** the `comm` rules (R005–R007, R011,
+  R012, R014–R016, posture's recon and lolbas). `comm` is the basename of
+  the name invoked, and a renamed copy evades them; that is the 10.9
+  "exec by inode property" item.
+
+### 11.2 One LSM program, the file the kernel opened
+
+`exec_check_lsm` on `bprm_check_security`, observe only (it returns 0;
+Q4 leaves the deny to the inline-enforcement item). The hook runs once
+per binfmt pass, before the point of no return: for a `#!` script once
+for the script, then for the interpreter (`bprm->file` and `bprm->interp`
+change, `bprm->filename` does not). Pass 0 is the one where
+`bprm->interp == bprm->filename`. For each pass it reads `bprm->file`:
+
+- `(dev, ino)` as `stat()` reports it (review 55);
+- the superblock magic (tmpfs and hugetlbfs: `TMPFS`), a `memfd:` dentry
+  name (`MEMFD`) and `i_nlink == 0` (`DELETED`: an unlinked file or an
+  `O_TMPFILE`);
+- the mount-relative path from the dentry, with the mount root's key
+  (§10.4). The walk is a global BPF function (`nn_exe_walk`, verified on
+  its own: KERNEL_COMPATIBILITY rule 6) that goes up to 64 levels. It
+  keeps the 12 names nearest the file and the last 4 below the root, so
+  a deep path still shows its top (`/tmp/a/b/…/x`). Past 64 levels the
+  root is not reached and the record says so (`UNRESOLVED`).
+
+It emits one `ExecCheck` per pass (kernel data now: the canonical path,
+the inode facts, the pass number, `ppid` from the task). At pass 0 it
+also leaves the same facts in `EXEC_HANDOFF[task]`. `sched_process_exec`
+runs in the same task once the exec has succeeded. It appends them to
+`ProcessSpawnRaw` and deletes the entry. A failed exec leaves an entry
+that the task's next exec overwrites at its own pass 0.
+
+### 11.3 Rules read the canonical path
+
+`Event::ProcessSpawn` and `Event::ExecCheck` gain `exe`: the absolute
+path (the mount table maps the root key to a mount point, as for file
+opens), `(dev, ino)` and the flags. `exe.path_or(filename)` gives the
+canonical path, or the caller's string when there is none (tracepoint
+mode, `UNRESOLVED`). The prefix and exact-path consumers use it: R001,
+R002, R003, R008, R009, R010, R013's and R017's exemptions, CHAIN-002's
+precursor, posture's arm (now on `ProcessSpawn` only), the auth-lineage
+tracker, process canaries (either string), and the verdict's
+`event_filename`.
+
+R004 keeps its string patterns (an exec through `/proc/self/fd/N` or
+`/dev/fd/N`) and also fires on `MEMFD`, so a symlink to the fd no longer
+hides a memfd. `DELETED` alone does not kill: a binary replaced by an
+upgrade and re-executed through `/proc/self/exe` is deleted too. It is
+recorded for the inode-property item.
+
+### 11.4 Switch, attach, sizes
+
+- `--exec-sensor lsm|tracepoint` (`NN_EXEC_SENSOR`), default `lsm`, for
+  one soak cycle (Q6). In LSM mode `sys_enter_execve` is not attached;
+  in tracepoint mode the LSM program is not attached and `exe` stays
+  empty. The program is attached inside the multiplexer, so the BPF link
+  self-check covers it.
+- New offsets (optional slots; if one is missing the agent stays on the
+  tracepoint): `linux_binprm.file`, `.filename`, `.interp`,
+  `inode.i_nlink`.
+- `ExeIdentityRaw` is 552 bytes. It goes into `ExecCheckRaw` (296 → 848
+  bytes) and is appended to `ProcessSpawnRaw` (840 → 1,392). The exec
+  ring grows from 256 KiB to 1 MiB, so it holds about 750 records instead
+  of 309.
+- The cost is one walk per pass, about 3 µs on the lab for an ordinary
+  depth, against roughly 800 µs for an exec.
+
+### 11.5 Verification
+
+`nn-lab.sh exec-sensor-check` runs these cases:
+
+- the program is armed, and `sys_enter_execve` is retired without a
+  missing-link report;
+- `cd /tmp && ./x` is killed by R001; on main it is not;
+- `x` run through a symlink in a root-owned directory is killed by R001;
+- `/usr/bin/../../tmp/x` is killed by R001;
+- a script in `/tmp` run as `./x.sh` is killed by R001 on the script;
+- a memfd run through `execveat(AT_EMPTY_PATH)` is killed by R004;
+- `/usr/bin/sleep` is not killed;
+- the telemetry probe never goes silent.
+
+The gates of §7 apply on the three lab kernels, plus the exec workload of
+`nn-lab.sh overhead` in both modes.
+
+### 11.6 Implementation status
+
+Implemented in lab PR 53:
+
+- **Kernel**, `agent-ebpf/src/exec_lsm.rs`:
+  - `exec_check_lsm` on `bprm_check_security`;
+  - `nn_exe_walk`, a global function, for the dentry walk;
+  - `EXEC_HANDOFF`, an LRU of 1,024 entries keyed by task, for the
+    post-exec record.
+- **`sched_process_exec`** appends the handed-over identity to
+  `ProcessSpawnRaw`. Its ring grows to 1 MiB.
+- **Wire**, `common/src/wire/exe.rs`: `ExeIdentityRaw` and the path
+  rebuild. `ExeIdentity` (`model.rs`) carries `path_or`.
+- **Userland**, `agent/src/sensors/exe_identity.rs`:
+  - the switch and the attach, with a fallback to `sys_enter_execve`;
+  - mount-table resolution before any consumer reads the event.
+- **Consumers.** The exec rules, CHAIN-002, posture, the lineage tracker,
+  process canaries, ADE (prompt and sanitising) and the detection store's
+  `exe` all use the file the kernel executed.
+- **New offset slots** (optional): `linux_binprm.file`, `.filename` and
+  `.interp`, `inode.i_nlink`, `task_struct.fs`, `fs_struct.root`.
+
+Found on the way: review 61 (above) and, from the gate runs, reviews 62
+and 63 (a restarted agent lost the kill/ptrace evidence and filled
+`PROTECTED_INODES`; fixed separately in lab PR 54).

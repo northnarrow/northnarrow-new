@@ -301,8 +301,10 @@ impl Principal {
 /// The full executable path that triggered a detection, when the
 /// originating event names one. ONLY the two exec-sensor events carry
 /// an executable: `ProcessSpawn` (post-exec) and `ExecCheck` (pre-exec
-/// `bprm_check_security`); their `filename` IS the full path (e.g.
-/// `/tmp/payload`). Every other event names no executable — `FileOpen`
+/// `bprm_check_security`). Tappa 10.9 step 2: the file the kernel
+/// executed (`exe.path`, review 61), else the caller's `filename`, which
+/// may be relative or name a symlink. Every other event names no
+/// executable — `FileOpen`
 /// carries the *opened* file (not an exe), `ModuleLoad` a `.ko` source
 /// path, the net / canary / anti-tamper events nothing — so they map to
 /// `None`. Exhaustive (no wildcard) on purpose, like [`Sensor::from_event`]
@@ -310,8 +312,8 @@ impl Principal {
 /// force an explicit decision here rather than silently yield `None`.
 fn exe_from_event(event: &Event) -> Option<String> {
     match event {
-        Event::ProcessSpawn { filename, .. } | Event::ExecCheck { filename, .. } => {
-            Some(filename.clone())
+        Event::ProcessSpawn { filename, exe, .. } | Event::ExecCheck { filename, exe, .. } => {
+            Some(exe.path_or(filename).to_string())
         }
         Event::FileOpen { .. }
         | Event::MassWrite { .. }
@@ -1229,6 +1231,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 
@@ -1332,6 +1335,7 @@ mod tests {
             comm: "nn-test-mock-re".to_string(),
             filename: "/tmp/staging/dropper".to_string(),
             timestamp_ns: 456,
+            exe: Default::default(),
         }
     }
 

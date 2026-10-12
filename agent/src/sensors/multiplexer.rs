@@ -187,12 +187,13 @@ impl SensorMultiplexer {
             "syscalls",
             "sys_enter_openat",
         )?;
-        attach_tracepoint(
-            &mut ebpf,
-            "sys_enter_execve",
-            "syscalls",
-            "sys_enter_execve",
-        )?;
+        // Tappa 10.9 step 2: the exec sensor on LSM `bprm_check_security`
+        // (`--exec-sensor`), or `sys_enter_execve` when the LSM program
+        // is not wanted, lacks an offset or is refused. Attached here, so
+        // the BPF link self-check covers whichever runs.
+        crate::sensors::exe_identity::attach(&mut ebpf, |ebpf| {
+            attach_tracepoint(ebpf, "sys_enter_execve", "syscalls", "sys_enter_execve")
+        })?;
         // io_uring (Tappa 10.8): soft attach — a kernel built without
         // CONFIG_IO_URING has no such tracepoints and nothing to observe.
         // The submit tracepoint was renamed across kernels (`_sqe` ≤ 6.1,

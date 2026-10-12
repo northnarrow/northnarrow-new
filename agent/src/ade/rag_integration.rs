@@ -44,10 +44,17 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
         Event::BpfSyscall { comm, cmd, .. } => {
             format!("bpf() {} by {comm}", common::wire::bpf_cmd_name(*cmd))
         }
-        Event::ProcessSpawn { comm, filename, .. } => format!("process {comm} from {filename}"),
+        Event::ProcessSpawn {
+            comm,
+            filename,
+            exe,
+            ..
+        } => format!("process {comm} from {}", exe.path_or(filename)),
         Event::FileOpen { filename, .. } => format!("file open {filename}"),
         Event::MassWrite { comm, count, .. } => format!("mass write by {comm} ({count} files)"),
-        Event::ExecCheck { filename, .. } => format!("exec check {filename}"),
+        Event::ExecCheck { filename, exe, .. } => {
+            format!("exec check {}", exe.path_or(filename))
+        }
         Event::TcpConnect {
             comm,
             dst_addr,
@@ -260,6 +267,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("xmrig"));

@@ -24,13 +24,15 @@ impl Rule for R001ExecFromTmp {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { filename, .. } = event else {
+        let Event::ProcessSpawn { filename, exe, .. } = event else {
             return None;
         };
+        // Review 61: the file the kernel executed, not the caller's string.
+        let filename = exe.path_or(filename);
         if !filename.starts_with("/tmp/") {
             return None;
         }
-        if TMP_WHITELIST.iter().any(|w| filename == w) {
+        if TMP_WHITELIST.contains(&filename) {
             return None;
         }
         Some(build_verdict(
@@ -47,6 +49,25 @@ impl Rule for R001ExecFromTmp {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::spawn;
+
+    /// Review 61: `cd /tmp && ./payload`, a symlink or `..` — the rule
+    /// matches the file the kernel executed.
+    #[test]
+    fn fires_on_the_executed_file_not_the_callers_string() {
+        use crate::decision::rules::testutil::spawn_exe;
+        for caller in [
+            "./payload",
+            "/usr/local/bin/notes",
+            "/usr/bin/../../tmp/payload",
+        ] {
+            let event = spawn_exe("payload", caller, "/tmp/payload", 0);
+            let v = R001ExecFromTmp.evaluate(&event).expect(caller);
+            assert_eq!(v.event_filename, "/tmp/payload", "{caller}");
+        }
+        // and a `/tmp/…` string that resolves elsewhere does not fire
+        let event = spawn_exe("ls", "/tmp/ls-link", "/usr/bin/ls", 0);
+        assert!(R001ExecFromTmp.evaluate(&event).is_none());
+    }
 
     #[test]
     fn fires_on_exec_from_tmp() {

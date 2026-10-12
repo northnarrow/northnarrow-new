@@ -21,7 +21,7 @@ use aya_ebpf::{
 use northnarrow_common::wire::{ExecCheckRaw, FILENAME_LEN, TASK_COMM_LEN};
 
 #[map]
-static EXEC_CHECK_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+pub(crate) static EXEC_CHECK_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 // sys_enter_execve event format:
 //   field:int            __syscall_nr;  offset:8;
