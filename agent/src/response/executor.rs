@@ -111,12 +111,16 @@ impl Executor {
         // isolation on the same flag, so both enforcement entry points
         // honour one switch.
         if self.config.dry_run {
-            warn!(
-                target: "response.detect_only",
-                action = ?action,
-                target_pid,
-                "DETECT-ONLY: would execute response action — suppressed, no system change"
-            );
+            // A Log verdict has nothing to suppress: no line per verdict
+            // (a flood of them filled the journal, review 75).
+            if !matches!(action, ResponseAction::Log) {
+                warn!(
+                    target: "response.detect_only",
+                    action = ?action,
+                    target_pid,
+                    "DETECT-ONLY: would execute response action — suppressed, no system change"
+                );
+            }
             return ExecutionReport {
                 action,
                 primary: ExecutionOutcome::WouldExecute { pid: target_pid },

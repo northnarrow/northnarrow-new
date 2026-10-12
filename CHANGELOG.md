@@ -6,6 +6,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An unprivileged loop of reads disabled the FIM kill rules and erased
+  detection records (review 75, High). Every open of the user's own
+  credential file, or of a world-readable sensitive file such as
+  `/etc/passwd`, sent a record to a kernel ring and a verdict to the journal
+  and the detection store. Two `open()` loops lost 94 % of the open-sensor
+  ring and kept the agent's event channel full; the FIM drain then dropped
+  the drift events it could not queue, so a root process writing a cron
+  drop-in was not killed. journald suppressed 400k agent lines, and the
+  store's queue evicted the records of real kills. Now the kernel drops a
+  task's repeated reads of a file within one second, the FIM drain waits
+  for room instead of dropping, detections are logged and stored within a
+  per-rule, per-uid budget (every verdict is still acted on; the rest are
+  counted and reported), and a full queue evicts logged-only records first.
 - NN-L-NET-009 (more than 100 MiB sent) never fired for UDP (review 74,
   High). The flow tracker emits one UDP row per kernel record, at most
   about 1 MiB, so no row reached the threshold: 150 MB sent over UDP in

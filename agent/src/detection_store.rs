@@ -23,11 +23,14 @@
 //!   pushes records into. It NEVER blocks on fsync: a record is stamped
 //!   with a monotonic id, pushed onto a bounded in-memory queue, and a
 //!   dedicated writer task is woken. On a full queue the OLDEST record
-//!   is dropped and a counter is bumped (a live dashboard cares about
-//!   the freshest detections; the drop is observable via the counter +
-//!   a log line). This is the bounded-MPSC-with-drop-oldest the design
-//!   calls for; a raw `mpsc` can't drop from the *oldest* end at the
-//!   producer, so the queue is a `Mutex<VecDeque>` woken by a `Notify`.
+//!   that was only logged is dropped, a record of a response that ran
+//!   only when nothing else is queued (review 75), and a counter is
+//!   bumped (a live dashboard cares about the freshest detections; the
+//!   drop is observable via the counter + a log line). This is the
+//!   bounded-MPSC-with-drop-oldest the design calls for; a raw `mpsc`
+//!   can't drop from the *oldest* end at the producer, so the queue is a
+//!   `Mutex<VecDeque>` woken by a `Notify`. Floods of one detection are
+//!   kept off the queue upstream ([`crate::detection_budget`]).
 //! - [`open`] — wires a [`RotatingChainLog<DetectionRecord>`] (the same
 //!   signed, rotation-aware primitive behind audit / FIM / netflow /
 //!   canary, [`crate::chainlog`]) to the sink + writer task, seeding the
@@ -98,8 +101,8 @@ pub const DEFAULT_MAX_ARCHIVES: usize = 8;
 
 /// Default bounded-queue depth between the hot path and the writer task.
 /// At a few KiB per record this is ≈ a couple MiB of worst-case buffered
-/// memory. A burst beyond this drops the OLDEST queued record (see
-/// [`DetectionSink`]).
+/// memory. A burst beyond this drops the oldest queued record that was
+/// only logged (see [`DetectionSink`]).
 pub const DEFAULT_QUEUE_CAP: usize = 1024;
 
 // ── record shape ────────────────────────────────────────────────────
@@ -396,6 +399,11 @@ pub struct DetectionRecord {
     /// `None`); wired by a later sub-step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explanation: Option<XaiEvidenceChain>,
+    /// Detections of the same rule and uid acted on but not recorded
+    /// since the previous report, because they exceeded the per-rule
+    /// budget ([`crate::detection_budget`], review 75). Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_before: Option<u64>,
 }
 
 impl DetectionRecord {
@@ -433,6 +441,7 @@ impl DetectionRecord {
             detection_type: verdict.category.clone(),
             status: DetectionStatus::Open,
             explanation: None,
+            suppressed_before: None,
         }
     }
 
@@ -469,6 +478,21 @@ impl DetectionRecord {
             detection_type,
             status: DetectionStatus::Open,
             explanation: None,
+            suppressed_before: None,
+        }
+    }
+}
+
+impl DetectionRecord {
+    /// The record of a response that ran, or would have in detect-only
+    /// mode (a kill, an isolation, a kernel denial), as opposed to a
+    /// verdict that was only logged. A full queue evicts these last
+    /// (review 75).
+    fn acted(&self) -> bool {
+        match &self.verdict {
+            DetectionVerdict::Rule(ResponseAction::Log) => self.sensor == Sensor::AntiTamper,
+            DetectionVerdict::Rule(_) => true,
+            DetectionVerdict::Ade(_) => self.response != "none",
         }
     }
 }
@@ -547,7 +571,7 @@ struct SinkInner {
     /// Last assigned id (seeded from the persisted tail). The next id is
     /// `fetch_add(1) + 1`, so a fresh store hands out `1, 2, 3, …`.
     last_id: AtomicU64,
-    /// Cumulative records dropped under backpressure (drop-oldest).
+    /// Cumulative records dropped under backpressure.
     dropped: AtomicU64,
     cap: usize,
 }
@@ -567,15 +591,27 @@ impl DetectionSink {
     }
 
     /// Push `record` onto the bounded queue. If full, drop the OLDEST
-    /// queued record and bump the dropped counter, then enqueue the new
-    /// one (freshest-wins). Wakes the writer. Holds the queue lock only
-    /// for the push — the fsync happens on the writer task, never here.
+    /// queued record that was only logged and bump the dropped counter,
+    /// then enqueue the new one (freshest-wins). The record of a response
+    /// that ran goes only when every queued record is one: a flood of
+    /// logged verdicts can no longer evict the record of a kill (review
+    /// 75); then a logged record that finds no room is the one dropped.
+    /// Wakes the writer. Holds the queue lock only for the push — the
+    /// fsync happens on the writer task, never here.
     fn enqueue(&self, record: DetectionRecord) {
         {
             let mut q = self.inner.queue.lock();
             if q.len() >= self.inner.cap {
-                q.pop_front();
                 self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                match q.iter().position(|r| !r.acted()) {
+                    Some(i) => {
+                        q.remove(i);
+                    }
+                    None if !record.acted() => return,
+                    None => {
+                        q.pop_front();
+                    }
+                }
             }
             q.push_back(record);
         }
@@ -583,15 +619,18 @@ impl DetectionSink {
     }
 
     /// Record a rule-path detection (off the hot path).
+    /// `suppressed_before`: see [`DetectionRecord::suppressed_before`].
     pub fn record_rule(
         &self,
         event: &Event,
         verdict: &Verdict,
         posture: PostureKind,
         response: String,
+        suppressed_before: u64,
     ) {
-        let record =
+        let mut record =
             DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response);
+        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         self.enqueue(record);
     }
 
@@ -602,9 +641,11 @@ impl DetectionSink {
         verdict: &AdeVerdict,
         posture: PostureKind,
         response: String,
+        suppressed_before: u64,
     ) {
-        let record =
+        let mut record =
             DetectionRecord::from_ade(self.next_id(), now_ts(), event, verdict, posture, response);
+        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         self.enqueue(record);
     }
 
@@ -710,7 +751,7 @@ fn spawn_writer(
                 warn!(
                     target: "detection_store",
                     dropped_total = dropped,
-                    "detection records dropped under backpressure (queue full, drop-oldest)",
+                    "detection records dropped under backpressure (queue full: logged-only records first)",
                 );
                 reported_dropped = dropped;
             }
@@ -1298,6 +1339,7 @@ mod tests {
             detection_type: "reverse_shell".to_string(),
             status: DetectionStatus::Open,
             explanation: None,
+            suppressed_before: None,
         };
         assert_roundtrip(&record);
     }
@@ -1454,12 +1496,14 @@ mod tests {
             &sample_verdict(),
             PostureKind::Observing,
             "KillProcess".to_string(),
+            0,
         );
         sink.record_rule(
             &sample_file_open(),
             &sample_verdict(),
             PostureKind::Observing,
             "none".to_string(),
+            0,
         );
 
         // Poll until the writer task has flushed both (bounded wait).
@@ -1512,10 +1556,103 @@ mod tests {
                 &sample_verdict(),
                 PostureKind::Observing,
                 "none".to_string(),
+                0,
             );
         }
         assert_eq!(sink.queue_snapshot(), vec![2, 3], "freshest two retained");
         assert_eq!(sink.dropped(), 1, "exactly one (oldest) dropped");
+    }
+
+    /// Review 75: a flood of logged verdicts must not evict the record of
+    /// a kill. A full queue drops the oldest logged record first, and a
+    /// logged record that finds only kills queued is the one dropped.
+    #[test]
+    fn full_queue_evicts_logged_records_before_kills() {
+        let sink = DetectionSink::for_test(3, 0);
+        let mut logged = sample_verdict();
+        logged.action = ResponseAction::Log;
+        let kill = sample_verdict();
+        let push = |v: &Verdict, response: &str| {
+            sink.record_rule(
+                &sample_event(),
+                v,
+                PostureKind::Observing,
+                response.to_string(),
+                0,
+            )
+        };
+        push(&kill, "KillProcess"); // 1
+        push(&logged, "none"); // 2
+        push(&kill, "KillProcess"); // 3
+        push(&logged, "none"); // 4: evicts 2, the oldest logged one
+        assert_eq!(sink.queue_snapshot(), vec![1, 3, 4]);
+        push(&kill, "KillProcess"); // 5: evicts 4, the only logged one
+        assert_eq!(sink.queue_snapshot(), vec![1, 3, 5]);
+        push(&logged, "none"); // 6: only kills queued → 6 is dropped
+        assert_eq!(sink.queue_snapshot(), vec![1, 3, 5]);
+        push(&kill, "KillProcess"); // 7: only kills → the oldest goes
+        assert_eq!(sink.queue_snapshot(), vec![3, 5, 7]);
+        assert_eq!(sink.dropped(), 4);
+    }
+
+    /// An anti-tamper denial is a Log verdict, but the kernel acted: it
+    /// is kept like a kill.
+    #[test]
+    fn anti_tamper_denial_counts_as_acted() {
+        let mut logged = sample_verdict();
+        logged.action = ResponseAction::Log;
+        let denial = Event::FsProtectDenial {
+            timestamp_ns: 1,
+            pid: 4242,
+            uid: 0,
+            comm: "rm".to_string(),
+            target_dev: 1,
+            target_ino: 2,
+            operation: common::FsProtectOperation::Unlink,
+        };
+        let r = DetectionRecord::from_rule(
+            1,
+            now_ts(),
+            &denial,
+            &logged,
+            PostureKind::Observing,
+            "denied in kernel (anti-tamper LSM hook)".to_string(),
+        );
+        assert!(r.acted());
+        let r = DetectionRecord::from_rule(
+            2,
+            now_ts(),
+            &sample_event(),
+            &logged,
+            PostureKind::Observing,
+            "none".to_string(),
+        );
+        assert!(!r.acted());
+    }
+
+    /// `suppressed_before` is absent unless something was held back, so
+    /// records without it keep the pre-field byte shape.
+    #[test]
+    fn suppressed_before_absent_unless_held() {
+        let sink = DetectionSink::for_test(4, 0);
+        for held in [0, 7] {
+            sink.record_rule(
+                &sample_event(),
+                &sample_verdict(),
+                PostureKind::Observing,
+                "KillProcess".to_string(),
+                held,
+            );
+        }
+        let q = sink.inner.queue.lock();
+        let lines: Vec<String> = q
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        assert!(!lines[0].contains("suppressed_before"));
+        assert!(lines[1].ends_with(",\"suppressed_before\":7}"));
+        let back: DetectionRecord = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(back.suppressed_before, Some(7));
     }
 
     #[tokio::test]
@@ -1539,6 +1676,7 @@ mod tests {
                 &sample_verdict(),
                 PostureKind::Observing,
                 "KillProcess".to_string(),
+                0,
             );
         }
 
@@ -1616,6 +1754,7 @@ mod tests {
             detection_type: "test".to_string(),
             status,
             explanation: None,
+            suppressed_before: None,
         }
     }
 

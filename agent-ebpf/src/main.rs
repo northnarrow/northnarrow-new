@@ -33,6 +33,7 @@ mod io_uring;
 mod module_load;
 mod open_sensor;
 mod ptrace_check;
+mod read_repeat;
 mod sensor_probe;
 mod task_kill;
 mod tcp_close;
