@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, PROC-001 (Critical): a fileless (memfd)
+  exec escaped R004 when its parent named itself `systemd` and its
+  `argv[0]` ended in `/systemd-executor`. With the exec sensor's
+  identity R004 now judges what the kernel executed: a memfd, or an
+  unlinked file reached through an fd. systemd's launch of every unit (a
+  real file) is no longer something to exempt. Without the identity,
+  the exemption needs `argv[0]` exactly and a systemd parent by
+  identity, never by name.
 - External audit, Wave 0, network (Critical NET-001 and NET-010, High
   EBPF-007, NET-002, NET-005, NET-011):
   - A dual-stack IPv6 socket reaching an IPv4 address (`::ffff:a.b.c.d`)

@@ -26,7 +26,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 
 | ID | Audit ref | Severity | Area | File | Status |
 |---|---|---|---|---|---|
-| NN-AUD-001 | PROC-001 | Critical | Process rules | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs` | open |
+| NN-AUD-001 | PROC-001 | Critical | Process rules | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs` | fixed (lab PR 79) |
 | NN-AUD-002 | POS-001 | Critical | Posture | `agent/src/posture/mod.rs` | open |
 | NN-AUD-003 | LLMP-002 | Critical | LLM prompts | `agent/src/ade/structured_prompt.rs` | open |
 | NN-AUD-004 | LLMR-002 | Critical | LLM runtime | `agent/src/ade/mod.rs` | open |
@@ -85,3 +85,28 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 - **NN-AUD-060 (NET-011), lab PR 78.** `100.64.0.0/10` (CGNAT: Tailscale,
   EKS, ISP space) and `198.18.0.0/15` (VPN and SD-WAN clients) are out of
   the shipped blocklist, which feeds a KillProcessTree rule.
+- **NN-AUD-001 (PROC-001), lab PR 79.** R004's systemd-executor
+  exemption trusted the parent's `comm` (`prctl`) and any `argv[0]`
+  ending in `/systemd-executor` (the caller's choice).
+  - **With the exec sensor's identity** (LSM mode, the default), R004
+    has no exemption: what the kernel executed decides. Fileless code is
+    a memfd, or an unlinked file (O_TMPFILE) reached through an fd. A
+    real file reached through an fd is not fileless; the other rules
+    judge it on its canonical path. One exception: systemd's own
+    `systemd-executor` left unlinked by an upgrade, which PID 1 keeps
+    launching units from.
+  - **Tracepoint mode** keeps the path heuristic. Its exemption now
+    needs `argv[0]` to be an install path exactly and a systemd parent:
+    PID 1, or a `systemd --user` manager by exec identity, never by
+    `comm`.
+  - **A regression caught in the lab, before the PR.** A first version
+    kept the exemption in LSM mode and required the executor's path to
+    lack the `TASK_ROOT` flag. The exec sensor sets that flag for every
+    process on the root filesystem. On Ubuntu 24.04 (systemd 255) R004
+    then killed every unit start, the watchdog included — the regression
+    the audit warned about.
+  - **Lab.** Ubuntu 24.04 (systemd 255): units started with `systemd-run`
+    drew no verdict; a memfd exec'd by a parent renamed `systemd`, with
+    `argv[0]` set to the executor's path, drew R004 (KillProcessTree)
+    and was killed. Ubuntu 22.04: the same forged exec was killed;
+    before, it was exempt.

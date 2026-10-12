@@ -77,7 +77,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     let chains = chain::chain_rule_set();
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
     let tappa2: Vec<Box<dyn Rule>> = vec![
-        Box::new(R004ExecFromProcSelfFd),
+        Box::new(R004ExecFromProcSelfFd::default()),
         Box::new(R007CryptoMiner),
         Box::new(R006ReverseShellTooling),
         Box::new(R009RootExecFromUserPath),
@@ -144,7 +144,7 @@ pub fn default_rules_with_net(
     let chains = chain::chain_rule_set();
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
     let tappa2: Vec<Box<dyn Rule>> = vec![
-        Box::new(R004ExecFromProcSelfFd),
+        Box::new(R004ExecFromProcSelfFd::new(lineage.clone())),
         Box::new(R007CryptoMiner),
         Box::new(R006ReverseShellTooling),
         Box::new(R009RootExecFromUserPath),
