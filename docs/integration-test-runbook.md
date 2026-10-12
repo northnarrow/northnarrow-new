@@ -279,6 +279,34 @@ The helper `deploy/lab/exec-sensor/memfd-exec.c` is built on the guest
 `Environment=NN_EXEC_SENSOR=tracepoint` (the old sensor) the evasion
 cases fail: that is the gap the step closes.
 
+### DNS sensor (Tappa 10.9 step 3)
+
+```
+deploy/lab/nn-lab.sh dns-sensor-check   # after sync + install
+```
+
+Checks the default (`skb`) mode end to end on the running agent. Run as
+the lab user, a helper sends one query for a name with NET-004's
+tunnelling shape to a local port 53, in a different way per case. The
+sender must be killed by NET-004, because the sensor reads the kernel's
+copy of the query (reviews 66, 67):
+
+- the sensor is armed on `udp_send_skb` and `udp_v6_send_skb`, with no
+  missing-link report;
+- connected `send()` and unconnected `sendto()` to `127.0.0.1:53`;
+- connected `send()` to `[::1]:53`;
+- the query in a file mapping the process has not touched yet;
+- a zero byte inside the first label, in a long name;
+- the query sent in two pieces (`MSG_MORE`) gives a NET-004 record (Log)
+  for a partial name, and the sender is not killed;
+- `getent hosts` through the system resolver gives no NET record;
+- the telemetry probe never went silent.
+
+The helper `deploy/lab/dns-sensor/dns-send.c` is built on the guest
+(`/usr/local/libexec/nn-lab/nn-dns-send`). With a unit drop-in setting
+`Environment=NN_DNS_SENSOR=sendmsg` (the old sensor), the IPv6, unfaulted
+page and zero-byte cases fail: that is the gap the step closes.
+
 ### btrfs inode keys (review 55)
 
 ```

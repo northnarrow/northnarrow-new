@@ -11,6 +11,11 @@
  *            sys_enter_execve, the agent's userland rule pass
  *   connect  TCP connect/accept/close on 127.0.0.1             — tcp_v4_connect
  *            kprobe, tcp_close fexit, inet_csk_listen
+ *   udp      sendto() of a 64-byte datagram to 127.0.0.1, drained — the
+ *            udp_sendmsg_outbound kprobe and the DNS sensor's port check
+ *            (udp_send_skb kprobe, Tappa 10.9 step 3)
+ *   dns      sendto() of a DNS query (A, 30-byte name) to 127.0.0.1:53 — one
+ *            DNS record per query and the agent's userland DNS pass
  *
  * usage: nn-bench <mode> <iterations> <workdir>   → prints "<mode> <ops/s>"
  */
@@ -119,10 +124,48 @@ static int bench_connect(long n)
     return 0;
 }
 
+/* One datagram per iteration from an unconnected socket. `dns`: a query
+ * to port 53 (nothing listens: the kernel answers ICMP, rate-limited, and
+ * the datagram is built and sent all the same); otherwise a bound receiver
+ * on an ephemeral port, drained after each send. */
+static int bench_udp(long n, int dns)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int r = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (s < 0 || r < 0 || bind(r, (struct sockaddr *)&sa, sizeof sa) < 0)
+        return -1;
+    socklen_t sl = sizeof sa;
+    getsockname(r, (struct sockaddr *)&sa, &sl);
+    if (dns)
+        sa.sin_port = htons(53);
+    /* header (id, RD, QDCOUNT 1), bench.nn-lab.invalid, A, IN */
+    static const unsigned char q[] =
+        "\x4e\x42\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        "\x05" "bench" "\x06" "nn-lab" "\x07" "invalid" "\x00\x00\x01\x00\x01";
+    unsigned char buf[64];
+    memset(buf, 'u', sizeof buf);
+    const void *p = dns ? (const void *)q : (const void *)buf;
+    size_t len = dns ? sizeof q - 1 : sizeof buf;
+    for (long i = 0; i < n; i++) {
+        if (sendto(s, p, len, 0, (struct sockaddr *)&sa, sizeof sa) < 0)
+            return -1;
+        if (!dns)
+            while (recv(r, buf, sizeof buf, 0) > 0)
+                ;
+    }
+    close(r);
+    close(s);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4) {
-        fprintf(stderr, "usage: %s open|wopen|exec|connect <iterations> <workdir>\n", argv[0]);
+        fprintf(stderr, "usage: %s open|wopen|exec|connect|udp|dns <iterations> <workdir>\n", argv[0]);
         return 2;
     }
     const char *mode = argv[1];
@@ -138,6 +181,10 @@ int main(int argc, char **argv)
         rc = bench_exec(n);
     else if (!strcmp(mode, "connect"))
         rc = bench_connect(n);
+    else if (!strcmp(mode, "udp"))
+        rc = bench_udp(n, 0);
+    else if (!strcmp(mode, "dns"))
+        rc = bench_udp(n, 1);
     else
         return 2;
     double dt = now() - t0;

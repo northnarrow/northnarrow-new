@@ -759,6 +759,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             dns_server,
             family,
             timestamp_ns,
+            // Tappa 10.9 step 3 sensor flag, not a model input: bind-ignore.
+            qname_partial: _,
         } => match field {
             F::Comm => comm.clear(),
             F::QueryName => query_name.clear(),
@@ -905,6 +907,7 @@ mod tests {
             dns_server: [0u8; ADDR_LEN],
             family: 2,
             timestamp_ns: 1,
+            qname_partial: false,
         }
     }
     fn ctx(recent: Vec<Event>) -> EventContext {

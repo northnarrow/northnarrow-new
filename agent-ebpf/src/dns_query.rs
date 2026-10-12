@@ -1,4 +1,7 @@
-//! DNS query sensor (kprobe on `udp_sendmsg`).
+//! DNS query sensor (kprobe on `udp_sendmsg`) — `--dns-sensor sendmsg`.
+//! The default since Tappa 10.9 step 3 is [`crate::dns_skb`], which reads
+//! the kernel's copy of the query (IPv4 and IPv6); this program stays for
+//! one soak cycle.
 //!
 //! Emits one `DnsQueryRaw` per outbound UDP datagram to port 53,
 //! carrying pid/comm/uid, the destination DNS server, and the
@@ -57,8 +60,10 @@ use crate::btf_offsets::{
     IOVEC_IOV_BASE_OFFSET,
 };
 
+/// Shared with the socket-buffer sensor ([`crate::dns_skb`], Tappa 10.9
+/// step 3): one ring, whichever program `--dns-sensor` attaches.
 #[map]
-static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+pub(crate) static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 const DNS_PORT_BE: u16 = 0x3500; // 53 in network byte order
 const AF_INET: u16 = 2;

@@ -737,6 +737,7 @@ impl Rule for NnLNet004SuspiciousDnsQname {
             exe,
             query_name,
             timestamp_ns,
+            qname_partial,
             ..
         } = event
         else {
@@ -745,6 +746,31 @@ impl Rule for NnLNet004SuspiciousDnsQname {
         let long = query_name.len() > 60;
         let b64 = Self::looks_like_base64(query_name);
         if !long && !b64 {
+            // Tappa 10.9 step 3: the name does not end in the kernel's
+            // linear copy — sent in pieces (MSG_MORE / UDP_CORK), with UDP
+            // GSO or zero copy, or not DNS at all. A resolver sends a query
+            // in one piece. Recorded for one soak cycle, never killed. (A
+            // prefix that already has the long or base64 shape is judged
+            // above like a whole name: the name sent is at least that.)
+            if *qname_partial
+                && self
+                    .dedup
+                    .lock()
+                    .observe(*pid, hash_qname(query_name), *timestamp_ns)
+            {
+                return Some(net_verdict(
+                    self,
+                    ResponseAction::Log,
+                    Severity::High,
+                    "DNS query whose name does not end in the kernel's linear copy — \
+                     sent in pieces (MSG_MORE / UDP_CORK), with UDP GSO or zero copy, \
+                     or not DNS at all; resolvers send a query in one piece \
+                     (tunnelling-evasion shape)",
+                    *pid,
+                    comm.clone(),
+                    *timestamp_ns,
+                ));
+            }
             return None;
         }
         let reason = match (long, b64) {
@@ -1673,6 +1699,7 @@ mod tests {
             dns_server: [0; 16],
             family: 2,
             timestamp_ns: ts_ns,
+            qname_partial: false,
         }
     }
 
@@ -1822,6 +1849,41 @@ mod tests {
     fn net_004_does_not_fire_on_normal_qname() {
         let rule = net_004();
         assert!(rule.evaluate(&dns_event(1, "example.com", 1)).is_none());
+    }
+
+    fn partial(e: Event) -> Event {
+        let mut e = e;
+        if let Event::DnsQuery { qname_partial, .. } = &mut e {
+            *qname_partial = true;
+        }
+        e
+    }
+
+    /// Tappa 10.9 step 3: a name that does not end in the kernel's linear
+    /// copy (a query sent in pieces) is recorded, never killed; once per
+    /// (pid, name) like the other NET-004 verdicts.
+    #[test]
+    fn net_004_logs_a_partial_name() {
+        let rule = net_004();
+        let v = rule
+            .evaluate(&partial(dns_event(7, "x", 0)))
+            .expect("partial name");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::High);
+        assert!(v.reasoning.contains("in pieces"));
+        assert!(rule.evaluate(&partial(dns_event(7, "x", 0))).is_none());
+    }
+
+    /// A partial prefix that already has the tunnelling shape is judged like
+    /// a whole name: the name sent is at least as long.
+    #[test]
+    fn net_004_kills_on_a_partial_prefix_with_the_tunnel_shape() {
+        let rule = net_004();
+        let q = "ZGVhZGJlZWZmZmZmZmZmZmNhZmU";
+        let v = rule
+            .evaluate(&partial(dns_event(8, q, 0)))
+            .expect("b64 prefix");
+        assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
     // ── NN-L-NET-014 (DNS-tunnel entropy) ────────────────────────

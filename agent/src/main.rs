@@ -129,6 +129,21 @@ struct Cli {
     )]
     exec_sensor: ExecSensor,
 
+    /// DNS sensor (Tappa 10.9 step 3). `skb` (default): kprobes on
+    /// `udp_send_skb` / `udp_v6_send_skb` read the query from the socket
+    /// buffer the kernel built — the name actually sent, IPv4 and IPv6
+    /// (reviews 66, 67). `sendmsg`: the previous `udp_sendmsg` kprobe, which
+    /// read user memory before the kernel's copy and saw IPv4 only; kept
+    /// for one soak cycle as a fallback (also `NN_DNS_SENSOR=sendmsg` in a
+    /// unit drop-in).
+    #[arg(
+        long = "dns-sensor",
+        env = "NN_DNS_SENSOR",
+        value_enum,
+        default_value_t = DnsSensor::Skb
+    )]
+    dns_sensor: DnsSensor,
+
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
     ade_model: Option<PathBuf>,
@@ -532,6 +547,13 @@ enum FileOpenSensor {
 enum ExecSensor {
     Lsm,
     Tracepoint,
+}
+
+/// `--dns-sensor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DnsSensor {
+    Skb,
+    Sendmsg,
 }
 
 /// Tappa 10.9 step 1: switch the file-open sensor to LSM `file_open`, once
@@ -968,6 +990,8 @@ async fn main() -> Result<()> {
     };
     // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
     northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
+    // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
+    northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
     let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
