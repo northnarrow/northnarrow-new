@@ -38,6 +38,11 @@ pub use model::*;
 #[cfg(feature = "std")]
 pub mod ade_types;
 
+/// Network addresses as the kernel records them, in canonical form
+/// (external audit NET-001: IPv4-mapped IPv6).
+#[cfg(feature = "std")]
+pub mod netaddr;
+
 /// Adaptive Defensive Posture types (Sub-tappa 6.5).
 #[cfg(feature = "std")]
 pub mod posture_types;

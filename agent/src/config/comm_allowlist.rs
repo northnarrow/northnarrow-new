@@ -39,9 +39,62 @@ pub const NETFLOW_COMM_ALLOWLIST_LOCAL: &str = "/etc/northnarrow/netflow-comm-al
 /// An immutable set of allowlisted comms. Built once at boot from a
 /// family's `.v1` + `.local` files; the rule layer queries it with
 /// [`CommAllowlist::contains`] on the hot path.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct CommAllowlist {
     entries: BTreeSet<String>,
+    /// External audit NET-010 (NN-AUD-006): where [`Self::judge`] reads
+    /// what the kernel executed. `None` (tests, legacy callers): the
+    /// entries match `comm`, as before.
+    identity: Option<crate::posture::lineage::AuthSessionTracker>,
+}
+
+impl PartialEq for CommAllowlist {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+impl Eq for CommAllowlist {}
+
+/// External audit NET-010 (NN-AUD-006): how the allowlist applies to a
+/// process, judged on what the kernel executed rather than on `comm`,
+/// which any process sets for itself with `prctl(PR_SET_NAME)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Judgement {
+    /// The process's exec identity is an allowlisted program: no verdict.
+    Allowed,
+    /// Its `comm` names an allowlisted program but its exec identity
+    /// cannot be read (it exited before its exec event was): the verdict
+    /// is recorded, not acted on.
+    Unverified,
+    /// Not allowlisted. `claimed`: its `comm` names an allowlisted program
+    /// that its exec identity is not.
+    Denied { claimed: bool },
+}
+
+impl Judgement {
+    /// Shape the verdict a rule built for a process that is not
+    /// [`Judgement::Allowed`].
+    pub fn apply(self, mut v: common::Verdict, comm: &str) -> common::Verdict {
+        match self {
+            Judgement::Unverified => {
+                v.action = common::ResponseAction::Log;
+                v.reasoning = format!(
+                    "{} [named '{comm}', an allowlisted program, but its exec could not be \
+                     read: recorded, not acted on]",
+                    v.reasoning
+                );
+            }
+            Judgement::Denied { claimed: true } => {
+                v.reasoning = format!(
+                    "{} [named '{comm}', an allowlisted program, but the kernel ran \
+                     something else]",
+                    v.reasoning
+                );
+            }
+            Judgement::Allowed | Judgement::Denied { claimed: false } => {}
+        }
+        v
+    }
 }
 
 impl CommAllowlist {
@@ -49,6 +102,36 @@ impl CommAllowlist {
     pub fn from_iter_owned(it: impl IntoIterator<Item = String>) -> Self {
         Self {
             entries: it.into_iter().collect(),
+            identity: None,
+        }
+    }
+
+    /// External audit NET-010: judge entries on exec identity read from
+    /// `tracker` (production). An entry is then a program name (the exe's
+    /// or script's basename) or a tree ending in `/`, inside a root-owned
+    /// system tree ([`crate::posture::lineage::ExecIdentity::is_client`]).
+    pub fn with_identity(mut self, tracker: crate::posture::lineage::AuthSessionTracker) -> Self {
+        self.identity = Some(tracker);
+        self
+    }
+
+    /// How the allowlist applies to process `pid` named `comm`
+    /// ([`Judgement`]). Without an identity source, `comm` decides.
+    pub fn judge(&self, pid: u32, comm: &str) -> Judgement {
+        let named = self.entries.contains(comm);
+        let Some(tracker) = &self.identity else {
+            return if named {
+                Judgement::Allowed
+            } else {
+                Judgement::Denied { claimed: false }
+            };
+        };
+        let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
+        match tracker.exec_identity(pid) {
+            Some(id) if id.is_client(&entries) => Judgement::Allowed,
+            Some(_) => Judgement::Denied { claimed: named },
+            None if named => Judgement::Unverified,
+            None => Judgement::Denied { claimed: false },
         }
     }
 
@@ -85,7 +168,10 @@ pub fn load_comm_allowlist(
 ) -> Result<CommAllowlist> {
     let OverlayLoad { effective, .. } =
         overlay::load_flat_list(label, v1_path, local_path, &validate_comm)?;
-    Ok(CommAllowlist { entries: effective })
+    Ok(CommAllowlist {
+        entries: effective,
+        identity: None,
+    })
 }
 
 /// Convenience: load the process-comm allowlist from its default

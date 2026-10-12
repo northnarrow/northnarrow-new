@@ -64,7 +64,6 @@ const NET_LOG_FILE_MODE: u32 = 0o644;
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
-const AF_INET: u8 = 2;
 
 // ── on-disk JSONL row shapes ─────────────────────────────────────────
 
@@ -550,14 +549,10 @@ async fn process_listen_record(
 
 // ── helpers ──────────────────────────────────────────────────────────
 
+/// The canonical address (external audit NET-001: an IPv4-mapped IPv6
+/// address is the IPv4 address it maps).
 fn decode_addr(family: u8, bytes: [u8; 16]) -> IpAddr {
-    if family == AF_INET {
-        let mut v4 = [0u8; 4];
-        v4.copy_from_slice(&bytes[..4]);
-        IpAddr::V4(std::net::Ipv4Addr::from(v4))
-    } else {
-        IpAddr::V6(std::net::Ipv6Addr::from(bytes))
-    }
+    common::netaddr::canonical_ip(family, &bytes)
 }
 
 fn comm_to_string(comm: &[u8; 16]) -> String {

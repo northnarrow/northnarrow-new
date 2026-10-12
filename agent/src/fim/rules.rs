@@ -2125,7 +2125,7 @@ impl Rule for InteractiveAdmin {
 /// `sshd` appended to `/var/log/wtmp`, with no detection. The rules now
 /// fire for every process, and this wrapper drops the verdict only for a
 /// process whose exec identity ([`AuthSessionTracker::exec_identity`]:
-/// the spawn cache, else `/proc`) is one of `clients` ([`is_own_client`]).
+/// the spawn cache, else `/proc`) is one of `clients` ([`ExecIdentity::is_client`](crate::posture::lineage::ExecIdentity::is_client)).
 /// Python-based clients (gcloud, the Azure CLI, AWS CLI v1), whose `comm`
 /// is `python3`, are now recognised too.
 ///
@@ -2173,7 +2173,7 @@ impl Rule for OwnClient {
         if !is_foreign_read(fe)
             && identity
                 .as_ref()
-                .is_some_and(|id| is_own_client(id, self.clients))
+                .is_some_and(|id| id.is_client(self.clients))
         {
             return None;
         }
@@ -2201,59 +2201,6 @@ impl Rule for OwnClient {
     }
 }
 
-/// Review 85: `path` lies in a root-owned system tree, which a process
-/// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
-/// memfd, and not a binary deleted or replaced while it runs.
-fn in_system_tree(path: &str) -> bool {
-    const TREES: &[&str] = &[
-        "/usr/",
-        "/opt/",
-        "/snap/",
-        "/bin/",
-        "/sbin/",
-        "/lib/",
-        "/lib64/",
-        "/var/lib/snapd/snap/",
-        "/nix/store/",
-    ];
-    TREES.iter().any(|t| path.starts_with(t))
-        && !path.contains("/../")
-        && !path.ends_with(" (deleted)")
-}
-
-/// Review 85: is `id` one of `clients`? An entry ending in `/` is a tree
-/// only that client installs (its bundled runtime): the exe must lie in
-/// it. Any other entry is a basename: the exe's for a binary, else the
-/// script's (`.py` dropped) an interpreter runs. The exe, and a script,
-/// must lie in a root-owned system tree ([`in_system_tree`]); an
-/// interpreter running an inline program (`python3 -c …`), a module
-/// (`-m`) or nothing is never a client by name.
-fn is_own_client(id: &crate::posture::lineage::ExecIdentity, clients: &[&str]) -> bool {
-    let exe = id.exe.to_string_lossy();
-    if !in_system_tree(&exe) {
-        return false;
-    }
-    if clients
-        .iter()
-        .any(|c| c.ends_with('/') && exe.starts_with(c))
-    {
-        return true;
-    }
-    let named = |p: &str| {
-        let base = p.rsplit('/').next().unwrap_or(p);
-        let base = base.strip_suffix(".py").unwrap_or(base);
-        clients.iter().any(|c| !c.ends_with('/') && *c == base)
-    };
-    match &id.script {
-        None => named(&exe),
-        Some(script) if script.starts_with('/') => in_system_tree(script) && named(script),
-        // A module run with `-m` resolves through the working directory
-        // and PYTHONPATH, both the caller's: only a client's own runtime
-        // tree (above) vouches for it.
-        Some(_) => false,
-    }
-}
-
 /// Review 83 — a write by an account tool is recorded, not killed.
 ///
 /// `passwd`, `chsh`, `useradd`, `usermod`, `chpasswd`, `systemd-sysusers`
@@ -2266,7 +2213,7 @@ fn is_own_client(id: &crate::posture::lineage::ExecIdentity, clients: &[&str]) -
 /// home on Ubuntu 24.04. A user changing their own password with `passwd`
 /// was killed the same way.
 ///
-/// The tool is told by what the kernel executed ([`is_own_client`] over
+/// The tool is told by what the kernel executed ([`ExecIdentity::is_client`](crate::posture::lineage::ExecIdentity::is_client) over
 /// [`ACCOUNT_TOOLS`]), never by `comm`. Its write is recorded: at Low
 /// when a user other than root ran it (a setuid tool changing that user's
 /// own entry), else at the rule's severity — a root process creating an
@@ -2303,7 +2250,7 @@ impl Rule for AccountTool {
         let Some(id) = self.lineage.exec_identity(fe.modifier_pid) else {
             return Some(verdict);
         };
-        if !is_own_client(&id, ACCOUNT_TOOLS) {
+        if !id.is_client(ACCOUNT_TOOLS) {
             return Some(verdict);
         }
         Some(Verdict {
@@ -4664,7 +4611,7 @@ mod tests {
             "/opt/google/chrome/chrome",
             "/snap/firefox/1/usr/lib/firefox/firefox",
         ] {
-            assert!(in_system_tree(p), "{p}");
+            assert!(crate::posture::lineage::in_system_tree(p), "{p}");
         }
         for p in [
             "/tmp/aws",
@@ -4675,7 +4622,7 @@ mod tests {
             "/usr/bin/aws (deleted)",
             "/usr/../tmp/aws",
         ] {
-            assert!(!in_system_tree(p), "{p}");
+            assert!(!crate::posture::lineage::in_system_tree(p), "{p}");
         }
     }
 

@@ -78,10 +78,13 @@ impl NetBlocklistEntry {
     }
 
     /// Does this entry match `addr`?
+    /// External audit NET-001: both sides in canonical form, so an
+    /// IPv4-mapped IPv6 address matches the IPv4 entry it maps.
     pub fn matches(&self, addr: &IpAddr) -> bool {
+        let addr = common::netaddr::canonical(*addr);
         match self {
-            NetBlocklistEntry::Ip(e) => e == addr,
-            NetBlocklistEntry::Cidr { net, prefix } => cidr_contains(net, *prefix, addr),
+            NetBlocklistEntry::Ip(e) => common::netaddr::canonical(*e) == addr,
+            NetBlocklistEntry::Cidr { net, prefix } => cidr_contains(net, *prefix, &addr),
         }
     }
 }
@@ -208,25 +211,65 @@ impl NetBlocklist {
 fn read_v1(path: &Path) -> Result<BTreeSet<NetBlocklistEntry>> {
     let body =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut out = BTreeSet::new();
+    Ok(each_line(&path.display().to_string(), &body, |t| {
+        if t.starts_with('+') || t.starts_with('-') {
+            return Err(anyhow!("default list must not use +/- prefixes"));
+        }
+        NetBlocklistEntry::parse(t)
+    })
+    .into_iter()
+    .collect())
+}
+
+/// External audit NET-002 (NN-AUD-056): a malformed line drops that line,
+/// never the list. A typo in one line used to empty the whole default
+/// blocklist (NN-L-NET-001, KillProcessTree) with a single WARN, and
+/// every later line with it. Each dropped line is its own WARN. The
+/// overlay validation before signing stays strict
+/// ([`parse_blocklist_overlay_text`]): there the operator sees the error.
+fn each_line<T>(label: &str, body: &str, mut parse: impl FnMut(&str) -> Result<T>) -> Vec<T> {
+    let mut out = Vec::new();
     for (lineno, raw) in body.lines().enumerate() {
         let trimmed = strip_comment(raw).trim();
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed.starts_with('+') || trimmed.starts_with('-') {
-            return Err(anyhow!(
-                "{}:{}: default list must not use +/- prefixes",
-                path.display(),
-                lineno + 1
-            ));
+        match parse(trimmed) {
+            Ok(v) => out.push(v),
+            Err(e) => warn!(
+                file = label,
+                line = lineno + 1,
+                error = %e,
+                "blocklist: malformed line skipped (the rest of the list is kept)"
+            ),
         }
-        out.insert(
-            NetBlocklistEntry::parse(trimmed)
-                .with_context(|| format!("{}:{}: malformed entry", path.display(), lineno + 1))?,
-        );
     }
-    Ok(out)
+    out
+}
+
+/// One overlay line: `+entry` / `entry` adds, `-entry` disables.
+fn overlay_line<T>(t: &str, parse: impl Fn(&str) -> Result<T>) -> Result<(bool, T)> {
+    let (is_disable, rest) = if let Some(r) = t.strip_prefix('+') {
+        (false, r.trim_start())
+    } else if let Some(r) = t.strip_prefix('-') {
+        (true, r.trim_start())
+    } else {
+        (false, t)
+    };
+    Ok((is_disable, parse(rest)?))
+}
+
+fn split_overlay<T: Ord>(lines: Vec<(bool, T)>) -> (BTreeSet<T>, BTreeSet<T>) {
+    let mut adds = BTreeSet::new();
+    let mut disables = BTreeSet::new();
+    for (is_disable, v) in lines {
+        if is_disable {
+            disables.insert(v);
+        } else {
+            adds.insert(v);
+        }
+    }
+    (adds, disables)
 }
 
 fn read_local(path: &Path) -> Result<(BTreeSet<NetBlocklistEntry>, BTreeSet<NetBlocklistEntry>)> {
@@ -235,7 +278,11 @@ fn read_local(path: &Path) -> Result<(BTreeSet<NetBlocklistEntry>, BTreeSet<NetB
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     };
-    parse_blocklist_overlay_text(&path.display().to_string(), &body)
+    Ok(split_overlay(each_line(
+        &path.display().to_string(),
+        &body,
+        |t| overlay_line(t, NetBlocklistEntry::parse),
+    )))
 }
 
 /// Text form of the `netflow-blocklist.local` parser (Tappa 10.8: the same
@@ -349,26 +396,14 @@ fn parse_ja3_hash(s: &str) -> Result<String> {
 fn read_ja3_v1(path: &Path) -> Result<BTreeSet<String>> {
     let body =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut out = BTreeSet::new();
-    for (lineno, raw) in body.lines().enumerate() {
-        let trimmed = strip_comment(raw).trim();
-        if trimmed.is_empty() {
-            continue;
+    Ok(each_line(&path.display().to_string(), &body, |t| {
+        if t.starts_with('+') || t.starts_with('-') {
+            return Err(anyhow!("default list must not use +/- prefixes"));
         }
-        if trimmed.starts_with('+') || trimmed.starts_with('-') {
-            return Err(anyhow!(
-                "{}:{}: default list must not use +/- prefixes",
-                path.display(),
-                lineno + 1
-            ));
-        }
-        out.insert(
-            parse_ja3_hash(trimmed).with_context(|| {
-                format!("{}:{}: malformed JA3 entry", path.display(), lineno + 1)
-            })?,
-        );
-    }
-    Ok(out)
+        parse_ja3_hash(t)
+    })
+    .into_iter()
+    .collect())
 }
 
 fn read_ja3_local(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
@@ -377,7 +412,11 @@ fn read_ja3_local(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     };
-    parse_ja3_overlay_text(&path.display().to_string(), &body)
+    Ok(split_overlay(each_line(
+        &path.display().to_string(),
+        &body,
+        |t| overlay_line(t, parse_ja3_hash),
+    )))
 }
 
 /// Text form of the `netflow-ja3-blocklist.local` parser (Tappa 10.8).
@@ -421,6 +460,20 @@ fn strip_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit NET-001: a dual-stack socket reports an IPv4 peer as
+    /// `::ffff:a.b.c.d`; it must match the IPv4 entries.
+    #[test]
+    fn blocklist_matches_ipv4_mapped_v6_form() {
+        let bl = NetBlocklist::from_entries([
+            NetBlocklistEntry::parse("192.0.2.0/24").unwrap(),
+            NetBlocklistEntry::parse("203.0.113.9").unwrap(),
+        ]);
+        assert!(bl.contains(&"::ffff:192.0.2.1".parse().unwrap()));
+        assert!(bl.contains(&"::ffff:203.0.113.9".parse().unwrap()));
+        assert!(!bl.contains(&"::ffff:198.51.100.1".parse().unwrap()));
+        assert!(!bl.contains(&"2001:db8::1".parse().unwrap()));
+    }
     use std::io::Write;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tempfile::TempDir;
@@ -524,23 +577,66 @@ mod tests {
     /// number — operators get an actionable parse error
     /// instead of a silent "no defaults this boot."
     #[test]
-    fn netblocklist_malformed_entry_errors_with_line_number() {
+    fn shipped_seed_contains_no_prefix_in_real_world_use() {
+        // External audit NET-011 (NN-AUD-060): the seed feeds NN-L-NET-001
+        // (KillProcessTree); CGNAT and benchmarking space are in daily use.
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs/netflow-blocklist.v1");
         let dir = TempDir::new().unwrap();
-        let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\nnot-an-ip\n");
-        let local = dir.path().join("netflow-blocklist.local");
-        let err = NetBlocklist::load(&v1, &local);
-        // The malformed v1 is fatal — read_v1 propagates the
-        // error to the caller; load() turns it into "no defaults"
-        // with a WARN, which is the same path tested in
-        // `netblocklist_parses_bare_flat_v1` for the OK case.
-        // We verify the parse-only path here:
-        let body = "1.1.1.1\nnot-an-ip\n";
-        std::fs::write(&v1, body).unwrap();
-        // read_v1 is private; exercise it via load().
-        let _ = err;
-        let bl = NetBlocklist::load(&v1, &local).expect("load with WARN");
-        // The v1 read failed, so no defaults loaded.
-        assert!(bl.is_empty(), "malformed v1 should yield empty default set");
+        let bl = NetBlocklist::load(&shipped, &dir.path().join("absent.local")).unwrap();
+        for a in [
+            "100.64.0.1",
+            "100.100.100.100",
+            "198.18.0.1",
+            "198.19.255.1",
+        ] {
+            assert!(
+                !bl.contains(&a.parse().unwrap()),
+                "{a}: CGNAT/VPN space must not be on a KillProcessTree list"
+            );
+        }
+        assert!(bl.contains(&"192.0.2.1".parse().unwrap()));
+        assert!(bl.contains(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn malformed_line_does_not_disable_the_whole_list() {
+        // External audit NET-002 (NN-AUD-056): one bad line used to empty
+        // the default list.
+        let dir = TempDir::new().unwrap();
+        let v1 = write_file(
+            &dir,
+            "netflow-blocklist.v1",
+            "1.1.1.1\nnot-an-ip\n+3.3.3.3\n2.2.2.2\n",
+        );
+        let local = write_file(
+            &dir,
+            "netflow-blocklist.local",
+            "+4.4.4.4\n+bad\n-1.1.1.1\n",
+        );
+        let bl = NetBlocklist::load(&v1, &local).expect("load");
+        assert_eq!(bl.len(), 2, "2.2.2.2 and 4.4.4.4; 1.1.1.1 disabled");
+        assert!(bl.contains(&"2.2.2.2".parse().unwrap()));
+        assert!(bl.contains(&"4.4.4.4".parse().unwrap()));
+        assert!(!bl.contains(&"1.1.1.1".parse().unwrap()));
+        // the overlay validation before signing stays strict
+        assert!(parse_blocklist_overlay_text("x", "+bad\n").is_err());
+    }
+
+    #[test]
+    fn malformed_ja3_line_does_not_disable_the_whole_list() {
+        let dir = TempDir::new().unwrap();
+        let good = "a".repeat(32);
+        let other = "b".repeat(32);
+        let v1 = write_file(
+            &dir,
+            "netflow-ja3-blocklist.v1",
+            &format!("{good}\nnot-a-hash\n{other}\n"),
+        );
+        let local = dir.path().join("netflow-ja3-blocklist.local");
+        let bl = Ja3Blocklist::load(&v1, &local).expect("load");
+        assert_eq!(bl.len(), 2);
+        assert!(bl.contains(&good) && bl.contains(&other));
+        assert!(parse_ja3_overlay_text("x", "+zz\n").is_err());
     }
 
     // ── JA3 blocklist tests ─────────────────────────────────────────

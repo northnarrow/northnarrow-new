@@ -659,14 +659,9 @@ fn tcp_connect_info_from_raw(raw: &TcpConnectRaw) -> TcpConnectInfo {
     }
 }
 
+/// The canonical address (external audit NET-001).
 fn decode_addr(family: u8, bytes: [u8; 16]) -> std::net::IpAddr {
-    if family == 2 {
-        let mut v4 = [0u8; 4];
-        v4.copy_from_slice(&bytes[..4]);
-        std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4))
-    } else {
-        std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes))
-    }
+    common::netaddr::canonical_ip(family, &bytes)
 }
 
 /// FP-3 best-effort resolve of a DNS sender's `/proc/<pid>/exe`.

@@ -301,6 +301,62 @@ pub struct ExecIdentity {
     pub script: Option<String>,
 }
 
+impl ExecIdentity {
+    /// Review 85: is this identity one of `clients`? An entry ending in
+    /// `/` is a tree only that client installs (its bundled runtime): the
+    /// exe must lie in it. Any other entry is a basename: the exe's for a
+    /// binary, else the script's (`.py` dropped) an interpreter runs. The
+    /// exe, and a script, must lie in a root-owned system tree
+    /// ([`in_system_tree`]); an interpreter running an inline program
+    /// (`python3 -c …`), a module (`-m`) or nothing is never a client by
+    /// name.
+    pub fn is_client(&self, clients: &[&str]) -> bool {
+        let exe = self.exe.to_string_lossy();
+        if !in_system_tree(&exe) {
+            return false;
+        }
+        if clients
+            .iter()
+            .any(|c| c.ends_with('/') && exe.starts_with(c))
+        {
+            return true;
+        }
+        let named = |p: &str| {
+            let base = p.rsplit('/').next().unwrap_or(p);
+            let base = base.strip_suffix(".py").unwrap_or(base);
+            clients.iter().any(|c| !c.ends_with('/') && *c == base)
+        };
+        match &self.script {
+            None => named(&exe),
+            Some(script) if script.starts_with('/') => in_system_tree(script) && named(script),
+            // A module run with `-m` resolves through the working directory
+            // and PYTHONPATH, both the caller's: only a client's own runtime
+            // tree (above) vouches for it.
+            Some(_) => false,
+        }
+    }
+}
+
+/// Review 85: `path` lies in a root-owned system tree, which a process
+/// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
+/// memfd, and not a binary deleted or replaced while it runs.
+pub(crate) fn in_system_tree(path: &str) -> bool {
+    const TREES: &[&str] = &[
+        "/usr/",
+        "/opt/",
+        "/snap/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/var/lib/snapd/snap/",
+        "/nix/store/",
+    ];
+    TREES.iter().any(|t| path.starts_with(t))
+        && !path.contains("/../")
+        && !path.ends_with(" (deleted)")
+}
+
 /// Mutex-shielded state. A single lock guards both the map and the
 /// FIFO eviction queue so the two never observe each other in an
 /// inconsistent state mid-ingest.

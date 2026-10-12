@@ -165,9 +165,17 @@ pub fn default_rules_with_net(
     rules.extend(bpf::bpf_rules(Arc::clone(&process_allowlist_for_iouring)));
     rules.extend(crate::fim::rules::fim_rules_with_lineage(
         installer_override,
-        lineage,
+        lineage.clone(),
     ));
     rules.extend(canary::canary_rules());
+    // External audit NET-010 (NN-AUD-006): the network allowlist judged on
+    // what the kernel executed, not on comm.
+    let netflow_comm_allowlist = Arc::new(
+        netflow_comm_allowlist
+            .as_ref()
+            .clone()
+            .with_identity(lineage.clone()),
+    );
     rules.extend(net::net_rules(
         blocklist,
         ja3_blocklist,

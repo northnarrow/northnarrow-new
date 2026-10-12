@@ -58,7 +58,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
-use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::Rule;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 use crate::net::dns_cache::DnsCache;
@@ -948,18 +948,22 @@ impl Rule for NnLNet006UncommonListener {
         if LISTENER_COMMON_PORTS.contains(&nl.bind_port) {
             return None;
         }
-        if self.allowlist.contains(&nl.comm) {
+        let judged = self.allowlist.judge(nl.pid, &nl.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::Log,
-            Severity::Medium,
-            "Process opened a TCP listener on an uncommon port \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::Medium,
+                "Process opened a TCP listener on an uncommon port \
              without operator allowlist coverage — posture → ALERTED",
-            nl.pid,
-            nl.comm.clone(),
-            nl.timestamp_ns,
+                nl.pid,
+                nl.comm.clone(),
+                nl.timestamp_ns,
+            ),
+            &nl.comm,
         ))
     }
 }
@@ -1008,19 +1012,23 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
         if !Self::is_rfc1918(&nf.dst_addr) {
             return None;
         }
-        if self.allowlist.contains(&nf.comm) {
+        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::Log,
-            Severity::Medium,
-            "Outbound to an internal RFC1918 destination from a comm \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::Medium,
+                "Outbound to an internal RFC1918 destination from a comm \
              outside the operator allowlist — possible lateral movement; \
              posture → ALERTED",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ),
+            &nf.comm,
         ))
     }
 }
@@ -1148,10 +1156,10 @@ impl Rule for NnLNet009ByteAnomaly {
             return None;
         };
         if nf.proto == 17 {
-            // Review 74: sum the UDP rows of this (pid, destination).
-            if self.allowlist.contains(&nf.comm) {
-                return None;
-            }
+            // Review 74: sum the UDP rows of this (pid, destination). The
+            // allowlist is judged once the sum crosses the threshold
+            // (external audit NET-010: on exec identity, which costs more
+            // than a comm lookup per row).
             let total = self.udp.lock().add(
                 (nf.pid, nf.dst_addr, nf.dst_port),
                 nf.start_ns,
@@ -1164,31 +1172,42 @@ impl Rule for NnLNet009ByteAnomaly {
                 nf.dst_addr,
                 nf.dst_port
             );
-            return Some(net_verdict(
-                self,
-                ResponseAction::Log,
-                Severity::High,
-                &reasoning,
-                nf.pid,
-                nf.comm.clone(),
-                nf.start_ns,
+            let judged = self.allowlist.judge(nf.pid, &nf.comm);
+            if judged == Judgement::Allowed {
+                return None;
+            }
+            return Some(judged.apply(
+                net_verdict(
+                    self,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &reasoning,
+                    nf.pid,
+                    nf.comm.clone(),
+                    nf.start_ns,
+                ),
+                &nf.comm,
             ));
         }
         if nf.bytes_sent <= HIGH_VOLUME_BYTES_SENT {
             return None;
         }
-        if self.allowlist.contains(&nf.comm) {
+        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::Log,
-            Severity::High,
-            "Outbound flow exceeded 100 MiB sent from a non-allowlist \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::High,
+                "Outbound flow exceeded 100 MiB sent from a non-allowlist \
              comm — possible exfiltration; posture → ENGAGED",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ),
+            &nf.comm,
         ))
     }
 }
@@ -1225,19 +1244,23 @@ impl Rule for NnLNet010OutboundToHighRiskC2Port {
         if !HIGH_RISK_C2_PORTS.contains(&nf.dst_port) {
             return None;
         }
-        if self.allowlist.contains(&nf.comm) {
+        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::KillProcess,
-            Severity::High,
-            "Outbound to a high-risk C2 / tooling-default port (e.g. 4444 \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::KillProcess,
+                Severity::High,
+                "Outbound to a high-risk C2 / tooling-default port (e.g. 4444 \
              Metasploit, 6667 IRC, 9001 Tor) from a non-allowlisted comm \
              — likely C2 (T1571); kill the process + posture → ENGAGED",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ),
+            &nf.comm,
         ))
     }
 }
@@ -1275,19 +1298,23 @@ impl Rule for NnLNet011PlaintextCredService {
         if !PLAINTEXT_CRED_PORTS.contains(&nf.dst_port) {
             return None;
         }
-        if self.allowlist.contains(&nf.comm) {
+        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::Log,
-            Severity::Medium,
-            "Outbound to a plaintext-credential service (FTP 21 / Telnet 23) \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::Medium,
+                "Outbound to a plaintext-credential service (FTP 21 / Telnet 23) \
              from a non-allowlisted comm — credentials transit in clear \
              (T1071); posture → ALERTED",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ),
+            &nf.comm,
         ))
     }
 }
@@ -1329,25 +1356,31 @@ impl Rule for NnLNet013Beacon {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        // Skip trusted periodic clients before observation so their
-        // regular traffic never seeds the window.
-        if self.allowlist.contains(&nf.comm) {
-            return None;
-        }
         let is_beacon = self.window.lock().observe(nf.pid, nf.dst_addr, nf.start_ns);
         if !is_beacon {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::Log,
-            Severity::High,
-            "Periodic low-jitter outbound flows to a single destination \
-             from one process — C2-beacon timing pattern (T1071/T1029); \
-             posture → ENGAGED",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+        // External audit NET-010 (NN-AUD-006): the allowlist is judged on
+        // exec identity, once a beacon is seen (it costs more than a comm
+        // lookup per flow). A trusted periodic client's flows now seed the
+        // window too; the window is bounded.
+        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        if judged == Judgement::Allowed {
+            return None;
+        }
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::High,
+                "Periodic low-jitter outbound flows to a single destination \
+                 from one process — C2-beacon timing pattern (T1071/T1029); \
+                 posture → ENGAGED",
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ),
+            &nf.comm,
         ))
     }
 }
@@ -1390,20 +1423,24 @@ impl Rule for NnLNet018Rfc1918LateralPort {
         if !LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) {
             return None;
         }
-        if self.allowlist.contains(&nf.comm) {
+        let judged = self.allowlist.judge(nf.pid, &nf.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::KillProcess,
-            Severity::High,
-            "Outbound to an internal RFC1918 host on a lateral-movement \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::KillProcess,
+                Severity::High,
+                "Outbound to an internal RFC1918 host on a lateral-movement \
              port (445 SMB / 3389 RDP / 5985 WinRM / 5900 VNC) from a \
              non-allowlisted comm — lateral movement (T1021); kill the \
              process + posture → ENGAGED",
-            nf.pid,
-            nf.comm.clone(),
-            nf.start_ns,
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ),
+            &nf.comm,
         ))
     }
 }
@@ -1453,19 +1490,23 @@ impl Rule for NnLNet019WildcardListener {
         if LISTENER_COMMON_PORTS.contains(&nl.bind_port) {
             return None;
         }
-        if self.allowlist.contains(&nl.comm) {
+        let judged = self.allowlist.judge(nl.pid, &nl.comm);
+        if judged == Judgement::Allowed {
             return None;
         }
-        Some(net_verdict(
-            self,
-            ResponseAction::Log,
-            Severity::Medium,
-            "New listener bound to the wildcard address on an uncommon \
+        Some(judged.apply(
+            net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::Medium,
+                "New listener bound to the wildcard address on an uncommon \
              port from a non-allowlisted comm — network-exposed backdoor \
              surface (T1571); posture → ALERTED",
-            nl.pid,
-            nl.comm.clone(),
-            nl.timestamp_ns,
+                nl.pid,
+                nl.comm.clone(),
+                nl.timestamp_ns,
+            ),
+            &nl.comm,
         ))
     }
 }
@@ -3049,5 +3090,61 @@ mod tests {
         let later = t0 + BEACON_WINDOW_NS + 1;
         w.observe(1, dst, later);
         assert_eq!(w.tracked_keys(), 1, "only the live flow must remain");
+    }
+
+    // ── external audit NET-010 (NN-AUD-006) — allowlist by exec identity ──
+
+    /// The shipped allowlist judged on exec identity, with `execs`
+    /// ingested as the exec sensor would (pid, exe, argv).
+    fn identity_al(execs: &[(u32, &str, &[&str])]) -> (tempfile::TempDir, Arc<CommAllowlist>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        for (pid, exe, argv) in execs {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            t.ingest_spawn_with_argv(*pid, 1, exe, &argv, 1);
+        }
+        (tmp, Arc::new(al().as_ref().clone().with_identity(t)))
+    }
+
+    fn with_pid(mut e: Event, pid: u32) -> Event {
+        match &mut e {
+            Event::NetFlow(nf) => nf.pid = pid,
+            Event::NetListener(nl) => nl.pid = pid,
+            _ => {}
+        }
+        e
+    }
+
+    #[test]
+    fn a_spoofed_comm_no_longer_suppresses_the_network_rules() {
+        let (_tmp, al) = identity_al(&[
+            // python renamed to `nginx` with prctl: an inline program
+            (500, "/usr/bin/python3.12", &["python3", "-c", "x"]),
+            // the real nginx
+            (501, "/usr/sbin/nginx", &["nginx"]),
+        ]);
+        let listen = NnLNet006UncommonListener::new(Arc::clone(&al));
+        let v = listen
+            .evaluate(&with_pid(listener(31337, "nginx"), 500))
+            .expect("a listener named nginx that is not nginx fires");
+        assert!(v.reasoning.contains("named 'nginx'"), "{}", v.reasoning);
+        assert!(listen
+            .evaluate(&with_pid(listener(31337, "nginx"), 501))
+            .is_none());
+
+        // NN-L-NET-010 (KillProcess): never seen → recorded, not acted on
+        let c2 = NnLNet010OutboundToHighRiskC2Port::new(Arc::clone(&al));
+        let v = c2
+            .evaluate(&with_pid(flow(v4(198, 51, 100, 7), 4444, "curl"), 599))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(v.reasoning.contains("could not be read"), "{}", v.reasoning);
+        // the same send from a process that is not curl is acted on
+        let (_tmp2, al2) = identity_al(&[(600, "/tmp/curl", &["/tmp/curl"])]);
+        let v = NnLNet010OutboundToHighRiskC2Port::new(al2)
+            .evaluate(&with_pid(flow(v4(198, 51, 100, 7), 4444, "curl"), 600))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert!(v.reasoning.contains("something else"), "{}", v.reasoning);
     }
 }

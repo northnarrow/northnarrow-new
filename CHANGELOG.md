@@ -6,6 +6,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, network (Critical NET-001 and NET-010, High
+  EBPF-007, NET-002, NET-005, NET-011):
+  - A dual-stack IPv6 socket reaching an IPv4 address (`::ffff:a.b.c.d`)
+    slipped past the IP blocklist and the posture's internal and loopback
+    checks. Addresses are now canonical wherever they are decoded.
+  - A process could silence the network rules by naming itself like an
+    allowlisted program (`prctl(PR_SET_NAME)`). The allowlist is now
+    judged on what the kernel executed; when that cannot be read, the
+    verdict is recorded instead of acted on.
+  - UDP sent from port 53 to anything but a local client was dropped by
+    the kernel sensor. It is now reported, aggregated per client address
+    for a DNS server.
+  - One malformed line emptied a whole blocklist at load; now only that
+    line is dropped.
+  - A DNS query issued after a connect hid the hostname the connect was
+    attributed to.
+  - The shipped blocklist held CGNAT (`100.64.0.0/10`) and benchmarking
+    (`198.18.0.0/15`) space, which Tailscale, EKS and VPN clients use,
+    on a rule that kills the process tree.
 - A file capability granted by any route other than the `setcap` program
   (a direct `setxattr`, `cp --preserve=xattr`, `tar --xattrs`) drew no
   verdict (review 86, High). In the lab a user read `/etc/shadow`
