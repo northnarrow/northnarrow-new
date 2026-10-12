@@ -1470,6 +1470,104 @@ impl Rule for NnLNet019WildcardListener {
     }
 }
 
+// ── NN-L-NET-020 — DNS query flood (review 78) ─────────────────────
+
+/// Window over which [`NnLNet020DnsQueryFlood`] sums held-back queries.
+const DNS_FLOOD_WINDOW_NS: u64 = 10 * 1_000_000_000;
+/// Held-back queries in a window that make it fire.
+const DNS_FLOOD_MIN_HELD: u64 = 256;
+/// Processes and users tracked at most; when full, ended windows go.
+const DNS_FLOOD_MAX_KEYS: usize = 4096;
+
+/// NN-L-NET-020 — a process, or a user across its processes, sent DNS
+/// queries well beyond the kernel's DNS budget (review 78). The queries
+/// over the budget are not recorded, so the DNS rules (NN-L-NET-004,
+/// -005, -014) never see them: a flood could carry a tunnel. Within the
+/// budget (64 queries, then 128 per second, per process; 2,048 then 1,024
+/// per second per user) every query is recorded; beyond it, the process
+/// is reported here (MITRE T1071.004). The local resolvers' users are
+/// exempt in the kernel.
+/// (uid, pid — 0 for the user's budget) → (window start, held, fired).
+type HeldWindows = HashMap<(u32, u32), (u64, u64, bool)>;
+
+pub struct NnLNet020DnsQueryFlood {
+    held: Mutex<HeldWindows>,
+}
+
+impl NnLNet020DnsQueryFlood {
+    pub fn new() -> Self {
+        Self {
+            held: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for NnLNet020DnsQueryFlood {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for NnLNet020DnsQueryFlood {
+    fn id(&self) -> &'static str {
+        "NN-L-NET-020_DnsQueryFlood"
+    }
+    fn name(&self) -> &'static str {
+        "DNS queries beyond the kernel's DNS budget"
+    }
+    fn category(&self) -> &'static str {
+        CATEGORY_HIGH
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::DnsFlood {
+            pid,
+            uid,
+            comm,
+            held,
+            uid_level,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let key = (*uid, if *uid_level { 0 } else { *pid });
+        let sum = {
+            let mut map = self.held.lock();
+            if map.len() >= DNS_FLOOD_MAX_KEYS && !map.contains_key(&key) {
+                map.retain(|_, w| timestamp_ns.saturating_sub(w.0) < DNS_FLOOD_WINDOW_NS);
+                if map.len() >= DNS_FLOOD_MAX_KEYS {
+                    map.clear();
+                }
+            }
+            let w = map.entry(key).or_insert((*timestamp_ns, 0, false));
+            if timestamp_ns.saturating_sub(w.0) >= DNS_FLOOD_WINDOW_NS {
+                *w = (*timestamp_ns, 0, false);
+            }
+            w.1 += u64::from(*held);
+            if w.2 || w.1 < DNS_FLOOD_MIN_HELD {
+                return None;
+            }
+            w.2 = true;
+            w.1
+        };
+        let scope = if *uid_level { "its user's" } else { "its own" };
+        Some(net_verdict(
+            self,
+            ResponseAction::Log,
+            Severity::High,
+            &format!(
+                "{comm} (pid {pid}, uid {uid}) sent at least {sum} DNS queries beyond {scope} \
+                 DNS budget within 10 seconds: those queries were not recorded, so a DNS tunnel \
+                 could hide among them (T1071.004)"
+            ),
+            *pid,
+            comm.clone(),
+            *timestamp_ns,
+        ))
+    }
+}
+
 // ── NN-L-NET-014 — DNS qname high-entropy label (tunnelling) ────────
 
 /// DNS-tunnelling refinement (MITRE T1071.004). Where NN-L-NET-004
@@ -1673,6 +1771,8 @@ pub fn net_rules(
             &comm_allowlist,
         ))),
         Box::new(NnLNet019WildcardListener::new(Arc::clone(&comm_allowlist))),
+        // Review 78: no comm allowlist — the kernel exempts the resolvers.
+        Box::new(NnLNet020DnsQueryFlood::new()),
         // Broad Tappa 10 catch-alls last among the comm-gated rules.
         Box::new(NnLNet006UncommonListener::new(Arc::clone(&comm_allowlist))),
         Box::new(NnLNet007Rfc1918FromUnusualProc::new(Arc::clone(
@@ -2477,6 +2577,62 @@ mod tests {
             .is_none());
     }
 
+    fn dns_flood(pid: u32, uid: u32, held: u32, uid_level: bool, ts: u64) -> Event {
+        Event::DnsFlood {
+            pid,
+            uid,
+            comm: "flooder".to_string(),
+            exe: None,
+            held,
+            uid_level,
+            timestamp_ns: ts,
+        }
+    }
+
+    /// Review 78: held-back queries are summed per process over 10 s; the
+    /// rule fires once per window at 256, and a new window starts over.
+    #[test]
+    fn net_020_sums_held_queries_per_process_and_window() {
+        const SEC: u64 = 1_000_000_000;
+        let rule = NnLNet020DnsQueryFlood::new();
+        assert!(rule.evaluate(&dns_flood(10, 1000, 200, false, 0)).is_none());
+        // Another process of the same user has its own sum.
+        assert!(rule
+            .evaluate(&dns_flood(11, 1000, 200, false, SEC))
+            .is_none());
+        let v = rule
+            .evaluate(&dns_flood(10, 1000, 100, false, 2 * SEC))
+            .expect("300 held within 10 s");
+        assert_eq!(v.rule_id, "NN-L-NET-020_DnsQueryFlood");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.event_pid, 10);
+        assert!(v.reasoning.contains("300"));
+        // Once per window.
+        assert!(rule
+            .evaluate(&dns_flood(10, 1000, 500, false, 3 * SEC))
+            .is_none());
+        // A new window starts over.
+        assert!(rule
+            .evaluate(&dns_flood(10, 1000, 100, false, 12 * SEC))
+            .is_none());
+        assert!(rule
+            .evaluate(&dns_flood(10, 1000, 200, false, 13 * SEC))
+            .is_some());
+    }
+
+    /// The user's budget is summed per user, whichever process reports it.
+    #[test]
+    fn net_020_user_budget_is_summed_per_user() {
+        let rule = NnLNet020DnsQueryFlood::new();
+        assert!(rule.evaluate(&dns_flood(20, 1000, 150, true, 0)).is_none());
+        let v = rule
+            .evaluate(&dns_flood(21, 1000, 150, true, 1))
+            .expect("300 held by the user's processes");
+        assert!(v.reasoning.contains("its user's"));
+        // Another user is apart.
+        assert!(rule.evaluate(&dns_flood(22, 1001, 150, true, 2)).is_none());
+    }
+
     #[test]
     fn net_009_udp_window_and_allowlist() {
         let rule = NnLNet009ByteAnomaly::new(al());
@@ -2507,17 +2663,17 @@ mod tests {
 
     // ── Builder + invariants ────────────────────────────────────
 
-    /// Required builder test — the factory returns 14 net rules
+    /// Required builder test — the factory returns 16 net rules
     /// (Tappa 10 N6 shipped 9; Tappa 10.5 D4 adds 5:
-    /// NN-L-NET-010/011/013/018/019). Future rule additions must
-    /// update this assertion.
+    /// NN-L-NET-010/011/013/018/019; review 78 adds NN-L-NET-020).
+    /// Future rule additions must update this assertion.
     #[test]
-    fn net_rules_builder_returns_15_rules() {
+    fn net_rules_builder_returns_16_rules() {
         let rules = net_rules_empty();
         assert_eq!(
             rules.len(),
-            15,
-            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 = 15 net rules"
+            16,
+            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 = 16 net rules"
         );
     }
 

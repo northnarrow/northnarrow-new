@@ -10,9 +10,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   High). The DNS sensor recorded every datagram into one ring: a loop of
   benign queries lost half of the records and took more than a CPU of the
   agent, and a tunnelling-shaped query in the middle evaded NN-L-NET-004
-  one time in three. Each process now has a budget in the kernel (256
-  queries in a burst, then 128 per second); the rest are counted in the
-  `dns_rate` drop slot.
+  one time in three. The kernel now gives each process and each user a DNS
+  budget; queries over it are not recorded but counted on the process's
+  next record, and the new NN-L-NET-020 reports the process that floods.
+  The local resolvers are exempt.
 - A file detection did not say which file it was about (review 77). The
   record of a cron drop-in named the writer but not the drop-in; records
   carried a path only for exec detections. Detection records now have a

@@ -143,6 +143,7 @@ impl Sensor {
             Event::BpfSyscall { .. } => Sensor::AntiTamper,
             Event::TcpConnect { .. }
             | Event::DnsQuery { .. }
+            | Event::DnsFlood { .. }
             | Event::NetFlow(_)
             | Event::NetListener(_) => Sensor::Network,
             Event::FsProtectDenial { .. } => Sensor::AntiTamper,
@@ -243,6 +244,7 @@ impl Principal {
             | Event::MassWrite { pid, uid, comm, .. }
             | Event::TcpConnect { pid, uid, comm, .. }
             | Event::DnsQuery { pid, uid, comm, .. }
+            | Event::DnsFlood { pid, uid, comm, .. }
             | Event::FsProtectDenial { pid, uid, comm, .. } => Principal {
                 pid: *pid,
                 comm: comm.clone(),
@@ -325,6 +327,7 @@ fn exe_from_event(event: &Event) -> Option<String> {
         | Event::BpfSyscall { .. }
         | Event::TcpConnect { .. }
         | Event::DnsQuery { .. }
+        | Event::DnsFlood { .. }
         | Event::FsProtectDenial { .. }
         | Event::CanaryTripped { .. }
         | Event::Fim(_)
@@ -348,6 +351,7 @@ fn file_from_event(event: &Event) -> Option<String> {
         | Event::BpfSyscall { .. }
         | Event::TcpConnect { .. }
         | Event::DnsQuery { .. }
+        | Event::DnsFlood { .. }
         | Event::FsProtectDenial { .. }
         | Event::CanaryTripped { .. }
         | Event::NetFlow(_)

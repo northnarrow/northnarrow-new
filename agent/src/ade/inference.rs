@@ -256,7 +256,9 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             filename_for_pkg = exe.path_or(filename).to_string();
             category = MockCategory::Unknown;
         }
-        Event::TcpConnect { pid, comm, .. } | Event::DnsQuery { pid, comm, .. } => {
+        Event::TcpConnect { pid, comm, .. }
+        | Event::DnsQuery { pid, comm, .. }
+        | Event::DnsFlood { pid, comm, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = comm.clone();
         }

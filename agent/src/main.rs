@@ -3106,6 +3106,14 @@ async fn process_event(
                 "dns_query"
             )
         }
+        // Review 78: the rule (NN-L-NET-020) reports it.
+        Event::DnsFlood {
+            pid,
+            comm,
+            held,
+            uid_level,
+            ..
+        } => debug!(pid, comm = %comm, held, uid_level, "dns_flood"),
         // Tappa 7: kernel-side LSM hook denied a tamper attempt on
         // protected state. The posture machine observed the event
         // at the top of this function and will route it through the

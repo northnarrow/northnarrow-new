@@ -28,8 +28,8 @@ use aya::{
 };
 use bytemuck::Pod;
 use common::wire::{
-    BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, IoUringRaw,
-    ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw,
+    dns_flags, BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw,
+    IoUringRaw, ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw,
 };
 use common::Event;
 use parking_lot::Mutex;
@@ -716,8 +716,11 @@ async fn pump_dns_query(
             match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
                 Ok(raw) => {
                     let mut event = Event::from(raw);
+                    let mut flood = None;
                     if let Event::DnsQuery {
                         pid,
+                        uid,
+                        comm,
                         exe,
                         query_name,
                         query_type,
@@ -740,9 +743,27 @@ async fn pump_dns_query(
                                 *timestamp_ns,
                             );
                         }
+                        // Review 78: queries the kernel's DNS budgets held
+                        // back since this process's previous record.
+                        if raw.held != 0 {
+                            flood = Some(Event::DnsFlood {
+                                pid: *pid,
+                                uid: *uid,
+                                comm: comm.clone(),
+                                exe: exe.clone(),
+                                held: u32::from(raw.held),
+                                uid_level: raw.flags & dns_flags::RATE_HELD_UID != 0,
+                                timestamp_ns: *timestamp_ns,
+                            });
+                        }
                     }
                     if tx.send(event).await.is_err() {
                         return Ok(());
+                    }
+                    if let Some(flood) = flood {
+                        if tx.send(flood).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
                 Err(_e) => {
