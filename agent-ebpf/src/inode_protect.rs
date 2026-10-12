@@ -133,7 +133,8 @@ pub static FS_PROTECT_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 /// `antitamper_bpf::reattach_fresh` (driven by `filesystem::attach`)
 /// attaches this boot's program BEFORE purging the prior boot's pin —
 /// zero-window split-brain — while binding to this fresh ring. task_kill /
-/// ptrace keep the pinned-reuse path (they emit no ring).
+/// ptrace emit here too (`emit_task_denial`) and are reattached fresh the
+/// same way (review 62).
 #[map]
 pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 

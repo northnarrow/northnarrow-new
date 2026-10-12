@@ -182,6 +182,23 @@ PID=$(agent_pid)
 printf '+backupd\n' > /tmp/nn-ovl-allow
 WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && systemctl restart northnarrow-agent"
 PID=$(agent_pid)
+# Review 62: after a restart the task deny hooks must still report. They
+# were reused from the pinned link, bound to the previous boot's ring, so
+# C01-C03 passed on a fresh install and the same attempts left no
+# evidence once the agent had restarted (C23/C24 just did).
+run_case C28 "kill -9 the agent after an agent restart" denied "op=signal" 0 -- kill -9 "$PID"
+run_case C29 "ptrace attach after an agent restart" denied "op=ptrace" 0 -- bash -c "dd if=/proc/$PID/mem bs=1 count=1 skip=4194304 of=/dev/null"
+# Review 63: the pinned PROTECTED_INODES map outlives the agent. Each boot
+# protects new inodes (the pins of the hooks reattached fresh), and the
+# earlier boots' keys piled up until an insert failed at 1024 entries and
+# the agent refused to start. One more restart must not grow it.
+if [[ -z "$ONLY" || ",$ONLY," == *",C30,"* ]]; then
+    pi_count() { bpftool -j map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_INODES 2>/dev/null | grep -o '"key":' | wc -l; }
+    n1=$(pi_count); systemctl restart northnarrow-agent; sleep 20; n2=$(pi_count); PID=$(agent_pid)
+    if (( n2 > n1 )); then v="DEVIATION (grew by $(( n2 - n1 )))"; fail=1; else v="OK"; fi
+    rows+=("| C30 | PROTECTED_INODES across an agent restart | $n1 → $n2 entries | — | $v |")
+    echo "C30 PROTECTED_INODES across an agent restart → $n1 → $n2 entries; $v" >&2
+fi
 # Kernel lockdown (integrity or confidentiality) is the host setting that
 # closes kexec and unsigned modules; without it they are known gaps, with it
 # a missing refusal is a deviation. The agent itself runs unchanged under

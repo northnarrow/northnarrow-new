@@ -364,18 +364,24 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     // path, so re-deriving it here keeps the change inside
     // `anti_tamper/` without threading a new param through the
     // multiplexer. `None` (no bpffs) ⇒ transient attach, no
-    // persistence — `attach_lsm` handles the degrade + log.
+    // persistence — `reattach_fresh` handles the degrade + log.
     let pin_root = prepare_pin_root();
 
-    // On success `attach_lsm` logs the disposition (reused / freshly
-    // attached / purged-then-attached) itself — the call sites only
-    // escalate the *failure* case with its operator-facing severity.
+    // On success `reattach_fresh` logs the disposition (re-attached fresh,
+    // prior pin purged) itself — the call sites only escalate the
+    // *failure* case with its operator-facing severity.
     // Audit `ebpf-lsm-1`: every deny-hook attach failure used to be a
     // lone WARN while the agent kept reporting healthy. Collect them all,
     // emit ONE aggregate health line, and fail closed by default.
     let mut deny_failures: Vec<(&'static str, String)> = Vec::new();
 
-    if let Err(e) = attach_lsm(ebpf, TASK_KILL_PROGRAM, TASK_KILL_HOOK, &btf, pin_root) {
+    // Review 62: task_kill and ptrace_access_check emit their denials on
+    // the FS_PROTECT_EVENTS ring (`inode_protect::emit_task_denial`), so
+    // they are attached fresh every boot like the FS deny hooks (BUG-024).
+    // Reusing the prior boot's pinned link kept the prior program bound
+    // to the prior ring: after any agent restart, kill and ptrace attempts
+    // on the agent were still denied but left no evidence.
+    if let Err(e) = reattach_fresh(ebpf, TASK_KILL_PROGRAM, TASK_KILL_HOOK, &btf, pin_root) {
         warn!(
             program = TASK_KILL_PROGRAM,
             hook = TASK_KILL_HOOK,
@@ -385,7 +391,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
         deny_failures.push((TASK_KILL_PROGRAM, format!("{e:#}")));
     }
 
-    if let Err(e) = attach_lsm(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
+    if let Err(e) = reattach_fresh(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
         warn!(
             program = PTRACE_PROGRAM,
             hook = PTRACE_HOOK,
@@ -442,6 +448,19 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
             );
             deny_failures.push(("filesystem::register_bpffs_pins", format!("{e:#}")));
         }
+    }
+    // Review 63: every inode this boot protects is registered now; the
+    // earlier boots' keys go (the map is pinned and used to fill up).
+    match filesystem::prune_stale_inodes(ebpf) {
+        Ok(0) => {}
+        Ok(removed) => info!(
+            removed,
+            "anti-tamper FS: PROTECTED_INODES keys of earlier boots removed"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper FS: PROTECTED_INODES keys of earlier boots NOT removed"
+        ),
     }
 
     report_lsm_health(&deny_failures, &observe_failures)

@@ -6,6 +6,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The agent stopped starting after about 41 restarts in one uptime
+  (review 63, High). Every boot added the inodes it protects to the
+  pinned `PROTECTED_INODES` map (23 per restart on the lab, mostly the
+  re-created bpffs pins) and never removed the earlier boots' keys; at
+  1024 entries an insert failed and the agent refused to start with a
+  missing protection. The boot now removes every key it did not register
+  itself, after registering its own, and `tamper-check` checks that one
+  more restart does not grow the map.
+- After an agent restart, kill -9 and ptrace attempts on the agent were
+  still refused but left no evidence (review 62). The two hooks emit on the
+  anti-tamper ring, yet reused the previous boot's pinned program, bound to
+  a ring no one read any more. They are now reattached fresh every boot,
+  like the file-protection hooks, and `tamper-check` repeats the kill and
+  ptrace cases after its restarts.
 - `nn-lab.sh tamper-check` left its overlays in `/etc/northnarrow`, and
   C24's was signed, so its `+backupd` exemption stayed in force on the
   lab guest. The e2e fixtures' agents then logged it as an unauthorised
