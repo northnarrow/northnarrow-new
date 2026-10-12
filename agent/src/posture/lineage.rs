@@ -139,6 +139,21 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
     "/usr/sbin/unix_update",
 ];
 
+/// Review 52: the binaries an administrator elevates a session through.
+/// A subset of [`AUTH_BINARY_EXES`]: the login and scheduling daemons
+/// (sshd, cron, logind, gdm, `systemd-run`) start sessions and jobs, they
+/// do not elevate one. `sudo` and `su` stay in the lineage (they fork the
+/// command and wait for it); `doas` and `pkexec` replace themselves with
+/// the command, so they never appear in a lineage and are not listed.
+/// Same exact-path, kernel-resolved-exe keying as the lists around it.
+pub const ELEVATION_EXES: &[&str] = &[
+    "/bin/su",
+    "/bin/sudo",
+    "/usr/bin/su",
+    "/usr/bin/sudo",
+    "/usr/bin/sudoedit",
+];
+
 /// Hard-coded allowlist of system package-management / cache-refresh
 /// daemon exec paths whose mass-write + persistence writes are routine
 /// maintenance, not adversarial. Same exe-path keying as
@@ -423,6 +438,130 @@ impl AuthSessionTracker {
         self.lineage_exe_matches(pid, is_system_daemon_binary)
     }
 
+    /// Review 52: `pid` belongs to an administrator's interactive session
+    /// that elevated through sudo or su — an [`ELEVATION_EXES`] binary in
+    /// its lineage, a login uid (a PAM login chain set it) and a
+    /// controlling terminal. A service has no login uid; a cron job or a
+    /// `systemd-run` unit has no elevation binary; `ssh host sudo …`
+    /// without a terminal has no terminal; a process that reached root any
+    /// other way (a setuid exploit) has no elevation binary.
+    ///
+    /// Login uid and terminal are read from `/proc`, on `pid` itself while
+    /// it runs. A short-lived writer (`sudo tee`) has usually exited by the
+    /// time its event is read; then the nearest running process up its
+    /// recorded lineage answers, normally the shell that ran sudo (the
+    /// login uid is inherited, and that shell holds the terminal).
+    pub fn is_interactive_admin(&self, pid: u32) -> bool {
+        if !self.lineage_exe_matches(pid, is_elevation_binary) {
+            return false;
+        }
+        let Some(live) = self.nearest_running(pid) else {
+            return false;
+        };
+        self.has_valid_loginuid(live) && self.has_controlling_tty(live)
+    }
+
+    /// The login uid of `pid`, or of its nearest running ancestor once it
+    /// has exited: the login uid is inherited, so the session's shell
+    /// answers for a short-lived process. Scopes the posture's
+    /// corroboration ledger.
+    pub fn session_loginuid(&self, pid: u32) -> Option<u32> {
+        self.loginuid_of(self.nearest_running(pid)?)
+    }
+
+    /// Review 52: [`Self::is_interactive_admin`] for the posture's
+    /// corroboration ledger, or `None` while it cannot be told. That is
+    /// the case when the lineage walk loses the chain before it ends (a
+    /// process that is exiting and whose `exe` is gone, or a parent that
+    /// has exited with no exec event in the cache: sudo's monitor is a
+    /// fork without exec), or when sudo/su is found but nothing of the
+    /// session runs any more to show a login uid and a terminal.
+    pub fn interactive_admin_status(&self, pid: u32) -> Option<bool> {
+        if !self.lineage_exe_matches_known(pid, is_elevation_binary)? {
+            return Some(false);
+        }
+        let live = self.nearest_running(pid)?;
+        Some(self.has_valid_loginuid(live) && self.has_controlling_tty(live))
+    }
+
+    /// [`Self::lineage_exe_matches`], but `None` when a hop can be read
+    /// neither from the spawn cache nor from `/proc` before the walk ends.
+    fn lineage_exe_matches_known(
+        &self,
+        pid: u32,
+        is_match: impl Fn(&Path) -> bool,
+    ) -> Option<bool> {
+        if pid == 0 || pid == 1 {
+            return Some(false);
+        }
+        let mut cur = pid;
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            let (ppid, exe) = self.lookup_cache(cur).or_else(|| self.lookup_proc(cur))?;
+            if is_match(&exe) {
+                return Some(true);
+            }
+            if ppid == 0 || ppid == 1 || ppid == cur {
+                return Some(false);
+            }
+            cur = ppid;
+        }
+        Some(false)
+    }
+
+    /// `/proc/<pid>` exists and is not a zombie. A zombie (`Z`: exited, not
+    /// yet reaped by its parent) still has its directory, but its `exe` is
+    /// gone and its lineage can no longer be read: `sudo tee` sits in that
+    /// state until sudo reaps it.
+    fn is_running(&self, pid: u32) -> bool {
+        let dir = self.inner.proc_root.join(pid.to_string());
+        if !dir.is_dir() {
+            return false;
+        }
+        let Ok(stat) = fs::read_to_string(dir.join("stat")) else {
+            return true;
+        };
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next());
+        !matches!(state, Some("Z" | "X"))
+    }
+
+    /// `pid` if it still runs, else the nearest running ancestor in the
+    /// spawn cache. `None` past PID 1, a cache miss, or the depth cap.
+    fn nearest_running(&self, pid: u32) -> Option<u32> {
+        let mut cur = pid;
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            if cur == 0 || cur == 1 {
+                return None;
+            }
+            if self.is_running(cur) {
+                return Some(cur);
+            }
+            let (ppid, _) = self.lookup_cache(cur)?;
+            if ppid == cur {
+                return None;
+            }
+            cur = ppid;
+        }
+        None
+    }
+
+    /// `tty_nr` (field 7 of `/proc/<pid>/stat`) is set. Counted after the
+    /// `(comm)` field, which may itself hold spaces or parentheses.
+    fn has_controlling_tty(&self, pid: u32) -> bool {
+        if pid == 0 || pid == 1 {
+            return false;
+        }
+        let path = self.inner.proc_root.join(pid.to_string()).join("stat");
+        let Ok(stat) = fs::read_to_string(path) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(4))
+            .and_then(|tty| tty.parse::<i64>().ok())
+            .is_some_and(|tty| tty != 0)
+    }
+
     /// FP-2 — true iff `pid` is npm's own node process: a DIRECT
     /// (non-lineage) check that the focal writer's `exe` ∈ [`NODE_EXES`]
     /// AND its precomputed [`Entry::argv_npm_cli`] flag is set (argv[1]
@@ -585,6 +724,11 @@ fn is_auth_binary(exe: &Path) -> bool {
 fn is_system_daemon_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     SYSTEM_DAEMON_EXES.iter().any(|p| s == *p)
+}
+
+fn is_elevation_binary(exe: &Path) -> bool {
+    let s = exe.to_string_lossy();
+    ELEVATION_EXES.iter().any(|p| s == *p)
 }
 
 /// FP-2: exact-path match against the Node.js interpreter allowlist
@@ -1140,6 +1284,132 @@ mod tests {
         let t = AuthSessionTracker::new(tmp.path());
         assert!(!t.has_valid_loginuid(0));
         assert!(!t.has_valid_loginuid(1));
+    }
+
+    // ── Review 52: interactive admin session ───────────────────────
+
+    /// `/proc/<pid>/stat` with the given `tty_nr`; `comm` holds a space
+    /// and a parenthesis, as a real one may.
+    fn write_stat(dir: &Path, pid: u32, ppid: u32, tty_nr: i64) {
+        let pid_dir = dir.join(pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(
+            pid_dir.join("stat"),
+            format!("{pid} (my (tee)) S {ppid} {pid} {pid} {tty_nr} -1 4194560 0 0\n"),
+        )
+        .unwrap();
+    }
+
+    /// A shell (pid 50, terminal, login uid 1000) ran `sudo` (100), which
+    /// ran the writer (200).
+    fn admin_session(tty_nr: i64, loginuid: u32) -> (TempDir, AuthSessionTracker) {
+        let tmp = TempDir::new().unwrap();
+        write_loginuid(tmp.path(), 200, loginuid);
+        write_stat(tmp.path(), 200, 100, tty_nr);
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
+        t.ingest_spawn(100, 50, "/usr/bin/sudo", 2);
+        t.ingest_spawn(200, 100, "/usr/sbin/useradd", 3);
+        (tmp, t)
+    }
+
+    #[test]
+    fn sudo_with_login_and_terminal_is_interactive_admin() {
+        let (_tmp, t) = admin_session(34816, 1000);
+        assert!(t.is_interactive_admin(200));
+    }
+
+    #[test]
+    fn no_terminal_or_no_login_is_not_interactive_admin() {
+        // `ssh host sudo …` without a terminal.
+        let (_tmp, t) = admin_session(0, 1000);
+        assert!(!t.is_interactive_admin(200));
+        // A service: no login uid.
+        let (_tmp, t) = admin_session(34816, LOGINUID_UNSET);
+        assert!(!t.is_interactive_admin(200));
+        // Never seen and not in /proc.
+        let (_tmp, t) = admin_session(34816, 1000);
+        assert!(!t.is_interactive_admin(999));
+    }
+
+    /// `sudo tee` has exited (and sudo with it) when its event is read:
+    /// the shell that ran sudo, still running, answers for it. Without a
+    /// running ancestor with a terminal, it is not an admin session.
+    #[test]
+    fn exited_writer_is_judged_by_its_running_shell() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
+        t.ingest_spawn(100, 50, "/usr/bin/sudo", 2);
+        t.ingest_spawn(200, 100, "/usr/bin/tee", 3);
+        assert!(!t.is_interactive_admin(200), "nothing runs");
+        write_loginuid(tmp.path(), 50, 1000);
+        write_stat(tmp.path(), 50, 40, 0);
+        assert!(!t.is_interactive_admin(200), "shell without a terminal");
+        write_stat(tmp.path(), 50, 40, 34816);
+        assert!(t.is_interactive_admin(200));
+        // A zombie writer (exited, not yet reaped) does not answer: its
+        // running shell does.
+        write_loginuid(tmp.path(), 200, 1000);
+        fs::write(
+            tmp.path().join("200").join("stat"),
+            "200 (tee) Z 100 50 50 0 -1 0\n",
+        )
+        .unwrap();
+        assert!(t.is_interactive_admin(200));
+        // A running writer answers for itself, even when its shell would
+        // pass: a background job detached from the terminal is not one.
+        write_loginuid(tmp.path(), 200, 1000);
+        write_stat(tmp.path(), 200, 100, 0);
+        assert!(!t.is_interactive_admin(200));
+    }
+
+    /// The ledger's view: unknown while a hop of the chain is lost (sudo's
+    /// monitor, a fork without exec, has exited) or nothing of the session
+    /// runs; known once the chain reads to its end.
+    #[test]
+    fn interactive_admin_status_is_unknown_until_the_chain_reads() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(50, 40, "/usr/bin/bash", 1);
+        t.ingest_spawn(100, 50, "/usr/bin/sudo", 2);
+        // tee (300) ran under sudo's monitor (200), never exec'd, gone.
+        t.ingest_spawn(300, 200, "/usr/bin/tee", 3);
+        assert_eq!(t.interactive_admin_status(300), None, "monitor lost");
+        // sudo → tee directly, but nothing of the session runs any more.
+        t.ingest_spawn(400, 100, "/usr/bin/tee", 4);
+        assert_eq!(t.interactive_admin_status(400), None, "session gone");
+        // The shell still runs with a terminal and a login uid.
+        write_loginuid(tmp.path(), 50, 1000);
+        write_stat(tmp.path(), 50, 40, 34816);
+        assert_eq!(t.interactive_admin_status(400), Some(true));
+        // A chain that reads to PID 1 with no sudo is known: not an admin.
+        t.ingest_spawn(500, 1, "/usr/bin/sh", 5);
+        assert_eq!(t.interactive_admin_status(500), Some(false));
+    }
+
+    /// Login daemons and job runners authenticate, they do not elevate: a
+    /// cron job or an sshd session child is not an admin session, and
+    /// neither is a root process with no elevation binary above it.
+    #[test]
+    fn only_sudo_and_su_elevate() {
+        let tmp = TempDir::new().unwrap();
+        for pid in [300, 400, 500] {
+            write_loginuid(tmp.path(), pid, 1000);
+            write_stat(tmp.path(), pid, 1, 34816);
+        }
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(290, 1, "/usr/sbin/cron", 1);
+        t.ingest_spawn(300, 290, "/usr/bin/sh", 2);
+        t.ingest_spawn(390, 1, "/usr/sbin/sshd", 3);
+        t.ingest_spawn(400, 390, "/usr/bin/bash", 4);
+        t.ingest_spawn(490, 1, "/usr/bin/su", 5);
+        t.ingest_spawn(500, 490, "/usr/bin/bash", 6);
+        assert!(!t.is_interactive_admin(300));
+        assert!(!t.is_interactive_admin(400));
+        assert!(t.is_interactive_admin(500));
+        assert!(!is_elevation_binary(Path::new("/usr/bin/pkexec")));
+        assert!(!is_elevation_binary(Path::new("/tmp/sudo")));
     }
 
     #[test]

@@ -53,6 +53,12 @@ struct LedgerEntry {
     trigger: TriggerType,
     at: Instant,
     scope: Scope,
+    /// Review 52: the writer of a configuration change that could not be
+    /// placed when it was recorded (it had exited and its exec event was
+    /// still in flight). It corroborates nothing until
+    /// [`CorroborationLedger::resolve_pending`] finds it was not an
+    /// administrator's interactive session.
+    pending_writer: Option<u32>,
 }
 
 /// Bounded, in-memory record of recent escalation signals (ENGAGED-tier
@@ -91,7 +97,10 @@ impl CorroborationLedger {
     /// Caller must [`prune`](Self::prune) first.
     pub fn corroborated(&self, current: TriggerType, scope: Scope) -> bool {
         // posture-ledger-scope-1: only same-scope entries count.
-        let same_scope = self.entries.iter().filter(|e| e.scope == scope);
+        let same_scope = self
+            .entries
+            .iter()
+            .filter(|e| e.scope == scope && e.pending_writer.is_none());
         if same_scope.clone().any(|e| e.trigger != current) {
             return true;
         }
@@ -103,7 +112,48 @@ impl CorroborationLedger {
     /// whose `target_level() >= Engaged` (ALERTED-tier recon/DNS is too
     /// noisy to count as corroboration).
     pub fn record(&mut self, trigger: TriggerType, at: Instant, scope: Scope) {
-        self.entries.push_back(LedgerEntry { trigger, at, scope });
+        self.entries.push_back(LedgerEntry {
+            trigger,
+            at,
+            scope,
+            pending_writer: None,
+        });
+    }
+
+    /// Review 52: record a configuration change whose writer could not be
+    /// placed yet. See [`Self::resolve_pending`].
+    pub fn record_pending(&mut self, trigger: TriggerType, at: Instant, scope: Scope, writer: u32) {
+        self.entries.push_back(LedgerEntry {
+            trigger,
+            at,
+            scope,
+            pending_writer: Some(writer),
+        });
+    }
+
+    /// Review 52: place the pending writers. `place` answers `None` while
+    /// it still cannot tell (the entry stays pending), else whether the
+    /// writer was an administrator's interactive session (the entry is
+    /// dropped: routine administration corroborates nothing) and its
+    /// session's scope (otherwise the entry becomes an ordinary signal in
+    /// that scope). Call after [`Self::prune`], before
+    /// [`Self::corroborated`].
+    pub fn resolve_pending(&mut self, place: impl Fn(u32) -> Option<(bool, Scope)>) {
+        self.entries
+            .retain_mut(|e| match e.pending_writer.map(&place) {
+                Some(Some((true, _))) => false,
+                Some(Some((false, scope))) => {
+                    e.pending_writer = None;
+                    e.scope = scope;
+                    true
+                }
+                _ => true,
+            });
+    }
+
+    /// `true` when an entry still waits for [`Self::resolve_pending`].
+    pub fn has_pending(&self) -> bool {
+        self.entries.iter().any(|e| e.pending_writer.is_some())
     }
 
     /// Forget every recorded signal. Called when an admin releases
@@ -130,6 +180,29 @@ impl CorroborationLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 52: a pending configuration change corroborates nothing
+    /// until it is placed; placed as an admin session it is dropped, as
+    /// anything else it counts.
+    #[test]
+    fn pending_writer_counts_only_once_placed_outside_an_admin_session() {
+        let now = Instant::now();
+        let mut l = CorroborationLedger::new();
+        l.record_pending(TriggerType::CriticalFileModification, now, None, 42);
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
+        l.resolve_pending(|_| None);
+        assert!(l.has_pending());
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
+        l.resolve_pending(|_| Some((true, Some(1000))));
+        assert!(l.is_empty(), "an admin change is dropped");
+
+        // Placed outside an admin session, in the scope of its session.
+        l.record_pending(TriggerType::CriticalFileModification, now, None, 43);
+        l.resolve_pending(|_| Some((false, Some(1000))));
+        assert!(!l.has_pending());
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
+        assert!(l.corroborated(TriggerType::PersistenceMechanism, Some(1000)));
+    }
 
     #[test]
     fn lone_signal_is_not_corroborated() {

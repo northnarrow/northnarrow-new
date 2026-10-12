@@ -106,6 +106,31 @@ the v1 default list — no-op (check spelling)`). Common cause: the
 operator typo'd the path or is trying to disable an `+`-added
 path — the disable directive is for *defaults only*.
 
+## Writers that are recorded, not killed (reviews 49 and 52)
+
+A write that a FIM rule answers with a kill is still written: the file
+changes before the writer is killed. For the writers below, the kill only
+broke legitimate work, so the rule records the write instead.
+
+| Writer | Rules | Recorded as |
+|---|---|---|
+| The package manager: `dpkg`, `rpm`, `apt`, `dnf`, `yum`, `snapd`, `packagekitd` and their children (kernel-resolved lineage) | system binaries, setuid binaries, kernel and PAM modules, sensitive configs, cron drop-ins, units, timers | Log, Low |
+| An interactive administrator session: `sudo` or `su` in the lineage, a login uid and a terminal | sensitive configs (NN-L-FIM-003), cron drop-ins (-007), units (-009), timers (-023) | Log, at the rule's severity |
+
+Everything else keeps the rule's response. That includes:
+
+- a service;
+- a cron job;
+- a command run without a terminal (`ssh host 'sudo …'`, most automation);
+- a root process with no `sudo`/`su` above it;
+- `doas` and `pkexec`, which replace themselves with the command and so leave no trace in the lineage.
+
+The `ld.so.preload`, `authorized_keys`, bait and credential rules are never relaxed.
+
+An administrator session's configuration changes still raise the posture to ENGAGED and stay in the signed detection chain. They do not corroborate each other into COMBAT: editing `sshd_config` and then adding a unit is routine work. A signal of another kind in the same login session (an offensive tool, exfiltration, an exec from `/tmp`) still takes the next one to COMBAT.
+
+Whoever holds an administrator's session and sudo password is that administrator to these rules.
+
 ## What FIM does not protect against
 
 - **Host already compromised at install time** (TOFU window —
