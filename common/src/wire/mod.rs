@@ -877,6 +877,13 @@ pub struct FimEvent {
     /// pre-BUG-022 JSONL chains deserialisable.
     #[serde(default)]
     pub child_truncated: bool,
+    /// Tappa 10.9 step 1: an open found by the file-open sensor's
+    /// credential-name table (every home), not by the operator's watch
+    /// list. The FIM rules report it without killing until the owner
+    /// decides otherwise (design Q8): the owner's own tools (an editor,
+    /// an SDK such as boto3) open these files too.
+    #[serde(default)]
+    pub wide_coverage: bool,
 }
 
 /// Tappa 9 (C1) — typed inflation of [`FimDriftRaw::op`]. Wire
@@ -966,6 +973,7 @@ pub mod admin_protocol;
 pub mod admin_signed_payload;
 
 /// Tappa 10.9 step 0 — sensor-feasibility probe records.
+pub mod open_sensor;
 pub mod sensor_probe;
 
 /// Decode a fixed-size, possibly NUL-terminated byte buffer into a
@@ -1339,6 +1347,7 @@ mod tests {
             modifier_comm: "dpkg".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1400,6 +1409,7 @@ mod tests {
             modifier_comm: "ransomware_loop".to_string(),
             dest_path: Some("/home/u/documents/quarterly.docx.crypted".to_string()),
             child_truncated: false,
+            wide_coverage: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

@@ -101,6 +101,20 @@ struct Cli {
     #[arg(long = "sensor-feasibility", hide = true)]
     sensor_feasibility: bool,
 
+    /// File-open sensor (Tappa 10.9 step 1). `lsm` (default): the FIM
+    /// `file_open` observer classifies every open in the kernel and ships
+    /// only the ones a rule reads, counting write-opens for mass write.
+    /// `tracepoint`: the previous `sys_enter_openat` sensor, which ships
+    /// every open to userland; kept for one soak cycle as a fallback (also
+    /// `NN_FILE_OPEN_SENSOR=tracepoint` in a unit drop-in).
+    #[arg(
+        long = "file-open-sensor",
+        env = "NN_FILE_OPEN_SENSOR",
+        value_enum,
+        default_value_t = FileOpenSensor::Lsm
+    )]
+    file_open_sensor: FileOpenSensor,
+
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
     ade_model: Option<PathBuf>,
@@ -490,6 +504,104 @@ impl Cli {
             northnarrow_agent::posture::sibling_watchdog_exe(own.as_deref())
         })
     }
+}
+
+/// `--file-open-sensor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum FileOpenSensor {
+    Lsm,
+    Tracepoint,
+}
+
+/// Tappa 10.9 step 1: switch the file-open sensor to LSM `file_open`, once
+/// the FIM observer that hosts it is attached; otherwise (or on
+/// `--file-open-sensor tracepoint`) `sys_enter_openat` stays in charge.
+fn start_open_sensor(
+    sensor: &mut SensorMultiplexer,
+    mode: FileOpenSensor,
+    fim_attached: &[&str],
+    carveout: &[String],
+) {
+    use northnarrow_agent::sensors::open_sensor::{
+        pump, refresh, take_ringbuf, OpenSensorMaps, RuleInputs, RuleSet,
+    };
+    if mode == FileOpenSensor::Tracepoint {
+        info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
+        return;
+    }
+    if !fim_attached.contains(&northnarrow_agent::fim::attach::OPEN_SENSOR_PROGRAM) {
+        warn!(
+            "file-open sensor: its file_open observer is not attached — keeping sys_enter_openat"
+        );
+        return;
+    }
+    let rules = RuleSet::build(&RuleInputs::from_host(carveout));
+    let mut maps = match OpenSensorMaps::take(sensor.ebpf_mut()) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "file-open sensor: rule maps unavailable — keeping sys_enter_openat");
+            return;
+        }
+    };
+    if let Err(e) = maps.apply(&rules, None) {
+        warn!(error = %e, "file-open sensor: writing the rules failed — keeping sys_enter_openat");
+        return;
+    }
+    let ring = match take_ringbuf(sensor.ebpf_mut()) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "file-open sensor: ring unavailable — keeping sys_enter_openat");
+            return;
+        }
+    };
+    let handle = tokio::spawn(pump(ring, sensor.event_tx()));
+    sensor.register_pump_handle(handle);
+    if let Err(e) = maps.arm(true) {
+        warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
+        return;
+    }
+    northnarrow_agent::posture::triggers::set_kernel_mass_write(true);
+    // Armed: the old tracepoint (every openat to userland) goes. Its link
+    // is retired first, or the BPF self-defence would report its absence
+    // as tampering.
+    let detached = match sensor.ebpf_mut().program_mut("sys_enter_openat") {
+        Some(p) => match <&mut aya::programs::TracePoint>::try_from(p) {
+            Ok(tp) => {
+                if let Ok(info) = tp.info() {
+                    northnarrow_agent::anti_tamper::bpf_defense::retire_program_links(info.id());
+                }
+                tp.unload().is_ok()
+            }
+            Err(_) => false,
+        },
+        None => false,
+    };
+    info!(
+        inode_rules = rules.inodes.len(),
+        child_rules = rules.children.len(),
+        name_rules = rules.names.len(),
+        runtime_dirs = rules.runtime.len(),
+        skipped = ?rules.skipped,
+        sys_enter_openat_detached = detached,
+        "file-open sensor armed on LSM file_open (Tappa 10.9 step 1)"
+    );
+    // New homes, runtime directories (logins) and paths created since:
+    // re-registered every minute.
+    let carveout = carveout.to_vec();
+    let refresher = tokio::spawn(async move {
+        let mut current = rules;
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            match refresh(&mut maps, &current, &carveout) {
+                Ok(Some(next)) => current = next,
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "file-open sensor: rule refresh failed"),
+            }
+        }
+    });
+    sensor.register_pump_handle(refresher);
 }
 
 #[tokio::main]
@@ -1226,6 +1338,17 @@ async fn main() -> Result<()> {
     };
 
     let exempt = ExemptPids::with_agent(std::process::id());
+    // Tappa 10.9 step 1: the file-open sensor applies the operator's
+    // mass-write carve-outs in the kernel (same signed overlay).
+    let open_sensor_carveout =
+        northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
+            &overlay_gate.effective(
+                OverlayKind::MassWriteCarveout,
+                std::path::Path::new(
+                    northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+                ),
+            ),
+        );
     let posture = if let Some(iso) = isolator.as_ref() {
         // T7.13 (Beta Step 5): the auth-lineage tracker shared with
         // the posture trigger detector. Reads /proc on cache miss;
@@ -1991,15 +2114,27 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+                let mut fim_attached: Vec<&'static str> = Vec::new();
                 if let Some(btf) = btf.as_ref() {
-                    if let Err(e) = attach_observe_programs(sensor.ebpf_mut(), btf) {
-                        warn!(
+                    match attach_observe_programs(
+                        sensor.ebpf_mut(),
+                        btf,
+                        cli.file_open_sensor == FileOpenSensor::Lsm,
+                    ) {
+                        Ok(a) => fim_attached = a,
+                        Err(e) => warn!(
                             error = %e,
                             "fim: attach_observe_programs returned error — \
                              observe hooks may be partial"
-                        );
+                        ),
                     }
                 }
+                start_open_sensor(
+                    &mut sensor,
+                    cli.file_open_sensor,
+                    &fim_attached,
+                    &open_sensor_carveout,
+                );
                 let inode_map = match populate_watched_paths(
                     sensor.ebpf_mut(),
                     &watched_paths_load.effective,
@@ -2824,6 +2959,19 @@ async fn process_event(
         } => {
             debug!(pid, comm = %comm, filename = %filename, "file open")
         }
+        Event::MassWrite {
+            pid,
+            comm,
+            count,
+            filename,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %comm,
+            count = *count,
+            last = %filename,
+            "mass write: write-open threshold crossed (counted in the kernel)"
+        ),
         Event::ExecCheck {
             filename,
             comm,

@@ -724,6 +724,7 @@ mod tests {
             modifier_comm: "exfil".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 
@@ -840,6 +841,7 @@ mod tests {
             modifier_comm: "x".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

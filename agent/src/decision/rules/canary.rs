@@ -361,6 +361,7 @@ mod tests {
             modifier_comm: "tester".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 

@@ -55,6 +55,7 @@ pub fn transform_to_escalate(
         }
         Event::ProcessSpawn { pid, filename, .. }
         | Event::FileOpen { pid, filename, .. }
+        | Event::MassWrite { pid, filename, .. }
         | Event::ExecCheck { pid, filename, .. } => (*pid, filename.clone()),
         Event::TcpConnect { pid, comm, .. } | Event::DnsQuery { pid, comm, .. } => {
             (*pid, comm.clone())

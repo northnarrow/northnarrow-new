@@ -67,6 +67,29 @@ struct OwnLinks {
 
 static OWN_LINKS: OnceLock<OwnLinks> = OnceLock::new();
 
+/// Links the agent detached on purpose (Tappa 10.9 step 1: the
+/// `sys_enter_openat` tracepoint once the LSM file-open sensor takes
+/// over). The self-check stops expecting them; any other missing link is
+/// still tampering.
+static RETIRED_LINKS: OnceLock<parking_lot::Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn retired_links() -> &'static parking_lot::Mutex<HashSet<u32>> {
+    RETIRED_LINKS.get_or_init(Default::default)
+}
+
+/// Retire every live link of program `prog_id` before the agent itself
+/// detaches it; the number of links retired.
+pub fn retire_program_links(prog_id: u32) -> usize {
+    let pin_root = OWN_LINKS.get().and_then(|o| o.pin_root.clone());
+    let ids: Vec<u32> = live_links(pin_root.as_deref())
+        .into_iter()
+        .filter(|(_, prog)| *prog == prog_id)
+        .map(|(id, _)| id)
+        .collect();
+    retired_links().lock().extend(ids.iter().copied());
+    ids.len()
+}
+
 /// `BPF_OBJ_GET` command number (uapi, stable).
 const BPF_OBJ_GET_CMD: libc::c_long = 7;
 
@@ -462,7 +485,8 @@ pub fn spawn_link_self_check(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>
                 .map(|(id, _)| id)
                 .collect();
             for id in &ids {
-                if live.contains(id) || !reported.insert(*id) {
+                if live.contains(id) || retired_links().lock().contains(id) || !reported.insert(*id)
+                {
                     continue;
                 }
                 error!(

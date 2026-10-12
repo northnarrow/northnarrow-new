@@ -407,7 +407,10 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
         }
         Event::ProcessSpawn { filename, comm, .. }
         | Event::ExecCheck { filename, comm, .. }
-        | Event::FileOpen { filename, comm, .. } => (filename.clone(), comm.clone(), String::new()),
+        | Event::FileOpen { filename, comm, .. }
+        | Event::MassWrite { filename, comm, .. } => {
+            (filename.clone(), comm.clone(), String::new())
+        }
         Event::TcpConnect { comm, .. } => (String::new(), comm.clone(), String::new()),
         Event::DnsQuery {
             comm, query_name, ..
@@ -459,7 +462,9 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
         Event::ProcessSpawn { filename, comm, .. } | Event::ExecCheck { filename, comm, .. } => {
             vec![filename.clone(), comm.clone()]
         }
-        Event::FileOpen { filename, comm, .. } => vec![comm.clone(), filename.clone()],
+        Event::FileOpen { filename, comm, .. } | Event::MassWrite { filename, comm, .. } => {
+            vec![comm.clone(), filename.clone()]
+        }
         Event::TcpConnect { comm, .. } => vec![comm.clone()],
         Event::DnsQuery {
             comm, query_name, ..

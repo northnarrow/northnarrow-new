@@ -172,6 +172,16 @@ pub(crate) fn format_event_line(event: &Event) -> String {
         } => format!(
             "- file_open pid={pid} uid={uid} comm={comm} flags={flags:#o} filename={filename}"
         ),
+        Event::MassWrite {
+            pid,
+            uid,
+            comm,
+            count,
+            filename,
+            ..
+        } => format!(
+            "- mass_write pid={pid} uid={uid} comm={comm} write_opens_in_60s={count} last={filename}"
+        ),
         Event::ExecCheck {
             pid,
             ppid,

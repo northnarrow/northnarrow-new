@@ -134,7 +134,7 @@ impl Sensor {
     pub fn from_event(event: &Event) -> Self {
         match event {
             Event::ProcessSpawn { .. } | Event::ExecCheck { .. } => Sensor::Exec,
-            Event::FileOpen { .. } | Event::Fim(_) => Sensor::File,
+            Event::FileOpen { .. } | Event::MassWrite { .. } | Event::Fim(_) => Sensor::File,
             Event::ModuleLoad { .. } => Sensor::ModuleLoad,
             Event::IoUring { .. } => Sensor::IoUring,
             Event::BpfSyscall { .. } => Sensor::AntiTamper,
@@ -237,6 +237,7 @@ impl Principal {
                 ppid: Some(*ppid),
             },
             Event::FileOpen { pid, uid, comm, .. }
+            | Event::MassWrite { pid, uid, comm, .. }
             | Event::TcpConnect { pid, uid, comm, .. }
             | Event::DnsQuery { pid, uid, comm, .. }
             | Event::FsProtectDenial { pid, uid, comm, .. } => Principal {
@@ -313,6 +314,7 @@ fn exe_from_event(event: &Event) -> Option<String> {
             Some(filename.clone())
         }
         Event::FileOpen { .. }
+        | Event::MassWrite { .. }
         | Event::ModuleLoad { .. }
         | Event::IoUring { .. }
         | Event::BpfSyscall { .. }

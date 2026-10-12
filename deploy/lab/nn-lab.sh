@@ -30,6 +30,7 @@
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
 #   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
 #   deploy/lab/nn-lab.sh btrfs-check      # review 55: a watched file on a btrfs subvolume is still detected
+#   deploy/lab/nn-lab.sh open-sensor-check # Tappa 10.9 step 1: the file-open sensor on LSM file_open, end to end
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
@@ -220,7 +221,12 @@ cmd_sync() {
     local kb_note="no target/kb — RAG gates will be skipped"
     ls "$REPO"/target/kb/*.jsonl >/dev/null 2>&1 && kb_note="target/kb included"
     log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included, $kb_note)"
-    rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
+    # Compare by content and let changed files take the guest's clock. With
+    # the host's mtimes preserved, a sync from another checkout or worktree
+    # can land sources older than the guest's last build: cargo's mtime
+    # fingerprint then keeps the stale crate and the build fails, or worse,
+    # links the old code.
+    rsync -az --checksum --no-times --delete -e "ssh ${SSH_OPTS[*]}" \
         --exclude='/fuzz/artifacts/' \
         --exclude='/fuzz/corpus/' \
         --exclude='/fuzz/target/' \
@@ -614,6 +620,16 @@ cmd_sensor_feasibility() {
     return "$rc"
 }
 
+cmd_open_sensor_check() {
+    # Tappa 10.9 step 1 (deploy/lab/open-sensor/open-sensor-check.sh): the
+    # sensor is armed and the old tracepoint retired, credential stores in
+    # a user's home are detected (also through io_uring), a mass write is
+    # one kernel-counted event, a cron write raises PersistenceMechanism,
+    # and the telemetry probe never goes silent. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/open-sensor/open-sensor-check.sh'
+}
+
 cmd_fim_reuse_check() {
     # Review 57 (deploy/lab/fim/inode-reuse-check.sh): a file dropped in a
     # watched directory and deleted gives its inode number back; a write to
@@ -636,7 +652,18 @@ cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
     vm_running || die "guest is not running"
-    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; cd ~/northnarrow && sudo bash deploy/lab/adversarial/anti-tamper.sh'
+    local rc=0
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; cd ~/northnarrow && sudo bash deploy/lab/adversarial/anti-tamper.sh' || rc=$?
+    # C19, C23 and C24 leave overlays in /etc/northnarrow, and C24's is
+    # signed: its `+backupd` exemption stayed in force, and the e2e
+    # fixtures' agents (another agent_id) logged it as an unauthorised
+    # overlay, which broke audit_verify_e2e's entry count. The agent
+    # protects an overlay once it has seen it, so remove them the operator
+    # way: purge the pins, delete, start the units again.
+    log "removing the overlays the run left in /etc/northnarrow"
+    lab_purge_pins >/dev/null
+    vssh 'sudo rm -f /etc/northnarrow/zz-tamper-*.local /etc/northnarrow/process-comm-allowlist.local /etc/northnarrow/process-comm-allowlist.local.sig; sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog' || rc=1
+    return "$rc"
 }
 
 cmd_ssh() {
@@ -1022,6 +1049,7 @@ case "${1:-help}" in
     release-check) shift; cmd_release_check "$@" ;;
     sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
     btrfs-check)   cmd_btrfs_check ;;
+    open-sensor-check) cmd_open_sensor_check ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;

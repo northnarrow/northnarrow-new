@@ -717,7 +717,21 @@ cambia l'ordine delle Tappe successive.
   (AlmaLinux 9 dopo il soak). Costo per apertura misurato su 6.8: un
   programma LSM vuoto aggiunge 147 ns (−4,6 %), quindi la soglia del 5 %
   non è raggiungibile in lab (nuova decisione Q7 per il founder); il
-  filtro completo costa 1,6 µs e va messo in cache per directory. Trovato
+  filtro completo costa 1,6 µs e va messo in cache per directory. Passo 1
+  (aperture file) fatto il 12 ottobre (lab PR 52) nell'osservatore FIM su
+  `file_open`: regole per inode, per (padre, nome) e per nome delle
+  credenziali, classe delle directory in cache (la risalita degli
+  antenati è una funzione BPF globale, verificata a parte: inline superava
+  il milione di istruzioni del verificatore 5.15), scritture contate nel
+  kernel (`Event::MassWrite`), `sys_enter_openat` staccato una volta
+  armato il sensore (interruttore `--file-open-sensor tracepoint` per un
+  ciclo di soak); rilievo 54 corretto (credenziali in ogni home segnalate
+  senza kill, nuova decisione Q8 per il founder); `nn-lab.sh
+  open-sensor-check` 8/8 e `tamper-check` OK su 6.8, 5.15 e 6.1. Misura su
+  6.8: perdita sulle aperture dal 31,9 % al 28,2 %, CPU dell'agente per
+  apertura da 6,4 µs a quasi zero; il dimezzamento proposto in Q7 non è
+  raggiunto, perché il resto viene dagli hook FIM di chiusura e di
+  scrittura (nuovo rilievo 59, decisione per il founder). Trovato
   e corretto il rilievo 55: su btrfs
   le chiavi `(dev, ino)` dello userland non corrispondevano a quelle del
   kernel, e FIM e protezione dei file non vedevano nulla (ora il kernel

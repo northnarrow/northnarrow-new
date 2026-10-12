@@ -25,6 +25,7 @@
 //!   pipeline syntax.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::posture_types::TriggerType;
@@ -81,7 +82,7 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///   processes legitimately write (lock files, dbus
 ///   sockets). Counted toward mass-write so a
 ///   compromised user session is still detectable.
-pub(super) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
+pub(crate) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
     &["/sys/", "/proc/", "/run/systemd/", "/run/log/journal/"];
 
 /// Returns true if `filename` is in a path class the mass-write arm of
@@ -95,6 +96,20 @@ fn is_mass_write_carveout(filename: &str, extras: &[String]) -> bool {
         .iter()
         .any(|p| filename.starts_with(p))
         || extras.iter().any(|p| filename.starts_with(p.as_str()))
+}
+
+/// Tappa 10.9 step 1: `true` once the file-open sensor on LSM `file_open`
+/// counts write-opens in the kernel and reports bursts as
+/// `Event::MassWrite`. Only the opens a rule reads reach userland then,
+/// so counting `FileOpen` events here would be wrong (and double): the
+/// mass-write arm reads `MassWrite` instead. `false` (tracepoint mode,
+/// the Q6 switch) keeps the userland count.
+static KERNEL_MASS_WRITE: AtomicBool = AtomicBool::new(false);
+
+/// Switch the mass-write arm between the kernel count (LSM file-open
+/// sensor armed) and the userland count (tracepoint mode).
+pub fn set_kernel_mass_write(on: bool) {
+    KERNEL_MASS_WRITE.store(on, Ordering::Relaxed);
 }
 
 /// Lateral movement: 3+ distinct internal hosts on admin ports in 10 min.
@@ -127,22 +142,26 @@ const ADMIN_PORTS: &[u16] = &[22, 3389, 445, 5985, 5986];
 /// suppressed by the SAME auth-lineage gate that protects `/etc/shadow`
 /// (see [`sensitive_file_access`]), so adding it here does NOT
 /// re-introduce the T7.13 FP for sudo/sshd/login/etc.
-const SENSITIVE_FILES: &[&str] = &[
+pub(crate) const SENSITIVE_FILES: &[&str] = &[
     "/etc/passwd",
     "/etc/shadow",
     "/etc/gshadow",
     "/etc/sudoers",
     "/etc/login.defs",
 ];
-const CRITICAL_FILES_PREFIXES: &[&str] = &[
+pub(crate) const CRITICAL_FILES_PREFIXES: &[&str] = &[
     "/etc/sshd_config",
     "/etc/ssh/sshd_config",
+    // Already matched by the prefix above; spelled out because the LSM
+    // file-open sensor (Tappa 10.9) classifies by directory, not by name
+    // prefix, and sshd reads its drop-ins from here.
+    "/etc/ssh/sshd_config.d/",
     "/etc/crontab",
     "/etc/sudoers.d/",
     "/etc/pam.d/",
     "/root/.ssh/",
 ];
-const PERSISTENCE_PREFIXES: &[&str] = &[
+pub(crate) const PERSISTENCE_PREFIXES: &[&str] = &[
     "/etc/cron.d/",
     "/etc/cron.hourly/",
     "/etc/cron.daily/",
@@ -390,6 +409,7 @@ pub fn event_owner_pid(event: &Event) -> Option<u32> {
     match event {
         Event::ProcessSpawn { pid, .. }
         | Event::FileOpen { pid, .. }
+        | Event::MassWrite { pid, .. }
         | Event::ExecCheck { pid, .. }
         | Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }
@@ -644,8 +664,44 @@ fn confirmed_intrusion(
             return true;
         }
     }
+    // Mass-write counted in the kernel (Tappa 10.9 step 1): one event per
+    // burst, carve-outs (pseudo-filesystems, /run/systemd, the journal,
+    // the operator's extras, the writer's own runtime dir) already
+    // applied; the lineage gates below stay here.
+    if let Event::MassWrite {
+        pid,
+        comm,
+        filename,
+        count,
+        timestamp_ns,
+        ..
+    } = focal
+    {
+        if auth.is_auth_mediated(*pid)
+            || auth.is_system_daemon_mediated(*pid)
+            || auth.is_npm_cli_writer(*pid)
+        {
+            return false;
+        }
+        if mass_write_warn_due(warned, *pid, *timestamp_ns) {
+            tracing::warn!(
+                trigger = "ConfirmedIntrusion_MassWrite",
+                focal_pid = *pid,
+                focal_comm = %comm,
+                focal_filename = %filename,
+                count_within_window = *count,
+                threshold = MASS_WRITE_MIN,
+                window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
+                "mass-write threshold crossed (kernel count) — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
+            );
+        }
+        return true;
+    }
     // Mass-write / encryption-pattern: many writes from same pid in
-    // a short window.
+    // a short window (tracepoint mode: every open reaches userland).
+    if KERNEL_MASS_WRITE.load(Ordering::Relaxed) {
+        return false;
+    }
     if let Event::FileOpen {
         pid: focal_pid,
         comm: focal_comm,

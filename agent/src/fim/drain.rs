@@ -814,6 +814,7 @@ pub fn process_drift(
                 modifier_comm: comm_to_string(&raw.modifier_comm),
                 dest_path: None,
                 child_truncated,
+                wide_coverage: false,
             });
             if tx.try_send(event).is_err() {
                 warn!(
@@ -946,6 +947,7 @@ pub fn process_drift(
             modifier_comm: comm_to_string(&raw.modifier_comm),
             dest_path,
             child_truncated,
+            wide_coverage: false,
         });
         if tx.try_send(event).is_err() {
             warn!(

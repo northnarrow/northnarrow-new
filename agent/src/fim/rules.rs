@@ -147,6 +147,14 @@ fn fim_verdict(
     severity: Severity,
     reasoning: &str,
 ) -> Verdict {
+    // Tappa 10.9 step 1: opens found by the file-open sensor's credential
+    // names (every home) are reported, not acted on, until the owner
+    // decides (design Q8) — the owner's own editor or SDK opens them too.
+    let action = if fe.wide_coverage {
+        ResponseAction::Log
+    } else {
+        action
+    };
     Verdict {
         rule_id: rule.id().to_string(),
         rule_name: rule.name().to_string(),
@@ -1887,6 +1895,7 @@ mod tests {
             modifier_comm: "attacker".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 
@@ -1915,6 +1924,7 @@ mod tests {
             modifier_comm: "rsyslogd".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 
@@ -1936,6 +1946,7 @@ mod tests {
             modifier_comm: "attacker".to_string(),
             dest_path: Some(dest.to_string()),
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 
@@ -2472,6 +2483,7 @@ mod tests {
             modifier_comm: "crontab".to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 
@@ -2929,6 +2941,7 @@ mod tests {
             modifier_comm: comm.to_string(),
             dest_path: None,
             child_truncated: false,
+            wide_coverage: false,
         })
     }
 
@@ -3754,5 +3767,29 @@ mod tests {
             .unwrap();
         assert_eq!(v.severity, Severity::High);
         assert_eq!(v.reasoning, "own reasoning");
+    }
+
+    /// Tappa 10.9 step 1 (design Q8): a credential-store open found by the
+    /// file-open sensor's name table (any home) is reported at the same
+    /// severity but never acted on; the same open of a watched file still
+    /// kills.
+    #[test]
+    fn wide_coverage_cred_read_is_reported_not_killed() {
+        let watched = fim_event_with_comm(FimOp::Opened, "/root/.aws/credentials", "cat");
+        let v = NnLFim011AwsCredsRead
+            .evaluate(&watched)
+            .expect("watched read fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        let mut wide =
+            fim_event_with_comm(FimOp::Opened, "/home/alice/.aws/credentials", "python3");
+        if let Event::Fim(fe) = &mut wide {
+            fe.wide_coverage = true;
+        }
+        let v = NnLFim011AwsCredsRead
+            .evaluate(&wide)
+            .expect("wide-coverage read fires");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.event_filename, "/home/alice/.aws/credentials");
     }
 }
