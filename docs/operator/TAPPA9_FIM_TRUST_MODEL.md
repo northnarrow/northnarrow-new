@@ -106,7 +106,7 @@ the v1 default list — no-op (check spelling)`). Common cause: the
 operator typo'd the path or is trying to disable an `+`-added
 path — the disable directive is for *defaults only*.
 
-## Writers that are recorded, not killed (reviews 49 and 52)
+## Writers that are recorded, not killed (reviews 49, 52 and 83)
 
 A write that a FIM rule answers with a kill is still written: the file
 changes before the writer is killed. For the writers below, the kill only
@@ -116,6 +116,7 @@ broke legitimate work, so the rule records the write instead.
 |---|---|---|
 | The package manager: `dpkg`, `rpm`, `apt`, `dnf`, `yum`, `snapd`, `packagekitd` and their children (kernel-resolved lineage) | system binaries, setuid binaries, kernel and PAM modules, sensitive configs, cron drop-ins, units, timers | Log, Low |
 | An interactive administrator session: `sudo` or `su` in the lineage, a login uid and a terminal | sensitive configs (NN-L-FIM-003), cron drop-ins (-007), units (-009), timers (-023) | Log, at the rule's severity |
+| An account tool (`passwd`, `useradd`, `usermod`, `chpasswd`, `systemd-sysusers`, libuser's `l*` tools…), told by its exe | `/etc/passwd` and `/etc/shadow` (NN-L-FIM-003), `/var/log/lastlog` (-018) | Log: Low when a user other than root ran it, else the rule's severity |
 
 Everything else keeps the rule's response. That includes:
 

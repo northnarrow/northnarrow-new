@@ -1266,6 +1266,47 @@ const LOGIN_RECORD_WRITERS: &[&str] = &[
     "lastlog2",
 ];
 
+/// Review 83: the account tools that write `/etc/passwd`, `/etc/shadow`
+/// and `/var/log/lastlog` by design (shadow-utils, libuser, systemd), by
+/// exe basename.
+const ACCOUNT_TOOLS: &[&str] = &[
+    "passwd",
+    "chsh",
+    "chfn",
+    "chage",
+    "gpasswd",
+    "expiry",
+    "useradd",
+    "usermod",
+    "userdel",
+    "groupadd",
+    "groupmod",
+    "groupdel",
+    "chpasswd",
+    "chgpasswd",
+    "newusers",
+    "pwconv",
+    "pwunconv",
+    "grpconv",
+    "grpunconv",
+    "vipw",
+    "vigr",
+    "pwck",
+    "grpck",
+    "systemd-sysusers",
+    "luseradd",
+    "lusermod",
+    "luserdel",
+    "lgroupadd",
+    "lgroupmod",
+    "lgroupdel",
+    "lpasswd",
+    "lchage",
+    "lchfn",
+    "lchsh",
+    "lnewusers",
+];
+
 /// NN-L-FIM-020: shell-history file fragments. The clear-history
 /// attack deletes or renames these (truncate-in-place is
 /// indistinguishable from a normal append at the rule layer without
@@ -2045,6 +2086,76 @@ fn is_own_client(id: &crate::posture::lineage::ExecIdentity, clients: &[&str]) -
     }
 }
 
+/// Review 83 — a write by an account tool is recorded, not killed.
+///
+/// `passwd`, `chsh`, `useradd`, `usermod`, `chpasswd`, `systemd-sysusers`
+/// and the rest of shadow-utils (and libuser's `l*` tools) write
+/// `/etc/passwd`, `/etc/shadow` and `/var/log/lastlog` by design. The
+/// write lands before the kill, so the kill never undid it: in the lab
+/// (2026-10-12) `useradd` killed by NN-L-FIM-018 for resetting the new
+/// uid's `lastlog` entry created no account on AlmaLinux 9, and killed by
+/// NN-L-FIM-003 after `/etc/passwd` left an account with no group and no
+/// home on Ubuntu 24.04. A user changing their own password with `passwd`
+/// was killed the same way.
+///
+/// The tool is told by what the kernel executed ([`is_own_client`] over
+/// [`ACCOUNT_TOOLS`]), never by `comm`. Its write is recorded: at Low
+/// when a user other than root ran it (a setuid tool changing that user's
+/// own entry), else at the rule's severity — a root process creating an
+/// account stays a detection worth reading.
+pub struct AccountTool {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker,
+}
+
+impl AccountTool {
+    pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker) -> Self {
+        Self { inner, lineage }
+    }
+}
+
+impl Rule for AccountTool {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        if verdict.action == ResponseAction::Log {
+            return Some(verdict);
+        }
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        let Some(id) = self.lineage.exec_identity(fe.modifier_pid) else {
+            return Some(verdict);
+        };
+        if !is_own_client(&id, ACCOUNT_TOOLS) {
+            return Some(verdict);
+        }
+        Some(Verdict {
+            action: ResponseAction::Log,
+            severity: if fe.modifier_uid == 0 {
+                verdict.severity
+            } else {
+                Severity::Low
+            },
+            reasoning: format!(
+                "{} [written by the account tool {}: recorded, not killed — killing it \
+                 mid-update leaves passwd, shadow and group inconsistent]",
+                verdict.reasoning,
+                id.exe.display()
+            ),
+            ..verdict
+        })
+    }
+}
+
 /// The FIM rule set with a live `/proc`-backed lineage tracker for the
 /// package-manager carve-out ([`PackageManaged`]). Production threads the
 /// agent's shared tracker through [`fim_rules_with_lineage`] instead, so
@@ -2058,7 +2169,8 @@ pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<d
 /// configs, cron drop-ins, systemd units and timers) are wrapped in
 /// [`PackageManaged`] over `lineage`, and the configuration and scheduling
 /// ones also in [`InteractiveAdmin`]. The credential and login-record rules
-/// are wrapped in [`OwnClient`]. Order and ids are unchanged.
+/// are wrapped in [`OwnClient`], and the account-file rules (NN-L-FIM-003,
+/// -018) in [`AccountTool`]. Order and ids are unchanged.
 pub fn fim_rules_with_lineage(
     installer_override: Arc<TrustedInstallerOverride>,
     lineage: AuthSessionTracker,
@@ -2068,6 +2180,9 @@ pub fn fim_rules_with_lineage(
     };
     let own = |rule: Box<dyn Rule>, clients: &'static [&'static str]| -> Box<dyn Rule> {
         Box::new(OwnClient::new(rule, clients, lineage.clone()))
+    };
+    let acct = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
+        Box::new(AccountTool::new(rule, lineage.clone()))
     };
     // Outside the package carve-out, so `sudo apt install` keeps its Log +
     // Low (an inner Log passes through unchanged).
@@ -2087,7 +2202,7 @@ pub fn fim_rules_with_lineage(
         pkg(Box::new(NnLFim002NewSuidBinary)),
         pkg(Box::new(NnLFim008KernelModuleModified)),
         // High next.
-        admin(Box::new(NnLFim003SensitiveConfigModified)),
+        admin(acct(Box::new(NnLFim003SensitiveConfigModified))),
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
         admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
@@ -2114,7 +2229,10 @@ pub fn fim_rules_with_lineage(
             PASSWORD_MANAGER_CLIENTS,
         ),
         own(Box::new(NnLFim017GpgKeyringAccessed), GPG_CLIENTS),
-        own(Box::new(NnLFim018LastlogTampered), LOGIN_RECORD_WRITERS),
+        own(
+            acct(Box::new(NnLFim018LastlogTampered)),
+            LOGIN_RECORD_WRITERS,
+        ),
         own(Box::new(NnLFim019WtmpBtmpTampered), LOGIN_RECORD_WRITERS),
         admin(Box::new(NnLFim023SystemdTimerCreated)),
         // Medium last.
@@ -4052,14 +4170,14 @@ mod tests {
         .unwrap();
     }
 
-    /// bash (700) → sudo (710) → useradd (720, terminal) | apt-get (730) →
+    /// bash (700) → sudo (710) → vim (720, terminal) | apt-get (730) →
     /// dpkg (740) | tee (750, no terminal); bash (500) → cp (600): a root
     /// shell with a terminal and a login uid but no elevation binary.
     fn admin_fixture() -> (tempfile::TempDir, AuthSessionTracker) {
         let (tmp, t) = pkg_fixture();
         t.ingest_spawn(700, 1, "/usr/bin/bash", 7);
         t.ingest_spawn(710, 700, "/usr/bin/sudo", 8);
-        t.ingest_spawn(720, 710, "/usr/sbin/useradd", 9);
+        t.ingest_spawn(720, 710, "/usr/bin/vim.basic", 9);
         t.ingest_spawn(730, 710, "/usr/bin/apt-get", 10);
         t.ingest_spawn(740, 730, "/usr/bin/dpkg", 11);
         t.ingest_spawn(750, 710, "/usr/bin/tee", 12);
@@ -4108,9 +4226,7 @@ mod tests {
             );
             let no_tty = rule.evaluate(&written_by(*op, path, 750, "tee")).unwrap();
             assert_ne!(no_tty.action, ResponseAction::Log, "{id}: no terminal");
-            let v = rule
-                .evaluate(&written_by(*op, path, 720, "useradd"))
-                .unwrap();
+            let v = rule.evaluate(&written_by(*op, path, 720, "vim")).unwrap();
             assert_eq!(v.action, ResponseAction::Log, "{id} on {path}");
             assert_eq!(v.severity, killed.severity, "{id} keeps its severity");
             assert!(
@@ -4382,6 +4498,60 @@ mod tests {
             "/usr/../tmp/aws",
         ] {
             assert!(!in_system_tree(p), "{p}");
+        }
+    }
+
+    // ── review 83 — account tools are recorded, not killed ────────────
+
+    #[test]
+    fn account_tools_are_recorded_not_killed() {
+        let (_tmp, lineage) = exec_fixture(&[
+            (300, "/usr/sbin/useradd", &["useradd", "-m", "nn3"]),
+            (301, "/usr/bin/passwd", &["passwd"]),
+            (302, "/usr/bin/systemd-sysusers", &["systemd-sysusers"]),
+            (303, "/tmp/useradd", &["/tmp/useradd"]),
+            (304, "/usr/bin/python3.12", &["python3", "-c", "x"]),
+        ]);
+        let rules = rules_by_id(&lineage);
+        let fim003 = &rules["NN-L-FIM-003_SensitiveConfigModified"];
+        let fim018 = &rules["NN-L-FIM-018_LastlogTampered"];
+        let by = |path: &str, pid: u32, uid: u32, comm: &str| {
+            let mut e = written_by(FimOp::Modified, path, pid, comm);
+            if let Event::Fim(fe) = &mut e {
+                fe.modifier_uid = uid;
+            }
+            e
+        };
+        // root's useradd: recorded at the rule's severity.
+        for (rule, path) in [(fim003, "/etc/passwd"), (fim018, "/var/log/lastlog")] {
+            let v = rule
+                .evaluate(&by(path, 300, 0, "useradd"))
+                .expect("records");
+            assert_eq!(v.action, ResponseAction::Log, "{path}");
+            assert_eq!(v.severity, Severity::High, "{path}");
+            assert!(
+                v.reasoning.contains("account tool /usr/sbin/useradd"),
+                "{}",
+                v.reasoning
+            );
+        }
+        // a user's own passwd: recorded at Low.
+        let v = fim003
+            .evaluate(&by("/etc/shadow", 301, 1000, "passwd"))
+            .unwrap();
+        assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
+        let v = fim003
+            .evaluate(&by("/etc/passwd", 302, 0, "systemd-sysusers"))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::Log);
+        // named like a tool, but not one: still acted on.
+        for (pid, comm) in [(303, "useradd"), (304, "passwd"), (399, "useradd")] {
+            let v = fim003.evaluate(&by("/etc/passwd", pid, 0, comm)).unwrap();
+            assert_ne!(v.action, ResponseAction::Log, "pid {pid}");
+            let v = fim018
+                .evaluate(&by("/var/log/lastlog", pid, 0, comm))
+                .unwrap();
+            assert_ne!(v.action, ResponseAction::Log, "pid {pid}");
         }
     }
 }

@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An account tool was killed after it wrote `/etc/passwd`, `/etc/shadow`
+  or `/var/log/lastlog` (review 83). On AlmaLinux 9 `useradd` was killed
+  for resetting the new uid's `lastlog` entry and created no account. On
+  Ubuntu `useradd` run without a terminal left an account with no group
+  and no home. A user changing their own password with `passwd` was
+  killed the same way. Writes by the account tools (shadow-utils,
+  libuser, `systemd-sysusers`), told by what the kernel executed, are now
+  recorded: at Low for a user's own change, else at the rule's severity.
 - A process could read cloud, browser, password-manager and GPG
   credentials, or write `wtmp`, `btmp` and `lastlog`, with no detection
   by giving itself a legitimate client's name (review 85, High):
