@@ -20,6 +20,9 @@ License:        Apache-2.0
 BuildArch:      noarch
 %global debug_package %{nil}
 %global __brp_check_rpaths %{nil}
+# The setuid probe is a copy of /bin/true (an ELF): RHEL 9's rpmbuild
+# refuses arch-dependent files in a noarch package unless told not to.
+%global _binaries_in_noarch_packages_terminate_build 0
 
 %description
 Harmless files in every persistence shape the FIM rules watch.
