@@ -120,6 +120,16 @@ pub fn quarantine_process_binary(
             };
         }
     };
+    quarantine_binary(&original, target_pid, cfg)
+}
+
+/// Review 87: encrypt the binary at `original` into the vault and remove
+/// it. `pid` is the process it backed, for the outcome. The combat
+/// ladder's NEUTRALIZE looks the binary up before it kills the process
+/// and quarantines it by path here: after the kill, `/proc/<pid>/exe` is
+/// gone.
+pub fn quarantine_binary(original: &Path, pid: u32, cfg: &ExecutorConfig) -> ExecutionOutcome {
+    let target_pid = pid;
     let original_str = original.to_string_lossy().into_owned();
 
     if cfg.dry_run {
@@ -134,7 +144,7 @@ pub fn quarantine_process_binary(
         };
     }
 
-    match quarantine_file(&original, cfg) {
+    match quarantine_file(original, cfg) {
         Ok(vault_id) => {
             info!(
                 pid = target_pid,
@@ -328,12 +338,18 @@ fn quarantine_file(original: &Path, cfg: &ExecutorConfig) -> Result<String, Quar
     // Update index.json atomically (tmp + fsync + rename).
     update_index(&cfg.quarantine_dir, &vault_id, &original_str, size)?;
 
-    // Remove the original. If unlink fails (e.g. EBUSY because the
-    // binary is mmaped by the running process), fall back to
-    // chmod 000 so it can't be re-executed by anyone non-root.
-    if let Err(e) = fs::remove_file(original) {
+    // Remove the original, through the host's view of it (review 87:
+    // the agent's own mounts are read-only, so a plain unlink failed with
+    // EROFS outside its state directories). If unlink fails (e.g. EBUSY
+    // because the binary is mmaped by the running process), fall back to
+    // chmod 000 so it can't be re-executed by anyone non-root. If both
+    // fail the binary is still there: that is a failure, never reported
+    // as a quarantine.
+    if let Err(e) = super::on_host_path(original, |p| fs::remove_file(p)) {
         warn!(error = %e, path = %original.display(), "remove original failed; chmod 000");
-        let _ = fs::set_permissions(original, fs::Permissions::from_mode(0o000));
+        super::on_host_path(original, |p| {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o000))
+        })?;
     }
 
     Ok(vault_id)

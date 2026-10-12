@@ -6,6 +6,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A file capability granted by any route other than the `setcap` program
+  (a direct `setxattr`, `cp --preserve=xattr`, `tar --xattrs`) drew no
+  verdict (review 86, High). In the lab a user read `/etc/shadow`
+  through a copy of `cat` given `cap_dac_read_search`. The agent now
+  watches `security.capability` on every file (LSM
+  `inode_post_setxattr`). The new rule NN-L-FIM-025 strips the capability
+  again, Critical for a root-equivalent one. Package-manager installs and
+  interactive admin sessions keep theirs. The unit's capability bounding
+  set gains `CAP_SETFCAP` for the strip.
+- The COMBAT ladder's NEUTRALIZE never quarantined the offender's binary
+  (review 87, High). It looked the binary up after the kill, when it was
+  already gone, and under the unit's read-only sandbox the unlink failed
+  while the outcome still claimed success. NEUTRALIZE now reads the
+  binary before the kill. File-changing responses reach the host's view
+  of the file through `/proc/1/root`, and a quarantine that leaves the
+  binary in place is reported as failed.
 - An account tool was killed after it wrote `/etc/passwd`, `/etc/shadow`
   or `/var/log/lastlog` (review 83). On AlmaLinux 9 `useradd` was killed
   for resetting the new uid's `lastlog` entry and created no account. On

@@ -1792,6 +1792,174 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
     }
 }
 
+// ── NN-L-FIM-025 — file capability granted (review 86) ────────────
+
+/// Capability names by bit (linux/capability.h).
+const CAP_NAMES: [&str; 41] = [
+    "cap_chown",
+    "cap_dac_override",
+    "cap_dac_read_search",
+    "cap_fowner",
+    "cap_fsetid",
+    "cap_kill",
+    "cap_setgid",
+    "cap_setuid",
+    "cap_setpcap",
+    "cap_linux_immutable",
+    "cap_net_bind_service",
+    "cap_net_broadcast",
+    "cap_net_admin",
+    "cap_net_raw",
+    "cap_ipc_lock",
+    "cap_ipc_owner",
+    "cap_sys_module",
+    "cap_sys_rawio",
+    "cap_sys_chroot",
+    "cap_sys_ptrace",
+    "cap_sys_pacct",
+    "cap_sys_admin",
+    "cap_sys_boot",
+    "cap_sys_nice",
+    "cap_sys_resource",
+    "cap_sys_time",
+    "cap_sys_tty_config",
+    "cap_mknod",
+    "cap_lease",
+    "cap_audit_write",
+    "cap_audit_control",
+    "cap_setfcap",
+    "cap_mac_override",
+    "cap_mac_admin",
+    "cap_syslog",
+    "cap_wake_alarm",
+    "cap_block_suspend",
+    "cap_audit_read",
+    "cap_perfmon",
+    "cap_bpf",
+    "cap_checkpoint_restore",
+];
+
+/// Capabilities that make a binary a root backdoor for whoever runs it:
+/// changing identity, bypassing file permissions, loading kernel code,
+/// tracing or administering the system, granting capabilities.
+const ROOT_EQUIVALENT_CAPS: u64 = (1 << 0)
+    | (1 << 1)
+    | (1 << 2)
+    | (1 << 3)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 16)
+    | (1 << 17)
+    | (1 << 19)
+    | (1 << 21)
+    | (1 << 31)
+    | (1 << 39);
+
+fn capability_names(permitted: u64) -> String {
+    (0..64)
+        .filter(|bit| permitted & (1u64 << bit) != 0)
+        .map(|bit| {
+            CAP_NAMES
+                .get(bit)
+                .map_or_else(|| format!("cap_{bit}"), |n| (*n).to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Review 86 — a file capability granted, by any route (`setcap`, a
+/// direct `setxattr`, `cp --preserve=xattr`, `tar --xattrs`). Whoever
+/// runs the file gains the permitted set: `cap_setuid` on a copy of
+/// python is a root shell for every user (T1548). The only rule before
+/// it, R012, matched the `setcap` program's `comm`; in the lab
+/// (2026-10-12, AlmaLinux 9) python granting `cap_dac_read_search` to a
+/// copy of `cat` drew no verdict, and a user then read `/etc/shadow`
+/// through it.
+///
+/// The grant is undone: [`ResponseAction::StripFileCapability`] removes
+/// the xattr. Critical when the set holds a root-equivalent capability,
+/// else High. A namespaced capability (inside a user namespace whose root
+/// is not the host's, e.g. a rootless container build) grants nothing on
+/// the host and is only recorded. The package manager installs files with
+/// capabilities (`newuidmap`, `ping`, `dumpcap`): recorded at Low through
+/// [`PackageManaged`]; an administrator's interactive sudo session through
+/// [`InteractiveAdmin`].
+pub struct NnLFim025FileCapabilityGranted {
+    /// While the operator's trusted-installer window is open, a grant is
+    /// recorded and kept: the planned way to add one from a script or a
+    /// configuration-management run.
+    installer_override: Arc<TrustedInstallerOverride>,
+}
+
+impl NnLFim025FileCapabilityGranted {
+    pub fn new(installer_override: Arc<TrustedInstallerOverride>) -> Self {
+        Self { installer_override }
+    }
+}
+
+impl Rule for NnLFim025FileCapabilityGranted {
+    fn id(&self) -> &'static str {
+        "NN-L-FIM-025_FileCapabilityGranted"
+    }
+    fn name(&self) -> &'static str {
+        "File capability granted"
+    }
+    fn category(&self) -> &'static str {
+        "fim_privilege_escalation"
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let fe = as_fim(event)?;
+        if fe.op != FimOp::CapabilitySet {
+            return None;
+        }
+        let cap = fe.capability?;
+        if cap.permitted == 0 {
+            return None;
+        }
+        let names = capability_names(cap.permitted);
+        let effective = if cap.effective { ", effective" } else { "" };
+        if cap.namespaced {
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::Log,
+                Severity::Medium,
+                &format!(
+                    "namespaced file capability granted ({names}{effective}): it applies \
+                     only inside its user namespace"
+                ),
+            ));
+        }
+        let severity = if cap.permitted & ROOT_EQUIVALENT_CAPS != 0 {
+            Severity::Critical
+        } else {
+            Severity::High
+        };
+        if self.installer_override.is_window_open() {
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::Log,
+                severity,
+                &format!(
+                    "file capability granted ({names}{effective}) while the trusted-installer \
+                     window is open: recorded, kept"
+                ),
+            ));
+        }
+        Some(fim_verdict(
+            self,
+            fe,
+            ResponseAction::StripFileCapability,
+            severity,
+            &format!(
+                "file capability granted ({names}{effective}): whoever runs the file gains \
+                 it (T1548)"
+            ),
+        ))
+    }
+}
+
 // ── public builder ─────────────────────────────────────────────────
 
 /// Build the FIM rules in evaluation order. The agent's
@@ -2206,9 +2374,9 @@ pub fn fim_rules_with_lineage(
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
         admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
-        admin(Box::new(NnLFim009SystemdUnitDropped::new(
-            installer_override,
-        ))),
+        admin(Box::new(NnLFim009SystemdUnitDropped::new(Arc::clone(
+            &installer_override,
+        )))),
         // C5.3 — cloud credential read family. Same High
         // tier as the rest of the credential-access bucket
         // (NN-L-FIM-003 sensitive config / NN-L-FIM-004
@@ -2235,6 +2403,10 @@ pub fn fim_rules_with_lineage(
         ),
         own(Box::new(NnLFim019WtmpBtmpTampered), LOGIN_RECORD_WRITERS),
         admin(Box::new(NnLFim023SystemdTimerCreated)),
+        // Review 86 — a file capability grant, undone.
+        admin(Box::new(NnLFim025FileCapabilityGranted::new(
+            installer_override,
+        ))),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
         Box::new(NnLFim020ShellHistoryCleared),
@@ -2266,6 +2438,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 
@@ -2297,6 +2470,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 
@@ -2321,6 +2495,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 
@@ -2861,6 +3036,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 
@@ -3321,6 +3497,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 
@@ -3478,12 +3655,13 @@ mod tests {
     }
 
     #[test]
-    fn fim_builder_has_twenty_four_rules_post_t9_5_1() {
+    fn fim_builder_has_twenty_five_rules() {
         // C5 shipped 9, C5.1 added 1, C5.3 added 4 → 14; Tappa 10.5
         // D3 adds NN-L-FIM-015..023 (9) → 23; Tappa 9.5.1 adds
-        // NN-L-FIM-024 (anti-tamper bait) → 24 total.
+        // NN-L-FIM-024 (anti-tamper bait) → 24; review 86 adds
+        // NN-L-FIM-025 (file capability granted) → 25.
         let n = fim_rules(TrustedInstallerOverride::inert_arc()).len();
-        assert_eq!(n, 24, "expected 24 FIM rules post-T9.5.1, got {n}");
+        assert_eq!(n, 25, "expected 25 FIM rules, got {n}");
     }
 
     // ── Tappa 9.5.1 — NN-L-FIM-024 anti-tamper bait ─────────────────
@@ -4553,5 +4731,106 @@ mod tests {
                 .unwrap();
             assert_ne!(v.action, ResponseAction::Log, "pid {pid}");
         }
+    }
+
+    // ── review 86 — file capability granted ───────────────────────────
+
+    fn cap_set(path: &str, pid: u32, permitted: u64, namespaced: bool) -> Event {
+        let mut e = written_by(FimOp::CapabilitySet, path, pid, "python3");
+        if let Event::Fim(fe) = &mut e {
+            fe.capability = Some(common::wire::FileCapability {
+                permitted,
+                effective: true,
+                namespaced,
+            });
+        }
+        e
+    }
+
+    #[test]
+    fn fim025_strips_a_granted_capability() {
+        let r = NnLFim025FileCapabilityGranted::new(TrustedInstallerOverride::inert_arc());
+        let v = r
+            .evaluate(&cap_set("/opt/lab48/catcap", 42, 1 << 2, false))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::StripFileCapability);
+        assert_eq!(
+            v.severity,
+            Severity::Critical,
+            "dac_read_search is root-equivalent"
+        );
+        assert_eq!(v.event_filename, "/opt/lab48/catcap");
+        assert!(
+            v.reasoning.contains("cap_dac_read_search, effective"),
+            "{}",
+            v.reasoning
+        );
+        let v = r
+            .evaluate(&cap_set("/usr/local/bin/node", 42, 1 << 10, false))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::StripFileCapability, Severity::High)
+        );
+        assert!(v.reasoning.contains("cap_net_bind_service"));
+        // namespaced: only recorded.
+        let v = r
+            .evaluate(&cap_set("/home/u/ping", 42, 1 << 13, true))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Medium)
+        );
+        // an empty set grants nothing; other ops are not this rule's.
+        assert!(r.evaluate(&cap_set("/opt/x", 42, 0, false)).is_none());
+        assert!(r.evaluate(&fim_event(FimOp::Modified, "/opt/x")).is_none());
+        assert_eq!(
+            capability_names((1 << 7) | (1 << 40) | (1 << 50)),
+            "cap_setuid,cap_checkpoint_restore,cap_50"
+        );
+    }
+
+    /// While the operator's trusted-installer window is open, a grant is
+    /// recorded and kept.
+    #[test]
+    fn fim025_keeps_a_grant_inside_the_trusted_installer_window() {
+        let v = NnLFim025FileCapabilityGranted::new(armed_override())
+            .evaluate(&cap_set("/opt/app/bin", 42, 1 << 10, false))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        assert!(
+            v.reasoning.contains("trusted-installer window"),
+            "{}",
+            v.reasoning
+        );
+    }
+
+    /// The package manager installs files with capabilities, and an
+    /// administrator may grant one from a terminal: both recorded, the
+    /// capability kept.
+    #[test]
+    fn fim025_package_manager_and_interactive_admin_keep_the_capability() {
+        let (_tmp, lineage) = admin_fixture();
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-025_FileCapabilityGranted"];
+        let v = r
+            .evaluate(&cap_set("/usr/bin/newuidmap", 200, 1 << 7, false))
+            .unwrap();
+        assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
+        let v = r
+            .evaluate(&cap_set("/usr/local/bin/node", 720, 1 << 10, false))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning.contains("interactive sudo/su session"),
+            "{}",
+            v.reasoning
+        );
+        // a root shell with no sudo: stripped.
+        let v = r.evaluate(&cap_set("/opt/x", 600, 1 << 7, false)).unwrap();
+        assert_eq!(v.action, ResponseAction::StripFileCapability);
     }
 }

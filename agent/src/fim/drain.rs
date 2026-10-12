@@ -237,6 +237,9 @@ impl DriftClassifier {
             // bucket can throttle them without losing High
             // tokens.
             FimOp::Modified | FimOp::Renamed => DriftSeverity::Medium,
+            // Review 86: a capability grant comes from the file-open
+            // sensor, never from the drift ring; never throttled.
+            FimOp::CapabilitySet => DriftSeverity::Critical,
             // C5.2: FimOp::Opened fires on every open of a
             // watched inode. Default to Medium so legitimate
             // periodic reads (cloud-CLI tools, monitoring
@@ -830,6 +833,7 @@ pub fn process_drift(
                 wide_coverage: false,
                 owner_uid: None,
                 reader_dac_capable: false,
+                capability: None,
             }));
             return Ok(true);
         }
@@ -970,6 +974,7 @@ pub fn process_drift(
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         }));
     }
     Ok(true)

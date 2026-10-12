@@ -364,6 +364,7 @@ mod tests {
             wide_coverage: false,
             owner_uid: None,
             reader_dac_capable: false,
+            capability: None,
         })
     }
 

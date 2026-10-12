@@ -3290,11 +3290,16 @@ async fn process_event(
         let exec = executor.clone();
         let action = verdict.action.clone();
         let target_pid = verdict.event_pid;
+        let target_file = verdict.event_filename.clone();
         // A Log verdict runs nothing: no blocking task for it.
         let report = if matches!(action, common::ResponseAction::Log) {
             exec.execute(action, target_pid)
         } else {
-            match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
+            match tokio::task::spawn_blocking(move || {
+                exec.execute_for(action, target_pid, &target_file)
+            })
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, "executor task join failed");

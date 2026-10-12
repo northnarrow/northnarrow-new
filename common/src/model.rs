@@ -858,6 +858,10 @@ pub enum ResponseAction {
     FullNetworkIsolation,
     Quarantine,
     ThrottleProcess,
+    /// Review 86: remove the `security.capability` xattr from the
+    /// verdict's file, undoing a capability grant. Acts on the file, not
+    /// on the process.
+    StripFileCapability,
 }
 
 /// Decision produced by the engine for a given event.

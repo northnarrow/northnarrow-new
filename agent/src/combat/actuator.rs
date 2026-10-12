@@ -124,6 +124,12 @@ impl CombatActuator for SystemActuator {
             };
         }
 
+        // Review 87: the binaries are looked up before the kill. After
+        // it `/proc/<pid>/exe` is gone, and the quarantine by pid that
+        // ran here found nothing every time (AlreadyGone).
+        let binaries: Vec<(u32, Option<std::path::PathBuf>)> =
+            offenders.iter().map(|&pid| (pid, binary_of(pid))).collect();
+
         // First pass: kill the offending tree(s). Any non-contained
         // primary outcome means the threat is uncontainable → isolate.
         for &pid in offenders {
@@ -146,8 +152,22 @@ impl CombatActuator for SystemActuator {
         // surviving parent / supervisor cannot re-exec them. A
         // quarantine failure does NOT force isolation — the process is
         // already dead — but it is logged.
-        for &pid in offenders {
-            let report = self.executor.execute(ResponseAction::Quarantine, pid);
+        let mut done: Vec<std::path::PathBuf> = Vec::new();
+        for (pid, binary) in binaries {
+            let Some(path) = binary else {
+                warn!(
+                    target: "combat.actuator",
+                    pid,
+                    "NEUTRALIZE: no binary on disk to quarantine (exited before NEUTRALIZE, or \
+                     deleted while running)"
+                );
+                continue;
+            };
+            if done.contains(&path) {
+                continue;
+            }
+            let report = self.executor.quarantine_path(&path, pid);
+            done.push(path);
             match report.primary {
                 ExecutionOutcome::Quarantined { .. }
                 | ExecutionOutcome::AlreadyGone { .. }
@@ -196,5 +216,64 @@ impl CombatActuator for SystemActuator {
 
     fn is_dry_run(&self) -> bool {
         self.detect_only
+    }
+}
+
+/// Review 87: the file a process runs, read before it is killed. `None`
+/// once it has exited, or when the binary was deleted while it ran (the
+/// kernel's ` (deleted)` suffix): nothing on disk to quarantine.
+fn binary_of(pid: u32) -> Option<std::path::PathBuf> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    (!exe.to_string_lossy().ends_with(" (deleted)")).then_some(exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::config::ExecutorConfig;
+
+    /// Review 87: NEUTRALIZE kills the offender, then quarantines the
+    /// binary it ran, looked up before the kill. The quarantine by pid
+    /// that ran after the kill found `/proc/<pid>/exe` gone every time.
+    #[test]
+    fn neutralize_quarantines_the_offenders_binary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mal = tmp.path().join("mal");
+        std::fs::copy("/bin/sleep", &mal).unwrap();
+        let mut child = std::process::Command::new(&mal).arg("60").spawn().unwrap();
+        let pid = child.id();
+        // the exec has replaced the image before NEUTRALIZE reads it
+        for _ in 0..100 {
+            if binary_of(pid).as_deref() == Some(mal.as_path()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // for_test is detect-only; this test enforces, on its own child,
+        // with every path under the temp dir.
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(&tmp.path().join("state"))
+        };
+        let vault = cfg.quarantine_dir.join("vault");
+        let actuator = SystemActuator::new(Executor::with_config(cfg), None, false);
+        let outcome = actuator.neutralize(&[pid]);
+        assert!(
+            matches!(outcome, NeutralizeOutcome::Contained),
+            "{outcome:?}"
+        );
+        let _ = child.wait();
+        assert!(!mal.exists(), "the offender's binary must be quarantined");
+        let bins = std::fs::read_dir(&vault)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "bin")
+            })
+            .count();
+        assert_eq!(bins, 1);
     }
 }
