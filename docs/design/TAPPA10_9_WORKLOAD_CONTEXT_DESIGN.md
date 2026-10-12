@@ -1,7 +1,7 @@
 # Tappa 10.9 — Workload context (cgroup, namespaces, container, unit) Design
 
-**Status:** Draft — for the owner's review. Nothing in the agent changes
-until it is accepted.
+**Status:** Accepted on 2026-10-12. The owner delegated the decisions; they
+are recorded in §8. Implementation follows §7, one PR per step.
 **Author:** Claude Code (architecture), 2026-10-12.
 **Scope:** the second item of Tappa 10.9 ("Contesto del carico di lavoro"):
 the cgroup, namespaces and, where present, container, pod and systemd unit
@@ -230,22 +230,37 @@ This needs Podman installed on the lab guests (Q6).
 | a process contained by `block_outbound` | its next detections keep the identity it had before |
 | cost (`bpf_stats` and `nn-lab.sh overhead`) | one helper call per record; no measurable change in the workloads |
 
-## 8. Decisions for the owner
+## 8. Decisions
+
+Accepted on 2026-10-12, as proposed. The owner delegated the choice
+("hai libertà di prendere decisioni"); the reasons are below each question.
 
 - **Q1 — Container runtime APIs.** None (proposed: the id and the pod uid
   come from the cgroup path), or read-only lookups of image and names over
   the runtime sockets, off by default.
+  **Decision: none for now.** The cgroup path gives the container id and the
+  pod uid without the agent talking to a root socket. Image and names stay
+  a later, opt-in step 3.
 - **Q2 — Allowlist format.** A new `identity-allowlist` kind (proposed),
   or a scope suffix on the existing comm lists (`+runc @unit=…`).
+  **Decision: the new kind.** It keeps the comm lists' meaning unchanged
+  while operators migrate, and it is the place for `exe=` keys, which also
+  replace the forgeable comm exemptions of NN-L-FIM-011..017.
 - **Q3 — Namespaces.** Read in userland once per cgroup (proposed), or
   also in the kernel at exec, for processes that exit before their first
   event is resolved. The kernel option needs four new offsets: `nsproxy`
   and the inode of three namespaces.
+  **Decision: userland, once per cgroup.** Revisit if step 1 shows many
+  identities left unresolved by short-lived processes.
 - **Q4 — cgroup v1 hosts.** Unsupported (proposed): the identity is
   "unknown" and rules fall back to comm and path. The alternative is
   parsing v1 controller paths.
+  **Decision: unsupported.** Every supported distribution runs the unified
+  hierarchy by default.
 - **Q5 — Where the id lives in events.** On every variant (proposed), or
   on the process events only, with a lookup by pid for the others; that
   lookup races with process exit.
+  **Decision: on every variant.** No race with process exit.
 - **Q6 — Lab.** Install Podman on the four guests (proposed); Docker
   where the distro packages it.
+  **Decision: Podman on the four guests**, Docker where packaged.
