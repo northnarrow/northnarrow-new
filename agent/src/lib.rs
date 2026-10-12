@@ -21,6 +21,7 @@ pub mod combat;
 pub mod config;
 pub mod correlation;
 pub mod decision;
+pub mod detection_budget;
 pub mod detection_store;
 pub mod fim;
 #[doc(hidden)]

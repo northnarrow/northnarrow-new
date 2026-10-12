@@ -76,7 +76,7 @@ use aya_ebpf::{
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
     },
     macros::{lsm, map},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
 };
 use northnarrow_common::wire::{
@@ -85,9 +85,11 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET,
-    INODE_I_SB_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET,
+    INODE_I_INO_OFFSET, INODE_I_SB_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET,
+    SUPER_BLOCK_S_DEV_OFFSET,
 };
+use crate::read_repeat::ReadSeenKey;
 
 // ── Maps ────────────────────────────────────────────────────────────
 
@@ -131,6 +133,14 @@ pub static WATCHED_PATHS: HashMap<InodeKey, u8> = HashMap::pinned(8192, 0);
 /// Keep it unpinned.
 #[map]
 pub static FS_FIM_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Review 75: the last `Opened` reported per (task, watched inode), for
+/// read-only opens ([`crate::read_repeat`]).
+#[map]
+pub static FIM_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
+
+/// `FMODE_WRITE` from `include/linux/fs.h`: the open can write.
+const FMODE_WRITE: u32 = 0x2;
 
 /// `MAY_WRITE` from `include/linux/fs.h` — the `mask` bit the
 /// `file_permission` LSM hook carries for a write access
@@ -669,7 +679,13 @@ unsafe fn try_fim_file_open(ctx: &LsmContext) -> i32 {
 pub(crate) unsafe fn observe_open_plain(file: *const u8) {
     if let Some(inode) = inode_from_file(file as *const c_void) {
         if let Some(key) = should_emit(inode) {
-            emit_drift(FIM_OP_OPENED, key);
+            // Review 75: a read-only repeat by the same task is dropped; an
+            // unreadable `f_mode` counts as a write and reports.
+            let mode = bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32)
+                .unwrap_or(FMODE_WRITE);
+            if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&FIM_READ_SEEN, &key) {
+                emit_drift(FIM_OP_OPENED, key);
+            }
         }
     }
 }

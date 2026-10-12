@@ -52,6 +52,7 @@ use crate::btf_offsets::{
     INODE_I_SB_OFFSET, PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
 };
+use crate::read_repeat::ReadSeenKey;
 
 const FMODE_WRITE: u32 = 0x2;
 /// `BTRFS_SUPER_MAGIC`, include/uapi/linux/magic.h.
@@ -104,6 +105,10 @@ pub static DIR_CLASS_GEN: Array<u32> = Array::with_max_entries(1, 0);
 /// Per-tgid write-open windows (mass write).
 #[map]
 static OPEN_WRITES: LruHashMap<u32, OpenWriteWindow> = LruHashMap::with_max_entries(4096, 0);
+/// Review 75: the last read-only report per (task, inode)
+/// ([`crate::read_repeat`]).
+#[map]
+static OPEN_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
 /// Names and the child-rule key are built here, never on the stack:
 /// [0..32) a name, [32..64) its parent's name, [64..112) a
 /// `ChildRuleKey` (5.15 rule 4).
@@ -495,18 +500,21 @@ pub unsafe fn on_open(file: *const u8) {
         dev: crate::inode_dev::stat_dev(inode, sb, s_dev) as u64,
         ino,
     };
+    let mode = win_u32(w, FILE_WIN, file, off!(FILE_F_MODE_OFFSET));
     let watched = crate::fim_watch::WATCHED_PATHS.get(&key).is_some();
     if watched {
         // The agent's own opens: neither FIM nor the sensor reports them.
         if crate::fim_watch::caller_is_in_family() {
             return;
         }
-        crate::fim_watch::emit_drift(FIM_OP_OPENED, key);
+        // Review 75: a read-only repeat by the same task is dropped.
+        if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&crate::fim_watch::FIM_READ_SEEN, &key) {
+            crate::fim_watch::emit_drift(FIM_OP_OPENED, key);
+        }
     }
     if !armed() {
         return;
     }
-    let mode = win_u32(w, FILE_WIN, file, off!(FILE_F_MODE_OFFSET));
     let dentry = win_u64(w, FILE_WIN, file, off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const u8;
     let flags = win_u32(w, FILE_WIN, file, off!(FILE_F_FLAGS_OFFSET));
     observe(&key, watched, watched, mode, flags, dentry);
@@ -612,6 +620,11 @@ unsafe fn observe(key: &InodeKey, watched: bool, family_checked: bool, mode: u32
         return;
     }
     if !family_checked && crate::fim_watch::caller_is_in_family() {
+        return;
+    }
+    // Review 75: a read-only repeat by the same task is dropped (the
+    // telemetry probe excepted: each of its opens is a check).
+    if !write && reason & open_reason::PROBE == 0 && crate::read_repeat::repeat(&OPEN_READ_SEEN, key) {
         return;
     }
     emit(reason, key, dentry, flags, mode, count);

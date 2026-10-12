@@ -40,6 +40,7 @@ use northnarrow_agent::anti_tamper::btf_revalidate::{
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::detection_budget::{self, Admit};
 use northnarrow_agent::net::blocklist::{
     Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
     DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
@@ -1804,6 +1805,8 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&overlay_gate)),
     );
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
+    // Review 75: detections held back by the per-rule budget, reported.
+    detection_budget::spawn_reporter(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.
@@ -3114,12 +3117,6 @@ async fn process_event(
             operation,
             ..
         } => {
-            warn!(
-                pid, uid, comm = %comm,
-                op = %operation,
-                target_dev, target_ino,
-                "ANTI-TAMPER DENIAL"
-            );
             // Short-circuit: a kernel deny is not something the
             // rule engine or ADE LLM should re-evaluate. The
             // posture trigger above is the response. The attempt itself
@@ -3127,23 +3124,41 @@ async fn process_event(
             // the kernel already refused it) — the adversarial check found
             // refused attempts that left no record in the chain logs.
             use northnarrow_agent::decision::Rule as _;
-            if let Some(verdict) =
-                northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial
-                    .evaluate(&event)
-            {
+            let verdict = northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial
+                .evaluate(&event);
+            // Review 75: a loop of denied attempts is logged and stored
+            // within the rule's budget for that uid.
+            let admit = match &verdict {
+                Some(v) => budget_admit(&v.rule_id, *uid),
+                None => Admit::Record {
+                    suppressed_before: 0,
+                },
+            };
+            if admit.record() {
                 warn!(
-                    rule = %verdict.rule_id,
-                    severity = ?verdict.severity,
-                    reasoning = %verdict.reasoning,
-                    "VERDICT (rule)"
+                    pid, uid, comm = %comm,
+                    op = %operation,
+                    target_dev, target_ino,
+                    "ANTI-TAMPER DENIAL"
                 );
-                if let Some(sink) = detection_sink {
-                    sink.record_rule(
-                        &event,
-                        &verdict,
-                        posture.current_kind(),
-                        "denied in kernel (anti-tamper LSM hook)".to_string(),
+            }
+            if let Some(verdict) = verdict {
+                if let Admit::Record { suppressed_before } = admit {
+                    warn!(
+                        rule = %verdict.rule_id,
+                        severity = ?verdict.severity,
+                        reasoning = %verdict.reasoning,
+                        "VERDICT (rule)"
                     );
+                    if let Some(sink) = detection_sink {
+                        sink.record_rule(
+                            &event,
+                            &verdict,
+                            posture.current_kind(),
+                            "denied in kernel (anti-tamper LSM hook)".to_string(),
+                            suppressed_before,
+                        );
+                    }
                 }
             }
             return;
@@ -3240,45 +3255,58 @@ async fn process_event(
     }
 
     if let Some(verdict) = engine.evaluate(&event) {
-        warn!(
-            rule = %verdict.rule_id,
-            rule_name = %verdict.rule_name,
-            category = %verdict.category,
-            action = ?verdict.action,
-            severity = ?verdict.severity,
-            target_pid = verdict.event_pid,
-            target_filename = %verdict.event_filename,
-            reasoning = %verdict.reasoning,
-            "VERDICT (rule)"
-        );
+        // Review 75: every verdict is acted on; its log lines and its
+        // record count against the rule's budget for the acting uid.
+        let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+        let admit = budget_admit(&verdict.rule_id, uid);
+        if admit.record() {
+            warn!(
+                rule = %verdict.rule_id,
+                rule_name = %verdict.rule_name,
+                category = %verdict.category,
+                action = ?verdict.action,
+                severity = ?verdict.severity,
+                target_pid = verdict.event_pid,
+                target_filename = %verdict.event_filename,
+                reasoning = %verdict.reasoning,
+                "VERDICT (rule)"
+            );
+        }
 
         let exec = executor.clone();
         let action = verdict.action.clone();
         let target_pid = verdict.event_pid;
-        let report =
+        // A Log verdict runs nothing: no blocking task for it.
+        let report = if matches!(action, common::ResponseAction::Log) {
+            exec.execute(action, target_pid)
+        } else {
             match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, "executor task join failed");
                     return;
                 }
-            };
+            }
+        };
 
-        info!(
-            action = ?report.action,
-            primary = ?report.primary,
-            additional_count = report.additional.len(),
-            elapsed_us = report.elapsed.as_micros() as u64,
-            "EXECUTED"
-        );
-        // Tappa 9.0.a: persist the rule detection (off the hot path).
-        if let Some(sink) = detection_sink {
-            sink.record_rule(
-                &event,
-                &verdict,
-                posture.current_kind(),
-                northnarrow_agent::detection_store::describe_response(&report),
+        if let Admit::Record { suppressed_before } = admit {
+            info!(
+                action = ?report.action,
+                primary = ?report.primary,
+                additional_count = report.additional.len(),
+                elapsed_us = report.elapsed.as_micros() as u64,
+                "EXECUTED"
             );
+            // Tappa 9.0.a: persist the rule detection (off the hot path).
+            if let Some(sink) = detection_sink {
+                sink.record_rule(
+                    &event,
+                    &verdict,
+                    posture.current_kind(),
+                    northnarrow_agent::detection_store::describe_response(&report),
+                    suppressed_before,
+                );
+            }
         }
         return;
     }
@@ -3342,7 +3370,16 @@ async fn process_event(
         // response runs. `Allow` is benign ⇒ not a detection.
         if let Some(sink) = detection_sink {
             if verdict.verdict != common::ade_types::AdeAction::Allow {
-                sink.record_ade(&event, &verdict, posture.current_kind(), "none".to_string());
+                let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+                if let Admit::Record { suppressed_before } = budget_admit("ADE", uid) {
+                    sink.record_ade(
+                        &event,
+                        &verdict,
+                        posture.current_kind(),
+                        "none".to_string(),
+                        suppressed_before,
+                    );
+                }
             }
         }
         return;
@@ -3370,13 +3407,34 @@ async fn process_event(
     );
     // Tappa 9.0.a: persist the ADE detection (a response ran ⇒ non-benign).
     if let Some(sink) = detection_sink {
-        sink.record_ade(
-            &event,
-            &verdict,
-            posture.current_kind(),
-            northnarrow_agent::detection_store::describe_response(&report),
+        let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+        if let Admit::Record { suppressed_before } = budget_admit("ADE", uid) {
+            sink.record_ade(
+                &event,
+                &verdict,
+                posture.current_kind(),
+                northnarrow_agent::detection_store::describe_response(&report),
+                suppressed_before,
+            );
+        }
+    }
+}
+
+/// [`detection_budget::admit`], plus one WARN when a (rule, uid) runs out
+/// of budget (review 75). The counts of what it held back reach the
+/// journal and the audit log through the budget's reporter task.
+fn budget_admit(rule: &str, uid: u32) -> Admit {
+    let admit = detection_budget::admit(rule, uid);
+    if admit == (Admit::Hold { first: true }) {
+        warn!(
+            rule,
+            uid,
+            burst = detection_budget::BURST,
+            "detections of this rule and uid exceed the record budget: further ones are acted on \
+             and counted, one per second is logged and stored, until the rate falls"
         );
     }
+    admit
 }
 
 /// Render a 16-byte address according to family (`2` = AF_INET → first
