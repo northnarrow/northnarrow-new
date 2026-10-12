@@ -28,6 +28,15 @@ jobs:
   package:
     name: package (x86_64-linux)
     runs-on: ubuntu-latest
+    env:
+      # Review 64: .cargo/config.toml builds with target-cpu=native, which
+      # made the release binaries need whatever the runner had. On a runner
+      # with AVX-512 the agent used AVX-512, so it died with SIGILL at start
+      # on a CPU without it (the lab guests; many servers). Releases target
+      # x86-64-v2, the baseline btf-matrix and kani already use. Only the
+      # x86_64 target: RUSTFLAGS would also replace the eBPF build's flags
+      # (debuginfo, --btf).
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v2"
     permissions:
       contents: write        # upload release assets on a tag
       id-token: write        # sign the provenance attestation (OIDC)

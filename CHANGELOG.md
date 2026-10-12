@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Release binaries could die with SIGILL at start (review 64, High). The
+  workspace builds with `target-cpu=native`, and the release workflow did
+  not override it, so a release built on a GitHub runner with AVX-512 used
+  AVX-512 and did not run on CPUs without it (the lab's guests, many
+  servers). Releases now target `x86-64-v2`.
 - The agent stopped starting after about 41 restarts in one uptime
   (review 63, High). Every boot added the inodes it protects to the
   pinned `PROTECTED_INODES` map (23 per restart on the lab, mostly the

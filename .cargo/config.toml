@@ -5,8 +5,11 @@ xtask = "run --quiet --package xtask --release --"
 # can emit FMA fused mul-adds, AVX-512 lanes when present, and any
 # other host-specific instructions candle's CPU kernels rely on for
 # memory-bound LLM decode. The flag inflates the binary's hardware
-# requirement to "the build host or newer" — for the agent that's a
-# feature, not a bug, because we only ship from the deployment host.
+# requirement to "the build host or newer": fine for a build on the host
+# that runs it, never for a binary shipped elsewhere. The release workflow
+# (.github/workflows/release.yml) therefore overrides it with x86-64-v2
+# (review 64: a runner with AVX-512 produced releases that died with
+# SIGILL on CPUs without it).
 #
 # `lld` would shave a few seconds off link time but is not available
 # on the production host (Hetzner CCX23, May 2026); leaving the
