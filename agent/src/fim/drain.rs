@@ -16,7 +16,9 @@
 //!    and diff against the BaselineDb's last entry for the
 //!    path.
 //! 5. If the SHA actually differs, the drift is REAL. Apply
-//!    the §6.5 hierarchical token-bucket rate-limiter, then:
+//!    the §6.5 hierarchical token-bucket rate-limiter to drift
+//!    written by a package manager (review 76: only there; any
+//!    other writer always reaches the rules), then:
 //!    - **Always** append a [`FimDriftEntry`] to
 //!      `/var/lib/northnarrow/fim_drift.jsonl` (evidence
 //!      preservation is non-negotiable — Q4 lock-in).
@@ -78,6 +80,8 @@ use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_TRUNCATED};
 use common::Event;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+use crate::posture::lineage::AuthSessionTracker;
 use tracing::{debug, info, warn};
 
 use crate::audit::AgentSigningKey;
@@ -258,6 +262,8 @@ fn is_user_writable_prefix(path: &str) -> bool {
 /// Hierarchical token-bucket per `DriftSeverity` tier. Critical
 /// is never throttled (per Q4 lock-in). High + Medium have
 /// independent buckets that refill linearly over a 60s window.
+/// [`process_drift`] spends them only on drift written by a package
+/// manager (review 76).
 ///
 /// Thread-safety: a single `Mutex` wraps the bucket state. The
 /// async drain loop holds the lock for microseconds per drift
@@ -675,12 +681,18 @@ fn forget_if_gone(
 ///    Equal → no real drift; skip silently (kernel hook fires
 ///    on every setattr including no-op touches).
 /// 4. Apply rate limiter → record `decision_engine_skipped` +
-///    `skip_reason` on the persisted entry.
+///    `skip_reason` on the persisted entry. Only drift whose writer
+///    descends from a package manager (`lineage`) is throttled: the
+///    buckets are host-wide, so a writer that could spend them could
+///    also skip the rules for its own next write (review 76). With no
+///    `lineage`, nothing is throttled.
 /// 5. Append to drift DB (always, evidence preservation).
-/// 6. Emit `Event::Fim` to `event_tx` ONLY if rate limiter
-///    allowed.
+/// 6. Push `Event::Fim` onto `outbox` ONLY if rate limiter
+///    allowed. The drain loop forwards the outbox to the engine
+///    with backpressure (review 75): a full event channel delays
+///    an event, it never drops it.
 ///
-/// Returns `Ok(true)` if an event was emitted to the bus,
+/// Returns `Ok(true)` if an event was emitted to the outbox,
 /// `Ok(false)` if processing completed without emission (path
 /// unknown, no drift, or rate-limited). Errors are propagated
 /// for the drain loop to log + continue.
@@ -693,7 +705,8 @@ pub fn process_drift(
     classifier: &DriftClassifier,
     rate_limiter: &DriftRateLimiter,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
-    event_tx: Option<&mpsc::Sender<Event>>,
+    lineage: Option<&AuthSessionTracker>,
+    outbox: Option<&mut Vec<Event>>,
 ) -> Result<bool> {
     let key = InodeKey {
         dev: raw.target_dev,
@@ -797,8 +810,8 @@ pub fn process_drift(
             "BUG-012 v2: forwarding FimOp::Opened on credential/canary path to rule engine \
              (silent — not recorded as drift)"
         );
-        if let Some(tx) = event_tx {
-            let event = Event::Fim(FimEvent {
+        if let Some(out) = outbox {
+            out.push(Event::Fim(FimEvent {
                 timestamp_ns: raw.timestamp_ns,
                 path: path.clone(),
                 op,
@@ -815,14 +828,7 @@ pub fn process_drift(
                 dest_path: None,
                 child_truncated,
                 wide_coverage: false,
-            });
-            if tx.try_send(event).is_err() {
-                warn!(
-                    target: "fim.drain",
-                    path = %path,
-                    "Event::Fim (cred-read) send to decision engine failed (channel full / closed)"
-                );
-            }
+            }));
             return Ok(true);
         }
         return Ok(false);
@@ -882,9 +888,21 @@ pub fn process_drift(
     }
 
     let severity = classifier.classify(op, &path);
-    let (skipped, skip_reason) = match rate_limiter.try_consume(severity) {
-        Ok(()) => (false, String::new()),
-        Err(reason) => (true, reason),
+    // Review 76: the §6.5 buckets are host-wide. Spent by anyone, they
+    // made the next writer's drift skip the rules: 60 throwaway files in
+    // /etc/cron.d, then a real drop-in, and NN-L-FIM-007 never ran. They
+    // now pace only the burst source they were sized for, a package
+    // transaction (whose writes the rules log, not kill, anyway); every
+    // other write reaches the rules. The journal and the detection store
+    // have their own per-rule budget (`detection_budget`).
+    let package_managed = lineage.is_some_and(|l| l.is_system_daemon_mediated(raw.modifier_pid));
+    let (skipped, skip_reason) = if package_managed {
+        match rate_limiter.try_consume(severity) {
+            Ok(()) => (false, String::new()),
+            Err(reason) => (true, reason),
+        }
+    } else {
+        (false, String::new())
     };
 
     let draft = FimDriftDraft {
@@ -912,7 +930,7 @@ pub fn process_drift(
         return Ok(false);
     }
 
-    if let Some(tx) = event_tx {
+    if let Some(out) = outbox {
         // Polish #3: resolve the rename dest path via InodePathMap.
         // Populated only when raw.dest_dev + raw.dest_ino are non-
         // zero (the kernel-side fim_rename_observe sets them when
@@ -929,7 +947,7 @@ pub fn process_drift(
         } else {
             None
         };
-        let event = Event::Fim(FimEvent {
+        out.push(Event::Fim(FimEvent {
             timestamp_ns: raw.timestamp_ns,
             path: path.clone(),
             op,
@@ -948,14 +966,7 @@ pub fn process_drift(
             dest_path,
             child_truncated,
             wide_coverage: false,
-        });
-        if tx.try_send(event).is_err() {
-            warn!(
-                target: "fim.drain",
-                path = %path,
-                "Event::Fim send to decision engine failed (channel full / closed)"
-            );
-        }
+        }));
     }
     Ok(true)
 }
@@ -1015,6 +1026,7 @@ pub async fn drain_loop(
     classifier: std::sync::Arc<DriftClassifier>,
     rate_limiter: std::sync::Arc<DriftRateLimiter>,
     watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
+    lineage: AuthSessionTracker,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     use tokio::io::unix::AsyncFd;
@@ -1024,6 +1036,11 @@ pub async fn drain_loop(
         baseline_cache_entries = baseline_cache.len(),
         "fim drain loop: ready"
     );
+    // Events for the engine, forwarded as soon as they are made, with
+    // backpressure. `try_send` dropped them when the channel was full, and a
+    // flood of events (an unprivileged loop of reads was enough) filled it:
+    // the FIM kill rules never saw a persistence write (review 75).
+    let mut outbox: Vec<Event> = Vec::new();
     loop {
         // Review 58: while children wait for their file to appear, wake up
         // every few milliseconds to retry them.
@@ -1040,6 +1057,7 @@ pub async fn drain_loop(
         };
         let inner = guard.get_inner_mut();
         let mut drained = 0u32;
+        let mut more = false;
         while let Some(item) = inner.next() {
             drained += 1;
             let bytes: &[u8] = item.as_ref();
@@ -1077,7 +1095,8 @@ pub async fn drain_loop(
                 classifier.as_ref(),
                 rate_limiter.as_ref(),
                 watched_paths.as_deref(),
-                Some(&event_tx),
+                Some(&lineage),
+                Some(&mut outbox),
             ) {
                 warn!(
                     target: "fim.drain",
@@ -1085,13 +1104,33 @@ pub async fn drain_loop(
                     "process_drift error — event dropped, drain continues"
                 );
             }
+            drop(db);
+            // Forward at once: under a flood of reads the ring never runs
+            // empty, and an event held for the end of the batch would wait
+            // for the flood to stop.
+            if !outbox.is_empty() || drained >= DRAIN_TURN {
+                more = true;
+                break;
+            }
         }
-        guard.clear_ready();
+        // Records still queued: stay ready so the next turn reads them at once.
+        if !more {
+            guard.clear_ready();
+        }
+        drop(guard);
+        for event in outbox.drain(..) {
+            if event_tx.send(event).await.is_err() {
+                warn!(target: "fim.drain", "event channel closed — Event::Fim not delivered");
+            }
+        }
         if drained == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 }
+
+/// Records read per drain turn at most before the loop yields.
+const DRAIN_TURN: u32 = 4096;
 
 fn decode_sha_hex(hex_str: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(hex_str).ok()?;
@@ -1183,7 +1222,7 @@ mod tests {
 
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, mut rx) = mpsc::channel(4);
+        let mut out: Vec<Event> = Vec::new();
         let emitted = process_drift(
             &raw,
             &path_map,
@@ -1192,12 +1231,13 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
 
         assert!(emitted, "a drop into a watched dir must emit");
-        let ev = match rx.try_recv().unwrap() {
+        let ev = match out.remove(0) {
             Event::Fim(fe) => fe,
             other => panic!("expected Event::Fim, got {other:?}"),
         };
@@ -1243,6 +1283,7 @@ mod tests {
             &mut drift_db,
             &DriftClassifier::new(),
             &DriftRateLimiter::new(),
+            None,
             None,
             None,
         )
@@ -1300,6 +1341,7 @@ mod tests {
                 &rate_limiter,
                 None,
                 None,
+                None,
             )
             .unwrap();
         }
@@ -1348,7 +1390,7 @@ mod tests {
 
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, mut rx) = mpsc::channel(4);
+        let mut out: Vec<Event> = Vec::new();
         let emitted = process_drift(
             &raw,
             &path_map,
@@ -1357,12 +1399,13 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
 
         assert!(emitted);
-        let ev = match rx.try_recv().unwrap() {
+        let ev = match out.remove(0) {
             Event::Fim(fe) => fe,
             other => panic!("expected Event::Fim, got {other:?}"),
         };
@@ -1645,7 +1688,7 @@ mod tests {
         let path_map = InodePathMap::new(); // empty
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, _rx) = mpsc::channel::<Event>(8);
+        let mut out: Vec<Event> = Vec::new();
         let raw = fake_raw(0x800002, 99, FimOp::Modified as u8);
         let emitted = process_drift(
             &raw,
@@ -1655,7 +1698,8 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
         assert!(!emitted, "unknown path → no event");
@@ -1704,7 +1748,7 @@ mod tests {
         );
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut out: Vec<Event> = Vec::new();
         let raw = fake_raw(
             watched_meta.dev(),
             watched_meta.ino(),
@@ -1718,11 +1762,12 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
         assert!(emitted, "real drift must emit Event::Fim");
-        match rx.try_recv().unwrap() {
+        match out.remove(0) {
             Event::Fim(fe) => {
                 assert_eq!(fe.path, watched.to_string_lossy());
                 assert_eq!(fe.op, FimOp::Modified);
@@ -1771,7 +1816,7 @@ mod tests {
 
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut out: Vec<Event> = Vec::new();
         let raw = fake_raw(
             watched_meta.dev(),
             watched_meta.ino(),
@@ -1785,11 +1830,12 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
         assert!(!emitted, "no-op drift (hash matches) must not emit");
-        assert!(rx.try_recv().is_err(), "no event must be sent");
+        assert!(out.is_empty(), "no event must be sent");
         // Drift log also empty — no point recording a no-op.
         assert!(!drift_path.exists() || std::fs::read_to_string(&drift_path).unwrap().is_empty());
     }
@@ -1825,12 +1871,16 @@ mod tests {
         let classifier = DriftClassifier::new();
         // Zero Medium tokens → first Modified drift suppressed.
         let rate_limiter = DriftRateLimiter::with_caps(50, 0);
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut out: Vec<Event> = Vec::new();
         let raw = fake_raw(
             watched_meta.dev(),
             watched_meta.ino(),
             FimOp::Modified as u8,
         );
+        // The writer descends from dpkg: the only drift the buckets pace
+        // (review 76).
+        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        lineage.ingest_spawn(raw.modifier_pid, 1, "/usr/bin/dpkg", 0);
         let emitted = process_drift(
             &raw,
             &path_map,
@@ -1839,17 +1889,80 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            Some(&lineage),
+            Some(&mut out),
         )
         .unwrap();
         assert!(!emitted, "throttled drift must NOT emit Event::Fim");
-        assert!(rx.try_recv().is_err(), "no event must be sent");
+        assert!(out.is_empty(), "no event must be sent");
         // BUT drift log MUST contain the row with skipped flag.
         let body = std::fs::read_to_string(&drift_path).unwrap();
         assert_eq!(body.lines().count(), 1);
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(row.decision_engine_skipped, "audit chain MUST record");
         assert_eq!(row.skip_reason, "rate_limit:tier_medium");
+    }
+
+    /// Review 76: spent buckets no longer let any other writer skip the
+    /// rules. Root wrote 60 throwaway files in /etc/cron.d, and the real
+    /// drop-in after them never reached NN-L-FIM-007.
+    #[test]
+    fn process_drift_never_throttles_a_writer_outside_the_package_manager() {
+        let dir = TempDir::new().unwrap();
+        let key = fresh_signing_key(&dir);
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            key,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("watched.bin");
+        std::fs::write(&watched, b"new content").unwrap();
+        let watched_meta = std::fs::metadata(&watched).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        path_map.insert(
+            InodeKey {
+                dev: watched_meta.dev(),
+                ino: watched_meta.ino(),
+            },
+            watched.to_string_lossy().to_string(),
+        );
+        let stale_baseline = dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
+        // Both buckets empty, as after a burst of throwaway writes.
+        let rate_limiter = DriftRateLimiter::with_caps(0, 0);
+        // The writer is a shell under sshd, not a package manager.
+        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        let mut raw = fake_raw(
+            watched_meta.dev(),
+            watched_meta.ino(),
+            FimOp::Modified as u8,
+        );
+        raw.modifier_comm = *b"sh\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        lineage.ingest_spawn(raw.modifier_pid, 4000, "/usr/bin/dash", 0);
+        lineage.ingest_spawn(4000, 1, "/usr/sbin/sshd", 0);
+        let mut out: Vec<Event> = Vec::new();
+        let emitted = process_drift(
+            &raw,
+            &path_map,
+            Some(&stale_baseline),
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &rate_limiter,
+            None,
+            Some(&lineage),
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(emitted, "the drift must reach the rules");
+        assert_eq!(out.len(), 1);
+        let body = std::fs::read_to_string(&drift_path).unwrap();
+        let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
+        assert!(!row.decision_engine_skipped);
+        assert!(row.skip_reason.is_empty());
     }
 
     // ─── BUG-012 (v2) — op-level FimOp::Opened handling ─────────────
@@ -1921,7 +2034,7 @@ mod tests {
             let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, path);
             let classifier = DriftClassifier::new();
             let rate_limiter = DriftRateLimiter::new();
-            let (tx, mut rx) = mpsc::channel::<Event>(8);
+            let mut out: Vec<Event> = Vec::new();
             let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
 
             let emitted = process_drift(
@@ -1932,13 +2045,14 @@ mod tests {
                 &classifier,
                 &rate_limiter,
                 None,
-                Some(&tx),
+                None,
+                Some(&mut out),
             )
             .unwrap();
 
             assert!(!emitted, "{path}: Opened must yield zero drift");
             assert!(
-                rx.try_recv().is_err(),
+                out.is_empty(),
                 "{path}: no Event::Fim → main.rs logs no 'FIM DRIFT' WARN"
             );
             assert!(
@@ -1976,7 +2090,7 @@ mod tests {
         let (_on_disk, key_ino, path_map) = make_watched_alias(&dir, "/root/.aws/credentials");
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut out: Vec<Event> = Vec::new();
         // fake_raw uses modifier_comm "dpkg" — NOT an AWS CLI, so the
         // NN-L-FIM-011 FP guard does not exempt it.
         let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Opened as u8);
@@ -1989,7 +2103,8 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
 
@@ -2000,9 +2115,8 @@ mod tests {
             "cred-path read MUST NOT append to fim_drift.jsonl (no 'FIM DRIFT' noise)"
         );
 
-        let ev = rx
-            .try_recv()
-            .expect("Event::Fim must be sent for cred-path read");
+        assert_eq!(out.len(), 1, "Event::Fim must be sent for cred-path read");
+        let ev = out.remove(0);
         let fe = match &ev {
             Event::Fim(fe) => {
                 assert_eq!(fe.path, "/root/.aws/credentials");
@@ -2042,7 +2156,7 @@ mod tests {
 
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut out: Vec<Event> = Vec::new();
         let stale_baseline = dummy_baseline("/etc/passwd", &"42".repeat(32));
         let raw = fake_raw(key_ino.dev, key_ino.ino, FimOp::Modified as u8);
 
@@ -2054,11 +2168,12 @@ mod tests {
             &classifier,
             &rate_limiter,
             None,
-            Some(&tx),
+            None,
+            Some(&mut out),
         )
         .unwrap();
         assert!(emitted, "Modified on /etc/passwd MUST still fire");
-        match rx.try_recv().unwrap() {
+        match out.remove(0) {
             Event::Fim(fe) => {
                 assert_eq!(fe.path, "/etc/passwd");
                 assert_eq!(fe.op, FimOp::Modified);

@@ -35,6 +35,44 @@ use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::lineage::AuthSessionTracker;
 
+/// The recent events the triggers scan, borrowed (review 72). The
+/// correlation buffer is a ring of up to 1,000 events; cloning it for every
+/// event made the agent spend most of its time allocating under an exec
+/// burst. The ring is two slices when it wraps, hence the pair.
+#[derive(Clone, Copy)]
+pub struct Recent<'a>(&'a [Event], &'a [Event]);
+
+impl<'a> Recent<'a> {
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = &'a Event> + Clone {
+        self.0.iter().chain(self.1.iter())
+    }
+}
+
+impl<'a> From<&'a [Event]> for Recent<'a> {
+    fn from(s: &'a [Event]) -> Self {
+        Recent(s, &[])
+    }
+}
+
+impl<'a, const N: usize> From<&'a [Event; N]> for Recent<'a> {
+    fn from(s: &'a [Event; N]) -> Self {
+        Recent(s, &[])
+    }
+}
+
+impl<'a> From<&'a Vec<Event>> for Recent<'a> {
+    fn from(v: &'a Vec<Event>) -> Self {
+        Recent(v, &[])
+    }
+}
+
+impl<'a> From<&'a std::collections::VecDeque<Event>> for Recent<'a> {
+    fn from(q: &'a std::collections::VecDeque<Event>) -> Self {
+        let (a, b) = q.as_slices();
+        Recent(a, b)
+    }
+}
+
 /// Recon window: 3+ distinct dst_port from same pid in 10 min.
 pub(super) const RECON_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
 pub(super) const RECON_DISTINCT_PORTS_MIN: usize = 3;
@@ -301,7 +339,8 @@ impl TriggerDetector {
         event_owner_pid(event).and_then(|pid| self.auth.loginuid_of(pid))
     }
 
-    pub fn detect(&self, event: &Event, recent: &[Event]) -> Vec<TriggerType> {
+    pub fn detect<'a>(&self, event: &Event, recent: impl Into<Recent<'a>>) -> Vec<TriggerType> {
+        let recent = recent.into();
         // T7.13: ingest ProcessSpawn into the auth-lineage tracker
         // FIRST, so the focal spawn's own lineage is visible to the
         // arms below (e.g. a spawn whose parent is sudo gets the
@@ -425,7 +464,7 @@ pub fn event_owner_pid(event: &Event) -> Option<u32> {
     }
 }
 
-fn recon_pattern(focal: &Event, recent: &[Event]) -> bool {
+fn recon_pattern(focal: &Event, recent: Recent<'_>) -> bool {
     if let Event::ProcessSpawn { comm, .. } = focal {
         if RECON_TOOL_COMMS.iter().any(|c| comm == c) {
             return true;
@@ -444,7 +483,7 @@ fn recon_pattern(focal: &Event, recent: &[Event]) -> bool {
         >= RECON_DISTINCT_PORTS_MIN
 }
 
-fn heavy_recon(focal: &Event, recent: &[Event]) -> bool {
+fn heavy_recon(focal: &Event, recent: Recent<'_>) -> bool {
     let Event::TcpConnect {
         pid: focal_pid,
         timestamp_ns: focal_ts,
@@ -460,11 +499,11 @@ fn heavy_recon(focal: &Event, recent: &[Event]) -> bool {
 fn distinct_dst_ports_in_window(
     pid: u32,
     focal_ts: u64,
-    recent: &[Event],
+    recent: Recent<'_>,
     window_ns: u64,
 ) -> usize {
     let mut ports: HashSet<u16> = HashSet::new();
-    for e in recent {
+    for e in recent.iter() {
         if let Event::TcpConnect {
             pid: p,
             dst_port,
@@ -480,7 +519,7 @@ fn distinct_dst_ports_in_window(
     ports.len()
 }
 
-fn suspicious_dns(focal: &Event, recent: &[Event]) -> bool {
+fn suspicious_dns(focal: &Event, recent: Recent<'_>) -> bool {
     let Event::DnsQuery {
         pid: focal_pid,
         query_name,
@@ -494,7 +533,7 @@ fn suspicious_dns(focal: &Event, recent: &[Event]) -> bool {
         return false;
     }
     let mut count = 1usize; // include focal
-    for e in recent {
+    for e in recent.iter() {
         if let Event::DnsQuery {
             pid,
             query_name: q,
@@ -606,7 +645,7 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     SENSITIVE_FILES.iter().any(|f| filename == f)
 }
 
-fn lolbas_pattern(focal: &Event, recent: &[Event]) -> bool {
+fn lolbas_pattern(focal: &Event, recent: Recent<'_>) -> bool {
     let Event::ProcessSpawn {
         comm: child_comm,
         ppid,
@@ -652,7 +691,7 @@ fn critical_file_modification(focal: &Event) -> bool {
 
 fn confirmed_intrusion(
     focal: &Event,
-    recent: &[Event],
+    recent: Recent<'_>,
     auth: &AuthSessionTracker,
     mass_write_extras: &[String],
     warned: &parking_lot::Mutex<HashMap<u32, u64>>,
@@ -789,7 +828,7 @@ fn confirmed_intrusion(
                 return false;
             }
             let mut count = 1usize;
-            for e in recent {
+            for e in recent.iter() {
                 if let Event::FileOpen {
                     pid,
                     filename,
@@ -896,7 +935,7 @@ fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
     true
 }
 
-fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList) -> bool {
+fn lateral_movement(focal: &Event, recent: Recent<'_>, allow: &EscalationAllowList) -> bool {
     let Event::TcpConnect {
         pid: focal_pid,
         comm: focal_comm,
@@ -929,7 +968,7 @@ fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList
     if counts(dst_addr, *family, *dst_port) {
         hosts.insert(*dst_addr);
     }
-    for e in recent {
+    for e in recent.iter() {
         if let Event::TcpConnect {
             pid,
             family: fam,
@@ -953,7 +992,7 @@ fn lateral_movement(focal: &Event, recent: &[Event], allow: &EscalationAllowList
     hosts.len() >= LATERAL_DISTINCT_DST_MIN
 }
 
-fn exfiltration_pattern(focal: &Event, recent: &[Event], allow: &EscalationAllowList) -> bool {
+fn exfiltration_pattern(focal: &Event, recent: Recent<'_>, allow: &EscalationAllowList) -> bool {
     let Event::TcpConnect {
         pid: focal_pid,
         comm: focal_comm,
@@ -986,7 +1025,7 @@ fn exfiltration_pattern(focal: &Event, recent: &[Event], allow: &EscalationAllow
         !allow.excludes(AllowTrigger::Exfil, focal_comm, dst, fam, port)
     };
     let mut count = usize::from(counts(dst_addr, *family, *dst_port));
-    for e in recent {
+    for e in recent.iter() {
         if let Event::TcpConnect {
             pid,
             family: fam,
@@ -1103,6 +1142,7 @@ pub(super) mod testutil {
             dns_server: [0u8; 16],
             family: 2,
             timestamp_ns: ts,
+            qname_partial: false,
         }
     }
 

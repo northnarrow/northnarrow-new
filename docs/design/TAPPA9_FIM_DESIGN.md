@@ -733,6 +733,15 @@ below: **Decision**, **Rationale**, **Implementation note**
 - **Reversibility:** medium — `decision_engine_skipped: true`
   schema field commits to disk; bucket parameters are
   runtime-tuneable. Schema additive from day one.
+- **Review 76 (2026-10-12):** the shipped buckets are per tier
+  and host-wide, not per rule, and a created file is High, a
+  modified one Medium. So they did open a suppression window: 60
+  throwaway files in `/etc/cron.d` made the next real drop-in skip
+  NN-L-FIM-007, and its writer was not killed. The buckets now pace
+  only drift whose writer descends from a package manager, the
+  upgrade noise they were sized for. Every other drift reaches the
+  rules. The journal and the detection store are bounded per
+  (rule, uid) by the detection budget (review 75).
 
 ### Q5 — Baseline-on-install vs first-boot
 

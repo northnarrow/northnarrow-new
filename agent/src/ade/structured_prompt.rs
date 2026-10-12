@@ -165,6 +165,7 @@ fn event_kind_label(e: &Event) -> &'static str {
         Event::ExecCheck { .. } => "exec_check",
         Event::TcpConnect { .. } => "tcp_connect",
         Event::DnsQuery { .. } => "dns_query",
+        Event::DnsFlood { .. } => "dns_flood",
         Event::FsProtectDenial { .. } => "fs_protect_denial",
         // Tappa 9 (C4): FIM event label. Doesn't appear in the
         // ADE structured prompt in V1.0.
@@ -192,6 +193,7 @@ fn push_pid_uid(buf: &mut String, e: &Event) {
         | Event::ExecCheck { pid, uid, .. }
         | Event::TcpConnect { pid, uid, .. }
         | Event::DnsQuery { pid, uid, .. }
+        | Event::DnsFlood { pid, uid, .. }
         | Event::FsProtectDenial { pid, uid, .. } => (*pid, *uid),
         // Tappa 9 (C4): FIM modifier triple.
         Event::Fim(fe) => (fe.modifier_pid, fe.modifier_uid),
@@ -349,6 +351,7 @@ mod tests {
             dns_server: [0u8; 16],
             family: 2,
             timestamp_ns: 0,
+            qname_partial: false,
         };
         let s = sanitize_event_for_ade(&dns);
         let p = build_structured_prompt(&fixture_system(), &fixture_config(), &s, &ctx());

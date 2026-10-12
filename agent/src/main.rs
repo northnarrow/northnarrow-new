@@ -40,6 +40,7 @@ use northnarrow_agent::anti_tamper::btf_revalidate::{
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::detection_budget::{self, Admit};
 use northnarrow_agent::net::blocklist::{
     Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
     DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
@@ -128,6 +129,21 @@ struct Cli {
         default_value_t = ExecSensor::Lsm
     )]
     exec_sensor: ExecSensor,
+
+    /// DNS sensor (Tappa 10.9 step 3). `skb` (default): kprobes on
+    /// `udp_send_skb` / `udp_v6_send_skb` read the query from the socket
+    /// buffer the kernel built — the name actually sent, IPv4 and IPv6
+    /// (reviews 66, 67). `sendmsg`: the previous `udp_sendmsg` kprobe, which
+    /// read user memory before the kernel's copy and saw IPv4 only; kept
+    /// for one soak cycle as a fallback (also `NN_DNS_SENSOR=sendmsg` in a
+    /// unit drop-in).
+    #[arg(
+        long = "dns-sensor",
+        env = "NN_DNS_SENSOR",
+        value_enum,
+        default_value_t = DnsSensor::Skb
+    )]
+    dns_sensor: DnsSensor,
 
     /// Override the GGUF model path used by ADE.
     #[arg(long = "ade-model", value_name = "PATH")]
@@ -534,6 +550,26 @@ enum ExecSensor {
     Tracepoint,
 }
 
+/// `--dns-sensor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DnsSensor {
+    Skb,
+    Sendmsg,
+}
+
+/// Review 69: the LSM file-open sensor could not be armed, so
+/// `sys_enter_openat` (attached, inert until now) starts emitting.
+fn open_tracepoint_fallback(sensor: &mut SensorMultiplexer) {
+    if let Err(e) =
+        northnarrow_agent::sensors::open_sensor::set_tracepoint_emitting(sensor.ebpf_mut(), true)
+    {
+        error!(
+            error = %e,
+            "file-open sensor: sys_enter_openat could not be turned on — file opens are NOT observed"
+        );
+    }
+}
+
 /// Tappa 10.9 step 1: switch the file-open sensor to LSM `file_open`, once
 /// the FIM observer that hosts it is attached; otherwise (or on
 /// `--file-open-sensor tracepoint`) `sys_enter_openat` stays in charge.
@@ -554,6 +590,7 @@ fn start_open_sensor(
         warn!(
             "file-open sensor: its file_open observer is not attached — keeping sys_enter_openat"
         );
+        open_tracepoint_fallback(sensor);
         return;
     }
     let rules = RuleSet::build(&RuleInputs::from_host(carveout));
@@ -561,17 +598,20 @@ fn start_open_sensor(
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "file-open sensor: rule maps unavailable — keeping sys_enter_openat");
+            open_tracepoint_fallback(sensor);
             return;
         }
     };
     if let Err(e) = maps.apply(&rules, None) {
         warn!(error = %e, "file-open sensor: writing the rules failed — keeping sys_enter_openat");
+        open_tracepoint_fallback(sensor);
         return;
     }
     let ring = match take_ringbuf(sensor.ebpf_mut()) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "file-open sensor: ring unavailable — keeping sys_enter_openat");
+            open_tracepoint_fallback(sensor);
             return;
         }
     };
@@ -579,6 +619,7 @@ fn start_open_sensor(
     sensor.register_pump_handle(handle);
     if let Err(e) = maps.arm(true) {
         warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
+        open_tracepoint_fallback(sensor);
         return;
     }
     northnarrow_agent::posture::triggers::set_kernel_mass_write(true);
@@ -968,6 +1009,13 @@ async fn main() -> Result<()> {
     };
     // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
     northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
+    // Review 69: `sys_enter_openat` emits from the start only in tracepoint
+    // mode; otherwise `start_open_sensor` decides.
+    northnarrow_agent::sensors::open_sensor::want_tracepoint(
+        cli.file_open_sensor == FileOpenSensor::Tracepoint,
+    );
+    // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
+    northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
     let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
@@ -1757,6 +1805,8 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&overlay_gate)),
     );
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
+    // Review 75: detections held back by the per-rule budget, reported.
+    detection_budget::spawn_reporter(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.
@@ -2260,6 +2310,8 @@ async fn main() -> Result<()> {
                             let inode_map_for_drain = Arc::clone(&inode_map);
                             let baseline_cache_for_drain = Arc::clone(&baseline_cache);
                             let watched_paths_for_drain = watched_paths_handle.clone();
+                            // Review 76: only package-manager drift is paced.
+                            let lineage_for_drain = lineage.clone();
                             let event_tx = sensor.event_tx();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = drain_loop(
@@ -2270,6 +2322,7 @@ async fn main() -> Result<()> {
                                     classifier,
                                     rate_limiter_clone,
                                     watched_paths_for_drain,
+                                    lineage_for_drain,
                                     event_tx,
                                 )
                                 .await
@@ -2316,7 +2369,11 @@ async fn main() -> Result<()> {
                     drift_log_path: cli.fim_drift_file.clone(),
                 }))
             }
-            None => None,
+            None => {
+                // Review 69: no FIM, so no LSM file-open sensor either.
+                open_tracepoint_fallback(&mut sensor);
+                None
+            }
         }
     };
 
@@ -2551,10 +2608,12 @@ async fn main() -> Result<()> {
             let event_tx = sensor.event_tx();
             let close_rb = net_bufs.close_rb;
             let listen_rb = net_bufs.listen_rb;
+            let udp_rb = net_bufs.udp_rb;
             let handle = tokio::spawn(async move {
                 if let Err(e) = drain_loop(
                     close_rb,
                     listen_rb,
+                    udp_rb,
                     flow_tracker_for_drain,
                     dns_cache_for_drain,
                     netflow_db,
@@ -2899,8 +2958,12 @@ async fn process_event(
     // correlation buffer — the trigger detector counts the focal as
     // a fresh +1 on top of `recent`, and `recent` already containing
     // the focal would double-count it.
-    let recent_for_posture = correlation.snapshot();
-    if let Some((new_state, firing_trigger)) = posture.observe(&event, &recent_for_posture) {
+    // Review 72: borrowed under the buffer's read lock, not cloned (up to
+    // 1,000 events, for every event, was most of the agent's CPU under an
+    // exec burst). Nothing pushes to the buffer until this returns.
+    if let Some((new_state, firing_trigger)) =
+        correlation.with_recent(|recent| posture.observe(&event, recent))
+    {
         // BUG-015 observability: include the firing TriggerType so
         // operators can see in the journal what caused a transition.
         // `firing_trigger` is `Some` for any upward crossing and `None`
@@ -2933,8 +2996,14 @@ async fn process_event(
     }
     correlation.push(event.clone());
 
+    // Review 71: per-event lines for the frequent events (every exec,
+    // every flow, every open) are DEBUG. At INFO, an exec burst made
+    // journald rate-limit the agent and drop its other lines (boot, sensor
+    // arming, verdict context), and every command line on the host, with
+    // any secret in its arguments, was copied into the journal. Exec and
+    // flow records live in the detection store and the signed netflow log.
     match &event {
-        Event::ProcessSpawn { .. } => info!(event = ?event, "process spawn detected"),
+        Event::ProcessSpawn { .. } => debug!(event = ?event, "process spawn detected"),
         Event::ModuleLoad {
             method,
             loader_pid,
@@ -3037,6 +3106,14 @@ async fn process_event(
                 "dns_query"
             )
         }
+        // Review 78: the rule (NN-L-NET-020) reports it.
+        Event::DnsFlood {
+            pid,
+            comm,
+            held,
+            uid_level,
+            ..
+        } => debug!(pid, comm = %comm, held, uid_level, "dns_flood"),
         // Tappa 7: kernel-side LSM hook denied a tamper attempt on
         // protected state. The posture machine observed the event
         // at the top of this function and will route it through the
@@ -3051,12 +3128,6 @@ async fn process_event(
             operation,
             ..
         } => {
-            warn!(
-                pid, uid, comm = %comm,
-                op = %operation,
-                target_dev, target_ino,
-                "ANTI-TAMPER DENIAL"
-            );
             // Short-circuit: a kernel deny is not something the
             // rule engine or ADE LLM should re-evaluate. The
             // posture trigger above is the response. The attempt itself
@@ -3064,23 +3135,41 @@ async fn process_event(
             // the kernel already refused it) — the adversarial check found
             // refused attempts that left no record in the chain logs.
             use northnarrow_agent::decision::Rule as _;
-            if let Some(verdict) =
-                northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial
-                    .evaluate(&event)
-            {
+            let verdict = northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial
+                .evaluate(&event);
+            // Review 75: a loop of denied attempts is logged and stored
+            // within the rule's budget for that uid.
+            let admit = match &verdict {
+                Some(v) => budget_admit(&v.rule_id, *uid, &event),
+                None => Admit::Record {
+                    suppressed_before: 0,
+                },
+            };
+            if admit.record() {
                 warn!(
-                    rule = %verdict.rule_id,
-                    severity = ?verdict.severity,
-                    reasoning = %verdict.reasoning,
-                    "VERDICT (rule)"
+                    pid, uid, comm = %comm,
+                    op = %operation,
+                    target_dev, target_ino,
+                    "ANTI-TAMPER DENIAL"
                 );
-                if let Some(sink) = detection_sink {
-                    sink.record_rule(
-                        &event,
-                        &verdict,
-                        posture.current_kind(),
-                        "denied in kernel (anti-tamper LSM hook)".to_string(),
+            }
+            if let Some(verdict) = verdict {
+                if let Admit::Record { suppressed_before } = admit {
+                    warn!(
+                        rule = %verdict.rule_id,
+                        severity = ?verdict.severity,
+                        reasoning = %verdict.reasoning,
+                        "VERDICT (rule)"
                     );
+                    if let Some(sink) = detection_sink {
+                        sink.record_rule(
+                            &event,
+                            &verdict,
+                            posture.current_kind(),
+                            "denied in kernel (anti-tamper LSM hook)".to_string(),
+                            suppressed_before,
+                        );
+                    }
                 }
             }
             return;
@@ -3109,7 +3198,10 @@ async fn process_event(
                     modifier_comm = %fe.modifier_comm,
                     "fim credential-path read forwarded to rule engine (not drift)"
                 );
-            } else {
+            } else if budget_admit("FIM-DRIFT", fe.modifier_uid, &event).record() {
+                // Review 76: every drift now reaches the rules; its journal
+                // line has the per-uid budget (the signed fim_drift.jsonl
+                // row is always written).
                 warn!(
                     path = %fe.path,
                     op = ?fe.op,
@@ -3155,7 +3247,7 @@ async fn process_event(
         // tracker + N2 listener kprobe feed these into the rule
         // engine below. Full drain wiring is a follow-up commit.
         Event::NetFlow(nf) => {
-            info!(
+            debug!(
                 pid = %nf.pid,
                 comm = %nf.comm,
                 dst_addr = %nf.dst_addr,
@@ -3177,45 +3269,58 @@ async fn process_event(
     }
 
     if let Some(verdict) = engine.evaluate(&event) {
-        warn!(
-            rule = %verdict.rule_id,
-            rule_name = %verdict.rule_name,
-            category = %verdict.category,
-            action = ?verdict.action,
-            severity = ?verdict.severity,
-            target_pid = verdict.event_pid,
-            target_filename = %verdict.event_filename,
-            reasoning = %verdict.reasoning,
-            "VERDICT (rule)"
-        );
+        // Review 75: every verdict is acted on; its log lines and its
+        // record count against the rule's budget for the acting uid.
+        let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+        let admit = budget_admit(&verdict.rule_id, uid, &event);
+        if admit.record() {
+            warn!(
+                rule = %verdict.rule_id,
+                rule_name = %verdict.rule_name,
+                category = %verdict.category,
+                action = ?verdict.action,
+                severity = ?verdict.severity,
+                target_pid = verdict.event_pid,
+                target_filename = %verdict.event_filename,
+                reasoning = %verdict.reasoning,
+                "VERDICT (rule)"
+            );
+        }
 
         let exec = executor.clone();
         let action = verdict.action.clone();
         let target_pid = verdict.event_pid;
-        let report =
+        // A Log verdict runs nothing: no blocking task for it.
+        let report = if matches!(action, common::ResponseAction::Log) {
+            exec.execute(action, target_pid)
+        } else {
             match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, "executor task join failed");
                     return;
                 }
-            };
+            }
+        };
 
-        info!(
-            action = ?report.action,
-            primary = ?report.primary,
-            additional_count = report.additional.len(),
-            elapsed_us = report.elapsed.as_micros() as u64,
-            "EXECUTED"
-        );
-        // Tappa 9.0.a: persist the rule detection (off the hot path).
-        if let Some(sink) = detection_sink {
-            sink.record_rule(
-                &event,
-                &verdict,
-                posture.current_kind(),
-                northnarrow_agent::detection_store::describe_response(&report),
+        if let Admit::Record { suppressed_before } = admit {
+            info!(
+                action = ?report.action,
+                primary = ?report.primary,
+                additional_count = report.additional.len(),
+                elapsed_us = report.elapsed.as_micros() as u64,
+                "EXECUTED"
             );
+            // Tappa 9.0.a: persist the rule detection (off the hot path).
+            if let Some(sink) = detection_sink {
+                sink.record_rule(
+                    &event,
+                    &verdict,
+                    posture.current_kind(),
+                    northnarrow_agent::detection_store::describe_response(&report),
+                    suppressed_before,
+                );
+            }
         }
         return;
     }
@@ -3279,7 +3384,16 @@ async fn process_event(
         // response runs. `Allow` is benign ⇒ not a detection.
         if let Some(sink) = detection_sink {
             if verdict.verdict != common::ade_types::AdeAction::Allow {
-                sink.record_ade(&event, &verdict, posture.current_kind(), "none".to_string());
+                let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+                if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
+                    sink.record_ade(
+                        &event,
+                        &verdict,
+                        posture.current_kind(),
+                        "none".to_string(),
+                        suppressed_before,
+                    );
+                }
             }
         }
         return;
@@ -3307,13 +3421,36 @@ async fn process_event(
     );
     // Tappa 9.0.a: persist the ADE detection (a response ran ⇒ non-benign).
     if let Some(sink) = detection_sink {
-        sink.record_ade(
-            &event,
-            &verdict,
-            posture.current_kind(),
-            northnarrow_agent::detection_store::describe_response(&report),
+        let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+        if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
+            sink.record_ade(
+                &event,
+                &verdict,
+                posture.current_kind(),
+                northnarrow_agent::detection_store::describe_response(&report),
+                suppressed_before,
+            );
+        }
+    }
+}
+
+/// [`detection_budget::admit`], plus one WARN when a (rule, uid) runs out
+/// of budget (review 75). The counts of what it held back reach the
+/// journal and the audit log through the budget's reporter task.
+fn budget_admit(rule: &str, uid: u32, event: &Event) -> Admit {
+    let admit = detection_budget::admit(rule, uid, || {
+        northnarrow_agent::detection_store::held_sample(event)
+    });
+    if admit == (Admit::Hold { first: true }) {
+        warn!(
+            rule,
+            uid,
+            burst = detection_budget::BURST,
+            "detections of this rule and uid exceed the record budget: further ones are acted on \
+             and counted, one per second is logged and stored, until the rate falls"
         );
     }
+    admit
 }
 
 /// Render a 16-byte address according to family (`2` = AF_INET → first

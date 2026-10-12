@@ -2,8 +2,9 @@
 
 **Status:** Accepted — merged on 2026-10-11 at the owner's request. The
 options §8 proposes are taken as decided unless the owner says otherwise;
-Q5 is restated after step 0 (§9), which refused `fexit` below 6.5. Step 0
-is done (§9); nothing in the agent changed yet.
+Q5 is restated after step 0 (§9), which refused `fexit` below 6.5, and
+revised in step 3 (§12). Done: step 0 (§9), step 1 — file opens (§10),
+step 2 — exec (§11). Step 3 — DNS is §12.
 **Author:** Claude Code (architecture), 2026-10-11.
 **Scope:** the first item of Tappa 10.9 ("Punto di aggancio dei sensori").
 The other 10.9 items (workload identity, runtime injection, persistence
@@ -227,7 +228,10 @@ New slots: `sk_buff.head`, `sk_buff.transport_header` (an offset from
 - The exec ring's comment promises "~880 events"; at 840-byte records the
   256 KiB ring holds about 309.
 - DNS over IPv6 is not captured (§3.3) — a coverage gap independent of
-  this design, fixed by §4.3.
+  this design, fixed by §4.3 (step 3: review 67). The N2 UDP flow sensor
+  has the same gap (review 68).
+- DNS over TCP (port 53) gives a flow but no query name, with either
+  sensor.
 - Default credential coverage stops at `/root` (§3.1, review 54).
 
 ## 6. What this prepares
@@ -286,6 +290,13 @@ suites, the telemetry probe, plus:
   socket buffer on all four kernels; the `udp_send_skb` kprobe stays the
   fallback (static functions: attached by name on the lab kernels, but a
   compiler is free to inline or rename them).
+  *Revised in step 3 (§12.1):* the return probe cannot tell a DNS query
+  from another datagram, because the UDP header, port included, is written
+  after `ip_make_skb` returns. It would also miss corked sends, and its
+  instance pool can drop calls. Step 3 therefore attaches the kprobe on
+  `udp_send_skb` / `udp_v6_send_skb`, and falls back to the old
+  `udp_sendmsg` program if that function cannot be attached. The owner can
+  reverse this.
 - **Q6 — Transition.** Old programs kept behind a switch for one soak
   cycle and then deleted (proposed), or a direct switch.
 - **Q7 — Overhead gate (added after step 0).** On the lab, an empty BPF
@@ -779,3 +790,177 @@ Implemented in lab PR 53:
 Found on the way: review 61 (above) and, from the gate runs, reviews 62
 and 63 (a restarted agent lost the kill/ptrace evidence and filled
 `PROTECTED_INODES`; fixed separately in lab PR 54).
+
+## 12. Step 3 — DNS: implementation design
+
+Step 0 read the query from the socket buffer on the three lab kernels it
+ran on, at both candidate attach points (§9). This section is the
+implementation plan. It revises Q5: the return probe Q5 proposed cannot
+tell a DNS query from any other datagram (§12.1).
+
+### 12.1 What the code survey found (reviews 66, 67)
+
+- **The name is read from user memory before the kernel copies it**
+  (`agent-ebpf/src/dns_query.rs`, kprobe at `udp_sendmsg` entry). Besides
+  the race of §1, this has three effects:
+  - a payload in a page the process has not touched yet (a file it has
+    just mapped) cannot be read from BPF, which may not fault. The record
+    has an empty name and NET-004/-005/-014 see nothing. The kernel's own
+    copy faults the page in, and the query leaves intact;
+  - the read stops at the first zero byte (`bpf_probe_read_user_str`). A
+    label may contain one, and the name is cut there;
+  - a query sent in two pieces (`MSG_MORE` or `UDP_CORK`) is read once per
+    `sendmsg`: a header with no name, then a name read 12 bytes too far.
+- **No IPv6.** `udpv6_sendmsg` is not attached, so a query to an IPv6
+  resolver gives no record at all (§3.3). An IPv4-mapped destination is not
+  affected: `udpv6_sendmsg` hands it to `udp_sendmsg`.
+- **Q5's return probe has no port to filter on.** When `ip_make_skb`
+  returns, the UDP header is still blank: `udp_send_skb` writes it
+  afterwards, from the flow (`fl4->fl4_dport`). The return probe no longer
+  has the flow argument, so it would need a second program at the
+  function's entry to keep it per task. Two more limits:
+  - corked sends never call `ip_make_skb`; `udp_push_pending_frames`
+    builds the buffer with `ip_finish_skb`;
+  - a return probe has a fixed pool of instances (`maxactive`: 10 on a
+    4-CPU host when created through perf), and a call that finds the pool
+    empty is not seen.
+- **The N2 UDP flow sensor has the same IPv6 gap** (`udp_sendmsg_outbound`
+  is attached to `udp_sendmsg` only). It is outside this step: review 68,
+  fixed separately in lab PR 58.
+
+### 12.2 One kprobe per family, where the buffer is sent
+
+`udp_send_skb(skb, fl4, cork)` and `udp_v6_send_skb(skb, fl6, cork)` are
+where both send paths meet: the uncorked one right after
+`ip_make_skb` / `ip6_make_skb`, the corked one after `ip_finish_skb` /
+`ip6_finish_skb`. At their entry:
+
+- the flow argument holds the destination the datagram will use, after any
+  `cgroup/sendmsg` BPF rewrite: `fl4->daddr` and `fl4->uli.ports.dport`,
+  or the same fields of `fl6`. A port other than 53 returns at once, after
+  one read per datagram;
+- the buffer holds the kernel's copy of the payload, which starts 8 bytes
+  after `skb->head + skb->transport_header`. The UDP header in between is
+  still blank, since this function fills it. The linear data ends at
+  `skb->head + skb->tail`.
+
+`dns_udp_send_skb` and `dns_udp_v6_send_skb` share one body. It copies
+up to 288 bytes from the start of the name (12 bytes into the payload, after
+the DNS header), in 32-byte reads that stop at the end of the linear data.
+That is enough for the longest legal name (255 bytes) and the type and
+class after it. Userland then walks the labels with the `QnameLabels`
+iterator that Kani checks, and reads the type after the root label. A zero
+byte inside a label no longer cuts the name.
+
+A name that does not end within the linear data is marked partial. Either
+the rest is in page fragments (a corked send, UDP GSO, zero copy), or the
+datagram is not a DNS query. Resolvers send a query in one piece. NET-004
+records a partial name (Log, High) for one soak cycle, without killing.
+Reading the fragments would need a page's address from BPF; it is left out.
+
+Both functions are `static`, so a compiler may inline or rename them. On
+the lab kernels both attach by their plain name (§9). Only the plain name
+is attached, because a renamed copy (`.isra.0`, `.constprop.0`) may take
+different arguments. If the IPv4 function cannot be attached, the agent
+falls back to the `udp_sendmsg` program. If only the IPv6 one cannot,
+IPv4 stays on the socket buffer and the log says IPv6 queries are not seen.
+
+### 12.3 Records and events
+
+- `DnsQueryRaw` keeps its fields. `query_name` grows from 253 to 288 bytes,
+  so the record grows from 312 to 344 bytes and the 256 KiB ring holds
+  about 760 records instead of 840.
+- The pad byte after `family` becomes `flags`:
+  - `SKB`: read from the socket buffer; `query_name` holds wire bytes;
+  - `NONLINEAR`: `skb->data_len != 0`.
+- `Event::DnsQuery` gains `qname_partial` (`#[serde(default)]`).
+- In `sendmsg` mode the record is the one of today: a string read, IPv4
+  only.
+
+### 12.4 Switch, attach, sizes
+
+- `--dns-sensor skb|sendmsg` (`NN_DNS_SENSOR`), default `skb`, for one
+  soak cycle (Q6). The programs are attached inside the multiplexer, so
+  the BPF link self-check covers them.
+- New offsets (optional slots): `sk_buff.head`, `.tail`,
+  `.transport_header`, `.data_len`; `flowi4.daddr`, `.uli`; `flowi6.daddr`,
+  `.uli`. If one is missing, the agent stays on `udp_sendmsg`.
+- `udp_sendmsg_outbound` (N2 flows) is unchanged.
+- The cost is one kprobe hit and one read per UDP datagram. A DNS query
+  adds about ten reads. Measured on 6.8 (§12.6): 176 ns per UDP datagram
+  against 256 ns for the `udp_sendmsg` program, and 919 ns per DNS query
+  against 904 ns.
+
+### 12.5 Verification
+
+`nn-lab.sh dns-sensor-check` sends queries for a name NET-004 kills on: a
+first label of 40 base64 characters. It runs these cases:
+
+- the programs are armed, and `udp_sendmsg` is retired without a
+  missing-link report;
+- connected `send()` to `127.0.0.1:53`: killed by NET-004;
+- unconnected `sendto()`: killed;
+- the same query to `[::1]:53`: killed; on main there is no record;
+- the payload in a page not faulted in yet: killed; on main the name is
+  empty;
+- a zero byte inside the first label: killed with the whole name; on main
+  the name is cut;
+- the query sent in two pieces (`MSG_MORE`): a NET-004 record for a
+  partial name;
+- `getent hosts` through the system resolver: no NET record;
+- the telemetry probe never goes silent.
+
+The §7 gate "a query whose payload changes after `sendmsg` entry" is
+covered by the page that is not faulted in. Both are a read of user memory
+at a different time from the kernel's copy, but the page case gives the
+same result on every run, while a second thread rewriting the buffer is a
+race the reproducer may lose. With `--dns-sensor sendmsg` the IPv6,
+page and zero-byte cases are expected to fail. The gates of §7 apply on the
+three lab kernels.
+
+### 12.6 Implementation status
+
+Implemented in lab PR 57:
+
+- **Kernel**, `agent-ebpf/src/dns_skb.rs`: `dns_udp_send_skb` and
+  `dns_udp_v6_send_skb`, one body; the record goes to the existing DNS
+  ring.
+- **Wire**: `DnsQueryRaw.flags` (`SKB`, `NONLINEAR`) and a 288-byte
+  `query_name`.
+- **Model**: `qname_wire_end` (with a Kani proof) and `qname_partial`.
+- **Userland**, `agent/src/sensors/dns_sensor.rs`: the switch and the
+  attach, with the fallbacks of §12.2.
+- **NET-004**: the partial-name verdict.
+- **New offset slots** (optional): `sk_buff.head`, `.tail`,
+  `.transport_header` and `.data_len`; `flowi4.daddr` and `.uli`;
+  `flowi6.daddr` and `.uli`.
+- **Lab**: `nn-lab.sh dns-sensor-check`, and the `udp` and `dns`
+  workloads of `nn-bench`.
+
+#### Measured
+
+The programs load and attach on 5.15, 6.1 and 6.8. `dns-sensor-check`
+gives 10/10 on all three. With `--dns-sensor sendmsg`, the four cases the
+old sensor misses (IPv6, the unfaulted page, the zero byte, the query in
+two pieces) go undetected on all three. Per case, on Ubuntu 24.04 (6.8):
+
+| | `skb` (default) | `sendmsg` (the old sensor) |
+|---|---|---|
+| armed, no missing-link report | yes | — |
+| connected `send()`, unconnected `sendto()` to `127.0.0.1:53` | killed | killed |
+| `[::1]:53` | killed | **no record** |
+| payload in a page not faulted in yet | killed | **no record** (empty name) |
+| a zero byte inside the first label | killed | **no record** (name cut) |
+| a query in two pieces (`MSG_MORE`) | NET-004 Log, partial name | no record |
+| `getent hosts` | no NET record | no NET record |
+
+BPF cost (`kernel.bpf_stats_enabled`, ns per run, 6.8):
+
+| | `skb` | `sendmsg` |
+|---|---|---|
+| a UDP datagram to another port (`nn-bench udp`) | 176 | 256 |
+| a DNS query (`nn-bench dns`) | 919 | 904 |
+
+The N2 flow program on `udp_sendmsg` costs 350–525 ns per datagram in
+both modes; it is unchanged.
+

@@ -32,6 +32,7 @@
 #   deploy/lab/nn-lab.sh btrfs-check      # review 55: a watched file on a btrfs subvolume is still detected
 #   deploy/lab/nn-lab.sh open-sensor-check # Tappa 10.9 step 1: the file-open sensor on LSM file_open, end to end
 #   deploy/lab/nn-lab.sh exec-sensor-check # Tappa 10.9 step 2: the exec sensor on LSM bprm_check_security (review 61)
+#   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
@@ -254,7 +255,11 @@ cmd_build() {
     # the guest has ~7 GiB, so default to thin here (NN_LAB_LTO=fat to
     # mirror production exactly on a bigger guest).
     local lto=${NN_LAB_LTO:-thin}
-    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
+    # NN_LAB_CARGO_ENV: extra variables for this build, e.g. a profiling
+    # build with symbols ('CARGO_PROFILE_RELEASE_STRIP=none
+    # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only'); perf can then name the
+    # agent's functions (the release profile strips them).
+    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 # Purge the pin root on the guest the way an operator must now do it (review
@@ -469,8 +474,9 @@ REMOTE
 cmd_overhead() {
     # Tappa 10.8 — overhead of the agent on the operations it hooks. Alternates
     # agent OFF (units stopped, pin root purged: no hook attached) and agent
-    # ON, ROUNDS times, runs deploy/lab/overhead/nn-bench.c on four workloads
-    # and reports the medians (plus the agent's own CPU time per workload).
+    # ON, ROUNDS times, runs deploy/lab/overhead/nn-bench.c on six workloads
+    # (udp and dns since Tappa 10.9 step 3) and reports the medians (plus the
+    # agent's own CPU time per workload).
     # Run it on an otherwise idle host: other guests' load is noise.
     vm_running || die "guest is not running"
     local rounds=${1:-3}
@@ -505,7 +511,7 @@ for line in open(raw):
 print(f"# Agent overhead — {distro} ({kernel})\n")
 print("| workload | agent off (ops/s) | agent on (ops/s) | overhead | agent CPU during the run |")
 print("|---|---|---|---|---|")
-for wl in ("open", "wopen", "exec", "connect"):
+for wl in ("open", "wopen", "exec", "connect", "udp", "dns"):
     if wl not in rows:
         continue
     off, on = statistics.median(rows[wl]["off"]), statistics.median(rows[wl]["on"])
@@ -648,6 +654,16 @@ cmd_exec_sensor_check() {
     # segments, a script, a memfd behind a symlink. Needs a sync + install.
     vm_running || die "guest is not running"
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/exec-sensor/exec-sensor-check.sh'
+}
+
+cmd_dns_sensor_check() {
+    # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
+    # sensor reads the kernel's copy of the query. NET-004 kills a sender
+    # over IPv4 and IPv6, with the payload in a page not faulted in yet or a
+    # zero byte inside a label, and records a query sent in pieces. Needs a
+    # sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/dns-sensor/dns-sensor-check.sh'
 }
 
 cmd_fim_reuse_check() {
@@ -1071,6 +1087,7 @@ case "${1:-help}" in
     btrfs-check)   cmd_btrfs_check ;;
     open-sensor-check) cmd_open_sensor_check ;;
     exec-sensor-check) cmd_exec_sensor_check ;;
+    dns-sensor-check) cmd_dns_sensor_check ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;

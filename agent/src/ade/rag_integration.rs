@@ -67,6 +67,7 @@ pub fn build_rag_query_from_event(event: &Event) -> String {
         Event::DnsQuery {
             comm, query_name, ..
         } => format!("dns query from {comm} to {query_name}"),
+        Event::DnsFlood { comm, held, .. } => format!("dns query flood from {comm}: {held} held"),
         Event::FsProtectDenial {
             comm, operation, ..
         } => format!("anti-tamper denial of {operation} by {comm}"),
@@ -286,6 +287,7 @@ mod tests {
             dns_server: [0u8; 16],
             family: 2,
             timestamp_ns: 0,
+            qname_partial: false,
         };
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("evil.example.org"));

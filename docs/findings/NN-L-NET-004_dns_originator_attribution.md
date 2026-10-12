@@ -31,6 +31,8 @@ agent/src/response/network_isolation.rs:113
 
 The sensor is a **kprobe on `udp_sendmsg` filtered to destination port 53**. It records the PID of **whoever calls `udp_sendmsg`**, i.e. the current task at the moment the datagram is sent:
 
+> **Update (Tappa 10.9 step 3, 2026-10-12).** The default sensor is now a kprobe on `udp_send_skb` / `udp_v6_send_skb` (`agent-ebpf/src/dns_skb.rs`). It runs in the same sending task, so the attribution below is unchanged, and it also sees IPv6 resolvers. It reads the name from the kernel's copy of the query rather than from user memory (reviews 66, 67). The `udp_sendmsg` program described here stays for one soak cycle behind `--dns-sensor sendmsg`.
+
 ```
 agent-ebpf/src/dns_query.rs:149-155
   let pid_tgid = bpf_get_current_pid_tgid();
@@ -152,7 +154,7 @@ Add the known-resolver **exes** to the kill-protection set (and/or downgrade -00
 6. **Correlation-window tuning.** The forwarder's upstream query and the originator's stub query are ~microseconds apart, far inside any window. But the cache TTL is 300 s with most-recent-wins, so a **stale** same-qname entry from an earlier unrelated PID is a theoretical mis-attribution source — hence the **tight ≤2 s** back-correlation window in step 4 rather than the full TTL.
 7. **TCP DNS / DoT / DoH are unobserved (pre-existing, not introduced here).** The kprobe only sees `udp_sendmsg`. A forwarder configured with `DNSOverTLS=yes` emits **no** upstream UDP/53 ⇒ no forwarder event (no FP) but the upstream leg is invisible; the originator's UDP/53 stub query (case B) is still seen. Large TCP responses (`TC` bit retried over TCP) and DoH-from-the-app are entirely outside this sensor.
 8. **IPv6 + full loopback range.** The loopback check must cover `127.0.0.0/8` (not just `.53`) and `::1`; some stubs also bind `::1`.
-9. **`extract_qname` only handles `ITER_UBUF`** (dns_query.rs:342) — `ITER_IOVEC` sendmsg leaves the qname empty (`qname_len=0`). Such events can't trip the content rules at all (a separate pre-existing coverage gap, orthogonal to attribution).
+9. **(`sendmsg` mode only since Tappa 10.9 step 3.) `extract_qname` only handles `ITER_UBUF`** (dns_query.rs:342) — `ITER_IOVEC` sendmsg leaves the qname empty (`qname_len=0`). Such events can't trip the content rules at all (a separate pre-existing coverage gap, orthogonal to attribution).
 
 ---
 

@@ -6,6 +6,113 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Sealed chain-log archives and their manifests could be altered by root
+  after an agent restart (review 81, High): only the active files were
+  protected again at start, and the manifest never was. The agent now
+  protects every retained archive and manifest at start and the manifest
+  at each rotation.
+- An evicted log archive left its inode protected until the next agent
+  start (review 80): when the filesystem reused the number for an
+  unrelated file, that file could not be written or removed and each try
+  was an anti-tamper detection. The agent now releases an archive's inode
+  before evicting it.
+- The TCP close sensor sent a record for every passive socket (listeners,
+  accepted peers) that the agent then dropped, so inbound connections
+  could fill the ring the outbound flow closes need; and a close lost to a
+  full ring left a stale entry that misattributed a later socket's close
+  (review 79, part). Only sockets the connect sensor recorded are reported
+  now. Still open: a loop of outbound connects can still overflow the flow
+  rings (design pending).
+- Detections held back by the per-rule budget (review 75) were reported
+  only as a count, so a flood of one rule could hide which file another
+  detection of that rule was about. The held report (journal and signed
+  audit entry) now names up to eight distinct subjects per rule and uid.
+- An unprivileged loop of DNS queries could hide a DNS tunnel (review 78,
+  High). The DNS sensor recorded every datagram into one ring: a loop of
+  benign queries lost half of the records and took more than a CPU of the
+  agent, and a tunnelling-shaped query in the middle evaded NN-L-NET-004
+  one time in three. The kernel now gives each process and each user a DNS
+  budget; queries over it are not recorded but counted on the process's
+  next record, and the new NN-L-NET-020 reports the process that floods.
+  The local resolvers are exempt.
+- A file detection did not say which file it was about (review 77). The
+  record of a cron drop-in named the writer but not the drop-in; records
+  carried a path only for exec detections. Detection records now have a
+  `file` field for the file sensors (FIM drift, file open, mass write,
+  module load).
+- Root could switch off the FIM kill rules for a minute at a time (review
+  76, High). The drift events handed to the rules were paced by host-wide
+  buckets (50 created and 100 modified files per minute, whoever wrote
+  them). After 60 throwaway files in `/etc/cron.d`, a real cron drop-in
+  was only logged: NN-L-FIM-007 never ran and its writer was not killed.
+  The buckets now pace only package-manager writes, the upgrade noise they
+  were meant for; every other write reaches the rules.
+- An unprivileged loop of reads disabled the FIM kill rules and erased
+  detection records (review 75, High). Every open of the user's own
+  credential file, or of a world-readable sensitive file such as
+  `/etc/passwd`, sent a record to a kernel ring and a verdict to the journal
+  and the detection store. Two `open()` loops lost 94 % of the open-sensor
+  ring and kept the agent's event channel full; the FIM drain then dropped
+  the drift events it could not queue, so a root process writing a cron
+  drop-in was not killed. journald suppressed 400k agent lines, and the
+  store's queue evicted the records of real kills. Now the kernel drops a
+  task's repeated reads of a file within one second, the FIM drain waits
+  for room instead of dropping, detections are logged and stored within a
+  per-rule, per-uid budget (every verdict is still acted on; the rest are
+  counted and reported), and a full queue evicts logged-only records first.
+- NN-L-NET-009 (more than 100 MiB sent) never fired for UDP (review 74,
+  High). The flow tracker emits one UDP row per kernel record, at most
+  about 1 MiB, so no row reached the threshold: 150 MB sent over UDP in
+  0.6 s went unflagged. NET-009 now sums the UDP rows of a (process,
+  destination) over 10 minutes.
+- An unprivileged UDP burst could erase every network flow record (review
+  73, High). A connected UDP socket emitted one record per `send()` into the
+  ring the TCP closes share. One process sending 146k datagrams/s lost 1.45
+  million records in 10 s, TCP flows included. UDP sends are now aggregated
+  in the kernel per destination: one record per second, or per MiB, carrying
+  the bytes sent. UDP records also have their own ring.
+- An unprivileged shell loop could blind the exec rules (review 72, High).
+  For every event, the agent cloned its ring of up to 1,000 recent events to
+  hand the posture triggers a slice. Under an exec burst (four `cat` loops,
+  about 2,000 execs/s) that was a full CPU on Ubuntu 24.04. On Ubuntu 22.04
+  and Debian 12 the exec rings overflowed, so the execs in the burst,
+  including a hidden payload, reached no rule. The triggers now read the
+  ring in place: the agent's CPU per exec drops from about 520 µs to 80 µs.
+- A credential theft could be reported only as a `/tmp` C2 connection
+  (review 70). CHAIN-007 (`/tmp` exec → credential read → egress) and
+  CHAIN-001 checked their precursors only when the egress arrived. A
+  credential read processed after the connect it preceded (it comes
+  through another ring) left both silent: CHAIN-002 killed the tree but
+  did not name the theft (lab, Ubuntu 22.04). A late read now completes
+  the chain with the egress it preceded.
+- The agent wrote every exec and every network flow to the journal at INFO
+  (review 71). On a busy host journald then rate-limited the agent, which
+  lost other lines too, and every command line on the host (with any
+  secret in its arguments) was copied into the journal. Both lines are now
+  DEBUG; the records stay in the detection store and the signed netflow
+  log.
+- An agent start could lose events in its first seconds (review 69). Until
+  the LSM file-open sensor took over, the `sys_enter_openat` tracepoint sent
+  every open of the host to the agent's event channel, which nothing reads
+  before the boot sequence ends. The channel filled, every sensor waited
+  behind it, and the file-open ring overflowed: up to 1,018 records lost on
+  the lab. The tracepoint now stays inert in the default mode until it is
+  needed (`--file-open-sensor tracepoint`, or as the fallback).
+- UDP datagrams to IPv6 destinations left no flow row (review 68, High).
+  The N2 UDP program was attached to `udp_sendmsg` only, so a QUIC-like
+  beacon or raw-UDP exfiltration over IPv6 was invisible to the flow
+  rules. It is now attached to `udpv6_sendmsg` too. An IPv4-mapped
+  destination still gives one row, not two.
+- DNS tunnelling could escape NET-004/-005/-014 (reviews 66, 67, High).
+  The DNS sensor read the query name from user memory before the kernel
+  copied it, and saw IPv4 only. On the lab, a tunnelling-shaped name ran
+  untouched when it was sent in any of these ways:
+  - to an IPv6 resolver (`[::1]:53`);
+  - from a page the process had not touched yet (the name read as empty);
+  - with a zero byte inside its first label (the name was cut there).
+  The sensor now reads the kernel's copy, IPv4 and IPv6, and all three are
+  killed. A query whose name does not end in the copy's linear data (sent
+  in pieces, with UDP GSO or zero copy) is recorded by NET-004 (Log).
 - The exec kill rules could be evaded with a relative path (review 61,
   High). They matched the string the caller passed to `execve`, so
   `cd /tmp && ./payload` ran with no detection while `/tmp/payload` was
@@ -163,6 +270,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- DNS sensor on the socket buffer (Tappa 10.9 step 3). Kprobes on
+  `udp_send_skb` and `udp_v6_send_skb` read the query from the buffer the
+  kernel sends: the destination from the flow, and the name from the
+  kernel's copy of the payload. Userland walks the labels, so a zero byte
+  inside a label no longer cuts the name. `udp_sendmsg` is no longer
+  attached for DNS; `--dns-sensor sendmsg` (or `NN_DNS_SENSOR`) keeps it
+  for one soak cycle. `DnsQuery` gains `qname_partial`. Eight optional BTF
+  slots (`sk_buff.{head,tail,transport_header,data_len}`,
+  `flowi4.{daddr,uli}`, `flowi6.{daddr,uli}`). `nn-lab.sh
+  dns-sensor-check` verifies it end to end.
 - Exec sensor on LSM `bprm_check_security` (Tappa 10.9 step 2). For each
   binfmt pass (a `#!` script: the script, then its interpreter) it reads
   the file the kernel opened. It records `(dev, ino)`, whether the file is

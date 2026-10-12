@@ -20,6 +20,7 @@
 mod btf_offsets;
 mod bpf_defense;
 mod dns_query;
+mod dns_skb;
 mod drops;
 mod exec_check;
 mod exec_lsm;
@@ -32,6 +33,7 @@ mod io_uring;
 mod module_load;
 mod open_sensor;
 mod ptrace_check;
+mod read_repeat;
 mod sensor_probe;
 mod task_kill;
 mod tcp_close;

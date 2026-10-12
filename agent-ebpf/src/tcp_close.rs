@@ -80,6 +80,22 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    // Review 79: only a socket the connect kprobe recorded has a flow to
+    // close. Every passive socket (listeners, accepted peers) and every
+    // connect that predates the agent missed FLOW_SOCK_MAP, and userland
+    // dropped those records ("not recorded"): sending them only let an
+    // inbound connection flood fill this ring and push out the closes of
+    // outbound flows, the ones the flow rules judge.
+    let corr: [u8; 16] = match FLOW_SOCK_MAP.get(&sk_key) {
+        Some(c) => *c,
+        None => return Ok(()),
+    };
+    // Forget the socket before anything can fail: an entry left behind by
+    // a full ring would be found again by the next socket the slab puts at
+    // this address (an accepted peer, typically), and its close would pass
+    // for an outbound flow's.
+    let _ = FLOW_SOCK_MAP.remove(&sk_key);
+
     // Reserve a slot before the field-read avalanche; if the
     // ringbuf is full we drop the event cheaply.
     let mut entry = match NET_FLOW_CLOSE_EVENTS.reserve::<NetFlowCloseRaw>(0) {
@@ -128,13 +144,6 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
-
-    // flow_id from FLOW_SOCK_MAP[sk_ptr]. LRU miss leaves zeros.
-    let corr_opt = FLOW_SOCK_MAP.get(&sk_key);
-    let corr: [u8; 16] = match corr_opt {
-        Some(c) => *c,
-        None => [0u8; 16],
-    };
 
     (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
     (*raw_ptr).bytes_sent = bytes_sent;
@@ -204,10 +213,6 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         *cdst.add(i) = *src.add(i);
         i += 1;
     }
-
-    // Drop the FLOW_SOCK_MAP entry on close so the LRU has room
-    // for the next flow on this sk slot. Best-effort; ignore err.
-    let _ = FLOW_SOCK_MAP.remove(&sk_key);
 
     entry.submit(0);
     Ok(())

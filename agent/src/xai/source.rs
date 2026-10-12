@@ -261,6 +261,7 @@ mod tests {
             dns_server: [9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             family: 2,
             timestamp_ns: 1,
+            qname_partial: false,
         }
     }
     fn fopen(file: &str) -> Event {

@@ -334,6 +334,17 @@ pub trait ProtectionManager: Send + Sync {
     /// Register a freshly-created active file's inode in
     /// `PROTECTED_INODES` so the LSM defends it like its predecessor.
     fn register_active(&self, path: &Path) -> Result<()>;
+
+    /// Drop an archive's inode from `PROTECTED_INODES` just before it is
+    /// evicted (review 80). Left there, the key outlived the file until the
+    /// next agent start, and the filesystem gives a freed inode number to
+    /// the next file it creates: an unrelated file, anyone's, that could no
+    /// longer be written, renamed or removed, each try an anti-tamper
+    /// denial (NN-L-AT-001, the strongest posture signal). Default: no
+    /// protection, nothing to drop.
+    fn release(&self, _path: &Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// No-op manager for unprotected logs and tests: the dir is plain-
@@ -619,16 +630,29 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
                 .with_context(|| format!("creating fresh active {}", active.display()))?;
             protection_inner.register_active(&active)?;
             // 4. Manifest + eviction — NON-FATAL (archive already committed).
-            let evicted = evict_excess_archives(&active, max_archives).unwrap_or_else(|e| {
+            let evicted = evict_excess_archives(&active, max_archives, protection_inner.as_ref())
+                .unwrap_or_else(|e| {
                 error!(error = %e, "chainlog: archive eviction failed post-rotate (committed; continuing)");
                 Vec::new()
             });
-            if let Err(e) = self.manifest_append(ManifestEvent::Rotated {
+            let rotated = self.manifest_append(ManifestEvent::Rotated {
                 seq,
                 terminator_hash: terminator_hash.clone(),
                 bytes: sealed_bytes,
                 records: sealed_records,
-            }) {
+            });
+            // Review 81: the manifest is born at the first rotation; protect
+            // it like the logs it attests (idempotent on later rotations).
+            if self.manifest_path.exists() {
+                if let Err(e) = protection_inner.register_active(&self.manifest_path) {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        path = %self.manifest_path.display(),
+                        "chainlog: could not register the manifest in PROTECTED_INODES"
+                    );
+                }
+            }
+            if let Err(e) = rotated {
                 error!(
                     error = %e, seq,
                     "chainlog: manifest Rotated append failed — archive committed + chain \
@@ -705,6 +729,24 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
 
 // ── path helpers ────────────────────────────────────────────────────
 
+/// The sealed files of the chain log whose active file is `active`: its
+/// archives and its manifest, those that exist (review 81). The agent
+/// registers them in `PROTECTED_INODES` at start: until then a sealed
+/// archive kept its key only for the boot that rotated it, and a manifest
+/// never had one.
+pub fn sealed_files(active: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = list_archive_seqs(active)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|seq| archive_path(active, seq))
+        .collect();
+    let manifest = manifest_path_for(active);
+    if manifest.exists() {
+        out.push(manifest);
+    }
+    out
+}
+
 fn manifest_path_for(active: &Path) -> PathBuf {
     let mut s = active.as_os_str().to_os_string();
     s.push(".manifest.jsonl");
@@ -756,7 +798,12 @@ fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
 /// Drop oldest archives beyond `max_archives`, returning the
 /// `(seq, terminator_hash)` of each evicted file (hash read from the
 /// archive's terminator line before unlink, for the manifest record).
-fn evict_excess_archives(active: &Path, max_archives: usize) -> Result<Vec<(u64, String)>> {
+/// Each archive's inode is released from the protection first (review 80).
+fn evict_excess_archives(
+    active: &Path,
+    max_archives: usize,
+    protection: &dyn ProtectionManager,
+) -> Result<Vec<(u64, String)>> {
     let seqs = list_archive_seqs(active)?;
     if seqs.len() <= max_archives {
         return Ok(Vec::new());
@@ -766,6 +813,13 @@ fn evict_excess_archives(active: &Path, max_archives: usize) -> Result<Vec<(u64,
     for &seq in seqs.iter().take(drop_n) {
         let path = archive_path(active, seq);
         let hash = read_terminator_hash(&path).unwrap_or_default();
+        if let Err(e) = protection.release(&path) {
+            warn!(
+                error = %format!("{e:#}"),
+                path = %path.display(),
+                "chainlog: could not release an evicted archive's inode from PROTECTED_INODES"
+            );
+        }
         fs::remove_file(&path).with_context(|| format!("evicting archive {}", path.display()))?;
         evicted.push((seq, hash));
     }
@@ -1617,6 +1671,85 @@ mod tests {
         );
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
         assert_eq!(report.earliest_retained_seq, earliest);
+    }
+
+    /// Review 81: the sealed files of a log are its retained archives and
+    /// its manifest — what the agent registers at start.
+    #[test]
+    fn sealed_files_are_the_archives_and_the_manifest() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        assert!(sealed_files(&active).is_empty());
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            key(),
+            cfg(2000, 2),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        for i in 0..60 {
+            log.append(payload(i)).unwrap();
+        }
+        let sealed = sealed_files(&active);
+        let archives: Vec<PathBuf> = list_archive_seqs(&active)
+            .unwrap()
+            .into_iter()
+            .map(|seq| archive_path(&active, seq))
+            .collect();
+        assert_eq!(archives.len(), 2);
+        assert_eq!(sealed.len(), 3);
+        assert!(archives.iter().all(|a| sealed.contains(a)));
+        assert!(sealed.contains(&manifest_path_for(&active)));
+        assert!(!sealed.contains(&active));
+    }
+
+    /// Review 80: every archive the retention evicts is released from the
+    /// protection before it is removed (while it still exists), and only
+    /// those: the retained archives and the active file keep theirs.
+    #[test]
+    fn eviction_releases_each_archive_before_removing_it() {
+        #[derive(Default)]
+        struct Recorder {
+            released: std::sync::Mutex<Vec<(PathBuf, bool)>>,
+        }
+        impl ProtectionManager for Recorder {
+            fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+                f()
+            }
+            fn register_active(&self, _path: &Path) -> Result<()> {
+                Ok(())
+            }
+            fn release(&self, path: &Path) -> Result<()> {
+                self.released
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), path.exists()));
+                Ok(())
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let rec = std::sync::Arc::new(Recorder::default());
+        let mut log =
+            RotatingChainLog::<TestPayload>::open(&active, key(), cfg(2000, 2), rec.clone())
+                .unwrap();
+        for i in 0..60 {
+            log.append(payload(i)).unwrap();
+        }
+        let retained = list_archive_seqs(&active).unwrap();
+        let released = rec.released.lock().unwrap().clone();
+        assert!(!released.is_empty(), "the retention evicted archives");
+        for (path, existed) in &released {
+            assert!(existed, "{} released after its removal", path.display());
+            assert!(!path.exists(), "{} released but kept", path.display());
+            assert!(retained
+                .iter()
+                .all(|&seq| archive_path(&active, seq) != *path));
+        }
+        assert_eq!(
+            released.len() + retained.len(),
+            retained.last().copied().unwrap() as usize
+        );
     }
 
     /// The evicted-prefix trust rests entirely on the manifest, so a

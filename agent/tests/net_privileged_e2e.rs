@@ -82,6 +82,14 @@ const LISTENER_PORT: u16 = 41999;
 /// burst. Nothing listens there; the datagrams are dropped locally
 /// and ICMP-unreachable is irrelevant for the kprobe.
 const UDP_SENDTO_PORT: u16 = 34999;
+/// Review 68: the IPv6 datagram's destination port, and the port of the
+/// IPv4-mapped one sent from the same IPv6 socket. Nothing listens.
+const UDP6_SENDTO_PORT: u16 = 35997;
+const UDP6_MAPPED_PORT: u16 = 35998;
+/// Review 73: the connected-UDP burst's destination, and the TCP listener
+/// the same helper connects to during the burst.
+const UDP_BURST_PORT: u16 = 35996;
+const TCP_DURING_BURST_PORT: u16 = 35995;
 
 fn agent_bin() -> &'static str {
     env!("CARGO_BIN_EXE_northnarrow-agent")
@@ -761,5 +769,154 @@ s.close()
     assert!(
         (1..=3).contains(&ours),
         "unconnected sendto burst of 40 must be rate-limited to ~1 row/s per (pid, dst); got {ours} rows"
+    );
+}
+
+/// Review 68: the N2 UDP program was attached to `udp_sendmsg` only, so a
+/// datagram to an IPv6 destination left no flow row. It is now attached to
+/// `udpv6_sendmsg` too. An IPv4-mapped destination, which `udpv6_sendmsg`
+/// hands to `udp_sendmsg`, must still give exactly one row.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_ipv6_udp_sendto_records_one_flow() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+
+    let helper = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+for dst in (("::1", {p6}), ("::ffff:127.0.0.1", {pm})):
+    try:
+        s.sendto(b"nn-udp-v6 " * 4, dst)
+    except Exception:
+        pass
+s.close()
+"#,
+        p6 = UDP6_SENDTO_PORT,
+        pm = UDP6_MAPPED_PORT,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn python3 helper for the IPv6 UDP flow test");
+    assert!(
+        status.success(),
+        "python3 helper exited non-zero: {status:?}"
+    );
+
+    let v6 = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(17)
+            && r["dst_port"].as_u64() == Some(UDP6_SENDTO_PORT as u64)
+            && r["dst_addr"].as_str() == Some("::1")
+    };
+    let rows = fx.wait_netflow_matching(1, v6);
+    assert!(
+        rows[0]["comm"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("python")),
+        "comm must be the python helper; got {:?}",
+        rows[0]["comm"]
+    );
+
+    let mapped = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(17) && r["dst_port"].as_u64() == Some(UDP6_MAPPED_PORT as u64)
+    };
+    fx.wait_netflow_matching(1, mapped);
+    std::thread::sleep(Duration::from_secs(2));
+    let n = read_jsonl(&fx.netflow_log)
+        .into_iter()
+        .filter(mapped)
+        .count();
+    assert_eq!(
+        n, 1,
+        "an IPv4-mapped destination must give one row (udp_sendmsg), not one per hook"
+    );
+}
+
+/// Review 73: a connected UDP socket emitted one record per `send()`, into
+/// the ring the TCP closes share. An unprivileged burst lost 1.45 M records
+/// in 10 s on the lab, the TCP flows of the moment with them. Sends are now
+/// aggregated per destination in the kernel (one record per second, or per
+/// MiB, carrying the bytes since the last), and UDP has its own ring.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_connected_udp_burst_is_aggregated_and_spares_tcp_flows() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+
+    let listener = TcpListener::bind(("127.0.0.1", TCP_DURING_BURST_PORT))
+        .expect("bind the TCP listener for the burst test");
+    let accept_thread = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        }
+    });
+
+    // 20,000 datagrams of 512 bytes (about 10 MB) on one connected socket,
+    // and a TCP connection opened half-way through.
+    let helper = format!(
+        r#"
+import socket
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.connect(("127.0.0.1", {udp}))
+payload = b"b" * 512
+for i in range(20000):
+    try:
+        u.send(payload)
+    except OSError:
+        pass
+    if i == 10000:
+        t = socket.create_connection(("127.0.0.1", {tcp}), timeout=2)
+        t.sendall(b"nn-tcp-during-burst")
+        t.close()
+u.close()
+"#,
+        udp = UDP_BURST_PORT,
+        tcp = TCP_DURING_BURST_PORT,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn python3 helper for the UDP burst test");
+    assert!(
+        status.success(),
+        "python3 helper exited non-zero: {status:?}"
+    );
+    let _ = accept_thread.join();
+
+    let tcp_row = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(6)
+            && r["dst_port"].as_u64() == Some(TCP_DURING_BURST_PORT as u64)
+    };
+    fx.wait_netflow_matching(1, tcp_row);
+
+    let udp_row = |r: &serde_json::Value| {
+        r["proto"].as_u64() == Some(17) && r["dst_port"].as_u64() == Some(UDP_BURST_PORT as u64)
+    };
+    fx.wait_netflow_matching(1, udp_row);
+    std::thread::sleep(Duration::from_secs(3));
+    let rows: Vec<serde_json::Value> = read_jsonl(&fx.netflow_log)
+        .into_iter()
+        .filter(udp_row)
+        .collect();
+    let bytes: u64 = rows.iter().filter_map(|r| r["bytes_sent"].as_u64()).sum();
+    assert!(
+        (1..=60).contains(&rows.len()),
+        "20,000 sends to one destination must be aggregated; got {} rows",
+        rows.len()
+    );
+    // The last interval of each CPU (under 1 MiB) waits for a next send.
+    assert!(
+        bytes >= 5_000_000,
+        "the aggregated rows must carry most of the ~10 MB sent; got {bytes} bytes in {} rows",
+        rows.len()
     );
 }

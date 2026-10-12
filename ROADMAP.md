@@ -21,7 +21,7 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
 | **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
-| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passo 1 (aperture file su LSM) fatto il 12 ottobre |
+| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passi 1 (aperture file su LSM) e 2 (exec su LSM) fatti il 12 ottobre, passo 3 (DNS letto dal buffer del socket, anche IPv6) in verifica |
 | UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 
@@ -556,7 +556,8 @@ Pianificato, in quest'ordine:
   sposta i campi di 4 byte); resta la BTF esterna per kernel senza BTF
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
   mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
-  24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
+  24 h su AlmaLinux 9 superata il 12 ottobre (RSS +0,04 MB/h, nessun
+  riavvio né errore, fd stabili); le 72 h richiedono un host sempre acceso
 - Verifica della provenienza all'installazione (fatta il 10 ottobre, lab
   PR 21): `install.sh` controlla
   `SHA256SUMS` e l'attestazione SLSA del tarball (builder atteso: il
@@ -655,9 +656,11 @@ Pianificato, in quest'ordine:
   filtrato nel kernel insieme allo spostamento su LSM di 10.9 (rilievo 45).
   Il log INFO di ogni exec vale circa il 5 % della CPU dell'agent sugli
   exec. Lo stesso giro ha trovato due falsi positivi che uccidevano
-  processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Restano i
-  numeri ufficiali a tre giri, su host a riposo, per ogni guest. Dato
-  grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
+  processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Numeri
+  ufficiali a tre giri su host a riposo, Ubuntu 24.04, 12 ottobre (lab PR
+  69): open +25,4 %, scrittura +29,1 %, exec +8,6 %, connect +34,1 %, udp
+  +25,2 %, dns +14,2 %; restano gli altri guest. Dato grezzo dal soak:
+  ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm`. Prerequisiti fatti l'11 ottobre:
   - binari fuori da `/usr/local/bin` (lab PR 39, rilievi 26 e 51): l'agent
     protegge e riconosce sia il layout di `install.sh` sia `/usr/bin` +
@@ -675,7 +678,8 @@ Pianificato, in quest'ordine:
   un'installazione con `install.sh`, aggiornamento e rimozione solo con la
   finestra trusted-installer, nessun avvio alla prima installazione);
   `nn-lab.sh pkg-check` verifica l'intero ciclo di vita, superato su Ubuntu
-  24.04, Debian 12 e Ubuntu 22.04. Resta quella dell'RPM su AlmaLinux 9
+  24.04, Debian 12 e Ubuntu 22.04, e il 12 ottobre su AlmaLinux 9 con
+  l'RPM, insieme a `pkgmgr-check` con rpm e dnf (lab PR 68)
 - BTF esterna per kernel senza BTF nativa (valutata l'11 ottobre, lab PR
   41, decisione del founder: i programmi LSM, fentry/fexit e `tp_btf` si
   agganciano tramite la BTF interna del kernel, che nessun file esterno
@@ -692,8 +696,8 @@ Stato all'11 ottobre (lab PR 45): lo stesso tarball prodotto e attestato
 dalla CI supera `nn-lab.sh release-check` su Ubuntu 24.04, Ubuntu 22.04 e
 Debian 12 (checksum, binari eseguibili sulla glibc del guest, verifica di
 `install.sh` con provenienza `checksums`, integrità al boot, hook, sonda,
-una detection); AlmaLinux 9 dopo il soak di 24 h in corso fino al 12
-ottobre.
+una detection). Il 12 ottobre anche su AlmaLinux 9, con gli artefatti CI
+di `main` 1777e6f: la demo vale sulle quattro distribuzioni.
 
 ---
 
@@ -731,7 +735,19 @@ cambia l'ordine delle Tappe successive.
   6.8: perdita sulle aperture dal 31,9 % al 28,2 %, CPU dell'agente per
   apertura da 6,4 µs a quasi zero; il dimezzamento proposto in Q7 non è
   raggiunto, perché il resto viene dagli hook FIM di chiusura e di
-  scrittura (nuovo rilievo 59, decisione per il founder). Trovato
+  scrittura (nuovo rilievo 59, decisione per il founder). Passo 2 (exec)
+  fatto il 12 ottobre (lab PR 53): sensore su LSM `bprm_check_security`,
+  le regole di exec leggono il file eseguito dal kernel (rilievo 61:
+  `cd /tmp && ./x`, un symlink o `..` eludevano R001–R010);
+  `nn-lab.sh exec-sensor-check` 8/8 su 6.8, 6.1 e 5.15. Passo 3 (DNS) il
+  12 ottobre (lab PR 57): kprobe su `udp_send_skb` / `udp_v6_send_skb`, il
+  QNAME si legge dalla copia del kernel, anche verso resolver IPv6
+  (rilievi 66 e 67: un resolver IPv6, una pagina non ancora caricata o un
+  byte zero in una label eludevano NET-004); la Q5 è rivista perché il
+  `kretprobe` su `ip_make_skb` non vede la porta di destinazione;
+  `nn-lab.sh dns-sensor-check`. Trovati nel frattempo i rilievi 65 (il fix
+  della build di release per x86-64-v2 non arrivava alla build, corretto)
+  e 68 (flussi UDP verso IPv6 senza riga netflow). Trovato
   e corretto il rilievo 55: su btrfs
   le chiavi `(dev, ino)` dello userland non corrispondevano a quelle del
   kernel, e FIM e protezione dei file non vedevano nulla (ora il kernel
