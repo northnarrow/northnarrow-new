@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An agent start could lose events in its first seconds (review 69). Until
+  the LSM file-open sensor took over, the `sys_enter_openat` tracepoint sent
+  every open of the host to the agent's event channel, which nothing reads
+  before the boot sequence ends. The channel filled, every sensor waited
+  behind it, and the file-open ring overflowed: up to 1,018 records lost on
+  the lab. The tracepoint now stays inert in the default mode until it is
+  needed (`--file-open-sensor tracepoint`, or as the fallback).
 - UDP datagrams to IPv6 destinations left no flow row (review 68, High).
   The N2 UDP program was attached to `udp_sendmsg` only, so a QUIC-like
   beacon or raw-UDP exfiltration over IPv6 was invisible to the flow

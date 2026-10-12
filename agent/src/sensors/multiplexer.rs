@@ -187,6 +187,11 @@ impl SensorMultiplexer {
             "syscalls",
             "sys_enter_openat",
         )?;
+        // Review 69: inert in LSM mode until the LSM sensor takes over (or
+        // its fallback turns it on, `main::start_open_sensor`).
+        if crate::sensors::open_sensor::tracepoint_wanted() {
+            crate::sensors::open_sensor::set_tracepoint_emitting(&mut ebpf, true)?;
+        }
         // Tappa 10.9 step 2: the exec sensor on LSM `bprm_check_security`
         // (`--exec-sensor`), or `sys_enter_execve` when the LSM program
         // is not wanted, lacks an offset or is refused. Attached here, so
