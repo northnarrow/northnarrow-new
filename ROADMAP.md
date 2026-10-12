@@ -556,7 +556,8 @@ Pianificato, in quest'ordine:
   sposta i campi di 4 byte); resta la BTF esterna per kernel senza BTF
 - Test di durata 24–72 h con traffico sintetico (memoria, chain log,
   mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
-  24 h su AlmaLinux 9 in corso; le 72 h richiedono un host sempre acceso
+  24 h su AlmaLinux 9 superata il 12 ottobre (RSS +0,04 MB/h, nessun
+  riavvio né errore, fd stabili); le 72 h richiedono un host sempre acceso
 - Verifica della provenienza all'installazione (fatta il 10 ottobre, lab
   PR 21): `install.sh` controlla
   `SHA256SUMS` e l'attestazione SLSA del tarball (builder atteso: il
@@ -655,9 +656,11 @@ Pianificato, in quest'ordine:
   filtrato nel kernel insieme allo spostamento su LSM di 10.9 (rilievo 45).
   Il log INFO di ogni exec vale circa il 5 % della CPU dell'agent sugli
   exec. Lo stesso giro ha trovato due falsi positivi che uccidevano
-  processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Restano i
-  numeri ufficiali a tre giri, su host a riposo, per ogni guest. Dato
-  grezzo dal soak: ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
+  processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Numeri
+  ufficiali a tre giri su host a riposo, Ubuntu 24.04, 12 ottobre (lab PR
+  69): open +25,4 %, scrittura +29,1 %, exec +8,6 %, connect +34,1 %, udp
+  +25,2 %, dns +14,2 %; restano gli altri guest. Dato grezzo dal soak:
+  ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
 - Pacchetti `.deb`/`.rpm`. Prerequisiti fatti l'11 ottobre:
   - binari fuori da `/usr/local/bin` (lab PR 39, rilievi 26 e 51): l'agent
     protegge e riconosce sia il layout di `install.sh` sia `/usr/bin` +
@@ -675,7 +678,8 @@ Pianificato, in quest'ordine:
   un'installazione con `install.sh`, aggiornamento e rimozione solo con la
   finestra trusted-installer, nessun avvio alla prima installazione);
   `nn-lab.sh pkg-check` verifica l'intero ciclo di vita, superato su Ubuntu
-  24.04, Debian 12 e Ubuntu 22.04. Resta quella dell'RPM su AlmaLinux 9
+  24.04, Debian 12 e Ubuntu 22.04, e il 12 ottobre su AlmaLinux 9 con
+  l'RPM, insieme a `pkgmgr-check` con rpm e dnf (lab PR 68)
 - BTF esterna per kernel senza BTF nativa (valutata l'11 ottobre, lab PR
   41, decisione del founder: i programmi LSM, fentry/fexit e `tp_btf` si
   agganciano tramite la BTF interna del kernel, che nessun file esterno
@@ -692,8 +696,8 @@ Stato all'11 ottobre (lab PR 45): lo stesso tarball prodotto e attestato
 dalla CI supera `nn-lab.sh release-check` su Ubuntu 24.04, Ubuntu 22.04 e
 Debian 12 (checksum, binari eseguibili sulla glibc del guest, verifica di
 `install.sh` con provenienza `checksums`, integrità al boot, hook, sonda,
-una detection); AlmaLinux 9 dopo il soak di 24 h in corso fino al 12
-ottobre.
+una detection). Il 12 ottobre anche su AlmaLinux 9, con gli artefatti CI
+di `main` 1777e6f: la demo vale sulle quattro distribuzioni.
 
 ---
 
