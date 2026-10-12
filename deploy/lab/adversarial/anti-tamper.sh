@@ -167,7 +167,10 @@ WAIT=12 run_case C21 "exec flood (20k) hiding an exec from /tmp" allowed "R001_E
 # from userland (the openat tracepoint is blind to it by construction).
 IOU_SRC="$(dirname "$0")/iouring-probe.c"
 IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
-if [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>/tmp/nn-iou-cc.log; then
+if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
+    # RHEL 9 ships kernel.io_uring_disabled=2: no ring, not even for root.
+    echo "C22 skipped: io_uring disabled on this host (kernel.io_uring_disabled=2)" >&2
+elif [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>/tmp/nn-iou-cc.log; then
     WAIT=8 run_case C22 "io_uring: openat + read + connect through a ring" allowed "NN-L-IOU-00[12]" 0 -- "$IOU_BIN" /etc/hostname 127.0.0.1 9
 else
     echo "C22 skipped: cannot build the io_uring probe ($(head -1 /tmp/nn-iou-cc.log 2>/dev/null))" >&2
@@ -206,8 +209,12 @@ fi
 LOCKDOWN=$(grep -o '\[[a-z]*\]' /sys/kernel/security/lockdown 2>/dev/null | tr -d '[]')
 KGAP=1
 [[ "$LOCKDOWN" == integrity || "$LOCKDOWN" == confidentiality ]] && KGAP=0
+# The initrd is /boot/initrd.img-<ver> on Debian/Ubuntu, /boot/initramfs-<ver>.img
+# on RHEL: a missing one made kexec fail before the load, read as "allowed".
+KINITRD=/boot/initrd.img-$(uname -r)
+[[ -f $KINITRD ]] || KINITRD=/boot/initramfs-$(uname -r).img
 if command -v kexec >/dev/null 2>&1; then
-    run_case C17 "kexec -l of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "" "$KGAP" -- kexec -l /boot/vmlinuz-$(uname -r) --initrd=/boot/initrd.img-$(uname -r) --reuse-cmdline
+    run_case C17 "kexec -l of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "" "$KGAP" -- kexec -l /boot/vmlinuz-$(uname -r) --initrd="$KINITRD" --reuse-cmdline
     kexec -u 2>/dev/null || true
 fi
 # An unsigned module (dummy.ko with its signature stripped), loaded with a
