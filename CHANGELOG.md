@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Detections held back by the per-rule budget (review 75) were reported
+  only as a count, so a flood of one rule could hide which file another
+  detection of that rule was about. The held report (journal and signed
+  audit entry) now names up to eight distinct subjects per rule and uid.
 - An unprivileged loop of DNS queries could hide a DNS tunnel (review 78,
   High). The DNS sensor recorded every datagram into one ring: a loop of
   benign queries lost half of the records and took more than a CPU of the
