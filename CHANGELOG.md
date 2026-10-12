@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- Every file operation on the host went through a global kernel lock
+  (review 56). 45 `bpf_printk` diagnostic markers from a 2026-05
+  investigation were still in the anti-tamper LSM programs: one per
+  `file_open`, up to five per write-open, and more on every unlink,
+  rename, setattr and ioctl. `bpf_trace_printk` serialises on one spinlock
+  and writes the trace buffer, and its "trace_printk() … unsafe for
+  production" banner appeared on every agent host. All are removed.
+  Overhead benchmark on Ubuntu 24.04, 3 rounds: open throughput loss
+  falls from 38.5 % to 31.9 %, write-open from 48.8 % to 25.6 %.
 - On btrfs, FIM and the anti-tamper file protection saw nothing (review
   55). Userland keys watched and protected files by `(dev, ino)` from
   `stat()`, which on btrfs reports the subvolume's device. The eBPF hooks

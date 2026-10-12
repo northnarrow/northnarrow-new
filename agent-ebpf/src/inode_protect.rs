@@ -31,21 +31,19 @@ use aya_ebpf::{
     cty::{c_int, c_uint, c_void},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_printk, bpf_probe_read_kernel,
+        bpf_probe_read_kernel,
     },
     macros::{lsm, map},
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
 };
 
-// 2026-05-12 iter 2: removed the `nn_printk_u64` helper (and its
-// `bpf_trace_vprintk` import). The helper was a workaround for aya
-// 0.13's `bpf_printk!` macro losing values on the 1-3 args path, but
-// iteration 1 proved the helper itself silently drops *every* call
-// on Ubuntu 6.8's BPF-LSM trampoline. Diagnostics now use the
-// zero-arg form of `bpf_printk!`, which is the only printk path
-// observationally known to work on this build (see
-// docs/TAPPA7_TASK5_DEEP_DEBUG.md §2 bug #1).
+// Review 56: the zero-arg `bpf_printk!` diagnostic markers of the
+// 2026-05 investigation (docs/TAPPA7_TASK5_DEEP_DEBUG.md) are gone.
+// `bpf_trace_printk` takes a global lock and writes the trace buffer on
+// every call: one per `file_open` and up to five per write-open of the
+// whole host, and the kernel's "trace_printk() being used" banner on every
+// agent host. Do not put printk back in a hot hook; count in a map instead.
 
 use northnarrow_common::wire::{
     FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
@@ -310,20 +308,12 @@ fn emit_denial(operation: u8, key: InodeKey) {
 /// be blocked; emits the audit record as a side effect.
 #[inline(always)]
 unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
-    // 2026-05-12 iter 2: zero-arg bpf_printk! markers throughout —
-    // bpf_trace_vprintk was confirmed broken in iteration 1 and
-    // ripped out. These REACHED markers, plus the granular
-    // pre-deny markers in each try_* wrapper, let us localise the
-    // current cutoff (body marker fires, REACHED-deny-if does not).
-    bpf_printk!(b"nn-diag-REACHED-deny-if");
     let key = match inode_key(target) {
         Some(k) => k,
         None => {
-            bpf_printk!(b"nn-diag-REACHED-key-none");
             return false;
         }
     };
-    bpf_printk!(b"nn-diag-REACHED-key-ok");
     // at-authz-1: the map value is a flag-mask. An absent key is not
     // protected; a present key is denied for THIS op only if the op's
     // bit is set. `FS_OP_WRITE` requires `FS_PROTECT_WRITE` (the
@@ -333,7 +323,6 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
     let flags = match PROTECTED_INODES.get(&key) {
         Some(f) => *f,
         None => {
-            bpf_printk!(b"nn-diag-REACHED-MISS");
             return false;
         }
     };
@@ -343,11 +332,9 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
         FS_PROTECT_MUTATE
     };
     if flags & required == 0 {
-        bpf_printk!(b"nn-diag-REACHED-MISS");
         return false;
     }
     if override_active() {
-        bpf_printk!(b"nn-diag-REACHED-OVERRIDE");
         return false;
     }
     // Tappa 8 A14 (B4): caller-side mutual whitelist. If the
@@ -361,10 +348,8 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
     // while denying every unrelated root caller.
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if crate::task_kill::PROTECTED_PIDS.get(&caller_tgid).is_some() {
-        bpf_printk!(b"nn-diag-REACHED-CALLER-EXEMPT");
         return false;
     }
-    bpf_printk!(b"nn-diag-REACHED-MATCH");
     emit_denial(operation, key);
     true
 }
@@ -375,11 +360,6 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
 
 #[lsm(hook = "inode_unlink")]
 pub fn inode_unlink(ctx: LsmContext) -> i32 {
-    // Unconditional body marker — same role as inode_rename / file_ioctl
-    // (see docs/TAPPA7_TASK5_DEEP_DEBUG.md). If `rm` runs and this
-    // line never lands in trace_pipe, the kernel is not dispatching
-    // security_inode_unlink to our BPF program at all.
-    unsafe { bpf_printk!(b"nn-diag-unlink-body fired") };
     unsafe { try_inode_unlink(&ctx) }
 }
 
@@ -393,47 +373,38 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
     // either the parent dir or the target inode itself is in the
     // protected set — that covers both "rm somefile inside dir" and
     // "rm /the/protected/file".
-    bpf_printk!(b"nn-diag-unlink-tryentry");
     let parent: *const c_void = ctx.arg(0);
-    bpf_printk!(b"nn-diag-unlink-pre-deny-parent");
     if deny_if_protected(FS_OP_UNLINK, parent) {
         return -EPERM;
     }
     let dentry: *const c_void = ctx.arg(1);
     if let Some(target_inode) = inode_from_dentry(dentry) {
-        bpf_printk!(b"nn-diag-unlink-pre-deny-target");
         if deny_if_protected(FS_OP_UNLINK, target_inode) {
             return -EPERM;
         }
     } else {
-        bpf_printk!(b"nn-diag-unlink-target-dentry-none");
     }
     0
 }
 
 #[lsm(hook = "inode_rmdir")]
 pub fn inode_rmdir(ctx: LsmContext) -> i32 {
-    unsafe { bpf_printk!(b"nn-diag-rmdir-body fired") };
     unsafe { try_inode_rmdir(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
     // No prev-retval read — see task_kill.rs.
-    bpf_printk!(b"nn-diag-rmdir-tryentry");
     let parent: *const c_void = ctx.arg(0);
-    bpf_printk!(b"nn-diag-rmdir-pre-deny-parent");
     if deny_if_protected(FS_OP_RMDIR, parent) {
         return -EPERM;
     }
     let dentry: *const c_void = ctx.arg(1);
     if let Some(target_inode) = inode_from_dentry(dentry) {
-        bpf_printk!(b"nn-diag-rmdir-pre-deny-target");
         if deny_if_protected(FS_OP_RMDIR, target_inode) {
             return -EPERM;
         }
     } else {
-        bpf_printk!(b"nn-diag-rmdir-target-dentry-none");
     }
     0
 }
@@ -446,7 +417,6 @@ pub fn inode_rename(ctx: LsmContext) -> i32 {
     // security_inode_rename but our BPF prog didn't run" vs
     // "our prog ran but its logic didn't match" during 2026-05-12
     // Tappa 7 task 5 diagnosis.
-    unsafe { bpf_printk!(b"nn-diag-rename-body fired") };
     unsafe { try_inode_rename(&ctx) }
 }
 
@@ -454,36 +424,29 @@ pub fn inode_rename(ctx: LsmContext) -> i32 {
 unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
     // Kernel signature: (old_dir, old_dentry, new_dir, new_dentry).
     // No prev-retval read — see task_kill.rs for rationale.
-    bpf_printk!(b"nn-diag-rename-tryentry");
 
     let old_dir: *const c_void = ctx.arg(0);
-    bpf_printk!(b"nn-diag-rename-pre-deny-old-dir");
     if deny_if_protected(FS_OP_RENAME, old_dir) {
         return -EPERM;
     }
     let new_dir: *const c_void = ctx.arg(2);
-    bpf_printk!(b"nn-diag-rename-pre-deny-new-dir");
     if deny_if_protected(FS_OP_RENAME, new_dir) {
         return -EPERM;
     }
 
     let old_dentry: *const c_void = ctx.arg(1);
     if let Some(old_inode) = inode_from_dentry(old_dentry) {
-        bpf_printk!(b"nn-diag-rename-pre-deny-old-inode");
         if deny_if_protected(FS_OP_RENAME, old_inode) {
             return -EPERM;
         }
     } else {
-        bpf_printk!(b"nn-diag-rename-old-dentry-none");
     }
     let new_dentry: *const c_void = ctx.arg(3);
     if let Some(new_inode) = inode_from_dentry(new_dentry) {
-        bpf_printk!(b"nn-diag-rename-pre-deny-new-inode");
         if deny_if_protected(FS_OP_RENAME, new_inode) {
             return -EPERM;
         }
     } else {
-        bpf_printk!(b"nn-diag-rename-new-dentry-none");
     }
     0
 }
@@ -493,7 +456,6 @@ pub fn inode_setattr(ctx: LsmContext) -> i32 {
     // Body marker covers chmod / chown / truncate paths. `touch` on
     // an existing file routes through notify_change → security_inode_setattr
     // so we expect this marker for `touch existingfile` too.
-    unsafe { bpf_printk!(b"nn-diag-setattr-body fired") };
     unsafe { try_inode_setattr(&ctx) }
 }
 
@@ -504,15 +466,12 @@ unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
     // prepended a `struct mnt_idmap *`. We previously read
     // ctx.arg(2) as the aya "phony retval" but per task_kill.rs
     // rationale we no longer trust that slot, so the read is gone.
-    bpf_printk!(b"nn-diag-setattr-tryentry");
     let dentry: *const c_void = ctx.arg(0);
     if let Some(target_inode) = inode_from_dentry(dentry) {
-        bpf_printk!(b"nn-diag-setattr-pre-deny");
         if deny_if_protected(FS_OP_SETATTR, target_inode) {
             return -EPERM;
         }
     } else {
-        bpf_printk!(b"nn-diag-setattr-dentry-none");
     }
     0
 }
@@ -524,7 +483,6 @@ pub fn file_ioctl(ctx: LsmContext) -> i32 {
     // security_file_ioctl but this line never appears in
     // trace_pipe, our BPF program is registered to the wrong
     // attach point.
-    unsafe { bpf_printk!(b"nn-diag-ioctl-body fired") };
     unsafe { try_file_ioctl(&ctx) }
 }
 
@@ -546,36 +504,27 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
     // SETFLAGS, the cmd-filter list is incomplete and we need to
     // widen it.
     if cmd == FS_IOC_SETFLAGS {
-        bpf_printk!(b"nn-diag-ioctl-cmd-SETFLAGS");
     } else if cmd == FS_IOC32_SETFLAGS {
-        bpf_printk!(b"nn-diag-ioctl-cmd-SETFLAGS32");
     } else if cmd == FS_IOC_FSSETXATTR {
-        bpf_printk!(b"nn-diag-ioctl-cmd-FSSETXATTR");
     } else if cmd == FS_IOC_FSGETXATTR {
-        bpf_printk!(b"nn-diag-ioctl-cmd-FSGETXATTR");
     }
 
     if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS {
         return 0;
     }
-    bpf_printk!(b"nn-diag-ioctl-cmd-matched");
 
     let file: *const c_void = ctx.arg(0);
     if file.is_null() {
-        bpf_printk!(b"nn-diag-ioctl-file-null");
         return 0;
     }
-    bpf_printk!(b"nn-diag-ioctl-file-ok");
 
     let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
         Err(_) => {
-            bpf_printk!(b"nn-diag-ioctl-probe-err");
             return 0;
         }
     };
-    bpf_printk!(b"nn-diag-ioctl-pre-deny");
     if deny_if_protected(FS_OP_IOCTL, inode) {
         return -EPERM;
     }
@@ -603,9 +552,6 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
 /// re-implemented.
 #[lsm(hook = "file_open")]
 pub fn protected_open_deny(ctx: LsmContext) -> i32 {
-    // Unconditional body marker — same role as inode_rename / file_ioctl
-    // (see docs/TAPPA7_TASK5_DEEP_DEBUG.md).
-    unsafe { bpf_printk!(b"nn-diag-open-body fired") };
     unsafe { try_protected_open_deny(&ctx) }
 }
 
@@ -630,7 +576,6 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
     if f_mode & FMODE_WRITE == 0 {
         return 0;
     }
-    bpf_printk!(b"nn-diag-open-write-intent");
 
     let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
