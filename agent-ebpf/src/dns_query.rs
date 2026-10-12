@@ -46,7 +46,7 @@ use aya_ebpf::{
         bpf_probe_read_kernel, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, map},
-    maps::RingBuf,
+    maps::{LruHashMap, RingBuf},
     programs::ProbeContext,
 };
 use northnarrow_common::wire::{DnsQueryRaw, ADDR_LEN, QNAME_LEN, TASK_COMM_LEN};
@@ -64,6 +64,63 @@ use crate::btf_offsets::{
 /// step 3): one ring, whichever program `--dns-sensor` attaches.
 #[map]
 pub(crate) static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Review 78: a process's DNS record budget. One process sending benign
+/// queries in a loop (6 million in 10 s, unprivileged) overflowed the
+/// ring above: most records were lost, a tunnelling-shaped query in the
+/// middle evaded NN-L-NET-004 one time in three, and the agent took more
+/// than a CPU. A token bucket per process (tgid: its threads share it)
+/// lets [`DNS_BURST`] records through, then one per [`DNS_REFILL_NS`]; the
+/// rest are counted in the `dns_rate` drop slot, never silently. A tunnel
+/// or a DGA burst still shows its shape in the records it gets; a loop of
+/// `fork()`s pays a process per query.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DnsBudget {
+    last_ns: u64,
+    tokens: u64,
+}
+
+#[map]
+static DNS_BUDGET: LruHashMap<u32, DnsBudget> = LruHashMap::with_max_entries(8192, 0);
+
+/// Records a process may send in a burst.
+const DNS_BURST: u64 = 256;
+/// After a burst, one record per interval (128 per second).
+const DNS_REFILL_NS: u64 = 1_000_000_000 / 128;
+
+/// `true` when the current process may record one more DNS query; when it
+/// may not, the query is counted in the `dns_rate` slot.
+#[inline(always)]
+pub(crate) unsafe fn dns_admit() -> bool {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let now = bpf_ktime_get_ns();
+    if let Some(b) = DNS_BUDGET.get_ptr_mut(&tgid) {
+        let steps = now.wrapping_sub((*b).last_ns) / DNS_REFILL_NS;
+        let mut tokens = (*b).tokens;
+        if steps > 0 {
+            if tokens + steps >= DNS_BURST {
+                tokens = DNS_BURST;
+                (*b).last_ns = now;
+            } else {
+                tokens += steps;
+                (*b).last_ns += steps * DNS_REFILL_NS;
+            }
+        }
+        if tokens == 0 {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_RATE);
+            return false;
+        }
+        (*b).tokens = tokens - 1;
+        return true;
+    }
+    let b = DnsBudget {
+        last_ns: now,
+        tokens: DNS_BURST - 1,
+    };
+    let _ = DNS_BUDGET.insert(&tgid, &b, 0);
+    true
+}
 
 const DNS_PORT_BE: u16 = 0x3500; // 53 in network byte order
 const AF_INET: u16 = 2;
@@ -141,6 +198,10 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
 
     // Cheap filter: only DNS (UDP/53).
     if dest.port_be != DNS_PORT_BE {
+        return Ok(());
+    }
+    // Review 78: the process's DNS record budget.
+    if !unsafe { dns_admit() } {
         return Ok(());
     }
 

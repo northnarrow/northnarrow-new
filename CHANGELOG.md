@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An unprivileged loop of DNS queries could hide a DNS tunnel (review 78,
+  High). The DNS sensor recorded every datagram into one ring: a loop of
+  benign queries lost half of the records and took more than a CPU of the
+  agent, and a tunnelling-shaped query in the middle evaded NN-L-NET-004
+  one time in three. Each process now has a budget in the kernel (256
+  queries in a burst, then 128 per second); the rest are counted in the
+  `dns_rate` drop slot.
 - A file detection did not say which file it was about (review 77). The
   record of a cron drop-in named the writer but not the drop-in; records
   carried a path only for exec detections. Detection records now have a

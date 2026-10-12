@@ -130,6 +130,10 @@ unsafe fn try_dns_send_skb(ctx: &ProbeContext, v6: bool) {
         Some(o) => o & 0xffff,
         None => return,
     };
+    // Review 78: the process's DNS record budget.
+    if !crate::dns_query::dns_admit() {
+        return;
+    }
 
     let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
         Some(e) => e,
