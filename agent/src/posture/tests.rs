@@ -1058,6 +1058,131 @@ fn non_daemon_masswrite_plus_persistence_reaches_combat() {
     );
 }
 
+// ─── Review 52 — an admin session's configuration changes ───────────
+//
+// Lab, 2026-10-12 (Ubuntu 24.04): `sudo` appending to sshd_config
+// (CriticalFileModification → ENGAGED) and then writing a unit
+// (PersistenceMechanism) from the same terminal corroborated to COMBAT,
+// and the ladder named the unit's writer an offender to kill.
+
+/// `/proc/<pid>` of a process in an interactive session: login uid 1000
+/// and a terminal.
+fn session_proc(dir: &std::path::Path, pid: u32, ppid: u32) {
+    let d = dir.join(pid.to_string());
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("loginuid"), "1000").unwrap();
+    std::fs::write(
+        d.join("stat"),
+        format!("{pid} (x) S {ppid} {pid} {pid} 34816 -1 0\n"),
+    )
+    .unwrap();
+}
+
+/// A terminal shell (700) that ran sudo (710) → two writers (720, 730),
+/// and ran a writer (800) and `nc` (810) without sudo.
+fn admin_session_machine() -> (tempfile::TempDir, PostureMachine) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    for (pid, ppid) in [
+        (700, 1),
+        (710, 700),
+        (720, 710),
+        (730, 710),
+        (800, 700),
+        (810, 700),
+    ] {
+        session_proc(tmp.path(), pid, ppid);
+    }
+    let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        Arc::new(|| {}),
+        Arc::new(|_| {}),
+        ExemptPids::default(),
+        AuthSessionTracker::new(tmp.path()),
+    );
+    for (pid, ppid, comm, exe) in [
+        (700, 1, "bash", "/usr/bin/bash"),
+        (710, 700, "sudo", "/usr/bin/sudo"),
+        (720, 710, "tee", "/usr/bin/tee"),
+        (730, 710, "tee", "/usr/bin/tee"),
+        (800, 700, "tee", "/usr/bin/tee"),
+    ] {
+        let _ = m.observe(&spawn(pid, ppid, comm, exe, 1), &[]);
+    }
+    (tmp, m)
+}
+
+#[test]
+fn admin_session_config_changes_stay_engaged() {
+    let (_tmp, m) = admin_session_machine();
+    let _ = m.observe(&file_open(720, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let _ = m.observe(
+        &file_open(730, 0, "/etc/systemd/system/backup.service", 1, 200),
+        &[],
+    );
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "routine admin edits must not corroborate each other to COMBAT"
+    );
+}
+
+/// The same two writes without sudo in the lineage still corroborate.
+#[test]
+fn config_changes_without_sudo_still_reach_combat() {
+    let (_tmp, m) = admin_session_machine();
+    let _ = m.observe(&file_open(800, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
+    let _ = m.observe(
+        &file_open(800, 0, "/etc/systemd/system/backup.service", 1, 200),
+        &[],
+    );
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
+/// An admin session that first ran an offensive tool: its unit write is
+/// corroborated by that signal, so sudo is still no free pass.
+#[test]
+fn admin_change_after_another_signal_reaches_combat() {
+    let (_tmp, m) = admin_session_machine();
+    let _ = m.observe(&spawn(810, 700, "nc", "/usr/bin/nc", 50), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let _ = m.observe(
+        &file_open(730, 0, "/etc/systemd/system/backup.service", 1, 200),
+        &[],
+    );
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
+/// `sudo tee` on sshd_config (740) has exited and its exec event is still
+/// in flight when its write is read: the change is recorded pending.
+/// Placed when the next signal arrives (sudo in its lineage, the shell
+/// that ran it still running with a terminal), it corroborates nothing.
+#[test]
+fn exited_admin_writer_is_placed_before_it_corroborates() {
+    let (_tmp, m) = admin_session_machine();
+    let _ = m.observe(&file_open(740, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let _ = m.observe(&spawn(740, 710, "tee", "/usr/bin/tee", 101), &[]);
+    let _ = m.observe(
+        &file_open(730, 0, "/etc/systemd/system/backup.service", 1, 200),
+        &[],
+    );
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// The same exited writer without sudo above it is placed as an ordinary
+/// signal of its session, and corroborates.
+#[test]
+fn exited_writer_without_sudo_still_corroborates() {
+    let (_tmp, m) = admin_session_machine();
+    let _ = m.observe(&file_open(840, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
+    let _ = m.observe(&spawn(840, 700, "sh", "/usr/bin/sh", 101), &[]);
+    let _ = m.observe(
+        &file_open(800, 0, "/etc/systemd/system/backup.service", 1, 200),
+        &[],
+    );
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
 /// Required A10 test 4: same-state transition is a no-op — no
 /// `last_admin_action` timestamp recorded, no log transition
 /// added, no hook fires. Anchors the §12.2 design contract that

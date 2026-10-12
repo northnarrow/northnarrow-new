@@ -1822,6 +1822,79 @@ impl Rule for PackageManaged {
     }
 }
 
+/// Review 52 — a configuration or scheduling write made in an
+/// administrator's interactive sudo/su session is recorded at the rule's
+/// severity, not killed.
+///
+/// `sudo tee -a /etc/ssh/sshd_config`, `sudo systemctl edit`, `sudo vim
+/// /etc/crontab` and `sudo useradd` write files these rules watch. The
+/// write lands before the kill, so killing the writer never undid it: it
+/// cost the administrator the editor, and in the lab (2026-10-12, Ubuntu
+/// 24.04) `useradd` killed after `/etc/passwd` left an account with no
+/// group and no home. [`AuthSessionTracker::is_interactive_admin`] wants
+/// sudo or su in the writer's lineage, a login uid and a terminal, so a
+/// service, a cron job, a command run without a terminal and a process
+/// that reached root any other way keep the kill.
+///
+/// Wrapped: NN-L-FIM-003 (sensitive configs), -007 (cron drop-ins), -009
+/// (systemd units) and -023 (timers). Not wrapped: the system-binary,
+/// setuid, kernel-module and PAM-module rules (rootkit shapes; an
+/// administrator installs those through the package manager), and, as for
+/// [`PackageManaged`], `ld.so.preload`, `authorized_keys`, the bait and
+/// the credential rules.
+///
+/// Trust boundary: whoever holds an administrator's session and sudo
+/// password is that administrator to these rules. The write stays a
+/// detection at the rule's severity in the signed chain, the posture
+/// triggers still rise (they give sudo no pass), and the chain rules still
+/// see it.
+pub struct InteractiveAdmin {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker,
+}
+
+impl InteractiveAdmin {
+    pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker) -> Self {
+        Self { inner, lineage }
+    }
+}
+
+impl Rule for InteractiveAdmin {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        if verdict.action == ResponseAction::Log {
+            return Some(verdict);
+        }
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        if !self.lineage.is_interactive_admin(fe.modifier_pid) {
+            return Some(verdict);
+        }
+        Some(Verdict {
+            action: ResponseAction::Log,
+            reasoning: format!(
+                "{} [written in an interactive sudo/su session (login uid {}, terminal): \
+                 recorded, not killed]",
+                verdict.reasoning,
+                self.lineage
+                    .loginuid_of(fe.modifier_pid)
+                    .map_or_else(|| "?".to_string(), |u| u.to_string())
+            ),
+            ..verdict
+        })
+    }
+}
+
 /// The FIM rule set with a live `/proc`-backed lineage tracker for the
 /// package-manager carve-out ([`PackageManaged`]). Production threads the
 /// agent's shared tracker through [`fim_rules_with_lineage`] instead, so
@@ -1833,13 +1906,19 @@ pub fn fim_rules(installer_override: Arc<TrustedInstallerOverride>) -> Vec<Box<d
 /// The FIM rule set. The rules a package transaction legitimately trips
 /// (system binaries, setuid binaries, kernel and PAM modules, sensitive
 /// configs, cron drop-ins, systemd units and timers) are wrapped in
-/// [`PackageManaged`] over `lineage`; order and ids are unchanged.
+/// [`PackageManaged`] over `lineage`, and the configuration and scheduling
+/// ones also in [`InteractiveAdmin`]; order and ids are unchanged.
 pub fn fim_rules_with_lineage(
     installer_override: Arc<TrustedInstallerOverride>,
     lineage: AuthSessionTracker,
 ) -> Vec<Box<dyn Rule>> {
     let pkg = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
         Box::new(PackageManaged::new(rule, lineage.clone()))
+    };
+    // Outside the package carve-out, so `sudo apt install` keeps its Log +
+    // Low (an inner Log passes through unchanged).
+    let admin = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
+        Box::new(InteractiveAdmin::new(pkg(rule), lineage.clone()))
     };
     // NN-L-FIM-005's rsyslogd-append carve-out (FP-1) needs the host's
     // `syslog` uid. Resolve it once here (a /etc/passwd parse) instead
@@ -1854,11 +1933,11 @@ pub fn fim_rules_with_lineage(
         pkg(Box::new(NnLFim002NewSuidBinary)),
         pkg(Box::new(NnLFim008KernelModuleModified)),
         // High next.
-        pkg(Box::new(NnLFim003SensitiveConfigModified)),
+        admin(Box::new(NnLFim003SensitiveConfigModified)),
         Box::new(NnLFim004AuthorizedKeysModified),
         Box::new(NnLFim005LogTruncated::new(syslog_uid)),
-        pkg(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
-        pkg(Box::new(NnLFim009SystemdUnitDropped::new(
+        admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
+        admin(Box::new(NnLFim009SystemdUnitDropped::new(
             installer_override,
         ))),
         // C5.3 — cloud credential read family. Same High
@@ -1880,7 +1959,7 @@ pub fn fim_rules_with_lineage(
         Box::new(NnLFim017GpgKeyringAccessed),
         Box::new(NnLFim018LastlogTampered),
         Box::new(NnLFim019WtmpBtmpTampered),
-        pkg(Box::new(NnLFim023SystemdTimerCreated)),
+        admin(Box::new(NnLFim023SystemdTimerCreated)),
         // Medium last.
         Box::new(NnLFim006OperatorBinaryModified),
         Box::new(NnLFim020ShellHistoryCleared),
@@ -3857,5 +3936,118 @@ mod tests {
         let v = NnLFim011AwsCredsRead.evaluate(&e).expect("fires");
         assert_eq!(v.action, ResponseAction::Log);
         assert!(!v.reasoning.contains("read a file owned by"));
+    }
+
+    // ── review 52 — interactive admin writes are recorded, not killed ──
+
+    /// `/proc` entries for an interactive admin session: login uid 1000
+    /// and, unless `tty_nr` is 0, a terminal.
+    fn session_proc(dir: &std::path::Path, pid: u32, ppid: u32, tty_nr: i64) {
+        let pid_dir = dir.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("loginuid"), "1000").unwrap();
+        std::fs::write(
+            pid_dir.join("stat"),
+            format!("{pid} (w) S {ppid} {pid} {pid} {tty_nr} -1 0\n"),
+        )
+        .unwrap();
+    }
+
+    /// bash (700) → sudo (710) → useradd (720, terminal) | apt-get (730) →
+    /// dpkg (740) | tee (750, no terminal); bash (500) → cp (600): a root
+    /// shell with a terminal and a login uid but no elevation binary.
+    fn admin_fixture() -> (tempfile::TempDir, AuthSessionTracker) {
+        let (tmp, t) = pkg_fixture();
+        t.ingest_spawn(700, 1, "/usr/bin/bash", 7);
+        t.ingest_spawn(710, 700, "/usr/bin/sudo", 8);
+        t.ingest_spawn(720, 710, "/usr/sbin/useradd", 9);
+        t.ingest_spawn(730, 710, "/usr/bin/apt-get", 10);
+        t.ingest_spawn(740, 730, "/usr/bin/dpkg", 11);
+        t.ingest_spawn(750, 710, "/usr/bin/tee", 12);
+        session_proc(tmp.path(), 720, 710, 34816);
+        session_proc(tmp.path(), 740, 730, 34816);
+        session_proc(tmp.path(), 750, 710, 0);
+        session_proc(tmp.path(), 600, 500, 34816);
+        (tmp, t)
+    }
+
+    #[test]
+    fn interactive_admin_config_writes_are_logged_at_rule_severity() {
+        let (_tmp, lineage) = admin_fixture();
+        let rules = rules_by_id(&lineage);
+        let cases: &[(&str, FimOp, &str)] = &[
+            (
+                "NN-L-FIM-003_SensitiveConfigModified",
+                FimOp::Modified,
+                "/etc/passwd",
+            ),
+            (
+                "NN-L-FIM-007_CronDropInCreated",
+                FimOp::Created,
+                "/etc/cron.d/backup",
+            ),
+            (
+                "NN-L-FIM-009_SystemdUnitDropped",
+                FimOp::Created,
+                "/etc/systemd/system/backup.service",
+            ),
+            (
+                "NN-L-FIM-023_SystemdTimerCreated",
+                FimOp::Created,
+                "/etc/systemd/system/backup.timer",
+            ),
+        ];
+        for (id, op, path) in cases {
+            let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));
+            let killed = rule
+                .evaluate(&written_by(*op, path, 600, "cp"))
+                .unwrap_or_else(|| panic!("{id} must fire on {path}"));
+            assert_ne!(
+                killed.action,
+                ResponseAction::Log,
+                "{id}: root shell, no sudo"
+            );
+            let no_tty = rule.evaluate(&written_by(*op, path, 750, "tee")).unwrap();
+            assert_ne!(no_tty.action, ResponseAction::Log, "{id}: no terminal");
+            let v = rule
+                .evaluate(&written_by(*op, path, 720, "useradd"))
+                .unwrap();
+            assert_eq!(v.action, ResponseAction::Log, "{id} on {path}");
+            assert_eq!(v.severity, killed.severity, "{id} keeps its severity");
+            assert!(
+                v.reasoning
+                    .contains("interactive sudo/su session (login uid 1000, terminal)"),
+                "{}",
+                v.reasoning
+            );
+        }
+    }
+
+    /// The package carve-out still applies inside an admin session (`sudo
+    /// apt install`: Log + Low), and the rootkit-shaped rules are not
+    /// wrapped: an admin session writing them is still acted on.
+    #[test]
+    fn interactive_admin_leaves_package_and_rootkit_rules_alone() {
+        let (_tmp, lineage) = admin_fixture();
+        let rules = rules_by_id(&lineage);
+        let dpkg = rules["NN-L-FIM-009_SystemdUnitDropped"]
+            .evaluate(&written_by(
+                FimOp::Created,
+                "/usr/lib/systemd/system/x.service",
+                740,
+                "dpkg",
+            ))
+            .unwrap();
+        assert_eq!(dpkg.action, ResponseAction::Log);
+        assert_eq!(dpkg.severity, Severity::Low);
+        for (id, path) in [
+            ("NN-L-FIM-001_SystemBinaryModified", "/usr/bin/rsync"),
+            ("NN-L-FIM-022_LdSoPreloadModified", "/etc/ld.so.preload"),
+        ] {
+            let v = rules[id]
+                .evaluate(&written_by(FimOp::Modified, path, 720, "cp"))
+                .unwrap_or_else(|| panic!("{id} must fire on {path}"));
+            assert_ne!(v.action, ResponseAction::Log, "{id} is not wrapped");
+        }
     }
 }

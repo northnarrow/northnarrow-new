@@ -238,7 +238,9 @@ pub struct TriggerDetector {
     exempt: ExemptPids,
     /// T7.13 (Beta Step 5) — sudo-mediated process lineage tracker.
     /// Consulted ONLY by `sensitive_file_access` and the mass-write
-    /// arm of `confirmed_intrusion`; every other COMBAT-tier trigger
+    /// arm of `confirmed_intrusion` (and, review 52, by
+    /// [`Self::is_admin_change`], which decides what corroborates, never
+    /// what fires); every other COMBAT-tier trigger
     /// (FsProtectDenial, exec from /tmp, persistence_mechanism,
     /// critical_file_modification, lateral_movement,
     /// exfiltration_pattern, exploit_attempt, lolbas_pattern) fires
@@ -336,7 +338,32 @@ impl TriggerDetector {
     /// the login uid of the owning pid, or `None` for host-level
     /// activity / events with no owning pid.
     pub fn session_scope(&self, event: &Event) -> super::corroboration::Scope {
-        event_owner_pid(event).and_then(|pid| self.auth.loginuid_of(pid))
+        event_owner_pid(event).and_then(|pid| self.auth.session_loginuid(pid))
+    }
+
+    /// Review 52: whether `event` is a write-open by an administrator's
+    /// interactive sudo/su session
+    /// ([`AuthSessionTracker::is_interactive_admin`]) — a configuration
+    /// change, which raises the posture but does not corroborate. `None`
+    /// when its writer cannot be placed yet
+    /// ([`AuthSessionTracker::interactive_admin_status`]); `Some(false)`
+    /// for any other event.
+    pub fn admin_change_status(&self, event: &Event) -> Option<bool> {
+        match event {
+            Event::FileOpen { pid, flags, .. } if is_write_open(*flags) => {
+                self.auth.interactive_admin_status(*pid)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// Review 52: a pending writer placed —
+    /// [`AuthSessionTracker::interactive_admin_status`] and its session's
+    /// scope — or `None` while it still cannot be.
+    pub fn place_writer(&self, pid: u32) -> Option<(bool, super::corroboration::Scope)> {
+        self.auth
+            .interactive_admin_status(pid)
+            .map(|admin| (admin, self.auth.session_loginuid(pid)))
     }
 
     pub fn detect<'a>(&self, event: &Event, recent: impl Into<Recent<'a>>) -> Vec<TriggerType> {

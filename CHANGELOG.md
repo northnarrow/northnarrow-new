@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An administrator's `sudo` edit of a watched configuration, cron, unit or
+  timer file killed the command or the editor (review 52). `sudo useradd`
+  was killed after writing `/etc/passwd` and left an account with no group
+  or home. Two such edits in one session also put the host in COMBAT,
+  whose ladder then killed the writer. Writes from an interactive sudo/su
+  session (login uid and terminal) to these files are now recorded at the
+  rule's severity. They raise the posture without corroborating each
+  other. Services, jobs, commands run without a terminal and root
+  processes with no sudo/su above them keep the kill.
 - Root could boot a kernel without the agent through kexec (review 82,
   High): on AlmaLinux 9, `kexec -l` succeeded with the agent running. The
   agent now refuses every kexec image load outside the trusted-installer

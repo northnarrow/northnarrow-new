@@ -308,6 +308,16 @@ impl PostureMachine {
         // scope (login session); a weak signal from one user/container
         // never vouches for a blunt signal from another.
         let scope = self.inner.triggers.session_scope(event);
+        // Review 52, read before the state lock (they read `/proc`); see
+        // the recording below.
+        let admin_change = self.inner.triggers.admin_change_status(event);
+        {
+            let mut ledger = self.inner.corroboration.lock();
+            ledger.prune(now);
+            if ledger.has_pending() {
+                ledger.resolve_pending(|pid| self.inner.triggers.place_writer(pid));
+            }
+        }
 
         let mut guard = self.inner.state.write();
         let mut ledger = self.inner.corroboration.lock();
@@ -374,8 +384,31 @@ impl PostureMachine {
         // Record this round's escalation signals AFTER the decision, so
         // the current signal does not self-corroborate via the ledger
         // (same-round corroboration is handled by `escalation_now`).
+        //
+        // Review 52: a configuration change written in an administrator's
+        // interactive sudo/su session still raises the posture, but it is
+        // not recorded as corroboration. Editing `sshd_config` and then
+        // adding a unit is routine administration; recorded, the first
+        // signal promoted the second to COMBAT and the ladder then killed
+        // the session's writer. A prior signal of another kind in the same
+        // session (an exploit tool, exfiltration) still promotes it. A
+        // short-lived writer (`sudo tee`) has often exited before its exec
+        // event is read; its change is then recorded pending, and placed
+        // when the next signal consults the ledger.
         for t in &escalation_now {
-            ledger.record(*t, now, scope);
+            let config_change = matches!(
+                t,
+                TriggerType::CriticalFileModification | TriggerType::PersistenceMechanism
+            );
+            match (
+                config_change,
+                admin_change,
+                triggers::event_owner_pid(event),
+            ) {
+                (true, Some(true), _) => {}
+                (true, None, Some(writer)) => ledger.record_pending(*t, now, scope, writer),
+                _ => ledger.record(*t, now, scope),
+            }
         }
         drop(ledger);
 
