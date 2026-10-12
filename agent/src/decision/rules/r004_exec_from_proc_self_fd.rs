@@ -118,12 +118,17 @@ impl Rule for R004ExecFromProcSelfFd {
             ppid,
             parent_comm,
             argv,
+            exe,
             ..
         } = event
         else {
             return None;
         };
-        if !Self::is_proc_fd_path(filename) {
+        // The caller's string names the fd; the kernel's flag names the
+        // memfd whatever path reached it (review 61: a symlink to
+        // `/proc/self/fd/N` hid it from the string match).
+        let memfd = exe.has(common::wire::exe::exe_flags::MEMFD);
+        if !Self::is_proc_fd_path(filename) && !memfd {
             return None;
         }
         // Tappa 10.6.5: systemd-executor launches every unit via
@@ -165,7 +170,22 @@ mod tests {
             parent_comm: parent_comm.to_string(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
+    }
+
+    /// Review 61: a memfd reached through a symlink to `/proc/self/fd/N`
+    /// carries no fd path, but the kernel flags the file itself.
+    #[test]
+    fn fires_on_a_memfd_whatever_path_reached_it() {
+        use crate::decision::rules::testutil::spawn_exe;
+        use common::wire::exe::exe_flags;
+        let event = spawn_exe("x", "/usr/local/bin/notes", "", exe_flags::MEMFD);
+        let v = R004ExecFromProcSelfFd.evaluate(&event).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        // a deleted file alone is no memfd (an upgraded binary re-exec'd)
+        let event = spawn_exe("x", "/usr/bin/x", "/usr/bin/x", exe_flags::DELETED);
+        assert!(R004ExecFromProcSelfFd.evaluate(&event).is_none());
     }
 
     #[test]

@@ -21,7 +21,7 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
 | **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
-| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15 |
+| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passo 1 (aperture file su LSM) fatto il 12 ottobre |
 | UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 

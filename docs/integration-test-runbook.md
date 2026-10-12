@@ -254,6 +254,31 @@ Checks the default (LSM) mode end to end on the running agent:
 Put a unit drop-in with `Environment=NN_FILE_OPEN_SENSOR=tracepoint` to
 compare with the old sensor, for example under `nn-lab.sh overhead`.
 
+### Exec sensor (Tappa 10.9 step 2)
+
+```
+deploy/lab/nn-lab.sh exec-sensor-check   # after sync + install
+```
+
+Checks the default (LSM) mode end to end on the running agent. Run as the
+lab user, the execs below must be killed by the rule that names the file
+the kernel executed, not the string the caller passed (review 61):
+
+- the sensor is armed on `bprm_check_security`, with no missing-link
+  report;
+- `cd /tmp && ./x`, a symlink in a root-owned directory pointing to
+  `/tmp/x`, `/usr/bin/../../tmp/x`, and a script in `/tmp` run as `./x.sh`
+  are killed by R001;
+- a memfd run through an ordinary symlink in the home (to
+  `/proc/self/fd/N`) is killed by R004 on the kernel's memfd flag;
+- `/usr/bin/sleep` runs untouched;
+- the telemetry probe never went silent.
+
+The helper `deploy/lab/exec-sensor/memfd-exec.c` is built on the guest
+(`/usr/local/libexec/nn-lab/nn-memfd-exec`). With a unit drop-in setting
+`Environment=NN_EXEC_SENSOR=tracepoint` (the old sensor) the evasion
+cases fail: that is the gap the step closes.
+
 ### btrfs inode keys (review 55)
 
 ```

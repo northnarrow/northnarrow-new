@@ -22,6 +22,7 @@ mod bpf_defense;
 mod dns_query;
 mod drops;
 mod exec_check;
+mod exec_lsm;
 mod file_open;
 mod fim_watch;
 mod inet_csk_listen;
@@ -58,9 +59,10 @@ use crate::btf_offsets::{
 };
 
 /// Ringbuffer carrying [`ProcessSpawnRaw`] events to userland.
-/// 256 KiB is room for ~880 events; sized to absorb short bursts.
+/// 1 MiB: about 750 records of 1,392 bytes (Tappa 10.9 step 2 appended
+/// the executed file's identity), sized to absorb short bursts.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 
 // `sched_process_exec` event format (see
@@ -265,6 +267,21 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                     }
                 }
             }
+        }
+
+        // Tappa 10.9 step 2: the file the caller named, as the LSM exec
+        // sensor found it on pass 0 (`exec_lsm::EXEC_HANDOFF`, same task).
+        // Absent in tracepoint mode: `exe` stays zero.
+        let key = task as u64;
+        if let Some(v) = crate::exec_lsm::EXEC_HANDOFF.get_ptr(&key) {
+            unsafe {
+                let _ = aya_ebpf::helpers::gen::bpf_probe_read_kernel(
+                    &mut (*raw_ptr).exe as *mut _ as *mut aya_ebpf::cty::c_void,
+                    core::mem::size_of::<northnarrow_common::wire::exe::ExeIdentityRaw>() as u32,
+                    v as *const aya_ebpf::cty::c_void,
+                );
+            }
+            let _ = crate::exec_lsm::EXEC_HANDOFF.remove(&key);
         }
     }
 

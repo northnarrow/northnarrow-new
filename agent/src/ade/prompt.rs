@@ -152,15 +152,18 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             "- bpf_syscall pid={pid} comm={comm} cmd={} arg={arg}",
             common::wire::bpf_cmd_name(*cmd)
         ),
+        // Tappa 10.9 step 2: the file the kernel executed (review 61).
         Event::ProcessSpawn {
             pid,
             ppid,
             uid,
             comm,
             filename,
+            exe,
             ..
         } => format!(
-            "- process_spawn pid={pid} ppid={ppid} uid={uid} comm={comm} filename={filename}"
+            "- process_spawn pid={pid} ppid={ppid} uid={uid} comm={comm} filename={}",
+            exe.path_or(filename)
         ),
         Event::FileOpen {
             pid,
@@ -188,9 +191,13 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             uid,
             comm,
             filename,
+            exe,
             ..
         } => {
-            format!("- exec_check pid={pid} ppid={ppid} uid={uid} comm={comm} filename={filename}")
+            format!(
+                "- exec_check pid={pid} ppid={ppid} uid={uid} comm={comm} filename={}",
+                exe.path_or(filename)
+            )
         }
         Event::TcpConnect {
             pid,
@@ -301,6 +308,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         let ctx = EventContext {
             recent_events: vec![],
@@ -332,6 +340,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         let recent = Event::ProcessSpawn {
             pid: 41,
@@ -345,6 +354,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         let ctx = EventContext {
             recent_events: vec![recent],

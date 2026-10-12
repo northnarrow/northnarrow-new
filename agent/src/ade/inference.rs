@@ -235,20 +235,25 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
             pid,
             comm,
             filename,
+            exe,
             ..
         } => {
+            // The file the kernel executed (review 61).
+            let path = exe.path_or(filename);
             pid_for_pkg = *pid;
-            filename_for_pkg = filename.clone();
-            category = classify_process(comm, filename);
+            filename_for_pkg = path.to_string();
+            category = classify_process(comm, path);
         }
         Event::FileOpen { pid, filename, .. } | Event::MassWrite { pid, filename, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = filename.clone();
             category = MockCategory::Unknown;
         }
-        Event::ExecCheck { pid, filename, .. } => {
+        Event::ExecCheck {
+            pid, filename, exe, ..
+        } => {
             pid_for_pkg = *pid;
-            filename_for_pkg = filename.clone();
+            filename_for_pkg = exe.path_or(filename).to_string();
             category = MockCategory::Unknown;
         }
         Event::TcpConnect { pid, comm, .. } | Event::DnsQuery { pid, comm, .. } => {
@@ -628,6 +633,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         });
         assert_eq!(v.verdict, AdeAction::Kill);
         assert_eq!(v.severity, AdeSeverity::High);
@@ -647,6 +653,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         });
         assert_eq!(v.verdict, AdeAction::Allow);
         assert_eq!(v.severity, AdeSeverity::None);
@@ -666,6 +673,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         });
         assert_eq!(v.verdict, AdeAction::KillTree);
         assert_eq!(v.severity, AdeSeverity::Critical);
@@ -685,6 +693,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         });
         assert_eq!(v.verdict, AdeAction::Escalate);
         assert_eq!(v.escalation_tier, Some(EscalationTier::Tier1Review));
@@ -705,6 +714,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         });
         assert_eq!(v.verdict, AdeAction::Alert);
         assert_eq!(v.severity, AdeSeverity::Medium);

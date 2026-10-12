@@ -49,6 +49,7 @@ impl Rule for R013NamespaceEscapeTooling {
             comm,
             filename,
             argv,
+            exe,
             ..
         } = event
         else {
@@ -57,6 +58,9 @@ impl Rule for R013NamespaceEscapeTooling {
         if !ESCAPE_TOOLS.contains(&comm.as_str()) {
             return None;
         }
+        // Review 61: the file the kernel executed (`/usr/bin/../../tmp/x`
+        // is not under /usr/bin; a symlink to /usr/bin/x is).
+        let filename = exe.path_or(filename);
         // Fail-safe: an EMPTY filename means the sensor could not read
         // the exec path (a tracepoint layout the agent did not expect —
         // RHEL 9 shifted `sched_process_exec.filename` and this rule

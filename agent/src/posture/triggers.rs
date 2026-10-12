@@ -314,13 +314,20 @@ impl TriggerDetector {
             filename,
             argv,
             timestamp_ns,
+            exe,
             ..
         } = event
         {
             // FP-2: pass argv so the tracker can precompute the npm-CLI
             // flag (node running npm-cli.js) for the mass-write exemption.
-            self.auth
-                .ingest_spawn_with_argv(*pid, *ppid, filename, argv, *timestamp_ns);
+            // Tappa 10.9 step 2: the file the kernel executed (review 61).
+            self.auth.ingest_spawn_with_argv(
+                *pid,
+                *ppid,
+                exe.path_or(filename),
+                argv,
+                *timestamp_ns,
+            );
         }
 
         // Stack-exclusion: never raise a trigger on the NorthNarrow
@@ -659,8 +666,13 @@ fn confirmed_intrusion(
     // run binaries out of these paths. NOT gated by auth-lineage —
     // a sudo-spawned process exec'ing /tmp/payload is exactly the
     // post-compromise pattern we want to catch.
-    if let Event::ProcessSpawn { filename, .. } | Event::ExecCheck { filename, .. } = focal {
-        if filename.starts_with("/tmp/") || filename.starts_with("/dev/shm/") {
+    //
+    // Tappa 10.9 step 2: on the file the kernel executed (review 61).
+    if let Event::ProcessSpawn { filename, exe, .. } | Event::ExecCheck { filename, exe, .. } =
+        focal
+    {
+        let path = exe.path_or(filename);
+        if path.starts_with("/tmp/") || path.starts_with("/dev/shm/") {
             return true;
         }
     }
@@ -1048,6 +1060,7 @@ pub(super) mod testutil {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 
@@ -1447,6 +1460,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 
@@ -1465,6 +1479,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 

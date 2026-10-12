@@ -18,9 +18,11 @@ impl Rule for R003ExecFromVarTmp {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { filename, .. } = event else {
+        let Event::ProcessSpawn { filename, exe, .. } = event else {
             return None;
         };
+        // Review 61: the file the kernel executed, not the caller's string.
+        let filename = exe.path_or(filename);
         if !filename.starts_with("/var/tmp/") {
             return None;
         }

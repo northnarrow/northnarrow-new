@@ -259,12 +259,14 @@ pub(crate) fn build_verdict(
     reasoning: &str,
 ) -> Verdict {
     let (event_pid, event_filename, timestamp_ns) = match event {
+        // Review 61: the file the kernel executed, when known.
         Event::ProcessSpawn {
             pid,
             filename,
             timestamp_ns,
+            exe,
             ..
-        } => (*pid, filename.clone(), *timestamp_ns),
+        } => (*pid, exe.path_or(filename).to_string(), *timestamp_ns),
         // BUG-034: R018 fires on Event::ModuleLoad — target the LOADER
         // process (else a Critical KillProcessTree would carry pid 0 and
         // be refused at the executor's PID floor, a silent no-op).
@@ -320,7 +322,20 @@ pub(crate) mod testutil {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
+    }
+
+    /// Tappa 10.9 step 2 (review 61): a spawn whose caller passed
+    /// `filename` while the kernel executed `exe_path` (`flags` from
+    /// `wire::exe::exe_flags`).
+    pub(crate) fn spawn_exe(comm: &str, filename: &str, exe_path: &str, flags: u32) -> Event {
+        let mut e = spawn(comm, filename);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.path = exe_path.to_string();
+            exe.flags = flags | common::wire::exe::exe_flags::KNOWN;
+        }
+        e
     }
 
     /// Same as [`spawn`] but lets the caller override uid (used by
@@ -338,6 +353,7 @@ pub(crate) mod testutil {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 
@@ -363,6 +379,7 @@ pub(crate) mod testutil {
             parent_comm: parent_comm.to_string(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 }

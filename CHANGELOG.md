@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- The exec kill rules could be evaded with a relative path (review 61,
+  High). They matched the string the caller passed to `execve`, so
+  `cd /tmp && ./payload` ran with no detection while `/tmp/payload` was
+  killed (lab, Debian 12). A symlink, `..` or `execveat` with a directory
+  fd did the same, and a memfd behind a symlink escaped R004. R001, R002,
+  R003, R008, R009, R010, R013's and R017's exemptions, CHAIN-002, the
+  posture's `/tmp` arm, process canaries and the auth-lineage tracker now
+  read the file the kernel executed, and R004 also fires on the kernel's
+  memfd flag.
 - Review 64's fix had no effect (review 65, High). `cargo xtask build`
   dropped every `CARGO_*` variable before building, including the release
   job's `x86-64-v2` override. A release built on a runner with AVX-512 still
@@ -154,6 +163,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Exec sensor on LSM `bprm_check_security` (Tappa 10.9 step 2). For each
+  binfmt pass (a `#!` script: the script, then its interpreter) it reads
+  the file the kernel opened. It records `(dev, ino)`, whether the file is
+  on a memory-backed filesystem, is a memfd or is unlinked, and its path
+  rebuilt from the dentry up to the exec'ing task's root (containers and
+  chroots keep their own view). The path walk is a global BPF function,
+  verified on its own. The first pass's identity is handed to the
+  post-exec `ProcessSpawn`, and `ExecCheck` now carries kernel data (and
+  a real `ppid`). `sys_enter_execve` is no longer attached;
+  `--exec-sensor tracepoint` (or `NN_EXEC_SENSOR`) keeps it for one soak
+  cycle. The exec ring grows to 1 MiB for the larger records.
+  `nn-lab.sh exec-sensor-check` verifies it end to end.
 - File-open sensor on LSM `file_open` (Tappa 10.9 step 1). The FIM
   `file_open` observer now also classifies every open in the kernel, and
   only the opens a rule reads reach userland:

@@ -53,10 +53,15 @@ pub fn transform_to_escalate(
         Event::IoUring { pid, comm, .. } | Event::BpfSyscall { pid, comm, .. } => {
             (*pid, comm.clone())
         }
-        Event::ProcessSpawn { pid, filename, .. }
-        | Event::FileOpen { pid, filename, .. }
-        | Event::MassWrite { pid, filename, .. }
-        | Event::ExecCheck { pid, filename, .. } => (*pid, filename.clone()),
+        Event::ProcessSpawn {
+            pid, filename, exe, ..
+        }
+        | Event::ExecCheck {
+            pid, filename, exe, ..
+        } => (*pid, exe.path_or(filename).to_string()),
+        Event::FileOpen { pid, filename, .. } | Event::MassWrite { pid, filename, .. } => {
+            (*pid, filename.clone())
+        }
         Event::TcpConnect { pid, comm, .. } | Event::DnsQuery { pid, comm, .. } => {
             (*pid, comm.clone())
         }
@@ -204,6 +209,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         let host = host();
         let m = meta(&host);
@@ -232,6 +238,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         };
         let host = host();
         let m = meta(&host);

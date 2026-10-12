@@ -307,12 +307,17 @@ impl Detector {
                 comm,
                 filename,
                 timestamp_ns,
+                exe,
                 ..
             } => {
-                let path = PathBuf::from(filename);
+                // The file the kernel executed (review 61: a symlink or a
+                // relative path no longer misses the canary), else the
+                // caller's string.
                 let canary_id = {
                     let idx = self.indexes.lock();
-                    idx.is_canary_exe(&path).map(String::from)
+                    idx.is_canary_exe(&PathBuf::from(exe.path_or(filename)))
+                        .or_else(|| idx.is_canary_exe(&PathBuf::from(filename)))
+                        .map(String::from)
                 };
                 let canary_id = canary_id?;
                 (
@@ -546,6 +551,7 @@ mod tests {
             parent_comm: String::new(),
             parent_start_ns: 0,
             parent_is_kthread: false,
+            exe: Default::default(),
         }
     }
 

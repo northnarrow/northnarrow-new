@@ -21,9 +21,14 @@ impl Rule for R009RootExecFromUserPath {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { uid, filename, .. } = event else {
+        let Event::ProcessSpawn {
+            uid, filename, exe, ..
+        } = event
+        else {
             return None;
         };
+        // Review 61: the file the kernel executed, not the caller's string.
+        let filename = exe.path_or(filename);
         if *uid != 0 {
             return None;
         }
