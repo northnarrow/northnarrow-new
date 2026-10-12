@@ -1071,13 +1071,65 @@ impl Rule for NnLNet008OutboundFromTmpExec {
 
 /// `bytes_sent > 100 MiB` on a single flow from a comm outside
 /// the high-volume allowlist. Possible exfiltration.
+///
+/// Review 74: a UDP flow row is one kernel emission — one datagram before
+/// review 73, at most about 1 MiB since — so no single UDP row can cross
+/// the threshold, and UDP exfiltration of any volume never fired. UDP rows
+/// are summed per (pid, destination) over [`UDP_VOLUME_WINDOW_NS`].
 pub struct NnLNet009ByteAnomaly {
     allowlist: Arc<CommAllowlist>,
+    udp: Mutex<UdpVolume>,
 }
 
 impl NnLNet009ByteAnomaly {
     pub fn new(allowlist: Arc<CommAllowlist>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            udp: Mutex::new(UdpVolume::default()),
+        }
+    }
+}
+
+/// Window over which NET-009 sums a (pid, destination)'s UDP bytes.
+const UDP_VOLUME_WINDOW_NS: u64 = 600 * 1_000_000_000;
+/// Destinations tracked at once; the oldest window goes first.
+const UDP_VOLUME_MAX_KEYS: usize = 4096;
+
+/// Review 74: UDP bytes per (pid, dst addr, dst port): window start,
+/// bytes in the window, and whether the window already fired.
+#[derive(Default)]
+struct UdpVolume {
+    keys: HashMap<(u32, IpAddr, u16), (u64, u64, bool)>,
+}
+
+impl UdpVolume {
+    /// Add a row's bytes. Returns the window's total the first time it
+    /// exceeds [`HIGH_VOLUME_BYTES_SENT`].
+    fn add(&mut self, key: (u32, IpAddr, u16), ts_ns: u64, bytes: u64) -> Option<u64> {
+        if !self.keys.contains_key(&key) && self.keys.len() >= UDP_VOLUME_MAX_KEYS {
+            self.keys
+                .retain(|_, (start, _, _)| ts_ns.saturating_sub(*start) <= UDP_VOLUME_WINDOW_NS);
+            if self.keys.len() >= UDP_VOLUME_MAX_KEYS {
+                if let Some(oldest) = self
+                    .keys
+                    .iter()
+                    .min_by_key(|(_, (start, _, _))| *start)
+                    .map(|(k, _)| *k)
+                {
+                    self.keys.remove(&oldest);
+                }
+            }
+        }
+        let e = self.keys.entry(key).or_insert((ts_ns, 0, false));
+        if ts_ns.saturating_sub(e.0) > UDP_VOLUME_WINDOW_NS {
+            *e = (ts_ns, 0, false);
+        }
+        e.1 = e.1.saturating_add(bytes);
+        if !e.2 && e.1 > HIGH_VOLUME_BYTES_SENT {
+            e.2 = true;
+            return Some(e.1);
+        }
+        None
     }
 }
 
@@ -1095,6 +1147,33 @@ impl Rule for NnLNet009ByteAnomaly {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        if nf.proto == 17 {
+            // Review 74: sum the UDP rows of this (pid, destination).
+            if self.allowlist.contains(&nf.comm) {
+                return None;
+            }
+            let total = self.udp.lock().add(
+                (nf.pid, nf.dst_addr, nf.dst_port),
+                nf.start_ns,
+                nf.bytes_sent,
+            )?;
+            let reasoning = format!(
+                "UDP: {} MiB sent to {}:{} within 10 minutes from a non-allowlist \
+                 comm — possible exfiltration over UDP; posture → ENGAGED",
+                total >> 20,
+                nf.dst_addr,
+                nf.dst_port
+            );
+            return Some(net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::High,
+                &reasoning,
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ));
+        }
         if nf.bytes_sent <= HIGH_VOLUME_BYTES_SENT {
             return None;
         }
@@ -2357,6 +2436,62 @@ mod tests {
             nf.bytes_sent = 5 * 1024 * 1024 * 1024;
         }
         assert!(rule.evaluate(&e).is_none());
+    }
+
+    const SEC_NS: u64 = 1_000_000_000;
+
+    /// A UDP row from the flow tracker: `bytes` sent at `ts_ns`.
+    fn udp_row(pid: u32, dst_port: u16, comm: &str, bytes: u64, ts_ns: u64) -> Event {
+        let mut e = flow(v4(203, 0, 113, 7), dst_port, comm);
+        if let Event::NetFlow(nf) = &mut e {
+            nf.proto = 17;
+            nf.pid = pid;
+            nf.bytes_sent = bytes;
+            nf.start_ns = ts_ns;
+            nf.end_ns = ts_ns;
+            nf.bytes_recv = 0;
+        }
+        e
+    }
+
+    /// Review 74: no UDP row exceeds ~1 MiB, so NET-009 sums them per
+    /// (pid, destination): it fires once when 100 MiB are crossed.
+    #[test]
+    fn net_009_sums_udp_rows_per_destination() {
+        let rule = NnLNet009ByteAnomaly::new(al());
+        let mib = 1024 * 1024;
+        let mut fired = 0;
+        for i in 0..150u64 {
+            if rule
+                .evaluate(&udp_row(77, 9999, "evilbin", mib, i * 100_000_000))
+                .is_some()
+            {
+                fired += 1;
+                assert!(i >= 100, "fired at row {i}, before 100 MiB");
+            }
+        }
+        assert_eq!(fired, 1, "once per window");
+        // Another destination of the same process starts from zero.
+        assert!(rule
+            .evaluate(&udp_row(77, 9998, "evilbin", mib, 20 * SEC_NS))
+            .is_none());
+    }
+
+    #[test]
+    fn net_009_udp_window_and_allowlist() {
+        let rule = NnLNet009ByteAnomaly::new(al());
+        let mib = 1024 * 1024;
+        // 60 MiB, then 60 MiB more 11 minutes later: two windows, no fire.
+        assert!(rule
+            .evaluate(&udp_row(5, 4000, "evilbin", 60 * mib, 0))
+            .is_none());
+        assert!(rule
+            .evaluate(&udp_row(5, 4000, "evilbin", 60 * mib, 660 * SEC_NS))
+            .is_none());
+        // An allowlisted comm is never summed.
+        assert!(rule
+            .evaluate(&udp_row(6, 4000, "rsync", 200 * mib, 0))
+            .is_none());
     }
 
     #[test]
