@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- An unprivileged UDP burst could erase every network flow record (review
+  73, High). A connected UDP socket emitted one record per `send()` into the
+  ring the TCP closes share. One process sending 146k datagrams/s lost 1.45
+  million records in 10 s, TCP flows included. UDP sends are now aggregated
+  in the kernel per destination: one record per second, or per MiB, carrying
+  the bytes sent. UDP records also have their own ring.
 - An unprivileged shell loop could blind the exec rules (review 72, High).
   For every event, the agent cloned its ring of up to 1,000 recent events to
   hand the posture triggers a slice. Under an exec burst (four `cat` loops,

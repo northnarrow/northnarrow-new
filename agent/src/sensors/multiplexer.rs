@@ -66,6 +66,8 @@ pub struct NetWiring {
 pub struct NetRingBufs {
     pub close_rb: RingBuf<MapData>,
     pub listen_rb: RingBuf<MapData>,
+    /// Review 73: the UDP flow records, apart from the TCP closes.
+    pub udp_rb: RingBuf<MapData>,
 }
 
 /// Owns the loaded eBPF object and every attached link. Dropping the
@@ -248,10 +250,12 @@ impl SensorMultiplexer {
             }
             let close_rb = take_ringbuf(&mut ebpf, "NET_FLOW_CLOSE_EVENTS")?;
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
+            let udp_rb = take_ringbuf(&mut ebpf, "NET_UDP_EVENTS")?;
             info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)");
             Some(NetRingBufs {
                 close_rb,
                 listen_rb,
+                udp_rb,
             })
         } else {
             None
