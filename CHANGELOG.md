@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A process could read cloud, browser, password-manager and GPG
+  credentials, or write `wtmp`, `btmp` and `lastlog`, with no detection
+  by giving itself a legitimate client's name (review 85, High):
+  `prctl(PR_SET_NAME, "aws")` was enough. The rules now recognise a
+  client by what the kernel executed: its exe, or the script an
+  interpreter runs, inside a root-owned system tree. They also recognise
+  gcloud, the Azure CLI and AWS CLI v1, which run as `python3`. A client
+  reading another user's credentials is no longer exempted.
 - An administrator's `sudo` edit of a watched configuration, cron, unit or
   timer file killed the command or the editor (review 52). `sudo useradd`
   was killed after writing `/etc/passwd` and left an account with no group
