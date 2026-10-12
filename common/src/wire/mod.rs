@@ -930,11 +930,23 @@ pub struct FimEvent {
     pub child_truncated: bool,
     /// Tappa 10.9 step 1: an open found by the file-open sensor's
     /// credential-name table (every home), not by the operator's watch
-    /// list. The FIM rules report it without killing until the owner
-    /// decides otherwise (design Q8): the owner's own tools (an editor,
-    /// an SDK such as boto3) open these files too.
+    /// list. The FIM rules report it, and act on it only when another
+    /// non-root user read it ([`Self::owner_uid`], design Q8): the
+    /// owner's own tools (an editor, an SDK such as boto3) open these
+    /// files too.
     #[serde(default)]
     pub wide_coverage: bool,
+    /// Owner (uid) of the file a wide-coverage credential open read, when
+    /// the path still named that inode. Q8, decided 2026-10-12: another
+    /// user's read (not root's: backups) is acted on, not only reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
+    /// The reader of a wide-coverage credential open held
+    /// `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` in the initial user
+    /// namespace: it reads every file as root does (a backup tool given
+    /// the capability instead of root), so Q8 treats it as root.
+    #[serde(default)]
+    pub reader_dac_capable: bool,
 }
 
 /// Tappa 9 (C1) — typed inflation of [`FimDriftRaw::op`]. Wire
@@ -1425,6 +1437,8 @@ mod tests {
             dest_path: None,
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1487,6 +1501,8 @@ mod tests {
             dest_path: Some("/home/u/documents/quarterly.docx.crypted".to_string()),
             child_truncated: false,
             wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
