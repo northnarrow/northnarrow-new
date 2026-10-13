@@ -6,6 +6,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the agent's own binaries as a way around the BPF
+  self-defence (High EBPF-002):
+  - The guard on the agent's maps and links exempted any process running
+    one of the agent's executables (agent, watchdog, `nn-admin`). Root could
+    preload its own library into one of them: in the lab, `nn-admin`, a
+    second agent and a second watchdog each got a write handle on
+    `PROTECTED_PIDS` and a handle on the task_kill hook's link (enough to
+    detach it). Now only the successor of an agent or a watchdog that
+    exited may open the maps before it is a protected pid — while no live
+    process holds that role (tracked in the kernel: the slot empties when
+    the process exits), from its main thread, in its first minute. No
+    process gets a link handle, `nn-admin` is not exempt at all, and a
+    process running the agent's or the watchdog's binary cannot be ptraced
+    before it registers.
+  - The agent no longer protects a second watchdog that the pidfile names
+    while the registered one still runs.
 - External audit, Wave 1, systemd as a way around the anti-tamper (High
   EBPF-001):
   - The task_kill hook let PID 1 deliver any signal to the agent and the

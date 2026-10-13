@@ -35,7 +35,7 @@ UNIT=${UNIT:-/etc/systemd/system/northnarrow-agent.service}
 # systemd's signals reach the agent only inside a signed trusted-installer
 # window. The cases that restart the agent on purpose take the operator's
 # path: the window (lab key), SIGTERM, the watchdog brings it back.
-grant_window() { "$NNADMIN" trusted-installer-grant --key "$ETC/admin.key" --window-secs 120 >/dev/null 2>&1; }
+grant_window() { "$NNADMIN" trusted-installer-grant --key "$ETC/admin.key" --window-secs "${1:-120}" >/dev/null 2>&1; }
 restart_agent() {
     local old new i
     old=$(cat /run/northnarrow/agent.pid 2>/dev/null)
@@ -112,6 +112,19 @@ run_case() {
 
 PID=$(agent_pid)
 [[ -n "$PID" ]] || { echo "agent not running (no pid file)"; exit 2; }
+# A trusted-installer window still open from an earlier step suspends the
+# filesystem deny hooks by design: C04-C07 would pass, and C07 would purge
+# the pins. Wait until this agent closes it (a restart ends it too: the
+# grants are bound to the boot's session nonce).
+window_open() {
+    journalctl --namespace=northnarrow _PID="$(agent_pid)" --since "-30min" --no-pager -o cat 2>/dev/null \
+        | grep -oE 'trusted-installer override (ARMED|CLOSED)' | tail -1 | grep -q ARMED
+}
+for i in $(seq 1 130); do
+    window_open || break
+    (( i == 1 )) && echo "a trusted-installer window is open: waiting for it to close" >&2
+    sleep 1
+done
 # BPF guard mode of the running agent (lab builds observe unless forced)
 BPF_MODE=$(jlines "-2h" | grep -o 'own objects registered.*mode="[a-z]*"' | tail -1 | grep -o 'mode="[a-z]*"' | cut -d'"' -f2)
 BPF_MODE=${BPF_MODE:-enforce}
@@ -219,7 +232,12 @@ run_case C29 "ptrace attach after an agent restart" denied "op=ptrace" 0 -- bash
 # protects new inodes (the pins of the hooks reattached fresh), and the
 # earlier boots' keys piled up until an insert failed at 1024 entries and
 # the agent refused to start. One more restart must not grow it.
-if [[ -z "$ONLY" || ",$ONLY," == *",C30,"* ]]; then
+if [[ "$BPF_MODE" == enforce ]] && [[ -z "$ONLY" || ",$ONLY," == *",C30,"* ]]; then
+    # bpftool opens maps read-write, which the guard refuses in enforce mode:
+    # the count would read 0 → 0 and prove nothing.
+    rows+=("| C30 | PROTECTED_INODES across an agent restart | skipped (enforce: bpftool cannot open the map) | — | — |")
+    echo "C30 skipped: the BPF guard is in enforce mode (bpftool cannot open the map)" >&2
+elif [[ -z "$ONLY" || ",$ONLY," == *",C30,"* ]]; then
     pi_count() { bpftool -j map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_INODES 2>/dev/null | grep -o '"key":' | wc -l; }
     n1=$(pi_count); restart_agent; sleep 20; n2=$(pi_count); PID=$(agent_pid)
     if (( n2 > n1 )); then v="DEVIATION (grew by $(( n2 - n1 )))"; fail=1; else v="OK"; fi
@@ -296,6 +314,63 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C33,"* ]]; then
     fi
     rows+=("| C33 | systemctl stop the agent (no window) | $st | $ev | $v |")
     echo "C33 systemctl stop the agent (no window) → $st; $ev; $v" >&2
+fi
+
+# ── the agent's own binaries (external audit EBPF-002) ───────────────────
+# Running the agent's, the watchdog's or nn-admin's executable is no longer
+# an exemption: root could preload its own library into one of them and
+# take the agent's maps or links. A fresh agent or watchdog binary takes
+# write handles only while its role has no live process (the successor of
+# one that exited), from its main thread, in its first minute; no binary is
+# exempt from the link deny, and a process running one of the two binaries
+# cannot be ptraced before it registers.
+PBF_SRC="$(dirname "$0")/bpf-handle-probe.c"
+PBF_LIB=/usr/local/libexec/nn-lab/nn-bpf-probe.so
+AGENT_BIN=${AGENT_EXE:-/usr/local/bin/northnarrow-agent}
+WATCHDOG_BIN=$(dirname "$AGENT_BIN")/northnarrow-watchdog
+if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -O2 -o "$PBF_LIB" "$PBF_SRC" 2>/tmp/nn-pbf-cc.log; then
+    env LD_PRELOAD="$PBF_LIB" NNX_SLEEP=20 "$AGENT_BIN" >/dev/null 2>&1 &
+    FRESH=$!
+    sleep 1
+    run_case C34 "ptrace attach: /proc/<pid>/mem of a fresh agent binary" denied "op=ptrace" 0 -- bash -c "dd if=/proc/$FRESH/mem bs=1 count=1 skip=4194304 of=/dev/null"
+    kill "$FRESH" 2>/dev/null; wait "$FRESH" 2>/dev/null
+    run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
+    run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
+    run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
+else
+    echo "C34-C37 skipped: cannot build the probe library ($(head -1 /tmp/nn-pbf-cc.log 2>/dev/null))" >&2
+fi
+# The way in that stays open: a watchdog restarted inside a window is the
+# fresh successor of its role and registers itself (the agent's restart is
+# C23/C24/C28-C30). It exits cleanly on SIGTERM (Restart=on-failure does not
+# bring it back): the operator starts it, as install.sh does.
+if [[ -z "$ONLY" || ",$ONLY," == *",C38,"* ]]; then
+    t0=$(date -u +"%Y-%m-%d %H:%M:%S")
+    old=$(systemctl show -p MainPID --value northnarrow-watchdog)
+    grant_window 20
+    systemctl kill --signal=SIGTERM northnarrow-watchdog
+    for i in $(seq 1 10); do
+        sleep 1
+        systemctl is-active --quiet northnarrow-watchdog || break
+    done
+    systemctl start northnarrow-watchdog
+    new=""
+    for i in $(seq 1 40); do
+        sleep 1
+        new=$(systemctl show -p MainPID --value northnarrow-watchdog)
+        [[ -n "$new" && "$new" != 0 && "$new" != "$old" ]] && break
+    done
+    sleep 5
+    if [[ -n "$new" && "$new" != 0 && "$new" != "$old" ]] \
+       && jlines "$t0" | grep -q "watchdog PID registered in PROTECTED_PIDS pid=$new"; then
+        v="OK"; st="restarted $old → $new, registered"
+    else
+        v="DEVIATION (the restarted watchdog did not register)"; fail=1; st="restarted $old → ${new:-?}"
+    fi
+    rows+=("| C38 | the watchdog restarted in a window registers itself | $st | — | $v |")
+    echo "C38 the watchdog restarted in a window registers itself → $st; $v" >&2
+    # the agent kept running: leave no open window behind
+    for i in $(seq 1 40); do window_open || break; sleep 1; done
 fi
 
 echo

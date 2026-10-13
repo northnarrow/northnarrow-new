@@ -1022,6 +1022,15 @@ pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
         bpffs_root = %bpffs_root.display(),
         "watchdog PID registered in PROTECTED_PIDS"
     );
+    // External audit EBPF-002: now a protected pid, record this watchdog
+    // as the live one — a second watchdog binary started beside it takes
+    // no write handle on the agent's maps. The agent records it too once
+    // it verifies this pid; a failure here is not fatal.
+    if let Err(e) =
+        antitamper_bpf::claim_role(bpffs_root, antitamper_bpf::ROLE_SLOT_WATCHDOG, own_pid)
+    {
+        debug!(target: "watchdog", error = %e, "watchdog role not recorded (the agent records it on verification)");
+    }
     Ok(())
 }
 

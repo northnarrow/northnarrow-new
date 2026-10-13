@@ -810,6 +810,17 @@ pub fn register_protected_pid(bpffs_root: Option<&Path>, pid: u32) -> Result<()>
     Ok(())
 }
 
+/// External audit EBPF-002: record the verified watchdog `pid` as the live
+/// watchdog in the pinned `ROLE_TGIDS` (it records itself too; this covers
+/// a watchdog that started before the agent pinned the map). No bpffs ⇒
+/// no-op.
+pub fn claim_watchdog_role(bpffs_root: Option<&Path>, pid: u32) -> Result<()> {
+    let Some(root) = bpffs_root else {
+        return Ok(());
+    };
+    antitamper_bpf::claim_role(root, antitamper_bpf::ROLE_SLOT_WATCHDOG, pid)
+}
+
 /// Remove `pid` from the pinned `PROTECTED_PIDS` (external audit
 /// MAIN-001: a watchdog pid that no longer runs the watchdog binary).
 /// No bpffs ⇒ no pinned map ⇒ no-op.

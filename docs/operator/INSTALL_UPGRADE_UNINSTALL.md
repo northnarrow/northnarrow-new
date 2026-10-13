@@ -176,8 +176,13 @@ the agent or the watchdog: `bpftool map update/delete` fails with
 posture ladder, like an unlink attempt on `/etc/northnarrow`. Read-only
 handles are allowed in principle, but `bpftool` opens every map read-write,
 so `bpftool map dump` on the agent's maps fails too: use `nn-admin status`
-and the agent's own telemetry instead. The agent's own binaries (watchdog,
-`nn-admin`, matched by executable inode) are exempt. The `bpf` hook also records who
+and the agent's own telemetry instead. Running one of the agent's binaries
+is not an exemption (external audit EBPF-002: root could preload its own
+library into one). Only the successor of an agent or a watchdog that
+exited may take write handles before it is a protected pid — while no live
+process holds that role, from its main thread, in its first minute — and
+no process gets a handle on the agent's links. `nn-admin` talks to the agent
+over its socket and needs none. The `bpf` hook also records who
 drives BPF on the host — program loads, attaches, link create/detach,
 handles-by-id on the agent's maps — as `NN-L-BPF-001/002` alerts (Log).
 

@@ -34,6 +34,17 @@ pub const GUARD_HOOK: &str = "bpf_map";
 pub const OBSERVE_PROGRAM: &str = "bpf_syscall_observe";
 pub const OBSERVE_HOOK: &str = "bpf";
 
+/// External audit EBPF-002: roles in `OWN_EXE_INODES` (mirrors
+/// `agent-ebpf/src/bpf_defense.rs`).
+const ROLE_WATCHDOG: u8 = 1;
+const ROLE_AGENT: u8 = 2;
+pub const ROLE_EXIT_PROGRAM: &str = "role_exit";
+/// Pin of the liveness watch's link (a `link_*` pin: protected like the
+/// LSM links, and found by the link self-check).
+const ROLE_EXIT_LINK_PIN: &str = "link_role_exit";
+/// The liveness watch is attached: `ROLE_TGIDS` slots are claimed.
+static ROLE_WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const OWN_IDS_MAP: &str = "OWN_BPF_IDS";
 const OWN_EXE_MAP: &str = "OWN_EXE_INODES";
 const MODE_MAP: &str = "BPF_DEFENSE_MODE";
@@ -156,6 +167,31 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Bpf
             health.deny_failures.push((GUARD_PROGRAM, format!("{e:#}")));
         }
     }
+    // External audit EBPF-002: the liveness watch behind the fresh-instance
+    // window. Without it the window is bounded by age only (an ERROR):
+    // restarts keep working.
+    match attach_role_exit(ebpf, pin_root) {
+        Ok(()) => {
+            ROLE_WATCH.store(true, std::sync::atomic::Ordering::SeqCst);
+            info!(
+                program = ROLE_EXIT_PROGRAM,
+                "BPF self-defence: role liveness watch attached (sched_process_exit)"
+            );
+        }
+        Err(e) => {
+            dump_verifier_log(ROLE_EXIT_PROGRAM, &e);
+            error!(
+                program = ROLE_EXIT_PROGRAM,
+                error = format!("{e:#}"),
+                "BPF self-defence: role liveness watch attach FAILED — a fresh agent or \
+                 watchdog binary may take the agent's maps in its first minute even beside \
+                 the live one"
+            );
+            health
+                .observe_failures
+                .push((ROLE_EXIT_PROGRAM, format!("{e:#}")));
+        }
+    }
     match antitamper_bpf::attach_transient(ebpf, OBSERVE_PROGRAM, OBSERVE_HOOK, btf) {
         Ok(()) => info!(
             program = OBSERVE_PROGRAM,
@@ -171,6 +207,71 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Bpf
         }
     }
     health
+}
+
+/// Attach the liveness watch and pin its link (`link_role_exit`): it must
+/// outlive the agent's own objects — a clean exit releases them before the
+/// process ends, and a dead agent must still see the watchdog exit. The
+/// prior run's pin is replaced only once the fresh link fires.
+fn attach_role_exit(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
+    let prog: &mut aya::programs::RawTracePoint = ebpf
+        .program_mut(ROLE_EXIT_PROGRAM)
+        .with_context(|| format!("{ROLE_EXIT_PROGRAM} missing from the eBPF object"))?
+        .try_into()
+        .context("role_exit is not a raw tracepoint program")?;
+    prog.load().context("loading role_exit")?;
+    let link_id = prog
+        .attach("sched_process_exit")
+        .context("attaching role_exit to sched_process_exit")?;
+    if let Some(root) = pin_root {
+        let link_path = root.join(ROLE_EXIT_LINK_PIN);
+        antitamper_bpf::purge_stale_pin(&link_path);
+        let link = prog
+            .take_link(link_id)
+            .context("taking ownership of the role_exit link")?;
+        let fd_link: aya::programs::links::FdLink = link.into();
+        fd_link
+            .pin(&link_path)
+            .with_context(|| format!("pinning the role_exit link to {}", link_path.display()))?;
+    }
+    Ok(())
+}
+
+/// External audit EBPF-002: pin `ROLE_TGIDS` and record this agent as the
+/// live one, once it is a protected pid and the liveness watch runs (else
+/// the slot stays vacant: the window is bounded by age only).
+fn claim_agent_role(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
+    if let Some(root) = pin_root {
+        let pin = root.join(antitamper_bpf::ROLE_TGIDS_MAP_NAME);
+        if !pin.exists() {
+            ebpf.map_mut(antitamper_bpf::ROLE_TGIDS_MAP_NAME)
+                .with_context(|| {
+                    format!(
+                        "{} missing from the eBPF object",
+                        antitamper_bpf::ROLE_TGIDS_MAP_NAME
+                    )
+                })?
+                .pin(&pin)
+                .with_context(|| format!("pinning {}", pin.display()))?;
+        }
+    }
+    if !ROLE_WATCH.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    let map = ebpf
+        .map_mut(antitamper_bpf::ROLE_TGIDS_MAP_NAME)
+        .with_context(|| {
+            format!(
+                "{} missing from the eBPF object",
+                antitamper_bpf::ROLE_TGIDS_MAP_NAME
+            )
+        })?;
+    let mut roles: Array<&mut MapData, u32> =
+        Array::try_from(map).context("ROLE_TGIDS is not an Array<u32>")?;
+    roles
+        .set(antitamper_bpf::ROLE_SLOT_AGENT, std::process::id(), 0)
+        .context("recording the agent in ROLE_TGIDS")?;
+    Ok(())
 }
 
 /// Fill `OWN_BPF_IDS` with the ids of every map and program of this object
@@ -230,25 +331,29 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
                 .context("registering own link pin name")?;
         }
     }
-    // The agent's own binaries: this executable plus its siblings in the
-    // same directory (watchdog, nn-admin). Registered by (dev, ino) so the
-    // watchdog's self-registration write passes before it is a protected
-    // pid; a copy elsewhere has another inode and stays foreign.
-    let mut exe_keys: Vec<common::wire::InodeKey> = Vec::new();
+    // The agent's own binaries, by role: this executable (the agent) and
+    // its sibling watchdog. External audit EBPF-002: a process running one
+    // of them may take write handles before it is a protected pid only
+    // while that role has no live process, in its first minute
+    // (`fresh_instance_may_load`); `nn-admin` is not one of them — it talks
+    // to the agent through its socket. A copy elsewhere has another inode.
+    let mut exe_keys: Vec<(common::wire::InodeKey, u8)> = Vec::new();
     if let Ok(own) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         let dir = own.parent().map(Path::to_path_buf);
-        let mut paths = vec![own];
+        let mut paths = vec![(own, ROLE_AGENT)];
         if let Some(d) = dir {
-            paths.push(d.join("northnarrow-watchdog"));
-            paths.push(d.join("nn-admin"));
+            paths.push((d.join("northnarrow-watchdog"), ROLE_WATCHDOG));
         }
-        for path in paths {
+        for (path, role) in paths {
             if let Ok(meta) = std::fs::metadata(&path) {
                 use std::os::unix::fs::MetadataExt;
-                exe_keys.push(common::wire::InodeKey {
-                    dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
-                    ino: meta.ino(),
-                });
+                exe_keys.push((
+                    common::wire::InodeKey {
+                        dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(meta.dev()),
+                        ino: meta.ino(),
+                    },
+                    role,
+                ));
             }
         }
     }
@@ -258,11 +363,20 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
             .with_context(|| format!("{OWN_EXE_MAP} missing from the eBPF object"))?;
         let mut exe_map: HashMap<&mut MapData, crate::anti_tamper::filesystem::AyaInodeKey, u8> =
             HashMap::try_from(exe_map).context("OWN_EXE_INODES is not a HashMap<InodeKey, u8>")?;
-        for k in &exe_keys {
+        for (k, role) in &exe_keys {
             exe_map
-                .insert(crate::anti_tamper::filesystem::AyaInodeKey(*k), 1u8, 0)
+                .insert(crate::anti_tamper::filesystem::AyaInodeKey(*k), *role, 0)
                 .with_context(|| format!("registering own exe inode {}:{}", k.dev, k.ino))?;
         }
+    }
+    // Not fatal: without the claim the fresh-instance window is bounded by
+    // age only, while a failure here must not leave the guard unarmed.
+    if let Err(e) = claim_agent_role(ebpf, pin_root) {
+        error!(
+            error = format!("{e:#}"),
+            "BPF self-defence: the agent's role NOT recorded in ROLE_TGIDS — a fresh agent \
+             binary may take the agent's maps in its first minute even beside this one"
+        );
     }
     let enforce = enforce_mode();
     let mode = ebpf
@@ -573,6 +687,21 @@ mod tests {
         assert_eq!(keys.iter().collect::<HashSet<_>>().len(), 3);
         assert_eq!(own_key(KIND_MAP, 357) & 0xFFFF_FFFF, 357);
         assert_eq!(own_key(KIND_LINK, u32::MAX) >> 32, KIND_LINK as u64);
+    }
+
+    #[test]
+    fn a_role_reads_the_slot_its_process_claims() {
+        // External audit EBPF-002: the guard reads ROLE_TGIDS[role - 1] for
+        // the role OWN_EXE_INODES gives a binary; the watchdog and the agent
+        // claim their slots by the shared crate's constants.
+        assert_eq!(
+            antitamper_bpf::ROLE_SLOT_WATCHDOG,
+            u32::from(ROLE_WATCHDOG) - 1
+        );
+        assert_eq!(antitamper_bpf::ROLE_SLOT_AGENT, u32::from(ROLE_AGENT) - 1);
+        assert_ne!(ROLE_WATCHDOG, ROLE_AGENT);
+        assert_ne!(ROLE_WATCHDOG, 0, "0 is \"not one of ours\" in the guard");
+        assert_ne!(ROLE_AGENT, 0, "0 is \"not one of ours\" in the guard");
     }
 
     #[test]

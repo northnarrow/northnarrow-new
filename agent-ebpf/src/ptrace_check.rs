@@ -120,7 +120,12 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
     // hash map (see task_kill.rs for the rationale on the Tappa 7
     // task 6 single-PID → hash-set migration).
-    if PROTECTED_PIDS.get(&target_tgid).is_none() {
+    // External audit EBPF-002: a process running the agent's or the
+    // watchdog's binary is protected before it registers (its first moments
+    // are when it may still take the agent's maps).
+    if PROTECTED_PIDS.get(&target_tgid).is_none()
+        && !crate::bpf_defense::task_runs_own_binary(target as *const u8)
+    {
         return 0;
     }
 
