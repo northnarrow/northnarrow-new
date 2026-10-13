@@ -134,7 +134,7 @@ fn rules_share_consistent_metadata() {
         Box::new(R006ReverseShellTooling),
         Box::new(R007CryptoMiner),
         Box::new(R008HiddenHomeBinary),
-        Box::new(R009RootExecFromUserPath),
+        Box::new(R009RootExecFromUserPath::default()),
         Box::new(R010BinaryInWebroot),
     ];
     for r in &rules {
@@ -182,7 +182,10 @@ fn rule_ids_are_pinned() {
     assert_eq!(R006ReverseShellTooling.id(), "R006_ReverseShellTooling");
     assert_eq!(R007CryptoMiner.id(), "R007_CryptoMiner");
     assert_eq!(R008HiddenHomeBinary.id(), "R008_HiddenHomeBinary");
-    assert_eq!(R009RootExecFromUserPath.id(), "R009_RootExecFromUserPath");
+    assert_eq!(
+        R009RootExecFromUserPath::default().id(),
+        "R009_RootExecFromUserPath"
+    );
     assert_eq!(R010BinaryInWebroot.id(), "R010_BinaryInWebroot");
     // Tappa 10.5 D2 process rules — instantiated with an empty
     // allowlist (id() is state-independent).

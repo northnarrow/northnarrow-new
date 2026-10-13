@@ -47,7 +47,9 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 
-use northnarrow_common::wire::{ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT};
+use northnarrow_common::wire::{
+    ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT, MODULE_PATH_TOO_DEEP, MODULE_PATH_UNREADABLE,
+};
 
 use crate::btf_offsets::{
     DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_PATH_OFFSET, PATH_DENTRY_OFFSET,
@@ -169,7 +171,7 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
             if !leaf.is_null() {
                 let (n, truncated) = walk_components(leaf, (*raw).path.as_mut_ptr());
                 (*raw).path_len = n as u16;
-                (*raw).path_truncated = truncated as u8;
+                (*raw).path_truncated = truncated;
             }
         }
     }
@@ -181,17 +183,20 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
 /// from a `match` on the iteration index → a constant per iteration, so
 /// the verifier sees in-bounds writes into the 256-byte `path` field
 /// with no running-offset reasoning. Returns `(slots written, truncated)`
-/// where `truncated` is `true` when the slots ran out BEFORE the root
-/// dentry was reached (prefix unknown — userland must not classify the
-/// path's origin). Fails SAFE — any failed probe stops the walk
-/// (short/empty path, never garbage) and also counts as truncated.
+/// where `truncated` is the wire's [`ModuleLoadRaw::path_truncated`]: 0 the
+/// root dentry was reached, [`MODULE_PATH_TOO_DEEP`] every slot was used
+/// before it (deeper than any module directory), [`MODULE_PATH_UNREADABLE`]
+/// a read failed (prefix unknown). Fails SAFE — a failed probe stops the
+/// walk (short/empty path, never garbage).
 #[inline(always)]
-unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
+unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8) {
     let mut dentry = leaf;
     let mut n: usize = 0;
     let mut reached_root = false;
+    let mut failed = false;
     for i in 0..MODULE_PATH_SLOTS {
         if dentry.is_null() {
+            failed = true;
             break;
         }
         let off = match i {
@@ -216,11 +221,14 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
         // dentry->d_name.name (struct qstr → const u8*).
         let name_pp =
             dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)) as *const *const u8;
-        if let Ok(name_ptr) = bpf_probe_read_kernel::<*const u8>(name_pp) {
-            if !name_ptr.is_null() {
+        match bpf_probe_read_kernel::<*const u8>(name_pp) {
+            Ok(name_ptr) if !name_ptr.is_null() => {
                 let slot = core::slice::from_raw_parts_mut(dst.add(off), MODULE_PATH_SLOT_LEN);
-                let _ = bpf_probe_read_kernel_str_bytes(name_ptr, slot);
+                if bpf_probe_read_kernel_str_bytes(name_ptr, slot).is_err() {
+                    failed = true;
+                }
             }
+            _ => failed = true,
         }
         n = i + 1;
         // Step to the parent; stop at the root (d_parent == self) or a
@@ -232,10 +240,24 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
                 reached_root = true;
                 break;
             }
-            _ => break,
+            _ => {
+                failed = true;
+                break;
+            }
         }
     }
-    (n, !reached_root)
+    // External audit PROC-004: the two causes are told apart. Every slot
+    // used without reaching the root is a path deeper than any module
+    // directory — the loader chose that depth, it cannot make the load
+    // unverifiable.
+    let code = if failed {
+        MODULE_PATH_UNREADABLE
+    } else if reached_root {
+        0
+    } else {
+        MODULE_PATH_TOO_DEEP
+    };
+    (n, code)
 }
 
 /// Read the loader's real-parent `comm` + `PF_KTHREAD` flag into `raw`.

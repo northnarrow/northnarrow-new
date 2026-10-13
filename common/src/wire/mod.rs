@@ -689,6 +689,11 @@ pub const MODULE_LOAD_INIT: u8 = 2;
 /// SIGKILLed + COMBATed benign loads. 16 covers every path in a stock
 /// 6.8 tree; deeper paths are flagged via [`ModuleLoadRaw::path_truncated`].
 pub const MODULE_PATH_LEN: usize = 512;
+/// [`ModuleLoadRaw::path_truncated`]: the path is deeper than the walk's
+/// slots — deeper than any module directory.
+pub const MODULE_PATH_TOO_DEEP: u8 = 1;
+/// [`ModuleLoadRaw::path_truncated`]: a kernel read failed during the walk.
+pub const MODULE_PATH_UNREADABLE: u8 = 2;
 
 /// Kernel module-load observation (BUG-034). Emitted by the
 /// `kernel_read_file` / `kernel_load_data` BPF-LSM hooks
@@ -719,6 +724,9 @@ pub struct ModuleLoadRaw {
     /// filesystem root: `path` then holds only the leaf-most components
     /// and its prefix is unknown. Userland reconstructs such a path
     /// WITHOUT a leading `/` so consumers can tell it apart.
+    /// 0: the path reached the filesystem root. [`MODULE_PATH_TOO_DEEP`]:
+    /// every slot was used first. [`MODULE_PATH_UNREADABLE`]: a kernel
+    /// read failed (external audit PROC-004 tells the two apart).
     pub path_truncated: u8,
     pub _pad: [u8; 3],
     /// Source `.ko` path for a finit_module load (stage 1b); zeroed otherwise.

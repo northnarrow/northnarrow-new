@@ -606,11 +606,7 @@ impl From<&crate::wire::ModuleLoadRaw> for Event {
             loader_comm: crate::wire::cstr_lossy(&raw.loader_comm).into_owned(),
             parent_comm: crate::wire::cstr_lossy(&raw.parent_comm).into_owned(),
             parent_is_kthread: raw.parent_is_kthread != 0,
-            path: reconstruct_module_path(
-                &raw.path,
-                raw.path_len as usize,
-                raw.path_truncated != 0,
-            ),
+            path: reconstruct_module_path(&raw.path, raw.path_len as usize, raw.path_truncated),
             timestamp_ns: raw.timestamp_ns,
         }
     }
@@ -629,7 +625,7 @@ impl From<&crate::wire::ModuleLoadRaw> for Event {
 fn reconstruct_module_path(
     path: &[u8; crate::wire::MODULE_PATH_LEN],
     slots: usize,
-    truncated: bool,
+    truncated: u8,
 ) -> Option<String> {
     const SLOT: usize = 32;
     let n = slots.min(crate::wire::MODULE_PATH_LEN / SLOT);
@@ -649,9 +645,16 @@ fn reconstruct_module_path(
     }
     comps.reverse(); // kernel wrote leaf→root; flip to root→leaf
     let joined = comps.join("/");
-    if truncated {
+    if truncated != 0 {
         // Prefix unknown: keep it relative, strip any stray leading '/'.
-        return Some(joined.trim_start_matches('/').to_string());
+        // External audit PROC-004: a path deeper than the walk's slots
+        // reads "…/<components>" — see `module_path_too_deep`.
+        let rel = joined.trim_start_matches('/');
+        return Some(if truncated == crate::wire::MODULE_PATH_TOO_DEEP {
+            format!("{MODULE_PATH_DEEPER}{rel}")
+        } else {
+            rel.to_string()
+        });
     }
     Some(if joined.starts_with("//") {
         joined[1..].to_string()
@@ -666,6 +669,19 @@ fn reconstruct_module_path(
 /// [`reconstruct_module_path`]): relative, i.e. no leading `/`.
 pub fn module_path_is_truncated(path: &str) -> bool {
     !path.starts_with('/')
+}
+
+/// What a module path deeper than the kernel walk's slots starts with:
+/// "there is more above".
+const MODULE_PATH_DEEPER: &str = "…/";
+
+/// External audit PROC-004: `true` when a truncated module path is so only
+/// because it is deeper than the walk's slots (16 components) — deeper
+/// than any module directory, so not a legitimate location, whatever lies
+/// above. `false` for a complete path, and for one a failed read left
+/// unknown.
+pub fn module_path_too_deep(path: &str) -> bool {
+    path.starts_with(MODULE_PATH_DEEPER)
 }
 
 impl From<&TcpConnectRaw> for Event {

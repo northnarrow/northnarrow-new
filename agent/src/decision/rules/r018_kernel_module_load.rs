@@ -101,20 +101,41 @@ impl Rule for R018KernelModuleLoad {
                 // unknown, so it must not be classified as non-standard
                 // (that branch SIGKILLs + COMBATs). Surface it as a
                 // Medium alert unless the loader is allowlisted.
+                // External audit PROC-004: deeper than the walk's slots is
+                // deeper than any module directory (a legitimate one sits a
+                // dozen components down at most). The loader chose that
+                // depth; it must not buy the load an alert instead of the
+                // kill.
+                if common::module_path_too_deep(p) {
+                    return Some(build_verdict(
+                        self,
+                        event,
+                        ResponseAction::KillProcessTree,
+                        Severity::Critical,
+                        &format!(
+                            "Kernel module loaded from a path deeper than any module \
+                             directory ({p}) by '{loader_comm}' (parent '{parent_comm}') — \
+                             legit modules live under /lib/modules; near-certain rootkit \
+                             (T1014 / T1547.006). Kill tree + posture → COMBAT."
+                        ),
+                    ));
+                }
                 if common::module_path_is_truncated(p) {
                     if self.loader_allowlist.contains(loader_comm)
                         || self.loader_allowlist.contains(parent_comm)
                     {
                         return None;
                     }
+                    // A kernel read failed: the origin is unknown, which is
+                    // not the same as benign (external audit PROC-004).
                     return Some(build_verdict(
                         self,
                         event,
                         ResponseAction::Log,
-                        Severity::Medium,
+                        Severity::High,
                         &format!(
-                            "Kernel module loaded from a path deeper than the sensor's slot \
-                             budget (leaf components: {p}) by '{loader_comm}' (parent \
+                            "Kernel module loaded from a path the sensor could not read to \
+                             the root (components: {p}) by '{loader_comm}' (parent \
                              '{parent_comm}') — origin unverifiable, NOT auto-killing. Alert."
                         ),
                     ));
@@ -228,8 +249,20 @@ mod tests {
         }
         r.path_len = slot as u16;
         // Mirrors the kernel walk: the root dentry ("/") is the last
-        // component written; a path that never reaches it is truncated.
-        r.path_truncated = u8::from(path_root_to_leaf.first() != Some(&"/"));
+        // component written; a path that never reaches it is truncated —
+        // here by a failed read (`raw_too_deep` for the other cause).
+        r.path_truncated = if path_root_to_leaf.first() == Some(&"/") {
+            0
+        } else {
+            common::wire::MODULE_PATH_UNREADABLE
+        };
+        r
+    }
+
+    /// [`raw`] for a walk that used every slot without reaching the root.
+    fn raw_too_deep(loader: &str, parent: &str, leaf_side: &[&str]) -> ModuleLoadRaw {
+        let mut r = raw(MODULE_LOAD_FINIT, loader, parent, 0, leaf_side);
+        r.path_truncated = common::wire::MODULE_PATH_TOO_DEEP;
         r
     }
 
@@ -300,10 +333,32 @@ mod tests {
         assert_eq!(v.severity, Severity::Medium);
     }
 
-    /// A path deeper than the 16-slot budget comes back RELATIVE
-    /// (prefix unknown) and must never take the Critical/KillTree branch.
+    /// External audit PROC-004: a path deeper than the 16-slot budget is
+    /// deeper than any module directory — the depth the loader chose must
+    /// not turn the kill into an alert, allowlisted loader or not.
     #[test]
-    fn truncated_path_is_medium_log_never_killtree() {
+    fn too_deep_path_is_not_downgraded() {
+        let leaf_side: Vec<String> = (0..15).map(|i| format!("d{i}")).collect();
+        let mut comps: Vec<&str> = leaf_side.iter().map(String::as_str).collect();
+        comps.push("evil.ko");
+        for (loader, parent) in [("insmod", "bash"), ("systemd-udevd", "systemd")] {
+            let e = ev(&raw_too_deep(loader, parent, &comps));
+            let Event::ModuleLoad { ref path, .. } = e else {
+                panic!("not ModuleLoad")
+            };
+            let p = path.as_deref().unwrap();
+            assert!(common::module_path_too_deep(p), "{p}");
+            let v = rule().evaluate(&e).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{loader}");
+            assert_eq!(v.severity, Severity::Critical);
+        }
+    }
+
+    /// A path a failed read left unknown comes back RELATIVE and must never
+    /// take the Critical/KillTree branch — but unknown is not benign
+    /// (external audit PROC-004): High, not Medium.
+    #[test]
+    fn unreadable_path_is_high_log_never_killtree() {
         // No leading "/" component → raw() marks it truncated.
         let tail = ["6.8.0-124-generic", "kernel", "drivers", "x", "deep.ko.zst"];
         let e = ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &tail));
@@ -320,7 +375,7 @@ mod tests {
         }
         let v = rule().evaluate(&e).expect("alert");
         assert_eq!(v.action, ResponseAction::Log);
-        assert_eq!(v.severity, Severity::Medium);
+        assert_eq!(v.severity, Severity::High);
 
         // Allowlisted loader + truncated path: silent, like a standard path.
         let e2 = ev(&raw(
