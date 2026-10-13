@@ -6,6 +6,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, detection (High FIMP-002, FIMP-005, FIMP-006,
+  NETR-001, DEC-003):
+  - A watched symlink pointing at a FIFO froze file integrity
+    monitoring for good; one pointing at a device read forever.
+  - After `mv` of a watched file, edits to the moved copy were reported
+    under the watched name, and could get the editor killed.
+  - When the drift log could not be written, the FIM rules never saw
+    the change. They now always do, and the lost evidence is reported.
+  - A credential file opened by its own application (a keyring, a
+    browser profile) and a network flow by the same process drew a
+    KillProcessTree; such opens are reported only, as designed.
+  - File canaries never worked once deployed by the installed agent:
+    writing the decoy failed on its read-only sandbox, the decoy was never
+    watched by the kernel, and after a restart its reads were dropped.
+    Decoys are now written through the host's view without following a
+    symlink anywhere on the way, watched from deploy to burn, and watched
+    again at every boot (High DEC-001, DEC-002 from Wave 1).
 - External audit, Wave 0, COMBAT response (High CMB-002, CMB-005, and
   CMB-003 from Wave 1):
   - NEUTRALIZE reported a threat contained when the root of its tree

@@ -602,18 +602,113 @@ static PENDING_ENROLL: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
     std::sync::Mutex::new(Vec::new());
 const ENROLL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Retry the pending enrollments; `true` while some are still waiting.
+/// External audit FIMP-005: watched inodes renamed away from their path,
+/// waiting for the rename to land (the LSM hook fires before it). See
+/// [`settle_rename`].
+static PENDING_RENAME: std::sync::Mutex<Vec<(InodeKey, String, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Retry the pending enrollments and renames; `true` while some are still
+/// waiting.
 fn retry_pending_enrollments(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> bool {
+    let renames_waiting = match PENDING_RENAME.lock() {
+        Ok(mut pending) => {
+            pending.retain(|(key, path, since)| {
+                !settle_rename(key, path, path_map, watched_paths)
+                    && since.elapsed() < ENROLL_RETRY_FOR
+            });
+            !pending.is_empty()
+        }
+        Err(_) => false,
+    };
     let Ok(mut pending) = PENDING_ENROLL.lock() else {
-        return false;
+        return renames_waiting;
     };
     pending.retain(|(path, since)| {
         !enroll_child(path, path_map, watched_paths) && since.elapsed() < ENROLL_RETRY_FOR
     });
-    !pending.is_empty()
+    renames_waiting || !pending.is_empty()
+}
+
+/// External audit FIMP-005: a watched file renamed away keeps its inode,
+/// which went on resolving to the watched path — every later event on the
+/// moved file was reported under the watched name (`mv authorized_keys
+/// authorized_keys.bak`, then an edit of the copy, drew the
+/// authorized_keys rule's kill). Once the path no longer resolves to
+/// `key`, forget `key` and watch whatever now lives at the path. `false`
+/// while the path still resolves to `key`: the rename has not landed yet,
+/// or was refused.
+fn settle_rename(
+    key: &InodeKey,
+    path: &str,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> bool {
+    if matches!(key_for_path(Path::new(path)), Ok(k) if k == *key) {
+        return false;
+    }
+    forget_if_gone(key, path, path_map, watched_paths);
+    // A replacement may already sit at the path (rename-over). If nothing
+    // does, wait for one: see AWAITING_RETURN.
+    if !enroll_child(path, path_map, watched_paths) {
+        if let Ok(mut awaiting) = AWAITING_RETURN.lock() {
+            if !awaiting.iter().any(|p| p == path) && awaiting.len() < AWAITING_RETURN_MAX {
+                awaiting.push(path.to_string());
+            }
+        }
+    }
+    true
+}
+
+/// External audit FIMP-005: watched paths whose file was renamed away and
+/// not replaced. The kernel watches inodes, and nothing tells the drain
+/// when a file comes back to a path no watched inode holds — `mv` back,
+/// or a new file put there. The drain looks once a second
+/// ([`AWAITING_RETURN_EVERY`]); a file back at its path is watched again
+/// and checked against the baseline as a creation: a replacement is a
+/// change of the watched file.
+static AWAITING_RETURN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const AWAITING_RETURN_MAX: usize = 256;
+const AWAITING_RETURN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Paths back at their place since the last look: enrolled again, and
+/// returned with their new inode for a drift check.
+fn returned_paths(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> Vec<InodeKey> {
+    let mut back = Vec::new();
+    if let Ok(mut awaiting) = AWAITING_RETURN.lock() {
+        awaiting.retain(|path| match key_for_path(Path::new(path)) {
+            Ok(key) if enroll_child(path, path_map, watched_paths) => {
+                back.push(key);
+                false
+            }
+            _ => true,
+        });
+    }
+    back
+}
+
+/// `true` while a renamed-away path waits for its file.
+fn awaiting_returns() -> bool {
+    AWAITING_RETURN
+        .lock()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
+/// External audit FIMP-005: the drift record for a file back at a watched
+/// path — a creation, whose writer the drain cannot know.
+fn returned_raw(key: InodeKey) -> FimDriftRaw {
+    let mut raw: FimDriftRaw = bytemuck::Zeroable::zeroed();
+    raw.target_dev = key.dev;
+    raw.target_ino = key.ino;
+    raw.op = FimOp::Created as u8;
+    raw
 }
 
 /// BUG-022 — enroll a freshly-dropped child of a watched directory
@@ -760,6 +855,16 @@ pub fn process_drift(
         };
     if op == FimOp::Deleted {
         forget_if_gone(&key, &path, path_map, watched_paths);
+    }
+    // External audit FIMP-005: the watched inode itself renamed (no child
+    // leaf: the source was watched).
+    if op == FimOp::Renamed
+        && raw.child_name[0] == 0
+        && !settle_rename(&key, &path, path_map, watched_paths)
+    {
+        if let Ok(mut pending) = PENDING_RENAME.lock() {
+            pending.push((key, path.clone(), std::time::Instant::now()));
+        }
     }
 
     // BUG-012 (v2): a read (`FimOp::Opened`) is NEVER an integrity
@@ -923,7 +1028,13 @@ pub fn process_drift(
         decision_engine_skipped: skipped,
         skip_reason: skip_reason.clone(),
     };
-    let _ = drift_db.append(draft).context("append to drift DB")?;
+    // External audit FIMP-006: evidence and detection are separate. A drift
+    // log that cannot be written (disk full, a rotation or protection
+    // fault) used to return here, before the event reached the rules —
+    // silencing every FIM rule on every watched path at once.
+    if let Err(e) = drift_db.append(draft).context("append to drift DB") {
+        report_evidence_loss(&path, &e);
+    }
 
     if skipped {
         info!(
@@ -978,6 +1089,29 @@ pub fn process_drift(
         }));
     }
     Ok(true)
+}
+
+/// External audit FIMP-006: drift the agent detected but could not
+/// record. Logged at ERROR once a minute with the count since, never
+/// silently.
+fn report_evidence_loss(path: &str, error: &anyhow::Error) {
+    static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_REPORT: parking_lot::Mutex<Option<std::time::Instant>> =
+        parking_lot::Mutex::new(None);
+    let lost = LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut last = LAST_REPORT.lock();
+    if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    tracing::error!(
+        target: "fim.drain",
+        path,
+        error = %format!("{error:#}"),
+        lost_since_boot = lost,
+        "FIM EVIDENCE LOSS: fim_drift.jsonl cannot be written — drift still reaches the \
+         rules, but is not recorded"
+    );
 }
 
 fn comm_to_string(comm: &[u8]) -> String {
@@ -1050,19 +1184,54 @@ pub async fn drain_loop(
     // flood of events (an unprivileged loop of reads was enough) filled it:
     // the FIM kill rules never saw a persistence write (review 75).
     let mut outbox: Vec<Event> = Vec::new();
+    let mut returns_checked = std::time::Instant::now();
     loop {
         // Review 58: while children wait for their file to appear, wake up
         // every few milliseconds to retry them.
         let waiting = retry_pending_enrollments(inode_map.as_ref(), watched_paths.as_deref());
-        let mut guard = if waiting {
-            match tokio::time::timeout(std::time::Duration::from_millis(5), async_fd.readable_mut())
-                .await
-            {
+        // External audit FIMP-005: a file back at a watched path it was
+        // renamed away from is watched again and checked as a creation.
+        if returns_checked.elapsed() >= AWAITING_RETURN_EVERY && awaiting_returns() {
+            returns_checked = std::time::Instant::now();
+            for key in returned_paths(inode_map.as_ref(), watched_paths.as_deref()) {
+                let raw = returned_raw(key);
+                let last_baseline = inode_map
+                    .lookup(&key)
+                    .and_then(|p| baseline_cache.get_content(&p));
+                let mut db = drift_db.lock();
+                if let Err(e) = process_drift(
+                    &raw,
+                    inode_map.as_ref(),
+                    last_baseline.as_ref(),
+                    &mut db,
+                    classifier.as_ref(),
+                    rate_limiter.as_ref(),
+                    watched_paths.as_deref(),
+                    Some(&lineage),
+                    Some(&mut outbox),
+                ) {
+                    warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a returned file failed");
+                }
+            }
+            for event in outbox.drain(..) {
+                if event_tx.send(event).await.is_err() {
+                    warn!(target: "fim.drain", "event channel closed — Event::Fim not delivered");
+                }
+            }
+        }
+        let wake_after = if waiting {
+            Some(std::time::Duration::from_millis(5))
+        } else if awaiting_returns() {
+            Some(AWAITING_RETURN_EVERY)
+        } else {
+            None
+        };
+        let mut guard = match wake_after {
+            Some(after) => match tokio::time::timeout(after, async_fd.readable_mut()).await {
                 Ok(g) => g?,
                 Err(_) => continue,
-            }
-        } else {
-            async_fd.readable_mut().await?
+            },
+            None => async_fd.readable_mut().await?,
         };
         let inner = guard.get_inner_mut();
         let mut drained = 0u32;
@@ -1788,6 +1957,180 @@ mod tests {
         assert_eq!(body.lines().count(), 1);
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(!row.decision_engine_skipped);
+    }
+
+    /// External audit FIMP-005: a watched file renamed away stops
+    /// resolving to the watched path; a file renamed over the watched
+    /// path is watched in its place.
+    #[test]
+    fn renamed_watched_file_stops_resolving_to_old_path() {
+        let dir = TempDir::new().unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            fresh_signing_key(&dir),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("authorized_keys");
+        std::fs::write(&watched, b"ssh-ed25519 AAAA admin\n").unwrap();
+        let old = key_for_path(&watched).unwrap();
+        let watched_str = watched.to_string_lossy().to_string();
+        path_map.insert(old, watched_str.clone());
+
+        // mv authorized_keys authorized_keys.bak
+        std::fs::rename(&watched, dir.path().join("authorized_keys.bak")).unwrap();
+        let raw = fake_raw(old.dev, old.ino, FimOp::Renamed as u8);
+        let _ = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            path_map.lookup(&old),
+            None,
+            "the moved inode is no longer the watched path"
+        );
+
+        // Moved back: the file is watched again (and drift-checked as a
+        // creation) once the drain looks for returns.
+        assert!(AWAITING_RETURN.lock().unwrap().contains(&watched_str));
+        std::fs::rename(dir.path().join("authorized_keys.bak"), &watched).unwrap();
+        let back = key_for_path(&watched).unwrap();
+        assert!(returned_paths(&path_map, None).contains(&back));
+        assert_eq!(
+            path_map.lookup(&back).as_deref(),
+            Some(watched_str.as_str())
+        );
+        assert!(!AWAITING_RETURN.lock().unwrap().contains(&watched_str));
+        let raw = returned_raw(back);
+        assert_eq!(raw.op, FimOp::Created as u8);
+        assert_eq!((raw.target_dev, raw.target_ino), (back.dev, back.ino));
+        // Away again, for the rename-over case below.
+        std::fs::rename(&watched, dir.path().join("authorized_keys.bak")).unwrap();
+        let raw = fake_raw(back.dev, back.ino, FimOp::Renamed as u8);
+        let _ = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            None,
+        );
+
+        // A new file renamed over the watched path is watched in its place.
+        let fresh = dir.path().join("authorized_keys.new");
+        std::fs::write(&fresh, b"ssh-ed25519 BBBB admin\n").unwrap();
+        std::fs::write(&watched, b"placeholder\n").unwrap();
+        let placeholder = key_for_path(&watched).unwrap();
+        path_map.insert(placeholder, watched_str.clone());
+        std::fs::rename(&fresh, &watched).unwrap();
+        let new = key_for_path(&watched).unwrap();
+        let raw = fake_raw(placeholder.dev, placeholder.ino, FimOp::Renamed as u8);
+        let _ = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(path_map.lookup(&placeholder), None);
+        assert_eq!(path_map.lookup(&new).as_deref(), Some(watched_str.as_str()));
+    }
+
+    /// External audit FIMP-005: the hook fires before the rename lands; a
+    /// drain that runs first keeps the inode, and the retry settles it.
+    #[test]
+    fn rename_seen_before_it_lands_is_settled_by_the_retry() {
+        let dir = TempDir::new().unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            fresh_signing_key(&dir),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("sshd_config");
+        std::fs::write(&watched, b"PermitRootLogin no\n").unwrap();
+        let key = key_for_path(&watched).unwrap();
+        path_map.insert(key, watched.to_string_lossy().to_string());
+        let raw = fake_raw(key.dev, key.ino, FimOp::Renamed as u8);
+        let _ = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            path_map.lookup(&key).is_some(),
+            "not moved yet: still watched"
+        );
+        std::fs::rename(&watched, dir.path().join("sshd_config.orig")).unwrap();
+        retry_pending_enrollments(&path_map, None);
+        assert_eq!(path_map.lookup(&key), None);
+    }
+
+    /// External audit FIMP-006: a drift log that cannot be written must not
+    /// keep the event from the rules.
+    #[test]
+    fn drift_append_failure_still_emits_event() {
+        let dir = TempDir::new().unwrap();
+        let drift_path = dir.path().join("drift.jsonl");
+        let mut drift_db = FimDriftDb::open(
+            &drift_path,
+            fresh_signing_key(&dir),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        // Every append now fails (EISDIR), whoever runs the test.
+        let _ = std::fs::remove_file(&drift_path);
+        std::fs::create_dir(&drift_path).unwrap();
+
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("watched.bin");
+        std::fs::write(&watched, b"the new content").unwrap();
+        let key = key_for_path(&watched).unwrap();
+        path_map.insert(key, watched.to_string_lossy().to_string());
+        let stale = dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
+        let mut out: Vec<Event> = Vec::new();
+        let emitted = process_drift(
+            &fake_raw(key.dev, key.ino, FimOp::Modified as u8),
+            &path_map,
+            Some(&stale),
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .expect("an unwritable drift log is not a processing error");
+        assert!(emitted);
+        assert!(matches!(out.first(), Some(Event::Fim(_))), "{out:?}");
     }
 
     // ── C4 test 9: process_drift on no-real-drift skips silently ────

@@ -191,6 +191,10 @@ struct CanaryFixture {
     /// refresh, init) routes through this path so R009 doesn't
     /// kill the op mid-flight. Kept alive by `_installed_admin`.
     nn_admin_path: PathBuf,
+    /// The agent's binary and arguments, to start it again
+    /// ([`CanaryFixture::restart`]).
+    agent_bin: PathBuf,
+    agent_args: Vec<std::ffi::OsString>,
     /// Drop order: AgentGuard first (SIGQUIT the agent), then
     /// the InstalledBin handles (sudo rm the /usr/local/bin/
     /// copies). Rust drops struct fields in declaration order,
@@ -323,37 +327,41 @@ impl CanaryFixture {
         // cargo test` invocation) but lets the test work under any
         // privilege-elevation flow that authorises sudo for the
         // user.
+        let agent_args: Vec<std::ffi::OsString> = [
+            "--combat-rules".into(),
+            combat.clone().into_os_string(),
+            "--admin-pub".into(),
+            admin_pub.clone().into_os_string(),
+            "--admin-socket".into(),
+            admin_socket.clone().into_os_string(),
+            "--agent-id-file".into(),
+            agent_id.clone().into_os_string(),
+            "--audit-log-file".into(),
+            audit_log.clone().into_os_string(),
+            "--signing-key-file".into(),
+            signing_key.clone().into_os_string(),
+            "--shutdown-marker-file".into(),
+            marker.clone().into_os_string(),
+            "--fim-paths-v1".into(),
+            fim_paths_v1.clone().into_os_string(),
+            "--fim-paths-local".into(),
+            fim_paths_local.clone().into_os_string(),
+            "--fim-baseline-file".into(),
+            baseline_log.clone().into_os_string(),
+            "--fim-drift-file".into(),
+            drift_log.clone().into_os_string(),
+            "--canary-registry-file".into(),
+            canary_registry.clone().into_os_string(),
+            "--canary-access-file".into(),
+            canary_access.clone().into_os_string(),
+            "--canary-template-dir".into(),
+            templates_dir.clone().into_os_string(),
+            "--no-ade".into(),
+        ]
+        .to_vec();
         let child = Command::new("sudo")
             .arg(&installed_agent.path)
-            .arg("--combat-rules")
-            .arg(&combat)
-            .arg("--admin-pub")
-            .arg(&admin_pub)
-            .arg("--admin-socket")
-            .arg(&admin_socket)
-            .arg("--agent-id-file")
-            .arg(&agent_id)
-            .arg("--audit-log-file")
-            .arg(&audit_log)
-            .arg("--signing-key-file")
-            .arg(&signing_key)
-            .arg("--shutdown-marker-file")
-            .arg(&marker)
-            .arg("--fim-paths-v1")
-            .arg(&fim_paths_v1)
-            .arg("--fim-paths-local")
-            .arg(&fim_paths_local)
-            .arg("--fim-baseline-file")
-            .arg(&baseline_log)
-            .arg("--fim-drift-file")
-            .arg(&drift_log)
-            .arg("--canary-registry-file")
-            .arg(&canary_registry)
-            .arg("--canary-access-file")
-            .arg(&canary_access)
-            .arg("--canary-template-dir")
-            .arg(&templates_dir)
-            .arg("--no-ade")
+            .args(&agent_args)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -369,10 +377,29 @@ impl CanaryFixture {
             admin_socket,
             canary_access_log: canary_access,
             nn_admin_path,
+            agent_bin: installed_agent.path.clone(),
+            agent_args,
             _agent_guard: guard,
             _installed_agent: installed_agent,
             _installed_admin: installed_admin,
         }
+    }
+
+    /// Stop the agent and start it again with the same arguments: its
+    /// state (registry, keys, logs) stays, its in-memory indexes and the
+    /// kernel watches it registers are rebuilt from it.
+    fn restart(&mut self) {
+        drop(std::mem::replace(&mut self._agent_guard, AgentGuard(None)));
+        let _ = std::fs::remove_file(&self.admin_socket);
+        let child = Command::new("sudo")
+            .arg(&self.agent_bin)
+            .args(&self.agent_args)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("respawn northnarrow-agent for canary e2e");
+        self._agent_guard = AgentGuard(Some(child));
+        wait_for_socket(&self.admin_socket);
     }
 
     /// Submit a signed `nn-admin canary deploy file --path <file>`
@@ -560,10 +587,13 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
     // attaches. The agent reads fim-paths.v1 + stat()s each path
     // exactly once at boot — a path that doesn't yet exist gets
     // silently skipped and never traps an open.
+    // External audit DEC-001: the decoy is NOT pre-listed in
+    // fim-paths.v1 (it used to be, which hid that a deployed decoy was
+    // never watched) and does not exist before the deploy, which writes
+    // it.
     let tmp = tempfile::tempdir().expect("decoy tempdir");
     let decoy = tmp.path().join("decoy_aws_keys.txt");
-    std::fs::write(&decoy, b"placeholder\n").expect("seed decoy file");
-    let fx = CanaryFixture::setup(&[&decoy]);
+    let fx = CanaryFixture::setup(&[]);
     let canary_id = fx.deploy_file_canary("honeypot-aws", &decoy);
     assert_eq!(canary_id.len(), 32, "canary_id should be 32 hex chars");
 
@@ -620,6 +650,41 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
         64,
         "agent_sig must decode to 64 bytes (Ed25519 signature); got {} bytes",
         sig_bytes.len()
+    );
+}
+
+/// External audit DEC-001 and DEC-003: a file canary deployed at runtime
+/// in a directory the FIM path list does not cover trips, and still trips
+/// after the agent restarts — the boot used to publish an empty
+/// read-forward set and leave the decoy unwatched.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn file_canary_deployed_at_runtime_survives_an_agent_restart() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("decoy tempdir");
+    let decoy = tmp.path().join("payroll").join("2026_salaries.xlsx");
+    let mut fx = CanaryFixture::setup(&[]);
+    let canary_id = fx.deploy_file_canary("honeypot-payroll", &decoy);
+
+    let cat = || {
+        Command::new("cat")
+            .arg(&decoy)
+            .stdout(Stdio::null())
+            .status()
+            .expect("spawn cat for canary trip")
+    };
+    assert!(cat().success());
+    let rows = fx.wait_access(1);
+    assert_eq!(rows[0]["canary_id"].as_str(), Some(canary_id.as_str()));
+
+    fx.restart();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(cat().success());
+    let rows = fx.wait_access(2);
+    assert_eq!(
+        rows[1]["canary_id"].as_str(),
+        Some(canary_id.as_str()),
+        "a read after the restart must trip the canary again: {rows:?}"
     );
 }
 
@@ -729,8 +794,7 @@ fn refresh_rearms_canary_for_repeat_trips() {
 
     let tmp = tempfile::tempdir().expect("decoy tempdir");
     let decoy = tmp.path().join("decoy_rearm.txt");
-    std::fs::write(&decoy, b"placeholder\n").expect("seed decoy file");
-    let fx = CanaryFixture::setup(&[&decoy]);
+    let fx = CanaryFixture::setup(&[]);
 
     let canary_id = fx.deploy_file_canary("honeypot-rearm", &decoy);
 

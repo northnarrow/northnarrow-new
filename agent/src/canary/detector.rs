@@ -189,6 +189,32 @@ impl CanaryIndexes {
         self.name_index.get(canary_id).cloned()
     }
 
+    /// External audit DEC-003: the rebuild the boot and every admin
+    /// operation share. The boot used to rebuild with no inode resolver:
+    /// the inode index stayed empty, read-forward was published empty, and
+    /// the FIM drain dropped every read of a file canary until an operator
+    /// deployed, burned or refreshed one. Inodes are resolved here
+    /// ([`stat_inode_key`]) and File/Credential paths layered into the
+    /// path index, in one place.
+    pub fn rebuild_live(&mut self, registry: &Registry) {
+        self.rebuild_from_registry(registry, stat_inode_key);
+        for canary in registry.list() {
+            match &canary.deployment {
+                CanaryDeploymentWire::File { path, .. }
+                | CanaryDeploymentWire::Credential { path, .. } => {
+                    self.add_file_path_index(PathBuf::from(path), canary.canary_id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// File and Credential canaries whose inode is indexed — the inodes
+    /// published to read-forward.
+    pub fn file_inodes(&self) -> usize {
+        self.inode_index.len()
+    }
+
     /// K6 admin-deploy helper: add a File/Credential canary's
     /// path into the `exe_index`-shaped path lookup so the K3
     /// detector's path-based fallback (V1.0 pragmatism while
@@ -423,6 +449,19 @@ impl Detector {
     }
 }
 
+/// External audit DEC-003: the kernel's `(dev, ino)` for `path` —
+/// `stat(2)` without following a link, `dev` encoded as the kernel does
+/// (`(major << 20) | minor`). `None` when the file is not there.
+pub fn stat_inode_key(path: &Path) -> Option<InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    let dev = m.dev();
+    Some(InodeKey {
+        dev: ((libc::major(dev) as u64) << 20) | libc::minor(dev) as u64,
+        ino: m.ino(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +489,38 @@ mod tests {
             Arc::clone(&indexes),
         );
         (detector, registry)
+    }
+
+    /// External audit DEC-003: the boot rebuild resolves a file canary's
+    /// inode — the index read-forward is published from — and the path
+    /// index too. It used to rebuild with no resolver, leaving the reads of
+    /// every file canary dropped until an admin operation.
+    #[test]
+    fn boot_rebuild_indexes_file_canary_inodes() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        let decoy = dir.path().join("passwords.xlsx");
+        std::fs::write(&decoy, b"decoy").unwrap();
+        let path = decoy.to_string_lossy().to_string();
+        registry
+            .lock()
+            .deploy(CanaryTokenDraft {
+                name: "decoy".to_string(),
+                canary_type: CanaryTypeWire::File,
+                deployment: CanaryDeploymentWire::File {
+                    path: path.clone(),
+                    template: None,
+                },
+                deployed_by_fp: "deadbeef".to_string(),
+            })
+            .unwrap();
+        let mut idx = CanaryIndexes::new();
+        idx.rebuild_live(&registry.lock());
+        let key = stat_inode_key(&decoy).expect("decoy exists");
+        assert!(idx.is_canary_inode(&key).is_some());
+        assert_eq!(idx.file_inodes(), 1);
+        assert!(idx.is_canary_exe(&decoy).is_some(), "path index layered in");
+        drop(detector);
     }
 
     fn deploy_process_canary(

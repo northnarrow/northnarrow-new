@@ -187,6 +187,18 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
         // warn — defensible for V1.0 where ~100 paths are
         // operator-curated.
         match fs::metadata(path) {
+            // External audit FIMP-002: only a regular file is hashed. A link
+            // to a FIFO blocked the open for good (and with it the drain,
+            // holding the drift DB), one to /dev/zero never reached EOF.
+            Ok(tmeta) if !tmeta.is_file() => {
+                tracing::warn!(
+                    path = %path.display(),
+                    file_type = ?tmeta.file_type(),
+                    "fim baseline: symlink target is not a regular file — emitting the \
+                     link-metadata row only"
+                );
+                Ok(vec![link_draft])
+            }
             Ok(tmeta) => {
                 let content_hash = sha256_of_file_content(path)
                     .with_context(|| format!("hashing content via {}", path.display()))?;
@@ -238,12 +250,39 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
     }
 }
 
+/// External audit FIMP-002: the largest file the baseline hashes. Watched
+/// files are configuration and binaries; an initramfs is the largest.
+const MAX_HASHABLE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Stream-read a file in 64 KiB chunks and feed each chunk into
 /// the SHA-256 hasher. Avoids loading large baselined binaries
 /// (sshd is ~1 MB; some kernel modules go several MB) into RAM.
+///
+/// External audit FIMP-002: opened non-blocking (a FIFO swapped in after
+/// the type check cannot block the open), and refused unless the opened
+/// file is regular and at most [`MAX_HASHABLE_BYTES`] long.
 fn sha256_of_file_content(path: &Path) -> std::io::Result<[u8; 32]> {
     use std::io::Read;
-    let mut f = OpenOptions::new().read(true).open(path)?;
+    let mut f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file (file_type={:?})", meta.file_type()),
+        ));
+    }
+    if meta.len() > MAX_HASHABLE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} bytes, over the {MAX_HASHABLE_BYTES}-byte hashing cap",
+                meta.len()
+            ),
+        ));
+    }
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -1013,5 +1052,37 @@ mod tests {
     fn baseline_cache_get_unknown_path_returns_none() {
         let cache = BaselineCache::new();
         assert!(cache.get_content("/never/baselined").is_none());
+    }
+
+    /// External audit FIMP-002: a watched symlink to a FIFO or a character
+    /// device yields the link row only — it used to block the open for
+    /// good, or read /dev/zero forever.
+    #[test]
+    fn symlink_to_fifo_or_device_does_not_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: mkfifo on a NUL-terminated path in our temp dir.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        for target in [fifo.as_path(), Path::new("/dev/zero")] {
+            let link = dir.path().join(format!(
+                "link-{}",
+                target.file_name().unwrap().to_string_lossy()
+            ));
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let l = link.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(compute_baseline(&l).map(|rows| rows.len()));
+            });
+            let rows = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("compute_baseline must not block")
+                .expect("a link to a special file is not an error");
+            assert_eq!(rows, 1, "{}: the link-metadata row only", target.display());
+        }
+        // Hashing the special file directly is refused, without blocking.
+        assert!(sha256_of_file_content(&fifo).is_err());
+        assert!(sha256_of_file_content(Path::new("/dev/zero")).is_err());
     }
 }

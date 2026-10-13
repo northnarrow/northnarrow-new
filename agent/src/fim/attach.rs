@@ -89,7 +89,7 @@ pub const FS_FIM_EVENTS_MAP: &str = "FS_FIM_EVENTS";
 /// [`crate::anti_tamper::filesystem::stat_dev_to_kernel_dev`]
 /// (private there — duplicated here so the FIM module doesn't
 /// reach into anti-tamper internals).
-fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
+pub(crate) fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
     let major = libc::major(st_dev) as u64;
     let minor = libc::minor(st_dev) as u64;
     (major << 20) | minor
@@ -423,6 +423,47 @@ impl WatchedPathsHandle {
     /// Stop watching an inode whose file is gone (review 57).
     pub fn unenroll(&mut self, key: InodeKey) {
         let _ = self.map.remove(&AyaInodeKey(key));
+    }
+}
+
+/// External audit DEC-001: the drain's view of what is watched — the
+/// inode→path map it resolves events with, and the kernel's
+/// `WATCHED_PATHS` — for watches added at runtime. File canaries are
+/// watched through it: the kernel emitted nothing for a decoy outside the
+/// FIM path list, and the drain would have dropped an event for an inode
+/// it could not name.
+#[derive(Clone)]
+pub struct FimWatch {
+    pub path_map: std::sync::Arc<crate::fim::drain::InodePathMap>,
+    pub watched_paths: Option<std::sync::Arc<parking_lot::Mutex<WatchedPathsHandle>>>,
+}
+
+impl FimWatch {
+    /// No kernel map behind it (tests, or a boot without one).
+    pub fn detached() -> Self {
+        Self {
+            path_map: std::sync::Arc::new(crate::fim::drain::InodePathMap::new()),
+            watched_paths: None,
+        }
+    }
+
+    /// Watch inode `key` as `path`. `false` when the kernel map refused
+    /// it (full, or absent): the drain can name it, the kernel will not
+    /// report it.
+    pub fn watch(&self, key: InodeKey, path: &str) -> bool {
+        self.path_map.insert(key, path.to_string());
+        match &self.watched_paths {
+            Some(wp) => wp.lock().enroll(key),
+            None => false,
+        }
+    }
+
+    /// Stop watching inode `key`.
+    pub fn unwatch(&self, key: InodeKey) {
+        self.path_map.remove(&key);
+        if let Some(wp) = &self.watched_paths {
+            wp.lock().unenroll(key);
+        }
     }
 }
 

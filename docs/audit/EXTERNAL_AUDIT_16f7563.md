@@ -34,10 +34,10 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-006 | NET-010 | Critical | Network | `configs/netflow-comm-allowlist.v1` | fixed (lab PR 78) |
 | NN-AUD-016 | EBPF-003 | High | eBPF kernel | `agent-ebpf/src/ptrace_check.rs` | open |
 | NN-AUD-018 | EBPF-007 | High | eBPF kernel | `agent-ebpf/src/udp_sendmsg_outbound.rs` | fixed (lab PR 78) |
-| NN-AUD-030 | FIMP-002 | High | FIM pipeline | `agent/src/fim/baseline.rs` | open |
-| NN-AUD-033 | FIMP-005 | High | FIM pipeline | `agent/src/fim/drain.rs` | open |
-| NN-AUD-034 | FIMP-006 | High | FIM pipeline | `agent/src/fim/drain.rs` | open |
-| NN-AUD-035 | NETR-001 | High | Net rules | `agent/src/decision/rules/chain.rs` | open |
+| NN-AUD-030 | FIMP-002 | High | FIM pipeline | `agent/src/fim/baseline.rs` | fixed (lab PR 84) |
+| NN-AUD-033 | FIMP-005 | High | FIM pipeline | `agent/src/fim/drain.rs` | fixed (lab PR 84) |
+| NN-AUD-034 | FIMP-006 | High | FIM pipeline | `agent/src/fim/drain.rs` | fixed (lab PR 84) |
+| NN-AUD-035 | NETR-001 | High | Net rules | `agent/src/decision/rules/chain.rs` | fixed (lab PR 84) |
 | NN-AUD-047 | CMB-002 | High | Combat response | `agent/src/combat/actuator.rs` | fixed (lab PR 83) |
 | NN-AUD-048 | CMB-003 | High | Combat response | `agent/src/combat/protected.rs` | fixed (lab PR 83; Wave 1, taken with NN-AUD-049) |
 | NN-AUD-049 | CMB-005 | High | Combat response | `agent/src/response/executor.rs` | fixed (lab PR 83) |
@@ -47,7 +47,9 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-056 | NET-002 | High | Network | `agent/src/net/blocklist.rs` | fixed (lab PR 78) |
 | NN-AUD-059 | NET-005 | High | Network | `agent/src/net/dns_cache.rs` | fixed (lab PR 78) |
 | NN-AUD-060 | NET-011 | High | Network | `configs/netflow-blocklist.v1` | fixed (lab PR 78) |
-| NN-AUD-063 | DEC-003 | High | Deception | `agent/src/canary/read_forward.rs` | open |
+| NN-AUD-061 | DEC-001 | High | Deception | `agent/src/admin_socket.rs` | fixed (lab PR 84; Wave 1, taken with NN-AUD-063) |
+| NN-AUD-062 | DEC-002 | High | Deception | `agent/src/canary/path_policy.rs` | fixed (lab PR 84; Wave 1, taken with NN-AUD-063) |
+| NN-AUD-063 | DEC-003 | High | Deception | `agent/src/canary/read_forward.rs` | fixed (lab PR 84) |
 | NN-AUD-070 | WDG-004 | High | Watchdog tooling | `watchdog/src/main.rs` | open |
 
 ## Notes on the fixes
@@ -238,3 +240,71 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     threat was contained without isolation. The SSH service kept
     accepting connections, and the quarantine refused `/usr/sbin/sshd`
     (a protected system prefix).
+- **NN-AUD-030 (FIMP-002), lab PR 84.** The baseline hashed a watched
+  symlink's target without checking its type. A link to a FIFO blocked
+  the open for good, and with it the drain, which holds the drift
+  database: FIM went blind, silently. A link to `/dev/zero` never reached
+  EOF. A link to anything but a regular file now yields the link row
+  only. The hash opens non-blocking and refuses a non-regular file, or
+  one over 512 MiB.
+- **NN-AUD-033 (FIMP-005), lab PR 84.** A watched file renamed away kept
+  resolving to the watched path. `mv authorized_keys authorized_keys.bak`
+  followed by an edit of the copy was reported as a change to
+  `authorized_keys`, and its rule killed the editor. Once the rename
+  lands, the moved inode is forgotten and whatever now lives at the path
+  is watched — a file renamed over it included. The hook fires before
+  the rename, so a drain that runs first retries for two seconds.
+- **NN-AUD-034 (FIMP-006), lab PR 84.** A drift log that could not be
+  written (disk full, a rotation or protection fault) made the drain
+  return before the event reached the rules, silencing every FIM rule
+  at once. The event now always goes out. Evidence that could not be
+  recorded is reported at ERROR, once a minute with a count.
+- **NN-AUD-035 (NETR-001), lab PR 84.** Review 54 decided that a
+  wide-coverage credential open (any home's keyring, browser or
+  password store) is reported, never acted on: the owner application
+  opens it, and so does a backup. The chain rules ignored that and
+  recorded it as the CredRead precursor, so the next flow of the same
+  process drew KillProcessTree. They now skip wide-coverage opens; the
+  FIM rules still log them.
+- **NN-AUD-061 (DEC-001), NN-AUD-062 (DEC-002) and NN-AUD-063 (DEC-003),
+  lab PR 84 — file canaries, end to end.** In the lab no file canary
+  deployed at runtime ever tripped; three defects stacked up, and a
+  fourth the audit did not list.
+  - *The decoy was never watched* (DEC-001). Only the FIM path list
+    filled the kernel's `WATCHED_PATHS`, so the kernel emitted nothing for
+    a decoy outside it, and the drain would have dropped an event for an
+    inode it could not name. The privileged e2e hid it by listing its
+    decoys in `fim-paths.v1`. A deploy now watches the decoy's inode
+    (`FimWatch`, the drain's own handles), a burn stops, and every boot
+    watches the registry's decoys again — the FIM boot keeps only what it
+    registers.
+  - *The write could be redirected* (DEC-002). The path was checked, then
+    re-resolved by `create_dir_all` and an open that refused a symlink
+    only as the last component. A user owning a directory on the way
+    could swap in a symlink in between. The decoy is now written by a
+    walk from the root, `O_NOFOLLOW` on every component, with missing
+    directories made by `mkdirat` inside the walk, and must be a regular
+    file.
+  - *The installed agent could not write a decoy at all.* The unit's
+    `ProtectSystem=strict` and `ProtectHome=read-only` make every decoy
+    location read-only in its namespace: each deploy failed with EROFS.
+    The walk starts at the host's root as PID 1 sees it (`/proc/1/root`),
+    as the quarantine and capability responses do (reviews 86 and 87).
+  - *After a restart, reads were dropped* (DEC-003, below).
+  - Lab, Ubuntu 22.04, installed agent: a deploy under `/home/nn` now
+    succeeds; a `cat` of the decoy drew CANARY TRIPPED and NN-L-CANARY-001,
+    and so did one after `systemctl restart northnarrow-agent` (the boot
+    reported `read_forward=1`). Before: the deploy failed with EROFS, and
+    a decoy in place never tripped.
+- **Lab for NN-AUD-033 and NN-AUD-035 (Ubuntu 22.04).** `mv
+  /etc/hosts.allow` away and an edit of the moved copy drew no event
+  under `/etc/hosts.allow`; moved back, the file was watched again and
+  its changed content reported (`FIM DRIFT … op=Created`). A process that
+  read `~/.gnupg/private-keys-v1.d/…` and then opened a flow drew
+  NN-L-FIM-017 at Log, and no CHAIN-001.
+- **NN-AUD-063 (DEC-003), lab PR 84.** The boot rebuilt the canary
+  indexes with no inode resolver. The read-forward set came out empty,
+  and the FIM drain dropped every read of a file canary until an
+  operator deployed, burned or refreshed one. Boot and admin now share
+  one rebuild (`CanaryIndexes::rebuild_live`). The boot log reports the
+  read-forward count, and warns when a file canary's decoy is missing.
