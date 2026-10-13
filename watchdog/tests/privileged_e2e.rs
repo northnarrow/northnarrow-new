@@ -300,8 +300,10 @@ impl E2eFixture {
         self.agent_child = Some(child);
 
         // Poll for pidfile readiness (agent writes it AFTER all
-        // anti-tamper attach completes — solid readiness signal).
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // anti-tamper attach completes — solid readiness signal). 30 s,
+        // like the respawn waits: a cold boot on the lab guest was seen
+        // to take 15.07 s (a slow blocklist load after the hooks).
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if let Ok(s) = fs::read_to_string(self.agent_pidfile()) {
                 if let Ok(pid) = s.trim().parse::<u32>() {
@@ -311,7 +313,7 @@ impl E2eFixture {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!(
-            "agent pidfile {} never appeared within 15s",
+            "agent pidfile {} never appeared within 30s",
             self.agent_pidfile().display()
         );
     }
