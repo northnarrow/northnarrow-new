@@ -31,6 +31,24 @@ if ! have_mkfs; then
     have_mkfs || { say "FAIL — mkfs.btrfs not available"; exit 1; }
 fi
 
+# External audit EBPF-001: the agent unit refuses `systemctl restart`, and
+# systemd's signals reach the agent only inside a signed trusted-installer
+# window: open one with the lab key, SIGTERM the agent, and let the watchdog
+# bring it back (started by hand if it has not within 30 s).
+restart_agent() {
+    local nn_admin old new i
+    nn_admin=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
+    old=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
+    sudo "$nn_admin" trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 120 >/dev/null 2>&1
+    sudo systemctl kill --signal=SIGTERM northnarrow-agent
+    for i in $(seq 1 30); do
+        sleep 1
+        new=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
+        [ -n "$new" ] && [ "$new" != "$old" ] && sudo kill -0 "$new" 2>/dev/null && return 0
+    done
+    sudo systemctl start northnarrow-agent
+}
+
 cleanup() {
     sudo umount /root/.aws 2>/dev/null
     sudo umount "$MNT" 2>/dev/null
@@ -40,14 +58,14 @@ cleanup() {
     else
         sudo rmdir /root/.aws 2>/dev/null
     fi
-    sudo systemctl restart northnarrow-agent && sleep 8
+    restart_agent && sleep 8
 }
 trap cleanup EXIT
 
 # One read of /root/.aws/credentials after an agent restart (the agent
 # registers the watched files' keys at start): 0 when NN-L-FIM-011 lands.
 read_once() {
-    sudo systemctl restart northnarrow-agent && sleep 12
+    restart_agent && sleep 12
     systemctl is-active --quiet northnarrow-agent || { say "  agent not active after restart"; return 1; }
     local before after hit
     before=$(sudo cat "$DET" 2>/dev/null | wc -l)

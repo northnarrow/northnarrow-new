@@ -1361,6 +1361,44 @@ fn observe_returns_firing_trigger_on_transition() {
     assert_eq!(firing, Some(TriggerType::AntiTamperDenial));
 }
 
+/// External audit EBPF-001: a signal PID 1 relayed for a `systemctl stop`
+/// outside a trusted-installer window is refused and raises ENGAGED — the
+/// requester is unknown, and a COMBAT with init as the offender could only
+/// end in ISOLATE (lab: one refused `systemctl kill` isolated the host).
+#[test]
+fn a_relayed_signal_denial_engages_but_never_reaches_combat() {
+    let m = PostureMachine::new();
+    let relayed = Event::FsProtectDenial {
+        pid: 1,
+        uid: 0,
+        comm: "systemd".into(),
+        target_dev: 15,
+        target_ino: 4242,
+        operation: common::FsProtectOperation::Signal,
+        timestamp_ns: 1,
+    };
+    let (state, firing) = m.observe(&relayed, &[]).expect("posture transitioned");
+    assert_eq!(state.kind(), PostureKind::Engaged);
+    assert_eq!(firing, Some(TriggerType::RelayedTamperAttempt));
+    for ts in 2..6 {
+        let again = Event::FsProtectDenial {
+            pid: 1,
+            uid: 0,
+            comm: "systemd".into(),
+            target_dev: 9,
+            target_ino: 4242,
+            operation: common::FsProtectOperation::Signal,
+            timestamp_ns: ts,
+        };
+        let _ = m.observe(&again, &[]);
+    }
+    assert_ne!(
+        m.current().kind(),
+        PostureKind::Combat,
+        "repeats alone never isolate"
+    );
+}
+
 #[test]
 fn observe_returns_none_when_no_transition() {
     // A spawn that matches no trigger leaves posture at Observing

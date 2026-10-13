@@ -63,7 +63,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-011 | ATP-001 | Anti-tamper | M | fixed (lab PR 92) |
 | NN-AUD-012 | ATP-002 | Anti-tamper | M | fixed (lab PR 89) |
 | NN-AUD-013 | ATP-004 | Anti-tamper | M | fixed (lab PR 93) |
-| NN-AUD-014 | EBPF-001 | eBPF kernel | M | open |
+| NN-AUD-014 | EBPF-001 | eBPF kernel | M | fixed (lab PR 94) |
 | NN-AUD-015 | EBPF-002 | eBPF kernel | M | open |
 | NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
 | NN-AUD-019 | EBPF-010 | eBPF kernel | M | open |
@@ -740,3 +740,57 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   drop-in rewritten through the maintenance path is reported at the next
   boot — an ERROR `INTEGRITY DRIFT … kind="unit_dropin"` and a signed
   `integrity_drift` entry (`at_boot: true`).
+- **NN-AUD-014 (EBPF-001), lab PR 94.** BUG-010's `KILL_OVERRIDE` let PID 1
+  send any signal to any protected pid for the agent's whole life, so root
+  only had to ask systemd. `KILL_GRANT` replaces it: one pinned slot
+  (`{nonce, sig_mask, expires_ns}`) the agent writes when a signed
+  trusted-installer window opens — SIGTERM, SIGCONT, SIGKILL until the
+  window ends — and withdraws when it closes; zeroed at every boot. The
+  other way through is the final stage of a shutdown: PID 1's comm is
+  `systemd-shutdown` and its executable is the one recorded in
+  `SHUTDOWN_EXE` (refreshed every minute, so a systemd upgrade is
+  followed; the executable check defeats a comm set by `ptrace` of PID 1).
+  - systemd treats the EPERM as "ignoring": a refused `systemctl stop`
+    reported both units dead while they ran. The units now refuse a manual
+    stop (`RefuseManualStop=yes`), and `SendSIGKILL=no` makes systemd
+    refuse to start a second instance next to a running one (verified:
+    "Unit process … remains running after unit stopped"). `install.sh`,
+    `uninstall.sh` and the lab stop the units with `systemctl kill -s
+    SIGTERM` inside the window; `respawn-check`, `btrfs-check` and the
+    anti-tamper suite open the window before they restart or kill the
+    agent.
+  - Posture: the first lab run of the fix isolated the guest. The refused
+    `systemctl kill` became a Decisive `AntiTamperDenial` with init as the
+    offender; NEUTRALIZE spares init, so the ladder isolated the host. A
+    denial from PID 1 now raises `RelayedTamperAttempt` (ENGAGED, Kernel
+    class, not Decisive), init is never a COMBAT offender, and the
+    NN-L-AT-001 detection names the `systemctl` request. While systemd
+    reports the host as `stopping` (`SystemState` over its private socket,
+    read in-process — a child `systemctl` sits in the agent's cgroup and was
+    killed by the very request it judged — and only from a server whose
+    `SO_PEERCRED` is PID 1), the refusal is not reported, the ladder stands
+    down and the posture stops escalating; a 2-s watch catches the
+    shutdown before the agent's own stop job.
+  - Found on the way: the agent and the watchdog aborted (SIGABRT) as soon
+    as `systemd-journald@northnarrow` stopped — tracing-subscriber reports a
+    failed write with `eprintln!`, which panics on the same broken pipe, and
+    the release profile aborts on panic. Every reboot ended the agent that
+    way ("previous run ended abruptly"); root could repeat it until the
+    watchdog's ceiling. `log_internal_errors(false)` in both. And the
+    mass-write counter counted device nodes (`/dev/console` at shutdown,
+    `> /dev/null` loops): regular files only now, `/dev/shm` still counted.
+  - Lab. Before (Ubuntu 22.04, main): `systemctl kill -s SIGKILL
+    northnarrow-agent` killed the agent (respawned); `systemctl stop` of
+    both units: exit 0 in 0.58 s, both inactive, no respawn. A reboot ended
+    the agent with SIGABRT. After (Ubuntu 22.04, 5.15): `systemctl kill` →
+    "Access denied", same pid, signed NN-L-AT-001, posture ENGAGED
+    (`RelayedTamperAttempt`), no COMBAT; `systemctl stop` → refused at once
+    (exit 4), both units still active; the window, then `systemctl kill -s
+    SIGTERM` → `agent_stop` "sigterm" and the watchdog's respawn; reboot in
+    19 s (26 s before), the agent's stop job timed out after 5 s, the
+    process ended at the final stage with `agent_stop` "system_shutdown",
+    the next boot read `previous_run: clean`, and no detection or COMBAT
+    stage was recorded during the shutdown. The anti-tamper suite passes
+    whole (C01–C33, with the new C31 `systemctl kill -s SIGKILL`, C32
+    `systemctl kill -s SIGSTOP` of the watchdog, C33 `systemctl stop`), and
+    `respawn-check` takes the window path.

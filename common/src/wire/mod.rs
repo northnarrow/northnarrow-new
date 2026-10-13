@@ -477,6 +477,40 @@ pub struct InodeKey {
     pub ino: u64,
 }
 
+/// External audit EBPF-001: the one slot of the pinned `KILL_GRANT` map —
+/// when PID 1 (systemd) may signal a protected process. The agent writes
+/// it only while a signed trusted-installer window is open (`systemctl
+/// stop`/`restart` of the units during an upgrade or maintenance) and
+/// zeroes it when the window closes and at every boot. The hook honours it
+/// for a signal in `sig_mask` (bit `n` = signal `n`), before `expires_ns`
+/// (`bpf_ktime_get_ns`, CLOCK_MONOTONIC), with `nonce` equal to this
+/// boot's non-zero session nonce.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct KillGrant {
+    pub nonce: u32,
+    pub sig_mask: u32,
+    pub expires_ns: u64,
+}
+
+impl KillGrant {
+    /// The signals systemd sends to stop a unit: `KillSignal=` (SIGTERM),
+    /// the SIGCONT that follows it, and `FinalKillSignal=` (SIGKILL).
+    pub const STOP_SIGNALS: u32 = (1 << 15) | (1 << 18) | (1 << 9);
+
+    /// Whether this grant lets PID 1 send `sig` at monotonic `now_ns`
+    /// under session `session` — the kernel hook's test, kept here so it
+    /// is unit-tested once.
+    pub fn allows(&self, sig: i32, now_ns: u64, session: u32) -> bool {
+        self.nonce != 0
+            && self.nonce == session
+            && (1..32).contains(&sig)
+            && self.sig_mask & (1u32 << sig) != 0
+            && now_ns < self.expires_ns
+    }
+}
+
 // Tappa 7 filesystem-protection denial codes. The eBPF inode hooks
 // write one of these into `FsProtectDenialRaw.operation` when they
 // return `-EPERM`. Userland inflates the byte into the typed
@@ -1231,6 +1265,29 @@ pub struct NetListenerEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit EBPF-001: PID 1 may signal a protected process only
+    /// with a live grant of this boot, for a stop signal, before expiry.
+    #[test]
+    fn a_kill_grant_is_bounded_by_session_signal_and_time() {
+        let g = KillGrant {
+            nonce: 0xABCD,
+            sig_mask: KillGrant::STOP_SIGNALS,
+            expires_ns: 1_000,
+        };
+        assert!(g.allows(15, 999, 0xABCD), "SIGTERM inside the window");
+        assert!(g.allows(9, 0, 0xABCD), "SIGKILL inside the window");
+        assert!(g.allows(18, 0, 0xABCD), "SIGCONT inside the window");
+        assert!(!g.allows(15, 1_000, 0xABCD), "expired");
+        assert!(!g.allows(15, 0, 0x1234), "another boot's session");
+        assert!(!g.allows(19, 0, 0xABCD), "SIGSTOP is not a stop signal");
+        assert!(!g.allows(2, 0, 0xABCD), "SIGINT is not a stop signal");
+        assert!(!g.allows(0, 0, 0xABCD) && !g.allows(32, 0, 0xABCD) && !g.allows(-1, 0, 0xABCD));
+        assert!(
+            !KillGrant::default().allows(15, 0, 0),
+            "the zeroed slot grants nothing"
+        );
+    }
     use core::mem::{align_of, size_of};
 
     #[test]

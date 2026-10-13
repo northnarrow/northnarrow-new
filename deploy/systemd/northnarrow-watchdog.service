@@ -15,6 +15,14 @@ After=northnarrow-agent.service
 # down instead of respawning. Wants= pulls the agent in when the
 # watchdog is started on a cold host.
 Wants=northnarrow-agent.service
+# External audit EBPF-001: no manual stop or restart (`systemctl stop`,
+# `restart`, `isolate` of this unit alone): systemd only relays root's
+# request, and the task_kill hook refuses its signals outside a signed
+# trusted-installer window anyway — without this line systemd ignored the
+# EPERM and reported the unit dead while it ran. Stops as a dependency
+# (shutdown) still go through. Maintenance, inside the window: `systemctl
+# kill -s SIGTERM` (install.sh, uninstall.sh; docs/operator §3.7).
+RefuseManualStop=yes
 # No Requires=sys-fs-bpf.mount: /sys/fs/bpf is an API VFS with no
 # materialisable mount unit (see northnarrow-agent.service). The
 # watchdog is ordered After= the agent, which has already validated
@@ -52,6 +60,13 @@ ExecStart=/usr/local/bin/northnarrow-watchdog \
 # because the bpffs map pin is independent of the watchdog
 # process lifetime.
 Restart=on-failure
+# External audit EBPF-001: outside a signed trusted-installer window the
+# task_kill hook refuses systemd's signals; a stop job (shutdown) then ends
+# within TimeoutStopSec with the process still running, which ends with
+# systemd-shutdown's final SIGTERM (allowed). SendSIGKILL=no: with a
+# process left in the cgroup systemd refuses to start a second instance.
+TimeoutStopSec=5s
+SendSIGKILL=no
 RestartSec=2s
 
 # Resource ceilings per design §9 "Resource ceiling (V1 targets)":

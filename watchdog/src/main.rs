@@ -57,10 +57,14 @@ async fn main() -> ExitCode {
     // Single-source EnvFilter init mirroring the agent. RUST_LOG
     // env var still wins; default is "info" so the boot-sequence
     // log lines are visible without extra flags.
+    // A write to a closed log stream (journald@northnarrow stopped) must
+    // not abort the watchdog: the fmt layer's own error report is an
+    // `eprintln!` that panics on the same broken pipe (panic = "abort").
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .log_internal_errors(false)
         .try_init();
 
     let cli = Cli::parse();

@@ -5,7 +5,8 @@
 //! the signed detection chain instead of a journal line only, so the
 //! adversarial check (`deploy/lab/adversarial/anti-tamper.sh`) finds every
 //! refused case in `detections.jsonl`. Posture still reacts through the
-//! `AntiTamperDenial` trigger (COMBAT / INVESTIGATE). Log only: the attempt
+//! `AntiTamperDenial` trigger (COMBAT / INVESTIGATE) — or, for a signal
+//! systemd relayed, `RelayedTamperAttempt` (ENGAGED). Log only: the attempt
 //! already failed, and killing the actor is the ladder's call.
 //!
 //! Not in the engine's rule list: `process_event` short-circuits every
@@ -30,6 +31,7 @@ impl Rule for NnLAt001AntiTamperDenial {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::FsProtectDenial {
+            pid,
             comm,
             target_dev,
             target_ino,
@@ -40,10 +42,14 @@ impl Rule for NnLAt001AntiTamperDenial {
             return None;
         };
         let what = match operation {
-            FsProtectOperation::Signal => format!(
-                "signal {target_dev} to protected pid {target_ino} (kill / pkill / systemctl kill \
-                 outside the PID-1 carve-out)"
+            // External audit EBPF-001: systemd only relays root's request.
+            FsProtectOperation::Signal if *pid == 1 => format!(
+                "to deliver signal {target_dev} to protected pid {target_ino} on behalf of a \
+                 `systemctl stop` / `kill` / `restart` outside a trusted-installer window"
             ),
+            FsProtectOperation::Signal => {
+                format!("signal {target_dev} to protected pid {target_ino} (kill / pkill)")
+            }
             FsProtectOperation::Ptrace => format!(
                 "ptrace attach (mode {target_dev:#x}) on protected pid {target_ino} — debugger, \
                  /proc/<pid>/mem or process_vm_readv/writev"
@@ -128,5 +134,19 @@ mod tests {
             .evaluate(&denial(FsProtectOperation::Signal))
             .unwrap();
         assert!(v.reasoning.contains("signal 9 to protected pid 709"));
+    }
+
+    /// External audit EBPF-001: a signal PID 1 relayed names the request,
+    /// not systemd, as what was refused.
+    #[test]
+    fn a_relayed_signal_names_the_systemctl_request() {
+        let mut e = denial(FsProtectOperation::Signal);
+        if let Event::FsProtectDenial { pid, comm, .. } = &mut e {
+            *pid = 1;
+            *comm = "systemd".into();
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert!(v.reasoning.contains("systemctl stop"), "{}", v.reasoning);
+        assert!(v.reasoning.contains("trusted-installer window"));
     }
 }

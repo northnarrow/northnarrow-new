@@ -64,6 +64,30 @@ done
 
 log() { echo "uninstall.sh: $*"; }
 
+# External audit EBPF-001: the units refuse a manual stop
+# (RefuseManualStop=yes) and their processes take systemd's signals only
+# inside the trusted-installer window: stop by signal, SIGTERM first (the
+# agent writes agent_stop), SIGKILL only if a process outlives 10 s.
+stop_nn_unit() {
+    local u=$1 i
+    systemctl kill --signal=SIGTERM "$u.service" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do
+        nn_unit_has_procs "$u" || break
+        sleep 0.5
+    done
+    if nn_unit_has_procs "$u"; then
+        systemctl kill --signal=SIGKILL "$u.service" 2>/dev/null || true
+        sleep 1
+    fi
+    systemctl reset-failed "$u.service" 2>/dev/null || true
+}
+nn_unit_has_procs() {
+    local cg
+    cg=$(systemctl show -p ControlGroup --value "$1.service" 2>/dev/null)
+    cg=${cg:-/system.slice/$1.service}
+    [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
+}
+
 echo "NorthNarrow uninstall"
 echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin}"
 echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog}.service"
@@ -91,7 +115,8 @@ fi
 for u in northnarrow-watchdog northnarrow-agent; do
     if systemctl list-unit-files "$u.service" >/dev/null 2>&1; then
         log "stopping + disabling $u"
-        systemctl disable --now "$u.service" 2>/dev/null || systemctl stop "$u.service" 2>/dev/null || true
+        systemctl disable "$u.service" 2>/dev/null || true
+        stop_nn_unit "$u"
     fi
 done
 

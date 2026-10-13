@@ -103,3 +103,28 @@ fn agent_unit_keeps_restart_no_and_disables_start_rate_limit() {
     let caps = value(&d, "CapabilityBoundingSet").expect("bounding set");
     assert!(caps.split_whitespace().any(|c| c == "CAP_KILL"), "{caps}");
 }
+
+/// External audit EBPF-001: systemd's stop signals are refused outside a
+/// signed trusted-installer window, so a stop must give up quickly and
+/// never escalate to a second instance beside the running one.
+#[test]
+fn both_units_give_up_a_refused_stop_quickly_and_never_double_start() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        assert_eq!(
+            value(&d, "TimeoutStopSec"),
+            Some("5s"),
+            "{name}: bounded wait on a refused stop"
+        );
+        assert_eq!(
+            value(&d, "SendSIGKILL"),
+            Some("no"),
+            "{name}: with leftover processes systemd must refuse a new start"
+        );
+        assert_eq!(
+            value(&d, "RefuseManualStop"),
+            Some("yes"),
+            "{name}: a manual stop must fail loudly, not report a running unit dead"
+        );
+    }
+}

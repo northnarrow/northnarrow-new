@@ -432,6 +432,30 @@ fi
 # through the agent's admin socket with a key carrying the `trusted-installer`
 # role (the key install.sh bootstraps has it) and survives the agent's stop
 # long enough for the purge (the override lives in a pinned map).
+# External audit EBPF-001: the units refuse a manual stop
+# (RefuseManualStop=yes) and their processes take systemd's signals only
+# inside the trusted-installer window: stop by signal, SIGTERM first (the
+# agent writes agent_stop), SIGKILL only if a process outlives 10 s.
+stop_nn_unit() {
+    local u=$1 i
+    systemctl kill --signal=SIGTERM "$u.service" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do
+        nn_unit_has_procs "$u" || break
+        sleep 0.5
+    done
+    if nn_unit_has_procs "$u"; then
+        systemctl kill --signal=SIGKILL "$u.service" 2>/dev/null || true
+        sleep 1
+    fi
+    systemctl reset-failed "$u.service" 2>/dev/null || true
+}
+nn_unit_has_procs() {
+    local cg
+    cg=$(systemctl show -p ControlGroup --value "$1.service" 2>/dev/null)
+    cg=${cg:-/system.slice/$1.service}
+    [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
+}
+
 open_trusted_installer_window() {
     local key=$1
     [[ -r "$key" ]] || { echo "install.sh: --grant-key $key is not readable" >&2; return 1; }
@@ -507,8 +531,7 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     # Watchdog first: stopping the agent alone makes it respawn it.
     for u in northnarrow-watchdog northnarrow-agent; do
         echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null | tr -d '\n'))"
-        systemctl stop "$u.service" 2>/dev/null || true
-        systemctl reset-failed "$u.service" 2>/dev/null || true
+        stop_nn_unit "$u"
     done
     purge_pin_root || exit 1
     if command -v bpftool >/dev/null 2>&1; then
