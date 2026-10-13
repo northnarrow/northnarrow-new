@@ -133,20 +133,65 @@ static MOUNTS: Mutex<Option<MountTable>> = Mutex::new(None);
 /// another namespace, the memfd mount) leaves no path, so consumers fall
 /// back to the caller's string, as before this sensor.
 pub fn resolve(event: &mut Event) {
-    let exe = match event {
-        Event::ProcessSpawn { exe, .. } | Event::ExecCheck { exe, .. } => exe,
+    let (pid, filename, exe) = match event {
+        Event::ProcessSpawn {
+            pid, filename, exe, ..
+        }
+        | Event::ExecCheck {
+            pid, filename, exe, ..
+        } => (*pid, filename.as_str(), exe),
         _ => return,
     };
-    if exe.root == (0, 0) {
-        return;
+    if exe.root != (0, 0) {
+        let mut guard = MOUNTS.lock();
+        let table = guard.get_or_insert_with(MountTable::load);
+        match table.absolute(exe.root, &exe.path) {
+            Some(abs) => exe.path = abs,
+            None => exe.path.clear(),
+        }
+        exe.root = (0, 0);
     }
-    let mut guard = MOUNTS.lock();
-    let table = guard.get_or_insert_with(MountTable::load);
-    match table.absolute(exe.root, &exe.path) {
-        Some(abs) => exe.path = abs,
-        None => exe.path.clear(),
+    // External audit PROC-002/003: without a path the kernel resolved
+    // (tracepoint mode, or a file the sensor could not place), the rules
+    // fell back on the string the caller passed to execve. A relative
+    // `./payload` run from /tmp matched no staging rule, and
+    // `/usr/bin/../../tmp/nsenter` passed R013/R017's standard-prefix
+    // exemption. Give them the real path instead: the string normalised,
+    // or the running image's when the string is relative. The flags are
+    // untouched: nothing reads this as a kernel-resolved identity.
+    if exe.path.is_empty() {
+        if let Some(path) = fallback_exec_path(pid, filename) {
+            exe.path = path;
+        }
     }
-    exe.root = (0, 0);
+}
+
+/// External audit PROC-002/003: an exec path the rules can judge when the
+/// kernel's is missing — `filename` with `.`, `..` and repeated slashes
+/// resolved lexically when it is absolute (no I/O, no race), else the
+/// target of `/proc/<pid>/exe` while the process still runs.
+fn fallback_exec_path(pid: u32, filename: &str) -> Option<String> {
+    if filename.starts_with('/') {
+        return Some(lexically_normal(filename));
+    }
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// `path` (absolute) with `.`, `..` and empty components resolved.
+fn lexically_normal(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 #[cfg(test)]
@@ -169,6 +214,57 @@ mod tests {
             parent_is_kthread: false,
             exe,
         }
+    }
+
+    /// External audit PROC-002/003: with no kernel path, the rules get
+    /// the caller's string normalised, or the running image when it is
+    /// relative — not the raw string.
+    #[test]
+    fn missing_kernel_path_falls_back_on_the_real_one() {
+        let spawn = |pid: u32, filename: &str| Event::ProcessSpawn {
+            pid,
+            ppid: 0,
+            uid: 0,
+            gid: 0,
+            comm: "x".into(),
+            filename: filename.into(),
+            timestamp_ns: 0,
+            argv: vec![],
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            parent_is_kthread: false,
+            exe: Default::default(),
+        };
+        for (raw, want) in [
+            ("/usr/bin/../../tmp/nsenter", "/tmp/nsenter"),
+            ("//tmp/./payload", "/tmp/payload"),
+            ("/var/tmp/../tmp/x", "/var/tmp/x"),
+            ("/usr/bin//nsenter", "/usr/bin/nsenter"),
+        ] {
+            let mut e = spawn(1, raw);
+            resolve(&mut e);
+            let Event::ProcessSpawn { exe, filename, .. } = &e else {
+                unreachable!()
+            };
+            assert_eq!(exe.path_or(filename), want, "{raw}");
+            assert_eq!(filename, raw, "the caller's string is kept as evidence");
+        }
+        // relative: the running image (this test binary)
+        let me = std::process::id();
+        let mut e = spawn(me, "./payload");
+        resolve(&mut e);
+        let Event::ProcessSpawn { exe, filename, .. } = &e else {
+            unreachable!()
+        };
+        let own = std::fs::read_link("/proc/self/exe").unwrap();
+        assert_eq!(exe.path_or(filename), own.to_string_lossy());
+        // relative, process gone: nothing better than the string
+        let mut e = spawn(u32::MAX - 7, "./payload");
+        resolve(&mut e);
+        let Event::ProcessSpawn { exe, filename, .. } = &e else {
+            unreachable!()
+        };
+        assert_eq!(exe.path_or(filename), "./payload");
     }
 
     #[test]

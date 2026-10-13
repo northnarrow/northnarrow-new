@@ -52,6 +52,65 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-063 | DEC-003 | High | Deception | `agent/src/canary/read_forward.rs` | fixed (lab PR 84) |
 | NN-AUD-070 | WDG-004 | High | Watchdog tooling | `watchdog/src/main.rs` | fixed (lab PR 85) |
 
+## Wave 1
+
+| ID | Audit ref | Area | Effort | Status |
+|---|---|---|---|---|
+| NN-AUD-007 | ASK-001 | Admin socket | M | fixed (lab PR 84, with NN-AUD-062) |
+| NN-AUD-008 | MAIN-001 | Agent main | M | open |
+| NN-AUD-009 | MAIN-002 | Agent main | M | fixed (lab PR 82, as NN-AUD-004) |
+| NN-AUD-010 | MAIN-003 | Agent main | M | open |
+| NN-AUD-011 | ATP-001 | Anti-tamper | M | open |
+| NN-AUD-012 | ATP-002 | Anti-tamper | M | open |
+| NN-AUD-013 | ATP-004 | Anti-tamper | M | open |
+| NN-AUD-014 | EBPF-001 | eBPF kernel | M | open |
+| NN-AUD-015 | EBPF-002 | eBPF kernel | M | open |
+| NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
+| NN-AUD-019 | EBPF-010 | eBPF kernel | M | open |
+| NN-AUD-020 | EVD-001 | Evidence logs | L | open |
+| NN-AUD-021 | EVD-005 | Evidence logs | M | open |
+| NN-AUD-022 | EVD-021 | Evidence logs | M | open |
+| NN-AUD-023 | FIMR-001 | FIM rules | M | open |
+| NN-AUD-024 | FIMR-002 | FIM rules | M | open |
+| NN-AUD-025 | FIMR-003 | FIM rules | M | open |
+| NN-AUD-026 | FIMR-004 | FIM rules | M | open |
+| NN-AUD-027 | FIMR-005 | FIM rules | M | open |
+| NN-AUD-028 | FIMR-006 | FIM rules | L | open |
+| NN-AUD-029 | FIMP-001 | FIM pipeline | M | open |
+| NN-AUD-031 | FIMP-003 | FIM pipeline | M | open |
+| NN-AUD-032 | FIMP-004 | FIM pipeline | M | open |
+| NN-AUD-036 | NETR-002 | Net rules | M | open |
+| NN-AUD-037 | NETR-003 | Net rules | M | open |
+| NN-AUD-038 | PROC-002 | Process rules | M | fixed (lab PR 86) |
+| NN-AUD-039 | PROC-003 | Process rules | M | fixed (lab PR 86) |
+| NN-AUD-040 | PROC-004 | Process rules | M | fixed (lab PR 86) |
+| NN-AUD-041 | PROC-005 | Process rules | L | open |
+| NN-AUD-042 | PROC-007 | Process rules | M | fixed (lab PR 86) |
+| NN-AUD-043 | POS-002 | Posture | M | open |
+| NN-AUD-044 | POS-003 | Posture | M | open |
+| NN-AUD-045 | POS-004 | Posture | L | open |
+| NN-AUD-046 | CMB-001 | Combat response | M | open |
+| NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
+| NN-AUD-050 | CMB-006 | Combat response | M | open |
+| NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
+| NN-AUD-055 | LLMR-012 | LLM runtime | M | open |
+| NN-AUD-057 | NET-003 | Network | M | open |
+| NN-AUD-058 | NET-004 | Network | M | open |
+| NN-AUD-061 | DEC-001 | Deception | M | fixed (lab PR 84, with Wave 0) |
+| NN-AUD-062 | DEC-002 | Deception | M | fixed (lab PR 84, with Wave 0) |
+| NN-AUD-064 | DEC-004 | Deception | M | open |
+| NN-AUD-065 | DEC-005 | Deception | M | open |
+| NN-AUD-066 | DEC-006 | Deception | L | open |
+| NN-AUD-067 | WDG-001 | Watchdog tooling | M | open |
+| NN-AUD-068 | WDG-002 | Watchdog tooling | M | open |
+| NN-AUD-069 | WDG-003 | Watchdog tooling | M | open |
+| NN-AUD-071 | WDG-005 | Watchdog tooling | M | fixed (lab PR 85, with NN-AUD-070) |
+| NN-AUD-072 | DEP-001 | Deploy | M | open |
+| NN-AUD-073 | DEP-002 | Deploy | M | open |
+| NN-AUD-074 | DEP-003 | Deploy | M | open |
+| NN-AUD-075 | SUP-003 | Supply chain | M | open |
+| NN-AUD-076 | TST-003 | Privileged tests | M | open |
+
 ## Notes on the fixes
 
 - **NN-AUD-005 (NET-001), lab PR 78.** A dual-stack `AF_INET6` socket
@@ -334,3 +393,46 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   respawned). The watchdog's privileged e2e had never run in the lab
   gate — they are gated by a feature, not `#[ignore]`, and `test-ignored`
   compiled them out — so `nn-lab.sh test-ignored` now runs them too (5/5).
+- **NN-AUD-038 (PROC-002) and NN-AUD-039 (PROC-003), lab PR 86.** Since
+  Tappa 10.9 the exec rules judge the path the kernel resolved from the
+  executed file's dentry (canonical, symlinks resolved), which closes
+  both findings where the LSM exec sensor runs — the default. Without it
+  (tracepoint mode, or a file the sensor could not place) the rules fell
+  back on the string passed to `execve`: a relative `./payload` run from
+  /tmp matched no staging rule, and `/usr/bin/../../tmp/nsenter` passed
+  R013/R017's standard-prefix exemption. That fallback is now the string
+  resolved lexically (`.`, `..`, `//`) when it is absolute, and the
+  running image's path when it is relative. The caller's string is kept
+  as evidence.
+- **NN-AUD-040 (PROC-004), lab PR 86.** R018's only autonomous response
+  (Critical, KillProcessTree for a module loaded from outside
+  /lib/modules) was turned into a Medium alert by any truncated path,
+  including one nested past the kernel walk's 16 components — a depth the
+  loader chooses. The walk now tells its two causes apart. Deeper than
+  16 components is deeper than any module directory, whose modules sit
+  a dozen down at most: it is killed, allowlisted loader or not. A failed
+  kernel read leaves the origin unknown: an alert, raised from Medium to
+  High. Lab, Ubuntu 24.04: the stock `dummy.ko.zst` copied 18
+  directories deep and loaded with `insmod` drew R018 Critical,
+  KillProcessTree (`…/d4/…/d18/dummy.ko.zst`); it drew a Medium alert
+  before.
+- **NN-AUD-042 (PROC-007), lab PR 86.** R009 killed every root exec from
+  a home or a temporary directory, `sudo ~/deploy.sh` and RPM scriptlets
+  included. It once killed `nn-admin`. An administrator's sudo/su
+  session at a terminal, and a package manager's transaction, are now
+  recorded instead — review 52's boundaries for the FIM rules. The
+  audit's proposed carve-out, any "auth-mediated" process, was not
+  taken. That covers every descendant of sshd (NN-AUD-043), so it would
+  have spared the escalation R009 exists for: an exploit run from an ssh
+  session. Lab, Ubuntu 24.04: a root script in `/home/nn` run with `sudo`
+  at a terminal drew R009 at Log and completed; the same script run with
+  `sudo` without a terminal was killed. A script that exits within a few
+  milliseconds can still draw the kill: its lineage is read once it has
+  gone, and the kill then finds nothing to stop.
+- **NN-AUD-041 (PROC-005), open — a design question.** Only root can load
+  a module, and root can put one under /lib/modules, so R018's path test
+  cannot be the discriminant. The audit's fix (a baseline of module
+  inodes) would kill every DKMS build after a kernel update. The
+  candidates are the kernel's own module-signature verdict, and a
+  trusted-installer window for module loads as for kexec (review 82).
+  Both change what operators may do, and are left for a dedicated change.

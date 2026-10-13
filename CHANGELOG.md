@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, process rules (High PROC-002, PROC-003,
+  PROC-004, PROC-007):
+  - Without the kernel-resolved path (tracepoint mode), a relative
+    `./payload` from /tmp or `/usr/bin/../../tmp/x` slipped past the exec
+    rules; the fallback path is now normalised or read from the process.
+  - A kernel module loaded from a directory nested deeper than 16 levels
+    got an alert instead of the kill; it is now killed, and an unreadable
+    path raises a High alert.
+  - R009 no longer kills root scripts run from a home or /tmp in an
+    administrator's sudo session at a terminal, nor package scriptlets;
+    it records them. Other root execs from those paths are still killed.
 - External audit, Wave 0, anti-tamper (High EBPF-003, WDG-004):
   - A single write to the pinned ptrace override map lifted the agent's
     ptrace protection until the next reboot. The override now needs the
