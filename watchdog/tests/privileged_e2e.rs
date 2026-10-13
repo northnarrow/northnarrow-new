@@ -714,6 +714,67 @@ fn watchdog_respawns_agent_3_cycles_with_backoff() {
     );
 }
 
+/// The agent pid the pidfile names once it differs from `old`, or `None`
+/// after `within`.
+fn new_agent_pid(fx: &E2eFixture, old: u32, within: Duration) -> Option<u32> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Ok(s) = fs::read_to_string(fx.agent_pidfile()) {
+            if let Ok(pid) = s.trim().parse::<u32>() {
+                if pid != old && Path::new(&format!("/proc/{pid}")).exists() {
+                    return Some(pid);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// External audit WDG-004: past the restart ceiling (5 respawns in 60 s)
+/// the watchdog used to exit 0 — no restart by systemd, no failed unit,
+/// agent and watchdog gone. It now holds: alive, not respawning, until
+/// an agent is started again, which it then supervises.
+#[test]
+fn watchdog_holds_after_the_restart_ceiling() {
+    let mut fx = E2eFixture::setup();
+    let mut pid = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let watchdog: u32 = fs::read_to_string(fx.watchdog_pidfile())
+        .expect("watchdog pidfile")
+        .trim()
+        .parse()
+        .expect("watchdog pid");
+
+    // Kill every agent the watchdog brings back until it stops doing so.
+    let mut respawns = 0;
+    loop {
+        fx.unprotect_and_sigkill_agent(pid);
+        match new_agent_pid(&fx, pid, Duration::from_secs(30)) {
+            Some(next) => {
+                respawns += 1;
+                assert!(respawns <= 8, "the restart ceiling never tripped");
+                pid = next;
+            }
+            None => break,
+        }
+    }
+    assert!(respawns >= 5, "held after only {respawns} respawns");
+    assert!(
+        Path::new(&format!("/proc/{watchdog}")).exists(),
+        "the watchdog must stay alive past the ceiling"
+    );
+
+    // An agent started by hand: supervised again, with a fresh window.
+    let manual = fx.spawn_agent();
+    std::thread::sleep(Duration::from_secs(5));
+    fx.unprotect_and_sigkill_agent(manual);
+    assert!(
+        new_agent_pid(&fx, manual, Duration::from_secs(30)).is_some(),
+        "the watchdog must resume supervision once an agent runs again"
+    );
+}
+
 // ── Test 3: W5 stuck-recovery on real BPF map ───────────────────────
 
 /// **Required W5 privileged integration:** `stuck_recovery`

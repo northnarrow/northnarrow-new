@@ -396,6 +396,11 @@ cmd_test_ignored() {
     vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_map_pin $pin_test -- --ignored --test-threads=1" || rc=1
     lab_purge_pins >/dev/null
     vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1 --skip $pin_test$skip_args" || rc=1
+    # The watchdog's privileged e2e are gated by its own feature, not by
+    # #[ignore]: the run above compiled them out (0 tests), so they never
+    # ran in the gate. Run them on their own, on a purged pin root.
+    lab_purge_pins >/dev/null
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1" || rc=1
     return "$rc"
 }
 

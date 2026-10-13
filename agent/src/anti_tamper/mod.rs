@@ -186,6 +186,10 @@ pub(crate) const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
 /// [`boot_zero_fs_override`]; armed/disarmed cross-task by
 /// [`trusted_installer::TrustedInstallerOverride`] via its bpffs path.
 pub(crate) const FS_PROTECT_OVERRIDE_MAP_NAME: &str = "FS_PROTECT_OVERRIDE";
+/// External audit EBPF-003: the ptrace override map (mirrors `#[map] pub
+/// static PTRACE_OVERRIDE` in `agent-ebpf/src/ptrace_check.rs`). Boot-zeroed
+/// and pinned like [`FS_PROTECT_OVERRIDE_MAP_NAME`].
+const PTRACE_OVERRIDE_MAP_NAME: &str = "PTRACE_OVERRIDE";
 
 /// Names mirroring `#[lsm(hook = "…")]` declarations in
 /// `agent-ebpf/src/{task_kill,ptrace_check}.rs`. Kept here as
@@ -336,6 +340,18 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
              compare still bounds any stale value to a prior boot)"
         );
     }
+    // External audit EBPF-003: the same for the ptrace override. It was
+    // never written nor zeroed, and the hook accepted any non-zero value:
+    // one write to the pinned map lifted the ptrace protection for every
+    // later agent until a reboot. A failure counts as a deny shortfall.
+    let ptrace_override_zeroed = boot_zero_override(ebpf, PTRACE_OVERRIDE_MAP_NAME);
+    if let Err(e) = &ptrace_override_zeroed {
+        warn!(
+            error = %e,
+            "anti-tamper: PTRACE_OVERRIDE boot-zero/pin FAILED (the kernel's session-nonce \
+             compare still keeps a stale value inert)"
+        );
+    }
 
     // `Btf::from_sys_fs()` reads `/sys/kernel/btf/vmlinux`. The Lsm
     // loader resolves `bpf_lsm_<hook>` against it to set the
@@ -374,6 +390,9 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) ->
     // lone WARN while the agent kept reporting healthy. Collect them all,
     // emit ONE aggregate health line, and fail closed by default.
     let mut deny_failures: Vec<(&'static str, String)> = Vec::new();
+    if let Err(e) = ptrace_override_zeroed {
+        deny_failures.push(("ptrace_override_boot_zero", format!("{e:#}")));
+    }
 
     // Review 62: task_kill and ptrace_access_check emit their denials on
     // the FS_PROTECT_EVENTS ring (`inode_protect::emit_task_denial`), so
@@ -623,26 +642,28 @@ fn arm_kill_override(ebpf: &mut Ebpf) -> Result<()> {
 /// kernel `override_active` compares `FS_PROTECT_OVERRIDE[0]` against the
 /// session nonce, so a fresh nonce must already be in place.
 fn boot_zero_fs_override(ebpf: &mut Ebpf) -> Result<()> {
-    write_array_u32(ebpf, FS_PROTECT_OVERRIDE_MAP_NAME, 0)
-        .with_context(|| format!("boot-zeroing {FS_PROTECT_OVERRIDE_MAP_NAME}[0]"))?;
+    boot_zero_override(ebpf, FS_PROTECT_OVERRIDE_MAP_NAME)
+}
+
+/// Zero slot 0 of the override map `map_name` and pin it by name, so an
+/// override never survives a restart and userland can arm it through its
+/// bpffs path. Runs after [`arm_kill_override`]: the hooks compare the
+/// slot against the fresh session nonce.
+fn boot_zero_override(ebpf: &mut Ebpf, map_name: &'static str) -> Result<()> {
+    write_array_u32(ebpf, map_name, 0).with_context(|| format!("boot-zeroing {map_name}[0]"))?;
 
     if let Some(root) = prepare_pin_root() {
-        let map_pin_path = root.join(FS_PROTECT_OVERRIDE_MAP_NAME);
+        let map_pin_path = root.join(map_name);
         purge_stale_pin(&map_pin_path);
-        ebpf.map_mut(FS_PROTECT_OVERRIDE_MAP_NAME)
-            .ok_or_else(|| anyhow!("map {FS_PROTECT_OVERRIDE_MAP_NAME} missing from eBPF object"))?
+        ebpf.map_mut(map_name)
+            .ok_or_else(|| anyhow!("map {map_name} missing from eBPF object"))?
             .pin(&map_pin_path)
-            .with_context(|| {
-                format!(
-                    "pinning {FS_PROTECT_OVERRIDE_MAP_NAME} to {}",
-                    map_pin_path.display()
-                )
-            })?;
+            .with_context(|| format!("pinning {map_name} to {}", map_pin_path.display()))?;
     }
 
     info!(
-        map = FS_PROTECT_OVERRIDE_MAP_NAME,
-        "anti-tamper: FS_PROTECT_OVERRIDE boot-zeroed + pinned (FIM-009 §15.1)"
+        map = map_name,
+        "anti-tamper: override map boot-zeroed + pinned"
     );
     Ok(())
 }

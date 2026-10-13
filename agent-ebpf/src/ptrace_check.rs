@@ -78,8 +78,12 @@ const EPERM: c_int = 1;
 /// independent capabilities and Tappa 8 should be able to grant
 /// one without the other.
 ///
-/// Pinned by-name alongside `PROTECTED_PIDS`. Tappa-8 caveat: slot 0
-/// persists across agent restart and must be zeroed on boot.
+/// Pinned by-name alongside `PROTECTED_PIDS`, so slot 0 persists across
+/// agent restarts. External audit EBPF-003: the agent zeroes it on boot,
+/// and the hook honours it only when it carries this boot's session nonce
+/// (`task_kill::AGENT_SESSION`), like `KILL_OVERRIDE` and
+/// `FS_PROTECT_OVERRIDE` — a value left in the map, by an earlier install
+/// or through a map handle, is inert.
 #[map]
 pub static PTRACE_OVERRIDE: Array<u32> = Array::pinned(1, 0);
 
@@ -160,12 +164,17 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
 
     // Tappa 8 escape hatch. The map is empty in the shipped Tappa 7
     // build; the lookup exists so the wiring is in place when the
-    // Ed25519 verifier lands.
-    let override_active = match PTRACE_OVERRIDE.get(0) {
+    // Ed25519 verifier lands. External audit EBPF-003: only a value equal
+    // to this boot's session nonce opens it.
+    let override_value = match PTRACE_OVERRIDE.get(0) {
         Some(v) => *v,
         None => 0,
     };
-    if override_active != 0 {
+    let session = match crate::task_kill::AGENT_SESSION.get(0) {
+        Some(v) => *v,
+        None => 0,
+    };
+    if override_value != 0 && override_value == session {
         return 0;
     }
 

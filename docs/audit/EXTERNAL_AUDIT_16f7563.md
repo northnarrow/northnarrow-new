@@ -32,7 +32,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-004 | LLMR-002 | Critical | LLM runtime | `agent/src/ade/mod.rs` | fixed (lab PR 82) |
 | NN-AUD-005 | NET-001 | Critical | Network | `agent/src/net/blocklist.rs` | fixed (lab PR 78) |
 | NN-AUD-006 | NET-010 | Critical | Network | `configs/netflow-comm-allowlist.v1` | fixed (lab PR 78) |
-| NN-AUD-016 | EBPF-003 | High | eBPF kernel | `agent-ebpf/src/ptrace_check.rs` | open |
+| NN-AUD-016 | EBPF-003 | High | eBPF kernel | `agent-ebpf/src/ptrace_check.rs` | fixed (lab PR 85) |
 | NN-AUD-018 | EBPF-007 | High | eBPF kernel | `agent-ebpf/src/udp_sendmsg_outbound.rs` | fixed (lab PR 78) |
 | NN-AUD-030 | FIMP-002 | High | FIM pipeline | `agent/src/fim/baseline.rs` | fixed (lab PR 84) |
 | NN-AUD-033 | FIMP-005 | High | FIM pipeline | `agent/src/fim/drain.rs` | fixed (lab PR 84) |
@@ -50,7 +50,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-061 | DEC-001 | High | Deception | `agent/src/admin_socket.rs` | fixed (lab PR 84; Wave 1, taken with NN-AUD-063) |
 | NN-AUD-062 | DEC-002 | High | Deception | `agent/src/canary/path_policy.rs` | fixed (lab PR 84; Wave 1, taken with NN-AUD-063) |
 | NN-AUD-063 | DEC-003 | High | Deception | `agent/src/canary/read_forward.rs` | fixed (lab PR 84) |
-| NN-AUD-070 | WDG-004 | High | Watchdog tooling | `watchdog/src/main.rs` | open |
+| NN-AUD-070 | WDG-004 | High | Watchdog tooling | `watchdog/src/main.rs` | fixed (lab PR 85) |
 
 ## Notes on the fixes
 
@@ -308,3 +308,29 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   operator deployed, burned or refreshed one. Boot and admin now share
   one rebuild (`CanaryIndexes::rebuild_live`). The boot log reports the
   read-forward count, and warns when a file canary's decoy is missing.
+- **NN-AUD-016 (EBPF-003), lab PR 85.** Of the three pinned override
+  maps, `PTRACE_OVERRIDE` alone was neither tied to the session nonce nor
+  zeroed at boot, and its hook accepted any non-zero value. One write to
+  the pinned map lifted the ptrace protection of every later agent until
+  a reboot: its memory became readable, a debugger attachable, and the
+  hook returned before recording anything. It now opens only on this
+  boot's session nonce, like `KILL_OVERRIDE` and `FS_PROTECT_OVERRIDE`,
+  and the agent zeroes and pins it at boot, before the hooks attach. A
+  failure there counts as a deny shortfall. Lab, Ubuntu 24.04: the hook
+  loads with the compare, the pinned map reads 0 after boot, and root
+  opening `/proc/<agent>/mem` gets EPERM, recorded as an `op=ptrace`
+  denial.
+- **NN-AUD-070 (WDG-004), lab PR 85.** Past the restart ceiling (five
+  respawns in sixty seconds, "tamper suspected"), or when a respawn
+  failed, the watchdog exited 0. Its unit's `Restart=on-failure`
+  neither restarted it nor marked it failed: agent and watchdog were
+  gone, with one journal line as the only trace. It now holds instead.
+  It stays alive and protected, reports `DEGRADED` to systemd
+  (`systemctl status` shows why), and respawns nothing. Once an operator
+  starts the agent again, it supervises it with a fresh restart window.
+  Lab, Ubuntu 24.04: the new privileged e2e killed every respawned agent
+  until the ceiling tripped; the watchdog stayed alive and respawned
+  nothing; an agent started by hand was supervised again (killed, it was
+  respawned). The watchdog's privileged e2e had never run in the lab
+  gate — they are gated by a feature, not `#[ignore]`, and `test-ignored`
+  compiled them out — so `nn-lab.sh test-ignored` now runs them too (5/5).
