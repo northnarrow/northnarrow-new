@@ -578,6 +578,11 @@ pub const FS_OP_PTRACE: u8 = 10;
 /// `target_ino` = 0). A loaded image lets root reboot straight into a
 /// kernel without the agent.
 pub const FS_OP_KEXEC: u8 = 11;
+/// External audit EVD-001: an open of a READ-protected inode — the agent's
+/// private signing key — by a process outside the agent's family, read
+/// access included. Recorded, not a COMBAT trigger: a backup of `/etc`
+/// meets it too.
+pub const FS_OP_READ: u8 = 12;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -594,6 +599,13 @@ pub const FS_PROTECT_MUTATE: u8 = 0b01;
 /// only on the secret/integrity subset (admin.pub, agent_id, audit.log,
 /// agent.sig.key, the state chains, the agent binaries/units).
 pub const FS_PROTECT_WRITE: u8 = 0b10;
+/// `FS_PROTECT_READ` (bit2, external audit EVD-001): any open, read-only
+/// included (`FS_OP_READ`) — set only on the agent's private signing key,
+/// whose inode number also sits in `READ_PROTECTED_INOS` so the common
+/// read path pays no map lookup.
+pub const FS_PROTECT_READ: u8 = 0b100;
+/// Slots of the `READ_PROTECTED_INOS` array (inode numbers; 0 = empty).
+pub const READ_PROTECTED_SLOTS: u32 = 4;
 
 /// Audit record emitted whenever a Tappa 7 inode-protection LSM hook
 /// returns `-EPERM`. The denial is the security event — userland

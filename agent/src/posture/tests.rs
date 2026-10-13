@@ -1408,3 +1408,17 @@ fn observe_returns_none_when_no_transition() {
     assert!(m.observe(&benign, &[]).is_none());
     assert_eq!(m.current_kind(), PostureKind::Observing);
 }
+
+/// External audit EVD-001: a refused read of the agent's signing key is a
+/// credential reach (ALERTED), not the decisive tamper that reaches COMBAT
+/// alone — a backup of /etc meets it too.
+#[test]
+fn a_refused_read_of_the_signing_key_alerts_without_combat() {
+    let m = PostureMachine::new();
+    let mut read = super::triggers::testutil::fs_protect_denial(7, 1);
+    if let common::Event::FsProtectDenial { operation, .. } = &mut read {
+        *operation = common::FsProtectOperation::Read;
+    }
+    m.observe(&read, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Alerted);
+}

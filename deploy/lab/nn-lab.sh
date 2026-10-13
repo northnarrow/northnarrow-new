@@ -949,7 +949,11 @@ sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start nor
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
 pid_before=$(sudo cat /run/northnarrow/agent.pid)
 audit_before=$(sudo wc -l < /etc/northnarrow/audit.log)
-fp_before=$(sudo sha256sum /etc/northnarrow/admin.pub /etc/northnarrow/agent.sig.key /etc/northnarrow/agent_id | sha256sum | cut -c1-16)
+# External audit EVD-001: the signing key is closed to root; its public
+# half stands for it (absent before that release: left out on both sides).
+idfiles="/etc/northnarrow/admin.pub /etc/northnarrow/agent_id"
+sudo test -e /etc/northnarrow/agent.sig.pub && idfiles="$idfiles /etc/northnarrow/agent.sig.pub"
+fp_before=$(sudo sha256sum $idfiles | sha256sum | cut -c1-16)
 echo "before: agent pid=$pid_before audit_lines=$audit_before identity=$fp_before"
 # Without --upgrade the script must refuse (units active) — exit 1, no change.
 if at_tty sudo ./deploy/install.sh >/tmp/nn-upgrade-refuse.log 2>&1; then
@@ -962,14 +966,14 @@ at_tty sudo ./deploy/install.sh --upgrade --grant-key "$key" 2>&1 | grep -E "UPG
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
 audit_after=$(sudo wc -l < /etc/northnarrow/audit.log)
-fp_after=$(sudo sha256sum /etc/northnarrow/admin.pub /etc/northnarrow/agent.sig.key /etc/northnarrow/agent_id | sha256sum | cut -c1-16)
+fp_after=$(sudo sha256sum $idfiles | sha256sum | cut -c1-16)
 echo "after : agent pid=$pid_after audit_lines=$audit_after identity=$fp_after"
 fail=0
 [[ "$(systemctl is-active northnarrow-agent)" == active ]] || { echo "FAIL: agent unit not active after upgrade"; fail=1; }
 [[ "$(systemctl is-active northnarrow-watchdog)" == active ]] || { echo "FAIL: watchdog unit not active after upgrade"; fail=1; }
 [[ "$pid_after" != "$pid_before" ]] || { echo "FAIL: agent pid unchanged — binary not restarted"; fail=1; }
 (( audit_after > audit_before )) || { echo "FAIL: no new audit entry (agent_boot) after upgrade"; fail=1; }
-[[ "$fp_after" == "$fp_before" ]] || { echo "FAIL: admin.pub / agent.sig.key / agent_id changed across the upgrade"; fail=1; }
+[[ "$fp_after" == "$fp_before" ]] || { echo "FAIL: admin.pub / agent.sig.pub / agent_id changed across the upgrade"; fail=1; }
 n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
 (( n >= 7 )) || { echo "FAIL: only $n LSM programs after upgrade"; fail=1; }
 sudo ls /sys/fs/bpf/northnarrow/PROTECTED_PIDS >/dev/null || { echo "FAIL: PROTECTED_PIDS not re-pinned"; fail=1; }

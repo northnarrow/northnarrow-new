@@ -34,7 +34,9 @@ use aya::{
     maps::{HashMap as AyaHashMap, Map as AyaMap, MapData},
     Btf, Ebpf,
 };
-use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
+use common::wire::{
+    InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_READ, FS_PROTECT_WRITE, READ_PROTECTED_SLOTS,
+};
 
 /// Aya requires its own marker trait [`aya::Pod`] for map K/V types,
 /// distinct from `bytemuck::Pod`. The orphan rule prevents the
@@ -155,7 +157,17 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // spares, and their signature. MUTATE-only like the other overlays.
     "canary-readers.local",
     "canary-readers.local.sig",
+    // External audit EVD-001: the signing key's public half, written by
+    // the agent; what `nn-admin audit verify` reads.
+    "agent.sig.pub",
 ];
+
+/// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
+/// process outside the agent's family may open at all, to read included
+/// (`FS_PROTECT_READ`): the private signing key. Root read it and could
+/// rebuild every signed chain offline. Its public half is
+/// `agent.sig.pub`. At most [`READ_PROTECTED_SLOTS`] entries.
+pub const ETC_READ_DENY_FILES: &[&str] = &["agent.sig.key"];
 
 /// at-authz-1: the subset of [`ETC_PROTECTED_FILES`] that is also
 /// WRITE-open-denied (`FS_PROTECT_WRITE`), not just mutation-denied.
@@ -173,6 +185,9 @@ pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     "agent_id",
     "audit.log",
     "agent.sig.key",
+    // External audit EVD-001: the public half, written by the agent at
+    // start; what `nn-admin audit verify` reads.
+    "agent.sig.pub",
     // written only by install.sh with the units stopped; an append at
     // runtime corrupts the boot-time integrity check (observed on the
     // lab guest: `echo x >>` went through while MUTATE-only).
@@ -580,6 +595,7 @@ pub(crate) fn attach(
 /// info-log line.
 pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usize> {
     let mut registered = 0usize;
+    let mut read_protected: Vec<u64> = Vec::new();
     // Review `etc-dir-protect-1`: the DIRECTORY inode too. The files
     // below are mutation-denied, but the directory that holds them was
     // not, so `mv /etc/northnarrow /etc/x` (or rmdir after an unlink
@@ -648,14 +664,19 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
         };
         // at-authz-1: secret/integrity identity files (ETC_WRITE_DENY_FILES)
         // get WRITE+MUTATE; operator-tunable files get MUTATE only.
+        let read_deny = ETC_READ_DENY_FILES.contains(name);
         let flags = FS_PROTECT_MUTATE
             | if ETC_WRITE_DENY_FILES.contains(name) {
                 FS_PROTECT_WRITE
             } else {
                 0
-            };
+            }
+            | if read_deny { FS_PROTECT_READ } else { 0 };
         register_inode(ebpf, &key, flags)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        if read_deny {
+            read_protected.push(key.ino);
+        }
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
@@ -665,14 +686,41 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
         );
         registered += 1;
     }
+    if let Err(e) = set_read_protected(ebpf, &read_protected) {
+        warn!(
+            error = %e,
+            "anti-tamper FS: the read-protected inodes could not be set — the signing key \
+             stays readable by root this boot"
+        );
+    }
     info!(
         etc_dir = %etc_dir.display(),
         registered,
+        read_protected = read_protected.len(),
         total = ETC_PROTECTED_FILES.len() + 1, // + the directory inode
         "anti-tamper FS: /etc/northnarrow file registration complete"
     );
     Ok(registered)
 }
+
+/// External audit EVD-001: the inode numbers the `file_open` deny matches
+/// a read-only open against ([`READ_PROTECTED_INOS_MAP`]); the slots past
+/// `inos` are cleared, so a key replaced since an earlier boot is not
+/// matched by its old number.
+fn set_read_protected(ebpf: &mut Ebpf, inos: &[u64]) -> Result<()> {
+    let map = ebpf
+        .map_mut(READ_PROTECTED_INOS_MAP)
+        .ok_or_else(|| anyhow!("map {READ_PROTECTED_INOS_MAP} missing from eBPF object"))?;
+    let mut array: aya::maps::Array<&mut MapData, u64> = aya::maps::Array::try_from(map)
+        .with_context(|| format!("{READ_PROTECTED_INOS_MAP} is not an Array<u64>"))?;
+    for slot in 0..READ_PROTECTED_SLOTS {
+        let ino = inos.get(slot as usize).copied().unwrap_or(0);
+        array.set(slot, ino, 0)?;
+    }
+    Ok(())
+}
+
+const READ_PROTECTED_INOS_MAP: &str = "READ_PROTECTED_INOS";
 
 /// Review 81: register the sealed archives and the manifest of the chain
 /// log whose active file is `active`, like the active file (WRITE+MUTATE).
@@ -1783,6 +1831,21 @@ mod tests {
     /// and Tappa 10.5 D1 appended the four comm-allowlist files —
     /// each later commit only APPENDS so existing positions stay
     /// stable for any audit-log reader that indexes by slot.
+    /// External audit EVD-001: a read-denied file is write- and
+    /// mutation-denied too, and they fit the kernel's slots.
+    #[test]
+    fn read_denied_files_are_write_denied_and_fit_the_slots() {
+        for f in ETC_READ_DENY_FILES {
+            assert!(ETC_WRITE_DENY_FILES.contains(f), "{f}");
+            assert!(ETC_PROTECTED_FILES.contains(f), "{f}");
+        }
+        for f in ETC_WRITE_DENY_FILES {
+            assert!(ETC_PROTECTED_FILES.contains(f), "{f}");
+        }
+        assert!(ETC_READ_DENY_FILES.len() <= READ_PROTECTED_SLOTS as usize);
+        assert!(!ETC_READ_DENY_FILES.contains(&"agent.sig.pub"));
+    }
+
     #[test]
     fn etc_protected_files_lists_the_design_files() {
         assert_eq!(
@@ -1821,6 +1884,7 @@ mod tests {
                 "combat-allow.cidrs.sig",
                 "canary-readers.local",
                 "canary-readers.local.sig",
+                "agent.sig.pub",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

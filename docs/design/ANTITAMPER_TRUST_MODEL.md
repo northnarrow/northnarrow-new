@@ -390,3 +390,30 @@ the slots are never claimed and the window is bounded by age only.
 All three additions are **agent-owned writers** (kernel maps written only
 by agent; sentinel written by install.sh and validated by agent against
 an agent-owned nonce). No attacker-controllable input is trusted.
+
+## EVD-001 — the signing key is closed to readers
+
+The agent's Ed25519 key (`/etc/northnarrow/agent.sig.key`) signs every
+evidence chain: `audit.log`, the detections, netflow, FIM drift, canary
+access. The `file_open` deny hook refused writes to it but let any read
+through, so root could copy it and rebuild any chain offline with valid
+signatures. It is now `FS_PROTECT_READ`: any open, read-only included, by a
+process outside the agent's family is refused (`EPERM`, a `FsProtectDenial`
+with `op=read`, the NN-L-AT-001 detection, `SensitiveFileAccess` — ALERTED,
+not the decisive tamper trigger: a backup of `/etc` meets it too). The
+trusted-installer window lifts it like the other denies.
+
+The common read path stays cheap: the hook matches a read-only open against
+the inode numbers in `READ_PROTECTED_INOS` (a 4-slot pinned array) before any
+map lookup; only a match pays for `deny_if_protected`.
+
+The public half is published by the agent at `agent.sig.pub` (0444,
+write-denied); `nn-admin audit verify` reads it, and never mints a key. On a
+restart the previous instance's pinned hooks close the key to the new process
+until it registers; the loads after the attach read it.
+
+Not closed: root with the means to bypass the LSM altogether (a kernel
+module, the disk read from another OS). A key that never leaves a TPM or the
+kernel keyring, and chain heads anchored off-host, are the follow-up
+(at-authz-2).
+

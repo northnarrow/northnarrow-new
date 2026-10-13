@@ -401,6 +401,13 @@ else
     echo "C39-C40 skipped: cannot build the link probe ($(head -1 /tmp/nn-lnk-cc.log 2>/dev/null))" >&2
 fi
 
+# External audit EVD-001: the agent's private signing key — every evidence
+# chain is signed with it — is closed to any reader outside the agent's
+# family, root included; its public half is what verification reads.
+run_case C41 "read the agent's private signing key" denied "op=read" 0 -- cat "$ETC/agent.sig.key"
+run_case C42 "verify the audit chain from the public half" allowed "" 0 -- \
+    /usr/local/bin/nn-admin audit verify --from "$ETC/audit.log"
+
 echo
 echo "| case | action | outcome | evidence | verdict |"
 echo "|---|---|---|---|---|"

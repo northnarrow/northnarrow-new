@@ -832,10 +832,19 @@ pub fn load_audit_pubkey(explicit_hex: Option<&str>, key_path: &Path) -> Result<
         return VerifyingKey::from_bytes(&arr)
             .map_err(|e| anyhow!("--agent-pubkey is not a valid Ed25519 pubkey: {e}"));
     }
-    let key = crate::audit::AgentSigningKey::load_or_bootstrap(key_path).with_context(|| {
+    // External audit EVD-001: the public half the agent publishes; the
+    // private key is closed to every reader outside the agent's family.
+    // A host from before it has only the key: parsed, never minted (a
+    // verifier must not create the key it checks against).
+    let pub_path = crate::audit::verifying_key_path(key_path);
+    if pub_path.exists() {
+        return crate::audit::read_verifying_key(&pub_path);
+    }
+    let key = crate::audit::read_signing_key(key_path).with_context(|| {
         format!(
-            "deriving agent pubkey from signing key file {}; pass --agent-pubkey \
-             <hex> when verifying off-host",
+            "no {} — deriving the agent pubkey from the signing key file {} (refused \
+             once the agent protects it); pass --agent-pubkey <hex> when verifying off-host",
+            pub_path.display(),
             key_path.display()
         )
     })?;
@@ -2481,6 +2490,27 @@ pub fn run_config_overlay_sign(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit EVD-001: the verifier reads the published public
+    /// half; without it, a host from before parses the key; it never mints
+    /// one.
+    #[test]
+    fn audit_verify_reads_the_public_half_and_never_mints_a_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        assert!(load_audit_pubkey(None, &key_path).is_err());
+        assert!(!key_path.exists(), "no key minted by a verifier");
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        assert_eq!(
+            load_audit_pubkey(None, &key_path).unwrap(),
+            key.verifying_key()
+        );
+        std::fs::remove_file(crate::audit::verifying_key_path(&key_path)).unwrap();
+        assert_eq!(
+            load_audit_pubkey(None, &key_path).unwrap(),
+            key.verifying_key()
+        );
+    }
     use common::posture_types::PostureKind;
     use common::wire::admin_protocol::{Challenge, StatusResponse};
     use std::os::unix::net::UnixListener;

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_PTRACE, FS_OP_RENAME,
-    FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_UNLINK, FS_OP_WRITE,
+    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_PTRACE, FS_OP_READ,
+    FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_UNLINK, FS_OP_WRITE,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -386,6 +386,9 @@ pub enum FsProtectOperation {
     Ptrace,
     /// A kexec kernel image load refused (review 82).
     Kexec,
+    /// External audit EVD-001: an open of the agent's private signing key
+    /// by a process outside its family, a read included.
+    Read,
     Unknown(u8),
 }
 
@@ -403,6 +406,7 @@ impl FsProtectOperation {
             FS_OP_SIGNAL => Self::Signal,
             FS_OP_PTRACE => Self::Ptrace,
             FS_OP_KEXEC => Self::Kexec,
+            FS_OP_READ => Self::Read,
             other => Self::Unknown(other),
         }
     }
@@ -420,6 +424,7 @@ impl FsProtectOperation {
             Self::Ptrace => "ptrace",
             Self::Kexec => "kexec",
             Self::Write => "write",
+            Self::Read => "read",
             Self::Unknown(_) => "unknown",
         }
     }
