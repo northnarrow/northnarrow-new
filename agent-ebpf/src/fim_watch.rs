@@ -81,7 +81,7 @@ use aya_ebpf::{
 };
 use northnarrow_common::wire::{
     FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
-    FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, TASK_COMM_LEN,
+    FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_REPLACED, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
@@ -131,8 +131,13 @@ pub static WATCHED_PATHS: HashMap<InodeKey, u8> = HashMap::pinned(8192, 0);
 /// (re-attached fresh each boot — `agent/src/fim/attach.rs`), so
 /// a fresh ring + fresh program + fresh consumer always align.
 /// Keep it unpinned.
+///
+/// External audit FIMP-003: 1 MiB (was 256 KiB, ~1 700 records). The drain
+/// writes a signed drift row per event, a few milliseconds each; one
+/// process closing a watched file in a tight loop outran 256 KiB in the
+/// lab within a second. Drops are still counted, logged and audited.
 #[map]
-pub static FS_FIM_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+pub static FS_FIM_EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 /// Review 75: the last `Opened` reported per (task, watched inode), for
 /// read-only opens ([`crate::read_repeat`]).
@@ -256,7 +261,7 @@ pub(crate) fn caller_is_in_family() -> bool {
 /// so we're emitting an event we definitely want.
 #[inline(always)]
 pub(crate) fn emit_drift(op: u8, key: InodeKey) {
-    emit_drift_with_dest(op, key, NO_DEST);
+    emit_drift_with_dest(op, key, NO_DEST, 0);
 }
 
 /// "No destination" marker for [`emit_drift_with_dest`]: dev 0 / ino 0
@@ -279,7 +284,7 @@ const NO_DEST: InodeKey = InodeKey { dev: 0, ino: 0 };
 /// stack` (uninitialised slot on the `None` path). Newer verifiers
 /// tolerate that read for privileged loaders; 5.15 does not.
 #[inline(always)]
-fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey) {
+fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8) {
     let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
         Some(e) => e,
         None => {
@@ -303,6 +308,7 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey) {
         (*raw_ptr).target_dev = key.dev;
         (*raw_ptr).target_ino = key.ino;
         (*raw_ptr).op = op;
+        (*raw_ptr).op_flags = op_flags;
         if let Ok(comm) = bpf_get_current_comm() {
             (*raw_ptr).modifier_comm = comm;
         }
@@ -563,7 +569,7 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     let mut combined_emitted_for_old_inode = false;
     if let Some(old_inode) = old_inode_opt {
         if let Some(key) = should_emit(old_inode) {
-            emit_drift_with_dest(FIM_OP_RENAMED, key, new_dir_key);
+            emit_drift_with_dest(FIM_OP_RENAMED, key, new_dir_key, 0);
             combined_emitted_for_old_inode = true;
         }
     }
@@ -583,7 +589,9 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     let new_dentry: *const c_void = ctx.arg(3);
     if let Some(new_inode) = inode_from_dentry(new_dentry) {
         if let Some(key) = should_emit(new_inode) {
-            emit_drift(FIM_OP_RENAMED, key);
+            // External audit FIMR-004: another file is renamed over the
+            // watched one — its path's content replaced in one call.
+            emit_drift_with_dest(FIM_OP_RENAMED, key, NO_DEST, FIM_RENAME_REPLACED);
         }
     }
     0

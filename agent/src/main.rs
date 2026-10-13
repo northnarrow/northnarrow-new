@@ -2375,6 +2375,7 @@ async fn main() -> Result<()> {
                         Arc::clone(baseline_db),
                         Arc::clone(&baseline_cache),
                         Arc::clone(&inode_map),
+                        watched_paths_handle.clone(),
                         move || {
                             northnarrow_agent::fim::paths_config::load_watched_paths(
                                 &v1_for_snapshot,
