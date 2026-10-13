@@ -78,6 +78,12 @@ pub enum Event {
         filename: String,
         flags: u32,
         timestamp_ns: u64,
+        /// External audit POS-004: `filename` is the string the caller
+        /// passed, read from its memory at syscall entry (tracepoint mode),
+        /// before any permission check and unresolved — not the path the
+        /// kernel opened (LSM mode). `false` on older records.
+        #[serde(default)]
+        path_from_user: bool,
     },
     /// Tappa 10.9 step 1: one process crossed the mass-write threshold
     /// (`OPEN_MASS_WRITE_MIN` write-opens within the window), counted in
@@ -487,6 +493,7 @@ impl From<&FileOpenRaw> for Event {
             filename: crate::wire::cstr_lossy(&raw.filename).into_owned(),
             flags: raw.flags,
             timestamp_ns: raw.timestamp_ns,
+            path_from_user: true,
         }
     }
 }

@@ -1449,6 +1449,7 @@ mod tests {
             filename: "/etc/shadow".to_string(),
             flags: 0,
             timestamp_ns: 789,
+            path_from_user: false,
         }
     }
 

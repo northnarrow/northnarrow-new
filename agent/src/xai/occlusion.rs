@@ -681,6 +681,7 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             filename,
             flags,
             timestamp_ns,
+            ..
         } => match field {
             F::Comm => comm.clear(),
             F::Filename => filename.clear(),

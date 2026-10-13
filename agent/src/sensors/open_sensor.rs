@@ -616,6 +616,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             filename: filename.clone(),
             flags: r.flags,
             timestamp_ns: r.timestamp_ns,
+            path_from_user: false,
         });
     }
     if r.reason & open_reason::CRED != 0 {

@@ -274,6 +274,7 @@ mod tests {
             filename: file.to_string(),
             flags: 0,
             timestamp_ns: 1,
+            path_from_user: false,
         }
     }
 
