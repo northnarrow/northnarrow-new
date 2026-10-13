@@ -111,6 +111,175 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-075 | SUP-003 | Supply chain | M | fixed (lab PR 106) |
 | NN-AUD-076 | TST-003 | Privileged tests | M | fixed (lab PR 88) |
 
+## Wave 2
+
+The Medium findings. Each was re-checked against `main` at `19926ae`
+(2026-10-13) before it was scheduled: six had been fixed by earlier
+changes (marked "already fixed"), and the checks found adjacent defects
+the audit did not report, noted with the fix that takes them.
+
+| ID | Audit ref | Area | Effort | Status |
+|---|---|---|---|---|
+| NN-AUD-077 | ASK-002 | Admin socket | M | open |
+| NN-AUD-078 | ASK-003 | Admin socket | M | open |
+| NN-AUD-079 | ASK-004 | Admin socket | M | open |
+| NN-AUD-080 | ASK-006 | Admin socket | M | open |
+| NN-AUD-081 | ASK-007 | Admin socket | S | open |
+| NN-AUD-082 | ASK-008 | Admin socket | S | open |
+| NN-AUD-083 | ASK-010 | Admin socket | S | open |
+| NN-AUD-084 | ASK-011 | Admin socket | M | open |
+| NN-AUD-085 | AUT-002 | Admin auth | S | open |
+| NN-AUD-086 | AUT-003 | Admin auth | S | open |
+| NN-AUD-087 | AUT-004 | Admin auth | S | open |
+| NN-AUD-088 | AUT-009 | Admin auth | M | open |
+| NN-AUD-089 | MAIN-004 | Agent main | S | open |
+| NN-AUD-090 | MAIN-005 | Agent main | S | open |
+| NN-AUD-091 | MAIN-006 | Agent main | M | open |
+| NN-AUD-092 | MAIN-007 | Agent main | M | open |
+| NN-AUD-093 | MAIN-008 | Agent main | S | open |
+| NN-AUD-094 | ATP-003 | Anti-tamper | S | open |
+| NN-AUD-095 | ATP-005 | Anti-tamper | S | open |
+| NN-AUD-096 | ATP-008 | Anti-tamper | M | open |
+| NN-AUD-097 | ATP-009 | Anti-tamper | S | open |
+| NN-AUD-098 | ATP-010 | Anti-tamper | M | open |
+| NN-AUD-099 | ATP-012 | Anti-tamper | S | open |
+| NN-AUD-100 | ATP-013 | Anti-tamper | S | open |
+| NN-AUD-101 | EBPF-004 | eBPF kernel | M | open |
+| NN-AUD-102 | EBPF-008 | eBPF kernel | S | open |
+| NN-AUD-103 | EBPF-009 | eBPF kernel | S | open |
+| NN-AUD-104 | EBPF-011 | eBPF kernel | M | open |
+| NN-AUD-105 | EBPF-013 | eBPF kernel | M | open |
+| NN-AUD-106 | EBPF-014 | eBPF kernel | S | open |
+| NN-AUD-107 | EBPF-015 | eBPF kernel | M | open |
+| NN-AUD-108 | EVD-002 | Evidence logs | L | open |
+| NN-AUD-109 | EVD-003 | Evidence logs | M | open |
+| NN-AUD-110 | EVD-004 | Evidence logs | M | open |
+| NN-AUD-111 | EVD-006 | Evidence logs | M | open |
+| NN-AUD-112 | EVD-009 | Evidence logs | M | open |
+| NN-AUD-113 | EVD-012 | Evidence logs | S | open |
+| NN-AUD-114 | EVD-013 | Evidence logs | M | open |
+| NN-AUD-115 | EVD-018 | Evidence logs | S | open |
+| NN-AUD-116 | FIMR-007 | FIM rules | S | open |
+| NN-AUD-117 | FIMR-008 | FIM rules | M | open |
+| NN-AUD-118 | FIMR-009 | FIM rules | S | open |
+| NN-AUD-119 | FIMP-007 | FIM pipeline | S | open |
+| NN-AUD-120 | FIMP-008 | FIM pipeline | M | open |
+| NN-AUD-121 | FIMP-009 | FIM pipeline | M | open |
+| NN-AUD-122 | FIMP-010 | FIM pipeline | M | open |
+| NN-AUD-123 | FIMP-011 | FIM pipeline | S | open |
+| NN-AUD-124 | NETR-004 | Net rules | S | open |
+| NN-AUD-125 | NETR-005 | Net rules | M | open |
+| NN-AUD-126 | NETR-006 | Net rules | S | open |
+| NN-AUD-127 | NETR-007 | Net rules | S | open |
+| NN-AUD-128 | NETR-008 | Net rules | S | open |
+| NN-AUD-129 | NETR-009 | Net rules | M | open |
+| NN-AUD-130 | NETR-010 | Net rules | M | open |
+| NN-AUD-131 | PROC-006 | Process rules | M | already fixed (lab PR 87, with NN-AUD-055) |
+| NN-AUD-132 | PROC-008 | Process rules | S | open |
+| NN-AUD-133 | PROC-009 | Process rules | S | open |
+| NN-AUD-134 | PROC-010 | Process rules | S | open |
+| NN-AUD-135 | POS-005 | Posture | M | open |
+| NN-AUD-136 | POS-009 | Posture | M | open |
+| NN-AUD-137 | POS-015 | Posture | M | open |
+| NN-AUD-138 | CMB-004 | Combat response | L | open |
+| NN-AUD-139 | CMB-007 | Combat response | M | open |
+| NN-AUD-140 | CMB-008 | Combat response | M | already fixed (lab PR 77; lab PR 100, with NN-AUD-046) |
+| NN-AUD-141 | CMB-009 | Combat response | S | already fixed (lab PR 103, with NN-AUD-050) |
+| NN-AUD-142 | CMB-010 | Combat response | M | open |
+| NN-AUD-143 | CMB-011 | Combat response | M | open |
+| NN-AUD-144 | CMB-012 | Combat response | M | open |
+| NN-AUD-145 | CMB-013 | Combat response | S | open |
+| NN-AUD-146 | CMB-014 | Combat response | S | open |
+| NN-AUD-147 | CMB-015 | Combat response | S | open |
+| NN-AUD-148 | CMB-016 | Combat response | M | open |
+| NN-AUD-149 | CMB-017 | Combat response | S | open |
+| NN-AUD-150 | CMB-019 | Combat response | M | open |
+| NN-AUD-151 | LLMP-003 | LLM prompts | S | open |
+| NN-AUD-152 | LLMP-004 | LLM prompts | S | open |
+| NN-AUD-153 | LLMP-006 | LLM prompts | S | open |
+| NN-AUD-154 | LLMP-011 | LLM prompts | S | open |
+| NN-AUD-155 | LLMP-013 | LLM prompts | M | open |
+| NN-AUD-156 | LLMR-003 | LLM runtime | S | open |
+| NN-AUD-157 | LLMR-005 | LLM runtime | M | already fixed (lab PR 105, with NN-AUD-053) |
+| NN-AUD-158 | LLMR-008 | LLM runtime | M | open |
+| NN-AUD-159 | LLMR-010 | LLM runtime | S | open |
+| NN-AUD-160 | LLMR-013 | LLM runtime | M | open |
+| NN-AUD-161 | LLMR-014 | LLM runtime | M | open |
+| NN-AUD-162 | LLMR-016 | LLM runtime | S | open |
+| NN-AUD-163 | LLMR-017 | LLM runtime | M | open |
+| NN-AUD-164 | NET-006 | Network | M | open |
+| NN-AUD-165 | NET-009 | Network | L | open |
+| NN-AUD-166 | NET-012 | Network | M | open |
+| NN-AUD-167 | NET-016 | Network | M | open |
+| NN-AUD-168 | NET-019 | Network | L | open |
+| NN-AUD-169 | DEC-007 | Deception | S | open |
+| NN-AUD-170 | DEC-008 | Deception | M | open |
+| NN-AUD-171 | DEC-009 | Deception | S | already fixed (lab PR 84, with NN-AUD-062) |
+| NN-AUD-172 | DEC-010 | Deception | M | open |
+| NN-AUD-173 | DEC-011 | Deception | M | open |
+| NN-AUD-174 | DEC-018 | Deception | L | open |
+| NN-AUD-175 | XAI-001 | XAI and RAG | M | open |
+| NN-AUD-176 | XAI-002 | XAI and RAG | M | open |
+| NN-AUD-177 | XAI-004 | XAI and RAG | S | open |
+| NN-AUD-178 | XAI-005 | XAI and RAG | M | open |
+| NN-AUD-179 | XAI-009 | XAI and RAG | S | open |
+| NN-AUD-180 | XAI-010 | XAI and RAG | S | open |
+| NN-AUD-181 | XAI-011 | XAI and RAG | S | open |
+| NN-AUD-182 | XAI-013 | XAI and RAG | M | open |
+| NN-AUD-183 | XAI-018 | XAI and RAG | S | open |
+| NN-AUD-184 | SNS-001 | Sensors | M | open |
+| NN-AUD-185 | SNS-002 | Sensors | S | open |
+| NN-AUD-186 | SNS-003 | Sensors | M | open |
+| NN-AUD-187 | SNS-005 | Sensors | S | open |
+| NN-AUD-188 | SNS-006 | Sensors | M | open |
+| NN-AUD-189 | SNS-007 | Sensors | M | open |
+| NN-AUD-190 | SNS-008 | Sensors | S | open |
+| NN-AUD-191 | SNS-009 | Sensors | M | open |
+| NN-AUD-192 | WDG-006 | Watchdog tooling | S | already fixed (lab PR 89, with NN-AUD-069) |
+| NN-AUD-193 | WDG-009 | Watchdog tooling | M | open |
+| NN-AUD-194 | WDG-011 | Watchdog tooling | S | open |
+| NN-AUD-195 | WDG-R01 | Watchdog tooling | S | open |
+| NN-AUD-196 | DEP-004 | Deploy | S | open |
+| NN-AUD-197 | DEP-006 | Deploy | M | open |
+| NN-AUD-198 | DEP-007 | Deploy | M | open |
+| NN-AUD-199 | DEP-008 | Deploy | M | open |
+| NN-AUD-200 | DEP-009 | Deploy | M | open |
+| NN-AUD-201 | SUP-001 | Supply chain | S | open |
+| NN-AUD-202 | SUP-002 | Supply chain | S | open |
+| NN-AUD-203 | SUP-005 | Supply chain | S | open |
+| NN-AUD-204 | SUP-006 | Supply chain | S | fixed (lab PR 110) |
+| NN-AUD-205 | SUP-017 | Supply chain | S | open |
+| NN-AUD-206 | LAB-001 | Lab scripts | M | open |
+| NN-AUD-207 | LAB-002 | Lab scripts | L | open |
+| NN-AUD-208 | LAB-003 | Lab scripts | S | open |
+| NN-AUD-209 | LAB-004 | Lab scripts | L | open |
+| NN-AUD-210 | LAB-005 | Lab scripts | M | open |
+| NN-AUD-211 | LAB-006 | Lab scripts | S | open |
+| NN-AUD-212 | LAB-007 | Lab scripts | S | open |
+| NN-AUD-213 | LAB-008 | Lab scripts | M | open |
+| NN-AUD-214 | LAB-009 | Lab scripts | M | open |
+| NN-AUD-215 | LAB-010 | Lab scripts | S | open |
+| NN-AUD-216 | LAB-011 | Lab scripts | M | open |
+| NN-AUD-217 | LAB-012 | Lab scripts | M | open |
+| NN-AUD-218 | LAB-013 | Lab scripts | L | open |
+| NN-AUD-219 | LAB-014 | Lab scripts | S | open |
+| NN-AUD-220 | LAB-015 | Lab scripts | S | open |
+| NN-AUD-221 | LAB-016 | Lab scripts | S | open |
+| NN-AUD-222 | LAB-017 | Lab scripts | M | open |
+| NN-AUD-223 | LAB-018 | Lab scripts | S | open |
+| NN-AUD-224 | TST-001 | Privileged tests | M | open |
+| NN-AUD-225 | TST-002 | Privileged tests | S | open |
+| NN-AUD-226 | TST-004 | Privileged tests | S | open |
+| NN-AUD-227 | TST-005 | Privileged tests | M | open |
+| NN-AUD-228 | TST-006 | Privileged tests | M | open |
+| NN-AUD-229 | TST-008 | Privileged tests | S | open |
+| NN-AUD-230 | TST-009 | Privileged tests | M | open |
+| NN-AUD-231 | TST-010 | Privileged tests | S | open |
+| NN-AUD-232 | TST-011 | Privileged tests | S | open |
+| NN-AUD-233 | TST-012 | Privileged tests | M | open |
+| NN-AUD-234 | TST-018 | Privileged tests | L | open |
+| NN-AUD-235 | TST-019 | Privileged tests | M | open |
+
 ## Notes on the fixes
 
 - **NN-AUD-005 (NET-001), lab PR 78.** A dual-stack `AF_INET6` socket
@@ -1359,3 +1528,21 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   - Not closed: root able to bypass the LSM (a kernel module, the disk
     from another OS). A TPM- or keyring-held key and off-host chain
     anchors remain the follow-up.
+- **NN-AUD-204 (SUP-006), lab PR 110.** The RustSEC gate read only the
+  root `Cargo.lock`: the fuzz harness and the eBPF crate have lockfiles of
+  their own, never audited. It now audits all three. It also runs
+  `cargo-audit` itself (pinned, `--locked`) instead of
+  `rustsec/audit-check`, which reported through the checks API and from
+  2026-10-13 failed PR runs that had found nothing ("Not Found" updating
+  its own check run); the job's exit status is the gate, and its token is
+  read-only (no `checks: write`, no `issues: write`).
+- **Already fixed (Wave 2).** NN-AUD-131 (PROC-006): the io_uring and BPF
+  rules judge exec identity, not `comm` (NN-AUD-055). NN-AUD-140 (CMB-008):
+  NEUTRALIZE opens the offender's binary before the kill and quarantines
+  the held inode (review 87, NN-AUD-046). NN-AUD-141 (CMB-009): the whole
+  `northnarrow` table is no longer deleted; only the legacy isolation
+  chains are retired (NN-AUD-050). NN-AUD-157 (LLMR-005): no silent
+  fallback to the mock backend (NN-AUD-053). NN-AUD-171 (DEC-009): the
+  canary file is opened `O_NONBLOCK` and checked to be a regular file
+  (NN-AUD-062). NN-AUD-192 (WDG-006): the watchdog registers itself before
+  it waits for the agent (NN-AUD-069).

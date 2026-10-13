@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the advisory gate (Medium SUP-006): `cargo audit`
+  checks every lockfile — the fuzz harness and the eBPF crate were never
+  audited — and runs as a plain step with a read-only token; the action it
+  replaces failed pull requests that had found nothing.
 - External audit, Wave 1, the evidence signing key (High EVD-001): the
   agent's private signing key can no longer be read by root (or anyone
   outside the agent); its public half is published at
