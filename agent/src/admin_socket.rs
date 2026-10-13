@@ -143,6 +143,9 @@ pub struct FimAdminState {
     /// Path to the on-disk drift log. Same shape as
     /// `baseline_log_path` — read for the row count only.
     pub drift_log_path: PathBuf,
+    /// External audit DEC-001: the drain's watch handles, shared with the
+    /// canary subsystem.
+    pub watch: crate::fim::attach::FimWatch,
 }
 
 /// `Copy`-able subset of [`crate::fim::paths_config::WatchedPathsLoad`]
@@ -182,6 +185,9 @@ impl WatchedPathsSummary {
 /// scale, ~10-50 deployments per host).
 #[derive(Clone)]
 pub struct CanaryAdminState {
+    /// External audit DEC-001: the FIM's watch handles, to watch a decoy
+    /// at deploy and stop at burn. `None` when FIM is not running.
+    pub fim_watch: Option<crate::fim::attach::FimWatch>,
     /// K2 registry handle (shared with the K3 detector).
     /// dispatch_canary_deploy / burn / refresh take the
     /// write-lock; dispatch_canary_list takes the read-lock
@@ -2404,46 +2410,43 @@ async fn write_frame(stream: &mut UnixStream, msg: &AdminMessage) -> Result<()> 
 /// inode_index — files that don't yet exist (deploy race)
 /// fall back to the path-based exe_index pathway K3 already
 /// uses (V1.0 pragmatism documented in K3 module doc).
-fn rebuild_canary_indexes(state: &CanaryAdminState) {
+/// The decoy path of a File or Credential canary.
+pub fn canary_path(
+    deployment: &common::wire::admin_signed_payload::CanaryDeploymentWire,
+) -> Option<&str> {
     use common::wire::admin_signed_payload::CanaryDeploymentWire;
-    use common::wire::InodeKey;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
+    match deployment {
+        CanaryDeploymentWire::File { path, .. } | CanaryDeploymentWire::Credential { path, .. } => {
+            Some(path)
+        }
+        _ => None,
+    }
+}
 
-    // The K3 detector's `is_canary_exe` HashMap also serves
-    // as the File/Credential path lookup (per the K3 V1.0
-    // pragmatism note). We populate it here from the
-    // deployment.path of every File + Credential canary AND
-    // from the deployment.path of every Process canary. The
-    // rebuild_from_registry helper's match arms only populate
-    // exe_index for Process today, so K6 has to layer the
-    // File/Credential paths in after the rebuild.
+/// External audit DEC-001: watch a decoy's inode through the FIM.
+fn watch_decoy(state: &CanaryAdminState, key: common::wire::InodeKey, path: &str) {
+    match &state.fim_watch {
+        Some(watch) => {
+            if !watch.watch(key, path) {
+                warn!(
+                    path,
+                    "canary: the kernel watch map refused the decoy (full, or absent) — \
+                     its opens will not be seen"
+                );
+            }
+        }
+        None => warn!(
+            path,
+            "canary: FIM is not running — the decoy's opens will not be seen"
+        ),
+    }
+}
+
+fn rebuild_canary_indexes(state: &CanaryAdminState) {
+    // External audit DEC-003: the same rebuild the boot runs.
     let mut idx = state.indexes.lock();
     let reg = state.registry.lock();
-    idx.rebuild_from_registry(&reg, |path: &Path| {
-        std::fs::symlink_metadata(path).ok().map(|m| {
-            let st_dev = m.dev();
-            let major = libc::major(st_dev) as u64;
-            let minor = libc::minor(st_dev) as u64;
-            InodeKey {
-                dev: (major << 20) | minor,
-                ino: m.ino(),
-            }
-        })
-    });
-    // Layer File + Credential paths into the exe_index so the
-    // K3 path-based fallback matches. The K3 V1.0 detector
-    // uses the same `exe_index` HashMap for both Process exe
-    // paths AND File/Credential paths.
-    for canary in reg.list() {
-        match &canary.deployment {
-            CanaryDeploymentWire::File { path, .. }
-            | CanaryDeploymentWire::Credential { path, .. } => {
-                idx.add_file_path_index(path.into(), canary.canary_id.clone());
-            }
-            _ => {}
-        }
-    }
+    idx.rebuild_live(&reg);
 }
 
 /// dispatch_canary_deploy — verify 1-of-N quorum with
@@ -2508,17 +2511,20 @@ fn dispatch_canary_deploy(
     // on the resulting inode (after rebuild_canary_indexes
     // stats it).
     let primary_fp = fps_out.first().cloned().unwrap_or_default();
-    if let Err(e) = materialise_canary_file(&extra.deployment, state, &primary_fp) {
-        warn!(
-            error = %e,
-            signer_fp = %primary_fp,
-            "canary-deploy: REFUSED — file materialisation failed (path policy or I/O)"
-        );
-        return CanaryDeployResponse {
-            result: AdminResult::UnknownOperation,
-            canary_id: String::new(),
-        };
-    }
+    let decoy = match materialise_canary_file(&extra.deployment, state, &primary_fp) {
+        Ok(decoy) => decoy,
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                signer_fp = %primary_fp,
+                "canary-deploy: REFUSED — file materialisation failed (path policy or I/O)"
+            );
+            return CanaryDeployResponse {
+                result: AdminResult::UnknownOperation,
+                canary_id: String::new(),
+            };
+        }
+    };
 
     // Deploy via the K2 registry. Allocates the canary_id +
     // appends the Deploy row to the chain.
@@ -2542,6 +2548,12 @@ fn dispatch_canary_deploy(
         }
     };
 
+    // External audit DEC-001: have the kernel report the decoy's opens,
+    // and the drain name them — a decoy outside the FIM path list was
+    // never watched, so it never tripped.
+    if let (Some(key), Some(path)) = (decoy, canary_path(&extra.deployment)) {
+        watch_decoy(state, key, path);
+    }
     // Refresh the K3 detector's hot-path indexes so the new
     // canary is visible to the next inbound event.
     rebuild_canary_indexes(state);
@@ -2573,7 +2585,7 @@ fn materialise_canary_file(
     deployment: &common::wire::admin_signed_payload::CanaryDeploymentWire,
     state: &CanaryAdminState,
     deployed_by_fp: &str,
-) -> Result<()> {
+) -> Result<Option<common::wire::InodeKey>> {
     use crate::canary::templates::{render, CredFamily};
     use common::wire::admin_signed_payload::CanaryDeploymentWire;
     match deployment {
@@ -2590,11 +2602,10 @@ fn materialise_canary_file(
             );
             // canary-path-1: a signed deploy must not become "write a
             // root-owned file anywhere" — policy check + O_NOFOLLOW write.
-            let target = crate::canary::path_policy::check_canary_path(path)?;
-            ensure_parent_dir(&target)?;
-            crate::canary::path_policy::write_canary_file(&target, body.as_bytes())
-                .map_err(|e| anyhow::anyhow!("writing file canary {path}: {e}"))?;
-            Ok(())
+            // canary-path-1 / external audit DEC-002: policy check, then a
+            // walk that follows no symlink (write_canary_checked).
+            let decoy = crate::canary::path_policy::write_canary_checked(path, body.as_bytes())?;
+            Ok(Some(decoy_key(&decoy)?))
         }
         CanaryDeploymentWire::Credential { path, cred_family } => {
             let family = CredFamily::from_wire(cred_family)
@@ -2610,27 +2621,25 @@ fn materialise_canary_file(
             let seed = format!("{deployed_by_fp}:{path}");
             let body = render(family, &seed, state.template_dir.as_deref())
                 .map_err(|e| anyhow::anyhow!("rendering cred canary: {e}"))?;
-            let target = crate::canary::path_policy::check_canary_path(path)?;
-            ensure_parent_dir(&target)?;
-            crate::canary::path_policy::write_canary_file(&target, body.as_bytes())
-                .map_err(|e| anyhow::anyhow!("writing cred canary {path}: {e}"))?;
-            Ok(())
+            let decoy = crate::canary::path_policy::write_canary_checked(path, body.as_bytes())?;
+            Ok(Some(decoy_key(&decoy)?))
         }
         // Process + Network canaries: no file materialisation
         // at deploy time. K7 install.sh / K8 e2e set up the
         // binary placement + listener spawn separately.
-        CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => Ok(()),
+        CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => Ok(None),
     }
 }
 
-fn ensure_parent_dir(path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("creating parent dir {}: {e}", parent.display()))?;
-        }
-    }
-    Ok(())
+/// External audit DEC-001: the kernel's `(dev, ino)` of the decoy just
+/// written, read from its open file — no second path resolution.
+fn decoy_key(decoy: &std::fs::File) -> Result<common::wire::InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    let m = decoy.metadata()?;
+    Ok(common::wire::InodeKey {
+        dev: crate::fim::attach::stat_dev_to_kernel_dev(m.dev()),
+        ino: m.ino(),
+    })
 }
 
 /// dispatch_canary_list — verify 1-of-N quorum with
@@ -2777,12 +2786,23 @@ fn dispatch_canary_burn(
         }
     };
     let primary_fp = fps_out.first().cloned().unwrap_or_default();
-    let result = {
+    let (result, decoy) = {
         let mut reg = state.registry.lock();
-        reg.burn(&canary_id, &primary_fp)
+        let decoy = reg
+            .list()
+            .iter()
+            .find(|c| c.canary_id == canary_id)
+            .and_then(|c| canary_path(&c.deployment).map(str::to_string));
+        (reg.burn(&canary_id, &primary_fp), decoy)
     };
     match result {
         Ok(_) => {
+            // External audit DEC-001: a burned decoy is no longer watched.
+            if let (Some(path), Some(watch)) = (decoy, &state.fim_watch) {
+                if let Ok(key) = crate::fim::attach::key_for_path(std::path::Path::new(&path)) {
+                    watch.unwatch(key);
+                }
+            }
             rebuild_canary_indexes(state);
             info!(
                 target: "admin.canary_burn",

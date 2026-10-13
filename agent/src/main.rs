@@ -2381,6 +2381,11 @@ async fn main() -> Result<()> {
                     paths_summary,
                     baseline_log_path: cli.fim_baseline_file.clone(),
                     drift_log_path: cli.fim_drift_file.clone(),
+                    // External audit DEC-001: shared with the canaries.
+                    watch: northnarrow_agent::fim::attach::FimWatch {
+                        path_map: Arc::clone(&inode_map),
+                        watched_paths: watched_paths_handle.clone(),
+                    },
                 }))
             }
             None => {
@@ -2511,24 +2516,53 @@ async fn main() -> Result<()> {
                         // File + Credential (added below); Process
                         // canaries are exe-path keyed (handled by
                         // rebuild_from_registry directly).
+                        let fim_watch = fim_admin_state.as_ref().map(|f| f.watch.clone());
                         {
-                            use common::wire::admin_signed_payload::CanaryDeploymentWire;
                             let reg = registry.lock();
                             let mut idx = indexes.lock();
-                            idx.rebuild_from_registry(&reg, |_| None);
+                            // External audit DEC-003: inodes resolved at
+                            // boot too — they feed read-forward.
+                            idx.rebuild_live(&reg);
+                            // External audit DEC-001: the FIM boot keeps only
+                            // the watches it registers, so the decoys are
+                            // watched again here, every boot.
+                            let mut missing: Vec<String> = Vec::new();
                             for canary in reg.list() {
-                                match &canary.deployment {
-                                    CanaryDeploymentWire::File { path, .. }
-                                    | CanaryDeploymentWire::Credential { path, .. } => {
-                                        idx.add_file_path_index(
-                                            std::path::PathBuf::from(path),
-                                            canary.canary_id.clone(),
-                                        );
+                                let Some(path) = admin_socket::canary_path(&canary.deployment)
+                                else {
+                                    continue;
+                                };
+                                let key = northnarrow_agent::fim::attach::key_for_path(
+                                    std::path::Path::new(path),
+                                );
+                                match (key, &fim_watch) {
+                                    (Ok(key), Some(watch)) => {
+                                        if !watch.watch(key, path) {
+                                            warn!(
+                                                path,
+                                                "canary: the kernel watch map refused the decoy"
+                                            );
+                                        }
                                     }
-                                    _ => {}
+                                    (Ok(_), None) => warn!(
+                                        path,
+                                        "canary: FIM is not running — decoy opens unseen"
+                                    ),
+                                    (Err(_), _) => missing.push(path.to_string()),
                                 }
                             }
-                            info!(canaries = idx.len(), "canary indexes rebuilt from registry");
+                            if !missing.is_empty() {
+                                warn!(
+                                    decoys = ?missing,
+                                    "canary: decoy missing on disk — its reads cannot be seen \
+                                     until it is redeployed"
+                                );
+                            }
+                            let read_forward = northnarrow_agent::canary::read_forward::len();
+                            info!(
+                                canaries = idx.len(),
+                                read_forward, "canary indexes rebuilt from registry"
+                            );
                         }
                         let detector =
                             Arc::new(northnarrow_agent::canary::detector::Detector::new(
@@ -2537,6 +2571,7 @@ async fn main() -> Result<()> {
                                 indexes.clone(),
                             ));
                         let admin_state = Arc::new(admin_socket::CanaryAdminState {
+                            fim_watch,
                             registry,
                             indexes,
                             registry_log_path: cli.canary_registry_file.clone(),

@@ -189,7 +189,12 @@ impl Rule for NnLChain001CredReadThenEgress {
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
             // Precursor: record + fall through (FIM-015/016/017 fires).
-            Event::Fim(fe) if is_credential_store_access(fe) => {
+            // External audit NETR-001: not a wide-coverage open (any home's
+            // keyring, browser or password store, Tappa 10.9). The owner
+            // application opens those too — so does a backup — and
+            // review 54 decided they are reported, never acted on; here
+            // they fed a KillProcessTree. FIM-015/017 still log them.
+            Event::Fim(fe) if is_credential_store_access(fe) && !fe.wide_coverage => {
                 let mut store = self.buf.lock();
                 store.record_for_pid(fe.modifier_pid, PrecursorKind::CredRead, fe.timestamp_ns);
                 // Review 70: the read happened before an egress of the same
@@ -605,7 +610,9 @@ impl Rule for NnLChain007TmpCredExfilSequence {
             // the egress (the open sensor's or FIM's ring, behind the
             // network drain), though it happened before it. Recorded here
             // too: this verdict ends the rule pass before CHAIN-001 runs.
-            Event::Fim(fe) if is_credential_store_access(fe) => {
+            // External audit NETR-001: wide-coverage opens excluded, as in
+            // CHAIN-001.
+            Event::Fim(fe) if is_credential_store_access(fe) && !fe.wide_coverage => {
                 let key = ProcKey::unresolved(fe.modifier_pid);
                 let mut store = self.buf.lock();
                 if !store.has_recent(
@@ -881,6 +888,32 @@ mod tests {
         assert_eq!(v.rule_id, "NN-L-CHAIN-001_CredReadThenEgress");
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// External audit NETR-001: a wide-coverage credential open (the owner
+    /// application, a backup) is reported by the FIM rules, never acted
+    /// on; it no longer arms the chain's KillProcessTree — in either
+    /// order of processing.
+    #[test]
+    fn chain001_ignores_wide_coverage_reads() {
+        let wide = |pid, ts| match cred_fim(pid, ts) {
+            Event::Fim(mut fe) => {
+                fe.wide_coverage = true;
+                Event::Fim(fe)
+            }
+            _ => unreachable!(),
+        };
+        let r = chain001();
+        assert!(r.evaluate(&wide(42, 10 * SEC)).is_none());
+        assert!(r.evaluate(&flow(42, 443, 15 * SEC)).is_none());
+        // the read processed after the flow (review 70)
+        let r = chain001();
+        assert!(r.evaluate(&flow(43, 443, 20 * SEC)).is_none());
+        assert!(r.evaluate(&wide(43, 19 * SEC)).is_none());
+        // the same read off the wide-coverage path still arms it
+        let r = chain001();
+        assert!(r.evaluate(&cred_fim(44, 30 * SEC)).is_none());
+        assert!(r.evaluate(&flow(44, 443, 31 * SEC)).is_some());
     }
 
     #[test]
