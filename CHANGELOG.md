@@ -6,6 +6,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, COMBAT rulesets (High ATP-001, DEP-003): the
+  files that decide what COMBAT isolates — `combat-rules.v4`,
+  `combat-rules.v6` and the management carve-out `combat-allow.cidrs` —
+  were protected by file permissions only, re-read at every isolation and
+  never signed. A root process could rewrite the rulesets so COMBAT dropped
+  nothing, delete them so isolation failed, or add its own network to the
+  carve-out, while the agent still logged "network isolated".
+  - They are now applied only as shipped (the content the agent was built
+    with) or with an admin signature (`config-manage`) for their exact
+    content — the signed-overlay mechanism, with three new kinds
+    (`combat-rules-v4`, `combat-rules-v6`, `combat-allow`). Anything else,
+    or a missing file, makes COMBAT apply the built-in content; the
+    refusal is an ERROR and a signed `integrity_drift` entry.
+  - A signed ruleset must still isolate (filter table, the COMBAT chain and
+    its DROP, the INPUT and OUTPUT jumps, COMMIT); a signed carve-out must
+    parse whole.
+  - The files and their signatures join the protected `/etc/northnarrow`
+    set (unlink, rename and attribute changes denied), and the periodic
+    integrity check reports one that differs from the shipped content
+    without a signature, before COMBAT ever needs it.
+  - Operators store a carve-out with `nn-admin config overlay set
+    combat-allow --file <cidrs> --key <key>`; `install.sh --upgrade` adopts
+    one edited by hand under an earlier release with the grant key.
 - External audit, Wave 1, FIM availability (High MAIN-003, FIMR-001,
   FIMP-001):
   - The FIM sensors, the file-open sensor, the drain and every FIM rule

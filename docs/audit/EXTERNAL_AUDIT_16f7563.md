@@ -60,7 +60,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-008 | MAIN-001 | Agent main | M | fixed (lab PR 89) |
 | NN-AUD-009 | MAIN-002 | Agent main | M | fixed (lab PR 82, as NN-AUD-004) |
 | NN-AUD-010 | MAIN-003 | Agent main | M | fixed (lab PR 91) |
-| NN-AUD-011 | ATP-001 | Anti-tamper | M | open |
+| NN-AUD-011 | ATP-001 | Anti-tamper | M | fixed (lab PR 92) |
 | NN-AUD-012 | ATP-002 | Anti-tamper | M | fixed (lab PR 89) |
 | NN-AUD-013 | ATP-004 | Anti-tamper | M | open |
 | NN-AUD-014 | EBPF-001 | eBPF kernel | M | open |
@@ -107,7 +107,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-071 | WDG-005 | Watchdog tooling | M | fixed (lab PR 85, with NN-AUD-070) |
 | NN-AUD-072 | DEP-001 | Deploy | M | open |
 | NN-AUD-073 | DEP-002 | Deploy | M | open |
-| NN-AUD-074 | DEP-003 | Deploy | M | open |
+| NN-AUD-074 | DEP-003 | Deploy | M | fixed (lab PR 92, with NN-AUD-011) |
 | NN-AUD-075 | SUP-003 | Supply chain | M | open |
 | NN-AUD-076 | TST-003 | Privileged tests | M | fixed (lab PR 88) |
 
@@ -649,3 +649,44 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     op=Modified`. `fim_baseline.jsonl` replaced by a lone fragment:
     before, "fim baseline DB open failed" and no FIM drain; after, the
     same failure, "FIM still detects", and "fim: drain loop spawned".
+- **NN-AUD-011 and NN-AUD-074 (ATP-001, DEP-003), lab PR 92.** The
+  COMBAT rulesets and carve-out were outside the protected set, unsigned,
+  and re-read at every engage: what COMBAT did was up to whoever could
+  write `/etc/northnarrow`.
+  - The two audit fixes differed (signed overlays; a hash in the install
+    manifest). The overlay one is used: it lets an operator change the
+    carve-out during an incident with an off-host key, and works without
+    an install manifest (source-tree installs). `OverlayKind` gains
+    `CombatRulesV4`, `CombatRulesV6`, `CombatAllow` (wire bytes 8-10,
+    append-only), with their own file names.
+  - `overlay_auth::shipped_default`: the content the agent was built with
+    (`include_str!` of `configs/`) needs no signature — an unmodified
+    install changes nothing. `NetworkIsolator::trusted_source`, at every
+    engage: the file when shipped or signed (the gate logs and records a
+    refusal), the built-in content otherwise or when the file is missing —
+    a deleted ruleset no longer makes engage fail, and a missing v6 ruleset
+    no longer leaves IPv6 open.
+  - `validate_content`: a ruleset submitted for signing must keep the
+    filter table, the COMBAT chain and its catch-all DROP, the INPUT and
+    OUTPUT jumps and COMMIT (`network_isolate::validate_ruleset`); a
+    carve-out must parse with no rejected line.
+  - The six files (three, and their `.sig`) join `ETC_PROTECTED_FILES`
+    (MUTATE only — an operator's signed change goes through the agent).
+    `install.sh --upgrade` maps the new kinds to their files when it adopts
+    unsigned overlays; `nn-admin config overlay status` reports "shipped
+    default"; `COMBAT_RECOVERY.md` describes the signed carve-out.
+  - The self-integrity check (every ~30 s) now also reports a COMBAT file
+    that differs from the shipped content and carries no valid signature
+    (`config_overlay` finding, signed `integrity_drift`), so a tampered
+    ruleset is visible at once, not only when COMBAT engages.
+  - Lab, Ubuntu 22.04. Before: with the agent installed, root appended a
+    second filter section to `combat-rules.v4` that inserts an ACCEPT at
+    the top of the COMBAT chain (the in-place write MUTATE does not deny);
+    the file was applied as such at every engage, and `config overlay
+    status` did not know the COMBAT files. After, with the same tampered
+    file: `combat-rules-v4 NOT LOADED … no signature file — COMBAT applies
+    the built-in content`, v6 and the carve-out "shipped default"; a signed
+    `integrity_drift` for `/etc/northnarrow/combat-rules.v4 (1840 bytes)`
+    15 s after the boot; `rm combat-rules.v6` denied. COMBAT itself was not
+    engaged in the lab (the empty carve-out would cut the lab's SSH); the
+    rulesets it builds are covered by the unit tests.

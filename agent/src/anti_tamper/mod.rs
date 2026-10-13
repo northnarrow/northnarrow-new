@@ -888,6 +888,13 @@ mod tests {
             .arg("5")
             .spawn()
             .unwrap();
+        // `spawn` can return before the child has exec'd.
+        let want = ExeIdentity::of_file(Path::new("/bin/sleep"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ExeIdentity::of_process(child.id()) != want {
+            assert!(std::time::Instant::now() < deadline, "never exec'd sleep");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let other = ExeIdentity::of_process(child.id());
         let _ = child.kill();
         let _ = child.wait();

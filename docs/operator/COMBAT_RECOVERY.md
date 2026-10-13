@@ -73,8 +73,9 @@ If you administer hosts remotely, full isolation can lock you out before
 you can run the unlock. The **opt-in** management carve-out keeps an SSH
 path open from a network you declare.
 
-Edit `/etc/northnarrow/combat-allow.cidrs` and add your management
-network (one IPv4 address or CIDR per line):
+Write your management network (one IPv4 address or CIDR per line) into a
+file, and store it as `/etc/northnarrow/combat-allow.cidrs` with an admin
+signature — a key whose `admin.pub` line carries `config-manage`:
 
 ```
 # management jump host / admin subnet
@@ -82,16 +83,31 @@ network (one IPv4 address or CIDR per line):
 10.0.10.0/24
 ```
 
+```
+nn-admin config overlay set combat-allow --file mgmt.cidrs --key <config-manage key>
+```
+
+The agent applies the carve-out only as shipped (empty) or with a valid
+signature for its exact content (external audit ATP-001): a carve-out
+written by hand — or by an intruder adding their own network — is not
+applied, COMBAT isolates without it, and the refusal is an ERROR plus a
+signed `integrity_drift` entry. The same holds for `combat-rules.v4` and
+`combat-rules.v6` (`combat-rules-v4`, `combat-rules-v6`): an unsigned
+change, or a deleted file, makes COMBAT apply the rulesets the agent was
+built with. `nn-admin config overlay status` shows what the next COMBAT
+will use; `install.sh --upgrade` signs a carve-out edited by hand under an
+earlier release with the grant key.
+
 - **Default is empty** = full isolation (no carve-out).
 - Each entry is allowed **both inbound and outbound**, so an SSH session
   to/from it survives COMBAT.
 - The file is **re-read at every COMBAT engage** (never cached) — you can
-  add an emergency CIDR from a local console and it applies the next time
-  isolation engages.
+  store an emergency CIDR from a local console (`config overlay set`, the
+  key on removable media) and it applies the next time isolation engages.
 - **Fail-secure**: a malformed line is skipped (and logged), never
   widened; an unreadable file applies no carve-out.
-- It is intentionally **not** in the FIM deny-zone, so you can edit it
-  during an incident. Changes are still FIM-observed (audited).
+- It is protected against deletion and replacement, and its content is
+  vouched for by the signature, not by file permissions.
 
 > Security note: anything you carve out is **not** contained during an
 > incident. Only list networks you trust to reach a possibly-compromised
@@ -164,7 +180,7 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 | Situation | Action |
 |-----------|--------|
 | Provision admin key | `install.sh` auto-bootstraps; **move `admin.key` offline** |
-| Avoid remote lockout | add your mgmt CIDR to `/etc/northnarrow/combat-allow.cidrs` |
+| Avoid remote lockout | `nn-admin config overlay set combat-allow --file <cidrs> --key <config-manage key>` |
 | Check state | `nn-admin status` |
 | Release COMBAT | `nn-admin unlock --key <admin.key>` |
 | Re-engage after crash | `nn-admin force-posture combat --key <admin.key>` |

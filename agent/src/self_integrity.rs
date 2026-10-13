@@ -282,16 +282,34 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
     };
+    // External audit ATP-001 / DEP-003: the COMBAT files too, reported as
+    // soon as they differ from what the agent was built with — not only
+    // when COMBAT engages (a signed change is not drift: see the checker).
+    let combat_kind = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(common::wire::admin_signed_payload::OverlayKind::from_keyword)
+            .filter(|k| crate::config::overlay_auth::shipped_default(*k).is_some())
+    };
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("local"))
+        .filter(|p| {
+            p.extension().and_then(|x| x.to_str()) == Some("local") || combat_kind(p).is_some()
+        })
         .collect();
     paths.sort();
     for path in paths {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
+        if let Some(kind) = combat_kind(&path) {
+            if crate::config::overlay_auth::shipped_default(kind)
+                .is_some_and(|d| d.as_bytes() == bytes.as_slice())
+            {
+                continue;
+            }
+        }
         let digest = Sha256::digest(&bytes);
         let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
         out.push(Finding {
@@ -573,6 +591,22 @@ mod tests {
         assert!(f.iter().all(|x| x.kind == "shutdown_marker_rejected"));
         assert!(f[0].detail.contains("agent pid 4242"), "{}", f[0].detail);
         assert!(f[1].detail.contains("not json"), "{}", f[1].detail);
+    }
+
+    /// External audit ATP-001 / DEP-003: a COMBAT file is reported once it
+    /// differs from the shipped content; the shipped content is not.
+    #[test]
+    fn combat_files_are_reported_when_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let v4 = dir.path().join("combat-rules.v4");
+        std::fs::write(&v4, crate::anti_tamper::network_isolate::BUILTIN_RULES_V4).unwrap();
+        assert!(config_overlays(dir.path()).is_empty());
+        let mut tampered = crate::anti_tamper::network_isolate::BUILTIN_RULES_V4.to_string();
+        tampered.push_str("*filter\n-I NORTHNARROW_COMBAT 1 -j ACCEPT\nCOMMIT\n");
+        std::fs::write(&v4, tampered).unwrap();
+        let f = config_overlays(dir.path());
+        assert_eq!(f.len(), 1);
+        assert!(f[0].detail.contains("combat-rules.v4"), "{}", f[0].detail);
     }
 
     #[test]

@@ -677,10 +677,18 @@ pub enum OverlayKind {
     MassWriteCarveout = 6,
     /// `escalation-allow.local` — escalations the posture ladder accepts.
     EscalationAllow = 7,
+    /// External audit ATP-001 / DEP-003: `combat-rules.v4`, the ruleset
+    /// COMBAT isolates the host with. The shipped content needs no
+    /// signature; any other content does.
+    CombatRulesV4 = 8,
+    /// `combat-rules.v6`, the IPv6 twin of [`Self::CombatRulesV4`].
+    CombatRulesV6 = 9,
+    /// `combat-allow.cidrs`, the management networks COMBAT does not cut.
+    CombatAllow = 10,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 7] = [
+    pub const ALL: [OverlayKind; 10] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -688,6 +696,9 @@ impl OverlayKind {
         OverlayKind::NetflowJa3Blocklist,
         OverlayKind::MassWriteCarveout,
         OverlayKind::EscalationAllow,
+        OverlayKind::CombatRulesV4,
+        OverlayKind::CombatRulesV6,
+        OverlayKind::CombatAllow,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -700,17 +711,32 @@ impl OverlayKind {
             OverlayKind::NetflowJa3Blocklist => "netflow-ja3-blocklist",
             OverlayKind::MassWriteCarveout => "mass-write-carveout",
             OverlayKind::EscalationAllow => "escalation-allow",
+            OverlayKind::CombatRulesV4 => "combat-rules-v4",
+            OverlayKind::CombatRulesV6 => "combat-rules-v6",
+            OverlayKind::CombatAllow => "combat-allow",
         }
     }
 
     /// Default file name in `/etc/northnarrow`.
     pub fn file_name(self) -> String {
-        format!("{}.local", self.keyword())
+        match self {
+            OverlayKind::CombatRulesV4 => "combat-rules.v4".to_string(),
+            OverlayKind::CombatRulesV6 => "combat-rules.v6".to_string(),
+            OverlayKind::CombatAllow => "combat-allow.cidrs".to_string(),
+            _ => format!("{}.local", self.keyword()),
+        }
     }
 
+    /// The kind named by its keyword or by its file name.
     pub fn from_keyword(s: &str) -> Option<Self> {
-        let s = s.trim().trim_end_matches(".local");
-        OverlayKind::ALL.into_iter().find(|k| k.keyword() == s)
+        let s = s.trim();
+        OverlayKind::ALL
+            .into_iter()
+            .find(|k| k.file_name() == s)
+            .or_else(|| {
+                let s = s.trim_end_matches(".local");
+                OverlayKind::ALL.into_iter().find(|k| k.keyword() == s)
+            })
     }
 }
 
@@ -731,6 +757,9 @@ impl TryFrom<u8> for OverlayKind {
             5 => Ok(Self::NetflowJa3Blocklist),
             6 => Ok(Self::MassWriteCarveout),
             7 => Ok(Self::EscalationAllow),
+            8 => Ok(Self::CombatRulesV4),
+            9 => Ok(Self::CombatRulesV6),
+            10 => Ok(Self::CombatAllow),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }

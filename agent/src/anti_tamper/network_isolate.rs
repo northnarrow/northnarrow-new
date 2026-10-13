@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::combat_allow;
 
@@ -99,6 +99,59 @@ pub struct NetworkIsolator {
     rules_path_v6: PathBuf,
     restore_bin_v6: PathBuf,
     ip6tables_bin: PathBuf,
+    /// External audit ATP-001 / DEP-003: who vouches for the three files
+    /// COMBAT reads ([`Self::trusted_source`]). `None` (tests, tools):
+    /// the files are trusted as they are.
+    gate: Option<std::sync::Arc<crate::config::overlay_auth::OverlayGate>>,
+}
+
+/// The rulesets and carve-out the agent was built with — what COMBAT
+/// applies when a file on disk is missing or not vouched for.
+pub const BUILTIN_RULES_V4: &str = include_str!("../../../configs/combat-rules.v4");
+/// See [`BUILTIN_RULES_V4`].
+pub const BUILTIN_RULES_V6: &str = include_str!("../../../configs/combat-rules.v6");
+/// See [`BUILTIN_RULES_V4`]: comments only, no network spared.
+pub const BUILTIN_ALLOW: &str = include_str!("../../../configs/combat-allow.cidrs");
+
+/// What a COMBAT ruleset must keep to still isolate: the filter table, the
+/// COMBAT chain and its catch-all DROP, the INPUT and OUTPUT jumps into
+/// it, and COMMIT. Checked before a ruleset can be signed.
+pub fn validate_ruleset(text: &str) -> Result<()> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let has = |pred: &dyn Fn(&str) -> bool| lines.iter().any(|l| pred(l));
+    let jump = format!("-j {COMBAT_CHAIN}");
+    let checks: [(&str, bool); 6] = [
+        ("*filter", has(&|l| l == "*filter")),
+        (
+            "the COMBAT chain",
+            has(&|l| l.starts_with(&format!(":{COMBAT_CHAIN}"))),
+        ),
+        (
+            "its catch-all DROP",
+            has(&|l| l == format!("-A {COMBAT_CHAIN} -j DROP")),
+        ),
+        (
+            "the INPUT jump",
+            has(&|l| l.contains("INPUT") && l.ends_with(&jump)),
+        ),
+        (
+            "the OUTPUT jump",
+            has(&|l| l.contains("OUTPUT") && l.ends_with(&jump)),
+        ),
+        ("COMMIT", has(&|l| l == "COMMIT")),
+    ];
+    for (what, ok) in checks {
+        if !ok {
+            return Err(anyhow!(
+                "COMBAT ruleset lacks {what} — it would not isolate"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl NetworkIsolator {
@@ -119,7 +172,58 @@ impl NetworkIsolator {
             rules_path_v6: PathBuf::from(DEFAULT_RULES_V6),
             restore_bin_v6: PathBuf::from(DEFAULT_RESTORE_BIN_V6),
             ip6tables_bin: PathBuf::from(DEFAULT_IPTABLES_BIN_V6),
+            gate: None,
         })
+    }
+
+    /// External audit ATP-001 / DEP-003: vouch for the COMBAT files with
+    /// the signed-overlay gate ([`Self::trusted_source`]).
+    pub fn with_overlay_gate(
+        mut self,
+        gate: std::sync::Arc<crate::config::overlay_auth::OverlayGate>,
+    ) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// External audit ATP-001 / DEP-003: the content COMBAT may apply for
+    /// `kind` read from `path`. A root process could rewrite the rulesets
+    /// so COMBAT dropped nothing, delete them so engage failed, or add its
+    /// own network to the carve-out — and the agent still logged "network
+    /// isolated". Now the file is applied only when it is the shipped
+    /// content or carries an admin `config-manage` signature for its exact
+    /// content (the overlay gate, which logs and records a refusal);
+    /// otherwise, or when the file is missing, the built-in content is.
+    fn trusted_source(
+        &self,
+        kind: common::wire::admin_signed_payload::OverlayKind,
+        path: &std::path::Path,
+        builtin: &'static str,
+    ) -> String {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "COMBAT: file unreadable — applying the built-in content"
+                );
+                return builtin.to_string();
+            }
+        };
+        let Some(gate) = &self.gate else {
+            return text;
+        };
+        if gate.effective(kind, path) == path {
+            text
+        } else {
+            error!(
+                file = %path.display(),
+                "COMBAT: file not vouched for (modified without an admin signature) — \
+                 applying the built-in content instead"
+            );
+            builtin.to_string()
+        }
     }
 
     /// Override the management carve-out CIDR file path (Beta Step 4b).
@@ -163,6 +267,7 @@ impl NetworkIsolator {
             allow_cidrs_path: combat_allow::default_path(),
             restore_bin,
             iptables_bin,
+            gate: None,
         })
     }
 
@@ -256,10 +361,14 @@ impl NetworkIsolator {
     /// ruleset and the list of IPv4 CIDRs actually carved out (for
     /// logging). Re-reads the allow file every call — never cached.
     fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
-        let base = std::fs::read_to_string(&self.rules_path)
-            .with_context(|| format!("reading {}", self.rules_path.display()))?;
+        use common::wire::admin_signed_payload::OverlayKind;
+        let base = self.trusted_source(
+            OverlayKind::CombatRulesV4,
+            &self.rules_path,
+            BUILTIN_RULES_V4,
+        );
 
-        let load = combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
+        let load = self.trusted_allow();
         if let Some(reason) = &load.read_error {
             // The default-secure case is an absent/empty file, so this
             // is expected on most hosts — debug, not warn.
@@ -289,21 +398,39 @@ impl NetworkIsolator {
     /// degrades with a WARN). Splices the IPv6 carve-out entries — which
     /// the v4 path parses but ignores — ahead of the v6 catch-all DROP.
     fn build_engaged_ruleset_v6(&self) -> Result<Option<(String, Vec<String>)>> {
-        let base = match std::fs::read_to_string(&self.rules_path_v6) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("reading {}", self.rules_path_v6.display()))
-            }
-        };
+        use common::wire::admin_signed_payload::OverlayKind;
+        // External audit DEP-003: a missing v6 ruleset no longer leaves
+        // IPv6 open when the built-in one can be applied (with a gate).
+        if self.gate.is_none() && !self.rules_path_v6.exists() {
+            return Ok(None);
+        }
+        let base = self.trusted_source(
+            OverlayKind::CombatRulesV6,
+            &self.rules_path_v6,
+            BUILTIN_RULES_V6,
+        );
         // The allow file's read errors + malformed-line warnings were
         // already surfaced by the v4 builder (engage() runs v4 first);
         // here we just take the validated entries.
-        let load = combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
+        let load = self.trusted_allow();
         let accept_block = combat_allow::generate_accept_rules_v6(&load.entries, COMBAT_CHAIN);
         let carved = combat_allow::ipv6_raw(&load.entries);
         Ok(Some((splice_carveout(&base, &accept_block), carved)))
+    }
+
+    /// The management carve-out, vouched for like the rulesets: an
+    /// unsigned change spares no network (the built-in list is empty).
+    fn trusted_allow(&self) -> combat_allow::AllowLoad {
+        use common::wire::admin_signed_payload::OverlayKind;
+        if self.gate.is_none() || !self.allow_cidrs_path.exists() {
+            return combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
+        }
+        let text = self.trusted_source(
+            OverlayKind::CombatAllow,
+            &self.allow_cidrs_path,
+            BUILTIN_ALLOW,
+        );
+        combat_allow::parse_allow_text(&text)
     }
 
     /// Beta Step 4a: tear down a STALE COMBAT chain left over from a
@@ -728,6 +855,63 @@ mod tests {
             return None;
         }
         Some(NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap())
+    }
+
+    /// External audit ATP-001 / DEP-003: with the overlay gate, a ruleset
+    /// rewritten to isolate nothing and a carve-out adding a network,
+    /// neither signed, are not applied — the built-in content is; the
+    /// shipped content is applied as it is; a deleted ruleset no longer
+    /// fails the engage.
+    #[test]
+    fn unsigned_combat_files_give_way_to_the_builtin_content() {
+        let Some(restore) = mock_restore_bin() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        std::fs::write(&admin_pub, format!("{} config-manage\n", "00".repeat(32))).unwrap();
+        let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
+            &admin_pub,
+            [1; 16],
+            &dir.path().join("audit.log"),
+        ));
+        let v4 = dir.path().join("combat-rules.v4");
+        let allow = dir.path().join("combat-allow.cidrs");
+        std::fs::write(
+            &v4,
+            "*filter\n:NORTHNARROW_COMBAT - [0:0]\n-A NORTHNARROW_COMBAT -j ACCEPT\nCOMMIT\n",
+        )
+        .unwrap();
+        std::fs::write(&allow, "203.0.113.0/24\n").unwrap();
+        let iso = NetworkIsolator::new_with_bin(v4.clone(), restore, PathBuf::from("/bin/true"))
+            .unwrap()
+            .with_allow_cidrs_path(allow.clone())
+            .with_overlay_gate(gate);
+        let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
+        assert!(
+            ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"),
+            "{ruleset}"
+        );
+        assert!(
+            !ruleset.contains("-A NORTHNARROW_COMBAT -j ACCEPT\n"),
+            "{ruleset}"
+        );
+        assert!(
+            carved.is_empty(),
+            "an unsigned carve-out spares nothing: {carved:?}"
+        );
+        // the shipped content is applied as it is
+        std::fs::write(&v4, BUILTIN_RULES_V4).unwrap();
+        std::fs::write(&allow, BUILTIN_ALLOW).unwrap();
+        let (ruleset, _) = iso.build_engaged_ruleset().expect("build");
+        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
+        // deleted: the built-in ruleset, not a failed engage
+        std::fs::remove_file(&v4).unwrap();
+        let (ruleset, _) = iso.build_engaged_ruleset().expect("built-in when deleted");
+        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
+        assert!(validate_ruleset(BUILTIN_RULES_V4).is_ok());
+        assert!(validate_ruleset(BUILTIN_RULES_V6).is_ok());
+        assert!(validate_ruleset("*filter\n:NORTHNARROW_COMBAT - [0:0]\nCOMMIT\n").is_err());
     }
 
     #[test]
