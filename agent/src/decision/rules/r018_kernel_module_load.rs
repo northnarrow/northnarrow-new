@@ -35,6 +35,7 @@ use std::sync::Arc;
 use common::{Event, ModuleLoadMethod, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::decision::rules::module_provenance::{ModuleOwners, Provenance};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Standard kernel-module locations. A `.ko` loaded from anywhere else
@@ -51,11 +52,20 @@ pub struct R018KernelModuleLoad {
     /// Deliberately NOT `insmod`/`modprobe`: they load arbitrary paths,
     /// so allowlisting them would blind the non-standard-path Critical.
     loader_allowlist: Arc<CommAllowlist>,
+    /// External audit PROC-005: who installed a module file.
+    owners: ModuleOwners,
 }
 
 impl R018KernelModuleLoad {
     pub fn new(loader_allowlist: Arc<CommAllowlist>) -> Self {
-        Self { loader_allowlist }
+        Self::with_owners(loader_allowlist, ModuleOwners::default())
+    }
+
+    pub fn with_owners(loader_allowlist: Arc<CommAllowlist>, owners: ModuleOwners) -> Self {
+        Self {
+            loader_allowlist,
+            owners,
+        }
     }
 }
 
@@ -153,6 +163,43 @@ impl Rule for R018KernelModuleLoad {
                         ),
                     ));
                 }
+                // External audit PROC-005: whoever loads a module can write
+                // under /lib/modules; a file there that no package installed
+                // and DKMS did not build was put there by hand. From an
+                // unexpected loader that is the non-standard case again;
+                // from a system loader (a locally built module at boot, or
+                // a comm that only claims to be one) an alert, no kill.
+                if self.owners.of(p) == Provenance::Unowned {
+                    let system_loader = self.loader_allowlist.contains(loader_comm)
+                        || self.loader_allowlist.contains(parent_comm);
+                    return Some(if system_loader {
+                        build_verdict(
+                            self,
+                            event,
+                            ResponseAction::Log,
+                            Severity::High,
+                            &format!(
+                                "Kernel module {p} loaded by '{loader_comm}' (parent \
+                                 '{parent_comm}') is in a module directory but no package \
+                                 installed it and DKMS did not build it (T1547.006). Alert."
+                            ),
+                        )
+                    } else {
+                        build_verdict(
+                            self,
+                            event,
+                            ResponseAction::KillProcessTree,
+                            Severity::Critical,
+                            &format!(
+                                "Kernel module {p} loaded by '{loader_comm}' (parent \
+                                 '{parent_comm}') — under /lib/modules, but no package \
+                                 installed it and DKMS did not build it: copied there by \
+                                 hand; rootkit shape (T1014 / T1547.006). Kill tree + \
+                                 posture → COMBAT."
+                            ),
+                        )
+                    });
+                }
             }
         }
 
@@ -207,12 +254,103 @@ mod tests {
     use super::*;
     use common::wire::{ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT};
 
-    fn rule() -> R018KernelModuleLoad {
-        R018KernelModuleLoad::new(Arc::new(CommAllowlist::from_iter_owned(
+    fn allowlist() -> Arc<CommAllowlist> {
+        Arc::new(CommAllowlist::from_iter_owned(
             ["systemd-udevd", "systemd-modules-load", "kmod"]
                 .into_iter()
                 .map(String::from),
-        )))
+        ))
+    }
+
+    /// The rule on a host with no package database (provenance unknown:
+    /// judged by path and loader, as before PROC-005).
+    fn rule() -> R018KernelModuleLoad {
+        R018KernelModuleLoad::with_owners(allowlist(), ModuleOwners::new("/nonexistent-root"))
+    }
+
+    /// External audit PROC-005: a module copied under /lib/modules — no
+    /// package lists it, DKMS did not build it — is the non-standard case
+    /// for an unexpected loader, an alert for a system loader; a packaged
+    /// one keeps its Medium alert.
+    #[test]
+    fn a_module_copied_under_lib_modules_is_not_standard() {
+        let host = tempfile::TempDir::new().unwrap();
+        let info = host.path().join("var/lib/dpkg/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(host.path().join("var/lib/dpkg/status"), "").unwrap();
+        std::fs::write(
+            info.join("linux-modules-6.8.0.list"),
+            "/lib/modules/6.8.0/kernel/fs/foo.ko\n",
+        )
+        .unwrap();
+        let r = R018KernelModuleLoad::with_owners(allowlist(), ModuleOwners::new(host.path()));
+        let copied = [
+            "/", "usr", "lib", "modules", "6.8.0", "kernel", "fs", "rk.ko",
+        ];
+        let v = r
+            .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &copied)))
+            .expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical)
+        );
+        let v = r
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "systemd-udevd",
+                "systemd",
+                0,
+                &copied,
+            )))
+            .expect("alerts");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        let packaged = ["/", "lib", "modules", "6.8.0", "kernel", "fs", "foo.ko"];
+        let v = r
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "modprobe",
+                "bash",
+                0,
+                &packaged,
+            )))
+            .expect("alerts");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Medium)
+        );
+        assert!(r
+            .evaluate(&ev(&raw(
+                MODULE_LOAD_FINIT,
+                "systemd-udevd",
+                "systemd",
+                0,
+                &packaged
+            )))
+            .is_none());
+    }
+
+    /// External audit PROC-005: a component that is not UTF-8 is kept, and
+    /// the path it leads with is no module directory.
+    #[test]
+    fn a_non_utf8_component_does_not_collapse_into_a_standard_path() {
+        let mut r = raw(
+            MODULE_LOAD_FINIT,
+            "insmod",
+            "bash",
+            0,
+            &["/", "x", "lib", "modules", "6.8.0", "rk.ko"],
+        );
+        // the "x" slot (5th from the leaf) holds bytes that are not UTF-8
+        r.path[4 * 32] = 0xff;
+        r.path[4 * 32 + 1] = 0xfe;
+        let v = rule().evaluate(&ev(&r)).expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical)
+        );
     }
 
     fn put_comm(dst: &mut [u8; 16], s: &str) {

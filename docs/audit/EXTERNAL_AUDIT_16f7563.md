@@ -84,7 +84,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-038 | PROC-002 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-039 | PROC-003 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-040 | PROC-004 | Process rules | M | fixed (lab PR 86) |
-| NN-AUD-041 | PROC-005 | Process rules | L | open |
+| NN-AUD-041 | PROC-005 | Process rules | L | fixed (lab PR 109) |
 | NN-AUD-042 | PROC-007 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-043 | POS-002 | Posture | M | fixed (lab PR 101) |
 | NN-AUD-044 | POS-003 | Posture | M | fixed (lab PR 101) |
@@ -598,13 +598,13 @@ the audit did not report, noted with the fix that takes them.
   `sudo` without a terminal was killed. A script that exits within a few
   milliseconds can still draw the kill: its lineage is read once it has
   gone, and the kill then finds nothing to stop.
-- **NN-AUD-041 (PROC-005), open — a design question.** Only root can load
-  a module, and root can put one under /lib/modules, so R018's path test
-  cannot be the discriminant. The audit's fix (a baseline of module
-  inodes) would kill every DKMS build after a kernel update. The
-  candidates are the kernel's own module-signature verdict, and a
-  trusted-installer window for module loads as for kexec (review 82).
-  Both change what operators may do, and are left for a dedicated change.
+- **NN-AUD-041 (PROC-005), left open here as a design question; decided
+  in lab PR 109 (its entry below).** Only root can load a module, and root
+  can put one under /lib/modules, so R018's path test cannot be the
+  discriminant. The audit's fix (a baseline of module inodes) would kill
+  every DKMS build after a kernel update. The candidates were the kernel's
+  own module-signature verdict, and a trusted-installer window for module
+  loads as for kexec (review 82).
 - **NN-AUD-024 and NN-AUD-025 (FIMR-002, FIMR-003).** Fixed after the
   audit's commit by review 85 (PR #246, lab PR 75): NN-L-FIM-011..019
   fire for every process, and `OwnClient` drops the verdict only for a
@@ -635,8 +635,9 @@ the audit did not report, noted with the fix that takes them.
     alerts for loads from the module directories, and loading a module
     needs CAP_SYS_MODULE, so it gives an unprivileged process nothing.
     On exec identity it would over-match: `modprobe` and `insmod` are
-    links to `kmod`. It belongs with NN-AUD-041, the open question of
-    how R018 tells a legitimate load.
+    links to `kmod`. It belongs with NN-AUD-041, how R018 tells a
+    legitimate load (lab PR 109 kept it: a system loader's unowned module
+    is an alert, not a kill).
   - Lab, Ubuntu 24.04. Before: the io_uring probe built as `nginx` in a
     home directory read `/etc/hostname` and connected to port 22 through
     one ring, and python renamed `systemd` loaded a socket filter, both
@@ -1569,3 +1570,46 @@ the audit did not report, noted with the fix that takes them.
     `/proc/self/cwd/` raised nothing. After: the refused opens took it to
     ALERTED (SensitiveFileAccess); the 25 writes raised ConfirmedIntrusion
     (ENGAGED).
+- **NN-AUD-041 (PROC-005), lab PR 109.** R018's only autonomous kill was
+  "a module loaded from outside /lib/modules", and the path was the only
+  discriminator: whoever loads a module holds `CAP_SYS_MODULE` and can copy
+  the image under /lib/modules first, which turned the kill into a Medium
+  alert. Two path-reconstruction holes made it easier still.
+  - Decided (the design question this entry was left with): the path
+    stays the first discriminator, provenance is the second. A module file
+    under a module directory that no package lists (dpkg's `.list` files,
+    read once and again when `/var/lib/dpkg/status` changes; `rpm -qf` on
+    the RPM family) and DKMS did not build (a registered module in
+    `updates/dkms` or `extra`) was put there by hand: from an unexpected
+    loader it is the non-standard case — Critical, KillProcessTree; from a
+    system loader (`systemd-udevd`, `systemd-modules-load`: a locally built
+    module at boot, or a comm only claiming to be one) High, alert only. A
+    host with neither database is judged as before. `/usr` is dropped from
+    both sides (a merged-`/usr` host reports `/usr/lib/modules`, packages
+    list `/lib/modules`). `module_provenance::ModuleOwners`.
+  - The kernel's walk stopped at the root of the `.ko`'s filesystem, so a
+    file on a mount whose own tree reads `lib/modules/…` was "standard".
+    The hook now records that root's inode key (`ModuleLoadRaw::root_dev`,
+    `root_ino`) and the module-load pump puts the path on its mount point
+    (the file-open sensor's `MountTable`); a filesystem no mount shows is
+    `/(unplaced filesystem dev:ino)/…`, a non-standard path.
+  - A component that is not UTF-8 was dropped, and `<bytes>/lib/modules/…`
+    collapsed into a standard path; it is now kept (lossily).
+  - Lab, Debian 12 (6.1), the in-tree `dummy` module loaded with
+    `finit_module(2)` by a small loader of its own (an `insmod` exec draws
+    R011's kill first). Before: a copy under
+    `/usr/lib/modules/<ver>/kernel/drivers/net/nnx-rk.ko` — R018 Log,
+    Medium; a copy on a tmpfs mounted at `/mnt/nnx` (its tree
+    `lib/modules/<ver>/`) — reported as `/lib/modules/<ver>/dummy.ko`, Log,
+    Medium. After: the copy — Critical, KillProcessTree (no package
+    installed it); the tmpfs one — `/mnt/nnx/lib/modules/…`, Critical, the
+    loader killed before it printed; the packaged `dummy.ko` (dpkg lists
+    `/lib/modules/…`, the kernel reports `/usr/lib/modules/…`) — Log,
+    Medium, as before.
+  - The package database and the DKMS registry are root's to rewrite:
+    copying the image is no longer enough, but a root that also adds its
+    path to a dpkg list passes. What root cannot forge is the kernel's own
+    judgement, which needs the distribution's key — after a load,
+    `/sys/module/<name>/taint` shows an unsigned (`E`) or out-of-tree (`O`)
+    module. That check, and denying the load at the hook (BUG-037), are not
+    done here.
