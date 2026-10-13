@@ -6,6 +6,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the bootstrap admin key as a standing bypass (High
+  DEP-001):
+  - The package hooks no longer pick up the admin key left on the host on
+    their own: an upgrade or removal opens the trusted-installer window only
+    with the key in `NN_GRANT_KEY` (or one the operator opened first).
+    Before, every `apt upgrade` suspended the anti-tamper with
+    `/etc/northnarrow/admin.key` if it was still there.
+  - A fresh install writes the bootstrap private key to
+    `/root/northnarrow-admin.key` (`--admin-key-out` to choose; never under
+    `/etc/northnarrow` or `/var/lib/northnarrow`, where backups, etckeeper
+    and tooling would pick it up). `uninstall.sh --purge` removes it.
+  - While an admin private key sits at either location, `nn-admin
+    host-check` reports `WARN admin_key` and the agent records
+    `admin_key_on_host` in the signed audit chain (`integrity_drift`).
 - External audit, Wave 1, the agent's own binaries as a way around the BPF
   self-defence (High EBPF-002):
   - The guard on the agent's maps and links exempted any process running

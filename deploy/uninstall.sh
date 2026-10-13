@@ -17,7 +17,10 @@
 #      agent_id, rule files) and /var/lib/northnarrow (FIM / canary /
 #      netflow / detections chain logs) unless --purge is given: the
 #      signed audit chain and the admin key are evidence and identity,
-#      an uninstall must not destroy them by default.
+#      an uninstall must not destroy them by default. --purge also
+#      removes the bootstrap admin private key install.sh wrote
+#      (/root/northnarrow-admin.key since external audit DEP-001; it used
+#      to live in /etc/northnarrow and went with it).
 #
 # Usage:
 #   sudo ./deploy/uninstall.sh            # binaries + units, keep config/state
@@ -183,10 +186,14 @@ done
 systemctl daemon-reload
 
 # ── 5. config + state ─────────────────────────────────────────────────
+BOOTSTRAP_KEY=/root/northnarrow-admin.key
 if (( PURGE )); then
     for d in "$ETC_DIR" "$STATE_DIR"; do
         [[ -e "$d" ]] && { log "PURGE: removing $d"; rm -rf "$d"; }
     done
+    # Its admin.pub line went with $ETC_DIR: the key opens nothing here any
+    # more, and a reinstall bootstraps a new one at the same path.
+    [[ -f "$BOOTSTRAP_KEY" ]] && { log "PURGE: removing the bootstrap admin private key $BOOTSTRAP_KEY"; rm -f "$BOOTSTRAP_KEY"; }
     for j in /var/log/journal/*.northnarrow /run/log/journal/*.northnarrow; do
         [[ -e "$j" ]] && { log "PURGE: removing namespace journal $j"; rm -rf "$j"; }
     done
@@ -195,6 +202,7 @@ else
     echo "Kept (evidence + identity — remove with --purge if this host is being retired):"
     [[ -e "$ETC_DIR" ]]   && echo "  $ETC_DIR    (admin.pub, agent.sig.key, audit.log, agent_id, rule files)"
     [[ -e "$STATE_DIR" ]] && echo "  $STATE_DIR  (FIM / canary / netflow / detections chain logs)"
+    [[ -f "$BOOTSTRAP_KEY" ]] && echo "  $BOOTSTRAP_KEY  (admin PRIVATE key still on this host — move it offline)"
 fi
 
 echo ""

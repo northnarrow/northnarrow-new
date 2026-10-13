@@ -172,10 +172,18 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
+# The admin key, if it is still on the range host: install.sh writes it to
+# /root/northnarrow-admin.key since external audit DEP-001 (the agent reports
+# it there, as intended on a range).
+ADMIN_KEY=
+for k in /root/northnarrow-admin.key "$NN_ETC_DIR/admin.key"; do
+    [ -f "$k" ] && { ADMIN_KEY=$k; break; }
+done
+
 # ── 6. fresh FIM baseline (reflects prod, not the dev box) ───────────
-if [ -f "$NN_ETC_DIR/admin.key" ]; then
+if [ -n "$ADMIN_KEY" ]; then
     log "Re-seeding FIM baseline (signed, fim-manage role)..."
-    "$NN_BIN_DIR/nn-admin" fim baseline --key "$NN_ETC_DIR/admin.key" 2>/dev/null \
+    "$NN_BIN_DIR/nn-admin" fim baseline --key "$ADMIN_KEY" 2>/dev/null \
         || warn "fim baseline re-seed failed — verify manually (nn-admin fim baseline)"
 else
     warn "no admin.key — skipping FIM baseline re-seed (deploy it offline per BUG-013)"
@@ -185,10 +193,10 @@ fi
 # Canary deploy is an authenticated op (--key). It needs the single admin
 # key; on a clean range this is acceptable, but we skip rather than fail if
 # the key has been moved offline.
-if [ -f "$NN_ETC_DIR/admin.key" ] && [ "${DEPLOY_CANARIES:-1}" = 1 ]; then
+if [ -n "$ADMIN_KEY" ] && [ "${DEPLOY_CANARIES:-1}" = 1 ]; then
     log "Deploying baseline canaries..."
     "$NN_BIN_DIR/nn-admin" canary deploy --name range-aws-creds \
-        --key "$NN_ETC_DIR/admin.key" credential \
+        --key "$ADMIN_KEY" credential \
         --path /home/forty/.aws/credentials.bak --cred-family aws 2>/dev/null \
         || warn "canary deploy failed — deploy manually (nn-admin canary deploy ...)"
 else

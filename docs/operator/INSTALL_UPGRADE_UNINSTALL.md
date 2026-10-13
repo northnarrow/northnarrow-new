@@ -26,9 +26,13 @@ see section 6.
 `install.sh` copies binaries, units, the journald namespace config, the
 rule and allowlist files, the canary templates and the ten inert
 control-surface bait files; bootstraps an admin keypair if
-`admin.pub` is absent (move `admin.key` off the host — see
-`COMBAT_RECOVERY.md` §1); and does **not** start anything. Enable the
-agent first, then the watchdog.
+`admin.pub` is absent — the private half goes to
+`/root/northnarrow-admin.key` (`--admin-key-out PATH`; never under
+`/etc/northnarrow` or `/var/lib/northnarrow`): move it off the host, see
+`COMBAT_RECOVERY.md` §1 — and does **not** start anything. Enable the
+agent first, then the watchdog. If a file already exists at the key path
+and `admin.pub` does not, `install.sh` leaves both alone and says so
+(`uninstall.sh --purge` removes the bootstrap key with the rest).
 
 If the units are already active, `install.sh` refuses with
 `Re-run with --upgrade`: with the hooks up every copy below would fail
@@ -516,10 +520,12 @@ manager's to verify (`dpkg --verify northnarrow`, `rpm -V northnarrow`).
 **Upgrade and removal need the trusted-installer window.** The running
 agent protects its binaries, units and pin root, so the package's hooks
 stop it the way `install.sh --upgrade` does. They open the window with the
-key in `NN_GRANT_KEY`, or with `/etc/northnarrow/admin.key` while that
-bootstrap key is still on the host. Without a usable key the operation
-stops before any file changes, the running version keeps running, and the
-package stays at its current version:
+key in `NN_GRANT_KEY` — never with a key they find on the host (external
+audit DEP-001: a bootstrap key left there made every package operation
+open the window with whatever key root could read). Without a usable key,
+or a window you opened first, the operation stops before any file
+changes, the running version keeps running, and the package stays at its
+current version:
 
 ```sh
 sudo NN_GRANT_KEY=/path/to/admin.key apt-get install ./northnarrow_<ver>-<rel>_amd64.deb

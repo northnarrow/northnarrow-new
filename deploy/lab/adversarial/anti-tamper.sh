@@ -35,7 +35,14 @@ UNIT=${UNIT:-/etc/systemd/system/northnarrow-agent.service}
 # systemd's signals reach the agent only inside a signed trusted-installer
 # window. The cases that restart the agent on purpose take the operator's
 # path: the window (lab key), SIGTERM, the watchdog brings it back.
-grant_window() { "$NNADMIN" trusted-installer-grant --key "$ETC/admin.key" --window-secs "${1:-120}" >/dev/null 2>&1; }
+# The lab's admin key: /root/northnarrow-admin.key since external audit
+# DEP-001 (install.sh writes it there), /etc/northnarrow/admin.key on a
+# guest installed before.
+ADMIN_KEY=${NN_ADMIN_KEY:-}
+for k in /root/northnarrow-admin.key "$ETC/admin.key"; do
+    [[ -z "$ADMIN_KEY" && -r "$k" ]] && ADMIN_KEY=$k
+done
+grant_window() { "$NNADMIN" trusted-installer-grant --key "$ADMIN_KEY" --window-secs "${1:-120}" >/dev/null 2>&1; }
 restart_agent() {
     local old new i
     old=$(cat /run/northnarrow/agent.pid 2>/dev/null)
@@ -49,7 +56,7 @@ restart_agent() {
     systemctl start northnarrow-agent
 }
 export -f grant_window restart_agent
-export NNADMIN ETC
+export NNADMIN ETC ADMIN_KEY
 jlines() { journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$1" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -v "process spawn detected"; }
 audit_count() { wc -l < "$AUDIT" 2>/dev/null || echo 0; }
 dets_count() { wc -l < "$DETS" 2>/dev/null || echo 0; }
@@ -220,7 +227,7 @@ PID=$(agent_pid)
 # The same overlay stored the authorised way (lab key, config-manage),
 # then a restart: stored with its signature, accepted at boot.
 printf '+backupd\n' > /tmp/nn-ovl-allow
-WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && restart_agent"
+WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ADMIN_KEY && restart_agent"
 PID=$(agent_pid)
 # Review 62: after a restart the task deny hooks must still report. They
 # were reused from the pinned link, bound to the previous boot's ring, so

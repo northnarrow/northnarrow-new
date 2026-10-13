@@ -62,7 +62,27 @@ pub fn run_in(root: &Path) -> Vec<Check> {
         ima(root),
         kexec_load_disabled(root),
         bpffs_mounts(root),
+        admin_key(root),
     ]
+}
+
+/// External audit DEP-001: where an admin PRIVATE key lands on the host —
+/// the bootstrap key `install.sh` wrote before the fix and the one it writes
+/// now (`--admin-key-out` default), relative to the root.
+pub const ADMIN_KEY_PATHS: &[&str] = &["etc/northnarrow/admin.key", "root/northnarrow-admin.key"];
+
+/// The admin private keys found at [`ADMIN_KEY_PATHS`] under `root`
+/// (non-empty regular files), as absolute host paths.
+pub fn admin_keys_on_host(root: &Path) -> Vec<String> {
+    ADMIN_KEY_PATHS
+        .iter()
+        .filter(|rel| {
+            std::fs::metadata(root.join(rel))
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+        })
+        .map(|rel| format!("/{rel}"))
+        .collect()
 }
 
 /// Number of `Warn` checks in `checks`.
@@ -283,6 +303,25 @@ fn bpffs_mounts(root: &Path) -> Check {
     }
 }
 
+/// External audit DEP-001: a private admin key on the host is a credential
+/// for whoever is root on it — COMBAT release, trusted-installer windows
+/// (the anti-tamper suspended), overlay signatures.
+fn admin_key(root: &Path) -> Check {
+    let found = admin_keys_on_host(root);
+    let (status, value) = if found.is_empty() {
+        (Status::Ok, "none at the bootstrap paths".to_string())
+    } else {
+        (Status::Warn, found.join(", "))
+    };
+    Check {
+        id: "admin_key",
+        name: "admin private key off the host",
+        status,
+        value,
+        fix: "move the admin private key offline (`mv <key> <offline media>`): on the host it lets root release COMBAT, open trusted-installer windows (the anti-tamper suspended) and sign overlays",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,15 +360,17 @@ mod tests {
         );
         w(r, "proc/sys/kernel/kexec_load_disabled", b"1\n");
         w(r, "proc/self/mountinfo", b"36 25 0:30 / /sys/fs/bpf rw,nosuid shared:17 - bpf bpf rw,mode=700\n40 25 0:31 / /proc rw - proc proc rw\n");
+        // admin.pub only: the private key went offline
+        w(r, "etc/northnarrow/admin.pub", b"ab unlock\n");
         let checks = run_in(r);
-        assert_eq!(checks.len(), 8);
+        assert_eq!(checks.len(), 9);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
         assert!(
             checks.iter().all(|c| c.status == Status::Ok),
             "{:?}",
             checks
         );
-        assert!(render_table(&checks).contains("8 check(s), 0 warning(s)"));
+        assert!(render_table(&checks).contains("9 check(s), 0 warning(s)"));
     }
 
     #[test]
@@ -356,6 +397,8 @@ mod tests {
         );
         w(r, "proc/sys/kernel/kexec_load_disabled", b"0\n");
         w(r, "proc/self/mountinfo", b"36 25 0:30 / /sys/fs/bpf rw shared:17 - bpf bpf rw\n37 25 0:32 / /mnt/bpf2 rw - bpf bpf rw\n");
+        // the lab keeps the bootstrap key where install.sh used to write it
+        w(r, "etc/northnarrow/admin.key", b"0123456789abcdef\n");
         let checks = run_in(r);
         let by_id = |id: &str| checks.iter().find(|c| c.id == id).unwrap().status;
         assert_eq!(by_id("bpf_lsm"), Status::Ok);
@@ -366,20 +409,25 @@ mod tests {
         assert_eq!(by_id("ima"), Status::Warn);
         assert_eq!(by_id("kexec_load_disabled"), Status::Warn);
         assert_eq!(by_id("bpffs"), Status::Warn);
-        assert_eq!(warn_count(&checks), 5);
+        assert_eq!(by_id("admin_key"), Status::Warn);
+        assert_eq!(warn_count(&checks), 6);
         let table = render_table(&checks);
         assert!(table.contains("fix: boot with `lockdown=integrity`"));
         assert!(table.contains("mounted 2×"));
+        assert!(table.contains("/etc/northnarrow/admin.key"));
     }
 
     #[test]
     fn empty_tree_is_unknown_not_warn_except_bpffs() {
         let d = tempfile::tempdir().unwrap();
         let checks = run_in(d.path());
-        // nothing readable: every check is Unknown except bpffs (no mount = Warn)
+        // nothing readable: every check is Unknown except bpffs (no mount =
+        // Warn) and admin_key (no key file = Ok)
         for c in &checks {
             if c.id == "bpffs" {
                 assert_eq!(c.status, Status::Warn);
+            } else if c.id == "admin_key" {
+                assert_eq!(c.status, Status::Ok);
             } else {
                 assert_eq!(c.status, Status::Unknown, "{}", c.id);
             }
@@ -408,5 +456,30 @@ mod tests {
             b"[none] integrity confidentiality\n",
         );
         assert_eq!(module_sig_enforce(r).status, Status::Warn);
+    }
+
+    /// External audit DEP-001: both bootstrap locations are found, an empty
+    /// or non-regular entry is not a key.
+    #[test]
+    fn admin_private_keys_on_the_host_are_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        assert!(admin_keys_on_host(r).is_empty());
+        w(r, "root/northnarrow-admin.key", b"");
+        std::fs::create_dir_all(r.join("etc/northnarrow/admin.key")).unwrap();
+        assert!(
+            admin_keys_on_host(r).is_empty(),
+            "empty file or a directory"
+        );
+        w(r, "root/northnarrow-admin.key", b"k\n");
+        assert_eq!(admin_keys_on_host(r), vec!["/root/northnarrow-admin.key"]);
+        std::fs::remove_dir(r.join("etc/northnarrow/admin.key")).unwrap();
+        w(r, "etc/northnarrow/admin.key", b"k\n");
+        let c = admin_key(r);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.value,
+            "/etc/northnarrow/admin.key, /root/northnarrow-admin.key"
+        );
     }
 }

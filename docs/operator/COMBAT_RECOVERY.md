@@ -17,15 +17,24 @@ back, and the safety nets that keep you from being locked out.
 Releasing COMBAT requires an **Ed25519 admin key**. On a fresh install
 `install.sh` bootstraps one (`nn-admin init`) if `/etc/northnarrow/admin.pub`
 is absent, and prints a loud warning: the **private** half is written
-to `/etc/northnarrow/admin.key` and you **must move it off the host**:
+to `/root/northnarrow-admin.key` (`--admin-key-out PATH` to choose another
+place — never under `/etc/northnarrow` or `/var/lib/northnarrow`, which
+`install.sh` refuses) and you **must move it off the host**:
 
 ```sh
-mv /etc/northnarrow/admin.key  <secure-offline-location>
+mv /root/northnarrow-admin.key  <secure-offline-location>
 ```
 
 Leaving the private key on the host means anyone with root on that host
-can release COMBAT — defeating containment. Keep only `admin.pub` on the
-host.
+can release COMBAT, open a trusted-installer window (the anti-tamper
+suspended) and sign overlays — defeating containment. Keep only
+`admin.pub` on the host. While a key sits at `/root/northnarrow-admin.key`
+or `/etc/northnarrow/admin.key` (where installs before external audit
+DEP-001 wrote it), the agent records it at every start and while it stays
+(`integrity_drift`, kind `admin_key_on_host`, signed) and
+`nn-admin host-check` reports `WARN admin_key`. Nothing on the host uses
+that key on its own: upgrades and removals take it only when you pass it
+(`--grant-key`, `NN_GRANT_KEY`).
 
 > If `admin.pub` does not exist, COMBAT is **unrecoverable** except by
 > reboot. Always provision an admin key.
@@ -179,7 +188,7 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 
 | Situation | Action |
 |-----------|--------|
-| Provision admin key | `install.sh` auto-bootstraps; **move `admin.key` offline** |
+| Provision admin key | `install.sh` auto-bootstraps; **move `/root/northnarrow-admin.key` offline** |
 | Avoid remote lockout | `nn-admin config overlay set combat-allow --file <cidrs> --key <config-manage key>` |
 | Check state | `nn-admin status` |
 | Release COMBAT | `nn-admin unlock --key <admin.key>` |

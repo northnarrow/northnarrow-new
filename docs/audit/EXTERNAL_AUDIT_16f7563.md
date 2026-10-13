@@ -105,7 +105,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-068 | WDG-002 | Watchdog tooling | M | fixed (lab PR 89) |
 | NN-AUD-069 | WDG-003 | Watchdog tooling | M | fixed (lab PR 89) |
 | NN-AUD-071 | WDG-005 | Watchdog tooling | M | fixed (lab PR 85, with NN-AUD-070) |
-| NN-AUD-072 | DEP-001 | Deploy | M | open |
+| NN-AUD-072 | DEP-001 | Deploy | M | fixed (lab PR 96) |
 | NN-AUD-073 | DEP-002 | Deploy | M | fixed (lab PR 93) |
 | NN-AUD-074 | DEP-003 | Deploy | M | fixed (lab PR 92, with NN-AUD-011) |
 | NN-AUD-075 | SUP-003 | Supply chain | M | open |
@@ -859,3 +859,55 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     preloaded) and C38 (a watchdog restarted in a window registers itself);
     `respawn-check` OK; privileged gate (`test-ignored`, 24.04): 27 suites,
     63 passed, 0 failed.
+- **NN-AUD-072 (DEP-001), lab PR 96.** `install.sh` wrote the private half
+  of the bootstrap admin key to `/etc/northnarrow/admin.key` with every role
+  the product has (`unlock,audit-read,trusted-installer,config-manage`),
+  only a banner asked the operator to move it, nothing checked that it had
+  gone — and the package hooks fell back to it on their own, so every
+  `apt upgrade` / `dpkg -i` / `rpm -U` opened the trusted-installer window
+  (the anti-tamper suspended, the pin root removable) with whatever key
+  root could read. Root on the host read one file and held the whole
+  control plane.
+  - The fallback is gone: the package hooks take the key from
+    `NN_GRANT_KEY` only, or find a window the operator opened first.
+  - A fresh install writes the private key outside the product's trees:
+    `/root/northnarrow-admin.key` by default, `--admin-key-out PATH`
+    otherwise; a path under `/etc/northnarrow` or `/var/lib/northnarrow` is
+    refused (those trees are backed up, kept in etckeeper, and read by
+    tooling that would pick a key up from there). An existing file at that
+    path is never overwritten. `uninstall.sh --purge` removes it, as it
+    removed the key inside `/etc/northnarrow` before.
+  - Reported while it stays: `nn-admin host-check` has a new `admin_key`
+    check (WARN with the path, both locations), and the agent's integrity
+    check records `admin_key_on_host` at boot and whenever a key appears
+    there (ERROR + signed `integrity_drift`), seen through PID 1's mount
+    namespace.
+  - The audit's third point (cut the bootstrap key's roles to
+    `unlock,audit-read`) is rejected, as the audit itself concluded: it
+    would break the documented `install.sh --upgrade --grant-key` /
+    `uninstall.sh --grant-key` path (registry entry 19,
+    `install-key-roles-doc-1`).
+  - Lab scripts find the lab key at either path (new installs:
+    `/root/northnarrow-admin.key`; guests installed before:
+    `/etc/northnarrow/admin.key`). `pkg-check` passes `NN_GRANT_KEY` and
+    first checks that a package operation over a running install WITHOUT it
+    is refused; `uninstall-check` checks that the purge removed the key and
+    that the reinstall wrote a new one outside `/etc/northnarrow`.
+    `upgrade-check` and `uninstall-check` now run `install.sh` /
+    `uninstall.sh` at a pty (`script`): R009 (PROC-007) sanctions a root
+    exec from a home directory only in an administrator's sudo session at a
+    terminal, and killed both scripts run over a non-interactive ssh.
+    `pkg-check` waits for the dpkg lock (unattended-upgrades took it once).
+  - Lab, Ubuntu 22.04. Before: `pkg-check` (2026-10-11) installed, upgraded
+    and removed the package over a running install without being given a
+    key — the hooks took `/etc/northnarrow/admin.key` on their own. After:
+    on a guest installed before the fix, `nn-admin host-check` reports
+    `WARN admin_key /etc/northnarrow/admin.key` and the agent records
+    `integrity_drift` / `admin_key_on_host` at boot (signed); a fresh
+    install writes `/root/northnarrow-admin.key` (0600) and nothing in
+    `/etc/northnarrow`, reported the same way; `upgrade-check` opens the
+    window with it; `uninstall-check` (purge) removes it and the reinstall
+    writes a new one; `pkg-check` PASS (28/28) with the new step 0 —
+    `dpkg -i` over a running install without `NN_GRANT_KEY` is refused and
+    the units are untouched; the anti-tamper suite's window cases (C23,
+    C24, C38) pass with the key at the new path.
