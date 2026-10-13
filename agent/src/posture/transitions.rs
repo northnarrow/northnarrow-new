@@ -21,6 +21,10 @@ use super::state::PostureState;
 pub const ALERTED_DECAY: Duration = Duration::from_secs(60 * 60);
 /// 24 hours: ENGAGED -> ALERTED decay window.
 pub const ENGAGED_DECAY: Duration = Duration::from_secs(24 * 60 * 60);
+/// External audit POS-001: an unlocked COMBAT (heuristic evidence only)
+/// decays to ENGAGED after this long without a new escalation signal,
+/// twice the corroboration window. A locked COMBAT never decays.
+pub const COMBAT_QUIET_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Apply `trigger` to `state`, returning the new state.
 ///

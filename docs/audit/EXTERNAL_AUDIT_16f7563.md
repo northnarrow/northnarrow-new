@@ -27,7 +27,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | ID | Audit ref | Severity | Area | File | Status |
 |---|---|---|---|---|---|
 | NN-AUD-001 | PROC-001 | Critical | Process rules | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs` | fixed (lab PR 79) |
-| NN-AUD-002 | POS-001 | Critical | Posture | `agent/src/posture/mod.rs` | open |
+| NN-AUD-002 | POS-001 | Critical | Posture | `agent/src/posture/mod.rs` | fixed (lab PR 80) |
 | NN-AUD-003 | LLMP-002 | Critical | LLM prompts | `agent/src/ade/structured_prompt.rs` | fixed (lab PR 81) |
 | NN-AUD-004 | LLMR-002 | Critical | LLM runtime | `agent/src/ade/mod.rs` | open |
 | NN-AUD-005 | NET-001 | Critical | Network | `agent/src/net/blocklist.rs` | fixed (lab PR 78) |
@@ -141,3 +141,43 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   rule-only mode there. The prompt builder, the sanitizer and the
   verifier are pure code; they are covered by unit tests and by
   end-to-end `evaluate` tests over scripted backends.
+- **NN-AUD-002 (POS-001), lab PR 80.** Two heuristic signals of
+  different trigger types corroborated each other into a locked COMBAT,
+  and every heuristic is cheap for an unprivileged user. An update's
+  twenty HTTPS connections followed by three internal SSH sessions
+  reached COMBAT. Its ladder could then isolate the host, and only a
+  signed release ended it.
+  - **Corroboration needs two kinds of evidence**: network, execution,
+    file system, kernel. The mass-write arm of ConfirmedIntrusion counts
+    as file system, so snapd's state rewrite and its unit write (the
+    2026-06-02 self-lock) are one kind.
+  - **COMBAT on heuristics alone is unlocked.** The ladder contains at
+    the process level, refuses ISOLATE (a signed audit entry says why)
+    and the posture decays to ENGAGED after 30 minutes without a new
+    escalation signal. The ladder stands down with it.
+  - **COMBAT is locked** — isolation allowed, no decay, signed release —
+    on a kernel-adjudicated denial, on root changing a system file
+    outside an administrator's session, or when an administrator forces
+    it. An isolation refused earlier in the episode runs as soon as
+    COMBAT locks.
+  - **Where this departs from the audit's fix.** It proposed that no two
+    signals an unprivileged user can forge corroborate. The only signal
+    such a user cannot forge (AntiTamperDenial) reaches COMBAT alone, so
+    the corroboration path would have been dead. Here the kind of
+    evidence gates COMBAT, and privilege gates isolation.
+  - **Lab, Ubuntu 24.04 (6.8) and AlmaLinux 9 (5.14).** The exfiltration
+    burst and the internal SSH fan-out each raised ENGAGED, in either
+    order, and together stayed there. A binary run from /tmp, then an
+    exfiltration burst through an `ssh -D` tunnel from the same session,
+    reached COMBAT with `locked=false`. On 24.04 the offender was the
+    session's sshd, which the ladder spares; it escalated to ISOLATE and
+    refused it, and the host stayed reachable. Before the fix, that
+    sequence isolated the host. On AlmaLinux (OpenSSH 9.9, sessions run
+    `sshd-session`) the offender was killed and contained, with no
+    isolation. On 24.04, thirty minutes after the last signal, the
+    unlocked COMBAT decayed to ENGAGED and the ladder stood down. In a
+    new episode, after the refused isolation, root's attempt to delete
+    the agent binary was denied by the kernel; COMBAT locked, and the
+    next ladder tick isolated the host. The signed audit log shows the
+    refusal at 00:37:07 and the isolation at 00:37:24, "COMBAT since
+    locked on non-heuristic evidence".

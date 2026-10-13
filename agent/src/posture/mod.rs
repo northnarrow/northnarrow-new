@@ -50,7 +50,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, RwLock};
 
 use common::ade_types::AdeVerdict;
-use common::posture_types::{Confidence, PostureKind, PostureTransition, TriggerType};
+use common::posture_types::{
+    Confidence, EvidenceClass, PostureKind, PostureTransition, TriggerType,
+};
 use common::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
@@ -114,6 +116,9 @@ struct Inner {
     /// release. `None` if no admin action has occurred since boot.
     /// Read by `StatusResponse` via [`PostureMachine::last_admin_action_secs_ago`].
     last_admin_action: Mutex<Option<Instant>>,
+    /// External audit POS-001: run when an unlocked COMBAT decays (the
+    /// agent stands the ladder down). Set once at boot.
+    combat_decay_hook: std::sync::OnceLock<CombatEntryHook>,
 }
 
 impl PostureMachine {
@@ -275,8 +280,25 @@ impl PostureMachine {
                 combat_entry_hook,
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),
+                combat_decay_hook: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// External audit POS-001: COMBAT on evidence an unprivileged user
+    /// cannot produce (or forced by an administrator) — the only COMBAT in
+    /// which the ladder may isolate the host.
+    pub fn is_combat_locked(&self) -> bool {
+        matches!(
+            *self.inner.state.read(),
+            PostureState::Combat { locked: true, .. }
+        )
+    }
+
+    /// External audit POS-001: run `hook` when an unlocked COMBAT decays.
+    /// Set once; a second call is ignored.
+    pub fn on_combat_decay(&self, hook: CombatEntryHook) {
+        let _ = self.inner.combat_decay_hook.set(hook);
     }
 
     /// Snapshot of the current posture state.
@@ -355,7 +377,7 @@ impl PostureMachine {
                 let level = if t.target_level() == PostureKind::Combat
                     && t.confidence() == Confidence::NeedsCorroboration
                 {
-                    if ledger.corroborated(t, scope) {
+                    if ledger.corroborated_as(t, triggers::evidence_class(t, event), scope) {
                         PostureKind::Combat
                     } else {
                         PostureKind::Engaged
@@ -379,6 +401,29 @@ impl PostureMachine {
                 firing = Some(t);
             }
             current = next;
+        }
+
+        // External audit POS-001 (NN-AUD-002): COMBAT is LOCKED — no decay,
+        // a signed release, and the ladder may isolate the host — only on
+        // evidence an unprivileged user cannot produce: a kernel-adjudicated
+        // signal, or root changing a system file outside an administrator's
+        // interactive session. COMBAT reached on heuristics alone (two
+        // patterns any user can trigger) is unlocked: the ladder stays at
+        // the process level and the posture decays once quiet.
+        let file_system =
+            |t: &TriggerType| triggers::evidence_class(*t, event) == EvidenceClass::FileSystem;
+        let root_change =
+            triggers::event_uid(event) == Some(0) && escalation_now.iter().any(file_system);
+        let privileged_now = root_change && admin_change == Some(false);
+        let mut lock_acquired = false;
+        if let PostureState::Combat { since, .. } = current {
+            let was_locked = matches!(*guard, PostureState::Combat { locked: true, .. });
+            let locked = was_locked
+                || hits.iter().any(|t| t.confidence() == Confidence::Decisive)
+                || privileged_now
+                || ledger.has_privileged(scope);
+            lock_acquired = locked && !was_locked && before == PostureKind::Combat;
+            current = PostureState::Combat { since, locked };
         }
 
         // Record this round's escalation signals AFTER the decision, so
@@ -406,8 +451,16 @@ impl PostureMachine {
                 triggers::event_owner_pid(event),
             ) {
                 (true, Some(true), _) => {}
-                (true, None, Some(writer)) => ledger.record_pending(*t, now, scope, writer),
-                _ => ledger.record(*t, now, scope),
+                (true, None, Some(writer)) => {
+                    ledger.record_pending(*t, now, scope, writer, root_change && file_system(t))
+                }
+                _ => ledger.record_with(
+                    *t,
+                    triggers::evidence_class(*t, event),
+                    now,
+                    scope,
+                    privileged_now && file_system(t),
+                ),
             }
         }
         drop(ledger);
@@ -415,6 +468,13 @@ impl PostureMachine {
         let after = current.kind();
         *guard = current.clone();
         drop(guard);
+        if lock_acquired {
+            tracing::warn!(
+                triggers = %describe_triggers(&hits),
+                "COMBAT locked: evidence an unprivileged user cannot produce — the ladder may \
+                 isolate the host, and only a signed release ends COMBAT"
+            );
+        }
 
         if after != before {
             self.log_transition(before, after, firing, describe_triggers(&hits));
@@ -444,8 +504,44 @@ impl PostureMachine {
     /// Apply decay if the appropriate window has elapsed. Returns
     /// `Some(new_state)` if a transition fired.
     pub fn tick_decay(&self) -> Option<PostureState> {
-        let now = Instant::now();
+        self.tick_decay_at(Instant::now())
+    }
+
+    /// [`Self::tick_decay`] as of `now`.
+    ///
+    /// External audit POS-001: an unlocked COMBAT (heuristic evidence
+    /// only) decays to ENGAGED once no escalation signal has been recorded
+    /// for [`transitions::COMBAT_QUIET_WINDOW`]; the decay hook stands the
+    /// ladder down. A locked COMBAT never decays.
+    pub fn tick_decay_at(&self, now: Instant) -> Option<PostureState> {
         let mut guard = self.inner.state.write();
+        if let PostureState::Combat {
+            since,
+            locked: false,
+        } = *guard
+        {
+            let newest = self.inner.corroboration.lock().newest();
+            let quiet_since = newest.map_or(since, |n| n.max(since));
+            if now.saturating_duration_since(quiet_since) < transitions::COMBAT_QUIET_WINDOW {
+                return None;
+            }
+            let next = PostureState::Engaged {
+                since: now,
+                last_trigger: now,
+            };
+            *guard = next.clone();
+            drop(guard);
+            self.log_transition(
+                PostureKind::Combat,
+                PostureKind::Engaged,
+                None,
+                "unlocked COMBAT (heuristic evidence only) quiet: decay COMBAT -> ENGAGED".into(),
+            );
+            if let Some(hook) = self.inner.combat_decay_hook.get() {
+                hook();
+            }
+            return Some(next);
+        }
         let before = guard.kind();
         let next = transitions::apply_decay(&guard, now)?;
         let after = next.kind();

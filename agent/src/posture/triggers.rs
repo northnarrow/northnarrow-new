@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use common::posture_types::TriggerType;
+use common::posture_types::{EvidenceClass, TriggerType};
 use common::Event;
 
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
@@ -475,6 +475,33 @@ fn within(focal_ts: u64, ts: u64, window_ns: u64) -> bool {
 /// PID an event is attributed to, for self-exclusion. Variants the
 /// agent itself never originates (e.g. `CanaryTripped`, `NetFlow`,
 /// `NetListener`) return `None` so they are never filtered.
+/// External audit POS-001: the kind of evidence `trigger`, raised on
+/// `event`, is — [`TriggerType::evidence_class`], except that the
+/// mass-write arm of `ConfirmedIntrusion` is file-system evidence, not
+/// execution. (snapd's state rewrite and its unit write, the 2026-06-02
+/// self-lock, are one kind of behaviour.)
+pub fn evidence_class(trigger: TriggerType, event: &Event) -> EvidenceClass {
+    match (trigger, event) {
+        (TriggerType::ConfirmedIntrusion, Event::MassWrite { .. } | Event::FileOpen { .. }) => {
+            EvidenceClass::FileSystem
+        }
+        _ => trigger.evidence_class(),
+    }
+}
+
+/// External audit POS-001: the uid an event's process acted as, where the
+/// event carries one.
+pub fn event_uid(event: &Event) -> Option<u32> {
+    match event {
+        Event::ProcessSpawn { uid, .. }
+        | Event::FileOpen { uid, .. }
+        | Event::MassWrite { uid, .. }
+        | Event::TcpConnect { uid, .. }
+        | Event::DnsQuery { uid, .. } => Some(*uid),
+        _ => None,
+    }
+}
+
 /// PID that "owns" an event — the actor whose behaviour the event
 /// attributes. Exposed so the COMBAT ladder can attribute the offending
 /// process from the focal event that drove the COMBAT transition.

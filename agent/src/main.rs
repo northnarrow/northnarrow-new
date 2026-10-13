@@ -1819,28 +1819,42 @@ async fn main() -> Result<()> {
     // then publish it to the slot the posture combat hooks read. Driven
     // from three places: the combat-entry hook (above), `process_event`
     // (offender context + per-event jump-ahead), and the tick below.
-    let ladder = Arc::new(northnarrow_agent::combat::CombatLadder::new(
-        Box::new(northnarrow_agent::combat::SystemActuator::new(
-            executor.clone(),
-            isolator.clone(),
-            detect_only,
-        )),
-        Box::new(northnarrow_agent::combat::AuditEvidence::new(
-            audit_log.clone(),
-        )),
-        // Never kill / net-cut PID 1, the agent, its watchdog, or sshd —
-        // skip + escalate to ISOLATE instead. Reuses the same `exempt`
-        // handle the posture machine holds (so the watchdog PID stays the
-        // timer-refreshed value) plus the same `--watchdog-exe` the refresh
-        // task verifies against, so the watchdog branch can re-check
-        // /proc/<pid>/exe inline at the kill/spare decision.
-        Box::new(northnarrow_agent::combat::SystemProtectedProcs::new(
-            executor.own_pid(),
-            exempt.clone(),
-            cli.resolved_watchdog_exe(),
-        )),
-        northnarrow_agent::combat::LadderConfig::default(),
-    ));
+    let ladder = Arc::new(
+        northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                executor.clone(),
+                isolator.clone(),
+                detect_only,
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(
+                audit_log.clone(),
+            )),
+            // Never kill / net-cut PID 1, the agent, its watchdog, or sshd —
+            // skip + escalate to ISOLATE instead. Reuses the same `exempt`
+            // handle the posture machine holds (so the watchdog PID stays the
+            // timer-refreshed value) plus the same `--watchdog-exe` the refresh
+            // task verifies against, so the watchdog branch can re-check
+            // /proc/<pid>/exe inline at the kill/spare decision.
+            Box::new(northnarrow_agent::combat::SystemProtectedProcs::new(
+                executor.own_pid(),
+                exempt.clone(),
+                cli.resolved_watchdog_exe(),
+            )),
+            northnarrow_agent::combat::LadderConfig::default(),
+        )
+        // External audit POS-001 (NN-AUD-002): ISOLATE only in a locked COMBAT
+        // (non-heuristic evidence, or forced by an administrator).
+        .with_isolation_gate({
+            let posture = posture.clone();
+            move || posture.is_combat_locked()
+        }),
+    );
+    // External audit POS-001: an unlocked COMBAT decays once quiet; the
+    // ladder stands down with it (lifts the per-PID egress blocks).
+    {
+        let ladder = Arc::clone(&ladder);
+        posture.on_combat_decay(Arc::new(move || ladder.stand_down(Instant::now())));
+    }
     // combat-avail-2: the same host-critical knowledge the ladder uses to
     // spare attributed offenders must also spare the /proc DESCENDANTS a
     // KillProcessTree walk reaps (an sshd or the watchdog under an
@@ -2697,8 +2711,10 @@ async fn main() -> Result<()> {
     }
 
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
-    // idle, ENGAGED→ALERTED after 24h idle). COMBAT never decays
-    // here; it requires an admin-signed release. The 60 s cadence is
+    // idle, ENGAGED→ALERTED after 24h idle, and — external audit POS-001 —
+    // an unlocked COMBAT, reached on heuristics alone, to ENGAGED after
+    // 30 min without a new escalation signal). A locked COMBAT never
+    // decays; it requires an admin-signed release. The 60 s cadence is
     // a coarse heartbeat, not a precise deadline.
     let posture_decay = posture.clone();
     tokio::spawn(async move {
@@ -2971,6 +2987,9 @@ async fn process_event(
         // because the kind() display alone is enough to follow state.
         warn!(
             state = %new_state.kind(),
+            // External audit POS-001: a COMBAT reached on heuristics alone
+            // is unlocked — no isolation, and it decays once quiet.
+            locked = new_state.is_combat_locked(),
             trigger = ?firing_trigger,
             "POSTURE TRANSITION"
         );

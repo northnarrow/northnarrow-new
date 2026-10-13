@@ -581,3 +581,82 @@ fn jump_ahead_on_protected_offender_escalates_to_isolate() {
     );
     assert!(log.iter().any(|e| e == "isolate"), "{log:?}");
 }
+
+// ── External audit POS-001 (NN-AUD-002): ISOLATE only in a locked COMBAT ──
+#[test]
+fn isolation_waits_for_a_locked_combat() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let win = Duration::from_secs(30);
+    let (l, rec) = ladder(
+        NeutralizeOutcome::Uncontainable {
+            reason: "respawns via supervisor".to_string(),
+        },
+        win,
+    );
+    let locked = Arc::new(AtomicBool::new(false));
+    let l = l.with_isolation_gate({
+        let locked = Arc::clone(&locked);
+        move || locked.load(Ordering::SeqCst)
+    });
+    let t0 = Instant::now();
+    l.engage(Some(1234), Some(TriggerType::ExfiltrationPattern), t0);
+    l.tick(t0 + win + Duration::from_secs(1));
+    l.tick(t0 + win + Duration::from_secs(6));
+
+    // Heuristic COMBAT: the offender is neutralized, the isolation it
+    // would have escalated to is refused (recorded once), and the host
+    // stays on the network.
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    let log = rec.log();
+    assert!(log.iter().any(|e| e.starts_with("neutralize")), "{log:?}");
+    assert!(!log.iter().any(|e| e == "isolate"), "{log:?}");
+    assert_eq!(
+        log.iter()
+            .filter(|e| *e == "audit:NEUTRALIZE->NEUTRALIZE")
+            .count(),
+        1,
+        "the refusal is recorded once: {log:?}"
+    );
+
+    // The posture locks COMBAT on later evidence: the next tick isolates,
+    // once, evidence first.
+    locked.store(true, Ordering::SeqCst);
+    l.tick(t0 + win + Duration::from_secs(11));
+    l.tick(t0 + win + Duration::from_secs(16));
+    assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
+    let log = rec.log();
+    assert_eq!(log.iter().filter(|e| *e == "isolate").count(), 1, "{log:?}");
+    let audit_idx = log
+        .iter()
+        .position(|e| e == "audit:NEUTRALIZE->ISOLATE")
+        .expect("ISOLATE stage audit must be recorded");
+    let isolate_idx = log.iter().position(|e| e == "isolate").unwrap();
+    assert!(audit_idx < isolate_idx, "{log:?}");
+}
+
+/// External audit POS-001: an unlocked COMBAT that decays stands the
+/// ladder down; a deferred isolation does not survive it.
+#[test]
+fn stand_down_drops_a_deferred_isolation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let win = Duration::from_secs(30);
+    let (l, rec) = ladder(
+        NeutralizeOutcome::Uncontainable {
+            reason: "respawns via supervisor".to_string(),
+        },
+        win,
+    );
+    let locked = Arc::new(AtomicBool::new(false));
+    let l = l.with_isolation_gate({
+        let locked = Arc::clone(&locked);
+        move || locked.load(Ordering::SeqCst)
+    });
+    let t0 = Instant::now();
+    l.engage(Some(1234), Some(TriggerType::ExfiltrationPattern), t0);
+    l.tick(t0 + win + Duration::from_secs(1));
+    l.stand_down(t0 + win + Duration::from_secs(2));
+    locked.store(true, Ordering::SeqCst);
+    l.tick(t0 + win + Duration::from_secs(6));
+    assert_eq!(l.current_stage(), None);
+    assert!(!rec.log().iter().any(|e| e == "isolate"), "{:?}", rec.log());
+}
