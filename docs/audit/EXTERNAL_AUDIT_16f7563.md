@@ -68,7 +68,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
 | NN-AUD-019 | EBPF-010 | eBPF kernel | M | open |
 | NN-AUD-020 | EVD-001 | Evidence logs | L | open |
-| NN-AUD-021 | EVD-005 | Evidence logs | M | open |
+| NN-AUD-021 | EVD-005 | Evidence logs | M | fixed (lab PR 90) |
 | NN-AUD-022 | EVD-021 | Evidence logs | M | fixed (lab PR 88) |
 | NN-AUD-023 | FIMR-001 | FIM rules | M | open |
 | NN-AUD-024 | FIMR-002 | FIM rules | M | fixed (lab PR 75, review 85) |
@@ -94,13 +94,13 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-050 | CMB-006 | Combat response | M | open |
 | NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
 | NN-AUD-055 | LLMR-012 | LLM runtime | M | fixed (lab PR 87) |
-| NN-AUD-057 | NET-003 | Network | M | open |
+| NN-AUD-057 | NET-003 | Network | M | fixed (lab PR 90) |
 | NN-AUD-058 | NET-004 | Network | M | open |
 | NN-AUD-061 | DEC-001 | Deception | M | fixed (lab PR 84, with Wave 0) |
 | NN-AUD-062 | DEC-002 | Deception | M | fixed (lab PR 84, with Wave 0) |
 | NN-AUD-064 | DEC-004 | Deception | M | open |
 | NN-AUD-065 | DEC-005 | Deception | M | open |
-| NN-AUD-066 | DEC-006 | Deception | L | open |
+| NN-AUD-066 | DEC-006 | Deception | L | fixed (lab PR 90) |
 | NN-AUD-067 | WDG-001 | Watchdog tooling | M | fixed (lab PR 88) |
 | NN-AUD-068 | WDG-002 | Watchdog tooling | M | fixed (lab PR 89) |
 | NN-AUD-069 | WDG-003 | Watchdog tooling | M | fixed (lab PR 89) |
@@ -568,3 +568,45 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     watchdog refused the decoy in `agent.pid` (ERROR on
     `watchdog.tamper`, start refused) and came up on its own once the
     pidfile named the agent again.
+- **NN-AUD-021, NN-AUD-057, NN-AUD-066 (EVD-005, NET-003, DEC-006), lab
+  PR 90.** The append-only chain logs outside `RotatingChainLog` were
+  read strictly at open: one unreadable line made the open fail, and the
+  callers turned that into a subsystem switched off (the agent refusing
+  to start, the network drain not spawned, deception disabled).
+  - `chainlog::repair_torn_tail`: only the final fragment after the last
+    newline — the signature of a write cut short — is repaired: given its
+    newline back when it parses as a whole line, otherwise cut off. A
+    file with no complete line is refused and left untouched, so a
+    repair never empties a chain (the audit's warning about
+    `recover_tail` truncating to GENESIS). Complete lines before the end
+    are never touched.
+  - `audit.log`: repaired at `AuditLog::open` and attested in the chain
+    itself (`chain_tail_repaired`: file, dropped length, dropped bytes'
+    SHA-256). A bad complete line before the end still refuses the log
+    and stays fatal in enforce mode, as the audit recommends: the
+    evidence is left for the operator.
+  - `netflow_listeners.jsonl`: repaired at open and attested by `main`.
+    The drain now takes the listener log as optional: if it cannot be
+    opened, flows and listener events still reach the rules. Not
+    changed: the file still has no rotation (`RotatingChainLog`
+    migration noted for later).
+  - Canary registry and access log: repaired at open; an unreadable line
+    elsewhere is skipped and counted, `main` records it as a signed
+    `integrity_drift` (`chain_lines_unreadable`), and the readable
+    canaries stay deployed and watched. Appends resume after the last
+    readable line, so an off-host verifier sees the gap the attestation
+    explains.
+  - Lab, Ubuntu 22.04. With agent and watchdog stopped, root cannot
+    modify these files (the pinned hooks keep protecting them), so the
+    power-loss state was reproduced by unmounting bpffs first. Before (the
+    build in place): a torn fragment at the end of `audit.log` kept the
+    agent from starting at every attempt ("Refusing to run unaudited");
+    with `audit.log` restored, the torn listener log left "net: drain
+    loop not spawned" and a garbage line in `canaries.jsonl` "canary
+    registry open failed — rule engine sees no CanaryTripped events".
+    After, on the same corrupted files: the agent started; the signed
+    chain holds `chain_tail_repaired` for `audit.log` (38 bytes cut,
+    447,661 bytes of complete lines kept) and for the listener log (50
+    bytes cut), and `integrity_drift`/`chain_lines_unreadable` for
+    `canaries.jsonl` (1 line skipped); the journal shows "canary indexes
+    rebuilt from registry canaries=2" and "net: drain loop spawned".

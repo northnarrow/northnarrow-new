@@ -426,6 +426,14 @@ impl AuditLog {
     /// `nn-admin audit verify` (later commit) is the
     /// signature-checking reader.
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
+        // External audit EVD-005: a last write cut short (crash, power
+        // loss) left a fragment that `read_tail` refused, and the agent
+        // would not start again in enforce mode. Only that fragment is
+        // repaired — and attested below; a bad line before the end is
+        // corruption and still refuses the log, untouched.
+        let repair = crate::chainlog::repair_torn_tail(path, |l| {
+            serde_json::from_slice::<AuditEntry>(l).is_ok()
+        })?;
         let (last_hash, previous_run) = read_tail(path)?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
@@ -441,14 +449,75 @@ impl AuditLog {
                     })?;
             }
         }
-        Ok(Self {
+        let mut log = Self {
             path: path.to_path_buf(),
             io_path: crate::anchored::anchor(path),
             key,
             agent_id,
             last_hash,
             previous_run,
+        };
+        if let Some(r) = repair {
+            log.attest_tail_repair(path, &r)?;
+        }
+        Ok(log)
+    }
+
+    /// Record in the signed chain that `file`'s torn last write was
+    /// repaired ([`crate::chainlog::repair_torn_tail`]): what was dropped
+    /// is fingerprinted, so a boot repair can be told from tampering.
+    pub fn attest_tail_repair(
+        &mut self,
+        file: &Path,
+        repair: &crate::chainlog::TailRepair,
+    ) -> Result<()> {
+        tracing::warn!(
+            file = %file.display(),
+            detail = %repair.describe(),
+            "chain log: torn last write repaired"
+        );
+        self.append(AuditEntryDraft {
+            op: CHAIN_TAIL_REPAIRED_OP.to_string(),
+            extra: serde_json::json!({
+                "file": file.display().to_string(),
+                "detail": repair.describe(),
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "repaired".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
         })
+        .map(|_| ())
+        .context("audit log: chain_tail_repaired entry")
+    }
+
+    /// Record in the signed chain that `file` holds lines that could not
+    /// be read and were skipped (external audit DEC-006: the subsystem
+    /// keeps working on the readable ones instead of switching off).
+    pub fn attest_skipped_lines(&mut self, file: &Path, skipped: usize) -> Result<()> {
+        tracing::error!(
+            file = %file.display(),
+            skipped,
+            "chain log: unreadable lines skipped — corruption or tampering"
+        );
+        self.append(AuditEntryDraft {
+            op: crate::self_integrity::AUDIT_OP.to_string(),
+            extra: serde_json::json!({
+                "kind": "chain_lines_unreadable",
+                "detail": format!("{}: {skipped} unreadable line(s) skipped at boot", file.display()),
+                "at_boot": true,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        })
+        .map(|_| ())
+        .context("audit log: chain_lines_unreadable entry")
     }
 
     /// How the previous run ended (see [`PreviousRun`]).
@@ -564,6 +633,9 @@ impl AuditLog {
         .context("audit log boot probe (agent_boot entry)")
     }
 }
+
+/// Audit op recording a repaired torn tail of a chain log.
+pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 
 /// Escape hatch: run with an unwritable / unopenable audit log.
 pub const AUDIT_ALLOW_UNWRITABLE_ENV: &str = "NN_AUDIT_ALLOW_UNWRITABLE";
@@ -788,6 +860,46 @@ mod tests {
         let key_path = dir.path().join("agent.sig.key");
         let log_path = dir.path().join("audit.log");
         (dir, key_path, log_path)
+    }
+
+    /// External audit EVD-005: a torn last write no longer keeps the
+    /// agent from starting — it is cut off and attested; a bad complete
+    /// line before the end still refuses the log, which stays untouched.
+    #[test]
+    fn a_torn_last_write_is_repaired_and_attested_mid_file_corruption_is_not() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        log.append(sample_draft(2)).unwrap();
+        let good = fs::read(&log_path).unwrap();
+        // a crash in the middle of the third append
+        let mut torn = good.clone();
+        torn.extend_from_slice(br#"{"ts":"2026-10-13T00:00:00Z","agent_id":"00","op":"x"#);
+        fs::write(&log_path, &torn).unwrap();
+        let log = AuditLog::open(&log_path, key(), [0u8; 16]).expect("opens after a torn write");
+        let body = fs::read_to_string(&log_path).unwrap();
+        assert!(body.starts_with(std::str::from_utf8(&good).unwrap()));
+        let last = body.lines().last().unwrap();
+        assert!(last.contains(CHAIN_TAIL_REPAIRED_OP), "{last}");
+        assert!(last.contains("sha256"), "{last}");
+        drop(log);
+        // the chain still links: every line's prev_hash is the line before's hash
+        let entries: Vec<AuditEntry> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for w in entries.windows(2) {
+            assert_eq!(w[1].prev_hash, w[0].entry_hash);
+        }
+
+        // a complete garbage line mid-file: refused, file untouched
+        let mut mid = good.clone();
+        mid.extend_from_slice(b"not an entry\n");
+        mid.extend_from_slice(&good[..good.iter().position(|&c| c == b'\n').unwrap() + 1]);
+        fs::write(&log_path, &mid).unwrap();
+        assert!(AuditLog::open(&log_path, key(), [0u8; 16]).is_err());
+        assert_eq!(fs::read(&log_path).unwrap(), mid);
     }
 
     #[test]

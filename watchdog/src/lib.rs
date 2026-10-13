@@ -2391,6 +2391,16 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
+        // `spawn` can return before the child has exec'd: until then its
+        // `exe` is this test binary.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runs_binary(child.id(), Path::new("/bin/sleep")).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the child never exec'd /bin/sleep"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::write(&pidfile, format!("{}\n", child.id())).unwrap();
         let (pid, fd) = open_verified_agent(&pidfile, Path::new("/bin/sleep")).unwrap();
         assert_eq!(pid, child.id());

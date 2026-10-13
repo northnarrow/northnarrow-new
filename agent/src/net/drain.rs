@@ -222,10 +222,16 @@ pub struct NetListenerDb {
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
+    tail_repair: Option<crate::chainlog::TailRepair>,
 }
 
 impl NetListenerDb {
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
+        // External audit NET-003: a torn last write used to make every
+        // later open fail, and the network drain never ran again.
+        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
+            serde_json::from_slice::<NetListenerEntry>(l).is_ok()
+        })?;
         let last_hash = read_tail_hash_listener(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
@@ -233,7 +239,13 @@ impl NetListenerDb {
             key,
             agent_id,
             last_hash,
+            tail_repair,
         })
+    }
+
+    /// The torn tail repaired at open, for the caller to attest once.
+    pub fn take_tail_repair(&mut self) -> Option<crate::chainlog::TailRepair> {
+        self.tail_repair.take()
     }
 
     pub fn append(&mut self, ev: &NetListenerEvent) -> Result<NetListenerEntry> {
@@ -309,7 +321,9 @@ pub async fn drain_loop(
     flow_tracker: Arc<Mutex<FlowTracker>>,
     dns_cache: Arc<DnsCache>,
     netflow_db: Arc<Mutex<NetFlowDb>>,
-    listener_db: Arc<Mutex<NetListenerDb>>,
+    // External audit NET-003: `None` when the listener log cannot be
+    // opened — listener events still reach the rules, unpersisted.
+    listener_db: Option<Arc<Mutex<NetListenerDb>>>,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut close_fd = AsyncFd::new(close_rb)?;
@@ -365,7 +379,7 @@ pub async fn drain_loop(
                 let mut drained = 0u32;
                 while let Some(item) = inner.next() {
                     drained += 1;
-                    process_listen_record(item.as_ref(), &listener_db, &event_tx).await;
+                    process_listen_record(item.as_ref(), listener_db.as_ref(), &event_tx).await;
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -513,7 +527,7 @@ async fn process_close_record(
 
 async fn process_listen_record(
     bytes: &[u8],
-    listener_db: &Arc<Mutex<NetListenerDb>>,
+    listener_db: Option<&Arc<Mutex<NetListenerDb>>>,
     event_tx: &mpsc::Sender<Event>,
 ) {
     let raw: &NetListenRaw = match bytemuck::try_from_bytes(bytes) {
@@ -539,8 +553,10 @@ async fn process_listen_record(
         comm: comm_to_string(&raw.comm),
         exe: None,
     };
-    if let Err(e) = listener_db.lock().append(&ev) {
-        warn!(error = %e, "appending NetListenerEntry to listeners log failed");
+    if let Some(db) = listener_db {
+        if let Err(e) = db.lock().append(&ev) {
+            warn!(error = %e, "appending NetListenerEntry to listeners log failed");
+        }
     }
     if event_tx.send(Event::NetListener(ev)).await.is_err() {
         // bus closed
@@ -655,6 +671,36 @@ mod tests {
     fn fresh_key() -> AgentSigningKey {
         let dir = tempfile::tempdir().unwrap();
         AgentSigningKey::load_or_bootstrap(&dir.path().join("k.sig")).unwrap()
+    }
+
+    /// External audit NET-003: a torn last write of the listener log no
+    /// longer fails every later open (the network drain never started).
+    #[test]
+    fn a_torn_listener_log_reopens_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow_listeners.jsonl");
+        let ev = NetListenerEvent {
+            timestamp_ns: 1,
+            family: 2,
+            bind_addr: "0.0.0.0".parse().unwrap(),
+            bind_port: 8080,
+            proto: 6,
+            pid: 42,
+            uid: 0,
+            comm: "nc".to_string(),
+            exe: None,
+        };
+        let first = {
+            let mut db = NetListenerDb::open(&path, fresh_key(), [0u8; 16]).unwrap();
+            db.append(&ev).unwrap()
+        };
+        let mut body = std::fs::read(&path).unwrap();
+        body.extend_from_slice(br#"{"ts":"2026-10-13T00:00:00Z","timestamp_ns":2,"fam"#);
+        std::fs::write(&path, &body).unwrap();
+        let mut db = NetListenerDb::open(&path, fresh_key(), [0u8; 16]).expect("reopens");
+        assert!(db.take_tail_repair().is_some());
+        assert_eq!(db.last_hash(), first.entry_hash);
+        db.append(&ev).expect("appends continue");
     }
 
     /// BUG-026 migration GATE for netflow: an existing on-disk **v1**

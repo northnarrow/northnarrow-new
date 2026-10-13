@@ -2471,7 +2471,14 @@ async fn main() -> Result<()> {
                     reg_key,
                     agent_id,
                 ) {
-                    Ok(r) => Some(Arc::new(parking_lot::Mutex::new(r))),
+                    Ok(mut r) => {
+                        attest_open_findings(
+                            audit_log.as_ref(),
+                            &cli.canary_registry_file,
+                            r.take_open_findings(),
+                        );
+                        Some(Arc::new(parking_lot::Mutex::new(r)))
+                    }
                     Err(e) => {
                         warn!(
                             error = %e,
@@ -2488,7 +2495,14 @@ async fn main() -> Result<()> {
                     access_key,
                     agent_id,
                 ) {
-                    Ok(a) => Some(Arc::new(parking_lot::Mutex::new(a))),
+                    Ok(mut a) => {
+                        attest_open_findings(
+                            audit_log.as_ref(),
+                            &cli.canary_access_file,
+                            a.take_open_findings(),
+                        );
+                        Some(Arc::new(parking_lot::Mutex::new(a)))
+                    }
                     Err(e) => {
                         warn!(
                             error = %e,
@@ -2635,18 +2649,32 @@ async fn main() -> Result<()> {
         )
         .and_then(|key| NetListenerDb::open(&cli.netflow_listeners_file, key, agent_id))
         {
-            Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+            Ok(mut db) => {
+                if let (Some(r), Some(log)) = (db.take_tail_repair(), audit_log.as_ref()) {
+                    if let Err(e) = log
+                        .lock()
+                        .attest_tail_repair(&cli.netflow_listeners_file, &r)
+                    {
+                        warn!(error = %e, "attesting the listener log repair failed");
+                    }
+                }
+                Some(Arc::new(parking_lot::Mutex::new(db)))
+            }
             Err(e) => {
-                warn!(
+                // External audit NET-003: no longer stops the whole drain —
+                // flows and listener events still reach the rules; only the
+                // listener log is not written.
+                error!(
                     error = %e,
                     path = %cli.netflow_listeners_file.display(),
-                    "netflow_listeners DB open failed — net drain loop will not \
-                     spawn; kernel listen events will be dropped this boot"
+                    "netflow_listeners log cannot be opened — listener events are \
+                     evaluated but not persisted this boot"
                 );
                 None
             }
         };
-        if let (Some(netflow_db), Some(listener_db)) = (netflow_db_opt, listener_db_opt) {
+        if let Some(netflow_db) = netflow_db_opt {
+            let listener_db = listener_db_opt;
             let flow_tracker_for_drain = Arc::clone(&flow_tracker);
             let dns_cache_for_drain = Arc::clone(&dns_cache);
             let event_tx = sensor.event_tx();
@@ -3588,14 +3616,6 @@ async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
     }
 }
 
-/// Beta Step 3: background task that keeps the watchdog PID slot of
-/// `exempt` in sync with the live, exe-verified watchdog.
-///
-/// Re-resolves every 30 s (the first tick fires immediately so the
-/// exemption activates as soon as the watchdog publishes its pidfile).
-/// Logs only on a *change* of verified PID so a steady state doesn't
-/// flood the journal; any non-`Verified` outcome clears the exemption
-/// (fail toward over-triggering).
 /// External audit MAIN-001: remove a former watchdog pid from
 /// PROTECTED_PIDS unless it still runs the watchdog binary.
 fn withdraw_watchdog_pid(
@@ -3620,6 +3640,37 @@ fn withdraw_watchdog_pid(
     }
 }
 
+/// External audit DEC-006 / NET-003: what a chain log's open repaired or
+/// skipped is recorded in the signed audit chain.
+fn attest_open_findings(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    file: &std::path::Path,
+    (repair, skipped): (Option<northnarrow_agent::chainlog::TailRepair>, usize),
+) {
+    let Some(log) = audit_log else {
+        return;
+    };
+    let mut log = log.lock();
+    if let Some(r) = repair {
+        if let Err(e) = log.attest_tail_repair(file, &r) {
+            warn!(error = %e, file = %file.display(), "attesting a chain repair failed");
+        }
+    }
+    if skipped > 0 {
+        if let Err(e) = log.attest_skipped_lines(file, skipped) {
+            warn!(error = %e, file = %file.display(), "attesting skipped chain lines failed");
+        }
+    }
+}
+
+/// Beta Step 3: background task that keeps the watchdog PID slot of
+/// `exempt` in sync with the live, exe-verified watchdog.
+///
+/// Re-resolves every 30 s (the first tick fires immediately so the
+/// exemption activates as soon as the watchdog publishes its pidfile).
+/// Logs only on a *change* of verified PID so a steady state doesn't
+/// flood the journal; any non-`Verified` outcome clears the exemption
+/// (fail toward over-triggering).
 fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_exe: PathBuf) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));

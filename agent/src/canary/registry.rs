@@ -241,6 +241,8 @@ pub struct Registry {
     agent_id: [u8; 16],
     last_hash: String,
     live: BTreeMap<String, CanaryLiveState>,
+    tail_repair: Option<crate::chainlog::TailRepair>,
+    skipped_lines: usize,
 }
 
 impl Registry {
@@ -251,7 +253,14 @@ impl Registry {
     /// for ensuring the parent directory exists with the right
     /// mode; this `open` doesn't create the parent.
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let (last_hash, live) = read_chain(path)?;
+        // External audit DEC-006: one bad line switched deception off for
+        // good. A torn last write is repaired; a line that cannot be read
+        // anywhere else is skipped and reported (`skipped_lines`), and the
+        // canaries that can be read stay deployed and watched.
+        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
+            serde_json::from_slice::<CanaryToken>(l).is_ok()
+        })?;
+        let (last_hash, live, skipped_lines) = read_chain(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
             path: crate::anchored::anchor(path),
@@ -259,7 +268,18 @@ impl Registry {
             agent_id,
             last_hash,
             live,
+            tail_repair,
+            skipped_lines,
         })
+    }
+
+    /// What the open found wrong, for the caller to attest once: the
+    /// torn tail it repaired and the number of unreadable lines skipped.
+    pub fn take_open_findings(&mut self) -> (Option<crate::chainlog::TailRepair>, usize) {
+        (
+            self.tail_repair.take(),
+            std::mem::take(&mut self.skipped_lines),
+        )
     }
 
     /// Deploy a fresh canary. Computes `canary_id` (per-canary
@@ -500,24 +520,27 @@ pub enum RegistryError {
 /// → empty (genesis tail + empty live set). Errors propagate
 /// on malformed lines so a corrupted chain surfaces at open
 /// time rather than at first append.
-fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>)> {
+fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>, usize)> {
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((GENESIS_PREV_HASH.to_string(), BTreeMap::new()));
+            return Ok((GENESIS_PREV_HASH.to_string(), BTreeMap::new(), 0));
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
     let reader = BufReader::new(f);
     let mut last: Option<String> = None;
     let mut live: BTreeMap<String, CanaryLiveState> = BTreeMap::new();
+    let mut skipped = 0usize;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
             continue;
         }
-        let entry: CanaryToken =
-            serde_json::from_str(&line).with_context(|| format!("parsing canary line: {line}"))?;
+        let Ok(entry) = serde_json::from_str::<CanaryToken>(&line) else {
+            skipped += 1;
+            continue;
+        };
         match entry.action {
             RegistryAction::Deploy => {
                 live.insert(
@@ -546,7 +569,11 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>)
         }
         last = Some(entry.entry_hash);
     }
-    Ok((last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()), live))
+    Ok((
+        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+        live,
+        skipped,
+    ))
 }
 
 /// Pure helper: compute `entry_hash` + signature for a chain
@@ -761,6 +788,32 @@ mod tests {
             },
             deployed_by_fp: format!("{seq:08x}"),
         }
+    }
+
+    /// External audit DEC-006: an unreadable line no longer switches the
+    /// canary subsystem off — it is skipped and reported, the readable
+    /// canaries stay deployed, and a torn last write is repaired.
+    #[test]
+    fn an_unreadable_line_is_skipped_and_the_rest_kept() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            reg.deploy(sample_draft(1)).unwrap();
+            reg.deploy(sample_draft(2)).unwrap();
+        }
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        body.insert_str(body.find('\n').unwrap() + 1, "garbage line\n");
+        body.push_str("{\"torn\":");
+        std::fs::write(&log_path, &body).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).expect("opens");
+        assert_eq!(reg.list().len(), 2, "both canaries still deployed");
+        let (repair, skipped) = reg.take_open_findings();
+        assert!(repair.is_some(), "the torn tail was repaired");
+        assert_eq!(skipped, 1);
+        reg.deploy(sample_draft(3)).expect("appends continue");
     }
 
     // ── K2 test #1: deploy appends + advances tail ────────────────
