@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Structured adversarial check of the anti-tamper (Tappa 10.8).
 #
-# Runs ON THE GUEST as root against the installed agent (25 cases), one case per
+# Runs ON THE GUEST as root against the installed agent (one case per
 # documented way of neutralising a Linux EDR, and answers two questions for
 # each: was the action denied, and did it leave EVIDENCE in the signed chain
 # logs (audit.log ops, detections.jsonl rule ids) or at least in the journal?
@@ -31,6 +31,25 @@ AGENT_EXE=$(systemctl show -p ExecStart --value northnarrow-agent 2>/dev/null | 
 NNADMIN=$(dirname "${AGENT_EXE:-/usr/local/bin/northnarrow-agent}")/nn-admin
 UNIT=$(systemctl show -p FragmentPath --value northnarrow-agent 2>/dev/null)
 UNIT=${UNIT:-/etc/systemd/system/northnarrow-agent.service}
+# External audit EBPF-001: the units refuse `systemctl stop`/`restart`, and
+# systemd's signals reach the agent only inside a signed trusted-installer
+# window. The cases that restart the agent on purpose take the operator's
+# path: the window (lab key), SIGTERM, the watchdog brings it back.
+grant_window() { "$NNADMIN" trusted-installer-grant --key "$ETC/admin.key" --window-secs 120 >/dev/null 2>&1; }
+restart_agent() {
+    local old new i
+    old=$(cat /run/northnarrow/agent.pid 2>/dev/null)
+    grant_window
+    systemctl kill --signal=SIGTERM northnarrow-agent
+    for i in $(seq 1 30); do
+        sleep 1
+        new=$(cat /run/northnarrow/agent.pid 2>/dev/null)
+        [[ -n "$new" && "$new" != "$old" ]] && kill -0 "$new" 2>/dev/null && return 0
+    done
+    systemctl start northnarrow-agent
+}
+export -f grant_window restart_agent
+export NNADMIN ETC
 jlines() { journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$1" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -v "process spawn detected"; }
 audit_count() { wc -l < "$AUDIT" 2>/dev/null || echo 0; }
 dets_count() { wc -l < "$DETS" 2>/dev/null || echo 0; }
@@ -74,7 +93,8 @@ run_case() {
     sleep "${WAIT:-4}"
     # outcome from the error, not the exit code: bpftool exits non-zero
     # after printing an object it was allowed to open
-    if echo "$out" | grep -qE "Operation not permitted|Permission denied"; then status=denied; else status=allowed; fi
+    # (`systemctl kill` reports the kernel's EPERM as "Access denied")
+    if echo "$out" | grep -qE "Operation not permitted|Permission denied|Access denied"; then status=denied; else status=allowed; fi
     ev=$(evidence "$t0" "$a0" "$d0")
     local verdict="OK"
     # A known gap (e.g. kexec without kernel lockdown, closed by host
@@ -182,12 +202,12 @@ fi
 # ── signed overlays (Tappa 10.8) ──────────────────────────────────────────
 # An unsigned exemption appended to the allowlist overlay, then a restart:
 # the agent must boot on the shipped defaults and record the refusal.
-WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unauthorized_overlay" 0 -- bash -c "echo '+evil-implant' >> $ETC/process-comm-allowlist.local && systemctl restart northnarrow-agent"
+WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unauthorized_overlay" 0 -- bash -c "echo '+evil-implant' >> $ETC/process-comm-allowlist.local && restart_agent"
 PID=$(agent_pid)
 # The same overlay stored the authorised way (lab key, config-manage),
 # then a restart: stored with its signature, accepted at boot.
 printf '+backupd\n' > /tmp/nn-ovl-allow
-WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && systemctl restart northnarrow-agent"
+WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ETC/admin.key && restart_agent"
 PID=$(agent_pid)
 # Review 62: after a restart the task deny hooks must still report. They
 # were reused from the pinned link, bound to the previous boot's ring, so
@@ -201,7 +221,7 @@ run_case C29 "ptrace attach after an agent restart" denied "op=ptrace" 0 -- bash
 # the agent refused to start. One more restart must not grow it.
 if [[ -z "$ONLY" || ",$ONLY," == *",C30,"* ]]; then
     pi_count() { bpftool -j map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_INODES 2>/dev/null | grep -o '"key":' | wc -l; }
-    n1=$(pi_count); systemctl restart northnarrow-agent; sleep 20; n2=$(pi_count); PID=$(agent_pid)
+    n1=$(pi_count); restart_agent; sleep 20; n2=$(pi_count); PID=$(agent_pid)
     if (( n2 > n1 )); then v="DEVIATION (grew by $(( n2 - n1 )))"; fail=1; else v="OK"; fi
     rows+=("| C30 | PROTECTED_INODES across an agent restart | $n1 → $n2 entries | — | $v |")
     echo "C30 PROTECTED_INODES across an agent restart → $n1 → $n2 entries; $v" >&2
@@ -256,6 +276,27 @@ else:
     rmmod dummy 2>/dev/null
 fi
 rm -f /tmp/nn_signed_dummy.ko /tmp/nn_unsigned_dummy.ko
+
+# ── systemd as the relay (external audit EBPF-001) ───────────────────────
+# Outside a trusted-installer window PID 1's signals are refused like a root
+# shell's (`systemctl kill` reports EPERM) and the units refuse a manual
+# stop (RefuseManualStop=yes).
+PID=$(agent_pid)
+run_case C31 "systemctl kill -s SIGKILL the agent (no window)" denied "op=signal" 0 -- systemctl kill -s SIGKILL northnarrow-agent
+run_case C32 "systemctl kill -s SIGSTOP the watchdog (no window)" denied "op=signal" 0 -- systemctl kill -s SIGSTOP northnarrow-watchdog
+if [[ -z "$ONLY" || ",$ONLY," == *",C33,"* ]]; then
+    t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+    out=$(timeout 60 systemctl stop northnarrow-agent 2>&1); rc=$?
+    sleep 2; ev=$(evidence "$t0" "$a0" "$d0")
+    if (( rc != 0 )) && [[ "$(agent_pid)" == "$PID" ]] && kill -0 "$PID" 2>/dev/null \
+       && systemctl is-active --quiet northnarrow-agent; then
+        v="OK"; st="denied (refused by systemd: $(echo "$out" | head -1 | cut -c1-60))"
+    else
+        v="DEVIATION (stopped, or reported stopped)"; fail=1; st="allowed"
+    fi
+    rows+=("| C33 | systemctl stop the agent (no window) | $st | $ev | $v |")
+    echo "C33 systemctl stop the agent (no window) → $st; $ev; $v" >&2
+fi
 
 echo
 echo "| case | action | outcome | evidence | verdict |"

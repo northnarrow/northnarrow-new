@@ -15,13 +15,13 @@ policed only SIGKILL and SIGTERM, so `kill -INT`/`-HUP`/`-QUIT`/`-STOP` from a
 root shell stopped or froze the agent — `task-kill-signals-1`. The hook is now
 deny-by-default: every userspace signal towards a protected PID is refused
 unless it is signal 0, a self-signal, a signal from another protected PID
-(watchdog ↔ agent), or the PID-1 nonce carve-out below.) That is correct against the V1 adversary
+(watchdog ↔ agent), or PID 1 under the grant described below.) That is correct against the V1 adversary
 ("post-compromise root tries to silence the defender"), but it locks out
 three legitimate principals:
 
 | Principal | Wants to | V1 blocks via |
 |---|---|---|
-| systemd | SIGTERM the agent for `systemctl restart` | `task_kill` LSM |
+| systemd | SIGTERM the agent for `systemctl restart` (since EBPF-001: inside a signed trusted-installer window only) | `task_kill` LSM |
 | watchdog | read `/proc/<agent>/exe` to reconstruct argv | `ptrace_access_check` LSM |
 | operator | issue first `rotate-keys add` on a single-key install | 2-of-N quorum bootstrap |
 
@@ -112,6 +112,43 @@ recorded as TAMPER_SUSPECTED (existing audit path) — so an attacker who
 abuses the legitimate-restart path still leaves an audit trail and gets
 respawned. The carve-out is not "you can silently kill us," it is "you
 can request a restart, and we'll come back."
+
+### As built, after the external audit (EBPF-001)
+
+The carve-out above was armed at boot for the agent's whole life, with no
+bound on the signal, the target or the time: any root shell could stop or
+kill the agent and the watchdog with `systemctl stop`/`kill` — systemd only
+relays root's request, and a `systemctl stop` of both units left no
+respawn. `KILL_OVERRIDE` is gone. PID 1 now passes the hook in two cases
+only:
+
+- **A grant** (`KILL_GRANT`, one pinned slot of `{nonce, sig_mask,
+  expires_ns}`), written by the agent when a signed trusted-installer
+  window opens and withdrawn when it closes: the stop signals (SIGTERM, the
+  SIGCONT after it, SIGKILL), until the window ends, under this boot's
+  session nonce. `install.sh --upgrade`, `uninstall.sh` and an operator
+  restart open the window first.
+- **The final stage of a shutdown**: PID 1's comm is `systemd-shutdown`
+  AND its executable is the `systemd-shutdown` the agent recorded
+  (`SHUTDOWN_EXE`, refreshed every minute so a systemd upgrade is
+  followed). Only PID 1 can set its own comm; the executable check means a
+  comm set by `ptrace` of PID 1 is not enough, and exec'ing the real
+  `systemd-shutdown` ends in a halt or reboot.
+
+The units refuse a manual stop (`RefuseManualStop=yes`; without it systemd
+ignored the EPERM and reported the units dead while they ran), and
+`SendSIGKILL=no` keeps systemd from starting a second instance beside a
+running one. A stop as a dependency (shutdown) ends after at most
+`TimeoutStopSec=5s` with the processes running; the agent keeps detecting
+until the final stage. Maintenance
+inside the window is `systemctl kill -s SIGTERM`.
+
+A refused signal whose sender is PID 1 raises `RelayedTamperAttempt`
+(ENGAGED), not the Decisive `AntiTamperDenial`: systemd is the relay, and a
+COMBAT with init as the offender could only end in ISOLATE (the lab's first
+refused `systemctl kill` isolated the host that way). Init is never a COMBAT
+offender, and while systemd reports the host as `stopping` the refusal of
+its stop job is expected and not reported.
 
 ## BUG-011 — `PROTECTED_OBSERVERS`: legitimate observation
 
@@ -296,7 +333,7 @@ admin operations.
 (BUG-010's commentary suggests `nn-admin shutdown` as the graceful-stop
 path, which works once the operator has minted the second key — i.e.
 post-bootstrap. The bootstrap window itself is short enough that
-`sudo systemctl stop` via the new `KILL_OVERRIDE` is the canonical
+`sudo systemctl stop` inside a trusted-installer window is the canonical
 in-bootstrap stop path.)
 
 ## Implementation surface summary

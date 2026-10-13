@@ -39,5 +39,6 @@ pub mod self_integrity;
 pub mod sensor_feasibility;
 pub mod sensors;
 pub mod shutdown_marker;
+pub mod systemd_state;
 pub mod telemetry_probe;
 pub mod xai;

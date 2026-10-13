@@ -297,7 +297,18 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
                 && echo "admin.pub: config-manage added for the lab key"
         fi
     fi
-    sudo systemctl stop northnarrow-watchdog northnarrow-agent 2>/dev/null
+    # External audit EBPF-001: the units refuse a manual stop; inside the
+    # window systemd's signals are delivered — watchdog first (it would
+    # respawn the agent), SIGTERM, SIGKILL for whatever outlives 10 s.
+    for u in northnarrow-watchdog northnarrow-agent; do
+        sudo systemctl kill --signal=SIGTERM "$u" 2>/dev/null
+        for i in $(seq 1 20); do
+            [ -z "$(sudo cat /sys/fs/cgroup/system.slice/$u.service/cgroup.procs 2>/dev/null)" ] && break
+            sleep 0.5
+        done
+        sudo systemctl kill --signal=SIGKILL "$u" 2>/dev/null
+        sudo systemctl reset-failed "$u" 2>/dev/null
+    done
     sudo pkill -9 -f "northnarrow-agent-e2etes[t]|northnarrow-watchdog-e2etes[t]" 2>/dev/null
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
@@ -429,14 +440,23 @@ old=$(sudo cat /run/northnarrow/agent.pid)
 echo "agent pid before: $old"
 # A plain `kill -9` from a root shell is DENIED by the task_kill LSM
 # hook (the agent is in PROTECTED_PIDS — Tappa 7 working as designed).
-# systemd (PID 1) is carved out so `systemctl stop` works, so deliver
-# the SIGKILL through it: no shutdown marker is written (that is the
-# signed nn-admin path only), hence the watchdog treats it as a crash.
+# So is `systemctl kill` (external audit EBPF-001): PID 1 relays root's
+# signal only inside a signed trusted-installer window. Open one with the
+# lab key and deliver the SIGKILL through systemd: no shutdown marker is
+# written (that is the signed nn-admin path only), hence the watchdog
+# treats it as a crash. The respawned agent boots with the window closed.
 if sudo kill -9 "$old" 2>/dev/null; then
     echo "WARN: plain kill -9 from a root shell succeeded — task_kill deny hook NOT active?"
 else
-    echo "kill -9 from a root shell: denied (task_kill LSM hook OK) — using systemctl kill"
-    sudo systemctl kill --kill-who=main  -s SIGKILL northnarrow-agent.service
+    echo "kill -9 from a root shell: denied (task_kill LSM hook OK)"
+    nn_admin=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
+    if sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service 2>/dev/null; then
+        echo "WARN: systemctl kill outside a trusted-installer window succeeded — PID-1 grant NOT enforced?"
+    else
+        echo "systemctl kill outside a window: refused — opening the window, then systemctl kill"
+        sudo "$nn_admin" trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 120 >/dev/null
+        sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service
+    fi
 fi
 deadline=$(( $(date +%s) + 60 ))
 new=""

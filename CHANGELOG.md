@@ -6,6 +6,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, systemd as a way around the anti-tamper (High
+  EBPF-001):
+  - The task_kill hook let PID 1 deliver any signal to the agent and the
+    watchdog for the agent's whole life (BUG-010's `KILL_OVERRIDE`, armed
+    at boot). systemd only relays root's request: `systemctl stop` of both
+    units ended them in 0.6 s and nothing respawned them, `systemctl kill
+    -s SIGKILL` killed the agent. PID 1 now passes only under a grant the
+    agent writes when a signed trusted-installer window opens — the stop
+    signals, until the window ends, under this boot's session nonce — or
+    as `systemd-shutdown`, the last stage of a shutdown, recognised by its
+    comm and its executable.
+  - The units refuse a manual stop (`RefuseManualStop=yes`; without it
+    systemd ignored the EPERM and reported the units dead while they ran)
+    and never start a second instance beside a running one
+    (`SendSIGKILL=no`). Maintenance takes the window and `systemctl kill
+    -s SIGTERM`; `install.sh`, `uninstall.sh` and the lab do so.
+  - A refused signal relayed by systemd is a signed detection (NN-L-AT-001,
+    "on behalf of a `systemctl stop` / `kill` / `restart`") and raises the
+    posture to ENGAGED (`RelayedTamperAttempt`), not COMBAT: init is never
+    an offender (in the lab, the first refused `systemctl kill` made init
+    the offender, which the ladder could only contain by isolating the
+    host). While systemd reports the host as stopping — asked over its
+    private socket, served by PID 1 — the refusal is expected, the ladder
+    stands down and the posture stops escalating; the agent runs, and
+    detects, until `systemd-shutdown`, and records `agent_stop` with reason
+    `system_shutdown`.
+- Found while verifying it in the lab:
+  - Stopping `systemd-journald@northnarrow` aborted both the agent and the
+    watchdog (the log writer reported the broken pipe with an `eprintln!`
+    that panicked, and `panic = "abort"`), so every reboot ended the agent
+    with SIGABRT and five stops in a minute would have tripped the
+    watchdog's ceiling. A lost log line no longer costs the process.
+  - The mass-write counter (the ransomware shape) counted write-opens of
+    device nodes: `> /dev/null` in a script loop, systemd writing
+    `/dev/console` at shutdown. It counts regular files only (files in
+    `/dev/shm` still count).
 - External audit, Wave 1, bootstrap gate and unit drop-in (High ATP-004,
   DEP-002):
   - The one-time relaxation that lets a one-key install add its second

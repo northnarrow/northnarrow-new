@@ -687,11 +687,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Lab finding (external audit EBPF-001 work): when the log stream is
+    // gone — journald@northnarrow stopped, at shutdown or by root — the
+    // fmt layer reported the failed write with `eprintln!`, which panics
+    // on the same broken pipe; with `panic = "abort"` the agent died at its
+    // next log line, and five such deaths tripped the watchdog's ceiling.
+    // A lost log line must never cost the agent.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
+        .log_internal_errors(false)
         .init();
 
     info!("NorthNarrow agent starting...");
@@ -1540,6 +1547,10 @@ async fn main() -> Result<()> {
             cli.resolved_watchdog_exe(),
         );
     }
+    // External audit EBPF-001: PID 1 may signal the agent at the very end
+    // of a shutdown only while it runs the `systemd-shutdown` the hook
+    // knows; follow a systemd upgrade that replaces it.
+    spawn_shutdown_exe_refresh();
 
     // Beta Step 4a: reconcile a stale COMBAT chain left by a crash.
     // The agent always boots into OBSERVING, so if the
@@ -1887,9 +1898,31 @@ async fn main() -> Result<()> {
         tick.tick().await; // skip the immediate first tick
         loop {
             tick.tick().await;
+            if HOST_STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
             ladder_tick.tick(Instant::now());
         }
     });
+
+    // External audit EBPF-001: the agent now outlives the units' stop jobs
+    // and runs until systemd-shutdown's final stage. Ask systemd every 2 s
+    // whether the host is stopping: from then on the shutdown's own traffic
+    // (logs truncated, services killed, the console written) must not drive
+    // the posture or the ladder. Detection goes on.
+    if std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET).exists() {
+        let ladder_stop = Arc::clone(&ladder);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if systemd_state().await.as_deref() == Some("stopping") {
+                    host_stopping(&ladder_stop);
+                    break;
+                }
+            }
+        });
+    }
 
     // Tappa 8 A8: shutdown signal — the dispatcher fires it on a
     // successfully-verified `ShutdownRequest` so this main loop
@@ -2867,9 +2900,10 @@ async fn main() -> Result<()> {
     // SIGHUP silently dropped; only SIGQUIT brought the agent down).
     // A pre-registered `Signal` stream is the documented robust path.
     //
-    // SIGTERM is normally caught by the Tappa 7 LSM hook before
-    // userland ever sees it; the handler is here for builds running
-    // without anti-tamper (kernels lacking `bpf` in their LSM chain).
+    // SIGTERM reaches the agent only from itself, the watchdog, PID 1
+    // inside a signed trusted-installer window, or `systemd-shutdown` at
+    // the end of a shutdown (the task_kill hook refuses everyone else) —
+    // and from anyone on a kernel without `bpf` in its LSM chain.
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
@@ -2936,8 +2970,11 @@ async fn main() -> Result<()> {
                 break;
             }
             _ = sigterm.recv() => {
-                info!("SIGTERM received; shutting down");
-                stop_reason = "sigterm";
+                // External audit EBPF-001: PID 1's SIGTERM reaches the agent
+                // only inside a signed trusted-installer window or from
+                // `systemd-shutdown`, the last stage of a shutdown.
+                stop_reason = if pid1_is_systemd_shutdown() { "system_shutdown" } else { "sigterm" };
+                info!(reason = stop_reason, "SIGTERM received; shutting down");
                 break;
             }
             _ = sighup.recv() => {
@@ -3088,6 +3125,37 @@ async fn process_event(
     // own is_window_open() read; this sweep re-syncs the kernel map.
     installer_override.close_if_expired(Instant::now());
 
+    // External audit EBPF-001: while systemd stops the host, its SIGTERM to
+    // the agent and the watchdog is refused until `systemd-shutdown` (the
+    // units outlive their stop jobs). Expected, so neither an attempt nor a
+    // posture signal.
+    if let Event::FsProtectDenial {
+        pid: 1,
+        operation: common::FsProtectOperation::Signal,
+        target_dev: sig,
+        target_ino: target,
+        ..
+    } = &event
+    {
+        let state = systemd_state().await;
+        if state.as_deref() == Some("stopping") {
+            info!(
+                signal = sig,
+                target,
+                "systemd is stopping the host — its signal to a protected process is refused \
+                 until systemd-shutdown's final stage (expected, not an attempt)"
+            );
+            host_stopping(ladder);
+            return;
+        }
+        info!(
+            signal = sig,
+            target,
+            systemd_state = state.as_deref().unwrap_or("(no answer)"),
+            "signal relayed by systemd outside a trusted-installer window — not a shutdown"
+        );
+    }
+
     // Tappa 9.5 (K3): canary precedence over FIM rules per
     // §12 Q9 OPTION B inline-filter lock-in. The detector
     // checks the event against the deployed canary registry;
@@ -3113,8 +3181,10 @@ async fn process_event(
     // Review 72: borrowed under the buffer's read lock, not cloned (up to
     // 1,000 events, for every event, was most of the agent's CPU under an
     // exec burst). Nothing pushes to the buffer until this returns.
-    if let Some((new_state, firing_trigger)) =
-        correlation.with_recent(|recent| posture.observe(&event, recent))
+    let host_stopping = HOST_STOPPING.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some((new_state, firing_trigger)) = (!host_stopping)
+        .then(|| correlation.with_recent(|recent| posture.observe(&event, recent)))
+        .flatten()
     {
         // BUG-015 observability: include the firing TriggerType so
         // operators can see in the journal what caused a transition.
@@ -3135,8 +3205,11 @@ async fn process_event(
         // this is the idempotent merge that attributes the focal
         // process. Reaching COMBAT does NOT isolate — the ladder does.
         if new_state.kind() == PostureKind::Combat {
+            // External audit EBPF-001: init is never an offender — its only
+            // containment would be ISOLATE, and the events it owns (a relayed
+            // `systemctl`, the console writes of a shutdown) are not its own.
             ladder.engage(
-                northnarrow_agent::posture::triggers::event_owner_pid(&event),
+                northnarrow_agent::posture::triggers::event_owner_pid(&event).filter(|p| *p > 1),
                 firing_trigger,
                 Instant::now(),
             );
@@ -3146,7 +3219,7 @@ async fn process_event(
     // for the jump-ahead check: an offender actively exfiltrating or
     // spawning children DURING INVESTIGATE pre-empts the time-bound
     // deadline and advances straight to NEUTRALIZE.
-    if ladder.current_stage().is_some() {
+    if !host_stopping && ladder.current_stage().is_some() {
         ladder.observe(&event, Instant::now());
     }
     correlation.push(event.clone());
@@ -3768,6 +3841,85 @@ fn attest_open_findings(
 /// Logs only on a *change* of verified PID so a steady state doesn't
 /// flood the journal; any non-`Verified` outcome clears the exemption
 /// (fail toward over-triggering).
+/// External audit EBPF-001: systemd (PID 1 itself, `SO_PEERCRED`) reported
+/// the host as stopping — no posture escalation and no ladder until the
+/// process ends at systemd-shutdown's final stage.
+static HOST_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host is shutting down: stand the ladder down once and stop
+/// escalating (see [`HOST_STOPPING`]).
+fn host_stopping(ladder: &northnarrow_agent::combat::CombatLadder) {
+    if !HOST_STOPPING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        warn!("host shutting down — active response stood down, detection continues");
+        ladder.stand_down(Instant::now());
+    }
+}
+
+/// What systemd reports the host as (`SystemState`: `running`,
+/// `degraded`, `stopping`, …), asked over its private socket from this
+/// process ([`northnarrow_agent::systemd_state`]) — only for a signal PID 1
+/// relayed and the kernel refused, and every 2 s by the shutdown watch;
+/// at most once a second. `None` when
+/// systemd does not answer within 1 s, or the socket is not served by
+/// PID 1.
+async fn systemd_state() -> Option<String> {
+    static LAST: parking_lot::Mutex<Option<(Instant, Option<String>)>> =
+        parking_lot::Mutex::new(None);
+    if let Some((at, state)) = LAST.lock().clone() {
+        if at.elapsed() < Duration::from_secs(1) {
+            return state;
+        }
+    }
+    let ask = tokio::task::spawn_blocking(|| {
+        northnarrow_agent::systemd_state::system_state(
+            std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET),
+            Duration::from_millis(800),
+        )
+    });
+    let state = match tokio::time::timeout(Duration::from_secs(1), ask).await {
+        Ok(Ok(Ok(state))) => Some(state),
+        Ok(Ok(Err(e))) => {
+            debug!(error = %e, "systemd's state could not be read");
+            None
+        }
+        _ => None,
+    };
+    *LAST.lock() = Some((Instant::now(), state.clone()));
+    state
+}
+
+/// PID 1 is `systemd-shutdown` (its comm, truncated to 15 bytes): the
+/// machine is in the last stage of a shutdown.
+fn pid1_is_systemd_shutdown() -> bool {
+    std::fs::read_to_string("/proc/1/comm").is_ok_and(|c| c.trim_end() == "systemd-shutdow")
+}
+
+/// External audit EBPF-001: re-record `systemd-shutdown`'s identity every
+/// minute (a package upgrade gives it a new inode).
+fn spawn_shutdown_exe_refresh() {
+    let Some(root) = northnarrow_agent::anti_tamper::prepare_pin_root() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match northnarrow_agent::anti_tamper::refresh_shutdown_exe(root) {
+                Ok(Some(k)) => info!(
+                    dev = k.dev,
+                    ino = k.ino,
+                    "anti-tamper: systemd-shutdown changed on disk — final-stage identity updated"
+                ),
+                Ok(None) => {}
+                Err(e) => warn!(
+                    error = format!("{e:#}"),
+                    "anti-tamper: SHUTDOWN_EXE refresh failed"
+                ),
+            }
+        }
+    });
+}
+
 fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_exe: PathBuf) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));

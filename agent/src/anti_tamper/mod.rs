@@ -10,7 +10,7 @@
 //! ## Design notes
 //!
 //! - All LSM programs and anti-tamper maps (`PROTECTED_PIDS`,
-//!   `KILL_OVERRIDE`, `PTRACE_OVERRIDE`, `PROTECTED_INODES`,
+//!   `KILL_GRANT`, `PTRACE_OVERRIDE`, `PROTECTED_INODES`,
 //!   `FS_PROTECT_OVERRIDE`, `FS_PROTECT_EVENTS`) live in the same
 //!   eBPF object as the sensors. Loading that object twice would
 //!   create two independent kernel copies of `PROTECTED_PIDS`, only
@@ -63,7 +63,11 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use aya::{maps::Array as AyaArray, Btf, Ebpf};
+use aya::{
+    maps::{Array as AyaArray, MapData},
+    Btf, Ebpf,
+};
+use common::wire::{InodeKey, KillGrant};
 use rand::RngCore;
 use tracing::{debug, error, info, warn};
 
@@ -155,29 +159,18 @@ pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
     }
 }
 
-// TODO(Tappa 8): the three override arrays — KILL_OVERRIDE,
-// PTRACE_OVERRIDE, FS_PROTECT_OVERRIDE — are now `pinned` by-name
-// (commit #2), so slot 0 now SURVIVES an agent restart. They are
-// shipped empty and never written in Tappa 7, so this is inert
-// today. When Tappa 8 wires the Ed25519 verifier that writes a
-// capability token into slot 0, it MUST zero that slot on agent
-// boot (`MapData::insert(0, &0, 0)`) before trusting it, or a
-// pre-restart grant would silently outlive its window. No zeroing
-// is added here in commit #2: it would be dead code with no
-// Tappa-7 caller and is out of this commit's scope.
-//
-// BUG-010 (PHASE 15.1) supersedes the KILL_OVERRIDE TODO above:
-// `arm_kill_override` below writes a fresh per-boot session nonce
-// into BOTH `KILL_OVERRIDE` and `AGENT_SESSION` before LSM attach.
-// The hook accepts the PID-1 carve-out only when both slots match
-// AND are non-zero, so a leftover `KILL_OVERRIDE` value from a prior
-// install can't unlock the new agent (different session nonce).
+// The override maps (`FS_PROTECT_OVERRIDE`, `PTRACE_OVERRIDE`) and
+// `KILL_GRANT` are pinned by name, so slot 0 survives an agent restart:
+// [`arm_session`] rolls a fresh per-boot `AGENT_SESSION` nonce, and every
+// slot is zeroed at boot and only honoured by the hooks while it carries
+// that nonce.
 
-/// BUG-010 (PHASE 15.1): map names for the PID-1 carve-out, mirroring
-/// the `#[map] pub static …` declarations in
-/// `agent-ebpf/src/task_kill.rs`. Kept here because aya looks maps up
-/// by string at runtime.
-const KILL_OVERRIDE_MAP_NAME: &str = "KILL_OVERRIDE";
+/// Map names mirroring the `#[map] pub static …` declarations in
+/// `agent-ebpf/src/task_kill.rs` (aya looks maps up by string).
+/// External audit EBPF-001: `KILL_GRANT` replaces BUG-010's
+/// `KILL_OVERRIDE`, which was armed at boot for the agent's whole life.
+pub(crate) const KILL_GRANT_MAP_NAME: &str = "KILL_GRANT";
+pub(crate) const SHUTDOWN_EXE_MAP_NAME: &str = "SHUTDOWN_EXE";
 pub(crate) const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
 /// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
 /// map (mirrors `#[map] pub static FS_PROTECT_OVERRIDE` in
@@ -312,29 +305,23 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
         }
     }
 
-    // BUG-010 (PHASE 15.1): arm the PID-1 carve-out BEFORE the LSM
-    // hook attaches. The hook checks `caller_tgid == 1 &&
-    // KILL_OVERRIDE[0] == AGENT_SESSION[0] && != 0` — both maps must
-    // be populated with the same fresh per-boot nonce or the carve-out
-    // stays dormant (deny path). Doing this PRE-attach means the very
-    // first hook firing already honours systemd's SIGTERM; doing it
-    // POST-attach would leave a microsecond window where systemctl
-    // restart could race the arming write and get denied.
-    //
-    // Pin both maps by-name so the slots survive agent restart (the
-    // hook itself is also pinned, so a fresh agent boot's hook reads
-    // the prior install's slot until we overwrite — which is exactly
-    // what the session-nonce mismatch defends against).
-    if let Err(e) = arm_kill_override(ebpf) {
+    // Roll this boot's session nonce, zero `KILL_GRANT` and record
+    // `systemd-shutdown`'s identity BEFORE the hooks attach (pinned, so a
+    // restarted agent's hooks read them too). External audit EBPF-001:
+    // PID 1 no longer gets a carve-out for the agent's whole life — only
+    // a grant for a signed trusted-installer window, or the final stage
+    // of a shutdown.
+    if let Err(e) = arm_session(ebpf) {
         warn!(
             error = %e,
-            "anti-tamper: KILL_OVERRIDE arming FAILED — systemctl restart will hang \
-             (BUG-010 mitigation absent this boot)"
+            "anti-tamper: session nonce / KILL_GRANT / SHUTDOWN_EXE setup FAILED — \
+             overrides and grants stay dormant this boot (systemctl stop is refused \
+             even inside a trusted-installer window)"
         );
     }
 
     // FIM-009 self-upgrade (§15.1): boot-zero + pin FS_PROTECT_OVERRIDE
-    // AFTER arm_kill_override (which rolls AGENT_SESSION) so the override
+    // AFTER arm_session (which rolls AGENT_SESSION) so the override
     // starts dormant this boot and the kernel's session-nonce compare in
     // inode_protect::override_active has a fresh nonce to anchor against.
     if let Err(e) = boot_zero_fs_override(ebpf) {
@@ -565,59 +552,61 @@ fn deny_shortfall(deny_attached: usize, failed: &[String]) -> Result<()> {
     )
 }
 
-/// BUG-010 (PHASE 15.1): arm the PID-1 carve-out by writing a fresh
-/// per-boot session nonce into both `KILL_OVERRIDE` and `AGENT_SESSION`.
-/// The kernel hook only honours the carve-out when both slots are
-/// equal AND non-zero, so:
+/// Roll this boot's session nonce into `AGENT_SESSION`, zero
+/// `KILL_GRANT`, record `systemd-shutdown` in `SHUTDOWN_EXE`, and pin
+/// the three maps by name.
 ///
-/// - A stale `KILL_OVERRIDE` value pinned by a prior install does NOT
-///   unlock this boot (new nonce won't match).
-/// - An attacker who writes only `KILL_OVERRIDE` after boot (without
-///   reading `AGENT_SESSION`) gets no match.
-/// - An attacker who can write both is one who already has the kernel
-///   power to unpin the LSM hook outright — V1-scope out of scope.
+/// - Every override and grant the hooks honour must carry the nonce, so
+///   a value pinned by an earlier run is dead after a restart.
+/// - External audit EBPF-001: `KILL_GRANT` starts empty. PID 1 may signal
+///   the agent or the watchdog only once a signed trusted-installer
+///   window writes it ([`trusted_installer`]), or as `systemd-shutdown`
+///   (`SHUTDOWN_EXE`, kept current by [`refresh_shutdown_exe`]).
 ///
-/// Both slots are also pinned by-name so they survive the agent's own
-/// graceful exit; the next agent boot overwrites them before LSM
-/// attach completes, so the carve-out is always "armed for this boot"
-/// and never "armed for prior boot but stale."
-///
-/// We rely on `rand::thread_rng().next_u32()` (OS-seeded ChaCha) for
-/// the nonce; predictability would only matter to an attacker who has
-/// also gained BPF write privilege, in which case prediction adds
-/// nothing — see Authentication discussion in
+/// `rand::thread_rng().next_u32()` (OS-seeded ChaCha) draws the nonce;
+/// an attacker able to read it already holds BPF write privilege — see
 /// `docs/design/ANTITAMPER_TRUST_MODEL.md` §BUG-010.
-fn arm_kill_override(ebpf: &mut Ebpf) -> Result<()> {
-    // u32::MAX (4 billion) of possible nonces; collision odds across
-    // an agent restart are ~2^-32 per boot. Re-roll on zero so we
-    // never accidentally write the "disarmed" sentinel.
+fn arm_session(ebpf: &mut Ebpf) -> Result<()> {
+    // Re-roll on zero: zero is the "disarmed" value of every slot.
     let mut nonce: u32 = 0;
     while nonce == 0 {
         nonce = rand::thread_rng().next_u32();
     }
-
-    // AGENT_SESSION is the "ground truth" — write it FIRST so a
-    // partial-failure (AGENT_SESSION written, KILL_OVERRIDE write
-    // fails) leaves the carve-out dormant (slots unequal). The
-    // alternative ordering would leave a stale nonce in
-    // KILL_OVERRIDE matching the prior install's AGENT_SESSION,
-    // re-arming the prior carve-out unintentionally.
     write_array_u32(ebpf, AGENT_SESSION_MAP_NAME, nonce)
         .with_context(|| format!("writing {AGENT_SESSION_MAP_NAME}[0]"))?;
-    write_array_u32(ebpf, KILL_OVERRIDE_MAP_NAME, nonce)
-        .with_context(|| format!("writing {KILL_OVERRIDE_MAP_NAME}[0]"))?;
+    {
+        let map = ebpf
+            .map_mut(KILL_GRANT_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {KILL_GRANT_MAP_NAME} missing from eBPF object"))?;
+        let mut arr: AyaArray<_, AyaKillGrant> = AyaArray::try_from(map)
+            .with_context(|| format!("{KILL_GRANT_MAP_NAME} is not an Array<KillGrant>"))?;
+        arr.set(0, AyaKillGrant(KillGrant::default()), 0)
+            .with_context(|| format!("zeroing {KILL_GRANT_MAP_NAME}[0]"))?;
+    }
+    let shutdown = shutdown_exe_key();
+    {
+        let map = ebpf
+            .map_mut(SHUTDOWN_EXE_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {SHUTDOWN_EXE_MAP_NAME} missing from eBPF object"))?;
+        let mut arr: AyaArray<_, filesystem::AyaInodeKey> = AyaArray::try_from(map)
+            .with_context(|| format!("{SHUTDOWN_EXE_MAP_NAME} is not an Array<InodeKey>"))?;
+        arr.set(
+            0,
+            filesystem::AyaInodeKey(shutdown.unwrap_or(InodeKey { dev: 0, ino: 0 })),
+            0,
+        )
+        .with_context(|| format!("writing {SHUTDOWN_EXE_MAP_NAME}[0]"))?;
+    }
 
-    // Pin both maps so the slots survive agent restart and the
-    // kernel-side hook can reference one persistent map object.
-    // prepare_pin_root() is idempotent / silent on the happy path;
-    // None ⇒ no bpffs ⇒ skip pinning (the in-process Ebpf map still
-    // works for the lifetime of this process, just won't survive
-    // restart). The hook's empty-map fallback returns zero, so a
-    // restart without pinning means the carve-out goes dormant after
-    // the agent exits — a safer degraded mode than persisting a
-    // mismatched nonce.
+    // Pinned so a restarted agent's hooks — and `trusted_installer`,
+    // through the bpffs path — use the same kernel objects. No bpffs:
+    // the in-process maps serve this run only.
     if let Some(root) = prepare_pin_root() {
-        for map_name in [AGENT_SESSION_MAP_NAME, KILL_OVERRIDE_MAP_NAME] {
+        for map_name in [
+            AGENT_SESSION_MAP_NAME,
+            KILL_GRANT_MAP_NAME,
+            SHUTDOWN_EXE_MAP_NAME,
+        ] {
             let map_pin_path = root.join(map_name);
             purge_stale_pin(&map_pin_path);
             ebpf.map_mut(map_name)
@@ -628,12 +617,64 @@ fn arm_kill_override(ebpf: &mut Ebpf) -> Result<()> {
     }
 
     info!(
-        kill_override = KILL_OVERRIDE_MAP_NAME,
-        agent_session = AGENT_SESSION_MAP_NAME,
-        "anti-tamper: KILL_OVERRIDE armed for PID-1 carve-out (BUG-010)"
+        systemd_shutdown = ?shutdown.map(|k| (k.dev, k.ino)),
+        "anti-tamper: session armed — PID 1 may signal the agent only inside a signed \
+         trusted-installer window or as systemd-shutdown (external audit EBPF-001)"
     );
     Ok(())
 }
+
+/// Where `systemd-shutdown` lives (merged `/usr` makes the two one file).
+const SHUTDOWN_EXE_PATHS: &[&str] = &[
+    "/usr/lib/systemd/systemd-shutdown",
+    "/lib/systemd/systemd-shutdown",
+];
+
+/// `(dev, ino)` of `systemd-shutdown` in the kernel's `s_dev` encoding,
+/// or `None` on a host without it (no systemd: no carve-out needed).
+fn shutdown_exe_key() -> Option<InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    SHUTDOWN_EXE_PATHS.iter().find_map(|p| {
+        std::fs::metadata(p).ok().map(|m| InodeKey {
+            dev: filesystem::stat_dev_to_kernel_dev(m.dev()),
+            ino: m.ino(),
+        })
+    })
+}
+
+/// External audit EBPF-001: keep `SHUTDOWN_EXE` on the file a shutdown
+/// would run — a systemd upgrade replaces `systemd-shutdown` (new inode),
+/// and a stale identity would make the final stage's SIGTERM wait out
+/// its timeout. Returns the new identity when it changed.
+pub fn refresh_shutdown_exe(bpffs_root: &Path) -> Result<Option<InodeKey>> {
+    let want = shutdown_exe_key().unwrap_or(InodeKey { dev: 0, ino: 0 });
+    let pin_path = bpffs_root.join(SHUTDOWN_EXE_MAP_NAME);
+    let map_data = MapData::from_pin(&pin_path).with_context(|| {
+        format!(
+            "opening pinned {SHUTDOWN_EXE_MAP_NAME} at {}",
+            pin_path.display()
+        )
+    })?;
+    let mut arr: AyaArray<_, filesystem::AyaInodeKey> =
+        AyaArray::try_from(aya::maps::Map::Array(map_data))
+            .with_context(|| format!("{SHUTDOWN_EXE_MAP_NAME} is not an Array<InodeKey>"))?;
+    let have = arr.get(&0, 0).map(|k| k.0).ok();
+    if have == Some(want) {
+        return Ok(None);
+    }
+    arr.set(0, filesystem::AyaInodeKey(want), 0)
+        .with_context(|| format!("writing {SHUTDOWN_EXE_MAP_NAME}[0]"))?;
+    Ok(Some(want))
+}
+
+/// aya view of [`KillGrant`].
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct AyaKillGrant(pub(crate) KillGrant);
+
+// SAFETY: `KillGrant` is `#[repr(C)]` over u32, u32, u64 — no padding,
+// every bit pattern valid; `AyaKillGrant` is `#[repr(transparent)]`.
+unsafe impl aya::Pod for AyaKillGrant {}
 
 /// FIM-009 self-upgrade (§15.1): boot-zero + pin the trusted-installer
 /// FS-pin override map. Writing slot 0 to zero on every boot guarantees
@@ -643,7 +684,7 @@ fn arm_kill_override(ebpf: &mut Ebpf) -> Result<()> {
 /// `trusted_installer` userland arm/disarm the SAME kernel object via
 /// its bpffs path after boot, without re-borrowing the `Ebpf` instance.
 ///
-/// MUST run after [`arm_kill_override`] (which rolls AGENT_SESSION): the
+/// MUST run after [`arm_session`] (which rolls AGENT_SESSION): the
 /// kernel `override_active` compares `FS_PROTECT_OVERRIDE[0]` against the
 /// session nonce, so a fresh nonce must already be in place.
 fn boot_zero_fs_override(ebpf: &mut Ebpf) -> Result<()> {
@@ -652,7 +693,7 @@ fn boot_zero_fs_override(ebpf: &mut Ebpf) -> Result<()> {
 
 /// Zero slot 0 of the override map `map_name` and pin it by name, so an
 /// override never survives a restart and userland can arm it through its
-/// bpffs path. Runs after [`arm_kill_override`]: the hooks compare the
+/// bpffs path. Runs after [`arm_session`]: the hooks compare the
 /// slot against the fresh session nonce.
 fn boot_zero_override(ebpf: &mut Ebpf, map_name: &'static str) -> Result<()> {
     write_array_u32(ebpf, map_name, 0).with_context(|| format!("boot-zeroing {map_name}[0]"))?;
@@ -674,9 +715,7 @@ fn boot_zero_override(ebpf: &mut Ebpf, map_name: &'static str) -> Result<()> {
 }
 
 /// Internal: write `value` to slot 0 of the named `Array<u32>` map
-/// in `ebpf`. Wraps the aya `Array::try_from` + `set` boilerplate so
-/// [`arm_kill_override`] reads as the two-line essence (AGENT_SESSION
-/// first, then KILL_OVERRIDE).
+/// in `ebpf`.
 fn write_array_u32(ebpf: &mut Ebpf, map_name: &str, value: u32) -> Result<()> {
     let map = ebpf
         .map_mut(map_name)
@@ -978,82 +1017,33 @@ mod tests {
         assert_eq!(read_watchdog_pid_optional(&p3), None);
     }
 
-    // ── BUG-010 (PHASE 15.1): kernel hook predicate documentation
-    //
-    // The actual LSM hook in `agent-ebpf/src/task_kill.rs` runs
-    // in kernel-space and can't be reached by a userland unit test.
-    // What we CAN do here is mirror the predicate as a pure Rust
-    // function and assert its truth table — a regression in the
-    // kernel-side hook would not be caught by this test BUT the
-    // test serves as executable documentation of the security
-    // contract, and a CI grep across the repo for `pid1_carveout`
-    // would surface any divergence between BPF source and this
-    // mirror.
-    //
-    // Truth table (kill_override_val, agent_session_val, caller_tgid)
-    // → allow?
-    //   - (0, 0, anything): deny (carve-out dormant)
-    //   - (N, N, 1) where N≠0: ALLOW (PID 1 + matching nonce)
-    //   - (N, N, 999): deny (not PID 1)
-    //   - (1, N, 1) where N≠1: deny (attacker wrote KILL_OVERRIDE=1
-    //     without knowing AGENT_SESSION's value)
-    //   - (N, 0, 1): deny (AGENT_SESSION never armed; stale KILL_OVERRIDE)
-
-    /// Mirror of the BPF `task_kill` hook's PID-1 carve-out
-    /// predicate. Returns `true` ⇒ allow signal; `false` ⇒ deny.
-    /// Keep in lock-step with `agent-ebpf/src/task_kill.rs`.
-    fn pid1_carveout_predicate(
-        caller_tgid: u32,
-        kill_override_val: u32,
-        agent_session_val: u32,
-    ) -> bool {
-        caller_tgid == 1 && kill_override_val != 0 && kill_override_val == agent_session_val
-    }
-
+    /// External audit EBPF-001: the grant the agent writes for a window
+    /// lets PID 1 stop the units (the predicate itself is tested with
+    /// `KillGrant` in `northnarrow_common`), and `systemd-shutdown` is
+    /// found where systemd installs it.
     #[test]
-    fn bug010_carveout_dormant_when_either_slot_zero() {
-        // Default state: both slots zero (no agent has armed) → deny.
-        assert!(!pid1_carveout_predicate(1, 0, 0));
-        // Agent armed AGENT_SESSION but not KILL_OVERRIDE (partial
-        // failure path that `arm_kill_override` orders to leave dormant
-        // rather than active) → deny.
-        assert!(!pid1_carveout_predicate(1, 0, 0xCAFE));
-        // KILL_OVERRIDE written but AGENT_SESSION never armed (stale
-        // pin from prior install) → deny.
-        assert!(!pid1_carveout_predicate(1, 0xCAFE, 0));
-    }
-
-    #[test]
-    fn bug010_carveout_allows_only_pid1_with_matching_nonce() {
-        // Happy path: PID 1, both slots equal & non-zero → allow.
-        assert!(pid1_carveout_predicate(1, 0xDEADBEEF, 0xDEADBEEF));
-        // Same slots but a non-PID-1 caller → deny.
-        assert!(!pid1_carveout_predicate(999, 0xDEADBEEF, 0xDEADBEEF));
-        assert!(!pid1_carveout_predicate(0, 0xDEADBEEF, 0xDEADBEEF));
-        assert!(!pid1_carveout_predicate(2, 0xDEADBEEF, 0xDEADBEEF));
-    }
-
-    /// ATTACK CASE: root attacker writes `KILL_OVERRIDE = 1` (a
-    /// natural guess for a "boolean" override) without reading the
-    /// agent's session nonce. Carve-out stays dormant.
-    #[test]
-    fn bug010_carveout_rejects_attacker_who_only_wrote_kill_override() {
-        // Agent armed N=0xABCD; attacker writes 1 to KILL_OVERRIDE.
-        // 1 != 0xABCD ⇒ no match ⇒ deny.
-        assert!(!pid1_carveout_predicate(1, 1, 0xABCD));
-    }
-
-    /// ATTACK CASE: root attacker who replays a STALE KILL_OVERRIDE
-    /// value from a prior install. The new agent's AGENT_SESSION is
-    /// freshly random and won't match.
-    #[test]
-    fn bug010_carveout_rejects_stale_nonce_from_prior_install() {
-        // Prior install's nonce was 0xPRIOR; the agent rebooted and
-        // armed AGENT_SESSION with a fresh 0xFRESH. The pinned
-        // KILL_OVERRIDE still has 0xPRIOR (we re-write at boot, but
-        // imagine a window between map open and arm). The hook
-        // refuses.
-        assert!(!pid1_carveout_predicate(1, 0x1111_AAAA, 0xBBBB_2222));
+    fn the_window_grant_covers_systemds_stop_signals() {
+        let g = KillGrant {
+            nonce: 7,
+            sig_mask: KillGrant::STOP_SIGNALS,
+            expires_ns: u64::MAX,
+        };
+        for (sig, what) in [
+            (15, "KillSignal"),
+            (18, "SIGCONT after it"),
+            (9, "FinalKillSignal"),
+        ] {
+            assert!(g.allows(sig, 0, 7), "{what} must be granted");
+        }
+        assert!(!g.allows(19, 0, 7), "SIGSTOP is never part of a stop");
+        assert_eq!(
+            std::mem::size_of::<KillGrant>(),
+            16,
+            "the eBPF map value and the userland view must agree"
+        );
+        assert!(SHUTDOWN_EXE_PATHS
+            .iter()
+            .all(|p| p.ends_with("/systemd-shutdown")));
     }
 
     /// Cross-crate consistency anchor: WATCHDOG_COMM must match

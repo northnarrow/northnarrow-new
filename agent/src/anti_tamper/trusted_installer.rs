@@ -20,11 +20,16 @@
 //!   systemd units from `KillProcess`/High to an audit-level `Log`
 //!   (see `crate::fim::rules`). It is a *pure read* of this state.
 //!
-//! ## Invariants (mirroring the `KILL_OVERRIDE` shape, BUG-010)
+//! - **PID-1 stop grant (external audit EBPF-001):** `KILL_GRANT` lets
+//!   systemd deliver the stop signals to the agent and the watchdog until
+//!   the window ends, so `systemctl stop`/`restart` works for the
+//!   installer; outside a window it is refused.
+//!
+//! ## Invariants
 //!
 //! - **boot-zero.** The agent boot-zeroes `FS_PROTECT_OVERRIDE` and
 //!   rolls a fresh `AGENT_SESSION` nonce on every start
-//!   (`super::boot_zero_fs_override` + `super::arm_kill_override`), and
+//!   (`super::boot_zero_fs_override` + `super::arm_session`), and
 //!   this struct constructs disarmed. A grant NEVER survives a restart;
 //!   it must be re-presented. Even if the boot-zero map write is lost,
 //!   the kernel's session-nonce compare rejects a stale pinned value.
@@ -62,8 +67,11 @@ use aya::maps::{Array as AyaArray, Map as AyaMap, MapData};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use super::{AGENT_SESSION_MAP_NAME, FS_PROTECT_OVERRIDE_MAP_NAME};
+use super::{
+    AyaKillGrant, AGENT_SESSION_MAP_NAME, FS_PROTECT_OVERRIDE_MAP_NAME, KILL_GRANT_MAP_NAME,
+};
 use crate::audit::{AuditEntryDraft, AuditLog};
+use common::wire::KillGrant;
 
 /// Hard ceiling on a grant window. A grant whose `window_secs` exceeds
 /// this is clamped down — a captured or fat-fingered grant can never
@@ -185,7 +193,7 @@ impl TrustedInstallerOverride {
             warn!(
                 target: "anti_tamper.trusted_installer",
                 "no AGENT_SESSION nonce readable — trusted-installer FS suspension will be \
-                 DORMANT this boot (detection downgrade still available); kill-override arming \
+                 DORMANT this boot (detection downgrade still available); session arming \
                  may have failed or bpffs is absent"
             );
         }
@@ -246,6 +254,33 @@ impl TrustedInstallerOverride {
             false
         };
 
+        // External audit EBPF-001: for the same window, PID 1 may deliver
+        // the stop signals to the agent and the watchdog — `systemctl
+        // stop`/`restart` by install.sh, uninstall.sh or the operator.
+        // Outside a window systemd's signals are refused like any root
+        // shell's.
+        let systemctl_stop_granted = if self.session_nonce != 0 {
+            let grant = KillGrant {
+                nonce: self.session_nonce,
+                sig_mask: KillGrant::STOP_SIGNALS,
+                expires_ns: monotonic_ns().saturating_add(window.as_nanos() as u64),
+            };
+            match write_kill_grant(self.bpffs_root.as_deref(), grant) {
+                Ok(()) => self.bpffs_root.is_some(),
+                Err(e) => {
+                    warn!(
+                        target: "anti_tamper.trusted_installer",
+                        error = %e,
+                        "arming the PID-1 stop grant failed — `systemctl stop` of the units \
+                         stays refused in this window"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         self.inner.lock().deadline = Some(now + window);
         self.armed.store(true, Ordering::SeqCst);
         info!(
@@ -253,6 +288,7 @@ impl TrustedInstallerOverride {
             window_secs = secs,
             requested_secs = window_secs,
             fs_pin_suspended,
+            systemctl_stop_granted,
             "trusted-installer override ARMED (FIM-009 §15.1)"
         );
         window
@@ -312,6 +348,13 @@ impl TrustedInstallerOverride {
                  next boot-zero (kernel session-nonce compare still bounds it to this boot)"
             );
         }
+        if let Err(e) = write_kill_grant(self.bpffs_root.as_deref(), KillGrant::default()) {
+            warn!(
+                target: "anti_tamper.trusted_installer",
+                error = %e,
+                "withdrawing the PID-1 stop grant failed — it still expires with the window"
+            );
+        }
         if was_armed {
             info!(
                 target: "anti_tamper.trusted_installer",
@@ -369,6 +412,39 @@ fn write_fs_override(bpffs_root: Option<&Path>, value: u32) -> Result<()> {
     arr.set(0, value, 0)
         .with_context(|| format!("setting {FS_PROTECT_OVERRIDE_MAP_NAME}[0] = {value}"))?;
     Ok(())
+}
+
+/// External audit EBPF-001: write the pinned `KILL_GRANT` slot (a zeroed
+/// grant withdraws it). `bpffs_root: None` ⇒ no-op success.
+fn write_kill_grant(bpffs_root: Option<&Path>, grant: KillGrant) -> Result<()> {
+    let Some(root) = bpffs_root else {
+        return Ok(());
+    };
+    let pin_path = root.join(KILL_GRANT_MAP_NAME);
+    let map_data = MapData::from_pin(&pin_path).with_context(|| {
+        format!(
+            "opening pinned {KILL_GRANT_MAP_NAME} at {}",
+            pin_path.display()
+        )
+    })?;
+    let mut arr: AyaArray<_, AyaKillGrant> = AyaArray::try_from(AyaMap::Array(map_data))
+        .with_context(|| format!("{KILL_GRANT_MAP_NAME} is not an Array<KillGrant>"))?;
+    arr.set(0, AyaKillGrant(grant), 0)
+        .with_context(|| format!("setting {KILL_GRANT_MAP_NAME}[0]"))?;
+    Ok(())
+}
+
+/// CLOCK_MONOTONIC in nanoseconds — the clock of `bpf_ktime_get_ns`.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer; CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 /// Best-effort read of this boot's `AGENT_SESSION[0]` session nonce from

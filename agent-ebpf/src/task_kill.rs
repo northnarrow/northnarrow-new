@@ -20,16 +20,14 @@
 //! 0 if this is the first hook on the path. We honour any prior
 //! denial by passing it through.
 //!
-//! Tappa 8 dependency: the signed-channel exception is stubbed via
-//! the [`KILL_OVERRIDE`] map. It is always empty in the Tappa 7
-//! build, so root truly cannot kill the agent. Tappa 8 will wire an
-//! Ed25519 verifier in userland that flips slot 0 to a non-zero
-//! capability token after admin-signed approval.
-
-use northnarrow_common::wire::FS_OP_SIGNAL;
+//! PID 1 (systemd) is no exception by itself: it signals a protected
+//! process only under a [`KILL_GRANT`] the agent writes for a signed
+//! trusted-installer window, or as `systemd-shutdown` at the very end of
+//! a shutdown (external audit EBPF-001).
+use northnarrow_common::wire::{InodeKey, KillGrant, FS_OP_SIGNAL};
 use aya_ebpf::{
     cty::{c_int, c_void},
-    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
     macros::{lsm, map},
     maps::{Array, HashMap},
     programs::LsmContext,
@@ -70,30 +68,32 @@ const EPERM: c_int = 1;
 #[map]
 pub static PROTECTED_PIDS: HashMap<u32, u8> = HashMap::pinned(16, 0);
 
-/// BUG-010 (PHASE 15.1): PID-1 carve-out token. Slot 0 holds the
-/// agent's per-boot session nonce when the carve-out is armed;
-/// zero (the default) means the carve-out is dormant and even PID 1
-/// is denied.
+/// External audit EBPF-001: when PID 1 may signal a protected process.
+/// One slot, written by the agent only while a signed trusted-installer
+/// window is open (the units are stopped or restarted with `systemctl`
+/// during an upgrade or maintenance) and zeroed when it closes and at
+/// every boot. It replaces BUG-010's `KILL_OVERRIDE`, which the agent
+/// armed at boot for its whole life: any root shell could then stop or
+/// kill the agent with `systemctl stop`/`kill`. See
+/// [`KillGrant`](northnarrow_common::wire::KillGrant).
 ///
-/// The hook compares `KILL_OVERRIDE[0]` against [`AGENT_SESSION`]`[0]`.
-/// Both are written by the agent at boot (see
-/// `agent/src/anti_tamper/mod.rs::arm_kill_override`); a non-zero
-/// match plus `caller_tgid == 1` bypasses the deny. The double-map
-/// design lets a leftover pinned `KILL_OVERRIDE` from a prior install
-/// be effectively dead after restart (new session nonce won't match
-/// stale slot value).
-///
-/// Pinned by-name alongside `PROTECTED_PIDS` so the pinned hook and
-/// userland share one kernel object across agent restarts.
+/// Pinned by name alongside `PROTECTED_PIDS` so the pinned hook and the
+/// agent share one kernel object across restarts.
 #[map]
-pub static KILL_OVERRIDE: Array<u32> = Array::pinned(1, 0);
+pub static KILL_GRANT: Array<KillGrant> = Array::pinned(1, 0);
+
+/// External audit EBPF-001: `(dev, ino)` of `systemd-shutdown`, the
+/// program PID 1 becomes for the final stage of a shutdown (it signals
+/// every remaining process, then halts or reboots). Written by the agent
+/// at boot and kept current; zero means no carve-out.
+#[map]
+pub static SHUTDOWN_EXE: Array<InodeKey> = Array::pinned(1, 0);
 
 /// BUG-010 (PHASE 15.1): per-boot session nonce. The agent picks a
-/// fresh random u32 at boot and writes the SAME value to both this
-/// map and [`KILL_OVERRIDE`] before LSM attach. The hook accepts the
-/// PID-1 carve-out only when both slots are equal and non-zero;
-/// otherwise (stale pinned slot from prior install, attacker who only
-/// wrote `KILL_OVERRIDE`, etc.) it falls through to the deny.
+/// fresh random u32 at boot and writes it here before LSM attach. Every
+/// override and grant the hooks honour ([`KILL_GRANT`],
+/// `FS_PROTECT_OVERRIDE`, `PTRACE_OVERRIDE`) must carry it, so a value
+/// pinned by an earlier run is dead after a restart.
 #[map]
 pub static AGENT_SESSION: Array<u32> = Array::pinned(1, 0);
 
@@ -133,7 +133,8 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     //     tgkill between its own threads).
     //   - caller is itself in PROTECTED_PIDS: the watchdog's
     //     stuck-recovery SIGINT→SIGKILL and the agent↔watchdog pair.
-    //   - caller is PID 1 with the armed session nonce (below).
+    //   - caller is PID 1 under a live grant, or PID 1 as
+    //     systemd-shutdown (below).
     let sig: c_int = ctx.arg(2);
     if sig == 0 {
         return 0;
@@ -173,35 +174,60 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
-    // BUG-010 (PHASE 15.1): PID-1 carve-out. systemd is the host's
-    // legitimate process supervisor; without this `systemctl restart`
-    // hangs forever (catalog §4). The carve-out fires ONLY when:
-    //   1. The caller is PID 1 (kernel-assigned; not spoofable from
-    //      userspace).
-    //   2. The agent has armed the override by writing matching
-    //      session-nonce values to KILL_OVERRIDE and AGENT_SESSION.
-    //      Both default to zero; a leftover pinned slot from a prior
-    //      install will not match the new agent's freshly-chosen
-    //      nonce, so stale pins are effectively dead.
-    // An attacker running `kill -TERM <agent>` from their own PID has
-    // `caller_tgid != 1` and is still denied. A root attacker capable
-    // of writing both BPF maps already has the kernel-side power to
-    // unpin the LSM hook outright — out of scope for the V1 model.
-    if caller_tgid == 1 {
-        let override_val = match KILL_OVERRIDE.get(0) {
-            Some(v) => *v,
-            None => 0,
-        };
-        let session_val = match AGENT_SESSION.get(0) {
-            Some(v) => *v,
-            None => 0,
-        };
-        if override_val != 0 && override_val == session_val {
-            return 0;
-        }
+    // External audit EBPF-001: PID 1 (systemd) signals a protected
+    // process only (a) under a live grant — written for a signed
+    // trusted-installer window, for the stop signals, until the window
+    // ends, under this boot's session nonce — or (b) as
+    // `systemd-shutdown`, the final stage of a shutdown, past which the
+    // machine halts: the units are not stopped by the shutdown
+    // transaction (no `Conflicts=shutdown.target`) and end here.
+    // `systemctl stop`/`kill`/`restart` outside a window is refused like
+    // a root shell's `kill`: systemd only relays root's request.
+    if caller_tgid == 1 && (pid1_granted(sig) || pid1_is_final_shutdown()) {
+        return 0;
     }
 
     // Evidence: a refused signal is an attempt on the agent (rate-limited).
     crate::inode_protect::emit_task_denial(FS_OP_SIGNAL, sig as u64, target_tgid);
     -EPERM
+}
+
+#[inline(always)]
+fn pid1_granted(sig: c_int) -> bool {
+    let session = match AGENT_SESSION.get(0) {
+        Some(v) => *v,
+        None => return false,
+    };
+    match KILL_GRANT.get(0) {
+        Some(g) => g.allows(sig, unsafe { bpf_ktime_get_ns() }, session),
+        None => false,
+    }
+}
+
+/// `comm` of `systemd-shutdown` (15 bytes and the NUL), as two words: an
+/// array compare would lower to a `memcmp` call.
+const SHUTDOWN_COMM_LO: u64 = u64::from_ne_bytes(*b"systemd-");
+const SHUTDOWN_COMM_HI: u64 = u64::from_ne_bytes(*b"shutdow\0");
+
+/// PID 1 is running `systemd-shutdown`: the comm (only PID 1 itself can
+/// set it) AND the executable the agent recorded — a comm set through
+/// `ptrace` of PID 1 is not enough.
+#[inline(always)]
+fn pid1_is_final_shutdown() -> bool {
+    let comm = match bpf_get_current_comm() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let words: [u64; 2] = unsafe { core::mem::transmute(comm) };
+    if words[0] != SHUTDOWN_COMM_LO || words[1] != SHUTDOWN_COMM_HI {
+        return false;
+    }
+    let want = match SHUTDOWN_EXE.get(0) {
+        Some(k) if k.ino != 0 => *k,
+        _ => return false,
+    };
+    match unsafe { crate::bpf_defense::caller_exe_key() } {
+        Some(k) => k.dev == want.dev && k.ino == want.ino,
+        None => false,
+    }
 }

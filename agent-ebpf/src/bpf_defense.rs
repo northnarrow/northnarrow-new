@@ -292,8 +292,9 @@ unsafe fn obj_get_names_own_link(attr: *const c_void) -> bool {
     }
 }
 
+/// `(dev, ino)` of the calling task's executable (`mm->exe_file`).
 #[inline(always)]
-unsafe fn caller_exe_key() -> Option<InodeKey> {
+pub(crate) unsafe fn caller_exe_key() -> Option<InodeKey> {
     let task = bpf_get_current_task() as *const u8;
     if task.is_null() {
         return None;

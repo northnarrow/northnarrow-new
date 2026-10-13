@@ -115,7 +115,11 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///   catch journald's normal append rhythm here.
 ///
 /// Deliberately **NOT** excluded:
-/// - `/dev/`        — includes `/dev/shm/`, a real ransomware staging tmpfs.
+/// - `/dev/shm/`    — a real ransomware staging tmpfs. The rest of `/dev`
+///   holds device nodes (`/dev/null` in a script's
+///   redirects, `/dev/console` that systemd writes at
+///   shutdown), not data: excluded by [`is_device_node`],
+///   as the kernel counter counts regular files only.
 /// - `/run/`        — broad, includes `/run/user/<uid>/` where user
 ///   processes legitimately write (lock files, dbus
 ///   sockets). Counted toward mass-write so a
@@ -133,7 +137,16 @@ fn is_mass_write_carveout(filename: &str, extras: &[String]) -> bool {
     MASS_WRITE_CARVEOUT_PREFIXES
         .iter()
         .any(|p| filename.starts_with(p))
+        || is_device_node(filename)
         || extras.iter().any(|p| filename.starts_with(p.as_str()))
+}
+
+/// A device node under `/dev` (not the `/dev/shm` and `/dev/mqueue`
+/// filesystems, which hold files).
+fn is_device_node(filename: &str) -> bool {
+    filename.starts_with("/dev/")
+        && !filename.starts_with("/dev/shm/")
+        && !filename.starts_with("/dev/mqueue/")
 }
 
 /// Tappa 10.9 step 1: `true` once the file-open sensor on LSM `file_open`
@@ -442,8 +455,15 @@ impl TriggerDetector {
         // BUG-032: a denied anti-tamper attempt is kernel-adjudicated
         // malice — the Decisive signal that reaches COMBAT on its own
         // (split out of confirmed_intrusion's old FsProtectDenial arm).
-        if matches!(event, Event::FsProtectDenial { .. }) {
-            hits.push(TriggerType::AntiTamperDenial);
+        // External audit EBPF-001: a denial whose sender is PID 1 is a
+        // `systemctl` request systemd relayed — refused, recorded, ENGAGED;
+        // the requester is unknown, and init is no offender to contain.
+        if let Event::FsProtectDenial { pid, .. } = event {
+            hits.push(if *pid == 1 {
+                TriggerType::RelayedTamperAttempt
+            } else {
+                TriggerType::AntiTamperDenial
+            });
         }
         if confirmed_intrusion(
             event,
@@ -1392,6 +1412,18 @@ mod tests {
         let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// Lab finding (EBPF-001 work): systemd writing `/dev/console` at
+    /// shutdown, a script's `> /dev/null`, are not data writes; files in
+    /// `/dev/shm` are.
+    #[test]
+    fn device_nodes_are_not_mass_write_but_dev_shm_is() {
+        assert!(is_mass_write_carveout("/dev/console", &[]));
+        assert!(is_mass_write_carveout("/dev/null", &[]));
+        assert!(is_mass_write_carveout("/dev/pts/0", &[]));
+        assert!(!is_mass_write_carveout("/dev/shm/locked.bin", &[]));
+        assert!(!is_mass_write_carveout("/home/u/doc.pdf", &[]));
     }
 
     #[test]

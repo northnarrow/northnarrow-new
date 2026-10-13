@@ -81,6 +81,14 @@ pub enum TriggerType {
     // FsProtectDenial arm: a *denied* anti-tamper attempt is the kernel
     // having already blocked malice, not a heuristic pattern.
     AntiTamperDenial,
+
+    // External audit EBPF-001: a signal to the agent or the watchdog that
+    // PID 1 relayed (`systemctl stop`/`kill`/`restart`) outside a signed
+    // trusted-installer window, refused by the kernel. The requester is
+    // not known — systemd only relays it — so it raises ENGAGED, never a
+    // COMBAT with init as the offender (whose only containment would be
+    // ISOLATE). Appended last to keep variant ordering stable.
+    RelayedTamperAttempt,
 }
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
@@ -127,7 +135,9 @@ impl TriggerType {
             TriggerType::SensitiveFileAccess
             | TriggerType::CriticalFileModification
             | TriggerType::PersistenceMechanism => EvidenceClass::FileSystem,
-            TriggerType::AntiTamperDenial => EvidenceClass::Kernel,
+            TriggerType::AntiTamperDenial | TriggerType::RelayedTamperAttempt => {
+                EvidenceClass::Kernel
+            }
         }
     }
 
@@ -142,7 +152,8 @@ impl TriggerType {
             TriggerType::ExploitAttempt
             | TriggerType::AdjacentCompromise
             | TriggerType::HeavyReconnaissance
-            | TriggerType::CriticalFileModification => PostureKind::Engaged,
+            | TriggerType::CriticalFileModification
+            | TriggerType::RelayedTamperAttempt => PostureKind::Engaged,
 
             TriggerType::ConfirmedIntrusion
             | TriggerType::PersistenceMechanism
@@ -177,6 +188,7 @@ impl TriggerType {
             TriggerType::LateralMovement => "LateralMovement",
             TriggerType::ExfiltrationPattern => "ExfiltrationPattern",
             TriggerType::AntiTamperDenial => "AntiTamperDenial",
+            TriggerType::RelayedTamperAttempt => "RelayedTamperAttempt",
         }
     }
 }

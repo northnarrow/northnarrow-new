@@ -217,7 +217,8 @@ the deny path is off (observe mode, tests).
 
 **The pin root is protected (review entry 39).** The hooks survive the
 agent's death only through their pins, and `systemctl stop` of both units
-is allowed (the PID-1 carve-out), so `rm -rf /sys/fs/bpf/northnarrow`
+was allowed (the PID-1 carve-out, since limited to the same window — §3.7),
+so `rm -rf /sys/fs/bpf/northnarrow`
 afterwards used to drop every hook — the two-command disable. The agent
 now registers the pin root and every pin in the protected-inode set:
 unlink, rmdir, rename and setattr are denied to any process that is not
@@ -291,10 +292,10 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
 
 **How the previous run ended.** Some kills cannot be refused at all: a write
-to the unit's `cgroup.kill`, `systemctl kill -s KILL`, the OOM killer — and a
-crash or a power loss look the same. The watchdog brings the agent back; the
-evidence is in the chain: every run writes `agent_stop` (with the reason it
-left its event loop: `sigterm`, `sigint`, `sighup`, `admin_shutdown`,
+to the unit's `cgroup.kill`, the OOM killer — and a crash or a power loss look
+the same. The watchdog brings the agent back; the evidence is in the chain:
+every run writes `agent_stop` (with the reason it left its event loop:
+`sigterm`, `system_shutdown`, `sigint`, `sighup`, `admin_shutdown`,
 `sensor_pump_exited`) and every `agent_boot` carries `previous_run`:
 
 ```sh
@@ -341,6 +342,40 @@ every `.sig` are now protected against unlink and rename like the other
 overlays. Escape hatch for a migration: `NN_OVERLAY_ALLOW_UNSIGNED=1` loads
 unsigned overlays anyway, still reported, and is itself reported as a
 weakening environment variable.
+
+### 3.7 Stopping and restarting the agent
+
+The units refuse a manual stop (`RefuseManualStop=yes`: `systemctl stop`,
+`restart`, `isolate` of the unit alone fail at once with "may be requested
+by dependency only"), and the task_kill hook refuses systemd's signals to
+the agent and the watchdog unless a trusted-installer window is open
+(external audit EBPF-001): systemd only relays root's request, and root is
+the adversary this agent is built against. Outside a window `systemctl
+kill` fails with "Access denied"; the attempt is a signed detection
+(NN-L-AT-001, "on behalf of a `systemctl stop` / `kill` / `restart`") and
+raises the posture to ENGAGED — never COMBAT: systemd is the relay, not the
+offender, and the requester is not known.
+
+To restart, for example after `nn-admin config overlay set`:
+
+```sh
+sudo nn-admin trusted-installer-grant --key <trusted-installer key> --window-secs 120
+sudo systemctl kill -s SIGTERM northnarrow-agent       # the watchdog starts it again
+```
+
+To stop for good, `nn-admin shutdown` (2-of-N quorum; the watchdog stands
+down). For maintenance, the window, then `sudo systemctl kill -s SIGTERM
+northnarrow-watchdog` and the same for `northnarrow-agent` (watchdog first,
+or it starts the agent again). `install.sh --upgrade` and `uninstall.sh` do
+exactly this.
+
+A shutdown or reboot needs no window and waits at most the units' 5-s stop
+timeout: their stop jobs end with the processes still running, the agent
+keeps detecting through the rest of the shutdown, and both end with
+`systemd-shutdown`'s final SIGTERM, which the hook allows only to that
+program, verified by its executable (`agent_stop` reason
+`system_shutdown`). The refused SIGTERM of the stop job is not reported as
+an attempt while systemd reports the host as `stopping`.
 
 ## 4. What still needs a reboot
 

@@ -59,6 +59,7 @@ const FMODE_WRITE: u32 = 0x2;
 /// `BTRFS_SUPER_MAGIC`, include/uapi/linux/magic.h.
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 const S_IFMT: u16 = 0o170_000;
+const S_IFREG: u16 = 0o100_000;
 const S_IFDIR: u16 = 0o040_000;
 
 /// Filesystems whose writes are kernel calls, not data (the posture's
@@ -518,13 +519,25 @@ pub unsafe fn on_open(file: *const u8) {
     }
     let dentry = win_u64(w, FILE_WIN, file, off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const u8;
     let flags = win_u32(w, FILE_WIN, file, off!(FILE_F_FLAGS_OFFSET));
-    observe(&key, watched, watched, mode, flags, dentry);
+    // Mass write is the ransomware shape — data files. A device, FIFO or
+    // socket opened for writing (`> /dev/null` in a script loop, systemd
+    // writing `/dev/console` at shutdown) does not count.
+    let regular = (win_u32(iw, INODE_WIN, inode, off!(INODE_I_MODE_OFFSET)) as u16) & S_IFMT == S_IFREG;
+    observe(&key, watched, watched, mode, flags, dentry, regular);
 }
 
 /// The sensor proper. `family_checked`: the caller already knows the
 /// opener is not the agent itself.
 #[inline(always)]
-unsafe fn observe(key: &InodeKey, watched: bool, family_checked: bool, mode: u32, flags: u32, dentry: *const u8) {
+unsafe fn observe(
+    key: &InodeKey,
+    watched: bool,
+    family_checked: bool,
+    mode: u32,
+    flags: u32,
+    dentry: *const u8,
+    regular: bool,
+) {
     let write = mode & FMODE_WRITE != 0;
     if dentry.is_null() {
         return;
@@ -611,7 +624,7 @@ unsafe fn observe(key: &InodeKey, watched: bool, family_checked: bool, mode: u32
     // under its own tgid and are dropped here when they cross the
     // threshold (once per window).
     let mut count = 0u32;
-    if write {
+    if write && regular {
         count = count_write(&cls);
         if count != 0 {
             reason |= open_reason::MASS_WRITE;

@@ -49,7 +49,8 @@ edit a copy, store it signed through the agent, and restart:
 cp /etc/northnarrow/process-comm-allowlist.local.example /tmp/allow
 $EDITOR /tmp/allow                                         # uncomment +runc, etc.
 sudo nn-admin config overlay set process-comm-allowlist --file /tmp/allow --key <config-manage key>
-sudo systemctl restart northnarrow-agent
+sudo nn-admin trusted-installer-grant --key <trusted-installer key> --window-secs 120
+sudo systemctl kill -s SIGTERM northnarrow-agent          # the watchdog starts it again
 sudo nn-admin config overlay status                        # process-comm-allowlist  signed
 ```
 
