@@ -380,6 +380,27 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C38,"* ]]; then
     for i in $(seq 1 40); do window_open || break; sleep 1; done
 fi
 
+# ── the agent's links (external audit EBPF-010) ──────────────────────────
+# A handle on one of the agent's pinned links: through a path padded past
+# the hook's buffer (it used to pass the name check), and through a symlink
+# (a check on the caller's string cannot follow it). Whatever the handle,
+# detaching or replacing the hook is refused to a foreign process — the
+# kernels we support refuse both on these link types anyway (EOPNOTSUPP /
+# EINVAL in observe mode).
+LNK_SRC="$(dirname "$0")/link-detach-probe.c"
+LNK_BIN=/usr/local/libexec/nn-lab/nn-link-probe
+if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BIN" "$LNK_SRC" 2>/tmp/nn-lnk-cc.log; then
+    long="$PINS/"
+    while (( ${#long} < 280 )); do long+="./"; done
+    long+="link_task_kill"
+    run_case C39 "link handle through a $(( ${#long} ))-byte path to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" "$long"
+    ln -sfn "$PINS/link_task_kill" /tmp/nn-link-alias
+    run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" /tmp/nn-link-alias
+    rm -f /tmp/nn-link-alias
+else
+    echo "C39-C40 skipped: cannot build the link probe ($(head -1 /tmp/nn-lnk-cc.log 2>/dev/null))" >&2
+fi
+
 echo
 echo "| case | action | outcome | evidence | verdict |"
 echo "|---|---|---|---|---|"

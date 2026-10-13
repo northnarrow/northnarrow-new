@@ -477,6 +477,26 @@ pub struct InodeKey {
     pub ino: u64,
 }
 
+/// External audit EBPF-010: the keys of the eBPF `OWN_PIN_NAMES` map —
+/// FNV-1a (64-bit) of a link pin's final path component. The `bpf` LSM hook
+/// hashes the final component of an `OBJ_GET` path in one pass, a loop the
+/// verifier checks in linear time (copying it into a 32-byte key made it
+/// explore every length and `/` position, past the million-instruction
+/// budget); userland registers each pin name with [`pin_name_hash`].
+pub const PIN_NAME_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+pub const PIN_NAME_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// [`PIN_NAME_HASH_SEED`] folded with `name`, byte by byte, as the hook does.
+pub fn pin_name_hash(name: &[u8]) -> u64 {
+    let mut h = PIN_NAME_HASH_SEED;
+    let mut i = 0;
+    while i < name.len() {
+        h = (h ^ name[i] as u64).wrapping_mul(PIN_NAME_HASH_PRIME);
+        i += 1;
+    }
+    h
+}
+
 /// External audit EBPF-001: the one slot of the pinned `KILL_GRANT` map —
 /// when PID 1 (systemd) may signal a protected process. The agent writes
 /// it only while a signed trusted-installer window is open (`systemctl

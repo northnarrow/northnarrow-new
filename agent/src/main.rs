@@ -3013,6 +3013,9 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // The links go with the agent from here on: the self-check stops
+    // reporting them (a spurious signed bpf_link_missing otherwise).
+    northnarrow_agent::anti_tamper::bpf_defense::mark_stopping();
 
     if let Some(log) = &audit_log {
         let uptime = loop_started.elapsed().as_secs();

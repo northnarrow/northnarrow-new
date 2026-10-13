@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the agent's BPF links (High EBPF-010):
+  - Detaching or replacing one of the agent's links is refused to any
+    process but the agent and the watchdog, by the link the fd names —
+    however the handle was obtained. The supported kernels refused both on
+    the agent's link types already (EOPNOTSUPP / EINVAL in the lab); the
+    agent no longer depends on it.
+  - A link handle through a pin path padded past the hook's buffer is
+    denied like the plain path (it went through in enforce mode).
+  - Pin names are matched by a hash of the path's final component: the
+    previous byte-by-byte key made the `bpf()` observer fail the kernel's
+    verifier once the deny was added (it would have run without it).
 - External audit, Wave 1, kills on everyday shapes (High FIMR-006, NETR-002):
   - A file created in a watched directory under `/home` (or `/tmp`,
     `/var/tmp`, `/dev/shm`) no longer kills the process tree and moves the

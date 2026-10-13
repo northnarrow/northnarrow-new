@@ -185,8 +185,11 @@ is not an exemption (external audit EBPF-002: root could preload its own
 library into one). Only the successor of an agent or a watchdog that
 exited may take write handles before it is a protected pid — while no live
 process holds that role, from its main thread, in its first minute — and
-no process gets a handle on the agent's links. `nn-admin` talks to the agent
-over its socket and needs none. The `bpf` hook also records who
+no process gets a handle on the agent's links (by id or through a pin; a
+symlink to a pin still yields one, which can neither detach nor replace the
+hook: since external audit EBPF-010 `BPF_LINK_DETACH` / `BPF_LINK_UPDATE` on
+one of the agent's links is denied whatever the handle). `nn-admin` talks to
+the agent over its socket and needs none. The `bpf` hook also records who
 drives BPF on the host — program loads, attaches, link create/detach,
 handles-by-id on the agent's maps — as `NN-L-BPF-001/002` alerts (Log).
 

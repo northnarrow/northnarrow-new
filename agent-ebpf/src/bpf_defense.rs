@@ -44,11 +44,12 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    BPF_MAP_ID_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
-    MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, TASK_STRUCT_MM_OFFSET,
-    TASK_STRUCT_START_TIME_OFFSET,
+    BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
+    FILES_STRUCT_FDT_OFFSET, FILE_F_INODE_OFFSET, FILE_PRIVATE_DATA_OFFSET, INODE_I_INO_OFFSET,
+    INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
 };
-use northnarrow_common::wire::InodeKey;
+use northnarrow_common::wire::{InodeKey, PIN_NAME_HASH_PRIME, PIN_NAME_HASH_SEED};
 
 const EPERM: c_int = 1;
 /// `FMODE_WRITE` (include/linux/fs.h).
@@ -76,8 +77,8 @@ pub const OWN_KIND_MAP: u8 = 1;
 pub const OWN_KIND_PROG: u8 = 2;
 pub const OWN_KIND_LINK: u8 = 3;
 
-/// Fixed-width key of [`OWN_PIN_NAMES`]: the final path component of a
-/// pin, NUL-padded. Our link pins are `link_<hook>` (≤ 25 bytes).
+/// The window of an `OBJ_GET` path read for its final component: our link
+/// pins are `link_<hook>` (≤ 25 bytes).
 pub const PIN_NAME_LEN: usize = 32;
 
 /// Pathname buffer for `OBJ_GET` (power of two: indexes are masked).
@@ -91,14 +92,16 @@ const PATH_BUF_LEN: usize = 256;
 #[map]
 static OBJ_GET_PATH_SCRATCH: PerCpuArray<[u8; PATH_BUF_LEN]> = PerCpuArray::with_max_entries(1, 0);
 
-/// Final path components of the agent's own LINK pins (value =
-/// [`OWN_KIND_LINK`]), written by userland after the pins exist. `OBJ_GET`
-/// on one of them by a foreign process is the pinned-path route to
-/// `bpftool link detach`; the id route is [`OWN_BPF_IDS`]. Matching the
-/// last component (not a prefix) also covers relative paths, symlinks and
-/// `..` — bpffs has no hard links and the pins cannot be renamed.
+/// Final path components of the agent's own LINK pins, hashed
+/// (`northnarrow_common::wire::pin_name_hash`; value = [`OWN_KIND_LINK`]),
+/// written by userland after the pins exist. `OBJ_GET` on one of them by a
+/// foreign process is the pinned-path route to a link handle; the id route
+/// is [`OWN_BPF_IDS`]. Matching the last component (not a prefix) covers
+/// relative paths and `..`; a symlink with another name does not match —
+/// external audit EBPF-010: what a link handle could do (detach, update) is
+/// denied by the link it names in `try_bpf_syscall_observe`.
 #[map]
-pub static OWN_PIN_NAMES: HashMap<[u8; PIN_NAME_LEN], u8> = HashMap::with_max_entries(64, 0);
+pub static OWN_PIN_NAMES: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
 
 /// The agent's own maps, programs and links. Key = `(kind << 32) | id`
 /// ([`own_key`]): map, program and link ids are three independent kernel
@@ -215,9 +218,82 @@ fn is_own_kind(id: u32, kind: u8) -> bool {
     unsafe { OWN_BPF_IDS.get(&own_key(kind, id)).is_some() }
 }
 
+/// The agent's pin root (`DEFAULT_BPFFS_ROOT` in userland), with the
+/// trailing slash: a truncated `OBJ_GET` path under it counts as ours.
+const PIN_ROOT: &[u8; 24] = b"/sys/fs/bpf/northnarrow/";
+
+/// [`link_id_of_fd`] as a global BPF function (exported, never inlined,
+/// scalar argument): the verifier checks it once, on its own, and the hook
+/// sees one unknown return value — `u64::MAX` for "no link". Inlined, its
+/// six optional offsets multiplied the hook's states.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_link_id_of_fd(fd: u64) -> u64 {
+    match unsafe { link_id_of_fd(fd as u32) } {
+        Some(id) => u64::from(id),
+        None => u64::MAX,
+    }
+}
+
+/// External audit EBPF-010: the id of the BPF link `fd` names in the
+/// caller's file table (`task->files->fdt->fd[fd]->private_data`), or
+/// `None` when it cannot be read (an optional offset absent on this
+/// kernel, an fd out of range or closed). The file is not checked to be a
+/// link: ids are unique, so another link never matches one of ours, and a
+/// non-link fd fails in the kernel whatever is read here.
+#[inline(always)]
+unsafe fn link_id_of_fd(fd: u32) -> Option<u32> {
+    let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET)?;
+    let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET)?;
+    let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET)?;
+    let o_fd = off_opt!(FDTABLE_FD_OFFSET)?;
+    let o_priv = off_opt!(FILE_PRIVATE_DATA_OFFSET)?;
+    let o_id = off_opt!(BPF_LINK_ID_OFFSET)?;
+    let task = bpf_get_current_task() as *const u8;
+    if task.is_null() {
+        return None;
+    }
+    let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).ok()?;
+    if files == 0 {
+        return None;
+    }
+    let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64).ok()?;
+    if fdt == 0 {
+        return None;
+    }
+    let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32).ok()?;
+    if fd >= max {
+        return None;
+    }
+    let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64).ok()?;
+    if arr == 0 {
+        return None;
+    }
+    let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).ok()?;
+    if file == 0 {
+        return None;
+    }
+    let link = bpf_probe_read_kernel::<u64>((file as *const u8).add(o_priv) as *const u64).ok()?;
+    if link == 0 {
+        return None;
+    }
+    bpf_probe_read_kernel::<u32>((link as *const u8).add(o_id) as *const u32).ok()
+}
+
+/// [`obj_get_names_own_link`] as a global BPF function (exported, never
+/// inlined, scalar argument): the verifier checks its loops once, on its
+/// own. Inlined, they multiplied with the rest of the hook past the
+/// million-instruction budget once the detach/update deny was added (lab,
+/// 6.8: "BPF program is too large").
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
+    u64::from(unsafe { obj_get_names_own_link(user_ptr) })
+}
+
 /// `OBJ_GET` whose pathname's final component is one of the agent's own
-/// LINK pins. `attr` is the kernel copy of `bpf_attr`; the first field of
-/// the `OBJ_GET` variant is the user pointer to the pathname.
+/// LINK pins. `user_ptr` is the first field of the `OBJ_GET` variant of
+/// the kernel's copy of `bpf_attr`: the user pointer to the pathname.
 ///
 /// Verifier budget (5.15): the string is read once only to learn its
 /// length `n`, then the LAST [`PIN_NAME_LEN`] bytes are read again from
@@ -228,11 +304,7 @@ fn is_own_kind(id: u32, kind: u8) -> bool {
 /// negative" on 5.15), no 256-byte scan (minutes of verification), no
 /// stack array (memset subprogram).
 #[inline(always)]
-unsafe fn obj_get_names_own_link(attr: *const c_void) -> bool {
-    let user_ptr = match bpf_probe_read_kernel::<u64>(attr as *const u64) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
+unsafe fn obj_get_names_own_link(user_ptr: u64) -> bool {
     if user_ptr == 0 {
         return false;
     }
@@ -250,8 +322,25 @@ unsafe fn obj_get_names_own_link(attr: *const c_void) -> bool {
         Ok(s) => s.len(),
         Err(_) => return false,
     };
-    if n == 0 || n >= PATH_BUF_LEN - 1 {
+    if n == 0 {
         return false;
+    }
+    // External audit EBPF-010: a path that does not fit the buffer is not
+    // let through when it starts at the agent's pin root — padding a pin's
+    // path past the buffer (`/sys/fs/bpf/northnarrow/./././…/link_task_kill`)
+    // took a link handle in enforce mode. Nothing of a third party lives
+    // under that root. (A symlink or a rewritten buffer still gets past a
+    // check on the caller's string: the guarantee is the detach/update deny
+    // in `try_bpf_syscall_observe`.)
+    if n >= PATH_BUF_LEN - 1 {
+        let mut i: usize = 0;
+        while i < PIN_ROOT.len() {
+            if (*buf)[i] != PIN_ROOT[i] {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
     }
     // pass 2: the last PIN_NAME_LEN bytes plus the terminator (user-pointer
     // arithmetic is a plain scalar add for the verifier)
@@ -268,44 +357,25 @@ unsafe fn obj_get_names_own_link(attr: *const c_void) -> bool {
     if m == 0 || m > PIN_NAME_LEN {
         return false;
     }
-    // last '/' inside the window → the final component starts after it
-    let mut start: usize = 0;
+    // External audit EBPF-010: the final component, hashed in one pass —
+    // the hash restarts after every '/'. An empty component (trailing '/')
+    // hashes to the seed and a window with no '/' to 32 bytes, neither of
+    // which is one of our names.
+    let mut h: u64 = PIN_NAME_HASH_SEED;
     let mut j: usize = 0;
     while j < PIN_NAME_LEN {
         if j >= m {
             break;
         }
-        if (*buf)[j] == b'/' {
-            start = j + 1;
+        let c = (*buf)[j];
+        if c == b'/' {
+            h = PIN_NAME_HASH_SEED;
+        } else {
+            h = (h ^ c as u64).wrapping_mul(PIN_NAME_HASH_PRIME);
         }
         j += 1;
     }
-    // `[0u8; 32]` would lower to a memset subprogram: zero with volatile
-    // stores (see zero.rs), then fill.
-    let mut key = core::mem::MaybeUninit::<[u8; PIN_NAME_LEN]>::uninit();
-    let kp = key.as_mut_ptr() as *mut u8;
-    let mut z: usize = 0;
-    while z < PIN_NAME_LEN {
-        core::ptr::write_volatile(kp.add(z), 0u8);
-        z += 1;
-    }
-    let mut len: usize = 0;
-    let mut k: usize = 0;
-    while k < PIN_NAME_LEN {
-        let idx = start + k;
-        if idx >= m || idx >= PIN_NAME_LEN {
-            break;
-        }
-        core::ptr::write_volatile(kp.add(k), (*buf)[idx]);
-        len += 1;
-        k += 1;
-    }
-    // empty (trailing '/') or as long as the key: not one of ours
-    if len == 0 || len >= PIN_NAME_LEN {
-        return false;
-    }
-    let key = key.assume_init();
-    match OWN_PIN_NAMES.get(&key) {
+    match OWN_PIN_NAMES.get(&h) {
         Some(kind) => *kind == OWN_KIND_LINK,
         None => false,
     }
@@ -516,7 +586,12 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // the deny on the write path.
     let own_map_handle = cmd == BPF_MAP_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_MAP);
     let own_link_handle = cmd == BPF_LINK_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_LINK);
-    let own_link_pin = cmd == BPF_OBJ_GET && !attr.is_null() && obj_get_names_own_link(attr);
+    let own_link_pin = cmd == BPF_OBJ_GET
+        && !attr.is_null()
+        && match bpf_probe_read_kernel::<u64>(attr as *const u64) {
+            Ok(p) => nn_obj_get_own_link(p) == 1,
+            Err(_) => false,
+        };
     // Second half of the self-defence: a link handle is the only thing
     // that can DETACH or UPDATE one of our LSM hooks (`bpftool link detach
     // id N` / `… pinned <path>`), so in enforce mode a foreign process
@@ -528,6 +603,20 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     if (own_link_handle || own_link_pin) && enforce() {
         emit_denial(FS_OP_BPF_LINK, if own_link_handle { arg } else { 0 });
         return -EPERM;
+    }
+    // External audit EBPF-010: whatever gave the handle (a pin reached
+    // through a symlink, or a buffer rewritten after the name check), a
+    // foreign process neither detaches nor replaces one of the agent's
+    // links. The kernels the agent supports refuse both on its link types
+    // anyway (tracing, raw tracepoint and perf links have no .detach /
+    // .update_prog: EOPNOTSUPP / EINVAL in the lab); this keeps it so on a
+    // kernel that adds them. `arg` is the link fd for both commands.
+    if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {
+        let id = nn_link_id_of_fd(u64::from(arg));
+        if id <= u64::from(u32::MAX) && is_own_kind(id as u32, OWN_KIND_LINK) {
+            emit_denial(FS_OP_BPF_LINK, id as u32);
+            return -EPERM;
+        }
     }
     let foreign_handle = own_map_handle || own_link_handle || own_link_pin;
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;

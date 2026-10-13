@@ -66,7 +66,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-014 | EBPF-001 | eBPF kernel | M | fixed (lab PR 94) |
 | NN-AUD-015 | EBPF-002 | eBPF kernel | M | fixed (lab PR 95) |
 | NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
-| NN-AUD-019 | EBPF-010 | eBPF kernel | M | open |
+| NN-AUD-019 | EBPF-010 | eBPF kernel | M | fixed (lab PR 97) |
 | NN-AUD-020 | EVD-001 | Evidence logs | L | open |
 | NN-AUD-021 | EVD-005 | Evidence logs | M | fixed (lab PR 90) |
 | NN-AUD-022 | EVD-021 | Evidence logs | M | fixed (lab PR 88) |
@@ -959,3 +959,40 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     (a tunnel's shape) was killed at the 8th distinct label (NN-L-NET-014
     KillProcess). `dns-sensor-check` OK (every send shape recorded,
     senders untouched).
+- **NN-AUD-019 (EBPF-010), lab PR 97.** The deny on link handles taken
+  through a pin compared the caller's path string: read twice from user
+  memory, not compared at all past the 255-byte buffer, and blind to a
+  symlink with another name. The lab confirmed the bypass (a 294-byte path
+  to `link_task_kill`, and a symlink, took a handle in enforce mode) and
+  measured what the handle can do: on 5.15 and 6.8 `BPF_LINK_DETACH` gets
+  EOPNOTSUPP and `BPF_LINK_UPDATE` EINVAL — even with the link's own
+  program — on every link type the agent uses (tracing/LSM, raw
+  tracepoint, perf: no `.detach`, no `.update_prog`). So the audit's "the
+  whole kernel half detached" does not hold on the supported kernels; the
+  fix makes the guarantee the agent's instead of the kernel's.
+  - The `bpf` hook denies `BPF_LINK_DETACH` and `BPF_LINK_UPDATE` on one of
+    the agent's links to a foreign process, by the link the fd names
+    (`task->files->fdt->fd[fd]->private_data`, `bpf_link.id` in
+    `OWN_BPF_IDS`): whatever gave the handle — a symlink, a rewritten
+    buffer, an fd passed over a socket. Six new optional BTF offsets
+    (`task_struct.files`, `files_struct.fdt`, `fdtable.max_fds/fd`,
+    `file.private_data`, `bpf_link.id`); a kernel without one of them runs
+    without this deny (the kernel's own refusal stays).
+  - A path that does not fit the buffer and starts with the pin root
+    (`/sys/fs/bpf/northnarrow/`) is treated as ours: denied in enforce.
+  - Pin names are matched by a one-pass FNV-1a hash of the final component
+    (`common::wire::pin_name_hash`, `OWN_PIN_NAMES` keyed by `u64`) instead
+    of a 32-byte key copied byte by byte, and the name check and the fd
+    lookup are global BPF functions verified on their own. Found in the
+    lab: with the deny inlined, `bpf_syscall_observe` hit the verifier's
+    million-instruction limit ("BPF program is too large") and the agent
+    ran without its `bpf()` observer — reported only as an observe-hook
+    shortfall; the copy loop alone explored every length and `/` position.
+  - Found in the lab, fixed here: the link self-check of an agent stopped
+    in a trusted-installer window reported a link the stop had just
+    released (44 ms after `agent_stop`) — a signed `bpf_link_missing` for
+    an authorised restart. The check stops once the event loop ends
+    (`mark_stopping`).
+  - Not done: the link self-check still reports a missing link (ERROR,
+    signed) instead of re-attaching it; with detach denied the only way a
+    link goes is a pin removed inside a trusted-installer window.

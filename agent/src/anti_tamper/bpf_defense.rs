@@ -58,7 +58,8 @@ pub(crate) fn own_key(kind: u8, id: u32) -> u64 {
     ((kind as u64) << 32) | id as u64
 }
 const PIN_NAMES_MAP: &str = "OWN_PIN_NAMES";
-/// Width of an `OWN_PIN_NAMES` key (mirrors `PIN_NAME_LEN` in the eBPF crate).
+/// The window the kernel reads a pin's final component from (mirrors
+/// `PIN_NAME_LEN` in the eBPF crate): a longer name is never matched.
 const PIN_NAME_LEN: usize = 32;
 /// Prefix of the LSM link pins written by `antitamper_bpf::lsm_pin_paths`.
 const LINK_PIN_PREFIX: &str = "link_";
@@ -323,8 +324,8 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
         let names = ebpf
             .map_mut(PIN_NAMES_MAP)
             .with_context(|| format!("{PIN_NAMES_MAP} missing from the eBPF object"))?;
-        let mut names: HashMap<&mut MapData, [u8; PIN_NAME_LEN], u8> =
-            HashMap::try_from(names).context("OWN_PIN_NAMES is not a HashMap<[u8; 32], u8>")?;
+        let mut names: HashMap<&mut MapData, u64, u8> =
+            HashMap::try_from(names).context("OWN_PIN_NAMES is not a HashMap<u64, u8>")?;
         for key in &pin_names {
             names
                 .insert(key, KIND_LINK, 0)
@@ -527,7 +528,7 @@ fn obj_get_fd(path: &Path) -> Option<OwnedFd> {
 
 /// NUL-padded keys for the `link_*` pins under `pin_root` (names that do
 /// not fit the key are skipped with a WARN — none of ours is that long).
-fn link_pin_names(pin_root: Option<&Path>) -> Vec<[u8; PIN_NAME_LEN]> {
+fn link_pin_names(pin_root: Option<&Path>) -> Vec<u64> {
     let Some(root) = pin_root else {
         return Vec::new();
     };
@@ -556,15 +557,32 @@ fn link_pin_names(pin_root: Option<&Path>) -> Vec<[u8; PIN_NAME_LEN]> {
     keys
 }
 
-/// The fixed-width key the kernel computes for the final path component.
-fn pin_name_key(name: &str) -> Option<[u8; PIN_NAME_LEN]> {
+/// The key the kernel computes for the final path component (external
+/// audit EBPF-010: its hash, `common::wire::pin_name_hash`), or `None` for
+/// a name the kernel's window cannot hold.
+fn pin_name_key(name: &str) -> Option<u64> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() >= PIN_NAME_LEN {
         return None;
     }
-    let mut key = [0u8; PIN_NAME_LEN];
-    key[..bytes.len()].copy_from_slice(bytes);
-    Some(key)
+    Some(common::wire::pin_name_hash(bytes))
+}
+
+/// The agent is stopping: its links go with it, and the self-check must
+/// not report them. Set by `main` as soon as the event loop ends, before
+/// anything is released.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the agent as stopping (see [`spawn_link_self_check`]). The lab
+/// caught the self-check of an agent stopped in a trusted-installer window
+/// reporting a link it had just released, 44 ms after `agent_stop`: a
+/// signed `bpf_link_missing` for an authorised restart.
+pub fn mark_stopping() {
+    STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn stopping() -> bool {
+    STOPPING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Periodic proof that the agent's own links are still attached: every
@@ -593,12 +611,19 @@ pub fn spawn_link_self_check(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>
                 LINK_CHECK_SECS,
             )))
             .await;
+            if stopping() {
+                return;
+            }
             let live: HashSet<u32> = live_links(own.pin_root.as_deref())
                 .into_iter()
                 .filter(|(_, prog)| *prog != 0)
                 .map(|(id, _)| id)
                 .collect();
             for id in &ids {
+                // re-read per link: the stop can begin during the walk
+                if stopping() {
+                    return;
+                }
                 if live.contains(id) || retired_links().lock().contains(id) || !reported.insert(*id)
                 {
                     continue;
@@ -705,12 +730,30 @@ mod tests {
     }
 
     #[test]
-    fn pin_name_key_pads_and_rejects_long_names() {
+    fn pin_name_key_hashes_and_rejects_long_names() {
         let k = pin_name_key("link_task_kill").unwrap();
-        assert_eq!(&k[..14], b"link_task_kill");
-        assert!(k[14..].iter().all(|b| *b == 0));
+        assert_eq!(k, common::wire::pin_name_hash(b"link_task_kill"));
+        assert_ne!(k, pin_name_key("link_task_kil").unwrap());
         assert!(pin_name_key("").is_none());
         assert!(pin_name_key(&"x".repeat(PIN_NAME_LEN)).is_none());
         assert!(pin_name_key(&"x".repeat(PIN_NAME_LEN - 1)).is_some());
+    }
+
+    /// External audit EBPF-010: the hook restarts the hash after every '/'
+    /// of the window; the name it ends with must hash as userland
+    /// registered it (FNV-1a, 64-bit — the published vector for "a").
+    #[test]
+    fn the_kernels_one_pass_hash_matches_the_registered_name() {
+        assert_eq!(common::wire::pin_name_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        let window = b"fs/bpf/northnarrow/link_task_kill";
+        let mut h = common::wire::PIN_NAME_HASH_SEED;
+        for &c in window.iter() {
+            if c == b'/' {
+                h = common::wire::PIN_NAME_HASH_SEED;
+            } else {
+                h = (h ^ u64::from(c)).wrapping_mul(common::wire::PIN_NAME_HASH_PRIME);
+            }
+        }
+        assert_eq!(Some(h), pin_name_key("link_task_kill"));
     }
 }
