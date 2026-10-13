@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the tracepoint fallback (High POS-004): when the
+  file-open sensor runs on the `openat` tracepoint, an open's path is the
+  caller's own string, read before any permission check. A refused open of
+  a persistence or critical path no longer counts as a COMBAT-tier signal
+  (it alerts), and a path through `/proc/self/cwd` or `..` no longer
+  escapes the mass-write count.
 - External audit, Wave 2, the advisory gate (Medium SUP-006): `cargo audit`
   checks every lockfile — the fuzz harness and the eBPF crate were never
   audited — and runs as a plain step with a read-only token; the action it

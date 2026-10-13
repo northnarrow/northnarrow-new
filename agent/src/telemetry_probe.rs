@@ -416,6 +416,7 @@ mod tests {
             filename: format!("{PROBE_DIR}/{n}"),
             flags: 0,
             timestamp_ns: 0,
+            path_from_user: false,
         };
         assert_eq!(matches(&fo, n), Some(Sensor::FileOpen));
         let dns = Event::DnsQuery {

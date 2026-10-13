@@ -141,6 +141,59 @@ fn is_mass_write_carveout(filename: &str, extras: &[String]) -> bool {
         || extras.iter().any(|p| filename.starts_with(p.as_str()))
 }
 
+/// External audit POS-004: [`is_mass_write_carveout`] for a path the caller
+/// passed (tracepoint mode), which no kernel resolved: it is judged after
+/// its `.` and `..` segments are folded, and a path through a process's
+/// `cwd`, `root` or `fd` link under `/proc` — a door to any file, not a
+/// pseudo-file — is never carved out (`/proc/self/cwd/report.docx`,
+/// `/proc/../home/u/x` evaded the mass-write count).
+fn is_mass_write_carveout_unresolved(filename: &str, extras: &[String]) -> bool {
+    let folded = fold_dot_segments(filename);
+    if through_proc_link(&folded) {
+        return false;
+    }
+    is_mass_write_carveout(&folded, extras)
+}
+
+/// `path` with `.` and `..` segments and repeated slashes folded, as the
+/// kernel would walk them were there no symlink on the way.
+fn fold_dot_segments(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    let joined = parts.join("/");
+    if path.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// `/proc/<pid|self|thread-self>[/task/<tid>]/{cwd,root,fd}/…`: a link the
+/// kernel follows to the process's directory, root or open file (an
+/// `fd/<n>` reopens that file).
+fn through_proc_link(path: &str) -> bool {
+    let task = |s: &str| {
+        s == "self"
+            || s == "thread-self"
+            || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let door = |s: &str| matches!(s, "cwd" | "root" | "fd");
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match segs.as_slice() {
+        ["proc", who, "task", tid, link, _, ..] => task(who) && task(tid) && door(link),
+        ["proc", who, link, _, ..] => task(who) && door(link),
+        _ => false,
+    }
+}
+
 /// A device node under `/dev` (not the `/dev/shm` and `/dev/mqueue`
 /// filesystems, which hold files).
 fn is_device_node(filename: &str) -> bool {
@@ -451,8 +504,26 @@ impl TriggerDetector {
         if heavy_recon(event, recent) {
             hits.push(TriggerType::HeavyReconnaissance);
         }
+        // External audit POS-004: in tracepoint mode an open's path is the
+        // string the caller passed, read at syscall entry — before any
+        // permission check (a refused open counts) and unresolved. It
+        // cannot carry a COMBAT-tier file signal: two refused opens of
+        // `/etc/cron.d/x` and `/etc/ssh/sshd_config` were the corroborating
+        // pair of POS-001, with no privilege and nothing written. It
+        // raises the credential-reach tier (ALERTED) instead.
+        let unadjudicated = matches!(
+            event,
+            Event::FileOpen {
+                path_from_user: true,
+                ..
+            }
+        );
         if critical_file_modification(event) {
-            hits.push(TriggerType::CriticalFileModification);
+            hits.push(if unadjudicated {
+                TriggerType::SensitiveFileAccess
+            } else {
+                TriggerType::CriticalFileModification
+            });
         }
 
         // ENGAGED -> COMBAT tier
@@ -484,7 +555,11 @@ impl TriggerDetector {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event, &self.auth) {
-            hits.push(TriggerType::PersistenceMechanism);
+            hits.push(if unadjudicated {
+                TriggerType::SensitiveFileAccess
+            } else {
+                TriggerType::PersistenceMechanism
+            });
         }
         if lateral_movement(event, recent, &self.escalation_allow) {
             hits.push(TriggerType::LateralMovement);
@@ -877,7 +952,9 @@ fn confirmed_intrusion(
             // check below mirrors it so an attacker can't pad a
             // window of real data writes with sysfs noise to dilute
             // the count.
-            if is_mass_write_carveout(focal_filename, mass_write_extras) {
+            // External audit POS-004: a caller's string, not the opened path.
+            let carved = |f: &str| is_mass_write_carveout_unresolved(f, mass_write_extras);
+            if carved(focal_filename) {
                 return false;
             }
             // T7.13 — auth-mediated PIDs (sudo + its children: apt,
@@ -950,7 +1027,7 @@ fn confirmed_intrusion(
                     if *pid == *focal_pid
                         && is_write_open(*f)
                         && counted(*f)
-                        && !is_mass_write_carveout(filename, mass_write_extras)
+                        && !carved(filename)
                         && !in_own_runtime(filename)
                         && within(*focal_ts, *timestamp_ns, MASS_WRITE_WINDOW_NS)
                     {
@@ -1237,6 +1314,7 @@ pub(super) mod testutil {
             filename: filename.into(),
             flags,
             timestamp_ns: ts,
+            path_from_user: false,
         }
     }
 
@@ -1847,6 +1925,79 @@ mod tests {
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "unattributed mass-write must still fire, got {hits:?}"
         );
+    }
+
+    // ── External audit POS-004 ──────────────────────────────────────
+
+    fn file_open_from_user(pid: u32, filename: &str, flags: u32, ts: u64) -> Event {
+        let mut e = file_open(pid, 1000, filename, flags, ts);
+        if let Event::FileOpen { path_from_user, .. } = &mut e {
+            *path_from_user = true;
+        }
+        e
+    }
+
+    /// In tracepoint mode an open's path is the caller's string, read
+    /// before any permission check: a refused open of a persistence or a
+    /// critical path raises the credential-reach tier (ALERTED), never a
+    /// COMBAT-tier file signal; the same opens seen by the LSM sensor do.
+    #[test]
+    fn refused_opens_in_tracepoint_mode_cannot_forge_combat_signals() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(700, 1, "/home/u/tool", 1), &[]);
+        for (path, combat_tier) in [
+            ("/etc/cron.d/x", TriggerType::PersistenceMechanism),
+            (
+                "/etc/ssh/sshd_config",
+                TriggerType::CriticalFileModification,
+            ),
+        ] {
+            let hits = det.detect(&file_open_from_user(700, path, 1, 5), &[]);
+            assert!(!hits.contains(&combat_tier), "{path}: {hits:?}");
+            assert!(
+                hits.contains(&TriggerType::SensitiveFileAccess),
+                "{path}: {hits:?}"
+            );
+            let hits = det.detect(&file_open(700, 1000, path, 1, 6), &[]);
+            assert!(hits.contains(&combat_tier), "LSM-mode {path}: {hits:?}");
+        }
+    }
+
+    /// The mass-write count no longer skips a caller's path that only
+    /// looks like a pseudo-filesystem one.
+    #[test]
+    fn the_mass_write_carveout_is_not_dodged_through_proc_links() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(710, 1, "/srv/app/worker", 1), &[]);
+        let burst = |path: &dyn Fn(u64) -> String| {
+            let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+                .map(|i| file_open_from_user(710, &path(i), 2, i + 10))
+                .collect();
+            let focal = file_open_from_user(710, &path(99), 2, MASS_WRITE_MIN as u64 + 11);
+            det.detect(&focal, &recent)
+        };
+        let fired = |hits: Vec<TriggerType>| hits.contains(&TriggerType::ConfirmedIntrusion);
+        assert!(fired(burst(&|i| format!("/proc/self/cwd/docs/{i}.docx"))));
+        assert!(fired(burst(&|i| format!("/proc/../home/u/docs/{i}.docx"))));
+        assert!(fired(burst(&|i| format!("/proc/1234/root/home/u/{i}"))));
+        assert!(fired(burst(&|i| format!("/proc/self/fd/{i}"))));
+        assert!(
+            !fired(burst(&|i| format!("/proc/sys/vm/knob{i}"))),
+            "a real pseudo-file"
+        );
+        assert!(!fired(burst(&|i| format!("/sys/fs/cgroup/x/{i}"))));
+    }
+
+    #[test]
+    fn dot_segments_fold_and_proc_links_are_doors() {
+        assert_eq!(fold_dot_segments("/proc/../home//u/./x"), "/home/u/x");
+        assert_eq!(fold_dot_segments("/a/b/../../.."), "/");
+        assert!(through_proc_link("/proc/self/cwd/x"));
+        assert!(through_proc_link("/proc/42/task/43/root/etc/x"));
+        assert!(through_proc_link("/proc/thread-self/fd/3"));
+        assert!(!through_proc_link("/proc/self/cwd"));
+        assert!(!through_proc_link("/proc/sys/vm/x"));
+        assert!(!through_proc_link("/proc/self/oom_score_adj"));
     }
 
     // ── External audit POS-002 / POS-003 ────────────────────────────

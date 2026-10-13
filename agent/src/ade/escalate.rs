@@ -316,6 +316,7 @@ mod tests {
             filename: "/etc/passwd".into(),
             flags: 0,
             timestamp_ns: 0,
+            path_from_user: false,
         };
         let host = host();
         let m = meta(&host);

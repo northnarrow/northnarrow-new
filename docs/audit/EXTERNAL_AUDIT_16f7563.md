@@ -88,7 +88,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-042 | PROC-007 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-043 | POS-002 | Posture | M | fixed (lab PR 101) |
 | NN-AUD-044 | POS-003 | Posture | M | fixed (lab PR 101) |
-| NN-AUD-045 | POS-004 | Posture | L | open |
+| NN-AUD-045 | POS-004 | Posture | L | fixed (lab PR 108) |
 | NN-AUD-046 | CMB-001 | Combat response | M | fixed (lab PR 100) |
 | NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
 | NN-AUD-050 | CMB-006 | Combat response | M | fixed (lab PR 103) |
@@ -1546,3 +1546,26 @@ the audit did not report, noted with the fix that takes them.
   canary file is opened `O_NONBLOCK` and checked to be a regular file
   (NN-AUD-062). NN-AUD-192 (WDG-006): the watchdog registers itself before
   it waits for the agent (NN-AUD-069).
+- **NN-AUD-045 (POS-004), lab PR 108.** In tracepoint mode (no LSM
+  `file_open`, or `--file-open-sensor tracepoint`) an open's `filename` is
+  the string the caller passed, read from its memory at `sys_enter_openat`
+  — before any permission check and unresolved. The posture judged it like
+  the LSM sensor's canonical path: a refused `open("/etc/cron.d/x",
+  O_WRONLY)` raised PersistenceMechanism (and a critical path
+  CriticalFileModification) with no privilege and nothing written; and
+  `/proc/self/cwd/…` or `/proc/../home/…` dodged the mass-write count
+  through its `/proc/` carve-out. Known internally as `posture-path-string-1`
+  (fixed in LSM mode, open on the fallback).
+  - `Event::FileOpen::path_from_user` marks the tracepoint's events.
+  - Their persistence and critical-file hits raise SensitiveFileAccess
+    (ALERTED): no COMBAT-tier file signal, no corroboration, from a string.
+  - The mass-write carve-out judges such a path after folding its `.` and
+    `..` segments, and never carves out one through a process's `cwd`,
+    `root` or `fd` link under `/proc`.
+  - Lab, Debian 12 (6.1), agent in tracepoint mode, an unprivileged
+    service. Before: `open("/etc/cron.d/nnx-tp", "w")` and
+    `open("/etc/ssh/sshd_config", "a")`, both refused (EACCES), took the
+    posture to ENGAGED on PersistenceMechanism; 25 files written through
+    `/proc/self/cwd/` raised nothing. After: the refused opens took it to
+    ALERTED (SensitiveFileAccess); the 25 writes raised ConfirmedIntrusion
+    (ENGAGED).
