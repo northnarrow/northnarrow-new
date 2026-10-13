@@ -390,6 +390,13 @@ pub(crate) fn attach(
 
     // Step 1: ensure dir exists, mode 0700, root-owned.
     ensure_state_dir(dir).with_context(|| format!("preparing {}", dir.display()))?;
+    // Step 1.5: the response executor's vault, before the dir is `+i`.
+    if let Err(e) = ensure_quarantine_dirs(dir) {
+        warn!(
+            error = format!("{e:#}"),
+            "anti-tamper FS: quarantine vault directory not created — a quarantine will fail"
+        );
+    }
     let meta = std::fs::metadata(dir)
         .with_context(|| format!("re-stating {} after mkdir", dir.display()))?;
     info!(
@@ -1298,6 +1305,33 @@ pub fn bootstrap_audit_log(audit_log_path: &Path) -> Result<()> {
         path = %audit_log_path.display(),
         "anti-tamper FS: audit log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
     );
+    Ok(())
+}
+
+/// The response executor's vault, `quarantine/vault` (mode 0700). Under
+/// the state directory's `chattr +i` nobody — the agent included — adds an
+/// entry to it: the first quarantine on a fresh install failed with EPERM
+/// creating the vault (lab, external audit CMB-001 verification). Created
+/// here at every start when missing, with `+i` lifted for the moment it
+/// takes when a previous boot set it ([`ImmutabilityGuard`] re-applies it).
+fn ensure_quarantine_dirs(dir: &Path) -> Result<()> {
+    let quarantine = dir.join("quarantine");
+    let vault = quarantine.join("vault");
+    if vault.is_dir() {
+        return Ok(());
+    }
+    // only the state dir itself carries +i: an existing quarantine/ takes
+    // its vault without lifting anything
+    let _guard = if quarantine.is_dir() {
+        None
+    } else {
+        Some(ImmutabilityGuard::lift(dir)?)
+    };
+    DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&vault)
+        .with_context(|| format!("mkdir {}", vault.display()))?;
     Ok(())
 }
 

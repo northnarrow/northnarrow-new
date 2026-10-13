@@ -118,14 +118,15 @@ impl Executor {
         }
     }
 
-    /// Review 87: quarantine the binary at `path`, which backed `pid`
-    /// (already killed). Detect-only reports `WouldExecute`.
-    pub fn quarantine_path(&self, path: &std::path::Path, pid: u32) -> ExecutionReport {
+    /// Review 87: quarantine the binary `handle` holds, which backed `pid`
+    /// (already killed; external audit CMB-001: opened before the kill, the
+    /// inode itself, not a path). Detect-only reports `WouldExecute`.
+    pub fn quarantine_handle(&self, handle: &quarantine::ExeHandle, pid: u32) -> ExecutionReport {
         let start = Instant::now();
         let primary = if self.config.dry_run {
             ExecutionOutcome::WouldExecute { pid }
         } else {
-            quarantine::quarantine_binary(path, pid, &self.config)
+            quarantine::quarantine_handle(handle, pid, &self.config)
         };
         ExecutionReport {
             action: ResponseAction::Quarantine,

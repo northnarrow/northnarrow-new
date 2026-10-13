@@ -89,7 +89,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-043 | POS-002 | Posture | M | open |
 | NN-AUD-044 | POS-003 | Posture | M | open |
 | NN-AUD-045 | POS-004 | Posture | L | open |
-| NN-AUD-046 | CMB-001 | Combat response | M | open |
+| NN-AUD-046 | CMB-001 | Combat response | M | fixed (lab PR 100) |
 | NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
 | NN-AUD-050 | CMB-006 | Combat response | M | open |
 | NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
@@ -1020,3 +1020,58 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     like the other overlays) when an operator's backup runs them.
   - The trip event and the chain row now carry the accessor's executable
     (`/proc/<pid>/exe`; it was always `None`).
+- **NN-AUD-046 (CMB-001), lab PR 100.** The quarantine resolved
+  `/proc/<pid>/exe` once, then checked the denylist, read the file and
+  unlinked it BY NAME (and NEUTRALIZE resolved the name before the kill
+  and quarantined after it). A user who owns a directory of their own
+  binary's path could swap it for a symlink in between and have the agent —
+  root, `CAP_DAC_OVERRIDE` — vault and delete any file; the lexical
+  denylist (registry entry 3) was judged on the string from before the
+  swap.
+  - The binary is now held open (`ExeHandle`): opened through
+    `/proc/<pid>/exe`, the kernel's link to the inode (NEUTRALIZE opens it
+    before the kill, which also keeps the inode alive). Size and content
+    come from that descriptor; the denylist is judged on the inode's own
+    current path (`/proc/self/fd/N`).
+  - The removal is verified (`remove_verified`): the parent directory is
+    opened once (host view), the name opened under it with `O_NOFOLLOW` and
+    compared by `(dev, ino)` with the descriptor, then `unlinkat` under that
+    same directory; a mismatch is `PathSwapped` — the content stays vaulted,
+    nothing is removed, the outcome is a refusal naming the swap. The
+    fallback for an unlink that fails (EBUSY) is `fchmod 000` on the
+    verified descriptor, not a `chmod` by name.
+  - The audit's `openat2(RESOLVE_NO_SYMLINKS)` on the parent path was not
+    used: it refuses every host where a legitimate component is a symlink
+    (`/usr/local`, `/home` → elsewhere); the `(dev, ino)` comparison is the
+    protection.
+  - A binary replaced under its name after it was opened (a rename over
+    it) is `Gone`: its inode is no longer on disk, the new file is left
+    alone.
+  - The removal is tried up to 8 times (`remove_held`), each try from the
+    inode's current name re-read from the descriptor and judged by the
+    denylist again: a swap racing one try fails that try's comparison,
+    not the quarantine. Unit test with a real flipper thread
+    (`a_directory_flipped_in_a_loop_never_redirects_the_removal`, 20
+    rounds): the victim survives every round. Measured once over 200
+    rounds: with one try the binary was left in place in 156
+    (`PathSwapped`), with eight it was removed in all 200.
+  - Found in the lab: on a fresh install no quarantine had ever completed.
+    The vault directory was created on first use inside
+    `/var/lib/northnarrow`, which is `chattr +i` (EPERM). The agent now
+    creates `quarantine/vault` (0700) at start, lifting `+i` for that step
+    only when it is missing (`ensure_quarantine_dirs`).
+  - Lab, Debian 12 (6.1), before: an unprivileged offender (a 40-file mass
+    write and 21 connects to one address: COMBAT, NEUTRALIZE) whose
+    directory `~/nnx-q/own` a loop of the same user kept exchanging
+    (`renameat2(RENAME_EXCHANGE)`) with a relative symlink to a root-owned
+    `/opt/nnx-victim` holding a file of the binary's name. At the 4th
+    attempt the vault held the offender's binary (16 380 bytes: 16 352
+    and the GCM nonce and tag) and the unlink followed the swapped name:
+    the root-owned `/opt/nnx-victim/mw` was deleted, the offender's binary
+    stayed in place. An absolute symlink was stopped only by the unit's
+    read-only view of `/opt` (EROFS); a relative one resolves inside
+    `/proc/1/root`, the host view the quarantine works through.
+  - Lab, Ubuntu 22.04 (5.15), after, the same probe: with one removal try,
+    8 attempts, the victim intact in all 8, the binary removed in 6 and
+    left in place, reported, in 2; with the retry, 8 attempts, the victim
+    intact and the binary vaulted and removed in all 8.

@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the quarantine (High CMB-001):
+  - The agent vaults and removes the file a process ran — held open from
+    `/proc/<pid>/exe`, removed only after the name is checked to still be
+    that inode — never whatever its path leads to by the time the
+    quarantine runs. A user could swap a directory of their own binary's
+    path for a symlink and have the agent (root) delete any file.
+  - Found in the lab: on a fresh install no quarantine completed — the
+    vault directory was created on first use, inside the immutable state
+    directory (EPERM). The agent now creates it at start.
 - External audit, Wave 1, canaries (High DEC-004, DEC-005):
   - A canary kills on its first access only; later accesses are recorded
     (every access stays in the signed canary access chain). Before, every
