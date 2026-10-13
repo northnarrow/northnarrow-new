@@ -10,6 +10,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::Judgement;
 use crate::decision::{rules::build_verdict, Rule};
 
 /// One-shot scheduling tool comms (design §7.1).
@@ -43,7 +44,10 @@ impl Rule for R014AtBatchScheduling {
         if !SCHEDULING_TOOLS.contains(&comm.as_str()) {
             return None;
         }
-        if self.allowlist.contains(comm) {
+        // External audit NETR-003 class: the allowlist judged on what the
+        // kernel executed, not on the comm the process chose.
+        let judgement = super::judge_spawn(&self.allowlist, event);
+        if judgement == Judgement::Allowed {
             return None;
         }
         // D5: surface the scheduled time-spec from argv (e.g. `at now + 1
@@ -55,12 +59,15 @@ impl Rule for R014AtBatchScheduling {
         if argv.len() > 1 {
             reasoning = format!("{reasoning} — argv: {}", argv.join(" "));
         }
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::Log,
-            Severity::Medium,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Medium,
+                &reasoning,
+            ),
+            comm,
         ))
     }
 }

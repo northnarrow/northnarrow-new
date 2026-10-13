@@ -22,7 +22,9 @@ Every rule and allowlist keys on `comm` or on a path. Three costs follow.
    wherever it runs from. The shipped example says so
    (`configs/process-comm-allowlist.local.example`). The same holds for
    every `comm` exemption of R011–R017, the io_uring and BPF rules, and the
-   eight `netflow-comm-allowlist` rules.
+   eight `netflow-comm-allowlist` rules. (Since external audit NET-010 and
+   LLMR-012 these exemptions read the executable the kernel ran instead
+   of `comm`; they are still host-wide.)
 2. **A detection does not say where it happened.** The detection record's
    principal is pid, comm, uid and ppid. An analyst cannot tell whether
    R001 fired in a container, in a pod, in a systemd service or in an SSH

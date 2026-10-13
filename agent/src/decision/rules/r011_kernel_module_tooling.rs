@@ -36,6 +36,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::Judgement;
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Kernel-module load/manage tool comms (design §7.1).
@@ -77,7 +78,10 @@ impl Rule for R011KernelModuleTooling {
         if !KMOD_TOOLS.contains(&comm.as_str()) {
             return None;
         }
-        if self.allowlist.contains(comm) {
+        // External audit NETR-003 class: the allowlist judged on what the
+        // kernel executed, not on the comm the process chose.
+        let judgement = super::judge_spawn(&self.allowlist, event);
+        if judgement == Judgement::Allowed {
             return None;
         }
         // Cluster 15.3 — the kernel-driven-load exemption turns ENTIRELY
@@ -131,12 +135,15 @@ impl Rule for R011KernelModuleTooling {
         if !parent_comm.is_empty() {
             reasoning = format!("{reasoning}; parent={parent_comm}");
         }
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::KillProcess,
-            Severity::High,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcess,
+                Severity::High,
+                &reasoning,
+            ),
+            comm,
         ))
     }
 }

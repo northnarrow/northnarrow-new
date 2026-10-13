@@ -61,14 +61,18 @@ Overlay entries are prefixed:
 
 | Prefix | Meaning |
 |--------|---------|
-| `+comm` | add `comm` to the allowlist (exempt from R011–R017) |
-| `-comm` | re-enable detection on a `comm` the `.v1` default allowlists |
+| `+name` | add a program to the allowlist (exempt from R011–R017 and the io_uring and BPF rules) |
+| `-name` | re-enable detection on a program the `.v1` default allowlists |
 
-Comms are bare process names, **TASK_COMM_LEN-truncated to 15 chars**
-(e.g. `containerd-shim-runc-v2` is reported by the kernel as
-`containerd-shim`). Of the container-runtime comms, only `runc` is an
-R013 target today; the others are listed for parity / forward
-compatibility and are harmless but unnecessary for silencing R013.
+A name is matched on what the kernel executed: the executable's
+basename, or the script's an interpreter runs, and that file must lie in
+a root-owned system tree (`/usr`, `/opt`, `/bin`, `/sbin`, `/lib`,
+`/snap`, `/nix/store`). A process that only names itself like an entry
+is not exempt. The kernel's 15-character form of a longer name still
+matches it (`containerd-shim` covers `containerd-shim-runc-v2`). Of the
+container-runtime names, only `runc` is an R013 target today; the others
+are listed for parity / forward compatibility and are harmless but
+unnecessary for silencing R013.
 
 ## How to verify it is active
 

@@ -302,6 +302,28 @@ pub struct ExecIdentity {
 }
 
 impl ExecIdentity {
+    /// The identity of an exec event's own process: the file the kernel
+    /// executed (or the caller's string, normalised, without it) and the
+    /// script an interpreter runs, from its argv.
+    pub fn of_exec(exe: &str, argv: &[String]) -> Self {
+        let path = PathBuf::from(exe);
+        let script = script_of(&path, argv).map(|s| s.to_string());
+        Self { exe: path, script }
+    }
+
+    /// A rule's built-in client: the executed file itself is one of
+    /// `programs` ([`names`]), in a root-owned system tree — whatever
+    /// script an interpreter among them runs.
+    pub fn is_known_binary(&self, programs: &[&str]) -> bool {
+        let exe = self.exe.to_string_lossy();
+        in_system_tree(&exe)
+            && self
+                .exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| programs.iter().any(|p| names(p, n)))
+    }
+
     /// Review 85: is this identity one of `clients`? An entry ending in
     /// `/` is a tree only that client installs (its bundled runtime): the
     /// exe must lie in it. Any other entry is a basename: the exe's for a
@@ -324,7 +346,7 @@ impl ExecIdentity {
         let named = |p: &str| {
             let base = p.rsplit('/').next().unwrap_or(p);
             let base = base.strip_suffix(".py").unwrap_or(base);
-            clients.iter().any(|c| !c.ends_with('/') && *c == base)
+            clients.iter().any(|c| !c.ends_with('/') && names(c, base))
         };
         match &self.script {
             None => named(&exe),
@@ -336,6 +358,17 @@ impl ExecIdentity {
         }
     }
 }
+
+/// An allowlist entry `entry` names the program `base` (a basename): the
+/// same name, or the kernel's `comm` for it — the first
+/// [`COMM_LEN_MAX`] bytes — since the allowlists are written in the
+/// names `ps` shows (`unattended-upgr` for `unattended-upgrade`).
+fn names(entry: &str, base: &str) -> bool {
+    entry == base || (entry.len() == COMM_LEN_MAX && base.starts_with(entry))
+}
+
+/// `TASK_COMM_LEN` less its NUL.
+const COMM_LEN_MAX: usize = 15;
 
 /// Review 85: `path` lies in a root-owned system tree, which a process
 /// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
@@ -1655,5 +1688,20 @@ mod tests {
         a.ingest_spawn(100, 1, "/usr/bin/sudo", 1);
         // Clone observes the ingest — same Arc-backed state.
         assert!(b.is_auth_mediated(100));
+    }
+
+    /// An allowlist written in `comm` names (15 bytes) still names the
+    /// program the kernel cut it from; a shorter entry is never a prefix.
+    #[test]
+    fn a_comm_length_entry_names_the_longer_program() {
+        let id = |exe: &str| ExecIdentity {
+            exe: PathBuf::from(exe),
+            script: None,
+        };
+        assert!(id("/usr/lib/systemd/systemd-networkd").is_client(&["systemd-network"]));
+        assert!(id("/usr/lib/systemd/systemd-networkd").is_known_binary(&["systemd-network"]));
+        assert!(!id("/usr/lib/systemd/systemd-logindx").is_client(&["systemd-logind"]));
+        assert!(!id("/tmp/systemd-networkd").is_client(&["systemd-network"]));
+        assert!(!id("/tmp/systemd-networkd").is_known_binary(&["systemd-network"]));
     }
 }

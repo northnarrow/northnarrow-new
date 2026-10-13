@@ -15,6 +15,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::Judgement;
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Debugger / tracer tool comms (design §7.1).
@@ -58,7 +59,10 @@ impl Rule for R016DebuggerServiceUid {
         if *uid == 0 || *uid >= SYSTEM_UID_CEILING {
             return None;
         }
-        if self.allowlist.contains(comm) {
+        // External audit NETR-003 class: the allowlist judged on what the
+        // kernel executed, not on the comm the process chose.
+        let judgement = super::judge_spawn(&self.allowlist, event);
+        if judgement == Judgement::Allowed {
             return None;
         }
         // D5: `-p <pid>` (attach to a live process) is the credential-dump
@@ -74,12 +78,15 @@ impl Rule for R016DebuggerServiceUid {
         {
             reasoning = format!("{reasoning} — attaching to a live process (argv has -p/--pid)");
         }
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::Log,
-            Severity::Medium,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Medium,
+                &reasoning,
+            ),
+            comm,
         ))
     }
 }

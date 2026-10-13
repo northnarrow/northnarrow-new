@@ -12,6 +12,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::Judgement;
 use crate::decision::{rules::build_verdict, Rule};
 
 pub struct R012SetcapTooling {
@@ -42,7 +43,10 @@ impl Rule for R012SetcapTooling {
         if comm != "setcap" {
             return None;
         }
-        if self.allowlist.contains(comm) {
+        // External audit NETR-003 class: the allowlist judged on what the
+        // kernel executed, not on the comm the process chose.
+        let judgement = super::judge_spawn(&self.allowlist, event);
+        if judgement == Judgement::Allowed {
             return None;
         }
         // D5: a capability spec in argv (e.g. `cap_setuid+ep`) names the
@@ -57,12 +61,15 @@ impl Rule for R012SetcapTooling {
         {
             reasoning = format!("{reasoning} — capability grant in argv ({cap})");
         }
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::KillProcess,
-            Severity::High,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcess,
+                Severity::High,
+                &reasoning,
+            ),
+            comm,
         ))
     }
 }
