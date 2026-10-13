@@ -6,6 +6,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, posture lineage (High POS-002, POS-003):
+  - Ransomware run from an SSH, desktop or cron session no longer goes
+    unseen: every process of a session was exempt from the mass-write
+    trigger. A session's new files (a build, a clone, an archive, a
+    browser's cache) still do not count; its rewrites of existing files —
+    encryption in place, told apart by the kernel — do. A credential-file
+    read is exempt only for the authentication program itself (sudo, su,
+    unix_chkpwd, …) or its direct child, not for the whole session.
+  - A process can no longer borrow sudo's (or a package manager's)
+    exemption by forking its payload and then executing sudo, which needs
+    no password to be seen, nor through the pid of an exited parent: an
+    ancestor counts only if it ran the program before the process below
+    it was forked.
 - External audit, Wave 1, the quarantine (High CMB-001):
   - The agent vaults and removes the file a process ran — held open from
     `/proc/<pid>/exe`, removed only after the name is checked to still be

@@ -31,6 +31,24 @@
 //! password and is dropping a `/tmp` payload still trips
 //! ConfirmedIntrusion via the exec-from-`/tmp` arm.
 //!
+//! External audit POS-002 narrowed what the tag buys. The lineage of
+//! every SSH, desktop and cron session walks back to sshd, gdm or cron,
+//! so the tag covered whole sessions and the mass-write arm never saw a
+//! ransomware run from one. Now a credential read is exempt only for the
+//! authentication binary itself or its direct child
+//! ([`AuthSessionTracker::is_credential_reader`]), and the mass-write arm
+//! drops only an auth-mediated process's new files, counting its
+//! rewrites of existing files (the kernel tells them apart:
+//! `FMODE_CREATED`).
+//!
+//! External audit POS-003: the walk is ordered. A process inherits what
+//! its parent runs when it is forked, not what the parent executes
+//! afterwards; a pid outlives its process. Each exec event carries the
+//! process's own start (its fork), so an ancestor's match counts only if
+//! it ran the binary before the process below it was forked, and a hop
+//! whose start is later than its child's (an exited parent's pid taken
+//! by a later process) ends the walk ([`AuthSessionTracker::lineage_match`]).
+//!
 //! ## Why exe-path, not comm
 //!
 //! `comm` is attacker-controllable (`prctl(PR_SET_NAME, …)`), so
@@ -81,7 +99,10 @@ use parking_lot::RwLock;
 ///      unprivileged-auth password check raises SensitiveFileAccess.
 ///      (`sudo`/`su` dodge this because they are setuid-root and
 ///      `pam_unix` reads shadow directly in-process — already covered by
-///      class 1.)
+///      class 1.) `chage` and `expiry` (setgid `shadow` on Debian/Ubuntu)
+///      read a user's own password ageing the same way: once the session
+///      no longer covered `chage -l` (external audit POS-002), they are
+///      listed here.
 ///
 /// Covers Debian/Ubuntu, Fedora/RHEL, Arch, and openSUSE conventions for
 /// the canonical paths. Adding paths is a soft change (expands
@@ -91,7 +112,9 @@ use parking_lot::RwLock;
 ///
 /// SECURITY: matching is on the kernel-resolved, non-forgeable
 /// `/proc/<pid>/exe` (NEVER `comm`), exact-path only, and only suppresses
-/// the credential-read (`sensitive_file_access`) + mass-write arms —
+/// the credential-read arm (`sensitive_file_access`: the binary itself or
+/// its direct child) and the mass-write arm's count of new files (external
+/// audit POS-002) —
 /// every kernel-adjudicated COMBAT trigger (FsProtectDenial, exec from
 /// `/tmp`, persistence, lateral, exfil) still fires. Compromise OF one of
 /// these binaries means root, which is outside the posture machine's
@@ -106,10 +129,12 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
     "/lib/systemd/systemd-logind",
     "/sbin/unix_chkpwd",
     "/sbin/unix_update",
+    "/usr/bin/chage",
     "/usr/bin/chfn",
     "/usr/bin/chsh",
     "/usr/bin/crond",
     "/usr/bin/doas",
+    "/usr/bin/expiry",
     "/usr/bin/gpasswd",
     "/usr/bin/login",
     "/usr/bin/machinectl",
@@ -269,16 +294,18 @@ const LINEAGE_DEPTH_CAP: usize = 32;
 /// in the catalog for the FP this fixes.
 const LOGINUID_UNSET: u32 = u32::MAX;
 
-/// PID→{ppid, exe, spawn_ns} cache entry recorded from
-/// `Event::ProcessSpawn`. `spawn_ns` is retained for forward
-/// compatibility with a `(pid, start_ns)` PID-reuse disambiguator;
-/// today we simply overwrite the entry on a fresh spawn.
+/// PID→Entry cache entry recorded from `Event::ProcessSpawn`.
 #[derive(Debug, Clone)]
 struct Entry {
     ppid: u32,
     exe: PathBuf,
-    #[allow(dead_code)]
+    /// When the process executed `exe` (the event's timestamp,
+    /// CLOCK_MONOTONIC ns).
     spawn_ns: u64,
+    /// External audit POS-003: the process's own start (its fork; exec
+    /// keeps it), same clock. Without one (older records, the plain
+    /// ingest calls) its exec time stands in: the latest it can be.
+    start_ns: u64,
     /// FP-2: `true` iff this spawn's `argv[1]` is npm's CLI entrypoint
     /// ([`NPM_CLI_SUFFIX`]). Precomputed at ingest so the mass-write
     /// exemption is a single cheap field read AND the variable-length
@@ -415,6 +442,17 @@ struct Inner {
     state: RwLock<InnerState>,
     /// Injectable for tests; `"/proc"` in production.
     proc_root: PathBuf,
+    /// External audit POS-003: check a cached exec against the process
+    /// its pid names now ([`AuthSessionTracker::for_host`]).
+    live: bool,
+    /// When the agent started, in `/proc/<pid>/stat` clock ticks since
+    /// boot: a process started before it ran its exe before any exec event
+    /// could be seen.
+    observer_start: std::sync::OnceLock<Option<u64>>,
+    /// Tests: the time the host spent suspended (`CLOCK_BOOTTIME` −
+    /// `CLOCK_MONOTONIC`) instead of the clocks'.
+    #[cfg(test)]
+    suspended_ns: Option<u64>,
 }
 
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
@@ -430,6 +468,10 @@ impl AuthSessionTracker {
     /// indirection is the test seam: production uses
     /// [`Self::with_proc`]; unit tests point at a fixture tree.
     pub fn new(proc_root: impl Into<PathBuf>) -> Self {
+        Self::build(proc_root.into(), false)
+    }
+
+    fn build(proc_root: PathBuf, live: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: RwLock::new(InnerState {
@@ -438,14 +480,37 @@ impl AuthSessionTracker {
                     daemons: HashMap::new(),
                     daemon_order: VecDeque::new(),
                 }),
-                proc_root: proc_root.into(),
+                proc_root,
+                live,
+                observer_start: std::sync::OnceLock::new(),
+                #[cfg(test)]
+                suspended_ns: None,
             }),
         }
     }
 
-    /// Production constructor — reads the live `/proc`.
+    /// Reads the live `/proc`, without checking a cached exec against the
+    /// process its pid names now (tests and tools, whose pids are made
+    /// up). The agent uses [`Self::for_host`].
     pub fn with_proc() -> Self {
         Self::new("/proc")
+    }
+
+    /// The agent's tracker: the live `/proc`, and every cached exec the
+    /// lineage walks checked against the process its pid names now —
+    /// a pid reused by a fork, which no exec event announces, does not
+    /// inherit the entry (external audit POS-003).
+    pub fn for_host() -> Self {
+        Self::build(PathBuf::from("/proc"), true)
+    }
+
+    /// Tests: [`Self::for_host`] on a fixture `/proc`, with the host's
+    /// suspended time given.
+    #[cfg(test)]
+    fn live_on(proc_root: &Path, suspended_ns: u64) -> Self {
+        let mut t = Self::build(proc_root.to_path_buf(), true);
+        Arc::get_mut(&mut t.inner).unwrap().suspended_ns = Some(suspended_ns);
+        t
     }
 
     /// Record a `ProcessSpawn` observation. Overwrites any prior
@@ -456,7 +521,7 @@ impl AuthSessionTracker {
     /// PID 0 is the kernel "no process" sentinel and is never
     /// recorded.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
-        self.ingest_inner(pid, ppid, exe, false, None, spawn_ns);
+        self.ingest_inner(pid, ppid, exe, false, None, spawn_ns, 0);
     }
 
     /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
@@ -473,11 +538,27 @@ impl AuthSessionTracker {
         argv: &[String],
         spawn_ns: u64,
     ) {
-        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
-        let script = script_of(Path::new(exe), argv);
-        self.ingest_inner(pid, ppid, exe, argv_npm_cli, script, spawn_ns);
+        self.ingest_exec(pid, ppid, exe, argv, spawn_ns, 0);
     }
 
+    /// External audit POS-003: [`Self::ingest_spawn_with_argv`] with the
+    /// process's own start (`Event::ProcessSpawn::start_ns`, its fork),
+    /// as the exec event carries it (production; 0 unknown).
+    pub fn ingest_exec(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
+        argv: &[String],
+        spawn_ns: u64,
+        start_ns: u64,
+    ) {
+        let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
+        let script = script_of(Path::new(exe), argv);
+        self.ingest_inner(pid, ppid, exe, argv_npm_cli, script, spawn_ns, start_ns);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn ingest_inner(
         &self,
         pid: u32,
@@ -486,6 +567,7 @@ impl AuthSessionTracker {
         argv_npm_cli: bool,
         script: Option<Box<str>>,
         spawn_ns: u64,
+        start_ns: u64,
     ) {
         if pid == 0 {
             return;
@@ -494,6 +576,7 @@ impl AuthSessionTracker {
             ppid,
             exe: PathBuf::from(exe),
             spawn_ns,
+            start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
             argv_npm_cli,
             script,
         };
@@ -530,12 +613,25 @@ impl AuthSessionTracker {
         }
     }
 
-    /// True iff `pid` or any ancestor's exe is a canonical setuid
-    /// administration binary ([`AUTH_BINARY_EXES`]). Thin wrapper over
-    /// [`Self::lineage_exe_matches`] — behaviour is byte-identical to the
-    /// pre-refactor inline walk.
+    /// True iff `pid` or an ancestor ran an authentication binary
+    /// ([`AUTH_BINARY_EXES`]) before the process below it in the lineage
+    /// was forked ([`Self::lineage_exe_matches`]): `pid` runs inside an
+    /// authenticated session, a job or an elevation. External audit
+    /// POS-002: what that buys is narrow — the mass-write arm counts only
+    /// such a process's rewrites of existing files, not the files it
+    /// creates; a credential read is judged by
+    /// [`Self::is_credential_reader`].
     pub fn is_auth_mediated(&self, pid: u32) -> bool {
         self.lineage_exe_matches(pid, is_auth_binary)
+    }
+
+    /// External audit POS-002: `pid` is an authentication binary itself,
+    /// or the direct child of one forked after it ran it — the PAM stack
+    /// reading `/etc/shadow` at the caller's uid (sudo, su, passwd,
+    /// unix_chkpwd, a cron or gdm worker). A shell of the session it
+    /// opened, and everything below, reads as itself.
+    pub fn is_credential_reader(&self, pid: u32) -> bool {
+        self.lineage_match(pid, is_auth_binary, 1).unwrap_or(false)
     }
 
     /// True iff `pid` or any ancestor's exe is a known system
@@ -603,21 +699,7 @@ impl AuthSessionTracker {
         pid: u32,
         is_match: impl Fn(&Path) -> bool,
     ) -> Option<bool> {
-        if pid == 0 || pid == 1 {
-            return Some(false);
-        }
-        let mut cur = pid;
-        for _ in 0..LINEAGE_DEPTH_CAP {
-            let (ppid, exe) = self.lookup_cache(cur).or_else(|| self.lookup_proc(cur))?;
-            if is_match(&exe) {
-                return Some(true);
-            }
-            if ppid == 0 || ppid == 1 || ppid == cur {
-                return Some(false);
-            }
-            cur = ppid;
-        }
-        Some(false)
+        self.lineage_match(pid, is_match, LINEAGE_DEPTH_CAP)
     }
 
     /// `/proc/<pid>` exists and is not a zombie. A zombie (`Z`: exited, not
@@ -707,42 +789,224 @@ impl AuthSessionTracker {
             .is_some_and(|e| e.argv_npm_cli && is_node_exe(&e.exe))
     }
 
-    /// Walk the lineage of `pid` upward through (ppid, exe) pairs and
-    /// return true if any hop's exe satisfies `is_match`. Cache miss
-    /// falls back to `/proc/<pid>/exe` (symlink read, kernel-resolved)
-    /// plus `/proc/<pid>/status` `PPid:` parsing. Capped at
-    /// [`LINEAGE_DEPTH_CAP`] hops to bound the worst-case cost. PIDs 0
-    /// and 1 (kernel / init) never match and are an unconditional
-    /// terminator. Shared by [`Self::is_auth_mediated`] and
-    /// [`Self::is_system_daemon_mediated`] so both use the identical,
-    /// non-forgeable walk.
+    /// Walk the lineage of `pid` upward and return true if `pid` runs an
+    /// `is_match` binary, or an ancestor ran one before the process below
+    /// it was forked ([`Self::lineage_match`]). Shared by every lineage
+    /// predicate so all use the identical, non-forgeable walk.
     fn lineage_exe_matches(&self, pid: u32, is_match: impl Fn(&Path) -> bool) -> bool {
+        self.lineage_match(pid, is_match, LINEAGE_DEPTH_CAP)
+            .unwrap_or(false)
+    }
+
+    /// The lineage walk, at most `max_up` hops above `pid` (and
+    /// [`LINEAGE_DEPTH_CAP`]); `None` when a hop can be read neither from
+    /// the spawn cache nor from `/proc`. Each hop comes from the spawn
+    /// cache, else from `/proc/<pid>/exe` (kernel-resolved) and
+    /// `/proc/<pid>/status`. PIDs 0 and 1 (kernel / init) never match and
+    /// end the walk.
+    ///
+    /// External audit POS-003: a process inherits what its parent runs
+    /// when it is forked, not what the parent executes afterwards, and a
+    /// pid outlives its process. An ancestor's match counts only when it
+    /// ran the binary before the process below it was forked
+    /// ([`Self::ran_before`]): a parent that forks the payload and then
+    /// executes `sudo` (any user may run it; the exec event comes before
+    /// any authentication) vouches for nothing. And a parent starts before
+    /// its child: a process that started after the one below it is a
+    /// later process given the pid of an exited parent, and the lineage
+    /// ends there.
+    fn lineage_match(
+        &self,
+        pid: u32,
+        is_match: impl Fn(&Path) -> bool,
+        max_up: usize,
+    ) -> Option<bool> {
         if pid == 0 || pid == 1 {
+            return Some(false);
+        }
+        let mut below = self.hop(pid)?;
+        if is_match(&below.exe) {
+            return Some(true);
+        }
+        for _ in 0..max_up.min(LINEAGE_DEPTH_CAP) {
+            let ppid = below.ppid;
+            if ppid == 0 || ppid == 1 || ppid == below.pid {
+                return Some(false);
+            }
+            let up = self.hop(ppid)?;
+            if !self.started_no_later(&up, &below) {
+                return Some(false);
+            }
+            if is_match(&up.exe) && self.ran_before(&up, &below) {
+                return Some(true);
+            }
+            below = up;
+        }
+        Some(false)
+    }
+
+    /// One hop of the walk: the spawn cache's record of `pid` while it
+    /// still describes the process `pid` names, else `/proc`.
+    fn hop(&self, pid: u32) -> Option<Hop> {
+        let cached = {
+            let s = self.inner.state.read();
+            s.map.get(&pid).or_else(|| s.daemons.get(&pid)).cloned()
+        };
+        if let Some(e) = cached {
+            if self.entry_is_current(pid, &e) {
+                return Some(Hop {
+                    pid,
+                    ppid: e.ppid,
+                    exe: e.exe,
+                    cached: true,
+                    spawn_ns: e.spawn_ns,
+                    start_ns: e.start_ns,
+                });
+            }
+        }
+        let (ppid, exe) = self.lookup_proc(pid)?;
+        Some(Hop {
+            pid,
+            ppid,
+            exe,
+            cached: false,
+            spawn_ns: 0,
+            start_ns: 0,
+        })
+    }
+
+    /// `up` started no later than `below`, as the parent of a process
+    /// does. A cached hop's start is on the monotonic clock; `/proc` shows
+    /// a start on the boot clock, ahead of it by the time suspended before
+    /// that start (between nothing and [`Self::suspended_ns`]): only a
+    /// start that is later whatever that time was ends the walk. A start
+    /// `/proc` does not show is not held against it.
+    fn started_no_later(&self, up: &Hop, below: &Hop) -> bool {
+        let slack = 2 * tick_ns();
+        let boot = |h: &Hop| {
+            self.proc_start_ticks(h.pid)
+                .map(|t| t.saturating_mul(tick_ns()))
+        };
+        match (up.cached, below.cached) {
+            (true, true) => up.start_ns <= below.start_ns,
+            (true, false) => boot(below).is_none_or(|b| up.start_ns <= b + slack),
+            (false, true) => {
+                boot(up).is_none_or(|u| u <= below.start_ns + self.suspended_ns() + slack)
+            }
+            (false, false) => match (boot(up), boot(below)) {
+                (Some(u), Some(b)) => u <= b + slack,
+                _ => true,
+            },
+        }
+    }
+
+    /// External audit POS-003: `up` ran its exe before `below` was forked.
+    /// - Both seen executing: `up`'s exec precedes `below`'s start.
+    /// - `below` never seen executing: it runs the image it was forked
+    ///   with, so the same exe as `up` means `up` ran it already. Any
+    ///   other exe and the order is unknown.
+    /// - `up` never seen executing ([`Self::held_validly`]).
+    fn ran_before(&self, up: &Hop, below: &Hop) -> bool {
+        if !up.cached {
+            return self.held_validly(up, 0);
+        }
+        if below.cached {
+            up.spawn_ns <= below.start_ns
+        } else {
+            below.exe == up.exe
+        }
+    }
+
+    /// A process read from `/proc` (no exec event of it in the cache) has
+    /// run its exe since before any exec could be seen: it started before
+    /// the agent, or it was forked, without executing anything, from a
+    /// parent that validly runs the same exe (a cron job's worker, sudo's
+    /// monitor, an sshd session process). A process started since, whose
+    /// exec event is missing (evicted, dropped), is not trusted.
+    fn held_validly(&self, hop: &Hop, depth: usize) -> bool {
+        if self.predates_observer(hop.pid) {
+            return true;
+        }
+        if depth >= LINEAGE_DEPTH_CAP || hop.ppid == 0 || hop.ppid == 1 || hop.ppid == hop.pid {
             return false;
         }
-        let mut cur = pid;
-        let mut visited = 0usize;
-        loop {
-            if visited >= LINEAGE_DEPTH_CAP {
-                return false;
-            }
-            visited += 1;
-
-            let (ppid, exe) = match self.lookup_cache(cur) {
-                Some(pair) => pair,
-                None => match self.lookup_proc(cur) {
-                    Some(pair) => pair,
-                    None => return false,
-                },
-            };
-            if is_match(&exe) {
-                return true;
-            }
-            if ppid == 0 || ppid == 1 || ppid == cur {
-                return false;
-            }
-            cur = ppid;
+        let Some(parent) = self.hop(hop.ppid) else {
+            return false;
+        };
+        if parent.exe != hop.exe {
+            return false;
         }
+        parent.cached || self.held_validly(&parent, depth + 1)
+    }
+
+    /// The cached exec `e` still describes the process `pid` names: with
+    /// live checks on, its start matches the one `/proc/<pid>/stat` shows
+    /// (an exited process leaves the cache as the only record).
+    fn entry_is_current(&self, pid: u32, e: &Entry) -> bool {
+        !self.inner.live || self.started_at(pid, e.start_ns) != Some(false)
+    }
+
+    /// Does the process `pid` names now have the start `start_ns`
+    /// (CLOCK_MONOTONIC)? `/proc/<pid>/stat` shows it in clock ticks of
+    /// CLOCK_BOOTTIME, which runs ahead of the monotonic clock by the time
+    /// the host was suspended before the process started: between nothing
+    /// and all of the suspended time so far. `None` without live checks,
+    /// without `/proc/<pid>/stat`, or for an unknown `start_ns`.
+    fn started_at(&self, pid: u32, start_ns: u64) -> Option<bool> {
+        if !self.inner.live || start_ns == 0 {
+            return None;
+        }
+        let tick = tick_ns();
+        let shown = self.proc_start_ticks(pid)?.saturating_mul(tick);
+        let slack = 2 * tick;
+        Some(shown + slack >= start_ns && shown <= start_ns + self.suspended_ns() + slack)
+    }
+
+    /// `pid` started before the agent did.
+    fn predates_observer(&self, pid: u32) -> bool {
+        let observer = *self
+            .inner
+            .observer_start
+            .get_or_init(|| self.proc_start_ticks_of("self"));
+        match (observer, self.proc_start_ticks(pid)) {
+            (Some(o), Some(p)) => p < o,
+            _ => false,
+        }
+    }
+
+    fn proc_start_ticks(&self, pid: u32) -> Option<u64> {
+        self.proc_start_ticks_of(&pid.to_string())
+    }
+
+    /// `starttime`, field 22 of `/proc/<name>/stat`, counted after the
+    /// `(comm)` field, which may itself hold spaces or parentheses.
+    fn proc_start_ticks_of(&self, name: &str) -> Option<u64> {
+        let stat = fs::read_to_string(self.inner.proc_root.join(name).join("stat")).ok()?;
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()
+    }
+
+    /// `CLOCK_BOOTTIME` − `CLOCK_MONOTONIC` now: the time the host has
+    /// spent suspended.
+    fn suspended_ns(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(s) = self.inner.suspended_ns {
+            return s;
+        }
+        let now = |clock| {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: a valid clock id and a timespec to fill.
+            unsafe { libc::clock_gettime(clock, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+        };
+        now(libc::CLOCK_BOOTTIME).saturating_sub(now(libc::CLOCK_MONOTONIC))
     }
 
     /// BUG-018 (tactical): true iff `/proc/<pid>/loginuid` contains
@@ -860,6 +1124,33 @@ impl Default for AuthSessionTracker {
     }
 }
 
+/// One hop of a lineage walk.
+#[derive(Debug)]
+struct Hop {
+    pid: u32,
+    ppid: u32,
+    exe: PathBuf,
+    /// From the spawn cache (the exec was seen), else from `/proc`.
+    cached: bool,
+    /// Cached only: when it executed `exe`, and its start.
+    spawn_ns: u64,
+    start_ns: u64,
+}
+
+/// Nanoseconds per `/proc` clock tick (`sysconf(_SC_CLK_TCK)`).
+fn tick_ns() -> u64 {
+    static TICK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TICK.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz > 0 {
+            1_000_000_000 / hz as u64
+        } else {
+            10_000_000
+        }
+    })
+}
+
 fn is_auth_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     AUTH_BINARY_EXES.iter().any(|p| s == *p)
@@ -965,6 +1256,17 @@ mod tests {
         let pid_dir = dir.join(pid.to_string());
         fs::create_dir_all(&pid_dir).unwrap();
         fs::write(pid_dir.join("loginuid"), value.to_string()).unwrap();
+    }
+
+    /// `/proc/<name>/stat` with `starttime` (field 22) at `ticks`.
+    fn write_started(dir: &Path, name: &str, ppid: u32, ticks: u64) {
+        let pid_dir = dir.join(name);
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(
+            pid_dir.join("stat"),
+            format!("1 (a b) S {ppid} 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+        )
+        .unwrap();
     }
 
     fn write_exe(dir: &Path, pid: u32, target: &str) {
@@ -1263,17 +1565,31 @@ mod tests {
     fn lineage_cold_start_falls_back_to_proc() {
         let tmp = TempDir::new().unwrap();
         let proc_root = tmp.path();
-        // Build a fake /proc fixture:
-        //   pid 123 -> exe /usr/bin/sudo, ppid=1
-        //   pid 124 -> exe /usr/bin/apt,  ppid=123
+        // Build a fake /proc fixture, the agent started at tick 500:
+        //   pid 123 -> exe /usr/bin/sudo, ppid=1, started at tick 100
+        //   pid 124 -> exe /usr/bin/apt,  ppid=123, started at tick 200
+        write_started(proc_root, "self", 1, 500);
         write_exe(proc_root, 123, "/usr/bin/sudo");
         write_status(proc_root, 123, 1);
+        write_started(proc_root, "123", 1, 100);
         write_exe(proc_root, 124, "/usr/bin/apt");
         write_status(proc_root, 124, 123);
+        write_started(proc_root, "124", 123, 200);
 
         let t = AuthSessionTracker::new(proc_root);
-        // Cache is empty — the walk must reconstruct from /proc.
+        // Cache is empty — the walk must reconstruct from /proc: sudo
+        // started before the agent, so it ran sudo before any exec event
+        // could be seen.
         assert!(t.is_auth_mediated(124));
+        assert!(t.is_auth_mediated(123));
+
+        // External audit POS-003: a sudo seen only in /proc that started
+        // after the agent (its exec event lost or evicted) vouches for
+        // nothing below it; itself, it still runs sudo.
+        write_started(proc_root, "123", 1, 600);
+        write_started(proc_root, "124", 123, 700);
+        let t = AuthSessionTracker::new(proc_root);
+        assert!(!t.is_auth_mediated(124));
         assert!(t.is_auth_mediated(123));
     }
 
@@ -1475,6 +1791,124 @@ mod tests {
         let t = AuthSessionTracker::new(tmp.path());
         assert!(!t.has_valid_loginuid(0));
         assert!(!t.has_valid_loginuid(1));
+    }
+
+    // ── External audit POS-002 / POS-003 ───────────────────────────
+
+    const S: u64 = 1_000_000_000;
+
+    /// A parent that forks the payload and only then executes sudo (any
+    /// user may: the exec event comes before any password) does not make
+    /// the payload sudo's: it was forked from what the parent ran before.
+    #[test]
+    fn a_parent_executing_sudo_after_forking_does_not_launder_its_children() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(50, 1, "/usr/sbin/nginx", &[], 10 * S, 10 * S);
+        // the parent (100) runs the payload, forks 200 at 30 s, then
+        // executes sudo at 40 s; 200 executes its own payload at 50 s
+        t.ingest_exec(100, 50, "/srv/www/payload", &[], 21 * S, 20 * S);
+        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 40 * S, 20 * S);
+        t.ingest_exec(200, 100, "/srv/www/crypt", &[], 50 * S, 30 * S);
+        assert!(
+            !t.is_auth_mediated(200),
+            "forked before its parent ran sudo"
+        );
+        assert!(t.is_auth_mediated(100), "the parent itself runs sudo");
+        // what the parent forks after it ran sudo is sudo's
+        t.ingest_exec(300, 100, "/usr/bin/apt", &[], 46 * S, 45 * S);
+        assert!(t.is_auth_mediated(300));
+
+        // a child forked before, that never executed: /proc shows the
+        // image it was forked with — not sudo, so not sudo's
+        write_exe(tmp.path(), 400, "/srv/www/payload");
+        write_status(tmp.path(), 400, 100);
+        assert!(!t.is_auth_mediated(400));
+        // forked after, without executing (sudo's monitor): sudo's image
+        write_exe(tmp.path(), 401, "/usr/bin/sudo");
+        write_status(tmp.path(), 401, 100);
+        t.ingest_exec(402, 401, "/usr/bin/tee", &[], 61 * S, 60 * S);
+        assert!(t.is_auth_mediated(402));
+        // the same holds for a package manager's exemption
+        t.ingest_exec(500, 50, "/srv/www/payload", &[], 71 * S, 70 * S);
+        t.ingest_exec(600, 500, "/srv/www/crypt", &[], 81 * S, 75 * S);
+        t.ingest_exec(500, 50, "/usr/bin/dpkg", &[], 80 * S, 70 * S);
+        assert!(!t.is_system_daemon_mediated(600));
+    }
+
+    /// A parent starts before its child: a process that started after the
+    /// one below it holds the pid of an exited parent, and the lineage
+    /// ends there instead of climbing into the newcomer's session.
+    #[test]
+    fn a_pid_taken_by_a_later_process_ends_the_lineage() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // a service (100) forks 200 at 30 s, then exits
+        t.ingest_exec(100, 1, "/usr/sbin/nginx", &[], 20 * S, 20 * S);
+        t.ingest_exec(200, 100, "/tmp/crypt", &[], 31 * S, 30 * S);
+        assert!(!t.is_auth_mediated(200));
+        // pid 100 goes to a shell of an SSH session, started at 45 s
+        t.ingest_exec(50, 1, "/usr/sbin/sshd", &[], 5 * S, 5 * S);
+        t.ingest_exec(100, 50, "/usr/bin/bash", &[], 46 * S, 45 * S);
+        assert!(t.is_auth_mediated(100));
+        assert!(!t.is_auth_mediated(200), "not the session's");
+        assert_eq!(t.interactive_admin_status(200), Some(false));
+        // a thread of the parent forking it is still the parent: the
+        // process's own start is what is compared
+        t.ingest_exec(300, 100, "/usr/bin/make", &[], 51 * S, 50 * S);
+        assert!(t.is_auth_mediated(300));
+    }
+
+    /// The agent's tracker checks a cached exec against the process its
+    /// pid names now: a fork that took the pid of an exited sudo (no exec
+    /// event announces it) is read from /proc, not from sudo's entry. The
+    /// boot clock /proc shows runs ahead by the time suspended.
+    #[test]
+    fn a_cached_exec_is_checked_against_the_process_its_pid_names_now() {
+        let tmp = TempDir::new().unwrap();
+        let ticks = |ns: u64| ns / tick_ns();
+        let t = AuthSessionTracker::live_on(tmp.path(), 0);
+        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
+        write_started(tmp.path(), "100", 1, ticks(1000 * S));
+        assert!(t.is_auth_mediated(100), "the same process");
+        // a later process forked into pid 100
+        write_started(tmp.path(), "100", 1, ticks(2000 * S));
+        write_exe(tmp.path(), 100, "/home/u/crypt");
+        write_status(tmp.path(), 100, 1);
+        assert!(!t.is_auth_mediated(100), "sudo's entry is stale");
+        // a laptop suspended an hour before sudo started: /proc shows its
+        // start an hour later on the boot clock — still sudo
+        let t = AuthSessionTracker::live_on(tmp.path(), 3600 * S);
+        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
+        write_started(tmp.path(), "100", 1, ticks(4600 * S));
+        assert!(t.is_auth_mediated(100));
+        // an exited process: the cache is the record
+        fs::remove_dir_all(tmp.path().join("100")).unwrap();
+        assert!(t.is_auth_mediated(100));
+        // without live checks (tests, tools) the cache is trusted
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
+        write_started(tmp.path(), "100", 1, ticks(9000 * S));
+        assert!(t.is_auth_mediated(100));
+    }
+
+    /// External audit POS-002: a credential read is the PAM stack's when
+    /// the reader is the authentication binary or its direct child — not
+    /// when it runs anywhere in the session that binary opened.
+    #[test]
+    fn a_credential_reader_is_the_auth_binary_not_its_session() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(50, 1, "/usr/sbin/sshd", &[], S, S);
+        t.ingest_exec(60, 50, "/usr/bin/bash", &[], 2 * S, 2 * S);
+        t.ingest_exec(70, 60, "/usr/bin/cat", &[], 3 * S, 3 * S);
+        t.ingest_exec(80, 60, "/usr/bin/sudo", &[], 4 * S, 4 * S);
+        t.ingest_exec(90, 1, "/usr/sbin/unix_chkpwd", &[], 5 * S, 5 * S);
+        assert!(t.is_auth_mediated(70), "in the session");
+        assert!(!t.is_credential_reader(70), "but not the PAM stack");
+        assert!(t.is_credential_reader(80));
+        assert!(t.is_credential_reader(90));
+        assert!(t.is_credential_reader(60), "the session's first child");
     }
 
     // ── Review 52: interactive admin session ───────────────────────

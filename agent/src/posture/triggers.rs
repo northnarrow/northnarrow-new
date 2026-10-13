@@ -394,18 +394,22 @@ impl TriggerDetector {
             argv,
             timestamp_ns,
             exe,
+            start_ns,
             ..
         } = event
         {
             // FP-2: pass argv so the tracker can precompute the npm-CLI
             // flag (node running npm-cli.js) for the mass-write exemption.
             // Tappa 10.9 step 2: the file the kernel executed (review 61).
-            self.auth.ingest_spawn_with_argv(
+            // External audit POS-003: and the process's own start, which
+            // orders its fork against its ancestors' execs.
+            self.auth.ingest_exec(
                 *pid,
                 *ppid,
                 exe.path_or(filename),
                 argv,
                 *timestamp_ns,
+                *start_ns,
             );
         }
 
@@ -683,9 +687,12 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     // a canonical auth binary or PAM daemon (sudo, su, sshd, login,
     // systemd-logind, polkitd, cron/crond, gdm/lightdm, …) — verified via
     // the kernel-resolved /proc/<pid>/exe symlink, NEVER the forgeable
-    // comm. Unexpected readers (cat, less, cp, a /tmp binary, a shell
-    // one-liner) have no such ancestor and still fire below.
-    if auth.is_auth_mediated(*pid) {
+    // comm. External audit POS-002: the reader itself, or its direct
+    // child forked after it ran it — the PAM stack's open, not the session
+    // it opened: a shell of an SSH or desktop session, and whatever it
+    // runs (cat, less, cp, a /tmp binary, a shell one-liner), still fires
+    // below.
+    if auth.is_credential_reader(*pid) {
         return false;
     }
     // BUG-018 (tactical) — systemd-user@<uid>.service children
@@ -799,13 +806,30 @@ fn confirmed_intrusion(
         filename,
         count,
         timestamp_ns,
+        overwrites,
         ..
     } = focal
     {
-        if auth.is_auth_mediated(*pid)
-            || auth.is_system_daemon_mediated(*pid)
-            || auth.is_npm_cli_writer(*pid)
-        {
+        if auth.is_system_daemon_mediated(*pid) || auth.is_npm_cli_writer(*pid) {
+            return false;
+        }
+        // External audit POS-002: a process of an authenticated session
+        // (SSH, desktop, a cron job, sudo) was exempt whatever it wrote,
+        // so ransomware run from a session never raised it. Its new files
+        // (a build, a clone, an archive extracted, a browser's cache) still
+        // do not count; its rewrites of existing files — the shape of
+        // encryption in place — do.
+        // Recorded, not silent: the kernel reports a crossing once per
+        // window per process.
+        if !*overwrites && auth.is_auth_mediated(*pid) {
+            tracing::info!(
+                pid = *pid,
+                comm = %comm,
+                filename = %filename,
+                count_within_window = *count,
+                "mass write of new files inside an authenticated session — not counted (a build, \
+                 a clone, an archive extracted); rewriting existing files would be"
+            );
             return false;
         }
         if mass_write_warn_due(warned, *pid, *timestamp_ns) {
@@ -815,6 +839,7 @@ fn confirmed_intrusion(
                 focal_comm = %comm,
                 focal_filename = %filename,
                 count_within_window = *count,
+                overwrites = *overwrites,
                 threshold = MASS_WRITE_MIN,
                 window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
                 "mass-write threshold crossed (kernel count) — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
@@ -880,10 +905,16 @@ fn confirmed_intrusion(
             // so a bare node_modules constraint would reintroduce the FP
             // for the cache-write burst; a correct v2 must allowlist the
             // (configurable) cache dir too.
-            if auth.is_auth_mediated(*focal_pid)
-                || auth.is_system_daemon_mediated(*focal_pid)
-                || auth.is_npm_cli_writer(*focal_pid)
-            {
+            if auth.is_system_daemon_mediated(*focal_pid) || auth.is_npm_cli_writer(*focal_pid) {
+                return false;
+            }
+            // External audit POS-002 (tracepoint mode, which sees the open
+            // flags but not whether the file existed): a session's opens
+            // that may create (`O_CREAT`) do not count, its opens of an
+            // existing file to write do.
+            let session = auth.is_auth_mediated(*focal_pid);
+            let counted = |f: u32| !session || f & O_CREAT == 0;
+            if !counted(*flags) {
                 return false;
             }
             // Audit `posture-3`: a PAM session (valid loginuid) writing
@@ -913,6 +944,7 @@ fn confirmed_intrusion(
                 {
                     if *pid == *focal_pid
                         && is_write_open(*f)
+                        && counted(*f)
                         && !is_mass_write_carveout(filename, mass_write_extras)
                         && !in_own_runtime(filename)
                         && within(*focal_ts, *timestamp_ns, MASS_WRITE_WINDOW_NS)
@@ -1166,6 +1198,9 @@ fn is_write_open(flags: u32) -> bool {
     access == 1 || access == 2
 }
 
+/// `O_CREAT` on Linux (0o100): the open may create the file.
+const O_CREAT: u32 = 0o100;
+
 #[cfg(test)]
 pub(super) mod testutil {
     use super::*;
@@ -1182,6 +1217,7 @@ pub(super) mod testutil {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
         }
@@ -1595,6 +1631,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
         }
@@ -1614,6 +1651,7 @@ mod tests {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
         }
@@ -1804,6 +1842,115 @@ mod tests {
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "unattributed mass-write must still fire, got {hits:?}"
         );
+    }
+
+    // ── External audit POS-002 / POS-003 ────────────────────────────
+
+    fn spawn_started(pid: u32, ppid: u32, filename: &str, ts: u64, start_ns: u64) -> Event {
+        let mut e = spawn_with_exe(pid, ppid, filename, ts);
+        if let Event::ProcessSpawn { start_ns: s, .. } = &mut e {
+            *s = start_ns;
+        }
+        e
+    }
+
+    fn mass_write(pid: u32, overwrites: bool, ts: u64) -> Event {
+        Event::MassWrite {
+            pid,
+            uid: 1000,
+            comm: "x".into(),
+            count: MASS_WRITE_MIN as u32,
+            filename: "/home/u/docs/report.docx".into(),
+            timestamp_ns: ts,
+            overwrites,
+        }
+    }
+
+    /// A process of an SSH session was exempt from the mass-write arm
+    /// whatever it wrote. Its new files (a build, a clone) still do not
+    /// count; its rewrites of existing files — encryption in place — do.
+    #[test]
+    fn mass_write_in_an_ssh_session_fires_on_rewrites_not_on_new_files() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(400, 300, "/home/u/cryptor", 3), &[]);
+        let hits = det.detect(&mass_write(400, false, 10), &[]);
+        assert!(
+            !hits.contains(&TriggerType::ConfirmedIntrusion),
+            "a session's new files: {hits:?}"
+        );
+        let hits = det.detect(&mass_write(400, true, 11), &[]);
+        assert!(
+            hits.contains(&TriggerType::ConfirmedIntrusion),
+            "a session's rewrites: {hits:?}"
+        );
+        // under sudo too: an elevated rewrite of many files counts
+        let _ = det.detect(&spawn_with_exe(500, 300, "/usr/bin/sudo", 4), &[]);
+        let _ = det.detect(&spawn_with_exe(510, 500, "/usr/bin/cp", 5), &[]);
+        let hits = det.detect(&mass_write(510, true, 12), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+        // outside any session, new files count as before
+        let _ = det.detect(&spawn_with_exe(600, 1, "/srv/app/worker", 6), &[]);
+        let hits = det.detect(&mass_write(600, false, 13), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+        // a package manager stays exempt either way
+        let _ = det.detect(&spawn_with_exe(700, 500, "/usr/bin/dpkg", 7), &[]);
+        let hits = det.detect(&mass_write(700, true, 14), &[]);
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// Tracepoint mode sees the open flags, not whether the file existed:
+    /// a session's opens that may create do not count, its opens of
+    /// existing files to write (no `O_CREAT`) do.
+    #[test]
+    fn tracepoint_mass_write_in_a_session_counts_opens_of_existing_files() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/home/u/tool", 2), &[]);
+        let burst = |flags: u32| {
+            let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+                .map(|i| file_open(300, 1000, &format!("/home/u/d/{i}"), flags, i + 10))
+                .collect();
+            let focal = file_open(300, 1000, "/home/u/d/x", flags, MASS_WRITE_MIN as u64 + 11);
+            det.detect(&focal, &recent)
+        };
+        // O_WRONLY | O_CREAT | O_TRUNC: a build writing its outputs
+        assert!(!burst(0o1101).contains(&TriggerType::ConfirmedIntrusion));
+        // O_RDWR on files that exist: rewritten in place
+        assert!(burst(0o2).contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// The credential-read exemption is the PAM stack's, not the session's:
+    /// `cat /etc/shadow` from an SSH shell fires (a member of `shadow`, a
+    /// misconfigured mode); sudo's own read does not.
+    #[test]
+    fn credential_read_from_an_ssh_session_fires_but_not_sudos() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(310, 300, "/usr/bin/cat", 3), &[]);
+        let _ = det.detect(&spawn_with_exe(320, 300, "/usr/bin/sudo", 4), &[]);
+        let hits = det.detect(&file_open(310, 1000, "/etc/shadow", 0, 5), &[]);
+        assert!(hits.contains(&TriggerType::SensitiveFileAccess), "{hits:?}");
+        let hits = det.detect(&file_open(320, 1000, "/etc/shadow", 0, 6), &[]);
+        assert!(
+            !hits.contains(&TriggerType::SensitiveFileAccess),
+            "{hits:?}"
+        );
+    }
+
+    /// External audit POS-003 through the detector: a service's child,
+    /// forked before its parent executed sudo, writes many new files —
+    /// it is not sudo's, and it fires.
+    #[test]
+    fn a_child_forked_before_its_parent_ran_sudo_is_not_exempt() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_started(100, 1, "/srv/www/payload", 21, 20), &[]);
+        let _ = det.detect(&spawn_started(200, 100, "/srv/www/crypt", 50, 30), &[]);
+        let _ = det.detect(&spawn_started(100, 1, "/usr/bin/sudo", 40, 20), &[]);
+        let hits = det.detect(&mass_write(200, false, 60), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
     }
 
     // ── (ii) — system package-management daemon exemption ───────────

@@ -666,7 +666,9 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             capability: Some(file_capability(r)),
         }));
     }
-    if r.reason & open_reason::MASS_WRITE != 0 {
+    // External audit POS-002: one event per crossing; an open crossing
+    // both thresholds is one event, an overwrite one.
+    if r.reason & (open_reason::MASS_WRITE | open_reason::MASS_OVERWRITE) != 0 {
         out.push(Event::MassWrite {
             pid: r.pid,
             uid: r.uid,
@@ -674,6 +676,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             count: r.count,
             filename,
             timestamp_ns: r.timestamp_ns,
+            overwrites: r.reason & open_reason::MASS_OVERWRITE != 0,
         });
     }
     out
@@ -897,8 +900,21 @@ mod tests {
             matches!(&ev[0], Event::FileOpen { filename, flags: 1, .. } if filename == "/etc/systemd/system/x.service")
         );
         assert!(
-            matches!(&ev[1], Event::MassWrite { count: 20, filename, .. } if filename == "/etc/systemd/system/x.service")
+            matches!(&ev[1], Event::MassWrite { count: 20, filename, overwrites: false, .. } if filename == "/etc/systemd/system/x.service")
         );
+        // External audit POS-002: the overwrite threshold, alone or with
+        // the write one on the same open, is one event that says so.
+        for reason in [
+            open_reason::MASS_OVERWRITE,
+            open_reason::MASS_WRITE | open_reason::MASS_OVERWRITE,
+        ] {
+            let r = record(reason, &["a.docx", "nn", "home", "/"], (7, 2));
+            let ev = events_of(&r, &mut mounts);
+            assert_eq!(ev.len(), 1);
+            assert!(
+                matches!(&ev[0], Event::MassWrite { overwrites: true, filename, .. } if filename == "/home/nn/a.docx")
+            );
+        }
         let r = record(
             open_reason::PROBE,
             &["n0nce", "probe", "northnarrow", "/"],

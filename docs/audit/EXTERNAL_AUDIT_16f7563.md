@@ -86,8 +86,8 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-040 | PROC-004 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-041 | PROC-005 | Process rules | L | open |
 | NN-AUD-042 | PROC-007 | Process rules | M | fixed (lab PR 86) |
-| NN-AUD-043 | POS-002 | Posture | M | open |
-| NN-AUD-044 | POS-003 | Posture | M | open |
+| NN-AUD-043 | POS-002 | Posture | M | fixed (lab PR 101) |
+| NN-AUD-044 | POS-003 | Posture | M | fixed (lab PR 101) |
 | NN-AUD-045 | POS-004 | Posture | L | open |
 | NN-AUD-046 | CMB-001 | Combat response | M | fixed (lab PR 100) |
 | NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
@@ -1075,3 +1075,76 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     8 attempts, the victim intact in all 8, the binary removed in 6 and
     left in place, reported, in 2; with the retry, 8 attempts, the victim
     intact and the binary vaulted and removed in all 8.
+- **NN-AUD-043 (POS-002) and NN-AUD-044 (POS-003), lab PR 101.** The
+  posture's auth-lineage exemption covered whole sessions and could be
+  borrowed.
+  - POS-002: `AUTH_BINARY_EXES` lists the login daemons (sshd, login,
+    cron, gdm, logind, polkitd) next to sudo and su, and the walk climbs
+    to PID 1: every process of an SSH, desktop or cron session was
+    auth-mediated, so both mass-write arms ignored it whatever it wrote
+    (silently: the WARN came after the exemption) and so did the
+    credential-read arm.
+  - POS-003: the walk read the spawn cache first and took whatever exe it
+    held for a pid. A parent that forks its payload and then executes
+    `sudo` (anyone may; the exec event comes before any password) made
+    the payload sudo's — deterministically, no race — and a pid an exited
+    parent left could be taken by a later process.
+  - The audit's fix for POS-002 (drop the session from the mass-write
+    arms) was not taken as written: a session's own new files cross the
+    threshold of 20 write-opens a minute all day — a browser's cache, a
+    build, a clone, an archive extracted — and a false COMBAT reaches
+    NEUTRALIZE (kill and quarantine) 30 s later. The kernel tells what
+    ransomware does to existing files from what those do: the open sensor
+    counts, per process, the write-opens of files that existed before the
+    open (no `FMODE_CREATED`) apart from all write-opens, and reports each
+    threshold once per window (`open_reason::MASS_OVERWRITE`,
+    `Event::MassWrite::overwrites`). An auth-mediated process's new files
+    do not count (recorded at INFO, no longer silent); its rewrites of
+    existing files raise ConfirmedIntrusion like anyone's. Package
+    managers and npm stay exempt. Tracepoint mode, which sees flags but
+    not the file, counts a session's opens without `O_CREAT`.
+  - The credential-read exemption (`sensitive_file_access`) is now the
+    PAM stack's: the authentication binary itself or its direct child
+    (`is_credential_reader`), not every process below it. `chage` and
+    `expiry` (setgid `shadow`, a user's own `chage -l`) are listed.
+  - POS-003: the audit's fix (compare a cached start with
+    `/proc/<pid>/stat`) does not stop the exec after the fork, which
+    keeps the pid and the start. Exec events now carry the process's own
+    start (`task->start_time`, its fork; `ProcessSpawnRaw::start_ns`), and
+    the walk (`lineage_match`) is ordered: an ancestor's match counts only
+    if it ran the binary before the process below it was forked; a child
+    never seen executing runs the image it was forked with, so it counts
+    only with the same exe; a process seen only in `/proc` counts if it
+    started before the agent or was forked, without executing, from a
+    parent that validly runs the same exe (sudo's monitor, a cron worker,
+    an sshd session process). A parent starts before its child: a hop
+    that started later is a later process given an exited parent's pid,
+    and the walk ends there. `parent_start_ns` was not used for this: it
+    is the start of the thread that forked, not of its process. The
+    agent's tracker (`for_host`) also checks a cached exec against the
+    start `/proc` shows for its pid (boot clock, ahead by the time
+    suspended), so a fork that took an exited sudo's pid is read from
+    `/proc`, not from sudo's entry. Same walk for the package-manager
+    exemption and for review 52's interactive-admin test.
+  - Accepted: a session copying over an existing tree (`cp -r` onto it,
+    `unzip -o`) rewrites existing files and raises ConfirmedIntrusion —
+    an alert (ENGAGED); COMBAT needs a second kind of evidence. GNU tar
+    extracting over a tree removes and recreates, and counts as new files.
+  - Not covered: ransomware that writes encrypted copies as new files and
+    deletes the originals, run from a session, is not counted by the
+    mass-write arm (no unlink count yet); File canaries in the session's
+    trees, the exec, persistence and network arms still apply.
+  - Lab, Ubuntu 22.04 (5.15), before: in an SSH session a program created
+    40 test files and then rewrote 40 existing ones in place — no trigger,
+    no log line. A transient service's child, forked before its parent
+    executed `sudo -n sleep 6`, created 40 files — no trigger, while the
+    same writes from a service without the sudo exec raised
+    ConfirmedIntrusion.
+  - Lab, after (22.04 / 5.15, Debian 12 / 6.1, Ubuntu 24.04 / 6.8): the
+    session's 40 new files recorded at INFO, not counted; its 40 rewrites
+    raised ConfirmedIntrusion (`overwrites=true`, ENGAGED); the laundered
+    child raised it (`overwrites=false`); a service's new files and its
+    rewrites carry `overwrites=false` and `true` on every kernel
+    (`FMODE_CREATED` at bit 20). In the session, `tar` extractions (over
+    an existing tree too) and `cp -r` into a new directory, 6 315 files,
+    were recorded at INFO only; `cp -r` over the existing tree raised it.
