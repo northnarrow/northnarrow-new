@@ -67,9 +67,6 @@ pub enum ExecutionOutcome {
     /// `northnarrow.slice/blocked.scope` cgroup and an `nftables`
     /// drop rule against that cgroup is now in effect.
     Blocked { pid: u32 },
-    /// `FullNetworkIsolation`: the host-wide isolation ruleset is
-    /// installed; the persistence flag has been written.
-    NetworkIsolated,
     /// `Quarantine`: the target's executable was encrypted into the
     /// vault and the original file was unlinked.
     Quarantined {

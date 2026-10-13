@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, a second network isolation (High CMB-006): an ADE
+  `Isolate` verdict no longer cuts the host off the network through an
+  nftables blackout of its own (no management carve-out, no release, not
+  in `status`). Host-wide isolation is the COMBAT ladder's alone; the
+  verdict kills the process tree it names. An older agent's leftover
+  chains are removed at start.
 - External audit, Wave 1, file integrity (High FIMR-004, FIMR-005,
   FIMP-003, FIMP-004):
   - A watched file replaced by renaming another over it (how installers

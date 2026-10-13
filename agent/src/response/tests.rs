@@ -55,7 +55,6 @@ fn detect_only_suppresses_every_action_with_would_execute() {
         ResponseAction::KillProcess,
         ResponseAction::KillProcessTree,
         ResponseAction::BlockOutbound,
-        ResponseAction::FullNetworkIsolation,
         ResponseAction::Quarantine,
         ResponseAction::ThrottleProcess,
     ] {
@@ -69,6 +68,28 @@ fn detect_only_suppresses_every_action_with_would_execute() {
             report.additional.is_empty(),
             "{action:?} must produce no child outcomes in detect-only"
         );
+    }
+}
+
+/// External audit CMB-006: host-wide isolation is the COMBAT ladder's; the
+/// executor refuses it from any other source, enforcing or not, and
+/// touches nothing.
+#[test]
+fn host_wide_isolation_is_refused_outside_the_ladder() {
+    for dry_run in [true, false] {
+        let exec = Executor::with_config(super::ExecutorConfig {
+            dry_run,
+            ..super::ExecutorConfig::default()
+        });
+        let report = exec.execute(ResponseAction::FullNetworkIsolation, 4321);
+        assert_eq!(
+            report.primary,
+            ExecutionOutcome::Refused {
+                pid: 4321,
+                reason: super::executor::ISOLATION_IS_THE_LADDERS,
+            }
+        );
+        assert!(report.additional.is_empty());
     }
 }
 

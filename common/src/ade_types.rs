@@ -212,7 +212,13 @@ impl AdeVerdict {
             AdeAction::KillTree => ResponseAction::KillProcessTree,
             AdeAction::Quarantine => ResponseAction::Quarantine,
             AdeAction::BlockNetwork => ResponseAction::BlockOutbound,
-            AdeAction::Isolate => ResponseAction::FullNetworkIsolation,
+            // External audit CMB-006: host-wide isolation is the COMBAT
+            // ladder's alone (locked COMBAT: kernel evidence; the
+            // management carve-out; the signed release). A model's
+            // verdict — fed by strings an attacker writes (comm, argv,
+            // paths) — contains the process tree it names, the most it may
+            // do on its own.
+            AdeAction::Isolate => ResponseAction::KillProcessTree,
             AdeAction::Throttle => ResponseAction::ThrottleProcess,
             AdeAction::Allow | AdeAction::Monitor | AdeAction::Alert | AdeAction::Escalate => {
                 ResponseAction::Log
@@ -352,10 +358,12 @@ mod tests {
         assert!(!v.requires_execution());
     }
 
+    /// External audit CMB-006: an Isolate verdict contains the process
+    /// tree; it never isolates the host.
     #[test]
-    fn isolate_maps_to_full_network_isolation() {
+    fn isolate_contains_the_process_tree_not_the_host() {
         let v = sample_verdict(AdeAction::Isolate, AdeSeverity::Critical, 0.92);
-        assert_eq!(v.to_response_action(), ResponseAction::FullNetworkIsolation);
+        assert_eq!(v.to_response_action(), ResponseAction::KillProcessTree);
         assert!(v.requires_execution());
     }
 

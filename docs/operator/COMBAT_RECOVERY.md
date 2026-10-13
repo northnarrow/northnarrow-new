@@ -172,6 +172,27 @@ So after a crash + restart the host comes back on the network on its own.
 > nn-admin force-posture combat --key /path/to/admin.key
 > ```
 
+### A second isolation, before CMB-006
+
+Agents before external audit CMB-006 could also isolate the host outside
+COMBAT: an ADE `Isolate` verdict installed two nftables chains,
+`isolation_input` and `isolation_output` (policy drop), in the
+`inet northnarrow` table. That isolation had no management carve-out (an
+open SSH session died too), no `unlock` and no `status` line. It no longer
+exists — host-wide isolation is the COMBAT ladder's alone, and an ADE
+`Isolate` verdict kills the process tree it names — and the agent removes
+the chains at start (WARN, and a `legacy_isolation_removed` entry in the
+signed audit log). By hand, from the console:
+
+```sh
+nft flush chain inet northnarrow isolation_input;  nft delete chain inet northnarrow isolation_input
+nft flush chain inet northnarrow isolation_output; nft delete chain inet northnarrow isolation_output
+rm -f /var/lib/northnarrow/isolated
+```
+
+The rest of the `northnarrow` table holds the per-process outbound
+blocks; leave it.
+
 ### Known limitation (documented for V1.0+)
 
 This reconcile is restart-scoped only — there is no persistent posture
@@ -194,6 +215,7 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 | Release COMBAT | `nn-admin unlock --key <admin.key>` |
 | Re-engage after crash | `nn-admin force-posture combat --key <admin.key>` |
 | Crash mid-COMBAT | automatic stale-chain reconcile on restart (see §4) |
+| Host cut off by an older agent's nftables isolation | agent restart removes it; by hand see §4 |
 
 Related: `configs/combat-rules.v4`,
 `agent/src/anti_tamper/network_isolate.rs`,

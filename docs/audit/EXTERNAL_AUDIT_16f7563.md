@@ -91,7 +91,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-045 | POS-004 | Posture | L | open |
 | NN-AUD-046 | CMB-001 | Combat response | M | fixed (lab PR 100) |
 | NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
-| NN-AUD-050 | CMB-006 | Combat response | M | open |
+| NN-AUD-050 | CMB-006 | Combat response | M | fixed (lab PR 103) |
 | NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
 | NN-AUD-055 | LLMR-012 | LLM runtime | M | fixed (lab PR 87) |
 | NN-AUD-057 | NET-003 | Network | M | fixed (lab PR 90) |
@@ -1208,3 +1208,36 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   - Not done: a reader task that drains the ring into a queue coalescing
     one writer's repeated closes of a file, which would keep a single
     process from filling any ring size.
+- **NN-AUD-050 (CMB-006), lab PR 103.** A second host-wide isolation sat
+  beside the COMBAT ladder's. `ResponseAction::FullNetworkIsolation`,
+  which an ADE `Isolate` verdict maps to (in production nothing else
+  emits it: the demo rule is behind `demo-tappa5`), installed two nftables
+  chains with policy drop in the agent's table: no management carve-out,
+  no established-traffic rule on output (an operator's open SSH session
+  died too), no release verb, no status line, and a flag file nothing
+  re-read. A model's verdict — fed by strings an attacker writes — could
+  cut the host off for good.
+  - The executor refuses the action, enforcing or not (`Refused`, "host-
+    wide isolation is the COMBAT ladder's"): isolation is engaged only from
+    locked COMBAT (POS-001), through `combat-allow.cidrs`, released with
+    the signed unlock, reported by `nn-admin status`.
+  - An ADE `Isolate` verdict contains the process tree it names
+    (`KillProcessTree`), the most a model's verdict may do on its own.
+    The audit's fix (route the verdict to the ladder's isolator) was not
+    taken: it would hand the model, and whoever steers it, the host's
+    network.
+  - The nftables blackout is gone (`network_isolation.rs` keeps only its
+    cleanup, and `c2_endpoints` its placeholder). At start the agent
+    removes the two chains an older agent may have left — the per-process
+    blocks share the table and stay — and the flag file, at WARN, with a
+    `legacy_isolation_removed` entry in the signed audit log.
+    COMBAT_RECOVERY §4 gives the console commands.
+  - Lab, Ubuntu 22.04 (5.15): the two chains planted in `inet northnarrow`
+    (policy accept here, to keep the session) next to the per-process
+    `output_blocked` and a test chain. Before, an agent restart left them;
+    after, the agent's start removed the two and kept the others (WARN,
+    `legacy_isolation_removed` in the audit log), again after a second
+    planting. Debian 12's image ships without `nft`: the old blackout
+    could only fail there. The state directory's `+i` refused the old
+    flag file, so the old engage applied the drop policy and then
+    reported a failure; the cleanup treats an unremovable flag as inert.
