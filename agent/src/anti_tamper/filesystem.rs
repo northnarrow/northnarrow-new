@@ -174,12 +174,10 @@ pub const ETC_READ_DENY_FILES: &[&str] = &["agent.sig.key"];
 /// These are the secret/integrity identity files written ONLY by the
 /// agent at runtime (admin.pub via the rename-based rotate-keys path;
 /// agent_id / agent.sig.key at bootstrap; audit.log via the append-only
-/// chain), so any runtime non-agent write is unambiguous tamper. The
-/// remaining [`ETC_PROTECTED_FILES`] are operator-tunable (allowlists /
-/// blocklists / fim-paths overlays) and stay MUTATE-only — write-denying
-/// them would turn a routine live edit into an enforce-mode COMBAT
-/// (NIC-isolation) trip. Every entry MUST also appear in
-/// [`ETC_PROTECTED_FILES`].
+/// chain), so any runtime non-agent write is unambiguous tamper; so are
+/// the shipped `.v1` lists, which only install.sh writes. The `.local`
+/// overlays operators tune stay MUTATE-only and are signature-gated.
+/// Every entry MUST also appear in [`ETC_PROTECTED_FILES`].
 pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     "admin.pub",
     "agent_id",
@@ -197,6 +195,15 @@ pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     // MUTATE-only and is signature-gated). An append at runtime could
     // add lines the next boot reads.
     "fim-paths.v1",
+    // External audit ATP-008: the other shipped lists, on the same
+    // reasoning — install.sh writes them with the pins dropped, operators
+    // tune the signed `.local` overlays (`nn-admin config overlay set`).
+    // An in-place append blinded a blocklist or allowlisted a comm at the
+    // next boot, with nothing refused.
+    "netflow-blocklist.v1",
+    "netflow-ja3-blocklist.v1",
+    "process-comm-allowlist.v1",
+    "netflow-comm-allowlist.v1",
 ];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
@@ -1890,6 +1897,18 @@ mod tests {
              Tappa 10.5 D1 specify these files in this order"
         );
         assert_eq!(CONFIG_DIR, "/etc/northnarrow");
+    }
+
+    /// External audit ATP-008 (with FIMR-001): every shipped `.v1` list is
+    /// write-denied — only install.sh writes one, with the pins dropped.
+    #[test]
+    fn curated_v1_lists_are_write_denied() {
+        for name in ETC_PROTECTED_FILES.iter().filter(|n| n.ends_with(".v1")) {
+            assert!(
+                ETC_WRITE_DENY_FILES.contains(name),
+                "{name} must be write-denied"
+            );
+        }
     }
 
     /// Tappa 10.5 D1 test: `ETC_PROTECTED_FILES` includes the four

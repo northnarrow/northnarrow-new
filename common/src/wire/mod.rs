@@ -541,6 +541,23 @@ impl KillGrant {
 // write one of these into `FsProtectDenialRaw.operation` when they
 // return `-EPERM`. Userland inflates the byte into the typed
 // `model::FsProtectOperation`.
+/// `_IOC(dir, type, nr, size)` as `<asm-generic/ioctl.h>` builds it.
+const fn ioc(dir: u32, ty: u8, nr: u8, size: u32) -> u32 {
+    (dir << 30) | (size << 16) | ((ty as u32) << 8) | nr as u32
+}
+const IOC_WRITE: u32 = 1;
+
+/// `FS_IOC_SETFLAGS = _IOW('f', 2, long)`: `chattr +i/-i/+a`.
+pub const FS_IOC_SETFLAGS: u32 = ioc(IOC_WRITE, b'f', 2, 8);
+/// `FS_IOC32_SETFLAGS = _IOW('f', 2, int)`: the same from a 32-bit binary.
+pub const FS_IOC32_SETFLAGS: u32 = ioc(IOC_WRITE, b'f', 2, 4);
+/// `FS_IOC_FSSETXATTR = _IOW('X', 32, struct fsxattr)` (28 bytes): the
+/// same flags (`FS_XFLAG_IMMUTABLE`, `FS_XFLAG_APPEND`, ...) by the fsxattr
+/// interface — `xfs_io -c 'chattr -i'`, and some `chattr` builds.
+/// External audit EBPF-008: the eBPF side had `0x40285821` here, a number
+/// no ioctl uses, and did not filter it anyway.
+pub const FS_IOC_FSSETXATTR: u32 = ioc(IOC_WRITE, b'X', 32, 28);
+
 pub const FS_OP_UNLINK: u8 = 1;
 pub const FS_OP_RMDIR: u8 = 2;
 pub const FS_OP_RENAME: u8 = 3;
@@ -1612,6 +1629,15 @@ mod tests {
     /// 1..=5. Variant order MUST track `FIM_OP_*` discriminant
     /// order — a reorder would silently change the byte semantics
     /// of every kernel-emitted `FimDriftRaw` record.
+    /// External audit EBPF-008: the ioctl numbers the file_ioctl deny
+    /// filters are the uapi ones (`<linux/fs.h>`, x86-64 and arm64).
+    #[test]
+    fn fs_ioctl_numbers_match_uapi() {
+        assert_eq!(FS_IOC_SETFLAGS, 0x4008_6602);
+        assert_eq!(FS_IOC32_SETFLAGS, 0x4004_6602);
+        assert_eq!(FS_IOC_FSSETXATTR, 0x401c_5820);
+    }
+
     #[test]
     fn fim_op_discriminants_lock_in() {
         assert_eq!(FimOp::Modified as u8, FIM_OP_MODIFIED);
