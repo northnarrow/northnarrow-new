@@ -74,9 +74,10 @@ async fn main() -> ExitCode {
         ..AdeConfig::default()
     };
     // `AdeEngine::new` routes through `build_default_backend`, which
-    // prefers the real Candle backend and falls back to `MockBackend`
-    // if the GGUF cannot load. The demo does not lock down the choice
-    // — whatever the runtime picks is what we measure.
+    // loads the real Candle backend; it falls back to `MockBackend` when
+    // the GGUF cannot load only with `NN_ADE_ALLOW_MOCK=1` (external audit
+    // LLMR-005). The demo does not lock down the choice — whatever the
+    // runtime picks is what we measure.
     let engine = match AdeEngine::new(cfg).await {
         Ok(e) => e,
         Err(e) => {

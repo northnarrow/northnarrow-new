@@ -30,6 +30,25 @@ modification.
 
 ## Model files
 
+Where the agent looks by default (external audit LLMR-004; it was a user's
+home): `/var/lib/northnarrow/models/foundation-sec-8b-reasoning-q4_k_m.gguf`
+and its tokenizer next to it. The agent loads a model and a tokenizer only
+when they — and every directory above them — are root's and not writable
+by group or others (a sticky directory excepted), the file a regular one;
+otherwise it runs on its rules alone and says why. To install:
+
+```sh
+install -d -o root -g root -m 0755 /var/lib/northnarrow/models
+install -o root -g root -m 0644 foundation-sec-8b-reasoning-q4_k_m.gguf \
+    foundation-sec-8b-reasoning-q4_k_m.tokenizer.json /var/lib/northnarrow/models/
+```
+
+(The state directory is immutable while the agent runs: create `models/`
+inside a trusted-installer window, or before the first start.)
+
+The development box keeps them in a home, used through `--ade-model` by
+tools run as that user:
+
 - `/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.gguf`
   (~4.92 GB) — production model.
 - `/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.tokenizer.json`

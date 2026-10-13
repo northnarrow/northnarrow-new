@@ -92,7 +92,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-046 | CMB-001 | Combat response | M | fixed (lab PR 100) |
 | NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
 | NN-AUD-050 | CMB-006 | Combat response | M | fixed (lab PR 103) |
-| NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
+| NN-AUD-053 | LLMR-004 | LLM runtime | M | fixed (lab PR 105) |
 | NN-AUD-055 | LLMR-012 | LLM runtime | M | fixed (lab PR 87) |
 | NN-AUD-057 | NET-003 | Network | M | fixed (lab PR 90) |
 | NN-AUD-058 | NET-004 | Network | M | fixed (lab PR 104) |
@@ -1270,3 +1270,48 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     127.0.0.2:53) for 180 s. Before, the agent's RSS grew linearly, 38 MB
     → 77 MB, and would have kept growing to the 300 s window. After, it
     grew to 63 MB by 120 s and stayed there (64.8 MB at the end).
+- **NN-AUD-053 (LLMR-004), lab PR 105.** The ADE loaded whatever GGUF and
+  `tokenizer.json` sat at the configured path — no owner, mode or link
+  check — and the default path was `/home/forty/models/…`, a user's home:
+  the user, or anyone who can write a directory on the path, chose the
+  root agent's model (verdicts tailored to `Allow`, or output that keeps
+  the escalation busy) and fed candle's GGUF parser a file of their
+  making.
+  - The default is under the state directory,
+    `/var/lib/northnarrow/models/`.
+  - `model_trust::open_trusted`, sshd's StrictModes for model artefacts:
+    the path resolved; every directory on it owned by root (or the
+    agent's own user) and not writable by group or others, a sticky
+    directory excepted; the file opened without following a link, a
+    regular file, same owner, no group or other write bit. The GGUF is
+    parsed from that descriptor and the tokenizer read from its own
+    (`Tokenizer::from_bytes`), so what was checked is what is loaded. A
+    refusal (`AdeError::ModelUntrusted`) leaves the ADE off and the agent
+    on its rules, with the reason in the journal — not on the mock
+    backend the other load failures fall back to (LLMR-005).
+  - Found in the lab: the ADE could not load on an installed host even
+    with a model. Its system prompt — the model's instructions — defaulted
+    to `dataset/system_prompt_v1.md`, a path relative to the working
+    directory that nothing installs, and a service runs from `/`. The v1
+    prompt is now built into the agent (`include_str!`) and used for the
+    default; a prompt given with `--ade-prompt` goes through the same
+    `open_trusted` as the model.
+  - LLMR-005 (Wave 2), taken here because the built-in prompt made it
+    reachable on installed hosts: any other load failure (a corrupt or
+    unsupported GGUF, a missing tokenizer, OOM) fell back to the mock
+    backend, a substring match on comm and the exec path — `Allow` at 0.97
+    for a process named `cargo` or `git`, a tree kill for a name holding
+    `miner`. A failed load now leaves the ADE off; the mock answers only
+    with `NN_ADE_ALLOW_MOCK=1` (demos, benchmarks).
+  - Lab, Debian 12 (6.1), with stand-in files (a few bytes, no model) at
+    the default location. Before: a GGUF and tokenizer owned by the
+    unprivileged user in `/home/forty/models/` reached candle's parser
+    (`reading GGUF metadata: unknown magic`), then the mock backend. After:
+    that file is no longer looked at; a GGUF owned by uid 1000 in
+    `/var/lib/northnarrow/models/` was refused (`ModelUntrusted … owned by
+    uid 1000`, ADE off, rules only); root's files passed the check and the
+    stand-in failed to parse — which, with `NN_ADE_ALLOW_MOCK` unset,
+    leaves the ADE off too.
+  - Not done: a pinned digest of the model. Root can replace a root-owned
+    model, and root is the anti-tamper layer's adversary, not this
+    check's.

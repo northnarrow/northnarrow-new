@@ -2,9 +2,9 @@
 //!
 //! Defaults match Sub-tappa 6.1 expectations: Foundation-Sec-8B
 //! Reasoning Q4_K_M living at
-//! `/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.gguf`,
-//! Italian outputs, 15 s hard timeout. CLI overrides arrive in
-//! `agent/src/main.rs`.
+//! `/var/lib/northnarrow/models/foundation-sec-8b-reasoning-q4_k_m.gguf`
+//! (external audit LLMR-004: it was a user's home), Italian outputs, 15 s
+//! hard timeout. CLI overrides arrive in `agent/src/main.rs`.
 //!
 //! The Gemma 4 GGUF stays accessible via `--ade-model PATH` for
 //! comparative benchmarks but is not the default any more — Llama
@@ -36,10 +36,19 @@ pub struct AdeConfig {
 impl AdeConfig {
     /// Default model path used by Sub-tappa 6.1 — Foundation-Sec-8B
     /// Reasoning Q4_K_M (Llama 3.1 architecture, full candle support).
+    ///
+    /// External audit LLMR-004: under the agent's state directory. It was
+    /// a user's home, where an unprivileged user could put the model the
+    /// root agent then loaded. The model and its tokenizer must be root's
+    /// and closed to others, the directories above them too
+    /// ([`super::model_trust::open_trusted`]); otherwise the agent runs on
+    /// its rules alone.
     pub const DEFAULT_MODEL_PATH: &'static str =
-        "/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.gguf";
+        "/var/lib/northnarrow/models/foundation-sec-8b-reasoning-q4_k_m.gguf";
 
-    /// Default system prompt path (relative to repo root).
+    /// Default system prompt: the v1 prompt built into the agent
+    /// ([`super::prompt::SystemPrompt::load`]; it was read from this path
+    /// relative to the working directory, which a service never had).
     pub const DEFAULT_SYSTEM_PROMPT_PATH: &'static str = "dataset/system_prompt_v1.md";
 
     /// Returns a [`AdeConfig`] with the model path overridden.

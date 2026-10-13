@@ -25,7 +25,6 @@
 //! a one-time bootstrap fetch documented in
 //! `docs/ADE_BACKEND_NOTES.md`.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -155,9 +154,10 @@ impl CandleBackend {
     pub fn load_with_tokenizer(model_path: &Path, tokenizer_path: &Path) -> Result<Self, AdeError> {
         let device = Device::Cpu;
 
-        let mut file = File::open(model_path).map_err(|e| {
-            AdeError::Backend(format!("opening GGUF {}: {e}", model_path.display()))
-        })?;
+        // External audit LLMR-004: only a model and a tokenizer nobody but
+        // root can have changed, read through the descriptor that was
+        // checked.
+        let (mut file, _) = super::model_trust::open_trusted(model_path)?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| AdeError::Backend(format!("reading GGUF metadata: {e}")))?;
 
@@ -168,7 +168,11 @@ impl CandleBackend {
         let weights = ModelWeights::from_gguf(content, &mut file, &device)
             .map_err(|e| AdeError::Backend(format!("loading GGUF weights: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
+        let (mut tokenizer_file, _) = super::model_trust::open_trusted(tokenizer_path)?;
+        let mut tokenizer_json = Vec::new();
+        std::io::Read::read_to_end(&mut tokenizer_file, &mut tokenizer_json)
+            .map_err(|e| AdeError::Backend(format!("reading tokenizer: {e}")))?;
+        let tokenizer = Tokenizer::from_bytes(&tokenizer_json)
             .map_err(|e| AdeError::Backend(format!("loading tokenizer: {e}")))?;
 
         // Llama 3.1 stop tokens.
