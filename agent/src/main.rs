@@ -1031,42 +1031,37 @@ async fn main() -> Result<()> {
     // leak. Per-hook failures are logged WARN inside the call and
     // tolerated so the agent still runs on kernels without BPF-LSM.
     //
-    // Watchdog W6: if the watchdog daemon is also deployed (its
-    // pidfile present at cli.watchdog_pidfile), co-register its
-    // PID into PROTECTED_PIDS so the LSM hooks deny kill/ptrace
-    // against the watchdog too. WATCHDOG_COMM goes into
-    // allowed_comms unconditionally — `evict_stale_pids` only
-    // KEEPS entries whose /proc/<pid>/comm matches an allowed
-    // name, so even if the watchdog isn't running yet we want
-    // its comm in the allowlist to avoid evicting it once it
-    // starts. read_watchdog_pid_optional NEVER errors — a
-    // missing/garbage pidfile just falls back to agent-only
-    // protection (logged).
+    // Watchdog W6: the watchdog is protected too. External audit
+    // MAIN-001: never on the word of `/run/northnarrow/watchdog.pid` —
+    // membership also lets a pid signal the agent and pass every inode
+    // deny hook. The watchdog's own entry (it registers itself) is kept
+    // below while it runs the installed watchdog binary, and the refresh
+    // task (`spawn_watchdog_exempt_refresh`, first round right after
+    // boot) registers a pid it has verified by `/proc/<pid>/exe`.
+    // External audit ATP-002: entries a previous agent left in the pinned
+    // map are kept only while they run the agent's or the watchdog's
+    // executable, no longer while they merely call themselves so.
     let agent_pid = std::process::id();
-    let agent_comm = northnarrow_agent::anti_tamper::read_self_comm()
-        .context("reading own /proc/self/comm for anti-tamper allowed-comm set")?;
-    let mut allowed_comms = std::collections::HashSet::new();
-    allowed_comms.insert(agent_comm);
-    allowed_comms.insert(northnarrow_agent::anti_tamper::WATCHDOG_COMM.to_string());
-
-    let watchdog_pid =
-        northnarrow_agent::anti_tamper::read_watchdog_pid_optional(&cli.watchdog_pidfile);
-    let pids: Vec<u32> = match watchdog_pid {
-        Some(wpid) => vec![agent_pid, wpid],
-        None => vec![agent_pid],
-    };
+    let keep: Vec<northnarrow_agent::anti_tamper::ExeIdentity> = [
+        northnarrow_agent::anti_tamper::ExeIdentity::of_file(std::path::Path::new(
+            "/proc/self/exe",
+        )),
+        northnarrow_agent::anti_tamper::ExeIdentity::of_file(&cli.resolved_watchdog_exe()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let pids = vec![agent_pid];
     // Audit `ebpf-lsm-1`: a deny-hook shortfall is fail-closed (the
     // escape hatch is NN_ANTI_TAMPER_ALLOW_DEGRADED=1, handled inside
     // anti_tamper::attach). A kernel without BPF-LSM is NOT an error
     // here — attach returns Ok after logging that anti-tamper is off.
-    sensor
-        .attach_anti_tamper(&pids, &allowed_comms)
-        .with_context(|| {
-            format!(
-                "anti-tamper setup failed (agent_pid={agent_pid}, watchdog_pid={watchdog_pid:?}) — \
+    sensor.attach_anti_tamper(&pids, &keep).with_context(|| {
+        format!(
+            "anti-tamper setup failed (agent_pid={agent_pid}) — \
                  refusing to start with a silently-absent protection"
-            )
-        })?;
+        )
+    })?;
 
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
@@ -3601,6 +3596,30 @@ async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
 /// Logs only on a *change* of verified PID so a steady state doesn't
 /// flood the journal; any non-`Verified` outcome clears the exemption
 /// (fail toward over-triggering).
+/// External audit MAIN-001: remove a former watchdog pid from
+/// PROTECTED_PIDS unless it still runs the watchdog binary.
+fn withdraw_watchdog_pid(
+    bpffs_root: Option<&std::path::Path>,
+    pid: u32,
+    watchdog_exe: &std::path::Path,
+) {
+    use northnarrow_agent::anti_tamper::ExeIdentity;
+    let watchdog = ExeIdentity::of_file(watchdog_exe);
+    if watchdog.is_some() && ExeIdentity::of_process(pid) == watchdog {
+        warn!(
+            pid,
+            "the watchdog pidfile no longer names the running watchdog — keeping it protected"
+        );
+        return;
+    }
+    match northnarrow_agent::anti_tamper::evict_protected_pid(bpffs_root, pid) {
+        Ok(()) => info!(pid, "former watchdog pid removed from PROTECTED_PIDS"),
+        Err(e) => {
+            warn!(pid, error = %e, "could not remove a former watchdog pid from PROTECTED_PIDS")
+        }
+    }
+}
+
 fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_exe: PathBuf) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -3619,6 +3638,21 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
             };
             if new_pid == last {
                 continue; // no change — stay quiet on the hot path
+            }
+            // External audit MAIN-001: PROTECTED_PIDS follows the verified
+            // watchdog. The previous pid leaves it once it no longer runs
+            // the watchdog binary (dead, or recycled by another program);
+            // a deleted or rewritten pidfile alone does not unprotect the
+            // watchdog that still runs.
+            if let Some(prev) = last {
+                withdraw_watchdog_pid(bpffs_root, prev, &expected_exe);
+            }
+            if let Some(p) = new_pid {
+                if let Err(e) =
+                    northnarrow_agent::anti_tamper::register_protected_pid(bpffs_root, p)
+                {
+                    warn!(watchdog_pid = p, error = %e, "PROTECTED_PIDS register of the verified watchdog failed");
+                }
             }
             match &resolution {
                 WatchdogResolution::Verified(p) => {

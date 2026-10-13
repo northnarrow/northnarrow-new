@@ -63,6 +63,19 @@ fn watchdog_execstart_names_the_agent_unit_and_binary() {
     );
 }
 
+/// External audit WDG-003: the watchdog verifies the agent's pid by its
+/// `/proc/<pid>/exe`, closed to a root process without CAP_SYS_PTRACE
+/// (the agent is not dumpable).
+#[test]
+fn watchdog_unit_can_verify_the_agents_executable() {
+    let d = directives(&unit("northnarrow-watchdog.service"));
+    let caps = value(&d, "CapabilityBoundingSet").expect("bounding set");
+    assert!(
+        caps.split_whitespace().any(|c| c == "CAP_SYS_PTRACE"),
+        "{caps}"
+    );
+}
+
 #[test]
 fn agent_unit_keeps_restart_no_and_disables_start_rate_limit() {
     let d = directives(&unit("northnarrow-agent.service"));

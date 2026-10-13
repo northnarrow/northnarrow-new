@@ -60,7 +60,6 @@ pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
     network_isolate::mint_unlock_token()
 }
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -213,10 +212,16 @@ const PTRACE_HOOK: &str = "ptrace_access_check";
 /// `pids` is a slice so callers can register multiple PIDs in one
 /// call (Tappa 7 task 6: agent + watchdog). Stale entries from a
 /// prior pinned-map load are evicted first — every entry whose PID
-/// is dead or whose `/proc/<pid>/comm` is not in `allowed_comms`
-/// is removed before `pids` is inserted.
-pub fn attach(ebpf: &mut Ebpf, pids: &[u32], allowed_comms: &HashSet<String>) -> Result<()> {
-    match evict_stale_pids(ebpf, allowed_comms) {
+/// is dead or does not run one of `keep` ([`ExeIdentity`]) is removed
+/// before `pids` is inserted.
+pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()> {
+    // The agent first: the scan below reads `/proc/<pid>/exe` of protected
+    // processes, which the previous agent's pinned ptrace_access_check
+    // hook allows only to a protected caller. Unregistered, the agent
+    // would read nothing and evict the live watchdog.
+    register_protected_pids(ebpf, &[std::process::id()])
+        .context("registering the agent in PROTECTED_PIDS before the stale scan")?;
+    match evict_stale_pids(ebpf, keep) {
         Ok(0) => {}
         Ok(n) => info!(
             evicted = n,
@@ -696,32 +701,51 @@ fn register_protected_pids(ebpf: &mut Ebpf, pids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-/// Walk every PID currently in `PROTECTED_PIDS`. Evict any entry
-/// whose PID is dead OR whose `/proc/<pid>/comm` is not in
-/// `allowed_comms`. Returns the number of entries removed.
+/// A program's identity: the device and inode of its executable — what
+/// `/proc/<pid>/exe` of a process running it resolves to, whatever the
+/// process calls itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExeIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl ExeIdentity {
+    /// The file at `path` (symlinks followed).
+    pub fn of_file(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| Self {
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+
+    /// The program `pid` runs; `None` when it is gone or unreadable.
+    pub fn of_process(pid: u32) -> Option<Self> {
+        Self::of_file(Path::new(&format!("/proc/{pid}/exe")))
+    }
+}
+
+/// Walk every PID currently in `PROTECTED_PIDS` and evict any entry
+/// that is dead or does not run one of `keep` (the agent's and the
+/// watchdog's executables).
 ///
-/// This is a no-op on a freshly-loaded eBPF object (the map is
-/// empty); it becomes load-bearing once the BPF pinning sprint
-/// pins the map to bpffs, at which point a restarted agent inherits
-/// the prior generation's entries and must clean up stale ones
-/// before the new PIDs take effect.
+/// External audit ATP-002: the check used to be `/proc/<pid>/comm`
+/// against `{agent comm, "northnarrow-wat"}`. A process names itself
+/// (`prctl(PR_SET_NAME)`), so one that landed on a recycled pid left in
+/// the pinned map kept the entry across agent restarts — immunity to
+/// kill and ptrace, and exemption from every inode deny hook.
 ///
-/// Watchdog W1: walk + evict now go through the
-/// [`ProtectedPidsHandle`] surface. Snapshot the PID set up front
-/// via [`ProtectedPidsHandle::pids`] (which materialises a `Vec`
-/// internally) so the eviction loop can call
-/// [`ProtectedPidsHandle::evict`] without fighting an iterator
-/// borrow on the underlying map.
-fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<usize> {
+/// Snapshot the PID set up front via [`ProtectedPidsHandle::pids`] (which
+/// materialises a `Vec` internally) so the eviction loop can call
+/// [`ProtectedPidsHandle::evict`] without fighting an iterator borrow on
+/// the underlying map.
+fn evict_stale_pids(ebpf: &mut Ebpf, keep: &[ExeIdentity]) -> Result<usize> {
     let mut handle = ProtectedPidsHandle::from_ebpf(ebpf)?;
     let existing = handle.pids()?;
     let mut evicted = 0usize;
     for pid in existing {
-        let alive_and_matching = match read_proc_comm(pid) {
-            Some(comm) => allowed_comms.contains(&comm),
-            None => false,
-        };
-        if alive_and_matching {
+        if ExeIdentity::of_process(pid).is_some_and(|id| keep.contains(&id)) {
             continue;
         }
         match handle.evict(pid) {
@@ -733,6 +757,31 @@ fn evict_stale_pids(ebpf: &mut Ebpf, allowed_comms: &HashSet<String>) -> Result<
         }
     }
     Ok(evicted)
+}
+
+/// Insert `pid` into the pinned `PROTECTED_PIDS` (a watchdog the agent
+/// verified). No bpffs ⇒ no pinned map ⇒ no-op.
+pub fn register_protected_pid(bpffs_root: Option<&Path>, pid: u32) -> Result<()> {
+    let Some(root) = bpffs_root else {
+        return Ok(());
+    };
+    let mut handle = ProtectedPidsHandle::open(root)
+        .with_context(|| format!("opening {PROTECTED_PIDS_MAP_NAME} for register"))?;
+    handle.insert(pid)?;
+    Ok(())
+}
+
+/// Remove `pid` from the pinned `PROTECTED_PIDS` (external audit
+/// MAIN-001: a watchdog pid that no longer runs the watchdog binary).
+/// No bpffs ⇒ no pinned map ⇒ no-op.
+pub fn evict_protected_pid(bpffs_root: Option<&Path>, pid: u32) -> Result<()> {
+    let Some(root) = bpffs_root else {
+        return Ok(());
+    };
+    let mut handle = ProtectedPidsHandle::open(root)
+        .with_context(|| format!("opening {PROTECTED_PIDS_MAP_NAME} for evict"))?;
+    handle.evict(pid)?;
+    Ok(())
 }
 
 /// BUG-011 (PHASE 15.1): boot-time scrub of PROTECTED_OBSERVERS.
@@ -828,6 +877,24 @@ pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit ATP-002: a protected pid is told by the file it
+    /// runs, not by the name it gives itself.
+    #[test]
+    fn exe_identity_is_the_file_a_process_runs() {
+        let me = ExeIdentity::of_process(std::process::id()).expect("own exe");
+        assert_eq!(Some(me), ExeIdentity::of_file(Path::new("/proc/self/exe")));
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let other = ExeIdentity::of_process(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(other, ExeIdentity::of_file(Path::new("/bin/sleep")));
+        assert_ne!(other, Some(me));
+        assert_eq!(ExeIdentity::of_process(u32::MAX), None);
+    }
     use tempfile::TempDir;
 
     /// Review 53: the no-BTF path and a per-hook shortfall share one

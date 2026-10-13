@@ -102,7 +102,12 @@ ReadWritePaths=/run/northnarrow
 #                  don't need CAP_NET_ADMIN / CAP_DAC_OVERRIDE
 #                  because the watchdog never touches iptables
 #                  and never chattr's anything)
-CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN
+# CAP_SYS_PTRACE — read /proc/<agent>/exe to verify that the pid the
+#                  agent pidfile names runs the agent binary before it
+#                  is protected, signalled or respawned from (external
+#                  audit WDG-003); the agent is not dumpable, so its
+#                  exe link is closed to a root process without it
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN CAP_SYS_PTRACE
 
 [Install]
 WantedBy=multi-user.target
