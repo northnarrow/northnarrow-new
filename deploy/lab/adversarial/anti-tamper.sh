@@ -412,6 +412,22 @@ run_case C41 "read the agent's private signing key" denied "op=read" 0 -- cat "$
 run_case C42 "verify the audit chain from the public half" allowed "" 0 -- \
     /usr/local/bin/nn-admin audit verify --from "$ETC/audit.log"
 
+# External audit EBPF-008: the inode flags through the fsxattr interface —
+# the file_ioctl deny filtered only FS_IOC_SETFLAGS (and held a wrong
+# FS_IOC_FSSETXATTR number): root cleared `+i` on the state directory, the
+# only thing keeping new entries out of it, or made audit.log append-only
+# to the agent. ATP-008: the shipped `.v1` lists were mutation-denied only.
+FSX_SRC="$(dirname "$0")/fsxattr-probe.c"
+FSX_BIN=/usr/local/libexec/nn-lab/nn-fsxattr-probe
+if [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BIN" "$FSX_SRC" 2>/tmp/nn-fsx-cc.log; then
+    run_case C44 "fsxattr: clear the immutable flag of the state directory" denied "op=ioctl" 0 -- "$FSX_BIN" "$STATE" -i
+    run_case C45 "fsxattr: make audit.log append-only" denied "op=ioctl" 0 -- "$FSX_BIN" "$ETC/audit.log" +a
+else
+    echo "C44-C45 skipped: cannot build the fsxattr probe ($(head -1 /tmp/nn-fsx-cc.log 2>/dev/null))" >&2
+fi
+run_case C46 "append to the shipped netflow blocklist" denied "op=write" 0 -- \
+    bash -c "echo '# nn-lab C46' >> $ETC/netflow-blocklist.v1"
+
 echo
 echo "| case | action | outcome | evidence | verdict |"
 echo "|---|---|---|---|---|"

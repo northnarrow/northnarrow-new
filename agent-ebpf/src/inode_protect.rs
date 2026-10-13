@@ -66,26 +66,15 @@ const EPERM: c_int = 1;
 /// init system reading a unit) has `FMODE_READ` only and passes through.
 const FMODE_WRITE: u32 = 0x2;
 
-/// `FS_IOC_SETFLAGS = _IOW('f', 2, long)` on a 64-bit kernel.
-/// `chattr +i` / `-i` sends this ioctl with the inode flag bitmap.
-const FS_IOC_SETFLAGS: c_uint = 0x4008_6602;
-
-/// `FS_IOC32_SETFLAGS = _IOW('f', 2, int)` — the 32-bit compat
-/// variant. A 32-bit `chattr` binary on a 64-bit kernel ends up
-/// here.
-const FS_IOC32_SETFLAGS: c_uint = 0x4004_6602;
-
-/// `FS_IOC_FSSETXATTR = _IOW('X', 32, struct fsxattr)` — the
-/// project-quota / fsxattr path. Diagnostic-only: some recent
-/// `chattr` binaries try this before falling back to FS_IOC_SETFLAGS.
-/// We only print a marker if we see it; we do not yet treat it as a
-/// chattr signal because it carries a 28-byte struct rather than a
-/// raw flag bitmap.
-const FS_IOC_FSSETXATTR: c_uint = 0x4028_5821;
-
-/// `FS_IOC_FSGETXATTR = _IOR('X', 31, struct fsxattr)` — usually
-/// paired with FSSETXATTR. Diagnostic marker only.
-const FS_IOC_FSGETXATTR: c_uint = 0x801c_581f;
+/// The chattr-family ioctls the deny filters: `FS_IOC_SETFLAGS` and its
+/// 32-bit variant carry the inode flag bitmap (`chattr +i/-i/+a`);
+/// `FS_IOC_FSSETXATTR` sets the same flags through `struct fsxattr`
+/// (`xfs_io -c 'chattr -i'`). External audit EBPF-008: the last one was
+/// neither filtered nor right (`0x40285821`); the numbers now come from
+/// `common`, where a test pins them to the uapi.
+const FS_IOC_SETFLAGS: c_uint = northnarrow_common::wire::FS_IOC_SETFLAGS;
+const FS_IOC32_SETFLAGS: c_uint = northnarrow_common::wire::FS_IOC32_SETFLAGS;
+const FS_IOC_FSSETXATTR: c_uint = northnarrow_common::wire::FS_IOC_FSSETXATTR;
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -511,18 +500,7 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
 
     let cmd: c_uint = ctx.arg(1);
 
-    // Forensic markers for the four chattr-family ioctls. Some
-    // recent `chattr` binaries try FSSETXATTR before falling back
-    // to SETFLAGS; if we see the FSSETXATTR marker but no
-    // SETFLAGS, the cmd-filter list is incomplete and we need to
-    // widen it.
-    if cmd == FS_IOC_SETFLAGS {
-    } else if cmd == FS_IOC32_SETFLAGS {
-    } else if cmd == FS_IOC_FSSETXATTR {
-    } else if cmd == FS_IOC_FSGETXATTR {
-    }
-
-    if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS {
+    if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS && cmd != FS_IOC_FSSETXATTR {
         return 0;
     }
 

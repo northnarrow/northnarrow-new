@@ -139,13 +139,13 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-093 | MAIN-008 | Agent main | S | open |
 | NN-AUD-094 | ATP-003 | Anti-tamper | S | open |
 | NN-AUD-095 | ATP-005 | Anti-tamper | S | open |
-| NN-AUD-096 | ATP-008 | Anti-tamper | M | open |
+| NN-AUD-096 | ATP-008 | Anti-tamper | M | fixed (lab PR 113) |
 | NN-AUD-097 | ATP-009 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-098 | ATP-010 | Anti-tamper | M | open |
 | NN-AUD-099 | ATP-012 | Anti-tamper | S | open |
 | NN-AUD-100 | ATP-013 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-101 | EBPF-004 | eBPF kernel | M | fixed (lab PR 112) |
-| NN-AUD-102 | EBPF-008 | eBPF kernel | S | open |
+| NN-AUD-102 | EBPF-008 | eBPF kernel | S | fixed (lab PR 113) |
 | NN-AUD-103 | EBPF-009 | eBPF kernel | S | open |
 | NN-AUD-104 | EBPF-011 | eBPF kernel | M | open |
 | NN-AUD-105 | EBPF-013 | eBPF kernel | M | open |
@@ -1715,3 +1715,32 @@ the audit did not report, noted with the fix that takes them.
     attached; `BTF_OFFSETS` shown `frozen` and an update refused even with
     the guard observing; `agent_boot` records `build_features`
     (`debug-trigger`, `test-privileged`) and `bpf_guard: enforce`.
+- **NN-AUD-102 (EBPF-008), NN-AUD-096 (ATP-008), lab PR 113.** Two ways
+  around the filesystem deny.
+  - EBPF-008, worse than reported: the `file_ioctl` deny filtered only
+    `FS_IOC_SETFLAGS` and its 32-bit twin; the fsxattr interface
+    (`FS_IOC_FSSETXATTR`, `xfs_io -c 'chattr -i'`) changes the same inode
+    flags and was let through — and the constant the program held for it
+    (`0x40285821`) is no ioctl number at all, so the audit's "constant
+    already defined" fix would have matched nothing. Root cleared `+i` on
+    the state directory (the only thing keeping new entries out of it) or
+    made `audit.log` append-only to the agent. The three numbers now come
+    from `common`, built as `<asm-generic/ioctl.h>` builds them
+    (`_IOW('X', 32, struct fsxattr)` = `0x401c5820`) and pinned to the
+    uapi by a test, and the deny filters all three.
+  - ATP-008: the shipped `.v1` lists (`netflow-blocklist`,
+    `netflow-ja3-blocklist`, `process-comm-allowlist`,
+    `netflow-comm-allowlist`) were mutation-denied only: an in-place append
+    went through, and the next boot read it — a blocklist blinded, a comm
+    allowlisted. Like `fim-paths.v1` (FIMR-001) they are now write-denied;
+    install.sh writes them with the pins dropped, operators tune the
+    signed `.local` overlays. Recording each list's hash on the signed
+    boot entry (the detection half) is left for later.
+  - Lab. Before, Debian 12 (6.1), the build of main: through the fsxattr
+    interface root cleared `+i` on `/var/lib/northnarrow` and set `+a` on
+    `audit.log` (the probe put each flag back), and an append to
+    `netflow-blocklist.v1` went through. After, Ubuntu 22.04 (5.15): all
+    three refused and recorded (NN-L-AT-001; `op=ioctl` twice, `op=write`),
+    in three new tamper-check cases — C44 and C45 with
+    `deploy/lab/adversarial/fsxattr-probe.c`, C46 the append — and the
+    anti-tamper suite OK.

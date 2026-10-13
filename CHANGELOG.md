@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the filesystem deny (Medium EBPF-008, ATP-008):
+  root could clear the immutable flag of the state directory, or make
+  `audit.log` append-only to the agent, through the fsxattr interface
+  (`xfs_io -c 'chattr -i'`): the deny let it through, and the number it
+  held for that ioctl was none. The shipped `.v1` lists (the netflow and
+  JA3 blocklists, the comm allowlists) can no longer be appended to; they
+  are tuned through their signed `.local` overlays.
 - External audit, Wave 2, the BPF guard (Medium ATP-013, ATP-009,
   EBPF-004): the agent's ring buffers and drop counters are guarded like
   its other maps — a root process could take a writable handle on each,
