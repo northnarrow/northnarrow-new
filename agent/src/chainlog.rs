@@ -826,6 +826,117 @@ fn evict_excess_archives(
     Ok(evicted)
 }
 
+// ── torn tail of an append-only chain file ─────────────────────────
+
+/// What [`repair_torn_tail`] did to a chain file's end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailRepair {
+    /// The last line was complete but its `\n` never reached the disk: the
+    /// newline was added, nothing dropped.
+    Terminated,
+    /// A fragment after the last newline did not parse — a write cut short.
+    /// It was cut off; `dropped_sha256` fingerprints it for the
+    /// attestation.
+    Truncated {
+        kept_len: u64,
+        dropped_len: u64,
+        dropped_sha256: String,
+    },
+}
+
+/// External audit EVD-005, NET-003, DEC-006: a crash, a power loss or
+/// ENOSPC between `write` and `fsync` leaves a chain file ending in a
+/// fragment with no newline, and the strict readers then refused the file
+/// at every later start — the agent would not boot (audit log), the
+/// network drain never ran (listener log), deception was off (canary
+/// logs).
+///
+/// Only that final fragment is repaired, never anything before it: a
+/// complete line that does not parse is corruption, which stays the
+/// reader's error. A fragment that `is_line` accepts gets its missing
+/// newline back; any other fragment is cut off, unless nothing would
+/// remain — a file with no complete line is left untouched and refused,
+/// so no repair ever empties a chain. `None` when the file is missing,
+/// empty or already ends in a newline.
+pub fn repair_torn_tail(
+    path: &Path,
+    is_line: impl Fn(&[u8]) -> bool,
+) -> Result<Option<TailRepair>> {
+    let mut f = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!(e).context(format!("opening {}", path.display()))),
+    };
+    let size = f.metadata()?.len();
+    if size == 0 {
+        return Ok(None);
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::Start(size - 1))?;
+    f.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(None);
+    }
+    // Walk back to the last newline, a window at a time.
+    let mut window = 64 * 1024u64;
+    let (fragment_start, fragment) = loop {
+        let start = size.saturating_sub(window);
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (size - start) as usize];
+        f.read_exact(&mut buf)?;
+        if let Some(nl) = buf.iter().rposition(|&c| c == b'\n') {
+            break (start + nl as u64 + 1, buf[nl + 1..].to_vec());
+        }
+        if start == 0 {
+            break (0, buf);
+        }
+        if window >= TAIL_WINDOW_MAX {
+            return Err(anyhow!(
+                "{}: no newline in the last {TAIL_WINDOW_MAX} bytes — corrupt, not torn",
+                path.display()
+            ));
+        }
+        window = window.saturating_mul(4);
+    };
+    if is_line(&fragment) {
+        f.seek(SeekFrom::End(0))?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+        return Ok(Some(TailRepair::Terminated));
+    }
+    if fragment_start == 0 {
+        return Err(anyhow!(
+            "{}: not one complete line ({size} bytes, no newline) — left untouched",
+            path.display()
+        ));
+    }
+    f.set_len(fragment_start)
+        .with_context(|| format!("truncating the torn tail of {}", path.display()))?;
+    f.sync_all()?;
+    Ok(Some(TailRepair::Truncated {
+        kept_len: fragment_start,
+        dropped_len: fragment.len() as u64,
+        dropped_sha256: sha256_hex(&fragment),
+    }))
+}
+
+impl TailRepair {
+    /// One line for the journal and the attestation.
+    pub fn describe(&self) -> String {
+        match self {
+            TailRepair::Terminated => "a complete last line lacked its newline: added".to_string(),
+            TailRepair::Truncated {
+                kept_len,
+                dropped_len,
+                dropped_sha256,
+            } => format!(
+                "a torn last write ({dropped_len} bytes, sha256 {dropped_sha256}) was cut off; \
+                 {kept_len} bytes of complete lines kept"
+            ),
+        }
+    }
+}
+
 // ── readers (tail recovery, recovery probe) ─────────────────────────
 
 /// Outcome of an O(1) tail recovery (see [`recover_tail`]).
@@ -2271,5 +2382,70 @@ mod tests {
             report.total_records, 4,
             "3 archived + 1 recovered off the prior terminator"
         );
+    }
+
+    // ── repair_torn_tail (external audit EVD-005, NET-003, DEC-006) ──
+
+    fn parses(l: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(l).is_ok()
+    }
+
+    #[test]
+    fn a_torn_last_write_is_cut_off_and_fingerprinted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("x.jsonl");
+        fs::write(&p, "{\"a\":1}\n{\"a\":2}\n{\"a\":3, \"tr").unwrap();
+        let r = repair_torn_tail(&p, parses).unwrap().unwrap();
+        assert!(
+            matches!(
+                r,
+                TailRepair::Truncated {
+                    dropped_len: 11,
+                    ..
+                }
+            ),
+            "{r:?}"
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), "{\"a\":1}\n{\"a\":2}\n");
+        // clean now
+        assert_eq!(repair_torn_tail(&p, parses).unwrap(), None);
+    }
+
+    #[test]
+    fn a_complete_last_line_only_gets_its_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("x.jsonl");
+        fs::write(&p, "{\"a\":1}\n{\"a\":2}").unwrap();
+        assert_eq!(
+            repair_torn_tail(&p, parses).unwrap(),
+            Some(TailRepair::Terminated)
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    #[test]
+    fn corruption_before_the_end_and_a_lone_fragment_are_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // a complete bad line mid-file is not a torn write: untouched
+        let p = dir.path().join("mid.jsonl");
+        fs::write(&p, "{\"a\":1}\ngarbage\n{\"a\":3}\n").unwrap();
+        assert_eq!(repair_torn_tail(&p, parses).unwrap(), None);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "{\"a\":1}\ngarbage\n{\"a\":3}\n"
+        );
+        // nothing complete would remain: refused, untouched
+        let q = dir.path().join("lone.jsonl");
+        fs::write(&q, "{\"a\":1, \"tor").unwrap();
+        assert!(repair_torn_tail(&q, parses).is_err());
+        assert_eq!(fs::read_to_string(&q).unwrap(), "{\"a\":1, \"tor");
+        // missing and empty files: nothing to do
+        assert_eq!(
+            repair_torn_tail(&dir.path().join("none"), parses).unwrap(),
+            None
+        );
+        let e = dir.path().join("empty");
+        fs::write(&e, "").unwrap();
+        assert_eq!(repair_torn_tail(&e, parses).unwrap(), None);
     }
 }

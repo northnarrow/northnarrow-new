@@ -6,6 +6,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, chain logs cut short (High EVD-005, NET-003,
+  DEC-006): one write interrupted by a crash or a power loss no longer
+  switches a subsystem off.
+  - A torn last line of `audit.log` kept the agent from starting again in
+    enforce mode ("Refusing to run unaudited", lab: Ubuntu 22.04). The
+    fragment is cut off — or given its missing newline when it is a whole
+    entry — and the repair is recorded in the signed chain
+    (`chain_tail_repaired`, with the dropped bytes' SHA-256). A bad line
+    before the end still refuses the log, untouched; no repair ever
+    empties a chain.
+  - A torn `netflow_listeners.jsonl` kept the network drain from starting
+    at every later boot, so no network rule saw a flow. The listener log
+    is repaired the same way, and if it still cannot be opened, flows and
+    listener events reach the rules anyway — only that log is not
+    written.
+  - One unreadable line in the canary registry or access log switched
+    deception off ("rule engine sees no CanaryTripped events"). The line
+    is skipped and reported (`integrity_drift`, `chain_lines_unreadable`);
+    the readable canaries stay deployed and watched.
 - External audit, Wave 1, identity of the protected processes (High
   MAIN-001, ATP-002, WDG-002, WDG-003):
   - The agent put whatever pid `/run/northnarrow/watchdog.pid` named into

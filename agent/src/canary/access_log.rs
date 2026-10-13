@@ -126,6 +126,8 @@ pub struct CanaryAccessDb {
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
+    tail_repair: Option<crate::chainlog::TailRepair>,
+    skipped_lines: usize,
 }
 
 impl CanaryAccessDb {
@@ -135,14 +137,30 @@ impl CanaryAccessDb {
     /// is responsible for ensuring the parent dir exists
     /// with the right mode.
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let last_hash = read_tail_hash(path)?;
+        // External audit DEC-006: a torn last write is repaired; an
+        // unreadable line elsewhere is skipped and reported instead of
+        // disabling the canary subsystem.
+        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
+            serde_json::from_slice::<CanaryAccessEntry>(l).is_ok()
+        })?;
+        let (last_hash, skipped_lines) = read_tail_hash(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
             path: crate::anchored::anchor(path),
             key,
             agent_id,
             last_hash,
+            tail_repair,
+            skipped_lines,
         })
+    }
+
+    /// What the open found wrong, for the caller to attest once.
+    pub fn take_open_findings(&mut self) -> (Option<crate::chainlog::TailRepair>, usize) {
+        (
+            self.tail_repair.take(),
+            std::mem::take(&mut self.skipped_lines),
+        )
     }
 
     /// Append one access entry. Computes timestamp + chain
@@ -184,26 +202,31 @@ impl CanaryAccessDb {
 
 // ── chain helpers ───────────────────────────────────────────────────
 
-fn read_tail_hash(path: &Path) -> Result<String> {
+fn read_tail_hash(path: &Path) -> Result<(String, usize)> {
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GENESIS_PREV_HASH.to_string());
+            return Ok((GENESIS_PREV_HASH.to_string(), 0));
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
     let reader = BufReader::new(f);
     let mut last: Option<String> = None;
+    let mut skipped = 0usize;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
             continue;
         }
-        let entry: CanaryAccessEntry = serde_json::from_str(&line)
-            .with_context(|| format!("parsing canary access line: {line}"))?;
-        last = Some(entry.entry_hash);
+        match serde_json::from_str::<CanaryAccessEntry>(&line) {
+            Ok(entry) => last = Some(entry.entry_hash),
+            Err(_) => skipped += 1,
+        }
     }
-    Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
+    Ok((
+        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+        skipped,
+    ))
 }
 
 fn build_signed_entry(
