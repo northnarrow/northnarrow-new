@@ -312,6 +312,13 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     "/usr/bin/northnarrow-watchdog",
     "/usr/lib/systemd/system/northnarrow-agent.service",
     "/usr/lib/systemd/system/northnarrow-watchdog.service",
+    // External audit DEP-002: the drop-in install.sh writes on a Debian
+    // host (a drop-in can replace ExecStart=, add a Condition*= that skips
+    // the start, or set a weakening Environment=), and its directory —
+    // removing or renaming an entry is denied; a new drop-in cannot be
+    // denied (no inode_create hook) and is reported by the integrity check.
+    "/etc/systemd/system/northnarrow-agent.service.d",
+    "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
 ];
 
 /// Permission bits applied at create time and re-asserted on every
@@ -2166,6 +2173,8 @@ mod tests {
                 "/usr/bin/northnarrow-watchdog",
                 "/usr/lib/systemd/system/northnarrow-agent.service",
                 "/usr/lib/systemd/system/northnarrow-watchdog.service",
+                "/etc/systemd/system/northnarrow-agent.service.d",
+                "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
             ],
             "the agent + watchdog binaries and their two systemd units \
              are the anti-tamper binary/unit pin set"

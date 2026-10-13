@@ -23,18 +23,24 @@
 //!
 //! A root attacker who recreates the sentinel after bootstrap
 //! completion must not be able to re-activate the 1-of-N relaxation.
-//! Three layered defenses, ALL of which must succeed for the
-//! sentinel to be honored:
+//! Layered defenses, ALL of which must succeed for the sentinel to
+//! be honored:
 //!
 //! 1. **Sentinel exists** at `/etc/northnarrow/.bootstrap`.
-//! 2. **`admin.pub` currently contains exactly one key.** If the
-//!    operator has already minted a second key, the sentinel is
-//!    structurally meaningless and we ignore it.
-//! 3. **Sentinel content matches `SHA256(install_nonce || admin.pub
+//! 2. **No second key was ever added.** External audit ATP-004: the
+//!    signed audit chain holds no successful `rotate_keys_add`
+//!    (`AuditLog::second_key_added` at boot, `mark_bootstrap_consumed`
+//!    after the add). Removing keys back to one does not re-arm it.
+//! 3. **The key set the agent loaded holds exactly one key** — the
+//!    `admin.pub` bytes the keys came from, not the file as it reads
+//!    now (a rewrite, or a bind mount over `/etc/northnarrow`, could
+//!    show one key while two are loaded).
+//! 4. **Sentinel content matches `SHA256(install_nonce || admin.pub
 //!    contents)`** where `install_nonce` is a 32-byte CSPRNG value
-//!    persisted at `/etc/northnarrow/.install_nonce` and known only
-//!    to the agent + the install-time operator. An attacker without
-//!    the nonce cannot forge a sentinel that the agent will honor.
+//!    persisted at `/etc/northnarrow/.install_nonce`. The nonce and
+//!    the sentinel are files root can read and write: before the
+//!    bootstrap is used, the admin key — one signature with the
+//!    `rotate-keys` role — is what guards the first add, not them.
 //!
 //! Successful 1-of-N add: best-effort `remove_file` on the
 //! sentinel. The agent ALSO scrubs any leftover sentinel on every
@@ -148,9 +154,6 @@ pub fn evaluate(paths: &BootstrapPaths) -> BootstrapGate {
     if !paths.sentinel.exists() {
         return BootstrapGate::SentinelAbsent;
     }
-
-    // Step 2 — count admin.pub keys. If ≥ 2, bootstrap is done;
-    // scrub a leftover sentinel and return `BootstrapAlreadyComplete`.
     let admin_pub_bytes = match fs::read(&paths.admin_pub) {
         Ok(b) => b,
         Err(e) => {
@@ -159,6 +162,34 @@ pub fn evaluate(paths: &BootstrapPaths) -> BootstrapGate {
             };
         }
     };
+    evaluate_loaded(paths, &admin_pub_bytes, false)
+}
+
+/// External audit ATP-004: the gate judged on the `admin.pub` bytes the
+/// agent's keys were loaded from (not the file as it reads now — a bind
+/// mount over `/etc/northnarrow`, or a rewrite, could present a one-key
+/// file), and never again once `consumed` (the signed audit chain shows a
+/// second key was added): removing keys back to one does not re-arm it.
+pub fn evaluate_loaded(
+    paths: &BootstrapPaths,
+    admin_pub_bytes: &[u8],
+    consumed: bool,
+) -> BootstrapGate {
+    if !paths.sentinel.exists() {
+        return BootstrapGate::SentinelAbsent;
+    }
+    if consumed {
+        info!(
+            target: "anti_tamper.bootstrap",
+            sentinel = %paths.sentinel.display(),
+            "BUG-013: bootstrap already used (signed audit chain) — sentinel ignored"
+        );
+        return BootstrapGate::BootstrapAlreadyComplete;
+    }
+
+    // Step 2 — count admin.pub keys. If ≥ 2, bootstrap is done;
+    // scrub a leftover sentinel and return `BootstrapAlreadyComplete`.
+    let admin_pub_bytes = admin_pub_bytes.to_vec();
     let key_count = count_admin_pub_keys(&admin_pub_bytes);
     if key_count >= 2 {
         // Self-healing scrub. Best-effort: a failure here just leaves
@@ -340,6 +371,49 @@ mod tests {
         fs::write(&paths.sentinel, &expected).unwrap();
 
         assert_eq!(evaluate(&paths), BootstrapGate::Armed);
+    }
+
+    /// External audit ATP-004: the gate judges the keys the agent loaded,
+    /// not the file as it reads now, and is closed for good once a second
+    /// key was added (the signed chain says so).
+    #[test]
+    fn the_loaded_keys_and_the_signed_history_decide_not_the_file() {
+        let dir = TempDir::new().unwrap();
+        let one = "1111111111111111111111111111111111111111111111111111111111111111\n";
+        let two = "1111111111111111111111111111111111111111111111111111111111111111\n\
+                   2222222222222222222222222222222222222222222222222222222222222222\n";
+        // an attacker presents a one-key admin.pub (rewrite or bind mount)
+        // with a matching sentinel, while the agent runs on two keys
+        let (paths, nonce) = make_install(&dir, one, None);
+        fs::write(
+            &paths.sentinel,
+            compute_sentinel_content(&nonce, one.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate(&paths),
+            BootstrapGate::Armed,
+            "the file alone would arm it"
+        );
+        assert_eq!(
+            evaluate_loaded(&paths, two.as_bytes(), false),
+            BootstrapGate::BootstrapAlreadyComplete
+        );
+        // keys revoked back to one after a second key was added once
+        fs::write(
+            &paths.sentinel,
+            compute_sentinel_content(&nonce, one.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_loaded(&paths, one.as_bytes(), true),
+            BootstrapGate::BootstrapAlreadyComplete
+        );
+        // a genuine first bootstrap still works
+        assert_eq!(
+            evaluate_loaded(&paths, one.as_bytes(), false),
+            BootstrapGate::Armed
+        );
     }
 
     /// Sentinel absent ⇒ SentinelAbsent (normal post-bootstrap state).

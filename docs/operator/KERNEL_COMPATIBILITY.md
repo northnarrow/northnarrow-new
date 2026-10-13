@@ -75,7 +75,11 @@ host (`/etc/os-release`, not Ubuntu) and installs
 `northnarrow-agent.service.d/10-debian-perf-paranoid.conf` adding
 `CAP_SYS_ADMIN` to the bounding set; the agent's attach error names the
 condition and the two remedies (drop-in, or `perf_event_paranoid=2`
-system-wide plus removing the drop-in to keep the narrower set).
+system-wide plus removing the drop-in to keep the narrower set). The
+agent protects the drop-in like its unit files — removing it takes a
+trusted-installer window, and `install.sh` puts it back on a
+Debian-family host — and reports one whose content differs from the
+shipped file (`integrity_drift`, kind `unit_dropin`).
 
 ## How it works, and what still stops a kernel
 

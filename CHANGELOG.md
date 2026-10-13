@@ -6,6 +6,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, bootstrap gate and unit drop-in (High ATP-004,
+  DEP-002):
+  - The one-time relaxation that lets a one-key install add its second
+    key with one signature (`rotate-keys add`, BUG-013) was decided on
+    files root can write: `admin.pub` as it read at the request, a
+    sentinel, and the install nonce the sentinel is computed from. After
+    a second key was added, a root process could show the agent a
+    one-key `admin.pub` again — rewritten before a restart, or
+    bind-mounted over the file while it ran — with a sentinel recomputed
+    from the readable nonce, and add a key of its own with one
+    signature. The gate now counts the keys the agent has loaded, not the
+    file, and is closed for good once the signed audit chain records a
+    successful `rotate-keys add`.
+  - `install.sh`'s Debian drop-in
+    (`northnarrow-agent.service.d/10-debian-perf-paranoid.conf`) was
+    neither protected nor checked: the integrity check skipped it by
+    path. A root process could add `ExecStart=`, `Condition…=` or
+    `Environment=` lines to it and stop or weaken the agent at its next
+    start, unreported. The drop-in directory and file join the protected
+    binary/unit set (writes, unlink and rename denied); the content ships
+    as `deploy/systemd/10-debian-perf-paranoid.conf`, and the integrity
+    check passes the drop-in only while it matches that file byte for
+    byte.
 - External audit, Wave 1, COMBAT rulesets (High ATP-001, DEP-003): the
   files that decide what COMBAT isolates — `combat-rules.v4`,
   `combat-rules.v6` and the management carve-out `combat-allow.cidrs` —

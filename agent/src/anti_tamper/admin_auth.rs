@@ -190,6 +190,15 @@ pub struct AdminAuth {
     /// clear "no on-disk config" error rather than a silent
     /// no-op.
     config_path: Option<PathBuf>,
+    /// External audit ATP-004: the `admin.pub` bytes the keys above were
+    /// parsed from (load / reload), so the bootstrap gate judges the keys
+    /// the agent uses, not a file re-read at request time (a bind mount
+    /// or a rewrite could present a one-key file).
+    loaded_admin_pub: RwLock<Vec<u8>>,
+    /// External audit ATP-004: a second key was added once (the signed
+    /// audit chain shows a `rotate_keys_add`, or this run added one): the
+    /// 1-of-N bootstrap relaxation never applies again.
+    bootstrap_consumed: std::sync::atomic::AtomicBool,
 }
 
 impl AdminAuth {
@@ -247,6 +256,7 @@ impl AdminAuth {
 
         let mut auth =
             Self::build_entries_with_agent_id(pub_keys, DEFAULT_RATE_LIMIT_WINDOW, agent_id);
+        *auth.loaded_admin_pub.write() = content.as_bytes().to_vec();
         // A13: remember the file we loaded from so the
         // rotate-keys dispatcher can atomically rewrite + reload
         // without an extra path threading through `dispatch()`.
@@ -297,6 +307,7 @@ impl AdminAuth {
             ));
         }
         *self.pub_keys.write() = new_keys;
+        *self.loaded_admin_pub.write() = content.into_bytes();
         Ok(())
     }
 
@@ -356,7 +367,27 @@ impl AdminAuth {
             rate_limit_window,
             agent_id,
             config_path: None,
+            loaded_admin_pub: RwLock::new(Vec::new()),
+            bootstrap_consumed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// External audit ATP-004: the `admin.pub` bytes the in-memory keys
+    /// came from.
+    pub fn loaded_admin_pub(&self) -> Vec<u8> {
+        self.loaded_admin_pub.read().clone()
+    }
+
+    /// External audit ATP-004: whether the bootstrap relaxation was used
+    /// up (see the field).
+    pub fn bootstrap_consumed(&self) -> bool {
+        self.bootstrap_consumed.load(Ordering::SeqCst)
+    }
+
+    /// Record that the bootstrap relaxation is used up — at boot from the
+    /// signed audit chain, and after a second key is added.
+    pub fn mark_bootstrap_consumed(&self) {
+        self.bootstrap_consumed.store(true, Ordering::SeqCst);
     }
 
     /// Test-only constructor that overrides the rate-limit window so

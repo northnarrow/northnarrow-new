@@ -65,9 +65,13 @@ const UNIT_SEARCH_PATH: &[&str] = &[
     "/run/systemd/generator.late",
 ];
 
-/// Drop-ins `install.sh` lays down itself.
-const KNOWN_DROPINS: &[&str] =
-    &["/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf"];
+/// Drop-ins `install.sh` lays down itself, with the content it writes.
+/// External audit DEP-002: matched on content, not on path alone — the
+/// path used to be skipped whatever the file said.
+const KNOWN_DROPINS: &[(&str, &str)] = &[(
+    "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
+    include_str!("../../deploy/systemd/10-debian-perf-paranoid.conf"),
+)];
 
 /// Environment variables that switch a protection off or into observe
 /// mode; `None` = any value counts.
@@ -154,6 +158,11 @@ pub fn weakening_env(vars: &[(String, String)]) -> Vec<Finding> {
 
 /// Unexpected drop-in files for our units under `roots`.
 pub fn unit_dropins(roots: &[&Path]) -> Vec<Finding> {
+    unit_dropins_with(roots, KNOWN_DROPINS)
+}
+
+/// [`unit_dropins`] with the drop-ins to accept (path, exact content).
+fn unit_dropins_with(roots: &[&Path], known_dropins: &[(&str, &str)]) -> Vec<Finding> {
     let mut out = Vec::new();
     for root in roots {
         let mut dirs: Vec<PathBuf> = UNITS.iter().map(|u| root.join(format!("{u}.d"))).collect();
@@ -169,7 +178,9 @@ pub fn unit_dropins(roots: &[&Path]) -> Vec<Finding> {
                     continue;
                 }
                 let shown = path.to_string_lossy().to_string();
-                if KNOWN_DROPINS.contains(&shown.as_str()) {
+                if known_dropins.iter().any(|(known, content)| {
+                    *known == shown && std::fs::read(&path).is_ok_and(|b| b == content.as_bytes())
+                }) {
                     continue;
                 }
                 let stamp = e
@@ -735,5 +746,24 @@ mod tests {
         let f = unit_dropins(&[dir.path()]);
         assert_eq!(f.len(), 2, "{f:?}");
         assert!(f.iter().all(|x| x.kind == "unit_dropin"));
+    }
+
+    /// External audit DEP-002: install.sh's own drop-in is skipped only
+    /// while it holds what install.sh wrote.
+    #[test]
+    fn the_known_dropin_is_judged_on_its_content() {
+        let content = KNOWN_DROPINS[0].1;
+        let root = tempfile::tempdir().unwrap();
+        let d = root.path().join("northnarrow-agent.service.d");
+        std::fs::create_dir_all(&d).unwrap();
+        let file = d.join("10-debian-perf-paranoid.conf");
+        std::fs::write(&file, content).unwrap();
+        let shown = file.to_string_lossy().to_string();
+        let known = [(shown.as_str(), content)];
+        assert!(unit_dropins_with(&[root.path()], &known).is_empty());
+        std::fs::write(&file, format!("{content}ExecStart=\nExecStart=/bin/true\n")).unwrap();
+        let f = unit_dropins_with(&[root.path()], &known);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].detail.contains("10-debian-perf-paranoid.conf"));
     }
 }

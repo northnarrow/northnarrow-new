@@ -2778,6 +2778,14 @@ async fn main() -> Result<()> {
     if let Some(iso) = isolator.as_ref() {
         match AdminAuth::load_with_agent_id(&cli.admin_pub, agent_id) {
             Ok(auth) => {
+                // External audit ATP-004: the one-key bootstrap is over for
+                // good once the signed chain shows a second key was added.
+                if audit_log
+                    .as_ref()
+                    .is_some_and(|l| l.lock().second_key_added())
+                {
+                    auth.mark_bootstrap_consumed();
+                }
                 let auth = Arc::new(auth);
                 let posture_clone = posture.clone();
                 let iso_clone = Arc::clone(iso);
