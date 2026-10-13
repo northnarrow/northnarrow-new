@@ -62,7 +62,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-010 | MAIN-003 | Agent main | M | fixed (lab PR 91) |
 | NN-AUD-011 | ATP-001 | Anti-tamper | M | fixed (lab PR 92) |
 | NN-AUD-012 | ATP-002 | Anti-tamper | M | fixed (lab PR 89) |
-| NN-AUD-013 | ATP-004 | Anti-tamper | M | open |
+| NN-AUD-013 | ATP-004 | Anti-tamper | M | fixed (lab PR 93) |
 | NN-AUD-014 | EBPF-001 | eBPF kernel | M | open |
 | NN-AUD-015 | EBPF-002 | eBPF kernel | M | open |
 | NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
@@ -106,7 +106,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-069 | WDG-003 | Watchdog tooling | M | fixed (lab PR 89) |
 | NN-AUD-071 | WDG-005 | Watchdog tooling | M | fixed (lab PR 85, with NN-AUD-070) |
 | NN-AUD-072 | DEP-001 | Deploy | M | open |
-| NN-AUD-073 | DEP-002 | Deploy | M | open |
+| NN-AUD-073 | DEP-002 | Deploy | M | fixed (lab PR 93) |
 | NN-AUD-074 | DEP-003 | Deploy | M | fixed (lab PR 92, with NN-AUD-011) |
 | NN-AUD-075 | SUP-003 | Supply chain | M | open |
 | NN-AUD-076 | TST-003 | Privileged tests | M | fixed (lab PR 88) |
@@ -690,3 +690,53 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     15 s after the boot; `rm combat-rules.v6` denied. COMBAT itself was not
     engaged in the lab (the empty carve-out would cut the lab's SSH); the
     rulesets it builds are covered by the unit tests.
+- **NN-AUD-013 (ATP-004), lab PR 93.** The bootstrap gate (BUG-013)
+  relaxes the first `rotate-keys add` on a one-key install to one
+  signature when a sentinel equals SHA-256(install nonce ‖ `admin.pub`)
+  and `admin.pub` holds one key. Root could meet that again after the
+  bootstrap: the nonce is readable, the sentinel can be created, and
+  `admin.pub` was read anew at each request. The gate now takes the
+  `admin.pub` bytes the agent's keys were loaded from
+  (`AdminAuth::loaded_admin_pub`), so a file shown later — rewritten or
+  bind-mounted — does not count, and it is closed once used: at boot,
+  when the signed chain holds a successful `rotate_keys_add`
+  (`AuditLog::second_key_added`; the log is never rotated), and right
+  after the add. `ANTITAMPER_TRUST_MODEL.md` now says what the code does.
+  Residuals: before the bootstrap is used, the gate still opens on the
+  sentinel and nonce files, which root can write; the one signature it
+  then needs, from a key with `rotate-keys`, is what guards the first
+  add. A rewrite before the agent starts is outside its view, and the
+  chain still closes the gate then.
+  - Lab, lab keys K1 (with `rotate-keys`), K2, K3; files laid through
+    the maintenance path. Before (Ubuntu 22.04, main): `admin.pub` with
+    K1 and K2 written at install; a one-key copy bind-mounted over it,
+    with a sentinel recomputed from the nonce — "bootstrap gate ARMED",
+    and an add of K3 signed by K1 alone passed the quorum (it failed
+    only at the rename onto the mount point, EBUSY). After the legitimate
+    bootstrap (K2 added with K1's signature), `admin.pub` laid back to K1
+    with a recomputed sentinel and the agent restarted: K3 was added with
+    K1's signature alone. After (Ubuntu 24.04), the same two attempts:
+    "leftover sentinel scrubbed (admin.pub already has ≥2 keys)" and
+    "bootstrap already used (signed audit chain) — sentinel ignored",
+    each refused with "quorum not met (1/2)". The legitimate bootstrap
+    works on both.
+- **NN-AUD-073 (DEP-002), lab PR 93.** `install.sh` writes
+  `northnarrow-agent.service.d/10-debian-perf-paranoid.conf` on
+  Debian-family hosts. It was not in the protected binary/unit set, and
+  `unit_dropins()` skipped it by path, so a rewrite (`ExecStart=`,
+  `ConditionPathExists=`, `Environment=`) was neither denied nor
+  reported. The directory and the file now join `BINARY_AND_UNIT_PATHS`
+  (MUTATE and WRITE): writes to the file, and unlink or rename in the
+  directory, are denied while the agent runs (a new `.conf` beside it is
+  not — there is no create hook — and is reported like any unknown
+  drop-in); `install.sh` writes the file only with the units stopped and
+  the pins removed. Its content moved from a heredoc to
+  `deploy/systemd/10-debian-perf-paranoid.conf`, which `install.sh`
+  installs and the agent embeds: `KNOWN_DROPINS` pairs the path with
+  that content, and anything else at the path is a `unit_dropin`
+  finding. Lab (Ubuntu 24.04), the shipped drop-in laid down through the
+  maintenance path. Before: root's `printf … >>` to it succeeded and no
+  integrity finding followed. After: the append fails with EPERM; the
+  drop-in rewritten through the maintenance path is reported at the next
+  boot — an ERROR `INTEGRITY DRIFT … kind="unit_dropin"` and a signed
+  `integrity_drift` entry (`at_boot: true`).

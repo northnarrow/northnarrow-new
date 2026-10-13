@@ -282,7 +282,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 
 | `kind` | Meaning |
 |---|---|
-| `unit_dropin` | a `.conf` drop-in for one of the two units that `install.sh` did not create (also `system.control`, `service.d`) |
+| `unit_dropin` | a `.conf` drop-in for one of the two units that `install.sh` did not create (also `system.control`, `service.d`), or its own Debian drop-in with content other than the shipped `deploy/systemd/10-debian-perf-paranoid.conf` |
 | `limit_changed` | `oom_score_adj`, `memory.max`, `pids.max`, `cpu.max` or `cgroup.freeze` differs from boot |
 | `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view) |
 | `bpffs_mount` | a bpffs outside `/sys/fs/bpf` (WARN: Cilium does this legitimately) |

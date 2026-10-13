@@ -227,6 +227,28 @@ to 1-of-N. Three defenses, layered:
    first key-count check sees 2 keys, removes the sentinel, and stays
    in permanent mode.
 
+**As built, after the external audit (ATP-004).** The nonce is a plain
+file, `/etc/northnarrow/.install_nonce`, not a field of `agent_id.json`,
+and `install.sh` writes neither it nor the sentinel: root can read the
+nonce and write a matching sentinel, so defense 1 alone does not stop a
+root attacker. The downgrade is closed by what the agent holds:
+
+- The gate counts the keys the agent **loaded**
+  (`AdminAuth::loaded_admin_pub`, the bytes the in-memory key set came
+  from), not `admin.pub` as it reads at the request. A rewrite, or a bind
+  mount over `/etc/northnarrow`, that shows one key while two are loaded
+  does not arm it. Defense 2's "no in-memory caching" is reversed on
+  purpose: the in-memory key set is the one signatures are verified
+  against.
+- The bootstrap's use is recorded in the **signed audit chain** (a
+  successful `rotate_keys_add`), read at boot, and set in memory right
+  after the add. From then on no sentinel is honored, whatever
+  `admin.pub` holds — defense 3's one-way flag, kept across restarts.
+
+Before the bootstrap is used, the gate still opens on files root can
+write. The one signature it then requires, from a key with the
+`rotate-keys` role, is what guards the first add.
+
 **Worked example of an attempted downgrade attack:**
 
 - Install: `admin.pub` has key A. Sentinel written with content =

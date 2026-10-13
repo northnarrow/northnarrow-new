@@ -1677,18 +1677,24 @@ fn dispatch_rotate_keys_add(
 ) -> AdminResult {
     // BUG-013 (PHASE 15.1): bootstrap-mode 1-of-N gate. Consulted
     // BEFORE verify_signed_payload_quorum so the relaxed min_distinct
-    // (1) goes into the verify call. The gate is evaluated against
-    // on-disk state (sentinel + nonce + admin.pub key count) and ALL
-    // three anti-downgrade conditions must hold; any other outcome
-    // falls through to the permanent 2-of-N path. See
+    // (1) goes into the verify call. The gate is evaluated against the
+    // key set in memory (one key), the signed chain (no second key ever
+    // added) and the sentinel + nonce on disk; ALL must hold, and any
+    // other outcome falls through to the permanent 2-of-N path. See
     // `crate::anti_tamper::bootstrap` for the full security argument.
     let bootstrap_armed = match auth.config_path() {
         Some(admin_pub_path) => {
             let paths = crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(
                 admin_pub_path.to_path_buf(),
             );
+            // External audit ATP-004: the keys in memory, and the
+            // consumption recorded in the signed chain.
             matches!(
-                crate::anti_tamper::bootstrap::evaluate(&paths),
+                crate::anti_tamper::bootstrap::evaluate_loaded(
+                    &paths,
+                    &auth.loaded_admin_pub(),
+                    auth.bootstrap_consumed(),
+                ),
                 crate::anti_tamper::bootstrap::BootstrapGate::Armed
             )
         }
@@ -1798,6 +1804,10 @@ fn dispatch_rotate_keys_add(
         }
     }
 
+    // External audit ATP-004: a second key exists now — no later admin.pub
+    // with one key re-arms the bootstrap in this run (the next boots read
+    // the signed chain).
+    auth.mark_bootstrap_consumed();
     info!(
         target: "admin.rotate_keys",
         new_key_fp = %hex::encode(crate::anti_tamper::admin_auth::fingerprint_bytes(&new_pubkey)),

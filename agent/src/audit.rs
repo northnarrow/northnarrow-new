@@ -410,6 +410,10 @@ pub struct AuditLog {
     io_path: PathBuf,
     /// How the run before this one ended (from the chain at open).
     previous_run: PreviousRun,
+    /// External audit ATP-004: the chain holds a successful
+    /// `rotate_keys_add` — the one-key bootstrap is over for good. The
+    /// log is never rotated (module doc); a rotation must carry this.
+    second_key_added: bool,
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
@@ -434,7 +438,7 @@ impl AuditLog {
         let repair = crate::chainlog::repair_torn_tail(path, |l| {
             serde_json::from_slice::<AuditEntry>(l).is_ok()
         })?;
-        let (last_hash, previous_run) = read_tail(path)?;
+        let (last_hash, previous_run, second_key_added) = read_tail(path)?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
         // `/etc/northnarrow/` install.
@@ -456,6 +460,7 @@ impl AuditLog {
             agent_id,
             last_hash,
             previous_run,
+            second_key_added,
         };
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
@@ -523,6 +528,12 @@ impl AuditLog {
     /// How the previous run ended (see [`PreviousRun`]).
     pub fn previous_run(&self) -> &PreviousRun {
         &self.previous_run
+    }
+
+    /// External audit ATP-004: a second admin key was added at some point
+    /// (a signed `rotate_keys_add` success in the chain).
+    pub fn second_key_added(&self) -> bool {
+        self.second_key_added
     }
 
     /// `agent_stop` entry: the event loop is over and the process is about
@@ -654,11 +665,11 @@ pub fn audit_failure_is_fatal(detect_only: bool, allow_env: Option<&str>) -> boo
 /// signal A12's verify-on-read flow surfaces, but for the
 /// agent's write path the early failure is preferable to
 /// chaining off garbage.
-fn read_tail(path: &Path) -> Result<(String, PreviousRun)> {
+fn read_tail(path: &Path) -> Result<(String, PreviousRun, bool)> {
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((GENESIS_PREV_HASH.to_string(), PreviousRun::None));
+            return Ok((GENESIS_PREV_HASH.to_string(), PreviousRun::None, false));
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
@@ -666,6 +677,7 @@ fn read_tail(path: &Path) -> Result<(String, PreviousRun)> {
     let mut last: Option<String> = None;
     let mut last_ts = String::new();
     let mut previous = PreviousRun::None;
+    let mut second_key_added = false;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -691,6 +703,7 @@ fn read_tail(path: &Path) -> Result<(String, PreviousRun)> {
                         .to_string(),
                 }
             }
+            "rotate_keys_add" if entry.result == "success" => second_key_added = true,
             _ => {}
         }
         last_ts = entry.ts.clone();
@@ -702,6 +715,7 @@ fn read_tail(path: &Path) -> Result<(String, PreviousRun)> {
     Ok((
         last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         previous,
+        second_key_added,
     ))
 }
 
@@ -900,6 +914,30 @@ mod tests {
         fs::write(&log_path, &mid).unwrap();
         assert!(AuditLog::open(&log_path, key(), [0u8; 16]).is_err());
         assert_eq!(fs::read(&log_path).unwrap(), mid);
+    }
+
+    /// External audit ATP-004: a successful `rotate_keys_add` in the chain
+    /// marks the one-key bootstrap as over, at every later open.
+    #[test]
+    fn a_second_key_in_the_chain_is_remembered() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert!(!log.second_key_added());
+        let mut refused = sample_draft(1);
+        refused.op = "rotate_keys_add".to_string();
+        refused.result = "quorum_not_met".to_string();
+        log.append(refused).unwrap();
+        assert!(!AuditLog::open(&log_path, key(), [0u8; 16])
+            .unwrap()
+            .second_key_added());
+        let mut added = sample_draft(2);
+        added.op = "rotate_keys_add".to_string();
+        added.result = "success".to_string();
+        log.append(added).unwrap();
+        assert!(AuditLog::open(&log_path, key(), [0u8; 16])
+            .unwrap()
+            .second_key_added());
     }
 
     #[test]
