@@ -29,12 +29,10 @@ pub struct ExecutorConfig {
     /// never collide with a host's existing nftables config.
     pub nft_table: String,
 
-    /// Path to the persistence flag for `FullNetworkIsolation`. While
-    /// this file exists at startup, the agent re-engages isolation.
+    /// The flag file the retired `FullNetworkIsolation` blackout left
+    /// (external audit CMB-006): removed at start
+    /// ([`super::network_isolation::retire_legacy`]).
     pub isolation_flag_file: PathBuf,
-    /// IPv4 endpoints (`addr:port`) that stay reachable while
-    /// isolated — placeholder for the Tappa 13 C2 backend.
-    pub c2_endpoints: Vec<String>,
 
     /// **The agent-wide detect-only / no-enforcement gate.** When
     /// `true`, NOTHING touches the system: the [`Executor`](super::Executor)
@@ -75,7 +73,6 @@ impl ExecutorConfig {
             cgroup_root: tmp_root.join("cgroup"),
             cgroup_slice: "northnarrow.slice".into(),
             nft_table: "northnarrow_test".into(),
-            c2_endpoints: Vec::new(),
             quarantine_max_bytes: 100 * 1024 * 1024,
             dry_run: true,
         }
@@ -114,7 +111,6 @@ impl Default for ExecutorConfig {
             cgroup_slice: "northnarrow.slice".into(),
             nft_table: "northnarrow".into(),
             isolation_flag_file: PathBuf::from("/var/lib/northnarrow/isolated"),
-            c2_endpoints: Vec::new(),
             dry_run: false,
         }
     }

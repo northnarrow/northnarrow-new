@@ -11,8 +11,7 @@ use common::ResponseAction;
 use tracing::warn;
 
 use super::{
-    block_outbound, kill, network_isolation, quarantine, throttle, ExecutionOutcome,
-    ExecutionReport, ExecutorConfig,
+    block_outbound, kill, quarantine, throttle, ExecutionOutcome, ExecutionReport, ExecutorConfig,
 };
 
 /// Hard floor on PIDs we're willing to touch. Anything below this is
@@ -141,6 +140,29 @@ impl Executor {
         let start = Instant::now();
         let mut additional: Vec<ExecutionOutcome> = Vec::new();
 
+        // External audit CMB-006: host-wide isolation is the COMBAT ladder's
+        // alone — engaged from locked COMBAT (kernel evidence), through the
+        // management carve-out (`combat-allow.cidrs`), released with the
+        // signed unlock, reported by `nn-admin status`. This action
+        // installed a second, separate nftables blackout reachable from an
+        // ADE verdict: no carve-out (an open SSH session died too: no
+        // established rule on output), no release verb, no status.
+        if action == ResponseAction::FullNetworkIsolation {
+            warn!(
+                target_pid,
+                "host-wide isolation requested outside the COMBAT ladder — refused"
+            );
+            return ExecutionReport {
+                action,
+                primary: ExecutionOutcome::Refused {
+                    pid: target_pid,
+                    reason: ISOLATION_IS_THE_LADDERS,
+                },
+                additional,
+                elapsed: clamp_elapsed(start.elapsed()),
+            };
+        }
+
         // Detect-only / monitor mode (BUG-033): the single agent-wide
         // no-enforcement gate, checked here at the dispatcher so it
         // covers EVERY action — including KillProcess[Tree], which has
@@ -225,7 +247,10 @@ impl Executor {
                     &self.protected,
                     &self.config,
                 ),
-                ResponseAction::FullNetworkIsolation => network_isolation::engage(&self.config),
+                ResponseAction::FullNetworkIsolation => ExecutionOutcome::Refused {
+                    pid: target_pid,
+                    reason: ISOLATION_IS_THE_LADDERS,
+                },
                 ResponseAction::Quarantine => {
                     quarantine::quarantine_process_binary(target_pid, &self.protected, &self.config)
                 }
@@ -248,6 +273,11 @@ impl Executor {
         }
     }
 }
+
+/// Why [`ResponseAction::FullNetworkIsolation`] is refused (external audit
+/// CMB-006).
+pub const ISOLATION_IS_THE_LADDERS: &str =
+    "host-wide isolation is the COMBAT ladder's (locked COMBAT, management carve-out, signed release)";
 
 impl Default for Executor {
     fn default() -> Self {

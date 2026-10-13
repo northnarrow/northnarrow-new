@@ -1256,6 +1256,30 @@ async fn main() -> Result<()> {
         exec_cfg.dry_run = true;
     }
     let detect_only = exec_cfg.dry_run;
+    // External audit CMB-006: an older agent's host-wide nftables blackout
+    // (no carve-out, no release, no status) is removed before anything
+    // else; host-wide isolation is the COMBAT ladder's alone.
+    let legacy_isolation_removed =
+        match northnarrow_agent::response::network_isolation::retire_legacy(&exec_cfg) {
+            Ok(removed) => {
+                if removed {
+                    warn!(
+                        "removed the host-wide nftables isolation an older agent left \
+                         (external audit CMB-006): host-wide isolation is the COMBAT ladder's"
+                    );
+                }
+                removed
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "an older agent's host-wide nftables isolation could not be removed — \
+                     `nft delete chain inet northnarrow isolation_output` (and isolation_input) \
+                     from the console"
+                );
+                false
+            }
+        };
     let executor = Executor::with_config(exec_cfg);
     if detect_only {
         warn!(
@@ -1977,6 +2001,9 @@ async fn main() -> Result<()> {
             Default::default()
         }
     };
+    if legacy_isolation_removed {
+        attest_legacy_isolation_removed(audit_log.as_ref());
+    }
     // External audit FIMR-001: FIM watching nothing used to show only as
     // `effective=0` in an INFO line.
     if watched_paths_load.effective.is_empty() {
@@ -3805,6 +3832,34 @@ fn withdraw_watchdog_pid(
         Err(e) => {
             warn!(pid, error = %e, "could not remove a former watchdog pid from PROTECTED_PIDS")
         }
+    }
+}
+
+/// External audit CMB-006: the removal of an older agent's host-wide
+/// nftables isolation at start is recorded in the signed audit chain.
+fn attest_legacy_isolation_removed(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+) {
+    let Some(log) = audit_log else {
+        return;
+    };
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
+        extra: serde_json::json!({
+            "kind": "legacy_isolation_removed",
+            "detail": "an older agent's nftables isolation chains (isolation_input, \
+                       isolation_output) were found at start and removed",
+            "at_boot": true,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "repaired".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "recording the removed legacy isolation failed");
     }
 }
 
