@@ -6,6 +6,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, authorised shutdown (High EVD-021, WDG-001,
+  TST-003):
+  - Any root process could switch NorthNarrow off for good: the watchdog
+    stood down — no respawn, exit 0 — for any file at
+    `/run/northnarrow/agent.shutdown_authorised` with a 64-hex hash and
+    a future deadline. In the lab, such a file and a `systemctl stop` of
+    the agent left both agent and watchdog off.
+  - The marker now carries the shutdown the admin quorum signed and the
+    exiting agent's pid, and the watchdog verifies it against
+    `admin.pub` as the agent did: quorum and role, this install, signed
+    while that agent ran and recently, not honoured before. Anything
+    else is refused: the agent is respawned, and the agent records the
+    refusal in its signed audit chain (`shutdown_marker_rejected`).
+  - The agent wrote the marker through a temporary file that followed a
+    symlink; it is now created exclusively, never through a link.
+  - New privileged tests cover both halves: a forged marker brings the
+    agent back, a quorum-signed one stands the watchdog down.
 - External audit, Wave 1, allowlists on exec identity (High LLMR-012;
   the NETR-003 class swept across the remaining rules):
   - A process could silence the io_uring and BPF rules by naming itself

@@ -27,6 +27,10 @@ std = [
     "dep:ciborium",
     "dep:sha2",
     "dep:ed25519-dalek",
+    # External audit WDG-001: admin.pub parsing (hex) and the shutdown
+    # marker (JSON) the watchdog verifies.
+    "dep:hex",
+    "dep:serde_json",
 ]
 # Opt-in for the nn-admin debug surface (DebugForcePosture variant in
 # the admin protocol). Off by default; production builds never see it.
@@ -50,6 +54,8 @@ sha2 = { version = "0.10", optional = true }
 # ed25519-dalek: signature primitives for sign/verify. Match the
 # agent's exact feature shape so the workspace resolves one version.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+hex = { version = "0.4", optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

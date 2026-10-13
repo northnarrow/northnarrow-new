@@ -36,19 +36,15 @@ use northnarrow_watchdog::{
     PingFailure, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER, SYSTEMD_RUNTIME_DIR,
 };
 use northnarrow_watchdog::{
-    evict_dead_agent, harden_self, hold_until_agent_returns, log_tamper_suspected,
-    open_agent_pidfd_with_retry, pidfd_open, ping_agent_status, read_pid_from_file,
-    register_self_pid, reinsert_new_agent_pid, sd_notify_ready, sd_notify_status,
-    shutdown_was_authorised, stuck_recovery, unregister_self_pid, wait_for_agent_death,
+    check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
+    log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open, ping_agent_status,
+    process_start_unix, read_pid_from_file, register_self_pid, reinsert_new_agent_pid,
+    sd_notify_ready, sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
     wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome,
-    RestartBackoff, StatusPingTracker, HOLD_POLL, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL,
-    STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
+    RestartBackoff, ShutdownCheck, ShutdownVerdict, StatusPingTracker, HOLD_POLL,
+    PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
+    STUCK_RECOVERY_HARDKILL_GRACE,
 };
-
-/// Path of the A8 shutdown-authorisation marker (Tappa 8 A7
-/// design §10.3). Hardcoded — the watchdog and the agent agree
-/// on this canonical location.
-const SHUTDOWN_MARKER_PATH: &str = "/run/northnarrow/agent.shutdown_authorised";
 
 /// Deadline budget for the post-respawn pidfile-readiness wait.
 /// Same shape as W2's PIDFD_OPEN_RETRY_DEADLINE — the agent's
@@ -151,6 +147,9 @@ async fn run(cli: Cli) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut backoff = RestartBackoff::new();
     let mut agent_pidfd = unsafe { OwnedFd::from_raw_fd(agent_fd) };
+    // External audit WDG-001: a shutdown authorisation must have been
+    // signed while the agent it stops was running.
+    let mut agent_started = process_start_unix(agent_pid);
 
     // W5: spawn the parallel STATUS-ping task. It pings the
     // agent's admin socket every STATUS_PING_INTERVAL (30s),
@@ -239,38 +238,33 @@ async fn run(cli: Cli) -> Result<()> {
                     ),
                 }
 
-                // A8 shutdown-authorisation check per Watchdog
-                // §13 Q4 resolution. If admin signed the
-                // shutdown, the marker is on disk and we stand
-                // down WITHOUT respawning.
-                match shutdown_was_authorised(&PathBuf::from(SHUTDOWN_MARKER_PATH)) {
-                    Ok(true) => {
+                // A8 shutdown-authorisation check (Watchdog §13 Q4): stand
+                // down only for a shutdown the admin quorum signed for
+                // this agent (external audit WDG-001). Anything else on
+                // disk is a forgery or a replay: respawn, and count the
+                // attempt toward the ceiling like any other death.
+                let check = ShutdownCheck {
+                    marker: &cli.shutdown_marker,
+                    admin_pub: &cli.admin_pub,
+                    agent_id_file: &cli.agent_id_file,
+                    agent_pid,
+                    agent_started,
+                };
+                match check_shutdown_marker(&check) {
+                    ShutdownVerdict::Authorised => {
                         info!(
                             target: "watchdog.shutdown_marker",
                             "admin-authorised shutdown observed — watchdog standing down (no respawn)"
                         );
-                        // Best-effort marker cleanup: the agent
-                        // wrote it, we honoured it, now remove
-                        // it so the next agent boot doesn't
-                        // inherit a stale "I was authorised"
-                        // signal.
-                        let _ = std::fs::remove_file(SHUTDOWN_MARKER_PATH);
                         break 'restart_loop;
                     }
-                    Ok(false) => { /* unsigned exit — proceed with respawn */ }
-                    Err(e) => {
-                        // Per design §10.4 step 4: malformed
-                        // marker is a TAMPERING signal. Log
-                        // loudly + proceed with respawn AND
-                        // count toward the ceiling (the bump
-                        // happens naturally — the next
-                        // `backoff.next_delay` call records
-                        // this attempt).
-                        warn!(
-                            target: "watchdog.shutdown_marker",
-                            error = %e,
-                            path = SHUTDOWN_MARKER_PATH,
-                            "shutdown marker exists but is malformed — treating as tampering signal"
+                    ShutdownVerdict::Absent => { /* unsigned exit — proceed with respawn */ }
+                    ShutdownVerdict::Refused(reason) => {
+                        error!(
+                            target: "watchdog.tamper",
+                            agent_pid,
+                            reason = %reason,
+                            "shutdown marker REFUSED — not signed by the admin quorum for this agent; respawning"
                         );
                     }
                 }
@@ -299,6 +293,7 @@ async fn run(cli: Cli) -> Result<()> {
                             Some((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
+                                agent_started = process_start_unix(pid);
                                 backoff = RestartBackoff::new();
                                 continue 'restart_loop;
                             }
@@ -329,6 +324,7 @@ async fn run(cli: Cli) -> Result<()> {
                     Ok((new_pid, new_fd)) => {
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
+                        agent_started = process_start_unix(new_pid);
                         info!(
                             target: "watchdog.respawn",
                             attempt,
@@ -359,6 +355,7 @@ async fn run(cli: Cli) -> Result<()> {
                             Some((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
+                                agent_started = process_start_unix(pid);
                                 backoff = RestartBackoff::new();
                             }
                             None => break 'restart_loop,

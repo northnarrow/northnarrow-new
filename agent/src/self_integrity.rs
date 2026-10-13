@@ -346,6 +346,33 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
     v
 }
 
+/// The shutdown markers the watchdog refused, one JSON line each
+/// ([`common::shutdown_marker::RejectedRecord`]) at `path`.
+pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let detail = match serde_json::from_str::<common::shutdown_marker::RejectedRecord>(l) {
+                Ok(r) => format!(
+                    "the watchdog refused a shutdown marker at {} (agent pid {}): {} [sha256 {}]",
+                    r.at, r.agent_pid, r.reason, r.sha256
+                ),
+                Err(_) => format!(
+                    "the watchdog refused a shutdown marker: {}",
+                    l.chars().take(300).collect::<String>()
+                ),
+            };
+            Finding {
+                kind: "shutdown_marker_rejected",
+                detail,
+            }
+        })
+        .collect()
+}
+
 struct Checker {
     seen: HashSet<Finding>,
     /// Signed overlays are configuration, not drift (Tappa 10.8).
@@ -426,6 +453,16 @@ impl Checker {
             for f in mount_findings(&mi, &self.own_files) {
                 self.report(f, at_boot);
             }
+        }
+        // External audit WDG-001: shutdown markers the watchdog refused
+        // (forged, replayed or stale) while the agent was down.
+        let rejected = Path::new(common::shutdown_marker::REJECTED_PATH);
+        let found = rejected_shutdowns(rejected);
+        if !found.is_empty() {
+            for f in found {
+                self.report(f, at_boot);
+            }
+            let _ = std::fs::remove_file(rejected);
         }
         let now = limits(&self.watchdog_pidfile);
         if at_boot {
@@ -514,6 +551,29 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_shutdown_markers_become_findings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("agent.shutdown_rejected");
+        assert!(rejected_shutdowns(&path).is_empty());
+        let rec = common::shutdown_marker::RejectedRecord {
+            at: 1_800_000_000,
+            agent_pid: 4242,
+            reason: "the admin signatures do not authorise it".to_string(),
+            sha256: "ab".repeat(32),
+        };
+        std::fs::write(
+            &path,
+            format!("{}\nnot json\n", serde_json::to_string(&rec).unwrap()),
+        )
+        .unwrap();
+        let f = rejected_shutdowns(&path);
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|x| x.kind == "shutdown_marker_rejected"));
+        assert!(f[0].detail.contains("agent pid 4242"), "{}", f[0].detail);
+        assert!(f[1].detail.contains("not json"), "{}", f[1].detail);
+    }
 
     #[test]
     fn jitter_stays_within_twenty_percent() {

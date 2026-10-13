@@ -69,7 +69,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-019 | EBPF-010 | eBPF kernel | M | open |
 | NN-AUD-020 | EVD-001 | Evidence logs | L | open |
 | NN-AUD-021 | EVD-005 | Evidence logs | M | open |
-| NN-AUD-022 | EVD-021 | Evidence logs | M | open |
+| NN-AUD-022 | EVD-021 | Evidence logs | M | fixed (lab PR 88) |
 | NN-AUD-023 | FIMR-001 | FIM rules | M | open |
 | NN-AUD-024 | FIMR-002 | FIM rules | M | fixed (lab PR 75, review 85) |
 | NN-AUD-025 | FIMR-003 | FIM rules | M | fixed (lab PR 75, review 85) |
@@ -101,7 +101,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-064 | DEC-004 | Deception | M | open |
 | NN-AUD-065 | DEC-005 | Deception | M | open |
 | NN-AUD-066 | DEC-006 | Deception | L | open |
-| NN-AUD-067 | WDG-001 | Watchdog tooling | M | open |
+| NN-AUD-067 | WDG-001 | Watchdog tooling | M | fixed (lab PR 88) |
 | NN-AUD-068 | WDG-002 | Watchdog tooling | M | open |
 | NN-AUD-069 | WDG-003 | Watchdog tooling | M | open |
 | NN-AUD-071 | WDG-005 | Watchdog tooling | M | fixed (lab PR 85, with NN-AUD-070) |
@@ -109,7 +109,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-073 | DEP-002 | Deploy | M | open |
 | NN-AUD-074 | DEP-003 | Deploy | M | open |
 | NN-AUD-075 | SUP-003 | Supply chain | M | open |
-| NN-AUD-076 | TST-003 | Privileged tests | M | open |
+| NN-AUD-076 | TST-003 | Privileged tests | M | fixed (lab PR 88) |
 
 ## Notes on the fixes
 
@@ -476,3 +476,42 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     `[named 'nginx' (or 'systemd'), an allowlisted program, but the
     kernel ran something else]`. Restarting `systemd-timesyncd` (PID 1
     attaching the unit's device policy) drew no BPF verdict.
+- **NN-AUD-022, NN-AUD-067, NN-AUD-076 (EVD-021, WDG-001, TST-003), lab
+  PR 88.** The watchdog stood down for any marker with a 64-hex
+  `entry_hash` and a future deadline; the unit test proved a hand-made
+  marker was accepted, and no test covered the watchdog's half.
+  - The fix the audit sketched — signing the marker with the agent's key
+    — would not hold: root reads `agent.sig.key`. The marker
+    (`common::shutdown_marker`, v2) carries the quorum-signed payload's
+    canonical CBOR, the signatures and the agent's pid. `verify` checks,
+    as the agent did, against `admin.pub` (private keys off the host):
+    2 distinct keys, one with `shutdown`; `agent_id`; signed no later
+    than 60 s ahead and acted on within 60 s + grace (capped at 300 s);
+    not before the dying agent started (`/proc/<pid>/stat`); the pid the
+    watchdog saw exit; the nonce never honoured before
+    (`/run/northnarrow/watchdog.honoured`).
+  - `admin.pub` parsing and the quorum rule moved from the agent to
+    `common::admin_quorum`, so the agent and the watchdog run the same
+    code; the Kani proof moved with the rule.
+  - Every failure — unreadable keys or install id included — is a
+    refusal: respawn, an ERROR (`watchdog.tamper`), the marker removed,
+    a record at `/run/northnarrow/agent.shutdown_rejected`. The agent's
+    self-integrity check turns it into a signed `integrity_drift` entry
+    (`shutdown_marker_rejected`).
+  - The agent's temporary marker file is removed and created with
+    `O_EXCL | O_NOFOLLOW`; the terminator write is no longer ignored.
+  - Tests: `common` (forgery, edited payload, quorum and role, replay,
+    wrong pid, before the agent started, expired, future, other install,
+    not a shutdown); the agent's dispatcher test runs the watchdog's
+    verification on the marker it wrote; the watchdog's unit test now
+    refuses the old shape; two privileged watchdog e2e tests (forged →
+    respawn and recorded; quorum-signed → stand-down, exit 0, recorded).
+  - Lab, Ubuntu 24.04. Before: a hand-written old-shape marker and
+    `systemctl stop northnarrow-agent` left agent and watchdog inactive
+    ("admin-authorised shutdown marker present + deadline valid —
+    watchdog standing down"). After: the watchdog logged `shutdown
+    marker REFUSED … not a v2 marker`, restarted the agent through
+    systemd within a second, and both were active; 15 s after its start
+    the agent appended a signed `integrity_drift` entry (`the watchdog
+    refused a shutdown marker … (agent pid …)`). The quorum-signed path
+    is covered by the privileged e2e tests on the same guest.

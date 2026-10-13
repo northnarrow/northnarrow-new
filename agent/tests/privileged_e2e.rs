@@ -872,10 +872,32 @@ fn shutdown_signed_round_trip() {
     // Marker lands on disk within the grace window.
     let marker = wait_for_marker(&paths.shutdown_marker_file, NN_ADMIN_OP_TIMEOUT)
         .expect("shutdown_authorised marker never appeared");
-    assert!(
-        marker.contains("entry_hash") && marker.contains("grace_deadline_unix_ts"),
-        "marker body unexpected: {marker}"
-    );
+    // External audit TST-003: the marker carries the quorum the agent
+    // verified, and verifies against the same admin.pub and agent_id —
+    // what the watchdog checks before it stands down.
+    let parsed = ::common::shutdown_marker::ShutdownMarker::parse(&marker)
+        .unwrap_or_else(|e| panic!("marker body unexpected ({e}): {marker}"));
+    let keys = ::common::admin_quorum::parse_admin_pub(
+        &std::fs::read_to_string(&paths.admin_pub).expect("admin.pub"),
+    )
+    .expect("admin.pub parses");
+    let agent_id = ::common::shutdown_marker::parse_agent_id(
+        &std::fs::read_to_string(&paths.agent_id_file).expect("agent_id"),
+    )
+    .expect("agent_id parses");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let exp = ::common::shutdown_marker::Expectation {
+        keys: &keys,
+        agent_id,
+        agent_pid: parsed.agent_pid,
+        agent_started: None,
+        now,
+    };
+    ::common::shutdown_marker::verify(&parsed, &exp, |_| false)
+        .unwrap_or_else(|e| panic!("the watchdog would refuse the agent's marker: {e}"));
 
     // Audit row emitted for the op (B5 wiring).
     let audit_body =

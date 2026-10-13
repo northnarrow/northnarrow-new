@@ -1690,6 +1690,7 @@ dependencies = [
  "bytemuck",
  "ciborium",
  "ed25519-dalek",
+ "hex",
  "postcard",
  "serde",
  "serde-big-array",
@@ -1703,6 +1704,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
+ "hex",
  "libc",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",

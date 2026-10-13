@@ -38,6 +38,9 @@ pub use model::*;
 #[cfg(feature = "std")]
 pub mod ade_types;
 
+#[cfg(feature = "std")]
+pub mod admin_quorum;
+
 /// Network addresses as the kernel records them, in canonical form
 /// (external audit NET-001: IPv4-mapped IPv6).
 #[cfg(feature = "std")]
@@ -50,6 +53,9 @@ pub mod posture_types;
 /// RAG knowledge-base types (Sub-tappa 6.7).
 #[cfg(feature = "std")]
 pub mod rag_types;
+
+#[cfg(feature = "std")]
+pub mod shutdown_marker;
 
 /// XAI Saliency Mapping forensic evidence schema (Tappa 6.9, v1.0.0).
 #[cfg(feature = "std")]
