@@ -108,7 +108,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-072 | DEP-001 | Deploy | M | fixed (lab PR 96) |
 | NN-AUD-073 | DEP-002 | Deploy | M | fixed (lab PR 93) |
 | NN-AUD-074 | DEP-003 | Deploy | M | fixed (lab PR 92, with NN-AUD-011) |
-| NN-AUD-075 | SUP-003 | Supply chain | M | open |
+| NN-AUD-075 | SUP-003 | Supply chain | M | fixed (lab PR 106) |
 | NN-AUD-076 | TST-003 | Privileged tests | M | fixed (lab PR 88) |
 
 ## Notes on the fixes
@@ -1315,3 +1315,22 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   - Not done: a pinned digest of the model. Root can replace a root-owned
     model, and root is the anti-tamper layer's adversary, not this
     check's.
+- **NN-AUD-075 (SUP-003), lab PR 106.** The release workflow built and
+  signed in one job: `contents: write`, `id-token: write` and
+  `attestations: write`, a checkout that left the job's token in
+  `.git/config` (`persist-credentials` defaults to true), and the build of
+  the whole dependency tree — every build script and proc-macro of ~370
+  crates running unconfined. One hostile build script anywhere in the tree
+  got the repository write token and the OIDC token that signs the
+  provenance attestations.
+  - `package` now holds `contents: read` only, checks out without
+    persisting the token, builds, smoke-tests and uploads the artefacts;
+    its last step fails the job if a token sits in the git config or the
+    job could request an OIDC token.
+  - `sign` (after `package`, not on pull requests) checks nothing out and
+    compiles nothing: it downloads the artefacts, verifies `SHA256SUMS`,
+    attests them and, on a tag, publishes them (`GH_REPO`, no checkout).
+  - Checked on GitHub: a `workflow_dispatch` run of the branch — `package`
+    built, smoke-tested and passed its no-credential step with
+    `contents: read`; `sign` downloaded the artefacts, matched
+    `SHA256SUMS` and attested them (nothing published off a tag).
