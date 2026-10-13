@@ -900,3 +900,69 @@ async fn timeout_stops_the_generation_and_frees_the_backend() {
     );
     assert_eq!(engine.stats().timeouts, 1);
 }
+
+/// External audit LLMR-004: a model (or tokenizer) that someone other than
+/// root could have written leaves the ADE off — an error, never the mock
+/// backend the other load failures fall back to.
+#[test]
+fn an_untrusted_model_leaves_the_ade_off_not_on_the_mock() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let model = tmp.path().join("m.gguf");
+    std::fs::write(&model, b"GGUF").unwrap();
+    std::fs::write(tmp.path().join("m.tokenizer.json"), b"{}").unwrap();
+    std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let cfg = AdeConfig::default().with_model_path(model);
+    match build_default_backend(&cfg) {
+        Err(AdeError::ModelUntrusted(why)) => assert!(why.contains("LLMR-004"), "{why}"),
+        Err(other) => panic!("expected ModelUntrusted, got {other:?}"),
+        Ok(_) => panic!("an untrusted model must not yield a backend"),
+    }
+}
+
+/// Found in the lab with external audit LLMR-004: the default prompt is
+/// the one built into the agent, whatever the working directory; an
+/// override is the model's instructions too and must be closed to others.
+#[test]
+fn the_default_prompt_is_built_in_and_an_override_must_be_trusted() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = prompt::SystemPrompt::load(Path::new(AdeConfig::DEFAULT_SYSTEM_PROMPT_PATH)).unwrap();
+    assert_eq!(p.raw, include_str!("../../../dataset/system_prompt_v1.md"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let custom = tmp.path().join("prompt.md");
+    std::fs::write(&custom, "You are a test.").unwrap();
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        prompt::SystemPrompt::load(&custom).unwrap().raw,
+        "You are a test."
+    );
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(matches!(
+        prompt::SystemPrompt::load(&custom),
+        Err(AdeError::ModelUntrusted(_))
+    ));
+}
+
+/// External audit LLMR-005: a model that fails to load leaves the ADE off;
+/// the mock backend is not the silent fallback (it answers by substrings
+/// of comm and the exec path).
+#[test]
+fn a_model_that_fails_to_load_leaves_the_ade_off() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("NN_ADE_ALLOW_MOCK").is_some() {
+        return;
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let model = tmp.path().join("m.gguf");
+    std::fs::write(&model, b"junk").unwrap();
+    std::fs::write(tmp.path().join("m.tokenizer.json"), b"{}").unwrap();
+    let cfg = AdeConfig::default().with_model_path(model);
+    match build_default_backend(&cfg) {
+        Err(AdeError::Backend(why)) => assert!(why.contains("GGUF"), "{why}"),
+        Err(other) => panic!("expected the load error, got {other:?}"),
+        Ok(_) => panic!("no backend, not the mock"),
+    }
+}

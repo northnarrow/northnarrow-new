@@ -24,6 +24,11 @@ pub enum AdeError {
     #[error("inference backend error: {0}")]
     Backend(String),
 
+    /// External audit LLMR-004: a model artefact someone other than root
+    /// could have written. The ADE stays off — never the mock backend.
+    #[error("{0}")]
+    ModelUntrusted(String),
+
     #[error("backend join error: {0}")]
     BackendJoin(String),
 

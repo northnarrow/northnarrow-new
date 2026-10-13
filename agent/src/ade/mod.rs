@@ -28,6 +28,7 @@ pub mod escalate;
 pub mod fim_template;
 pub mod inference;
 pub mod mem_guard;
+pub mod model_trust;
 pub mod parser;
 pub mod process_template;
 pub mod prompt;
@@ -523,16 +524,14 @@ fn make_escalate_for_verifier(
     v
 }
 
-/// Build the production backend with a graceful fallback chain.
+/// Build the production backend: Candle (Llama 3.1 GGUF).
 ///
-/// Order: Candle (Llama 3.1 GGUF) → Mock (last resort).
-///
-/// Sub-tappa 6.1 ships the Candle path as the production backend.
-/// If candle fails for any reason (missing tokenizer, GGUF parse
-/// error, OOM during weight load) we log loudly and fall back to
-/// `MockBackend` so the agent stays alive and the rule engine still
-/// runs. CI runs without a model and naturally rejects ahead of
-/// this branch via `ModelMissing`.
+/// If candle fails (missing tokenizer, GGUF parse error, OOM during weight
+/// load, an untrusted file) the error goes back to the caller and the agent
+/// runs on its rules alone. The mock backend answers instead only when
+/// asked for with `NN_ADE_ALLOW_MOCK=1` (external audit LLMR-005; it used
+/// to be the silent fallback). CI runs without a model and rejects ahead
+/// of this branch via `ModelMissing`.
 fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>, AdeError> {
     if !config.model_path.exists() {
         return Err(AdeError::ModelMissing {
@@ -557,14 +556,31 @@ fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>
             );
             return Ok(Arc::new(backend));
         }
+        // External audit LLMR-004: a model or tokenizer someone other than
+        // root could have written leaves the ADE off — the agent runs on
+        // its rules — never on the mock backend.
+        Err(e @ AdeError::ModelUntrusted(_)) => return Err(e),
+        // External audit LLMR-005: the mock is a substring match on comm
+        // and the exec path — strings the process observed chooses
+        // (`Allow` at 0.97 for a `cargo` or `git`, a tree kill for a name
+        // holding `miner`). A model that fails to load leaves the ADE off;
+        // the mock answers only when asked for (`NN_ADE_ALLOW_MOCK=1`:
+        // demos, benchmarks on an unsupported architecture).
+        Err(e) if !mock_allowed() => return Err(e),
         Err(e) => {
             tracing::warn!(
                 ?e,
                 model = %config.model_path.display(),
-                "candle backend failed to load, falling back to MockBackend"
+                "candle backend failed to load, falling back to MockBackend (NN_ADE_ALLOW_MOCK=1)"
             );
         }
     }
 
     Ok(Arc::new(MockBackend::from_model_path(&config.model_path)))
+}
+
+/// `NN_ADE_ALLOW_MOCK=1`: a model that fails to load falls back to the mock
+/// backend (external audit LLMR-005).
+fn mock_allowed() -> bool {
+    std::env::var_os("NN_ADE_ALLOW_MOCK").is_some_and(|v| v == "1")
 }

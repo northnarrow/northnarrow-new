@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the ADE model (High LLMR-004): the model and its
+  tokenizer are loaded only when root owns them and every directory above
+  them, closed to others; the default location moved from a user's home to
+  `/var/lib/northnarrow/models/`. **Upgrade note:** move a model kept
+  elsewhere there (or pass `--ade-model` to a root-owned location), or the
+  agent runs on its rules alone. The ADE's system prompt is built into the
+  agent (an installed agent never found the relative path it read). A model
+  that fails to load leaves the ADE off instead of falling back to the mock
+  backend, which judged by process names (LLMR-005); `NN_ADE_ALLOW_MOCK=1`
+  brings the mock back for demos.
+  agent (an installed agent never found the relative path it read).
+  agent runs on its rules alone.
 - External audit, Wave 1, DNS (High NET-004, EBPF-006): the cache of recent
   DNS queries is bounded in total (about 20 MiB at worst; it could grow
   past a gigabyte); a flood evicts the flooder's queries first. The DNS

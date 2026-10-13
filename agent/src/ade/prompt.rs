@@ -32,12 +32,33 @@ pub struct SystemPrompt {
     pub raw: String,
 }
 
+/// The v1 system prompt, built into the agent (found in the lab with
+/// external audit LLMR-004: the default was a path relative to the working
+/// directory, `dataset/system_prompt_v1.md`, which nothing installs — a
+/// service started from `/` never found it).
+const EMBEDDED_V1: &str = include_str!("../../../dataset/system_prompt_v1.md");
+
 impl SystemPrompt {
+    /// The prompt at `path`. The default path
+    /// ([`super::config::AdeConfig::DEFAULT_SYSTEM_PROMPT_PATH`]) is the
+    /// prompt built into the agent; any other file is the model's
+    /// instructions too, so it is read only when root owns it and every
+    /// directory above it, closed to others
+    /// ([`super::model_trust::open_trusted`], external audit LLMR-004).
     pub fn load(path: &Path) -> Result<Self, AdeError> {
-        let raw = fs::read_to_string(path).map_err(|e| AdeError::SystemPromptLoad {
+        if path == Path::new(super::config::AdeConfig::DEFAULT_SYSTEM_PROMPT_PATH) {
+            return Ok(SystemPrompt {
+                raw: EMBEDDED_V1.to_string(),
+            });
+        }
+        let not_found = |e: std::io::Error| AdeError::SystemPromptLoad {
             path: path.display().to_string(),
             source: e,
-        })?;
+        };
+        fs::metadata(path).map_err(not_found)?;
+        let (mut f, _) = super::model_trust::open_trusted(path)?;
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut f, &mut raw).map_err(not_found)?;
         if raw.trim().is_empty() {
             return Err(AdeError::SystemPromptEmpty);
         }
