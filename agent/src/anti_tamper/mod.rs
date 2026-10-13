@@ -436,14 +436,26 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     // and arm the mode. A failure leaves the guard with an empty set
     // (nothing denied) and counts as a deny-hook failure.
     match bpf_defense::register_own_objects(ebpf, pin_root) {
-        Ok(o) => debug!(
-            maps = o.maps,
-            programs = o.programs,
-            links = o.links,
-            pin_names = o.pin_names,
-            enforce = o.enforce,
-            "BPF self-defence armed"
-        ),
+        Ok(o) => {
+            debug!(
+                maps = o.maps,
+                programs = o.programs,
+                links = o.links,
+                pin_names = o.pin_names,
+                enforce = o.enforce,
+                "BPF self-defence armed"
+            );
+            // External audit ATP-009: a guard that only observes refuses
+            // nothing; in a production build it is a missing deny hook,
+            // and starts only with the degraded-mode override. (A
+            // debug-trigger build observes by design; its signed boot
+            // entry says so.)
+            if let Some(why) =
+                bpf_defense::observe_shortfall(o.enforce, cfg!(feature = "debug-trigger"))
+            {
+                deny_failures.push(("bpf_map_guard", why));
+            }
+        }
         Err(e) => {
             warn!(error = format!("{e:#}"), "BPF self-defence: own-object registration FAILED — the map guard has nothing to protect");
             deny_failures.push(("bpf_defense::register_own_objects", format!("{e:#}")));

@@ -146,6 +146,19 @@ pub fn enforce_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// External audit ATP-009: a guard that only observes refuses nothing. In a
+/// production build that is a missing deny hook (it then starts only with
+/// the degraded-mode override); a debug-trigger build observes by design
+/// and says so on its signed boot entry.
+pub(crate) fn observe_shortfall(enforce: bool, debug_build: bool) -> Option<String> {
+    (!enforce && !debug_build).then(|| {
+        format!(
+            "observe mode ({OBSERVE_ENV}=1): foreign write handles on the agent's maps and \
+             handles to its links are not refused"
+        )
+    })
+}
+
 /// Attach both hooks (deny + observe). Errors are reported to the caller's
 /// health accounting, not returned: the anti-tamper health decides the
 /// fail-closed outcome.
@@ -275,21 +288,95 @@ fn claim_agent_role(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// External audit ATP-013: the ids of every map of the object as loaded,
+/// taken before the sensors move maps out of it. `take_map` removes a map
+/// from `ebpf.maps()`, and the twelve ring buffers (`FS_PROTECT_EVENTS`,
+/// with the anti-tamper denials, among them) and `RING_DROPS` were taken
+/// before [`register_own_objects`] ran: none was in `OWN_BPF_IDS`, so the
+/// guard handed a foreign root a writable handle on each — enough to move
+/// a ring's consumer position, silencing that sensor, or to zero the drop
+/// counters. `Err` names the maps whose id could not be read.
+static LOADED_MAP_IDS: parking_lot::Mutex<Option<std::result::Result<Vec<u32>, String>>> =
+    parking_lot::Mutex::new(None);
+
+/// Record the ids of every map of `ebpf` — call right after the load,
+/// before any `take_map`.
+pub(crate) fn remember_loaded_maps(ebpf: &Ebpf) {
+    let mut ids = Vec::new();
+    let mut unreadable = Vec::new();
+    for (name, map) in ebpf.maps() {
+        match map_data(map).info() {
+            Ok(info) => ids.push(info.id()),
+            Err(e) => unreadable.push(format!("{name}: {e}")),
+        }
+    }
+    *LOADED_MAP_IDS.lock() = Some(if unreadable.is_empty() {
+        Ok(ids)
+    } else {
+        Err(unreadable.join("; "))
+    });
+}
+
+/// The maps a loaded program of ours uses that are not in `own`: what the
+/// guard would hand out. Empty when the set is complete.
+fn unregistered_maps(ebpf: &Ebpf, own: &HashSet<u32>) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (name, prog) in ebpf.programs() {
+        let Ok(info) = prog.info() else {
+            continue;
+        };
+        if let Ok(Some(used)) = info.map_ids() {
+            for id in used.into_iter().filter(|id| !own.contains(id)) {
+                missing.push(format!("map {id} (used by {name})"));
+            }
+        }
+    }
+    missing
+}
+
 /// Fill `OWN_BPF_IDS` with the ids of every map and program of this object
 /// and arm the mode. Call once every program is loaded (after the
 /// anti-tamper hooks), so the set is complete.
 pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<OwnObjects> {
-    let mut map_ids: Vec<u32> = Vec::new();
-    for (_, map) in ebpf.maps() {
-        if let Ok(info) = map_data(map).info() {
-            map_ids.push(info.id());
+    // External audit ATP-013: the maps taken out of the object before this
+    // point, as recorded at load; then those still in it. An id that cannot
+    // be read is a hole in the guard, not a map to skip.
+    let mut map_ids: Vec<u32> = match LOADED_MAP_IDS.lock().clone() {
+        Some(Ok(ids)) => ids,
+        Some(Err(unreadable)) => {
+            anyhow::bail!("own map ids unreadable at load: {unreadable}")
+        }
+        None => Vec::new(),
+    };
+    for (name, map) in ebpf.maps() {
+        let info = map_data(map)
+            .info()
+            .with_context(|| format!("reading own map {name}"))?;
+        map_ids.push(info.id());
+    }
+    map_ids.sort_unstable();
+    map_ids.dedup();
+    let mut prog_ids: Vec<u32> = Vec::new();
+    for (name, prog) in ebpf.programs() {
+        match prog.info() {
+            Ok(info) => prog_ids.push(info.id()),
+            // The programs of a sensor not chosen this boot are never loaded.
+            Err(aya::programs::ProgramError::NotLoaded) => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("reading own program {name}"))
+            }
         }
     }
-    let mut prog_ids: Vec<u32> = Vec::new();
-    for (_, prog) in ebpf.programs() {
-        if let Ok(info) = prog.info() {
-            prog_ids.push(info.id());
-        }
+    // Every map our programs use must be in the set: a map moved out of the
+    // object before its id was recorded would be guarded by nothing.
+    let own: HashSet<u32> = map_ids.iter().copied().collect();
+    let missing = unregistered_maps(ebpf, &own);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "maps used by the agent's programs are not registered as its own: {}",
+            missing.join(", ")
+        );
     }
     let own = ebpf
         .map_mut(OWN_IDS_MAP)
@@ -409,6 +496,41 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
         pin_names: pin_names.len(),
         enforce,
     })
+}
+
+/// External audit ATP-013: the programs and links attached after the
+/// anti-tamper step — the FIM observers, the file-open sensor — added to
+/// `OWN_BPF_IDS` in a second pass, so the set stays complete. Returns how
+/// many ids were written (inserting one already there changes nothing).
+pub fn register_late_objects(ebpf: &mut Ebpf) -> Result<usize> {
+    let mut prog_ids: Vec<u32> = Vec::new();
+    for (name, prog) in ebpf.programs() {
+        match prog.info() {
+            Ok(info) => prog_ids.push(info.id()),
+            Err(aya::programs::ProgramError::NotLoaded) => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("reading own program {name}"))
+            }
+        }
+    }
+    // Their links are held by this process (not pinned): found through
+    // its descriptors.
+    let link_ids = own_link_ids(&prog_ids, None);
+    let own = ebpf
+        .map_mut(OWN_IDS_MAP)
+        .with_context(|| format!("{OWN_IDS_MAP} missing from the eBPF object"))?;
+    let mut own: HashMap<&mut MapData, u64, u8> =
+        HashMap::try_from(own).context("OWN_BPF_IDS is not a HashMap<u64, u8>")?;
+    for id in &prog_ids {
+        own.insert(own_key(KIND_PROG, *id), KIND_PROG, 0)
+            .with_context(|| format!("registering own program id {id}"))?;
+    }
+    for id in &link_ids {
+        own.insert(own_key(KIND_LINK, *id), KIND_LINK, 0)
+            .with_context(|| format!("registering own link id {id}"))?;
+    }
+    Ok(prog_ids.len() + link_ids.len())
 }
 
 /// Test builds only: keep the whole error chain (the verifier log can be
@@ -699,6 +821,19 @@ mod tests {
         );
         // not a link
         assert_eq!(parse_link_fdinfo("pos:\t0\nflags:\t02\n"), None);
+    }
+
+    #[test]
+    fn observe_is_a_deny_shortfall_in_production_builds() {
+        assert!(observe_shortfall(false, false)
+            .unwrap()
+            .contains("observe mode"));
+        assert_eq!(
+            observe_shortfall(false, true),
+            None,
+            "debug-trigger: by design"
+        );
+        assert_eq!(observe_shortfall(true, false), None);
     }
 
     #[test]

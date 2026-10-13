@@ -344,6 +344,10 @@ if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -
     run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
     run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
     run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
+    # External audit ATP-013: the twelve ring buffers and RING_DROPS left
+    # the eBPF object before the guard listed the agent's maps; by id, a
+    # foreign root process got a writable handle on each.
+    run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
     echo "C34-C37 skipped: cannot build the probe library ($(head -1 /tmp/nn-pbf-cc.log 2>/dev/null))" >&2
 fi
