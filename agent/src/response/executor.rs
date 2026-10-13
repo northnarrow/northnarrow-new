@@ -171,10 +171,38 @@ impl Executor {
         // operate on a specific PID. `FullNetworkIsolation` is
         // host-wide and ignores `target_pid` entirely.
         let pid_scoped = !matches!(action, ResponseAction::FullNetworkIsolation);
+        // External audit CMB-005: the host-critical guard — the floor, and
+        // the ladder's guard (the agent's stack, the SSH service) — applies
+        // to every action that acts on a process. It was consulted only by
+        // the tree walk, so a rule's KillProcess, or a Quarantine,
+        // BlockOutbound or Throttle verdict, could take down sshd or the
+        // watchdog.
+        let guard = self.tree_guard.read().clone();
+        let spared = move |pid: u32| -> Option<&'static str> {
+            if pid < PID_PROTECTION_FLOOR {
+                return Some("PID below protection floor (kernel thread / core service)");
+            }
+            guard.as_ref().and_then(|g| g(pid))
+        };
+        let acts_on_process = matches!(
+            action,
+            ResponseAction::KillProcess
+                | ResponseAction::KillProcessTree
+                | ResponseAction::BlockOutbound
+                | ResponseAction::Quarantine
+                | ResponseAction::ThrottleProcess
+        );
         let primary = if pid_scoped && target_pid != 0 && target_pid < PID_PROTECTION_FLOOR {
             ExecutionOutcome::Refused {
                 pid: target_pid,
                 reason: "PID below protection floor (kernel thread / core service)",
+            }
+        } else if let Some(reason) =
+            spared(target_pid).filter(|_| acts_on_process && target_pid != 0)
+        {
+            ExecutionOutcome::Refused {
+                pid: target_pid,
+                reason,
             }
         } else {
             match action {
@@ -184,20 +212,10 @@ impl Executor {
                 },
                 ResponseAction::KillProcess => kill::kill_process(target_pid, &self.protected),
                 ResponseAction::KillProcessTree => {
-                    // The protection floor + the ladder's host-critical
-                    // guard apply to every pid the walk reaps, not only to
-                    // the attributed root (combat-avail-2).
-                    let guard = self.tree_guard.read().clone();
-                    let combined = move |pid: u32| -> Option<&'static str> {
-                        if pid < PID_PROTECTION_FLOOR {
-                            return Some(
-                                "PID below protection floor (kernel thread / core service)",
-                            );
-                        }
-                        guard.as_ref().and_then(|g| g(pid))
-                    };
+                    // The same guard for every pid the walk reaps, not
+                    // only for the attributed root (combat-avail-2).
                     let (p, kids) =
-                        kill::kill_process_tree_guarded(target_pid, &self.protected, &combined);
+                        kill::kill_process_tree_guarded(target_pid, &self.protected, &spared);
                     additional = kids;
                     p
                 }

@@ -51,6 +51,19 @@
 //!   fails the check — a substituted watchdog/sshd is what we must not
 //!   trust.
 //!
+//! ### The SSH service, not whoever runs its binary (external audit CMB-003)
+//!
+//! The exe alone was no anchor for sshd: `/usr/sbin/sshd` is
+//! world-executable and runs unprivileged on a high port, so any user's
+//! process could take its image and with it immunity from the kill — and,
+//! as the only offender, push the ladder straight to ISOLATE. An sshd is
+//! now spared only when it runs as root inside an SSH unit of systemd
+//! (`ssh.service`, `sshd.service`, or a socket-activated `ssh@…`/`sshd@…`
+//! instance). On a host without systemd units, exe and uid 0 are the only
+//! anchors left, and they still apply. A session's own processes live in
+//! the session's scope, not in the unit, and are not spared: when one of
+//! them is the offender, killing it is the containment.
+//!
 //! The guard is injected into [`super::CombatLadder`] as a trait object
 //! (like the actuator/evidence) so the ladder stays a pure, deterministic
 //! state machine in unit tests while production reads the live `/proc`.
@@ -194,7 +207,57 @@ impl SystemProtectedProcs {
             None => false,
         }
     }
+
+    /// External audit CMB-003: the SSH service is an sshd running as root
+    /// inside an SSH unit — or, where `/proc/<pid>/cgroup` names no
+    /// systemd unit at all, an sshd running as root.
+    fn is_ssh_service(&self, pid: u32) -> bool {
+        if !self.exe_is_sshd(pid) || self.real_uid(pid) != Some(0) {
+            return false;
+        }
+        match self.systemd_unit(pid) {
+            Some(unit) => SSH_UNIT_PREFIXES.iter().any(|p| unit.starts_with(p)),
+            None => true,
+        }
+    }
+
+    /// The real uid of `pid` (`Uid:` in `/proc/<pid>/status`).
+    fn real_uid(&self, pid: u32) -> Option<u32> {
+        let status =
+            fs::read_to_string(self.proc_root.join(pid.to_string()).join("status")).ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// The systemd unit (`*.service`, `*.scope`) `pid` runs in, read from
+    /// its cgroup path; `None` when the path names none (no systemd).
+    fn systemd_unit(&self, pid: u32) -> Option<String> {
+        let cgroup =
+            fs::read_to_string(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+        // The unified hierarchy (`0::/…`), or systemd's own on a v1 host.
+        let path = cgroup
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .or_else(|| {
+                cgroup
+                    .lines()
+                    .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p))
+            })?;
+        path.rsplit('/')
+            .find(|c| c.ends_with(".service") || c.ends_with(".scope"))
+            .map(str::to_string)
+    }
 }
+
+/// External audit CMB-003: the systemd units the SSH service runs in —
+/// Debian/Ubuntu's `ssh.service`, everyone else's `sshd.service`, and
+/// their per-connection instances under socket activation.
+const SSH_UNIT_PREFIXES: &[&str] = &["ssh.service", "sshd.service", "ssh@", "sshd@"];
 
 impl ProtectedProcs for SystemProtectedProcs {
     fn protected_reason(&self, pid: u32) -> Option<ProtectedReason> {
@@ -213,7 +276,7 @@ impl ProtectedProcs for SystemProtectedProcs {
         {
             return Some(ProtectedReason::Watchdog);
         }
-        if self.exe_is_sshd(pid) {
+        if self.is_ssh_service(pid) {
             return Some(ProtectedReason::SshService);
         }
         None
@@ -304,16 +367,69 @@ mod tests {
         assert_eq!(g.protected_reason(5000), None);
     }
 
+    /// `<proc_root>/<pid>/status` (real uid) and `cgroup` (unified path).
+    fn proc_identity(proc_root: &Path, pid: u32, uid: u32, cgroup: &str) {
+        let dir = proc_root.join(pid.to_string());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("status"),
+            format!("Name:\tsshd\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+    }
+
     #[test]
     fn recognizes_sshd_by_kernel_resolved_exe() {
         let tmp = TempDir::new().unwrap();
         link_exe(tmp.path(), 800, SSHD_EXE);
+        proc_identity(tmp.path(), 800, 0, "/system.slice/ssh.service");
         link_exe(tmp.path(), 801, "/usr/bin/python3"); // a non-sshd process
+        proc_identity(tmp.path(), 801, 0, "/system.slice/ssh.service");
         let g = guard(tmp.path(), 10, ExemptPids::with_agent(10));
         assert_eq!(g.protected_reason(800), Some(ProtectedReason::SshService));
         assert_eq!(g.protected_reason(801), None);
         // A PID with no /proc entry resolves to None (not a crash).
         assert_eq!(g.protected_reason(999_999), None);
+    }
+
+    /// External audit CMB-003: the SSH service, not whoever runs its
+    /// binary — a user's own sshd, or root's sshd outside the unit, is
+    /// fair game; socket-activated instances and RHEL's unit name are
+    /// the service; with no systemd unit at all, exe and uid 0 decide.
+    #[test]
+    fn sshd_exe_outside_the_ssh_unit_is_not_protected() {
+        let tmp = TempDir::new().unwrap();
+        let cases: &[(u32, u32, &str, bool)] = &[
+            (
+                900,
+                1000,
+                "/user.slice/user-1000.slice/session-3.scope",
+                false,
+            ),
+            (901, 1000, "/system.slice/ssh.service", false),
+            (902, 0, "/user.slice/user-1000.slice/session-3.scope", false),
+            (903, 0, "/system.slice/sshd.service", true),
+            (
+                904,
+                0,
+                "/system.slice/system-sshd.slice/sshd@1-10.0.0.1:22-10.0.0.2:51515.service",
+                true,
+            ),
+            (905, 0, "/", true),
+        ];
+        for &(pid, uid, cgroup, _) in cases {
+            link_exe(tmp.path(), pid, SSHD_EXE);
+            proc_identity(tmp.path(), pid, uid, cgroup);
+        }
+        let g = guard(tmp.path(), 10, ExemptPids::with_agent(10));
+        for &(pid, uid, cgroup, protected) in cases {
+            assert_eq!(
+                g.protected_reason(pid).is_some(),
+                protected,
+                "uid {uid} in {cgroup}"
+            );
+        }
     }
 
     #[test]

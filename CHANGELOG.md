@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, COMBAT response (High CMB-002, CMB-005, and
+  CMB-003 from Wave 1):
+  - NEUTRALIZE reported a threat contained when the root of its tree
+    died but descendants lived on, or when the tree walk stopped at its
+    limit. Every descendant now counts.
+  - The guard that spares sshd and the agent's watchdog applied only to
+    the tree walk; a rule's KillProcess, or a Quarantine, BlockOutbound
+    or Throttle verdict, ignored it. It now covers every action on a
+    process.
+  - The guard spared any process running the sshd binary, which any
+    user can run. It now spares the SSH service: sshd as root in an SSH
+    unit.
 - External audit, Wave 0, LLMR-002 (Critical): any user could blind the
   agent by running unknown binaries in a loop. Each one sent to ADE held
   the event loop for up to the inference timeout, and the kernel dropped

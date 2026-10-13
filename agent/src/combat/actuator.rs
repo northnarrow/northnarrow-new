@@ -92,6 +92,43 @@ impl SystemActuator {
                 | ExecutionOutcome::WouldExecute { .. }
         )
     }
+
+    /// External audit CMB-002: why the descendants of `root` (a kill
+    /// tree's `additional` outcomes) are not contained, or `None` when
+    /// every one is.
+    fn tree_not_contained(root: u32, descendants: &[ExecutionOutcome]) -> Option<String> {
+        let mut spared = Vec::new();
+        let mut alive = Vec::new();
+        let mut truncated = None;
+        for o in descendants.iter().filter(|o| !Self::contained(o)) {
+            match o {
+                ExecutionOutcome::Refused { pid, reason } => {
+                    spared.push(format!("{pid} ({reason})"))
+                }
+                ExecutionOutcome::TreeTruncated { limit, .. } => truncated = Some(*limit),
+                other => alive.push(format!("{other:?}")),
+            }
+        }
+        if spared.is_empty() && alive.is_empty() && truncated.is_none() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !alive.is_empty() {
+            parts.push(format!("descendants not killed: {}", alive.join(", ")));
+        }
+        if !spared.is_empty() {
+            parts.push(format!(
+                "descendants spared by the host-critical guard: {}",
+                spared.join(", ")
+            ));
+        }
+        if let Some(limit) = truncated {
+            parts.push(format!(
+                "the tree walk stopped at {limit} descendants; the rest were not reached"
+            ));
+        }
+        Some(format!("pid {root}: {}", parts.join("; ")))
+    }
 }
 
 impl CombatActuator for SystemActuator {
@@ -131,13 +168,20 @@ impl CombatActuator for SystemActuator {
             offenders.iter().map(|&pid| (pid, binary_of(pid))).collect();
 
         // First pass: kill the offending tree(s). Any non-contained
-        // primary outcome means the threat is uncontainable → isolate.
+        // outcome means the threat is uncontainable → isolate.
         for &pid in offenders {
             let report = self.executor.execute(ResponseAction::KillProcessTree, pid);
             if !Self::contained(&report.primary) {
                 return NeutralizeOutcome::Uncontainable {
                     reason: format!("pid {pid}: kill outcome {:?}", report.primary),
                 };
+            }
+            // External audit CMB-002: the whole tree, not only its root. A
+            // descendant still running — not killed, spared by the
+            // host-critical guard, or beyond a walk cut short — is a
+            // threat the process level did not contain.
+            if let Some(reason) = Self::tree_not_contained(pid, &report.additional) {
+                return NeutralizeOutcome::Uncontainable { reason };
             }
             info!(
                 target: "combat.actuator",
@@ -231,6 +275,99 @@ fn binary_of(pid: u32) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::response::config::ExecutorConfig;
+
+    /// External audit CMB-002: a tree is contained only when every
+    /// descendant is — not killed, spared by the guard, or past a walk cut
+    /// short each make it uncontainable, with the cause in the reason.
+    #[test]
+    fn tree_containment_counts_every_descendant() {
+        use ExecutionOutcome as O;
+        assert_eq!(
+            SystemActuator::tree_not_contained(
+                7,
+                &[
+                    O::Killed { pid: 8 },
+                    O::AlreadyGone { pid: 9 },
+                    O::WouldExecute { pid: 10 }
+                ]
+            ),
+            None
+        );
+        let r = SystemActuator::tree_not_contained(
+            7,
+            &[
+                O::Killed { pid: 8 },
+                O::PermissionDenied { pid: 9, errno: 1 },
+            ],
+        )
+        .unwrap();
+        assert!(r.contains("not killed") && r.contains("pid: 9"), "{r}");
+        let r = SystemActuator::tree_not_contained(
+            7,
+            &[O::Refused {
+                pid: 11,
+                reason: "ssh-service(sshd)",
+            }],
+        )
+        .unwrap();
+        assert!(
+            r.contains("spared") && r.contains("11 (ssh-service(sshd))"),
+            "{r}"
+        );
+        let r = SystemActuator::tree_not_contained(
+            7,
+            &[
+                O::Killed { pid: 8 },
+                O::TreeTruncated {
+                    pid: 7,
+                    limit: 1000,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(r.contains("stopped at 1000"), "{r}");
+    }
+
+    /// External audit CMB-002: the root killed while a descendant lives
+    /// on is not "contained" — here the guard spares the child.
+    #[test]
+    fn neutralize_escalates_when_a_descendant_survives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut parent = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(parent.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let child: u32 = line.trim().parse().unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(&tmp.path().join("state"))
+        };
+        let exec = Executor::with_config(cfg);
+        exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
+            (pid == child).then_some("test-guard")
+        }));
+        let actuator = SystemActuator::new(exec, None, false);
+        let outcome = actuator.neutralize(&[parent.id()]);
+        let _ = parent.wait();
+        // SAFETY: plain kill(2) on our own child.
+        unsafe { libc::kill(child as i32, libc::SIGKILL) };
+        match outcome {
+            NeutralizeOutcome::Uncontainable { reason } => {
+                assert!(
+                    reason.contains(&format!("{child} (test-guard)")),
+                    "{reason}"
+                )
+            }
+            other => panic!("a surviving descendant must not count as contained: {other:?}"),
+        }
+    }
 
     /// Review 87: NEUTRALIZE kills the offender, then quarantines the
     /// binary it ran, looked up before the kill. The quarantine by pid

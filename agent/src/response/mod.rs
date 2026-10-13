@@ -86,6 +86,9 @@ pub enum ExecutionOutcome {
     /// Review 86, `StripFileCapability`: the file no longer carries a
     /// `security.capability` xattr.
     CapabilityStripped { path: String },
+    /// External audit CMB-002, `KillProcessTree`: the `/proc` walk under
+    /// `pid` stopped at `limit` descendants; any beyond were not reached.
+    TreeTruncated { pid: u32, limit: usize },
 }
 
 /// Aggregate report for one verdict execution.
