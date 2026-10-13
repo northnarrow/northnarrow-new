@@ -142,6 +142,15 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "netflow-comm-allowlist.local.sig",
     "mass-write-carveout.local.sig",
     "escalation-allow.local.sig",
+    // External audit ATP-001 / DEP-003: the files COMBAT isolates with and
+    // their signatures. MUTATE-only like the other operator-tunable files;
+    // the signature check at every engage is what vouches for the content.
+    "combat-rules.v4",
+    "combat-rules.v6",
+    "combat-allow.cidrs",
+    "combat-rules.v4.sig",
+    "combat-rules.v6.sig",
+    "combat-allow.cidrs.sig",
 ];
 
 /// at-authz-1: the subset of [`ETC_PROTECTED_FILES`] that is also
@@ -1759,6 +1768,12 @@ mod tests {
                 "netflow-comm-allowlist.local.sig",
                 "mass-write-carveout.local.sig",
                 "escalation-allow.local.sig",
+                "combat-rules.v4",
+                "combat-rules.v6",
+                "combat-allow.cidrs",
+                "combat-rules.v4.sig",
+                "combat-rules.v6.sig",
+                "combat-allow.cidrs.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

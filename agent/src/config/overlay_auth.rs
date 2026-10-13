@@ -243,8 +243,33 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
                 return Err(anyhow!("{label}: {e}"));
             }
         }
+        // External audit ATP-001 / DEP-003: a signed ruleset must still
+        // isolate; a signed carve-out must parse whole.
+        OverlayKind::CombatRulesV4 | OverlayKind::CombatRulesV6 => {
+            crate::anti_tamper::network_isolate::validate_ruleset(text)
+                .map_err(|e| anyhow!("{label}: {e}"))?;
+        }
+        OverlayKind::CombatAllow => {
+            let load = crate::anti_tamper::combat_allow::parse_allow_text(text);
+            if let Some(w) = load.warnings.first() {
+                return Err(anyhow!("{label}: {w}"));
+            }
+        }
     }
     Ok(())
+}
+
+/// External audit ATP-001 / DEP-003: content of `kind` that needs no
+/// signature because it is what the agent was built with — the shipped
+/// COMBAT rulesets and carve-out. The `.local` overlays have none.
+pub fn shipped_default(kind: OverlayKind) -> Option<&'static str> {
+    use crate::anti_tamper::network_isolate as ni;
+    match kind {
+        OverlayKind::CombatRulesV4 => Some(ni::BUILTIN_RULES_V4),
+        OverlayKind::CombatRulesV6 => Some(ni::BUILTIN_RULES_V6),
+        OverlayKind::CombatAllow => Some(ni::BUILTIN_ALLOW),
+        _ => None,
+    }
 }
 
 /// Outcome of the boot check for one overlay.
@@ -277,6 +302,14 @@ pub struct OverlayGate {
     audit_log: Mutex<Option<Arc<Mutex<AuditLog>>>>,
     /// Decisions made before the audit log was attached.
     pending: Mutex<Vec<(OverlayKind, PathBuf, Decision)>>,
+}
+
+impl std::fmt::Debug for OverlayGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayGate")
+            .field("allow_unsigned", &self.allow_unsigned)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OverlayGate {
@@ -315,6 +348,10 @@ impl OverlayGate {
                 }
             }
         };
+        // The shipped COMBAT files are the defaults themselves.
+        if shipped_default(kind).is_some_and(|d| d.as_bytes() == bytes.as_slice()) {
+            return Decision::Absent;
+        }
         let digest = content_sha256(&bytes);
         let sha_hex = hex(&digest);
         let refuse = |reason: String| Decision::Refused {
@@ -604,6 +641,48 @@ mod tests {
         assert_eq!(
             gate.effective(OverlayKind::ProcessCommAllowlist, &p),
             PathBuf::from(EMPTY_OVERLAY)
+        );
+    }
+
+    /// External audit ATP-001 / DEP-003: the shipped COMBAT files need no
+    /// signature; a change does, and must still isolate to be signed.
+    #[test]
+    fn combat_files_are_trusted_as_shipped_or_signed() {
+        use crate::anti_tamper::network_isolate::{BUILTIN_RULES_V4, BUILTIN_RULES_V6};
+        let (dir, key, admin_pub, audit) = setup("config-manage");
+        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let v4 = dir.path().join(OverlayKind::CombatRulesV4.file_name());
+        std::fs::write(&v4, BUILTIN_RULES_V4).unwrap();
+        assert_eq!(
+            gate.check(OverlayKind::CombatRulesV4, &v4),
+            Decision::Absent
+        );
+        std::fs::write(&v4, "*filter\nCOMMIT\n").unwrap();
+        assert!(matches!(
+            gate.check(OverlayKind::CombatRulesV4, &v4),
+            Decision::Refused { .. }
+        ));
+        assert!(validate_content(OverlayKind::CombatRulesV4, "*filter\nCOMMIT\n").is_err());
+        assert!(validate_content(OverlayKind::CombatRulesV6, BUILTIN_RULES_V6).is_ok());
+        let allow = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::CombatAllow,
+            "10.0.0.0/8\n",
+            5,
+        );
+        assert!(matches!(
+            gate.check(OverlayKind::CombatAllow, &allow),
+            Decision::Accepted { .. }
+        ));
+        assert!(validate_content(OverlayKind::CombatAllow, "not-a-cidr\n").is_err());
+        assert_eq!(
+            OverlayKind::from_keyword("combat-allow.cidrs"),
+            Some(OverlayKind::CombatAllow)
+        );
+        assert_eq!(
+            OverlayKind::from_keyword("combat-rules-v6"),
+            Some(OverlayKind::CombatRulesV6)
         );
     }
 

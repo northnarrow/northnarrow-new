@@ -1358,7 +1358,10 @@ async fn main() -> Result<()> {
     let isolator = match NetworkIsolator::new(cli.combat_rules.clone()) {
         Ok(i) => Some(Arc::new(
             i.with_allow_cidrs_path(cli.combat_allow_cidrs.clone())
-                .with_rules_v6(cli.combat_rules_v6.clone()),
+                .with_rules_v6(cli.combat_rules_v6.clone())
+                // External audit ATP-001 / DEP-003: the COMBAT files are
+                // applied only as shipped or admin-signed.
+                .with_overlay_gate(Arc::clone(&overlay_gate)),
         )),
         Err(e) => {
             // ERROR, not WARN: besides losing isolation, no isolator means

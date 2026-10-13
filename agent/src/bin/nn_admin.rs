@@ -2124,7 +2124,15 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
             for kind in common::wire::admin_signed_payload::OverlayKind::ALL {
                 let path = dir.join(kind.file_name());
                 match gate.check(kind, &path) {
-                    Decision::Absent => println!("{:<24} absent", kind.keyword()),
+                    Decision::Absent => println!(
+                        "{:<24} {}",
+                        kind.keyword(),
+                        if path.exists() {
+                            "shipped default"
+                        } else {
+                            "absent"
+                        }
+                    ),
                     Decision::Accepted {
                         signed_ts, key_fps, ..
                     } => {
@@ -2137,8 +2145,15 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                     Decision::Refused { reason, .. } => {
                         unsigned += 1;
                         println!(
-                            "{:<24} NOT LOADED at the next start: {reason}",
-                            kind.keyword()
+                            "{:<24} NOT LOADED at the next start: {reason}{}",
+                            kind.keyword(),
+                            if northnarrow_agent::config::overlay_auth::shipped_default(kind)
+                                .is_some()
+                            {
+                                " — COMBAT applies the built-in content"
+                            } else {
+                                ""
+                            }
                         )
                     }
                 }

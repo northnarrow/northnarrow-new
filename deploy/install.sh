@@ -920,18 +920,28 @@ if (( UPGRADE )) && [[ -s "$ETC_DIR/agent_id" ]]; then
     }
     # status exits 1 when an overlay is not loadable: not an install failure
     unsigned=$( { ovl_status || true; } | awk '/NOT LOADED/ {printf "%s ", $1}')
+    # the file of an overlay kind: `<kind>.local`, except the COMBAT files
+    # (external audit ATP-001 / DEP-003), which keep their own names
+    ovl_file() {
+        case "$1" in
+            combat-rules-v4) echo "$ETC_DIR/combat-rules.v4" ;;
+            combat-rules-v6) echo "$ETC_DIR/combat-rules.v6" ;;
+            combat-allow) echo "$ETC_DIR/combat-allow.cidrs" ;;
+            *) echo "$ETC_DIR/$1.local" ;;
+        esac
+    }
     if [[ -n "$unsigned" && -n "$GRANT_KEY" ]]; then
         for kind in $unsigned; do
-            "$BIN_DIR/nn-admin" config overlay sign "$kind" --file "$ETC_DIR/$kind.local" --key "$GRANT_KEY" \
+            "$BIN_DIR/nn-admin" config overlay sign "$kind" --file "$(ovl_file "$kind")" --key "$GRANT_KEY" \
                 --agent-id-file "$ETC_DIR/agent_id" >/dev/null 2>&1 || true
         done
     fi
     # what the new agent will actually load (sign does not know admin.pub roles)
     while read -r kind state rest; do
         case "$state" in
-            signed) if [[ " $unsigned " == *" $kind "* ]]; then echo "install.sh: adopted overlay $ETC_DIR/$kind.local — signed with $GRANT_KEY"; fi ;;
-            NOT) echo "install.sh: WARNING — overlay $ETC_DIR/$kind.local will NOT be loaded (shipped defaults for that list):${rest#*start:}" >&2
-                 echo "install.sh:   sign it with a key that carries config-manage: nn-admin config overlay sign $kind --file $ETC_DIR/$kind.local --key <key>" >&2 ;;
+            signed) if [[ " $unsigned " == *" $kind "* ]]; then echo "install.sh: adopted overlay $(ovl_file "$kind") — signed with $GRANT_KEY"; fi ;;
+            NOT) echo "install.sh: WARNING — overlay $(ovl_file "$kind") will NOT be loaded (shipped defaults for that list):${rest#*start:}" >&2
+                 echo "install.sh:   sign it with a key that carries config-manage: nn-admin config overlay sign $kind --file $(ovl_file "$kind") --key <key>" >&2 ;;
         esac
     done < <(ovl_status || true)
 fi
