@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, the release pipeline (High SUP-003): building and
+  signing are separate jobs. The job that compiles the dependency tree has
+  a read-only token, not persisted, and cannot request the signing token;
+  the job that attests and publishes compiles nothing.
 - External audit, Wave 1, the ADE model (High LLMR-004): the model and its
   tokenizer are loaded only when root owns them and every directory above
   them, closed to others; the default location moved from a user's home to

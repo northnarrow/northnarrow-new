@@ -9,7 +9,15 @@ name: release
 # uploads everything to the GitHub release.
 #
 # On pull requests that touch the packaging it runs as a DRY RUN: same
-# build, artefacts kept on the workflow run only, nothing published.
+# build, artefacts kept on the workflow run only, nothing attested or
+# published.
+#
+# External audit SUP-003: building and signing are two jobs. `package`
+# compiles the whole dependency tree — every build script and proc-macro
+# of ~370 crates runs there — so it holds nothing worth stealing: a
+# read-only token, not persisted in .git/config, and no OIDC token. `sign`
+# compiles nothing and checks nothing out: it downloads the artefacts,
+# attests them and, on a tag, publishes them.
 
 on:
   push:
@@ -39,13 +47,12 @@ jobs:
       # nested cargo build; the qemu step below checks the result.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v2"
     permissions:
-      contents: write        # upload release assets on a tag
-      id-token: write        # sign the provenance attestation (OIDC)
-      attestations: write
+      contents: read         # the build writes nothing and signs nothing
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0     # git describe in README-RELEASE.md
+          persist-credentials: false   # no token left in .git/config
 
       - name: Free disk space
         run: |
@@ -142,6 +149,47 @@ jobs:
             qemu-x86_64 -cpu Nehalem "$tmp"/northnarrow-*/target/release/$b --version
           done
 
+      # External audit SUP-003: whatever ran in this job — every build
+      # script and proc-macro of the dependency tree — found no credential
+      # to take. Fails the job if a token sits in the git config or the
+      # job could ask for an OIDC token.
+      - name: No credential reached the build
+        run: |
+          if git config --get-regexp '^http\..*\.extraheader' >/dev/null; then
+            echo "a token is persisted in .git/config"; exit 1
+          fi
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "the build job can request an OIDC token"; exit 1
+          fi
+          echo "no credential in the build job"
+
+      - name: Upload workflow artefacts (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: northnarrow-release-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+  sign:
+    name: attest + publish
+    needs: package
+    # A pull request is a dry run: nothing is attested or published.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # upload release assets on a tag
+      id-token: write        # sign the provenance attestation (OIDC)
+      attestations: write
+    steps:
+      # No checkout and no build: the artefacts the package job made.
+      - uses: actions/download-artifact@v4
+        with:
+          name: northnarrow-release-${{ github.sha }}
+          path: dist
+
+      - name: Checksums match
+        run: cd dist && sha256sum -c SHA256SUMS
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
@@ -151,17 +199,11 @@ jobs:
             dist/*.rpm
             dist/*.sbom.cdx.json
 
-      - name: Upload workflow artefacts (always)
-        uses: actions/upload-artifact@v4
-        with:
-          name: northnarrow-release-${{ github.sha }}
-          path: dist/
-          if-no-files-found: error
-
       - name: Publish to the GitHub release (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           tag=${GITHUB_REF#refs/tags/}
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --generate-notes
