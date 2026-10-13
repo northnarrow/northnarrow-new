@@ -65,6 +65,7 @@ const OP_RENAMED: u64 = 4;
 #[allow(dead_code)]
 const OP_LINKED: u64 = 5;
 const OP_OPENED: u64 = 6;
+const OP_ATTR_CHANGED: u64 = 8;
 
 fn agent_bin() -> &'static str {
     env!("CARGO_BIN_EXE_northnarrow-agent")
@@ -272,6 +273,26 @@ impl FimFixture {
     /// Wait until the drift log has at least `n` chained entries.
     /// Returns the rows so the caller can assert on individual
     /// fields.
+    /// Wait for a drift row on `path` with op `op` (others may come
+    /// first: a write is a setattr as well as a change of content).
+    fn wait_drift_op(&self, path: &str, op: u64) -> serde_json::Value {
+        let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
+        loop {
+            let rows = read_jsonl(&self.drift_log);
+            if let Some(row) = rows
+                .iter()
+                .find(|r| r["path"] == serde_json::json!(path) && r["op"].as_u64() == Some(op))
+            {
+                return row.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no drift row with op {op} on {path} within {DRIFT_POLL_TIMEOUT:?}; rows: {rows:?}"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     fn wait_drift(&self, n: usize) -> Vec<serde_json::Value> {
         let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
         while Instant::now() < deadline {
@@ -353,13 +374,15 @@ fn fim_baseline_then_modify_records_drift_event() {
     // Modify the watched file — the C8-wired drain MUST observe.
     std::fs::write(&fx.watched_file, b"tampered-content\n").expect("modify watched file");
 
-    let drift = fx.wait_drift(1);
-    let row = &drift[0];
-    assert_eq!(row["path"], serde_json::json!(watched_str));
-    let op = row["op"].as_u64().unwrap_or(0);
+    // External audit TST-004: the row asserted is the Modified one on the
+    // watched path (accepting an Opened row hid a real gap), and a read is
+    // never recorded as drift (BUG-012 v2).
+    let row = fx.wait_drift_op(&watched_str, OP_MODIFIED);
     assert!(
-        op == OP_MODIFIED || op == OP_OPENED,
-        "expected op MODIFIED({OP_MODIFIED}) or OPENED({OP_OPENED}), got {op}"
+        read_jsonl(&fx.drift_log)
+            .iter()
+            .all(|r| r["op"].as_u64() != Some(OP_OPENED)),
+        "a read is not drift"
     );
     // Modifier should be SOME process — the kernel fills it.
     // We don't pin the PID because writeback / fs internals can
@@ -371,6 +394,41 @@ fn fim_baseline_then_modify_records_drift_event() {
     // expected them (no orphan tempdir state).
     assert!(fx.fim_paths_v1.exists());
     assert!(fx.fim_paths_local.exists());
+}
+
+// ── Test 1b: chmod u+s, content unchanged → attribute drift ──────────
+
+/// External audit TST-004 (Wave 2): `chmod u+s` changes no byte of the
+/// file, and the drain dropped it as a no-op touch — a set-uid bit on a
+/// watched binary left no trace. It is recorded as `AttrChanged` with the
+/// mode before and after.
+#[test]
+fn fim_chmod_setuid_records_attribute_drift() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = FimFixture::setup("tool.bin", b"#!/bin/true\n");
+    fx.wait_baseline();
+    let watched_str = fx.watched_file.to_string_lossy().into_owned();
+    let before = std::fs::metadata(&fx.watched_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    std::fs::set_permissions(
+        &fx.watched_file,
+        std::fs::Permissions::from_mode(before | 0o4000),
+    )
+    .expect("chmod u+s");
+
+    let row = fx.wait_drift_op(&watched_str, OP_ATTR_CHANGED);
+    assert_eq!(row["attrs"]["mode_before"].as_u64(), Some(before as u64));
+    assert_eq!(
+        row["attrs"]["mode_after"].as_u64(),
+        Some((before | 0o4000) as u64)
+    );
+    assert_eq!(
+        row["baseline_sha256"], row["new_sha256"],
+        "the content did not change"
+    );
 }
 
 // ── Test 2: subprocess unlink → Deleted drift event ─────────────────

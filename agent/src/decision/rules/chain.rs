@@ -812,6 +812,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         })
     }
 
@@ -961,6 +962,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         });
         assert!(r.evaluate(&benign).is_none());
         assert!(

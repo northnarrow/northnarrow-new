@@ -6,6 +6,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, file integrity (Medium TST-004, FIMR-007, FIMR-008,
+  FIMR-009, FIMP-011): a change of a watched file's permissions, owner or
+  group is drift of its own — a set-uid bit, or write for others, on a
+  system binary is treated as a rewrite of it; `chmod o+r /etc/shadow` as
+  a change of it. sshd's `.ssh/authorized_keys2` and
+  `/etc/ssh/authorized_keys` are judged like `.ssh/authorized_keys`. The
+  control-surface files the agent re-creates at boot are watched at once
+  (after a reboot the runtime ones were not), restored without following
+  a link, and a removal within one boot is recorded in the signed audit
+  log. File monitoring that attached nothing is recorded there too.
 - External audit, Wave 1, kernel module loads (High PROC-005): a module file
   under /lib/modules that no package installed and DKMS did not build is no
   longer "standard": loaded by an unexpected loader it is killed like one

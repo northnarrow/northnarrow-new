@@ -77,8 +77,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
-    FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED,
-    FIM_RENAME_REPLACED,
+    FileAttrChange, FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_NAME_LEN,
+    FIM_CHILD_TRUNCATED, FIM_RENAME_REPLACED,
 };
 use common::Event;
 use serde::{Deserialize, Serialize};
@@ -261,6 +261,9 @@ impl DriftClassifier {
             // Review 86: a capability grant comes from the file-open
             // sensor, never from the drift ring; never throttled.
             FimOp::CapabilitySet => DriftSeverity::Critical,
+            // Wave 2 (TST-004): a permission or ownership change is
+            // rarer than a content change and as telling.
+            FimOp::AttrChanged => DriftSeverity::High,
             // C5.2: FimOp::Opened fires on every open of a
             // watched inode. Default to Medium so legitimate
             // periodic reads (cloud-CLI tools, monitoring
@@ -470,6 +473,11 @@ pub struct FimDriftPayload {
     #[serde(default)]
     pub skip_reason: String,
     pub agent_id: String,
+    /// Wave 2 (TST-004): mode, owner and group before and after, on an
+    /// [`FimOp::AttrChanged`] row. Absent on every other row, so a line
+    /// written before it existed serialises (and verifies) as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<FileAttrChange>,
 }
 
 /// Caller-supplied fields for [`FimDriftDb::append`].
@@ -485,6 +493,8 @@ pub struct FimDriftDraft {
     pub severity: DriftSeverity,
     pub decision_engine_skipped: bool,
     pub skip_reason: String,
+    /// Wave 2 (TST-004): see [`FimDriftPayload::attrs`].
+    pub attrs: Option<FileAttrChange>,
 }
 
 // ── drift DB (mirror BaselineDb) ───────────────────────────────────
@@ -549,6 +559,7 @@ impl FimDriftDb {
             decision_engine_skipped: draft.decision_engine_skipped,
             skip_reason: draft.skip_reason,
             agent_id: hex::encode(self.agent_id),
+            attrs: draft.attrs,
         };
         self.inner.append(payload)
     }
@@ -1065,6 +1076,7 @@ pub fn process_drift(
                 owner_uid: None,
                 reader_dac_capable: false,
                 capability: None,
+                attrs: None,
             }));
             return Ok(true);
         }
@@ -1082,20 +1094,38 @@ pub fn process_drift(
         FimOp::Deleted | FimOp::Renamed => None,
         _ => content_after(&path, raw.timestamp_ns),
     };
-    let new_sha256 = content.as_ref().map(|c| c.0.clone());
-    let new_size = content.as_ref().map(|c| c.1);
+    let new_sha256 = content.as_ref().map(|c| c.sha256.clone());
+    let new_size = content.as_ref().map(|c| c.size);
     let baseline_sha256 = last_baseline.map(|b| b.sha256.clone());
     let baseline_size = last_baseline.map(|b| b.size_bytes);
+
+    // Wave 2 (TST-004): the kernel reports a chmod or chown as Modified,
+    // and an unchanged hash used to drop it as a no-op below — `chmod u+s`
+    // on a watched binary, `chmod o+r /etc/shadow`, left no trace. The
+    // baseline holds the mode and ownership too: a change there is drift
+    // of its own.
+    let attrs = match (op, last_baseline, &content) {
+        (FimOp::Modified, Some(base), Some(now)) if base.sha256 == now.sha256 => {
+            attr_change(base, now)
+        }
+        _ => None,
+    };
+    let op = if attrs.is_some() {
+        FimOp::AttrChanged
+    } else {
+        op
+    };
 
     // Skip if SHA matches baseline (kernel hook fired but
     // content didn't actually change — e.g., `touch -t` on an
     // unchanged file). Deleted/Renamed always counts as drift
     // even if hashes are None on both sides (the file
     // disappeared — operator wants to know).
-    let real_drift = !matches!(
-        (&baseline_sha256, &new_sha256),
-        (Some(old), Some(new)) if old == new
-    );
+    let real_drift = attrs.is_some()
+        || !matches!(
+            (&baseline_sha256, &new_sha256),
+            (Some(old), Some(new)) if old == new
+        );
     // Polish #2 semantics: ONLY suppress no-op events for
     // content-class ops (Modified / Created / Linked). Deleted
     // + Renamed always emit (the file disappeared; operator
@@ -1142,6 +1172,7 @@ pub fn process_drift(
         severity,
         decision_engine_skipped: skipped,
         skip_reason: skip_reason.clone(),
+        attrs,
     };
     // External audit FIMP-006: evidence and detection are separate. A drift
     // log that cannot be written (disk full, a rotation or protection
@@ -1201,9 +1232,31 @@ pub fn process_drift(
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs,
         }));
     }
     Ok(true)
+}
+
+/// The mode, owner or group of `now` where they differ from `base`.
+fn attr_change(base: &BaselineEntry, now: &Content) -> Option<FileAttrChange> {
+    // A baseline row whose mode does not parse cannot be compared: no
+    // attribute drift is claimed from it.
+    let mode_before = parse_mode(&base.mode)?;
+    let change = FileAttrChange {
+        mode_before,
+        mode_after: now.mode,
+        uid_before: base.uid,
+        uid_after: now.uid,
+        gid_before: base.gid,
+        gid_after: now.gid,
+    };
+    (change.mode_before != change.mode_after || change.owner_changed()).then_some(change)
+}
+
+/// A baseline mode, `"0o4755"`.
+fn parse_mode(mode: &str) -> Option<u32> {
+    u32::from_str_radix(mode.strip_prefix("0o")?, 8).ok()
 }
 
 /// External audit FIMP-006: drift the agent detected but could not
@@ -1438,13 +1491,25 @@ const HASH_REUSE_MARGIN_NS: u64 = 50_000_000;
 #[derive(Clone)]
 struct Hashed {
     began_ns: u64,
-    /// SHA-256 (hex) and size of the file, `None` when it could not be read.
-    content: Option<(String, u64)>,
+    /// The file's content and attributes, `None` when it could not be read.
+    content: Option<Content>,
+}
+
+/// A watched file as the drain re-read it after an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Content {
+    /// SHA-256, lowercase hex.
+    sha256: String,
+    size: u64,
+    /// `st_mode & 0o7777`, owner and group (Wave 2, TST-004).
+    mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 /// The content of `path` as of an event at `event_ns`: the last hash when
 /// it began after the event, else a new one.
-fn content_after(path: &str, event_ns: u64) -> Option<(String, u64)> {
+fn content_after(path: &str, event_ns: u64) -> Option<Content> {
     if let Ok(cache) = HASHED.lock() {
         if let Some(h) = cache.as_ref().and_then(|c| c.get(path)) {
             if event_ns != 0 && event_ns + HASH_REUSE_MARGIN_NS <= h.began_ns {
@@ -1454,10 +1519,13 @@ fn content_after(path: &str, event_ns: u64) -> Option<(String, u64)> {
     }
     let began_ns = monotonic_ns();
     let content = match compute_baseline(Path::new(path)) {
-        Ok(drafts) => drafts
-            .into_iter()
-            .find(|d| !d.is_symlink)
-            .map(|d| (d.sha256, d.size_bytes)),
+        Ok(drafts) => drafts.into_iter().find(|d| !d.is_symlink).map(|d| Content {
+            mode: parse_mode(&d.mode).unwrap_or(0),
+            sha256: d.sha256,
+            size: d.size_bytes,
+            uid: d.uid,
+            gid: d.gid,
+        }),
         Err(e) => {
             debug!(
                 target: "fim.drain",
@@ -1789,6 +1857,82 @@ mod tests {
         assert!(ev.path.starts_with(&format!("{dir_str}/")));
     }
 
+    /// Wave 2 (TST-004): `chmod u+s` on a watched file leaves its content
+    /// as it was; the drain used to drop the event as a no-op touch. A
+    /// mode or owner that differs from the baseline is drift of its own;
+    /// the same mode and owner is still the no-op it was.
+    #[test]
+    fn a_mode_change_with_unchanged_content_is_attribute_drift() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            signing,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let file = dir.path().join("sshd");
+        std::fs::write(&file, b"ELF binary").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let drafts = compute_baseline(&file).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let mut baseline = dummy_baseline(&path, &drafts[0].sha256);
+        baseline.mode = "0o755".to_string();
+        baseline.uid = meta.uid();
+        baseline.gid = meta.gid();
+
+        let key = InodeKey {
+            dev: 0x1234,
+            ino: 77,
+        };
+        let path_map = InodePathMap::new();
+        path_map.insert(key, path.clone());
+        let raw = fake_raw(key.dev, key.ino, FimOp::Modified as u8);
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let run = |db: &mut FimDriftDb| {
+            let mut out: Vec<Event> = Vec::new();
+            let emitted = process_drift(
+                &raw,
+                &path_map,
+                Some(&baseline),
+                db,
+                &classifier,
+                &rate_limiter,
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            (emitted, out)
+        };
+
+        // touch: same content, same mode — the no-op it always was
+        let (emitted, out) = run(&mut drift_db);
+        assert!(!emitted && out.is_empty(), "an unchanged file is no drift");
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let (emitted, mut out) = run(&mut drift_db);
+        assert!(emitted, "a set-uid bit is drift");
+        let Event::Fim(ev) = out.remove(0) else {
+            panic!("expected Event::Fim")
+        };
+        assert_eq!(ev.op, FimOp::AttrChanged);
+        let attrs = ev.attrs.expect("what changed rides on the event");
+        assert_eq!((attrs.mode_before, attrs.mode_after), (0o755, 0o4755));
+        assert!(attrs.grants_privilege());
+        assert_eq!(ev.new_sha256, ev.baseline_sha256, "content unchanged");
+        // and on the signed row
+        let text = std::fs::read_to_string(dir.path().join("drift.jsonl")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(row["op"], FimOp::AttrChanged as u8);
+        assert_eq!(row["attrs"]["mode_after"], 0o4755);
+    }
+
     fn dummy_baseline(path: &str, sha256: &str) -> BaselineEntry {
         BaselineEntry {
             ts: "2026-05-19T00:00:00.000000Z".to_string(),
@@ -2042,6 +2186,7 @@ mod tests {
             severity: DriftSeverity::High,
             decision_engine_skipped: false,
             skip_reason: String::new(),
+            attrs: None,
         };
         // A real legacy v1 line — built + signed EXACTLY as the old writer did.
         let legacy = build_signed_drift_entry(&draft, &key, &agent_id, GENESIS_PREV_HASH).unwrap();
@@ -2062,6 +2207,7 @@ mod tests {
                 decision_engine_skipped: legacy.decision_engine_skipped,
                 skip_reason: legacy.skip_reason.clone(),
                 agent_id: legacy.agent_id.clone(),
+                attrs: None,
             },
             fmt_ver: None,
             prev_hash: legacy.prev_hash.clone(),
@@ -2312,11 +2458,11 @@ mod tests {
         assert_eq!(content_after(&p, old_event).unwrap(), first);
         // an event since: read again
         let now = content_after(&p, monotonic_ns()).unwrap();
-        assert_eq!(now.0, hex::encode(Sha256::digest(b"second")));
+        assert_eq!(now.sha256, hex::encode(Sha256::digest(b"second")));
         // within the margin: read again too (the hook fires before the change)
         std::fs::write(&f, b"third").unwrap();
         let recent = content_after(&p, monotonic_ns()).unwrap();
-        assert_eq!(recent.0, hex::encode(Sha256::digest(b"third")));
+        assert_eq!(recent.sha256, hex::encode(Sha256::digest(b"third")));
     }
 
     /// External audit FIMP-004: re-enrolling a path watches the inode it
@@ -2548,7 +2694,11 @@ mod tests {
         let mut h = Sha256::new();
         h.update(b"same content");
         let matching_sha = hex::encode(h.finalize());
-        let matching_baseline = dummy_baseline(&watched.to_string_lossy(), &matching_sha);
+        let mut matching_baseline = dummy_baseline(&watched.to_string_lossy(), &matching_sha);
+        // ... and the same mode and owner (Wave 2: those are compared too).
+        matching_baseline.mode = format!("0o{:o}", watched_meta.mode() & 0o7777);
+        matching_baseline.uid = watched_meta.uid();
+        matching_baseline.gid = watched_meta.gid();
 
         let classifier = DriftClassifier::new();
         let rate_limiter = DriftRateLimiter::new();

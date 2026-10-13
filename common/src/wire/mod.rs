@@ -855,6 +855,12 @@ pub const FIM_OP_OPENED: u8 = 6;
 /// file, by any route. Built in userland from the file-open sensor's
 /// `inode_post_setxattr` record; never sent by the FIM watch.
 pub const FIM_OP_CAPABILITY_SET: u8 = 7;
+/// Wave 2 (TST-004): a watched file's mode, owner or group changed while
+/// its content did not (`chmod u+s`, `chmod o+r /etc/shadow`, `chown`).
+/// The kernel reports such a setattr as [`FIM_OP_MODIFIED`]; userland
+/// tells it apart from a content change against the baseline. Never sent
+/// by the FIM watch.
+pub const FIM_OP_ATTR_CHANGED: u8 = 8;
 
 /// Tappa 9 (BUG-022) — max bytes of a created/renamed-in child's
 /// leaf name carried inline in [`FimDriftRaw::child_name`]. A NUL
@@ -1054,6 +1060,94 @@ pub struct FimEvent {
     /// [`FimOp::CapabilitySet`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<FileCapability>,
+    /// Wave 2 (TST-004): the mode, owner and group before and after, for
+    /// [`FimOp::AttrChanged`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<FileAttrChange>,
+}
+
+/// Wave 2 (TST-004): a watched file's permission bits and ownership, as
+/// the baseline recorded them and as they are now.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileAttrChange {
+    /// `st_mode & 0o7777` in the baseline.
+    pub mode_before: u32,
+    /// `st_mode & 0o7777` now.
+    pub mode_after: u32,
+    pub uid_before: u32,
+    pub uid_after: u32,
+    pub gid_before: u32,
+    pub gid_after: u32,
+}
+
+#[cfg(feature = "std")]
+impl FileAttrChange {
+    const SET_ID: u32 = 0o6000;
+    const GROUP_OTHER_WRITE: u32 = 0o022;
+    const GROUP_OTHER_READ: u32 = 0o044;
+
+    /// Permission bits set now that the baseline did not have.
+    pub fn gained(&self) -> u32 {
+        self.mode_after & !self.mode_before & 0o7777
+    }
+
+    pub fn owner_changed(&self) -> bool {
+        self.uid_after != self.uid_before || self.gid_after != self.gid_before
+    }
+
+    /// A change that gives someone a power over the file they did not
+    /// have: a set-uid/set-gid bit (it runs as its owner), write for group
+    /// or others (they can replace it), or a new owner or group.
+    pub fn grants_privilege(&self) -> bool {
+        self.gained() & (Self::SET_ID | Self::GROUP_OTHER_WRITE) != 0 || self.owner_changed()
+    }
+
+    /// A change that lets more users read the file: read for group or
+    /// others, or a new owner or group. What matters for a secret
+    /// (`/etc/shadow`), not for a binary.
+    pub fn exposes_content(&self) -> bool {
+        self.gained() & Self::GROUP_OTHER_READ != 0 || self.owner_changed()
+    }
+
+    /// `mode 0o755 -> 0o4755 (set-uid added), uid 0 -> 1000`, for a
+    /// verdict's reasoning.
+    pub fn describe(&self) -> alloc::string::String {
+        use alloc::format;
+        let mut parts = alloc::vec::Vec::new();
+        if self.mode_before != self.mode_after {
+            let gained = self.gained();
+            let mut what = alloc::vec::Vec::new();
+            if gained & 0o4000 != 0 {
+                what.push("set-uid added");
+            }
+            if gained & 0o2000 != 0 {
+                what.push("set-gid added");
+            }
+            if gained & Self::GROUP_OTHER_WRITE != 0 {
+                what.push("writable by group/others");
+            }
+            if gained & Self::GROUP_OTHER_READ != 0 {
+                what.push("readable by group/others");
+            }
+            let note = if what.is_empty() {
+                alloc::string::String::new()
+            } else {
+                format!(" ({})", what.join(", "))
+            };
+            parts.push(format!(
+                "mode 0o{:o} -> 0o{:o}{note}",
+                self.mode_before, self.mode_after
+            ));
+        }
+        if self.uid_before != self.uid_after {
+            parts.push(format!("uid {} -> {}", self.uid_before, self.uid_after));
+        }
+        if self.gid_before != self.gid_after {
+            parts.push(format!("gid {} -> {}", self.gid_before, self.gid_after));
+        }
+        parts.join(", ")
+    }
 }
 
 /// Review 86: a file capability as the kernel stored it.
@@ -1094,6 +1188,9 @@ pub enum FimOp {
     Opened = FIM_OP_OPENED,
     /// Review 86: a file capability set on the file.
     CapabilitySet = FIM_OP_CAPABILITY_SET,
+    /// Wave 2 (TST-004): mode, owner or group changed, content unchanged;
+    /// what changed is in [`FimEvent::attrs`].
+    AttrChanged = FIM_OP_ATTR_CHANGED,
 }
 
 #[cfg(feature = "std")]
@@ -1115,6 +1212,7 @@ impl core::convert::TryFrom<u8> for FimOp {
             FIM_OP_LINKED => Ok(Self::Linked),
             FIM_OP_OPENED => Ok(Self::Opened),
             FIM_OP_CAPABILITY_SET => Ok(Self::CapabilitySet),
+            FIM_OP_ATTR_CHANGED => Ok(Self::AttrChanged),
             other => Err(FimOpDecodeError::UnknownByte(other)),
         }
     }
@@ -1534,6 +1632,8 @@ mod tests {
         assert_eq!(FIM_OP_LINKED, 5);
         assert_eq!(FIM_OP_OPENED, 6);
         assert_eq!(FIM_OP_CAPABILITY_SET, 7);
+        assert_eq!(FIM_OP_ATTR_CHANGED, 8);
+        assert_eq!(FimOp::AttrChanged as u8, FIM_OP_ATTR_CHANGED);
     }
 
     /// C1 test #4: [`FimOp`] try_from round-trip + unknown-byte
@@ -1551,6 +1651,7 @@ mod tests {
             FimOp::Linked,
             FimOp::Opened,
             FimOp::CapabilitySet,
+            FimOp::AttrChanged,
         ] {
             let byte: u8 = op.into();
             let round: FimOp = FimOp::try_from(byte).expect("known byte must decode");
@@ -1592,6 +1693,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1657,6 +1759,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

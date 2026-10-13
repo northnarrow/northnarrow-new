@@ -15,10 +15,19 @@
 //! carry "honeypot/decoy/canary/bait/trap" — an attacker reading these
 //! on a compromised host must see only plausible NN control config.
 
-use std::io;
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use crate::fim::rules::HONEYPOT_PATHS;
+
+/// A bait's mode, as `deploy/install.sh` writes it: readable, so that a
+/// look at it is plausible; root's to change.
+const BAIT_MODE: u32 = 0o644;
+/// A missing bait directory (the tmpfs `/run/northnarrow` outside
+/// systemd) is created as systemd's `RuntimeDirectoryMode` would.
+const BAIT_DIR_MODE: u32 = 0o700;
 
 macro_rules! bait {
     ($name:literal) => {
@@ -61,13 +70,28 @@ pub struct HoneypotIntegrityReport {
     /// failure here does not abort the sweep — the remaining baits are
     /// still restored.
     pub failed: Vec<String>,
+    /// External audit FIMR-009: paths that held something other than a
+    /// regular file — a symlink (it made the bait "present" while the
+    /// watch landed on the link, and a write through it went unseen), a
+    /// FIFO, a directory. Each was removed and re-created, so it is also
+    /// in `recreated` (or `failed`).
+    pub replaced: Vec<String>,
 }
 
 impl HoneypotIntegrityReport {
     /// `true` when every bait was already on disk (nothing recreated,
     /// nothing failed).
     pub fn all_present(&self) -> bool {
-        self.recreated.is_empty() && self.failed.is_empty()
+        self.recreated.is_empty() && self.failed.is_empty() && self.replaced.is_empty()
+    }
+
+    /// External audit FIMR-008: only the tmpfs baits under `/run` went
+    /// missing, after a reboot — their expected state on every boot.
+    pub fn only_volatile_after_reboot(&self, rebooted: bool) -> bool {
+        rebooted
+            && self.failed.is_empty()
+            && self.replaced.is_empty()
+            && self.recreated.iter().all(|p| p.starts_with("/run/"))
     }
 }
 
@@ -94,19 +118,39 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
     let mut present = 0;
     let mut recreated = Vec::new();
     let mut failed = Vec::new();
+    let mut replaced = Vec::new();
     for (path, content) in items {
         total += 1;
-        if Path::new(path).exists() {
-            present += 1;
-            continue;
-        }
-        let restored = (|| -> io::Result<()> {
-            if let Some(parent) = Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
+        let p = Path::new(path);
+        // External audit FIMR-009: judged without following a link. A link
+        // to an existing file was "present", and the restore wrote through
+        // a dangling one.
+        match fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_file() => {
+                present += 1;
+                continue;
             }
-            std::fs::write(path, content)
-        })();
-        match restored {
+            Ok(m) => {
+                replaced.push(path.to_string());
+                // Removes the link itself (or an empty directory), never
+                // what it points to.
+                let removed = if m.is_dir() {
+                    fs::remove_dir(p)
+                } else {
+                    fs::remove_file(p)
+                };
+                if removed.is_err() {
+                    failed.push(path.to_string());
+                    continue;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                failed.push(path.to_string());
+                continue;
+            }
+        }
+        match create_bait(p, content) {
             Ok(()) => recreated.push(path.to_string()),
             Err(_) => failed.push(path.to_string()),
         }
@@ -116,7 +160,71 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
         present,
         recreated,
         failed,
+        replaced,
     }
+}
+
+/// Create `path` exclusively — never through a link, never over what
+/// appeared since the check — with `content` and [`BAIT_MODE`]. A missing
+/// parent is created at [`BAIT_DIR_MODE`]; an existing one keeps its mode.
+fn create_bait(path: &Path, content: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && fs::symlink_metadata(parent).is_err() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(BAIT_DIR_MODE)
+                .create(parent)?;
+        }
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(BAIT_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    f.write_all(content.as_bytes())?;
+    // The umask may have narrowed the mode at creation.
+    f.set_permissions(fs::Permissions::from_mode(BAIT_MODE))
+}
+
+/// External audit FIMR-008: the file in the state directory holding the
+/// kernel boot id the agent last ran under.
+pub const BOOT_ID_FILE: &str = "last_boot_id";
+
+/// The kernel's boot id, `None` when it cannot be read.
+pub fn current_boot_id() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// External audit FIMR-008: whether the host rebooted since the agent last
+/// ran — `now` against the boot id recorded in `state_dir`. No record
+/// (first run, an unreadable one) counts as a reboot: the `/run` baits are
+/// then missing as after one.
+pub fn boot_changed(state_dir: &Path, now: &str) -> bool {
+    fs::read_to_string(state_dir.join(BOOT_ID_FILE)).map_or(true, |last| last.trim() != now)
+}
+
+/// Record `now` in `state_dir`: a temporary created exclusively, then
+/// renamed over — a link planted at either name is replaced, never written
+/// through. The caller lifts the directory's immutability around it.
+pub fn write_boot_id(state_dir: &Path, now: &str) -> io::Result<()> {
+    let file = state_dir.join(BOOT_ID_FILE);
+    let tmp = state_dir.join(format!("{BOOT_ID_FILE}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(format!("{now}\n").as_bytes()))
+        .and_then(|()| fs::rename(&tmp, &file));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -197,6 +305,105 @@ mod tests {
                 "leaky term {b:?} in deployed fim-paths.v1"
             );
         }
+    }
+
+    /// External audit FIMR-009: a link where a bait belongs made it
+    /// "present"; it is replaced, and what it pointed to is left alone.
+    #[test]
+    fn restore_replaces_a_symlinked_bait_and_leaves_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "THEIRS").unwrap();
+        let bait = dir.path().join("pause.flag");
+        std::os::unix::fs::symlink(&target, &bait).unwrap();
+        let bp = bait.to_str().unwrap();
+        let rep = restore_paths([(bp, "BAIT")].into_iter());
+        assert_eq!(rep.replaced, vec![bp.to_string()]);
+        assert_eq!(rep.recreated, vec![bp.to_string()]);
+        assert!(!rep.all_present());
+        assert!(std::fs::symlink_metadata(&bait)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(std::fs::read_to_string(&bait).unwrap(), "BAIT");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "THEIRS");
+    }
+
+    #[test]
+    fn restore_never_creates_through_a_dangling_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("would-be-created");
+        let bait = dir.path().join("unload.signal");
+        std::os::unix::fs::symlink(&target, &bait).unwrap();
+        let bp = bait.to_str().unwrap();
+        let rep = restore_paths([(bp, "BAIT")].into_iter());
+        assert_eq!(rep.replaced, vec![bp.to_string()]);
+        assert!(!target.exists(), "nothing written where the link pointed");
+        assert_eq!(std::fs::read_to_string(&bait).unwrap(), "BAIT");
+    }
+
+    #[test]
+    fn restored_bait_is_0644_and_existing_dirs_keep_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o751)).unwrap();
+        let bait = dir.path().join("kill_switch.conf");
+        let fresh = dir.path().join("run/pause.flag");
+        let (bp, fp) = (bait.to_str().unwrap(), fresh.to_str().unwrap());
+        let rep = restore_paths([(bp, "A"), (fp, "B")].into_iter());
+        assert_eq!(rep.recreated.len(), 2);
+        let mode =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&bait), 0o644);
+        assert_eq!(mode(&fresh), 0o644);
+        assert_eq!(
+            mode(dir.path()),
+            0o751,
+            "an existing directory is not chmodded"
+        );
+        assert_eq!(
+            mode(&dir.path().join("run")),
+            0o700,
+            "a missing one is created closed"
+        );
+    }
+
+    /// External audit FIMR-008: the `/run` baits are gone after every
+    /// reboot; the boot id tells that from a deletion within one boot.
+    #[test]
+    fn a_reboot_is_told_from_a_restart_by_the_boot_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert!(boot_changed(d, "aaaa"), "no record: as after a reboot");
+        write_boot_id(d, "aaaa").unwrap();
+        assert!(!boot_changed(d, "aaaa"), "same boot: a restart");
+        assert!(boot_changed(d, "bbbb"), "new boot id: a reboot");
+        // a link planted at the record's name is replaced, not followed
+        let victim = d.join("victim");
+        std::fs::write(&victim, "KEEP").unwrap();
+        std::fs::remove_file(d.join(BOOT_ID_FILE)).unwrap();
+        std::os::unix::fs::symlink(&victim, d.join(BOOT_ID_FILE)).unwrap();
+        write_boot_id(d, "cccc").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "KEEP");
+        assert!(!boot_changed(d, "cccc"));
+
+        let rep = |recreated: &[&str]| HoneypotIntegrityReport {
+            total: 10,
+            present: 10 - recreated.len(),
+            recreated: recreated.iter().map(|s| s.to_string()).collect(),
+            failed: Vec::new(),
+            replaced: Vec::new(),
+        };
+        let volatile = rep(&[
+            "/run/northnarrow/pause.flag",
+            "/run/northnarrow/unload.signal",
+        ]);
+        assert!(volatile.only_volatile_after_reboot(true));
+        assert!(
+            !volatile.only_volatile_after_reboot(false),
+            "same boot: deleted"
+        );
+        assert!(!rep(&["/etc/northnarrow/kill_switch.conf"]).only_volatile_after_reboot(true));
     }
 
     #[test]

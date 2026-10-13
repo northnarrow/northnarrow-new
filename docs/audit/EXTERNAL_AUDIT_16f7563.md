@@ -159,14 +159,14 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-113 | EVD-012 | Evidence logs | S | open |
 | NN-AUD-114 | EVD-013 | Evidence logs | M | open |
 | NN-AUD-115 | EVD-018 | Evidence logs | S | open |
-| NN-AUD-116 | FIMR-007 | FIM rules | S | open |
-| NN-AUD-117 | FIMR-008 | FIM rules | M | open |
-| NN-AUD-118 | FIMR-009 | FIM rules | S | open |
+| NN-AUD-116 | FIMR-007 | FIM rules | S | fixed (lab PR 111) |
+| NN-AUD-117 | FIMR-008 | FIM rules | M | fixed (lab PR 111) |
+| NN-AUD-118 | FIMR-009 | FIM rules | S | fixed (lab PR 111) |
 | NN-AUD-119 | FIMP-007 | FIM pipeline | S | open |
 | NN-AUD-120 | FIMP-008 | FIM pipeline | M | open |
 | NN-AUD-121 | FIMP-009 | FIM pipeline | M | open |
 | NN-AUD-122 | FIMP-010 | FIM pipeline | M | open |
-| NN-AUD-123 | FIMP-011 | FIM pipeline | S | open |
+| NN-AUD-123 | FIMP-011 | FIM pipeline | S | fixed (lab PR 111) |
 | NN-AUD-124 | NETR-004 | Net rules | S | open |
 | NN-AUD-125 | NETR-005 | Net rules | M | open |
 | NN-AUD-126 | NETR-006 | Net rules | S | open |
@@ -269,7 +269,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-223 | LAB-018 | Lab scripts | S | open |
 | NN-AUD-224 | TST-001 | Privileged tests | M | open |
 | NN-AUD-225 | TST-002 | Privileged tests | S | open |
-| NN-AUD-226 | TST-004 | Privileged tests | S | open |
+| NN-AUD-226 | TST-004 | Privileged tests | S | fixed (lab PR 111) |
 | NN-AUD-227 | TST-005 | Privileged tests | M | open |
 | NN-AUD-228 | TST-006 | Privileged tests | M | open |
 | NN-AUD-229 | TST-008 | Privileged tests | S | open |
@@ -1613,3 +1613,70 @@ the audit did not report, noted with the fix that takes them.
     `/sys/module/<name>/taint` shows an unsigned (`E`) or out-of-tree (`O`)
     module. That check, and denying the load at the hook (BUG-037), are not
     done here.
+- **NN-AUD-226 (TST-004), NN-AUD-116 (FIMR-007), NN-AUD-117 (FIMR-008),
+  NN-AUD-118 (FIMR-009), NN-AUD-123 (FIMP-011), lab PR 111.** Blind spots
+  of the FIM.
+  - TST-004's test accepted an `Opened` row for a `Modified` one; behind it
+    was a real gap: the drain dropped any `Modified` event whose content
+    hash matched the baseline, and the kernel reports a `chmod`/`chown` as
+    `Modified`. A set-uid bit on a watched binary, `chmod o+r
+    /etc/shadow`, a new owner: no trace. The baseline records mode, owner
+    and group; a difference there is now drift of its own,
+    `FimOp::AttrChanged` (wire byte 8, built in userland), with the values
+    before and after on the event and on the signed row (`attrs`, absent
+    on every other row, so older lines verify as they did).
+    NN-L-FIM-001 kills on a system binary given power it did not have — a
+    set-id bit, write for group/others, a new owner — and records one that
+    only loses it (`chmod u-s` is a hardening step); NN-L-FIM-003 fires on
+    a sensitive config made readable or writable by more users or given a
+    new owner; NN-L-FIM-004 on a key file given to another owner;
+    NN-L-FIM-024 on any change of a bait. The e2e asserts the `Modified`
+    row on the watched path and adds `fim_chmod_setuid_records_attribute_drift`.
+  - FIMR-007: NN-L-FIM-004 matched only `.ssh/authorized_keys`; sshd's
+    built-in `AuthorizedKeysFile` also reads `.ssh/authorized_keys2`, and
+    the shipped watch list covers `/etc/ssh/authorized_keys`. It now
+    matches both, the `/etc/ssh/authorized_keys/<user>` form, and a key
+    file created in a watched directory.
+  - FIMR-008: the boot sweep re-creates missing baits after the watch set
+    is built, and nothing enrolled them: after every reboot the tmpfs pair
+    under `/run/northnarrow` was unwatched until the agent restarted.
+    Re-created baits are watched at once. The kernel's boot id, recorded
+    in the state directory, tells the expected case (the `/run` pair after
+    a reboot: INFO) from a bait removed within a boot or a persistent one
+    (WARN and a signed `bait_missing_at_boot` record).
+  - FIMR-009: the sweep judged a bait by following links and restored it
+    with `fs::write`. It now looks at the entry itself: a link or another
+    type is replaced (the link removed, never its target), a bait is
+    created exclusively with `O_NOFOLLOW`, mode 0644; only a missing
+    directory is created (0700).
+  - FIMP-011: a FIM that attached no observer (no `bpf` in `lsm=`, no
+    BTF), or watches none of a non-empty list, said so in an INFO line.
+    It is now an ERROR and a signed `subsystem_degraded` record; a partial
+    attach names the shortfall.
+  - Lab, Ubuntu 24.04 (6.8). Before: `chmod u+s /usr/sbin/sshd` (a copy of
+    `chmod`) — nothing; a key appended to `/root/.ssh/authorized_keys2`
+    (created before the agent started) — a drift row only; after a
+    reboot, a WARN "Medium" at every boot, and `rm
+    /run/northnarrow/pause.flag` as root — nothing. After: an
+    `AttrChanged` row (`0o755` → `0o4755`, same hash) and NN-L-FIM-001
+    Critical; restoring the mode — nothing (back to the baseline);
+    NN-L-FIM-004 on the key; after a reboot an INFO "the runtime pair
+    re-created after a reboot", and NN-L-FIM-024 Critical on the `rm`; the
+    same bait removed and the agent restarted within one boot — a WARN and
+    a signed `bait_missing_at_boot` record (`rebooted: false`). FIMP-011
+    is unit-tested (it needs a kernel without `bpf` in `lsm=`).
+  - Found on the way: the state directory is `chattr +i`, so the boot id
+    is written through the same protection the log rotation uses, and
+    registered as a protected inode.
+  - Found on the way: the lab gate (`nn-lab.sh test-ignored`) runs the
+    `#[ignore]`d tests, and the FIM e2e suite and six admin e2e tests
+    (force-combat/unlock, a wrong key, status, the signed shutdown, key
+    rotation, audit verify) are gated by the feature alone: they never
+    ran in the gate. They now do, on their own pass. One of them,
+    `audit_verify_e2e`, had gone stale: it counted the audit entries, and
+    the agent now attests what it finds on the host (external audit
+    MAIN-003 — on a lab guest, the installed agent's FIM baseline signed
+    by another key); it checks the admin operations in order instead.
+  - Privileged gate: Ubuntu 24.04 (6.8) 29 suites, 74 passed; Ubuntu
+    22.04 (5.15) 73 passed, the one failure `audit_verify_e2e` before
+    that fix.
