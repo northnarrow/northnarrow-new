@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, LLM (Critical LLMP-002, High LLMP-001,
+  LLMR-001, LLMR-006):
+  - The correlated events reached the model raw, inside the prompt's
+    trusted block, and a line break in a file name could forge a prompt
+    section. They are now sanitized and untrusted, and every untrusted
+    string is printed as a JSON string.
+  - Model output with a multi-byte character at byte 4096 crashed the
+    agent when an escalation kept it.
+  - A low-confidence `KillTree` ran because the verifier answered
+    "inconclusive". Below its floor every destructive action is refused,
+    and an inconclusive check escalates.
 - External audit, Wave 0, PROC-001 (Critical): a fileless (memfd)
   exec escaped R004 when its parent named itself `systemd` and its
   `argv[0]` ended in `/systemd-executor`. With the exec sensor's

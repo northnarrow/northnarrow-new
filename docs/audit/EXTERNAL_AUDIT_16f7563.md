@@ -28,7 +28,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 |---|---|---|---|---|---|
 | NN-AUD-001 | PROC-001 | Critical | Process rules | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs` | fixed (lab PR 79) |
 | NN-AUD-002 | POS-001 | Critical | Posture | `agent/src/posture/mod.rs` | open |
-| NN-AUD-003 | LLMP-002 | Critical | LLM prompts | `agent/src/ade/structured_prompt.rs` | open |
+| NN-AUD-003 | LLMP-002 | Critical | LLM prompts | `agent/src/ade/structured_prompt.rs` | fixed (lab PR 81) |
 | NN-AUD-004 | LLMR-002 | Critical | LLM runtime | `agent/src/ade/mod.rs` | open |
 | NN-AUD-005 | NET-001 | Critical | Network | `agent/src/net/blocklist.rs` | fixed (lab PR 78) |
 | NN-AUD-006 | NET-010 | Critical | Network | `configs/netflow-comm-allowlist.v1` | fixed (lab PR 78) |
@@ -40,9 +40,9 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-035 | NETR-001 | High | Net rules | `agent/src/decision/rules/chain.rs` | open |
 | NN-AUD-047 | CMB-002 | High | Combat response | `agent/src/combat/actuator.rs` | open |
 | NN-AUD-049 | CMB-005 | High | Combat response | `agent/src/response/executor.rs` | open |
-| NN-AUD-051 | LLMP-001 | High | LLM prompts | `agent/src/ade/sanitize.rs` | open |
-| NN-AUD-052 | LLMR-001 | High | LLM runtime | `agent/src/ade/escalate.rs` | open |
-| NN-AUD-054 | LLMR-006 | High | LLM runtime | `agent/src/ade/dual_verify.rs` | open |
+| NN-AUD-051 | LLMP-001 | High | LLM prompts | `agent/src/ade/sanitize.rs` | fixed (lab PR 81) |
+| NN-AUD-052 | LLMR-001 | High | LLM runtime | `agent/src/ade/escalate.rs` | fixed (lab PR 81) |
+| NN-AUD-054 | LLMR-006 | High | LLM runtime | `agent/src/ade/dual_verify.rs` | fixed (lab PR 81) |
 | NN-AUD-056 | NET-002 | High | Network | `agent/src/net/blocklist.rs` | fixed (lab PR 78) |
 | NN-AUD-059 | NET-005 | High | Network | `agent/src/net/dns_cache.rs` | fixed (lab PR 78) |
 | NN-AUD-060 | NET-011 | High | Network | `configs/netflow-blocklist.v1` | fixed (lab PR 78) |
@@ -110,3 +110,34 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     `argv[0]` set to the executor's path, drew R004 (KillProcessTree)
     and was killed. Ubuntu 22.04: the same forged exec was killed;
     before, it was exempt.
+- **NN-AUD-003 (LLMP-002) and NN-AUD-051 (LLMP-001), lab PR 81.** The
+  model read up to twenty correlated events, raw, inside the block the
+  prompt calls trusted and immutable. Their names, paths and DNS queries
+  are chosen by the processes observed. A LF, CR or TAB in a file name
+  also passed the sanitizer, and a single LF could close the untrusted
+  block and open a forged one.
+  - The correlated events are sanitized like the focal one and printed
+    in their own untrusted block, newest first, capped at 4 KiB. An
+    event whose own score would have kept it from the model is left out
+    and counted in the prompt.
+  - Every untrusted string is printed as a JSON string literal, so no
+    value can end its line. TAB, LF and CR count as non-printable. The
+    prompt's section delimiter (`===`) inside an untrusted string is
+    broken up and raises its own flag.
+  - The sanity check weighs the correlated events' injection score with
+    the focal event's.
+- **NN-AUD-052 (LLMR-001), lab PR 81.** The raw model output kept in an
+  escalation was cut at byte 4096 with a slice. A multi-byte character
+  across the cut panicked, and with `panic = "abort"` that stopped the
+  agent. The cut now falls on a character boundary.
+- **NN-AUD-054 (LLMR-006), lab PR 81.** Below its confidence floor a
+  `KillTree` came back `Inconclusive`, which the engine executed, while
+  a `Kill` at the same confidence was refused. Below the floor every
+  destructive action is now refused (KillTree 0.85, Kill and Quarantine
+  0.70, BlockNetwork and Throttle 0.60), and an `Inconclusive` from any
+  verifier is escalated, never executed.
+- **Lab, for the LLM fixes (PR 81).** The lab guests carry no model (the
+  8B GGUF does not fit the guests' memory and CPU budget), so ADE runs in
+  rule-only mode there. The prompt builder, the sanitizer and the
+  verifier are pure code; they are covered by unit tests and by
+  end-to-end `evaluate` tests over scripted backends.

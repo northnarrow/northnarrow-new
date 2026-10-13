@@ -16,12 +16,14 @@
 //! - `Isolate` requires `severity == Critical` (already part of the
 //!   schema, but doubled-up here so a malformed verdict that slipped
 //!   the parser still gets caught),
-//! - `KillTree` and `Quarantine` need a confidence floor.
+//! - every destructive action needs a confidence floor, higher for the
+//!   more destructive ones (`KillTree` above `Kill`).
 //!
 //! When the deterministic check rejects, the engine swaps the
-//! verdict for an Escalate Tier3Review. When it returns
-//! `Inconclusive`, the engine keeps the verdict but stamps a flag
-//! into metadata (handled by the caller).
+//! verdict for an Escalate Tier3Review. External audit LLMR-006: an
+//! `Inconclusive` result is no permission either — the engine escalates
+//! it the same way. (It used to keep the verdict, so a `KillTree` at
+//! confidence 0.10 ran while a `Kill` at 0.69 was refused.)
 
 use common::ade_types::{AdeAction, AdeSeverity, AdeVerdict};
 use common::Event;
@@ -88,13 +90,18 @@ impl CriticalActionVerifier for DeterministicVerifier {
                         ),
                     };
                 }
-                if matches!(verdict.verdict, AdeAction::KillTree) && verdict.confidence < 0.85 {
-                    return VerificationResult::Inconclusive;
-                }
-                if verdict.confidence < 0.70 {
+                // External audit LLMR-006: a whole process tree needs more
+                // confidence than one process, and below the floor the
+                // answer is no — not "inconclusive", which ran it.
+                let floor = if matches!(verdict.verdict, AdeAction::KillTree) {
+                    0.85
+                } else {
+                    0.70
+                };
+                if verdict.confidence < floor {
                     return VerificationResult::Rejected {
                         reason: format!(
-                            "{} requires confidence ≥ 0.70 (got {:.2})",
+                            "{} requires confidence ≥ {floor:.2} (got {:.2})",
                             verdict.verdict, verdict.confidence
                         ),
                     };
@@ -132,8 +139,14 @@ impl CriticalActionVerifier for DeterministicVerifier {
                 VerificationResult::Confirmed
             }
             AdeAction::BlockNetwork | AdeAction::Throttle => {
+                // External audit LLMR-006: rejected below the floor.
                 if verdict.confidence < 0.60 {
-                    return VerificationResult::Inconclusive;
+                    return VerificationResult::Rejected {
+                        reason: format!(
+                            "{} requires confidence ≥ 0.60 (got {:.2})",
+                            verdict.verdict, verdict.confidence
+                        ),
+                    };
                 }
                 VerificationResult::Confirmed
             }
@@ -286,10 +299,28 @@ mod tests {
         assert!(matches!(r, VerificationResult::Rejected { .. }));
     }
 
+    /// External audit LLMR-006: below its floor a `KillTree` is refused —
+    /// it used to come back `Inconclusive` and run, while a `Kill` at the
+    /// same confidence was refused.
     #[test]
-    fn killtree_with_borderline_conf_is_inconclusive() {
-        let v = baseline(AdeAction::KillTree, AdeSeverity::High, 0.78);
+    fn killtree_below_floor_is_rejected() {
+        for conf in [0.78, 0.10] {
+            let v = baseline(AdeAction::KillTree, AdeSeverity::High, conf);
+            let r = DeterministicVerifier.verify(&v, &spawn(4242));
+            assert!(matches!(r, VerificationResult::Rejected { .. }), "{conf}");
+        }
+        let v = baseline(AdeAction::KillTree, AdeSeverity::High, 0.90);
         let r = DeterministicVerifier.verify(&v, &spawn(4242));
-        assert!(matches!(r, VerificationResult::Inconclusive));
+        assert!(matches!(r, VerificationResult::Confirmed));
+    }
+
+    /// External audit LLMR-006: the same for network blocking.
+    #[test]
+    fn block_network_below_floor_is_rejected() {
+        for action in [AdeAction::BlockNetwork, AdeAction::Throttle] {
+            let v = baseline(action, AdeSeverity::High, 0.0);
+            let r = DeterministicVerifier.verify(&v, &spawn(4242));
+            assert!(matches!(r, VerificationResult::Rejected { .. }), "{action}");
+        }
     }
 }
