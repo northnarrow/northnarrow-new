@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, DNS (High NET-004, EBPF-006): the cache of recent
+  DNS queries is bounded in total (about 20 MiB at worst; it could grow
+  past a gigabyte); a flood evicts the flooder's queries first. The DNS
+  sensor's degraded mode (query names read from the sender's memory, on
+  kernels where the socket-buffer programs cannot attach) is recorded in
+  the signed audit log.
 - External audit, Wave 1, a second network isolation (High CMB-006): an ADE
   `Isolate` verdict no longer cuts the host off the network through an
   nftables blackout of its own (no management carve-out, no release, not
