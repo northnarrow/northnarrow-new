@@ -1154,22 +1154,38 @@ fn audit_verify_e2e() {
         .output()
         .expect("spawn nn-admin rotate-keys add");
 
-    // Audit log should now have 4 entries: the boot-time `agent_boot`
-    // write probe (etc-readonly-audit-1) + unlock success + unlock
-    // failure + rotate_keys_add success. Verify chain integrity via
-    // the CLI.
+    // The audit log holds the boot-time `agent_boot` write probe
+    // (etc-readonly-audit-1), unlock success, unlock failure and
+    // rotate_keys_add success — and whatever the agent attests about the
+    // host it found (`integrity_drift`, external audit MAIN-003: on a lab
+    // guest, the installed agent's FIM baseline, signed by another key).
+    // Verify chain integrity via the CLI.
     let audit_body = std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable");
-    let entry_count = audit_body.lines().filter(|l| !l.is_empty()).count();
+    let entries: Vec<serde_json::Value> = audit_body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
+        .collect();
+    let ops: Vec<(String, String)> = entries
+        .iter()
+        .filter(|e| e["op"] != "integrity_drift")
+        .map(|e| {
+            (
+                e["op"].as_str().unwrap_or_default().to_string(),
+                e["result"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let ops: Vec<(&str, &str)> = ops.iter().map(|(o, r)| (o.as_str(), r.as_str())).collect();
     assert_eq!(
-        entry_count, 4,
-        "audit log should have exactly 4 entries (agent_boot + 3 admin ops): {audit_body}"
-    );
-    assert!(
-        audit_body
-            .lines()
-            .next()
-            .is_some_and(|first| first.contains("\"op\":\"agent_boot\"")),
-        "first audit entry must be the boot probe: {audit_body}"
+        ops,
+        [
+            ("agent_boot", "success"),
+            ("unlock", "success"),
+            ("unlock", "failure: invalid_signature"),
+            ("rotate_keys_add", "success"),
+        ],
+        "the boot probe, then the three admin ops: {audit_body}"
     );
 
     let out = Command::new(&paths.nn_admin_path)
@@ -1191,7 +1207,7 @@ fn audit_verify_e2e() {
     );
     let body = String::from_utf8_lossy(&out.stdout);
     assert!(
-        body.contains("4 entries") && body.contains("intact"),
+        body.contains(&format!("{} entries", entries.len())) && body.contains("intact"),
         "audit verify output unexpected: {body}"
     );
 }

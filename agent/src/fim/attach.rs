@@ -125,6 +125,37 @@ fn chain_tail(e: &anyhow::Error) -> String {
     )
 }
 
+/// External audit FIMP-011: what the FIM cannot see this boot, in a
+/// sentence for the signed audit chain; `None` when it sees what it was
+/// configured to. No observer attached (a kernel without `bpf` in its
+/// `lsm=` list, no BTF) or an empty watch set from a non-empty list means
+/// no file change is seen at all; some observers missing means some kinds
+/// of change are not.
+pub fn coverage_shortfall(
+    attached: usize,
+    programs: usize,
+    watched: usize,
+    configured: usize,
+) -> Option<String> {
+    if attached == 0 {
+        return Some(format!(
+            "fim: 0/{programs} observe programs attached — no file change is seen this boot"
+        ));
+    }
+    if watched == 0 && configured > 0 {
+        return Some(format!(
+            "fim: none of the {configured} configured paths could be watched — no file \
+             change is seen this boot"
+        ));
+    }
+    (attached < programs).then(|| {
+        format!(
+            "fim: {attached}/{programs} observe programs attached — some kinds of file \
+             change are not seen this boot"
+        )
+    })
+}
+
 /// Attach the six FIM observe programs via [`attach_transient`].
 /// Each program is loaded against its hook (the BTF lookup
 /// produces the verifier-required type info) and attached;
@@ -498,6 +529,23 @@ pub fn key_for_path(path: &Path) -> Result<InodeKey> {
 
 #[cfg(test)]
 mod tests {
+    use super::coverage_shortfall;
+
+    /// External audit FIMP-011.
+    #[test]
+    fn a_fim_that_sees_nothing_says_so() {
+        assert!(coverage_shortfall(0, 10, 0, 125)
+            .unwrap()
+            .contains("0/10 observe programs"));
+        assert!(coverage_shortfall(10, 10, 0, 125)
+            .unwrap()
+            .contains("none of the 125 configured paths"));
+        assert!(coverage_shortfall(7, 10, 90, 125).unwrap().contains("7/10"));
+        assert_eq!(coverage_shortfall(10, 10, 90, 125), None);
+        // an empty list was attested where it was loaded (FIMR-001)
+        assert_eq!(coverage_shortfall(10, 10, 0, 0), None);
+    }
+
     use super::*;
 
     /// C8 test: the 6-program list is anchored — order matters for

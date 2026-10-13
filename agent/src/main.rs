@@ -2392,6 +2392,18 @@ async fn main() -> Result<()> {
                         Arc::new(InodePathMap::new())
                     }
                 };
+                // External audit FIMP-011: a FIM that attached no observer, or
+                // watches nothing, sees no file change at all. Said in the
+                // signed audit chain, not only in an INFO among the boot lines.
+                if let Some(shortfall) = northnarrow_agent::fim::attach::coverage_shortfall(
+                    fim_attached.len(),
+                    northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS.len(),
+                    inode_map.len(),
+                    watched_paths_load.effective.len(),
+                ) {
+                    error!(target: "fim", "{shortfall}");
+                    attest_degraded(audit_log.as_ref(), &shortfall);
+                }
 
                 // BUG-022 — take an OWNED writable handle to WATCHED_PATHS
                 // (post-populate) so the drain loop can enroll children of
@@ -2564,11 +2576,52 @@ async fn main() -> Result<()> {
     // self-trigger NN-L-FIM-024. A missing bait at boot is itself a
     // tamper signal (Medium); all-present logs at Info.
     let report = northnarrow_agent::fim::honeypot::check_and_restore();
+    // External audit FIMR-008: a bait re-created here was absent when the
+    // watch set was built above, and nothing enrolled it afterwards — after
+    // every reboot the tmpfs pair under /run went unwatched until the next
+    // agent restart. Watched now.
+    if let Some(fim) = fim_admin_state.as_ref() {
+        for path in &report.recreated {
+            let watched = northnarrow_agent::fim::attach::key_for_path(std::path::Path::new(path))
+                .map(|key| fim.watch.watch(key, path));
+            if !matches!(watched, Ok(true)) {
+                warn!(
+                    target: "fim.honeypot",
+                    path = %path,
+                    "re-created control-surface file could not be watched"
+                );
+            }
+        }
+    }
+    let rebooted = {
+        use northnarrow_agent::fim::honeypot;
+        let state_dir = std::path::Path::new(northnarrow_agent::anti_tamper::filesystem::STATE_DIR);
+        match honeypot::current_boot_id() {
+            Some(now) => {
+                let changed = honeypot::boot_changed(state_dir, &now);
+                if changed {
+                    record_boot_id(state_protection.as_deref(), state_dir, &now);
+                }
+                changed
+            }
+            None => true,
+        }
+    };
     if report.all_present() {
         info!(
             present = report.present,
             total = report.total,
             "Honeypot integrity: {}/{} present",
+            report.present,
+            report.total
+        );
+    } else if report.only_volatile_after_reboot(rebooted) {
+        // The tmpfs pair is gone after every reboot: expected, not a tamper.
+        info!(
+            present = report.present,
+            total = report.total,
+            recreated = ?report.recreated,
+            "Honeypot integrity: {}/{} present; the runtime pair re-created after a reboot",
             report.present,
             report.total
         );
@@ -2580,11 +2633,15 @@ async fn main() -> Result<()> {
             present = report.present,
             recreated = report.recreated.len(),
             failed = report.failed.len(),
-            "Honeypot integrity: {} present, recreated {:?}, unrestorable {:?}",
+            replaced = report.replaced.len(),
+            "Honeypot integrity: {} present, recreated {:?}, not a file {:?}, unrestorable {:?}",
             report.present,
             report.recreated,
+            report.replaced,
             report.failed
         );
+        // FIMR-008: in the signed audit chain, not only in the journal.
+        attest_bait_integrity(audit_log.as_ref(), &report, rebooted);
     }
 
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
@@ -3887,6 +3944,72 @@ fn attest_legacy_isolation_removed(
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "recording the removed legacy isolation failed");
+    }
+}
+
+/// External audit FIMR-008: record the boot id the agent runs under, in
+/// the immutable state directory — lifted as the log rotation lifts it —
+/// and protected against foreign writes as the logs there are.
+fn record_boot_id(
+    protection: Option<&northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
+    dir: &std::path::Path,
+    now: &str,
+) {
+    use northnarrow_agent::chainlog::ProtectionManager;
+    use northnarrow_agent::fim::honeypot;
+    let file = dir.join(honeypot::BOOT_ID_FILE);
+    let written = match protection {
+        Some(p) => {
+            if file.exists() {
+                // The renamed-over inode leaves the protected set.
+                let _ = p.release(&file);
+            }
+            p.with_mutable_dir(&mut || {
+                honeypot::write_boot_id(dir, now).map_err(anyhow::Error::from)
+            })
+            .and_then(|()| p.register_active(&file))
+        }
+        None => honeypot::write_boot_id(dir, now).map_err(anyhow::Error::from),
+    };
+    if let Err(e) = written {
+        warn!(
+            error = %format!("{e:#}"),
+            "recording the boot id failed — the next start will judge missing runtime \
+             control-surface files as after a reboot"
+        );
+    }
+}
+
+/// External audit FIMR-008: control-surface files missing, replaced or
+/// unrestorable at boot — removed while the agent was not running, or a
+/// tmpfs one within the same boot — recorded in the signed audit chain.
+fn attest_bait_integrity(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    report: &northnarrow_agent::fim::honeypot::HoneypotIntegrityReport,
+    rebooted: bool,
+) {
+    let Some(log) = audit_log else {
+        return;
+    };
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
+        extra: serde_json::json!({
+            "kind": "bait_missing_at_boot",
+            "recreated": report.recreated,
+            "replaced": report.replaced,
+            "unrestorable": report.failed,
+            "rebooted": rebooted,
+            "at_boot": true,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "recording the control-surface file check failed");
     }
 }
 

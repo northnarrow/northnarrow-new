@@ -1484,6 +1484,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         });
         let r = DetectionRecord::from_rule(
             2,

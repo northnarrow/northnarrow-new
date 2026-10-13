@@ -416,6 +416,13 @@ cmd_test_ignored() {
     # ran in the gate. Run them on their own, on a purged pin root.
     lab_purge_pins >/dev/null
     vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1" || rc=1
+    # The same held for the agent's FIM e2e and for six of its admin e2e
+    # (force-combat/unlock, a wrong key, status, the signed shutdown, key
+    # rotation, audit verify): gated by the feature, not by #[ignore], so
+    # the --ignored run skipped them (found with lab PR 111). Their
+    # non-ignored tests, on a purged pin root.
+    lab_purge_pins >/dev/null
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test fim_privileged_e2e --test privileged_e2e -- --test-threads=1" || rc=1
     return "$rc"
 }
 

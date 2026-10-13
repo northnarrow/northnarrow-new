@@ -251,9 +251,25 @@ impl Rule for NnLFim001SystemBinaryModified {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
-        if fe.op != FimOp::Modified {
-            return None;
-        }
+        // Wave 2 (TST-004): a permission or ownership change that hands out
+        // power over the binary (a set-id bit, write for group or others, a
+        // new owner) is the same foothold as a rewrite. One that only takes
+        // power away (`chmod u-s`, a hardening step) is recorded, not
+        // killed.
+        let reasoning = match fe.op {
+            FimOp::Modified => {
+                "System binary modified — supply-chain / persistence indicator".to_string()
+            }
+            FimOp::AttrChanged => {
+                let attrs = fe.attrs.filter(|a| a.grants_privilege())?;
+                format!(
+                    "System binary permissions changed: {} — privilege-escalation / \
+                     persistence indicator",
+                    attrs.describe()
+                )
+            }
+            _ => return None,
+        };
         if !starts_with_any(&fe.path, SYSTEM_BINARY_PREFIXES) {
             return None;
         }
@@ -262,7 +278,7 @@ impl Rule for NnLFim001SystemBinaryModified {
             fe,
             ResponseAction::KillProcessTree,
             Severity::Critical,
-            "System binary modified — supply-chain / persistence indicator",
+            &reasoning,
         ))
     }
 }
@@ -345,9 +361,21 @@ impl Rule for NnLFim003SensitiveConfigModified {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
-        if fe.op != FimOp::Modified {
-            return None;
-        }
+        // Wave 2 (TST-004): `chmod o+r /etc/shadow` exposes every hash
+        // without touching a byte; a new owner can rewrite the file later.
+        let reasoning = match fe.op {
+            FimOp::Modified => "Sensitive system config modified".to_string(),
+            FimOp::AttrChanged => {
+                let attrs = fe
+                    .attrs
+                    .filter(|a| a.grants_privilege() || a.exposes_content())?;
+                format!(
+                    "Sensitive system config permissions changed: {}",
+                    attrs.describe()
+                )
+            }
+            _ => return None,
+        };
         if !SENSITIVE_CONFIG_EXACT.iter().any(|p| fe.path == *p) {
             return None;
         }
@@ -356,7 +384,7 @@ impl Rule for NnLFim003SensitiveConfigModified {
             fe,
             ResponseAction::KillProcess,
             Severity::High,
-            "Sensitive system config modified",
+            &reasoning,
         ))
     }
 }
@@ -380,16 +408,22 @@ impl Rule for NnLFim004AuthorizedKeysModified {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
-        if fe.op != FimOp::Modified {
-            return None;
+        // Wave 2 (TST-004): a key file handed to another owner, or made
+        // writable by group or others, is ready for someone else's key.
+        match fe.op {
+            // A key file that appears in a watched directory is a new
+            // key as much as an edited one is.
+            FimOp::Modified | FimOp::Created => {}
+            FimOp::AttrChanged if fe.attrs.is_some_and(|a| a.grants_privilege()) => {}
+            _ => return None,
         }
-        // `ends_with` rather than `contains` so `authorized_keys2`
-        // (legacy OpenSSH ≤ 5.9) doesn't trip a partial-substring
-        // match. The leading `/` requirement guards against
-        // pathological filenames the substring would otherwise
-        // false-positive on (e.g. an attacker-named directory
-        // containing the literal string).
-        if !fe.path.ends_with("/.ssh/authorized_keys") {
+        // External audit FIMR-007: sshd reads `.ssh/authorized_keys2` too
+        // — its built-in `AuthorizedKeysFile` is `.ssh/authorized_keys
+        // .ssh/authorized_keys2`, which Debian and Ubuntu leave in place —
+        // and the shipped watch list covers `/etc/ssh/authorized_keys`.
+        // Whole-component matches, so `authorized_keys2.bak` or a directory
+        // whose name merely contains the string do not match.
+        if !is_authorized_keys_path(&fe.path) {
             return None;
         }
         Some(fim_verdict(
@@ -400,6 +434,18 @@ impl Rule for NnLFim004AuthorizedKeysModified {
             "SSH authorized_keys modified — backdoor persistence indicator",
         ))
     }
+}
+
+/// A file sshd reads public keys from: `~/.ssh/authorized_keys`,
+/// `~/.ssh/authorized_keys2`, `/etc/ssh/authorized_keys`, or one under
+/// `/etc/ssh/authorized_keys/` (the `%u` form).
+fn is_authorized_keys_path(path: &str) -> bool {
+    path.ends_with("/.ssh/authorized_keys")
+        || path.ends_with("/.ssh/authorized_keys2")
+        || path == "/etc/ssh/authorized_keys"
+        || path
+            .strip_prefix("/etc/ssh/authorized_keys/")
+            .is_some_and(|leaf| !leaf.is_empty() && !leaf.contains('/'))
 }
 
 // ── NN-L-FIM-005 — log file truncated ──────────────────────────────
@@ -1798,9 +1844,10 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
+        // Wave 2 (TST-004): a chmod or chown of a bait is a touch too.
         if !matches!(
             fe.op,
-            FimOp::Created | FimOp::Modified | FimOp::Deleted | FimOp::Renamed
+            FimOp::Created | FimOp::Modified | FimOp::Deleted | FimOp::Renamed | FimOp::AttrChanged
         ) {
             return None;
         }
@@ -2418,6 +2465,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         })
     }
 
@@ -2450,6 +2498,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         })
     }
 
@@ -2475,6 +2524,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         })
     }
 
@@ -2700,17 +2750,126 @@ mod tests {
         }
     }
 
+    /// External audit FIMR-007: every file sshd reads keys from.
     #[test]
-    fn fim004_does_not_fire_on_authorized_keys2_or_other_ssh_files() {
+    fn fim004_fires_on_authorized_keys2_and_etc_ssh_forms() {
         let r = NnLFim004AuthorizedKeysModified;
-        // authorized_keys2 is legacy SSH; not strictly the same path. V1.0 doesn't cover.
+        for p in [
+            "/root/.ssh/authorized_keys2",
+            "/home/u/.ssh/authorized_keys2",
+            "/etc/ssh/authorized_keys",
+            "/etc/ssh/authorized_keys/alice",
+        ] {
+            assert!(r.evaluate(&fim_event(FimOp::Modified, p)).is_some(), "{p}");
+            assert!(r.evaluate(&fim_event(FimOp::Created, p)).is_some(), "{p}");
+        }
+    }
+
+    #[test]
+    fn fim004_does_not_fire_on_other_ssh_files() {
+        let r = NnLFim004AuthorizedKeysModified;
+        for p in [
+            // known_hosts isn't a backdoor surface.
+            "/root/.ssh/known_hosts",
+            "/root/.ssh/authorized_keys2.bak",
+            "/home/u/xauthorized_keys",
+            "/etc/ssh/authorized_keys/",
+            "/etc/ssh/authorized_keys/a/b",
+        ] {
+            assert!(r.evaluate(&fim_event(FimOp::Modified, p)).is_none(), "{p}");
+        }
+    }
+
+    // ── Wave 2 (TST-004): permission and ownership changes ─────────
+
+    fn attr_event(path: &str, before: (u32, u32, u32), after: (u32, u32, u32)) -> Event {
+        let mut e = fim_event(FimOp::AttrChanged, path);
+        if let Event::Fim(fe) = &mut e {
+            fe.attrs = Some(common::wire::FileAttrChange {
+                mode_before: before.0,
+                mode_after: after.0,
+                uid_before: before.1,
+                uid_after: after.1,
+                gid_before: before.2,
+                gid_after: after.2,
+            });
+        }
+        e
+    }
+
+    #[test]
+    fn a_set_uid_bit_on_a_system_binary_is_killed_its_removal_is_not() {
+        let r = NnLFim001SystemBinaryModified;
+        let v = r
+            .evaluate(&attr_event("/usr/sbin/sshd", (0o755, 0, 0), (0o4755, 0, 0)))
+            .expect("chmod u+s on a system binary");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert_eq!(v.severity, Severity::Critical);
+        assert!(v.reasoning.contains("set-uid added"), "{}", v.reasoning);
+        // writable by others, or a new owner: the next rewrite is anyone's
         assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/root/.ssh/authorized_keys2"))
-            .is_none());
-        // known_hosts isn't a backdoor surface.
+            .evaluate(&attr_event("/usr/bin/sudo", (0o755, 0, 0), (0o757, 0, 0)))
+            .is_some());
         assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/root/.ssh/known_hosts"))
+            .evaluate(&attr_event(
+                "/usr/bin/sudo",
+                (0o755, 0, 0),
+                (0o755, 1000, 0)
+            ))
+            .is_some());
+        // hardening (`chmod u-s`) and a harmless read bit: recorded only
+        assert!(r
+            .evaluate(&attr_event("/usr/bin/chfn", (0o4755, 0, 0), (0o755, 0, 0)))
             .is_none());
+        assert!(r
+            .evaluate(&attr_event("/usr/bin/x", (0o711, 0, 0), (0o755, 0, 0)))
+            .is_none());
+    }
+
+    #[test]
+    fn shadow_made_readable_by_others_is_a_sensitive_change() {
+        let r = NnLFim003SensitiveConfigModified;
+        let v = r
+            .evaluate(&attr_event("/etc/shadow", (0o640, 0, 42), (0o644, 0, 42)))
+            .expect("chmod o+r /etc/shadow");
+        assert_eq!(v.severity, Severity::High);
+        assert!(
+            v.reasoning.contains("readable by group/others"),
+            "{}",
+            v.reasoning
+        );
+        // closing it again is not
+        assert!(r
+            .evaluate(&attr_event("/etc/shadow", (0o644, 0, 42), (0o640, 0, 42)))
+            .is_none());
+    }
+
+    #[test]
+    fn an_authorized_keys_file_handed_to_another_owner_fires() {
+        let r = NnLFim004AuthorizedKeysModified;
+        assert!(r
+            .evaluate(&attr_event(
+                "/root/.ssh/authorized_keys",
+                (0o600, 0, 0),
+                (0o600, 1000, 1000)
+            ))
+            .is_some());
+        assert!(r
+            .evaluate(&attr_event(
+                "/root/.ssh/authorized_keys",
+                (0o644, 0, 0),
+                (0o600, 0, 0)
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn a_chmod_of_a_bait_is_a_touch() {
+        let r = NnLFim024AntiTamperHoneypotModified::new(1);
+        let bait = HONEYPOT_PATHS[0];
+        assert!(r
+            .evaluate(&attr_event(bait, (0o644, 0, 0), (0o600, 0, 0)))
+            .is_some());
     }
 
     // ── NN-L-FIM-005 ────────────────────────────────────────────
@@ -3029,6 +3188,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         })
     }
 
@@ -3490,6 +3650,7 @@ mod tests {
             owner_uid: None,
             reader_dac_capable: false,
             capability: None,
+            attrs: None,
         })
     }
 
