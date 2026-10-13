@@ -345,22 +345,31 @@ jobs:
           fi
 
   audit:
-    # RustSEC advisory gate. Fails on a vulnerability with a fix
-    # available; `unmaintained`/`unsound` warnings are reported but do
-    # not fail the job (they are tracked by dependabot).
+    # RustSEC advisory gate. Fails on a vulnerability;
+    # `unmaintained`/`unsound` warnings are reported but do not fail the
+    # job (they are tracked by dependabot).
     name: cargo audit (ubuntu-latest)
     runs-on: ubuntu-latest
-    # rustsec/audit-check publishes its result as a check run and, on
-    # `push`, files an issue per advisory; with the default read-only
-    # GITHUB_TOKEN those API calls fail with "Resource not accessible by
-    # integration" and the job went red on every push to main (the PR
-    # runs were green because the action only annotates there).
+    # cargo-audit itself, not rustsec/audit-check: the action reported
+    # its result through the checks API and, since 2026-10-13, failed PR
+    # runs that had found nothing — "Not Found" updating its own check
+    # run. The job's exit status is the gate; the token needs no write.
+    # External audit SUP-006: every lockfile is audited — the fuzz
+    # harness and the eBPF crate have their own.
     permissions:
       contents: read
-      checks: write
-      issues: write
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit Cargo.lock, fuzz/Cargo.lock, agent-ebpf/Cargo.lock
+        run: |
+          rc=0
+          for lock in Cargo.lock fuzz/Cargo.lock agent-ebpf/Cargo.lock; do
+            echo "::group::cargo audit --file $lock"
+            cargo audit --file "$lock" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
