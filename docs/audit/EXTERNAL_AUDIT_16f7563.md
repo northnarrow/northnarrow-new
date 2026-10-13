@@ -67,7 +67,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-015 | EBPF-002 | eBPF kernel | M | fixed (lab PR 95) |
 | NN-AUD-017 | EBPF-006 | eBPF kernel | M | already fixed (lab PR 57); attested (lab PR 104) |
 | NN-AUD-019 | EBPF-010 | eBPF kernel | M | fixed (lab PR 97) |
-| NN-AUD-020 | EVD-001 | Evidence logs | L | open |
+| NN-AUD-020 | EVD-001 | Evidence logs | L | fixed (lab PR 107) |
 | NN-AUD-021 | EVD-005 | Evidence logs | M | fixed (lab PR 90) |
 | NN-AUD-022 | EVD-021 | Evidence logs | M | fixed (lab PR 88) |
 | NN-AUD-023 | FIMR-001 | FIM rules | M | fixed (lab PR 91) |
@@ -1334,3 +1334,28 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     built, smoke-tested and passed its no-credential step with
     `contents: read`; `sign` downloaded the artefacts, matched
     `SHA256SUMS` and attested them (nothing published off a tag).
+- **NN-AUD-020 (EVD-001), lab PR 107.** The private key that signs every
+  evidence chain was readable by root: the `file_open` deny refused only
+  write opens, so root could copy the key and rebuild any chain offline
+  with valid signatures (a reopening of at-authz-2).
+  - `FS_PROTECT_READ` (bit2) on `agent.sig.key`: any open by a process
+    outside the agent's family, read included, is refused (`FS_OP_READ`),
+    the trusted-installer window excepted. A read-only open is matched on
+    the inode number against a 4-slot pinned array (`READ_PROTECTED_INOS`)
+    before any map lookup, so the host's read path stays cheap.
+  - A refused read is recorded (NN-L-AT-001, the signed chains) and raises
+    `SensitiveFileAccess` (ALERTED), not the decisive `AntiTamperDenial`:
+    a backup of `/etc` meets it too.
+  - The agent publishes the public half at `agent.sig.pub` (0444,
+    write-denied); `nn-admin audit verify` reads it and no longer goes
+    through `load_or_bootstrap` — a verifier minted a key on a host
+    without one. The lab's upgrade check fingerprints the public half.
+  - Lab, Ubuntu 22.04 (5.15). Before: `sudo cat agent.sig.key` printed the
+    key (65 bytes); there was no public half. After: `Operation not
+    permitted`; `agent.sig.pub` published (0444); the anti-tamper suite,
+    with two new cases, OK — C41 (read the key: denied, `op=read`,
+    NN-L-AT-001) and C42 (`nn-admin audit verify` from the public half:
+    OK).
+  - Not closed: root able to bypass the LSM (a kernel module, the disk
+    from another OS). A TPM- or keyring-held key and off-host chain
+    anchors remain the follow-up.

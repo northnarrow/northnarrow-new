@@ -462,9 +462,14 @@ impl TriggerDetector {
         // External audit EBPF-001: a denial whose sender is PID 1 is a
         // `systemctl` request systemd relayed — refused, recorded, ENGAGED;
         // the requester is unknown, and init is no offender to contain.
-        if let Event::FsProtectDenial { pid, .. } = event {
+        if let Event::FsProtectDenial { pid, operation, .. } = event {
             hits.push(if *pid == 1 {
                 TriggerType::RelayedTamperAttempt
+            } else if *operation == common::FsProtectOperation::Read {
+                // External audit EVD-001: a refused read of the agent's
+                // signing key is a credential reach (ALERTED), not a
+                // decisive tamper — a backup of /etc meets it too.
+                TriggerType::SensitiveFileAccess
             } else {
                 TriggerType::AntiTamperDenial
             });

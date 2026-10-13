@@ -854,12 +854,27 @@ async fn main() -> Result<()> {
     if let Err(e) =
         northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
     {
-        warn!(
-            error = %e,
-            path = %cli.signing_key_file.display(),
-            "agent signing key bootstrap failed pre-attach — audit log will be \
-             unsigned this boot"
-        );
+        // External audit EVD-001: on a restart the previous instance's
+        // pinned hooks already close the key to a process not yet
+        // registered; the loads after the attach read it.
+        let refused = e
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
+        if refused {
+            info!(
+                path = %cli.signing_key_file.display(),
+                "agent signing key closed to this process until it is registered with the \
+                 anti-tamper hooks — read after the attach"
+            );
+        } else {
+            warn!(
+                error = %e,
+                path = %cli.signing_key_file.display(),
+                "agent signing key bootstrap failed pre-attach — audit log will be \
+                 unsigned this boot"
+            );
+        }
     }
     if let Err(e) =
         northnarrow_agent::anti_tamper::filesystem::bootstrap_audit_log(&cli.audit_log_file)

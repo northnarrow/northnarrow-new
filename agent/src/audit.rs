@@ -88,7 +88,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default location of the tamper-evident audit log. Mirrors the
 /// `/etc/northnarrow/` install layout (`admin.pub`, `agent_id`).
@@ -186,7 +186,9 @@ impl AgentSigningKey {
                     path = %path.display(),
                     "reusing existing agent signing key"
                 );
-                Ok(Self { inner: key })
+                let key = Self { inner: key };
+                key.publish_verifying_key(path);
+                Ok(key)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = mint_signing_key()?;
@@ -196,7 +198,9 @@ impl AgentSigningKey {
                     path = %path.display(),
                     "bootstrapped fresh agent signing key"
                 );
-                Ok(Self { inner: key })
+                let key = Self { inner: key };
+                key.publish_verifying_key(path);
+                Ok(key)
             }
             Err(e) => Err(anyhow!(e).context(format!("reading {}", path.display()))),
         }
@@ -207,6 +211,49 @@ impl AgentSigningKey {
     /// doesn't need a separate key distribution step.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.inner.verifying_key()
+    }
+
+    /// External audit EVD-001: write the public half next to the key
+    /// (`agent.sig.key` → `agent.sig.pub`, 64 hex chars, mode 0444) unless
+    /// it already says the same. The private key is closed to every reader
+    /// outside the agent's family, root included; `nn-admin audit verify`
+    /// and any auditor read this instead. Best effort: a failure is logged.
+    pub fn publish_verifying_key(&self, key_path: &Path) {
+        let pub_path = verifying_key_path(key_path);
+        let want = format!("{}\n", hex::encode(self.verifying_key().to_bytes()));
+        if fs::read_to_string(&pub_path).is_ok_and(|have| have == want) {
+            return;
+        }
+        let tmp = pub_path.with_extension("pub.tmp");
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = fs::remove_file(&tmp);
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o444)
+                .open(&tmp)?;
+            f.write_all(want.as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &pub_path)
+        })();
+        match written {
+            Ok(()) => info!(
+                target: "audit.signing_key",
+                path = %pub_path.display(),
+                "agent signing key's public half published"
+            ),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                warn!(
+                    target: "audit.signing_key",
+                    path = %pub_path.display(),
+                    error = %e,
+                    "could not publish the agent signing key's public half"
+                );
+            }
+        }
     }
 
     /// Sign `msg` with the agent signing key. Used by
@@ -223,6 +270,32 @@ fn mint_signing_key() -> Result<SigningKey> {
         .try_fill_bytes(&mut secret)
         .map_err(|e| anyhow!("OsRng failed to provide entropy for signing key: {e}"))?;
     Ok(SigningKey::from_bytes(&secret))
+}
+
+/// External audit EVD-001: where the public half of the signing key at
+/// `key_path` lives (`agent.sig.key` → `agent.sig.pub`).
+pub fn verifying_key_path(key_path: &Path) -> std::path::PathBuf {
+    key_path.with_extension("pub")
+}
+
+/// The verifying key `publish_verifying_key` wrote at `path`.
+pub fn read_verifying_key(path: &Path) -> Result<VerifyingKey> {
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = hex::decode(raw.trim()).map_err(|e| anyhow!("{}: not hex: {e}", path.display()))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("{}: not 32 bytes", path.display()))?;
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| anyhow!("{}: not an Ed25519 key: {e}", path.display()))
+}
+
+/// The private key at `path`, read and parsed — never minted (legacy
+/// verification on a host without `agent.sig.pub`).
+pub fn read_signing_key(path: &Path) -> Result<AgentSigningKey> {
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(AgentSigningKey {
+        inner: parse_signing_key(&raw)?,
+    })
 }
 
 fn parse_signing_key(raw: &str) -> Result<SigningKey> {
@@ -866,6 +939,30 @@ pub fn verify_chain(entries: &[AuditEntry], pubkey: &VerifyingKey) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit EVD-001: the agent publishes the public half next to
+    /// its key (0444), rewrites it when it says something else, and a
+    /// reader gets the same verifying key from it.
+    #[test]
+    fn the_public_half_is_published_next_to_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pub_path = verifying_key_path(&key_path);
+        assert_eq!(pub_path, dir.path().join("agent.sig.pub"));
+        assert_eq!(read_verifying_key(&pub_path).unwrap(), key.verifying_key());
+        let mode = fs::metadata(&pub_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444);
+        // a wrong public half is replaced at the next load
+        fs::remove_file(&pub_path).unwrap();
+        fs::write(&pub_path, "00".repeat(32)).unwrap();
+        let again = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        assert_eq!(
+            read_verifying_key(&pub_path).unwrap(),
+            again.verifying_key()
+        );
+    }
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 

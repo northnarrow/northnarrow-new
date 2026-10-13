@@ -46,8 +46,9 @@ use aya_ebpf::{
 // agent host. Do not put printk back in a hot hook; count in a map instead.
 
 use northnarrow_common::wire::{
-    FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
-    FS_OP_UNLINK, FS_OP_WRITE, FS_PROTECT_MUTATE, FS_PROTECT_WRITE,
+    FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
+    FS_OP_SETATTR, FS_OP_UNLINK, FS_OP_WRITE, FS_PROTECT_MUTATE, FS_PROTECT_READ,
+    FS_PROTECT_WRITE, READ_PROTECTED_SLOTS,
 };
 
 use crate::btf_offsets::{
@@ -102,6 +103,15 @@ const FS_IOC_FSGETXATTR: c_uint = 0x801c_581f;
 /// into. See `task_kill::PROTECTED_PIDS` for the full rationale.
 #[map]
 pub static PROTECTED_INODES: HashMap<InodeKey, u8> = HashMap::pinned(1024, 0);
+
+/// External audit EVD-001: inode numbers of the READ-protected inodes (the
+/// agent's private signing key), 0 = empty slot. A read-only open is
+/// matched on the inode number against these few slots first, so the
+/// common read path pays no hash lookup; a match goes through
+/// `deny_if_protected` (`FS_OP_READ`, `FS_PROTECT_READ`, the device, the
+/// family and the trusted-installer window). Pinned with `PROTECTED_INODES`.
+#[map]
+pub static READ_PROTECTED_INOS: Array<u64> = Array::pinned(READ_PROTECTED_SLOTS, 0);
 
 /// Tappa 8 stub: Ed25519-signed override capability for FS
 /// modification. Non-zero slot 0 = active admin grant, hooks
@@ -329,6 +339,8 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
     };
     let required = if operation == FS_OP_WRITE {
         FS_PROTECT_WRITE
+    } else if operation == FS_OP_READ {
+        FS_PROTECT_READ
     } else {
         FS_PROTECT_MUTATE
     };
@@ -566,25 +578,51 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
-    // Only write-intent opens can mutate the file. Read first so the
-    // overwhelmingly-common read path early-returns before the map
-    // lookup in `deny_if_protected`.
+    // Only write-intent opens can mutate the file; a read-only open
+    // matters only for the few READ-protected inodes (external audit
+    // EVD-001), matched on the inode number before any map lookup.
     let mode_slot = (file as *const u8).add(off!(FILE_F_MODE_OFFSET)) as *const u32;
     let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
         Ok(m) => m,
         Err(_) => return 0,
     };
-    if f_mode & FMODE_WRITE == 0 {
-        return 0;
-    }
 
     let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
         Err(_) => return 0,
     };
+    if f_mode & FMODE_WRITE == 0 {
+        if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode) {
+            return -EPERM;
+        }
+        return 0;
+    }
     if deny_if_protected(FS_OP_WRITE, inode) {
         return -EPERM;
     }
     0
+}
+
+/// External audit EVD-001: `inode`'s number is one of
+/// [`READ_PROTECTED_INOS`] (the device is checked by the map lookup after).
+#[inline(always)]
+unsafe fn read_protected_ino(inode: *const c_void) -> bool {
+    if inode.is_null() {
+        return false;
+    }
+    let ino = match bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    let mut slot = 0u32;
+    while slot < READ_PROTECTED_SLOTS {
+        if let Some(v) = READ_PROTECTED_INOS.get(slot) {
+            if *v != 0 && *v == ino {
+                return true;
+            }
+        }
+        slot += 1;
+    }
+    false
 }

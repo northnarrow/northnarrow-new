@@ -66,6 +66,11 @@ impl Rule for NnLAt001AntiTamperDenial {
                  systemctl kexec) outside the trusted-installer window: a loaded image \
                  boots a kernel without the agent"
                 .to_string(),
+            // External audit EVD-001: the key that signs every evidence chain.
+            FsProtectOperation::Read => format!(
+                "to read the agent's private signing key (inode {target_dev}:{target_ino}), which \
+                 signs every evidence chain"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
