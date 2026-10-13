@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use common::admin_quorum::{self, distinct_matches, quorum_decision, QuorumDecision};
 use common::wire::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::{Mutex, RwLock};
@@ -56,16 +57,8 @@ pub const DEFAULT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// gate (`issue_challenge`) is.
 pub const RATE_LIMIT_THRESHOLD: u32 = 3;
 
-/// Hex length of an Ed25519 pubkey (32 bytes × 2 nibbles).
-const PUBKEY_HEX_LEN: usize = 64;
-
-/// Default role allowlist applied to admin.pub lines that omit the
-/// role token. `unlock` is the legacy-compat baseline (every key
-/// could perform unlock before A5); `audit-read` is the safe
-/// read-only complement per design §3.2 ("on-call minimum").
-fn default_roles() -> Vec<Role> {
-    vec![Role::Unlock, Role::AuditRead]
-}
+#[cfg(test)]
+use admin_quorum::default_roles;
 
 /// Reasons [`AdminAuth::issue_challenge`] / [`AdminAuth::verify_with_role`]
 /// can refuse, carrying the user-facing detail needed to translate
@@ -145,111 +138,10 @@ pub enum AdminAuthError {
     PayloadVerify(#[from] SignedPayloadError),
 }
 
-/// One loaded admin pubkey plus its parsed role allowlist. Stored
-/// inside [`AdminAuth`]; the type is intentionally crate-private
-/// because the only legitimate construction path is
-/// [`AdminAuth::load`] (line parser) or the test-only `build`
-/// helper (defaults the roles to [`default_roles`]).
-#[derive(Debug, Clone)]
-struct KeyEntry {
-    key: VerifyingKey,
-    roles: Vec<Role>,
-}
-
-impl KeyEntry {
-    /// `true` iff the key may authorise an operation whose required
-    /// role is `required`. [`Role::All`] is the break-glass
-    /// super-role and unconditionally satisfies any required role
-    /// (design §3.2 "break-glass key (kept offline)" pattern).
-    ///
-    /// Tappa 9.0.c role gradient: [`Role::Triage`] SUBSUMES
-    /// [`Role::TelemetryRead`] — a triage key can read the detections it
-    /// triages, so an operator running triage needs only the one role.
-    /// The subsumption is one-directional (read does NOT imply triage):
-    /// a `telemetry-read`-only key still fails a `Triage` requirement.
-    fn authorizes(&self, required: Role) -> bool {
-        self.roles.iter().any(|r| {
-            *r == required
-                || *r == Role::All
-                || (required == Role::TelemetryRead && *r == Role::Triage)
-        })
-    }
-}
-
-/// Outcome of [`quorum_decision`]: the distinct-key tally, threshold and
-/// role check of a multi-signature submission, with the cryptography
-/// already done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuorumDecision {
-    Accept,
-    /// A non-empty submission in which no signature matched any key —
-    /// the attack signal (rate-limited by the caller).
-    NoValidSignature,
-    QuorumNotMet {
-        required: u8,
-        provided: u8,
-    },
-    /// `role` is carried by no matched key; `first` is the first matched
-    /// key in submission order (the audit breadcrumb).
-    RoleDenied {
-        role: Role,
-        first: usize,
-    },
-}
-
-/// The quorum rule shared by [`AdminAuth::verify_quorum`] and
-/// [`AdminAuth::verify_signed_payload_quorum`], separated from the
-/// signature checks so it can be proved (Kani, `kani_proofs` below).
-///
-/// `per_signature[i]` is the index of the key the i-th signature verified
-/// against (`None`: no key). A key counts once however many of its
-/// signatures were submitted. Accepts only when at least
-/// `max(min_distinct, 1)` distinct keys matched and every role in
-/// `role_requirements` is carried by one of them: a `min_distinct` of 0
-/// never mints a token without a signature, in a release build as well.
-/// Allocation-free.
-pub(crate) fn quorum_decision(
-    per_signature: &[Option<usize>],
-    authorizes: impl Fn(usize, Role) -> bool,
-    min_distinct: u8,
-    role_requirements: &[Role],
-) -> QuorumDecision {
-    let first_seen = |i: usize| match per_signature[i] {
-        Some(key) => !per_signature[..i].contains(&Some(key)),
-        None => false,
-    };
-    let distinct = (0..per_signature.len()).filter(|&i| first_seen(i)).count();
-    if distinct == 0 && !per_signature.is_empty() {
-        return QuorumDecision::NoValidSignature;
-    }
-    let provided = distinct.min(u8::MAX as usize) as u8;
-    let required = min_distinct.max(1);
-    if provided < required {
-        return QuorumDecision::QuorumNotMet { required, provided };
-    }
-    for &role in role_requirements {
-        if !per_signature
-            .iter()
-            .flatten()
-            .any(|&key| authorizes(key, role))
-        {
-            let first = per_signature.iter().flatten().next().copied().unwrap_or(0);
-            return QuorumDecision::RoleDenied { role, first };
-        }
-    }
-    QuorumDecision::Accept
-}
-
-/// Distinct matched key indices in first-seen order (audit fingerprints).
-fn distinct_matches(per_signature: &[Option<usize>]) -> Vec<usize> {
-    let mut out: Vec<usize> = Vec::new();
-    for key in per_signature.iter().flatten() {
-        if !out.contains(key) {
-            out.push(*key);
-        }
-    }
-    out
-}
+/// One loaded admin pubkey plus its parsed role allowlist
+/// ([`admin_quorum::AdminKey`], shared with the watchdog since external
+/// audit WDG-001).
+type KeyEntry = admin_quorum::AdminKey;
 
 /// Server-side admin authenticator.
 ///
@@ -702,19 +594,7 @@ impl AdminAuth {
         // Which key each submitted signature verified against (the
         // constant-time scan keeps the last match, no early break), then
         // the shared quorum rule (`quorum_decision`, proved with Kani).
-        let per_signature: Vec<Option<usize>> = signatures
-            .iter()
-            .map(|sig_bytes| {
-                let sig = Signature::from_bytes(sig_bytes);
-                let mut this_match: Option<usize> = None;
-                for (idx, entry) in pub_keys.iter().enumerate() {
-                    if entry.key.verify_strict(&nonce, &sig).is_ok() {
-                        this_match = Some(idx);
-                    }
-                }
-                this_match
-            })
-            .collect();
+        let per_signature = admin_quorum::match_signatures(&pub_keys, &nonce, signatures);
         let distinct = distinct_matches(&per_signature).len().min(u8::MAX as usize) as u8;
         match quorum_decision(
             &per_signature,
@@ -1022,19 +902,7 @@ impl AdminAuth {
         // Per-signature constant-time scan (same machinery as
         // verify_quorum, except the message bytes are the SignedPayload
         // digest instead of the raw nonce), then the shared quorum rule.
-        let per_signature: Vec<Option<usize>> = signatures
-            .iter()
-            .map(|sig_bytes| {
-                let sig = Signature::from_bytes(sig_bytes);
-                let mut this_match: Option<usize> = None;
-                for (idx, entry) in pub_keys.iter().enumerate() {
-                    if entry.key.verify_strict(&digest, &sig).is_ok() {
-                        this_match = Some(idx);
-                    }
-                }
-                this_match
-            })
-            .collect();
+        let per_signature = admin_quorum::match_signatures(&pub_keys, &digest, signatures);
         let matched = distinct_matches(&per_signature);
         let distinct = matched.len().min(u8::MAX as usize) as u8;
         match quorum_decision(
@@ -1136,113 +1004,20 @@ impl AdminAuth {
 // ────────────────────────────────────────────────────────────────────
 
 /// Parse one already-trimmed, non-comment, non-blank admin.pub
-/// line into a [`KeyEntry`]. Whitespace-tokenised: the first token
-/// is the hex pubkey, the optional second token is the
-/// comma-separated role list. A third+ token is an error (catches
-/// the common operator mistake of forgetting the comma between
-/// roles, e.g. `<hex>  unlock audit-read`).
+/// line into a [`KeyEntry`] ([`admin_quorum::parse_admin_line`]).
 fn parse_admin_line(line: &str) -> Result<KeyEntry> {
-    let mut parts = line.split_whitespace();
-    let hex_token = parts.next().ok_or_else(|| {
-        // split_whitespace on a non-empty trimmed input always
-        // yields at least one item, so this is structurally
-        // unreachable; we name the error anyway because
-        // unwrap()-in-the-load-loop would be a worse failure mode.
-        anyhow!("line is empty after trimming (should have been skipped)")
-    })?;
-    if hex_token.len() != PUBKEY_HEX_LEN {
-        return Err(anyhow!(
-            "pub key must be {PUBKEY_HEX_LEN} hex chars (got {})",
-            hex_token.len()
-        ));
-    }
-    let raw_bytes = hex::decode(hex_token).map_err(|e| anyhow!("invalid hex: {e}"))?;
-    let key_bytes: [u8; 32] = raw_bytes
-        .try_into()
-        .expect("hex decode length pre-validated to 64 chars");
-    let key = VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|e| anyhow!("not a valid Ed25519 pubkey: {e}"))?;
-
-    let roles = match parts.next() {
-        None => default_roles(),
-        Some(role_list) => parse_role_list(role_list)?,
-    };
-    if parts.next().is_some() {
-        return Err(anyhow!(
-            "unexpected token after role list — roles must be \
-             comma-separated within a single token (no spaces)"
-        ));
-    }
-    Ok(KeyEntry { key, roles })
+    admin_quorum::parse_admin_line(line).map_err(|e| anyhow!(e))
 }
 
 /// Parse a comma-separated role list (e.g. `"unlock,audit-read"`)
-/// into a [`Vec<Role>`]. Empty list / single trailing comma / leading
-/// comma are all errors — the canonical writer emits a tight list.
-/// Duplicate roles inside the list are deduped before returning via
-/// linear scan (the list is at most 6 elements long, smaller than
-/// any reasonable hash table overhead).
+/// ([`admin_quorum::parse_role_list`]).
 pub fn parse_role_list(s: &str) -> Result<Vec<Role>> {
-    if s.is_empty() {
-        return Err(anyhow!("role list is empty"));
-    }
-    let mut out: Vec<Role> = Vec::new();
-    for token in s.split(',') {
-        if token.is_empty() {
-            return Err(anyhow!(
-                "role list has empty entry (leading/trailing/double comma)"
-            ));
-        }
-        let role = parse_role_keyword(token)?;
-        if !out.contains(&role) {
-            out.push(role);
-        }
-    }
-    Ok(out)
+    admin_quorum::parse_role_list(s).map_err(|e| anyhow!(e))
 }
 
-/// Map one role keyword to its [`Role`]. Keywords mirror the
-/// design §3.2 list verbatim — case-sensitive lowercase. The
-/// `all` keyword maps to [`Role::All`], which authorises every
-/// operation (break-glass).
-///
-/// Tappa 9 (C1) added the `fim-read` / `fim-manage` keywords;
-/// Tappa 9.5 (K1) added `canary-read` / `canary-manage` per
-/// design §12 Q7 split-role lock-in. The list MUST stay in
-/// sync with [`role_keyword`] (the emit-side helper) — the
-/// `load_parses_every_role_keyword_in_design_spec_3_2` test
-/// anchors that invariant.
+/// Parse one role keyword ([`admin_quorum::parse_role_keyword`]).
 pub fn parse_role_keyword(s: &str) -> Result<Role> {
-    match s {
-        "unlock" => Ok(Role::Unlock),
-        "shutdown" => Ok(Role::Shutdown),
-        "force-posture" => Ok(Role::ForcePosture),
-        "rotate-keys" => Ok(Role::RotateKeys),
-        "audit-read" => Ok(Role::AuditRead),
-        "fim-manage" => Ok(Role::FimManage),
-        "fim-read" => Ok(Role::FimRead),
-        "canary-read" => Ok(Role::CanaryRead),
-        "canary-manage" => Ok(Role::CanaryManage),
-        // Tappa 10 (N1) — network observability split-role
-        // pair; same wire shape operators see in admin.pub.
-        "net-read" => Ok(Role::NetRead),
-        "net-manage" => Ok(Role::NetManage),
-        "trusted-installer" => Ok(Role::TrustedInstaller),
-        // Tappa 9.0.b — low-privilege read-only telemetry role.
-        "telemetry-read" => Ok(Role::TelemetryRead),
-        // Tappa 9.0.c — triage role (subsumes telemetry-read).
-        "triage" => Ok(Role::Triage),
-        // Tappa 10.8 — signed operator overlays.
-        "config-manage" => Ok(Role::ConfigManage),
-        "all" => Ok(Role::All),
-        other => Err(anyhow!(
-            "unknown role `{other}` — expected one of: \
-             unlock, shutdown, force-posture, rotate-keys, audit-read, \
-             fim-manage, fim-read, canary-read, canary-manage, \
-             net-read, net-manage, trusted-installer, telemetry-read, \
-             triage, config-manage, all"
-        )),
-    }
+    admin_quorum::parse_role_keyword(s).map_err(|e| anyhow!(e))
 }
 
 /// 8-hex-char pubkey fingerprint: first 4 bytes of SHA-256 over the
@@ -2797,73 +2572,6 @@ mod tests {
                 expected.contains(fp),
                 "fp {fp} not in expected set {expected:?}"
             );
-        }
-    }
-}
-
-/// Kani proof of the quorum rule (`.github/workflows/kani.yml`). The
-/// signature checks are abstracted away: any key index (or none) for each
-/// submitted signature, any role assignment for each key.
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    const SIGS: usize = 4;
-    const KEYS: usize = 3;
-    const ROLES: [Role; 2] = [Role::Unlock, Role::TrustedInstaller];
-
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn quorum_accepts_only_enough_distinct_keys_carrying_every_role() {
-        let n: usize = kani::any();
-        kani::assume(n <= SIGS);
-        let mut per_sig = [None; SIGS];
-        for slot in per_sig.iter_mut() {
-            let m: Option<u8> = kani::any();
-            *slot = m.map(|k| (k as usize) % KEYS);
-        }
-        let per_sig = &per_sig[..n];
-        let carries: [[bool; 2]; KEYS] = kani::any();
-        let role_index = |r: Role| if r == ROLES[0] { 0 } else { 1 };
-        let min_distinct: u8 = kani::any();
-        let req_n: usize = kani::any();
-        kani::assume(req_n <= 2);
-        let reqs = &ROLES[..req_n];
-
-        let decision = quorum_decision(
-            per_sig,
-            |k, r| carries[k][role_index(r)],
-            min_distinct,
-            reqs,
-        );
-
-        // Ground truth, computed per key rather than per signature.
-        let mut distinct = 0u8;
-        let mut matched = [false; KEYS];
-        for (k, m) in matched.iter_mut().enumerate() {
-            *m = per_sig.contains(&Some(k));
-            if *m {
-                distinct += 1;
-            }
-        }
-        match decision {
-            QuorumDecision::Accept => {
-                assert!(distinct >= min_distinct.max(1));
-                for &r in reqs {
-                    assert!((0..KEYS).any(|k| matched[k] && carries[k][role_index(r)]));
-                }
-            }
-            QuorumDecision::NoValidSignature => {
-                assert!(n > 0 && distinct == 0);
-            }
-            QuorumDecision::QuorumNotMet { required, provided } => {
-                assert!(provided == distinct && provided < required);
-                assert!(required == min_distinct.max(1));
-            }
-            QuorumDecision::RoleDenied { role, first } => {
-                assert!(matched[first]);
-                assert!(!(0..KEYS).any(|k| matched[k] && carries[k][role_index(role)]));
-            }
         }
     }
 }

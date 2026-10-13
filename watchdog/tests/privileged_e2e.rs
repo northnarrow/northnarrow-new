@@ -252,6 +252,10 @@ impl E2eFixture {
         self.tempdir_path().join("combat-rules.v4")
     }
 
+    fn shutdown_marker_path(&self) -> PathBuf {
+        self.tempdir_path().join("agent.shutdown_authorised")
+    }
+
     /// Spawn the real agent with per-test tempdir paths. Agent
     /// loads its eBPF object (pins PROTECTED_PIDS under
     /// /sys/fs/bpf/northnarrow/), opens admin socket, writes
@@ -263,8 +267,11 @@ impl E2eFixture {
         // key — they only need the agent's anti_tamper bring-up.
         // Generate via openssl-equivalent: 32 random bytes as a
         // hex-encoded ed25519 public key shape.
-        let dummy_pub = "00".repeat(32);
-        fs::write(self.admin_pub_path(), format!("{dummy_pub}\n")).expect("write admin.pub");
+        // A test that signs shutdowns writes its own keys first.
+        if !self.admin_pub_path().exists() {
+            let dummy_pub = "00".repeat(32);
+            fs::write(self.admin_pub_path(), format!("{dummy_pub}\n")).expect("write admin.pub");
+        }
         fs::copy(combat_rules_src(), self.combat_rules_path()).expect("copy combat-rules");
 
         let child = Command::new("sudo")
@@ -331,6 +338,14 @@ impl E2eFixture {
             .arg("exec")
             .arg("--agent-bin")
             .arg(self.agent_priv_path())
+            // External audit WDG-001: the marker, and the keys and install
+            // id it is verified against, all in this test's directory.
+            .arg("--shutdown-marker")
+            .arg(self.shutdown_marker_path())
+            .arg("--admin-pub")
+            .arg(self.admin_pub_path())
+            .arg("--agent-id-file")
+            .arg(self.agent_id_path())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -773,6 +788,98 @@ fn watchdog_holds_after_the_restart_ceiling() {
         new_agent_pid(&fx, manual, Duration::from_secs(30)).is_some(),
         "the watchdog must resume supervision once an agent runs again"
     );
+}
+
+/// External audit WDG-001 / TST-003: a shutdown marker that is not
+/// signed by the admin quorum — the shape any root process could write
+/// before — no longer stands the watchdog down. The agent is respawned,
+/// and the refusal is recorded for the agent's signed audit chain.
+#[test]
+fn a_forged_shutdown_marker_is_refused_and_the_agent_respawned() {
+    let mut fx = E2eFixture::setup();
+    let pid = fx.spawn_agent();
+    fx.spawn_watchdog();
+    fs::write(
+        fx.shutdown_marker_path(),
+        format!(
+            r#"{{"entry_hash":"{}","grace_deadline_unix_ts":99999999999}}"#,
+            "ab".repeat(32)
+        ),
+    )
+    .expect("write forged marker");
+    fx.unprotect_and_sigkill_agent(pid);
+    assert!(
+        new_agent_pid(&fx, pid, Duration::from_secs(30)).is_some(),
+        "a forged marker must not stop the respawn"
+    );
+    assert!(
+        !fx.shutdown_marker_path().exists(),
+        "the forged marker is removed"
+    );
+    let rejected = fs::read_to_string(fx.tempdir_path().join("agent.shutdown_rejected"))
+        .expect("the refusal is recorded");
+    assert!(
+        rejected.contains(&format!(r#""agent_pid":{pid}"#)),
+        "{rejected}"
+    );
+}
+
+/// External audit TST-003: a shutdown the admin quorum signed for the
+/// agent that exits stands the watchdog down — no respawn — and the
+/// authorisation is recorded so it cannot be presented again.
+#[test]
+fn a_quorum_signed_shutdown_marker_stands_the_watchdog_down() {
+    use common::shutdown_marker::ShutdownMarker;
+    use common::wire::admin_signed_payload::{sign, SignedPayload};
+
+    let mut fx = E2eFixture::setup();
+    let a = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+    let b = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+    fs::write(
+        fx.admin_pub_path(),
+        format!(
+            "{} shutdown\n{} unlock\n",
+            hex::encode(a.verifying_key().to_bytes()),
+            hex::encode(b.verifying_key().to_bytes())
+        ),
+    )
+    .expect("write admin.pub");
+    let pid = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let agent_id = common::shutdown_marker::parse_agent_id(
+        &fs::read_to_string(fx.agent_id_path()).expect("agent_id written at boot"),
+    )
+    .expect("agent_id");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = SignedPayload::new_shutdown([0x5A; 32], now, agent_id, 30);
+    let sigs = [sign(&payload, &a).unwrap(), sign(&payload, &b).unwrap()];
+    let marker = ShutdownMarker::new(&payload, &sigs, pid).unwrap();
+    fs::write(fx.shutdown_marker_path(), marker.to_line()).expect("write marker");
+
+    fx.unprotect_and_sigkill_agent(pid);
+    let wd = fx.watchdog_child.as_mut().expect("watchdog child");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = wd.try_wait().expect("try_wait") {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watchdog did not stand down after an authorised shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "stand-down exits 0: {status:?}");
+    assert!(
+        new_agent_pid(&fx, pid, Duration::from_secs(3)).is_none(),
+        "no respawn after an authorised shutdown"
+    );
+    let honoured = fs::read_to_string(fx.tempdir_path().join("watchdog.honoured"))
+        .expect("the authorisation is recorded");
+    assert!(honoured.starts_with(&"5a".repeat(32)), "{honoured}");
 }
 
 // ── Test 3: W5 stuck-recovery on real BPF map ───────────────────────

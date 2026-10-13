@@ -72,8 +72,9 @@ pub const DEFAULT_AGENT_ID_PATH: &str = "/etc/northnarrow/agent_id";
 pub const AGENT_ID_LEN: usize = 16;
 
 /// Width of the on-disk hex encoding of one [`AGENT_ID_LEN`]-byte
-/// value. Used by the parser as the strict length pre-check before
-/// hex decoding (avoids a hex error for an obviously-truncated file).
+/// value (the parser, `common::shutdown_marker::parse_agent_id`,
+/// checks it before decoding).
+#[cfg(test)]
 const HEX_LEN: usize = AGENT_ID_LEN * 2;
 
 /// File mode for the persisted agent_id. World-readable per design
@@ -143,26 +144,9 @@ pub fn load_or_bootstrap(path: &Path) -> Result<[u8; AGENT_ID_LEN]> {
 /// decode; we accept both for operator convenience, write
 /// lowercase ourselves).
 fn parse(raw: &str) -> Result<[u8; AGENT_ID_LEN]> {
-    // Single trailing newline is part of the canonical encoding; we
-    // strip exactly one. Two trailing newlines, or a leading newline,
-    // or any embedded whitespace, is treated as corruption — the
-    // canonical writer never produces such bytes.
-    let trimmed = raw.strip_suffix('\n').unwrap_or(raw);
-    if trimmed.contains('\n') || trimmed.contains('\r') {
-        return Err(anyhow!(
-            "agent_id file has embedded newline — expected single-line hex"
-        ));
-    }
-    if trimmed.len() != HEX_LEN {
-        return Err(anyhow!(
-            "agent_id has {} hex chars (expected {HEX_LEN})",
-            trimmed.len()
-        ));
-    }
-    let bytes = hex::decode(trimmed).map_err(|e| anyhow!("agent_id is not valid hex: {e}"))?;
-    let mut out = [0u8; AGENT_ID_LEN];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    // Shared with the watchdog, which reads the same file to check the
+    // install a shutdown was signed for (external audit WDG-001).
+    common::shutdown_marker::parse_agent_id(raw).map_err(|e| anyhow!(e))
 }
 
 /// Mint 16 fresh CSPRNG bytes via `OsRng`. Same source the rest of

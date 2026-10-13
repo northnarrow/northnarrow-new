@@ -709,6 +709,23 @@ protocol:
    so a tampering attempt that tries to forge the marker just to
    suppress restarts gets counted into the 5-in-60s tamper signal.
 
+> **As built since external audit WDG-001 / EVD-021 / TST-003.** The
+> audit-log cross-check above was never built, and it would not have
+> held: the agent's signing key is readable by root, so root can forge
+> an audit entry too. The watchdog checked only the marker's shape, so
+> any root process could write one and switch the agent off for good.
+> The marker (`common::shutdown_marker`, format v2) now carries what the
+> admins signed — the payload's canonical CBOR and the signatures — and
+> the exiting agent's pid. The watchdog verifies it as the agent did,
+> against `admin.pub`, whose private keys are not on the host: a quorum
+> of 2 distinct keys, one carrying `shutdown`; this install's
+> `agent_id`; signed while the agent that died was running, and recent
+> (skew 60 s + grace, capped at 300 s); written by that agent's pid; not
+> honoured before (`/run/northnarrow/watchdog.honoured`). A refused
+> marker is removed and recorded at `/run/northnarrow/agent.shutdown_rejected`;
+> the agent reports it as an `integrity_drift` entry
+> (`shutdown_marker_rejected`) in its signed audit chain.
+
 ### 10.5 Operator UX
 
 ```

@@ -47,6 +47,8 @@ pub const DEFAULT_AGENT_PIDFILE: &str = "/run/northnarrow/agent.pid";
 pub const DEFAULT_ADMIN_SOCKET: &str = "/run/northnarrow/admin.sock";
 pub const DEFAULT_WATCHDOG_PIDFILE: &str = "/run/northnarrow/watchdog.pid";
 pub const DEFAULT_BPFFS_ROOT: &str = "/sys/fs/bpf/northnarrow";
+pub const DEFAULT_ADMIN_PUB: &str = "/etc/northnarrow/admin.pub";
+pub const DEFAULT_AGENT_ID_FILE: &str = "/etc/northnarrow/agent_id";
 
 /// Cap on the `pidfd_open` retry loop. The watchdog
 /// `After=northnarrow-agent.service` ordering means systemd has
@@ -118,6 +120,20 @@ pub struct Cli {
     /// systemd unit started by the `systemd` respawn backend.
     #[arg(long = "agent-unit", value_name = "UNIT", default_value = DEFAULT_AGENT_UNIT)]
     pub agent_unit: String,
+
+    /// The shutdown-authorisation marker the agent leaves when an admin
+    /// quorum stops it ([`check_shutdown_marker`]).
+    #[arg(long = "shutdown-marker", value_name = "PATH", default_value = common::shutdown_marker::MARKER_PATH)]
+    pub shutdown_marker: PathBuf,
+
+    /// The admin keys a shutdown must be signed by (external audit
+    /// WDG-001: the watchdog verifies the quorum the agent verified).
+    #[arg(long = "admin-pub", value_name = "PATH", default_value = DEFAULT_ADMIN_PUB)]
+    pub admin_pub: PathBuf,
+
+    /// This install's id; a shutdown signed for another install is refused.
+    #[arg(long = "agent-id-file", value_name = "PATH", default_value = DEFAULT_AGENT_ID_FILE)]
+    pub agent_id_file: PathBuf,
 }
 
 /// Apply the W2 process-hardening prctls per design §7.4:
@@ -972,84 +988,173 @@ pub fn reinsert_new_agent_pid(bpffs_root: &Path, new_pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Check A8's `/run/northnarrow/agent.shutdown_authorised`
-/// marker (per Tappa 8 sub-sprint A commit A7 + design §10.4 +
-/// Watchdog design §13 Q4 resolution). Returns:
-/// - `Ok(true)` when the marker is present AND its
-///   `grace_deadline_unix_ts` is in the future — admin
-///   authorised this shutdown, watchdog must NOT respawn.
-/// - `Ok(false)` when the marker is absent OR the deadline has
-///   elapsed (stale marker — unsigned restart proceeds).
-/// - `Err` when the marker exists but is malformed (parse
-///   failure, missing fields, non-hex entry_hash). The design
-///   §10.4 step 4 treats a malformed marker as a tampering
-///   signal: the caller should LOG the error and treat it as
-///   "not authorised" — fall through to the respawn path AND
-///   bump the per-window ceiling counter so a forge attempt
-///   gets counted into the 5-in-60s tamper signal.
-///
-/// Audit-log entry-hash cross-check (design §10.4 step 4 bullet
-/// 2) is deferred — it requires the A11 audit chain. The
-/// deadline check covers the staleness case; the entry-hash
-/// validation is a follow-on hardening once A11 ships.
-pub fn shutdown_was_authorised(marker_path: &Path) -> Result<bool> {
-    let raw = match std::fs::read_to_string(marker_path) {
-        Ok(s) => s,
+/// What the agent's exit means, from the shutdown-authorisation marker
+/// (Tappa 8 A7/A8, design §10.4; external audit WDG-001, EVD-021).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownVerdict {
+    /// No marker: the agent died — respawn it.
+    Absent,
+    /// A marker that verifies against the admin quorum: stand down.
+    Authorised,
+    /// A marker that does not (forged, replayed, stale, or the keys or the
+    /// install id could not be read): respawn, and report it. The marker
+    /// is removed and recorded at [`common::shutdown_marker::REJECTED_PATH`]
+    /// for the agent's signed audit chain.
+    Refused(String),
+}
+
+/// What [`check_shutdown_marker`] reads.
+#[derive(Debug, Clone)]
+pub struct ShutdownCheck<'a> {
+    /// The marker; the records of refusals and honoured authorisations sit
+    /// next to it.
+    pub marker: &'a Path,
+    /// `admin.pub`: the keys the shutdown must be signed by.
+    pub admin_pub: &'a Path,
+    /// `agent_id`: the install the shutdown must be signed for.
+    pub agent_id_file: &'a Path,
+    /// The agent that exited.
+    pub agent_pid: u32,
+    /// When it started (unix seconds), when known ([`process_start_unix`]).
+    pub agent_started: Option<u64>,
+}
+
+/// Decide what the agent's exit means. A marker is honoured only when it
+/// carries a shutdown signed by the admin quorum for this install, recent,
+/// written by the agent that exited, and not honoured before
+/// ([`common::shutdown_marker::verify`]); it was a JSON with a hash and a
+/// deadline any root process could write. Every failure is a refusal —
+/// the agent is respawned.
+pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
+    use common::shutdown_marker as sm;
+    let raw = match std::fs::read(c.marker) {
+        Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 target: "watchdog.shutdown_marker",
-                path = %marker_path.display(),
+                path = %c.marker.display(),
                 "no shutdown-authorisation marker — proceeding with restart"
             );
-            return Ok(false);
+            return ShutdownVerdict::Absent;
         }
-        Err(e) => {
-            return Err(anyhow!(e))
-                .with_context(|| format!("reading marker {}", marker_path.display()));
-        }
+        Err(e) => return refuse(c, &[], format!("reading the marker: {e}")),
     };
-
-    let v: serde_json::Value = serde_json::from_str(raw.trim())
-        .with_context(|| format!("parsing marker JSON at {}", marker_path.display()))?;
-    let entry_hash = v
-        .get("entry_hash")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("marker missing `entry_hash` field"))?;
-    if entry_hash.len() != 64 || !entry_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(anyhow!(
-            "marker entry_hash must be 64 hex chars (got {} chars)",
-            entry_hash.len()
-        ));
-    }
-    let deadline = v
-        .get("grace_deadline_unix_ts")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| anyhow!("marker missing `grace_deadline_unix_ts` field"))?;
-
+    let marker = match sm::ShutdownMarker::parse(&String::from_utf8_lossy(&raw)) {
+        Ok(m) => m,
+        Err(r) => return refuse(c, &raw, r.to_string()),
+    };
+    let keys = match std::fs::read_to_string(c.admin_pub)
+        .map_err(|e| e.to_string())
+        .and_then(|body| common::admin_quorum::parse_admin_pub(&body))
+    {
+        Ok(k) => k,
+        Err(e) => return refuse(c, &raw, format!("{}: {e}", c.admin_pub.display())),
+    };
+    let agent_id = match std::fs::read_to_string(c.agent_id_file)
+        .map_err(|e| e.to_string())
+        .and_then(|body| sm::parse_agent_id(&body))
+    {
+        Ok(id) => id,
+        Err(e) => return refuse(c, &raw, format!("{}: {e}", c.agent_id_file.display())),
+    };
+    let honoured_path = c.marker.with_file_name(file_name_of(sm::HONOURED_PATH));
+    let honoured = std::fs::read_to_string(&honoured_path).unwrap_or_default();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-
-    if deadline < now {
-        warn!(
-            target: "watchdog.shutdown_marker",
-            path = %marker_path.display(),
-            deadline,
-            now,
-            "shutdown marker is STALE — proceeding with restart"
-        );
-        return Ok(false);
+    let exp = sm::Expectation {
+        keys: &keys,
+        agent_id,
+        agent_pid: c.agent_pid,
+        agent_started: c.agent_started,
+        now,
+    };
+    match sm::verify(&marker, &exp, |nonce| sm::was_honoured(&honoured, nonce)) {
+        Ok(auth) => {
+            // Recorded before standing down: the same authorisation is
+            // refused if it is ever presented again.
+            if let Err(e) = append_line(&honoured_path, &sm::honoured_line(&auth)) {
+                warn!(
+                    target: "watchdog.shutdown_marker",
+                    error = %e,
+                    path = %honoured_path.display(),
+                    "could not record the honoured authorisation; its replay is bounded by the signature's age only"
+                );
+            }
+            let _ = std::fs::remove_file(c.marker);
+            info!(
+                target: "watchdog.shutdown_marker",
+                signed_at = auth.ts,
+                signers = auth.signers.len(),
+                "admin-authorised shutdown verified against admin.pub — watchdog standing down"
+            );
+            ShutdownVerdict::Authorised
+        }
+        Err(r) => refuse(c, &raw, r.to_string()),
     }
+}
 
-    info!(
-        target: "watchdog.shutdown_marker",
-        path = %marker_path.display(),
-        entry_hash,
-        deadline,
-        "admin-authorised shutdown marker present + deadline valid — watchdog standing down"
-    );
-    Ok(true)
+/// Record a refused marker for the agent and remove it.
+fn refuse(c: &ShutdownCheck<'_>, raw: &[u8], reason: String) -> ShutdownVerdict {
+    use common::shutdown_marker as sm;
+    let record = sm::RejectedRecord {
+        at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        agent_pid: c.agent_pid,
+        reason: reason.clone(),
+        sha256: sm::marker_sha256(raw),
+    };
+    let path = c.marker.with_file_name(file_name_of(sm::REJECTED_PATH));
+    let line = serde_json::to_string(&record).unwrap_or_default() + "\n";
+    if let Err(e) = append_line(&path, &line) {
+        warn!(target: "watchdog.shutdown_marker", error = %e, path = %path.display(), "could not record the refused marker");
+    }
+    let _ = std::fs::remove_file(c.marker);
+    ShutdownVerdict::Refused(reason)
+}
+
+fn file_name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Append `line` to `path` (created 0600; never through a symlink).
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(line.as_bytes())?;
+    f.sync_all()
+}
+
+/// When `pid` started, in unix seconds: `/proc/<pid>/stat` field 22
+/// (clock ticks since boot) over `/proc/stat`'s `btime`. Read while the
+/// process runs; `None` when either cannot be read.
+pub fn process_start_unix(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised comm, which may contain spaces.
+    let rest = stat.rsplit_once(')')?.1;
+    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+    let btime: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    Some(btime + ticks / hz as u64)
 }
 
 /// Helper: emit the "tamper suspected" journal line + escalate.
@@ -1912,68 +2017,101 @@ mod tests {
         }
     }
 
-    /// Required W4 test 6: shutdown_authorised marker check.
-    /// Covers all three branches: absent file → Ok(false);
-    /// present + future deadline → Ok(true); present + past
-    /// deadline → Ok(false) with WARN; malformed → Err.
+    /// External audit WDG-001 / TST-003: only a marker the admin quorum
+    /// signed for this agent stands the watchdog down. The old shape —
+    /// which this test used to prove was accepted — is refused, recorded
+    /// for the agent and removed; a genuine authorisation is honoured once.
     #[test]
-    fn shutdown_was_authorised_handles_all_marker_shapes() {
+    fn only_a_quorum_signed_marker_stands_the_watchdog_down() {
+        use common::shutdown_marker::ShutdownMarker;
+        use common::wire::admin_signed_payload::{sign, SignedPayload};
         let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("agent.shutdown_authorised");
+        let admin_pub = dir.path().join("admin.pub");
+        let agent_id_file = dir.path().join("agent_id");
+        let a = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+        let b = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        std::fs::write(
+            &admin_pub,
+            format!(
+                "{} shutdown\n{} unlock\n",
+                hex::encode(a.verifying_key().to_bytes()),
+                hex::encode(b.verifying_key().to_bytes())
+            ),
+        )
+        .unwrap();
+        std::fs::write(&agent_id_file, format!("{}\n", "07".repeat(16))).unwrap();
+        let check = ShutdownCheck {
+            marker: &marker,
+            admin_pub: &admin_pub,
+            agent_id_file: &agent_id_file,
+            agent_pid: 4242,
+            agent_started: None,
+        };
+        assert_eq!(check_shutdown_marker(&check), ShutdownVerdict::Absent);
 
-        // Branch 1: absent → Ok(false).
-        let absent = dir.path().join("nope.marker");
-        assert!(!shutdown_was_authorised(&absent).unwrap());
+        // what any root process could write before
+        std::fs::write(
+            &marker,
+            format!(
+                r#"{{"entry_hash":"{}","grace_deadline_unix_ts":99999999999}}"#,
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_shutdown_marker(&check),
+            ShutdownVerdict::Refused(_)
+        ));
+        assert!(!marker.exists(), "a refused marker is removed");
+        let rejected = std::fs::read_to_string(dir.path().join("agent.shutdown_rejected")).unwrap();
+        assert!(rejected.contains(r#""agent_pid":4242"#), "{rejected}");
 
-        // Branch 2: present + future deadline → Ok(true).
-        let valid = dir.path().join("valid.marker");
-        let future = SystemTime::now()
+        // a genuine authorisation, then the same one again
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs()
-            + 3600;
+            .as_secs();
+        let payload = SignedPayload::new_shutdown([9; 32], now, [7; 16], 30);
+        let sigs = [sign(&payload, &a).unwrap(), sign(&payload, &b).unwrap()];
+        let genuine = ShutdownMarker::new(&payload, &sigs, 4242)
+            .unwrap()
+            .to_line();
+        std::fs::write(&marker, &genuine).unwrap();
+        assert_eq!(check_shutdown_marker(&check), ShutdownVerdict::Authorised);
+        assert!(!marker.exists());
+        std::fs::write(&marker, &genuine).unwrap();
+        assert!(matches!(
+            check_shutdown_marker(&check),
+            ShutdownVerdict::Refused(r) if r.contains("replay")
+        ));
+
+        // the keys cannot be read: refused, never honoured
+        std::fs::remove_file(&admin_pub).unwrap();
+        let payload = SignedPayload::new_shutdown([10; 32], now, [7; 16], 30);
+        let sigs = [sign(&payload, &a).unwrap(), sign(&payload, &b).unwrap()];
         std::fs::write(
-            &valid,
-            format!(
-                r#"{{"entry_hash":"{}","grace_deadline_unix_ts":{future}}}"#,
-                "ab".repeat(32),
-            ),
+            &marker,
+            ShutdownMarker::new(&payload, &sigs, 4242)
+                .unwrap()
+                .to_line(),
         )
         .unwrap();
-        assert!(shutdown_was_authorised(&valid).unwrap());
+        assert!(matches!(
+            check_shutdown_marker(&check),
+            ShutdownVerdict::Refused(_)
+        ));
+    }
 
-        // Branch 3: present + past deadline → Ok(false).
-        let stale = dir.path().join("stale.marker");
-        std::fs::write(
-            &stale,
-            format!(
-                r#"{{"entry_hash":"{}","grace_deadline_unix_ts":1}}"#,
-                "cd".repeat(32),
-            ),
-        )
-        .unwrap();
-        assert!(
-            !shutdown_was_authorised(&stale).unwrap(),
-            "stale marker (deadline 1970) must NOT block restart"
-        );
-
-        // Branch 4: present + malformed → Err.
-        let bad = dir.path().join("bad.marker");
-        std::fs::write(&bad, "this is not json").unwrap();
-        assert!(shutdown_was_authorised(&bad).is_err());
-
-        // Branch 4b: present + JSON but missing fields → Err.
-        let partial = dir.path().join("partial.marker");
-        std::fs::write(&partial, r#"{"grace_deadline_unix_ts":9999}"#).unwrap();
-        assert!(shutdown_was_authorised(&partial).is_err());
-
-        // Branch 4c: present + entry_hash wrong length → Err.
-        let bad_hash = dir.path().join("bad_hash.marker");
-        std::fs::write(
-            &bad_hash,
-            r#"{"entry_hash":"abcd","grace_deadline_unix_ts":9999999999}"#,
-        )
-        .unwrap();
-        assert!(shutdown_was_authorised(&bad_hash).is_err());
+    #[test]
+    fn process_start_is_read_for_a_live_process() {
+        let me = process_start_unix(std::process::id()).expect("own start time");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(me <= now && now - me < 24 * 3600, "start {me}, now {now}");
+        assert_eq!(process_start_unix(u32::MAX), None);
     }
 
     // ── Supplementary W4 tests (anchors for forward-compat) ────────

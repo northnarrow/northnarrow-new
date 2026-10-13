@@ -1365,10 +1365,10 @@ fn dispatch_shutdown(
     };
     *fps_out = matched_fps;
 
-    // Per §10.3 step 2: build the marker. entry_hash is the
-    // SHA-256 over signing_digest(payload) — a stable opaque
-    // token until A11's audit hash chain replaces it with the
-    // actual audit-log entry hash. grace_deadline = now + grace.
+    // Per §10.3 step 2: the marker carries what the admins signed and
+    // this agent's pid, so the watchdog can verify it against admin.pub
+    // as we just did (external audit WDG-001) — a marker it cannot
+    // verify makes it respawn us.
     let grace_secs = match &req.payload.extra {
         common::wire::admin_signed_payload::OperationExtra::Shutdown(s) => s.grace_secs,
         // Other extras can't reach here — verify_signed_payload_quorum
@@ -1378,21 +1378,12 @@ fn dispatch_shutdown(
         _ => 30,
     };
     let grace_deadline_unix_ts = server_now.saturating_add(u64::from(grace_secs));
-
-    let digest = match common::wire::admin_signed_payload::signing_digest(&req.payload) {
-        Ok(d) => d,
+    let marker = match ShutdownMarker::new(&req.payload, &sigs, std::process::id()) {
+        Ok(m) => m,
         Err(e) => {
-            warn!(error = ?e, "computing signing digest for marker entry_hash failed");
+            warn!(error = ?e, "encoding the shutdown marker failed");
             return AdminResult::InvalidSignature;
         }
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(digest);
-    let entry_hash = hex::encode(hasher.finalize());
-
-    let marker = ShutdownMarker {
-        entry_hash,
-        grace_deadline_unix_ts,
     };
 
     // Per §10.3 step 2 (atomic write): tmpfile + fsync + rename.
@@ -3858,19 +3849,36 @@ mod tests {
             let marker = shutdown_marker::read_marker(&marker_c)
                 .expect("read")
                 .expect("marker present after Success");
-            assert_eq!(marker.entry_hash.len(), 64);
-            // grace_deadline = now + 30s; allow ±2s drift around
-            // the system clock read at sign time vs dispatch time.
-            let expected = now + 30;
-            assert!(
-                marker.grace_deadline_unix_ts.abs_diff(expected) <= 2,
-                "grace_deadline_unix_ts={} expected ~{}",
-                marker.grace_deadline_unix_ts,
-                expected
-            );
+            assert_eq!(marker.agent_pid, std::process::id());
 
-            // Suppress unused-key warnings from the move closure.
-            let _ = (signing_a, signing_b);
+            // External audit TST-003: the watchdog's half of the contract.
+            // The marker verifies against the admin keys, and the same
+            // marker with its signatures replaced does not.
+            use common::shutdown_marker::{verify, Expectation, Rejection};
+            let keys: Vec<common::admin_quorum::AdminKey> = [&signing_a, &signing_b]
+                .iter()
+                .map(|sk| common::admin_quorum::AdminKey {
+                    key: sk.verifying_key(),
+                    roles: vec![Role::Shutdown],
+                })
+                .collect();
+            let exp = Expectation {
+                keys: &keys,
+                agent_id: agent_id_c,
+                agent_pid: std::process::id(),
+                agent_started: None,
+                now,
+            };
+            let ok = verify(&marker, &exp, |_| false).expect("the watchdog accepts it");
+            assert_eq!(ok.nonce, nonce);
+            let mut forged = marker.clone();
+            let stranger = ed25519_dalek::SigningKey::from_bytes(&[0xEE; 32]);
+            let fake = SignedPayload::new_shutdown(nonce, now, agent_id_c, 30);
+            forged.signatures = vec![hex::encode(sign(&fake, &stranger).unwrap()); 2];
+            assert!(matches!(
+                verify(&forged, &exp, |_| false),
+                Err(Rejection::Quorum(_))
+            ));
         })
         .await;
 
