@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Validates a single entry AFTER directive stripping. Returns a
 /// human diagnostic on rejection; the loader wraps it with the
@@ -159,14 +159,22 @@ pub fn parse_default_list(path: &Path, validate: EntryValidator<'_>) -> Result<B
         if trimmed.is_empty() {
             continue;
         }
+        // External audit FIMR-001: one bad line used to discard the whole
+        // default list (FIM then watched nothing). It is skipped and
+        // reported; every valid line still counts.
         if trimmed.starts_with('+') || trimmed.starts_with('-') {
-            return Err(anyhow!(
-                "{}:{}: default list must not use +/- prefixes (those are local-overlay only)",
+            error!(
+                "{}:{}: default list must not use +/- prefixes (those are local-overlay only) \
+                 — line skipped",
                 path.display(),
                 lineno + 1
-            ));
+            );
+            continue;
         }
-        validate(trimmed).map_err(|e| anyhow!("{}:{}: {}", path.display(), lineno + 1, e))?;
+        if let Err(e) = validate(trimmed) {
+            error!("{}:{}: {} — line skipped", path.display(), lineno + 1, e);
+            continue;
+        }
         set.insert(trimmed.to_string());
     }
     Ok(set)
@@ -186,7 +194,7 @@ fn parse_local_overlay(
             return Err(anyhow!(e).context(format!("reading operator overlay {}", path.display())))
         }
     };
-    parse_overlay_text(&path.display().to_string(), &body, validate)
+    parse_overlay_lines(&path.display().to_string(), &body, validate, true)
 }
 
 /// Text form of [`parse_local_overlay`] (Tappa 10.8: the same rules
@@ -197,6 +205,19 @@ pub fn parse_overlay_text(
     body: &str,
     validate: EntryValidator<'_>,
 ) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    parse_overlay_lines(label, body, validate, false)
+}
+
+/// `lenient`: a bad line is skipped and reported instead of failing the
+/// text — the boot reading an overlay on disk (external audit FIMR-001: a
+/// bad line used to drop the whole overlay). Content submitted for
+/// signing is checked strictly, so the operator sees the error.
+fn parse_overlay_lines(
+    label: &str,
+    body: &str,
+    validate: EntryValidator<'_>,
+    lenient: bool,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let mut adds = BTreeSet::new();
     let mut disables = BTreeSet::new();
     for (lineno, raw) in body.lines().enumerate() {
@@ -205,7 +226,13 @@ pub fn parse_overlay_text(
             continue;
         }
         let (directive, rest) = split_directive(trimmed);
-        validate(rest).map_err(|e| anyhow!("{}:{}: {}", label, lineno + 1, e))?;
+        if let Err(e) = validate(rest) {
+            if !lenient {
+                return Err(anyhow!("{}:{}: {}", label, lineno + 1, e));
+            }
+            error!("{}:{}: {} — line skipped", label, lineno + 1, e);
+            continue;
+        }
         let entry = rest.to_string();
         match directive {
             Directive::Add => {
@@ -357,10 +384,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = dir.path().join("comm.v1");
         std::fs::write(&v1, "sshd\n+oops-overlay-syntax\n").unwrap();
-        let err = parse_default_list(&v1, &accept_any).expect_err("v1 must reject +/- prefixes");
-        assert!(
-            err.to_string().contains("local-overlay only"),
-            "expected directive-prefix diagnostic, got: {err}"
+        // External audit FIMR-001: the directive line is skipped, the rest
+        // of the list kept.
+        let set = parse_default_list(&v1, &accept_any).expect("a bad line is not a bad list");
+        assert_eq!(
+            set.into_iter().collect::<Vec<_>>(),
+            vec!["sshd".to_string()]
         );
     }
 }

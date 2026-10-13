@@ -164,6 +164,11 @@ pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     // runtime corrupts the boot-time integrity check (observed on the
     // lab guest: `echo x >>` went through while MUTATE-only).
     "install-manifest.json",
+    // External audit FIMR-001: the shipped FIM path list, written only by
+    // install.sh (operators tune `fim-paths.local`, which stays
+    // MUTATE-only and is signature-gated). An append at runtime could
+    // add lines the next boot reads.
+    "fim-paths.v1",
 ];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that

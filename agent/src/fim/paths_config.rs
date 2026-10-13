@@ -244,31 +244,45 @@ mod tests {
     /// agent up); this test confirms the inner `read_default_list`
     /// surfaces the diagnostic.
     #[test]
-    fn read_default_list_rejects_relative_path() {
+    fn read_default_list_skips_a_relative_path() {
         let dir = TempDir::new().unwrap();
         let v1 = dir.path().join("fim-paths.v1");
         std::fs::write(&v1, "relative/path/no-leading-slash\n").unwrap();
-        let err = read_default_list(&v1).expect_err("relative paths must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("must be absolute"),
-            "expected absolute-path diagnostic, got: {msg}"
-        );
+        // External audit FIMR-001: skipped and reported, not the whole list.
+        assert!(read_default_list(&v1).unwrap().is_empty());
     }
 
     /// C7 #5: a v1 file that accidentally contains `+`/`-` prefixed
-    /// lines (operator copied a `.local` template over `v1`) is
-    /// rejected up-front so the install error surfaces at boot.
+    /// lines (operator copied a `.local` template over `v1`): those lines
+    /// are reported and skipped (external audit FIMR-001), the rest kept.
     #[test]
-    fn read_default_list_rejects_directive_prefixes() {
+    fn read_default_list_skips_directive_prefixes() {
         let dir = TempDir::new().unwrap();
         let v1 = dir.path().join("fim-paths.v1");
         std::fs::write(&v1, "/usr/sbin/sshd\n+/oops/operator-overlay-syntax\n").unwrap();
-        let err = read_default_list(&v1).expect_err("v1 must reject +/- prefixes");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("local-overlay only"),
-            "expected directive-prefix diagnostic, got: {msg}"
+        let set = read_default_list(&v1).unwrap();
+        assert_eq!(
+            set.into_iter().collect::<Vec<_>>(),
+            vec![std::path::PathBuf::from("/usr/sbin/sshd")]
+        );
+    }
+
+    /// External audit FIMR-001: one invalid line used to empty the whole
+    /// default list — FIM watched nothing. Only that line is dropped now.
+    #[test]
+    fn one_invalid_line_drops_only_itself() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let v1 = dir.path().join("fim-paths.v1");
+        std::fs::write(&v1, "/etc/passwd\nrelative/path\n+/etc/x\n/etc/shadow\n").unwrap();
+        let load = load_watched_paths(&v1, &dir.path().join("none.local")).unwrap();
+        let got: Vec<String> = load
+            .effective
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["/etc/passwd".to_string(), "/etc/shadow".to_string()]
         );
     }
 }

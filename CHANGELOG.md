@@ -6,6 +6,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, FIM availability (High MAIN-003, FIMR-001,
+  FIMP-001):
+  - The FIM sensors, the file-open sensor, the drain and every FIM rule
+    were started only if the baseline database opened: one malformed line
+    in `fim_baseline.jsonl` switched FIM off for the boot. They now start
+    regardless; without the database only a new baseline cannot be
+    recorded, and that is written to the signed audit chain
+    (`subsystem_degraded`). A torn last write of the baseline is repaired
+    and a malformed line skipped, as for the other chain logs.
+  - The drain dropped "no-op" changes against baseline rows it never
+    verified: a forged row giving a watched file the hash of its
+    backdoored content hid every later change. Only the verified suffix of
+    the chain (signature, recomputed hash, link to the previous row) may
+    now silence an event; rows before a break report every change until a
+    new signed baseline, and the break is recorded.
+  - One invalid line in `fim-paths.v1` (or any shipped list) emptied the
+    whole list — FIM watched nothing. The line is skipped and reported;
+    an empty watch list is an ERROR and a signed record. `fim-paths.v1`
+    is now write-denied like `install-manifest.json` (install.sh writes it
+    with the pins purged); `fim-paths.local` stays MUTATE-only and
+    signature-gated.
 - External audit, Wave 1, chain logs cut short (High EVD-005, NET-003,
   DEC-006): one write interrupted by a crash or a power loss no longer
   switches a subsystem off.
