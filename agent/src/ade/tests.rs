@@ -720,3 +720,70 @@ async fn with_rag_splices_block_into_assembled_prompt() {
         "the retrieved fixture doc's summary line must appear in the spliced block"
     );
 }
+
+/// External audit LLMR-006: a destructive verdict the verifier does not
+/// confirm — here a `KillTree` at confidence 0.50, which the parser
+/// accepts — is escalated for review, never executed.
+#[tokio::test]
+async fn low_confidence_kill_tree_is_escalated_not_executed() {
+    use common::ade_types::EscalationTier;
+
+    struct FixedBackend(String);
+    impl InferenceBackend for FixedBackend {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn quantization(&self) -> &str {
+            "none"
+        }
+        fn model_id(&self) -> &str {
+            "fixed-model"
+        }
+        fn generate(
+            &self,
+            _: &str,
+            _: &Event,
+            _: usize,
+            _: f32,
+            _: f32,
+        ) -> Result<String, error::AdeError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let event = Event::ProcessSpawn {
+        pid: 4242,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "xmrig".into(),
+        filename: "/tmp/x".into(),
+        timestamp_ns: 0,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
+        parent_is_kthread: false,
+        exe: Default::default(),
+    };
+    let raw = MockBackend::new()
+        .generate("", &event, 512, 0.0, 1.0)
+        .expect("mock verdict");
+    let mut v: serde_json::Value = serde_json::from_str(&raw).expect("mock JSON");
+    v["verdict"] = "KillTree".into();
+    v["recommended_action"]["action"] = "KillTree".into();
+    v["confidence"] = 0.5.into();
+
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let cfg = cfg_with(prompt.path(), model.path());
+    let engine = AdeEngine::new_with_backend(cfg, Arc::new(FixedBackend(v.to_string())))
+        .await
+        .unwrap();
+    let ctx = EventContext {
+        recent_events: vec![],
+        host_context: HostContext::discover(),
+    };
+    let out = engine.evaluate(&event, &ctx).await.unwrap();
+    assert_eq!(out.verdict, AdeAction::Escalate);
+    assert_eq!(out.escalation_tier, Some(EscalationTier::Tier3Review));
+}

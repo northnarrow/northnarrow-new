@@ -47,7 +47,8 @@ pub enum InjectionFlag {
     ZeroWidthChar,
     /// Argv (concatenated) longer than the [`ARGV_TOTAL_CAP`] cap.
     OverlongArgv(usize),
-    /// ASCII control char that isn't `\t \n \r`.
+    /// ASCII control character. External audit LLMP-001: TAB, LF and CR
+    /// included — every untrusted field is one line of the prompt.
     NonPrintable,
     /// Right-to-left override / bidi-control char.
     BidiControl,
@@ -68,6 +69,10 @@ pub enum InjectionFlag {
     /// Variant of a known instruction keyword with a non-canonical
     /// separator (`northnarrow-` instead of `northnarrow:`).
     VariantSeparator { canonical: String, variant: String },
+    /// External audit LLMP-001: the prompt's section delimiter (`===`)
+    /// inside an untrusted string — an attempt to close the untrusted
+    /// block or to open a forged one.
+    SectionMarker,
 }
 
 impl InjectionFlag {
@@ -86,9 +91,18 @@ impl InjectionFlag {
             InjectionFlag::RotEncoded { .. } => 0.45,
             InjectionFlag::VisualSubstitution { .. } => 0.40,
             InjectionFlag::VariantSeparator { .. } => 0.40,
+            InjectionFlag::SectionMarker => 0.45,
         }
     }
 }
+
+/// External audit LLMP-001: the delimiter of the prompt's sections
+/// (`=== UNTRUSTED EVENT DATA ... ===`). Never left intact in an
+/// untrusted string.
+const SECTION_MARKER: &str = "===";
+
+/// External audit LLMP-002: correlated events the prompt carries at most.
+pub const CORRELATED_MAX: usize = 20;
 
 /// Hard caps applied during sanitization.
 pub const FILENAME_CAP: usize = 256;
@@ -147,6 +161,7 @@ impl SanitizedEvent {
                 InjectionFlag::VariantSeparator { canonical, variant } => {
                     format!("variant_sep:{variant}~{canonical}")
                 }
+                InjectionFlag::SectionMarker => "section_marker".to_string(),
             });
         }
         out.join(",")
@@ -393,6 +408,36 @@ pub fn sanitize_event_for_ade(event: &Event) -> SanitizedEvent {
     }
 }
 
+/// External audit LLMP-002: the correlated events of a prompt, sanitized
+/// like the focal one before any of their strings reaches the model.
+#[derive(Debug, Clone, Default)]
+pub struct SanitizedCorrelated {
+    /// Newest first, at most [`CORRELATED_MAX`], each scoring below
+    /// [`super::HIGH_INJECTION_SCORE_REJECT`].
+    pub events: Vec<SanitizedEvent>,
+    /// Events left out of the prompt for their injection score.
+    pub omitted: usize,
+    /// The highest injection score among `events`.
+    pub max_score: f32,
+}
+
+/// Sanitize the newest [`CORRELATED_MAX`] of `recent` (oldest first, as
+/// the correlation buffer holds them). An event whose own score would
+/// have kept it from the model as a focal event is left out and counted.
+pub fn sanitize_correlated(recent: &[Event]) -> SanitizedCorrelated {
+    let mut out = SanitizedCorrelated::default();
+    for e in recent.iter().rev().take(CORRELATED_MAX) {
+        let s = sanitize_event_for_ade(e);
+        if s.injection_score >= super::HIGH_INJECTION_SCORE_REJECT {
+            out.omitted += 1;
+            continue;
+        }
+        out.max_score = out.max_score.max(s.injection_score);
+        out.events.push(s);
+    }
+    out
+}
+
 fn extract_string_fields(event: &Event) -> (String, String, String) {
     match event {
         Event::ModuleLoad {
@@ -581,6 +626,13 @@ fn sanitize_string(input: &str, cap: usize, flags: &mut Vec<InjectionFlag>) -> S
         if buf.contains(tok) {
             flags.push(InjectionFlag::SpecialToken(redact_token(tok)));
             buf = buf.replace(tok, &"?".repeat(tok.len()));
+        }
+    }
+    // External audit LLMP-001: the prompt's own section delimiter.
+    if buf.contains(SECTION_MARKER) {
+        flags.push(InjectionFlag::SectionMarker);
+        while buf.contains(SECTION_MARKER) {
+            buf = buf.replace(SECTION_MARKER, "=?=");
         }
     }
 
@@ -841,11 +893,11 @@ fn is_bidi_control(ch: char) -> bool {
     )
 }
 
+/// External audit LLMP-001: TAB, LF and CR count too. Every untrusted
+/// field is one line of a line-oriented prompt, and a single LF in a file
+/// name (legal on Linux) was enough to forge a line or a section.
 fn is_non_printable(ch: char) -> bool {
     let c = ch as u32;
-    if matches!(ch, '\t' | '\n' | '\r') {
-        return false;
-    }
     c < 0x20 || c == 0x7F
 }
 
@@ -888,6 +940,7 @@ fn dedup_flags(flags: Vec<InjectionFlag>) -> Vec<InjectionFlag> {
                 suspected_target, ..
             } => format!("vs:{suspected_target}"),
             InjectionFlag::VariantSeparator { canonical, .. } => format!("vsep:{canonical}"),
+            InjectionFlag::SectionMarker => "sm".to_string(),
         };
         let n = counts.entry(key).or_insert(0);
         if *n < 2 {

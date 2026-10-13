@@ -30,6 +30,24 @@ pub struct EscalateMeta<'a> {
     pub inference_latency_ms: u64,
 }
 
+/// Bytes of raw model output an escalation package keeps.
+const RAW_OUTPUT_CAP: usize = 4096;
+
+/// External audit LLMR-001: `s` cut to at most `max` bytes, never inside
+/// a UTF-8 character. A byte slice through one panics, and with
+/// `panic = "abort"` that stops the agent; the model writes Italian, so
+/// a multi-byte character at the cut is ordinary.
+pub(crate) fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Build a valid `Escalate` verdict from an arbitrary error string and
 /// the raw model output (if any). The caller is responsible for
 /// passing the focal event so we can stamp pid/filename into the
@@ -149,8 +167,11 @@ pub fn transform_to_escalate(
                 "Has the schema drifted?".into(),
             ],
             raw_model_output: raw_output.map(|s| {
-                if s.len() > 4096 {
-                    format!("{}…(truncated)", &s[..4096])
+                if s.len() > RAW_OUTPUT_CAP {
+                    format!(
+                        "{}…(truncated)",
+                        truncate_on_char_boundary(s, RAW_OUTPUT_CAP)
+                    )
                 } else {
                     s.to_string()
                 }
@@ -222,6 +243,38 @@ mod tests {
         assert!(v.escalation_package.is_some());
         let pkg = v.escalation_package.unwrap();
         assert_eq!(pkg.source_event_pid, Some(1234));
+    }
+
+    /// External audit LLMR-001: a multi-byte character across the cut
+    /// used to panic the slice — and, with `panic = "abort"`, the agent.
+    #[test]
+    fn raw_output_truncated_on_a_char_boundary() {
+        let event = Event::ProcessSpawn {
+            pid: 1,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: "x".into(),
+            filename: "/x".into(),
+            timestamp_ns: 0,
+            argv: Vec::new(),
+            parent_comm: String::new(),
+            parent_start_ns: 0,
+            parent_is_kthread: false,
+            exe: Default::default(),
+        };
+        let host = host();
+        let m = meta(&host);
+        for lead in [4095, 4094, 4093] {
+            let raw = "A".repeat(lead) + "è€😀" + &"B".repeat(100);
+            let v = transform_to_escalate(&event, "long", Some(&raw), &m);
+            let stored = v.escalation_package.unwrap().raw_model_output.unwrap();
+            assert!(stored.len() <= RAW_OUTPUT_CAP + "…(truncated)".len());
+            assert!(stored.ends_with("…(truncated)"));
+        }
+        assert_eq!(truncate_on_char_boundary("aè", 2), "a");
+        assert_eq!(truncate_on_char_boundary("aè", 3), "aè");
+        assert_eq!(truncate_on_char_boundary("è", 1), "");
     }
 
     #[test]

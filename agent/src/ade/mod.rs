@@ -217,10 +217,14 @@ impl AdeEngine {
             r
         });
 
+        // External audit LLMP-002: the correlated events are sanitized
+        // like the focal one, and go in their own untrusted block.
+        let correlated = sanitize::sanitize_correlated(&context.recent_events);
         let parts = structured_prompt::build_structured_prompt_with_rag(
             &self.inner.system_prompt,
             &self.inner.config,
             &sanitized,
+            &correlated,
             context,
             rag_result.as_ref(),
         );
@@ -298,8 +302,14 @@ impl AdeEngine {
                 }
                 self.inner.stats.record_success(elapsed_ms);
 
-                // Layer 3: sanity check.
-                match sanity_check::verify_verdict_coherence(&v, &sanitized) {
+                // Layer 3: sanity check. External audit LLMP-002: an
+                // injection attempt in the correlated events weighs like
+                // one in the focal event.
+                let weighed = sanitize::SanitizedEvent {
+                    injection_score: sanitized.injection_score.max(correlated.max_score),
+                    ..sanitized.clone()
+                };
+                match sanity_check::verify_verdict_coherence(&v, &weighed) {
                     SanityCheckResult::Coherent => {}
                     SanityCheckResult::AnomalyDetected {
                         reason,
@@ -331,10 +341,18 @@ impl AdeEngine {
                                 self.escalate_meta(elapsed_ms),
                             );
                         }
+                        // External audit LLMR-006: no confirmation, no
+                        // destructive action — escalated like a rejection.
                         VerificationResult::Inconclusive => {
-                            tracing::info!(
+                            tracing::warn!(
                                 action = %v.verdict,
-                                "critical-action verifier inconclusive (kept)"
+                                "critical-action verifier inconclusive; escalating Tier3"
+                            );
+                            v = make_escalate_for_verifier(
+                                event,
+                                &v,
+                                "verifier inconclusive",
+                                self.escalate_meta(elapsed_ms),
                             );
                         }
                     }
@@ -381,10 +399,12 @@ impl AdeEngine {
             let query_text = build_rag_query_from_event(event);
             rag.retrieve(RagQuery::new(&query_text))
         });
+        let correlated = sanitize::sanitize_correlated(&context.recent_events);
         let parts = structured_prompt::build_structured_prompt_with_rag(
             &self.inner.system_prompt,
             &self.inner.config,
             &sanitized,
+            &correlated,
             context,
             rag_result.as_ref(),
         );
