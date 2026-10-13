@@ -38,8 +38,9 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-033 | FIMP-005 | High | FIM pipeline | `agent/src/fim/drain.rs` | open |
 | NN-AUD-034 | FIMP-006 | High | FIM pipeline | `agent/src/fim/drain.rs` | open |
 | NN-AUD-035 | NETR-001 | High | Net rules | `agent/src/decision/rules/chain.rs` | open |
-| NN-AUD-047 | CMB-002 | High | Combat response | `agent/src/combat/actuator.rs` | open |
-| NN-AUD-049 | CMB-005 | High | Combat response | `agent/src/response/executor.rs` | open |
+| NN-AUD-047 | CMB-002 | High | Combat response | `agent/src/combat/actuator.rs` | fixed (lab PR 83) |
+| NN-AUD-048 | CMB-003 | High | Combat response | `agent/src/combat/protected.rs` | fixed (lab PR 83; Wave 1, taken with NN-AUD-049) |
+| NN-AUD-049 | CMB-005 | High | Combat response | `agent/src/response/executor.rs` | fixed (lab PR 83) |
 | NN-AUD-051 | LLMP-001 | High | LLM prompts | `agent/src/ade/sanitize.rs` | fixed (lab PR 81) |
 | NN-AUD-052 | LLMR-001 | High | LLM runtime | `agent/src/ade/escalate.rs` | fixed (lab PR 81) |
 | NN-AUD-054 | LLMR-006 | High | LLM runtime | `agent/src/ade/dual_verify.rs` | fixed (lab PR 81) |
@@ -206,3 +207,34 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     execs in a burst: the first was evaluated (VERDICT (ADE)), the others
     were counted as skipped ("ADE busy"), and an exec from /tmp right
     after still drew R001 at once. The privileged suite passed (55/55).
+- **NN-AUD-047 (CMB-002), lab PR 83.** NEUTRALIZE judged a killed tree
+  by its root alone. A descendant still running — not killed, spared by
+  the host-critical guard, or beyond the 1000-descendant walk, which
+  stopped silently — left the episode "verified contained". Every
+  descendant now counts, the walk reports where it stopped
+  (`TreeTruncated`), and the reason names the cause. An uncontained
+  tree escalates like any uncontainable offender; isolation still needs
+  a locked COMBAT (NN-AUD-002).
+- **NN-AUD-049 (CMB-005) and NN-AUD-048 (CMB-003), lab PR 83.** The
+  host-critical guard (the agent's stack, the SSH service) was consulted
+  only by the kill-tree walk: a rule's KillProcess, or a Quarantine,
+  BlockOutbound or Throttle verdict, could take down sshd or the
+  watchdog. It now applies to every action on a process. That would
+  have widened a hole: the guard spared *any* process running
+  `/usr/sbin/sshd`, a binary any user can run, on a high port, to earn
+  immunity. NN-AUD-048 is therefore taken with it, ahead of Wave 1:
+  - sshd is spared only as root inside an SSH unit of systemd
+    (`ssh.service`, `sshd.service`, socket-activated `ssh@`/`sshd@`);
+  - with no systemd unit in the cgroup path, exe and uid 0 still decide;
+  - a session's own processes run in the session's scope and are not
+    spared — when one is the offender, killing it is the containment.
+    OpenSSH 9.8 and later run sessions as `sshd-session` anyway; on
+    Ubuntu 24.04 (OpenSSH 9.6) they ran `/usr/sbin/sshd` and were
+    spared.
+  - Lab, Ubuntu 24.04: a binary run from /tmp, then an exfiltration
+    burst through an `ssh -D` tunnel. Before, the tunnel's sshd (uid
+    1000, in the session's scope) was spared and the ladder escalated to
+    ISOLATE (refused since NN-AUD-002). Now NEUTRALIZE killed it and the
+    threat was contained without isolation. The SSH service kept
+    accepting connections, and the quarantine refused `/usr/sbin/sshd`
+    (a protected system prefix).

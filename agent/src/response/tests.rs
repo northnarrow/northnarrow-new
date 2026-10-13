@@ -194,3 +194,44 @@ fn kills_a_process_tree() {
 
     let _ = bash.wait();
 }
+
+/// External audit CMB-005: the host-critical guard applies to every
+/// action that acts on a process — it used to be consulted by the tree
+/// walk only, so a rule's KillProcess could take down sshd or the
+/// watchdog. The pid is fictitious: with the guard broken the actions
+/// would report it gone, never `Refused`.
+#[test]
+fn host_critical_guard_applies_to_every_pid_scoped_action() {
+    const GUARDED: u32 = 999_123;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut cfg = super::ExecutorConfig::for_test(tmp.path());
+    cfg.dry_run = false;
+    let exec = Executor::with_config(cfg);
+    exec.set_tree_guard(std::sync::Arc::new(|pid: u32| {
+        (pid == GUARDED).then_some("ssh-service(sshd)")
+    }));
+    for action in [
+        ResponseAction::KillProcess,
+        ResponseAction::KillProcessTree,
+        ResponseAction::Quarantine,
+        ResponseAction::BlockOutbound,
+        ResponseAction::ThrottleProcess,
+    ] {
+        let report = exec.execute(action.clone(), GUARDED);
+        assert_eq!(
+            report.primary,
+            ExecutionOutcome::Refused {
+                pid: GUARDED,
+                reason: "ssh-service(sshd)"
+            },
+            "{action:?}"
+        );
+        assert!(report.additional.is_empty(), "{action:?}");
+    }
+    // Not a process action: the guard has nothing to say.
+    let report = exec.execute(ResponseAction::Log, GUARDED);
+    assert!(matches!(
+        report.primary,
+        ExecutionOutcome::Refused { reason, .. } if reason.contains("Log action")
+    ));
+}

@@ -147,7 +147,7 @@ pub fn kill_process_tree_guarded(
     }
     // Snapshot the proc tree once before we kill anything; new
     // children spawned after this point are out of scope of this run.
-    let descendants = collect_descendants(root_pid).unwrap_or_default();
+    let (descendants, truncated) = collect_descendants(root_pid).unwrap_or_default();
 
     // Kill the parent FIRST: stops a fork bomb from outpacing us.
     let primary = match guard(root_pid) {
@@ -158,7 +158,7 @@ pub fn kill_process_tree_guarded(
         None => kill_process(root_pid, protected),
     };
 
-    let mut outcomes = Vec::with_capacity(descendants.len());
+    let mut outcomes = Vec::with_capacity(descendants.len() + 1);
     for child_pid in descendants {
         outcomes.push(match guard(child_pid) {
             Some(reason) => ExecutionOutcome::Refused {
@@ -168,12 +168,26 @@ pub fn kill_process_tree_guarded(
             None => kill_process(child_pid, protected),
         });
     }
+    // External audit CMB-002: a walk cut short is reported, not hidden —
+    // the descendants it did not reach are still running.
+    if truncated {
+        tracing::warn!(
+            root_pid,
+            limit = MAX_DESCENDANTS,
+            "kill tree: the /proc walk stopped at the descendant limit; the rest were not reached"
+        );
+        outcomes.push(ExecutionOutcome::TreeTruncated {
+            pid: root_pid,
+            limit: MAX_DESCENDANTS,
+        });
+    }
     (primary, outcomes)
 }
 
 /// BFS through the parent→children map built from `/proc/<pid>/status`.
-/// Returns descendant PIDs in BFS order, capped at [`MAX_DESCENDANTS`].
-fn collect_descendants(root_pid: u32) -> std::io::Result<Vec<u32>> {
+/// Returns descendant PIDs in BFS order, capped at [`MAX_DESCENDANTS`],
+/// and whether the cap cut the walk short (external audit CMB-002).
+fn collect_descendants(root_pid: u32) -> std::io::Result<(Vec<u32>, bool)> {
     let map = build_ppid_map()?;
     let mut out: Vec<u32> = Vec::new();
     let mut frontier: Vec<u32> = vec![root_pid];
@@ -188,14 +202,14 @@ fn collect_descendants(root_pid: u32) -> std::io::Result<Vec<u32>> {
                     continue;
                 }
                 if out.len() >= MAX_DESCENDANTS {
-                    return Ok(out);
+                    return Ok((out, true));
                 }
                 out.push(child);
                 frontier.push(child);
             }
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Build the `ppid → [child_pid, ...]` adjacency map from /proc.
@@ -340,15 +354,17 @@ mod tests {
     fn collect_descendants_never_yields_init_or_kthreadd() {
         // Even when asked for PID 0's subtree directly, the walk must
         // not surface PID 1 / PID 2 (and therefore none of their kids).
-        let kids = collect_descendants(0).expect("walk ok");
+        let (kids, truncated) = collect_descendants(0).expect("walk ok");
         assert!(kids.is_empty(), "got {kids:?}");
+        assert!(!truncated);
     }
 
     #[test]
     fn collect_descendants_returns_empty_for_unknown_root() {
         // PID 999_999_998 has no entry in /proc, so no descendants.
-        let kids = collect_descendants(999_999_998).expect("walk ok");
+        let (kids, truncated) = collect_descendants(999_999_998).expect("walk ok");
         assert!(kids.is_empty());
+        assert!(!truncated);
     }
 
     #[test]
