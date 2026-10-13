@@ -6,6 +6,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, kills on everyday shapes (High FIMR-006, NETR-002):
+  - A file created in a watched directory under `/home` (or `/tmp`,
+    `/var/tmp`, `/dev/shm`) no longer kills the process tree and moves the
+    host to COMBAT (NN-L-FIM-002): it is recorded. A watched binary
+    hardlinked there is still killed.
+  - Resolving a long DNS name no longer kills the resolving process
+    (NN-L-NET-004 and NN-L-NET-014 — S3 buckets, CDN, load balancers,
+    Kubernetes names): a name over 60 characters, or one high-entropy
+    label, is recorded. The kill is for a tunnel's shape: 8 distinct
+    high-entropy labels under one parent domain from one process within a
+    minute.
+    (NN-L-NET-004 — S3 buckets, CDN, load balancers, Kubernetes names): a
+    name over 60 characters is recorded; encoded labels stay NN-L-NET-014's.
 - External audit, Wave 1, the bootstrap admin key as a standing bypass (High
   DEP-001):
   - The package hooks no longer pick up the admin key left on the host on

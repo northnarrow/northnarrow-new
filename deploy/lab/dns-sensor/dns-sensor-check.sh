@@ -34,35 +34,38 @@ if [[ ! -x $HELPER ]]; then
     sudo mkdir -p "$(dirname "$HELPER")" && sudo cc -O2 -o "$HELPER" "$(dirname "$0")/dns-send.c" \
         || { bad "dns-send helper not built"; exit 1; }
 fi
-# A first label of 40 base64 characters: NET-004's tunnelling shape. Each
-# case uses its own name, so NET-004's per-name dedup never hides one.
-name() { printf 'ZGVhZGJlZWZjYWZlYmFiZWRlYWRiZWVm%s.nn-lab.invalid' "$1"; }
+# A name over 60 characters: NET-004 records it (external audit NETR-002:
+# recorded, no longer killed), and the record names the sender — the proof
+# the sensor read the name the kernel copied. Each case uses its own name,
+# so NET-004's per-name dedup never hides one.
+name() { printf 'ZGVhZGJlZWZjYWZlYmFiZWRlYWRiZWVm%s.dns-sensor-check.nn-lab.invalid' "$1"; }
 # NET-004 records whose principal is the helper (the record carries the
 # sender, not the name), since baseline $1
 net004() { new_dets "$1" | grep "\"rule_id\":\"$RULE\"" | grep '"comm":"nn-dns-send"'; }
-# kill_case <label> <mode> <name>: the sender must be killed by NET-004
-kill_case() {
+# seen_case <label> <mode> <name>: NET-004 records the sender (the name was
+# read whole), and the sender is left alone
+seen_case() {
     local label=$1 mode=$2 qname=$3
     local b rc n
-    b=$(det_count); rc=$(run_rc "$HELPER" "$mode" "$qname" 5); sleep 2
-    n=$(net004 "$b" | grep -c '"KillProcess"')
-    if [[ $rc -eq 137 && $n -ge 1 ]]; then
-        pass "$label: killed by NET-004"
+    b=$(det_count); rc=$(run_rc "$HELPER" "$mode" "$qname" 1); sleep 2
+    n=$(net004 "$b" | grep -c '"Log"')
+    if [[ $rc -eq 0 && $n -ge 1 ]]; then
+        pass "$label: name recorded by NET-004, sender untouched"
     else
-        bad "$label: rc=$rc NET-004 kill records=$n"
+        bad "$label: rc=$rc NET-004 records=$n"
     fi
 }
 # 2–4. IPv4 connected and unconnected, IPv6
-kill_case "connected send() to 127.0.0.1:53" connect4 "$(name c4c4c4c4)"
-kill_case "unconnected sendto() to 127.0.0.1:53" sendto4 "$(name s4s4s4s4)"
-kill_case "connected send() to [::1]:53" connect6 "$(name c6c6c6c6)"
+seen_case "connected send() to 127.0.0.1:53" connect4 "$(name c4c4c4c4)"
+seen_case "unconnected sendto() to 127.0.0.1:53" sendto4 "$(name s4s4s4s4)"
+seen_case "connected send() to [::1]:53" connect6 "$(name c6c6c6c6)"
 # 5. the payload in a page the process has not touched yet
-kill_case "query in a file mapping not faulted in yet" unfaulted "$(name pfpfpfpf)"
+seen_case "query in a file mapping not faulted in yet" unfaulted "$(name pfpfpfpf)"
 # 6. a zero byte inside the first label: the name is read past it (a
 # string read stops there and keeps one character); it is long, so NET-004
-# kills on length
+# records it on length
 long="x$(printf 'a%.0s' $(seq 1 50)).nn-lab.invalid"
-kill_case "a zero byte inside the first label" nul "$long"
+seen_case "a zero byte inside the first label" nul "$long"
 # 7. the query in two pieces (MSG_MORE): the name is not in the linear
 # data; NET-004 records it without killing
 b=$(det_count); rc=$(run_rc "$HELPER" cork "$(name ckckckck)" 1); sleep 2
@@ -76,7 +79,7 @@ fi
 b=$(det_count); getent hosts nn-lab-dns-check.invalid >/dev/null 2>&1; sleep 2
 n=$(new_dets "$b" | grep -c '"rule_id":"NN-L-NET-0')
 [[ $n -eq 0 ]] && pass "getent hosts: no NET record" || bad "getent hosts: $n NET record(s)"
-# The kills also escalate the posture: back to observing.
+# Any posture escalation the run caused: back to observing.
 NNADMIN=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
 sudo "$NNADMIN" debug force-posture observing >/dev/null 2>&1
 # 9. the telemetry probe (its own DNS query included) never went silent

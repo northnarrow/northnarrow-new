@@ -28,7 +28,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod common;
 use common::EniIptablesGuard;
 
-const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+// The agent's start (BTF, the eBPF object, the rules) took ~5 s on a lab
+// host running two other guests: the 5-s wait failed a gate run with the
+// socket about to open.
+const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Production combat ruleset used by every scenario. Copied verbatim

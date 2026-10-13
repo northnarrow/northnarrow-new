@@ -75,11 +75,11 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-025 | FIMR-003 | FIM rules | M | fixed (lab PR 75, review 85) |
 | NN-AUD-026 | FIMR-004 | FIM rules | M | open |
 | NN-AUD-027 | FIMR-005 | FIM rules | M | open |
-| NN-AUD-028 | FIMR-006 | FIM rules | L | open |
+| NN-AUD-028 | FIMR-006 | FIM rules | L | fixed (lab PR 98) |
 | NN-AUD-029 | FIMP-001 | FIM pipeline | M | fixed (lab PR 91) |
 | NN-AUD-031 | FIMP-003 | FIM pipeline | M | open |
 | NN-AUD-032 | FIMP-004 | FIM pipeline | M | open |
-| NN-AUD-036 | NETR-002 | Net rules | M | open |
+| NN-AUD-036 | NETR-002 | Net rules | M | fixed (lab PR 98) |
 | NN-AUD-037 | NETR-003 | Net rules | M | fixed (lab PR 78, with NN-AUD-006) |
 | NN-AUD-038 | PROC-002 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-039 | PROC-003 | Process rules | M | fixed (lab PR 86) |
@@ -911,3 +911,51 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     `dpkg -i` over a running install without `NN_GRANT_KEY` is refused and
     the units are untouched; the anti-tamper suite's window cases (C23,
     C24, C38) pass with the key at the new path.
+- **NN-AUD-028 (FIMR-006) and NN-AUD-036 (NETR-002), lab PR 98.** Two
+  rules killed processes on shapes legitimate software produces every day.
+  - NN-L-FIM-002 ("new SUID-root binary") killed the process tree, Critical
+    — and so moved the host to COMBAT — for ANY file created in a watched
+    directory under `/home`, `/tmp`, `/var/tmp` or `/dev/shm`: the kernel
+    hook carries no mode bits, so it never checked a SUID bit, and the
+    shipped `fim-paths.v1` tells operators to watch `/home/<user>/…`
+    profile paths (a browser's temporary file, a GnuPG lock). Now a
+    `Created` there is recorded (Log, Medium); a `Linked` — reported only
+    when the link's SOURCE inode is watched, i.e. a watched binary given a
+    name in a user-writable directory, the §13 Q2 evasion — keeps Critical
+    and the kill. This is what the drift classifier already did (Critical
+    only for `Linked`). A SUID bit set afterwards is a `chmod`, judged by
+    the rules on Modified and on capabilities.
+  - NN-L-NET-004 killed the sender of any DNS name over 60 characters or
+    whose first label had 20+ characters of the base64 alphabet — which
+    every LDH label of that length has: S3 buckets, storage accounts, CDN
+    and load-balancer names, Kubernetes FQDNs, ACME challenges (its own
+    tests killed `curl` and `getent`; review 43 had shortened the
+    telemetry probe's nonce to get under it). The base64 branch is gone —
+    an encoded payload in a label is NN-L-NET-014's, by Shannon entropy
+    over a ≥ 25-character label — and a long name is recorded (Log,
+    Medium), still attributed to the originating process (FP-3).
+  - NN-L-NET-014 killed on a single query too: a first label of ≥ 25
+    characters at ≥ 3.8 bits/char — which a 30-character name of English
+    words reaches (`my-company-prod-backups-archive`: 4.0), as do hex and
+    UUID labels. In the lab (Debian 12) `python3` was killed for an S3
+    bucket, a hashed ELB name and a Kubernetes FQDN — by NET-004 and
+    NET-014 both. A tunnel carries a new encoded label per query under the
+    attacker's domain, so the kill now takes 8 distinct high-entropy
+    labels under one parent domain from one process within 60 s
+    (`DnsTunnelCorroboration`, bounded at 4096 pairs); a single one is
+    recorded (Log, Medium), against the originator.
+  - `dns-sensor-check` proved the DNS sensor by NET-004's kill of the
+    sender; it now proves it by NET-004's record of the sender (names over
+    60 characters), the sender left running.
+  - Lab, Debian 12 (6.1). Before (the build installed on the guest): a
+    `python3` that resolved `my-company-prod-backups-archive.s3.amazonaws.com`,
+    `internal-payments-api-1234567890.eu-west-1.elb.amazonaws.com` or
+    `payments-api-7d4f8b9c6-x2kq9.payments-namespace.svc.cluster.local` was
+    killed (exit 137; NN-L-NET-004 and NN-L-NET-014 KillProcess), and one that
+    wrote a file in a `/home/nn/.nnx-profile` watched through a signed
+    `fim-paths` overlay was killed (NN-L-FIM-002 KillProcessTree,
+    Critical). After: all four ran to the end (exit 0), recorded (Log,
+    Medium); a process resolving 20 random base32 labels under one domain
+    (a tunnel's shape) was killed at the 8th distinct label (NN-L-NET-014
+    KillProcess). `dns-sensor-check` OK (every send shape recorded,
+    senders untouched).

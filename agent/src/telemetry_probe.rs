@@ -94,8 +94,10 @@ static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Round nonce: 40 low bits of the clock and the pid, hex, at most 16
 /// characters. It is the first DNS label of the probed name, and a label of
-/// 20+ alphanumerics is what NN-L-NET-004 calls a base64 payload (the first
-/// lab run tripped it with a 4-digit pid) — the probe must never fire a rule.
+/// 20+ alphanumerics is what NN-L-NET-004 called a base64 payload until
+/// external audit NETR-002 (the first lab run tripped it with a 4-digit
+/// pid) — the probe must never fire a rule: it stays below NN-L-NET-014's
+/// 25-character label and NN-L-NET-004's 60-character name.
 pub fn make_nonce(nanos: u64, pid: u32) -> String {
     format!("{:x}{:x}", nanos & 0xFF_FFFF_FFFF, pid & 0xFF_FFFF)
 }
@@ -438,7 +440,7 @@ mod tests {
         let name = dns_name(&n);
         assert!(
             name.split('.').next().unwrap().len() < 20,
-            "NN-L-NET-004 base64 shape"
+            "below NN-L-NET-014's label length"
         );
         assert!(name.len() <= 60, "NN-L-NET-004 length");
     }
