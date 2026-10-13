@@ -1930,6 +1930,21 @@ async fn main() -> Result<()> {
             Default::default()
         }
     };
+    // External audit FIMR-001: FIM watching nothing used to show only as
+    // `effective=0` in an INFO line.
+    if watched_paths_load.effective.is_empty() {
+        error!(
+            v1 = %cli.fim_paths_v1.display(),
+            "fim paths-config: no path to watch — FIM and the anti-tamper baits see nothing"
+        );
+        attest_degraded(
+            audit_log.as_ref(),
+            &format!(
+                "fim watches no path ({} yields none)",
+                cli.fim_paths_v1.display()
+            ),
+        );
+    }
     let paths_summary = admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
 
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
@@ -2111,22 +2126,38 @@ async fn main() -> Result<()> {
         // log's clone — they're separate domains with separate Db
         // handles). A failure here downgrades the FIM CLI surface
         // to "scheduled for next restart" + zero-snapshot status.
+        let mut baseline_pubkey: Option<ed25519_dalek::VerifyingKey> = None;
         let baseline_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
             &cli.signing_key_file,
         ) {
             Ok(key) => {
+                baseline_pubkey = Some(key.verifying_key());
                 match northnarrow_agent::fim::baseline::BaselineDb::open(
                     &cli.fim_baseline_file,
                     key,
                     agent_id,
                 ) {
-                    Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
+                    Ok(mut db) => {
+                        attest_open_findings(
+                            audit_log.as_ref(),
+                            &cli.fim_baseline_file,
+                            db.take_open_findings(),
+                        );
+                        Some(Arc::new(parking_lot::Mutex::new(db)))
+                    }
                     Err(e) => {
-                        warn!(
+                        // External audit MAIN-003: the sensors, the drain and
+                        // every FIM rule still run below; only re-baselining
+                        // is off this boot.
+                        error!(
                             error = %e,
                             path = %cli.fim_baseline_file.display(),
-                            "fim baseline DB open failed — admin `fim baseline` will \
-                             reject; status snapshot will report zero rows"
+                            "fim baseline DB open failed — FIM still detects; \
+                             `fim baseline` cannot record a new baseline this boot"
+                        );
+                        attest_degraded(
+                            audit_log.as_ref(),
+                            &format!("fim baseline database unavailable ({e:#}): re-baselining off this boot"),
                         );
                         None
                     }
@@ -2141,8 +2172,8 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        match baseline_db_opt {
-            Some(baseline_db) => {
+        {
+            {
                 use northnarrow_agent::fim::attach::{
                     attach_observe_programs, populate_watched_paths, take_fs_fim_events_ringbuf,
                     take_watched_paths_map,
@@ -2163,9 +2194,38 @@ async fn main() -> Result<()> {
                 // permission-set-to-same-value, etc.) — the cache
                 // miss path treats the event as a first observation
                 // and emits drift normally.
-                let baseline_cache = match BaselineCache::load_from_log(&cli.fim_baseline_file) {
-                    Ok(c) => {
-                        info!(entries = c.len(), "fim: baseline cache loaded");
+                // External audit FIMP-001: only the verified suffix of the
+                // chain may silence an event.
+                let loaded = match baseline_pubkey.as_ref() {
+                    Some(pk) => BaselineCache::load_verified(&cli.fim_baseline_file, pk),
+                    None => Err(anyhow::anyhow!("no agent key to verify the baseline with")),
+                };
+                let baseline_cache = match loaded {
+                    Ok((c, trust)) => {
+                        info!(
+                            entries = c.len(),
+                            rows = trust.rows,
+                            untrusted = trust.untrusted,
+                            "fim: baseline cache loaded from the verified chain"
+                        );
+                        if trust.breaks > 0 {
+                            error!(
+                                breaks = trust.breaks,
+                                untrusted = trust.untrusted,
+                                path = %cli.fim_baseline_file.display(),
+                                "fim: baseline rows that do not verify are kept out of the \
+                                 cache — their paths report every change until a new baseline"
+                            );
+                            attest_degraded(
+                                audit_log.as_ref(),
+                                &format!(
+                                    "{}: {} baseline row(s) behind {} chain break(s) not trusted",
+                                    cli.fim_baseline_file.display(),
+                                    trust.untrusted,
+                                    trust.breaks
+                                ),
+                            );
+                        }
                         Arc::new(c)
                     }
                     Err(e) => {
@@ -2262,23 +2322,29 @@ async fn main() -> Result<()> {
                 let v1_for_snapshot = cli.fim_paths_v1.clone();
                 let local_for_snapshot = cli.fim_paths_local.clone();
                 let gate_for_snapshot = Arc::clone(&overlay_gate);
-                tokio::spawn(run_recompute_task(
-                    receiver,
-                    Arc::clone(&baseline_db),
-                    Arc::clone(&baseline_cache),
-                    Arc::clone(&inode_map),
-                    move || {
-                        northnarrow_agent::fim::paths_config::load_watched_paths(
-                            &v1_for_snapshot,
-                            // a signed `fim baseline` re-reads the overlay:
-                            // same signature check as at boot
-                            &gate_for_snapshot
-                                .effective(OverlayKind::FimPaths, &local_for_snapshot),
-                        )
-                        .map(|l| l.effective)
-                        .unwrap_or_default()
-                    },
-                ));
+                if let Some(baseline_db) = baseline_db_opt.as_ref() {
+                    tokio::spawn(run_recompute_task(
+                        receiver,
+                        Arc::clone(baseline_db),
+                        Arc::clone(&baseline_cache),
+                        Arc::clone(&inode_map),
+                        move || {
+                            northnarrow_agent::fim::paths_config::load_watched_paths(
+                                &v1_for_snapshot,
+                                // a signed `fim baseline` re-reads the overlay:
+                                // same signature check as at boot
+                                &gate_for_snapshot
+                                    .effective(OverlayKind::FimPaths, &local_for_snapshot),
+                            )
+                            .map(|l| l.effective)
+                            .unwrap_or_default()
+                        },
+                    ));
+                } else {
+                    // No database to write a baseline into: requests are
+                    // refused (logged), detection is not affected.
+                    drop(receiver);
+                }
 
                 // C8: open the chained drift log + spawn the drain
                 // task. The drain takes ownership of the FS_FIM_EVENTS
@@ -2360,8 +2426,9 @@ async fn main() -> Result<()> {
                 // set = first boot, fire a recompute. The recompute
                 // task is already running (tokio::spawn doesn't
                 // block on the future's first poll).
-                if baseline_db.lock().last_hash() == northnarrow_agent::audit::GENESIS_PREV_HASH
-                    && !watched_paths_load.effective.is_empty()
+                if baseline_db_opt.as_ref().is_some_and(|db| {
+                    db.lock().last_hash() == northnarrow_agent::audit::GENESIS_PREV_HASH
+                }) && !watched_paths_load.effective.is_empty()
                 {
                     info!(
                         paths = watched_paths_load.effective.len(),
@@ -2382,11 +2449,6 @@ async fn main() -> Result<()> {
                         watched_paths: watched_paths_handle.clone(),
                     },
                 }))
-            }
-            None => {
-                // Review 69: no FIM, so no LSM file-open sensor either.
-                open_tracepoint_fallback(&mut sensor);
-                None
             }
         }
     };
@@ -3637,6 +3699,30 @@ fn withdraw_watchdog_pid(
         Err(e) => {
             warn!(pid, error = %e, "could not remove a former watchdog pid from PROTECTED_PIDS")
         }
+    }
+}
+
+/// External audit MAIN-003: a subsystem running degraded is recorded in
+/// the signed audit chain, not only in the journal.
+fn attest_degraded(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    detail: &str,
+) {
+    let Some(log) = audit_log else {
+        return;
+    };
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
+        extra: serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": true }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "attesting a degraded subsystem failed");
     }
 }
 

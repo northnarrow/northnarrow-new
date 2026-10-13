@@ -336,6 +336,15 @@ fn sha256_of_link_metadata(target: &str, lmeta: &fs::Metadata) -> [u8; 32] {
 /// operator-triggered ops). The map is `BTreeMap` instead of
 /// `HashMap` for deterministic iteration in
 /// `nn-admin fim status`-style summaries.
+/// What [`BaselineCache::load_verified`] found: rows read, breaks in the
+/// chain, and rows left out of the cache because of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheTrust {
+    pub rows: usize,
+    pub breaks: usize,
+    pub untrusted: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct BaselineCache {
     inner: parking_lot::RwLock<std::collections::BTreeMap<CacheKey, BaselineEntry>>,
@@ -393,6 +402,73 @@ impl BaselineCache {
         Ok(cache)
     }
 
+    /// External audit FIMP-001: the cache the drain uses to drop no-op
+    /// events, built from the baseline log's **verified suffix** only.
+    /// The rows used to be loaded unchecked: a forged row giving a
+    /// watched file the hash of its backdoored content silenced every
+    /// later change to it.
+    ///
+    /// Walking the log in order, a row that does not parse, whose
+    /// `entry_hash` or `agent_sig` does not verify under `pubkey`, or
+    /// whose `prev_hash` does not name the row before it, makes every row
+    /// up to it untrusted: only the rows after the last such break feed
+    /// the cache. Without a cache entry an event is drift, so a break
+    /// costs suppression, never detection; a signed `fim baseline` appends
+    /// a fresh verified suffix and restores it for good.
+    pub fn load_verified(path: &Path, pubkey: &VerifyingKey) -> Result<(Self, CacheTrust)> {
+        let cache = Self::new();
+        let mut trust = CacheTrust::default();
+        let f = match OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((cache, trust)),
+            Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+        };
+        let mut suffix: Vec<BaselineEntry> = Vec::new();
+        let mut prev: Option<String> = None;
+        for (idx, line) in BufReader::new(f).lines().enumerate() {
+            let line = line.with_context(|| format!("reading line from {}", path.display()))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            trust.rows += 1;
+            let entry = match serde_json::from_str::<BaselineEntry>(trimmed) {
+                Ok(e) => e,
+                Err(_) => {
+                    trust.breaks += 1;
+                    trust.untrusted += suffix.len() + 1;
+                    suffix.clear();
+                    prev = None;
+                    continue;
+                }
+            };
+            let linked = match &prev {
+                Some(p) => entry.prev_hash == *p,
+                None => true,
+            };
+            let sound = verify_entry(idx, &entry, pubkey).is_ok();
+            prev = Some(entry.entry_hash.clone());
+            if !(linked && sound) {
+                trust.breaks += 1;
+                trust.untrusted += suffix.len() + 1;
+                suffix.clear();
+                continue;
+            }
+            suffix.push(entry);
+        }
+        {
+            let mut guard = cache.inner.write();
+            for entry in suffix {
+                let key = CacheKey {
+                    path: entry.path.clone(),
+                    is_symlink: entry.is_symlink,
+                };
+                guard.insert(key, entry);
+            }
+        }
+        Ok((cache, trust))
+    }
+
     /// Look up the latest content-row (`is_symlink == false`)
     /// baseline for `path`. Returns an owned clone so the read
     /// lock is dropped immediately — the drain's downstream
@@ -441,6 +517,8 @@ pub struct BaselineDb {
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
+    tail_repair: Option<crate::chainlog::TailRepair>,
+    skipped_lines: usize,
 }
 
 impl BaselineDb {
@@ -451,14 +529,32 @@ impl BaselineDb {
     /// directory exists with the right mode; this `open`
     /// doesn't create the parent.
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
-        let last_hash = read_tail_hash(path)?;
+        // External audit MAIN-003: a malformed line used to fail this open
+        // and, with it, the whole FIM boot. A torn last write is repaired;
+        // the chain resumes after the last readable row, and the rows
+        // that do not verify are kept out of the drain's cache
+        // (`BaselineCache::load_verified`) until a new baseline.
+        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
+            serde_json::from_slice::<BaselineEntry>(l).is_ok()
+        })?;
+        let (last_hash, skipped_lines) = read_tail_hash(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
             path: crate::anchored::anchor(path),
             key,
             agent_id,
             last_hash,
+            tail_repair,
+            skipped_lines,
         })
+    }
+
+    /// What the open found wrong, for the caller to attest once.
+    pub fn take_open_findings(&mut self) -> (Option<crate::chainlog::TailRepair>, usize) {
+        (
+            self.tail_repair.take(),
+            std::mem::take(&mut self.skipped_lines),
+        )
     }
 
     /// Append one [`BaselineEntryDraft`]. Computes timestamp +
@@ -491,30 +587,34 @@ impl BaselineDb {
     }
 }
 
-/// Walk the existing chain to find the tail hash. Missing
-/// file → genesis. Errors propagate on malformed lines so a
-/// corrupted chain surfaces at open time rather than at first
-/// append (much cleaner failure mode).
-fn read_tail_hash(path: &Path) -> Result<String> {
+/// Walk the existing chain to find the tail hash — the last row that
+/// parses — and count the rows that do not (reported by the caller).
+/// Missing file → genesis.
+fn read_tail_hash(path: &Path) -> Result<(String, usize)> {
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GENESIS_PREV_HASH.to_string());
+            return Ok((GENESIS_PREV_HASH.to_string(), 0));
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
     let reader = BufReader::new(f);
     let mut last: Option<String> = None;
+    let mut skipped = 0usize;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
             continue;
         }
-        let entry: BaselineEntry = serde_json::from_str(&line)
-            .with_context(|| format!("parsing baseline line: {line}"))?;
-        last = Some(entry.entry_hash);
+        match serde_json::from_str::<BaselineEntry>(&line) {
+            Ok(entry) => last = Some(entry.entry_hash),
+            Err(_) => skipped += 1,
+        }
     }
-    Ok(last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
+    Ok((
+        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+        skipped,
+    ))
 }
 
 /// Pure helper: compute `entry_hash` + signature for a draft
@@ -605,15 +705,13 @@ pub enum BaselineVerifyError {
 
 /// Replay `entries` in order, recomputing each `entry_hash`
 /// and checking each `agent_sig` against `pubkey`. Returns
-/// `Ok(())` on a fully-intact chain. Used by the agent's own
-/// [`BaselineDb::open`] path (which uses it to validate
-/// integrity of the loaded chain at boot) and exposed for the
-/// future C6 `nn-admin fim verify-baseline` reader.
+/// `Ok(())` on a fully-intact chain. The agent's boot uses the
+/// per-entry form ([`BaselineCache::load_verified`]); this whole-chain
+/// form serves an off-host reader.
 pub fn verify_chain(
     entries: &[BaselineEntry],
     pubkey: &VerifyingKey,
 ) -> Result<(), BaselineVerifyError> {
-    use ed25519_dalek::Verifier;
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
     for (idx, entry) in entries.iter().enumerate() {
         if entry.prev_hash != expected_prev {
@@ -623,44 +721,55 @@ pub fn verify_chain(
                 expected: expected_prev,
             });
         }
-        // Recompute against a stripped copy (entry_hash +
-        // agent_sig cleared), matching the pre-image
-        // build_signed_entry hashed.
-        let mut stripped = entry.clone();
-        stripped.entry_hash.clear();
-        stripped.agent_sig.clear();
-        let recomputed =
-            compute_entry_hash(&stripped).map_err(|e| BaselineVerifyError::MalformedField {
-                idx,
-                reason: e.to_string(),
-            })?;
-        let recomputed_hex = hex::encode(recomputed);
-        if recomputed_hex != entry.entry_hash {
-            return Err(BaselineVerifyError::EntryHashMismatch {
-                idx,
-                recomputed: recomputed_hex,
-                stored: entry.entry_hash.clone(),
-            });
-        }
-        let sig_bytes =
-            B64.decode(&entry.agent_sig)
-                .map_err(|e| BaselineVerifyError::MalformedField {
-                    idx,
-                    reason: format!("agent_sig base64 decode: {e}"),
-                })?;
-        if sig_bytes.len() != 64 {
-            return Err(BaselineVerifyError::MalformedField {
-                idx,
-                reason: format!("agent_sig length {} (expected 64)", sig_bytes.len()),
-            });
-        }
-        let mut sig_arr = [0u8; 64];
-        sig_arr.copy_from_slice(&sig_bytes);
-        let sig = Signature::from_bytes(&sig_arr);
-        if pubkey.verify(&recomputed, &sig).is_err() {
-            return Err(BaselineVerifyError::SignatureInvalid { idx });
-        }
+        verify_entry(idx, entry, pubkey)?;
         expected_prev = entry.entry_hash.clone();
+    }
+    Ok(())
+}
+
+/// One entry's own integrity: its `entry_hash` recomputed from its
+/// fields, and its `agent_sig` over that hash under `pubkey`.
+fn verify_entry(
+    idx: usize,
+    entry: &BaselineEntry,
+    pubkey: &VerifyingKey,
+) -> Result<(), BaselineVerifyError> {
+    use ed25519_dalek::Verifier;
+    // Recompute against a stripped copy (entry_hash + agent_sig
+    // cleared), matching the pre-image build_signed_entry hashed.
+    let mut stripped = entry.clone();
+    stripped.entry_hash.clear();
+    stripped.agent_sig.clear();
+    let recomputed =
+        compute_entry_hash(&stripped).map_err(|e| BaselineVerifyError::MalformedField {
+            idx,
+            reason: e.to_string(),
+        })?;
+    let recomputed_hex = hex::encode(recomputed);
+    if recomputed_hex != entry.entry_hash {
+        return Err(BaselineVerifyError::EntryHashMismatch {
+            idx,
+            recomputed: recomputed_hex,
+            stored: entry.entry_hash.clone(),
+        });
+    }
+    let sig_bytes =
+        B64.decode(&entry.agent_sig)
+            .map_err(|e| BaselineVerifyError::MalformedField {
+                idx,
+                reason: format!("agent_sig base64 decode: {e}"),
+            })?;
+    if sig_bytes.len() != 64 {
+        return Err(BaselineVerifyError::MalformedField {
+            idx,
+            reason: format!("agent_sig length {} (expected 64)", sig_bytes.len()),
+        });
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+    if pubkey.verify(&recomputed, &sig).is_err() {
+        return Err(BaselineVerifyError::SignatureInvalid { idx });
     }
     Ok(())
 }
@@ -762,6 +871,94 @@ mod tests {
             size_bytes: 1024 * seq as u64,
             is_symlink: false,
         }
+    }
+
+    /// External audit FIMP-001: a forged row — the shape that gave a
+    /// backdoored file its own hash — and every row before it stay out of
+    /// the drain's cache; the verified suffix after it is used.
+    #[test]
+    fn only_the_verified_suffix_feeds_the_cache() {
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        {
+            let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+            for seq in 1..=4 {
+                db.append(sample_draft(seq)).unwrap();
+            }
+        }
+        let (cache, trust) = BaselineCache::load_verified(&log_path, &pubkey).unwrap();
+        assert_eq!((trust.rows, trust.breaks, trust.untrusted), (4, 0, 0));
+        assert!(cache.get_content("/etc/test_1").is_some());
+
+        // forge a row for /etc/test_9 between rows 2 and 3 (well-formed,
+        // signed by another key)
+        let lines: Vec<String> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        let mut forged: BaselineEntry = serde_json::from_str(&lines[1]).unwrap();
+        forged.path = "/etc/test_9".to_string();
+        forged.sha256 = hex::encode([0xBDu8; 32]);
+        let mut body = String::new();
+        for (i, l) in lines.iter().enumerate() {
+            body.push_str(l);
+            body.push('\n');
+            if i == 1 {
+                body.push_str(&serde_json::to_string(&forged).unwrap());
+                body.push('\n');
+            }
+        }
+        std::fs::write(&log_path, &body).unwrap();
+        let (cache, trust) = BaselineCache::load_verified(&log_path, &pubkey).unwrap();
+        // the forged row (a doctored copy of row 2) breaks: it and the rows
+        // before it are out; rows 3 and 4 still verify and link
+        assert_eq!(trust.breaks, 1, "{trust:?}");
+        assert_eq!(trust.untrusted, 3, "{trust:?}");
+        assert!(
+            cache.get_content("/etc/test_9").is_none(),
+            "the forgery is not trusted"
+        );
+        assert!(cache.get_content("/etc/test_1").is_none());
+        assert!(
+            cache.get_content("/etc/test_3").is_some(),
+            "the verified suffix is used"
+        );
+        assert!(cache.get_content("/etc/test_4").is_some());
+
+        // a new baseline after the break is trusted again, durably
+        let (key, _) = fresh_signing_key(&dir);
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        db.append(sample_draft(1)).unwrap();
+        let (cache, _) = BaselineCache::load_verified(&log_path, &pubkey).unwrap();
+        assert!(cache.get_content("/etc/test_1").is_some());
+    }
+
+    /// External audit MAIN-003: a malformed line no longer fails the open
+    /// (which took the whole FIM boot down); it is counted, and appends
+    /// resume after the last readable row.
+    #[test]
+    fn a_malformed_line_does_not_fail_the_open() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("baseline.jsonl");
+        let last = {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+            db.append(sample_draft(1)).unwrap();
+            db.append(sample_draft(2)).unwrap().entry_hash
+        };
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        body.insert_str(0, "not a row\n");
+        body.push_str("{\"torn\":");
+        std::fs::write(&log_path, &body).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).expect("opens");
+        assert_eq!(db.last_hash(), last);
+        let (repair, skipped) = db.take_open_findings();
+        assert!(repair.is_some());
+        assert_eq!(skipped, 1);
+        db.append(sample_draft(3)).expect("appends continue");
     }
 
     #[test]

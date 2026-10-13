@@ -59,7 +59,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-007 | ASK-001 | Admin socket | M | fixed (lab PR 84, with NN-AUD-062) |
 | NN-AUD-008 | MAIN-001 | Agent main | M | fixed (lab PR 89) |
 | NN-AUD-009 | MAIN-002 | Agent main | M | fixed (lab PR 82, as NN-AUD-004) |
-| NN-AUD-010 | MAIN-003 | Agent main | M | open |
+| NN-AUD-010 | MAIN-003 | Agent main | M | fixed (lab PR 91) |
 | NN-AUD-011 | ATP-001 | Anti-tamper | M | open |
 | NN-AUD-012 | ATP-002 | Anti-tamper | M | fixed (lab PR 89) |
 | NN-AUD-013 | ATP-004 | Anti-tamper | M | open |
@@ -70,13 +70,13 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-020 | EVD-001 | Evidence logs | L | open |
 | NN-AUD-021 | EVD-005 | Evidence logs | M | fixed (lab PR 90) |
 | NN-AUD-022 | EVD-021 | Evidence logs | M | fixed (lab PR 88) |
-| NN-AUD-023 | FIMR-001 | FIM rules | M | open |
+| NN-AUD-023 | FIMR-001 | FIM rules | M | fixed (lab PR 91) |
 | NN-AUD-024 | FIMR-002 | FIM rules | M | fixed (lab PR 75, review 85) |
 | NN-AUD-025 | FIMR-003 | FIM rules | M | fixed (lab PR 75, review 85) |
 | NN-AUD-026 | FIMR-004 | FIM rules | M | open |
 | NN-AUD-027 | FIMR-005 | FIM rules | M | open |
 | NN-AUD-028 | FIMR-006 | FIM rules | L | open |
-| NN-AUD-029 | FIMP-001 | FIM pipeline | M | open |
+| NN-AUD-029 | FIMP-001 | FIM pipeline | M | fixed (lab PR 91) |
 | NN-AUD-031 | FIMP-003 | FIM pipeline | M | open |
 | NN-AUD-032 | FIMP-004 | FIM pipeline | M | open |
 | NN-AUD-036 | NETR-002 | Net rules | M | open |
@@ -610,3 +610,42 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     bytes cut), and `integrity_drift`/`chain_lines_unreadable` for
     `canaries.jsonl` (1 line skipped); the journal shows "canary indexes
     rebuilt from registry canaries=2" and "net: drain loop spawned".
+- **NN-AUD-010, NN-AUD-023, NN-AUD-029 (MAIN-003, FIMR-001, FIMP-001), lab
+  PR 91.** FIM could be switched off, or blinded, by one line.
+  - MAIN-003: the boot no longer nests the FIM sensors, the file-open
+    sensor, `populate_watched_paths`, the drain and the admin state under
+    a successful `BaselineDb::open`. Without the database only the
+    recompute task (a new baseline) is missing: `fim baseline` requests
+    are dropped with a WARN, and the boot writes a signed
+    `integrity_drift`/`subsystem_degraded` entry. `BaselineDb::open`
+    itself now repairs a torn last write and skips malformed rows (the
+    chain resumes after the last readable one), attested like the other
+    chain logs.
+  - FIMP-001: `BaselineCache::load_verified` replaces the unchecked
+    loader at boot. Rows are checked one by one (`verify_entry`: recomputed
+    `entry_hash`, `agent_sig` under the agent's key) and for their link to
+    the row before; a failure makes every row up to it untrusted, and only
+    the suffix after the last break feeds the cache. A path without a
+    cache entry reports every change, so a break costs suppression, never
+    detection; a signed `fim baseline` appends a fresh verified suffix and
+    restores it durably. Breaks are an ERROR and a signed
+    `subsystem_degraded` entry. `verify_chain`'s doc no longer claims a
+    boot caller it never had. Residual, as the audit notes: root can read
+    `agent.sig.key` (NN-AUD-020) and sign a row.
+  - FIMR-001: `parse_default_list` and the boot reading of a `.local`
+    overlay skip and report a bad line instead of failing the list;
+    content submitted for signing (`config overlay set`) is still checked
+    strictly. An empty effective FIM list is an ERROR and a signed entry.
+    `fim-paths.v1` joins `ETC_WRITE_DENY_FILES`.
+  - Lab, Ubuntu 24.04; each file edited through the maintenance path
+    (trusted-installer window, units stopped, pins dropped), then the
+    agent started. A relative line appended to `fim-paths.v1`: before,
+    "no defaults this boot", `effective=0`; after, the line skipped with
+    an ERROR, `effective=125`. The `/etc/hosts.allow` baseline row
+    rewritten with the hash of the content the file was then changed to:
+    before, the cache loaded it (`entries=80`) and the change drew no
+    event; after, `entries=70 rows=80 untrusted=10`, an ERROR, a signed
+    `subsystem_degraded` entry, and `FIM DRIFT path=/etc/hosts.allow
+    op=Modified`. `fim_baseline.jsonl` replaced by a lone fragment:
+    before, "fim baseline DB open failed" and no FIM drain; after, the
+    same failure, "FIM still detects", and "fim: drain loop spawned".
