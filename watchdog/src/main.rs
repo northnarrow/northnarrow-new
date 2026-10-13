@@ -36,12 +36,13 @@ use northnarrow_watchdog::{
     PingFailure, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER, SYSTEMD_RUNTIME_DIR,
 };
 use northnarrow_watchdog::{
-    evict_dead_agent, harden_self, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open,
-    ping_agent_status, read_pid_from_file, register_self_pid, reinsert_new_agent_pid,
-    sd_notify_ready, shutdown_was_authorised, stuck_recovery, unregister_self_pid,
-    wait_for_agent_death, wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli,
-    PingOutcome, RestartBackoff, StatusPingTracker, PIDFD_OPEN_RETRY_DEADLINE,
-    STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
+    evict_dead_agent, harden_self, hold_until_agent_returns, log_tamper_suspected,
+    open_agent_pidfd_with_retry, pidfd_open, ping_agent_status, read_pid_from_file,
+    register_self_pid, reinsert_new_agent_pid, sd_notify_ready, sd_notify_status,
+    shutdown_was_authorised, stuck_recovery, unregister_self_pid, wait_for_agent_death,
+    wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome,
+    RestartBackoff, StatusPingTracker, HOLD_POLL, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL,
+    STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
 };
 
 /// Path of the A8 shutdown-authorisation marker (Tappa 8 A7
@@ -172,9 +173,9 @@ async fn run(cli: Cli) -> Result<()> {
     //      compute backoff, respawn, reinsert PROTECTED_PIDS,
     //      loop back
     //   3. On signal: break out cleanly
-    //   4. On ceiling breach: log TAMPER, break out (watchdog
-    //      stays alive after this; the loop exit + main exit
-    //      handler logs `watchdog stopped`)
+    //   4. On ceiling breach, or a failed respawn: log, then hold —
+    //      alive and protected, no respawn — until an operator starts
+    //      the agent again (external audit WDG-004; see `hold`)
     'restart_loop: loop {
         let select_outcome = tokio::select! {
             _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
@@ -285,7 +286,24 @@ async fn run(cli: Cli) -> Result<()> {
                         window,
                     } => {
                         log_tamper_suspected(attempts_in_window, window);
-                        break 'restart_loop;
+                        // External audit WDG-004: hold, never exit 0.
+                        match hold(
+                            &cli,
+                            &mut sigint,
+                            &mut sigterm,
+                            &mut stuck_rx,
+                            "agent restart ceiling tripped (tamper suspected)",
+                        )
+                        .await
+                        {
+                            Some((pid, fd)) => {
+                                agent_pid = pid;
+                                agent_pidfd = fd;
+                                backoff = RestartBackoff::new();
+                                continue 'restart_loop;
+                            }
+                            None => break 'restart_loop,
+                        }
                     }
                 };
 
@@ -323,17 +341,28 @@ async fn run(cli: Cli) -> Result<()> {
                             target: "watchdog.respawn",
                             attempt,
                             error = %e,
-                            "respawn cycle failed — counting toward ceiling, continuing loop"
+                            "respawn cycle failed"
                         );
-                        // The failed attempt already incremented
-                        // `backoff`'s sliding-window count (we
-                        // called `next_delay` above). The next
-                        // pidfd POLLIN... but we don't HAVE a new
-                        // pidfd to wait on. Fall through: the
-                        // `loop` runs again, signal-arm catches
-                        // operator stops, and pidfd wait would
-                        // immediately fail. Exit instead.
-                        break 'restart_loop;
+                        // No new pidfd to wait on. External audit
+                        // WDG-004: hold until the agent runs again,
+                        // rather than exit 0 and leave the host with
+                        // neither agent nor watchdog.
+                        match hold(
+                            &cli,
+                            &mut sigint,
+                            &mut sigterm,
+                            &mut stuck_rx,
+                            "agent respawn failed",
+                        )
+                        .await
+                        {
+                            Some((pid, fd)) => {
+                                agent_pid = pid;
+                                agent_pidfd = fd;
+                                backoff = RestartBackoff::new();
+                            }
+                            None => break 'restart_loop,
+                        }
                     }
                 }
             }
@@ -493,6 +522,59 @@ async fn respawn_cycle(
     }
 
     Ok((new_pid, new_fd))
+}
+
+/// External audit WDG-004: the watchdog never exits on the restart
+/// ceiling or a failed respawn. It exited 0 there, and the unit's
+/// `Restart=on-failure` neither restarted it nor marked it failed: agent
+/// and watchdog gone, silently. It holds instead — alive, still in
+/// PROTECTED_PIDS, `DEGRADED` in `systemctl status` — until an operator
+/// starts the agent again, then supervises it with a fresh restart
+/// window. `None` when the watchdog is told to stop meanwhile.
+async fn hold(
+    cli: &Cli,
+    sigint: &mut Signal,
+    sigterm: &mut Signal,
+    stuck_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    why: &str,
+) -> Option<(u32, OwnedFd)> {
+    // Once the dead agent's PID is reused its pidfile would read as live.
+    let _ = std::fs::remove_file(&cli.agent_pidfile);
+    sd_notify_status(&format!(
+        "DEGRADED: {why} — not respawning the agent; start northnarrow-agent once investigated"
+    ));
+    error!(
+        target: "watchdog.tamper",
+        why,
+        "watchdog HOLDING: alive and protected, not respawning the agent until an operator \
+         starts it"
+    );
+    let shutdown = async {
+        tokio::select! {
+            _ = sigint.recv() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        }
+    };
+    match hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown).await {
+        HoldOutcome::Resumed { pid, pidfd } => {
+            // Pings failed while no agent ran: those stuck signals are stale.
+            while stuck_rx.try_recv().is_ok() {}
+            if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, pid) {
+                warn!(target: "watchdog", error = %e, pid, "PROTECTED_PIDS reinsert after hold failed");
+            }
+            sd_notify_status(&format!("supervising agent pid {pid}"));
+            info!(
+                target: "watchdog",
+                pid,
+                "agent running again — supervision resumed with a fresh restart window"
+            );
+            Some((pid, pidfd))
+        }
+        HoldOutcome::Shutdown(name) => {
+            info!(target: "watchdog", signal = name, "shutting down while holding");
+            None
+        }
+    }
 }
 
 /// Sleep `delay`, but bail early if SIGTERM/SIGINT fires —

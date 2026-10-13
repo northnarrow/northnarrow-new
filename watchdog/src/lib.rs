@@ -343,6 +343,62 @@ pub fn sd_notify_ready() -> Result<()> {
     Ok(())
 }
 
+/// External audit WDG-004: `STATUS=<status>` to systemd, best effort (a
+/// no-op outside `Type=notify`). `systemctl status` shows it.
+pub fn sd_notify_status(status: &str) {
+    let Ok(sock_path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+    let sent = std::os::unix::net::UnixDatagram::unbound()
+        .and_then(|sock| sock.send_to(format!("STATUS={status}\n").as_bytes(), &sock_path));
+    if let Err(e) = sent {
+        warn!(target: "watchdog.sd_notify", error = %e, status, "sd_notify STATUS failed");
+    }
+}
+
+/// External audit WDG-004: how a hold ended.
+pub enum HoldOutcome {
+    /// An agent runs again; supervise it.
+    Resumed { pid: u32, pidfd: OwnedFd },
+    /// The watchdog itself was told to stop.
+    Shutdown(&'static str),
+}
+
+/// How often a holding watchdog looks for an agent started again.
+pub const HOLD_POLL: Duration = Duration::from_secs(2);
+
+/// External audit WDG-004: wait, without respawning anything, until an
+/// agent runs again — an operator started it after investigating, and its
+/// pidfile names a live pid — or until `shutdown` resolves. The caller
+/// removes the dead agent's pidfile first: once its PID is reused it would
+/// read as a live agent.
+pub async fn hold_until_agent_returns<S>(
+    agent_pidfile: &Path,
+    poll: Duration,
+    shutdown: S,
+) -> HoldOutcome
+where
+    S: std::future::Future<Output = &'static str>,
+{
+    tokio::pin!(shutdown);
+    let mut tick = tokio::time::interval(poll);
+    loop {
+        tokio::select! {
+            name = &mut shutdown => return HoldOutcome::Shutdown(name),
+            _ = tick.tick() => {
+                let Ok(pid) = read_pid_from_file(agent_pidfile) else {
+                    continue;
+                };
+                if let Ok(raw) = pidfd_open(pid) {
+                    // SAFETY: pidfd_open returned this fd to us; we own it.
+                    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+                    return HoldOutcome::Resumed { pid, pidfd };
+                }
+            }
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Watchdog W3 — pidfd-driven agent death detection + layer-2
 // PROTECTED_PIDS evict (design §6.2 + §12 row W3)
@@ -999,16 +1055,17 @@ pub fn shutdown_was_authorised(marker_path: &Path) -> Result<bool> {
 /// Helper: emit the "tamper suspected" journal line + escalate.
 /// The ceiling is the design §5.1 "5-in-60s" trigger; the
 /// watchdog stays alive after this for operator inspection
-/// (`systemctl reset-failed northnarrow-agent` is the
-/// documented recovery).
+/// (external audit WDG-004: it holds — [`hold_until_agent_returns`] —
+/// instead of exiting) and resumes once the agent is started again.
 pub fn log_tamper_suspected(attempts_in_window: u8, window: Duration) {
     error!(
         target: "watchdog.tamper",
         attempts_in_window,
         window_secs = window.as_secs(),
         "TAMPER SUSPECTED: agent restart ceiling tripped ({attempts_in_window} attempts in last {} s) — \
-         watchdog stops respawning; manual recovery via `systemctl reset-failed northnarrow-agent` \
-         then `systemctl start northnarrow-agent`",
+         watchdog stops respawning and holds; after investigating, \
+         `systemctl reset-failed northnarrow-agent` then `systemctl start northnarrow-agent`, \
+         and the watchdog resumes supervision",
         window.as_secs()
     );
 }
@@ -1543,6 +1600,39 @@ mod tests {
         // SAFETY: pidfd_open returned this fd to us; we own it.
         let owned = unsafe { OwnedFd::from_raw_fd(raw) };
         (child, owned)
+    }
+
+    /// External audit WDG-004: a holding watchdog resumes when an agent
+    /// runs again, and only then.
+    #[tokio::test]
+    async fn hold_resumes_when_an_agent_runs_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        // External audit WDG-004: no agent → the hold lasts until told
+        // to stop.
+        let out = hold_until_agent_returns(&pidfile, Duration::from_millis(20), async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            "SIGTERM"
+        })
+        .await;
+        assert!(matches!(out, HoldOutcome::Shutdown("SIGTERM")));
+        // An agent started again (its pidfile names a live pid) ends it.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, format!("{}\n", child.id())).unwrap();
+        let out = hold_until_agent_returns(&pidfile, Duration::from_millis(20), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            "SIGTERM"
+        })
+        .await;
+        let _ = child.kill();
+        let _ = child.wait();
+        match out {
+            HoldOutcome::Resumed { pid, .. } => assert_eq!(pid, child.id()),
+            HoldOutcome::Shutdown(s) => panic!("expected a resume, got shutdown by {s}"),
+        }
     }
 
     /// Required W3 test 1: AsyncFd registration + POLLIN wakeup

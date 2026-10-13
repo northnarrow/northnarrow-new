@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, anti-tamper (High EBPF-003, WDG-004):
+  - A single write to the pinned ptrace override map lifted the agent's
+    ptrace protection until the next reboot. The override now needs the
+    current session's nonce and is cleared at every start.
+  - When the agent kept dying (tamper suspected) the watchdog exited
+    quietly, leaving neither agent nor watchdog. It now stays up, reports
+    the degraded state to systemd, and resumes once the agent is started
+    again.
 - External audit, Wave 0, detection (High FIMP-002, FIMP-005, FIMP-006,
   NETR-001, DEC-003):
   - A watched symlink pointing at a FIFO froze file integrity
