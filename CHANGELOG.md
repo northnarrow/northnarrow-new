@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, canaries (High DEC-004, DEC-005):
+  - A canary kills on its first access only; later accesses are recorded
+    (every access stays in the signed canary access chain). Before, every
+    read of a tripped canary killed again.
+  - A File or Credential canary read by a backup, anti-malware, indexing or
+    sync program (restic, borg, clamd, tracker, syncthing, …: told by the
+    executable the kernel ran) is recorded, not killed. A backup that runs
+    a generic tool (`tar`, `rsync`) is added by the operator in the new
+    signed overlay `canary-readers.local`.
 - External audit, Wave 1, the agent's BPF links (High EBPF-010):
   - Detaching or replacing one of the agent's links is refused to any
     process but the agent and the watchdog, by the link the fd names —

@@ -843,6 +843,7 @@ mod tests {
             accessor_comm: "thief".to_string(),
             accessor_exe: None,
             timestamp_ns: ts_ns,
+            first_trip: true,
         }
     }
 

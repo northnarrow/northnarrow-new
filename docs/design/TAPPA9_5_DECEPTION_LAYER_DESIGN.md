@@ -494,6 +494,31 @@ credential canary read (both would fire KillProcess; the
 canary rule wins by happening first AND by being Critical
 vs the FIM rule's High).
 
+### 6.1 As built, after the external audit (DEC-004, DEC-005)
+
+- **Single trip.** `Event::CanaryTripped` carries `first_trip`. The K5
+  rules respond to the first access only; a later access to the same
+  canary is recorded (Log, Low) — every access still lands in the signed
+  `canary_access.jsonl` chain. Before, every read killed again (§7.5 was
+  enforced on the registry flag, not on the response).
+- **Readers of whole trees.** "No operator workflow reads a canary" holds
+  for Process and Network canaries; it does not for File and Credential
+  canaries, which sit where a backup run, an anti-malware scan, a desktop
+  indexer or a sync agent opens them. A read of one of those by a
+  program that reads whole trees by design is recorded (Log, High), not
+  killed. The program is told by what the kernel executed
+  (`ExecIdentity::is_client`: the exe, or the script an interpreter runs,
+  in a root-owned system tree), never by `comm`. Built in: restic, borg,
+  kopia, duplicity, rdiff-backup, bacula-fd, bareos-fd,
+  urbackupclientbackend, clamscan, clamd, tracker-miner-fs-3,
+  tracker-extract-3, baloo_file, baloo_file_extractor, syncthing. Generic
+  tools (`tar`, `rsync`, `cp`, `cat`, `rclone`) are what an intruder
+  collects and stages data with, and are not; an operator whose backup
+  runs one adds it in the signed `canary-readers.local` overlay
+  (`nn-admin config overlay set canary-readers --file … --key …`; a
+  program name, or a system tree ending in `/` such as `/opt/acme-backup/`),
+  knowing that it then reads every File / Credential canary without a kill.
+
 ---
 
 ## 7. Canary deployment + lifecycle

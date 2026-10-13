@@ -56,6 +56,9 @@ impl RuleEngine {
         // Review 49: the shared process-lineage cache the FIM rules'
         // package-manager carve-out reads.
         lineage: crate::posture::lineage::AuthSessionTracker,
+        // External audit DEC-005: the readers the File / Credential canary
+        // rules record instead of killing.
+        canary_readers: crate::canary::readers::CanaryReaders,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -68,6 +71,7 @@ impl RuleEngine {
             dns_cache,
             installer_override,
             lineage,
+            canary_readers,
         ) {
             e.add_rule(r);
         }

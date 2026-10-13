@@ -51,6 +51,7 @@
 
 use common::{CanaryAccessKind, CanaryTypeTag, Event, ResponseAction, Severity, Verdict};
 
+use crate::canary::readers::CanaryReaders;
 use crate::decision::Rule;
 
 // ── helpers ────────────────────────────────────────────────────────
@@ -70,6 +71,7 @@ fn as_canary(e: &Event) -> Option<CanaryView<'_>> {
             accessor_comm,
             accessor_exe,
             timestamp_ns,
+            first_trip,
         } => Some(CanaryView {
             canary_id,
             canary_name,
@@ -80,6 +82,7 @@ fn as_canary(e: &Event) -> Option<CanaryView<'_>> {
             accessor_comm,
             accessor_exe: accessor_exe.as_deref(),
             timestamp_ns: *timestamp_ns,
+            first_trip: *first_trip,
         }),
         _ => None,
     }
@@ -107,6 +110,7 @@ struct CanaryView<'a> {
     accessor_comm: &'a str,
     accessor_exe: Option<&'a str>,
     timestamp_ns: u64,
+    first_trip: bool,
 }
 
 /// Build a Verdict from a `CanaryView`. Same shape as
@@ -132,15 +136,79 @@ fn canary_verdict(rule: &dyn Rule, view: &CanaryView<'_>, reasoning: &str) -> Ve
     }
 }
 
+/// A recorded trip: the verdict without a response.
+fn logged(
+    rule: &dyn Rule,
+    view: &CanaryView<'_>,
+    severity: Severity,
+    reasoning: String,
+) -> Verdict {
+    Verdict {
+        action: ResponseAction::Log,
+        severity,
+        reasoning,
+        ..canary_verdict(rule, view, "")
+    }
+}
+
+/// External audit DEC-004 / DEC-005: what a trip gets. An access to a
+/// canary already tripped is recorded — the first one was the trip (design
+/// §7.5, §12 Q2), and every access is in the signed `canary_access.jsonl`
+/// chain all the same; before, every later read killed again, a backup's
+/// every scheduled run. A File or Credential canary read by `reader`, a
+/// program that reads whole trees by design ([`CanaryReaders`]), is
+/// recorded, not killed. Any other trip kills the accessor's tree.
+fn respond(
+    rule: &dyn Rule,
+    view: &CanaryView<'_>,
+    reasoning: &str,
+    reader: Option<String>,
+) -> Verdict {
+    if !view.first_trip {
+        return logged(
+            rule,
+            view,
+            Severity::Low,
+            "Access to a canary already tripped — recorded; the first access was the trip \
+             (design §7.5)"
+                .to_string(),
+        );
+    }
+    if let Some(reader) = reader {
+        return logged(
+            rule,
+            view,
+            Severity::High,
+            format!(
+                "Canary read by {reader}, a program that reads whole trees by design \
+                 (backup, anti-malware, indexer, sync) — recorded, not killed; if it should \
+                 not reach this canary, move the canary or drop it from canary-readers"
+            ),
+        );
+    }
+    canary_verdict(rule, view, reasoning)
+}
+
 // ── NN-L-CANARY-001 — File canary access ───────────────────────────
 
 /// File canary access — the K3 detector observed a
 /// `Event::Fim` whose inode matched a deployed `File`-type
-/// canary in the K2 registry. By zero-FP construction this is
-/// guaranteed-malicious activity (no operator workflow
-/// legitimately reads a canary file). Always Critical,
-/// KillProcessTree the accessor, posture → COMBAT.
-pub struct NnLCanary001FileAccess;
+/// canary in the K2 registry. Critical, KillProcessTree the
+/// accessor — on the first access, and unless the accessor is a
+/// program that reads whole trees by design (external audit
+/// DEC-005: a canary in a home directory is opened by every backup
+/// run and scan; "no workflow reads a canary" held for Process and
+/// Network canaries, not for these). See [`respond`].
+#[derive(Default)]
+pub struct NnLCanary001FileAccess {
+    readers: CanaryReaders,
+}
+
+impl NnLCanary001FileAccess {
+    pub fn new(readers: CanaryReaders) -> Self {
+        Self { readers }
+    }
+}
 
 impl Rule for NnLCanary001FileAccess {
     fn id(&self) -> &'static str {
@@ -165,11 +233,15 @@ impl Rule for NnLCanary001FileAccess {
         if view.access_kind != CanaryAccessKind::FileOpen {
             return None;
         }
-        Some(canary_verdict(
+        let reader = view
+            .first_trip
+            .then(|| self.readers.reader(view.accessor_pid))
+            .flatten();
+        Some(respond(
             self,
             &view,
-            "File canary access — zero-FP intrusion signal; \
-             kill the accessor tree + posture → COMBAT",
+            "File canary access — intrusion signal; kill the accessor tree + posture → COMBAT",
+            reader,
         ))
     }
 }
@@ -203,11 +275,12 @@ impl Rule for NnLCanary002ProcessExec {
         if view.access_kind != CanaryAccessKind::ProcessExec {
             return None;
         }
-        Some(canary_verdict(
+        Some(respond(
             self,
             &view,
             "Process canary executed — zero-FP intrusion signal; \
              kill the accessor tree + posture → COMBAT",
+            None,
         ))
     }
 }
@@ -276,8 +349,19 @@ impl Rule for NnLCanary003NetworkConnect {
 /// allowlist). Canary creds NEVER have a legitimate read —
 /// the K3 detector already filtered against the K2 registry,
 /// so reaching this rule is unambiguous. Critical, no
-/// allowlist, no exemptions.
-pub struct NnLCanary004CredentialRead;
+/// allowlist, no exemptions — except the readers of whole trees
+/// (external audit DEC-005, see [`respond`]): a canary credential under
+/// `~/.aws` is in every backup of that home.
+#[derive(Default)]
+pub struct NnLCanary004CredentialRead {
+    readers: CanaryReaders,
+}
+
+impl NnLCanary004CredentialRead {
+    pub fn new(readers: CanaryReaders) -> Self {
+        Self { readers }
+    }
+}
 
 impl Rule for NnLCanary004CredentialRead {
     fn id(&self) -> &'static str {
@@ -297,11 +381,15 @@ impl Rule for NnLCanary004CredentialRead {
         if view.access_kind != CanaryAccessKind::FileOpen {
             return None;
         }
-        Some(canary_verdict(
+        let reader = view
+            .first_trip
+            .then(|| self.readers.reader(view.accessor_pid))
+            .flatten();
+        Some(respond(
             self,
             &view,
-            "Credential canary read — zero-FP intrusion signal; \
-             kill the accessor tree + posture → COMBAT",
+            "Credential canary read — intrusion signal; kill the accessor tree + posture → COMBAT",
+            reader,
         ))
     }
 }
@@ -317,11 +405,18 @@ impl Rule for NnLCanary004CredentialRead {
 /// Wired into [`crate::decision::rules::default_rules`] via
 /// `rules.extend(crate::canary::rules::canary_rules())`.
 pub fn canary_rules() -> Vec<Box<dyn Rule>> {
+    canary_rules_with_readers(CanaryReaders::none())
+}
+
+/// [`canary_rules`] with the readers the File and Credential rules spare
+/// (production: the built-in readers plus the signed
+/// `canary-readers.local`, judged through the lineage cache).
+pub fn canary_rules_with_readers(readers: CanaryReaders) -> Vec<Box<dyn Rule>> {
     vec![
-        Box::new(NnLCanary001FileAccess),
+        Box::new(NnLCanary001FileAccess::new(readers.clone())),
         Box::new(NnLCanary002ProcessExec),
         Box::new(NnLCanary003NetworkConnect),
-        Box::new(NnLCanary004CredentialRead),
+        Box::new(NnLCanary004CredentialRead::new(readers)),
     ]
 }
 
@@ -343,7 +438,100 @@ mod tests {
             accessor_comm: "attacker".to_string(),
             accessor_exe: Some("/tmp/payload".to_string()),
             timestamp_ns: 1_700_000_000_000_000_000,
+            first_trip: true,
         }
+    }
+
+    fn trip(
+        canary_type: CanaryTypeTag,
+        access_kind: CanaryAccessKind,
+        pid: u32,
+        first_trip: bool,
+    ) -> Event {
+        match canary_event(canary_type, access_kind) {
+            Event::CanaryTripped {
+                canary_id,
+                canary_name,
+                canary_type,
+                access_kind,
+                accessor_uid,
+                accessor_comm,
+                accessor_exe,
+                timestamp_ns,
+                ..
+            } => Event::CanaryTripped {
+                canary_id,
+                canary_name,
+                canary_type,
+                access_kind,
+                accessor_pid: pid,
+                accessor_uid,
+                accessor_comm,
+                accessor_exe,
+                timestamp_ns,
+                first_trip,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// External audit DEC-004: only the first access is a trip the rules
+    /// respond to; a later one is recorded (every access is in the chain).
+    #[test]
+    fn a_later_access_to_a_tripped_canary_is_recorded_not_killed() {
+        for (ty, kind) in [
+            (CanaryTypeTag::File, CanaryAccessKind::FileOpen),
+            (CanaryTypeTag::Process, CanaryAccessKind::ProcessExec),
+            (CanaryTypeTag::Credential, CanaryAccessKind::FileOpen),
+        ] {
+            let fired: Vec<Verdict> = canary_rules()
+                .iter()
+                .filter_map(|r| r.evaluate(&trip(ty, kind, 77, false)))
+                .collect();
+            assert_eq!(fired.len(), 1, "{ty:?}");
+            assert_eq!(fired[0].action, ResponseAction::Log, "{ty:?}");
+            assert_eq!(fired[0].severity, Severity::Low, "{ty:?}");
+            let first: Vec<Verdict> = canary_rules()
+                .iter()
+                .filter_map(|r| r.evaluate(&trip(ty, kind, 77, true)))
+                .collect();
+            assert_eq!(first[0].action, ResponseAction::KillProcessTree, "{ty:?}");
+        }
+    }
+
+    /// External audit DEC-005: a File or Credential canary read by a backup,
+    /// anti-malware or indexing program — by what the kernel executed — is
+    /// recorded; a copy outside the system trees, a generic tool, and the
+    /// Process canary (nobody legitimately executes it) still kill.
+    #[test]
+    fn a_reader_of_whole_trees_is_recorded_not_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(dir.path());
+        t.ingest_spawn_with_argv(500, 1, "/usr/bin/restic", &["restic".into()], 1);
+        t.ingest_spawn_with_argv(501, 1, "/usr/sbin/clamd", &["clamd".into()], 1);
+        t.ingest_spawn_with_argv(502, 1, "/tmp/restic", &["restic".into()], 1);
+        t.ingest_spawn_with_argv(503, 1, "/usr/bin/tar", &["tar".into()], 1);
+        let rules = canary_rules_with_readers(CanaryReaders::new(Default::default(), t));
+        let verdict = |ty, kind, pid| -> Verdict {
+            rules
+                .iter()
+                .find_map(|r| r.evaluate(&trip(ty, kind, pid, true)))
+                .unwrap()
+        };
+        for ty in [CanaryTypeTag::File, CanaryTypeTag::Credential] {
+            for pid in [500, 501] {
+                let v = verdict(ty, CanaryAccessKind::FileOpen, pid);
+                assert_eq!(v.action, ResponseAction::Log, "{ty:?} {pid}");
+                assert_eq!(v.severity, Severity::High, "{ty:?} {pid}");
+                assert!(v.reasoning.contains("reads whole trees"), "{}", v.reasoning);
+            }
+            for pid in [502, 503, 504] {
+                let v = verdict(ty, CanaryAccessKind::FileOpen, pid);
+                assert_eq!(v.action, ResponseAction::KillProcessTree, "{ty:?} {pid}");
+            }
+        }
+        let v = verdict(CanaryTypeTag::Process, CanaryAccessKind::ProcessExec, 500);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     fn fim_event() -> Event {
@@ -374,7 +562,7 @@ mod tests {
     /// emits Critical KillProcessTree.
     #[test]
     fn canary001_fires_on_file_canary_file_open() {
-        let r = NnLCanary001FileAccess;
+        let r = NnLCanary001FileAccess::default();
         let v = r
             .evaluate(&canary_event(
                 CanaryTypeTag::File,
@@ -393,7 +581,7 @@ mod tests {
     /// canary kind.
     #[test]
     fn canary001_does_not_fire_on_non_file_canary_types() {
-        let r = NnLCanary001FileAccess;
+        let r = NnLCanary001FileAccess::default();
         for canary_type in [
             CanaryTypeTag::Process,
             CanaryTypeTag::Network,
@@ -475,7 +663,7 @@ mod tests {
 
     #[test]
     fn canary004_fires_on_credential_canary_read() {
-        let r = NnLCanary004CredentialRead;
+        let r = NnLCanary004CredentialRead::default();
         let v = r
             .evaluate(&canary_event(
                 CanaryTypeTag::Credential,
@@ -489,7 +677,7 @@ mod tests {
 
     #[test]
     fn canary004_does_not_fire_on_non_credential_canary_types() {
-        let r = NnLCanary004CredentialRead;
+        let r = NnLCanary004CredentialRead::default();
         for canary_type in [
             CanaryTypeTag::File,
             CanaryTypeTag::Process,

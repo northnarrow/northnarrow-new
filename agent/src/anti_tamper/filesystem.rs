@@ -151,6 +151,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     "combat-rules.v4.sig",
     "combat-rules.v6.sig",
     "combat-allow.cidrs.sig",
+    // External audit DEC-005: the readers a File / Credential canary
+    // spares, and their signature. MUTATE-only like the other overlays.
+    "canary-readers.local",
+    "canary-readers.local.sig",
 ];
 
 /// at-authz-1: the subset of [`ETC_PROTECTED_FILES`] that is also
@@ -1781,6 +1785,8 @@ mod tests {
                 "combat-rules.v4.sig",
                 "combat-rules.v6.sig",
                 "combat-allow.cidrs.sig",
+                "canary-readers.local",
+                "canary-readers.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

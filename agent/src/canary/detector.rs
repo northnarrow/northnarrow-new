@@ -382,6 +382,14 @@ impl Detector {
             }
         };
 
+        // External audit DEC-005 / DEC-014: the executable the kernel ran
+        // for the accessor, for the chain row and the trip event (the K5
+        // rules judge readers through the lineage cache). Best-effort: a
+        // short-lived reader may be gone.
+        let accessor_exe = std::fs::read_link(format!("/proc/{accessor_pid}/exe"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+
         // Mark tripped (idempotent per §12 Q2 — returns true on
         // FIRST observation only).
         let first_trip = {
@@ -402,7 +410,7 @@ impl Detector {
                 accessor_pid,
                 accessor_uid,
                 accessor_comm: accessor_comm.clone(),
-                accessor_exe: None,
+                accessor_exe: accessor_exe.clone(),
                 first_trip,
             }) {
                 Ok(entry) => entry.entry_hash,
@@ -443,8 +451,11 @@ impl Detector {
             accessor_pid,
             accessor_uid,
             accessor_comm,
-            accessor_exe: None,
+            accessor_exe,
             timestamp_ns: ts,
+            // External audit DEC-004: the K5 rules respond to the first
+            // access only; every access is in the chain above.
+            first_trip,
         })
     }
 }
@@ -746,12 +757,20 @@ mod tests {
         let first = detector.process_event(&event);
         assert!(first.is_some(), "first trip must emit");
         // Second trip: detector still emits (rule engine sees
-        // it), but the access log row records first_trip=false.
+        // it), the access log row records first_trip=false — and,
+        // external audit DEC-004, so does the event, so the K5 rules
+        // record it instead of responding again.
         let second = detector.process_event(&event);
         assert!(
             second.is_some(),
             "subsequent trips also emit; first_trip flag is in the chain row"
         );
+        let flag = |e: &Option<Event>| match e {
+            Some(Event::CanaryTripped { first_trip, .. }) => *first_trip,
+            _ => panic!("not a trip"),
+        };
+        assert!(flag(&first), "the first event is the trip");
+        assert!(!flag(&second), "a later access is not");
         // Read the access log and verify the flags.
         let log_path = dir.path().join("canary_access.jsonl");
         let body = std::fs::read_to_string(&log_path).unwrap();
