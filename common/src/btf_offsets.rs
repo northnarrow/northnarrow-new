@@ -959,6 +959,55 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    // External audit EBPF-010: the link a BPF_LINK_DETACH / UPDATE names.
+    OffsetSpec {
+        name: "TASK_STRUCT_FILES_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["files"],
+        expected: TASK_STRUCT_FILES_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "FILES_STRUCT_FDT_OFFSET",
+        struct_name: "files_struct",
+        field_path: &["fdt"],
+        expected: FILES_STRUCT_FDT_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "FDTABLE_MAX_FDS_OFFSET",
+        struct_name: "fdtable",
+        field_path: &["max_fds"],
+        expected: FDTABLE_MAX_FDS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "FDTABLE_FD_OFFSET",
+        struct_name: "fdtable",
+        field_path: &["fd"],
+        expected: FDTABLE_FD_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "FILE_PRIVATE_DATA_OFFSET",
+        struct_name: "file",
+        field_path: &["private_data"],
+        expected: FILE_PRIVATE_DATA_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "BPF_LINK_ID_OFFSET",
+        struct_name: "bpf_link",
+        field_path: &["id"],
+        expected: BPF_LINK_ID_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1055,16 +1104,22 @@ pub mod slot {
     pub const FLOWI4_ULI_OFFSET: u32 = 67;
     pub const FLOWI6_DADDR_OFFSET: u32 = 68;
     pub const FLOWI6_ULI_OFFSET: u32 = 69;
-    // enum slots 70–71 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 72;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 73;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 74;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 75;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 76;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 77;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 78;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 79;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 80;
+    pub const TASK_STRUCT_FILES_OFFSET: u32 = 70;
+    pub const FILES_STRUCT_FDT_OFFSET: u32 = 71;
+    pub const FDTABLE_MAX_FDS_OFFSET: u32 = 72;
+    pub const FDTABLE_FD_OFFSET: u32 = 73;
+    pub const FILE_PRIVATE_DATA_OFFSET: u32 = 74;
+    pub const BPF_LINK_ID_OFFSET: u32 = 75;
+    // enum slots 76–77 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 78;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 79;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 80;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 81;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 82;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 83;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 84;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 85;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 86;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -1139,6 +1194,12 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("FLOWI4_ULI_OFFSET", 67),
     ("FLOWI6_DADDR_OFFSET", 68),
     ("FLOWI6_ULI_OFFSET", 69),
+    ("TASK_STRUCT_FILES_OFFSET", 70),
+    ("FILES_STRUCT_FDT_OFFSET", 71),
+    ("FDTABLE_MAX_FDS_OFFSET", 72),
+    ("FDTABLE_FD_OFFSET", 73),
+    ("FILE_PRIVATE_DATA_OFFSET", 74),
+    ("BPF_LINK_ID_OFFSET", 75),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1218,6 +1279,21 @@ pub const FLOWI4_DADDR_OFFSET: usize = 44;
 pub const FLOWI4_ULI_OFFSET: usize = 48;
 pub const FLOWI6_DADDR_OFFSET: usize = 40;
 pub const FLOWI6_ULI_OFFSET: usize = 76;
+
+/// External audit EBPF-010: the `bpf` LSM hook resolves the link fd of a
+/// `BPF_LINK_DETACH` / `BPF_LINK_UPDATE` to the link it names —
+/// `task->files->fdt->fd[fd]->private_data` is the `struct bpf_link`, whose
+/// `id` says whether it is one of the agent's. All optional: without one of
+/// them that deny is off (the kernels the agent supports refuse both on the
+/// agent's link types anyway: no `.detach` / `.update_prog` on tracing, raw
+/// tracepoint and perf links). Compiled values: the 6.8 build kernel (5.15
+/// has `task_struct.files` at 3072).
+pub const TASK_STRUCT_FILES_OFFSET: usize = 3104;
+pub const FILES_STRUCT_FDT_OFFSET: usize = 32;
+pub const FDTABLE_MAX_FDS_OFFSET: usize = 0;
+pub const FDTABLE_FD_OFFSET: usize = 8;
+pub const FILE_PRIVATE_DATA_OFFSET: usize = 200;
+pub const BPF_LINK_ID_OFFSET: usize = 8;
 
 /// Tracepoint field offsets — the `read_at` positions inside a
 /// `TracePointContext`. They come from the tracefs `format` file, not from
@@ -1348,24 +1424,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 72),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 73),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 74),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 75),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 76),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 77),
-    ("TP_IOURING_CREATE_FD_OFFSET", 78),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 79),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 80),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 78),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 79),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 80),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 81),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 82),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 83),
+    ("TP_IOURING_CREATE_FD_OFFSET", 84),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 85),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 86),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 70), ("ITER_IOVEC_VALUE", 71)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 76), ("ITER_IOVEC_VALUE", 77)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 70;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 76;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 71;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 77;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -1383,7 +1459,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 69, "REVALIDATE must cover all 69 offsets");
+        assert_eq!(REVALIDATE.len(), 75, "REVALIDATE must cover all 75 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1403,7 +1479,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 81);
+        assert_eq!(BTF_OFFSETS_SLOTS, 87);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1433,8 +1509,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 72);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 75);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 78);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 81);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }
