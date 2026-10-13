@@ -6,6 +6,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, identity of the protected processes (High
+  MAIN-001, ATP-002, WDG-002, WDG-003):
+  - The agent put whatever pid `/run/northnarrow/watchdog.pid` named into
+    PROTECTED_PIDS: in the lab a root `sleep` copied as
+    `northnarrow-watchdog` became unkillable (`kill -9` from root: EPERM).
+    It now protects only a pid verified to run the installed watchdog
+    binary, re-checked every 30 s.
+  - Entries a previous agent left in the pinned map were kept while their
+    process merely called itself `northnarrow-wat`; they are now kept only
+    while they run the agent's or the watchdog's executable.
+  - The watchdog took the agent pidfile at its word: in the lab it watched
+    a `sleep` as the agent. It now verifies the process runs the agent
+    binary (pidfd first, then the executable's device and inode) before
+    it protects it, signals it or copies its command line, and signals
+    through the pidfd. The unit gains CAP_SYS_PTRACE for that check.
+  - A "stuck" signal buffered while the agent was dying could SIGINT,
+    evict and SIGKILL the healthy agent that replaced it. Signals now name
+    the agent they were raised against and are dropped for any other.
 - External audit, Wave 1, authorised shutdown (High EVD-021, WDG-001,
   TST-003):
   - Any root process could switch NorthNarrow off for good: the watchdog

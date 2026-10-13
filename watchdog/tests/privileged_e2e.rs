@@ -288,6 +288,10 @@ impl E2eFixture {
             .arg(self.agent_id_path())
             .arg("--watchdog-pidfile")
             .arg(self.watchdog_pidfile())
+            // External audit MAIN-001 / ATP-002: the agent protects only
+            // a watchdog running the binary it expects — here the test's.
+            .arg("--watchdog-exe")
+            .arg(self.watchdog_priv_path())
             .arg("--no-ade")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -904,13 +908,22 @@ fn stuck_recovery_kills_sigint_ignoring_subprocess_via_real_bpf() {
     let mut fx = E2eFixture::setup();
     let _agent_pid = fx.spawn_agent();
 
-    // Sentinel: a bash subprocess that ignores SIGINT, sleeps 60s.
-    let sleeper = Command::new("bash")
+    // Sentinel: a `sleep` that ignores SIGINT (the disposition survives
+    // the exec). External audit WDG-003: recovery checks the binary, so
+    // the stand-in must BE `sleep` before it is signalled — wait for the
+    // exec (bash itself may or may not exec its last command).
+    let sleeper = Command::new("sh")
         .arg("-c")
-        .arg("trap '' INT; sleep 60")
+        .arg("trap '' INT; exec sleep 60")
         .spawn()
         .expect("spawn sleeper subprocess");
     let sleeper_pid = sleeper.id();
+    let sleep_bin = fs::canonicalize("/bin/sleep").expect("sleep binary");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs::read_link(format!("/proc/{sleeper_pid}/exe")).ok() != Some(sleep_bin.clone()) {
+        assert!(Instant::now() < deadline, "the sentinel never exec'd sleep");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // Insert the sleeper PID into PROTECTED_PIDS via bpftool so
     // we exercise the real evict path. Key is little-endian u32.
@@ -966,10 +979,13 @@ fn stuck_recovery_kills_sigint_ignoring_subprocess_via_real_bpf() {
         .status()
         .expect("spawn bpftool");
     assert!(st.success(), "bpftool map update for own PID failed");
+    // External audit WDG-003: recovery signals only a process running
+    // the expected binary — here the `sleep` stand-in.
     let result = runtime.block_on(stuck_recovery(
         sleeper_pid,
         Path::new(BPFFS_ROOT),
         Duration::from_millis(200),
+        &sleep_bin,
     ));
     let _ = Command::new("sudo")
         .args(["bpftool", "map", "delete", "pinned"])

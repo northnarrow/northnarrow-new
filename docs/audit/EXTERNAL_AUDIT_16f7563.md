@@ -57,11 +57,11 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | ID | Audit ref | Area | Effort | Status |
 |---|---|---|---|---|
 | NN-AUD-007 | ASK-001 | Admin socket | M | fixed (lab PR 84, with NN-AUD-062) |
-| NN-AUD-008 | MAIN-001 | Agent main | M | open |
+| NN-AUD-008 | MAIN-001 | Agent main | M | fixed (lab PR 89) |
 | NN-AUD-009 | MAIN-002 | Agent main | M | fixed (lab PR 82, as NN-AUD-004) |
 | NN-AUD-010 | MAIN-003 | Agent main | M | open |
 | NN-AUD-011 | ATP-001 | Anti-tamper | M | open |
-| NN-AUD-012 | ATP-002 | Anti-tamper | M | open |
+| NN-AUD-012 | ATP-002 | Anti-tamper | M | fixed (lab PR 89) |
 | NN-AUD-013 | ATP-004 | Anti-tamper | M | open |
 | NN-AUD-014 | EBPF-001 | eBPF kernel | M | open |
 | NN-AUD-015 | EBPF-002 | eBPF kernel | M | open |
@@ -102,8 +102,8 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-065 | DEC-005 | Deception | M | open |
 | NN-AUD-066 | DEC-006 | Deception | L | open |
 | NN-AUD-067 | WDG-001 | Watchdog tooling | M | fixed (lab PR 88) |
-| NN-AUD-068 | WDG-002 | Watchdog tooling | M | open |
-| NN-AUD-069 | WDG-003 | Watchdog tooling | M | open |
+| NN-AUD-068 | WDG-002 | Watchdog tooling | M | fixed (lab PR 89) |
+| NN-AUD-069 | WDG-003 | Watchdog tooling | M | fixed (lab PR 89) |
 | NN-AUD-071 | WDG-005 | Watchdog tooling | M | fixed (lab PR 85, with NN-AUD-070) |
 | NN-AUD-072 | DEP-001 | Deploy | M | open |
 | NN-AUD-073 | DEP-002 | Deploy | M | open |
@@ -515,3 +515,56 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     the agent appended a signed `integrity_drift` entry (`the watchdog
     refused a shutdown marker … (agent pid …)`). The quorum-signed path
     is covered by the privileged e2e tests on the same guest.
+- **NN-AUD-008, NN-AUD-012, NN-AUD-068, NN-AUD-069 (MAIN-001, ATP-002,
+  WDG-002, WDG-003), lab PR 89.** Who the anti-tamper trusts is now told
+  by the executable a process runs, never by a pidfile alone or by
+  `comm`.
+  - Agent: the boot no longer co-registers whatever pid
+    `watchdog.pid` names. Stale entries of the pinned map are kept only
+    while they run the agent's or the watchdog's executable
+    (`ExeIdentity`, device and inode; was `comm`), so the watchdog's own
+    entry survives an agent restart and a decoy's does not. The agent
+    registers itself before that scan: the previous agent's pinned
+    `ptrace_access_check` hook lets only a protected caller read a
+    protected process's `exe` (found in the lab — unregistered, the scan
+    read EPERM and would have evicted the live watchdog). The refresh
+    task (first round right after boot, then every 30 s) registers a
+    watchdog it has verified by `/proc/<pid>/exe`; the previous pid
+    leaves PROTECTED_PIDS once it no longer runs the watchdog binary — a
+    deleted or rewritten pidfile alone does not unprotect the running
+    watchdog.
+  - Watchdog: `open_verified_agent` opens the pidfd, checks
+    `/proc/<pid>/exe` against `--agent-bin` (default
+    `/usr/local/bin/northnarrow-agent`) by device and inode, then checks
+    the process alive through the pidfd, so the pid cannot be reused in
+    between. Used at boot, after a respawn and to end a hold; stuck
+    recovery verifies the same way and signals with
+    `pidfd_send_signal`. A pidfile naming another process is an ERROR on
+    `watchdog.tamper`, waited out like a missing one. A process that has
+    already exited (a respawned agent killed at once leaves a zombie with
+    no `exe`) is not verified, protected or signalled: its pidfd only
+    reports its death, so the next respawn follows. The agent is not
+    dumpable, so the check needs CAP_SYS_PTRACE: added to the unit's
+    bounding set (a unit test pins it), and the watchdog registers
+    itself in PROTECTED_PIDS before it reads the agent's `exe`.
+  - WDG-002: the stuck channel carries the pid it was raised against;
+    the ping task restarts its count when the watched agent changes (a
+    `watch` channel); the main loop drops a signal for another pid and
+    drains the channel after every respawn or hold.
+  - Not covered: a root process running the genuine agent or watchdog
+    binary under `LD_PRELOAD` is that binary by executable — the class of
+    NN-AUD-015 (EBPF-002), still open. A pidfile overwritten at the
+    moment the watchdog starts leaves the agent unsupervised until it is
+    fixed (refused, never trusted); systemd's `MainPID` is a possible
+    second source.
+  - Lab, Ubuntu 24.04. Before: a root `sleep` copied as
+    `/root/northnarrow-watchdog` and written into `watchdog.pid` was
+    co-registered at the agent's restart, and `kill -9` from root got
+    EPERM; the same decoy's pid in `agent.pid` was taken by a restarted
+    watchdog as the agent ("boot sequence complete … agent_pid=<decoy>").
+    After: the decoy in `watchdog.pid` was not protected (`kill -9` from
+    root succeeded) while the real watchdog stayed protected across the
+    agent's restart (`kill -CONT` from root: EPERM); a restarted
+    watchdog refused the decoy in `agent.pid` (ERROR on
+    `watchdog.tamper`, start refused) and came up on its own once the
+    pidfile named the agent again.

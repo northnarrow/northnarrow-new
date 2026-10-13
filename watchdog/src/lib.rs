@@ -25,7 +25,7 @@
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
 use std::collections::VecDeque;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,6 +48,9 @@ pub const DEFAULT_ADMIN_SOCKET: &str = "/run/northnarrow/admin.sock";
 pub const DEFAULT_WATCHDOG_PIDFILE: &str = "/run/northnarrow/watchdog.pid";
 pub const DEFAULT_BPFFS_ROOT: &str = "/sys/fs/bpf/northnarrow";
 pub const DEFAULT_ADMIN_PUB: &str = "/etc/northnarrow/admin.pub";
+/// The installed agent binary: what a pid must be running to be treated
+/// as the agent when `--agent-bin` is not given (external audit WDG-003).
+pub const DEFAULT_AGENT_BIN: &str = "/usr/local/bin/northnarrow-agent";
 pub const DEFAULT_AGENT_ID_FILE: &str = "/etc/northnarrow/agent_id";
 
 /// Cap on the `pidfd_open` retry loop. The watchdog
@@ -205,6 +208,99 @@ pub fn read_pid_from_file(path: &Path) -> Result<u32> {
     })
 }
 
+/// External audit WDG-003: `pid` runs `bin` — `/proc/<pid>/exe` is the
+/// same file (device and inode). Another program, or the agent binary
+/// replaced on disk while the process ran, is not the agent. Reading
+/// another root process's `exe` needs CAP_SYS_PTRACE (the agent is not
+/// dumpable) and a caller the agent's `ptrace_access_check` hook admits
+/// (the watchdog registers itself in PROTECTED_PIDS first).
+pub fn runs_binary(pid: u32, bin: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let want = std::fs::metadata(bin).with_context(|| format!("stat {}", bin.display()))?;
+    let exe = format!("/proc/{pid}/exe");
+    let got = std::fs::metadata(&exe).with_context(|| format!("stat {exe}"))?;
+    if (got.dev(), got.ino()) == (want.dev(), want.ino()) {
+        return Ok(());
+    }
+    let runs = std::fs::read_link(&exe)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| String::from("?"));
+    Err(anyhow!("pid {pid} runs {runs}, not {}", bin.display()))
+}
+
+/// `pidfd_send_signal(2)`: signal the process the pidfd was opened on,
+/// never a process that later reused its pid. `sig == 0` checks that it
+/// still runs.
+pub fn pidfd_signal(pidfd: RawFd, sig: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: plain syscall on an fd we hold; a null siginfo is allowed.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// The process behind `pidfd` has exited (a zombie, or reaped): the pidfd
+/// polls readable.
+pub fn pidfd_exited(pidfd: &OwnedFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, zero timeout.
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    n > 0 && pfd.revents & libc::POLLIN != 0
+}
+
+/// Open a pidfd on `pid` and keep it only if the process runs `bin`. The
+/// pidfd is opened first and checked again after the identity check, so
+/// the pid cannot have been reused in between.
+///
+/// A process that has already exited is returned unverified (its `exe` is
+/// gone): it is no one's agent — nothing to protect or signal — and the
+/// caller sees its death at once ([`pidfd_exited`]). An agent killed right
+/// after a respawn must lead to the next respawn, not to a verification
+/// that can never succeed.
+pub fn open_verified_pidfd(pid: u32, bin: &Path) -> Result<OwnedFd> {
+    let raw = pidfd_open(pid).with_context(|| format!("pidfd_open({pid})"))?;
+    // SAFETY: pidfd_open returned this fd to us; we own it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if pidfd_exited(&fd) {
+        return Ok(fd);
+    }
+    if let Err(e) = runs_binary(pid, bin) {
+        if pidfd_exited(&fd) {
+            return Ok(fd);
+        }
+        return Err(e);
+    }
+    pidfd_signal(fd.as_raw_fd(), 0)
+        .with_context(|| format!("pid {pid} exited while it was being verified"))?;
+    Ok(fd)
+}
+
+/// The agent the pidfile names, verified ([`open_verified_pidfd`]). A
+/// pidfile naming another process — anyone who can write
+/// `/run/northnarrow` can make it name any pid — is an error: the
+/// watchdog does not protect, signal, or copy the command line of a
+/// process it has not verified.
+pub fn open_verified_agent(pidfile: &Path, bin: &Path) -> Result<(u32, OwnedFd)> {
+    let pid = read_pid_from_file(pidfile)?;
+    let fd = open_verified_pidfd(pid, bin)
+        .with_context(|| format!("the agent pidfile {} names pid {pid}", pidfile.display()))?;
+    Ok((pid, fd))
+}
+
 /// Raw `pidfd_open(2)` syscall wrapper. Linux 5.3+. Returns the
 /// fd on success or the underlying I/O error on failure (most
 /// commonly `ESRCH` — no such process).
@@ -233,30 +329,55 @@ pub fn pidfd_open(pid: u32) -> std::io::Result<RawFd> {
 ///
 /// Any other error short-circuits the loop (we don't want to
 /// poll forever on a misconfigured path).
+///
+/// External audit WDG-003: the pid must run `agent_bin`
+/// ([`open_verified_agent`]); a pidfile naming any other process is
+/// waited out like a missing one, and reported.
 pub async fn open_agent_pidfd_with_retry(
     agent_pidfile: &Path,
     deadline: Duration,
-) -> Result<RawFd> {
+    agent_bin: &Path,
+) -> Result<(u32, OwnedFd)> {
     let start = Instant::now();
     let mut attempts: u32 = 0;
+    let mut reported: Option<String> = None;
     loop {
         attempts += 1;
-        match try_open_once(agent_pidfile) {
-            Ok(fd) => {
+        match open_verified_agent(agent_pidfile, agent_bin) {
+            Ok((pid, fd)) => {
                 info!(
                     target: "watchdog.pidfd",
                     attempts,
                     elapsed_ms = start.elapsed().as_millis() as u64,
+                    pid,
                     pidfile = %agent_pidfile.display(),
-                    "agent pidfd opened"
+                    "agent pidfd opened (identity verified)"
                 );
-                return Ok(fd);
+                return Ok((pid, fd));
+            }
+            Err(e) if format!("{e:#}").contains(" runs ") => {
+                // A live process that is not the agent: worth an error
+                // once, then the same patience as for a missing pidfile.
+                let text = format!("{e:#}");
+                if reported.as_deref() != Some(text.as_str()) {
+                    error!(
+                        target: "watchdog.tamper",
+                        error = %text,
+                        "agent pidfile names a process that is not the agent — not protecting, \
+                         signalling or respawning from it"
+                    );
+                    reported = Some(text);
+                }
+                if start.elapsed() >= deadline {
+                    return Err(e).context("no verified agent before the deadline");
+                }
+                tokio::time::sleep(PIDFD_OPEN_RETRY_INTERVAL).await;
             }
             Err(transient) if start.elapsed() < deadline => {
                 debug!(
                     target: "watchdog.pidfd",
                     attempts,
-                    error = %transient,
+                    error = format!("{transient:#}"),
                     pidfile = %agent_pidfile.display(),
                     "agent pidfd not yet available, retrying"
                 );
@@ -267,7 +388,7 @@ pub async fn open_agent_pidfd_with_retry(
                     target: "watchdog.pidfd",
                     attempts,
                     elapsed_ms = start.elapsed().as_millis() as u64,
-                    error = %fatal,
+                    error = format!("{fatal:#}"),
                     pidfile = %agent_pidfile.display(),
                     "agent pidfd retry deadline elapsed"
                 );
@@ -281,15 +402,6 @@ pub async fn open_agent_pidfd_with_retry(
             }
         }
     }
-}
-
-/// One try-cycle: read PID + open pidfd. Errors are coarse-grained
-/// (one `anyhow::Error`) because the retry loop above doesn't
-/// distinguish between "pidfile missing" and "PID stale" — both
-/// are "agent not ready yet" until the deadline.
-fn try_open_once(pidfile: &Path) -> Result<RawFd> {
-    let pid = read_pid_from_file(pidfile)?;
-    pidfd_open(pid).with_context(|| format!("pidfd_open({pid})"))
 }
 
 /// Atomic pidfile write — tmpfile + fsync + `rename(2)`. Same
@@ -392,6 +504,7 @@ pub async fn hold_until_agent_returns<S>(
     agent_pidfile: &Path,
     poll: Duration,
     shutdown: S,
+    agent_bin: &Path,
 ) -> HoldOutcome
 where
     S: std::future::Future<Output = &'static str>,
@@ -402,12 +515,9 @@ where
         tokio::select! {
             name = &mut shutdown => return HoldOutcome::Shutdown(name),
             _ = tick.tick() => {
-                let Ok(pid) = read_pid_from_file(agent_pidfile) else {
-                    continue;
-                };
-                if let Ok(raw) = pidfd_open(pid) {
-                    // SAFETY: pidfd_open returned this fd to us; we own it.
-                    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+                // External audit WDG-003: only a process running the agent
+                // binary ends the hold.
+                if let Ok((pid, pidfd)) = open_verified_agent(agent_pidfile, agent_bin) {
                     return HoldOutcome::Resumed { pid, pidfd };
                 }
             }
@@ -449,13 +559,13 @@ pub struct EvictReport {
 /// AsyncFd. Idempotent re-arming is not supported — one fd,
 /// one wakeup, one watchdog cycle (the agent dies once per
 /// boot per the design's process model).
-pub async fn wait_for_agent_death(agent_pidfd: OwnedFd) -> Result<()> {
+pub async fn wait_for_agent_death(agent_pidfd: &OwnedFd) -> Result<()> {
     // AsyncFd registers the fd with mio's epoll; `Interest::READABLE`
     // maps to EPOLLIN, which is exactly what pidfd signals on
     // task reap. `with_interest` is preferred over `new()` so we
     // don't accidentally register WRITE interest and pay for
     // pointless EPOLLOUT wakeups.
-    let async_fd = AsyncFd::with_interest(agent_pidfd, Interest::READABLE)
+    let async_fd = AsyncFd::with_interest(agent_pidfd.as_fd(), Interest::READABLE)
         .context("registering agent pidfd with tokio AsyncFd")?;
     // `readable()` returns when epoll reports POLLIN. We drop
     // the ready guard immediately — there's nothing to "read"
@@ -870,49 +980,6 @@ pub fn respawn_agent(backend: &RespawnBackend) -> Result<()> {
             let child = spawn_agent(argv)?;
             std::mem::drop(child);
             Ok(())
-        }
-    }
-}
-
-/// Poll the new agent's pidfile until it contains a valid PID,
-/// or the deadline elapses. Mirrors W2's
-/// [`open_agent_pidfd_with_retry`] but doesn't open a pidfd
-/// (that's the caller's next step — we just need the PID for
-/// PROTECTED_PIDS reinsertion).
-///
-/// The agent writes its pidfile atomically (tmpfile + fsync +
-/// rename) AFTER every LSM hook is attached AND the "decision
-/// engine ready" log line has flushed — so a successful read
-/// here is also a readiness signal for the agent's anti-tamper
-/// surface.
-pub async fn wait_for_new_agent_pid(pidfile: &Path, deadline: Duration) -> Result<u32> {
-    let start = Instant::now();
-    let mut attempts: u32 = 0;
-    loop {
-        attempts += 1;
-        match read_pid_from_file(pidfile) {
-            Ok(pid) => {
-                info!(
-                    target: "watchdog.respawn",
-                    attempts,
-                    elapsed_ms = start.elapsed().as_millis() as u64,
-                    pid,
-                    "new agent pidfile observed"
-                );
-                return Ok(pid);
-            }
-            Err(_) if start.elapsed() < deadline => {
-                tokio::time::sleep(PIDFD_OPEN_RETRY_INTERVAL).await;
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "agent pidfile {} never appeared within {:?}",
-                        pidfile.display(),
-                        deadline
-                    )
-                });
-            }
         }
     }
 }
@@ -1412,7 +1479,7 @@ pub async fn ping_agent_status(socket_path: &Path, timeout: Duration) -> Result<
 
 /// Stuck-agent recovery sequence per design §4.1:
 ///
-/// 1. `kill(agent_pid, SIGINT)` — the only hook-passing stop
+/// 1. SIGINT through the pidfd — the only hook-passing stop
 ///    (the agent's Tappa 7 LSM task_kill hook only denies
 ///    SIGKILL + SIGTERM; SIGINT passes through and the agent
 ///    re-armed it explicitly for graceful shutdown per
@@ -1424,7 +1491,7 @@ pub async fn ping_agent_status(socket_path: &Path, timeout: Duration) -> Result<
 ///    hard-kill recipe from `docs/verify-2b.sh:57-63`. Without
 ///    this, the LSM task_kill hook would deny the subsequent
 ///    SIGKILL.
-/// 4. `kill(agent_pid, SIGKILL)`.
+/// 4. SIGKILL through the pidfd.
 /// 5. Wait for pidfd POLLIN — the kernel reaps the agent.
 ///
 /// Returns Ok when the agent is confirmed dead (pidfd POLLIN
@@ -1436,11 +1503,21 @@ pub async fn stuck_recovery(
     agent_pid: u32,
     bpffs_root: &Path,
     hardkill_grace: Duration,
+    agent_bin: &Path,
 ) -> Result<()> {
-    let raw = pidfd_open(agent_pid)
-        .with_context(|| format!("pidfd_open({agent_pid}) for stuck recovery"))?;
-    // SAFETY: pidfd_open returned this fd to us; we own it.
-    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    // External audit WDG-003: signal only a process verified to run the
+    // agent binary, and only through its pidfd — never a pid that a dead
+    // agent left behind for another process to reuse.
+    let owned = open_verified_pidfd(agent_pid, agent_bin)
+        .with_context(|| format!("stuck recovery: pid {agent_pid} is not the agent"))?;
+    if pidfd_exited(&owned) {
+        info!(
+            target: "watchdog.stuck_recovery",
+            agent_pid,
+            "agent already exited — restart path takes over"
+        );
+        return Ok(());
+    }
     let async_fd = AsyncFd::with_interest(owned, Interest::READABLE)
         .context("registering pidfd with AsyncFd for stuck recovery")?;
 
@@ -1450,15 +1527,8 @@ pub async fn stuck_recovery(
         agent_pid,
         "stuck recovery: sending SIGINT (hook-passing graceful stop)"
     );
-    // SAFETY: kill(2) with a known PID + standard signal is a
-    // trivial syscall.
-    let r = unsafe { libc::kill(agent_pid as libc::pid_t, libc::SIGINT) };
-    if r != 0 {
-        return Err(anyhow!(
-            "kill(SIGINT, pid={agent_pid}) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    pidfd_signal(async_fd.get_ref().as_raw_fd(), libc::SIGINT)
+        .with_context(|| format!("pidfd_send_signal(SIGINT, pid={agent_pid})"))?;
 
     // 2. Wait grace OR pidfd POLLIN.
     let gracefully_dead = tokio::select! {
@@ -1498,14 +1568,8 @@ pub async fn stuck_recovery(
             "PROTECTED_PIDS evict failed before SIGKILL — kill may EPERM"
         );
     }
-    // SAFETY: same as above.
-    let r = unsafe { libc::kill(agent_pid as libc::pid_t, libc::SIGKILL) };
-    if r != 0 {
-        return Err(anyhow!(
-            "kill(SIGKILL, pid={agent_pid}) after evict failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    pidfd_signal(async_fd.get_ref().as_raw_fd(), libc::SIGKILL)
+        .with_context(|| format!("pidfd_send_signal(SIGKILL, pid={agent_pid}) after evict"))?;
 
     // 5. Wait for kernel reap.
     let guard = async_fd
@@ -1589,6 +1653,7 @@ mod tests {
             &pidfile,
             // Short deadline so the test runs in <300 ms.
             Duration::from_millis(150),
+            Path::new("/bin/sleep"),
         )
         .await;
         let elapsed = started.elapsed();
@@ -1715,22 +1780,47 @@ mod tests {
         let pidfile = dir.path().join("agent.pid");
         // External audit WDG-004: no agent → the hold lasts until told
         // to stop.
-        let out = hold_until_agent_returns(&pidfile, Duration::from_millis(20), async {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            "SIGTERM"
-        })
+        let agent_bin = Path::new("/bin/sleep");
+        let out = hold_until_agent_returns(
+            &pidfile,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                "SIGTERM"
+            },
+            agent_bin,
+        )
         .await;
         assert!(matches!(out, HoldOutcome::Shutdown("SIGTERM")));
-        // An agent started again (its pidfile names a live pid) ends it.
-        let mut child = std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
         std::fs::write(&pidfile, format!("{}\n", child.id())).unwrap();
-        let out = hold_until_agent_returns(&pidfile, Duration::from_millis(20), async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            "SIGTERM"
-        })
+        // External audit WDG-003: a live pid that runs another program is
+        // not the agent coming back.
+        let out = hold_until_agent_returns(
+            &pidfile,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                "SIGTERM"
+            },
+            Path::new("/bin/true"),
+        )
+        .await;
+        assert!(matches!(out, HoldOutcome::Shutdown("SIGTERM")));
+        // An agent started again (its pidfile names a live pid running the
+        // agent binary) ends it.
+        let out = hold_until_agent_returns(
+            &pidfile,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "SIGTERM"
+            },
+            agent_bin,
+        )
         .await;
         let _ = child.kill();
         let _ = child.wait();
@@ -1766,7 +1856,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        wait_for_agent_death(pidfd)
+        wait_for_agent_death(&pidfd)
             .await
             .expect("pidfd POLLIN must fire on child death");
         let elapsed = start.elapsed();
@@ -1802,7 +1892,7 @@ mod tests {
         let _ = child.wait();
 
         let start = Instant::now();
-        wait_for_agent_death(pidfd)
+        wait_for_agent_death(&pidfd)
             .await
             .expect("POLLIN on already-dead child must still fire");
         let elapsed = start.elapsed();
@@ -2290,23 +2380,28 @@ mod tests {
         );
     }
 
-    /// Anchor: `wait_for_new_agent_pid` honours the deadline +
-    /// returns the pid once the pidfile materialises. Uses a
-    /// background tokio task to publish the pidfile mid-poll.
-    #[tokio::test(flavor = "current_thread")]
-    async fn wait_for_new_agent_pid_observes_late_pidfile() {
+    /// External audit WDG-003: the agent is the pid the pidfile names
+    /// only when that process runs the agent binary — any other live
+    /// process is refused, and a pidfd is never handed out for it.
+    #[test]
+    fn a_pidfile_naming_another_program_is_not_the_agent() {
         let dir = TempDir::new().unwrap();
         let pidfile = dir.path().join("agent.pid");
-        let writer_path = pidfile.clone();
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            write_pidfile_atomic(&writer_path, 4242).unwrap();
-        });
-        let pid = wait_for_new_agent_pid(&pidfile, Duration::from_secs(2))
-            .await
-            .expect("late pidfile must be observed within deadline");
-        assert_eq!(pid, 4242);
-        writer.await.unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pidfile, format!("{}\n", child.id())).unwrap();
+        let (pid, fd) = open_verified_agent(&pidfile, Path::new("/bin/sleep")).unwrap();
+        assert_eq!(pid, child.id());
+        pidfd_signal(fd.as_raw_fd(), 0).unwrap();
+        let err = open_verified_agent(&pidfile, Path::new("/bin/true")).unwrap_err();
+        assert!(format!("{err:#}").contains(" runs "), "{err:#}");
+        assert!(runs_binary(child.id(), Path::new("/bin/true")).is_err());
+        let _ = child.kill();
+        let _ = child.wait();
+        // gone: no pidfd either
+        assert!(open_verified_agent(&pidfile, Path::new("/bin/sleep")).is_err());
     }
 
     /// Required W3 test 5: layer-2 evict latency is observable
@@ -2335,7 +2430,7 @@ mod tests {
             *signaled_at.lock().unwrap() = Some(t);
         });
 
-        wait_for_agent_death(pidfd).await.unwrap();
+        wait_for_agent_death(&pidfd).await.unwrap();
         let wakeup_at = Instant::now();
         killer.await.unwrap();
         let kill_at = kill_signaled_at.lock().unwrap().unwrap();

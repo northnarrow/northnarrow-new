@@ -20,7 +20,7 @@
 //! Restart loop, layer-2 PROTECTED_PIDS evict, and the STATUS
 //! ping land in W3/W4/W5.
 
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -37,11 +37,11 @@ use northnarrow_watchdog::{
 };
 use northnarrow_watchdog::{
     check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
-    log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_open, ping_agent_status,
-    process_start_unix, read_pid_from_file, register_self_pid, reinsert_new_agent_pid,
-    sd_notify_ready, sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
-    wait_for_new_agent_pid, write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome,
-    RestartBackoff, ShutdownCheck, ShutdownVerdict, StatusPingTracker, HOLD_POLL,
+    log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, ping_agent_status,
+    process_start_unix, register_self_pid, reinsert_new_agent_pid, sd_notify_ready,
+    sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
+    write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome, RestartBackoff,
+    ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN, HOLD_POLL,
     PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
     STUCK_RECOVERY_HARDKILL_GRACE,
 };
@@ -97,11 +97,20 @@ async fn run(cli: Cli) -> Result<()> {
     // build keeps the wiring straightforward by using the agent
     // binary's own `--pid-file` flag pointed at the same
     // pidfile path the watchdog reads.
-    let agent_fd = open_agent_pidfd_with_retry(&cli.agent_pidfile, PIDFD_OPEN_RETRY_DEADLINE)
-        .await
-        .context("opening initial agent pidfd")?;
-    let mut agent_pid = read_pid_from_file(&cli.agent_pidfile)
-        .context("re-reading agent PID for layer-2 evict context")?;
+    // External audit WDG-003: the agent is the process the pidfile names
+    // only if it runs the agent binary. Checking that reads the agent's
+    // /proc/<pid>/exe, which its ptrace_access_check hook allows only to a
+    // protected caller: register first (see register_self_pid below).
+    let agent_bin = cli
+        .agent_bin
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_BIN));
+    let own_pid = std::process::id();
+    let self_registered = register_self_pid(&cli.bpffs_root, own_pid);
+    let (mut agent_pid, mut agent_pidfd) =
+        open_agent_pidfd_with_retry(&cli.agent_pidfile, PIDFD_OPEN_RETRY_DEADLINE, &agent_bin)
+            .await
+            .context("opening initial agent pidfd")?;
     // Respawn v2 (docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md): on a
     // systemd host the agent is brought back through ITS OWN unit, so
     // it gets the unit's ExecStart argv, cgroup, caps and ProtectHome —
@@ -116,14 +125,13 @@ async fn run(cli: Cli) -> Result<()> {
         || exec_argv(agent_pid, cli.agent_bin.as_deref(), &cli.agent_pidfile),
     )?;
 
-    let own_pid = std::process::id();
     write_pidfile_atomic(&cli.pidfile, own_pid)
         .with_context(|| format!("writing watchdog pidfile {}", cli.pidfile.display()))?;
 
     // Self-protection + signalling rights (see register_self_pid): the
     // task_kill hook only lets a PROTECTED caller signal the protected
     // agent, so without this entry stuck recovery could not fire.
-    if let Err(e) = register_self_pid(&cli.bpffs_root, own_pid) {
+    if let Err(e) = self_registered {
         warn!(
             target: "watchdog",
             error = %e,
@@ -146,7 +154,6 @@ async fn run(cli: Cli) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut backoff = RestartBackoff::new();
-    let mut agent_pidfd = unsafe { OwnedFd::from_raw_fd(agent_fd) };
     // External audit WDG-001: a shutdown authorisation must have been
     // signed while the agent it stops was running.
     let mut agent_started = process_start_unix(agent_pid);
@@ -162,9 +169,16 @@ async fn run(cli: Cli) -> Result<()> {
     // ping task can send a second. Buffer of 4 covers any
     // pathological burst without backpressure-blocking the
     // ping task.
-    let (stuck_tx, mut stuck_rx) = tokio::sync::mpsc::channel::<()>(4);
+    //
+    // External audit WDG-002: a signal names the agent it was raised
+    // against, the ping task restarts its count whenever the agent
+    // changes (`current_agent`), and the main loop drops a signal for an
+    // agent that is gone — a timeout buffered while the old agent was
+    // dying used to SIGINT, evict and SIGKILL the healthy new one.
+    let (stuck_tx, mut stuck_rx) = tokio::sync::mpsc::channel::<u32>(4);
+    let (current_agent, agent_watch) = tokio::sync::watch::channel(agent_pid);
     let ping_socket = cli.admin_socket.clone();
-    let ping_handle = tokio::spawn(run_ping_loop(ping_socket, stuck_tx));
+    let ping_handle = tokio::spawn(run_ping_loop(ping_socket, stuck_tx, agent_watch));
 
     // W4 restart loop. Each iteration:
     //   1. Park on {SIGTERM, SIGINT, agent pidfd POLLIN}
@@ -179,7 +193,7 @@ async fn run(cli: Cli) -> Result<()> {
         let select_outcome = tokio::select! {
             _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
             _ = sigterm.recv() => SelectOutcome::Signal("SIGTERM"),
-            result = wait_for_agent_death(agent_pidfd) => SelectOutcome::AgentDied(result),
+            result = wait_for_agent_death(&agent_pidfd) => SelectOutcome::AgentDied(result),
             // W5 stuck-recovery arm: the parallel ping task has
             // observed two consecutive STATUS-ping timeouts and
             // decided the agent is wedged. Run the SIGINT →
@@ -189,13 +203,22 @@ async fn run(cli: Cli) -> Result<()> {
             // to the normal layer-2 evict + respawn path below.
             // We synthesise an `AgentDied(Ok(()))` outcome so
             // the existing match arm handles the rest.
-            _ = stuck_rx.recv() => {
+            Some(stuck_pid) = stuck_rx.recv() => {
+                if stuck_pid != agent_pid {
+                    SelectOutcome::StaleStuck(stuck_pid)
+                } else {
                 warn!(
                     target: "watchdog.stuck_recovery",
                     agent_pid,
                     "STATUS-ping stuck signal received from ping task — running recovery"
                 );
-                let recovery = stuck_recovery(agent_pid, &cli.bpffs_root, STUCK_RECOVERY_HARDKILL_GRACE).await;
+                let recovery = stuck_recovery(
+                    agent_pid,
+                    &cli.bpffs_root,
+                    STUCK_RECOVERY_HARDKILL_GRACE,
+                    &agent_bin,
+                )
+                .await;
                 if let Err(e) = recovery {
                     warn!(
                         target: "watchdog.stuck_recovery",
@@ -205,6 +228,7 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
                 SelectOutcome::AgentDied(Ok(()))
+                }
             }
         };
 
@@ -212,6 +236,15 @@ async fn run(cli: Cli) -> Result<()> {
             SelectOutcome::Signal(name) => {
                 info!(target: "watchdog", signal = name, "shutting down");
                 break 'restart_loop;
+            }
+            SelectOutcome::StaleStuck(pid) => {
+                info!(
+                    target: "watchdog.stuck_recovery",
+                    stale_pid = pid,
+                    agent_pid,
+                    "dropping a stuck signal raised against an agent that is gone"
+                );
+                continue 'restart_loop;
             }
             SelectOutcome::AgentDied(Err(e)) => {
                 warn!(target: "watchdog.pidfd", error = %e, "pidfd wait failed — exiting");
@@ -287,6 +320,7 @@ async fn run(cli: Cli) -> Result<()> {
                             &mut sigterm,
                             &mut stuck_rx,
                             "agent restart ceiling tripped (tamper suspected)",
+                            &agent_bin,
                         )
                         .await
                         {
@@ -294,6 +328,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
                                 agent_started = process_start_unix(pid);
+                                new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                                 continue 'restart_loop;
                             }
@@ -316,15 +351,24 @@ async fn run(cli: Cli) -> Result<()> {
                 }
 
                 // Best-effort: remove the dead agent's pidfile
-                // BEFORE respawn so `wait_for_new_agent_pid`
+                // BEFORE respawn so the wait for the new agent
                 // doesn't immediately read the dead PID.
                 let _ = std::fs::remove_file(&cli.agent_pidfile);
 
-                match respawn_cycle(&backend, &cli.agent_pidfile, &cli.bpffs_root, attempt).await {
+                match respawn_cycle(
+                    &backend,
+                    &cli.agent_pidfile,
+                    &cli.bpffs_root,
+                    attempt,
+                    &agent_bin,
+                )
+                .await
+                {
                     Ok((new_pid, new_fd)) => {
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
                         agent_started = process_start_unix(new_pid);
+                        new_generation(&current_agent, &mut stuck_rx, new_pid);
                         info!(
                             target: "watchdog.respawn",
                             attempt,
@@ -349,6 +393,7 @@ async fn run(cli: Cli) -> Result<()> {
                             &mut sigterm,
                             &mut stuck_rx,
                             "agent respawn failed",
+                            &agent_bin,
                         )
                         .await
                         {
@@ -356,6 +401,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
                                 agent_started = process_start_unix(pid);
+                                new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                             }
                             None => break 'restart_loop,
@@ -391,9 +437,22 @@ async fn run(cli: Cli) -> Result<()> {
 
 /// Internal select-arm outcome — folds the three branches of the
 /// W4 main loop into one match.
+/// External audit WDG-002: a new agent is watched — tell the ping task,
+/// and drop the stuck signals raised against the previous one.
+fn new_generation(
+    current: &tokio::sync::watch::Sender<u32>,
+    stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
+    pid: u32,
+) {
+    current.send_replace(pid);
+    while stuck_rx.try_recv().is_ok() {}
+}
+
 enum SelectOutcome {
     Signal(&'static str),
     AgentDied(Result<()>),
+    /// External audit WDG-002: a stuck signal for an earlier agent.
+    StaleStuck(u32),
 }
 
 /// Reconstruct the agent's argv from its running PID. For W4
@@ -484,6 +543,7 @@ async fn respawn_cycle(
     pidfile: &std::path::Path,
     bpffs_root: &std::path::Path,
     attempt: u8,
+    agent_bin: &std::path::Path,
 ) -> Result<(u32, OwnedFd)> {
     info!(
         target: "watchdog.respawn",
@@ -498,17 +558,22 @@ async fn respawn_cycle(
     // is the pidfile below, written after every LSM hook is attached.
     respawn_agent(backend)?;
 
-    let new_pid = wait_for_new_agent_pid(pidfile, NEW_AGENT_PIDFILE_DEADLINE).await?;
+    // External audit WDG-003: the new agent is verified before it is
+    // protected or watched.
+    let (new_pid, new_fd) =
+        open_agent_pidfd_with_retry(pidfile, NEW_AGENT_PIDFILE_DEADLINE, agent_bin).await?;
 
-    let raw = pidfd_open(new_pid)
-        .with_context(|| format!("pidfd_open({new_pid}) for respawned agent"))?;
-    // SAFETY: pidfd_open returned this fd to us; we own it.
-    let new_fd = unsafe { OwnedFd::from_raw_fd(raw) };
-
-    // Defensive reinsert. Failure here just widens the brief
-    // window before the new agent's own register_protected_pids
+    // Defensive reinsert — never for an agent that already exited (its pid
+    // would wait in PROTECTED_PIDS for reuse). Failure here just widens
+    // the brief window before the new agent's own register_protected_pids
     // fires — not a fatal restart-cycle error.
-    if let Err(e) = reinsert_new_agent_pid(bpffs_root, new_pid) {
+    if pidfd_exited(&new_fd) {
+        info!(
+            target: "watchdog.respawn",
+            new_pid,
+            "the respawned agent already exited — its death is handled next"
+        );
+    } else if let Err(e) = reinsert_new_agent_pid(bpffs_root, new_pid) {
         warn!(
             target: "watchdog.respawn",
             error = %e,
@@ -532,8 +597,9 @@ async fn hold(
     cli: &Cli,
     sigint: &mut Signal,
     sigterm: &mut Signal,
-    stuck_rx: &mut tokio::sync::mpsc::Receiver<()>,
+    stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
     why: &str,
+    agent_bin: &std::path::Path,
 ) -> Option<(u32, OwnedFd)> {
     // Once the dead agent's PID is reused its pidfile would read as live.
     let _ = std::fs::remove_file(&cli.agent_pidfile);
@@ -552,12 +618,14 @@ async fn hold(
             _ = sigterm.recv() => "SIGTERM",
         }
     };
-    match hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown).await {
+    match hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown, agent_bin).await {
         HoldOutcome::Resumed { pid, pidfd } => {
             // Pings failed while no agent ran: those stuck signals are stale.
             while stuck_rx.try_recv().is_ok() {}
-            if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, pid) {
-                warn!(target: "watchdog", error = %e, pid, "PROTECTED_PIDS reinsert after hold failed");
+            if !pidfd_exited(&pidfd) {
+                if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, pid) {
+                    warn!(target: "watchdog", error = %e, pid, "PROTECTED_PIDS reinsert after hold failed");
+                }
             }
             sd_notify_status(&format!("supervising agent pid {pid}"));
             info!(
@@ -608,7 +676,11 @@ async fn sleep_or_signal(
 /// another stuck signal — but in practice the W4 restart loop
 /// will hit its 5-in-60s ceiling first and break out, dropping
 /// the channel and stopping this task.
-async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender<()>) {
+async fn run_ping_loop(
+    socket_path: PathBuf,
+    stuck_tx: tokio::sync::mpsc::Sender<u32>,
+    mut agent: tokio::sync::watch::Receiver<u32>,
+) {
     let mut tick = tokio::time::interval(STATUS_PING_INTERVAL);
     // `interval()` fires immediately on first tick — skip that
     // so the watchdog isn't immediately pinging the agent
@@ -616,8 +688,16 @@ async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender
     tick.tick().await;
 
     let mut tracker = StatusPingTracker::new();
+    let mut watching = *agent.borrow_and_update();
     loop {
         tick.tick().await;
+        // External audit WDG-002: timeouts against the previous agent do
+        // not count toward the new one.
+        let current = *agent.borrow_and_update();
+        if current != watching {
+            tracker.reset();
+            watching = current;
+        }
         let outcome = match ping_agent_status(&socket_path, STATUS_PING_TIMEOUT).await {
             Ok(()) => tracker.record_ok(),
             Err(e) => match classify_ping_error(&e) {
@@ -663,7 +743,7 @@ async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender
                     "STATUS ping threshold tripped — signalling main loop for stuck recovery"
                 );
                 tracker.reset();
-                if stuck_tx.send(()).await.is_err() {
+                if stuck_tx.send(watching).await.is_err() {
                     // Main loop has dropped the receiver. Exit
                     // cleanly — no listener.
                     info!(
@@ -677,9 +757,7 @@ async fn run_ping_loop(socket_path: PathBuf, stuck_tx: tokio::sync::mpsc::Sender
     }
 }
 
-// `FromRawFd` is brought in at the top of this file alongside
-// `IntoRawFd` so both trait-method call sites resolve. The
-// `IntoRawFd` import is kept for forward-compat with W4's
+// The `IntoRawFd` import is kept for forward-compat with W4's
 // AgentGuard pattern (it'll consume + re-wrap raw fds for child
 // process inheritance during agent respawn).
 #[allow(

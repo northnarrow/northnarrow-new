@@ -340,9 +340,9 @@ impl SensorMultiplexer {
     pub fn attach_anti_tamper(
         &mut self,
         pids: &[u32],
-        allowed_comms: &std::collections::HashSet<String>,
+        keep: &[crate::anti_tamper::ExeIdentity],
     ) -> Result<()> {
-        crate::anti_tamper::attach(&mut self.ebpf, pids, allowed_comms)
+        crate::anti_tamper::attach(&mut self.ebpf, pids, keep)
     }
 }
 
