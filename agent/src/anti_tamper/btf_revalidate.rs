@@ -539,6 +539,47 @@ pub fn arm_btf_offsets(ebpf: &mut aya::Ebpf) -> anyhow::Result<usize> {
     Ok(r.values.len())
 }
 
+/// `BPF_MAP_FREEZE` command number (uapi, stable).
+const BPF_MAP_FREEZE_CMD: libc::c_long = 22;
+
+/// External audit EBPF-004: once armed, `BTF_OFFSETS` is frozen — no
+/// process, root included, can write it again (`BPF_MAP_FREEZE`); the
+/// programs still read it. Nothing writes it after the arming, and a
+/// poisoned table would blind every hook that reads a kernel structure
+/// through it. Frozen unarmed too: the compiled-in offsets then apply for
+/// good.
+pub fn freeze_btf_offsets(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::fd::{AsFd, AsRawFd};
+    let map = ebpf
+        .map("BTF_OFFSETS")
+        .context("BTF_OFFSETS map missing from the eBPF object")?;
+    let aya::maps::Map::Array(data) = map else {
+        anyhow::bail!("BTF_OFFSETS is not an array map");
+    };
+    #[repr(C)]
+    struct FreezeAttr {
+        map_fd: u32,
+    }
+    let attr = FreezeAttr {
+        map_fd: data.fd().as_fd().as_raw_fd() as u32,
+    };
+    // SAFETY: plain syscall with a valid, fully initialised attr struct and
+    // its exact size; the fd is borrowed from the live map.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_FREEZE_CMD,
+            &attr as *const FreezeAttr as *const libc::c_void,
+            std::mem::size_of::<FreezeAttr>() as u32,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("BPF_MAP_FREEZE on BTF_OFFSETS");
+    }
+    Ok(())
+}
+
 /// Core comparison, split out so tests can drive it with synthetic BTF
 /// + specs (no real `/sys/kernel/btf/vmlinux` needed).
 fn revalidate_with(btf: &Btf, specs: &[OffsetSpec]) -> RevalidateOutcome {

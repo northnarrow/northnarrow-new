@@ -156,6 +156,10 @@ impl SensorMultiplexer {
         let mut ebpf = loader
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
+        // External audit ATP-013: every map's id, before the ring buffers
+        // and RING_DROPS are taken out of the object below — the BPF guard
+        // registers them as the agent's own from this record.
+        crate::anti_tamper::bpf_defense::remember_loaded_maps(&ebpf);
 
         // Multi-kernel, level 1: hand the programs the offsets resolved
         // from THIS kernel's BTF before anything attaches. 0 = nothing
@@ -170,6 +174,14 @@ impl SensorMultiplexer {
             );
         } else {
             warn!("BTF_OFFSETS map NOT armed — eBPF programs use compiled-in offsets");
+        }
+        // External audit EBPF-004: read-only from here on, for every process.
+        if let Err(e) = crate::anti_tamper::btf_revalidate::freeze_btf_offsets(&ebpf) {
+            error!(
+                error = format!("{e:#}"),
+                "BTF_OFFSETS NOT frozen — a root process could rewrite the kernel offsets the \
+                 hooks read while the BPF guard only observes"
+            );
         }
 
         if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {

@@ -706,6 +706,14 @@ impl AuditLog {
                 "binary_integrity": integrity,
                 "install_provenance": provenance,
                 "previous_run": self.previous_run.to_json(),
+                // External audit ATP-009: what the build is and how the BPF
+                // guard runs — a debug-trigger build only observes.
+                "build_features": build_features(),
+                "bpf_guard": if crate::anti_tamper::bpf_defense::enforce_mode() {
+                    "enforce"
+                } else {
+                    "observe"
+                },
             }),
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
@@ -719,6 +727,19 @@ impl AuditLog {
 }
 
 /// Audit op recording a repaired torn tail of a chain log.
+/// External audit ATP-009: the test and debug features this binary was
+/// built with — none in a release build.
+fn build_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if cfg!(feature = "debug-trigger") {
+        features.push("debug-trigger");
+    }
+    if cfg!(feature = "test-privileged") {
+        features.push("test-privileged");
+    }
+    features
+}
+
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 
 /// Escape hatch: run with an unwritable / unopenable audit log.

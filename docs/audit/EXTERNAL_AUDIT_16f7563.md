@@ -140,11 +140,11 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-094 | ATP-003 | Anti-tamper | S | open |
 | NN-AUD-095 | ATP-005 | Anti-tamper | S | open |
 | NN-AUD-096 | ATP-008 | Anti-tamper | M | open |
-| NN-AUD-097 | ATP-009 | Anti-tamper | S | open |
+| NN-AUD-097 | ATP-009 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-098 | ATP-010 | Anti-tamper | M | open |
 | NN-AUD-099 | ATP-012 | Anti-tamper | S | open |
-| NN-AUD-100 | ATP-013 | Anti-tamper | S | open |
-| NN-AUD-101 | EBPF-004 | eBPF kernel | M | open |
+| NN-AUD-100 | ATP-013 | Anti-tamper | S | fixed (lab PR 112) |
+| NN-AUD-101 | EBPF-004 | eBPF kernel | M | fixed (lab PR 112) |
 | NN-AUD-102 | EBPF-008 | eBPF kernel | S | open |
 | NN-AUD-103 | EBPF-009 | eBPF kernel | S | open |
 | NN-AUD-104 | EBPF-011 | eBPF kernel | M | open |
@@ -1680,3 +1680,38 @@ the audit did not report, noted with the fix that takes them.
   - Privileged gate: Ubuntu 24.04 (6.8) 29 suites, 74 passed; Ubuntu
     22.04 (5.15) 73 passed, the one failure `audit_verify_e2e` before
     that fix.
+- **NN-AUD-100 (ATP-013), NN-AUD-097 (ATP-009), NN-AUD-101 (EBPF-004), lab
+  PR 112.** The BPF guard's own-object set.
+  - ATP-013, worse than reported: `register_own_objects` listed the maps
+    still in the eBPF object, and `take_map` removes one. The twelve ring
+    buffers and `RING_DROPS` were taken by the sensors before it ran, so
+    none was in `OWN_BPF_IDS`, and the guard handed a foreign root process
+    a writable handle on each, every boot — enough to move a ring's
+    consumer position and silence that sensor (`FS_PROTECT_EVENTS` carries
+    the anti-tamper denials), or to zero the drop counters. A map or
+    program whose id could not be read was skipped in silence. Now the
+    ids of every map are recorded right after the load, before any
+    `take_map`; an unreadable id is a registration failure (a missing
+    deny hook), not a skip; every map an own program uses must be in the
+    set, checked at each boot; the programs and links attached after the
+    anti-tamper step (the FIM observers, the file-open sensor) are added
+    in a second pass.
+  - ATP-009: a guard that only observes was reported as an attached deny
+    hook. In a production build the observe switch is now a missing deny
+    hook (the agent then starts only with the degraded-mode override); a
+    debug-trigger build observes by design, and the signed `agent_boot`
+    entry records the build's test features and the guard's mode.
+  - EBPF-004: `BTF_OFFSETS` stayed writable after it was armed. It is
+    frozen right after (`BPF_MAP_FREEZE`): no process can rewrite the
+    kernel offsets the hooks read; the programs still read them.
+  - Lab, Debian 12 (6.1), guard in enforce mode. Before: a root process
+    (a library preloaded into `/bin/true`) took a read-write handle by id
+    on all thirteen — `RING_DROPS`, `FS_PROTECT_EVENTS`, `EVENTS`,
+    `FILE_OPEN_EVENTS`, `EXEC_CHECK_EVENTS`, `TCP_CONNECT_EVENTS`,
+    `DNS_QUERY_EVENTS`, `MODULE_LOAD_EVENTS`, `IOURING_EVENTS`,
+    `BPF_SYSCALL_EVENTS` and the three `NET_*` rings — while a handle on
+    `PROTECTED_PIDS` was refused; 54 maps registered. After: the thirteen
+    refused (tamper-check C43), 68 maps registered, all deny hooks
+    attached; `BTF_OFFSETS` shown `frozen` and an update refused even with
+    the guard observing; `agent_boot` records `build_features`
+    (`debug-trigger`, `test-privileged`) and `bpf_guard: enforce`.

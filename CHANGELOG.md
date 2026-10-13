@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the BPF guard (Medium ATP-013, ATP-009,
+  EBPF-004): the agent's ring buffers and drop counters are guarded like
+  its other maps — a root process could take a writable handle on each,
+  enough to silence a sensor, the anti-tamper denials included. The
+  kernel-offset table is frozen once armed. A production agent whose
+  guard only observes counts it as a missing deny hook, and the signed
+  boot entry records the build's test features and the guard's mode.
 - External audit, Wave 2, file integrity (Medium TST-004, FIMR-007, FIMR-008,
   FIMR-009, FIMP-011): a change of a watched file's permissions, owner or
   group is drift of its own — a set-uid bit, or write for others, on a

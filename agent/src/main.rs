@@ -2378,6 +2378,22 @@ async fn main() -> Result<()> {
                     &fim_attached,
                     &open_sensor_carveout,
                 );
+                // External audit ATP-013: the FIM observers and the file-open
+                // sensor were loaded after the BPF guard registered the
+                // agent's objects: their programs and links join the set.
+                match northnarrow_agent::anti_tamper::bpf_defense::register_late_objects(
+                    sensor.ebpf_mut(),
+                ) {
+                    Ok(n) => debug!(
+                        ids = n,
+                        "BPF self-defence: late programs and links registered"
+                    ),
+                    Err(e) => error!(
+                        error = format!("{e:#}"),
+                        "BPF self-defence: the FIM and file-open programs NOT registered as the \
+                         agent's own — the guard does not refuse handles to them"
+                    ),
+                }
                 let inode_map = match populate_watched_paths(
                     sensor.ebpf_mut(),
                     &watched_paths_load.effective,
