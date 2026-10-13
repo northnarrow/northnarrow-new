@@ -63,6 +63,9 @@ const MAX_OUTPUT_TOKENS_HARD_CAP: usize = 2048;
 /// tokens. A 4 K hard cap keeps p95 latency in the budget.
 const MAX_PROMPT_TOKENS: usize = 4096;
 
+/// Generation budget when the engine sets none (tests, tools).
+const DEFAULT_BUDGET: Duration = Duration::from_secs(120);
+
 /// Production-grade Candle GGUF backend.
 ///
 /// Cheap to share across tasks (`Arc`-backed). The model weights live
@@ -79,6 +82,11 @@ pub struct CandleBackend {
     quantization: String,
     model_path: PathBuf,
     warmed_up: AtomicBool,
+    /// External audit LLMR-002: how long one generation may run. The
+    /// engine sets its own timeout here ([`Self::with_budget`]); a
+    /// generation the engine has stopped waiting for must not keep the
+    /// weights eight times longer.
+    budget: Duration,
 }
 
 struct Inner {
@@ -191,7 +199,15 @@ impl CandleBackend {
             quantization: "Q4_K_M".to_string(),
             model_path: model_path.to_path_buf(),
             warmed_up: AtomicBool::new(false),
+            budget: DEFAULT_BUDGET,
         })
+    }
+
+    /// External audit LLMR-002: bound every generation by `budget` — the
+    /// engine passes its inference timeout.
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub fn model_path(&self) -> &Path {
@@ -449,10 +465,9 @@ impl InferenceBackend for CandleBackend {
         top_p: f32,
     ) -> Result<String, AdeError> {
         // The engine layer (mod.rs) wraps this in a tokio timeout +
-        // spawn_blocking; from this side the Duration just bounds
-        // how aggressively we self-abort if the caller didn't.
-        let budget = Duration::from_secs(120);
-        self.run_inference(prompt, max_tokens, temperature, top_p, budget)
+        // spawn_blocking; from this side the budget bounds how long we
+        // run if the caller stopped waiting (external audit LLMR-002).
+        self.run_inference(prompt, max_tokens, temperature, top_p, self.budget)
     }
 
     fn generate_streaming(
@@ -464,7 +479,6 @@ impl InferenceBackend for CandleBackend {
         top_p: f32,
         mut on_token: Box<dyn FnMut(&str) -> StreamControl + Send>,
     ) -> Result<String, AdeError> {
-        let budget = Duration::from_secs(120);
         // Adapt the trait's Box<dyn FnMut> into the &mut F shape
         // run_inference_streaming wants without a second allocation.
         self.run_inference_streaming(
@@ -472,7 +486,7 @@ impl InferenceBackend for CandleBackend {
             max_tokens,
             temperature,
             top_p,
-            budget,
+            self.budget,
             &mut |s: &str| on_token(s),
         )
     }

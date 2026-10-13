@@ -787,3 +787,105 @@ async fn low_confidence_kill_tree_is_escalated_not_executed() {
     assert_eq!(out.verdict, AdeAction::Escalate);
     assert_eq!(out.escalation_tier, Some(EscalationTier::Tier3Review));
 }
+
+/// External audit LLMR-002: on timeout the generation stops at its next
+/// token, and the engine reports the timeout once the backend is free —
+/// not up to 120 s later, with the next evaluations queued behind it.
+#[tokio::test]
+async fn timeout_stops_the_generation_and_frees_the_backend() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::error::AdeError;
+    use super::inference::StreamControl;
+
+    struct EndlessBackend {
+        stopped: Arc<AtomicBool>,
+    }
+    impl InferenceBackend for EndlessBackend {
+        fn name(&self) -> &str {
+            "endless"
+        }
+        fn quantization(&self) -> &str {
+            "none"
+        }
+        fn model_id(&self) -> &str {
+            "endless-model"
+        }
+        fn generate(
+            &self,
+            _: &str,
+            _: &Event,
+            _: usize,
+            _: f32,
+            _: f32,
+        ) -> Result<String, AdeError> {
+            Ok(String::new())
+        }
+        fn generate_streaming(
+            &self,
+            _: &str,
+            _: &Event,
+            _: usize,
+            _: f32,
+            _: f32,
+            mut on_token: Box<dyn FnMut(&str) -> StreamControl + Send>,
+        ) -> Result<String, AdeError> {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(30) {
+                if matches!(on_token("x"), StreamControl::Stop) {
+                    self.stopped.store(true, Ordering::SeqCst);
+                    return Ok("partial".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok("never stopped".into())
+        }
+    }
+
+    let stopped = Arc::new(AtomicBool::new(false));
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let mut cfg = cfg_with(prompt.path(), model.path());
+    cfg.timeout = Duration::from_millis(200);
+    let engine = AdeEngine::new_with_backend(
+        cfg,
+        Arc::new(EndlessBackend {
+            stopped: Arc::clone(&stopped),
+        }),
+    )
+    .await
+    .unwrap();
+    let event = Event::ProcessSpawn {
+        pid: 4242,
+        ppid: 1,
+        uid: 1000,
+        gid: 1000,
+        comm: "x".into(),
+        filename: "/usr/local/bin/x".into(),
+        timestamp_ns: 0,
+        argv: Vec::new(),
+        parent_comm: String::new(),
+        parent_start_ns: 0,
+        parent_is_kthread: false,
+        exe: Default::default(),
+    };
+    let ctx = EventContext {
+        recent_events: vec![],
+        host_context: HostContext::discover(),
+    };
+
+    let started = Instant::now();
+    let err = engine.evaluate(&event, &ctx).await.unwrap_err();
+    assert!(matches!(err, AdeError::Timeout { .. }), "{err:?}");
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the generation must have stopped by the time the timeout is reported"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(engine.stats().timeouts, 1);
+}

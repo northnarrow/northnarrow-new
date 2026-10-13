@@ -34,6 +34,7 @@ pub mod prompt;
 pub mod rag_integration;
 pub mod sanitize;
 pub mod sanity_check;
+pub mod slot;
 pub mod stats;
 pub mod streaming_parser;
 pub mod structured_prompt;
@@ -41,6 +42,7 @@ pub mod structured_prompt;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -246,30 +248,39 @@ impl AdeEngine {
         // get a single end-of-output callback via the trait's
         // default impl — same observable behaviour, just no early
         // termination saving.
-        let raw_result = tokio::time::timeout(
-            self.inner.config.timeout,
-            tokio::task::spawn_blocking(move || {
-                let mut detector = StreamingJsonDetector::new();
-                backend.generate_streaming(
-                    &prompt,
-                    &event_owned,
-                    max_tokens,
-                    temp,
-                    top_p,
-                    Box::new(move |chunk: &str| {
-                        if detector.feed(chunk) {
-                            inference::StreamControl::Stop
-                        } else {
-                            inference::StreamControl::Continue
-                        }
-                    }),
-                )
-            }),
-        )
-        .await;
+        // External audit LLMR-002: set when the timeout fires, so that the
+        // generation stops at its next token.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let mut generation = tokio::task::spawn_blocking(move || {
+            let mut detector = StreamingJsonDetector::new();
+            backend.generate_streaming(
+                &prompt,
+                &event_owned,
+                max_tokens,
+                temp,
+                top_p,
+                Box::new(move |chunk: &str| {
+                    if stop.load(Ordering::Relaxed) || detector.feed(chunk) {
+                        inference::StreamControl::Stop
+                    } else {
+                        inference::StreamControl::Continue
+                    }
+                }),
+            )
+        });
+        let raw_result = tokio::time::timeout(self.inner.config.timeout, &mut generation).await;
 
         let raw = match raw_result {
             Err(_) => {
+                // External audit LLMR-002: dropping the handle of a
+                // blocking task does not stop it. It ran on, holding the
+                // model's weights, up to the backend's own budget (then
+                // 120 s), while the next evaluations queued behind it and
+                // timed out in turn. Stop it at its next token, and give
+                // the backend back before reporting the timeout.
+                cancelled.store(true, Ordering::Relaxed);
+                let _ = generation.await;
                 self.inner.stats.record_timeout();
                 return Err(AdeError::Timeout {
                     seconds: self.inner.config.timeout.as_secs(),
@@ -535,7 +546,10 @@ fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>
     backend_candle::CandleBackend::configure_threads(config.effective_threads());
 
     match backend_candle::CandleBackend::load(&config.model_path) {
+        // External audit LLMR-002: a generation never outlives the
+        // engine's timeout by more than a token.
         Ok(backend) => {
+            let backend = backend.with_budget(config.timeout);
             tracing::info!(
                 backend = "candle-llama3.1",
                 model = %config.model_path.display(),

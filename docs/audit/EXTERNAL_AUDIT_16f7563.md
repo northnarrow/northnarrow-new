@@ -29,7 +29,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-001 | PROC-001 | Critical | Process rules | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs` | fixed (lab PR 79) |
 | NN-AUD-002 | POS-001 | Critical | Posture | `agent/src/posture/mod.rs` | fixed (lab PR 80) |
 | NN-AUD-003 | LLMP-002 | Critical | LLM prompts | `agent/src/ade/structured_prompt.rs` | fixed (lab PR 81) |
-| NN-AUD-004 | LLMR-002 | Critical | LLM runtime | `agent/src/ade/mod.rs` | open |
+| NN-AUD-004 | LLMR-002 | Critical | LLM runtime | `agent/src/ade/mod.rs` | fixed (lab PR 82) |
 | NN-AUD-005 | NET-001 | Critical | Network | `agent/src/net/blocklist.rs` | fixed (lab PR 78) |
 | NN-AUD-006 | NET-010 | Critical | Network | `configs/netflow-comm-allowlist.v1` | fixed (lab PR 78) |
 | NN-AUD-016 | EBPF-003 | High | eBPF kernel | `agent-ebpf/src/ptrace_check.rs` | open |
@@ -181,3 +181,28 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     next ladder tick isolated the host. The signed audit log shows the
     refusal at 00:37:07 and the isolation at 00:37:24, "COMBAT since
     locked on non-heuristic evidence".
+- **NN-AUD-004 (LLMR-002), lab PR 82.** The event loop awaited every ADE
+  evaluation inline. An exec that no rule matched held every sensor's
+  channel for up to the inference timeout (15 s), and the kernel ring
+  buffers dropped what arrived meanwhile: any user could keep the agent
+  blind by running unknown binaries in a loop. The timeout did not stop
+  the generation either. Dropping the handle of a blocking task leaves
+  it running, so it kept the model's weights up to the backend's own
+  120 s budget, and the next evaluations queued behind it and timed out
+  in turn.
+  - The evaluation and the response to its verdict run on their own
+    task (`AdeSlot`). One runs at a time; an exec that arrives while one
+    runs is judged by the rules only, counted, and the count is logged
+    once a minute. The event loop never waits on the model.
+  - On timeout the engine stops the generation at its next token and
+    reports the timeout once the backend is free. The backend's budget
+    is the engine's timeout.
+  - Tests: an evaluation that never ends refuses fifty more at once,
+    without waiting, and frees the slot when it ends; an endless
+    generation stops when the timeout fires, and the timeout is
+    reported after it stopped.
+  - Lab (Ubuntu 22.04): the agent run by hand with ADE on a placeholder
+    model (candle refuses it; the mock backend answers). Forty unknown
+    execs in a burst: the first was evaluated (VERDICT (ADE)), the others
+    were counted as skipped ("ADE busy"), and an exec from /tmp right
+    after still drew R001 at once. The privileged suite passed (55/55).

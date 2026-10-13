@@ -6,6 +6,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, LLMR-002 (Critical): any user could blind the
+  agent by running unknown binaries in a loop. Each one sent to ADE held
+  the event loop for up to the inference timeout, and the kernel dropped
+  events meanwhile; a timed-out generation also kept running for up to
+  two minutes. ADE now evaluates on its own task, one exec at a time
+  (the others are judged by the rules only and counted), and a timeout
+  stops the generation.
 - External audit, Wave 0, POS-001 (Critical): any local user could put
   the host in a locked COMBAT — network isolation, with no way out but a
   signed release — with two cheap heuristics, such as twenty HTTPS

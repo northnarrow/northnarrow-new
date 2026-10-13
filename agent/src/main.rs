@@ -2912,6 +2912,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// External audit LLMR-002: at most one ADE evaluation in flight, off the
+/// event loop.
+static ADE_SLOT: std::sync::LazyLock<northnarrow_agent::ade::slot::AdeSlot> =
+    std::sync::LazyLock::new(northnarrow_agent::ade::slot::AdeSlot::new);
+
 /// Categorise + log + evaluate + (maybe) execute.
 ///
 /// Tappa 4 ships five sensors; Tappa 2 rules only match `ProcessSpawn`,
@@ -3366,6 +3371,34 @@ async fn process_event(
         host_context: host.clone(),
     };
 
+    // External audit LLMR-002: the evaluation leaves the event loop, one
+    // at a time (`AdeSlot`). Awaited here, an exec no rule matched held
+    // every sensor for up to the inference timeout.
+    let (ade, executor, posture) = (ade.clone(), executor.clone(), posture.clone());
+    let detection_sink = detection_sink.cloned();
+    ADE_SLOT.try_spawn(async move {
+        evaluate_and_respond(
+            &ade,
+            &executor,
+            &posture,
+            detection_sink.as_ref(),
+            event,
+            context,
+        )
+        .await;
+    });
+}
+
+/// External audit LLMR-002: one ADE evaluation and the response to its
+/// verdict, on its own task (see [`ADE_SLOT`]).
+async fn evaluate_and_respond(
+    ade: &AdeEngine,
+    executor: &Executor,
+    posture: &PostureMachine,
+    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
+    event: Event,
+    context: EventContext,
+) {
     info!("ADE inference started");
     let verdict = match ade.evaluate(&event, &context).await {
         Ok(v) => v,
