@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use common::ResponseAction;
 
 use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::response::quarantine::ExeHandle;
 use crate::response::{block_outbound, ExecutionOutcome, Executor};
 
 /// Outcome of a STAGE-2 neutralization attempt — the signal the ladder
@@ -163,8 +164,10 @@ impl CombatActuator for SystemActuator {
 
         // Review 87: the binaries are looked up before the kill. After
         // it `/proc/<pid>/exe` is gone, and the quarantine by pid that
-        // ran here found nothing every time (AlreadyGone).
-        let binaries: Vec<(u32, Option<std::path::PathBuf>)> =
+        // ran here found nothing every time (AlreadyGone). External audit
+        // CMB-001: opened, not named — the inode stays the one the process
+        // ran whatever becomes of its path before the quarantine.
+        let binaries: Vec<(u32, Option<ExeHandle>)> =
             offenders.iter().map(|&pid| (pid, binary_of(pid))).collect();
 
         // First pass: kill the offending tree(s). Any non-contained
@@ -196,9 +199,9 @@ impl CombatActuator for SystemActuator {
         // surviving parent / supervisor cannot re-exec them. A
         // quarantine failure does NOT force isolation — the process is
         // already dead — but it is logged.
-        let mut done: Vec<std::path::PathBuf> = Vec::new();
+        let mut done: Vec<(u64, u64)> = Vec::new();
         for (pid, binary) in binaries {
-            let Some(path) = binary else {
+            let Some(handle) = binary else {
                 warn!(
                     target: "combat.actuator",
                     pid,
@@ -207,11 +210,11 @@ impl CombatActuator for SystemActuator {
                 );
                 continue;
             };
-            if done.contains(&path) {
+            if done.contains(&handle.key()) {
                 continue;
             }
-            let report = self.executor.quarantine_path(&path, pid);
-            done.push(path);
+            let report = self.executor.quarantine_handle(&handle, pid);
+            done.push(handle.key());
             match report.primary {
                 ExecutionOutcome::Quarantined { .. }
                 | ExecutionOutcome::AlreadyGone { .. }
@@ -263,12 +266,11 @@ impl CombatActuator for SystemActuator {
     }
 }
 
-/// Review 87: the file a process runs, read before it is killed. `None`
+/// Review 87: the file a process runs, opened before it is killed. `None`
 /// once it has exited, or when the binary was deleted while it ran (the
 /// kernel's ` (deleted)` suffix): nothing on disk to quarantine.
-fn binary_of(pid: u32) -> Option<std::path::PathBuf> {
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    (!exe.to_string_lossy().ends_with(" (deleted)")).then_some(exe)
+fn binary_of(pid: u32) -> Option<ExeHandle> {
+    ExeHandle::of_pid(pid).ok().flatten()
 }
 
 #[cfg(test)]
@@ -381,7 +383,7 @@ mod tests {
         let pid = child.id();
         // the exec has replaced the image before NEUTRALIZE reads it
         for _ in 0..100 {
-            if binary_of(pid).as_deref() == Some(mal.as_path()) {
+            if binary_of(pid).and_then(|h| h.current_path()).as_deref() == Some(mal.as_path()) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

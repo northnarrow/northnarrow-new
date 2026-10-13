@@ -25,9 +25,11 @@
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -77,12 +79,80 @@ const QUARANTINE_DENY_PREFIXES: &[&str] = &[
     "/run/northnarrow/",
 ];
 
-/// `true` when `path` must never be vaulted + unlinked. Lexical check
-/// on the path as resolved from `/proc/<pid>/exe` (already absolute
-/// and symlink-free, so `..`/symlink games cannot escape a prefix).
+/// `true` when `path` must never be vaulted + unlinked. Lexical check on
+/// the path of the inode itself ([`ExeHandle::current_path`]: absolute and
+/// symlink-free at the moment it is read).
 pub fn is_quarantine_denied(path: &Path) -> bool {
     let p = path.to_string_lossy();
     QUARANTINE_DENY_PREFIXES.iter().any(|d| p.starts_with(d))
+}
+
+/// External audit CMB-001: a binary to quarantine, held open — the inode a
+/// process ran, not a name. The quarantine used to resolve
+/// `/proc/<pid>/exe` once and then check the denylist, read, and unlink BY
+/// NAME: a user who owns a directory of their own binary's path could swap
+/// it for a symlink in between and have the agent (root, CAP_DAC_OVERRIDE)
+/// vault and delete any file. Opened through `/proc/<pid>/exe`, the
+/// kernel's link to the inode, the content read and the size checked are
+/// the binary's whatever becomes of its path; the denylist is judged on the
+/// inode's own path ([`Self::current_path`]) and the removal is verified
+/// against it ([`remove_verified`]).
+pub struct ExeHandle {
+    file: fs::File,
+    dev: u64,
+    ino: u64,
+}
+
+impl ExeHandle {
+    /// The executable `pid` runs. `Ok(None)` once the process has exited,
+    /// or when its binary was deleted while it ran (the kernel's
+    /// ` (deleted)` suffix): nothing on disk to quarantine.
+    pub fn of_pid(pid: u32) -> std::io::Result<Option<Self>> {
+        let link = format!("/proc/{pid}/exe");
+        match fs::read_link(&link) {
+            Ok(p) if p.to_string_lossy().ends_with(" (deleted)") => return Ok(None),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        match fs::File::open(&link) {
+            Ok(f) => Self::from_file(f).map(Some),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The file at `path` (tests, tools).
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::from_file(fs::File::open(path)?)
+    }
+
+    fn from_file(file: fs::File) -> std::io::Result<Self> {
+        let m = file.metadata()?;
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            file,
+        })
+    }
+
+    /// Where the inode is now, from the agent's own descriptor
+    /// (`/proc/self/fd/N`): a rename or a swapped directory moves it, a
+    /// string read earlier does not. `None` once it was unlinked.
+    pub fn current_path(&self) -> Option<PathBuf> {
+        let p = fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd())).ok()?;
+        (!p.to_string_lossy().ends_with(" (deleted)")).then_some(p)
+    }
+
+    /// The same inode as this handle's.
+    pub fn is_inode(&self, dev: u64, ino: u64) -> bool {
+        self.dev == dev && self.ino == ino
+    }
+
+    /// `(dev, ino)` of the inode.
+    pub fn key(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
 }
 const NONCE_LEN: usize = 12;
 
@@ -106,31 +176,30 @@ pub fn quarantine_process_binary(
         };
     }
 
-    let exe_link = format!("/proc/{target_pid}/exe");
-    let original = match fs::read_link(&exe_link) {
-        Ok(p) => p,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            return ExecutionOutcome::AlreadyGone { pid: target_pid }
-        }
+    let handle = match ExeHandle::of_pid(target_pid) {
+        Ok(Some(h)) => h,
+        Ok(None) => return ExecutionOutcome::AlreadyGone { pid: target_pid },
         Err(e) => {
-            warn!(pid = target_pid, error = %e, "read_link /proc/<pid>/exe");
+            warn!(pid = target_pid, error = %e, "open /proc/<pid>/exe");
             return ExecutionOutcome::Failed {
                 pid: target_pid,
                 errno: e.raw_os_error().unwrap_or(0),
             };
         }
     };
-    quarantine_binary(&original, target_pid, cfg)
+    quarantine_handle(&handle, target_pid, cfg)
 }
 
-/// Review 87: encrypt the binary at `original` into the vault and remove
+/// Review 87: encrypt the binary `handle` holds into the vault and remove
 /// it. `pid` is the process it backed, for the outcome. The combat
-/// ladder's NEUTRALIZE looks the binary up before it kills the process
-/// and quarantines it by path here: after the kill, `/proc/<pid>/exe` is
-/// gone.
-pub fn quarantine_binary(original: &Path, pid: u32, cfg: &ExecutorConfig) -> ExecutionOutcome {
+/// ladder's NEUTRALIZE opens the binary before it kills the process (after
+/// the kill `/proc/<pid>/exe` is gone) and quarantines it here.
+pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> ExecutionOutcome {
     let target_pid = pid;
-    let original_str = original.to_string_lossy().into_owned();
+    let original_str = match handle.current_path() {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => return ExecutionOutcome::AlreadyGone { pid: target_pid },
+    };
 
     if cfg.dry_run {
         info!(
@@ -144,7 +213,7 @@ pub fn quarantine_binary(original: &Path, pid: u32, cfg: &ExecutorConfig) -> Exe
         };
     }
 
-    match quarantine_file(original, cfg) {
+    match quarantine_file(handle, cfg) {
         Ok(vault_id) => {
             info!(
                 pid = target_pid,
@@ -155,6 +224,19 @@ pub fn quarantine_binary(original: &Path, pid: u32, cfg: &ExecutorConfig) -> Exe
             ExecutionOutcome::Quarantined {
                 original_path: original_str,
                 vault_id,
+            }
+        }
+        Err(QuarantineError::Gone) => ExecutionOutcome::AlreadyGone { pid: target_pid },
+        Err(QuarantineError::PathSwapped) => {
+            warn!(
+                pid = target_pid,
+                path = %original_str,
+                "the binary's path no longer names the file the process ran (a directory \
+                 swapped for a link?) — vaulted, not removed"
+            );
+            ExecutionOutcome::Refused {
+                pid: target_pid,
+                reason: "the binary's path changed under the quarantine — vaulted, not removed",
             }
         }
         Err(QuarantineError::ProtectedPath) => {
@@ -248,6 +330,11 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
 enum QuarantineError {
     /// Path is under [`QUARANTINE_DENY_PREFIXES`]; nothing was touched.
     ProtectedPath,
+    /// The file was unlinked before the quarantine reached it.
+    Gone,
+    /// External audit CMB-001: the path no longer names the inode the
+    /// process ran; the content is vaulted, nothing is removed.
+    PathSwapped,
     TooLarge {
         size: u64,
         max: u64,
@@ -262,11 +349,13 @@ impl From<std::io::Error> for QuarantineError {
     }
 }
 
-fn quarantine_file(original: &Path, cfg: &ExecutorConfig) -> Result<String, QuarantineError> {
+fn quarantine_file(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<String, QuarantineError> {
+    let original_buf = handle.current_path().ok_or(QuarantineError::Gone)?;
+    let original = original_buf.as_path();
     if is_quarantine_denied(original) {
         return Err(QuarantineError::ProtectedPath);
     }
-    let meta = fs::metadata(original)?;
+    let meta = handle.file.metadata()?;
     let size = meta.len();
     if size > cfg.quarantine_max_bytes {
         return Err(QuarantineError::TooLarge {
@@ -275,9 +364,11 @@ fn quarantine_file(original: &Path, cfg: &ExecutorConfig) -> Result<String, Quar
         });
     }
 
-    // Read once.
+    // Read once, from the inode the handle holds.
     let mut content = Vec::with_capacity(size as usize + 16);
-    fs::File::open(original)?.read_to_end(&mut content)?;
+    let mut reader = &handle.file;
+    reader.seek(SeekFrom::Start(0))?;
+    reader.read_to_end(&mut content)?;
     let sha = Sha256::digest(&content);
 
     // Encrypt.
@@ -338,21 +429,85 @@ fn quarantine_file(original: &Path, cfg: &ExecutorConfig) -> Result<String, Quar
     // Update index.json atomically (tmp + fsync + rename).
     update_index(&cfg.quarantine_dir, &vault_id, &original_str, size)?;
 
-    // Remove the original, through the host's view of it (review 87:
-    // the agent's own mounts are read-only, so a plain unlink failed with
-    // EROFS outside its state directories). If unlink fails (e.g. EBUSY
-    // because the binary is mmaped by the running process), fall back to
-    // chmod 000 so it can't be re-executed by anyone non-root. If both
-    // fail the binary is still there: that is a failure, never reported
-    // as a quarantine.
-    if let Err(e) = super::on_host_path(original, |p| fs::remove_file(p)) {
-        warn!(error = %e, path = %original.display(), "remove original failed; chmod 000");
-        super::on_host_path(original, |p| {
-            fs::set_permissions(p, fs::Permissions::from_mode(0o000))
-        })?;
-    }
-
+    remove_held(handle)?;
     Ok(vault_id)
+}
+
+/// Tries of the verified removal. A swap racing it fails the `(dev, ino)`
+/// comparison of that try only; the next one starts again from where the
+/// inode is (lab, CMB-001: a directory exchanged with a symlink in a tight
+/// loop failed about one try in two).
+const REMOVE_TRIES: usize = 8;
+
+/// Remove the binary `handle` holds by its current name, re-read from the
+/// descriptor for each try ([`ExeHandle::current_path`]) and judged by the
+/// denylist each time. [`QuarantineError::PathSwapped`] once the tries are
+/// spent, or once the name the agent knew is gone while the inode lives on
+/// (another name may hold it): vaulted, not removed.
+fn remove_held(handle: &ExeHandle) -> Result<(), QuarantineError> {
+    for _ in 0..REMOVE_TRIES {
+        let Some(path) = handle.current_path() else {
+            break;
+        };
+        if is_quarantine_denied(&path) {
+            return Err(QuarantineError::ProtectedPath);
+        }
+        match remove_verified(&path, handle) {
+            Err(QuarantineError::PathSwapped) => continue,
+            r => return r,
+        }
+    }
+    Err(QuarantineError::PathSwapped)
+}
+
+/// External audit CMB-001: remove `path` only while it names the inode
+/// `handle` holds. The parent directory is opened once (through the host's
+/// view of it — review 87: the agent's own mounts are read-only), the name
+/// opened under it without following a link in the last component and
+/// compared by `(dev, ino)`, then unlinked under that same directory: a
+/// directory of the path swapped for a symlink makes the comparison fail
+/// ([`QuarantineError::PathSwapped`]) instead of removing whatever the new
+/// path leads to. If the unlink fails (EBUSY on an mmapped binary), the
+/// verified file is made unusable (`fchmod 000`); if that fails too the
+/// binary is still there, which is a failure, never a quarantine.
+fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<(), QuarantineError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(QuarantineError::PathSwapped);
+    };
+    let dir = super::on_host_path(parent, |p| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(p)
+    })?;
+    let cname =
+        std::ffi::CString::new(name.as_bytes()).map_err(|_| QuarantineError::PathSwapped)?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: a valid directory fd and a NUL-terminated name; the returned
+    // fd is owned by the File below.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), flags) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::ELOOP) | Some(libc::ENOENT) | Some(libc::ENOTDIR) => {
+                QuarantineError::PathSwapped
+            }
+            _ => e.into(),
+        });
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nobody else.
+    let target = unsafe { fs::File::from_raw_fd(fd) };
+    let m = target.metadata()?;
+    if !handle.is_inode(m.dev(), m.ino()) {
+        return Err(QuarantineError::PathSwapped);
+    }
+    // SAFETY: the same directory fd and name as the openat above.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        warn!(error = %e, path = %path.display(), "remove original failed; chmod 000");
+        target.set_permissions(fs::Permissions::from_mode(0o000))?;
+    }
+    Ok(())
 }
 
 fn update_index(
@@ -466,7 +621,8 @@ mod tests {
         let payload = b"hello, this is the payload contents".to_vec();
         fs::write(&payload_path, &payload).unwrap();
 
-        let vault_id = quarantine_file(&payload_path, &cfg).expect("quarantine");
+        let vault_id =
+            quarantine_file(&ExeHandle::open(&payload_path).unwrap(), &cfg).expect("quarantine");
         assert!(!payload_path.exists(), "original should be unlinked");
 
         let restored_path = tmp.path().join("restored.bin");
@@ -509,7 +665,7 @@ mod tests {
         // metadata/read/unlink, so the file is untouched afterwards.
         let target = Path::new("/bin/sh");
         let before = fs::metadata(target).expect("/bin/sh exists on a Linux test host");
-        match quarantine_file(target, &cfg) {
+        match quarantine_file(&ExeHandle::open(target).unwrap(), &cfg) {
             Err(QuarantineError::ProtectedPath) => {}
             Ok(_) => panic!("expected ProtectedPath, got Ok"),
             Err(_) => panic!("expected ProtectedPath, got a different error"),
@@ -522,6 +678,139 @@ mod tests {
         );
     }
 
+    /// External audit CMB-001: a directory of the binary's path renamed and
+    /// replaced by a symlink to a victim directory before the quarantine.
+    /// The quarantine follows the inode it holds — the attacker's file,
+    /// wherever it went — never the victim the old path now leads to.
+    #[test]
+    fn a_swapped_directory_does_not_redirect_the_quarantine() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let dir = tmp.path().join("own");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("mal"), b"malware").unwrap();
+        let victim_dir = tmp.path().join("victim");
+        fs::create_dir(&victim_dir).unwrap();
+        fs::write(victim_dir.join("mal"), b"victim").unwrap();
+        let handle = ExeHandle::open(&dir.join("mal")).unwrap();
+        // the swap: the directory moved away, a link to the victim's in place
+        fs::rename(&dir, tmp.path().join("own.moved")).unwrap();
+        std::os::unix::fs::symlink(&victim_dir, &dir).unwrap();
+
+        let id = quarantine_file(&handle, &cfg).expect("quarantine");
+        assert_eq!(fs::read(victim_dir.join("mal")).unwrap(), b"victim");
+        assert!(
+            !tmp.path().join("own.moved/mal").exists(),
+            "the binary itself removed"
+        );
+        let restored = tmp.path().join("restored");
+        restore(&id, &restored, &cfg).unwrap();
+        assert_eq!(fs::read(&restored).unwrap(), b"malware");
+
+        // the removal step on its own, handed the old path: it leads to
+        // another inode now, and nothing is removed
+        fs::write(tmp.path().join("own.moved/mal2"), b"malware2").unwrap();
+        let h2 = ExeHandle::open(&tmp.path().join("own.moved/mal2")).unwrap();
+        fs::write(victim_dir.join("mal2"), b"victim2").unwrap();
+        assert!(matches!(
+            remove_verified(&dir.join("mal2"), &h2),
+            Err(QuarantineError::PathSwapped)
+        ));
+        assert_eq!(fs::read(victim_dir.join("mal2")).unwrap(), b"victim2");
+    }
+
+    /// External audit CMB-001, the lab's race: the binary's directory
+    /// exchanged with a symlink to a victim directory in a tight loop while
+    /// the quarantine runs. Whatever the timing, the victim survives and the
+    /// binary is vaulted; it is removed, or left where it is and reported
+    /// (`PathSwapped`) — never another file in its place.
+    #[test]
+    fn a_directory_flipped_in_a_loop_never_redirects_the_removal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        for round in 0..20 {
+            let tmp = TempDir::new().unwrap();
+            let cfg = cfg_for(&tmp);
+            let own = tmp.path().join("own");
+            let alt = tmp.path().join("own.alt");
+            let victim_dir = tmp.path().join("victim");
+            fs::create_dir(&own).unwrap();
+            fs::create_dir(&victim_dir).unwrap();
+            fs::write(own.join("mal"), b"malware").unwrap();
+            fs::write(victim_dir.join("mal"), b"victim").unwrap();
+            std::os::unix::fs::symlink(&victim_dir, &alt).unwrap();
+            let handle = ExeHandle::open(&own.join("mal")).unwrap();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let flipper = {
+                let stop = stop.clone();
+                let a = std::ffi::CString::new(own.as_os_str().as_bytes()).unwrap();
+                let b = std::ffi::CString::new(alt.as_os_str().as_bytes()).unwrap();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        // SAFETY: two NUL-terminated paths; renameat2 reads them only.
+                        unsafe {
+                            libc::syscall(
+                                libc::SYS_renameat2,
+                                libc::AT_FDCWD,
+                                a.as_ptr(),
+                                libc::AT_FDCWD,
+                                b.as_ptr(),
+                                libc::RENAME_EXCHANGE,
+                            );
+                        }
+                    }
+                })
+            };
+            let outcome = quarantine_file(&handle, &cfg);
+            stop.store(true, Ordering::Relaxed);
+            flipper.join().unwrap();
+
+            assert_eq!(
+                fs::read(victim_dir.join("mal")).unwrap(),
+                b"victim",
+                "round {round}: the victim must survive"
+            );
+            let real = if fs::symlink_metadata(&own).unwrap().is_dir() {
+                own.join("mal")
+            } else {
+                alt.join("mal")
+            };
+            match outcome {
+                Ok(id) => {
+                    assert!(!real.exists(), "round {round}: quarantined, so removed");
+                    let restored = tmp.path().join("restored");
+                    restore(&id, &restored, &cfg).unwrap();
+                    assert_eq!(fs::read(&restored).unwrap(), b"malware");
+                }
+                Err(QuarantineError::PathSwapped) => {
+                    assert_eq!(fs::read(&real).unwrap(), b"malware");
+                }
+                Err(e) => panic!("round {round}: unexpected {e:?}"),
+            }
+        }
+    }
+
+    /// A binary replaced under its name (a rename over it) after it was
+    /// opened: the inode held is gone from disk, nothing is vaulted or
+    /// removed, and the new file is left alone.
+    #[test]
+    fn a_binary_replaced_under_its_name_is_gone_not_the_new_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let p = tmp.path().join("tool");
+        fs::write(&p, b"old").unwrap();
+        let handle = ExeHandle::open(&p).unwrap();
+        let fresh = tmp.path().join("tool.new");
+        fs::write(&fresh, b"new").unwrap();
+        fs::rename(&fresh, &p).unwrap();
+        assert!(matches!(
+            quarantine_file(&handle, &cfg),
+            Err(QuarantineError::Gone)
+        ));
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+    }
+
     #[test]
     fn nonce_differs_per_call() {
         let tmp = TempDir::new().unwrap();
@@ -532,8 +821,8 @@ mod tests {
         fs::write(&p1, b"same content").unwrap();
         fs::write(&p2, b"same content").unwrap();
 
-        let id1 = quarantine_file(&p1, &cfg).unwrap();
-        let id2 = quarantine_file(&p2, &cfg).unwrap();
+        let id1 = quarantine_file(&ExeHandle::open(&p1).unwrap(), &cfg).unwrap();
+        let id2 = quarantine_file(&ExeHandle::open(&p2).unwrap(), &cfg).unwrap();
         assert_ne!(id1, id2);
 
         let bin1 = fs::read(cfg.quarantine_dir.join("vault").join(format!("{id1}.bin"))).unwrap();
@@ -551,7 +840,7 @@ mod tests {
 
         let p = tmp.path().join("too-big.bin");
         fs::write(&p, vec![0u8; 32]).unwrap();
-        let err = quarantine_file(&p, &cfg).unwrap_err();
+        let err = quarantine_file(&ExeHandle::open(&p).unwrap(), &cfg).unwrap_err();
         match err {
             QuarantineError::TooLarge { size, max } => {
                 assert_eq!(size, 32);
@@ -573,8 +862,8 @@ mod tests {
         fs::write(&pa, b"a contents").unwrap();
         fs::write(&pb, b"b contents").unwrap();
 
-        let _ida = quarantine_file(&pa, &cfg).unwrap();
-        let _idb = quarantine_file(&pb, &cfg).unwrap();
+        let _ida = quarantine_file(&ExeHandle::open(&pa).unwrap(), &cfg).unwrap();
+        let _idb = quarantine_file(&ExeHandle::open(&pb).unwrap(), &cfg).unwrap();
 
         let index_path = cfg.quarantine_dir.join("index.json");
         let s = fs::read_to_string(&index_path).unwrap();
