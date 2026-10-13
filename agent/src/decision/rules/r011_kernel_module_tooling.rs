@@ -173,6 +173,7 @@ mod tests {
             argv: vec!["modprobe".to_string(), "snd-pcm".to_string()],
             parent_comm: parent_comm.to_string(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread,
             exe: Default::default(),
         }

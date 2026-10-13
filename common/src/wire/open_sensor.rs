@@ -70,6 +70,11 @@ pub mod open_reason {
     /// the high 32, and `mode` the xattr's `magic_etc` (revision in the
     /// top byte, the effective flag in bit 0).
     pub const FILE_CAP: u32 = 1 << 6;
+    /// External audit POS-002: the tgid's write-opens of files that
+    /// existed before the open (no `FMODE_CREATED`: rewritten, not
+    /// created) crossed the mass-write threshold in the window. `count`
+    /// still carries all its write-opens.
+    pub const MASS_OVERWRITE: u32 = 1 << 7;
 }
 
 /// Names in the rule maps: NUL-padded, at most 31 bytes kept.
@@ -115,7 +120,12 @@ pub struct DirClass {
 pub struct OpenWriteWindow {
     pub start_ns: u64,
     pub count: u32,
+    /// [`open_reason::MASS_WRITE`] / [`open_reason::MASS_OVERWRITE`] once
+    /// each was reported in this window.
     pub fired: u32,
+    /// External audit POS-002: the write-opens of files that existed.
+    pub overwrites: u32,
+    pub _pad: u32,
 }
 
 /// One interesting open. 8-aligned, no implicit padding:
@@ -141,7 +151,8 @@ pub struct OpenRecordRaw {
     pub mode: u32,
     /// [`open_reason`] bits.
     pub reason: u32,
-    /// Write-opens in the window when `reason` has `MASS_WRITE`.
+    /// Write-opens in the window when `reason` has `MASS_WRITE` or
+    /// `MASS_OVERWRITE`.
     pub count: u32,
     pub comm: [u8; TASK_COMM_LEN],
     pub path_n: u16,
@@ -160,7 +171,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<OpenRecordRaw>(), 8);
         assert_eq!(core::mem::size_of::<ChildRuleKey>(), 48);
         assert_eq!(core::mem::size_of::<DirClass>(), 16);
-        assert_eq!(core::mem::size_of::<OpenWriteWindow>(), 16);
+        assert_eq!(core::mem::size_of::<OpenWriteWindow>(), 24);
     }
 
     #[test]

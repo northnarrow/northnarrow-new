@@ -178,6 +178,14 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
     // the argv block is a single bounded user read (no loop).
     let task = unsafe { bpf_get_current_task() } as *const u8;
     if !task.is_null() {
+        // External audit POS-003: the process's own start_time (its fork;
+        // exec keeps it), the time the lineage tracker orders an
+        // ancestor's exec against.
+        if let Ok(start) = unsafe {
+            bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _)
+        } {
+            unsafe { (*raw_ptr).start_ns = start };
+        }
         // Parent: task->real_parent, then tgid (userspace ppid) +
         // start_time (PID-reuse key) + comm.
         if let Ok(parent) = unsafe {

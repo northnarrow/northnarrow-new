@@ -1181,7 +1181,9 @@ async fn main() -> Result<()> {
     // rules' package-manager carve-out (review 49): "does this writer
     // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the
     // posture trigger detector; reads /proc on a cache miss.
-    let lineage = AuthSessionTracker::with_proc();
+    // External audit POS-003: every cached exec checked against the
+    // process its pid names now.
+    let lineage = AuthSessionTracker::for_host();
 
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();

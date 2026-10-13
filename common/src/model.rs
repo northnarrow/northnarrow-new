@@ -48,6 +48,11 @@ pub enum Event {
         /// for the correlation engine (0 until D2 / older records).
         #[serde(default)]
         parent_start_ns: u64,
+        /// External audit POS-003: the process's own `start_time` (its
+        /// fork; exec keeps it), on the clock of `timestamp_ns`. 0 on
+        /// older records.
+        #[serde(default)]
+        start_ns: u64,
         /// Cluster 15.3 / R011: BPF read `parent->flags & PF_KTHREAD`
         /// at exec time. `true` iff the parent was a kernel thread —
         /// non-forgeable from userspace (no prctl / unshare / ns trick
@@ -89,6 +94,12 @@ pub enum Event {
         /// The write-open that crossed it (absolute path when resolved).
         filename: String,
         timestamp_ns: u64,
+        /// External audit POS-002: the threshold crossed is the one of
+        /// write-opens of files that existed before the open (no
+        /// `FMODE_CREATED`) — rewriting files in place, the shape of
+        /// encryption — not only of write-opens.
+        #[serde(default)]
+        overwrites: bool,
     },
     /// Pre-exec event: one per binfmt pass of LSM `bprm_check_security`
     /// (Tappa 10.9 step 2), or one per `execve` in tracepoint mode.
@@ -450,6 +461,7 @@ impl From<&ProcessSpawnRaw> for Event {
             argv: parse_argv_blob(&raw.argv, raw.argv_len),
             parent_comm: crate::wire::cstr_lossy(&raw.parent_comm).into_owned(),
             parent_start_ns: raw.parent_start_ns,
+            start_ns: raw.start_ns,
             // Cluster 15.3 / R011: any non-zero byte from the BPF side
             // is "parent IS a kthread". Zero (the default for a BPF
             // read failure OR an older BPF that doesn't set this

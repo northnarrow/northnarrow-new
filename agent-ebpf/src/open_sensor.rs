@@ -56,6 +56,12 @@ use crate::btf_offsets::{
 use crate::read_repeat::ReadSeenKey;
 
 const FMODE_WRITE: u32 = 0x2;
+/// `FMODE_CREATED` (include/linux/fs.h, `1 << 20` since 4.19): this open
+/// created the file. Set before `security_file_open` runs.
+const FMODE_CREATED: u32 = 0x10_0000;
+/// `OpenWriteWindow::fired` bits: the threshold already reported.
+const FIRED_WRITES: u32 = 1;
+const FIRED_OVERWRITES: u32 = 2;
 /// `BTRFS_SUPER_MAGIC`, include/uapi/linux/magic.h.
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 const S_IFMT: u16 = 0o170_000;
@@ -380,32 +386,46 @@ unsafe fn loginuid() -> u32 {
     }
 }
 
-/// Count a write-open; the window's count when this open crosses the
-/// threshold (once per window), else 0.
+/// Count a write-open, and apart the write-opens of files that existed
+/// (`overwrite`: no `FMODE_CREATED`; external audit POS-002). Returns the
+/// [`open_reason`] bits this open adds — `MASS_WRITE` when the window's
+/// write-opens cross the threshold, `MASS_OVERWRITE` when its overwrites
+/// do, each once per window — and the window's count when it adds any.
 #[inline(always)]
-unsafe fn count_write(cls: &DirClass) -> u32 {
+unsafe fn count_write(cls: &DirClass, overwrite: bool) -> (u32, u32) {
     if cls.bits & TREE_CARVEOUT != 0 {
-        return 0;
+        return (0, 0);
     }
     if cls.bits & TREE_RUNTIME != 0 && loginuid() == cls.uid {
-        return 0;
+        return (0, 0);
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
+    let over = overwrite as u32;
     match OPEN_WRITES.get_ptr_mut(&tgid) {
         Some(w) => {
             if now.saturating_sub((*w).start_ns) > OPEN_MASS_WRITE_WINDOW_NS {
                 (*w).start_ns = now;
                 (*w).count = 1;
+                (*w).overwrites = over;
                 (*w).fired = 0;
-                0
+                (0, 0)
             } else {
                 (*w).count += 1;
-                if (*w).count >= OPEN_MASS_WRITE_MIN && (*w).fired == 0 {
-                    (*w).fired = 1;
-                    (*w).count
+                (*w).overwrites += over;
+                let mut bits = 0u32;
+                if (*w).count >= OPEN_MASS_WRITE_MIN && (*w).fired & FIRED_WRITES == 0 {
+                    (*w).fired |= FIRED_WRITES;
+                    bits |= open_reason::MASS_WRITE;
+                }
+                if (*w).overwrites >= OPEN_MASS_WRITE_MIN && (*w).fired & FIRED_OVERWRITES == 0 {
+                    (*w).fired |= FIRED_OVERWRITES;
+                    bits |= open_reason::MASS_OVERWRITE;
+                }
+                if bits == 0 {
+                    (0, 0)
                 } else {
-                    0
+                    (bits, (*w).count)
                 }
             }
         }
@@ -414,9 +434,11 @@ unsafe fn count_write(cls: &DirClass) -> u32 {
                 start_ns: now,
                 count: 1,
                 fired: 0,
+                overwrites: over,
+                _pad: 0,
             };
             let _ = OPEN_WRITES.insert(&tgid, &w, 0);
-            0
+            (0, 0)
         }
     }
 }
@@ -625,10 +647,9 @@ unsafe fn observe(
     // threshold (once per window).
     let mut count = 0u32;
     if write && regular {
-        count = count_write(&cls);
-        if count != 0 {
-            reason |= open_reason::MASS_WRITE;
-        }
+        let (bits, n) = count_write(&cls, mode & FMODE_CREATED == 0);
+        reason |= bits;
+        count = n;
     }
     if reason == 0 {
         return;

@@ -229,6 +229,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
         };
@@ -260,6 +261,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
         };
@@ -290,6 +292,7 @@ mod tests {
             argv: Vec::new(),
             parent_comm: String::new(),
             parent_start_ns: 0,
+            start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
         };

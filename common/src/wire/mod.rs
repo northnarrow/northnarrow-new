@@ -115,6 +115,11 @@ pub struct ProcessSpawnRaw {
     /// the canonical path the exec rules match (review 61). Zero in
     /// tracepoint mode.
     pub exe: exe::ExeIdentityRaw,
+    // ── External audit POS-003 APPENDED (never reorder the above) ──
+    /// The process's own `task->start_time` (its fork, CLOCK_MONOTONIC ns,
+    /// the clock of `timestamp_ns`; exec keeps it): with `timestamp_ns`,
+    /// what the lineage tracker orders an ancestor's exec against.
+    pub start_ns: u64,
 }
 
 impl ProcessSpawnRaw {
@@ -136,6 +141,7 @@ impl ProcessSpawnRaw {
             parent_is_kthread: 0,
             _pad: [0u8; 5],
             exe: exe::ExeIdentityRaw::zeroed(),
+            start_ns: 0,
         }
     }
 }
@@ -1317,7 +1323,7 @@ mod tests {
         // argv 512 + argv_len 2 + _pad 6 = 544. Total 840, align 8.
         // The trailing _pad keeps the Pod free of implicit padding.
         // Tappa 10.9 step 2 appended `exe` (552) at 840: 1,392.
-        assert_eq!(size_of::<ProcessSpawnRaw>(), 1392);
+        assert_eq!(size_of::<ProcessSpawnRaw>(), 1400);
         assert_eq!(align_of::<ProcessSpawnRaw>(), 8);
         // The existing-field prefix must not have shifted (strict APPEND).
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_comm), 296);
@@ -1362,6 +1368,7 @@ mod tests {
             timestamp_ns: 1_700_000_000_000_000_000,
             parent_comm: *b"bash\0\0\0\0\0\0\0\0\0\0\0\0",
             parent_start_ns: 1_699_999_000_000_000_000,
+            start_ns: 0,
             argv: {
                 let mut a = [0u8; ARGV_LEN];
                 a[..7].copy_from_slice(b"ls\0-la\0");
