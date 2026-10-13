@@ -7,7 +7,9 @@
 //! score the shape, not the mere use: io_uring is legitimate for
 //! databases, QEMU, nginx, liburing programs and libuv-based runtimes
 //! (Node ≥ 20), so both verdicts are **Log** — telemetry and an alert,
-//! never a kill — and every comm in the process allowlist is exempt.
+//! never a kill — and every program in the process allowlist is exempt,
+//! judged on the executable the kernel ran (external audit NETR-003
+//! class), not on the `comm` a process can name itself.
 //!
 //! * `NN-L-IOU-001_IoUringRingCreated` (Low): a ring created by a process
 //!   outside the allowlist. One line per creation; the baseline of who
@@ -26,16 +28,17 @@ use common::wire::{
 };
 use common::{Event, ResponseAction, Severity, Verdict};
 
-use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::{rules::build_verdict, Rule};
 
 const FILE_CLASSES: u32 = IOURING_CLASS_FILE_OPEN | IOURING_CLASS_FILE_RW;
 const NET_CLASSES: u32 = IOURING_CLASS_NET_CONNECT | IOURING_CLASS_NET_SENDRECV;
 
-/// Known legitimate io_uring users on a server (matched by comm, the
-/// kernel's 15-byte task name). Extended by the operator through
-/// `process-comm-allowlist.local` like every other comm exemption.
-pub const KNOWN_IOURING_COMMS: &[&str] = &[
+/// Known legitimate io_uring users on a server, matched on the executable
+/// the kernel ran (a 15-character name also covers the longer names the
+/// kernel truncates `comm` to it), and on `comm` only when that cannot be
+/// read. Extended by the operator through `process-comm-allowlist.local`.
+pub const KNOWN_IOURING_PROGRAMS: &[&str] = &[
     "qemu-system-x86",
     "qemu-kvm",
     "nginx",
@@ -71,6 +74,7 @@ impl Rule for NnLIou001IoUringRingCreated {
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::IoUring {
             created: true,
+            pid,
             comm,
             count,
             classes,
@@ -79,7 +83,8 @@ impl Rule for NnLIou001IoUringRingCreated {
         else {
             return None;
         };
-        if is_known(comm) || self.allowlist.contains(comm) {
+        let judgement = judge(&self.allowlist, *pid, comm);
+        if judgement == Judgement::Allowed {
             return None;
         }
         let reasoning = format!(
@@ -87,12 +92,9 @@ impl Rule for NnLIou001IoUringRingCreated {
              can now perform file and network I/O without the syscalls the other sensors hook \
              (T1562 defense evasion shape). Logged as baseline; NN-L-IOU-002 scores the usage."
         );
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::Log,
-            Severity::Low,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(self, event, ResponseAction::Log, Severity::Low, &reasoning),
+            comm,
         ))
     }
 }
@@ -120,6 +122,7 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::IoUring {
             created: false,
+            pid,
             comm,
             classes,
             last_opcode,
@@ -139,7 +142,8 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
         if last_class & (FILE_CLASSES | NET_CLASSES) == 0 {
             return None;
         }
-        if is_known(comm) || self.allowlist.contains(comm) {
+        let judgement = judge(&self.allowlist, *pid, comm);
+        if judgement == Judgement::Allowed {
             return None;
         }
         let names = common::io_uring_class_names(*classes);
@@ -147,7 +151,7 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
             "`{comm}` drives both file I/O and network I/O through io_uring rings ({}){}: \
              reads, writes and connections that never pass through openat/connect/sendto — \
              the blind-channel exfiltration/implant shape (RingReaper class, T1562). \
-             Alert only: legitimate io_uring servers are exempted by comm.",
+             Alert only: legitimate io_uring servers are exempted by executable.",
             names.join(", "),
             if *sq_thread {
                 " with SQPOLL kernel-thread submission"
@@ -155,18 +159,18 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
                 ""
             }
         );
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::Log,
-            Severity::High,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(self, event, ResponseAction::Log, Severity::High, &reasoning),
+            comm,
         ))
     }
 }
 
-fn is_known(comm: &str) -> bool {
-    KNOWN_IOURING_COMMS.contains(&comm)
+/// External audit NETR-003 class: the known servers and the operator
+/// allowlist judged on what the kernel ran, not on the `comm` a process
+/// names itself.
+fn judge(allowlist: &CommAllowlist, pid: u32, comm: &str) -> Judgement {
+    allowlist.judge_with(pid, comm, KNOWN_IOURING_PROGRAMS)
 }
 
 /// The two io_uring rules, sharing the process comm allowlist.
@@ -235,5 +239,58 @@ mod tests {
         // known servers and the allowlist are exempt
         assert!(r2.evaluate(&ev(false, "postgres", both, 16)).is_none());
         assert!(r2.evaluate(&ev(false, "myapp", both, 16)).is_none());
+    }
+
+    /// External audit LLMR-012 (NN-AUD-055): a process that calls itself
+    /// `nginx` (`prctl(PR_SET_NAME)`) no longer borrows nginx's exemption;
+    /// the servers are recognised by the executable the kernel ran.
+    #[test]
+    fn a_process_named_like_a_known_server_is_no_longer_exempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        for (pid, exe, argv) in [
+            (800, "/dev/shm/.k", &["/dev/shm/.k"][..]),
+            (801, "/usr/sbin/nginx", &["nginx"][..]),
+            (
+                802,
+                "/usr/bin/qemu-system-x86_64",
+                &["qemu-system-x86_64"][..],
+            ),
+            (
+                803,
+                "/usr/lib/systemd/systemd-journald",
+                &["systemd-journald"][..],
+            ),
+            (804, "/usr/bin/node", &["node", "/srv/app/server.js"][..]),
+        ] {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            t.ingest_spawn_with_argv(pid, 1, exe, &argv, 1);
+        }
+        let al = Arc::new(CommAllowlist::from_iter_owned(["myapp".to_string()]).with_identity(t));
+        let r1 = NnLIou001IoUringRingCreated::new(Arc::clone(&al));
+        let r2 = NnLIou002IoUringFileAndNetwork::new(al);
+        let by = |pid: u32, created: bool, comm: &str, classes: u32, op: u8| {
+            let mut e = ev(created, comm, classes, op);
+            if let Event::IoUring { pid: p, .. } = &mut e {
+                *p = pid;
+            }
+            e
+        };
+        let both = IOURING_CLASS_FILE_RW | IOURING_CLASS_NET_CONNECT;
+        let v = r2
+            .evaluate(&by(800, false, "nginx", both, 16))
+            .expect("an implant named nginx fires");
+        assert!(v.reasoning.contains("named 'nginx'"), "{}", v.reasoning);
+        assert!(r1.evaluate(&by(800, true, "nginx", 0, 0)).is_some());
+        assert!(r2.evaluate(&by(801, false, "nginx", both, 16)).is_none());
+        // the 15-character comm the kernel shows for the longer names
+        assert!(r1
+            .evaluate(&by(802, true, "qemu-system-x86", 0, 0))
+            .is_none());
+        assert!(r1
+            .evaluate(&by(803, true, "systemd-journal", 0, 0))
+            .is_none());
+        // a known runtime is known whatever script it runs
+        assert!(r2.evaluate(&by(804, false, "node", both, 16)).is_none());
     }
 }

@@ -71,8 +71,8 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-021 | EVD-005 | Evidence logs | M | open |
 | NN-AUD-022 | EVD-021 | Evidence logs | M | open |
 | NN-AUD-023 | FIMR-001 | FIM rules | M | open |
-| NN-AUD-024 | FIMR-002 | FIM rules | M | open |
-| NN-AUD-025 | FIMR-003 | FIM rules | M | open |
+| NN-AUD-024 | FIMR-002 | FIM rules | M | fixed (lab PR 75, review 85) |
+| NN-AUD-025 | FIMR-003 | FIM rules | M | fixed (lab PR 75, review 85) |
 | NN-AUD-026 | FIMR-004 | FIM rules | M | open |
 | NN-AUD-027 | FIMR-005 | FIM rules | M | open |
 | NN-AUD-028 | FIMR-006 | FIM rules | L | open |
@@ -80,7 +80,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-031 | FIMP-003 | FIM pipeline | M | open |
 | NN-AUD-032 | FIMP-004 | FIM pipeline | M | open |
 | NN-AUD-036 | NETR-002 | Net rules | M | open |
-| NN-AUD-037 | NETR-003 | Net rules | M | open |
+| NN-AUD-037 | NETR-003 | Net rules | M | fixed (lab PR 78, with NN-AUD-006) |
 | NN-AUD-038 | PROC-002 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-039 | PROC-003 | Process rules | M | fixed (lab PR 86) |
 | NN-AUD-040 | PROC-004 | Process rules | M | fixed (lab PR 86) |
@@ -93,7 +93,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-048 | CMB-003 | Combat response | M | fixed (lab PR 83, with Wave 0) |
 | NN-AUD-050 | CMB-006 | Combat response | M | open |
 | NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
-| NN-AUD-055 | LLMR-012 | LLM runtime | M | open |
+| NN-AUD-055 | LLMR-012 | LLM runtime | M | fixed (lab PR 87) |
 | NN-AUD-057 | NET-003 | Network | M | open |
 | NN-AUD-058 | NET-004 | Network | M | open |
 | NN-AUD-061 | DEC-001 | Deception | M | fixed (lab PR 84, with Wave 0) |
@@ -436,3 +436,43 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   candidates are the kernel's own module-signature verdict, and a
   trusted-installer window for module loads as for kexec (review 82).
   Both change what operators may do, and are left for a dedicated change.
+- **NN-AUD-024 and NN-AUD-025 (FIMR-002, FIMR-003).** Fixed after the
+  audit's commit by review 85 (PR #246, lab PR 75): NN-L-FIM-011..019
+  fire for every process, and `OwnClient` drops the verdict only for a
+  client told by what the kernel executed. The `(name)` form systemd
+  gives a unit's pre-exec child now only shapes the reasoning.
+- **NN-AUD-037 (NETR-003).** Fixed with NN-AUD-006 (NET-010, PR #249,
+  lab PR 78): every network rule, listeners included, judges its
+  allowlist on exec identity (`CommAllowlist::judge`).
+- **NN-AUD-055 (LLMR-012), lab PR 87.** NN-L-BPF-001/002 and
+  NN-L-IOU-001/002 skipped any process whose `comm` was on the rule's
+  known list or in the process allowlist.
+  - The known lists became program names (`KNOWN_BPF_PROGRAMS`,
+    `KNOWN_IOURING_PROGRAMS`), matched on the executable alone
+    (`ExecIdentity::is_known_binary`: `node` is known whatever script it
+    runs). The operator allowlist is matched as the network allowlist
+    is (`is_client`: the executable, or the script an interpreter
+    runs). Both must lie in a root-owned system tree.
+  - The process allowlist is now built with the lineage tracker
+    (`with_identity`). R011–R017 judge it on the exec event's own
+    identity (`judge_spawn` → `CommAllowlist::judge_exec`), with no
+    lookup.
+  - A 15-character entry, the kernel's cut of a longer name, matches
+    the longer program (`names` in `posture/lineage.rs`), so the shipped
+    allowlists keep working: `unattended-upgr`, `systemd-network`,
+    `systemd-resolve`, `northnarrow-wat`, `qemu-system-x86`.
+  - Not changed: R018's module-loader allowlist (`systemd-udevd`,
+    `systemd-modules`, `kmod`) still reads `comm`. It only spares the
+    alerts for loads from the module directories, and loading a module
+    needs CAP_SYS_MODULE, so it gives an unprivileged process nothing.
+    On exec identity it would over-match: `modprobe` and `insmod` are
+    links to `kmod`. It belongs with NN-AUD-041, the open question of
+    how R018 tells a legitimate load.
+  - Lab, Ubuntu 24.04. Before: the io_uring probe built as `nginx` in a
+    home directory read `/etc/hostname` and connected to port 22 through
+    one ring, and python renamed `systemd` loaded a socket filter, both
+    with no verdict. After: the probe drew NN-L-IOU-001 and
+    NN-L-IOU-002, and the renamed python NN-L-BPF-001, each noting
+    `[named 'nginx' (or 'systemd'), an allowlisted program, but the
+    kernel ran something else]`. Restarting `systemd-timesyncd` (PID 1
+    attaching the unit's device policy) drew no BPF verdict.

@@ -6,6 +6,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, allowlists on exec identity (High LLMR-012;
+  the NETR-003 class swept across the remaining rules):
+  - A process could silence the io_uring and BPF rules by naming itself
+    like a known program: in the lab, the io_uring probe built as
+    `nginx` read a file and connected through a ring, and python renamed
+    `systemd` with `prctl(PR_SET_NAME)` loaded a BPF program, with no
+    verdict. The rules' known programs and the operator allowlist are
+    now judged on the executable the kernel ran, inside a root-owned
+    system tree. The same now holds for R011–R017.
+  - The allowlists keep working as written: an entry of 15 characters,
+    the length the kernel cuts a process name to, also matches the
+    longer program it was cut from (`unattended-upgr`,
+    `systemd-network`). `systemd-udevd` is recognised as `udevadm`, the
+    file it links to.
+  - When the executable cannot be read (the process exited first), a
+    verdict for a process named like an allowlisted program is recorded,
+    not acted on.
 - External audit, Wave 1, process rules (High PROC-002, PROC-003,
   PROC-004, PROC-007):
   - Without the kernel-resolved path (tracepoint mode), a relative

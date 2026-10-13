@@ -1,14 +1,20 @@
 # NorthNarrow — NetFlow comm allowlist (default, v1)
 #
-# Tappa 10.5 (D1). BARE PROCESS COMM NAMES (basenames as the kernel
-# reports them, TASK_COMM_LEN-truncated) that the network detection
-# rules treat as TRUSTED ACTORS and suppress on: a flow / listener
-# attributed to one of these comms does not trip the comm-gated net
-# rules (NN-L-NET-006 uncommon-port listener, -007 RFC1918 outbound,
-# -009 byte-count anomaly, and the Tappa 10.5 -010/-011/-018/-019
-# additions).
+# Tappa 10.5 (D1). PROGRAM NAMES that the network detection rules
+# treat as TRUSTED ACTORS and suppress on: a flow / listener by one of
+# these programs does not trip the gated net rules (NN-L-NET-006
+# uncommon-port listener, -007 RFC1918 outbound, -009 byte-count
+# anomaly, and the Tappa 10.5 -010/-011/-018/-019 additions).
 #
-# Format: one comm per line; `#` introduces a comment; blank lines
+# An entry is matched on what the kernel executed (external audit
+# NET-010): the executable's basename, or the script's an interpreter
+# runs, inside a root-owned system tree — never on the name a process
+# gives itself. A 15-character entry also covers the longer names the
+# kernel truncates a process name to (`systemd-network` for
+# `systemd-networkd`). When the executable cannot be read (the process
+# exited first) the verdict is recorded instead of acted on.
+#
+# Format: one name per line; `#` introduces a comment; blank lines
 # ignored; NO `+`/`-` prefixes (those are .local-only). Operators
 # tune via the overlay at /etc/northnarrow/netflow-comm-allowlist.local
 # with `+comm` (add) / `-comm` (re-enable detection on a default).

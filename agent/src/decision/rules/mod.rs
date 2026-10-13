@@ -156,13 +156,19 @@ pub fn default_rules_with_net(
         Box::new(R008HiddenHomeBinary),
     ];
     rules.extend(tappa2);
-    let process_allowlist_for_iouring = Arc::clone(&process_allowlist);
-    rules.extend(process_rules(process_allowlist));
+    // External audit NETR-003 class: the process allowlist judged on what
+    // the kernel executed — from the exec event itself for R011..R017,
+    // through the lineage cache for the io_uring and BPF rules.
+    let process_allowlist = Arc::new(
+        process_allowlist
+            .as_ref()
+            .clone()
+            .with_identity(lineage.clone()),
+    );
+    rules.extend(process_rules(Arc::clone(&process_allowlist)));
     rules.extend(module_load_rules());
-    rules.extend(iouring::iouring_rules(Arc::clone(
-        &process_allowlist_for_iouring,
-    )));
-    rules.extend(bpf::bpf_rules(Arc::clone(&process_allowlist_for_iouring)));
+    rules.extend(iouring::iouring_rules(Arc::clone(&process_allowlist)));
+    rules.extend(bpf::bpf_rules(process_allowlist));
     rules.extend(crate::fim::rules::fim_rules_with_lineage(
         installer_override,
         lineage.clone(),
@@ -188,6 +194,36 @@ pub fn default_rules_with_net(
     // verdict never shadows a blocking rule on the same event.
     rules.extend(chains.tail);
     rules
+}
+
+/// External audit NETR-003 class (the allowlists keyed on `comm`, which a
+/// process sets for itself with `prctl(PR_SET_NAME)`): the operator
+/// allowlist judged on what the kernel executed for an exec event — its
+/// resolved path, and the script an interpreter runs.
+pub(crate) fn judge_spawn(
+    allowlist: &CommAllowlist,
+    event: &Event,
+) -> crate::config::comm_allowlist::Judgement {
+    let (comm, filename, exe, argv): (&str, &str, &common::ExeIdentity, &[String]) = match event {
+        Event::ProcessSpawn {
+            comm,
+            filename,
+            exe,
+            argv,
+            ..
+        } => (comm, filename, exe, argv),
+        Event::ExecCheck {
+            comm,
+            filename,
+            exe,
+            ..
+        } => (comm, filename, exe, &[]),
+        _ => {
+            return crate::config::comm_allowlist::Judgement::Denied { claimed: false };
+        }
+    };
+    let id = crate::posture::lineage::ExecIdentity::of_exec(exe.path_or(filename), argv);
+    allowlist.judge_exec(&id, comm)
 }
 
 /// Tappa 10.5 (D2) — build the 7 process rules R011..R017 sharing an

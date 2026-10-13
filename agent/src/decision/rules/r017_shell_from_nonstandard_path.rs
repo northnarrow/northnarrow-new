@@ -20,6 +20,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::config::comm_allowlist::Judgement;
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Interactive shell comms (design §7.1).
@@ -79,7 +80,10 @@ impl Rule for R017ShellFromNonstandardPath {
         if SHELL_STD_PREFIXES.iter().any(|p| filename.starts_with(p)) {
             return None;
         }
-        if self.allowlist.contains(comm) {
+        // External audit NETR-003 class: the allowlist judged on what the
+        // kernel executed, not on the comm the process chose.
+        let judgement = super::judge_spawn(&self.allowlist, event);
+        if judgement == Judgement::Allowed {
             return None;
         }
         // D5: `-c <payload>` is inline command exec (the reverse-shell
@@ -100,12 +104,15 @@ impl Rule for R017ShellFromNonstandardPath {
         if !parent_comm.is_empty() {
             reasoning = format!("{reasoning}; spawned by {parent_comm}");
         }
-        Some(build_verdict(
-            self,
-            event,
-            ResponseAction::KillProcess,
-            Severity::High,
-            &reasoning,
+        Some(judgement.apply(
+            build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcess,
+                Severity::High,
+                &reasoning,
+            ),
+            comm,
         ))
     }
 }
@@ -197,5 +204,20 @@ mod tests {
         assert!(r.evaluate(&spawn("bash", "/opt/tools/bash")).is_none());
         // A different shell comm not on the allowlist still fires.
         assert!(r.evaluate(&spawn("dash", "/opt/tools/dash")).is_some());
+    }
+
+    /// External audit NETR-003 class: the allowlist reads the file the
+    /// kernel executed — a shell copied where anyone can write, named
+    /// like an allowlisted program, is still killed.
+    #[test]
+    fn a_copied_shell_named_like_an_allowlisted_program_still_fires() {
+        let r = R017ShellFromNonstandardPath::new(Arc::new(CommAllowlist::from_iter_owned([
+            "bash".to_string(),
+        ])));
+        let v = r
+            .evaluate(&spawn("bash", "/dev/shm/bash"))
+            .expect("a copy in /dev/shm is not the allowlisted bash");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert!(v.reasoning.contains("named 'bash'"), "{}", v.reasoning);
     }
 }

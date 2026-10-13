@@ -1,20 +1,30 @@
 # NorthNarrow — process comm allowlist (default, v1)
 #
-# Tappa 10.5 (D1). BARE PROCESS COMM NAMES (basenames as the kernel
-# reports them, TASK_COMM_LEN-truncated) that are EXEMPT from the
-# Tappa 10.5 process detection rules (R011..). A site that runs a
-# normally-suspicious tool from trusted automation adds its comm here
-# to silence the rule WITHOUT a code change.
+# Tappa 10.5 (D1). PROGRAM NAMES that are EXEMPT from the Tappa 10.5
+# process detection rules (R011..R017) and from the io_uring and BPF
+# rules (NN-L-IOU-*, NN-L-BPF-*). A site that runs a normally-suspicious
+# tool from trusted automation adds its name here to silence the rule
+# WITHOUT a code change.
 #
-# Format: one comm per line; `#` introduces a comment; blank lines
+# An entry is matched on what the kernel executed (external audit
+# NETR-003 class): the executable's basename, or the script's an
+# interpreter runs (`.py` dropped), which must lie in a root-owned
+# system tree (/usr, /opt, /bin, /sbin, /lib, /snap, /nix/store). A
+# 15-character entry also covers the longer names the kernel truncates
+# a process name to (`unattended-upgr` for `unattended-upgrade`). A
+# process that only CALLS itself like an entry (prctl(PR_SET_NAME), a
+# copied binary) is not exempt; when its executable cannot be read
+# (it exited first) the verdict is recorded instead of acted on.
+#
+# Format: one name per line; `#` introduces a comment; blank lines
 # ignored; NO `+`/`-` prefixes (those are .local-only). Operators
 # tune via the overlay at /etc/northnarrow/process-comm-allowlist.local
-# with `+comm` (add) / `-comm` (re-enable detection on a default).
+# with `+name` (add) / `-name` (re-enable detection on a default).
 # Every disabled default emits a boot WARN.
 #
-# IMPORTANT — what NOT to put here: this file holds TRUSTED ACTOR
-# comms, not the detection targets. The process rules already key on
-# specific tool comms (e.g. insmod / modprobe / setcap / nsenter);
+# IMPORTANT — what NOT to put here: this file holds TRUSTED ACTORS,
+# not the detection targets. The process rules already key on
+# specific tool names (e.g. insmod / modprobe / setcap / nsenter);
 # adding those here would disable the rule globally. The conservative
 # default below is limited to package-manager + configuration-
 # management actors that legitimately perform privileged operations

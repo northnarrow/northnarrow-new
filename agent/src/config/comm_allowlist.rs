@@ -115,10 +115,27 @@ impl CommAllowlist {
         self
     }
 
-    /// How the allowlist applies to process `pid` named `comm`
-    /// ([`Judgement`]). Without an identity source, `comm` decides.
-    pub fn judge(&self, pid: u32, comm: &str) -> Judgement {
-        let named = self.entries.contains(comm);
+    /// [`Self::judge`] for an exec event's own process, whose identity the
+    /// event carries ([`crate::posture::lineage::ExecIdentity::of_exec`]):
+    /// no lookup, so never [`Judgement::Unverified`]. `comm` only says
+    /// whether the process claimed an allowlisted name.
+    pub fn judge_exec(&self, id: &crate::posture::lineage::ExecIdentity, comm: &str) -> Judgement {
+        let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
+        if id.is_client(&entries) {
+            Judgement::Allowed
+        } else {
+            Judgement::Denied {
+                claimed: self.entries.contains(comm),
+            }
+        }
+    }
+
+    /// [`Self::judge`] with a rule's built-in clients, `known`: program
+    /// names matched on the executable alone
+    /// ([`crate::posture::lineage::ExecIdentity::is_known_binary`]), and on
+    /// `comm` when the identity cannot be read.
+    pub fn judge_with(&self, pid: u32, comm: &str, known: &[&str]) -> Judgement {
+        let named = self.entries.contains(comm) || known.contains(&comm);
         let Some(tracker) = &self.identity else {
             return if named {
                 Judgement::Allowed
@@ -128,11 +145,17 @@ impl CommAllowlist {
         };
         let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
         match tracker.exec_identity(pid) {
-            Some(id) if id.is_client(&entries) => Judgement::Allowed,
+            Some(id) if id.is_client(&entries) || id.is_known_binary(known) => Judgement::Allowed,
             Some(_) => Judgement::Denied { claimed: named },
             None if named => Judgement::Unverified,
             None => Judgement::Denied { claimed: false },
         }
+    }
+
+    /// How the allowlist applies to process `pid` named `comm`
+    /// ([`Judgement`]). Without an identity source, `comm` decides.
+    pub fn judge(&self, pid: u32, comm: &str) -> Judgement {
+        self.judge_with(pid, comm, &[])
     }
 
     /// `true` if `comm` is allowlisted. The kernel-reported comm is
@@ -271,5 +294,76 @@ mod tests {
         assert!(!al.contains("curl"));
         assert_eq!(al.len(), 2);
         assert!(!al.is_empty());
+    }
+
+    // ── external audit NETR-003 class — exec identity ──
+
+    fn identity(exe: &str, argv: &[&str]) -> crate::posture::lineage::ExecIdentity {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        crate::posture::lineage::ExecIdentity::of_exec(exe, &argv)
+    }
+
+    #[test]
+    fn judge_exec_reads_what_the_kernel_executed() {
+        let al = CommAllowlist::from_iter_owned(["apt".to_string(), "unattended-upgr".to_string()]);
+        assert_eq!(
+            al.judge_exec(&identity("/usr/bin/apt", &["apt"]), "apt"),
+            Judgement::Allowed
+        );
+        // the shipped 15-character entry covers the script it was cut from
+        assert_eq!(
+            al.judge_exec(
+                &identity(
+                    "/usr/bin/python3.12",
+                    &["/usr/bin/python3", "/usr/bin/unattended-upgrade"]
+                ),
+                "unattended-upgr"
+            ),
+            Judgement::Allowed
+        );
+        // a copy named apt, and python calling itself apt
+        assert_eq!(
+            al.judge_exec(&identity("/tmp/apt", &["apt"]), "apt"),
+            Judgement::Denied { claimed: true }
+        );
+        assert_eq!(
+            al.judge_exec(
+                &identity("/usr/bin/python3.12", &["python3", "-c", "x"]),
+                "apt"
+            ),
+            Judgement::Denied { claimed: true }
+        );
+        assert_eq!(
+            al.judge_exec(&identity("/usr/bin/curl", &["curl"]), "curl"),
+            Judgement::Denied { claimed: false }
+        );
+    }
+
+    #[test]
+    fn judge_with_falls_back_on_comm_only_without_an_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn_with_argv(10, 1, "/usr/sbin/nginx", &["nginx".to_string()], 1);
+        t.ingest_spawn_with_argv(11, 1, "/tmp/nginx", &["nginx".to_string()], 1);
+        let known = ["nginx"];
+        // no tracker (tests, tools): comm decides, as before
+        let bare = CommAllowlist::default();
+        assert_eq!(bare.judge_with(11, "nginx", &known), Judgement::Allowed);
+        assert_eq!(
+            bare.judge_with(11, "evil", &known),
+            Judgement::Denied { claimed: false }
+        );
+        let al = CommAllowlist::default().with_identity(t);
+        assert_eq!(al.judge_with(10, "nginx", &known), Judgement::Allowed);
+        assert_eq!(
+            al.judge_with(11, "nginx", &known),
+            Judgement::Denied { claimed: true }
+        );
+        // gone before it was seen: named, so recorded rather than acted on
+        assert_eq!(al.judge_with(12, "nginx", &known), Judgement::Unverified);
+        assert_eq!(
+            al.judge_with(12, "evil", &known),
+            Judgement::Denied { claimed: false }
+        );
     }
 }

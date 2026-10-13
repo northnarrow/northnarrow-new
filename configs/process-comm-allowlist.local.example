@@ -10,13 +10,17 @@
 # `process-comm-allowlist.v1` default at boot. Unlike the `.v1` file,
 # entries here carry a prefix:
 #
-#     +comm   ADD comm to the allowlist (exempt it from R011..R017)
-#     -comm   RE-ENABLE detection on a comm that `.v1` allowlists
+#     +name   ADD a program to the allowlist (exempt it from R011..R017
+#             and from the io_uring and BPF rules)
+#     -name   RE-ENABLE detection on a program that `.v1` allowlists
 #
-# Blank lines and `#` comments are ignored. Comms are BARE process
-# names as the kernel reports them — TASK_COMM_LEN-truncated to 15
-# chars (e.g. `containerd-shim-runc-v2` is reported as
-# `containerd-shim`). Every change here is logged at boot.
+# Blank lines and `#` comments are ignored. A name is matched on what
+# the kernel executed: the executable's basename, or the script's an
+# interpreter runs, inside a root-owned system tree (/usr, /opt, /bin,
+# /sbin, /lib, /snap, /nix/store) — never on the name a process gives
+# itself. The kernel's 15-character form of a longer name still works
+# (`containerd-shim` covers `containerd-shim-runc-v2`). Every change
+# here is logged at boot.
 #
 # ─────────────────────────────────────────────────────────────────────
 # CONTAINER RUNTIMES — uncomment ONLY on a host that runs containers
