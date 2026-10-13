@@ -6,6 +6,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, file integrity (High FIMR-004, FIMR-005,
+  FIMP-003, FIMP-004):
+  - A watched file replaced by renaming another over it (how installers
+    and rootkits swap a binary, a PAM module, a unit) is now judged like a
+    modification: the new file checked against the baseline, attributed to
+    the process that renamed it. Before, only the rename was recorded.
+  - A change to a path a Critical rule guards (system binaries, kernel
+    and PAM modules, `ld.so.preload`, the baits) is never throttled.
+  - One large watched file can no longer stall the FIM pipeline: a burst
+    of changes to a 256 MiB file used to block the agent until the
+    watchdog killed and restarted it, losing other files' changes.
+  - A path added to the signed `fim-paths` overlay and re-baselined with
+    `nn-admin fim baseline` is watched at once, without a restart.
 - External audit, Wave 1, posture lineage (High POS-002, POS-003):
   - Ransomware run from an SSH, desktop or cron session no longer goes
     unseen: every process of a session was exempt from the mass-write

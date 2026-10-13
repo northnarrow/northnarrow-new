@@ -44,7 +44,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineDb};
 use crate::fim::drain::InodePathMap;
@@ -172,6 +172,7 @@ pub async fn run_recompute_task<F>(
     baseline_db: Arc<Mutex<BaselineDb>>,
     baseline_cache: Arc<BaselineCache>,
     inode_map: Arc<InodePathMap>,
+    watched_paths: Option<Arc<parking_lot::Mutex<crate::fim::attach::WatchedPathsHandle>>>,
     paths_snapshot: F,
 ) where
     F: Fn() -> BTreeSet<PathBuf> + Send + 'static,
@@ -186,6 +187,16 @@ pub async fn run_recompute_task<F>(
         for path in &paths {
             match compute_baseline(path) {
                 Ok(drafts) => {
+                    // External audit FIMP-004: the path is watched by the
+                    // inode it holds now — the map and the kernel's
+                    // WATCHED_PATHS were only ever filled at boot.
+                    if !crate::fim::drain::reenroll_path(
+                        &path.to_string_lossy(),
+                        &inode_map,
+                        watched_paths.as_deref(),
+                    ) {
+                        debug!(path = %path.display(), "fim recompute: nothing at the path to watch");
+                    }
                     let mut db = baseline_db.lock();
                     for draft in drafts {
                         match db.append(draft) {
@@ -198,7 +209,6 @@ pub async fn run_recompute_task<F>(
                                 // computed SHA on the next kernel
                                 // event for this path.
                                 baseline_cache.upsert(entry);
-                                let _ = &inode_map;
                             }
                             Err(e) => {
                                 errors += 1;

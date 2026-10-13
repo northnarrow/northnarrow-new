@@ -76,7 +76,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use common::wire::{FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_TRUNCATED};
+use common::wire::{
+    FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED,
+    FIM_RENAME_REPLACED,
+};
 use common::Event;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -157,6 +160,17 @@ impl InodePathMap {
         self.inner.write().remove(key);
     }
 
+    /// Every inode mapped to `path` (external audit FIMP-004: a path whose
+    /// file was replaced may still hold its old inode's entry).
+    pub fn keys_for_path(&self, path: &str) -> Vec<InodeKey> {
+        self.inner
+            .read()
+            .iter()
+            .filter(|(_, p)| p.as_str() == path)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
     /// Number of mapped inodes. Useful for `nn-admin fim
     /// status` (C6) summary output.
     pub fn len(&self) -> usize {
@@ -220,6 +234,13 @@ impl DriftClassifier {
     /// classification is otherwise op-only so C5's rule engine
     /// retains full path-policy authority.
     pub fn classify(&self, op: FimOp, path: &str) -> DriftSeverity {
+        // External audit FIMR-005: a path a Critical rule guards is never
+        // throttled (§6.5, Q4), whatever the op — a modification of
+        // /usr/sbin/sshd was "Medium" here. Since review 76 only a package
+        // transaction's drift is paced at all.
+        if op != FimOp::Opened && crate::fim::rules::is_critical_rule_path(path) {
+            return DriftSeverity::Critical;
+        }
         match op {
             // Hardlink into a user-writable dir on a SUID-root
             // inode is the §13 Q2 evasion path — never throttle.
@@ -479,6 +500,26 @@ pub struct FimDriftDb {
     agent_id: [u8; 16],
 }
 
+/// Where a drift row goes: the drift log itself, or the drain's shared one
+/// behind its lock. External audit FIMP-003: the drain held that lock
+/// while it hashed the file, so a large file stalled every other writer of
+/// the chain; the lock is now taken for the append alone.
+pub trait DriftSink {
+    fn append_drift(&mut self, draft: FimDriftDraft) -> Result<String>;
+}
+
+impl DriftSink for FimDriftDb {
+    fn append_drift(&mut self, draft: FimDriftDraft) -> Result<String> {
+        self.append(draft)
+    }
+}
+
+impl DriftSink for &parking_lot::Mutex<FimDriftDb> {
+    fn append_drift(&mut self, draft: FimDriftDraft) -> Result<String> {
+        self.lock().append(draft)
+    }
+}
+
 impl FimDriftDb {
     pub fn open(
         path: &Path,
@@ -605,8 +646,59 @@ const ENROLL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
 /// External audit FIMP-005: watched inodes renamed away from their path,
 /// waiting for the rename to land (the LSM hook fires before it). See
 /// [`settle_rename`].
-static PENDING_RENAME: std::sync::Mutex<Vec<(InodeKey, String, std::time::Instant)>> =
+static PENDING_RENAME: std::sync::Mutex<Vec<PendingRename>> = std::sync::Mutex::new(Vec::new());
+
+/// A watched inode renamed away, and — external audit FIMR-004 — the
+/// renamer's event when the rename put another file over it.
+type PendingRename = (InodeKey, String, std::time::Instant, Option<FimDriftRaw>);
+
+/// External audit FIMR-004: watched paths whose file another one replaced
+/// by a rename over it (`mv` of a prepared file onto a binary, a PAM
+/// module, a unit: how installers and rootkits alike swap a file), with
+/// the renamer's event, once the rename landed. The rename alone reached
+/// only the rename rules; every rule guarding the path's content watches
+/// modifications. Each is checked as one: the new file against the
+/// baseline, attributed to the renamer.
+static REPLACEMENTS: std::sync::Mutex<Vec<(String, FimDriftRaw)>> =
     std::sync::Mutex::new(Vec::new());
+const REPLACEMENTS_MAX: usize = 1024;
+
+fn queue_replacement(path: &str, renamed: &FimDriftRaw) {
+    let Ok(mut q) = REPLACEMENTS.lock() else {
+        return;
+    };
+    if q.len() < REPLACEMENTS_MAX {
+        q.push((path.to_string(), *renamed));
+    } else {
+        warn!(target: "fim.drain", path, "replacement checks queue full — this replacement is not checked");
+    }
+}
+
+/// The queued replacements as modification events of the file now at each
+/// path, by the renamer. A path holding nothing any more is dropped.
+fn replacement_raws() -> Vec<FimDriftRaw> {
+    let queued = match REPLACEMENTS.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => return Vec::new(),
+    };
+    queued
+        .into_iter()
+        .filter_map(|(path, mut raw)| {
+            let key = key_for_path(Path::new(&path)).ok()?;
+            // the rename has landed: read what is there now
+            raw.timestamp_ns = monotonic_ns();
+            raw.target_dev = key.dev;
+            raw.target_ino = key.ino;
+            raw.op = FimOp::Modified as u8;
+            raw.op_flags = 0;
+            raw.dest_dev = 0;
+            raw.dest_ino = 0;
+            raw.child_name = [0u8; FIM_CHILD_NAME_LEN];
+            raw.child_name_flags = 0;
+            Some(raw)
+        })
+        .collect()
+}
 
 /// Retry the pending enrollments and renames; `true` while some are still
 /// waiting.
@@ -616,9 +708,14 @@ fn retry_pending_enrollments(
 ) -> bool {
     let renames_waiting = match PENDING_RENAME.lock() {
         Ok(mut pending) => {
-            pending.retain(|(key, path, since)| {
-                !settle_rename(key, path, path_map, watched_paths)
-                    && since.elapsed() < ENROLL_RETRY_FOR
+            pending.retain(|(key, path, since, replaced)| {
+                if settle_rename(key, path, path_map, watched_paths) {
+                    if let Some(raw) = replaced {
+                        queue_replacement(path, raw);
+                    }
+                    return false;
+                }
+                since.elapsed() < ENROLL_RETRY_FOR
             });
             !pending.is_empty()
         }
@@ -705,10 +802,36 @@ fn awaiting_returns() -> bool {
 /// path — a creation, whose writer the drain cannot know.
 fn returned_raw(key: InodeKey) -> FimDriftRaw {
     let mut raw: FimDriftRaw = bytemuck::Zeroable::zeroed();
+    raw.timestamp_ns = monotonic_ns();
     raw.target_dev = key.dev;
     raw.target_ino = key.ino;
     raw.op = FimOp::Created as u8;
     raw
+}
+
+/// External audit FIMP-004: watch `path` by the inode it holds now — the
+/// recompute task's re-baseline (an operator's `nn-admin fim baseline`, a
+/// path added to the overlay) wrote the chain but left the kernel watching
+/// the inode of boot time, or nothing. Inodes the path held before are
+/// forgotten (map and `WATCHED_PATHS`), so an old file elsewhere does not
+/// answer for it. `false` when nothing is at the path.
+pub fn reenroll_path(
+    path: &str,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> bool {
+    let Ok(key) = key_for_path(Path::new(path)) else {
+        return false;
+    };
+    for stale in path_map.keys_for_path(path) {
+        if stale != key {
+            path_map.remove(&stale);
+            if let Some(w) = watched_paths {
+                w.lock().unenroll(stale);
+            }
+        }
+    }
+    enroll_child(path, path_map, watched_paths)
 }
 
 /// BUG-022 — enroll a freshly-dropped child of a watched directory
@@ -799,7 +922,7 @@ pub fn process_drift(
     raw: &FimDriftRaw,
     path_map: &InodePathMap,
     last_baseline: Option<&BaselineEntry>,
-    drift_db: &mut FimDriftDb,
+    drift_db: &mut impl DriftSink,
     classifier: &DriftClassifier,
     rate_limiter: &DriftRateLimiter,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
@@ -857,13 +980,16 @@ pub fn process_drift(
         forget_if_gone(&key, &path, path_map, watched_paths);
     }
     // External audit FIMP-005: the watched inode itself renamed (no child
-    // leaf: the source was watched).
-    if op == FimOp::Renamed
-        && raw.child_name[0] == 0
-        && !settle_rename(&key, &path, path_map, watched_paths)
-    {
-        if let Ok(mut pending) = PENDING_RENAME.lock() {
-            pending.push((key, path.clone(), std::time::Instant::now()));
+    // leaf: the source was watched). FIMR-004: or replaced by another file
+    // renamed over it — checked as a modification once the rename lands.
+    if op == FimOp::Renamed && raw.child_name[0] == 0 {
+        let replaced = (raw.op_flags & FIM_RENAME_REPLACED != 0).then_some(*raw);
+        if settle_rename(&key, &path, path_map, watched_paths) {
+            if let Some(r) = &replaced {
+                queue_replacement(&path, r);
+            }
+        } else if let Ok(mut pending) = PENDING_RENAME.lock() {
+            pending.push((key, path.clone(), std::time::Instant::now(), replaced));
         }
     }
 
@@ -952,23 +1078,12 @@ pub fn process_drift(
     // draft so the post-mod SIZE (`size_bytes`) rides alongside
     // the hash — NN-L-FIM-005's rsyslogd-append exemption needs
     // the size delta to tell an append (grew) from a truncation.
-    let new_draft = match op {
+    let content = match op {
         FimOp::Deleted | FimOp::Renamed => None,
-        _ => match compute_baseline(Path::new(&path)) {
-            Ok(drafts) => drafts.into_iter().find(|d| !d.is_symlink),
-            Err(e) => {
-                debug!(
-                    target: "fim.drain",
-                    path = %path,
-                    error = %e,
-                    "compute_baseline failed during drift re-hash; emitting with new_sha256=None"
-                );
-                None
-            }
-        },
+        _ => content_after(&path, raw.timestamp_ns),
     };
-    let new_sha256 = new_draft.as_ref().map(|d| d.sha256.clone());
-    let new_size = new_draft.as_ref().map(|d| d.size_bytes);
+    let new_sha256 = content.as_ref().map(|c| c.0.clone());
+    let new_size = content.as_ref().map(|c| c.1);
     let baseline_sha256 = last_baseline.map(|b| b.sha256.clone());
     let baseline_size = last_baseline.map(|b| b.size_bytes);
 
@@ -1032,7 +1147,7 @@ pub fn process_drift(
     // log that cannot be written (disk full, a rotation or protection
     // fault) used to return here, before the event reached the rules —
     // silencing every FIM rule on every watched path at once.
-    if let Err(e) = drift_db.append(draft).context("append to drift DB") {
+    if let Err(e) = drift_db.append_drift(draft).context("append to drift DB") {
         report_evidence_loss(&path, &e);
     }
 
@@ -1185,6 +1300,30 @@ pub async fn drain_loop(
     // the FIM kill rules never saw a persistence write (review 75).
     let mut outbox: Vec<Event> = Vec::new();
     let mut returns_checked = std::time::Instant::now();
+    // One event through the pipeline: the baseline looked up by the watched
+    // path, the hash and the rules' input built off the runtime's threads,
+    // the drift log locked for its append only (external audit FIMP-003).
+    let check = |raw: &FimDriftRaw, outbox: &mut Vec<Event>| -> Result<bool> {
+        let last_baseline = inode_map
+            .lookup(&InodeKey {
+                dev: raw.target_dev,
+                ino: raw.target_ino,
+            })
+            .and_then(|p| baseline_cache.get_content(&p));
+        off_the_runtime(|| {
+            process_drift(
+                raw,
+                inode_map.as_ref(),
+                last_baseline.as_ref(),
+                &mut drift_db.as_ref(),
+                classifier.as_ref(),
+                rate_limiter.as_ref(),
+                watched_paths.as_deref(),
+                Some(&lineage),
+                Some(outbox),
+            )
+        })
+    };
     loop {
         // Review 58: while children wait for their file to appear, wake up
         // every few milliseconds to retry them.
@@ -1194,29 +1333,20 @@ pub async fn drain_loop(
         if returns_checked.elapsed() >= AWAITING_RETURN_EVERY && awaiting_returns() {
             returns_checked = std::time::Instant::now();
             for key in returned_paths(inode_map.as_ref(), watched_paths.as_deref()) {
-                let raw = returned_raw(key);
-                let last_baseline = inode_map
-                    .lookup(&key)
-                    .and_then(|p| baseline_cache.get_content(&p));
-                let mut db = drift_db.lock();
-                if let Err(e) = process_drift(
-                    &raw,
-                    inode_map.as_ref(),
-                    last_baseline.as_ref(),
-                    &mut db,
-                    classifier.as_ref(),
-                    rate_limiter.as_ref(),
-                    watched_paths.as_deref(),
-                    Some(&lineage),
-                    Some(&mut outbox),
-                ) {
+                if let Err(e) = check(&returned_raw(key), &mut outbox) {
                     warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a returned file failed");
                 }
             }
-            for event in outbox.drain(..) {
-                if event_tx.send(event).await.is_err() {
-                    warn!(target: "fim.drain", "event channel closed — Event::Fim not delivered");
-                }
+        }
+        // External audit FIMR-004: files renamed over watched ones, landed.
+        for raw in replacement_raws() {
+            if let Err(e) = check(&raw, &mut outbox) {
+                warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a replaced file failed");
+            }
+        }
+        for event in outbox.drain(..) {
+            if event_tx.send(event).await.is_err() {
+                warn!(target: "fim.drain", "event channel closed — Event::Fim not delivered");
             }
         }
         let wake_after = if waiting {
@@ -1257,32 +1387,13 @@ pub async fn drain_loop(
             // hash the file, which can take milliseconds). Owning
             // `raw` by value already disconnected from the borrow.
             let _ = item; // keep clippy happy + readable
-                          // Resolve the watched path BEFORE locking the drift DB
-                          // so the BaselineCache lookup doesn't hold the DB mutex.
-            let path_for_lookup = inode_map.lookup(&InodeKey {
-                dev: raw.target_dev,
-                ino: raw.target_ino,
-            });
-            let last_baseline = path_for_lookup.and_then(|p| baseline_cache.get_content(&p));
-            let mut db = drift_db.lock();
-            if let Err(e) = process_drift(
-                &raw,
-                inode_map.as_ref(),
-                last_baseline.as_ref(),
-                &mut db,
-                classifier.as_ref(),
-                rate_limiter.as_ref(),
-                watched_paths.as_deref(),
-                Some(&lineage),
-                Some(&mut outbox),
-            ) {
+            if let Err(e) = check(&raw, &mut outbox) {
                 warn!(
                     target: "fim.drain",
                     error = %format!("{e:#}"),
                     "process_drift error — event dropped, drain continues"
                 );
             }
-            drop(db);
             // Forward at once: under a flood of reads the ring never runs
             // empty, and an event held for the end of the batch would wait
             // for the flood to stop.
@@ -1309,6 +1420,91 @@ pub async fn drain_loop(
 
 /// Records read per drain turn at most before the loop yields.
 const DRAIN_TURN: u32 = 4096;
+
+/// External audit FIMP-003: the content hash of each path, with when it
+/// began (CLOCK_MONOTONIC, the kernel events' clock). An event that
+/// happened before a hash of its path began is answered by that hash: the
+/// file it saw was already the one read. Each event is still checked and
+/// attributed on its own; a burst of events on one large file (up to 512
+/// MiB is hashed) no longer costs one hash each, which kept the drain —
+/// the only reader of the kernel's ring — behind while the ring filled.
+static HASHED: std::sync::Mutex<Option<HashMap<String, Hashed>>> = std::sync::Mutex::new(None);
+const HASHED_MAX: usize = 4096;
+/// The LSM hooks fire just before the change they report: a hash that
+/// began within this margin after an event may have read the file before
+/// the change landed, and does not answer for it.
+const HASH_REUSE_MARGIN_NS: u64 = 50_000_000;
+
+#[derive(Clone)]
+struct Hashed {
+    began_ns: u64,
+    /// SHA-256 (hex) and size of the file, `None` when it could not be read.
+    content: Option<(String, u64)>,
+}
+
+/// The content of `path` as of an event at `event_ns`: the last hash when
+/// it began after the event, else a new one.
+fn content_after(path: &str, event_ns: u64) -> Option<(String, u64)> {
+    if let Ok(cache) = HASHED.lock() {
+        if let Some(h) = cache.as_ref().and_then(|c| c.get(path)) {
+            if event_ns != 0 && event_ns + HASH_REUSE_MARGIN_NS <= h.began_ns {
+                return h.content.clone();
+            }
+        }
+    }
+    let began_ns = monotonic_ns();
+    let content = match compute_baseline(Path::new(path)) {
+        Ok(drafts) => drafts
+            .into_iter()
+            .find(|d| !d.is_symlink)
+            .map(|d| (d.sha256, d.size_bytes)),
+        Err(e) => {
+            debug!(
+                target: "fim.drain",
+                path = %path,
+                error = %e,
+                "compute_baseline failed during drift re-hash; emitting with new_sha256=None"
+            );
+            None
+        }
+    };
+    if let Ok(mut cache) = HASHED.lock() {
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if cache.len() >= HASHED_MAX {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_string(),
+            Hashed {
+                began_ns,
+                content: content.clone(),
+            },
+        );
+    }
+    content
+}
+
+/// CLOCK_MONOTONIC in ns: `bpf_ktime_get_ns`'s clock.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Run the drain's synchronous work (hashing, the drift log, `/proc`
+/// reads) where it does not hold up the runtime's other tasks.
+fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 fn decode_sha_hex(hex_str: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(hex_str).ok()?;
@@ -1341,7 +1537,8 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: *b"dpkg\0\0\0\0\0\0\0\0\0\0\0\0",
             op,
-            _pad: [0u8; 7],
+            op_flags: 0,
+            _pad: [0u8; 6],
             // Polish #3 defaults — non-Rename events leave the
             // dest pair zeroed; rename-specific tests construct
             // FimDriftRaw directly with non-zero dest values.
@@ -1635,12 +1832,53 @@ mod tests {
 
     // ── C4 test 2: Classifier provisional severity ──────────────────
 
+    /// External audit FIMR-005: a path a Critical rule guards is never
+    /// throttled, whatever the op (a read is not drift).
+    #[test]
+    fn critical_rule_paths_are_never_throttled() {
+        let c = DriftClassifier::new();
+        let rl = DriftRateLimiter::new();
+        for path in [
+            "/usr/sbin/sshd",
+            "/usr/bin/sudo",
+            "/bin/login",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib/modules/6.8.0/kernel/x.ko",
+            "/usr/lib/x86_64-linux-gnu/security/pam_unix.so",
+            "/etc/ld.so.preload",
+            crate::fim::rules::HONEYPOT_PATHS[0],
+        ] {
+            for op in [
+                FimOp::Modified,
+                FimOp::Renamed,
+                FimOp::Created,
+                FimOp::Deleted,
+            ] {
+                assert_eq!(
+                    c.classify(op, path),
+                    DriftSeverity::Critical,
+                    "{op:?} {path}"
+                );
+            }
+        }
+        // the buckets spent, a Critical drift still goes through
+        while rl.try_consume(DriftSeverity::Medium).is_ok() {}
+        while rl.try_consume(DriftSeverity::High).is_ok() {}
+        assert!(rl
+            .try_consume(c.classify(FimOp::Modified, "/usr/sbin/sshd"))
+            .is_ok());
+        assert_eq!(
+            c.classify(FimOp::Opened, "/usr/sbin/sshd"),
+            DriftSeverity::Medium
+        );
+    }
+
     #[test]
     fn classifier_assigns_provisional_severity() {
         let c = DriftClassifier::new();
         // Modified + Renamed → Medium (noisy under upgrades).
         assert_eq!(
-            c.classify(FimOp::Modified, "/usr/bin/sshd"),
+            c.classify(FimOp::Modified, "/etc/ssh/sshd_config"),
             DriftSeverity::Medium
         );
         assert_eq!(
@@ -1957,6 +2195,151 @@ mod tests {
         assert_eq!(body.lines().count(), 1);
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(!row.decision_engine_skipped);
+    }
+
+    /// External audit FIMR-004: a file renamed over a watched one (the
+    /// kernel flags the replaced inode) is checked, once the rename lands,
+    /// as a modification of the path: the new content against the
+    /// baseline, attributed to the renamer — the event the rules guarding
+    /// the path's content consume. The drift row is written through the
+    /// drain's lock (FIMP-003).
+    #[test]
+    fn a_file_renamed_over_a_watched_one_is_checked_as_a_modification() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let drift_path = dir.path().join("drift.jsonl");
+        let drift_db = parking_lot::Mutex::new(
+            FimDriftDb::open(
+                &drift_path,
+                fresh_signing_key(&dir),
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap(),
+        );
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("sshd");
+        std::fs::write(&watched, b"the real binary").unwrap();
+        let old = std::fs::metadata(&watched).unwrap();
+        let watched_s = watched.to_string_lossy().to_string();
+        path_map.insert(
+            InodeKey {
+                dev: old.dev(),
+                ino: old.ino(),
+            },
+            watched_s.clone(),
+        );
+        let baseline = dummy_baseline(&watched_s, &hex::encode(Sha256::digest(b"the real binary")));
+        // the trojan, prepared next to it and renamed over it
+        let prepared = dir.path().join(".sshd.new");
+        std::fs::write(&prepared, b"a trojan").unwrap();
+        std::fs::rename(&prepared, &watched).unwrap();
+
+        let mut raw = fake_raw(old.dev(), old.ino(), FimOp::Renamed as u8);
+        raw.op_flags = FIM_RENAME_REPLACED;
+        raw.modifier_pid = 4242;
+        raw.modifier_comm = *b"mv\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let (c, rl) = (DriftClassifier::new(), DriftRateLimiter::new());
+        let mut out = Vec::new();
+        process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut &drift_db,
+            &c,
+            &rl,
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(matches!(&out[..], [Event::Fim(fe)] if fe.op == FimOp::Renamed));
+
+        let replaced: Vec<_> = replacement_raws()
+            .into_iter()
+            .filter(|r| r.modifier_pid == 4242)
+            .collect();
+        assert_eq!(replaced.len(), 1, "one check of the new file");
+        let new = key_for_path(&watched).unwrap();
+        assert_eq!(
+            (replaced[0].target_dev, replaced[0].target_ino),
+            (new.dev, new.ino)
+        );
+        let mut out = Vec::new();
+        let emitted = process_drift(
+            &replaced[0],
+            &path_map,
+            Some(&baseline),
+            &mut &drift_db,
+            &c,
+            &rl,
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(emitted);
+        match &out[..] {
+            [Event::Fim(fe)] => {
+                assert_eq!(fe.op, FimOp::Modified);
+                assert_eq!(fe.path, watched_s);
+                assert_eq!(fe.modifier_pid, 4242);
+                assert_eq!(fe.modifier_comm, "mv");
+                assert_eq!(fe.new_sha256, Some(Sha256::digest(b"a trojan").into()));
+            }
+            other => panic!("{other:?}"),
+        }
+        let rows = std::fs::read_to_string(&drift_path).unwrap();
+        assert_eq!(rows.lines().count(), 2, "the rename and the modification");
+    }
+
+    /// External audit FIMP-003: an event that happened before a hash of
+    /// its path began is answered by that hash; a later one hashes again.
+    #[test]
+    fn an_event_before_the_last_hash_of_its_path_reuses_it() {
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("big.log");
+        let p = f.to_string_lossy().to_string();
+        std::fs::write(&f, b"first").unwrap();
+        let before = monotonic_ns();
+        let first = content_after(&p, before).unwrap();
+        std::fs::write(&f, b"second").unwrap();
+        // an event older than the hash (by more than the margin) is the
+        // same file the hash read
+        let old_event = before.saturating_sub(10 * HASH_REUSE_MARGIN_NS);
+        assert_eq!(content_after(&p, old_event).unwrap(), first);
+        // an event since: read again
+        let now = content_after(&p, monotonic_ns()).unwrap();
+        assert_eq!(now.0, hex::encode(Sha256::digest(b"second")));
+        // within the margin: read again too (the hook fires before the change)
+        std::fs::write(&f, b"third").unwrap();
+        let recent = content_after(&p, monotonic_ns()).unwrap();
+        assert_eq!(recent.0, hex::encode(Sha256::digest(b"third")));
+    }
+
+    /// External audit FIMP-004: re-enrolling a path watches the inode it
+    /// holds now and forgets the ones it held — a replaced file, a path
+    /// that appeared since boot.
+    #[test]
+    fn reenrolling_a_path_watches_its_current_inode_only() {
+        let dir = TempDir::new().unwrap();
+        let map = InodePathMap::new();
+        let f = dir.path().join("sshd_config");
+        let fs_ = f.to_string_lossy().to_string();
+        assert!(!reenroll_path(&fs_, &map, None), "nothing there yet");
+        std::fs::write(&f, b"a").unwrap();
+        assert!(reenroll_path(&fs_, &map, None), "appeared since boot");
+        let old_key = key_for_path(&f).unwrap();
+        assert_eq!(map.lookup(&old_key), Some(fs_.clone()));
+        let tmp = dir.path().join("sshd_config.new");
+        std::fs::write(&tmp, b"b").unwrap();
+        std::fs::rename(&tmp, &f).unwrap();
+        assert!(reenroll_path(&fs_, &map, None));
+        let new_key = key_for_path(&f).unwrap();
+        assert_eq!(map.lookup(&new_key), Some(fs_.clone()));
+        assert_eq!(map.lookup(&old_key), None, "the old inode forgotten");
+        assert_eq!(map.keys_for_path(&fs_), vec![new_key]);
     }
 
     /// External audit FIMP-005: a watched file renamed away stops

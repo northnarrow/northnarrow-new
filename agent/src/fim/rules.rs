@@ -1210,6 +1210,19 @@ pub fn is_credential_store_access(fe: &FimEvent) -> bool {
         .any(|f| fe.path.contains(f))
 }
 
+/// External audit FIMR-005: a path one of the Critical rules guards —
+/// system binaries (NN-L-FIM-001), kernel modules (008), PAM modules
+/// (021), `/etc/ld.so.preload` (022), the anti-tamper baits (024). The
+/// drain never throttles a drift on one of them (§6.5, Q4). Built from the
+/// rules' own constants, like [`is_credential_path`].
+pub fn is_critical_rule_path(path: &str) -> bool {
+    SYSTEM_BINARY_PREFIXES.iter().any(|p| path.starts_with(p))
+        || path.starts_with(KMOD_PREFIX)
+        || (path.contains(PAM_MODULE_DIR_FRAGMENT) && path.ends_with(PAM_MODULE_SUFFIX))
+        || path == LD_SO_PRELOAD_PATH
+        || HONEYPOT_PATHS.contains(&path)
+}
+
 /// BUG-012 (v2): `true` if `path` is a credential file that one of
 /// the NN-L-FIM-011..017 **read**-detection rules matches on. This is
 /// the SINGLE SOURCE OF TRUTH the FIM drain

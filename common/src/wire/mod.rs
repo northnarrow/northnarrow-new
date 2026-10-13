@@ -852,6 +852,12 @@ pub const FIM_CHILD_NAME_LEN: usize = 64;
 /// they can no longer see.
 pub const FIM_CHILD_TRUNCATED: u8 = 0x01;
 
+/// [`FimDriftRaw::op_flags`] bit (external audit FIMR-004): a rename put
+/// another file over this watched inode — the watched path's content was
+/// replaced in one call (`rename(2)` of a prepared file over a binary, a
+/// PAM module, a unit), not moved away.
+pub const FIM_RENAME_REPLACED: u8 = 0x01;
+
 /// Tappa 9 (C1) — kernel↔userland record emitted by the FIM
 /// observation hooks (design §5). One record per watched-inode
 /// drift event. Userland's `agent/src/fim/drain.rs` (C4) decodes
@@ -880,7 +886,10 @@ pub struct FimDriftRaw {
     /// One of the `FIM_OP_*` discriminants above. Inflated by
     /// userland into [`FimOp`].
     pub op: u8,
-    pub _pad: [u8; 7],
+    /// External audit FIMR-004: [`FIM_RENAME_REPLACED`] when the
+    /// rename put another file over the watched inode (`new_dentry`).
+    pub op_flags: u8,
+    pub _pad: [u8; 6],
     /// Polish #3 — rename DEST `(dev, ino)`. Populated by
     /// `fim_rename_observe` when the SOURCE inode is in
     /// WATCHED_PATHS (and the dest dentry's inode is reachable
@@ -920,7 +929,8 @@ impl FimDriftRaw {
             modifier_uid: 0,
             modifier_comm: [0u8; TASK_COMM_LEN],
             op: 0,
-            _pad: [0u8; 7],
+            op_flags: 0,
+            _pad: [0u8; 6],
             dest_dev: 0,
             dest_ino: 0,
             child_name: [0u8; FIM_CHILD_NAME_LEN],
@@ -1454,7 +1464,8 @@ mod tests {
             modifier_uid: 0,
             modifier_comm: *b"sshd\0\0\0\0\0\0\0\0\0\0\0\0",
             op: FIM_OP_RENAMED,
-            _pad: [0u8; 7],
+            op_flags: 0,
+            _pad: [0u8; 6],
             dest_dev: 0x800003,
             dest_ino: 67890,
             child_name: {

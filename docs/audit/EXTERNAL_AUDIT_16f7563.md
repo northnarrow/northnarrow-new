@@ -73,12 +73,12 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-023 | FIMR-001 | FIM rules | M | fixed (lab PR 91) |
 | NN-AUD-024 | FIMR-002 | FIM rules | M | fixed (lab PR 75, review 85) |
 | NN-AUD-025 | FIMR-003 | FIM rules | M | fixed (lab PR 75, review 85) |
-| NN-AUD-026 | FIMR-004 | FIM rules | M | open |
-| NN-AUD-027 | FIMR-005 | FIM rules | M | open |
+| NN-AUD-026 | FIMR-004 | FIM rules | M | fixed (lab PR 102) |
+| NN-AUD-027 | FIMR-005 | FIM rules | M | fixed (lab PR 102) |
 | NN-AUD-028 | FIMR-006 | FIM rules | L | fixed (lab PR 98) |
 | NN-AUD-029 | FIMP-001 | FIM pipeline | M | fixed (lab PR 91) |
-| NN-AUD-031 | FIMP-003 | FIM pipeline | M | open |
-| NN-AUD-032 | FIMP-004 | FIM pipeline | M | open |
+| NN-AUD-031 | FIMP-003 | FIM pipeline | M | fixed (lab PR 102) |
+| NN-AUD-032 | FIMP-004 | FIM pipeline | M | fixed (lab PR 102) |
 | NN-AUD-036 | NETR-002 | Net rules | M | fixed (lab PR 98) |
 | NN-AUD-037 | NETR-003 | Net rules | M | fixed (lab PR 78, with NN-AUD-006) |
 | NN-AUD-038 | PROC-002 | Process rules | M | fixed (lab PR 86) |
@@ -1148,3 +1148,63 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     (`FMODE_CREATED` at bit 20). In the session, `tar` extractions (over
     an existing tree too) and `cp -r` into a new directory, 6 315 files,
     were recorded at INFO only; `cp -r` over the existing tree raised it.
+- **NN-AUD-026 (FIMR-004), NN-AUD-027 (FIMR-005), NN-AUD-031 (FIMP-003),
+  NN-AUD-032 (FIMP-004), lab PR 102.** File integrity: a replacement no
+  rule judged, a classification blind to the path, a drain one large file
+  could stall, a re-baseline that watched nothing new.
+  - FIMR-004: a file renamed over a watched one — how installers and
+    rootkits alike swap a binary, a PAM module, a unit — reached the drain
+    as `Renamed`, which only the rename rules (ransomware extension, shell
+    history, baits) read; every rule guarding a path's content watches
+    modifications. The kernel now flags the replaced inode
+    (`FimDriftRaw::op_flags`, `FIM_RENAME_REPLACED`, set only on the
+    `new_dentry` arm — the audit's userland inference would also have
+    matched a rename out of a watched directory). Once the rename lands
+    (the hook fires before it; FIMP-005's settle and retry) the file now
+    at the path is checked as a modification, against the baseline,
+    attributed to the renamer. A package transaction's renames keep
+    NN-L-FIM-001's package carve-out (Log); `authorized_keys` rewritten
+    through a rename (`sed -i`, some editors) now draws the same kill as
+    an in-place edit.
+  - FIMR-005: the main vector — 60 throwaway drifts spending the host-wide
+    buckets so the next real one skipped the rules — was closed by review
+    76 (lab PR 64), the same day as the audit's commit: only a package
+    transaction's drift is paced. What remained: the classifier went by
+    the op alone, so a modification of `/usr/sbin/sshd` was "Medium".
+    A path a Critical rule guards (system binaries, kernel and PAM
+    modules, `ld.so.preload`, the baits: `is_critical_rule_path`, built
+    from the rules' own constants) is now Critical whatever the op, and
+    never throttled.
+  - FIMP-003: the drain — the only reader of the kernel's FIM ring —
+    hashed each event's file (up to 512 MiB since FIMP-002) on a runtime
+    worker, holding the drift log's lock. Found in the lab: during 3 000
+    one-byte appends to a watched 256 MiB file the drain wrote 106 rows in
+    a minute, the admin socket stopped answering the watchdog's STATUS
+    ping, and the watchdog's stuck recovery killed (SIGKILL) and restarted
+    the agent; a change to another watched file a second into the burst
+    was never recorded. Now an event that happened before a hash of its
+    path began (by more than 50 ms: the hooks fire before the change) is
+    answered by that hash — each event still checked and attributed on
+    its own; the synchronous work runs in `block_in_place`; the drift log
+    is locked for its append only (`DriftSink`). The ring is 1 MiB
+    (was 256 KiB), the drain writing a signed row per event.
+  - FIMP-004: the recompute task (`nn-admin fim baseline`, a path added
+    to the signed `fim-paths` overlay) wrote the baseline chain and never
+    touched the inode map or the kernel's `WATCHED_PATHS`: a path added at
+    runtime was not watched until a restart, and a replaced file kept its
+    old inode's entry. Each re-baselined path is now watched by the inode
+    it holds (`reenroll_path`), the inodes it held before forgotten in the
+    map and in `WATCHED_PATHS`.
+  - Lab, Ubuntu 22.04 (5.15), before: a copy of `/usr/bin/wget` one byte
+    longer renamed over it gave `FIM DRIFT op=Renamed` and nothing else; a
+    file added through the overlay and `fim baseline` drew no drift when
+    changed; the burst above. After: the same rename gave `Renamed`, then
+    `Modified` by `mv` and NN-L-FIM-001 (Critical, KillProcessTree of
+    `mv`); renaming the original back matched the baseline and was
+    dropped as a no-op; the runtime-added file's change was recorded; the
+    burst wrote all 3 000 rows in 8.4 s with no ring drop, no watchdog
+    recovery, the other file's change recorded in order (with the 256 KiB
+    ring: 862 rows in 3 s, 4 275 events dropped and audited, no restart).
+  - Not done: a reader task that drains the ring into a queue coalescing
+    one writer's repeated closes of a file, which would keep a single
+    process from filling any ring size.
