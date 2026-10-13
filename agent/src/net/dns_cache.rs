@@ -72,6 +72,15 @@ pub const DEFAULT_MAX_PIDS: usize = 4096;
 /// Insert interval between full-map stale-pid prunes (an O(pids) scan).
 const PRUNE_EVERY: u32 = 256;
 
+/// External audit NET-004: hard cap on the queries retained across all
+/// pids. The pid cap bounded the keys, not the memory: 4096 pids × 1024
+/// queries × a name of up to 253 bytes is over a gigabyte, within reach of
+/// an unprivileged process sending to port 53 from short-lived children.
+/// 65 536 queries are ~20 MiB at worst. Past the cap the oldest query of
+/// the pid holding the most goes — the flooder's, not a quiet process's
+/// one recent lookup.
+pub const MAX_TOTAL_ENTRIES: usize = 65_536;
+
 /// One observed DNS query (PRE-response, V1.0). The same PID
 /// might issue many queries within the TTL window; we keep the
 /// most-recent N (`max_per_pid`).
@@ -91,8 +100,12 @@ struct RecentQuery {
 
 #[derive(Debug, Default)]
 struct DnsCacheInner {
-    /// PID → recent queries, oldest at the front.
+    /// PID → recent queries, oldest at the front. Changed only through
+    /// [`DnsCacheInner::push`], [`DnsCacheInner::retain_pids`] and
+    /// [`DnsCacheInner::remove_pid`], which keep `total` right.
     by_pid: HashMap<u32, VecDeque<RecentQuery>>,
+    /// Queries held in `by_pid` (external audit NET-004).
+    total: usize,
     /// Inserts since the last stale-pid prune (see [`PRUNE_EVERY`]).
     inserts_since_prune: u32,
     /// FP-3 reverse index: recent `(qname, pid, ts_ns)` observations in
@@ -126,6 +139,61 @@ impl Default for DnsCache {
     }
 }
 
+impl DnsCacheInner {
+    /// Append a query for `pid`, keeping its queue to `max_per_pid` and
+    /// every queue together to `max_total`.
+    fn push(&mut self, pid: u32, q: RecentQuery, max_per_pid: usize, max_total: usize) {
+        let queue = self.by_pid.entry(pid).or_default();
+        queue.push_back(q);
+        self.total += 1;
+        while queue.len() > max_per_pid {
+            queue.pop_front();
+            self.total -= 1;
+        }
+        while self.total > max_total {
+            let Some(heaviest) = self
+                .by_pid
+                .iter()
+                .max_by_key(|(_, q)| q.len())
+                .map(|(pid, _)| *pid)
+            else {
+                break;
+            };
+            let empty = match self.by_pid.get_mut(&heaviest) {
+                Some(q) => {
+                    if q.pop_front().is_some() {
+                        self.total -= 1;
+                    }
+                    q.is_empty()
+                }
+                None => break,
+            };
+            if empty {
+                self.by_pid.remove(&heaviest);
+            }
+        }
+    }
+
+    /// Keep the pids `keep` accepts.
+    fn retain_pids(&mut self, mut keep: impl FnMut(&VecDeque<RecentQuery>) -> bool) {
+        let mut dropped = 0;
+        self.by_pid.retain(|_, q| {
+            let k = keep(q);
+            if !k {
+                dropped += q.len();
+            }
+            k
+        });
+        self.total -= dropped;
+    }
+
+    fn remove_pid(&mut self, pid: u32) {
+        if let Some(q) = self.by_pid.remove(&pid) {
+            self.total -= q.len();
+        }
+    }
+}
+
 impl DnsCache {
     /// Custom-bound constructor for tests + future V1.1 config
     /// surface. Production callers should use [`Self::default`]
@@ -148,17 +216,16 @@ impl DnsCache {
     /// `max_per_pid`.
     pub fn on_dns_query(&self, pid: u32, qname: String, qtype: u16, ts_ns: u64) {
         let mut g = self.inner.lock();
-        {
-            let q = g.by_pid.entry(pid).or_default();
-            q.push_back(RecentQuery {
+        g.push(
+            pid,
+            RecentQuery {
                 qname: qname.clone(),
                 qtype,
                 ts_ns,
-            });
-            while q.len() > self.max_per_pid {
-                q.pop_front();
-            }
-        }
+            },
+            self.max_per_pid,
+            MAX_TOTAL_ENTRIES,
+        );
         // FP-3 reverse index: record (qname, pid, ts) for forwarder-aware
         // originator back-correlation, then prune by the short retention
         // window + the hard size cap so unique DGA qnames can't grow it.
@@ -256,8 +323,7 @@ impl DnsCache {
     /// a fraction of a scan.
     fn prune_pids(g: &mut DnsCacheInner, now_ns: u64, ttl_ns: u64) {
         let cutoff = now_ns.saturating_sub(ttl_ns);
-        g.by_pid
-            .retain(|_, q| q.back().is_some_and(|e| e.ts_ns >= cutoff));
+        g.retain_pids(|q| q.back().is_some_and(|e| e.ts_ns >= cutoff));
         while g.by_pid.len() > DEFAULT_MAX_PIDS {
             let oldest = g
                 .by_pid
@@ -265,9 +331,7 @@ impl DnsCache {
                 .min_by_key(|(_, q)| q.back().map(|e| e.ts_ns).unwrap_or(0))
                 .map(|(pid, _)| *pid);
             match oldest {
-                Some(pid) => {
-                    g.by_pid.remove(&pid);
-                }
+                Some(pid) => g.remove_pid(pid),
                 None => break,
             }
         }
@@ -299,6 +363,14 @@ impl DnsCache {
     #[cfg(test)]
     fn tracked_pids(&self) -> usize {
         self.inner.lock().by_pid.len()
+    }
+
+    /// Test/diagnostic — queries retained across all pids, as counted and
+    /// as held.
+    #[cfg(test)]
+    fn totals(&self) -> (usize, usize) {
+        let g = self.inner.lock();
+        (g.total, g.by_pid.values().map(|q| q.len()).sum())
     }
 
     /// Test/diagnostic — number of queries currently retained
@@ -516,6 +588,45 @@ fn try_parse_answers(packet: &[u8]) -> Option<Vec<DnsAnswer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit NET-004: a query flood stays under the global cap,
+    /// counted right, and evicts the flooder's queries — not a quiet
+    /// process's one recent lookup.
+    #[test]
+    fn a_query_flood_stays_under_the_global_cap_and_spares_quiet_pids() {
+        let c = DnsCache::new(300, DEFAULT_MAX_PER_PID);
+        let long = "a".repeat(200);
+        c.on_dns_query(7, "quiet.example.com".into(), 1, 1);
+        for pid in 1000..1100u32 {
+            for k in 0..DEFAULT_MAX_PER_PID {
+                c.on_dns_query(pid, format!("{k}.{long}"), 1, 2 + k as u64);
+            }
+        }
+        let (counted, held) = c.totals();
+        assert_eq!(counted, held);
+        assert!(held <= MAX_TOTAL_ENTRIES, "{held}");
+        assert_eq!(c.lookup_for_connect(7, 5), Some("quiet.example.com".into()));
+    }
+
+    /// The count stays right when stale pids are pruned and when the pid
+    /// cap evicts.
+    #[test]
+    fn the_global_count_follows_every_removal() {
+        let c = DnsCache::new(1, 4);
+        for pid in 0..10u32 {
+            for k in 0..6 {
+                c.on_dns_query(pid, format!("n{k}.example"), 1, 1);
+            }
+        }
+        assert_eq!(c.totals(), (40, 40), "4 per pid kept");
+        // two seconds on: the stale pids go at the next prune
+        for k in 0..PRUNE_EVERY {
+            c.on_dns_query(99, format!("late{k}.example"), 1, 3_000_000_000);
+        }
+        let (counted, held) = c.totals();
+        assert_eq!(counted, held);
+        assert_eq!(held, 4);
+    }
 
     /// External audit NET-005 (NN-AUD-059): a query the pid issued after
     /// the connect must not hide the one before it.

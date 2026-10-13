@@ -2004,6 +2004,18 @@ async fn main() -> Result<()> {
     if legacy_isolation_removed {
         attest_legacy_isolation_removed(audit_log.as_ref());
     }
+    // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
+    // without what the socket-buffer programs need, or `--dns-sensor
+    // sendmsg`) a query's name is read from the sender's memory before the
+    // kernel copies it: the sender can change it in between, so the name
+    // recorded and the one sent may differ.
+    if !northnarrow_agent::sensors::dns_sensor::skb_active() {
+        attest_degraded(
+            audit_log.as_ref(),
+            "DNS sensor on udp_sendmsg: query names read from the sender's memory, which it \
+             can rewrite before the kernel sends them (IPv4 only)",
+        );
+    }
     // External audit FIMR-001: FIM watching nothing used to show only as
     // `effective=0` in an INFO line.
     if watched_paths_load.effective.is_empty() {

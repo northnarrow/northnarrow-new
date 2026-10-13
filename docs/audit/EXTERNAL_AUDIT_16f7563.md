@@ -65,7 +65,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-013 | ATP-004 | Anti-tamper | M | fixed (lab PR 93) |
 | NN-AUD-014 | EBPF-001 | eBPF kernel | M | fixed (lab PR 94) |
 | NN-AUD-015 | EBPF-002 | eBPF kernel | M | fixed (lab PR 95) |
-| NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
+| NN-AUD-017 | EBPF-006 | eBPF kernel | M | already fixed (lab PR 57); attested (lab PR 104) |
 | NN-AUD-019 | EBPF-010 | eBPF kernel | M | fixed (lab PR 97) |
 | NN-AUD-020 | EVD-001 | Evidence logs | L | open |
 | NN-AUD-021 | EVD-005 | Evidence logs | M | fixed (lab PR 90) |
@@ -95,7 +95,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-053 | LLMR-004 | LLM runtime | M | open |
 | NN-AUD-055 | LLMR-012 | LLM runtime | M | fixed (lab PR 87) |
 | NN-AUD-057 | NET-003 | Network | M | fixed (lab PR 90) |
-| NN-AUD-058 | NET-004 | Network | M | open |
+| NN-AUD-058 | NET-004 | Network | M | fixed (lab PR 104) |
 | NN-AUD-061 | DEC-001 | Deception | M | fixed (lab PR 84, with Wave 0) |
 | NN-AUD-062 | DEC-002 | Deception | M | fixed (lab PR 84, with Wave 0) |
 | NN-AUD-064 | DEC-004 | Deception | M | fixed (lab PR 99) |
@@ -1241,3 +1241,32 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     could only fail there. The state directory's `+i` refused the old
     flag file, so the old engage applied the drop policy and then
     reported a failure; the cleanup treats an unremovable flag as inert.
+- **NN-AUD-017 (EBPF-006) and NN-AUD-058 (NET-004), lab PR 104.** DNS.
+  - EBPF-006: the kprobe at `udp_sendmsg` entry read the query's name from
+    the sender's memory, which another thread can rewrite before the
+    kernel copies it — the name recorded and the one sent could differ.
+    Tappa 10.9 step 3 (lab PR 57, merged the day of the audit's commit,
+    after it) made the default sensor read the kernel's copy, on
+    `udp_send_skb` / `udp_v6_send_skb` (`dns_flags::SKB`); the `udp_sendmsg`
+    program remains only where those cannot attach (or with
+    `--dns-sensor sendmsg`). That degraded mode is now attested in the
+    signed audit log at start (MAIN-003's `subsystem_degraded`), not only
+    in a WARN line.
+  - NET-004: the cache of recent queries capped the pids (4096) and the
+    queries per pid (1024), not the total: over a gigabyte at worst. The
+    kernel's DNS budgets (review 78, after the audit's commit: 1 024
+    queries a second per user) cut what one user can record to ~300 000
+    queries in the 300 s window — still ~90 MB with long names, and more
+    users add up.
+    The audit's fix (32 per pid) would drop the attribution of a chatty
+    process's long-lived flows (NET-005 looks up the query before the
+    connect when the flow closes). A global cap instead, 65 536 queries
+    (~20 MiB at worst), kept by the only three places that change the
+    per-pid queues (`push`, `retain_pids`, `remove_pid`); past it the
+    oldest query of the pid holding the most goes — the flooder's, not a
+    quiet process's one lookup.
+  - Lab, Ubuntu 22.04 (5.15): one user sending ~1 000 DNS queries a second
+    (a child every 100 ms, 100 distinct ~200-byte names each, to
+    127.0.0.2:53) for 180 s. Before, the agent's RSS grew linearly, 38 MB
+    → 77 MB, and would have kept growing to the 300 s window. After, it
+    grew to 63 MB by 120 s and stayed there (64.8 MB at the end).
