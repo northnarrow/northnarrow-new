@@ -98,7 +98,39 @@ pub enum Confidence {
     NeedsCorroboration,
 }
 
+/// External audit POS-001 (NN-AUD-002): the kind of evidence a trigger
+/// is. Two heuristic signals corroborate each other only across classes:
+/// two network patterns (an update's twenty HTTPS connections, then three
+/// internal SSH sessions) are one kind of behaviour, not two pieces of
+/// evidence, and any unprivileged user produces both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvidenceClass {
+    Network,
+    Execution,
+    FileSystem,
+    Kernel,
+}
+
 impl TriggerType {
+    /// The kind of evidence this trigger is ([`EvidenceClass`]).
+    pub fn evidence_class(&self) -> EvidenceClass {
+        match self {
+            TriggerType::Reconnaissance
+            | TriggerType::SuspiciousDns
+            | TriggerType::HeavyReconnaissance
+            | TriggerType::AdjacentCompromise
+            | TriggerType::LateralMovement
+            | TriggerType::ExfiltrationPattern => EvidenceClass::Network,
+            TriggerType::Lolbas | TriggerType::ExploitAttempt | TriggerType::ConfirmedIntrusion => {
+                EvidenceClass::Execution
+            }
+            TriggerType::SensitiveFileAccess
+            | TriggerType::CriticalFileModification
+            | TriggerType::PersistenceMechanism => EvidenceClass::FileSystem,
+            TriggerType::AntiTamperDenial => EvidenceClass::Kernel,
+        }
+    }
+
     /// Highest posture level this trigger can promote to.
     pub fn target_level(&self) -> PostureKind {
         match self {

@@ -6,6 +6,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 0, POS-001 (Critical): any local user could put
+  the host in a locked COMBAT — network isolation, with no way out but a
+  signed release — with two cheap heuristics, such as twenty HTTPS
+  connections and then three internal SSH connections. Signals now
+  corroborate only across kinds of evidence (network, execution, file
+  system, kernel). A COMBAT reached on heuristics alone contains threats
+  at the process level, never isolates, and decays after 30 quiet
+  minutes. Isolation needs a locked COMBAT: a kernel-adjudicated denial,
+  root changing a system file outside an administrator's session, or an
+  administrator's order.
 - External audit, Wave 0, LLM (Critical LLMP-002, High LLMP-001,
   LLMR-001, LLMR-006):
   - The correlated events reached the model raw, inside the prompt's

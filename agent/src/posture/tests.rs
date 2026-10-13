@@ -366,10 +366,11 @@ fn single_blunt_combat_signal_caps_at_engaged() {
     );
 }
 
+/// External audit POS-001 (NN-AUD-002): an update's HTTPS burst, then
+/// three internal SSH sessions — two network patterns any unprivileged
+/// user produces — are one kind of behaviour and stay at ENGAGED.
 #[test]
-fn corroborated_pair_reaches_combat() {
-    // exfil alone → ENGAGED; a SECOND distinct signal (lateral) within
-    // the window corroborates → COMBAT.
+fn unprivileged_pair_does_not_reach_combat() {
     let m = PostureMachine::new();
     let (ef, er) = exfil_burst(42);
     m.observe(&ef, &er);
@@ -379,9 +380,110 @@ fn corroborated_pair_reaches_combat() {
     m.observe(&lf, &lr);
     assert_eq!(
         m.current_kind(),
-        PostureKind::Combat,
-        "two distinct blunt signals must corroborate to COMBAT"
+        PostureKind::Engaged,
+        "two network patterns must not corroborate each other"
     );
+}
+
+/// External audit POS-001: evidence of another kind — a binary run from
+/// /tmp, then an exfiltration burst — still corroborates to COMBAT, but
+/// an unlocked one: heuristics alone never let the ladder isolate.
+#[test]
+fn cross_class_pair_reaches_unlocked_combat() {
+    let m = PostureMachine::new();
+    m.observe(&spawn(42, 1, "evil", "/tmp/evil", 1), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(!m.is_combat_locked(), "heuristic COMBAT must not be locked");
+}
+
+/// External audit POS-001: a kernel-adjudicated denial still reaches a
+/// locked COMBAT, and a heuristic after it keeps it locked.
+#[test]
+fn decisive_plus_heuristic_reaches_combat() {
+    let m = PostureMachine::new();
+    m.observe(&fs_protect_denial(42, 1), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(m.is_combat_locked());
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(m.is_combat_locked());
+}
+
+/// External audit POS-001: a heuristic COMBAT locks once evidence an
+/// unprivileged user cannot produce arrives — here a kernel denial.
+#[test]
+fn unlocked_combat_locks_on_decisive_evidence() {
+    let m = PostureMachine::new();
+    m.observe(&spawn(42, 1, "evil", "/tmp/evil", 1), &[]);
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert!(!m.is_combat_locked());
+    m.observe(&fs_protect_denial(42, 200), &[]);
+    assert!(m.is_combat_locked());
+}
+
+/// External audit POS-001: root changing a system file outside an
+/// administrator's session is evidence an unprivileged user cannot
+/// produce — the COMBAT it corroborates is locked. The same unit written
+/// through a user's crontab (uid 1000) leaves it unlocked.
+#[test]
+fn root_system_file_change_locks_combat() {
+    for (uid, path, locked) in [
+        (0, "/etc/systemd/system/evil.service", true),
+        (1000, "/var/spool/cron/crontabs/u", false),
+    ] {
+        let m = machine_with_isolated_auth();
+        let _ = m.observe(&spawn(900, 1, "cryptor", "/usr/local/bin/cryptor", 1), &[]);
+        let _ = m.observe(&spawn(901, 900, "x", "/tmp/x", 2), &[]);
+        assert_eq!(m.current_kind(), PostureKind::Engaged);
+        let _ = m.observe(&file_open(900, uid, path, 1, 300), &[]);
+        assert_eq!(m.current_kind(), PostureKind::Combat, "{path}");
+        assert_eq!(m.is_combat_locked(), locked, "{path}");
+    }
+}
+
+/// External audit POS-001: an unlocked COMBAT decays to ENGAGED after a
+/// quiet window (the decay hook stands the ladder down); a locked one
+/// never decays.
+#[test]
+fn unlocked_combat_decays_once_quiet() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::transitions::COMBAT_QUIET_WINDOW;
+
+    let m = PostureMachine::new();
+    let decays = Arc::new(AtomicUsize::new(0));
+    let d = Arc::clone(&decays);
+    m.on_combat_decay(Arc::new(move || {
+        d.fetch_add(1, Ordering::SeqCst);
+    }));
+    m.observe(&spawn(42, 1, "evil", "/tmp/evil", 1), &[]);
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+
+    let now = Instant::now();
+    assert!(m
+        .tick_decay_at(now + COMBAT_QUIET_WINDOW - Duration::from_secs(60))
+        .is_none());
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    let next = m.tick_decay_at(now + COMBAT_QUIET_WINDOW + Duration::from_secs(1));
+    assert_eq!(next.map(|s| s.kind()), Some(PostureKind::Engaged));
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    assert_eq!(decays.load(Ordering::SeqCst), 1);
+
+    let m = PostureMachine::new();
+    m.observe(&fs_protect_denial(42, 1), &[]);
+    assert!(m
+        .tick_decay_at(Instant::now() + COMBAT_QUIET_WINDOW * 4)
+        .is_none());
+    assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
 #[test]
@@ -725,10 +827,14 @@ fn two_blunt_combat_signals_in_one_round_cap_at_engaged() {
         "same-round blunt signals must not corroborate each other into COMBAT"
     );
 
-    // A SECOND round, now with the first round's signals in the ledger,
-    // is the legitimate corroboration path and may reach COMBAT.
+    // A SECOND round of the same kind (more unit files) is still one kind
+    // of evidence (external audit POS-001)…
     let focal2 = file_open(900, 0, "/etc/systemd/system/nn-test-100.service", 1, 300);
     let _ = m.observe(&focal2, &recent);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    // …while evidence of another kind, with the earlier rounds' signals in
+    // the ledger, is the legitimate corroboration path and reaches COMBAT.
+    let _ = m.observe(&spawn(901, 900, "x", "/tmp/x", 400), &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
@@ -813,14 +919,14 @@ fn corroboration_is_scoped_to_the_login_session() {
         )
     };
 
-    // Session A (uid 1000): $HOME burst → ENGAGED, ledger entry scoped
-    // to 1000. Session B (uid 1001): persistence-prefix burst must NOT
-    // be vouched for by A's signal.
+    // Session A (uid 1000): a binary run from /tmp → ENGAGED, ledger
+    // entry scoped to 1000. Session B (uid 1001): a $HOME burst — evidence
+    // of another kind (external audit POS-001) — must NOT be vouched for
+    // by A's signal.
     let m = mk();
-    let (recent, focal) = burst(900, "/home/a", 100);
-    m.observe(&focal, &recent);
+    m.observe(&spawn(900, 1, "x", "/tmp/x", 50), &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
-    let (recent, focal) = burst(901, "/etc/systemd/system", 300);
+    let (recent, focal) = burst(901, "/home/b", 300);
     m.observe(&focal, &recent);
     assert_eq!(
         m.current_kind(),
@@ -830,9 +936,8 @@ fn corroboration_is_scoped_to_the_login_session() {
 
     // Same session for both rounds: legitimate corroboration → COMBAT.
     let m = mk();
-    let (recent, focal) = burst(900, "/home/a", 100);
-    m.observe(&focal, &recent);
-    let (recent, focal) = burst(900, "/etc/systemd/system", 300);
+    m.observe(&spawn(900, 1, "x", "/tmp/x", 50), &[]);
+    let (recent, focal) = burst(900, "/home/a", 300);
     m.observe(&focal, &recent);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
@@ -1030,7 +1135,11 @@ fn snapd_refresh_e2e_stays_at_observing() {
 }
 
 /// Detection intact: the IDENTICAL mass-write + persistence pair from a
-/// NON-daemon pid must still corroborate to COMBAT.
+/// NON-daemon pid still raises both signals. External audit POS-001: they
+/// are one kind of evidence (file system), so together they stay at
+/// ENGAGED; evidence of another kind from the same actor — a binary run
+/// from /tmp — then reaches COMBAT, locked because root changed a system
+/// file outside an administrator's session.
 #[test]
 fn non_daemon_masswrite_plus_persistence_reaches_combat() {
     let m = machine_with_isolated_auth();
@@ -1046,16 +1155,21 @@ fn non_daemon_masswrite_plus_persistence_reaches_combat() {
     assert!(r.is_some(), "non-daemon mass-write must transition");
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 
-    // 2. persistence (systemd unit drop) → PersistenceMechanism; with
-    //    ConfirmedIntrusion still in the ledger (distinct) → COMBAT.
+    // 2. persistence (systemd unit drop) → PersistenceMechanism: the same
+    //    kind of evidence as the mass-write, so still ENGAGED.
     let unit = file_open(900, 0, "/etc/systemd/system/evil.service", 1, 300);
-    let r = m.observe(&unit, &[]);
-    assert!(r.is_some(), "persistence must transition");
+    let _ = m.observe(&unit, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    // 3. the writer runs a binary from /tmp → evidence of another kind.
+    let r = m.observe(&spawn(901, 900, "x", "/tmp/x", 400), &[]);
+    assert!(r.is_some(), "exec from /tmp must transition");
     assert_eq!(
         m.current_kind(),
         PostureKind::Combat,
-        "non-daemon mass-write + persistence must corroborate to COMBAT"
+        "file-system evidence + an exec from /tmp must corroborate to COMBAT"
     );
+    assert!(m.is_combat_locked(), "root wrote the unit: locked");
 }
 
 // ─── Review 52 — an admin session's configuration changes ───────────
@@ -1124,18 +1238,25 @@ fn admin_session_config_changes_stay_engaged() {
         PostureKind::Engaged,
         "routine admin edits must not corroborate each other to COMBAT"
     );
+    // External audit POS-001: nor do they corroborate evidence of another
+    // kind from the session (the admin then pushes a backup over HTTPS).
+    let (ef, er) = exfil_burst(810);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
 }
 
-/// The same two writes without sudo in the lineage still corroborate.
+/// The same change without sudo in the lineage still corroborates
+/// (external audit POS-001: evidence of another kind), and — root
+/// changing a system file outside an administrator's session — locks the
+/// COMBAT it reaches.
 #[test]
 fn config_changes_without_sudo_still_reach_combat() {
     let (_tmp, m) = admin_session_machine();
     let _ = m.observe(&file_open(800, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
-    let _ = m.observe(
-        &file_open(800, 0, "/etc/systemd/system/backup.service", 1, 200),
-        &[],
-    );
+    let (ef, er) = exfil_burst(810);
+    let _ = m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(m.is_combat_locked());
 }
 
 /// An admin session that first ran an offensive tool: its unit write is
@@ -1150,6 +1271,9 @@ fn admin_change_after_another_signal_reaches_combat() {
         &[],
     );
     assert_eq!(m.current_kind(), PostureKind::Combat);
+    // External audit POS-001: an administrator's change is not evidence
+    // an unprivileged user cannot produce — unlocked.
+    assert!(!m.is_combat_locked());
 }
 
 /// `sudo tee` on sshd_config (740) has exited and its exec event is still
@@ -1162,10 +1286,8 @@ fn exited_admin_writer_is_placed_before_it_corroborates() {
     let _ = m.observe(&file_open(740, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
     let _ = m.observe(&spawn(740, 710, "tee", "/usr/bin/tee", 101), &[]);
-    let _ = m.observe(
-        &file_open(730, 0, "/etc/systemd/system/backup.service", 1, 200),
-        &[],
-    );
+    let (ef, er) = exfil_burst(810);
+    let _ = m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 }
 
@@ -1176,11 +1298,12 @@ fn exited_writer_without_sudo_still_corroborates() {
     let (_tmp, m) = admin_session_machine();
     let _ = m.observe(&file_open(840, 0, "/etc/ssh/sshd_config", 1, 100), &[]);
     let _ = m.observe(&spawn(840, 700, "sh", "/usr/bin/sh", 101), &[]);
-    let _ = m.observe(
-        &file_open(800, 0, "/etc/systemd/system/backup.service", 1, 200),
-        &[],
-    );
+    let (ef, er) = exfil_burst(810);
+    let _ = m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Combat);
+    // External audit POS-001: placed outside an administrator's session,
+    // root's change counts as privileged — locked.
+    assert!(m.is_combat_locked());
 }
 
 /// Required A10 test 4: same-state transition is a no-op — no

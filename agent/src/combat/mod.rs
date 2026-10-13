@@ -147,6 +147,10 @@ struct LadderState {
     /// not re-kill (the decision to escalate to ISOLATE is taken from
     /// that one attempt's outcome).
     neutralize_attempted: bool,
+    /// External audit POS-001: why the ladder wanted to isolate when the
+    /// isolation gate was closed. The tick retries once the gate opens
+    /// (the posture locked COMBAT on later evidence).
+    isolation_deferred: Option<String>,
 }
 
 impl LadderState {
@@ -159,6 +163,7 @@ impl LadderState {
             trigger: None,
             isolated: false,
             neutralize_attempted: false,
+            isolation_deferred: None,
         }
     }
 }
@@ -175,6 +180,12 @@ pub struct CombatLadder {
     /// to ISOLATE instead. See [`protected`].
     protected: Box<dyn ProtectedProcs>,
     cfg: LadderConfig,
+    /// External audit POS-001 (NN-AUD-002): whether ISOLATE may run.
+    /// Production asks the posture whether COMBAT is locked — reached on
+    /// evidence an unprivileged user cannot produce, or forced by an
+    /// administrator. On heuristics alone the ladder stops at the process
+    /// level. Default: always (tests, callers without a posture).
+    isolation_gate: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// Internal: the side effects a stage transition must perform once the
@@ -186,6 +197,12 @@ enum LadderStep {
     /// Already at/past the target (or not engaged) — nothing to do.
     None,
     Neutralize {
+        from: CombatStage,
+        offenders: Vec<u32>,
+        trigger: Option<TriggerType>,
+    },
+    /// External audit POS-001: ISOLATE was due but the gate is closed.
+    IsolationRefused {
         from: CombatStage,
         offenders: Vec<u32>,
         trigger: Option<TriggerType>,
@@ -210,7 +227,14 @@ impl CombatLadder {
             evidence,
             protected,
             cfg,
+            isolation_gate: Box::new(|| true),
         }
+    }
+
+    /// External audit POS-001: ISOLATE runs only while `gate` says so.
+    pub fn with_isolation_gate(mut self, gate: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.isolation_gate = Box::new(gate);
+        self
     }
 
     /// Partition `pids` into `(actionable, spared)` — the host-critical
@@ -441,9 +465,29 @@ impl CombatLadder {
                 "INVESTIGATE deadline elapsed — proceed to NEUTRALIZE",
             );
         }
+        // External audit POS-001: an isolation refused while COMBAT rested
+        // on heuristics runs once the posture locks COMBAT.
+        let deferred = {
+            let s = self.state.lock();
+            if s.engaged && !s.isolated {
+                s.isolation_deferred.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(why) = deferred {
+            if (self.isolation_gate)() {
+                self.drive_to(
+                    CombatStage::Isolate,
+                    now,
+                    &format!("{why} — COMBAT since locked on non-heuristic evidence"),
+                );
+            }
+        }
     }
 
-    /// Stand down — admin released COMBAT. Clears the episode, lifts the
+    /// Stand down — admin released COMBAT, or (external audit POS-001) an
+    /// unlocked COMBAT decayed. Clears the episode, lifts the
     /// surgical soft-egress blocks. (The full-isolation iptables teardown
     /// is performed by the posture release hook via
     /// `NetworkIsolator::release`, which holds the Ed25519 `UnlockToken`.)
@@ -459,7 +503,8 @@ impl CombatLadder {
         info!(
             target: "combat.ladder",
             from = %from,
-            "COMBAT: admin stand-down — active response cleared"
+            "COMBAT: stand-down (admin release, or an unlocked COMBAT decayed) — \
+             active response cleared"
         );
         for pid in offenders {
             self.actuator.soft_egress_clear(pid);
@@ -483,6 +528,9 @@ impl CombatLadder {
         let mut target = target;
         let mut reason = reason.to_string();
         loop {
+            // External audit POS-001: asked before taking the state lock,
+            // so the posture's lock is never taken under the ladder's.
+            let isolation_allowed = target != CombatStage::Isolate || (self.isolation_gate)();
             // ── Critical section: decide + mutate state, extract work ──
             let step = {
                 let mut s = self.state.lock();
@@ -508,8 +556,19 @@ impl CombatLadder {
                         CombatStage::Isolate => {
                             if s.isolated {
                                 LadderStep::None
+                            } else if !isolation_allowed {
+                                if s.isolation_deferred.replace(reason.clone()).is_some() {
+                                    LadderStep::None
+                                } else {
+                                    LadderStep::IsolationRefused {
+                                        from: s.stage,
+                                        offenders: s.offenders.iter().copied().collect(),
+                                        trigger: s.trigger,
+                                    }
+                                }
                             } else {
                                 let from = s.stage;
+                                s.isolation_deferred = None;
                                 s.isolated = true;
                                 s.stage = CombatStage::Isolate;
                                 s.stage_since = now;
@@ -632,6 +691,31 @@ impl CombatLadder {
                             // loop → ISOLATE (fresh critical section)
                         }
                     }
+                }
+                LadderStep::IsolationRefused {
+                    from,
+                    offenders,
+                    trigger,
+                } => {
+                    warn!(
+                        target: "combat.ladder",
+                        offenders = ?offenders,
+                        reason = %reason,
+                        "COMBAT: ISOLATE refused — COMBAT rests on heuristic evidence only \
+                         (unlocked); containment stays at the process level until the \
+                         posture locks COMBAT"
+                    );
+                    self.evidence.record_stage(&StageTransition {
+                        from: Some(from),
+                        to: from,
+                        trigger,
+                        offenders,
+                        reason: format!(
+                            "ISOLATE refused ({reason}): COMBAT rests on heuristic evidence only, \
+                             which any local user can produce; the host stays on the network"
+                        ),
+                    });
+                    return;
                 }
                 LadderStep::Isolate {
                     from,

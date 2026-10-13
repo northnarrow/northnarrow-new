@@ -22,7 +22,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use common::posture_types::TriggerType;
+use common::posture_types::{EvidenceClass, TriggerType};
 
 /// Calibration knob (NOT a fixed constant — tune on the VM). Window in
 /// which a second distinct escalation signal corroborates a blunt
@@ -51,6 +51,8 @@ pub type Scope = Option<u32>;
 #[derive(Clone, Copy)]
 struct LedgerEntry {
     trigger: TriggerType,
+    /// External audit POS-001: the kind of evidence it is.
+    class: EvidenceClass,
     at: Instant,
     scope: Scope,
     /// Review 52: the writer of a configuration change that could not be
@@ -59,6 +61,10 @@ struct LedgerEntry {
     /// [`CorroborationLedger::resolve_pending`] finds it was not an
     /// administrator's interactive session.
     pending_writer: Option<u32>,
+    /// External audit POS-001: root changed a system file (a file-system
+    /// signal from uid 0) — evidence an unprivileged user cannot produce,
+    /// which locks COMBAT and allows isolation.
+    privileged: bool,
 }
 
 /// Bounded, in-memory record of recent escalation signals (ENGAGED-tier
@@ -96,12 +102,25 @@ impl CorroborationLedger {
     ///
     /// Caller must [`prune`](Self::prune) first.
     pub fn corroborated(&self, current: TriggerType, scope: Scope) -> bool {
+        self.corroborated_as(current, current.evidence_class(), scope)
+    }
+
+    /// [`Self::corroborated`] for `current` raised as evidence of `class`
+    /// (see `triggers::evidence_class`).
+    pub fn corroborated_as(
+        &self,
+        current: TriggerType,
+        class: EvidenceClass,
+        scope: Scope,
+    ) -> bool {
         // posture-ledger-scope-1: only same-scope entries count.
         let same_scope = self
             .entries
             .iter()
             .filter(|e| e.scope == scope && e.pending_writer.is_none());
-        if same_scope.clone().any(|e| e.trigger != current) {
+        // External audit POS-001 (NN-AUD-002): a different kind of
+        // evidence, not merely a different trigger of the same kind.
+        if same_scope.clone().any(|e| e.class != class) {
             return true;
         }
         SUSTAINED_SAME_TYPE_PROMOTES
@@ -112,22 +131,62 @@ impl CorroborationLedger {
     /// whose `target_level() >= Engaged` (ALERTED-tier recon/DNS is too
     /// noisy to count as corroboration).
     pub fn record(&mut self, trigger: TriggerType, at: Instant, scope: Scope) {
+        self.record_with(trigger, trigger.evidence_class(), at, scope, false);
+    }
+
+    /// [`Self::record`] as evidence of `class`, marking a privileged
+    /// signal (external audit POS-001: root changing a system file).
+    pub fn record_with(
+        &mut self,
+        trigger: TriggerType,
+        class: EvidenceClass,
+        at: Instant,
+        scope: Scope,
+        privileged: bool,
+    ) {
         self.entries.push_back(LedgerEntry {
             trigger,
+            class,
             at,
             scope,
             pending_writer: None,
+            privileged,
         });
     }
 
+    /// External audit POS-001: a privileged signal is on record in `scope`.
+    pub fn has_privileged(&self, scope: Scope) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.scope == scope && e.privileged && e.pending_writer.is_none())
+    }
+
+    /// External audit POS-001: when the newest signal was recorded (any
+    /// scope); `None` when the ledger is empty. An unlocked COMBAT decays
+    /// once this is a quiet window old.
+    pub fn newest(&self) -> Option<Instant> {
+        self.entries.iter().map(|e| e.at).max()
+    }
+
     /// Review 52: record a configuration change whose writer could not be
-    /// placed yet. See [`Self::resolve_pending`].
-    pub fn record_pending(&mut self, trigger: TriggerType, at: Instant, scope: Scope, writer: u32) {
+    /// placed yet. See [`Self::resolve_pending`]. `privileged` (external
+    /// audit POS-001) takes effect only once the writer is placed outside
+    /// an administrator's session.
+    pub fn record_pending(
+        &mut self,
+        trigger: TriggerType,
+        at: Instant,
+        scope: Scope,
+        writer: u32,
+        privileged: bool,
+    ) {
         self.entries.push_back(LedgerEntry {
+            class: trigger.evidence_class(),
             trigger,
             at,
             scope,
             pending_writer: Some(writer),
+            privileged,
         });
     }
 
@@ -188,7 +247,7 @@ mod tests {
     fn pending_writer_counts_only_once_placed_outside_an_admin_session() {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
-        l.record_pending(TriggerType::CriticalFileModification, now, None, 42);
+        l.record_pending(TriggerType::CriticalFileModification, now, None, 42, false);
         assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
         l.resolve_pending(|_| None);
         assert!(l.has_pending());
@@ -197,11 +256,17 @@ mod tests {
         assert!(l.is_empty(), "an admin change is dropped");
 
         // Placed outside an admin session, in the scope of its session.
-        l.record_pending(TriggerType::CriticalFileModification, now, None, 43);
+        // External audit POS-001: it corroborates evidence of another
+        // kind, and a root change counts as privileged only once placed.
+        l.record_pending(TriggerType::CriticalFileModification, now, None, 43, true);
+        assert!(!l.has_privileged(None), "not before it is placed");
         l.resolve_pending(|_| Some((false, Some(1000))));
         assert!(!l.has_pending());
-        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
-        assert!(l.corroborated(TriggerType::PersistenceMechanism, Some(1000)));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, Some(1000)));
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, Some(1000)));
+        assert!(l.has_privileged(Some(1000)));
+        assert!(!l.has_privileged(None));
     }
 
     #[test]
@@ -211,13 +276,33 @@ mod tests {
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 
+    /// External audit POS-001: a prior signal of another kind of evidence
+    /// corroborates.
     #[test]
-    fn distinct_prior_signal_corroborates() {
+    fn prior_signal_of_another_class_corroborates() {
+        let now = Instant::now();
+        let mut l = CorroborationLedger::new();
+        l.record(TriggerType::ConfirmedIntrusion, now, None);
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(l.corroborated(TriggerType::PersistenceMechanism, None));
+    }
+
+    /// External audit POS-001 (NN-AUD-002): two network patterns are one
+    /// kind of behaviour — an update's HTTPS burst, then three internal
+    /// SSH sessions — not two pieces of evidence; likewise two file-system
+    /// or two execution signals.
+    #[test]
+    fn same_class_pair_does_not_corroborate() {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
         l.record(TriggerType::LateralMovement, now, None);
-        // a DIFFERENT escalation signal is present → corroborated.
-        assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        let mut l = CorroborationLedger::new();
+        l.record(TriggerType::CriticalFileModification, now, None);
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
+        let mut l = CorroborationLedger::new();
+        l.record(TriggerType::ExploitAttempt, now, None);
+        assert!(!l.corroborated(TriggerType::ConfirmedIntrusion, None));
     }
 
     #[test]
@@ -260,11 +345,11 @@ mod tests {
     fn different_scopes_do_not_corroborate() {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::LateralMovement, now, Some(1000));
+        l.record(TriggerType::ConfirmedIntrusion, now, Some(1000));
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, Some(1001)));
         assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
         assert!(l.corroborated(TriggerType::ExfiltrationPattern, Some(1000)));
-        l.record(TriggerType::LateralMovement, now, None);
+        l.record(TriggerType::ConfirmedIntrusion, now, None);
         assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
     }
 }
