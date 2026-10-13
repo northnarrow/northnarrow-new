@@ -36,10 +36,12 @@ fi
 # window: open one with the lab key, SIGTERM the agent, and let the watchdog
 # bring it back (started by hand if it has not within 30 s).
 restart_agent() {
-    local nn_admin old new i
+    local nn_admin old new i key
     nn_admin=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
     old=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null)
-    sudo "$nn_admin" trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 120 >/dev/null 2>&1
+    # the lab key: /root/northnarrow-admin.key since external audit DEP-001
+    key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+    sudo "$nn_admin" trusted-installer-grant --key "$key" --window-secs 120 >/dev/null 2>&1
     sudo systemctl kill --signal=SIGTERM northnarrow-agent
     for i in $(seq 1 30); do
         sleep 1

@@ -287,8 +287,12 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
        && systemctl list-unit-files northnarrow-agent.service >/dev/null 2>&1; then
         sudo systemctl start northnarrow-agent 2>/dev/null && sleep 5
     fi
-    if systemctl is-active --quiet northnarrow-agent && sudo test -r /etc/northnarrow/admin.key; then
-        if ! sudo "$nn_admin" trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 300 >/tmp/nn-grant.log 2>&1; then
+    # External audit DEP-001: install.sh writes the bootstrap key to
+    # /root/northnarrow-admin.key; a guest installed before keeps it in
+    # /etc/northnarrow.
+    key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+    if systemctl is-active --quiet northnarrow-agent && [ -n "$key" ]; then
+        if ! sudo "$nn_admin" trusted-installer-grant --key "$key" --window-secs 300 >/tmp/nn-grant.log 2>&1; then
             echo "grant refused: $(tail -1 /tmp/nn-grant.log)"
         elif ! sudo grep -q "config-manage" /etc/northnarrow/admin.pub; then
             # Tappa 10.8: the lab key signs overlays too; the window lets
@@ -454,7 +458,8 @@ else
         echo "WARN: systemctl kill outside a trusted-installer window succeeded — PID-1 grant NOT enforced?"
     else
         echo "systemctl kill outside a window: refused — opening the window, then systemctl kill"
-        sudo "$nn_admin" trusted-installer-grant --key /etc/northnarrow/admin.key --window-secs 120 >/dev/null
+        key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+        sudo "$nn_admin" trusted-installer-grant --key "$key" --window-secs 120 >/dev/null
         sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service
     fi
 fi
@@ -934,6 +939,12 @@ cmd_upgrade_check() {
     vssh bash -s <<'REMOTE'
 set -e
 cd ~/northnarrow
+# External audit PROC-007: R009 sanctions a root exec from a home directory
+# only in an administrator's sudo session at a terminal (the lab drives the
+# guest without one, and the running agent killed install.sh/uninstall.sh):
+# script(1) gives sudo the pty an operator's shell would have (stdin from
+# /dev/null: script forwards its stdin, the rest of this heredoc).
+at_tty() { script -qec "$*" /dev/null < /dev/null; }
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
 pid_before=$(sudo cat /run/northnarrow/agent.pid)
@@ -941,12 +952,13 @@ audit_before=$(sudo wc -l < /etc/northnarrow/audit.log)
 fp_before=$(sudo sha256sum /etc/northnarrow/admin.pub /etc/northnarrow/agent.sig.key /etc/northnarrow/agent_id | sha256sum | cut -c1-16)
 echo "before: agent pid=$pid_before audit_lines=$audit_before identity=$fp_before"
 # Without --upgrade the script must refuse (units active) — exit 1, no change.
-if sudo ./deploy/install.sh >/tmp/nn-upgrade-refuse.log 2>&1; then
+if at_tty sudo ./deploy/install.sh >/tmp/nn-upgrade-refuse.log 2>&1; then
     echo "FAIL: install.sh without --upgrade succeeded while the units were active"; exit 1
 fi
 grep -q "Re-run with --upgrade" /tmp/nn-upgrade-refuse.log || { echo "FAIL: refusal message missing"; cat /tmp/nn-upgrade-refuse.log; exit 1; }
 echo "install.sh without --upgrade: refused as expected"
-sudo ./deploy/install.sh --upgrade --grant-key /etc/northnarrow/admin.key 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|window|PROTECTED|grant" | cut -c1-140
+key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+at_tty sudo ./deploy/install.sh --upgrade --grant-key "$key" 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|window|PROTECTED|grant" | cut -c1-140
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
 audit_after=$(sudo wc -l < /etc/northnarrow/audit.log)
@@ -975,13 +987,21 @@ cmd_uninstall_check() {
     vssh bash -s <<'REMOTE'
 set -e
 cd ~/northnarrow
+# External audit PROC-007: R009 sanctions a root exec from a home directory
+# only in an administrator's sudo session at a terminal (the lab drives the
+# guest without one, and the running agent killed install.sh/uninstall.sh):
+# script(1) gives sudo the pty an operator's shell would have (stdin from
+# /dev/null: script forwards its stdin, the rest of this heredoc).
+at_tty() { script -qec "$*" /dev/null < /dev/null; }
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
-sudo ./deploy/uninstall.sh --purge --yes --grant-key /etc/northnarrow/admin.key 2>&1 | grep -E "uninstall.sh:|FAIL" | cut -c1-140
+key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+at_tty sudo ./deploy/uninstall.sh --purge --yes --grant-key "$key" 2>&1 | grep -E "uninstall.sh:|FAIL" | cut -c1-140
 fail=0
 for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
          /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
-         /etc/systemd/journald@northnarrow.conf /etc/northnarrow /var/lib/northnarrow /run/northnarrow /sys/fs/bpf/northnarrow; do
+         /etc/systemd/journald@northnarrow.conf /etc/northnarrow /var/lib/northnarrow /run/northnarrow /sys/fs/bpf/northnarrow \
+         /root/northnarrow-admin.key; do
     if sudo test -e "$f"; then echo "FAIL: $f still present"; fail=1; fi
 done
 n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
@@ -994,6 +1014,10 @@ if pgrep -f "northnarrow-(agent|watchdog)" >/dev/null; then echo "FAIL: northnar
 (( fail == 0 )) && echo "uninstall-check: OK (host clean)"
 # Bring the guest back: fresh install (new keys — the purge removed them).
 sudo ./deploy/install.sh >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
+# External audit DEP-001: the bootstrap private key is written outside
+# /etc/northnarrow
+sudo test -s /root/northnarrow-admin.key || { echo "FAIL: no bootstrap key at /root/northnarrow-admin.key"; fail=1; }
+if sudo test -e /etc/northnarrow/admin.key; then echo "FAIL: a private key in /etc/northnarrow"; fail=1; fi
 sudo systemctl daemon-reload && sudo systemctl enable --now northnarrow-agent >/dev/null 2>&1 && sleep 3 && sudo systemctl enable --now northnarrow-watchdog >/dev/null 2>&1
 echo "reinstalled: agent=$(systemctl is-active northnarrow-agent) watchdog=$(systemctl is-active northnarrow-watchdog)"
 [[ "$(systemctl is-active northnarrow-agent)" == active ]] || fail=1

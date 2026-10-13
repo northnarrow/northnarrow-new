@@ -73,6 +73,12 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 # and every chain log are preserved — install.sh never touches them.
 UPGRADE=0
 GRANT_KEY=
+# External audit DEP-001: where a fresh install writes the private half of
+# the bootstrap admin key. Never under /etc/northnarrow or the state dir:
+# those are the product's own trees (backed up, kept in etckeeper, read by
+# tooling that would pick a key up from there), and the key must leave the
+# host anyway — the agent reports it for as long as it stays.
+ADMIN_KEY_OUT=/root/northnarrow-admin.key
 # Package maintainer scripts (deploy/release/mk-packages.sh) drive this
 # script in two halves around the package manager's own file copy:
 #   --package-stop       before unpack/removal: stop the units, drop the pin
@@ -91,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
         --grant-key) GRANT_KEY=$2; shift ;;
+        --admin-key-out) ADMIN_KEY_OUT=$2; shift ;;
         --package-stop) MODE=stop ;;
         --package-configure) MODE=configure ;;
         --tarball) TARBALL=$2; shift ;;
@@ -101,6 +108,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "usage: sudo $0 [--upgrade] [--tarball FILE] [--sums FILE] [--attestation BUNDLE] [--require-attestation] [--no-verify]"
             echo "  --upgrade              stop the running units, replace binaries/units/configs, restart them"
+            echo "  --grant-key KEY        admin key with the trusted-installer role (opens the window an upgrade needs)"
+            echo "  --admin-key-out PATH   fresh install: where to write the bootstrap admin PRIVATE key"
+            echo "                         (default /root/northnarrow-admin.key; never under $ETC_DIR) — move it offline"
             echo "  --tarball FILE         the release tarball this tree was extracted from (default: ../<tree>.tar.gz)"
             echo "  --sums FILE            SHA256SUMS of the release (default: next to the tarball)"
             echo "  --attestation BUNDLE   offline Sigstore bundle for the tarball (gh attestation download)"
@@ -114,14 +124,20 @@ done
 if [[ $MODE != full ]]; then
     # The package manager verified and placed the files; there is no tree
     # to verify and nothing to copy. The trusted-installer key comes from
-    # --grant-key, NN_GRANT_KEY, or the bootstrap key if it is still on
-    # the host (the operator is told to move it offline).
+    # --grant-key or NN_GRANT_KEY only, or the operator opens the window
+    # before the package command. External audit DEP-001: a bootstrap key
+    # left on the host is never picked up on its own — that made every
+    # package upgrade suspend the anti-tamper with whatever key root could
+    # read.
     VERIFY=0
     GRANT_KEY=${GRANT_KEY:-${NN_GRANT_KEY:-}}
-    if [[ -z "$GRANT_KEY" && -r /etc/northnarrow/admin.key ]]; then
-        GRANT_KEY=/etc/northnarrow/admin.key
-    fi
 fi
+case "$ADMIN_KEY_OUT" in
+    "$ETC_DIR"|"$ETC_DIR"/*|"$STATE_DIR"|"$STATE_DIR"/*|/etc/northnarrow/*|/var/lib/northnarrow/*)
+        echo "install.sh: --admin-key-out $ADMIN_KEY_OUT is inside NorthNarrow's own directories — refused" >&2
+        echo "install.sh: (external audit DEP-001): write the private key elsewhere and move it offline." >&2
+        exit 2 ;;
+esac
 # Beta Step 4c: nn-admin is the operator's COMBAT-release / admin tool.
 # It must be on-host so an operator can unlock COMBAT, and install.sh
 # uses it below to bootstrap admin.pub on a fresh install (issue #124).
@@ -746,13 +762,20 @@ fi
 # runs and still enters COMBAT on intrusion, but there is NO way to
 # release it short of a reboot. Generate one ONLY when admin.pub is
 # absent (never overwrite operator-managed keys). The private half is
-# written to the host and MUST be moved offline — see the warning.
+# written to $ADMIN_KEY_OUT (external audit DEP-001: not under
+# /etc/northnarrow) and MUST be moved offline — see the warning; the agent
+# and `nn-admin host-check` report it while it stays on the host.
 if [[ -f "$ETC_DIR/admin.pub" ]]; then
     echo "install.sh: $ETC_DIR/admin.pub already present — leaving admin keys untouched"
+elif [[ -e "$ADMIN_KEY_OUT" ]]; then
+    echo "install.sh: WARNING — $ADMIN_KEY_OUT already exists; not overwriting it, admin.pub was NOT created." >&2
+    echo "install.sh: COMBAT will be UNRECOVERABLE without an admin key. Pick another --admin-key-out, or:" >&2
+    echo "install.sh:   nn-admin init --priv-out <offline-path> --pub-append $ETC_DIR/admin.pub" >&2
 else
     echo "install.sh: no admin.pub found — bootstrapping an Ed25519 admin keypair (nn-admin init)"
-    if "$BIN_DIR/nn-admin" init --priv-out "$ETC_DIR/admin.key" --pub-append "$ETC_DIR/admin.pub"; then
-        chmod 0600 "$ETC_DIR/admin.key" 2>/dev/null || true
+    mkdir -p "$(dirname "$ADMIN_KEY_OUT")"
+    if (umask 077 && "$BIN_DIR/nn-admin" init --priv-out "$ADMIN_KEY_OUT" --pub-append "$ETC_DIR/admin.pub"); then
+        chmod 0600 "$ADMIN_KEY_OUT" 2>/dev/null || true
         # Explicit role list: the defaults (unlock, audit-read) plus
         # trusted-installer, which `install.sh --upgrade --grant-key` and
         # `uninstall.sh --grant-key` need to purge the protected pin root.
@@ -760,17 +783,19 @@ else
         echo ""
         echo "  ##########################################################################"
         echo "  #  SECURITY — an admin PRIVATE key was just written to this host:         #"
-        echo "  #      $ETC_DIR/admin.key  (mode 0600)"
+        echo "  #      $ADMIN_KEY_OUT  (mode 0600)"
         echo "  #                                                                        #"
         echo "  #  This key RELEASES COMBAT isolation. Anyone holding it — or with root   #"
         echo "  #  on THIS host — can unlock the host. MOVE IT OFF THIS HOST NOW and      #"
         echo "  #  store it offline, e.g.:                                                #"
-        echo "  #      mv $ETC_DIR/admin.key  <secure-offline-location>"
+        echo "  #      mv $ADMIN_KEY_OUT  <secure-offline-location>"
         echo "  #  Keep ONLY the public half ($ETC_DIR/admin.pub) on the host.            #"
         echo "  #  Roles: unlock, audit-read, trusted-installer (what --upgrade and       #"
         echo "  #  uninstall.sh --grant-key use to purge the protected pin root) and      #"
         echo "  #  config-manage (signs *.local overlays). canary-manage / fim-manage /  #"
         echo "  #  force-posture need a role list on its admin.pub line.                  #"
+        echo "  #  Until it is gone the agent records it (integrity_drift, signed) and    #"
+        echo "  #  nn-admin host-check reports WARN admin_key.                            #"
         echo "  #  Recovery procedure: docs/operator/COMBAT_RECOVERY.md (section 1.1)    #"
         echo "  ##########################################################################"
         echo ""
@@ -994,14 +1019,14 @@ echo "  1. Verify the install layout:"
 echo "       systemctl status northnarrow-agent.service"
 echo "       systemctl status northnarrow-watchdog.service"
 echo ""
-echo "  2. Confirm /etc/northnarrow/ has admin.pub + admin.key +"
+echo "  2. Confirm /etc/northnarrow/ has admin.pub +"
 echo "     combat-rules.v4 + combat-rules.v6 + combat-allow.cidrs + agent_id +"
 echo "     fim-paths.v1 + canary-templates/ +"
 echo "     netflow-blocklist.v1 + netflow-ja3-blocklist.v1 +"
 echo "     process-comm-allowlist.v1 + netflow-comm-allowlist.v1 (the"
-echo "     agent bootstraps agent_id on first start; admin.pub + admin.key"
-echo "     were auto-generated above IF admin.pub was absent — MOVE"
-echo "     admin.key OFFLINE now (see docs/operator/COMBAT_RECOVERY.md);"
+echo "     agent bootstraps agent_id on first start; admin.pub and the"
+echo "     private key $ADMIN_KEY_OUT were auto-generated above IF admin.pub"
+echo "     was absent — MOVE that key OFFLINE now (docs/operator/COMBAT_RECOVERY.md);"
 echo "     combat-rules.v4 + .v6 are operator-provided (configs/ has both;"
 echo "     v6 preserves NDP — see its header); combat-allow.cidrs +"
 echo "     fim-paths.v1 + canary-templates/ + netflow-{,ja3-}blocklist.v1 +"

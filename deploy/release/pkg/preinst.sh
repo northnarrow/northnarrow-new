@@ -4,9 +4,11 @@
 # its binaries, units and pin root with LSM hooks, so the package manager could
 # not replace them. Stop it the way install.sh --upgrade does: trusted-installer
 # window, watchdog then agent, drop /sys/fs/bpf/northnarrow, wait for the hooks
-# to detach. The window needs a key with the trusted-installer role: NN_GRANT_KEY,
-# or /etc/northnarrow/admin.key while it is still on the host. Without it the
-# operation stops here, before any file changes, and the old version keeps running.
+# to detach. The window needs a key with the trusted-installer role, given in
+# NN_GRANT_KEY, or a window the operator opened before the package command (a
+# key left on the host is never used on its own: external audit DEP-001).
+# Without it the operation stops here, before any file changes, and the old
+# version keeps running.
 set -e
 case "${1:-}" in
     install|upgrade|1|2) ;;

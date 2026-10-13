@@ -13,7 +13,9 @@
 //! these against what it saw at boot and against what the install laid
 //! down, and every new finding is an ERROR in the journal and a signed
 //! audit entry (`integrity_drift`, `kind` + `detail`), once per finding.
-//! Weakening environment variables are reported once at boot.
+//! Weakening environment variables are reported once at boot. An admin
+//! private key left on the host (external audit DEP-001) is reported the
+//! same way: it is a credential for whoever is root here.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -493,6 +495,28 @@ impl Checker {
             }
             let _ = std::fs::remove_file(rejected);
         }
+        // External audit DEP-001: an admin private key on the host (the
+        // bootstrap key install.sh writes, until the operator moves it
+        // offline) is a credential for whoever is root here. Seen through
+        // PID 1's mount namespace when it can be reached (the unit's own
+        // view of /root is read-only, not hidden, so either works).
+        let root = if std::fs::metadata("/proc/1/root/").is_ok() {
+            Path::new("/proc/1/root")
+        } else {
+            Path::new("/")
+        };
+        for path in crate::host_hardening::admin_keys_on_host(root) {
+            self.report(
+                Finding {
+                    kind: "admin_key_on_host",
+                    detail: format!(
+                        "{path}: an admin private key on this host lets root release COMBAT, \
+                         open trusted-installer windows and sign overlays — move it offline"
+                    ),
+                },
+                at_boot,
+            );
+        }
         let now = limits(&self.watchdog_pidfile);
         if at_boot {
             self.baseline = now;
@@ -546,7 +570,7 @@ pub fn spawn(
     info!(
         every_secs = BASE_SECS,
         jitter_pct = 20,
-        "self-integrity check armed (unit drop-ins, set-property limits, oom_score_adj, mounts)"
+        "self-integrity check armed (unit drop-ins, set-property limits, oom_score_adj, mounts, admin keys on the host)"
     );
     tokio::spawn(async move {
         // the watchdog registers a few seconds after the agent
