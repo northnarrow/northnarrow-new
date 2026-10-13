@@ -140,7 +140,7 @@ pub fn armed() -> bool {
 }
 
 #[inline(always)]
-unsafe fn read_ptr(p: *const u8) -> *const u8 {
+pub(crate) unsafe fn read_ptr(p: *const u8) -> *const u8 {
     match bpf_probe_read_kernel::<*const u8>(p as *const *const u8) {
         Ok(v) => v,
         Err(_) => core::ptr::null(),
@@ -179,7 +179,7 @@ unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
 /// ino 0 when unreadable — a plain value, never an `Option` across the
 /// inlined calls (5.15 rule 3).
 #[inline(always)]
-unsafe fn key_of(inode: *const u8) -> InodeKey {
+pub(crate) unsafe fn key_of(inode: *const u8) -> InodeKey {
     let mut key = InodeKey { dev: 0, ino: 0 };
     if inode.is_null() {
         return key;

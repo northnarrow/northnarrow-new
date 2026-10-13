@@ -284,7 +284,7 @@ impl SensorMultiplexer {
             spawn_tcp_connect_pump(tcp_connect_rb, flow_tracker_for_tcp, tx.clone()),
             spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
             spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
-            spawn_pump::<ModuleLoadRaw>("module_load", module_load_rb, tx.clone()),
+            spawn_module_load_pump(module_load_rb, tx.clone()),
             spawn_pump::<IoUringRaw>("io_uring", iouring_rb, tx.clone()),
             spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
         ];
@@ -544,6 +544,54 @@ where
     T: Pod,
     for<'a> Event: From<&'a T>,
 {
+    pump_with(label, rb, tx, |_, e| e).await
+}
+
+/// External audit PROC-005: module loads, their path made absolute — the
+/// kernel's walk stops at the root of the `.ko`'s filesystem, which is put
+/// back on its mount point ([`module_path_on_host`]).
+fn spawn_module_load_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut mounts = crate::sensors::open_sensor::MountTable::load();
+        let place = move |raw: &ModuleLoadRaw, mut e: Event| {
+            if let Event::ModuleLoad { path: Some(p), .. } = &mut e {
+                if raw.path_truncated == 0 {
+                    *p = module_path_on_host(&mut mounts, (raw.root_dev, raw.root_ino), p);
+                }
+            }
+            e
+        };
+        if let Err(e) = pump_with("module_load", rb, tx, place).await {
+            error!(label = "module_load", error = %e, "ringbuf pump failed");
+        }
+    })
+}
+
+/// A module path relative to its filesystem's root, on the host: under the
+/// root's mount point, or — a filesystem no mount of this namespace shows
+/// (another namespace's, unmounted since) — under a marker that is no
+/// module directory, so the load is judged as one from an unknown place.
+pub(crate) fn module_path_on_host(
+    mounts: &mut crate::sensors::open_sensor::MountTable,
+    root: (u64, u64),
+    rel: &str,
+) -> String {
+    match mounts.absolute(root, rel) {
+        Some(p) => p,
+        None => format!("/(unplaced filesystem {}:{}){rel}", root.0, root.1),
+    }
+}
+
+async fn pump_with<T>(
+    label: &'static str,
+    rb: RingBuf<MapData>,
+    tx: mpsc::Sender<Event>,
+    mut after: impl FnMut(&T, Event) -> Event,
+) -> std::io::Result<()>
+where
+    T: Pod,
+    for<'a> Event: From<&'a T>,
+{
     let mut async_fd = AsyncFd::new(rb)?;
     let mut reject = RejectThrottle::new();
     loop {
@@ -555,7 +603,7 @@ where
             let bytes: &[u8] = item.as_ref();
             match bytemuck::try_from_bytes::<T>(bytes) {
                 Ok(raw) => {
-                    if tx.send(Event::from(raw)).await.is_err() {
+                    if tx.send(after(raw, Event::from(raw))).await.is_err() {
                         return Ok(());
                     }
                 }
@@ -771,5 +819,31 @@ async fn pump_dns_query(
             reject.flush_idle("dns_query", std::mem::size_of::<DnsQueryRaw>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod module_path_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// External audit PROC-005: a module path is put on its filesystem's
+    /// mount point; a filesystem no mount shows is no module directory.
+    #[test]
+    fn a_module_path_is_put_on_its_mount_point() {
+        let mut mounts = crate::sensors::open_sensor::MountTable::load();
+        let m = std::fs::metadata("/").unwrap();
+        let root = (
+            crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
+            m.ino(),
+        );
+        assert_eq!(
+            module_path_on_host(&mut mounts, root, "/lib/modules/6.8/kernel/x.ko"),
+            "/lib/modules/6.8/kernel/x.ko"
+        );
+        assert_eq!(
+            module_path_on_host(&mut mounts, (999_999, 7), "/lib/modules/6.8/kernel/x.ko"),
+            "/(unplaced filesystem 999999:7)/lib/modules/6.8/kernel/x.ko"
+        );
     }
 }

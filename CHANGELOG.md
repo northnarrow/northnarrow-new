@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 1, kernel module loads (High PROC-005): a module file
+  under /lib/modules that no package installed and DKMS did not build is no
+  longer "standard": loaded by an unexpected loader it is killed like one
+  from /tmp. A module on another mount is placed on its mount point (it
+  could pass for /lib/modules), and a path component that is not UTF-8 no
+  longer disappears.
 - External audit, Wave 1, the tracepoint fallback (High POS-004): when the
   file-open sensor runs on the `openat` tracepoint, an open's path is the
   caller's own string, read before any permission check. A refused open of

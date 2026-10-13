@@ -1496,8 +1496,9 @@ fn monotonic_ns() -> u64 {
 }
 
 /// Run the drain's synchronous work (hashing, the drift log, `/proc`
-/// reads) where it does not hold up the runtime's other tasks.
-fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
+/// reads) where it does not hold up the runtime's other tasks. Also R018's
+/// package-database lookups.
+pub(crate) fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)

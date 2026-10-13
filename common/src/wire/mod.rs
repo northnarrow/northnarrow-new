@@ -774,7 +774,7 @@ pub const MODULE_PATH_UNREADABLE: u8 = 2;
 /// R011 (tool exec) both miss.
 ///
 /// Field order chosen for natural u64 alignment with no implicit
-/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 1 + 3 + 512 = 568 (8-aligned).
+/// padding: 8 + 4 + 4 + 16 + 16 + 1 + 1 + 2 + 1 + 3 + 512 + 8 + 8 = 584 (8-aligned).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -803,6 +803,13 @@ pub struct ModuleLoadRaw {
     pub _pad: [u8; 3],
     /// Source `.ko` path for a finit_module load (stage 1b); zeroed otherwise.
     pub path: [u8; MODULE_PATH_LEN],
+    /// External audit PROC-005: the inode key of the filesystem root the
+    /// walk reached (`path_truncated == 0`), which userland maps to its
+    /// mount point: `path` is relative to that filesystem, so a `.ko` on a
+    /// mount whose own tree reads `lib/modules/…` looked standard. Zero
+    /// when the root was not reached.
+    pub root_dev: u64,
+    pub root_ino: u64,
 }
 
 impl ModuleLoadRaw {
@@ -819,6 +826,8 @@ impl ModuleLoadRaw {
             path_truncated: 0,
             _pad: [0u8; 3],
             path: [0u8; MODULE_PATH_LEN],
+            root_dev: 0,
+            root_ino: 0,
         }
     }
 }

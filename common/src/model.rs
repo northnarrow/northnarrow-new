@@ -665,16 +665,17 @@ fn reconstruct_module_path(
 ) -> Option<String> {
     const SLOT: usize = 32;
     let n = slots.min(crate::wire::MODULE_PATH_LEN / SLOT);
-    let mut comps: Vec<&str> = Vec::with_capacity(n);
+    let mut comps: Vec<String> = Vec::with_capacity(n);
     for i in 0..n {
         let s = &path[i * SLOT..i * SLOT + SLOT];
         let end = s.iter().position(|&b| b == 0).unwrap_or(SLOT);
         if end == 0 {
             continue;
         }
-        if let Ok(c) = core::str::from_utf8(&s[..end]) {
-            comps.push(c);
-        }
+        // External audit PROC-005: a component that is not UTF-8 was
+        // dropped, and `<bytes>/lib/modules/…` collapsed into a standard
+        // path. It is kept, lossily, and the path is no module directory.
+        comps.push(String::from_utf8_lossy(&s[..end]).into_owned());
     }
     if comps.is_empty() {
         return None;

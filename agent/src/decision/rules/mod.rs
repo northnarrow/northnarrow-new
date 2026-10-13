@@ -15,6 +15,7 @@ pub mod bpf;
 pub mod canary;
 pub mod chain;
 pub mod iouring;
+pub(crate) mod module_provenance;
 pub mod net;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;

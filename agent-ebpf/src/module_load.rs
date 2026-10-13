@@ -52,7 +52,7 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_PATH_OFFSET, PATH_DENTRY_OFFSET,
+    DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_PATH_OFFSET, PATH_DENTRY_OFFSET,
     PF_KTHREAD, QSTR_NAME_OFFSET, TASK_STRUCT_COMM_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
     TASK_STRUCT_REAL_PARENT_OFFSET,
 };
@@ -169,9 +169,18 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
             (file as *const u8).add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const *const u8;
         if let Ok(leaf) = bpf_probe_read_kernel::<*const u8>(dentry_slot) {
             if !leaf.is_null() {
-                let (n, truncated) = walk_components(leaf, (*raw).path.as_mut_ptr());
+                let (n, truncated, top) = walk_components(leaf, (*raw).path.as_mut_ptr());
                 (*raw).path_len = n as u16;
                 (*raw).path_truncated = truncated;
+                // External audit PROC-005: the filesystem root the walk
+                // reached, which userland maps to its mount point.
+                if !top.is_null() {
+                    let root = crate::open_sensor::key_of(crate::open_sensor::read_ptr(
+                        top.add(off!(DENTRY_D_INODE_OFFSET)),
+                    ));
+                    (*raw).root_dev = root.dev;
+                    (*raw).root_ino = root.ino;
+                }
             }
         }
     }
@@ -189,10 +198,11 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
 /// a read failed (prefix unknown). Fails SAFE — a failed probe stops the
 /// walk (short/empty path, never garbage).
 #[inline(always)]
-unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8) {
+unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8, *const u8) {
     let mut dentry = leaf;
     let mut n: usize = 0;
     let mut reached_root = false;
+    let mut top: *const u8 = core::ptr::null();
     let mut failed = false;
     for i in 0..MODULE_PATH_SLOTS {
         if dentry.is_null() {
@@ -238,6 +248,7 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8) {
             Ok(p) if !p.is_null() && p != dentry => dentry = p,
             Ok(p) if p == dentry => {
                 reached_root = true;
+                top = dentry;
                 break;
             }
             _ => {
@@ -257,7 +268,7 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8) {
     } else {
         MODULE_PATH_TOO_DEEP
     };
-    (n, code)
+    (n, code, if failed { core::ptr::null() } else { top })
 }
 
 /// Read the loader's real-parent `comm` + `PF_KTHREAD` flag into `raw`.
