@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    maps::{HashMap as AyaHashMap, Map as AyaMap, MapData},
+    maps::{Array as AyaArray, HashMap as AyaHashMap, Map as AyaMap, MapData},
     programs::{
         links::{FdLink, PinnedLink},
         Lsm,
@@ -68,6 +68,33 @@ use tracing::{info, warn};
 /// via `EbpfLoader::map_pin_path`, and the watchdog opens it by
 /// joining this name onto the bpffs root.
 pub const PROTECTED_PIDS_MAP_NAME: &str = "PROTECTED_PIDS";
+
+/// External audit EBPF-002: name of the pinned `ROLE_TGIDS` map (mirrors
+/// `agent-ebpf/src/bpf_defense.rs`): the tgid of the live watchdog (slot
+/// [`ROLE_SLOT_WATCHDOG`]) and agent (slot [`ROLE_SLOT_AGENT`]). While a
+/// slot holds a live tgid, a fresh process running that binary takes no
+/// write handle on the agent's maps until it is a protected pid.
+pub const ROLE_TGIDS_MAP_NAME: &str = "ROLE_TGIDS";
+pub const ROLE_SLOT_WATCHDOG: u32 = 0;
+pub const ROLE_SLOT_AGENT: u32 = 1;
+
+/// Write `tgid` into slot `slot` of the pinned `ROLE_TGIDS` map at
+/// `<bpffs_root>/ROLE_TGIDS`. The caller must already be a protected pid
+/// (the map guard denies anyone else a write handle).
+pub fn claim_role(bpffs_root: &Path, slot: u32, tgid: u32) -> Result<()> {
+    let pin_path = bpffs_root.join(ROLE_TGIDS_MAP_NAME);
+    let map_data = MapData::from_pin(&pin_path).with_context(|| {
+        format!(
+            "opening pinned {ROLE_TGIDS_MAP_NAME} at {}",
+            pin_path.display()
+        )
+    })?;
+    let mut arr: AyaArray<MapData, u32> = AyaArray::try_from(AyaMap::Array(map_data))
+        .with_context(|| format!("{ROLE_TGIDS_MAP_NAME} is not an Array<u32>"))?;
+    arr.set(slot, tgid, 0)
+        .with_context(|| format!("setting {ROLE_TGIDS_MAP_NAME}[{slot}] = {tgid}"))?;
+    Ok(())
+}
 
 /// BUG-011 (PHASE 15.1): name of the pinned `PROTECTED_OBSERVERS`
 /// map (mirrors the `#[map]` declaration in

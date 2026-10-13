@@ -64,7 +64,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-012 | ATP-002 | Anti-tamper | M | fixed (lab PR 89) |
 | NN-AUD-013 | ATP-004 | Anti-tamper | M | fixed (lab PR 93) |
 | NN-AUD-014 | EBPF-001 | eBPF kernel | M | fixed (lab PR 94) |
-| NN-AUD-015 | EBPF-002 | eBPF kernel | M | open |
+| NN-AUD-015 | EBPF-002 | eBPF kernel | M | fixed (lab PR 95) |
 | NN-AUD-017 | EBPF-006 | eBPF kernel | M | open |
 | NN-AUD-019 | EBPF-010 | eBPF kernel | M | open |
 | NN-AUD-020 | EVD-001 | Evidence logs | L | open |
@@ -553,7 +553,7 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     drains the channel after every respawn or hold.
   - Not covered: a root process running the genuine agent or watchdog
     binary under `LD_PRELOAD` is that binary by executable — the class of
-    NN-AUD-015 (EBPF-002), still open. A pidfile overwritten at the
+    NN-AUD-015 (EBPF-002), closed in lab PR 95 (below). A pidfile overwritten at the
     moment the watchdog starts leaves the agent unsupervised until it is
     fixed (refused, never trusted); systemd's `MainPID` is a possible
     second source.
@@ -794,3 +794,68 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
     whole (C01–C33, with the new C31 `systemctl kill -s SIGKILL`, C32
     `systemctl kill -s SIGSTOP` of the watchdog, C33 `systemctl stop`), and
     `respawn-check` takes the window path.
+- **NN-AUD-015 (EBPF-002), lab PR 95.** The BPF self-defence exempted any
+  process whose executable was one of the agent's binaries (agent, watchdog,
+  `nn-admin`, by inode) from both halves: write handles on the agent's maps
+  and handles to its links. The executable is not the code that runs: root
+  could start `nn-admin`, or a second agent or watchdog, with `LD_PRELOAD`
+  (or `ptrace` it before it registered) and take `PROTECTED_PIDS`,
+  `KILL_GRANT` or the mode map, or detach every LSM hook.
+  - What the exemption was for stays: the successor of an agent or a
+    watchdog that exited must open the pinned maps before it is a protected
+    pid (the dead agent's guard is still attached through its pinned link).
+    `OWN_EXE_INODES` now carries a role (1 watchdog, 2 agent; `nn-admin` is
+    gone — it talks to the agent over its socket). `ROLE_TGIDS` (pinned)
+    holds the live watchdog's and agent's tgid; each claims its slot once it
+    is a protected pid (the agent also records the watchdog it verifies),
+    and `role_exit`, a raw tracepoint on `sched_process_exit` with a pinned
+    link (`link_role_exit`), empties the slot when that process's main
+    thread exits. A process running one of the two binaries takes write
+    handles only while its role is vacant, from its main thread (a thread's
+    `start_time` is its own: a process could keep the window open by
+    spawning threads), in its first minute. No binary is exempt from the
+    link deny, and `ptrace_access_check` refuses a process running either
+    binary before it registers, so a fresh successor cannot be injected
+    into.
+  - The audit's diff (a 10-s window for the watchdog binary, at any time)
+    would have let a preloaded watchdog started beside the live one take
+    the maps in its first 10 s; the vacancy check closes that.
+  - One watchdog at a time: while the registered watchdog still runs the
+    watchdog binary, the agent does not protect another pid the pidfile
+    names (a rewritten pidfile would have handed a preloaded watchdog the
+    agent's maps through `PROTECTED_PIDS`).
+  - Found in the lab: with the liveness watch on a transient link, a clean
+    agent exit released the link before the process ended, the slot stayed
+    taken, and the respawned agent was refused its own pinned maps (aya
+    then failed with EEXIST pinning a fresh copy): the agent did not come
+    back. The link is pinned since. A failure to record the agent's role is
+    logged and leaves the window bounded by age only; it no longer aborts
+    the registration of the agent's objects (that left the guard in observe
+    mode).
+  - Residual: while a role is vacant — at boot, between the agent's start
+    and the watchdog's registration, and in the respawn gap after a crash —
+    a root process already running could start a preloaded binary of that
+    role. Trust model, "EBPF-002".
+  - Lab procedure: a trusted-installer window suspends the filesystem deny
+    hooks by design, and one left open by an earlier watchdog-only restart
+    made the anti-tamper suite's C04–C07 pass (C04 corrupted `admin.pub`,
+    which then disabled the admin socket — correctly — and C07 purged the
+    pins). The suite now waits for an open window to close before it starts,
+    and its own watchdog restart (C38) takes a 20-s window. C30 (bpftool
+    count of PROTECTED_INODES) is skipped in enforce mode, where bpftool
+    cannot open the map and the count read 0 → 0.
+  - Lab. Before (Ubuntu 22.04, the #265 build, guard in enforce):
+    `nn-admin`, `northnarrow-agent` and `northnarrow-watchdog` started with a
+    preloaded library each got a write handle on `PROTECTED_PIDS` and a
+    handle on `link_task_kill`. After, on 22.04 (5.15) and 24.04 (6.8): all
+    six refused (`ANTI-TAMPER DENIAL op=bpf_map` / `op=bpf_link`,
+    NN-L-AT-001); the agent restarted in a window came back and registered
+    (22.04: 2350 → 2745; 24.04: 6324 → 6738), so did the watchdog (2269 →
+    2935; 6255 → 6924), and the role slots followed both; a cold boot
+    attached the watch and filled both slots (`previous_run: clean`, the
+    stop recorded as `system_shutdown`). Anti-tamper suite C01–C38 OK with
+    the guard in enforce (22.04), with the new C34 (ptrace of a fresh agent
+    binary), C35–C37 (`nn-admin` / a second agent / a second watchdog,
+    preloaded) and C38 (a watchdog restarted in a window registers itself);
+    `respawn-check` OK; privileged gate (`test-ignored`, 24.04): 27 suites,
+    63 passed, 0 failed.

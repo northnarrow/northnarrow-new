@@ -24,6 +24,7 @@ three legitimate principals:
 | systemd | SIGTERM the agent for `systemctl restart` (since EBPF-001: inside a signed trusted-installer window only) | `task_kill` LSM |
 | watchdog | read `/proc/<agent>/exe` to reconstruct argv | `ptrace_access_check` LSM |
 | operator | issue first `rotate-keys add` on a single-key install | 2-of-N quorum bootstrap |
+| a restarted agent or watchdog | open the agent's pinned maps before it is a protected pid (since EBPF-002: only while its role is vacant) | `bpf_map` LSM (BPF self-defence) |
 
 The fix is **not** "weaken the LSM hook." The fix is **add explicit
 trust-anchored carve-outs** that an attacker with root cannot self-grant.
@@ -335,6 +336,48 @@ path, which works once the operator has minted the second key — i.e.
 post-bootstrap. The bootstrap window itself is short enough that
 `sudo systemctl stop` inside a trusted-installer window is the canonical
 in-bootstrap stop path.)
+
+## EBPF-002 — `ROLE_TGIDS`: the legitimate successor
+
+**Goal.** An agent (or watchdog) that replaces one that exited opens the
+pinned maps it shares with its predecessor before it is a protected pid —
+the guard of the dead agent is still attached through its pinned link — and
+nothing else gets the same right.
+
+**What it replaced.** The guard exempted every process whose executable was
+one of the agent's binaries (agent, watchdog, `nn-admin`), by inode, from
+both halves of the BPF self-defence. The executable is not the code that
+runs: root could start `nn-admin`, or a second agent or watchdog, with
+`LD_PRELOAD` (or `ptrace` it before it registered) and take
+`PROTECTED_PIDS`, `KILL_GRANT` or the mode map, or detach every LSM hook.
+
+### Authentication
+
+- **Principal:** the process that runs the agent's or the watchdog's binary
+  (`OWN_EXE_INODES`, now valued by role: 1 watchdog, 2 agent; `nn-admin` is
+  not registered — it talks to the agent over its socket).
+- **Mechanism:** the role is vacant. `ROLE_TGIDS` (pinned, two slots) holds
+  the tgid of the live watchdog and agent; each records itself once it is a
+  protected pid (the agent also records the watchdog it verifies), and
+  `role_exit` — a raw tracepoint on `sched_process_exit` whose link is
+  pinned (`link_role_exit`), so it outlives the agent that attached it —
+  empties the slot when that process's main thread exits. A second
+  instance started beside the live one, preloaded or not, gets nothing.
+- **Scope:** write handles on the agent's maps only (never a link handle),
+  from the process's main thread (a thread's `start_time` is its own: a
+  process could keep a window open by spawning threads), during the first
+  minute after the process started. `ptrace_access_check` refuses access to
+  a process running either binary before it registers, so a fresh successor
+  cannot be injected into.
+
+### Residual
+
+While a role is vacant — at boot, between the agent's start and the
+watchdog's registration, and in the respawn gap after a crash — a root
+process already running could start a preloaded binary of that role. It
+needs root present at that moment; the same gap exists wherever a defender
+restarts. If the liveness watch cannot be attached (logged as an ERROR),
+the slots are never claimed and the window is bounded by age only.
 
 ## Implementation surface summary
 

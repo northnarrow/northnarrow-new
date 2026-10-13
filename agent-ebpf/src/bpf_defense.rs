@@ -33,9 +33,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
-    macros::{lsm, map},
+    macros::{lsm, map, raw_tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf, PerCpuArray},
-    programs::LsmContext,
+    programs::{LsmContext, RawTracePointContext},
 };
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::{
@@ -46,6 +46,7 @@ use northnarrow_common::wire::{
 use crate::btf_offsets::{
     BPF_MAP_ID_OFFSET, FILE_F_INODE_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
     MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, TASK_STRUCT_MM_OFFSET,
+    TASK_STRUCT_START_TIME_OFFSET,
 };
 use northnarrow_common::wire::InodeKey;
 
@@ -119,13 +120,31 @@ pub fn own_key(kind: u8, id: u32) -> u64 {
 #[map]
 pub static BPF_DEFENSE_MODE: Array<u32> = Array::with_max_entries(1, 0);
 
-/// `(dev, ino)` of the agent's own binaries (agent, watchdog, nn-admin),
-/// registered by userland at boot. A caller running one of them is exempt
-/// from the map guard even before it is a protected pid: the watchdog
-/// registers itself in PROTECTED_PIDS right after start, and the binaries
-/// are inode-protected so a copy elsewhere has another inode.
+/// `(dev, ino)` of the agent's own binaries, registered by userland at
+/// boot, valued by role ([`ROLE_WATCHDOG`], [`ROLE_AGENT`]). External audit
+/// EBPF-002: running one of them is no longer an exemption by itself —
+/// root can start either binary with `LD_PRELOAD` or under `ptrace` and run
+/// its own code inside. See [`fresh_instance_may_load`]. `nn-admin` is not
+/// registered: it talks to the agent through its socket.
 #[map]
 pub static OWN_EXE_INODES: HashMap<InodeKey, u8> = HashMap::with_max_entries(8, 0);
+
+/// Roles in [`OWN_EXE_INODES`] and slots of [`ROLE_TGIDS`] (slot = role - 1).
+pub const ROLE_WATCHDOG: u8 = 1;
+pub const ROLE_AGENT: u8 = 2;
+
+/// External audit EBPF-002: the tgid of the live watchdog (slot 0) and
+/// agent (slot 1), written by each once it is a protected pid, zeroed by
+/// [`role_exit`] when that process exits. Pinned by name: the guard of an
+/// agent that died is still attached (pinned link) when its successor
+/// loads, and reads this to know the role is vacant.
+#[map]
+pub static ROLE_TGIDS: Array<u32> = Array::pinned(2, 0);
+
+/// How long after its start a fresh agent or watchdog may take write
+/// handles before it is a protected pid (the agent registers itself in
+/// well under a second; generous for a loaded host).
+const FRESH_INSTANCE_NS: u64 = 60_000_000_000;
 
 /// `bpf()` observations to userland.
 #[map]
@@ -295,7 +314,24 @@ unsafe fn obj_get_names_own_link(attr: *const c_void) -> bool {
 /// `(dev, ino)` of the calling task's executable (`mm->exe_file`).
 #[inline(always)]
 pub(crate) unsafe fn caller_exe_key() -> Option<InodeKey> {
-    let task = bpf_get_current_task() as *const u8;
+    task_exe_key(bpf_get_current_task() as *const u8)
+}
+
+/// External audit EBPF-002: `task` runs the agent's or the watchdog's
+/// binary — protected from `ptrace` before it is a protected pid, so a
+/// freshly started instance cannot be injected into.
+#[inline(always)]
+pub(crate) unsafe fn task_runs_own_binary(task: *const u8) -> bool {
+    match task_exe_key(task) {
+        Some(k) => OWN_EXE_INODES.get(&k).is_some(),
+        None => false,
+    }
+}
+
+/// `(dev, ino)` of `task`'s executable (`mm->exe_file`); `None` for a
+/// kernel thread (no `mm`).
+#[inline(always)]
+unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
     if task.is_null() {
         return None;
     }
@@ -324,12 +360,78 @@ pub(crate) unsafe fn caller_exe_key() -> Option<InodeKey> {
     })
 }
 
+/// Role of the calling task's executable (0: not one of ours).
 #[inline(always)]
-fn caller_exe_is_own() -> bool {
+fn caller_role() -> u8 {
     match unsafe { caller_exe_key() } {
-        Some(k) => unsafe { OWN_EXE_INODES.get(&k).is_some() },
-        None => false,
+        Some(k) => unsafe { OWN_EXE_INODES.get(&k).copied().unwrap_or(0) },
+        None => 0,
     }
+}
+
+/// External audit EBPF-002: a process that runs the agent's (or the
+/// watchdog's) binary may take write handles on the agent's maps before
+/// it is a protected pid only while no live process holds that role —
+/// the successor of one that exited, which must open the pinned maps to
+/// register itself — and only in its first minute. A second instance
+/// started beside the live one, `LD_PRELOAD` or not, gets nothing.
+///
+/// Only the main thread qualifies (both binaries open the pinned maps
+/// there before they register): its `start_time` is the process's, while
+/// a thread created later is always "fresh" and would keep the window
+/// open for as long as the process cares to spawn threads.
+#[inline(always)]
+fn fresh_instance_may_load() -> bool {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    if (pid_tgid >> 32) as u32 != pid_tgid as u32 {
+        return false;
+    }
+    let role = caller_role();
+    if role != ROLE_AGENT && role != ROLE_WATCHDOG {
+        return false;
+    }
+    let vacant = match ROLE_TGIDS.get((role - 1) as u32) {
+        Some(t) => *t == 0,
+        None => false,
+    };
+    if !vacant {
+        return false;
+    }
+    let task = unsafe { bpf_get_current_task() } as *const u8;
+    if task.is_null() {
+        return false;
+    }
+    let start = match unsafe {
+        bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const u64)
+    } {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    unsafe { bpf_ktime_get_ns() }.saturating_sub(start) < FRESH_INSTANCE_NS
+}
+
+/// `sched_process_exit` (raw tracepoint): when the group leader of the
+/// live agent or watchdog exits, its role is vacant ([`ROLE_TGIDS`]). The
+/// link is pinned by userland, so it keeps firing after the agent that
+/// attached it has released its own objects (a clean exit drops them
+/// before the process ends) or died.
+#[raw_tracepoint(tracepoint = "sched_process_exit")]
+pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    if tgid != pid_tgid as u32 {
+        return 0; // a thread, not the process
+    }
+    let mut slot = 0u32;
+    while slot < 2 {
+        if let Some(t) = ROLE_TGIDS.get_ptr_mut(slot) {
+            if unsafe { *t } == tgid {
+                unsafe { *t = 0 };
+            }
+        }
+        slot += 1;
+    }
+    0
 }
 
 #[lsm(hook = "bpf_map")]
@@ -352,7 +454,7 @@ unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    if !is_own_kind(id, OWN_KIND_MAP) || caller_is_protected() || caller_exe_is_own() {
+    if !is_own_kind(id, OWN_KIND_MAP) || caller_is_protected() || fresh_instance_may_load() {
         return 0;
     }
     if enforce() {
@@ -421,7 +523,9 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // never gets one — by id or through the pin. Map handles are decided
     // on the write path by the `bpf_map` guard; program handles are
     // harmless and stay allowed (`bpftool prog show` keeps working).
-    if (own_link_handle || own_link_pin) && enforce() && !caller_exe_is_own() {
+    // External audit EBPF-002: no exemption by executable — a link handle
+    // is taken only once the agent is a protected pid.
+    if (own_link_handle || own_link_pin) && enforce() {
         emit_denial(FS_OP_BPF_LINK, if own_link_handle { arg } else { 0 });
         return -EPERM;
     }

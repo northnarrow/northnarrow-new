@@ -3764,6 +3764,13 @@ async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
 
 /// External audit MAIN-001: remove a former watchdog pid from
 /// PROTECTED_PIDS unless it still runs the watchdog binary.
+/// `pid` runs the watchdog binary at `watchdog_exe` (same file identity).
+fn runs_watchdog_binary(pid: u32, watchdog_exe: &std::path::Path) -> bool {
+    use northnarrow_agent::anti_tamper::ExeIdentity;
+    let watchdog = ExeIdentity::of_file(watchdog_exe);
+    watchdog.is_some() && ExeIdentity::of_process(pid) == watchdog
+}
+
 fn withdraw_watchdog_pid(
     bpffs_root: Option<&std::path::Path>,
     pid: u32,
@@ -3925,6 +3932,8 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         // Last verified PID we stored (`None` == exemption cleared).
         let mut last: Option<u32> = None;
+        // A pid the pidfile named while the registered watchdog ran (logged once).
+        let mut refused: Option<u32> = None;
         // BUG-011 (PHASE 15.1): resolve the bpffs root once. None ⇒
         // no bpffs ⇒ register_protected_observer is a no-op (it
         // logs the degraded mode internally).
@@ -3939,6 +3948,25 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
             if new_pid == last {
                 continue; // no change — stay quiet on the hot path
             }
+            // External audit EBPF-002: one watchdog at a time. While the
+            // registered watchdog still runs, a pidfile naming another
+            // process — even one running the watchdog binary, possibly with
+            // LD_PRELOAD — is not protected: rewritten or mounted over, it
+            // would hand a root shell's process the agent's maps.
+            if let (Some(prev), Some(p)) = (last, new_pid) {
+                if runs_watchdog_binary(prev, &expected_exe) {
+                    if refused != Some(p) {
+                        warn!(
+                            registered = prev,
+                            named = p,
+                            "the watchdog pidfile names another process while the registered \
+                             watchdog runs — not protected"
+                        );
+                        refused = Some(p);
+                    }
+                    continue;
+                }
+            }
             // External audit MAIN-001: PROTECTED_PIDS follows the verified
             // watchdog. The previous pid leaves it once it no longer runs
             // the watchdog binary (dead, or recycled by another program);
@@ -3952,6 +3980,11 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                     northnarrow_agent::anti_tamper::register_protected_pid(bpffs_root, p)
                 {
                     warn!(watchdog_pid = p, error = %e, "PROTECTED_PIDS register of the verified watchdog failed");
+                }
+                // External audit EBPF-002: the verified watchdog is the
+                // live one — no second watchdog binary may load beside it.
+                if let Err(e) = northnarrow_agent::anti_tamper::claim_watchdog_role(bpffs_root, p) {
+                    debug!(watchdog_pid = p, error = %e, "watchdog role not recorded");
                 }
             }
             match &resolution {
