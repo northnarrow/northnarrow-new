@@ -414,7 +414,7 @@ enum OverlayCmd {
     Set {
         /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
         /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
-        /// escalation-allow.
+        /// escalation-allow, canary-readers.
         kind: String,
         /// The overlay content to store.
         #[arg(long)]

@@ -1201,6 +1201,15 @@ async fn main() -> Result<()> {
         // override; the admin dispatcher arms it on a signed grant.
         Arc::clone(&installer_override),
         lineage.clone(),
+        // External audit DEC-005: the built-in readers of whole trees plus
+        // the operator's signed canary-readers.local.
+        northnarrow_agent::canary::readers::CanaryReaders::load(
+            &overlay_gate.effective(
+                OverlayKind::CanaryReaders,
+                std::path::Path::new(northnarrow_agent::canary::readers::CANARY_READERS_LOCAL),
+            ),
+            lineage.clone(),
+        ),
     );
     info!(
         rules = engine.rule_count(),

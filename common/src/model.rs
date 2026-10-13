@@ -14,6 +14,11 @@ use crate::wire::{
     FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_UNLINK, FS_OP_WRITE,
 };
 
+/// Serde default of `Event::CanaryTripped::first_trip`.
+fn canary_first_trip_default() -> bool {
+    true
+}
+
 /// Canonical event emitted by a sensor.
 ///
 /// Tappa 4 turns the placeholder variants into rich data carriers,
@@ -265,6 +270,13 @@ pub enum Event {
         /// across the canary-precedence remap so the trip
         /// record's wall-clock context isn't lost.
         timestamp_ns: u64,
+        /// External audit DEC-004: the first access to this canary since it
+        /// was deployed (design §7.5, §12 Q2). Only the first one is a trip
+        /// the K5 rules respond to; every access is in the signed
+        /// `canary_access.jsonl` chain all the same. A record written before
+        /// the field existed reads as a first trip.
+        #[serde(default = "canary_first_trip_default")]
+        first_trip: bool,
     },
     /// Tappa 10 (N3) — userland-finalised network flow. The
     /// agent's `net::flow_tracker` stitches the BPF-side

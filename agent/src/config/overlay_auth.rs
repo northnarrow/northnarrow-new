@@ -210,6 +210,9 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::ProcessCommAllowlist | OverlayKind::NetflowCommAllowlist => {
             parse_overlay_text(&label, text, &crate::config::comm_allowlist::validate_comm)?;
         }
+        OverlayKind::CanaryReaders => {
+            parse_overlay_text(&label, text, &crate::canary::readers::validate_reader)?;
+        }
         OverlayKind::NetflowBlocklist => {
             crate::net::blocklist::parse_blocklist_overlay_text(&label, text)?;
         }

@@ -685,10 +685,15 @@ pub enum OverlayKind {
     CombatRulesV6 = 9,
     /// `combat-allow.cidrs`, the management networks COMBAT does not cut.
     CombatAllow = 10,
+    /// External audit DEC-005: `canary-readers.local` — programs that read
+    /// whole trees by design (the operator's backup agent, `tar` or
+    /// `rsync` if a backup runs them), on top of the built-in readers:
+    /// their read of a File or Credential canary is recorded, not killed.
+    CanaryReaders = 11,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 10] = [
+    pub const ALL: [OverlayKind; 11] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -699,6 +704,7 @@ impl OverlayKind {
         OverlayKind::CombatRulesV4,
         OverlayKind::CombatRulesV6,
         OverlayKind::CombatAllow,
+        OverlayKind::CanaryReaders,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -714,6 +720,7 @@ impl OverlayKind {
             OverlayKind::CombatRulesV4 => "combat-rules-v4",
             OverlayKind::CombatRulesV6 => "combat-rules-v6",
             OverlayKind::CombatAllow => "combat-allow",
+            OverlayKind::CanaryReaders => "canary-readers",
         }
     }
 
@@ -760,6 +767,7 @@ impl TryFrom<u8> for OverlayKind {
             8 => Ok(Self::CombatRulesV4),
             9 => Ok(Self::CombatRulesV6),
             10 => Ok(Self::CombatAllow),
+            11 => Ok(Self::CanaryReaders),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -1723,6 +1731,7 @@ mod tests {
             (OverlayKind::NetflowJa3Blocklist, 5, "netflow-ja3-blocklist"),
             (OverlayKind::MassWriteCarveout, 6, "mass-write-carveout"),
             (OverlayKind::EscalationAllow, 7, "escalation-allow"),
+            (OverlayKind::CanaryReaders, 11, "canary-readers"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);

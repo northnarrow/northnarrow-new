@@ -138,6 +138,9 @@ pub fn default_rules_with_net(
     // Review 49: the shared process-lineage cache — package-manager
     // writes are recorded, not killed, by the wrapped FIM rules.
     lineage: crate::posture::lineage::AuthSessionTracker,
+    // External audit DEC-005: the readers of whole trees the File and
+    // Credential canary rules record instead of killing.
+    canary_readers: crate::canary::readers::CanaryReaders,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -173,7 +176,7 @@ pub fn default_rules_with_net(
         installer_override,
         lineage.clone(),
     ));
-    rules.extend(canary::canary_rules());
+    rules.extend(canary::canary_rules_with_readers(canary_readers));
     // External audit NET-010 (NN-AUD-006): the network allowlist judged on
     // what the kernel executed, not on comm.
     let netflow_comm_allowlist = Arc::new(

@@ -98,8 +98,8 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
 | NN-AUD-058 | NET-004 | Network | M | open |
 | NN-AUD-061 | DEC-001 | Deception | M | fixed (lab PR 84, with Wave 0) |
 | NN-AUD-062 | DEC-002 | Deception | M | fixed (lab PR 84, with Wave 0) |
-| NN-AUD-064 | DEC-004 | Deception | M | open |
-| NN-AUD-065 | DEC-005 | Deception | M | open |
+| NN-AUD-064 | DEC-004 | Deception | M | fixed (lab PR 99) |
+| NN-AUD-065 | DEC-005 | Deception | M | fixed (lab PR 99) |
 | NN-AUD-066 | DEC-006 | Deception | L | fixed (lab PR 90) |
 | NN-AUD-067 | WDG-001 | Watchdog tooling | M | fixed (lab PR 88) |
 | NN-AUD-068 | WDG-002 | Watchdog tooling | M | fixed (lab PR 89) |
@@ -996,3 +996,27 @@ Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
   - Not done: the link self-check still reports a missing link (ERROR,
     signed) instead of re-attaching it; with detach denied the only way a
     link goes is a pin removed inside a trusted-installer window.
+- **NN-AUD-064 (DEC-004) and NN-AUD-065 (DEC-005), lab PR 99.** A canary
+  trip killed the accessor's process tree (Critical) on every access, and
+  whoever the accessor was.
+  - DEC-004: the detector computed the single-trip flag (design §7.5, §12
+    Q2) but used it only for the chain row; the trip event did not carry
+    it, so a backup's every scheduled run, an indexer's every pass, each
+    read killed again. `Event::CanaryTripped` now carries `first_trip`
+    (serde default `true` for records written before); the K5 rules
+    respond to the first access and record the later ones (Log, Low). Every
+    access is still a row of the signed `canary_access.jsonl` chain.
+  - DEC-005: "no workflow reads a canary" holds for Process and Network
+    canaries, not for File and Credential canaries placed in homes and
+    application trees. A read of one by a program that reads whole trees
+    by design — told by what the kernel executed, the exe or the script an
+    interpreter runs, in a root-owned system tree
+    (`ExecIdentity::is_client`), never by `comm` — is recorded (Log,
+    High), not killed. Built-in readers: dedicated backup, anti-malware,
+    indexing and sync programs (`canary::readers::CANARY_READERS`). Generic
+    tools (`tar`, `rsync`, `cp`, `cat`, `rclone`) are not built in — an
+    intruder collects and stages with them — and go in the new signed
+    overlay `canary-readers.local` (`OverlayKind::CanaryReaders`, protected
+    like the other overlays) when an operator's backup runs them.
+  - The trip event and the chain row now carry the accessor's executable
+    (`/proc/<pid>/exe`; it was always `None`).
