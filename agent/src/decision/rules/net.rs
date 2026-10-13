@@ -674,11 +674,66 @@ impl DnsQnameDedupWindow {
     }
 }
 
+// ── NN-L-NET-014 corroboration (external audit NETR-002) ──────────────
+
+/// How long the distinct high-entropy labels of one process under one
+/// parent domain add up.
+pub const DNS_TUNNEL_WINDOW_NS: u64 = 60 * 1_000_000_000;
+/// Distinct high-entropy first labels under one parent domain, from one
+/// process, within [`DNS_TUNNEL_WINDOW_NS`], that make a tunnel.
+pub const DNS_TUNNEL_DISTINCT_LABELS: usize = 8;
+/// Bound on the `(pid, parent)` pairs held at once.
+const DNS_TUNNEL_MAX_PAIRS: usize = 4096;
+
+/// External audit NETR-002: a DNS tunnel (iodine, dnscat2, exfiltration
+/// over DNS) carries its payload in a NEW label per query — dozens a
+/// second under the attacker's domain. A host resolves a UUID-named bucket
+/// or a hashed load-balancer name a handful of times: one high-entropy
+/// label is not a tunnel (the lab killed `python3` for
+/// `my-company-prod-backups-archive.s3.amazonaws.com`, 4.0 bits/char).
+#[derive(Default)]
+pub struct DnsTunnelCorroboration {
+    /// `(attributed pid, parent-domain hash)` → `(first seen ns, label
+    /// hash)` of the distinct labels in the window, at most
+    /// [`DNS_TUNNEL_DISTINCT_LABELS`].
+    seen: HashMap<(u32, u64), Vec<(u64, u64)>>,
+}
+
+impl DnsTunnelCorroboration {
+    /// Record `label_hash` under `(pid, parent_hash)` at `ts_ns` and return
+    /// how many distinct labels the pair has within the window, this one
+    /// included. A new pair beyond the bound is judged on its own (1).
+    pub fn observe(&mut self, pid: u32, parent_hash: u64, label_hash: u64, ts_ns: u64) -> usize {
+        self.seen.retain(|_, labels| {
+            labels.retain(|(t, _)| ts_ns.saturating_sub(*t) < DNS_TUNNEL_WINDOW_NS);
+            !labels.is_empty()
+        });
+        let key = (pid, parent_hash);
+        if !self.seen.contains_key(&key) && self.seen.len() >= DNS_TUNNEL_MAX_PAIRS {
+            return 1;
+        }
+        let labels = self.seen.entry(key).or_default();
+        if !labels.iter().any(|(_, h)| *h == label_hash) {
+            if labels.len() >= DNS_TUNNEL_DISTINCT_LABELS {
+                labels.remove(0);
+            }
+            labels.push((ts_ns, label_hash));
+        }
+        labels.len()
+    }
+}
+
 // ── NN-L-NET-004 — Suspicious DNS qname ──────────────────────────────
 
-/// Suspicious DNS qname shape: > 60 chars OR base64-looking
-/// (matches `^[A-Za-z0-9+/]{20,}` — DNS tunnelling payload
-/// shape). Per design §7.
+/// Unusually long DNS qname (> 60 chars), recorded. Per design §7.
+///
+/// External audit NETR-002: this rule used to KILL the sender of any name
+/// over 60 characters or whose first label was 20+ characters of the
+/// base64 alphabet — which every LDH label of that length is: S3 buckets
+/// and storage accounts, CDN and load-balancer names, Kubernetes service
+/// and pod FQDNs, ACME challenges; its own tests killed `curl` and
+/// `getent`. A label that carries an encoded payload is NN-L-NET-014's
+/// (Shannon entropy over a ≥ 25-char label); length alone is recorded.
 ///
 /// FP-3: holds the shared `Arc<DnsCache>` so a forwarded-leg trip can be
 /// back-correlated to the originating process — a `KillProcess` verdict
@@ -696,28 +751,6 @@ impl NnLNet004SuspiciousDnsQname {
             dedup: Arc::new(Mutex::new(DnsQnameDedupWindow::new())),
         }
     }
-
-    fn looks_like_base64(s: &str) -> bool {
-        // Reject if too short to be a meaningful payload.
-        if s.len() < 20 {
-            return false;
-        }
-        // Walk the first label only (everything before the first `.`).
-        // Tunnelling encodes payload INTO the leftmost label; the
-        // domain suffix (e.g. `attacker.com`) stays normal.
-        let first_label = s.split('.').next().unwrap_or(s);
-        if first_label.len() < 20 {
-            return false;
-        }
-        first_label.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || b == b'+'
-                || b == b'/'
-                || b == b'='
-                || b == b'-'
-                || b == b'_'
-        })
-    }
 }
 
 impl Rule for NnLNet004SuspiciousDnsQname {
@@ -725,7 +758,7 @@ impl Rule for NnLNet004SuspiciousDnsQname {
         "NN-L-NET-004_SuspiciousDnsQname"
     }
     fn name(&self) -> &'static str {
-        "Suspicious DNS qname (long subdomain or base64 shape)"
+        "Unusually long DNS qname (recorded)"
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
@@ -744,14 +777,13 @@ impl Rule for NnLNet004SuspiciousDnsQname {
             return None;
         };
         let long = query_name.len() > 60;
-        let b64 = Self::looks_like_base64(query_name);
-        if !long && !b64 {
+        if !long {
             // Tappa 10.9 step 3: the name does not end in the kernel's
             // linear copy — sent in pieces (MSG_MORE / UDP_CORK), with UDP
             // GSO or zero copy, or not DNS at all. A resolver sends a query
             // in one piece. Recorded for one soak cycle, never killed. (A
-            // prefix that already has the long or base64 shape is judged
-            // above like a whole name: the name sent is at least that.)
+            // prefix that is already long is judged below like a whole
+            // name: the name sent is at least that.)
             if *qname_partial
                 && self
                     .dedup
@@ -773,21 +805,8 @@ impl Rule for NnLNet004SuspiciousDnsQname {
             }
             return None;
         }
-        let reason = match (long, b64) {
-            (true, true) => {
-                "DNS qname is both unusually long (>60 chars) AND \
-                             matches base64-payload shape — DNS-tunnelling indicator"
-            }
-            (true, false) => {
-                "DNS qname is unusually long (>60 chars) — \
-                              possible exfiltration via label encoding"
-            }
-            (false, true) => {
-                "DNS first-label matches base64-payload shape — \
-                              possible exfiltration via DNS tunnelling"
-            }
-            (false, false) => unreachable!(),
-        };
+        let reason = "DNS qname is unusually long (>60 chars) — recorded; an encoded payload \
+                      in a label is NN-L-NET-014's (entropy)";
         // FP-3: forwarder-aware attribution. An originator-issued query
         // kills the sender (as before); a forwarded leg back-correlates
         // to the originator, or downgrades to Log when none is found —
@@ -815,8 +834,8 @@ impl Rule for NnLNet004SuspiciousDnsQname {
         Some(match attribution {
             DnsAttribution::Act { pid, label } => net_verdict(
                 self,
-                ResponseAction::KillProcess,
-                Severity::High,
+                ResponseAction::Log,
+                Severity::Medium,
                 reason,
                 pid,
                 label,
@@ -828,8 +847,8 @@ impl Rule for NnLNet004SuspiciousDnsQname {
             } => net_verdict(
                 self,
                 ResponseAction::Log,
-                Severity::High,
-                "Suspicious DNS qname observed on a forwarded leg with no \
+                Severity::Medium,
+                "Unusually long DNS qname observed on a forwarded leg with no \
                  attributable originator (Varlink/nss-resolve, LAN-resolver, \
                  or correlation miss) — surfaced as Log; the local resolver \
                  is NOT the originator and must not be killed",
@@ -1634,6 +1653,9 @@ pub struct NnLNet014DnsTunnelEntropy {
     /// Separate from -004's window — a qname that trips both must still
     /// raise one verdict from EACH rule.
     dedup: Arc<Mutex<DnsQnameDedupWindow>>,
+    /// External audit NETR-002: distinct high-entropy labels per
+    /// (originator, parent domain) — the kill needs a tunnel's volume.
+    corroboration: Arc<Mutex<DnsTunnelCorroboration>>,
 }
 
 impl NnLNet014DnsTunnelEntropy {
@@ -1641,6 +1663,7 @@ impl NnLNet014DnsTunnelEntropy {
         Self {
             dns_cache,
             dedup: Arc::new(Mutex::new(DnsQnameDedupWindow::new())),
+            corroboration: Arc::new(Mutex::new(DnsTunnelCorroboration::default())),
         }
     }
 
@@ -1649,10 +1672,12 @@ impl NnLNet014DnsTunnelEntropy {
     /// Most legitimate labels also sit below this.
     const MIN_LABEL_LEN: usize = 25;
     /// Bits-per-character threshold. Random base32 ≈ 5.0, base64 ≈ 6.0,
-    /// hex ≈ 4.0; varied English-ish labels stay below ≈ 3.5. 3.8 over
-    /// a ≥25-char label separates encoded payloads from legitimate
-    /// (even long) hostnames. Both constants are deliberate
-    /// refinement candidates for the T10.7 adversarial-validation loop.
+    /// hex ≈ 4.0 — and a varied 30-character name of English words
+    /// reaches 4.0 too (`my-company-prod-backups-archive`): the shape
+    /// alone does not tell a payload from a long legitimate name, so a
+    /// single label is recorded and the kill takes
+    /// [`DNS_TUNNEL_DISTINCT_LABELS`] of them under one parent domain
+    /// (external audit NETR-002).
     const ENTROPY_BITS: f64 = 3.8;
 
     /// Shannon entropy (bits/byte) of `s` over its observed byte
@@ -1731,14 +1756,35 @@ impl Rule for NnLNet014DnsTunnelEntropy {
         ) {
             return None;
         }
+        // External audit NETR-002: a tunnel is many distinct encoded labels
+        // under one parent domain; one is recorded.
+        let parent = query_name.split_once('.').map(|(_, p)| p).unwrap_or("");
+        let distinct = self.corroboration.lock().observe(
+            attribution.target_pid(),
+            hash_qname(parent),
+            hash_qname(first_label),
+            *timestamp_ns,
+        );
+        let tunnel = distinct >= DNS_TUNNEL_DISTINCT_LABELS;
         Some(match attribution {
-            DnsAttribution::Act { pid, label } => net_verdict(
+            DnsAttribution::Act { pid, label } if tunnel => net_verdict(
                 self,
                 ResponseAction::KillProcess,
                 Severity::High,
-                "DNS first-label carries high Shannon entropy over a long \
-                 label — encoded payload shape regardless of alphabet \
+                "DNS tunnel: distinct high-entropy first labels under one parent domain \
+                 from one process within a minute — encoded payload per query \
                  (DNS tunnelling / exfil, T1071.004); posture → ENGAGED",
+                pid,
+                label,
+                *timestamp_ns,
+            ),
+            DnsAttribution::Act { pid, label } => net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::Medium,
+                "DNS first label with high Shannon entropy over a long label — \
+                 recorded; a tunnel carries a new one per query under the same \
+                 parent domain (the kill takes several within a minute)",
                 pid,
                 label,
                 *timestamp_ns,
@@ -1749,7 +1795,11 @@ impl Rule for NnLNet014DnsTunnelEntropy {
             } => net_verdict(
                 self,
                 ResponseAction::Log,
-                Severity::High,
+                if tunnel {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                },
                 "High-entropy DNS label observed on a forwarded leg with no \
                  attributable originator (Varlink/nss-resolve, LAN-resolver, \
                  or correlation miss) — surfaced as Log; the local resolver \
@@ -2046,23 +2096,44 @@ mod tests {
     }
 
     #[test]
-    fn net_004_fires_on_long_qname() {
+    fn net_004_records_a_long_qname() {
         let rule = net_004();
         let long = format!("{}.example.com", "a".repeat(80));
         let v = rule.evaluate(&dns_event(1, &long, 1)).expect("long qname");
-        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
     }
 
+    /// External audit NETR-002: names a host resolves every day — a first
+    /// label of 20+ LDH characters, or a long FQDN — are never a kill.
     #[test]
-    fn net_004_fires_on_base64_shape() {
+    fn net_004_never_kills_long_cloud_and_cluster_names() {
         let rule = net_004();
-        // First label is 32 chars of base64-shaped + the actual
-        // dot-domain suffix.
-        let q = "ZGVhZGJlZWZmZmZmZmZmZmNhZmU=.example.com";
-        let v = rule
-            .evaluate(&dns_event(1, q, 1))
-            .expect("base64 first label");
-        assert_eq!(v.severity, Severity::High);
+        for (pid, q) in [
+            (11, "my-company-prod-backups.s3.amazonaws.com"),
+            (
+                12,
+                "internal-payments-api-1234567890.eu-west-1.elb.amazonaws.com",
+            ),
+            (13, "myaccountstorage2024prod.blob.core.windows.net"),
+            (
+                14,
+                "payments-api-7d4f8b9c6-x2kq9.payments.svc.cluster.local",
+            ),
+            (
+                15,
+                "_acme-challenge.payments-gateway-production.example.org",
+            ),
+            (16, "ZGVhZGJlZWZmZmZmZmZmZmNhZmU=.example.com"),
+        ] {
+            if let Some(v) = rule.evaluate(&dns_event(pid, q, 1)) {
+                assert_eq!(v.action, ResponseAction::Log, "{q}");
+            }
+        }
+        let long = "payments-api-7d4f8b9c6-x2kq9.payments-namespace.svc.cluster.local";
+        assert!(long.len() > 60);
+        let v = rule.evaluate(&dns_event(17, long, 1)).expect("recorded");
+        assert_eq!(v.action, ResponseAction::Log);
     }
 
     #[test]
@@ -2094,32 +2165,99 @@ mod tests {
         assert!(rule.evaluate(&partial(dns_event(7, "x", 0))).is_none());
     }
 
-    /// A partial prefix that already has the tunnelling shape is judged like
-    /// a whole name: the name sent is at least as long.
+    /// A partial prefix is recorded like any partial name (external audit
+    /// NETR-002: no shape of a name is a kill for this rule).
     #[test]
-    fn net_004_kills_on_a_partial_prefix_with_the_tunnel_shape() {
+    fn net_004_records_a_partial_prefix() {
         let rule = net_004();
         let q = "ZGVhZGJlZWZmZmZmZmZmZmNhZmU";
         let v = rule
             .evaluate(&partial(dns_event(8, q, 0)))
-            .expect("b64 prefix");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+            .expect("partial prefix");
+        assert_eq!(v.action, ResponseAction::Log);
     }
 
     // ── NN-L-NET-014 (DNS-tunnel entropy) ────────────────────────
 
     #[test]
-    fn net_014_fires_on_high_entropy_label() {
+    fn net_014_records_a_single_high_entropy_label() {
         let rule = net_014();
         // 40-char near-uniform alphanumeric first label (entropy well
-        // above 3.8) + a normal suffix — the encoded-payload shape.
+        // above 3.8) + a normal suffix — the encoded-payload shape, once.
         let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
         let v = rule
             .evaluate(&dns_event(7, q, 1))
-            .expect("high-entropy label should fire");
-        assert_eq!(v.severity, Severity::High);
+            .expect("high-entropy label should be recorded");
         assert_eq!(v.rule_id, "NN-L-NET-014_DnsTunnelEntropy");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
+    }
+
+    /// External audit NETR-002: names the lab saw killed — a bucket of
+    /// English words, a hashed load balancer, a UUID-named bucket — are
+    /// recorded at most, one by one.
+    #[test]
+    fn net_014_never_kills_a_long_legitimate_name_on_its_own() {
+        let rule = net_014();
+        for (pid, q) in [
+            (21, "my-company-prod-backups-archive.s3.amazonaws.com"),
+            (
+                22,
+                "internal-payments-api-1234567890.eu-west-1.elb.amazonaws.com",
+            ),
+            (23, "3f2504e04f8911d39a0c0305e82c3301.s3.amazonaws.com"),
+        ] {
+            if let Some(v) = rule.evaluate(&dns_event(pid, q, 1)) {
+                assert_eq!(v.action, ResponseAction::Log, "{q}");
+            }
+        }
+    }
+
+    /// A tunnel: a new encoded label per query under the attacker's domain.
+    /// The kill comes with the DNS_TUNNEL_DISTINCT_LABELS-th within the
+    /// window; other parents and other processes do not add up.
+    #[test]
+    fn net_014_kills_a_tunnel_of_distinct_labels_under_one_parent() {
+        let rule = net_014();
+        let label = |i: usize| format!("{i:02}q7v3k9x2m4p8r6t1w5y0z3b7c9d2f4h6j8l0n");
+        for i in 0..DNS_TUNNEL_DISTINCT_LABELS - 1 {
+            // the same process under another parent, and another process
+            // under the same parent, never reach the threshold
+            let other_parent = format!("{}.cdn.example.net", label(i));
+            let v = rule
+                .evaluate(&dns_event(31, &other_parent, 1))
+                .expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log);
+            let other_pid = format!("{}.t.attacker.example", label(i));
+            let v = rule
+                .evaluate(&dns_event(32, &other_pid, 1))
+                .expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log);
+        }
+        let mut last = None;
+        for i in 0..DNS_TUNNEL_DISTINCT_LABELS {
+            let q = format!("{}.t.attacker.example", label(100 + i));
+            last = rule.evaluate(&dns_event(33, &q, 1));
+            if i + 1 < DNS_TUNNEL_DISTINCT_LABELS {
+                assert_eq!(last.as_ref().unwrap().action, ResponseAction::Log);
+            }
+        }
+        let v = last.expect("tunnel verdict");
         assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.event_pid, 33);
+    }
+
+    #[test]
+    fn dns_tunnel_corroboration_forgets_after_the_window() {
+        let mut c = DnsTunnelCorroboration::default();
+        for i in 0..(DNS_TUNNEL_DISTINCT_LABELS as u64 - 1) {
+            assert_eq!(c.observe(1, 7, i, i), i as usize + 1);
+        }
+        // a repeat of a known label adds nothing
+        assert_eq!(c.observe(1, 7, 0, 10), DNS_TUNNEL_DISTINCT_LABELS - 1);
+        // past the window only the new label counts
+        assert_eq!(c.observe(1, 7, 99, DNS_TUNNEL_WINDOW_NS + 100), 1);
     }
 
     #[test]
@@ -2205,20 +2343,20 @@ mod tests {
     }
 
     /// FP-3 — originator-issued query (direct case A, or the
-    /// originator's own stub query): -004 kills the SENDER, exactly as
-    /// before. No regression for the no-forwarder host.
+    /// originator's own stub query): -004 records the SENDER (external
+    /// audit NETR-002: recorded, no longer killed).
     #[test]
-    fn fp3_004_originator_issued_kills_sender() {
+    fn fp3_004_originator_issued_records_sender() {
         let rule = net_004();
         let long = format!("{}.example.com", "a".repeat(80));
         let e = dns_event_full(4242, &long, 1, "curl", Some("/usr/bin/curl"), 1_000);
         let v = rule.evaluate(&e).expect("originator query fires");
-        assert_eq!(v.action, ResponseAction::KillProcess);
-        assert_eq!(v.event_pid, 4242, "kill targets the originating sender");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.event_pid, 4242, "recorded against the originating sender");
     }
 
     /// FP-3 — forwarded leg with a back-correlatable originator (the
-    /// split-resolver case B): -004 re-routes the KillProcess to the
+    /// split-resolver case B): -004 attributes the record to the
     /// ORIGINATOR's PID, never the resolver.
     #[test]
     fn fp3_004_forwarded_leg_back_correlates_to_originator() {
@@ -2230,9 +2368,9 @@ mod tests {
         // The forwarder (systemd-resolved, pid 673) relays it upstream.
         let leg = dns_event_full(673, &long, 1, "systemd-resolved", Some(RESOLVER_EXE), 1_500);
         let v = rule.evaluate(&leg).expect("forwarded leg still surfaces");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::Log);
         assert_eq!(v.event_pid, 5000, "verdict attributed to the originator");
-        assert_ne!(v.event_pid, 673, "the resolver is NEVER the kill target");
+        assert_ne!(v.event_pid, 673, "the resolver is never the target");
     }
 
     /// FP-3 — forwarded leg with NO attributable originator (Varlink
@@ -2278,7 +2416,8 @@ mod tests {
         let rule = NnLNet014DnsTunnelEntropy::new(Arc::clone(&cache));
         let leg = dns_event_full(673, q, 1, "systemd-resolved", Some(RESOLVER_EXE), 4_200);
         let v = rule.evaluate(&leg).expect("forwarded entropy leg surfaces");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        // one label: recorded (NETR-002), against the originator
+        assert_eq!(v.action, ResponseAction::Log);
         assert_eq!(v.event_pid, 8080, "attributed to the originator");
     }
 

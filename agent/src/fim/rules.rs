@@ -17,12 +17,14 @@
 //!   `agent/src/main.rs::process_event`). The C4 rate-limiter
 //!   never throttles Critical events — these rules fire for
 //!   every kernel-observed match.
-//! - **NN-L-FIM-002 hardlink semantics** (§13 Q2 lock-in): the
-//!   rule fires on Created OR Linked op, escalating to
-//!   Critical when the destination path is in a user-writable
-//!   directory (`/tmp/`, `/var/tmp/`, `/dev/shm/`, `/home/`).
-//!   Mirrors the C4 `DriftClassifier::classify` Critical arm
-//!   so the rule + classifier agree.
+//! - **NN-L-FIM-002 hardlink semantics** (§13 Q2 lock-in): a
+//!   Linked op whose destination is in a user-writable directory
+//!   (`/tmp/`, `/var/tmp/`, `/dev/shm/`, `/home/`) is Critical — the
+//!   kernel reports a link only when its SOURCE inode is watched, so
+//!   that is a watched binary given a second name. A Created op there
+//!   is recorded (Medium, external audit FIMR-006). Mirrors the C4
+//!   `DriftClassifier::classify` Critical arm so the rule + classifier
+//!   agree.
 //! - **NN-L-FIM-005 log-truncation** is High but log-only
 //!   (no kill) — operators legitimately truncate logs;
 //!   killing the modifier (often `logrotate`) is the wrong
@@ -267,13 +269,20 @@ impl Rule for NnLFim001SystemBinaryModified {
 
 // ── NN-L-FIM-002 — new SUID-root binary appeared ───────────────────
 
-/// `Created` or `Linked` op when the destination path is in a
-/// user-writable directory (§13 Q2 hardlink-evasion lock-in).
-/// V1.0 fires on the user-writable signal alone — the kernel
-/// hook doesn't surface mode bits in the [`FimDriftRaw`] today,
-/// so we can't post-hoc check SUID-root from the rule layer.
-/// The audit chain captures the modifier triple so the
-/// operator can correlate.
+/// `Linked` op whose destination is in a user-writable directory: a
+/// watched inode (`inode_link` reports a link only when its source is
+/// watched — a SUID-root system binary) given a name where an
+/// unprivileged user controls it, the §13 Q2 hardlink-evasion path.
+/// Critical, the process tree killed.
+///
+/// External audit FIMR-006: a `Created` op there is recorded, not killed.
+/// It comes from the hook on the watched DIRECTORY, and the shipped
+/// `fim-paths.v1` tells operators to watch `/home/<user>/…` profile paths:
+/// every temporary file a browser, GnuPG or an SDK wrote there killed its
+/// process tree and put the host in COMBAT. The kernel hook carries no mode
+/// bits, so a new SUID file cannot be told from any other file here; a
+/// SUID bit set afterwards is a `chmod` — Modified, NN-L-FIM-001's and the
+/// capability rules' ground.
 pub struct NnLFim002NewSuidBinary;
 
 impl Rule for NnLFim002NewSuidBinary {
@@ -294,12 +303,22 @@ impl Rule for NnLFim002NewSuidBinary {
         if !is_user_writable(&fe.path) {
             return None;
         }
+        if fe.op == FimOp::Created {
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::Log,
+                Severity::Medium,
+                "File created in a watched user-writable directory — recorded (a \
+                 hardlink of a watched binary is the kill case, §13 Q2)",
+            ));
+        }
         Some(fim_verdict(
             self,
             fe,
             ResponseAction::KillProcessTree,
             Severity::Critical,
-            "Created or hardlinked file in user-writable dir — SUID evasion path \
+            "Watched inode hardlinked into a user-writable dir — SUID evasion path \
              (§13 Q2)",
         ))
     }
@@ -2568,21 +2587,33 @@ mod tests {
     // ── NN-L-FIM-002 ────────────────────────────────────────────
 
     #[test]
-    fn fim002_fires_on_created_or_linked_in_user_writable_dir() {
+    fn fim002_kills_a_watched_inode_linked_into_a_user_writable_dir() {
         let r = NnLFim002NewSuidBinary;
-        for (op, path) in &[
-            (FimOp::Created, "/tmp/.x"),
-            (FimOp::Linked, "/tmp/.x"),
-            (FimOp::Created, "/var/tmp/y"),
-            (FimOp::Linked, "/var/tmp/y"),
-            (FimOp::Created, "/dev/shm/z"),
-            (FimOp::Linked, "/home/u/.x"),
-        ] {
+        for path in &["/tmp/.x", "/var/tmp/y", "/dev/shm/z", "/home/u/.x"] {
             let v = r
-                .evaluate(&fim_event(*op, path))
-                .unwrap_or_else(|| panic!("expected fire on ({op:?}, {path})"));
+                .evaluate(&fim_event(FimOp::Linked, path))
+                .unwrap_or_else(|| panic!("expected fire on (Linked, {path})"));
             assert_eq!(v.severity, Severity::Critical);
             assert_eq!(v.action, ResponseAction::KillProcessTree);
+        }
+    }
+
+    /// External audit FIMR-006: a file created in a watched /home profile
+    /// directory (a browser's temporary file) is recorded, not killed.
+    #[test]
+    fn fim002_records_a_file_created_in_a_watched_user_writable_dir() {
+        let r = NnLFim002NewSuidBinary;
+        for path in &[
+            "/home/alice/.mozilla/firefox/x.default/sessionstore.jsonlz4.tmp",
+            "/home/alice/.gnupg/.#lk0x0000561d.host.4242",
+            "/tmp/.x",
+            "/dev/shm/z",
+        ] {
+            let v = r
+                .evaluate(&fim_event(FimOp::Created, path))
+                .unwrap_or_else(|| panic!("expected a record on (Created, {path})"));
+            assert_eq!(v.action, ResponseAction::Log, "{path}");
+            assert_eq!(v.severity, Severity::Medium, "{path}");
         }
     }
 

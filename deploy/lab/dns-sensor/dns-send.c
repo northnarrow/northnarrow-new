@@ -1,6 +1,7 @@
 /* Tappa 10.9 step 3 lab helper (`nn-lab.sh dns-sensor-check`): send one DNS
  * query for NAME to a local port 53 in one of the shapes the check needs,
- * then wait LINGER seconds (the agent kills the sender on NN-L-NET-004).
+ * then wait LINGER seconds (until external audit NETR-002 the agent killed
+ * the sender on NN-L-NET-004; now it records it).
  *
  *   dns-send MODE NAME [LINGER]
  *
