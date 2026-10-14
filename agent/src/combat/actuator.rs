@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use common::ResponseAction;
 
 use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::response::proc_ref::ProcRef;
 use crate::response::quarantine::ExeHandle;
 use crate::response::{block_outbound, ExecutionOutcome, Executor};
 
@@ -43,10 +44,8 @@ pub enum NeutralizeOutcome {
 /// host) counted as containment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoftBlock {
-    /// The process's outbound traffic is dropped. `start_ticks` (its
-    /// start time) lets the stand-down release this process and no other
-    /// that later gets the PID.
-    Blocked { start_ticks: Option<u64> },
+    /// The process's outbound traffic is dropped.
+    Blocked,
     /// Nothing to contain, nothing to undo: detect-only, or the process
     /// had already exited.
     NotNeeded(&'static str),
@@ -56,23 +55,37 @@ pub enum SoftBlock {
 
 /// The operations [`super::CombatLadder`] performs on the system.
 pub trait CombatActuator: Send + Sync {
+    /// External audit CMB-004: capture the process `pid` names, when it is
+    /// attributed — with what the attributing event says about it:
+    /// `start_ns`, its exec's start, and `seen_ns`, the event's time (it
+    /// was running then); 0 when unknown.
+    fn identify(&self, pid: u32, start_ns: u64, seen_ns: u64) -> Arc<ProcRef> {
+        Arc::new(ProcRef::open_for_event(pid, start_ns, seen_ns))
+    }
+
+    /// External audit CMB-004: an event names `target`'s PID (with the
+    /// process start it reported, 0 when unknown) — is it about the
+    /// captured process, not a later holder of the PID?
+    fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
+        target.matches_event(start_ns)
+    }
+
     /// A COMBAT episode opens (external audit CMB-011: the drop ruleset
     /// is applied once per episode).
     fn begin_episode(&self) {}
 
-    /// STAGE 1 surgical soft egress: drop only this PID's outbound
+    /// STAGE 1 surgical soft egress: drop only this process's outbound
     /// traffic (cgroup-scoped), preserving the host's management +
     /// evidence channels. Idempotent.
-    fn soft_egress_block(&self, pid: u32) -> SoftBlock;
+    fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock;
 
-    /// Reverse [`Self::soft_egress_block`] (stand-down), for a process
-    /// [`Self::soft_egress_block`] reported blocked, with the start time
-    /// it reported.
-    fn soft_egress_clear(&self, pid: u32, start_ticks: Option<u64>);
+    /// Reverse [`Self::soft_egress_block`] (stand-down), for a process it
+    /// reported blocked.
+    fn soft_egress_clear(&self, target: &ProcRef);
 
-    /// STAGE 2: kill (tree) + quarantine the offending PID(s); report
+    /// STAGE 2: kill (tree) + quarantine the offending process(es); report
     /// whether the threat is contained at the process level.
-    fn neutralize(&self, offenders: &[u32]) -> NeutralizeOutcome;
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome;
 
     /// STAGE 3 (last resort): engage full host network isolation.
     fn isolate(&self);
@@ -159,9 +172,19 @@ impl CombatActuator for SystemActuator {
         block_outbound::forget_applied_ruleset();
     }
 
-    fn soft_egress_block(&self, pid: u32) -> SoftBlock {
-        // Read before the block: the identity the stand-down checks.
-        let start_ticks = block_outbound::proc_start_ticks(pid);
+    fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock {
+        let pid = target.pid();
+        // External audit CMB-004: the cgroup write takes a PID — only
+        // while it still names the attributed process.
+        if !self.detect_only && !target.still_named_by_pid() {
+            if let Some(errno) = target.capture_errno() {
+                return SoftBlock::Failed(format!(
+                    "the process could not be captured: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ));
+            }
+            return SoftBlock::NotNeeded("process already exited");
+        }
         let report = self.executor.execute(ResponseAction::BlockOutbound, pid);
         info!(
             target: "combat.actuator",
@@ -170,7 +193,7 @@ impl CombatActuator for SystemActuator {
             "INVESTIGATE soft egress: per-PID outbound block (host channels preserved)"
         );
         match report.primary {
-            ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked { start_ticks },
+            ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked,
             ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
             ExecutionOutcome::AlreadyGone { .. } => SoftBlock::NotNeeded("process already exited"),
             ExecutionOutcome::Failed { errno: 0, .. } => {
@@ -184,11 +207,17 @@ impl CombatActuator for SystemActuator {
         }
     }
 
-    fn soft_egress_clear(&self, pid: u32, start_ticks: Option<u64>) {
+    fn soft_egress_clear(&self, target: &ProcRef) {
         if self.detect_only {
             return;
         }
-        match block_outbound::release_blocked_pid(pid, start_ticks, self.executor.config()) {
+        let pid = target.pid();
+        if !target.is_live() {
+            info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
+            return;
+        }
+        match block_outbound::release_blocked_pid(pid, target.start_ticks(), self.executor.config())
+        {
             Ok(block_outbound::Release::Released) => {
                 info!(target: "combat.actuator", pid, "soft egress released")
             }
@@ -204,7 +233,7 @@ impl CombatActuator for SystemActuator {
         }
     }
 
-    fn neutralize(&self, offenders: &[u32]) -> NeutralizeOutcome {
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome {
         if offenders.is_empty() {
             // No process attributed — we cannot contain a threat at the
             // process level, so isolation is the proportionate fallback.
@@ -219,13 +248,21 @@ impl CombatActuator for SystemActuator {
         // ran here found nothing every time (AlreadyGone). External audit
         // CMB-001: opened, not named — the inode stays the one the process
         // ran whatever becomes of its path before the quarantine.
-        let binaries: Vec<(u32, Option<ExeHandle>)> =
-            offenders.iter().map(|&pid| (pid, binary_of(pid))).collect();
+        // External audit CMB-004: only while the PID still names the
+        // attributed process.
+        let binaries: Vec<(u32, Option<ExeHandle>)> = offenders
+            .iter()
+            .map(|r| {
+                let exe = r.still_named_by_pid().then(|| binary_of(r.pid())).flatten();
+                (r.pid(), exe)
+            })
+            .collect();
 
         // First pass: kill the offending tree(s). Any non-contained
         // outcome means the threat is uncontainable → isolate.
-        for &pid in offenders {
-            let report = self.executor.execute(ResponseAction::KillProcessTree, pid);
+        for r in offenders {
+            let pid = r.pid();
+            let report = self.executor.execute_on(ResponseAction::KillProcessTree, r);
             if !Self::contained(&report.primary) {
                 return NeutralizeOutcome::Uncontainable {
                     reason: format!("pid {pid}: kill outcome {:?}", report.primary),
@@ -408,7 +445,7 @@ mod tests {
             (pid == child).then_some("test-guard")
         }));
         let actuator = SystemActuator::new(exec, None, false);
-        let outcome = actuator.neutralize(&[parent.id()]);
+        let outcome = actuator.neutralize(&[Arc::new(ProcRef::open(parent.id()))]);
         let _ = parent.wait();
         // SAFETY: plain kill(2) on our own child.
         unsafe { libc::kill(child as i32, libc::SIGKILL) };
@@ -448,7 +485,7 @@ mod tests {
         };
         let vault = cfg.quarantine_dir.join("vault");
         let actuator = SystemActuator::new(Executor::with_config(cfg), None, false);
-        let outcome = actuator.neutralize(&[pid]);
+        let outcome = actuator.neutralize(&[Arc::new(ProcRef::open(pid))]);
         assert!(
             matches!(outcome, NeutralizeOutcome::Contained),
             "{outcome:?}"

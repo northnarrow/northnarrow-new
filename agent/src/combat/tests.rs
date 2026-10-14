@@ -18,6 +18,7 @@ use common::Event;
 
 use super::actuator::{CombatActuator, NeutralizeOutcome, SoftBlock};
 use super::evidence::{LadderEvidence, StageTransition};
+use super::ProcRef;
 use super::{
     CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
 };
@@ -45,27 +46,58 @@ struct MockActuator {
     failing_blocks: Vec<u32>,
 }
 
+/// A captured process without a pidfd (nothing is signalled), with a
+/// start time derived from the PID.
+fn mock_ref(pid: u32) -> Arc<ProcRef> {
+    Arc::new(ProcRef::for_test(pid, Some(u64::from(pid) * 10)))
+}
+
+/// PIDs from here up are offenders that have exited, for the mocks.
+const EXITED_FROM: u32 = 90_000;
+
+/// The mocks' identity check: an event start, when there is one, is the
+/// captured start ticks as they are (`mock_ref`: the PID × 10); without
+/// one, the process is the captured one while it runs (below
+/// [`EXITED_FROM`]).
+fn mock_same_process(target: &ProcRef, start_ns: u64) -> bool {
+    if start_ns == 0 {
+        return target.pid() < EXITED_FROM;
+    }
+    target.start_ticks() == Some(start_ns)
+}
+
+fn pids_of(offenders: &[Arc<ProcRef>]) -> Vec<u32> {
+    offenders.iter().map(|r| r.pid()).collect()
+}
+
 impl CombatActuator for MockActuator {
-    fn soft_egress_block(&self, pid: u32) -> SoftBlock {
+    fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
+        mock_ref(pid)
+    }
+    fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
+        mock_same_process(target, start_ns)
+    }
+    fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock {
+        let pid = target.pid();
         self.rec.push(format!("soft_block:{pid}"));
         if self.failing_blocks.contains(&pid) {
             SoftBlock::Failed("no nft".to_string())
         } else {
-            SoftBlock::Blocked {
-                start_ticks: Some(u64::from(pid) * 10),
-            }
+            SoftBlock::Blocked
         }
     }
-    fn soft_egress_clear(&self, pid: u32, start_ticks: Option<u64>) {
+    fn soft_egress_clear(&self, target: &ProcRef) {
+        let pid = target.pid();
         assert_eq!(
-            start_ticks,
+            target.start_ticks(),
             Some(u64::from(pid) * 10),
-            "the start time recorded at the block"
+            "the process captured at the attribution"
         );
         self.rec.push(format!("soft_clear:{pid}"));
     }
-    fn neutralize(&self, offenders: &[u32]) -> NeutralizeOutcome {
-        self.rec.push(format!("neutralize:{offenders:?}"));
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome {
+        self.rec
+            .push(format!("neutralize:{:?}", pids_of(offenders)));
         self.neutralize_outcome.clone()
     }
     fn isolate(&self) {
@@ -178,6 +210,11 @@ fn tcp_connect(pid: u32, dst: [u8; 4]) -> Event {
 }
 
 fn spawn(pid: u32, ppid: u32) -> Event {
+    spawn_started(pid, 0, ppid, 0)
+}
+
+/// A spawn whose event carries the starts of the child and its parent.
+fn spawn_started(pid: u32, start_ns: u64, ppid: u32, parent_start_ns: u64) -> Event {
     Event::ProcessSpawn {
         pid,
         ppid,
@@ -188,8 +225,8 @@ fn spawn(pid: u32, ppid: u32) -> Event {
         timestamp_ns: 1,
         argv: Vec::new(),
         parent_comm: String::new(),
-        parent_start_ns: 0,
-        start_ns: 0,
+        parent_start_ns,
+        start_ns,
         parent_is_kthread: false,
         exe: Default::default(),
     }
@@ -336,6 +373,58 @@ fn jump_ahead_on_lateral_spread_attributes_child() {
         "{:?}",
         rec.log()
     );
+}
+
+/// External audit CMB-004: a child of a process that took an offender's
+/// PID after the offender exited is not the offender's child.
+#[test]
+fn a_child_of_a_reused_offender_pid_is_not_attributed() {
+    let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
+    let t0 = Instant::now();
+    l.engage(Some(700), None, t0);
+    // offender 700 started at 7000 (mock_ref); this parent started at 1
+    l.observe(&spawn_started(701, 0, 700, 1), t0 + Duration::from_secs(1));
+    assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
+    assert_eq!(l.offenders(), vec![700]);
+    assert!(
+        !rec.log().iter().any(|e| e.starts_with("neutralize")),
+        "{:?}",
+        rec.log()
+    );
+    // the offender's own child: attributed
+    l.observe(
+        &spawn_started(702, 0, 700, 7000),
+        t0 + Duration::from_secs(2),
+    );
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    assert_eq!(l.offenders(), vec![700, 702]);
+}
+
+/// External audit CMB-004: an offender's PID taken by a new child of the
+/// tree after the offender exited — the new process is attributed (and
+/// soft-blocked) in its place, not skipped as already known.
+#[test]
+fn an_offender_pid_reused_inside_the_tree_is_attributed_afresh() {
+    let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
+    let t0 = Instant::now();
+    l.engage(Some(700), None, t0);
+    l.observe(&spawn(701, 700), t0 + Duration::from_secs(1));
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    let blocks = |rec: &Recorder| rec.log().iter().filter(|e| *e == "soft_block:701").count();
+    let before = blocks(&rec);
+    // the same child again: known, nothing new
+    l.observe(
+        &spawn_started(701, 7010, 700, 7000),
+        t0 + Duration::from_secs(2),
+    );
+    assert_eq!(blocks(&rec), before);
+    // 701 exited; its PID now names a new child of 700 (another start)
+    l.observe(
+        &spawn_started(701, 99, 700, 7000),
+        t0 + Duration::from_secs(3),
+    );
+    assert_eq!(blocks(&rec), before + 1, "{:?}", rec.log());
+    assert_eq!(l.offenders(), vec![700, 701]);
 }
 
 // ── Idempotent engage: hook + process_event both call it ──
@@ -500,6 +589,36 @@ fn neutralize_spares_protected_offender_and_escalates_to_isolate() {
             && reason.contains("spared")
             && reason.contains("ssh-service")),
         "NEUTRALIZE record must note the spared process: {r:?}"
+    );
+}
+
+/// External audit CMB-004: an offender that has exited, its PID now held
+/// by a protected process (an sshd child): not "spared" — the guard's
+/// lookup by PID would judge the new holder — and no ISOLATE for it. The
+/// kill reports it gone.
+#[test]
+fn an_exited_offender_on_a_protected_pid_is_not_spared() {
+    let win = Duration::from_secs(30);
+    let gone = EXITED_FROM + 1;
+    let mut prot = HashMap::new();
+    prot.insert(gone, ProtectedReason::SshService);
+    let (l, rec, reasons) = ladder_protected(NeutralizeOutcome::Contained, win, prot);
+    let t0 = Instant::now();
+    l.engage(Some(5000), Some(TriggerType::ConfirmedIntrusion), t0);
+    l.engage(Some(gone), None, t0);
+    l.tick(t0 + win + Duration::from_secs(1));
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    let log = rec.log();
+    assert!(
+        log.iter()
+            .any(|e| *e == format!("neutralize:[5000, {gone}]")),
+        "{log:?}"
+    );
+    assert!(!log.iter().any(|e| e == "isolate"), "{log:?}");
+    assert!(
+        !reasons.lock().iter().any(|(_, r)| r.contains("spared")),
+        "{:?}",
+        reasons.lock()
     );
 }
 
@@ -708,19 +827,25 @@ impl HeldActuator {
 }
 
 impl CombatActuator for HeldActuator {
-    fn soft_egress_block(&self, pid: u32) -> SoftBlock {
+    fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
+        mock_ref(pid)
+    }
+    fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
+        mock_same_process(target, start_ns)
+    }
+    fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock {
+        let pid = target.pid();
         self.wait_if(Held::SoftBlock(pid), &format!("soft_block:{pid}"));
         self.rec.push(format!("soft_block:{pid}"));
-        SoftBlock::Blocked {
-            start_ticks: Some(u64::from(pid) * 10),
-        }
+        SoftBlock::Blocked
     }
-    fn soft_egress_clear(&self, pid: u32, _start_ticks: Option<u64>) {
-        self.rec.push(format!("soft_clear:{pid}"));
+    fn soft_egress_clear(&self, target: &ProcRef) {
+        self.rec.push(format!("soft_clear:{}", target.pid()));
     }
-    fn neutralize(&self, offenders: &[u32]) -> NeutralizeOutcome {
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome {
         self.wait_if(Held::Neutralize, "neutralize");
-        self.rec.push(format!("neutralize:{offenders:?}"));
+        self.rec
+            .push(format!("neutralize:{:?}", pids_of(offenders)));
         self.neutralize_outcome.clone()
     }
     fn isolate(&self) {

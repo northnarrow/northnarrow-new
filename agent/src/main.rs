@@ -839,6 +839,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The COMBAT ladder holds a pidfd per attributed offender (external
+    // audit CMB-004), up to its cap of 1 024, on top of the agent's own
+    // ~140 descriptors: a soft limit of 1 024 (systemd's default) ran out
+    // in the lab ("Too many open files" in the quarantine).
+    match raise_nofile_rlimit() {
+        Ok(n) => info!(open_files = n, "RLIMIT_NOFILE soft limit raised"),
+        Err(e) => {
+            warn!(error = %e, "failed to raise RLIMIT_NOFILE; a large COMBAT episode may exhaust descriptors")
+        }
+    }
     if let Err(e) = bump_memlock_rlimit() {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
@@ -1343,6 +1353,19 @@ async fn main() -> Result<()> {
             }
         };
     let executor = Executor::with_config(exec_cfg);
+    // External audit CMB-019: a kill cgroup an earlier agent left in the
+    // middle of a kill (its tree frozen) is finished and removed.
+    if !detect_only {
+        let removed = northnarrow_agent::response::kill::reap_stale_kill_cgroups(
+            &executor.config().blocked_cgroup_dir(),
+        );
+        if removed > 0 {
+            warn!(
+                removed,
+                "kill cgroups left by an earlier agent were finished and removed"
+            );
+        }
+    }
     if detect_only {
         warn!(
             "DETECT-ONLY mode active (--detect-only / NN_DETECT_ONLY / NORTHNARROW_DRY_RUN): \
@@ -3446,8 +3469,15 @@ async fn process_event(
             // External audit EBPF-001: init is never an offender — its only
             // containment would be ISOLATE, and the events it owns (a relayed
             // `systemctl`, the console writes of a shutdown) are not its own.
-            ladder.engage(
+            // External audit CMB-004: with what the event says about the
+            // offender (its start, a time it was running) — it identifies
+            // the offender after it has exited.
+            let (start_ns, seen_ns) =
+                northnarrow_agent::posture::triggers::event_owner_seen(&event);
+            ladder.engage_with(
                 northnarrow_agent::posture::triggers::event_owner_pid(&event).filter(|p| *p > 1),
+                start_ns,
+                seen_ns,
                 firing_trigger,
                 Instant::now(),
             );
@@ -3757,12 +3787,27 @@ async fn process_event(
         let action = verdict.action.clone();
         let target_pid = verdict.event_pid;
         let target_file = verdict.event_filename.clone();
+        // External audit CMB-004: what the event says about the process
+        // the verdict is about — its start (an exec), the event's time — so
+        // a kill does not reach a process that took the PID after the event.
+        let (target_start_ns, target_seen_ns) =
+            if northnarrow_agent::posture::triggers::event_owner_pid(&event) == Some(target_pid) {
+                northnarrow_agent::posture::triggers::event_owner_seen(&event)
+            } else {
+                (0, 0)
+            };
         // A Log verdict runs nothing: no blocking task for it.
         let report = if matches!(action, common::ResponseAction::Log) {
             exec.execute(action, target_pid)
         } else {
             match tokio::task::spawn_blocking(move || {
-                exec.execute_for(action, target_pid, &target_file)
+                exec.execute_for_started(
+                    action,
+                    target_pid,
+                    target_start_ns,
+                    target_seen_ns,
+                    &target_file,
+                )
             })
             .await
             {
@@ -3900,11 +3945,21 @@ async fn evaluate_and_respond(
 
     let exec = executor.clone();
     let action = verdict.to_response_action();
+    // External audit CMB-004: the verdict comes back seconds after the
+    // event (the model's evaluation): the kill checks the process against
+    // what the event says (its exec's start, or the event's time), so it
+    // does not reach a process that took the PID meanwhile.
     let target_pid = match &event {
         Event::ProcessSpawn { pid, .. } | Event::ExecCheck { pid, .. } => *pid,
         _ => return,
     };
-    let report = match tokio::task::spawn_blocking(move || exec.execute(action, target_pid)).await {
+    let (target_start_ns, target_seen_ns) =
+        northnarrow_agent::posture::triggers::event_owner_seen(&event);
+    let report = match tokio::task::spawn_blocking(move || {
+        exec.execute_started(action, target_pid, target_start_ns, target_seen_ns)
+    })
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "executor task join failed");
@@ -4564,6 +4619,29 @@ fn write_pid_file(path: &std::path::Path) -> Result<()> {
         "pid_file written (atomic tempfile+rename; existence == post-attach readiness gate)"
     );
     Ok(())
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit (at most 65 536).
+/// Returns the new soft limit.
+fn raise_nofile_rlimit() -> std::io::Result<u64> {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a valid `rlimit` to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let want = rlim.rlim_max.min(65_536);
+    if rlim.rlim_cur >= want {
+        return Ok(rlim.rlim_cur);
+    }
+    rlim.rlim_cur = want;
+    // SAFETY: a valid `rlimit` passed by reference; the kernel only reads it.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(want)
 }
 
 /// Raise `RLIMIT_MEMLOCK` to infinity so older kernels accept large

@@ -219,36 +219,54 @@ fn kills_a_process_tree() {
 /// External audit CMB-005: the host-critical guard applies to every
 /// action that acts on a process — it used to be consulted by the tree
 /// walk only, so a rule's KillProcess could take down sshd or the
-/// watchdog. The pid is fictitious: with the guard broken the actions
-/// would report it gone, never `Refused`.
+/// watchdog. For the actions by PID the pid is fictitious: with the guard
+/// broken they would report it gone, never `Refused`. A kill target that
+/// does not run is gone before any guard (external audit CMB-004): the
+/// kills are tried on a `sleep` of the test's own.
 #[test]
 fn host_critical_guard_applies_to_every_pid_scoped_action() {
     const GUARDED: u32 = 999_123;
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let live = sleeper.id();
     let tmp = tempfile::TempDir::new().unwrap();
     let mut cfg = super::ExecutorConfig::for_test(tmp.path());
     cfg.dry_run = false;
     let exec = Executor::with_config(cfg);
-    exec.set_tree_guard(std::sync::Arc::new(|pid: u32| {
-        (pid == GUARDED).then_some("ssh-service(sshd)")
+    exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
+        (pid == GUARDED || pid == live).then_some("ssh-service(sshd)")
     }));
-    for action in [
-        ResponseAction::KillProcess,
-        ResponseAction::KillProcessTree,
-        ResponseAction::Quarantine,
-        ResponseAction::BlockOutbound,
-        ResponseAction::ThrottleProcess,
+    for (action, pid) in [
+        (ResponseAction::KillProcess, live),
+        (ResponseAction::KillProcessTree, live),
+        (ResponseAction::Quarantine, GUARDED),
+        (ResponseAction::BlockOutbound, GUARDED),
+        (ResponseAction::ThrottleProcess, GUARDED),
     ] {
-        let report = exec.execute(action.clone(), GUARDED);
+        let report = exec.execute(action.clone(), pid);
         assert_eq!(
             report.primary,
             ExecutionOutcome::Refused {
-                pid: GUARDED,
+                pid,
                 reason: "ssh-service(sshd)"
             },
             "{action:?}"
         );
         assert!(report.additional.is_empty(), "{action:?}");
     }
+    // the guarded process still runs; a kill target that has exited is
+    // gone, whatever the guard says about its PID
+    assert!(super::proc_ref::ProcRef::open(live).is_live());
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let report = exec.execute(ResponseAction::KillProcess, GUARDED);
+    assert_eq!(
+        report.primary,
+        ExecutionOutcome::AlreadyGone { pid: GUARDED }
+    );
     // Not a process action: the guard has nothing to say.
     let report = exec.execute(ResponseAction::Log, GUARDED);
     assert!(matches!(

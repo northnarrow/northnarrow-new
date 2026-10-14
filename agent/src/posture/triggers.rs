@@ -622,6 +622,26 @@ pub fn event_owner_pid(event: &Event) -> Option<u32> {
     }
 }
 
+/// What the event that names [`event_owner_pid`] says about that process
+/// (external audit CMB-004): its start (an exec's, `CLOCK_MONOTONIC` ns)
+/// and the event's time (it was running then); 0 when unknown.
+pub fn event_owner_seen(event: &Event) -> (u64, u64) {
+    match event {
+        Event::ProcessSpawn {
+            start_ns,
+            timestamp_ns,
+            ..
+        } => (*start_ns, *timestamp_ns),
+        Event::FileOpen { timestamp_ns, .. }
+        | Event::MassWrite { timestamp_ns, .. }
+        | Event::ExecCheck { timestamp_ns, .. }
+        | Event::TcpConnect { timestamp_ns, .. }
+        | Event::DnsQuery { timestamp_ns, .. }
+        | Event::FsProtectDenial { timestamp_ns, .. } => (0, *timestamp_ns),
+        _ => (0, 0),
+    }
+}
+
 fn recon_pattern(focal: &Event, recent: Recent<'_>) -> bool {
     if let Event::ProcessSpawn { comm, .. } = focal {
         if RECON_TOOL_COMMS.iter().any(|c| comm == c) {
