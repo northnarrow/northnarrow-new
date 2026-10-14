@@ -510,6 +510,51 @@ fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<(), QuarantineErro
     Ok(())
 }
 
+/// External audit CMB-017: what happened to a quarantine index that did
+/// not parse, waiting to be recorded in the signed audit log by the
+/// executor ([`take_index_notes`]).
+static INDEX_NOTES: parking_lot::Mutex<Vec<String>> = parking_lot::const_mutex(Vec::new());
+
+/// The index repairs since the last call (external audit CMB-017).
+pub fn take_index_notes() -> Vec<String> {
+    std::mem::take(&mut *INDEX_NOTES.lock())
+}
+
+/// The `.meta` of a vault entry: what was quarantined (path, size,
+/// sha256, time).
+pub fn vault_meta(vault_id: &str, cfg: &ExecutorConfig) -> Option<serde_json::Value> {
+    let s = fs::read_to_string(
+        cfg.quarantine_dir
+            .join("vault")
+            .join(format!("{vault_id}.meta")),
+    )
+    .ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// The index entries rebuilt from the vault's `.meta` files, oldest first.
+fn index_from_meta(quarantine_dir: &Path) -> Vec<serde_json::Value> {
+    let mut entries: Vec<serde_json::Value> = fs::read_dir(quarantine_dir.join("vault"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "meta"))
+                .filter_map(|e| fs::read_to_string(e.path()).ok())
+                .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|m| {
+                    serde_json::json!({
+                        "vault_id": m["vault_id"],
+                        "original_path": m["original_path"],
+                        "size_bytes": m["size_bytes"],
+                        "captured_at": m["captured_at"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by_key(|e| e["captured_at"].as_u64().unwrap_or(0));
+    entries
+}
+
 fn update_index(
     quarantine_dir: &Path,
     vault_id: &str,
@@ -520,7 +565,27 @@ fn update_index(
     let tmp_path = quarantine_dir.join("index.json.tmp");
 
     let mut entries: Vec<serde_json::Value> = match fs::read_to_string(&index_path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                // External audit CMB-017: an index that does not parse was
+                // replaced by an empty one — the record of every earlier
+                // quarantine lost. Kept aside, rebuilt from the vault's
+                // `.meta` files, and reported.
+                let kept =
+                    quarantine_dir.join(format!("index.json.corrupt-{}", current_timestamp()));
+                fs::rename(&index_path, &kept)?;
+                let rebuilt = index_from_meta(quarantine_dir);
+                let note = format!(
+                    "quarantine index did not parse ({e}); kept as {}; rebuilt from {} vault .meta file(s)",
+                    kept.display(),
+                    rebuilt.len()
+                );
+                warn!("{note}");
+                INDEX_NOTES.lock().push(note);
+                rebuilt
+            }
+        },
         Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
@@ -871,6 +936,55 @@ mod tests {
         assert_eq!(v.as_array().map(|a| a.len()), Some(2));
         // tmp file should not be left behind.
         assert!(!cfg.quarantine_dir.join("index.json.tmp").exists());
+    }
+
+    /// External audit CMB-017: an index that does not parse is kept
+    /// aside and rebuilt from the vault's `.meta` files, and the repair is
+    /// reported.
+    #[test]
+    fn a_corrupt_index_is_rebuilt_from_the_meta_files() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let vault = cfg.quarantine_dir.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        for (id, t) in [("aaa", 10u64), ("bbb", 20)] {
+            std::fs::write(
+                vault.join(format!("{id}.meta")),
+                serde_json::json!({"vault_id": id, "original_path": format!("/tmp/{id}"), "size_bytes": 3, "sha256": "x", "captured_at": t}).to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(cfg.quarantine_dir.join("index.json"), b"{ not json").unwrap();
+        let _ = take_index_notes();
+        update_index(&cfg.quarantine_dir, "ccc", "/tmp/ccc", 3).unwrap();
+        let index: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(cfg.quarantine_dir.join("index.json")).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = index
+            .iter()
+            .map(|e| e["vault_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["aaa", "bbb", "ccc"]);
+        let kept: Vec<_> = std::fs::read_dir(&cfg.quarantine_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("index.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "the corrupt index is kept aside");
+        let notes = take_index_notes();
+        assert!(
+            notes.len() == 1 && notes[0].contains("rebuilt from 2"),
+            "{notes:?}"
+        );
+        assert_eq!(
+            vault_meta("aaa", &cfg).unwrap()["original_path"],
+            "/tmp/aaa"
+        );
     }
 
     #[test]

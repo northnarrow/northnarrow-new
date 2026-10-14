@@ -12,6 +12,7 @@
 pub mod block_outbound;
 pub mod caps_preflight;
 pub mod config;
+pub mod containment;
 pub mod executor;
 pub mod file_caps;
 pub mod kill;
@@ -75,11 +76,14 @@ pub enum ExecutionOutcome {
         vault_id: String,
     },
     /// `ThrottleProcess`: the PID was placed in
-    /// `northnarrow.slice/throttled.scope` with hard limits.
+    /// `northnarrow.slice/throttled.scope`. External audit CMB-013: each
+    /// limit as read back from the scope after it was written — `None`
+    /// where it could not be set (controller not enabled, knob missing).
     Throttled {
         pid: u32,
-        cpu_max_pct: u8,
-        io_weight: u16,
+        cpu_max_pct: Option<u8>,
+        io_weight: Option<u16>,
+        memory_high_bytes: Option<u64>,
     },
     /// Review 86, `StripFileCapability`: the file no longer carries a
     /// `security.capability` xattr.

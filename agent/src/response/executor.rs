@@ -36,7 +36,13 @@ pub struct Executor {
     /// Set once the COMBAT ladder's `ProtectedProcs` exists (it is built
     /// after the executor, so this is a late-bound slot shared by clones).
     tree_guard: Arc<parking_lot::RwLock<Option<TreeGuard>>>,
+    /// External audit CMB-017: the signed audit log, once open (late-bound
+    /// like the guard) — every quarantine is recorded in it.
+    audit: Arc<parking_lot::RwLock<Option<SharedAuditLog>>>,
 }
+
+/// The agent's signed audit log, shared.
+pub type SharedAuditLog = Arc<parking_lot::Mutex<crate::audit::AuditLog>>;
 
 impl std::fmt::Debug for Executor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,6 +78,122 @@ impl Executor {
             protected: Arc::new(protected),
             config: Arc::new(config),
             tree_guard: Arc::new(parking_lot::RwLock::new(None)),
+            audit: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    /// External audit CMB-017: record quarantines in the signed audit log
+    /// from now on. Visible to every clone of this executor.
+    pub fn set_audit_log(&self, log: SharedAuditLog) {
+        *self.audit.write() = Some(log);
+    }
+
+    /// A response entry in the signed audit log, when it is open.
+    fn audit_entry(&self, op: &str, extra: serde_json::Value, result: &str) {
+        let Some(log) = self.audit.read().clone() else {
+            return;
+        };
+        let draft = crate::audit::AuditEntryDraft {
+            op: op.to_string(),
+            extra,
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: result.to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        };
+        let appended = log.lock().append(draft);
+        if let Err(e) = appended {
+            warn!(error = %e, op, "recording a response in the audit log failed");
+        }
+    }
+
+    /// External audit CMB-010: a process moved into a containment scope,
+    /// with the cgroup it came from, in the signed audit log.
+    fn record_contain(&self, pid: u32, scope: &str) {
+        let origin = super::containment::find(&self.config, pid, scope).map(|c| c.origin);
+        self.audit_entry(
+            "response_contain",
+            serde_json::json!({ "pid": pid, "scope": scope, "origin": origin }),
+            "success",
+        );
+    }
+
+    /// External audit CMB-010: a release (or a release left undone, with
+    /// why) in the signed audit log.
+    pub fn record_release(&self, pid: u32, scope: &str, outcome: &super::containment::Release) {
+        let (result, why) = match outcome {
+            super::containment::Release::Released => ("success", None),
+            super::containment::Release::Skipped(why) => ("skipped", Some(*why)),
+        };
+        self.audit_entry(
+            "response_release",
+            serde_json::json!({ "pid": pid, "scope": scope, "why": why }),
+            result,
+        );
+    }
+
+    /// External audit CMB-017: a quarantine (and any index repair) in the
+    /// signed audit log — the vault id, the path, the content's SHA-256
+    /// and size, the process.
+    fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
+        let notes = quarantine::take_index_notes();
+        let ExecutionOutcome::Quarantined {
+            original_path,
+            vault_id,
+        } = outcome
+        else {
+            if notes.is_empty() {
+                return;
+            }
+            return self.record_index_notes(notes);
+        };
+        let Some(log) = self.audit.read().clone() else {
+            warn!(vault_id = %vault_id, "quarantine not recorded: the audit log is not open");
+            return;
+        };
+        let meta = quarantine::vault_meta(vault_id, &self.config).unwrap_or_default();
+        let draft = crate::audit::AuditEntryDraft {
+            op: "response_quarantine".to_string(),
+            extra: serde_json::json!({
+                "vault_id": vault_id,
+                "original_path": original_path,
+                "sha256": meta["sha256"],
+                "size_bytes": meta["size_bytes"],
+                "pid": pid,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "success".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        };
+        if let Err(e) = log.lock().append(draft) {
+            warn!(error = %e, "recording a quarantine in the audit log failed");
+        }
+        self.record_index_notes(notes);
+    }
+
+    fn record_index_notes(&self, notes: Vec<String>) {
+        let Some(log) = self.audit.read().clone() else {
+            return;
+        };
+        for note in notes {
+            let draft = crate::audit::AuditEntryDraft {
+                op: crate::self_integrity::AUDIT_OP.to_string(),
+                extra: serde_json::json!({"kind": "quarantine_index_rebuilt", "detail": note}),
+                key_fp: "agent-self".to_string(),
+                cosigner_fps: Vec::new(),
+                result: "detected".to_string(),
+                client_pid: std::process::id(),
+                client_uid: 0,
+                client_comm: "northnarrow-agent".to_string(),
+            };
+            if let Err(e) = log.lock().append(draft) {
+                warn!(error = %e, "recording a quarantine index repair failed");
+            }
         }
     }
 
@@ -142,7 +264,9 @@ impl Executor {
         let primary = if self.config.dry_run {
             ExecutionOutcome::WouldExecute { pid }
         } else {
-            quarantine::quarantine_handle(handle, pid, &self.config)
+            let o = quarantine::quarantine_handle(handle, pid, &self.config);
+            self.record_quarantine(pid, &o);
+            o
         };
         ExecutionReport {
             action: ResponseAction::Quarantine,
@@ -317,20 +441,36 @@ impl Executor {
                     additional = kids;
                     p
                 }
-                ResponseAction::BlockOutbound => block_outbound::block_outbound_for_pid(
-                    target_pid,
-                    &self.protected,
-                    &self.config,
-                ),
+                ResponseAction::BlockOutbound => {
+                    let o = block_outbound::block_outbound_for_pid(
+                        target_pid,
+                        &self.protected,
+                        &self.config,
+                    );
+                    if matches!(o, ExecutionOutcome::Blocked { .. }) && !self.config.dry_run {
+                        self.record_contain(target_pid, "blocked");
+                    }
+                    o
+                }
                 ResponseAction::FullNetworkIsolation => ExecutionOutcome::Refused {
                     pid: target_pid,
                     reason: ISOLATION_IS_THE_LADDERS,
                 },
                 ResponseAction::Quarantine => {
-                    quarantine::quarantine_process_binary(target_pid, &self.protected, &self.config)
+                    let o = quarantine::quarantine_process_binary(
+                        target_pid,
+                        &self.protected,
+                        &self.config,
+                    );
+                    self.record_quarantine(target_pid, &o);
+                    o
                 }
                 ResponseAction::ThrottleProcess => {
-                    throttle::throttle_pid(target_pid, &self.protected, &self.config)
+                    let o = throttle::throttle_pid(target_pid, &self.protected, &self.config);
+                    if matches!(o, ExecutionOutcome::Throttled { .. }) && !self.config.dry_run {
+                        self.record_contain(target_pid, "throttled");
+                    }
+                    o
                 }
                 // Acts on a file: only through `execute_for`.
                 ResponseAction::StripFileCapability => ExecutionOutcome::Refused {

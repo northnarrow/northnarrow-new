@@ -51,47 +51,120 @@ pub fn throttle_pid(pid: u32, protected: &HashSet<u32>, cfg: &ExecutorConfig) ->
         info!(pid, "dry-run: would throttle pid");
         return ExecutionOutcome::Throttled {
             pid,
-            cpu_max_pct: CPU_MAX_PCT,
-            io_weight: IO_WEIGHT,
+            cpu_max_pct: Some(CPU_MAX_PCT),
+            io_weight: Some(IO_WEIGHT),
+            memory_high_bytes: Some(MEMORY_HIGH_BYTES),
         };
     }
 
+    // A process under the blocked scope — blocked, or in a kill cgroup
+    // being killed (CMB-019) — stays there: the move would lift its egress
+    // drop, or take it out of the kill.
+    if super::block_outbound::pid_under_blocked_scope(pid, cfg) {
+        warn!(
+            pid,
+            "throttle: the process is blocked (or being killed) — not moved"
+        );
+        return ExecutionOutcome::Refused {
+            pid,
+            reason: "in the blocked scope: moving it would lift the egress drop",
+        };
+    }
     let dir = cfg.throttled_cgroup_dir();
     if let Err(e) = ensure_throttled_cgroup(&dir, cfg) {
         return io_failed(pid, "ensure_throttled_cgroup", &e);
     }
-    if let Err(e) = write_throttle_limits(&dir) {
-        return io_failed(pid, "write_throttle_limits", &e);
+    // External audit CMB-013: the limits first, read back; a scope where
+    // none could be set throttles nothing, so the process is not moved.
+    let applied = match write_throttle_limits(&dir) {
+        Ok(a) => a,
+        Err(e) => return io_failed(pid, "write_throttle_limits", &e),
+    };
+    if applied.is_empty() {
+        warn!(
+            pid,
+            scope = %dir.display(),
+            "throttle: no limit could be set (cpu, io and memory controllers unavailable) — not moved"
+        );
+        return ExecutionOutcome::Failed {
+            pid,
+            errno: libc::EOPNOTSUPP,
+        };
     }
+    // External audit CMB-010: where it came from, recorded for the release.
+    let origin = super::containment::origin_of(pid);
+    let start_ticks = super::block_outbound::proc_start_ticks(pid);
     if let Err(e) = write_pid(&dir.join("cgroup.procs"), pid) {
         if matches!(e.raw_os_error(), Some(libc::ESRCH)) {
             return ExecutionOutcome::AlreadyGone { pid };
         }
         return io_failed(pid, "move_pid_to_throttled", &e);
     }
+    if let Some(origin) = origin {
+        if let Err(e) = super::containment::record(
+            cfg,
+            super::containment::Contained {
+                pid,
+                start_ticks,
+                scope: "throttled".into(),
+                origin,
+                since: super::containment::now(),
+            },
+        ) {
+            warn!(pid, error = %e, "the containment record could not be written — a release will leave it throttled");
+        }
+    }
 
     info!(
         pid,
-        cpu = CPU_MAX,
-        io_weight = IO_WEIGHT,
-        memory_high = MEMORY_HIGH_BYTES,
-        "throttled pid"
+        cpu_max_pct = ?applied.cpu_max_pct,
+        io_weight = ?applied.io_weight,
+        memory_high = ?applied.memory_high_bytes,
+        "throttled pid (limits as read back)"
     );
     ExecutionOutcome::Throttled {
         pid,
-        cpu_max_pct: CPU_MAX_PCT,
-        io_weight: IO_WEIGHT,
+        cpu_max_pct: applied.cpu_max_pct,
+        io_weight: applied.io_weight,
+        memory_high_bytes: applied.memory_high_bytes,
     }
 }
 
-/// Move a PID back to the root cgroup. Used by tests and a future
-/// CLI command. Idempotent.
-pub fn release_pid(pid: u32, cfg: &ExecutorConfig) -> std::io::Result<()> {
-    if cfg.dry_run {
-        return Ok(());
+/// The limits in force in the throttle scope, as read back.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Applied {
+    cpu_max_pct: Option<u8>,
+    io_weight: Option<u16>,
+    memory_high_bytes: Option<u64>,
+}
+
+impl Applied {
+    fn is_empty(&self) -> bool {
+        self.cpu_max_pct.is_none() && self.io_weight.is_none() && self.memory_high_bytes.is_none()
     }
-    let root_procs = cfg.cgroup_root.join("cgroup.procs");
-    write_pid(&root_procs, pid)
+}
+
+/// External audit CMB-010: release a throttled process back to the
+/// cgroup it came from (never the root cgroup) — see
+/// [`super::containment`].
+pub fn release_pid(
+    pid: u32,
+    start_ticks: Option<u64>,
+    cfg: &ExecutorConfig,
+) -> std::io::Result<super::containment::Release> {
+    let scope_rel = format!("/{}/throttled.scope", cfg.cgroup_slice);
+    super::containment::release_to_origin(
+        pid,
+        start_ticks,
+        "throttled",
+        cfg,
+        &super::containment::Probe {
+            in_scope: &|p| {
+                super::containment::origin_of(p).is_some_and(|c| c.ends_with(&scope_rel))
+            },
+            start_of: &super::block_outbound::proc_start_ticks,
+        },
+    )
 }
 
 fn ensure_throttled_cgroup(dir: &Path, cfg: &ExecutorConfig) -> std::io::Result<()> {
@@ -107,20 +180,55 @@ fn ensure_throttled_cgroup(dir: &Path, cfg: &ExecutorConfig) -> std::io::Result<
         .join("cgroup.subtree_control");
     for c in ["+cpu", "+io", "+memory"] {
         if let Err(e) = fs::write(&subtree, c) {
-            tracing::debug!(controller = c, error = %e, "enable controller failed; skipping");
+            // External audit CMB-013: a limit this controller would set
+            // will be missing — said where an operator sees it.
+            warn!(controller = c, error = %e, "throttle: enabling the controller failed; its limit will not apply");
         }
     }
     Ok(())
 }
 
-fn write_throttle_limits(dir: &Path) -> std::io::Result<()> {
+/// Write each limit, then read it back: what the outcome reports is what
+/// the scope holds (external audit CMB-013).
+fn write_throttle_limits(dir: &Path) -> std::io::Result<Applied> {
     write_if_present(&dir.join("cpu.max"), CPU_MAX.as_bytes())?;
     write_if_present(&dir.join("io.weight"), IO_WEIGHT.to_string().as_bytes())?;
     write_if_present(
         &dir.join("memory.high"),
         MEMORY_HIGH_BYTES.to_string().as_bytes(),
     )?;
-    Ok(())
+    let read = |knob: &str| fs::read_to_string(dir.join(knob)).ok();
+    Ok(Applied {
+        cpu_max_pct: read("cpu.max").as_deref().and_then(parse_cpu_max_pct),
+        io_weight: read("io.weight").as_deref().and_then(parse_io_weight),
+        memory_high_bytes: read("memory.high").as_deref().and_then(parse_memory_high),
+    })
+}
+
+/// `cpu.max` reads `"<quota> <period>"` (or `"max <period>"`: no limit).
+fn parse_cpu_max_pct(s: &str) -> Option<u8> {
+    let mut it = s.split_whitespace();
+    let quota: u64 = it.next()?.parse().ok()?;
+    let period: u64 = it.next()?.parse().ok()?;
+    (period > 0).then(|| (quota * 100 / period).min(u8::MAX as u64) as u8)
+}
+
+/// `io.weight` reads `"default <n>"` plus per-device lines on the io
+/// controller (BFQ's `io.bfq.weight` reads a bare number).
+fn parse_io_weight(s: &str) -> Option<u16> {
+    s.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("default"), Some(n)) => n.parse().ok(),
+            (Some(n), None) => n.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+/// `memory.high` reads a byte count, or `"max"` (no limit).
+fn parse_memory_high(s: &str) -> Option<u64> {
+    s.trim().parse().ok()
 }
 
 /// Write to a cgroup interface file. Treats "controller not
@@ -182,11 +290,62 @@ mod tests {
             out,
             ExecutionOutcome::Throttled {
                 pid: 4242,
-                cpu_max_pct: 10,
-                io_weight: 10
+                cpu_max_pct: Some(10),
+                io_weight: Some(10),
+                memory_high_bytes: Some(MEMORY_HIGH_BYTES),
             }
         ));
         assert!(!cfg.throttled_cgroup_dir().exists());
+    }
+
+    /// External audit CMB-013: a scope where no limit can be set (no
+    /// controller knobs, as in a tempdir) throttles nothing — `Failed`, and
+    /// the process is not moved.
+    #[test]
+    fn a_scope_without_knobs_fails_and_moves_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(tmp.path())
+        };
+        let dir = cfg.throttled_cgroup_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.procs"), b"").unwrap();
+        let out = throttle_pid(std::process::id() + 1_000_000, &HashSet::new(), &cfg);
+        assert!(
+            matches!(out, ExecutionOutcome::Failed { errno, .. } if errno == libc::EOPNOTSUPP),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(),
+            ""
+        );
+    }
+
+    /// External audit CMB-013: the limits are reported as read back.
+    #[test]
+    fn limits_are_parsed_as_the_kernel_shows_them() {
+        assert_eq!(parse_cpu_max_pct("10000 100000\n"), Some(10));
+        assert_eq!(parse_cpu_max_pct("max 100000\n"), None);
+        assert_eq!(parse_io_weight("default 10\n8:0 100\n"), Some(10));
+        assert_eq!(parse_io_weight("10\n"), Some(10));
+        assert_eq!(parse_io_weight("8:0 100\n"), None);
+        assert_eq!(parse_memory_high("104857600\n"), Some(104_857_600));
+        assert_eq!(parse_memory_high("max\n"), None);
+        // knobs written in a plain directory read back as written
+        let tmp = TempDir::new().unwrap();
+        for (knob, v) in [("cpu.max", ""), ("io.weight", ""), ("memory.high", "")] {
+            std::fs::write(tmp.path().join(knob), v).unwrap();
+        }
+        let a = write_throttle_limits(tmp.path()).unwrap();
+        assert_eq!(
+            a,
+            Applied {
+                cpu_max_pct: Some(CPU_MAX_PCT),
+                io_weight: Some(IO_WEIGHT),
+                memory_high_bytes: Some(MEMORY_HIGH_BYTES),
+            }
+        );
     }
 
     #[test]

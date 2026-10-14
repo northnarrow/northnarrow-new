@@ -24,10 +24,10 @@
 //!   CIDR explicitly; we never infer it from the live SSH session
 //!   (that would let an attacker mid-session carve themselves out).
 //!
-//! IPv4 only: the COMBAT ruleset is `iptables` (v4); COMBAT does not
-//! currently isolate IPv6 at all, so a v6 management network needs no
-//! carve-out. v6 entries are validated and accepted but emit no rule
-//! (with an informational log from the caller).
+//! Both families (BUG-031): COMBAT isolates IPv4 with `iptables` and IPv6
+//! with `ip6tables`; [`generate_accept_rules`] emits the IPv4 entries'
+//! ACCEPT rules and [`generate_accept_rules_v6`] the IPv6 ones, each
+//! spliced into its family's chain.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -120,7 +120,7 @@ pub fn load_allow_cidrs(path: &Path) -> AllowLoad {
 /// Generate the `iptables-restore` ACCEPT lines for the IPv4 entries,
 /// to be spliced into `chain` ahead of its DROP. Each network is
 /// allowed both inbound (`-s`) and outbound (`-d`) so an SSH session
-/// to/from it survives. IPv6 entries emit nothing (see module docs).
+/// to/from it survives. IPv6 entries go to [`generate_accept_rules_v6`].
 /// Returns an empty string when there are no IPv4 entries.
 pub fn generate_accept_rules(entries: &[AllowCidr], chain: &str) -> String {
     let mut out = String::new();
@@ -223,6 +223,42 @@ garbage-line\n\
     // BUG-031: the v6 generator is the mirror — v6 entries → two rules,
     // v4 → nothing. Together with the v4 test, every entry is applied to
     // exactly one table (no entry dropped, none double-applied).
+    /// External audit CMB-015: the shipped file with an IPv6 line added
+    /// produces the ip6tables ACCEPT rules.
+    #[test]
+    fn the_shipped_file_with_an_ipv6_line_carves_out_ipv6() {
+        let shipped = include_str!("../../../configs/combat-allow.cidrs");
+        let load = parse_allow_text(&format!("{shipped}\n2001:db8:10::/48\n"));
+        let v6 = generate_accept_rules_v6(&load.entries, "NORTHNARROW_COMBAT");
+        assert!(
+            v6.contains("-A NORTHNARROW_COMBAT -s 2001:db8:10::/48 -j ACCEPT"),
+            "{v6}"
+        );
+        assert!(
+            v6.contains("-A NORTHNARROW_COMBAT -d 2001:db8:10::/48 -j ACCEPT"),
+            "{v6}"
+        );
+        assert!(generate_accept_rules(&load.entries, "NORTHNARROW_COMBAT").is_empty());
+    }
+
+    /// External audit CMB-015: the shipped comments no longer say COMBAT
+    /// isolation is IPv4-only.
+    #[test]
+    fn the_shipped_docs_do_not_call_isolation_ipv4_only() {
+        for (name, text) in [
+            (
+                "configs/combat-allow.cidrs",
+                include_str!("../../../configs/combat-allow.cidrs"),
+            ),
+            (
+                "docs/operator/COMBAT_RECOVERY.md",
+                include_str!("../../../docs/operator/COMBAT_RECOVERY.md"),
+            ),
+        ] {
+            assert!(!text.contains("IPv4-only"), "{name} still says IPv4-only");
+        }
+    }
+
     #[test]
     fn generate_v6_emits_two_rules_per_ipv6_none_for_ipv4() {
         let entries = parse_allow_text("10.0.0.0/24\nfd00::/8\n").entries;

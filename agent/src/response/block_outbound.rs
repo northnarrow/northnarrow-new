@@ -113,6 +113,10 @@ pub fn block_outbound_for_pid(
         debug!(pid, "already in the blocked scope");
         return ExecutionOutcome::Blocked { pid };
     }
+    // External audit CMB-010: where it came from, read before the move —
+    // a release returns it there.
+    let origin = super::containment::origin_of(pid);
+    let start_ticks = proc_start_ticks(pid);
     if let Err(e) = move_pid_to_blocked(pid, cfg) {
         // ESRCH from the cgroup write means the process exited; treat
         // it the same as the kill path's AlreadyGone.
@@ -121,45 +125,48 @@ pub fn block_outbound_for_pid(
         }
         return io_failed(pid, "move_pid_to_blocked", &e);
     }
+    if let Some(origin) = origin {
+        if let Err(e) = super::containment::record(
+            cfg,
+            super::containment::Contained {
+                pid,
+                start_ticks,
+                scope: "blocked".into(),
+                origin,
+                since: super::containment::now(),
+            },
+        ) {
+            tracing::warn!(pid, error = %e, "the containment record could not be written — a release will leave it contained");
+        }
+    }
     info!(pid, cgroup = %cfg.blocked_cgroup_match(), "blocked outbound traffic");
     ExecutionOutcome::Blocked { pid }
 }
 
 /// What [`release_blocked_pid`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Release {
-    /// Moved out of `blocked.scope`.
-    Released,
-    /// Left alone, with the reason: not in `blocked.scope`, or the PID
-    /// now names another process.
-    Skipped(&'static str),
-}
+pub use super::containment::Release;
 
-/// External audit CMB-010 (stop-gap): release a PID this agent blocked —
-/// only while `/proc/<pid>/cgroup` still shows it in `blocked.scope` and
-/// its start time is the one recorded when it was blocked. The release
-/// wrote every attributed PID to the root cgroup: host-critical offenders
-/// that were never blocked, and unrelated processes that had since been
-/// given the PID of an offender killed earlier, left their systemd unit.
-/// (The released process still goes to the root cgroup: recording and
-/// restoring its own unit is the full fix.)
+/// External audit CMB-010: release a process this agent blocked back to
+/// the cgroup it came from (the containment record) — only while
+/// `/proc/<pid>/cgroup` still shows it in `blocked.scope` and its start time
+/// is the one recorded when it was blocked. It is never written to the root
+/// cgroup: without a record, or when its cgroup is gone or no longer a leaf,
+/// it stays contained.
 pub fn release_blocked_pid(
     pid: u32,
     start_ticks: Option<u64>,
     cfg: &ExecutorConfig,
 ) -> std::io::Result<Release> {
-    if cfg.dry_run {
-        return Ok(Release::Skipped("detect-only"));
-    }
-    if !pid_in_blocked_scope(pid, cfg) {
-        return Ok(Release::Skipped("not in the blocked scope"));
-    }
-    if start_ticks.is_none() || proc_start_ticks(pid) != start_ticks {
-        return Ok(Release::Skipped("the pid now names another process"));
-    }
-    let root_procs = cfg.cgroup_root.join("cgroup.procs");
-    write_pid(&root_procs, pid)?;
-    Ok(Release::Released)
+    super::containment::release_to_origin(
+        pid,
+        start_ticks,
+        "blocked",
+        cfg,
+        &super::containment::Probe {
+            in_scope: &|p| pid_in_blocked_scope(p, cfg),
+            start_of: &proc_start_ticks,
+        },
+    )
 }
 
 /// Whether `/proc/<pid>/cgroup` places the process in the blocked scope.
@@ -414,8 +421,62 @@ mod tests {
         let me = std::process::id();
         assert_eq!(
             release_blocked_pid(me, proc_start_ticks(me), &cfg).unwrap(),
-            Release::Skipped("not in the blocked scope")
+            Release::Skipped("not in the scope")
         );
+    }
+
+    /// External audit CMB-010 (privileged: root, systemd, cgroup v2,
+    /// nftables): a unit's process blocked and released goes back to its
+    /// unit (and its stop). Before, the release wrote it to the root
+    /// cgroup, out of its unit for good.
+    #[test]
+    #[ignore = "privileged: root, systemd, cgroup v2, nft"]
+    fn a_released_process_returns_to_its_unit() {
+        use std::process::Command;
+        if Command::new("nft").arg("--version").output().is_err() {
+            eprintln!("no nft on this host: skipped (the block needs it)");
+            return;
+        }
+        let unit = format!("nn-victim-{}", std::process::id());
+        let ok = Command::new("systemd-run")
+            .args(["--unit", &unit, "--quiet", "sleep", "300"])
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let out = Command::new("systemctl")
+            .args(["show", "-p", "MainPID", "--value", &unit])
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            cgroup_root: "/sys/fs/cgroup".into(),
+            cgroup_slice: "northnarrow-test.slice".into(),
+            ..ExecutorConfig::for_test(tmp.path())
+        };
+        let origin = super::super::containment::origin_of(pid).unwrap();
+        assert!(origin.ends_with(&format!("{unit}.service")), "{origin}");
+        let blocked = block_outbound_for_pid(pid, &HashSet::new(), &cfg);
+        assert!(
+            matches!(blocked, ExecutionOutcome::Blocked { .. }),
+            "{blocked:?}"
+        );
+        assert!(pid_in_blocked_scope(pid, &cfg));
+        let released = release_blocked_pid(pid, proc_start_ticks(pid), &cfg).unwrap();
+        let now = super::super::containment::origin_of(pid).unwrap();
+        let _ = Command::new("systemctl").args(["stop", &unit]).status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", &cfg.nft_table])
+            .status();
+        let _ = std::fs::remove_dir(cfg.blocked_cgroup_dir());
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice");
+        assert_eq!(released, Release::Released);
+        assert_eq!(now, origin, "back in its unit");
+        assert!(!alive, "the unit's stop reaches it");
     }
 
     #[test]

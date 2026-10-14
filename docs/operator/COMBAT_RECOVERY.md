@@ -4,9 +4,16 @@
 bootstrap.*
 
 When NorthNarrow confirms an intrusion it escalates posture to
-**COMBAT** and the agent isolates the host: `iptables-restore` installs
-the `NORTHNARROW_COMBAT` chain, which drops every non-loopback packet.
-COMBAT has **no automatic exit** — that is by design (a confirmed
+**COMBAT** and runs the active-response ladder: INVESTIGATE (network up,
+the offender's own egress blocked), NEUTRALIZE (the offending process tree
+killed and its binary quarantined), and only if that cannot contain the
+threat, ISOLATE — `iptables-restore` / `ip6tables-restore` install the
+`NORTHNARROW_COMBAT` chain, which drops every non-loopback packet of both
+families. External audit POS-001: ISOLATE runs only in a **locked** COMBAT
+(kernel-adjudicated evidence, root changing a system file outside an
+administrator's session, or an administrator's order); a COMBAT reached on
+heuristics alone is unlocked — it never isolates and decays once quiet. A
+locked COMBAT has **no automatic exit** — that is by design (a confirmed
 compromise should stay contained). This page covers how to get a host
 back, and the safety nets that keep you from being locked out.
 
@@ -82,8 +89,8 @@ If you administer hosts remotely, full isolation can lock you out before
 you can run the unlock. The **opt-in** management carve-out keeps an SSH
 path open from a network you declare.
 
-Write your management network (one IPv4 address or CIDR per line) into a
-file, and store it as `/etc/northnarrow/combat-allow.cidrs` with an admin
+Write your management network (one IPv4 or IPv6 address or CIDR per line)
+into a file, and store it as `/etc/northnarrow/combat-allow.cidrs` with an admin
 signature — a key whose `admin.pub` line carries `config-manage`:
 
 ```
@@ -120,8 +127,8 @@ earlier release with the grant key.
 
 > Security note: anything you carve out is **not** contained during an
 > incident. Only list networks you trust to reach a possibly-compromised
-> host. COMBAT isolation is currently IPv4-only; IPv6 entries are
-> validated but produce no rule (none is needed).
+> host. COMBAT isolates IPv4 and IPv6 (BUG-031): IPv4 entries become
+> iptables ACCEPT rules, IPv6 entries ip6tables ones.
 
 When a carve-out is active, the COMBAT engage logs at **WARN** and lists
 the CIDRs — they are conspicuous in the audit trail on purpose.
