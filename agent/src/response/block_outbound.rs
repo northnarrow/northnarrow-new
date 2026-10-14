@@ -28,10 +28,50 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, info};
 
 use super::{config::ExecutorConfig, ExecutionOutcome};
+
+/// External audit CMB-011: the drop ruleset goes in once per COMBAT
+/// episode, not once per blocked process — a fork storm by an offender
+/// made a fork and exec of `nft` for every child, each repeating a rule
+/// already in place (a child forked after its parent was moved is in
+/// `blocked.scope` already).
+static RULESET: RulesetOnce = RulesetOnce::new();
+
+/// Apply the ruleset again at the next block (a new COMBAT episode: the
+/// chain may have been flushed in between).
+pub fn forget_applied_ruleset() {
+    RULESET.forget();
+}
+
+/// A ruleset applied at most once until [`RulesetOnce::forget`].
+pub(crate) struct RulesetOnce(AtomicBool);
+
+impl RulesetOnce {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Run `apply` unless it already succeeded since the last `forget`.
+    pub(crate) fn ensure(
+        &self,
+        apply: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.0.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        apply()?;
+        self.0.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn forget(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Public entry point used by [`super::Executor::execute`].
 pub fn block_outbound_for_pid(
@@ -60,6 +100,18 @@ pub fn block_outbound_for_pid(
     if let Err(e) = ensure_blocked_cgroup(cfg) {
         return io_failed(pid, "ensure_blocked_cgroup", &e);
     }
+    // External audit CMB-014: the drop rule first. Moving the process
+    // into `blocked.scope` and then failing to install the rule (no `nft`
+    // on the host) left it there unblocked, counted as contained.
+    if let Err(e) = RULESET.ensure(|| apply_block_ruleset(cfg)) {
+        return io_failed(pid, "apply_block_ruleset", &e);
+    }
+    // External audit CMB-011: a process already in the scope (a child
+    // forked after its parent was moved) needs no write.
+    if pid_in_blocked_scope(pid, cfg) {
+        debug!(pid, "already in the blocked scope");
+        return ExecutionOutcome::Blocked { pid };
+    }
     if let Err(e) = move_pid_to_blocked(pid, cfg) {
         // ESRCH from the cgroup write means the process exited; treat
         // it the same as the kill path's AlreadyGone.
@@ -68,22 +120,77 @@ pub fn block_outbound_for_pid(
         }
         return io_failed(pid, "move_pid_to_blocked", &e);
     }
-    if let Err(e) = apply_block_ruleset(cfg) {
-        return io_failed(pid, "apply_block_ruleset", &e);
-    }
     info!(pid, cgroup = %cfg.blocked_cgroup_match(), "blocked outbound traffic");
     ExecutionOutcome::Blocked { pid }
 }
 
-/// Move a PID out of the blocked cgroup (back to the root). Used by
-/// the integration test and exposed for future CLI commands.
-pub fn unblock_pid(pid: u32, cfg: &ExecutorConfig) -> std::io::Result<()> {
+/// What [`release_blocked_pid`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// Moved out of `blocked.scope`.
+    Released,
+    /// Left alone, with the reason: not in `blocked.scope`, or the PID
+    /// now names another process.
+    Skipped(&'static str),
+}
+
+/// External audit CMB-010 (stop-gap): release a PID this agent blocked —
+/// only while `/proc/<pid>/cgroup` still shows it in `blocked.scope` and
+/// its start time is the one recorded when it was blocked. The release
+/// wrote every attributed PID to the root cgroup: host-critical offenders
+/// that were never blocked, and unrelated processes that had since been
+/// given the PID of an offender killed earlier, left their systemd unit.
+/// (The released process still goes to the root cgroup: recording and
+/// restoring its own unit is the full fix.)
+pub fn release_blocked_pid(
+    pid: u32,
+    start_ticks: Option<u64>,
+    cfg: &ExecutorConfig,
+) -> std::io::Result<Release> {
     if cfg.dry_run {
-        return Ok(());
+        return Ok(Release::Skipped("detect-only"));
+    }
+    if !pid_in_blocked_scope(pid, cfg) {
+        return Ok(Release::Skipped("not in the blocked scope"));
+    }
+    if start_ticks.is_none() || proc_start_ticks(pid) != start_ticks {
+        return Ok(Release::Skipped("the pid now names another process"));
     }
     let root_procs = cfg.cgroup_root.join("cgroup.procs");
     write_pid(&root_procs, pid)?;
-    Ok(())
+    Ok(Release::Released)
+}
+
+/// Whether `/proc/<pid>/cgroup` places the process in the blocked scope.
+pub fn pid_in_blocked_scope(pid: u32, cfg: &ExecutorConfig) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .is_ok_and(|c| cgroup_is(&c, &cfg.blocked_cgroup_match()))
+}
+
+/// Whether a `/proc/<pid>/cgroup` text puts the process in the cgroup v2
+/// path that ends with `rel` (`northnarrow.slice/blocked.scope`).
+fn cgroup_is(proc_cgroup: &str, rel: &str) -> bool {
+    proc_cgroup.lines().any(|l| {
+        l.strip_prefix("0::").is_some_and(|path| {
+            path.trim_end() == format!("/{rel}") || path.trim_end().ends_with(&format!("/{rel}"))
+        })
+    })
+}
+
+/// `starttime` (field 22 of `/proc/<pid>/stat`, after the `(comm)` field,
+/// which may hold spaces or parentheses): with the PID, the process.
+pub fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat_start_ticks(&stat)
+}
+
+fn stat_start_ticks(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// Construct the canonical idempotent ruleset for the block chain.
@@ -238,6 +345,70 @@ mod tests {
         ensure_blocked_cgroup(&cfg).expect("first create");
         ensure_blocked_cgroup(&cfg).expect("second create");
         assert!(cfg.blocked_cgroup_dir().exists());
+    }
+
+    /// External audit CMB-011: one `nft` run per episode, not per process.
+    #[test]
+    fn one_ruleset_apply_per_episode() {
+        let once = RulesetOnce::new();
+        let runs = std::cell::Cell::new(0);
+        for _ in 0..500 {
+            once.ensure(|| {
+                runs.set(runs.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(runs.get(), 1);
+        once.forget();
+        once.ensure(|| {
+            runs.set(runs.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(runs.get(), 2, "a new episode applies it again");
+        // a failed apply is retried at the next block
+        let once = RulesetOnce::new();
+        assert!(once
+            .ensure(|| Err(std::io::Error::other("no nft")))
+            .is_err());
+        once.ensure(|| Ok(())).unwrap();
+        let mut again = false;
+        once.ensure(|| {
+            again = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!again);
+    }
+
+    /// External audit CMB-010: only a process still in the blocked scope
+    /// is released.
+    #[test]
+    fn release_skips_a_pid_not_in_blocked_scope() {
+        let rel = "northnarrow.slice/blocked.scope";
+        assert!(cgroup_is("0::/northnarrow.slice/blocked.scope\n", rel));
+        assert!(!cgroup_is("0::/system.slice/ssh.service\n", rel));
+        assert!(!cgroup_is("0::/\n", rel));
+        assert!(!cgroup_is("0::/northnarrow.slice/blocked.scope.bak\n", rel));
+        // our own process is in none of the agent's scopes
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::default()
+        };
+        let me = std::process::id();
+        assert_eq!(
+            release_blocked_pid(me, proc_start_ticks(me), &cfg).unwrap(),
+            Release::Skipped("not in the blocked scope")
+        );
+    }
+
+    #[test]
+    fn start_ticks_survive_a_comm_with_spaces_and_parens() {
+        let stat = "42 (a b) c) S 1 42 42 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 98765 1000 100";
+        assert_eq!(stat_start_ticks(stat), Some(98765));
+        let me = std::process::id();
+        assert!(proc_start_ticks(me).is_some());
     }
 
     #[test]

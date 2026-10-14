@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the COMBAT ladder's execution model (Medium
+  CMB-007, CMB-011, CMB-012, CMB-014; CMB-010 stop-gap): the ladder's side
+  effects — `nft`, cgroup writes, kills, quarantine, iptables — ran on the
+  event loop, so no sensor event was read while a large tree was
+  neutralized; they now run in order on a worker thread. A stand-down waits
+  for a step already under way, so an isolation decided just before an
+  admin unlock no longer lands after the release. A forking offender costs
+  one `nft` run per episode, and a tree past 1 024 processes escalates. A
+  soft egress block that did not take effect (no `nft`) is recorded and
+  shortens INVESTIGATE to 10 s; `nn-admin host-check` reports a host
+  without `nft`. The stand-down releases only processes it blocked and
+  that are still the same process in the blocked scope.
 - External audit, Wave 2, the variables that weaken the agent (Medium
   MAIN-008, MAIN-004, MAIN-007): `NN_DETECT_ONLY=yes` (or `true`) switched
   the response off without the integrity finding `=1` gets, and detect-only

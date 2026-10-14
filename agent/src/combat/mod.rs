@@ -55,7 +55,8 @@
 //! iptables / audit machinery. The production wiring lives in
 //! [`actuator`] / [`evidence`]; `main.rs` constructs the trio.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -71,7 +72,7 @@ pub mod protected;
 #[cfg(test)]
 mod tests;
 
-pub use actuator::{CombatActuator, NeutralizeOutcome, SystemActuator};
+pub use actuator::{CombatActuator, NeutralizeOutcome, SoftBlock, SystemActuator};
 pub use evidence::{AuditEvidence, LadderEvidence, StageTransition};
 pub use protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason, SystemProtectedProcs};
 
@@ -112,6 +113,14 @@ pub struct LadderConfig {
     /// NEUTRALIZE absent a jump-ahead. Bounded so the investigate window
     /// can never become an indefinite free pass for a slow threat.
     pub investigate_window: Duration,
+    /// External audit CMB-014: the INVESTIGATE window of an episode in
+    /// which a soft egress block did not take effect — the offender is
+    /// not contained while we analyse, so the analysis is shorter.
+    pub failed_block_window: Duration,
+    /// External audit CMB-011: the most processes attributed to one
+    /// episode. A tree that grows past it is not containable process by
+    /// process: the ladder escalates instead of attributing more.
+    pub max_offenders: usize,
 }
 
 impl Default for LadderConfig {
@@ -122,6 +131,8 @@ impl Default for LadderConfig {
             // promptly. The jump-ahead path pre-empts this for an
             // actively-exfiltrating threat.
             investigate_window: Duration::from_secs(30),
+            failed_block_window: Duration::from_secs(10),
+            max_offenders: 1024,
         }
     }
 }
@@ -131,14 +142,30 @@ impl Default for LadderConfig {
 #[derive(Debug)]
 struct LadderState {
     engaged: bool,
+    /// External audit CMB-012: bumped when an episode opens and at
+    /// stand-down; the worker drops a queued step of another episode.
+    episode: u64,
     stage: CombatStage,
     /// When the current `stage` was entered (drives the INVESTIGATE
     /// deadline). Monotonic — immune to wall-clock skew, like the posture
     /// FSM's own timers.
     stage_since: Instant,
     /// PIDs attributed to the threat this episode. Grows as `observe`
-    /// sees the offender spawn children (lateral spread).
+    /// sees the offender spawn children (lateral spread), up to
+    /// [`LadderConfig::max_offenders`].
     offenders: BTreeSet<u32>,
+    /// External audit CMB-010: the processes the actuator reported
+    /// blocked this episode, with their start time — the only ones the
+    /// stand-down releases.
+    blocked: BTreeMap<u32, Option<u64>>,
+    /// External audit CMB-014: a soft egress block of this episode did
+    /// not take effect (the shorter window applies).
+    block_failed: bool,
+    /// External audit CMB-011: the offender set reached its cap.
+    attribution_capped: bool,
+    /// A stage advance is queued and has not started: the tick and the
+    /// jump-ahead do not queue another.
+    drive_queued: bool,
     /// The posture trigger that drove COMBAT (telemetry / audit only).
     trigger: Option<TriggerType>,
     /// Set once STAGE 3 has run, so a repeat tick/observe is a no-op.
@@ -154,38 +181,32 @@ struct LadderState {
 }
 
 impl LadderState {
-    fn idle(now: Instant) -> Self {
+    fn idle(now: Instant, episode: u64) -> Self {
         Self {
             engaged: false,
+            episode,
             stage: CombatStage::Investigate,
             stage_since: now,
             offenders: BTreeSet::new(),
+            blocked: BTreeMap::new(),
+            block_failed: false,
+            attribution_capped: false,
+            drive_queued: false,
             trigger: None,
             isolated: false,
             neutralize_attempted: false,
             isolation_deferred: None,
         }
     }
-}
 
-/// The graduated active-response controller. Cheap to share (`Arc` it in
-/// `main.rs`); all methods take `&self` and lock internally.
-pub struct CombatLadder {
-    state: Mutex<LadderState>,
-    actuator: Box<dyn CombatActuator>,
-    evidence: Box<dyn LadderEvidence>,
-    /// Host-critical process guard. Consulted before every per-PID action
-    /// so the ladder never kills / net-cuts PID 1, the agent, its
-    /// watchdog, or the SSH service — it skips + logs them and escalates
-    /// to ISOLATE instead. See [`protected`].
-    protected: Box<dyn ProtectedProcs>,
-    cfg: LadderConfig,
-    /// External audit POS-001 (NN-AUD-002): whether ISOLATE may run.
-    /// Production asks the posture whether COMBAT is locked — reached on
-    /// evidence an unprivileged user cannot produce, or forced by an
-    /// administrator. On heuristics alone the ladder stops at the process
-    /// level. Default: always (tests, callers without a posture).
-    isolation_gate: Box<dyn Fn() -> bool + Send + Sync>,
+    /// The INVESTIGATE window that applies to this episode.
+    fn investigate_window(&self, cfg: &LadderConfig) -> Duration {
+        if self.block_failed {
+            cfg.investigate_window.min(cfg.failed_block_window)
+        } else {
+            cfg.investigate_window
+        }
+    }
 }
 
 /// Internal: the side effects a stage transition must perform once the
@@ -214,6 +235,77 @@ enum LadderStep {
     },
 }
 
+/// The ladder's decisions and the side effects that carry them out.
+struct Inner {
+    state: Mutex<LadderState>,
+    actuator: Box<dyn CombatActuator>,
+    evidence: Box<dyn LadderEvidence>,
+    /// Host-critical process guard. Consulted before every per-PID action
+    /// so the ladder never kills / net-cuts PID 1, the agent, its
+    /// watchdog, or the SSH service — it skips + logs them and escalates
+    /// to ISOLATE instead. See [`protected`].
+    protected: Box<dyn ProtectedProcs>,
+    cfg: LadderConfig,
+    /// External audit POS-001 (NN-AUD-002): whether ISOLATE may run.
+    /// Production asks the posture whether COMBAT is locked — reached on
+    /// evidence an unprivileged user cannot produce, or forced by an
+    /// administrator. On heuristics alone the ladder stops at the process
+    /// level. Default: always (tests, callers without a posture).
+    isolation_gate: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// A side effect of the ladder, run in order by [`Runner`].
+enum Job {
+    /// An episode opened: soft-block its offenders, record INVESTIGATE.
+    Investigate {
+        episode: u64,
+        offenders: Vec<u32>,
+        trigger: Option<TriggerType>,
+    },
+    /// Soft-block an offender attributed later in the episode.
+    SoftBlock { episode: u64, pid: u32 },
+    /// Advance the episode to `target` (decided again when it runs).
+    Drive {
+        episode: u64,
+        target: CombatStage,
+        now: Instant,
+        reason: String,
+    },
+    /// Release what the closed episode blocked; `done` is told once the
+    /// release ran (every earlier job ran before it).
+    StandDown {
+        from: CombatStage,
+        blocked: Vec<(u32, Option<u64>)>,
+        done: Option<std::sync::mpsc::SyncSender<()>>,
+    },
+}
+
+/// How jobs run: in the caller (unit tests, and the fallback when the
+/// worker thread cannot start) or on the ladder's worker thread.
+enum Runner {
+    Inline,
+    Worker(std::sync::mpsc::SyncSender<Job>),
+}
+
+/// Jobs waiting for the worker. An episode queues at most one job per
+/// attributed offender plus a few stage advances.
+const QUEUE_DEPTH: usize = 4096;
+
+/// The graduated active-response controller. Cheap to share (`Arc` it in
+/// `main.rs`); all methods take `&self` and lock internally.
+///
+/// External audit CMB-007: the decisions are taken under the state lock
+/// in the caller (the event loop, the tick, the posture hooks); their
+/// side effects — `nft`, cgroup writes, kills with their verification,
+/// quarantine, iptables, the signed audit entries — run in order on one
+/// worker thread ([`CombatLadder::with_worker`]). A NEUTRALIZE of a large
+/// tree no longer stops the event loop, and the two drivers and the
+/// stand-down are serialised by the queue (CMB-012).
+pub struct CombatLadder {
+    inner: Arc<Inner>,
+    runner: Runner,
+}
+
 impl CombatLadder {
     pub fn new(
         actuator: Box<dyn CombatActuator>,
@@ -222,19 +314,587 @@ impl CombatLadder {
         cfg: LadderConfig,
     ) -> Self {
         Self {
-            state: Mutex::new(LadderState::idle(Instant::now())),
-            actuator,
-            evidence,
-            protected,
-            cfg,
-            isolation_gate: Box::new(|| true),
+            inner: Arc::new(Inner {
+                state: Mutex::new(LadderState::idle(Instant::now(), 0)),
+                actuator,
+                evidence,
+                protected,
+                cfg,
+                isolation_gate: Box::new(|| true),
+            }),
+            runner: Runner::Inline,
         }
     }
 
     /// External audit POS-001: ISOLATE runs only while `gate` says so.
+    /// Call before [`Self::with_worker`].
     pub fn with_isolation_gate(mut self, gate: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        self.isolation_gate = Box::new(gate);
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.isolation_gate = Box::new(gate),
+            None => warn!(
+                target: "combat.ladder",
+                "isolation gate set after the worker started — ignored"
+            ),
+        }
         self
+    }
+
+    /// External audit CMB-007: run the side effects on a worker thread of
+    /// their own. Without it (unit tests) they run in the caller.
+    pub fn with_worker(mut self) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(QUEUE_DEPTH);
+        let inner = Arc::clone(&self.inner);
+        match std::thread::Builder::new()
+            .name("nn-combat-ladder".into())
+            .spawn(move || {
+                for job in rx {
+                    inner.run(job);
+                }
+            }) {
+            Ok(_) => self.runner = Runner::Worker(tx),
+            Err(e) => tracing::error!(
+                target: "combat.ladder",
+                error = %e,
+                "COMBAT ladder worker could not start — side effects run on the caller"
+            ),
+        }
+        self
+    }
+
+    /// Current stage if a COMBAT episode is active, else `None`. Surfaced
+    /// for `nn-admin status` and used by tests. With the worker, the
+    /// stage is the decided one; its side effects may still be queued.
+    pub fn current_stage(&self) -> Option<CombatStage> {
+        let s = self.inner.state.lock();
+        if s.engaged {
+            Some(s.stage)
+        } else {
+            None
+        }
+    }
+
+    /// Snapshot of the offender PID set (test/telemetry helper).
+    pub fn offenders(&self) -> Vec<u32> {
+        self.inner.state.lock().offenders.iter().copied().collect()
+    }
+
+    /// Hand `job` to the runner. A full queue drops a soft block or a
+    /// stage advance (the tick queues the advance again); an episode
+    /// opening or a stand-down waits for room.
+    fn dispatch(&self, job: Job) {
+        let tx = match &self.runner {
+            Runner::Inline => return self.inner.run(job),
+            Runner::Worker(tx) => tx,
+        };
+        let must_run = matches!(job, Job::Investigate { .. } | Job::StandDown { .. });
+        let res = if must_run {
+            tx.send(job)
+                .map_err(|e| std::sync::mpsc::TrySendError::Disconnected(e.0))
+        } else {
+            tx.try_send(job)
+        };
+        match res {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                if let Job::Drive { .. } = job {
+                    self.inner.state.lock().drive_queued = false;
+                }
+                warn!(
+                    target: "combat.ladder",
+                    "COMBAT: the ladder's queue is full — a step was dropped (an advance is queued again by the tick)"
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => tracing::error!(
+                target: "combat.ladder",
+                "COMBAT: the ladder worker is gone — step not run"
+            ),
+        }
+    }
+
+    /// Queue an advance to `target` unless one is queued already.
+    fn queue_drive(
+        &self,
+        s: &mut LadderState,
+        target: CombatStage,
+        now: Instant,
+        reason: &str,
+    ) -> Option<Job> {
+        if s.drive_queued {
+            return None;
+        }
+        s.drive_queued = true;
+        Some(Job::Drive {
+            episode: s.episode,
+            target,
+            now,
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Attribute `pid` to the episode, within the cap. `Err` once the
+    /// cap is reached (the first time only: `Err(true)`).
+    fn attribute(&self, s: &mut LadderState, pid: u32) -> Result<bool, bool> {
+        if s.offenders.contains(&pid) {
+            return Ok(false);
+        }
+        if s.offenders.len() >= self.inner.cfg.max_offenders {
+            let first = !s.attribution_capped;
+            s.attribution_capped = true;
+            return Err(first);
+        }
+        s.offenders.insert(pid);
+        Ok(true)
+    }
+
+    /// External audit CMB-011: the step for a tree past the cap — not
+    /// containable process by process. During INVESTIGATE, neutralize
+    /// now; past it, ask for ISOLATE (through the gate).
+    fn capped_step(&self, s: &mut LadderState, now: Instant) -> Option<Job> {
+        let cap = self.inner.cfg.max_offenders;
+        warn!(
+            target: "combat.ladder",
+            cap,
+            "COMBAT: the offender tree grew past the attribution cap — not containable process by process"
+        );
+        if s.stage == CombatStage::Investigate {
+            self.queue_drive(
+                s,
+                CombatStage::Neutralize,
+                now,
+                &format!("jump-ahead: offender tree past {cap} processes during INVESTIGATE"),
+            )
+        } else {
+            // Not through `drive_queued`: an ISOLATE asked while a
+            // NEUTRALIZE is queued still has to run after it.
+            Some(Job::Drive {
+                episode: s.episode,
+                target: CombatStage::Isolate,
+                now,
+                reason: format!(
+                    "offender tree past {cap} processes: not containable at the process level"
+                ),
+            })
+        }
+    }
+
+    /// Enter (or re-confirm) active-response mode at STAGE 1 INVESTIGATE.
+    ///
+    /// Idempotent per episode: the first call opens the episode (records
+    /// the offender + trigger, applies surgical soft egress, captures the
+    /// initial dossier, and emits the INVESTIGATE audit entry). Later
+    /// calls — e.g. the context-free combat-entry hook firing alongside
+    /// the context-carrying `process_event` call — merely **merge** a
+    /// freshly-attributed offender and soft-egress-block it. Reaching
+    /// COMBAT does NOT isolate the network here; that is STAGE 3 only.
+    pub fn engage(&self, offender: Option<u32>, trigger: Option<TriggerType>, now: Instant) {
+        let job = {
+            let mut s = self.inner.state.lock();
+            if !s.engaged {
+                let episode = s.episode + 1;
+                *s = LadderState::idle(now, episode);
+                s.engaged = true;
+                s.stage = CombatStage::Investigate;
+                s.stage_since = now;
+                s.trigger = trigger;
+                if let Some(pid) = offender {
+                    s.offenders.insert(pid);
+                }
+                let offenders: Vec<u32> = s.offenders.iter().copied().collect();
+                info!(
+                    target: "combat.ladder",
+                    stage = %CombatStage::Investigate,
+                    offenders = ?offenders,
+                    trigger = ?trigger,
+                    "COMBAT: entered active-response mode — INVESTIGATE (network UP)"
+                );
+                Some(Job::Investigate {
+                    episode,
+                    offenders,
+                    trigger,
+                })
+            } else if let Some(pid) = offender {
+                // Already engaged: merge a newly-attributed offender (so
+                // the audit + any later NEUTRALIZE sees the full set).
+                match self.attribute(&mut s, pid) {
+                    Ok(true) => {
+                        info!(
+                            target: "combat.ladder",
+                            pid,
+                            "COMBAT: additional offender attributed during active response"
+                        );
+                        Some(Job::SoftBlock {
+                            episode: s.episode,
+                            pid,
+                        })
+                    }
+                    Ok(false) | Err(false) => None,
+                    Err(true) => self.capped_step(&mut s, now),
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(job) = job {
+            self.dispatch(job);
+        }
+    }
+
+    /// Feed one event to the ladder for the jump-ahead check. Called for
+    /// every event while engaged. If the offender is actively
+    /// exfiltrating (outbound connect to a non-loopback destination) or
+    /// spreading (spawning a child) DURING INVESTIGATE, the ladder
+    /// advances immediately — the investigate window must never let a
+    /// fast threat run free.
+    pub fn observe(&self, event: &Event, now: Instant) {
+        // Decide under the lock (attribute spread, evaluate jump-ahead);
+        // the side effects are queued (external audit CMB-007).
+        let job = {
+            let mut s = self.inner.state.lock();
+            if !s.engaged {
+                None
+            } else {
+                // Lateral spread: an offender spawned a child → attribute it.
+                let mut spread_child: Option<u32> = None;
+                let mut capped = false;
+                if let Event::ProcessSpawn { pid, ppid, .. } = event {
+                    if s.offenders.contains(ppid) {
+                        match self.attribute(&mut s, *pid) {
+                            Ok(true) => spread_child = Some(*pid),
+                            Ok(false) | Err(false) => {}
+                            Err(true) => capped = true,
+                        }
+                    }
+                }
+                // Active exfil: an offender opened an outbound connection
+                // to a non-loopback destination.
+                let exfil = match event {
+                    Event::TcpConnect {
+                        pid,
+                        family,
+                        dst_addr,
+                        ..
+                    } => s.offenders.contains(pid) && !is_loopback(*family, dst_addr),
+                    _ => false,
+                };
+                if capped {
+                    self.capped_step(&mut s, now)
+                } else if s.stage == CombatStage::Investigate && (spread_child.is_some() || exfil) {
+                    let reason = if exfil {
+                        "jump-ahead: offender active exfiltration during INVESTIGATE"
+                    } else {
+                        "jump-ahead: offender spawning children (lateral spread) during INVESTIGATE"
+                    };
+                    // The child is attributed; the NEUTRALIZE kills the
+                    // tree it belongs to.
+                    self.queue_drive(&mut s, CombatStage::Neutralize, now, reason)
+                } else {
+                    // Spread after INVESTIGATE (already neutralizing /
+                    // isolated): soft-egress the newly-attributed child.
+                    spread_child.map(|pid| Job::SoftBlock {
+                        episode: s.episode,
+                        pid,
+                    })
+                }
+            }
+        };
+        if let Some(job) = job {
+            self.dispatch(job);
+        }
+    }
+
+    /// Heartbeat: advance the time-bound INVESTIGATE deadline. A no-op
+    /// unless engaged and the investigate window has elapsed.
+    pub fn tick(&self, now: Instant) {
+        let due = {
+            let mut s = self.inner.state.lock();
+            if s.engaged
+                && s.stage == CombatStage::Investigate
+                && now.saturating_duration_since(s.stage_since)
+                    >= s.investigate_window(&self.inner.cfg)
+            {
+                let reason = if s.block_failed {
+                    "INVESTIGATE deadline elapsed (shortened: a soft egress block did not take effect) — proceed to NEUTRALIZE"
+                } else {
+                    "INVESTIGATE deadline elapsed — proceed to NEUTRALIZE"
+                };
+                self.queue_drive(&mut s, CombatStage::Neutralize, now, reason)
+            } else {
+                None
+            }
+        };
+        if let Some(job) = due {
+            self.dispatch(job);
+        }
+        // External audit POS-001: an isolation refused while COMBAT rested
+        // on heuristics runs once the posture locks COMBAT. The gate is
+        // asked without the ladder's lock (the posture's lock is never
+        // taken under it).
+        let deferred = {
+            let s = self.inner.state.lock();
+            if s.engaged && !s.isolated && !s.drive_queued {
+                s.isolation_deferred.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(why) = deferred {
+            if (self.inner.isolation_gate)() {
+                let job = {
+                    let mut s = self.inner.state.lock();
+                    if s.engaged && !s.isolated {
+                        self.queue_drive(
+                            &mut s,
+                            CombatStage::Isolate,
+                            now,
+                            &format!("{why} — COMBAT since locked on non-heuristic evidence"),
+                        )
+                    } else {
+                        None
+                    }
+                };
+                if let Some(job) = job {
+                    self.dispatch(job);
+                }
+            }
+        }
+    }
+
+    /// Stand down — admin released COMBAT, or (external audit POS-001) an
+    /// unlocked COMBAT decayed. Clears the episode, lifts the
+    /// surgical soft-egress blocks. (The full-isolation iptables teardown
+    /// is performed by the posture release hook via
+    /// `NetworkIsolator::release`, which holds the Ed25519 `UnlockToken`.)
+    pub fn stand_down(&self, now: Instant) {
+        self.stand_down_inner(now, None);
+    }
+
+    /// [`Self::stand_down`], returning once every step queued before it
+    /// — an ISOLATE among them — has run, or after `wait`. External audit
+    /// CMB-012: the release hook lifts the iptables isolation only after
+    /// this, so a step taken just before an admin unlock cannot isolate
+    /// the host after the release.
+    pub fn stand_down_and_wait(&self, now: Instant, wait: Duration) {
+        self.stand_down_inner(now, Some(wait));
+    }
+
+    fn stand_down_inner(&self, now: Instant, wait: Option<Duration>) {
+        let job = {
+            let mut s = self.inner.state.lock();
+            if !s.engaged {
+                return;
+            }
+            let from = s.stage;
+            // External audit CMB-010 (stop-gap): only what this episode
+            // blocked is released — not every attributed PID.
+            let blocked: Vec<(u32, Option<u64>)> =
+                s.blocked.iter().map(|(p, t)| (*p, *t)).collect();
+            let episode = s.episode + 1;
+            *s = LadderState::idle(now, episode);
+            info!(
+                target: "combat.ladder",
+                from = %from,
+                "COMBAT: stand-down (admin release, or an unlocked COMBAT decayed) — \
+                 active response cleared"
+            );
+            (from, blocked)
+        };
+        let (from, blocked) = job;
+        let (done_tx, done_rx) = match wait {
+            Some(_) => {
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
+        self.dispatch(Job::StandDown {
+            from,
+            blocked,
+            done: done_tx,
+        });
+        if let (Some(rx), Some(wait)) = (done_rx, wait) {
+            if rx.recv_timeout(wait).is_err() {
+                warn!(
+                    target: "combat.ladder",
+                    wait_secs = wait.as_secs(),
+                    "COMBAT: stand-down still queued behind a running step — releasing anyway"
+                );
+            }
+        }
+    }
+}
+
+impl Inner {
+    /// Run one job (on the worker, or inline).
+    fn run(&self, job: Job) {
+        let current = |episode: u64| {
+            let s = self.state.lock();
+            s.engaged && s.episode == episode
+        };
+        match job {
+            Job::Investigate {
+                episode,
+                offenders,
+                trigger,
+            } => {
+                if !current(episode) {
+                    return self.dropped("INVESTIGATE");
+                }
+                self.actuator.begin_episode();
+                // Surgical soft egress: block ONLY the offender(s) so a
+                // real threat can't exfiltrate while we analyse, without
+                // the full host lockout. A host-critical offender is
+                // SKIPPED (cutting sshd / the agent / the watchdog / init
+                // mid-INVESTIGATE would lock the operator out or blind the
+                // defender); its escalation is deferred to NEUTRALIZE.
+                //
+                // KNOWN GAP: a spared offender has NO egress cut during
+                // the investigate window; its pre-deadline containment is
+                // the `observe` jump-ahead (a fresh `TcpConnect`), not DNS
+                // or an established socket.
+                let mut notes = Vec::new();
+                for pid in &offenders {
+                    if let Some(note) = self.soft_block(episode, *pid, false) {
+                        notes.push(note);
+                    }
+                }
+                let mut reason = "COMBAT entry — investigate first, network up".to_string();
+                if !notes.is_empty() {
+                    reason.push_str(&format!(" | soft egress: {}", notes.join("; ")));
+                }
+                self.evidence.record_stage(&StageTransition {
+                    from: None,
+                    to: CombatStage::Investigate,
+                    trigger,
+                    offenders,
+                    reason,
+                });
+            }
+            Job::SoftBlock { episode, pid } => {
+                if !current(episode) {
+                    return self.dropped("soft egress");
+                }
+                self.soft_block(episode, pid, true);
+            }
+            Job::Drive {
+                episode,
+                target,
+                now,
+                reason,
+            } => {
+                {
+                    let mut s = self.state.lock();
+                    if s.episode == episode {
+                        s.drive_queued = false;
+                    }
+                }
+                if !current(episode) {
+                    return self.dropped(target.as_str());
+                }
+                self.drive_to(target, now, &reason);
+            }
+            Job::StandDown {
+                from,
+                blocked,
+                done,
+            } => {
+                info!(
+                    target: "combat.ladder",
+                    from = %from,
+                    blocked = blocked.len(),
+                    "COMBAT: stand-down — releasing the soft egress blocks of the closed episode"
+                );
+                for (pid, start_ticks) in blocked {
+                    self.actuator.soft_egress_clear(pid, start_ticks);
+                }
+                if let Some(done) = done {
+                    let _ = done.try_send(());
+                }
+            }
+        }
+    }
+
+    fn dropped(&self, what: &str) {
+        info!(
+            target: "combat.ladder",
+            step = what,
+            "COMBAT: a step of a closed episode was dropped"
+        );
+    }
+
+    /// Soft-block one offender of `episode`; record the outcome in the
+    /// state. Returns a note for the evidence when the block did not take
+    /// effect or the process was spared. With `record`, the episode's
+    /// first failed block is a signed record of its own (an offender
+    /// attributed after the INVESTIGATE record was written).
+    fn soft_block(&self, episode: u64, pid: u32, record: bool) -> Option<String> {
+        if let Some(reason) = self.protected.protected_reason(pid) {
+            warn!(
+                target: "combat.ladder",
+                pid,
+                protected = %reason,
+                "COMBAT: refusing surgical soft-egress on host-critical process — \
+                 skipped (network left intact)"
+            );
+            return Some(format!("{pid} spared ({reason})"));
+        }
+        let outcome = self.actuator.soft_egress_block(pid);
+        let mut s = self.state.lock();
+        let ours = s.engaged && s.episode == episode;
+        match outcome {
+            SoftBlock::Blocked { start_ticks } => {
+                if ours {
+                    s.blocked.insert(pid, start_ticks);
+                } else {
+                    // The episode closed while the block ran: its
+                    // stand-down did not know this process — release it
+                    // here, or it would stay blocked with no release.
+                    drop(s);
+                    info!(
+                        target: "combat.ladder",
+                        pid,
+                        "COMBAT: a soft block finished after its episode closed — released"
+                    );
+                    self.actuator.soft_egress_clear(pid, start_ticks);
+                }
+                None
+            }
+            SoftBlock::NotNeeded(why) => Some(format!("{pid} not blocked ({why})")),
+            SoftBlock::Failed(why) => {
+                // External audit CMB-014: the offender is not contained
+                // while we analyse — the episode's INVESTIGATE is shorter.
+                let first = ours && !s.block_failed;
+                if ours {
+                    s.block_failed = true;
+                }
+                let (stage, trigger) = (s.stage, s.trigger);
+                drop(s);
+                let window = self
+                    .cfg
+                    .investigate_window
+                    .min(self.cfg.failed_block_window);
+                warn!(
+                    target: "combat.ladder",
+                    pid,
+                    why = %why,
+                    window_secs = window.as_secs(),
+                    "COMBAT: soft egress block did NOT take effect — the INVESTIGATE window is shortened"
+                );
+                if record && first {
+                    self.evidence.record_stage(&StageTransition {
+                        from: Some(stage),
+                        to: stage,
+                        trigger,
+                        offenders: vec![pid],
+                        reason: format!(
+                            "soft egress: {pid} FAILED ({why}) — the offender is not contained; \
+                             INVESTIGATE shortened to {} s",
+                            window.as_secs()
+                        ),
+                    });
+                }
+                Some(format!("{pid} FAILED ({why})"))
+            }
+        }
     }
 
     /// Partition `pids` into `(actionable, spared)` — the host-critical
@@ -252,278 +912,19 @@ impl CombatLadder {
         (actionable, spared)
     }
 
-    /// Current stage if a COMBAT episode is active, else `None`. Surfaced
-    /// for `nn-admin status` and used by tests.
-    pub fn current_stage(&self) -> Option<CombatStage> {
-        let s = self.state.lock();
-        if s.engaged {
-            Some(s.stage)
-        } else {
-            None
-        }
-    }
-
-    /// Snapshot of the offender PID set (test/telemetry helper).
-    pub fn offenders(&self) -> Vec<u32> {
-        self.state.lock().offenders.iter().copied().collect()
-    }
-
-    /// Enter (or re-confirm) active-response mode at STAGE 1 INVESTIGATE.
-    ///
-    /// Idempotent per episode: the first call opens the episode (records
-    /// the offender + trigger, applies surgical soft egress, captures the
-    /// initial dossier, and emits the INVESTIGATE audit entry). Later
-    /// calls — e.g. the context-free combat-entry hook firing alongside
-    /// the context-carrying `process_event` call — merely **merge** a
-    /// freshly-attributed offender and soft-egress-block it. Reaching
-    /// COMBAT does NOT isolate the network here; that is STAGE 3 only.
-    pub fn engage(&self, offender: Option<u32>, trigger: Option<TriggerType>, now: Instant) {
-        let mut s = self.state.lock();
-        if !s.engaged {
-            *s = LadderState::idle(now);
-            s.engaged = true;
-            s.stage = CombatStage::Investigate;
-            s.stage_since = now;
-            s.trigger = trigger;
-            if let Some(pid) = offender {
-                s.offenders.insert(pid);
-            }
-            let offenders: Vec<u32> = s.offenders.iter().copied().collect();
-            let trig = s.trigger;
-            // Drop the lock before side effects so the actuator/evidence
-            // calls (which may shell out) don't serialise against a
-            // concurrent `current_stage()` reader for longer than needed.
-            drop(s);
-
-            info!(
-                target: "combat.ladder",
-                stage = %CombatStage::Investigate,
-                offenders = ?offenders,
-                trigger = ?trig,
-                "COMBAT: entered active-response mode — INVESTIGATE (network UP)"
-            );
-            // Surgical soft egress: block ONLY the offender(s) so a real
-            // threat can't exfiltrate while we analyse, without the full
-            // host lockout (management + evidence channels stay open).
-            // A host-critical offender is SKIPPED (cutting sshd / the
-            // agent / the watchdog / init mid-INVESTIGATE would lock the
-            // operator out or blind the defender); INVESTIGATE keeps the
-            // network up by design, so the proportionate escalation for a
-            // confirmed protected offender is deferred to NEUTRALIZE.
-            //
-            // KNOWN GAP: because the surgical block is the one containment
-            // that can never apply to a spared offender, a spared offender
-            // has NO egress cut during the investigate window. Its
-            // pre-deadline containment relies solely on the `observe`
-            // jump-ahead, which today fires only on a fresh `TcpConnect`
-            // (not `DnsQuery`, and not exfil over an already-established
-            // socket). So a protected offender exfiltrating over DNS or a
-            // pre-existing connection runs uncut until the deadline → ISOLATE
-            // (default 30s). Tightening this (DNS in the jump-ahead, or a
-            // shorter window for a spared offender) is a jump-ahead-semantics
-            // change tracked as a follow-up.
-            for pid in &offenders {
-                if let Some(reason) = self.protected.protected_reason(*pid) {
-                    warn!(
-                        target: "combat.ladder",
-                        pid,
-                        protected = %reason,
-                        "COMBAT: refusing surgical soft-egress on host-critical process — \
-                         skipped (network left intact)"
-                    );
-                    continue;
-                }
-                self.actuator.soft_egress_block(*pid);
-            }
-            self.evidence.record_stage(&StageTransition {
-                from: None,
-                to: CombatStage::Investigate,
-                trigger: trig,
-                offenders: offenders.clone(),
-                reason: "COMBAT entry — investigate first, network up".to_string(),
-            });
-            return;
-        }
-
-        // Already engaged: merge a newly-attributed offender. Still record
-        // it (so the audit + any later NEUTRALIZE sees the full set), but
-        // do NOT soft-cut a host-critical process.
-        if let Some(pid) = offender {
-            if s.offenders.insert(pid) {
-                drop(s);
-                info!(
-                    target: "combat.ladder",
-                    pid,
-                    "COMBAT: additional offender attributed during active response"
-                );
-                if let Some(reason) = self.protected.protected_reason(pid) {
-                    warn!(
-                        target: "combat.ladder",
-                        pid,
-                        protected = %reason,
-                        "COMBAT: refusing surgical soft-egress on host-critical offender — \
-                         skipped (network left intact)"
-                    );
-                } else {
-                    self.actuator.soft_egress_block(pid);
-                }
-            }
-        }
-    }
-
-    /// Feed one event to the ladder for the jump-ahead check. Called for
-    /// every event while engaged. If the offender is actively
-    /// exfiltrating (outbound connect to a non-loopback destination) or
-    /// spreading (spawning a child) DURING INVESTIGATE, the ladder
-    /// advances immediately — the investigate window must never let a
-    /// fast threat run free.
-    pub fn observe(&self, event: &Event, now: Instant) {
-        // Decide under the lock (attribute spread, evaluate jump-ahead),
-        // then RELEASE the lock before any side effect — so a kill /
-        // iptables / audit shell-out triggered by a jump-ahead never
-        // serialises against `current_stage()` or the tick task.
-        enum Next {
-            Idle,
-            JumpAhead(&'static str),
-            SoftBlock(u32),
-        }
-        let next = {
-            let mut s = self.state.lock();
-            if !s.engaged {
-                Next::Idle
-            } else {
-                // Lateral spread: an offender spawned a child → attribute it.
-                let mut spread_child: Option<u32> = None;
-                if let Event::ProcessSpawn { pid, ppid, .. } = event {
-                    if s.offenders.contains(ppid) && s.offenders.insert(*pid) {
-                        spread_child = Some(*pid);
-                    }
-                }
-                // Active exfil: an offender opened an outbound connection
-                // to a non-loopback destination.
-                let exfil = match event {
-                    Event::TcpConnect {
-                        pid,
-                        family,
-                        dst_addr,
-                        ..
-                    } => s.offenders.contains(pid) && !is_loopback(*family, dst_addr),
-                    _ => false,
-                };
-                if s.stage == CombatStage::Investigate && (spread_child.is_some() || exfil) {
-                    Next::JumpAhead(if exfil {
-                        "jump-ahead: offender active exfiltration during INVESTIGATE"
-                    } else {
-                        "jump-ahead: offender spawning children (lateral spread) during INVESTIGATE"
-                    })
-                } else if let Some(child) = spread_child {
-                    // Spread after INVESTIGATE (already neutralizing /
-                    // isolated): soft-egress the newly-attributed child.
-                    Next::SoftBlock(child)
-                } else {
-                    Next::Idle
-                }
-            }
-        };
-        match next {
-            Next::Idle => {}
-            Next::JumpAhead(reason) => self.drive_to(CombatStage::Neutralize, now, reason),
-            Next::SoftBlock(pid) => {
-                if let Some(reason) = self.protected.protected_reason(pid) {
-                    warn!(
-                        target: "combat.ladder",
-                        pid,
-                        protected = %reason,
-                        "COMBAT: refusing surgical soft-egress on host-critical spread child — \
-                         skipped (network left intact)"
-                    );
-                } else {
-                    self.actuator.soft_egress_block(pid);
-                }
-            }
-        }
-    }
-
-    /// Heartbeat: advance the time-bound INVESTIGATE deadline. A no-op
-    /// unless engaged and the investigate window has elapsed.
-    pub fn tick(&self, now: Instant) {
-        // Read the deadline under a short lock; act (if due) without it.
-        // A racing observe()-jump-ahead may have already advanced past
-        // INVESTIGATE between this check and `drive_to`'s own lock —
-        // `drive_to` re-checks under the lock and no-ops, so the two
-        // drivers never double-act.
-        let due = {
-            let s = self.state.lock();
-            s.engaged
-                && s.stage == CombatStage::Investigate
-                && now.saturating_duration_since(s.stage_since) >= self.cfg.investigate_window
-        };
-        if due {
-            self.drive_to(
-                CombatStage::Neutralize,
-                now,
-                "INVESTIGATE deadline elapsed — proceed to NEUTRALIZE",
-            );
-        }
-        // External audit POS-001: an isolation refused while COMBAT rested
-        // on heuristics runs once the posture locks COMBAT.
-        let deferred = {
-            let s = self.state.lock();
-            if s.engaged && !s.isolated {
-                s.isolation_deferred.clone()
-            } else {
-                None
-            }
-        };
-        if let Some(why) = deferred {
-            if (self.isolation_gate)() {
-                self.drive_to(
-                    CombatStage::Isolate,
-                    now,
-                    &format!("{why} — COMBAT since locked on non-heuristic evidence"),
-                );
-            }
-        }
-    }
-
-    /// Stand down — admin released COMBAT, or (external audit POS-001) an
-    /// unlocked COMBAT decayed. Clears the episode, lifts the
-    /// surgical soft-egress blocks. (The full-isolation iptables teardown
-    /// is performed by the posture release hook via
-    /// `NetworkIsolator::release`, which holds the Ed25519 `UnlockToken`.)
-    pub fn stand_down(&self, now: Instant) {
-        let mut s = self.state.lock();
-        if !s.engaged {
-            return;
-        }
-        let offenders: Vec<u32> = s.offenders.iter().copied().collect();
-        let from = s.stage;
-        *s = LadderState::idle(now);
-        drop(s);
-        info!(
-            target: "combat.ladder",
-            from = %from,
-            "COMBAT: stand-down (admin release, or an unlocked COMBAT decayed) — \
-             active response cleared"
-        );
-        for pid in offenders {
-            self.actuator.soft_egress_clear(pid);
-        }
-    }
-
     /// Advance to `target`, performing each stage's evidence + actuator
     /// side effects WITHOUT holding the state lock across them. Each
     /// `(mutate-state, drop-lock, side-effect)` is a distinct critical
     /// section, so a blocking kill / iptables / audit shell-out never
-    /// serialises against `current_stage()` or the other driver task.
+    /// serialises against `current_stage()` or the drivers.
     ///
     /// NEUTRALIZE chains into ISOLATE when the threat is uncontainable.
     /// The `neutralize_attempted` / `isolated` flags persist in the state
-    /// across the re-lock gap, so a racing tick + observe-jump-ahead can
-    /// never double-neutralize or double-isolate (the second caller's
-    /// under-lock check yields [`LadderStep::None`]). Evidence for a stage
-    /// is ALWAYS emitted before that stage's enforcement action — so the
-    /// dossier precedes any isolation in every COMBAT case.
+    /// across the re-lock gap, so a repeated advance can never
+    /// double-neutralize or double-isolate (its under-lock check yields
+    /// [`LadderStep::None`]). Evidence for a stage is ALWAYS emitted
+    /// before that stage's enforcement action — so the dossier precedes
+    /// any isolation in every COMBAT case.
     fn drive_to(&self, target: CombatStage, now: Instant, reason: &str) {
         let mut target = target;
         let mut reason = reason.to_string();
@@ -744,7 +1145,6 @@ impl CombatLadder {
         }
     }
 }
-
 /// Render the spared host-critical offenders for an audit reason string,
 /// e.g. `ssh-service(sshd) (pid 4242), northnarrow-watchdog (pid 4300)`.
 fn fmt_protected(spared: &[(u32, ProtectedReason)]) -> String {

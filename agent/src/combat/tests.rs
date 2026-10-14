@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use common::posture_types::TriggerType;
 use common::Event;
 
-use super::actuator::{CombatActuator, NeutralizeOutcome};
+use super::actuator::{CombatActuator, NeutralizeOutcome, SoftBlock};
 use super::evidence::{LadderEvidence, StageTransition};
 use super::{
     CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
@@ -41,13 +41,27 @@ impl Recorder {
 struct MockActuator {
     rec: Recorder,
     neutralize_outcome: NeutralizeOutcome,
+    /// PIDs whose soft block does not take effect (external audit CMB-014).
+    failing_blocks: Vec<u32>,
 }
 
 impl CombatActuator for MockActuator {
-    fn soft_egress_block(&self, pid: u32) {
+    fn soft_egress_block(&self, pid: u32) -> SoftBlock {
         self.rec.push(format!("soft_block:{pid}"));
+        if self.failing_blocks.contains(&pid) {
+            SoftBlock::Failed("no nft".to_string())
+        } else {
+            SoftBlock::Blocked {
+                start_ticks: Some(u64::from(pid) * 10),
+            }
+        }
     }
-    fn soft_egress_clear(&self, pid: u32) {
+    fn soft_egress_clear(&self, pid: u32, start_ticks: Option<u64>) {
+        assert_eq!(
+            start_ticks,
+            Some(u64::from(pid) * 10),
+            "the start time recorded at the block"
+        );
         self.rec.push(format!("soft_clear:{pid}"));
     }
     fn neutralize(&self, offenders: &[u32]) -> NeutralizeOutcome {
@@ -78,6 +92,7 @@ fn ladder(neutralize: NeutralizeOutcome, window: Duration) -> (CombatLadder, Rec
     let actuator = Box::new(MockActuator {
         rec: rec.clone(),
         neutralize_outcome: neutralize,
+        failing_blocks: Vec::new(),
     });
     let evidence = Box::new(MockEvidence { rec: rec.clone() });
     let l = CombatLadder::new(
@@ -86,6 +101,7 @@ fn ladder(neutralize: NeutralizeOutcome, window: Duration) -> (CombatLadder, Rec
         Box::new(NoProtectedProcs),
         LadderConfig {
             investigate_window: window,
+            ..LadderConfig::default()
         },
     );
     (l, rec)
@@ -130,6 +146,7 @@ fn ladder_protected(
     let actuator = Box::new(MockActuator {
         rec: rec.clone(),
         neutralize_outcome: neutralize,
+        failing_blocks: Vec::new(),
     });
     let evidence = Box::new(ReasonEvidence(reasons.clone()));
     let l = CombatLadder::new(
@@ -138,6 +155,7 @@ fn ladder_protected(
         Box::new(StubProtected(protected)),
         LadderConfig {
             investigate_window: window,
+            ..LadderConfig::default()
         },
     );
     (l, rec, reasons)
@@ -660,4 +678,313 @@ fn stand_down_drops_a_deferred_isolation() {
     l.tick(t0 + win + Duration::from_secs(6));
     assert_eq!(l.current_stage(), None);
     assert!(!rec.log().iter().any(|e| e == "isolate"), "{:?}", rec.log());
+}
+
+// ── External audit CMB-007 / 011 / 012 / 014 / 010: the ladder worker ──
+
+/// Which call of [`HeldActuator`] waits for the test.
+#[derive(Clone, Copy, PartialEq)]
+enum Held {
+    Neutralize,
+    Isolate,
+    SoftBlock(u32),
+}
+
+/// An actuator whose `held` call waits until the test lets it go.
+struct HeldActuator {
+    rec: Recorder,
+    hold: Mutex<std::sync::mpsc::Receiver<()>>,
+    held: Held,
+    neutralize_outcome: NeutralizeOutcome,
+}
+
+impl HeldActuator {
+    fn wait_if(&self, call: Held, name: &str) {
+        if self.held == call {
+            self.rec.push(format!("{name}:start"));
+            let _ = self.hold.lock().recv_timeout(Duration::from_secs(10));
+        }
+    }
+}
+
+impl CombatActuator for HeldActuator {
+    fn soft_egress_block(&self, pid: u32) -> SoftBlock {
+        self.wait_if(Held::SoftBlock(pid), &format!("soft_block:{pid}"));
+        self.rec.push(format!("soft_block:{pid}"));
+        SoftBlock::Blocked {
+            start_ticks: Some(u64::from(pid) * 10),
+        }
+    }
+    fn soft_egress_clear(&self, pid: u32, _start_ticks: Option<u64>) {
+        self.rec.push(format!("soft_clear:{pid}"));
+    }
+    fn neutralize(&self, offenders: &[u32]) -> NeutralizeOutcome {
+        self.wait_if(Held::Neutralize, "neutralize");
+        self.rec.push(format!("neutralize:{offenders:?}"));
+        self.neutralize_outcome.clone()
+    }
+    fn isolate(&self) {
+        self.wait_if(Held::Isolate, "isolate");
+        self.rec.push("isolate".to_string());
+    }
+    fn is_dry_run(&self) -> bool {
+        false
+    }
+}
+
+fn held_ladder(
+    held: Held,
+    neutralize: NeutralizeOutcome,
+) -> (Arc<CombatLadder>, Recorder, std::sync::mpsc::SyncSender<()>) {
+    let rec = Recorder::new();
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let l = CombatLadder::new(
+        Box::new(HeldActuator {
+            rec: rec.clone(),
+            hold: Mutex::new(rx),
+            held,
+            neutralize_outcome: neutralize,
+        }),
+        Box::new(MockEvidence { rec: rec.clone() }),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    )
+    .with_worker();
+    (Arc::new(l), rec, tx)
+}
+
+/// Wait until the log holds `entry` (the worker runs on its own thread).
+fn wait_for(rec: &Recorder, entry: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !rec.log().iter().any(|e| e == entry) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never logged {entry}: {:?}",
+            rec.log()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// External audit CMB-007: a NEUTRALIZE in progress does not hold up the
+/// event path — the side effects run on the worker.
+#[test]
+fn observe_returns_while_neutralize_runs() {
+    let (l, rec, go) = held_ladder(Held::Neutralize, NeutralizeOutcome::Contained);
+    let t0 = Instant::now();
+    l.engage(Some(100), None, t0);
+    l.observe(&spawn(101, 100), t0); // jump-ahead
+    wait_for(&rec, "neutralize:start");
+    let start = std::time::Instant::now();
+    for i in 0..200 {
+        l.observe(&spawn(5000 + i, 1), t0);
+        l.observe(&tcp_connect(100, [8, 8, 8, 8]), t0);
+        l.tick(t0 + Duration::from_secs(60));
+    }
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "the event path waited on the actuator: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    go.send(()).unwrap();
+    wait_for(&rec, "neutralize:[100, 101]");
+    // one NEUTRALIZE, however many advances were asked for meanwhile
+    std::thread::sleep(Duration::from_millis(50));
+    let kills = rec
+        .log()
+        .iter()
+        .filter(|e| e.starts_with("neutralize:["))
+        .count();
+    assert_eq!(kills, 1, "{:?}", rec.log());
+}
+
+/// External audit CMB-012: the stand-down runs after an ISOLATE already
+/// under way, and the release waits for it — the isolation cannot land
+/// after the release lifted it.
+#[test]
+fn stand_down_orders_after_an_in_flight_isolate() {
+    let (l, rec, go) = held_ladder(
+        Held::Isolate,
+        NeutralizeOutcome::Uncontainable {
+            reason: "respawning".into(),
+        },
+    );
+    let t0 = Instant::now();
+    l.engage(Some(100), None, t0);
+    l.tick(t0 + Duration::from_secs(31));
+    wait_for(&rec, "isolate:start");
+    let releaser = {
+        let l = Arc::clone(&l);
+        let rec = rec.clone();
+        std::thread::spawn(move || {
+            l.stand_down_and_wait(t0 + Duration::from_secs(32), Duration::from_secs(10));
+            rec.push("released");
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !rec.log().iter().any(|e| e == "released"),
+        "the release must wait for the in-flight isolate: {:?}",
+        rec.log()
+    );
+    assert_eq!(l.current_stage(), None, "the decision is immediate");
+    go.send(()).unwrap();
+    releaser.join().unwrap();
+    let log = rec.log();
+    let pos = |e: &str| log.iter().position(|x| x == e).unwrap_or(usize::MAX);
+    assert!(pos("isolate") < pos("soft_clear:100"), "{log:?}");
+    assert!(pos("soft_clear:100") < pos("released"), "{log:?}");
+}
+
+/// External audit CMB-012: a step queued for an episode that has since
+/// closed is dropped; a block that finished after the close is released.
+#[test]
+fn a_step_from_a_past_episode_is_dropped() {
+    let (l, rec, go) = held_ladder(Held::SoftBlock(100), NeutralizeOutcome::Contained);
+    let t0 = Instant::now();
+    l.engage(Some(100), None, t0);
+    wait_for(&rec, "soft_block:100:start");
+    l.engage(Some(101), None, t0); // queued for episode 1
+    l.stand_down(t0 + Duration::from_secs(1)); // episode closes
+    go.send(()).unwrap();
+    wait_for(&rec, "soft_clear:100");
+    std::thread::sleep(Duration::from_millis(50));
+    let log = rec.log();
+    assert!(
+        !log.iter().any(|e| e == "soft_block:101"),
+        "the closed episode's step must not run: {log:?}"
+    );
+}
+
+/// External audit CMB-011: attribution stops at the cap; past it the
+/// tree is not containable process by process and the ladder escalates.
+#[test]
+fn spread_attribution_is_capped_and_escalates() {
+    let rec = Recorder::new();
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: Vec::new(),
+        }),
+        Box::new(MockEvidence { rec: rec.clone() }),
+        Box::new(NoProtectedProcs),
+        LadderConfig {
+            max_offenders: 3,
+            ..LadderConfig::default()
+        },
+    );
+    let t0 = Instant::now();
+    l.engage(Some(100), None, t0);
+    l.observe(&spawn(101, 100), t0); // jump-ahead: NEUTRALIZE, contained
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    l.observe(&spawn(102, 101), t0); // third offender: soft-blocked
+    assert!(rec.log().iter().any(|e| e == "soft_block:102"));
+    assert!(!rec.log().iter().any(|e| e == "isolate"));
+    l.observe(&spawn(103, 102), t0); // past the cap
+    l.observe(&spawn(104, 102), t0);
+    assert_eq!(l.offenders(), vec![100, 101, 102]);
+    let log = rec.log();
+    assert_eq!(log.iter().filter(|e| *e == "isolate").count(), 1, "{log:?}");
+    assert!(
+        log.iter().any(|e| e == "audit:NEUTRALIZE->ISOLATE"),
+        "{log:?}"
+    );
+    assert!(!log
+        .iter()
+        .any(|e| e == "soft_block:103" || e == "soft_block:104"));
+}
+
+/// External audit CMB-014: a soft block that did not take effect is in
+/// the INVESTIGATE evidence, and the episode's window is the short one.
+#[test]
+fn a_failed_soft_block_is_recorded_and_shortens_investigate() {
+    let rec = Recorder::new();
+    let reasons = ReasonEvidence(Arc::new(Mutex::new(Vec::new())));
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: vec![100],
+        }),
+        Box::new(reasons.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(Some(100), None, t0);
+    let r = reasons.0.lock().clone();
+    assert!(
+        r[0].0 == "INVESTIGATE" && r[0].1.contains("100 FAILED (no nft)"),
+        "{r:?}"
+    );
+    l.tick(t0 + Duration::from_secs(9));
+    assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
+    l.tick(t0 + Duration::from_secs(10));
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    assert!(rec.log().iter().any(|e| e == "neutralize:[100]"));
+    let r = reasons.0.lock().clone();
+    assert!(r[1].1.contains("shortened"), "{r:?}");
+}
+
+/// External audit CMB-014: an offender attributed after the INVESTIGATE
+/// record whose block fails gets a signed record of its own (once per
+/// episode).
+#[test]
+fn a_failed_block_after_the_investigate_record_is_recorded() {
+    let reasons = ReasonEvidence(Arc::new(Mutex::new(Vec::new())));
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: Recorder::new(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: vec![100, 101],
+        }),
+        Box::new(reasons.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(None, None, t0); // the posture hook: no offender yet
+    l.engage(Some(100), None, t0);
+    l.engage(Some(101), None, t0);
+    let r = reasons.0.lock().clone();
+    assert_eq!(r.len(), 2, "{r:?}");
+    assert!(
+        r[1].0 == "INVESTIGATE" && r[1].1.contains("100 FAILED") && r[1].1.contains("10 s"),
+        "{r:?}"
+    );
+}
+
+/// External audit CMB-010: the stand-down releases what the episode
+/// blocked — not a spared host-critical offender, not one whose block
+/// failed.
+#[test]
+fn stand_down_releases_only_what_this_episode_blocked() {
+    let rec = Recorder::new();
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: vec![8],
+        }),
+        Box::new(MockEvidence { rec: rec.clone() }),
+        Box::new(StubProtected(HashMap::from([(
+            7,
+            ProtectedReason::SshService,
+        )]))),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(Some(9), None, t0);
+    l.engage(Some(7), None, t0);
+    l.engage(Some(8), None, t0);
+    assert_eq!(l.offenders(), vec![7, 8, 9]);
+    l.stand_down(t0 + Duration::from_secs(1));
+    let clears: Vec<_> = rec
+        .log()
+        .into_iter()
+        .filter(|e| e.starts_with("soft_clear:"))
+        .collect();
+    assert_eq!(clears, vec!["soft_clear:9".to_string()]);
 }
