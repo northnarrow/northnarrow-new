@@ -174,6 +174,8 @@ pub fn parse_role_keyword(s: &str) -> Result<Role, String> {
         "triage" => Role::Triage,
         // Tappa 10.8 — signed operator overlays.
         "config-manage" => Role::ConfigManage,
+        // External audit CMB-016 — undo a response (release, restore).
+        "response-manage" => Role::ResponseManage,
         "all" => Role::All,
         other => {
             return Err(format!(
@@ -181,7 +183,7 @@ pub fn parse_role_keyword(s: &str) -> Result<Role, String> {
                  unlock, shutdown, force-posture, rotate-keys, audit-read, \
                  fim-manage, fim-read, canary-read, canary-manage, \
                  net-read, net-manage, trusted-installer, telemetry-read, \
-                 triage, config-manage, all"
+                 triage, config-manage, response-manage, all"
             ))
         }
     })

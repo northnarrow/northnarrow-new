@@ -60,8 +60,15 @@ entry 39); `config-manage` signs the `*.local` overlays the agent loads
 them to its line before the next upgrade. The key releases COMBAT, reads
 the audit log, opens the installer window and signs overlays, and nothing
 else: `nn-admin canary deploy|burn|refresh` (`canary-manage`),
-`fim baseline` (`fim-manage`), `force-posture`, `shutdown` and
-`rotate-keys` are refused with an authorisation error.
+`fim baseline` (`fim-manage`), `response release|restore`
+(`response-manage`, §6), `force-posture`, `shutdown` and `rotate-keys` are
+refused with an authorisation error.
+
+`response-manage` undoes what the response layer did: it releases a
+contained process and writes a quarantined file back out of the vault
+(§6). A restore can put malware back on disk, so the role is never in a
+default allowlist and `install.sh` does not grant it: give it to a
+dedicated key, the way the canary example below does.
 
 Grant extra roles either by editing the line in `admin.pub` (the agent
 re-reads it at start; the file is write-protected by the agent's
@@ -223,6 +230,66 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 | Re-engage after crash | `nn-admin force-posture combat --key <admin.key>` |
 | Crash mid-COMBAT | automatic stale-chain reconcile on restart (see §4) |
 | Host cut off by an older agent's nftables isolation | agent restart removes it; by hand see §4 |
+| See what the response layer holds | `nn-admin response status --key <audit-read key>` (§6) |
+| Release a contained process | `nn-admin response release --pid <pid> --key <response-manage key>` |
+| Get a quarantined file back | `nn-admin response restore --vault-id <id> [--to <path>] --key <response-manage key>` |
+
+---
+
+## 6. Undoing a response
+
+A response is not always right: a throttled build server, a blocked
+backup agent, a quarantined in-house tool. Three signed verbs undo one,
+run by the agent itself over the admin socket (it holds the record of
+what it did, and the privileges), each recorded in the signed audit log
+with the key that signed it (`response_status`, `response_release`,
+`response_restore`):
+
+```sh
+# what the agent holds: contained processes (scope, the cgroup each came
+# from, whether the pid still names that process), the vault, the stage
+nn-admin response status --key <audit-read key>
+
+# a process blocked or throttled by the agent, back to its own cgroup
+nn-admin response release --pid 4242 --key <response-manage key>
+
+# a quarantined file, back where it was taken from ...
+nn-admin response restore --vault-id 3f2a…(32 hex) --key <response-manage key>
+# ... or somewhere else, to inspect it first
+nn-admin response restore --vault-id 3f2a… --to /root/inspect/sample.bin \
+    --key <response-manage key>
+```
+
+`response status` needs `audit-read`; `release` and `restore` need
+`response-manage` (§1.1). `nn-admin status` also shows the COMBAT stage
+and whether COMBAT is locked.
+
+What the verbs will and will not do:
+
+- **Release** works from the containment record
+  (`/run/northnarrow/containment.json`): a pid the agent did not contain is
+  answered `not contained by this agent`. The process goes back to the
+  cgroup it came from, never to the root cgroup, and only while the pid
+  still names the process that was moved (same start time); otherwise it
+  stays where it is and the reply says why (exit 9). During an open COMBAT
+  episode the ladder may contain it again: release COMBAT first (§3) when
+  the episode itself was the mistake.
+- **Restore** writes a **new** file, mode 0600 owned by root: it never
+  replaces an existing file and never follows a symlink, and the directory
+  must exist (it is not created). The destination defaults to the path the
+  file was taken from; `--to` takes an absolute path. Paths under the
+  prefixes the quarantine never touches (`/etc`, `/usr/bin`, `/usr/lib`,
+  `/boot`, `/var/lib/northnarrow`, `/run/northnarrow`, the agent's
+  binaries, …) are refused, also when a directory of the path is a link
+  that leads there. The content is checked against the SHA-256 recorded at
+  capture before anything is written. The vault keeps the entry: restore
+  again elsewhere if needed.
+- **A restored file may be malware.** Restore it to inspect it, or after
+  you have established it is not; it comes back non-executable (0600) on
+  purpose. The agent detects it again if it runs and is still malicious.
+
+Exit codes: 0 done, 9 verified but nothing done (the reason is printed),
+7 role denied, 2 bad signature, 5 transport or an agent without the verbs.
 
 Related: `configs/combat-rules.v4`,
 `agent/src/anti_tamper/network_isolate.rs`,

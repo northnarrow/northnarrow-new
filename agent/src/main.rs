@@ -3092,6 +3092,15 @@ async fn main() -> Result<()> {
                 let installer_override_for_serve = Some(Arc::clone(&installer_override));
                 // Tappa 9.0.c: detection triage state (status-event chain).
                 let detection_state_for_serve = detection_admin_state.clone();
+                // External audit CMB-016: the response verbs read the
+                // executor's record and vault, and the ladder's stage.
+                let response_state_for_serve = Some(Arc::new(admin_socket::ResponseAdminState {
+                    config: executor.config().clone(),
+                    combat_stage: {
+                        let ladder = Arc::clone(&ladder);
+                        Arc::new(move || ladder.current_stage().map(|s| s.as_str().to_string()))
+                    },
+                }));
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -3105,6 +3114,7 @@ async fn main() -> Result<()> {
                         canary_state_for_serve,
                         installer_override_for_serve,
                         detection_state_for_serve,
+                        response_state_for_serve,
                     )
                     .await
                     {

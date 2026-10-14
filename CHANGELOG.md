@@ -6,6 +6,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, undoing a response (Medium CMB-016, Low CMB-026):
+  three signed admin verbs, run by the agent and recorded in the signed
+  audit log. `nn-admin response status` (`audit-read`) lists the contained
+  processes, the quarantine vault and the COMBAT stage; `response release
+  --pid` and `response restore --vault-id [--to]` need the new
+  `response-manage` role, never granted by default. A release goes back to
+  the cgroup the process came from, by the containment record; a restore
+  checks the vault id (32 hex digits) and the SHA-256 recorded at capture,
+  creates a new file (mode 0600, never over an existing file or through a
+  link, never under a protected prefix, the directory must exist) and keeps
+  the vault entry — before, restore took any id as a path fragment and
+  overwrote whatever the destination named. `nn-admin status` shows the
+  COMBAT stage and whether COMBAT is locked.
 - External audit, Wave 2, containment state and recovery (Medium CMB-010,
   CMB-017, CMB-013, CMB-015): a released process goes back to its systemd
   unit (recorded when it was contained), never to the root cgroup — before,

@@ -1245,6 +1245,8 @@ pub fn role_keyword(r: Role) -> &'static str {
         Role::Triage => "triage",
         // Tappa 10.8 — signed operator overlays.
         Role::ConfigManage => "config-manage",
+        // External audit CMB-016 — undo a response.
+        Role::ResponseManage => "response-manage",
         Role::All => "all",
     }
 }
@@ -1943,6 +1945,7 @@ mod tests {
             // Tappa 9.0.c — triage role (subsumes telemetry-read).
             ("triage", Role::Triage),
             ("config-manage", Role::ConfigManage),
+            ("response-manage", Role::ResponseManage),
             ("all", Role::All),
         ];
         for (keyword, expected) in cases {
