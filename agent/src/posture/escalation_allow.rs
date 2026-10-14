@@ -51,9 +51,10 @@
 //! default). Malformed lines are skipped with a WARN.
 
 use std::net::IpAddr;
-use std::path::Path;
 
 use tracing::warn;
+
+use crate::config::overlay_auth::Verified;
 
 /// Default path for the operator-supplemental escalation allowlist.
 /// Missing/unreadable = empty allowlist (fail-secure). `main.rs` loads
@@ -132,32 +133,22 @@ impl EscalationAllowList {
         self.entries.len()
     }
 
-    /// Fail-secure load. Missing/unreadable → empty (logged on a
-    /// non-NotFound error). Malformed lines → skipped with a WARN.
-    pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let (list, warnings) = Self::parse(&text);
-                for w in &warnings {
-                    warn!(
-                        path = %path.display(),
-                        reject = %w,
-                        "escalation-allow: skipping malformed entry (fail-secure — ignored)"
-                    );
-                }
-                list
-            }
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        error = %e,
-                        path = %path.display(),
-                        "escalation-allow: read failed — empty allowlist this boot (fail-secure)"
-                    );
-                }
-                Self::empty()
-            }
+    /// Fail-secure load of the overlay as the signed-overlay gate verified
+    /// it (external audit LLMR-013). None → empty. Malformed lines →
+    /// skipped with a WARN.
+    pub fn load(local: &Verified) -> Self {
+        let Some(text) = local.text() else {
+            return Self::empty();
+        };
+        let (list, warnings) = Self::parse(text);
+        for w in &warnings {
+            warn!(
+                path = ?local.source(),
+                reject = %w,
+                "escalation-allow: skipping malformed entry (fail-secure — ignored)"
+            );
         }
+        list
     }
 
     /// Parse text → (list, per-line warnings). `pub` for unit tests.

@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the signed overlays (Medium LLMR-013, LLMR-016):
+  what the agent applies is the overlay it verified — the loaders, and
+  COMBAT at every engage, read the file a second time, so a root process
+  able to pause the agent's reads could get unsigned content applied. An
+  overlay is no longer read through a link, and a FIFO in its place no
+  longer stops the agent's boot. A shipped default list that cannot be
+  read gives way to the copy built into the agent, recorded in the signed
+  audit log.
 - External audit, Wave 2, the admin key files (Medium AUT-003, AUT-004,
   MAIN-005, AUT-002): a link planted in `/etc/northnarrow` no longer makes
   the agent write through it when it replaces `admin.pub` or a signed

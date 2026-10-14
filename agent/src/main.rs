@@ -1092,10 +1092,14 @@ async fn main() -> Result<()> {
     // production deploy bootstrap (N8 install.sh) ships the v1
     // defaults; missing .local overlay is the normal case for a
     // host without operator-specific block additions.
+    // External audit LLMR-013: every loader gets the overlay's text as the
+    // gate verified it (one read), never a path to read again; LLMR-016: a
+    // `.v1` that cannot be read gives way to the copy built into the agent,
+    // recorded.
     let netflow_blocklist = Arc::new(
         NetBlocklist::load(
             &cli.netflow_blocklist_v1,
-            &overlay_gate.effective(OverlayKind::NetflowBlocklist, &cli.netflow_blocklist_local),
+            &overlay_gate.verified(OverlayKind::NetflowBlocklist, &cli.netflow_blocklist_local),
         )
         .unwrap_or_else(|e| {
             warn!(
@@ -1107,10 +1111,16 @@ async fn main() -> Result<()> {
             NetBlocklist::empty()
         }),
     );
+    report_builtin_defaults(
+        &overlay_gate,
+        "netflow-blocklist",
+        &cli.netflow_blocklist_v1,
+        netflow_blocklist.defaults(),
+    );
     let ja3_blocklist = Arc::new(
         Ja3Blocklist::load(
             &cli.netflow_ja3_blocklist_v1,
-            &overlay_gate.effective(
+            &overlay_gate.verified(
                 OverlayKind::NetflowJa3Blocklist,
                 &cli.netflow_ja3_blocklist_local,
             ),
@@ -1125,6 +1135,12 @@ async fn main() -> Result<()> {
             Ja3Blocklist::empty()
         }),
     );
+    report_builtin_defaults(
+        &overlay_gate,
+        "netflow-ja3-blocklist",
+        &cli.netflow_ja3_blocklist_v1,
+        ja3_blocklist.defaults(),
+    );
     let burst_window = Arc::new(parking_lot::Mutex::new(
         northnarrow_agent::decision::rules::net::DnsBurstWindow::new(),
     ));
@@ -1138,7 +1154,8 @@ async fn main() -> Result<()> {
         northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
             "netflow-comm-allowlist",
             &cli.netflow_comm_allowlist_v1,
-            &overlay_gate.effective(
+            northnarrow_agent::config::comm_allowlist::BUILTIN_NETFLOW_COMM_ALLOWLIST_V1,
+            &overlay_gate.verified(
                 OverlayKind::NetflowCommAllowlist,
                 &cli.netflow_comm_allowlist_local,
             ),
@@ -1153,6 +1170,12 @@ async fn main() -> Result<()> {
             northnarrow_agent::config::comm_allowlist::CommAllowlist::default()
         }),
     );
+    report_builtin_defaults(
+        &overlay_gate,
+        "netflow-comm-allowlist",
+        &cli.netflow_comm_allowlist_v1,
+        netflow_comm_allowlist.defaults(),
+    );
     let beacon_window = Arc::new(parking_lot::Mutex::new(
         northnarrow_agent::decision::rules::net::BeaconWindow::new(),
     ));
@@ -1165,7 +1188,8 @@ async fn main() -> Result<()> {
         northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
             "process-comm-allowlist",
             &cli.process_comm_allowlist_v1,
-            &overlay_gate.effective(
+            northnarrow_agent::config::comm_allowlist::BUILTIN_PROCESS_COMM_ALLOWLIST_V1,
+            &overlay_gate.verified(
                 OverlayKind::ProcessCommAllowlist,
                 &cli.process_comm_allowlist_local,
             ),
@@ -1179,6 +1203,12 @@ async fn main() -> Result<()> {
             );
             northnarrow_agent::config::comm_allowlist::CommAllowlist::default()
         }),
+    );
+    report_builtin_defaults(
+        &overlay_gate,
+        "process-comm-allowlist",
+        &cli.process_comm_allowlist_v1,
+        process_allowlist.defaults(),
     );
 
     // FIM-009 self-upgrade (§15.1): construct the trusted-installer
@@ -1221,7 +1251,7 @@ async fn main() -> Result<()> {
         // External audit DEC-005: the built-in readers of whole trees plus
         // the operator's signed canary-readers.local.
         northnarrow_agent::canary::readers::CanaryReaders::load(
-            &overlay_gate.effective(
+            &overlay_gate.verified(
                 OverlayKind::CanaryReaders,
                 std::path::Path::new(northnarrow_agent::canary::readers::CANARY_READERS_LOCAL),
             ),
@@ -1465,15 +1495,17 @@ async fn main() -> Result<()> {
 
     let exempt = ExemptPids::with_agent(std::process::id());
     // Tappa 10.9 step 1: the file-open sensor applies the operator's
-    // mass-write carve-outs in the kernel (same signed overlay).
+    // mass-write carve-outs in the kernel (same signed overlay, read and
+    // verified once for both — external audit LLMR-013).
+    let mass_write_overlay = overlay_gate.verified(
+        OverlayKind::MassWriteCarveout,
+        std::path::Path::new(
+            northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
+        ),
+    );
     let open_sensor_carveout =
         northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
-            &overlay_gate.effective(
-                OverlayKind::MassWriteCarveout,
-                std::path::Path::new(
-                    northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
-                ),
-            ),
+            &mass_write_overlay,
         );
     let posture = if let Some(iso) = isolator.as_ref() {
         // T7.13 (Beta Step 5): the auth-lineage tracker shared with
@@ -1524,19 +1556,14 @@ async fn main() -> Result<()> {
         // wholesale.
         let mass_write_extras =
             northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
-                &overlay_gate.effective(
-                    OverlayKind::MassWriteCarveout,
-                    std::path::Path::new(
-                        northnarrow_agent::posture::mass_write_overlay::DEFAULT_MASS_WRITE_OVERLAY,
-                    ),
-                ),
+                &mass_write_overlay,
             );
         // BUG-032 — escalation allowlist (count-filter for exfil/lateral).
         // Missing file = empty (fail-secure). Loaded once at boot;
         // reload-on-restart for beta.
         let escalation_allow =
             northnarrow_agent::posture::escalation_allow::EscalationAllowList::load(
-                &overlay_gate.effective(
+                &overlay_gate.verified(
                     OverlayKind::EscalationAllow,
                     std::path::Path::new(
                         northnarrow_agent::posture::escalation_allow::DEFAULT_ESCALATION_ALLOW,
@@ -2003,7 +2030,7 @@ async fn main() -> Result<()> {
     //     in-process snapshot.
     let watched_paths_load = match northnarrow_agent::fim::paths_config::load_watched_paths(
         &cli.fim_paths_v1,
-        &overlay_gate.effective(OverlayKind::FimPaths, &cli.fim_paths_local),
+        &overlay_gate.verified(OverlayKind::FimPaths, &cli.fim_paths_local),
     ) {
         Ok(load) => load,
         Err(e) => {
@@ -2016,6 +2043,12 @@ async fn main() -> Result<()> {
             Default::default()
         }
     };
+    report_builtin_defaults(
+        &overlay_gate,
+        "fim-paths",
+        &cli.fim_paths_v1,
+        &watched_paths_load.defaults,
+    );
     if legacy_isolation_removed {
         attest_legacy_isolation_removed(audit_log.as_ref());
     }
@@ -2459,15 +2492,22 @@ async fn main() -> Result<()> {
                         Arc::clone(&inode_map),
                         watched_paths_handle.clone(),
                         move || {
-                            northnarrow_agent::fim::paths_config::load_watched_paths(
+                            // A signed `fim baseline` re-reads the overlay:
+                            // the same signature check as at boot, and the
+                            // bytes it verified are the ones applied.
+                            let load = northnarrow_agent::fim::paths_config::load_watched_paths(
                                 &v1_for_snapshot,
-                                // a signed `fim baseline` re-reads the overlay:
-                                // same signature check as at boot
                                 &gate_for_snapshot
-                                    .effective(OverlayKind::FimPaths, &local_for_snapshot),
+                                    .verified(OverlayKind::FimPaths, &local_for_snapshot),
                             )
-                            .map(|l| l.effective)
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                            report_builtin_defaults(
+                                &gate_for_snapshot,
+                                "fim-paths",
+                                &v1_for_snapshot,
+                                &load.defaults,
+                            );
+                            load.effective
                         },
                     ));
                 } else {
@@ -4087,6 +4127,20 @@ fn attest_degraded(
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "attesting a degraded subsystem failed");
+    }
+}
+
+/// External audit LLMR-016: a default list that could not be read, and
+/// gave way to the copy built into the agent, is recorded in the signed
+/// chain through the overlay gate (queued until the audit log is open).
+fn report_builtin_defaults(
+    gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
+    list: &str,
+    v1: &std::path::Path,
+    source: &northnarrow_agent::config::overlay::DefaultsSource,
+) {
+    if let northnarrow_agent::config::overlay::DefaultsSource::BuiltIn(why) = source {
+        gate.report_default_unavailable(list, v1, why);
     }
 }
 

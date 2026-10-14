@@ -21,18 +21,18 @@
 //! targets. There is no `.v1` curated default; the file is purely
 //! additive and OPTIONAL.
 
-use std::path::Path;
-
 use tracing::{info, warn};
+
+use crate::config::overlay_auth::Verified;
 
 /// Default deploy location of the optional mass-write carve-out
 /// overlay. Missing file → empty list (no extra exemptions); the
 /// hardcoded `MASS_WRITE_CARVEOUT_PREFIXES` still apply.
 pub const DEFAULT_MASS_WRITE_OVERLAY: &str = "/etc/northnarrow/mass-write-carveout.local";
 
-/// Parse the overlay file. Returns an empty Vec if the file is
-/// missing or unreadable (with a WARN on parse failure but never an
-/// error — this is purely additive and not boot-critical).
+/// Parse the overlay, as the signed-overlay gate verified it (external
+/// audit LLMR-013: its text, never the path read again). None → an empty
+/// Vec — this is purely additive and not boot-critical.
 ///
 /// Accepted line shapes (after stripping `#` comments and trimming):
 /// - `+/absolute/prefix`  — add prefix
@@ -44,22 +44,9 @@ pub const DEFAULT_MASS_WRITE_OVERLAY: &str = "/etc/northnarrow/mass-write-carveo
 ///
 /// Invalid entries (relative paths, empty, `-` directive) are
 /// surfaced via WARN with `path:lineno`.
-pub fn load_mass_write_carveout_extras(local_path: &Path) -> Vec<String> {
-    let body = match std::fs::read_to_string(local_path) {
-        Ok(s) => s,
-        Err(e) => {
-            // Missing file is the common case on operator hosts
-            // (no dev tooling to exempt). Only WARN on a non-NotFound
-            // error.
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    error = %e,
-                    path = %local_path.display(),
-                    "mass-write overlay: read failed — ignoring overlay this boot"
-                );
-            }
-            return Vec::new();
-        }
+pub fn load_mass_write_carveout_extras(local: &Verified) -> Vec<String> {
+    let (Some(body), Some(local_path)) = (local.text(), local.source()) else {
+        return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
     for (lineno, raw) in body.lines().enumerate() {
@@ -113,31 +100,28 @@ pub fn load_mass_write_carveout_extras(local_path: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn write_overlay(dir: &Path, body: &str) -> std::path::PathBuf {
-        let p = dir.join("mass-write-carveout.local");
-        std::fs::write(&p, body).unwrap();
-        p
+    fn overlay(body: &str) -> Verified {
+        Verified::Content {
+            path: DEFAULT_MASS_WRITE_OVERLAY.into(),
+            text: body.to_string(),
+        }
     }
 
     #[test]
     fn missing_file_returns_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("does-not-exist");
-        assert!(load_mass_write_carveout_extras(&p).is_empty());
+        assert!(load_mass_write_carveout_extras(&Verified::Missing).is_empty());
+        assert!(load_mass_write_carveout_extras(&Verified::Refused).is_empty());
     }
 
     #[test]
     fn parses_plus_and_bare_lines() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = write_overlay(
-            tmp.path(),
+        let out = load_mass_write_carveout_extras(&overlay(
             "# header comment\n\
              +/home/alice/.claude/\n\
              /tmp/claude-                  # bare path treated as add\n\
              \n\
              +/var/lib/devtool/cache/\n",
-        );
-        let out = load_mass_write_carveout_extras(&p);
+        ));
         assert_eq!(
             out,
             vec![
@@ -150,17 +134,13 @@ mod tests {
 
     #[test]
     fn relative_path_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = write_overlay(tmp.path(), "+not-absolute\n+/ok/\n");
-        let out = load_mass_write_carveout_extras(&p);
+        let out = load_mass_write_carveout_extras(&overlay("+not-absolute\n+/ok/\n"));
         assert_eq!(out, vec!["/ok/".to_string()]);
     }
 
     #[test]
     fn minus_directive_is_ignored_and_warned() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = write_overlay(tmp.path(), "-/sys/\n+/keep/\n");
-        let out = load_mass_write_carveout_extras(&p);
+        let out = load_mass_write_carveout_extras(&overlay("-/sys/\n+/keep/\n"));
         // `-` lines are dropped (no v1 to disable from). `+` line stays.
         assert_eq!(out, vec!["/keep/".to_string()]);
     }

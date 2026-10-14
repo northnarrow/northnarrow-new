@@ -194,35 +194,51 @@ impl NetworkIsolator {
     /// content or carries an admin `config-manage` signature for its exact
     /// content (the overlay gate, which logs and records a refusal);
     /// otherwise, or when the file is missing, the built-in content is.
+    ///
+    /// External audit LLMR-013: what is applied is the text the gate read
+    /// and verified. This read the file first, let the gate verify a second
+    /// read, and applied the first: a root process able to pause the
+    /// agent's `open()` could make the two differ at every engage, and
+    /// COMBAT would apply a ruleset nobody signed while it logged the host
+    /// isolated.
     fn trusted_source(
         &self,
         kind: common::wire::admin_signed_payload::OverlayKind,
         path: &std::path::Path,
         builtin: &'static str,
     ) -> String {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
+        use crate::config::overlay_auth::Verified;
+        let Some(gate) = &self.gate else {
+            return match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        file = %path.display(),
+                        error = %e,
+                        "COMBAT: file unreadable — applying the built-in content"
+                    );
+                    builtin.to_string()
+                }
+            };
+        };
+        match gate.verified(kind, path) {
+            Verified::Content { text, .. } => text,
+            Verified::ShippedDefault => builtin.to_string(),
+            Verified::Missing => {
                 warn!(
                     file = %path.display(),
-                    error = %e,
-                    "COMBAT: file unreadable — applying the built-in content"
+                    "COMBAT: file missing — applying the built-in content"
                 );
-                return builtin.to_string();
+                builtin.to_string()
             }
-        };
-        let Some(gate) = &self.gate else {
-            return text;
-        };
-        if gate.effective(kind, path) == path {
-            text
-        } else {
-            error!(
-                file = %path.display(),
-                "COMBAT: file not vouched for (modified without an admin signature) — \
-                 applying the built-in content instead"
-            );
-            builtin.to_string()
+            Verified::Refused => {
+                error!(
+                    file = %path.display(),
+                    "COMBAT: file not vouched for (modified without an admin signature) — \
+                     applying the built-in content instead"
+                );
+                builtin.to_string()
+            }
         }
     }
 
