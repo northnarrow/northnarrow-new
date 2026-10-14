@@ -114,8 +114,8 @@ LSM program, config, state or bait behind, then reinstalls
 The agent's anti-tamper (signals, ptrace, inode mutations denied to root
 by BPF LSM) holds only while root cannot rewrite the kernel at runtime.
 Those doors are closed by the host, not by the agent, so the installer,
-the agent at boot and `nn-admin` read the same eight settings and say
-what is missing and how to fix it:
+the agent at boot and `nn-admin` read the same settings and say what is
+missing and how to fix it:
 
 | Check | Expected | Why |
 |---|---|---|
@@ -127,6 +127,7 @@ what is missing and how to fix it:
 | IMA | measurements > 0 | a replaced binary fails before it runs (appraise) or is at least measured |
 | kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot; lockdown alone still lets a signed vendor kernel in through `kexec_file_load`, with any command line (one without `bpf` in `lsm=`, for instance). Since review 82 the running agent refuses every kexec image load itself (below); the setting still covers the time before the agent starts |
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
+| nftables | `nft` installed | the COMBAT soft egress block (INVESTIGATE) is an nftables rule: without `nft` the offender is not contained while the agent analyses it — the agent records the failure and shortens INVESTIGATE to 10 s |
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
 22.04 / 5.15: every deny hook attached, and `tamper-check` saw kexec and

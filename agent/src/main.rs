@@ -1538,8 +1538,11 @@ async fn main() -> Result<()> {
             // Admin released COMBAT: stand the ladder down (clears the
             // episode + lifts the surgical per-PID soft-egress blocks),
             // THEN tear down any full isolation STAGE 3 had engaged.
+            // External audit CMB-012: after every step queued before the
+            // stand-down has run, so an ISOLATE taken just before the
+            // unlock cannot land after the release.
             if let Some(ladder) = ladder_for_release.get() {
-                ladder.stand_down(Instant::now());
+                ladder.stand_down_and_wait(Instant::now(), LADDER_RELEASE_WAIT);
             }
             if let Err(e) = iso_release.release(token) {
                 tracing::error!(
@@ -1955,7 +1958,11 @@ async fn main() -> Result<()> {
         .with_isolation_gate({
             let posture = posture.clone();
             move || posture.is_combat_locked()
-        }),
+        })
+        // External audit CMB-007: the ladder's side effects (nft, cgroup
+        // writes, kills, quarantine, iptables, audit) run on a worker of
+        // their own, in order — never on the event loop.
+        .with_worker(),
     );
     // External audit POS-001: an unlocked COMBAT decays once quiet; the
     // ladder stands down with it (lifts the per-PID egress blocks).
@@ -4227,6 +4234,11 @@ fn attest_open_findings(
 /// the host as stopping — no posture escalation and no ladder until the
 /// process ends at systemd-shutdown's final stage.
 static HOST_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// External audit CMB-012: how long the COMBAT release waits for the
+/// ladder's queued steps (a NEUTRALIZE of a large tree takes seconds)
+/// before it lifts the isolation anyway.
+const LADDER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The host is shutting down: stand the ladder down once and stop
 /// escalating (see [`HOST_STOPPING`]).

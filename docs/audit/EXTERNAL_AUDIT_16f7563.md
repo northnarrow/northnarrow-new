@@ -182,14 +182,14 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-136 | POS-009 | Posture | M | open |
 | NN-AUD-137 | POS-015 | Posture | M | open |
 | NN-AUD-138 | CMB-004 | Combat response | L | open |
-| NN-AUD-139 | CMB-007 | Combat response | M | open |
+| NN-AUD-139 | CMB-007 | Combat response | M | fixed (lab PR 119) |
 | NN-AUD-140 | CMB-008 | Combat response | M | already fixed (lab PR 77; lab PR 100, with NN-AUD-046) |
 | NN-AUD-141 | CMB-009 | Combat response | S | already fixed (lab PR 103, with NN-AUD-050) |
-| NN-AUD-142 | CMB-010 | Combat response | M | open |
-| NN-AUD-143 | CMB-011 | Combat response | M | open |
-| NN-AUD-144 | CMB-012 | Combat response | M | open |
+| NN-AUD-142 | CMB-010 | Combat response | M | partial: stop-gap (lab PR 119), full fix with B5 |
+| NN-AUD-143 | CMB-011 | Combat response | M | fixed (lab PR 119) |
+| NN-AUD-144 | CMB-012 | Combat response | M | fixed (lab PR 119) |
 | NN-AUD-145 | CMB-013 | Combat response | S | open |
-| NN-AUD-146 | CMB-014 | Combat response | S | open |
+| NN-AUD-146 | CMB-014 | Combat response | S | fixed (lab PR 119) |
 | NN-AUD-147 | CMB-015 | Combat response | S | open |
 | NN-AUD-148 | CMB-016 | Combat response | M | open |
 | NN-AUD-149 | CMB-017 | Combat response | S | open |
@@ -1987,3 +1987,71 @@ the audit did not report, noted with the fix that takes them.
     tokio I/O failure and was not provoked in the lab. The anti-tamper
     suite: OK. Privileged gate: Ubuntu 24.04 (6.8) and Debian 12 (6.1), 29
     suites, 74 passed, 0 failed each.
+- **NN-AUD-139 (CMB-007), NN-AUD-143 (CMB-011), NN-AUD-144 (CMB-012),
+  NN-AUD-146 (CMB-014), NN-AUD-142 (CMB-010, stop-gap), lab PR 119.** The
+  COMBAT ladder's execution model.
+  - CMB-007: `process_event` called the ladder synchronously — `engage`
+    shelled out to `nft` per offender, a jump-ahead in `observe` killed
+    the tree (with its verification), quarantined and ran iptables — so no
+    sensor event was consumed during a NEUTRALIZE, and the posture's
+    combat-entry hook and the tick did the same. The ladder now decides
+    under its state lock in the caller and queues the side effects; one
+    worker thread (`nn-combat-ladder`) runs them in order
+    (`CombatLadder::with_worker`). `current_stage()` reads the decision.
+  - CMB-012: `drive_to` took a step under the lock and ran it after; the
+    release hook stood the ladder down and lifted the isolation, so an
+    ISOLATE decided just before an admin unlock could land after the
+    release. The stand-down is a queued job behind any step already
+    taken, and the release hook waits for it (`stand_down_and_wait`, up to
+    30 s) before lifting the isolation; each job carries the episode it
+    belongs to and the worker drops one of a closed episode. A soft block
+    that finishes after its episode closed is released at once.
+  - CMB-011: every child of an offender was attributed and soft-blocked
+    with a fork and exec of `nft` each, though a child forked after its
+    parent was moved is in `blocked.scope` already. The ruleset is applied
+    once per episode; a process already in the scope is not written; the
+    offender set stops at 1 024 — past it the tree is not containable
+    process by process: NEUTRALIZE during INVESTIGATE, ISOLATE (through
+    the gate) after it.
+  - CMB-014: the soft block's outcome was only logged, and the process was
+    moved into `blocked.scope` before the drop rule was applied — on a host
+    without `nft` (the Debian 12 lab image) every INVESTIGATE left the
+    offender there unblocked, counted as contained. The rule now goes in
+    first, the outcome per process is in the signed INVESTIGATE record
+    (`soft egress: <pid> FAILED (...)`), and an episode with a failed block
+    has a 10 s INVESTIGATE window. `nn-admin host-check` reports a host
+    without `nft`.
+  - CMB-010, stop-gap: the stand-down released every attributed PID to the
+    root cgroup — host-critical offenders that were never blocked, and
+    processes that had since been given an offender's PID. It now releases
+    only what the episode blocked, while `/proc/<pid>/cgroup` still shows
+    `blocked.scope` and the start time is the one recorded at the block.
+    Restoring the process's own unit is the full fix (B5).
+  - Lab: Ubuntu 24.04 (6.8, `nft` present) and Debian 12 (6.1, no
+    `nft`), the build of main before, guests under QEMU/WHPX
+    (`ladder119-probe.sh`). The offender tries to write
+    `/etc/northnarrow/admin.pub`; the kernel refuses it, which locks COMBAT
+    with the writer attributed.
+    - A fresh episode, the offender forking 500 children that exec
+      `sleep` (jump-ahead → NEUTRALIZE of the 500-process tree, 5.15 s in
+      both builds), with `/tmp/nnprobe-N` run every 250 ms: before, the
+      R001 verdicts of the probes run during the kill came up to 5.1 s
+      late (the event loop was inside the kill); after, at most 2 ms.
+    - The same spread in an episode already past INVESTIGATE: before, 502
+      "blocked outbound traffic" — a cgroup write and an `nft` run per
+      child on the event loop — and verdicts up to 10.9 s late; after, one
+      (the offender; its children are already in the scope), verdicts at
+      most 2 ms.
+    - Debian 12 without `nft`: before, `apply_block_ruleset` failed after
+      the move — the offender sat in `blocked.scope` unblocked, the signed
+      INVESTIGATE record said nothing, NEUTRALIZE came after 31.6 s; after,
+      the offender stays in its own scope, a signed record names the
+      failure ("soft egress: <pid> FAILED (... is nftables (`nft`)
+      installed?) — the offender is not contained; INVESTIGATE shortened to
+      10 s"), NEUTRALIZE after 10.8 s.
+    - Found in the lab: `debug force-posture observing` changes the posture
+      without standing the ladder down (a debug-build hatch, no release
+      hook), so the second spread ran in the first one's episode — which is
+      the per-child case above. The anti-tamper suite: OK.
+      Privileged gate: Ubuntu 24.04 (6.8) and Debian 12 (6.1), 29
+      suites, 74 passed, 0 failed each.

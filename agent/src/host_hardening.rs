@@ -63,7 +63,28 @@ pub fn run_in(root: &Path) -> Vec<Check> {
         kexec_load_disabled(root),
         bpffs_mounts(root),
         admin_key(root),
+        nft_tool(root),
     ]
+}
+
+/// External audit CMB-014: where `nft` may be installed. The COMBAT
+/// soft egress block (INVESTIGATE) is an nftables rule: without `nft`
+/// the offender is not contained while the agent analyses it.
+const NFT_PATHS: &[&str] = &["usr/sbin/nft", "sbin/nft", "usr/bin/nft", "bin/nft"];
+
+fn nft_tool(root: &Path) -> Check {
+    let found = NFT_PATHS.iter().find(|rel| root.join(rel).is_file());
+    let (status, value) = match found {
+        Some(rel) => (Status::Ok, format!("/{rel}")),
+        None => (Status::Warn, "not installed".to_string()),
+    };
+    Check {
+        id: "nft",
+        name: "nftables for COMBAT containment",
+        status,
+        value,
+        fix: "install nftables (`apt install nftables` / `dnf install nftables`) — without `nft` a COMBAT soft egress block does not take effect (the agent shortens INVESTIGATE and records the failure)",
+    }
 }
 
 /// External audit DEP-001: where an admin PRIVATE key lands on the host —
@@ -362,15 +383,16 @@ mod tests {
         w(r, "proc/self/mountinfo", b"36 25 0:30 / /sys/fs/bpf rw,nosuid shared:17 - bpf bpf rw,mode=700\n40 25 0:31 / /proc rw - proc proc rw\n");
         // admin.pub only: the private key went offline
         w(r, "etc/northnarrow/admin.pub", b"ab unlock\n");
+        w(r, "usr/sbin/nft", b"");
         let checks = run_in(r);
-        assert_eq!(checks.len(), 9);
+        assert_eq!(checks.len(), 10);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
         assert!(
             checks.iter().all(|c| c.status == Status::Ok),
             "{:?}",
             checks
         );
-        assert!(render_table(&checks).contains("9 check(s), 0 warning(s)"));
+        assert!(render_table(&checks).contains("10 check(s), 0 warning(s)"));
     }
 
     #[test]
@@ -410,7 +432,9 @@ mod tests {
         assert_eq!(by_id("kexec_load_disabled"), Status::Warn);
         assert_eq!(by_id("bpffs"), Status::Warn);
         assert_eq!(by_id("admin_key"), Status::Warn);
-        assert_eq!(warn_count(&checks), 6);
+        // the Debian 12 lab image has no nftables (CMB-006 lab note)
+        assert_eq!(by_id("nft"), Status::Warn);
+        assert_eq!(warn_count(&checks), 7);
         let table = render_table(&checks);
         assert!(table.contains("fix: boot with `lockdown=integrity`"));
         assert!(table.contains("mounted 2×"));
@@ -422,9 +446,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let checks = run_in(d.path());
         // nothing readable: every check is Unknown except bpffs (no mount =
-        // Warn) and admin_key (no key file = Ok)
+        // Warn), nft (no binary = Warn) and admin_key (no key file = Ok)
         for c in &checks {
-            if c.id == "bpffs" {
+            if c.id == "bpffs" || c.id == "nft" {
                 assert_eq!(c.status, Status::Warn);
             } else if c.id == "admin_key" {
                 assert_eq!(c.status, Status::Ok);

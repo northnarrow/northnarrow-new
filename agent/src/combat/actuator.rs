@@ -38,15 +38,37 @@ pub enum NeutralizeOutcome {
     Uncontainable { reason: String },
 }
 
+/// Outcome of a STAGE-1 soft egress block. External audit CMB-014: it
+/// was only logged, so a block that never took effect (no `nft` on the
+/// host) counted as containment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoftBlock {
+    /// The process's outbound traffic is dropped. `start_ticks` (its
+    /// start time) lets the stand-down release this process and no other
+    /// that later gets the PID.
+    Blocked { start_ticks: Option<u64> },
+    /// Nothing to contain, nothing to undo: detect-only, or the process
+    /// had already exited.
+    NotNeeded(&'static str),
+    /// The block did not take effect.
+    Failed(String),
+}
+
 /// The operations [`super::CombatLadder`] performs on the system.
 pub trait CombatActuator: Send + Sync {
+    /// A COMBAT episode opens (external audit CMB-011: the drop ruleset
+    /// is applied once per episode).
+    fn begin_episode(&self) {}
+
     /// STAGE 1 surgical soft egress: drop only this PID's outbound
     /// traffic (cgroup-scoped), preserving the host's management +
     /// evidence channels. Idempotent.
-    fn soft_egress_block(&self, pid: u32);
+    fn soft_egress_block(&self, pid: u32) -> SoftBlock;
 
-    /// Reverse [`Self::soft_egress_block`] (admin stand-down).
-    fn soft_egress_clear(&self, pid: u32);
+    /// Reverse [`Self::soft_egress_block`] (stand-down), for a process
+    /// [`Self::soft_egress_block`] reported blocked, with the start time
+    /// it reported.
+    fn soft_egress_clear(&self, pid: u32, start_ticks: Option<u64>);
 
     /// STAGE 2: kill (tree) + quarantine the offending PID(s); report
     /// whether the threat is contained at the process level.
@@ -133,7 +155,13 @@ impl SystemActuator {
 }
 
 impl CombatActuator for SystemActuator {
-    fn soft_egress_block(&self, pid: u32) {
+    fn begin_episode(&self) {
+        block_outbound::forget_applied_ruleset();
+    }
+
+    fn soft_egress_block(&self, pid: u32) -> SoftBlock {
+        // Read before the block: the identity the stand-down checks.
+        let start_ticks = block_outbound::proc_start_ticks(pid);
         let report = self.executor.execute(ResponseAction::BlockOutbound, pid);
         info!(
             target: "combat.actuator",
@@ -141,14 +169,38 @@ impl CombatActuator for SystemActuator {
             outcome = ?report.primary,
             "INVESTIGATE soft egress: per-PID outbound block (host channels preserved)"
         );
+        match report.primary {
+            ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked { start_ticks },
+            ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
+            ExecutionOutcome::AlreadyGone { .. } => SoftBlock::NotNeeded("process already exited"),
+            ExecutionOutcome::Failed { errno: 0, .. } => {
+                SoftBlock::Failed("block failed: nft rejected the drop ruleset".to_string())
+            }
+            ExecutionOutcome::Failed { errno, .. } => SoftBlock::Failed(format!(
+                "block failed: {} — is nftables (`nft`) installed?",
+                std::io::Error::from_raw_os_error(errno)
+            )),
+            other => SoftBlock::Failed(format!("{other:?}")),
+        }
     }
 
-    fn soft_egress_clear(&self, pid: u32) {
+    fn soft_egress_clear(&self, pid: u32, start_ticks: Option<u64>) {
         if self.detect_only {
             return;
         }
-        if let Err(e) = block_outbound::unblock_pid(pid, self.executor.config()) {
-            warn!(target: "combat.actuator", pid, error = %e, "soft-egress unblock failed");
+        match block_outbound::release_blocked_pid(pid, start_ticks, self.executor.config()) {
+            Ok(block_outbound::Release::Released) => {
+                info!(target: "combat.actuator", pid, "soft egress released")
+            }
+            Ok(block_outbound::Release::Skipped(why)) => info!(
+                target: "combat.actuator",
+                pid,
+                why,
+                "soft egress not released (left as it is)"
+            ),
+            Err(e) => {
+                warn!(target: "combat.actuator", pid, error = %e, "soft-egress unblock failed")
+            }
         }
     }
 
