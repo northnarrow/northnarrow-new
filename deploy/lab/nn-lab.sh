@@ -12,6 +12,16 @@
 #   sudo usermod -aG kvm "$USER"      # then re-login (WSL: `wsl --shutdown`)
 #   bpf-linker 0.10.3 + nightly on PATH for `cargo xtask build-ebpf`
 #
+# No /dev/kvm in WSL (nested virtualization not exposed — e.g. AMD hosts on
+# Windows 11 26100/26200/26300.9711, KB5127648, microsoft/WSL#41918):
+#   NN_LAB_ACCEL=whpx — the guest runs in QEMU for Windows on the Windows
+#     hypervisor, next to WSL instead of inside it, at full speed. Needs the
+#     "Windows Hypervisor Platform" feature, QEMU for Windows
+#     (NN_LAB_WIN_QEMU), `sudo apt install socat` and a systemd user session.
+#   NN_LAB_ACCEL=tcg — software emulation in WSL: slow, timing-sensitive
+#     tests may not hold.
+#   `echo whpx > ~/.cache/nn-lab/accel` makes it the default.
+#
 # Usage:
 #   deploy/lab/nn-lab.sh up            # download image, provision, boot, wait for ssh
 #   deploy/lab/nn-lab.sh check         # kernel / lsm / bpffs / iptables / cargo in the guest
@@ -43,7 +53,10 @@
 #   deploy/lab/nn-lab.sh soak start [HOURS] [INTERVAL_S] | status | stop | wait | report
 #                                      # hours of synthetic load + resource samples → $LAB_DIR/reports/soak-<stamp>.md
 #
-# Env overrides: NN_LAB_DIR (~/.cache/nn-lab), NN_LAB_CPUS (4), NN_LAB_MEM (8192),
+# Env overrides: NN_LAB_ACCEL (kvm | whpx | tcg; default $NN_LAB_DIR/accel or kvm),
+#   NN_LAB_WIN_DIR (C:\nn-lab), NN_LAB_WIN_QEMU / NN_LAB_WIN_QEMU_IMG (C:\Program Files\qemu\…),
+#   NN_LAB_BOOT_TIMEOUT (900 s),
+#   NN_LAB_DIR (~/.cache/nn-lab), NN_LAB_CPUS (4), NN_LAB_MEM (8192),
 #   NN_LAB_SSH_PORT (2222, remembered after `up`), NN_LAB_DISK (30G), NN_LAB_LTO (thin),
 #   NN_REPO (git toplevel of this script), NN_LAB_NIGHTLY_DOWN=1 (power the guest off at the end),
 #   NN_LAB_NIGHTLY_SKIP (space-separated steps to skip, e.g. "test-ignored").
@@ -56,6 +69,9 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 
 ROOT_LAB_DIR=${NN_LAB_DIR:-"$HOME/.cache/nn-lab"}
 CPUS=${NN_LAB_CPUS:-4}
+# kvm (default), whpx (QEMU for Windows, see the header) or tcg.
+ACCEL=${NN_LAB_ACCEL:-$(cat "${NN_LAB_DIR:-$HOME/.cache/nn-lab}/accel" 2>/dev/null || echo kvm)}
+case "$ACCEL" in kvm | whpx | tcg) ;; *) echo "nn-lab: unknown NN_LAB_ACCEL=$ACCEL (kvm | whpx | tcg)" >&2; exit 2 ;; esac
 MEM=${NN_LAB_MEM:-8192}
 DISK_SIZE=${NN_LAB_DISK:-30G}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -118,11 +134,117 @@ need_host_deps() {
     if ((${#missing[@]})); then
         die "missing on host: ${missing[*]} — run: sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client rsync curl"
     fi
-    [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm not usable: enable nested virtualization and add yourself to the kvm group (sudo usermod -aG kvm \$USER, then re-login)"
+    if [[ $ACCEL == kvm ]]; then
+        [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm not usable: enable nested virtualization and add yourself to the kvm group (sudo usermod -aG kvm \$USER, then re-login) — or NN_LAB_ACCEL=whpx (QEMU for Windows) / tcg (emulation)"
+    else
+        log "NN_LAB_ACCEL=tcg: software emulation, no KVM — builds and timing-sensitive tests run far slower"
+    fi
 }
 
 vm_running() {
+    if [[ $ACCEL == whpx ]]; then
+        vssh -o BatchMode=yes true 2>/dev/null
+        return
+    fi
     [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+# ── QEMU for Windows + WHPX (NN_LAB_ACCEL=whpx) ───────────────────────
+# The guest's disks live in $NN_LAB_WIN_DIR\<distro>. QEMU forwards ssh on
+# the WSL-facing host address only (not on the LAN), and a socat user unit
+# (nn-fwd-<distro>) maps it to 127.0.0.1:<port> here, so every sub-command
+# and lab probe talks to 127.0.0.1 as with KVM. WHPX hangs on a guest reset
+# ("reboot: Restarting system"), so QEMU runs with -no-reboot: a guest
+# reboot ends the process, and `up` (or the wait for ssh) starts it again.
+WIN_LAB_DIR=${NN_LAB_WIN_DIR:-'C:\nn-lab'}
+WIN_QEMU=${NN_LAB_WIN_QEMU:-'C:\Program Files\qemu\qemu-system-x86_64w.exe'}
+WIN_QEMU_IMG=${NN_LAB_WIN_QEMU_IMG:-'C:\Program Files\qemu\qemu-img.exe'}
+FWD_UNIT="nn-fwd-$DISTRO"
+
+whpx_dir_win() { printf '%s\\%s' "$WIN_LAB_DIR" "$DISTRO"; }
+whpx_dir() { wslpath -u "$(whpx_dir_win)"; }
+# A Windows program, from a Windows working directory (a WSL one makes it
+# warn about UNC paths); a user unit has no interop dirs on PATH.
+win() { (cd /mnt/c && PATH="$PATH:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0" "$@"); }
+whpx_host_ip() { ip route | awk '/default/ {print $3; exit}'; }
+whpx_pid() { tr -d '\r ' < "$(whpx_dir)/qemu.pid" 2>/dev/null || true; }
+whpx_qemu_running() {
+    local p; p=$(whpx_pid)
+    [[ -n "$p" ]] && win tasklist.exe /FI "PID eq $p" 2>/dev/null | tr -d '\r' | grep -q qemu-system
+}
+whpx_launch() {
+    win powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(whpx_dir_win)\\start.ps1" >/dev/null
+}
+whpx_forward() {
+    systemctl --user stop "$FWD_UNIT" 2>/dev/null || true
+    systemd-run --user --collect --quiet --unit="$FWD_UNIT" \
+        socat TCP-LISTEN:"$SSH_PORT",bind=127.0.0.1,fork,reuseaddr TCP:"$(whpx_host_ip)":"$SSH_PORT" ||
+        die "could not start the ssh forwarder (needs a systemd user session)"
+}
+
+whpx_up() {
+    local b
+    for b in wslpath socat cloud-localds ssh ssh-keygen curl; do
+        command -v "$b" >/dev/null 2>&1 || die "missing on host: $b — sudo apt install socat cloud-image-utils openssh-client curl"
+    done
+    [[ -f "$(wslpath -u "$WIN_QEMU")" ]] || die "QEMU for Windows not found at $WIN_QEMU (NN_LAB_WIN_QEMU)"
+    local dir dirw
+    dirw=$(whpx_dir_win)
+    dir=$(whpx_dir)
+    SERIAL="$dir/serial.log"
+    mkdir -p "$dir" "$LAB_DIR"
+    if [[ ! -f "$dir/$BASE_IMG_NAME" ]]; then
+        if [[ -f "$BASE_IMG" ]]; then
+            cp "$BASE_IMG" "$dir/"
+        else
+            log "downloading $IMAGE_URL"
+            curl -fL --progress-bar -o "$dir/$BASE_IMG_NAME.part" "$IMAGE_URL" && mv "$dir/$BASE_IMG_NAME.part" "$dir/$BASE_IMG_NAME"
+        fi
+    fi
+    [[ -f "$KEY" ]] || ssh-keygen -q -t ed25519 -N '' -C nn-lab -f "$KEY"
+    local fresh=0
+    if [[ ! -f "$dir/disk.qcow2" ]]; then
+        win "$(wslpath -u "$WIN_QEMU_IMG")" create -q -f qcow2 -b "$dirw\\$BASE_IMG_NAME" -F qcow2 "$dirw\\disk.qcow2" "$DISK_SIZE"
+        fresh=1
+    fi
+    if [[ ! -f "$dir/seed.iso" || $fresh == 1 ]]; then
+        local ud="$LAB_DIR/user-data" md="$LAB_DIR/meta-data"
+        sed "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" "$USER_DATA_TMPL" > "$ud"
+        printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$DISTRO" "$(date +%s)" "$DISTRO" > "$md"
+        cloud-localds "$dir/seed.iso" "$ud" "$md"
+    fi
+    echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
+    local h; h=$(whpx_host_ip)
+    cat > "$dir/start.ps1" <<EOF
+\$a = @("-accel","whpx","-machine","q35","-cpu","max","-smp","$CPUS","-m","$MEM",
+  "-drive","file=$dirw\\disk.qcow2,if=virtio,format=qcow2",
+  "-drive","file=$dirw\\seed.iso,if=virtio,format=raw,readonly=on",
+  "-netdev","user,id=n0,hostfwd=tcp:$h:$SSH_PORT-:22","-device","virtio-net-pci,netdev=n0",
+  "-device","virtio-rng-pci","-display","none","-serial","file:$dirw\\serial.log","-monitor","none","-no-reboot")
+\$p = Start-Process -FilePath "$WIN_QEMU" -ArgumentList \$a -PassThru -WindowStyle Hidden
+\$p.Id | Out-File -Encoding ascii "$dirw\\qemu.pid"
+EOF
+    if whpx_qemu_running; then
+        log "already running (QEMU for Windows pid $(whpx_pid))"
+    else
+        log "booting $DISTRO (whpx): ${CPUS} vCPU, ${MEM} MiB, ssh → $h:$SSH_PORT → 127.0.0.1:$SSH_PORT"
+        whpx_launch
+    fi
+    whpx_forward
+    wait_ssh "${NN_LAB_BOOT_TIMEOUT:-900}"
+    cmd_check
+}
+
+whpx_down() {
+    vssh 'sudo systemctl poweroff' >/dev/null 2>&1 || true
+    local _
+    for _ in $(seq 1 60); do whpx_qemu_running || break; sleep 2; done
+    if whpx_qemu_running; then
+        log "forcing QEMU exit"
+        win taskkill.exe /PID "$(whpx_pid)" /F >/dev/null 2>&1 || true
+    fi
+    systemctl --user stop "$FWD_UNIT" 2>/dev/null || true
+    log "stopped"
 }
 
 vssh() { ssh "${SSH_OPTS[@]}" "$GUEST" "$@"; }
@@ -142,6 +264,10 @@ wait_ssh() {
     local deadline=$(( $(date +%s) + ${1:-600} ))
     log "waiting for ssh on 127.0.0.1:$SSH_PORT (up to ${1:-600}s; first boot reboots once)…"
     while (( $(date +%s) < deadline )); do
+        if [[ $ACCEL == whpx ]] && ! whpx_qemu_running; then
+            log "QEMU exited (a guest reboot: -no-reboot) — starting it again"
+            whpx_launch
+        fi
         if vssh -o BatchMode=yes true 2>/dev/null; then
             # Provisioning done AND we are past the reboot (lsm=bpf active)?
             if vssh 'test -f /var/lib/nn-lab-provisioned && grep -q bpf /sys/kernel/security/lsm' 2>/dev/null; then
@@ -155,6 +281,10 @@ wait_ssh() {
 }
 
 cmd_up() {
+    if [[ $ACCEL == whpx ]]; then
+        whpx_up
+        return
+    fi
     need_host_deps
     mkdir -p "$LAB_DIR"
     vm_running && { log "already running (pid $(cat "$PIDFILE"))"; return 0; }
@@ -180,9 +310,11 @@ cmd_up() {
         die "127.0.0.1:$SSH_PORT is already in use on the host — pick another: NN_LAB_SSH_PORT=2322 $0 up"
     fi
     echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
-    log "booting $DISTRO: ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
+    local accel_args=(-enable-kvm -machine q35,accel=kvm -cpu host)
+    [[ $ACCEL == tcg ]] && accel_args=(-machine q35 -accel tcg,thread=multi,tb-size=1024 -cpu max)
+    log "booting $DISTRO ($ACCEL): ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
     qemu-system-x86_64 \
-        -enable-kvm -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEM" \
+        "${accel_args[@]}" -smp "$CPUS" -m "$MEM" \
         -drive "file=$DISK,if=virtio,format=qcow2" \
         -drive "file=$SEED,if=virtio,format=raw,readonly=on" \
         -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" \
@@ -190,7 +322,7 @@ cmd_up() {
         -device virtio-rng-pci \
         -display none -serial "file:$SERIAL" -monitor none \
         -daemonize -pidfile "$PIDFILE"
-    wait_ssh 900
+    wait_ssh "${NN_LAB_BOOT_TIMEOUT:-900}"
     cmd_check
 }
 
@@ -745,6 +877,14 @@ cmd_ssh() {
 }
 
 cmd_status() {
+    if [[ $ACCEL == whpx ]]; then
+        if whpx_qemu_running; then
+            echo "running: QEMU for Windows pid $(whpx_pid), ssh -i $KEY -p $SSH_PORT $GUEST (forwarder $FWD_UNIT: $(systemctl --user is-active "$FWD_UNIT" 2>/dev/null || true))"
+        else
+            echo "stopped"
+        fi
+        return 0
+    fi
     if vm_running; then
         echo "running: pid $(cat "$PIDFILE"), ssh -i $KEY -p $SSH_PORT $GUEST"
     else
@@ -756,6 +896,10 @@ cmd_status() {
 }
 
 cmd_down() {
+    if [[ $ACCEL == whpx ]]; then
+        whpx_down
+        return
+    fi
     vm_running || { log "not running"; return 0; }
     vssh sudo poweroff >/dev/null 2>&1 || true
     local pid; pid=$(cat "$PIDFILE")
@@ -763,22 +907,43 @@ cmd_down() {
     log "forcing qemu exit"; kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"
 }
 
+# qemu-img on the guest's disk: the Windows one under WHPX.
+lab_qemu_img() {
+    if [[ $ACCEL == whpx ]]; then
+        win "$(wslpath -u "$WIN_QEMU_IMG")" "$@" "$(whpx_dir_win)\\disk.qcow2"
+    else
+        qemu-img "$@" "$DISK"
+    fi
+}
+
+guest_down_or_die() {
+    if [[ $ACCEL == whpx ]]; then
+        whpx_qemu_running && die "stop the guest first (nn-lab.sh down)"
+    else
+        vm_running && die "stop the guest first (nn-lab.sh down)"
+    fi
+    return 0
+}
+
 cmd_snapshot() {
-    vm_running && die "stop the guest first (nn-lab.sh down)"
+    guest_down_or_die
     [[ -n "${1:-}" ]] || die "snapshot NAME"
-    qemu-img snapshot -c "$1" "$DISK" && log "snapshot '$1' created"
+    lab_qemu_img snapshot -c "$1" && log "snapshot '$1' created"
 }
 
 cmd_restore() {
-    vm_running && die "stop the guest first (nn-lab.sh down)"
+    guest_down_or_die
     [[ -n "${1:-}" ]] || die "restore NAME"
-    qemu-img snapshot -a "$1" "$DISK" && log "restored '$1'"
+    lab_qemu_img snapshot -a "$1" && log "restored '$1'"
 }
 
 cmd_destroy() {
     cmd_down
+    if [[ $ACCEL == whpx ]]; then
+        rm -f "$(whpx_dir)/disk.qcow2" "$(whpx_dir)/seed.iso" "$(whpx_dir)/serial.log"
+    fi
     rm -f "$DISK" "$SEED" "$LAB_DIR/user-data" "$LAB_DIR/meta-data" "$SERIAL"
-    log "guest disk removed (base image + ssh key kept in $LAB_DIR)"
+    log "guest disk removed (base image + ssh key kept)"
 }
 
 # ── soak: hours of synthetic load with periodic resource samples ─────

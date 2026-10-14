@@ -817,6 +817,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The lab's `test-e2e` step runs the FIM suite (it ran nowhere before).
 
 ### Added
+- Lab without `/dev/kvm` (`deploy/lab/nn-lab.sh`, `NN_LAB_ACCEL=whpx|tcg`):
+  WSL exposes no nested virtualization on AMD hosts since Windows
+  KB5127648 (microsoft/WSL#41918). `whpx` runs the guests in QEMU for
+  Windows on the Windows hypervisor, next to WSL, at full speed — disks in
+  `C:\nn-lab\<distro>`, ssh forwarded on the WSL-facing address only and
+  mapped to `127.0.0.1:<port>` by a socat user unit, so every sub-command and
+  probe works unchanged; a guest reboot (WHPX hangs on a reset) ends QEMU
+  and `up` starts it again. `tcg` is software emulation in WSL.
 - DNS sensor on the socket buffer (Tappa 10.9 step 3). Kprobes on
   `udp_send_skb` and `udp_v6_send_skb` read the query from the buffer the
   kernel sends: the destination from the flow, and the name from the
