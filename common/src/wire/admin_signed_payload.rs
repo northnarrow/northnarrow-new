@@ -181,6 +181,17 @@ pub enum OperationCode {
     /// overlay at boot only if a key carrying [`Role::ConfigManage`] signed
     /// its exact content. Authorised by `Role::ConfigManage`, 1-of-N.
     ConfigOverlaySet = 21,
+    /// External audit CMB-016 — read what the response layer holds on
+    /// this host: contained processes, quarantined files, the COMBAT
+    /// stage. Read-only; authorised by `Role::AuditRead`.
+    ResponseStatus = 22,
+    /// External audit CMB-016 — release one process from the cgroup
+    /// scope the agent moved it to (blocked or throttled). Authorised
+    /// by `Role::ResponseManage`.
+    ResponseRelease = 23,
+    /// External audit CMB-016 — write one quarantined file back out of
+    /// the vault. Authorised by `Role::ResponseManage`.
+    ResponseRestore = 24,
 }
 
 impl From<OperationCode> for u8 {
@@ -214,6 +225,9 @@ impl TryFrom<u8> for OperationCode {
             19 => Ok(Self::Detections),
             20 => Ok(Self::DetectionSetStatus),
             21 => Ok(Self::ConfigOverlaySet),
+            22 => Ok(Self::ResponseStatus),
+            23 => Ok(Self::ResponseRelease),
+            24 => Ok(Self::ResponseRestore),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -311,6 +325,13 @@ pub enum Role {
     /// role: never in a key's default allowlist; `install.sh` grants it to
     /// the key it bootstraps.
     ConfigManage = 15,
+    /// External audit CMB-016 — authorises undoing a response action:
+    /// [`OperationCode::ResponseRelease`] and
+    /// [`OperationCode::ResponseRestore`]. A restore can put a malicious
+    /// file back on disk, so this is a control role of its own: never in
+    /// a key's default allowlist, and `All` is the only other role that
+    /// carries it.
+    ResponseManage = 16,
     All = 255,
 }
 
@@ -339,6 +360,7 @@ impl TryFrom<u8> for Role {
             13 => Ok(Self::TelemetryRead),
             14 => Ok(Self::Triage),
             15 => Ok(Self::ConfigManage),
+            16 => Ok(Self::ResponseManage),
             255 => Ok(Self::All),
             other => Err(SignedPayloadError::UnknownRole(other)),
         }
@@ -784,6 +806,29 @@ pub struct ConfigOverlaySetExtra {
     pub len: u32,
 }
 
+/// Op-specific signed-scope fields for [`OperationCode::ResponseStatus`].
+/// Empty, like [`FimStatusExtra`]: the response carries the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResponseStatusExtra {}
+
+/// Op-specific signed-scope fields for [`OperationCode::ResponseRelease`]:
+/// the pid to release. The agent releases it only if its containment
+/// record names that pid, and checks the process start time from the
+/// record so a recycled pid is never touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseReleaseExtra {
+    pub pid: u32,
+}
+
+/// Op-specific signed-scope fields for [`OperationCode::ResponseRestore`]:
+/// the vault entry (32 hex digits) and an optional absolute destination.
+/// `None` restores to the path the file was taken from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseRestoreExtra {
+    pub vault_id: String,
+    pub to: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationExtra {
     Unlock(UnlockExtra),
@@ -822,6 +867,12 @@ pub enum OperationExtra {
     /// Tappa 9.0.c. Pairs with [`OperationCode::DetectionSetStatus`].
     DetectionSetStatus(DetectionSetStatusExtra),
     ConfigOverlaySet(ConfigOverlaySetExtra),
+    /// External audit CMB-016. Pairs with [`OperationCode::ResponseStatus`].
+    ResponseStatus(ResponseStatusExtra),
+    /// External audit CMB-016. Pairs with [`OperationCode::ResponseRelease`].
+    ResponseRelease(ResponseReleaseExtra),
+    /// External audit CMB-016. Pairs with [`OperationCode::ResponseRestore`].
+    ResponseRestore(ResponseRestoreExtra),
 }
 
 impl OperationExtra {
@@ -851,6 +902,9 @@ impl OperationExtra {
             OperationExtra::Detections(_) => OperationCode::Detections,
             OperationExtra::DetectionSetStatus(_) => OperationCode::DetectionSetStatus,
             OperationExtra::ConfigOverlaySet(_) => OperationCode::ConfigOverlaySet,
+            OperationExtra::ResponseStatus(_) => OperationCode::ResponseStatus,
+            OperationExtra::ResponseRelease(_) => OperationCode::ResponseRelease,
+            OperationExtra::ResponseRestore(_) => OperationCode::ResponseRestore,
         }
     }
 }
@@ -1374,6 +1428,48 @@ impl SignedPayload {
             }),
         }
     }
+
+    /// External audit CMB-016 — `response status` signed payload
+    /// constructor. Read-only; authorised by `Role::AuditRead`.
+    pub fn new_response_status(nonce: [u8; 32], ts: u64, agent_id: [u8; 16]) -> Self {
+        Self {
+            op: OperationCode::ResponseStatus,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::ResponseStatus(ResponseStatusExtra {}),
+        }
+    }
+
+    /// External audit CMB-016 — `response release` signed payload
+    /// constructor. Authorised by `Role::ResponseManage`.
+    pub fn new_response_release(nonce: [u8; 32], ts: u64, agent_id: [u8; 16], pid: u32) -> Self {
+        Self {
+            op: OperationCode::ResponseRelease,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::ResponseRelease(ResponseReleaseExtra { pid }),
+        }
+    }
+
+    /// External audit CMB-016 — `response restore` signed payload
+    /// constructor. Authorised by `Role::ResponseManage`.
+    pub fn new_response_restore(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        vault_id: String,
+        to: Option<String>,
+    ) -> Self {
+        Self {
+            op: OperationCode::ResponseRestore,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::ResponseRestore(ResponseRestoreExtra { vault_id, to }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1409,8 +1505,9 @@ mod tests {
     /// CBOR-determinism) silently picks up the Net* ops. Tappa
     /// 9.0.b added `TrustedInstallerGrant` (previously omitted) +
     /// `Detections`, bringing it to 19. Tappa 9.0.c added
-    /// `DetectionSetStatus`, bringing it to 20 — the full op set.
-    fn one_payload_per_op() -> [SignedPayload; 20] {
+    /// `DetectionSetStatus`, bringing it to 20. External audit CMB-016
+    /// added the three response ops (ConfigOverlaySet has its own test).
+    fn one_payload_per_op() -> [SignedPayload; 23] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -1475,6 +1572,15 @@ mod tests {
                 42,
                 "investigating".to_string(),
                 Some("paging the on-call".to_string()),
+            ),
+            SignedPayload::new_response_status(nonce(), TS, agent_id()),
+            SignedPayload::new_response_release(nonce(), TS, agent_id(), 4242),
+            SignedPayload::new_response_restore(
+                nonce(),
+                TS,
+                agent_id(),
+                "0123456789abcdef0123456789abcdef".to_string(),
+                Some("/tmp/restored".to_string()),
             ),
         ]
     }
@@ -1668,6 +1774,10 @@ mod tests {
             (OperationCode::DetectionSetStatus, 20),
             // Tappa 10.8 — APPENDED, never renumber.
             (OperationCode::ConfigOverlaySet, 21),
+            // External audit CMB-016 — APPENDED, never renumber.
+            (OperationCode::ResponseStatus, 22),
+            (OperationCode::ResponseRelease, 23),
+            (OperationCode::ResponseRestore, 24),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -1771,6 +1881,8 @@ mod tests {
             (Role::Triage, 14),
             // Tappa 10.8 — APPENDED, never renumber.
             (Role::ConfigManage, 15),
+            // External audit CMB-016 — APPENDED, never renumber.
+            (Role::ResponseManage, 16),
             (Role::All, 255),
         ];
         for (r, expected) in cases {

@@ -36,8 +36,10 @@ use common::wire::admin_protocol::{
     FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
     NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
     NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
-    RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest, StatusResponse,
-    TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
+    ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest,
+    ResponseRestoreResponse, ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest,
+    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, TrustedInstallerGrantRequest,
+    UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
@@ -241,6 +243,18 @@ pub struct DetectionAdminState {
     pub status_events_path: PathBuf,
 }
 
+/// External audit CMB-016 — what the response verbs (`nn-admin response
+/// status / release / restore`) need: the executor's configuration (the
+/// containment record, the quarantine vault, the cgroup root) and a reader
+/// of the COMBAT ladder's stage. main.rs builds it at boot; without it the
+/// verbs answer `UnknownOperation`, as the canary verbs do without theirs.
+#[derive(Clone)]
+pub struct ResponseAdminState {
+    pub config: crate::response::ExecutorConfig,
+    /// The ladder's stage while a COMBAT episode is open, else `None`.
+    pub combat_stage: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
 /// agent's main loop is expected to also exit on the same condition.
@@ -276,6 +290,7 @@ pub async fn serve(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -303,6 +318,7 @@ pub async fn serve_with_audit_log(
         marker_path,
         shutdown_signal,
         Some(audit_log),
+        None,
         None,
         None,
         None,
@@ -342,6 +358,7 @@ pub async fn serve_with_fim_state(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -375,6 +392,7 @@ pub async fn serve_with_canary_state(
         Some(canary_state),
         None,
         None,
+        None,
     )
     .await
 }
@@ -406,6 +424,9 @@ pub async fn serve_with_marker_path(
     // triage verbs (set-status write + read overlay). None on legacy /
     // test serve paths that don't wire the detection store.
     detection_state: Option<Arc<DetectionAdminState>>,
+    // External audit CMB-016: the response verbs' state. None on legacy /
+    // test serve paths.
+    response_state: Option<Arc<ResponseAdminState>>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -444,6 +465,7 @@ pub async fn serve_with_marker_path(
         let canary_state = canary_state.clone();
         let installer_override = installer_override.clone();
         let detection_state = detection_state.clone();
+        let response_state = response_state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -457,6 +479,7 @@ pub async fn serve_with_marker_path(
                 canary_state.as_ref(),
                 installer_override.as_ref(),
                 detection_state.as_ref(),
+                response_state.as_ref(),
             )
             .await
             {
@@ -493,6 +516,7 @@ async fn handle_connection(
     canary_state: Option<&Arc<CanaryAdminState>>,
     installer_override: Option<&Arc<TrustedInstallerOverride>>,
     detection_state: Option<&Arc<DetectionAdminState>>,
+    response_state: Option<&Arc<ResponseAdminState>>,
 ) -> Result<()> {
     // Capture peer creds once per connection — the audit log
     // wants pid/uid/comm of the caller, and a single connection
@@ -516,6 +540,7 @@ async fn handle_connection(
             canary_state.map(|s| s.as_ref()),
             installer_override.map(|s| s.as_ref()),
             detection_state.map(|s| s.as_ref()),
+            response_state.map(|s| s.as_ref()),
             &client,
             &mut matched_fps,
         );
@@ -948,6 +973,48 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // External audit CMB-016 — undoing a response. A verified request
+        // that did nothing (no record of the pid, a refused destination)
+        // is recorded with why, not as a success.
+        (AdminMessage::ResponseStatusRequest(req), AdminMessage::ResponseStatusResponse(r)) => (
+            "response_status",
+            serde_json::json!({
+                "contained_total": r.contained_total,
+                "quarantined_total": r.quarantined_total,
+                "combat_stage": r.combat_stage,
+            }),
+            audit_result_str(r.result),
+            req.signatures.len().saturating_sub(1),
+        ),
+        (AdminMessage::ResponseReleaseRequest(req), AdminMessage::ResponseReleaseResponse(r)) => {
+            let pid = match &req.payload.extra {
+                OperationExtra::ResponseRelease(e) => Some(e.pid),
+                _ => None,
+            };
+            (
+                "response_release",
+                serde_json::json!({ "pid": pid, "by": "admin", "detail": r.message }),
+                verified_result_str(r.result, r.released, &r.message),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
+        (AdminMessage::ResponseRestoreRequest(req), AdminMessage::ResponseRestoreResponse(r)) => {
+            let (vault_id, to) = match &req.payload.extra {
+                OperationExtra::ResponseRestore(e) => (e.vault_id.clone(), e.to.clone()),
+                _ => (String::new(), None),
+            };
+            (
+                "response_restore",
+                serde_json::json!({
+                    "vault_id": vault_id,
+                    "to": to,
+                    "path": r.path,
+                    "detail": r.message,
+                }),
+                verified_result_str(r.result, r.restored, &r.message),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable: ChallengeRequest, Status, the debug
         // path. Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
@@ -1000,6 +1067,18 @@ fn unlock_result_str(r: &UnlockResult) -> String {
     }
 }
 
+/// The audit `result` of a verb that can be verified and still do nothing:
+/// `success` only when it was done.
+fn verified_result_str(r: AdminResult, done: bool, message: &str) -> String {
+    if done {
+        "success".to_string()
+    } else if r == AdminResult::Success {
+        format!("failure: rejected ({message})")
+    } else {
+        audit_result_str(r)
+    }
+}
+
 /// Map an [`AdminResult`] to the audit-log `result` field shape
 /// from design §9.1: `"success"` or `"failure: <reason>"`.
 fn audit_result_str(r: AdminResult) -> String {
@@ -1043,6 +1122,7 @@ fn dispatch(
     canary_state: Option<&CanaryAdminState>,
     installer_override: Option<&TrustedInstallerOverride>,
     detection_state: Option<&DetectionAdminState>,
+    response_state: Option<&ResponseAdminState>,
     client: &AuditClient,
     fps_out: &mut Vec<String>,
 ) -> AdminMessage {
@@ -1139,6 +1219,9 @@ fn dispatch(
             last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
             ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
             ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
+            // External audit CMB-016: where the COMBAT ladder stands.
+            combat_stage: response_state.and_then(|s| (s.combat_stage)()),
+            combat_locked: Some(posture.is_combat_locked()),
         }),
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
@@ -1231,6 +1314,17 @@ fn dispatch(
             dispatch_detection_set_status(req, auth, detection_state, client, fps_out),
         ),
 
+        // External audit CMB-016 — undoing a response.
+        AdminMessage::ResponseStatusRequest(req) => AdminMessage::ResponseStatusResponse(
+            dispatch_response_status(req, auth, posture, response_state, fps_out),
+        ),
+        AdminMessage::ResponseReleaseRequest(req) => AdminMessage::ResponseReleaseResponse(
+            dispatch_response_release(req, auth, response_state, fps_out),
+        ),
+        AdminMessage::ResponseRestoreRequest(req) => AdminMessage::ResponseRestoreResponse(
+            dispatch_response_restore(req, auth, response_state, fps_out),
+        ),
+
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
         // closes naturally on the next read EOF.
@@ -1255,7 +1349,10 @@ fn dispatch(
         | AdminMessage::TrustedInstallerGrantResult(_)
         | AdminMessage::DetectionsResponse(_)
         | AdminMessage::DetectionSetStatusResponse(_)
-        | AdminMessage::ConfigOverlaySetResponse(_) => {
+        | AdminMessage::ConfigOverlaySetResponse(_)
+        | AdminMessage::ResponseStatusResponse(_)
+        | AdminMessage::ResponseReleaseResponse(_)
+        | AdminMessage::ResponseRestoreResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -2331,6 +2428,264 @@ fn extract_ts_field(line: &str) -> Option<String> {
     let start = line.find(key)? + key.len();
     let end = line[start..].find('"')?;
     Some(line[start..start + end].to_string())
+}
+
+// ── External audit CMB-016 — undoing a response ───────────────────
+
+fn empty_response_status(result: AdminResult) -> ResponseStatusResponse {
+    ResponseStatusResponse {
+        result,
+        contained: Vec::new(),
+        contained_total: 0,
+        quarantined: Vec::new(),
+        quarantined_total: 0,
+        combat_stage: None,
+        combat_locked: None,
+    }
+}
+
+/// `nn-admin response status`: the processes the agent holds in its
+/// `blocked` / `throttled` scopes (the containment record, with whether
+/// the pid still names the process moved), the quarantine vault, and the
+/// COMBAT stage. Read-only; `audit-read`, the role every key carries by
+/// default, so the operator who undoes a response sees what there is to
+/// undo.
+fn dispatch_response_status(
+    req: ResponseStatusRequest,
+    auth: &AdminAuth,
+    posture: &PostureMachine,
+    state: Option<&ResponseAdminState>,
+    fps_out: &mut Vec<String>,
+) -> ResponseStatusResponse {
+    use common::wire::admin_protocol::{
+        ContainedProcessWire, QuarantinedFileWire, MAX_RESPONSE_STATUS_ROWS,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::AuditRead],
+        OperationCode::ResponseStatus,
+        now_unix_secs(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return empty_response_status(map_admin_auth_error(e, "response-status")),
+    };
+    *fps_out = matched_fps;
+    if !matches!(&req.payload.extra, OperationExtra::ResponseStatus(_)) {
+        warn!("response-status payload extra is not ResponseStatus variant");
+        return empty_response_status(AdminResult::UnknownOperation);
+    }
+    let Some(state) = state else {
+        warn!("response-status: agent boot did not wire ResponseAdminState");
+        return empty_response_status(AdminResult::UnknownOperation);
+    };
+    let records = crate::response::containment::load(&state.config);
+    let contained_total = records.len() as u32;
+    let contained = records
+        .iter()
+        .rev()
+        .take(MAX_RESPONSE_STATUS_ROWS)
+        .map(|c| {
+            let now = crate::response::proc_ref::proc_start_ticks(c.pid);
+            ContainedProcessWire {
+                pid: c.pid,
+                scope: c.scope.clone(),
+                origin: c.origin.clone(),
+                since: c.since,
+                running: now.is_some() && (c.start_ticks.is_none() || now == c.start_ticks),
+            }
+        })
+        .collect();
+    let vault = crate::response::quarantine::list_vault(&state.config);
+    let quarantined_total = vault.len() as u32;
+    let quarantined = vault
+        .into_iter()
+        .rev()
+        .take(MAX_RESPONSE_STATUS_ROWS)
+        .map(|e| QuarantinedFileWire {
+            vault_id: e.vault_id,
+            // a path is at most PATH_MAX; keep the reply inside a frame
+            original_path: e.original_path.chars().take(512).collect(),
+            size_bytes: e.size_bytes,
+            captured_at: e.captured_at,
+        })
+        .collect();
+    ResponseStatusResponse {
+        result: AdminResult::Success,
+        contained,
+        contained_total,
+        quarantined,
+        quarantined_total,
+        combat_stage: (state.combat_stage)(),
+        combat_locked: Some(posture.is_combat_locked()),
+    }
+}
+
+/// `nn-admin response release --pid N`: write a process the agent
+/// contained back to the cgroup it came from, by its containment record
+/// (external audit CMB-010: never the root cgroup, and only while the pid
+/// still names the process moved). `response-manage`.
+fn dispatch_response_release(
+    req: ResponseReleaseRequest,
+    auth: &AdminAuth,
+    state: Option<&ResponseAdminState>,
+    fps_out: &mut Vec<String>,
+) -> ResponseReleaseResponse {
+    let refuse = |result: AdminResult, message: String| ResponseReleaseResponse {
+        result,
+        released: false,
+        message,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::ResponseManage],
+        OperationCode::ResponseRelease,
+        now_unix_secs(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return refuse(map_admin_auth_error(e, "response-release"), String::new()),
+    };
+    *fps_out = matched_fps;
+    let OperationExtra::ResponseRelease(extra) = &req.payload.extra else {
+        warn!("response-release payload extra is not ResponseRelease variant");
+        return refuse(AdminResult::UnknownOperation, String::new());
+    };
+    let pid = extra.pid;
+    let Some(state) = state else {
+        warn!("response-release: agent boot did not wire ResponseAdminState");
+        return refuse(AdminResult::UnknownOperation, String::new());
+    };
+    let records: Vec<_> = crate::response::containment::load(&state.config)
+        .into_iter()
+        .filter(|c| c.pid == pid)
+        .collect();
+    if records.is_empty() {
+        return refuse(
+            AdminResult::Success,
+            format!("pid {pid} is not contained by this agent (no containment record)"),
+        );
+    }
+    let mut released = false;
+    let mut parts = Vec::new();
+    for rec in records {
+        let outcome = match rec.scope.as_str() {
+            "blocked" => crate::response::block_outbound::release_blocked_pid(
+                pid,
+                rec.start_ticks,
+                &state.config,
+            ),
+            "throttled" => {
+                crate::response::throttle::release_pid(pid, rec.start_ticks, &state.config)
+            }
+            other => {
+                parts.push(format!("{other}: unknown scope, left as it is"));
+                continue;
+            }
+        };
+        match outcome {
+            Ok(crate::response::containment::Release::Released) => {
+                released = true;
+                parts.push(format!(
+                    "{}: released to {}",
+                    rec.scope,
+                    if rec.origin.is_empty() {
+                        "?"
+                    } else {
+                        &rec.origin
+                    }
+                ));
+            }
+            Ok(crate::response::containment::Release::Skipped(why)) => {
+                parts.push(format!("{}: skipped ({why})", rec.scope));
+            }
+            Err(e) => parts.push(format!("{}: failed ({e})", rec.scope)),
+        }
+    }
+    let message = parts.join("; ");
+    info!(
+        target: "admin.response_release",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        pid,
+        released,
+        detail = %message,
+        "response release"
+    );
+    ResponseReleaseResponse {
+        result: AdminResult::Success,
+        released,
+        message,
+    }
+}
+
+/// `nn-admin response restore --vault-id ID [--to PATH]`: write a
+/// quarantined file back out of the vault — to the path it was taken from
+/// unless `--to` says otherwise; never over an existing file, through a
+/// link, or under a protected prefix (external audit CMB-026). The entry
+/// stays in the vault. `response-manage`: a restore can put malware back.
+fn dispatch_response_restore(
+    req: ResponseRestoreRequest,
+    auth: &AdminAuth,
+    state: Option<&ResponseAdminState>,
+    fps_out: &mut Vec<String>,
+) -> ResponseRestoreResponse {
+    let refuse = |result: AdminResult, message: String| ResponseRestoreResponse {
+        result,
+        restored: false,
+        path: String::new(),
+        message,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::ResponseManage],
+        OperationCode::ResponseRestore,
+        now_unix_secs(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return refuse(map_admin_auth_error(e, "response-restore"), String::new()),
+    };
+    *fps_out = matched_fps;
+    let OperationExtra::ResponseRestore(extra) = &req.payload.extra else {
+        warn!("response-restore payload extra is not ResponseRestore variant");
+        return refuse(AdminResult::UnknownOperation, String::new());
+    };
+    let Some(state) = state else {
+        warn!("response-restore: agent boot did not wire ResponseAdminState");
+        return refuse(AdminResult::UnknownOperation, String::new());
+    };
+    match crate::response::quarantine::restore_entry(
+        &extra.vault_id,
+        extra.to.as_deref(),
+        &state.config,
+    ) {
+        Ok(path) => {
+            let path = path.to_string_lossy().into_owned();
+            warn!(
+                target: "admin.response_restore",
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                vault_id = %extra.vault_id,
+                path = %path,
+                "quarantined file restored by an administrator (mode 0600)"
+            );
+            ResponseRestoreResponse {
+                result: AdminResult::Success,
+                restored: true,
+                message: format!("restored to {path} (mode 0600); the vault keeps the entry"),
+                path,
+            }
+        }
+        Err(e) => {
+            warn!(vault_id = %extra.vault_id, error = %e, "response-restore refused");
+            refuse(AdminResult::Success, e.to_string())
+        }
+    }
 }
 
 /// Shared mapper from [`AdminAuthError`] to the wire
@@ -3751,7 +4106,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
                 socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None, None, None,
-                None,
+                None, None,
             )
             .await;
         });
@@ -4006,6 +4361,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         });
@@ -4214,6 +4570,8 @@ mod tests {
             last_admin_action_secs_ago: None,
             ringbuf_drops_total: None,
             ringbuf_drops: None,
+            combat_stage: None,
+            combat_locked: None,
         });
         emit_audit_for(
             &status_req,
@@ -4800,6 +5158,430 @@ mod tests {
         let mut fps = Vec::new();
         let r = dispatch_canary_refresh(req, &auth, None, &mut fps);
         assert!(matches!(r, AdminResult::UnknownOperation));
+    }
+
+    // ── External audit CMB-016 — undoing a response ────────────────
+
+    fn keyed(
+        payload: &common::wire::admin_signed_payload::SignedPayload,
+        signing: &SigningKey,
+    ) -> Vec<common::wire::admin_protocol::KeyedSignature> {
+        vec![common::wire::admin_protocol::KeyedSignature {
+            signature: common::wire::admin_signed_payload::sign(payload, signing).unwrap(),
+        }]
+    }
+
+    /// The response state over a temp tree (the containment record, the
+    /// vault, the cgroup root) with enforcement on, and a fixed stage.
+    fn response_state(dir: &TempDir) -> ResponseAdminState {
+        ResponseAdminState {
+            config: crate::response::ExecutorConfig {
+                dry_run: false,
+                ..crate::response::ExecutorConfig::for_test(dir.path())
+            },
+            combat_stage: Arc::new(|| Some("NEUTRALIZE".to_string())),
+        }
+    }
+
+    fn status_req(
+        signing: &SigningKey,
+        auth: &AdminAuth,
+        agent_id: [u8; 16],
+    ) -> ResponseStatusRequest {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_response_status(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+        );
+        let signatures = keyed(&payload, signing);
+        ResponseStatusRequest {
+            payload,
+            signatures,
+        }
+    }
+
+    fn release_req(
+        signing: &SigningKey,
+        auth: &AdminAuth,
+        agent_id: [u8; 16],
+        pid: u32,
+    ) -> ResponseReleaseRequest {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_response_release(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+            pid,
+        );
+        let signatures = keyed(&payload, signing);
+        ResponseReleaseRequest {
+            payload,
+            signatures,
+        }
+    }
+
+    fn restore_req(
+        signing: &SigningKey,
+        auth: &AdminAuth,
+        agent_id: [u8; 16],
+        vault_id: &str,
+        to: Option<String>,
+    ) -> ResponseRestoreRequest {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_response_restore(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+            vault_id.to_string(),
+            to,
+        );
+        let signatures = keyed(&payload, signing);
+        ResponseRestoreRequest {
+            payload,
+            signatures,
+        }
+    }
+
+    /// External audit CMB-016: `response status` is read-only, for
+    /// `audit-read`; a control role alone is denied.
+    #[test]
+    fn dispatch_response_status_needs_a_read_role() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x16; 16];
+        let dir = TempDir::new().unwrap();
+        let state = response_state(&dir);
+        let posture = PostureMachine::new();
+        let (auth, _d) = build_auth_with_roles(&signing, "unlock,force-posture", agent_id);
+        let r = dispatch_response_status(
+            status_req(&signing, &auth, agent_id),
+            &auth,
+            &posture,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::RoleDenied));
+        assert!(r.contained.is_empty() && r.quarantined.is_empty());
+
+        for role in ["audit-read", "response-manage,audit-read", "all"] {
+            let (auth, _d) = build_auth_with_roles(&signing, role, agent_id);
+            let mut fps = Vec::new();
+            let r = dispatch_response_status(
+                status_req(&signing, &auth, agent_id),
+                &auth,
+                &posture,
+                Some(&state),
+                &mut fps,
+            );
+            assert!(matches!(r.result, AdminResult::Success), "{role}");
+            assert!(!fps.is_empty());
+        }
+        // no state wired: UnknownOperation, as the canary verbs
+        let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let r = dispatch_response_status(
+            status_req(&signing, &auth, agent_id),
+            &auth,
+            &posture,
+            None,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::UnknownOperation));
+    }
+
+    /// External audit CMB-016: the status lists the containment record
+    /// (with whether the pid still names that process), the vault and the
+    /// COMBAT stage.
+    #[test]
+    fn dispatch_response_status_lists_contained_and_quarantined() {
+        use crate::response::containment::{record, Contained};
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x17; 16];
+        let dir = TempDir::new().unwrap();
+        let state = response_state(&dir);
+        let me = std::process::id();
+        record(
+            &state.config,
+            Contained {
+                pid: me,
+                start_ticks: crate::response::proc_ref::proc_start_ticks(me),
+                scope: "blocked".into(),
+                origin: "/user.slice/test.scope".into(),
+                since: 1,
+            },
+        )
+        .unwrap();
+        record(
+            &state.config,
+            Contained {
+                pid: me,
+                start_ticks: Some(1),
+                scope: "throttled".into(),
+                origin: "/x".into(),
+                since: 2,
+            },
+        )
+        .unwrap();
+        let payload = dir.path().join("dropper");
+        std::fs::write(&payload, b"bad bytes").unwrap();
+        let handle = crate::response::quarantine::ExeHandle::open(&payload).unwrap();
+        let out = crate::response::quarantine::quarantine_handle(&handle, 4242, &state.config);
+        assert!(matches!(
+            out,
+            crate::response::ExecutionOutcome::Quarantined { .. }
+        ));
+
+        let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let r = dispatch_response_status(
+            status_req(&signing, &auth, agent_id),
+            &auth,
+            &PostureMachine::new(),
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::Success));
+        assert_eq!(r.contained_total, 2);
+        let blocked = r.contained.iter().find(|c| c.scope == "blocked").unwrap();
+        assert!(blocked.running, "same start time: the process moved");
+        let throttled = r.contained.iter().find(|c| c.scope == "throttled").unwrap();
+        assert!(
+            !throttled.running,
+            "another start time: not the process moved"
+        );
+        assert_eq!(r.quarantined_total, 1);
+        assert_eq!(r.quarantined[0].original_path, payload.to_string_lossy());
+        assert_eq!(r.quarantined[0].size_bytes, 9);
+        assert_eq!(r.combat_stage.as_deref(), Some("NEUTRALIZE"));
+        assert_eq!(r.combat_locked, Some(false));
+    }
+
+    /// External audit CMB-016: `response release` needs `response-manage`;
+    /// a read role is denied and nothing is touched.
+    #[test]
+    fn dispatch_response_release_needs_response_manage() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x18; 16];
+        let dir = TempDir::new().unwrap();
+        let state = response_state(&dir);
+        for role in ["audit-read", "unlock", "canary-manage"] {
+            let (auth, _d) = build_auth_with_roles(&signing, role, agent_id);
+            let r = dispatch_response_release(
+                release_req(&signing, &auth, agent_id, 4242),
+                &auth,
+                Some(&state),
+                &mut Vec::new(),
+            );
+            assert!(matches!(r.result, AdminResult::RoleDenied), "{role}");
+            assert!(!r.released);
+        }
+    }
+
+    /// External audit CMB-016: with the role, a pid the agent did not
+    /// contain is answered plainly, and nothing is written to any cgroup.
+    #[test]
+    fn dispatch_response_release_of_an_uncontained_pid_says_so() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x19; 16];
+        let dir = TempDir::new().unwrap();
+        let state = response_state(&dir);
+        std::fs::create_dir_all(&state.config.cgroup_root).unwrap();
+        std::fs::write(state.config.cgroup_root.join("cgroup.procs"), b"").unwrap();
+        let (auth, _d) = build_auth_with_roles(&signing, "response-manage", agent_id);
+        let mut fps = Vec::new();
+        let r = dispatch_response_release(
+            release_req(&signing, &auth, agent_id, 4242),
+            &auth,
+            Some(&state),
+            &mut fps,
+        );
+        assert!(matches!(r.result, AdminResult::Success));
+        assert!(!r.released);
+        assert!(
+            r.message.contains("not contained by this agent"),
+            "{}",
+            r.message
+        );
+        assert!(!fps.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(state.config.cgroup_root.join("cgroup.procs")).unwrap(),
+            "",
+            "never the root cgroup"
+        );
+        // a record whose process is not in the scope: skipped, not released
+        crate::response::containment::record(
+            &state.config,
+            crate::response::containment::Contained {
+                pid: 4242,
+                start_ticks: Some(1),
+                scope: "blocked".into(),
+                origin: "/system.slice/x.service".into(),
+                since: 1,
+            },
+        )
+        .unwrap();
+        let r = dispatch_response_release(
+            release_req(&signing, &auth, agent_id, 4242),
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::Success));
+        assert!(!r.released);
+        assert!(r.message.contains("skipped"), "{}", r.message);
+        let r = dispatch_response_release(
+            release_req(&signing, &auth, agent_id, 4242),
+            &auth,
+            None,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::UnknownOperation));
+    }
+
+    /// External audit CMB-016: a payload whose extra is another verb's is
+    /// refused, whatever the role.
+    #[test]
+    fn dispatch_response_verbs_refuse_a_mismatched_extra() {
+        use common::wire::admin_signed_payload::{
+            OperationExtra, ResponseRestoreExtra, SignedPayload,
+        };
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1a; 16];
+        let dir = TempDir::new().unwrap();
+        let state = response_state(&dir);
+        let (auth, _d) = build_auth_with_roles(&signing, "all", agent_id);
+        let mut payload = SignedPayload::new_response_release(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+            4242,
+        );
+        payload.extra = OperationExtra::ResponseRestore(ResponseRestoreExtra {
+            vault_id: "0".repeat(32),
+            to: None,
+        });
+        let signatures = keyed(&payload, &signing);
+        let r = dispatch_response_release(
+            ResponseReleaseRequest {
+                payload,
+                signatures,
+            },
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(!matches!(r.result, AdminResult::Success), "{:?}", r.result);
+        assert!(!r.released);
+
+        let mut payload = SignedPayload::new_response_restore(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+            "0".repeat(32),
+            None,
+        );
+        payload.op = OperationCode::ResponseStatus;
+        let signatures = keyed(&payload, &signing);
+        let r = dispatch_response_restore(
+            ResponseRestoreRequest {
+                payload,
+                signatures,
+            },
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(!matches!(r.result, AdminResult::Success), "{:?}", r.result);
+        assert!(!r.restored);
+    }
+
+    /// External audit CMB-016 / CMB-026: `response restore` needs
+    /// `response-manage`; with it the file comes back (mode 0600, the vault
+    /// keeps it), and a traversing vault id is refused.
+    #[test]
+    fn dispatch_response_restore_is_gated_and_restores() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1b; 16];
+        let dir = TempDir::new().unwrap();
+        let state = response_state(&dir);
+        let payload = dir.path().join("dropper");
+        std::fs::write(&payload, b"bad bytes").unwrap();
+        let handle = crate::response::quarantine::ExeHandle::open(&payload).unwrap();
+        let crate::response::ExecutionOutcome::Quarantined { vault_id, .. } =
+            crate::response::quarantine::quarantine_handle(&handle, 4242, &state.config)
+        else {
+            panic!("not quarantined");
+        };
+        assert!(!payload.exists());
+
+        let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let r = dispatch_response_restore(
+            restore_req(&signing, &auth, agent_id, &vault_id, None),
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::RoleDenied));
+        assert!(!payload.exists(), "nothing restored without the role");
+
+        let (auth, _d) = build_auth_with_roles(&signing, "response-manage", agent_id);
+        let r = dispatch_response_restore(
+            restore_req(&signing, &auth, agent_id, "../../etc/shadow", None),
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(matches!(r.result, AdminResult::Success));
+        assert!(!r.restored);
+        assert!(r.message.contains("32 hex digits"), "{}", r.message);
+
+        let r = dispatch_response_restore(
+            restore_req(&signing, &auth, agent_id, &vault_id, None),
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(r.restored, "{}", r.message);
+        assert_eq!(r.path, payload.to_string_lossy());
+        assert_eq!(std::fs::read(&payload).unwrap(), b"bad bytes");
+        assert_eq!(
+            std::fs::metadata(&payload).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // never over an existing file
+        let r = dispatch_response_restore(
+            restore_req(&signing, &auth, agent_id, &vault_id, None),
+            &auth,
+            Some(&state),
+            &mut Vec::new(),
+        );
+        assert!(!r.restored);
+        assert_eq!(
+            crate::response::quarantine::list_vault(&state.config).len(),
+            1
+        );
+    }
+
+    /// External audit CMB-016: a verified release that did nothing is in
+    /// the audit chain as a rejection with why, not as a success.
+    #[test]
+    fn audit_records_a_release_that_did_nothing_as_rejected() {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let req = AdminMessage::ResponseReleaseRequest(ResponseReleaseRequest {
+            payload: SignedPayload::new_response_release([1; 32], 1_700_000_000, [2; 16], 77),
+            signatures: Vec::new(),
+        });
+        let reply = AdminMessage::ResponseReleaseResponse(ResponseReleaseResponse {
+            result: AdminResult::Success,
+            released: false,
+            message: "pid 77 is not contained by this agent".to_string(),
+        });
+        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &["ab".into()]);
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op, "response_release");
+        assert!(entries[0].result.starts_with("failure: rejected"));
+        assert_eq!(entries[0].extra["pid"], 77);
     }
 
     // ── Tappa 10 N7 — net admin dispatch + audit tests ────────────

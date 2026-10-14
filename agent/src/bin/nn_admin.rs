@@ -20,6 +20,8 @@
 //!   (NEW in Tappa 8 A9 per design §5.3)
 //! - 7  shutdown: role check failed (key valid but lacks `shutdown`)
 //!   (NEW in Tappa 8 A9 per design §5.3)
+//! - 9  canary burn/refresh: no such canary; response release/restore:
+//!   the agent verified the request and did nothing (reason printed)
 //!
 //! Air-gapped split flow (`unlock --request-only` writing a
 //! challenge file, plus a separate `nn-admin sign` offline) is on
@@ -376,6 +378,18 @@ enum Cmd {
         socket: PathBuf,
     },
 
+    /// External audit CMB-016 — undo what the response layer did:
+    /// `response status` lists the processes the agent holds in its
+    /// containment scopes, the quarantine vault and the COMBAT stage
+    /// (`audit-read`); `response release` returns a
+    /// contained process to the cgroup it came from and `response restore`
+    /// writes a quarantined file back out of the vault (`response-manage`).
+    /// The agent does the work and records it in the signed audit log.
+    Response {
+        #[command(subcommand)]
+        sub: ResponseCmd,
+    },
+
     /// Tappa 10.8 — operator configuration the agent loads only when an
     /// admin key signed it (`config overlay set|sign|status`).
     Config {
@@ -390,6 +404,57 @@ enum Cmd {
     Debug {
         #[command(subcommand)]
         sub: DebugCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ResponseCmd {
+    /// What the response layer holds on this host: contained processes
+    /// (scope, the cgroup each came from, whether the pid still names that
+    /// process), quarantined files, the COMBAT stage. Read-only.
+    Status {
+        /// A key with `audit-read`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Release a process the agent blocked or throttled back to the cgroup
+    /// it came from (never the root cgroup; only while the pid still names
+    /// the process that was moved). During an open COMBAT episode the
+    /// ladder may contain it again.
+    Release {
+        #[arg(long)]
+        pid: u32,
+        /// A key with `response-manage`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Write a quarantined file back out of the vault, to the path it was
+    /// taken from unless --to says otherwise. A new file only (never over
+    /// an existing one, never through a link), mode 0600, outside the
+    /// protected prefixes; the vault keeps the entry. The file may be
+    /// malware: restore it to inspect it, not to run it.
+    Restore {
+        /// The 32-hex vault id (`nn-admin response status`).
+        #[arg(long = "vault-id")]
+        vault_id: String,
+        /// Absolute destination; the directory must exist.
+        #[arg(long)]
+        to: Option<String>,
+        /// A key with `response-manage`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 }
 
@@ -1383,6 +1448,7 @@ fn main() -> ExitCode {
             }
         },
 
+        Cmd::Response { sub } => run_response_cmd(sub),
         Cmd::Config {
             sub: ConfigCmd::Overlay { sub },
         } => run_overlay_cmd(sub),
@@ -1793,7 +1859,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
@@ -1804,7 +1870,15 @@ fn print_status(out: &StatusOutcome, json: bool) {
                 Some(t) => t.to_string(),
                 None => "null".to_string(),
             },
-            drops.join(",")
+            drops.join(","),
+            match &out.combat_stage {
+                Some(st) => format!("\"{}\"", st.replace('"', "")),
+                None => "null".to_string(),
+            },
+            match out.combat_locked {
+                Some(l) => l.to_string(),
+                None => "null".to_string(),
+            },
         );
         return;
     }
@@ -1816,6 +1890,21 @@ fn print_status(out: &StatusOutcome, json: bool) {
         colorize("clear", "32", tty)
     };
     println!("network isolation : {iso}");
+    // External audit CMB-016: where the COMBAT ladder stands.
+    match (&out.combat_stage, out.combat_locked) {
+        (Some(st), locked) => println!(
+            "combat stage      : {}{}",
+            colorize(st, "31", tty),
+            if locked == Some(true) {
+                " (locked: `nn-admin unlock` to release)"
+            } else {
+                ""
+            }
+        ),
+        (None, Some(true)) => println!("combat stage      : (none) — COMBAT locked"),
+        (None, Some(false)) => println!("combat stage      : (no episode)"),
+        (None, None) => println!("combat stage      : (agent predates the field)"),
+    }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
         None => println!("last admin action : (none since agent start)"),
@@ -2039,6 +2128,138 @@ fn overlay_kind_arg(kind: &str) -> Option<common::wire::admin_signed_payload::Ov
         );
     }
     k
+}
+
+/// Exit code of a signed verb that the agent refused before doing
+/// anything (authentication, role, version).
+fn exit_from_admin_result(op: &str, r: common::wire::admin_protocol::AdminResult) -> ExitCode {
+    use common::wire::admin_protocol::AdminResult;
+    let (code, why) = match r {
+        AdminResult::Success => (0, String::new()),
+        AdminResult::InvalidSignature => (2, "invalid signature".to_string()),
+        AdminResult::NoPendingChallenge => (3, "no pending challenge (retry)".to_string()),
+        AdminResult::RateLimited { retry_after_secs } => {
+            (4, format!("rate limited; retry after {retry_after_secs}s"))
+        }
+        AdminResult::QuorumNotMet { required, provided } => {
+            (6, format!("quorum not met ({provided}/{required})"))
+        }
+        AdminResult::RoleDenied => (7, "role denied".to_string()),
+        AdminResult::UnknownOperation => (
+            5,
+            "the agent does not run this verb (older agent, or the response layer is not wired)"
+                .to_string(),
+        ),
+        other => (5, format!("{other:?}")),
+    };
+    if code != 0 {
+        eprintln!("{op}: {why}");
+    }
+    ExitCode::from(code)
+}
+
+/// External audit CMB-016: `nn-admin response status|release|restore`.
+/// Exit 0 when done, 9 when the agent verified the request and did nothing
+/// (not contained, refused destination: the reason is printed), the usual
+/// codes otherwise (2 signature, 3 challenge, 4 rate limit, 5 transport /
+/// version, 7 role).
+fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
+    use common::wire::admin_protocol::AdminResult;
+    use northnarrow_agent::admin_cli::{
+        run_response_release, run_response_restore, run_response_status, ResponseActionOutcome,
+    };
+    let finish = |op: &str, r: anyhow::Result<ResponseActionOutcome>| match r {
+        Ok(o) if o.done => {
+            println!("{op}: {}", o.message);
+            ExitCode::SUCCESS
+        }
+        Ok(o) if o.result == AdminResult::Success => {
+            eprintln!("{op}: not done: {}", o.message);
+            ExitCode::from(9)
+        }
+        Ok(o) => exit_from_admin_result(op, o.result),
+        Err(e) => {
+            eprintln!("{op}: {e:#}");
+            ExitCode::from(5)
+        }
+    };
+    match sub {
+        ResponseCmd::Status {
+            key,
+            agent_id_file,
+            socket,
+        } => match run_response_status(&socket, &key, &agent_id_file) {
+            Ok(r) if r.result == AdminResult::Success => {
+                println!(
+                    "combat stage      : {}{}",
+                    r.combat_stage.as_deref().unwrap_or("(no episode)"),
+                    match r.combat_locked {
+                        Some(true) => " (locked)",
+                        _ => "",
+                    }
+                );
+                println!("contained         : {}", r.contained_total);
+                for c in &r.contained {
+                    println!(
+                        "  pid {:<8} {:<9} from {}  since {}  {}",
+                        c.pid,
+                        c.scope,
+                        if c.origin.is_empty() { "?" } else { &c.origin },
+                        c.since,
+                        if c.running {
+                            "running"
+                        } else {
+                            "gone (or another process)"
+                        }
+                    );
+                }
+                if r.contained.len() < r.contained_total as usize {
+                    println!(
+                        "  … {} older not shown",
+                        r.contained_total as usize - r.contained.len()
+                    );
+                }
+                println!("quarantined       : {}", r.quarantined_total);
+                for q in &r.quarantined {
+                    println!(
+                        "  {}  {} bytes  at {}  from {}",
+                        q.vault_id, q.size_bytes, q.captured_at, q.original_path
+                    );
+                }
+                if r.quarantined.len() < r.quarantined_total as usize {
+                    println!(
+                        "  … {} older not shown",
+                        r.quarantined_total as usize - r.quarantined.len()
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(r) => exit_from_admin_result("response status", r.result),
+            Err(e) => {
+                eprintln!("response status: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        ResponseCmd::Release {
+            pid,
+            key,
+            agent_id_file,
+            socket,
+        } => finish(
+            "response release",
+            run_response_release(&socket, &key, &agent_id_file, pid),
+        ),
+        ResponseCmd::Restore {
+            vault_id,
+            to,
+            key,
+            agent_id_file,
+            socket,
+        } => finish(
+            "response restore",
+            run_response_restore(&socket, &key, &agent_id_file, vault_id, to),
+        ),
+    }
 }
 
 fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {

@@ -2606,6 +2606,8 @@ mod tests {
                 last_admin_action_secs_ago: None,
                 ringbuf_drops_total: None,
                 ringbuf_drops: None,
+                combat_stage: None,
+                combat_locked: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

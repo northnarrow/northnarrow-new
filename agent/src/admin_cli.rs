@@ -109,6 +109,11 @@ pub struct StatusOutcome {
     /// Ring-buffer drops since boot (`None`: agent predates the field).
     pub ringbuf_drops_total: Option<u64>,
     pub ringbuf_drops: Vec<(String, u64)>,
+    /// External audit CMB-016: the COMBAT ladder's stage while an episode
+    /// is open (`None` outside one, or from an agent older than the field).
+    pub combat_stage: Option<String>,
+    /// Whether the COMBAT is locked (`None`: agent predates the field).
+    pub combat_locked: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -234,6 +239,8 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         last_admin_action_secs_ago: resp.last_admin_action_secs_ago,
         ringbuf_drops_total: resp.ringbuf_drops_total,
         ringbuf_drops: resp.ringbuf_drops.unwrap_or_default(),
+        combat_stage: resp.combat_stage,
+        combat_locked: resp.combat_locked,
     })
 }
 
@@ -2402,6 +2409,147 @@ pub fn run_trusted_installer_grant(
     Ok(map_admin_result_to_trusted_installer(result))
 }
 
+// ── External audit CMB-016 — undoing a response ────────────────────────
+
+/// Outcome of `nn-admin response status`: the reply as the agent sent it
+/// (the lists are empty unless `result` is `Success`).
+pub type ResponseStatusOutcome = common::wire::admin_protocol::ResponseStatusResponse;
+
+/// Outcome of `nn-admin response release` / `restore`. `done` is false
+/// when the request was verified but nothing was done (`message` says
+/// why); `path` is where a restore wrote the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseActionOutcome {
+    pub result: AdminResult,
+    pub done: bool,
+    pub path: Option<String>,
+    pub message: String,
+}
+
+/// Challenge, sign `build(nonce, ts, agent_id)` with `key_path`, send the
+/// request `wrap` makes of it, return the reply.
+fn signed_request(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    build: impl FnOnce([u8; 32], u64, [u8; 16]) -> SignedPayload,
+    wrap: impl FnOnce(SignedPayload, Vec<KeyedSignature>) -> AdminMessage,
+) -> Result<AdminMessage> {
+    let signing = read_priv_key(key_path)?;
+    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
+        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let mut stream = connect_socket(socket)?;
+    write_frame(
+        &mut stream,
+        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+    )?;
+    let nonce = match read_frame(&mut stream)? {
+        AdminMessage::Challenge(c) => c.nonce,
+        other => bail!("unexpected reply to ChallengeRequest: {other:?}"),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let payload = build(nonce, now, agent_id_arr);
+    let sig = sign(&payload, &signing).map_err(|e| anyhow!("signing payload: {e}"))?;
+    write_frame(
+        &mut stream,
+        &wrap(payload, vec![KeyedSignature { signature: sig }]),
+    )?;
+    read_frame(&mut stream)
+}
+
+/// `nn-admin response status` (role `audit-read`):
+/// the processes the agent holds in its containment scopes, the
+/// quarantine vault, the COMBAT stage.
+pub fn run_response_status(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+) -> Result<ResponseStatusOutcome> {
+    use common::wire::admin_protocol::ResponseStatusRequest;
+    match signed_request(
+        socket,
+        key_path,
+        agent_id_path,
+        SignedPayload::new_response_status,
+        |payload, signatures| {
+            AdminMessage::ResponseStatusRequest(ResponseStatusRequest {
+                payload,
+                signatures,
+            })
+        },
+    )? {
+        AdminMessage::ResponseStatusResponse(r) => Ok(r),
+        other => bail!("unexpected reply to ResponseStatusRequest: {other:?}"),
+    }
+}
+
+/// `nn-admin response release --pid N` (role `response-manage`): the agent
+/// writes the process back to the cgroup it came from.
+pub fn run_response_release(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    pid: u32,
+) -> Result<ResponseActionOutcome> {
+    use common::wire::admin_protocol::ResponseReleaseRequest;
+    match signed_request(
+        socket,
+        key_path,
+        agent_id_path,
+        |n, ts, id| SignedPayload::new_response_release(n, ts, id, pid),
+        |payload, signatures| {
+            AdminMessage::ResponseReleaseRequest(ResponseReleaseRequest {
+                payload,
+                signatures,
+            })
+        },
+    )? {
+        AdminMessage::ResponseReleaseResponse(r) => Ok(ResponseActionOutcome {
+            result: r.result,
+            done: r.released,
+            path: None,
+            message: r.message,
+        }),
+        other => bail!("unexpected reply to ResponseReleaseRequest: {other:?}"),
+    }
+}
+
+/// `nn-admin response restore --vault-id ID [--to PATH]` (role
+/// `response-manage`): the agent decrypts the vault entry to a new file —
+/// the original path by default.
+pub fn run_response_restore(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    vault_id: String,
+    to: Option<String>,
+) -> Result<ResponseActionOutcome> {
+    use common::wire::admin_protocol::ResponseRestoreRequest;
+    match signed_request(
+        socket,
+        key_path,
+        agent_id_path,
+        |n, ts, id| SignedPayload::new_response_restore(n, ts, id, vault_id, to),
+        |payload, signatures| {
+            AdminMessage::ResponseRestoreRequest(ResponseRestoreRequest {
+                payload,
+                signatures,
+            })
+        },
+    )? {
+        AdminMessage::ResponseRestoreResponse(r) => Ok(ResponseActionOutcome {
+            result: r.result,
+            done: r.restored,
+            path: (!r.path.is_empty()).then_some(r.path),
+            message: r.message,
+        }),
+        other => bail!("unexpected reply to ResponseRestoreRequest: {other:?}"),
+    }
+}
+
 // ── Tappa 10.8 — signed operator overlays ──────────────────────────────
 
 /// Outcome of `nn-admin config overlay set`.
@@ -2979,10 +3127,14 @@ mod tests {
                     last_admin_action_secs_ago: Some(123),
                     ringbuf_drops_total: None,
                     ringbuf_drops: None,
+                    combat_stage: Some("ISOLATE".to_string()),
+                    combat_locked: Some(true),
                 }),
             );
         });
         let out = run_status(&socket).expect("status");
+        assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
+        assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);
         assert_eq!(out.last_admin_action_secs_ago, Some(123));
@@ -3098,6 +3250,68 @@ mod tests {
 
         let outcome = outcome.expect("client should not error");
         assert!(matches!(outcome, ShutdownOutcome::Success));
+    }
+
+    /// External audit CMB-016: `response restore` signs the vault id and
+    /// destination into the payload and maps the agent's reply.
+    #[test]
+    fn cli_response_restore_signs_the_extra_and_maps_the_reply() {
+        use common::wire::admin_signed_payload::OperationExtra;
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let key = dir.path().join("admin.key");
+        let signing = SigningKey::generate(&mut OsRng);
+        write_priv_key_file(&key, &signing);
+        let agent_id_path = write_agent_id_file(&dir, &[0x5Au8; 16]);
+        let vk = signing.verifying_key();
+        let socket_for_client = socket.clone();
+        let outcome = run_with_mock_server(
+            &socket,
+            move |stream| {
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                        nonce: [7u8; 32],
+                    }),
+                );
+                let req = match server_read_frame(stream) {
+                    AdminMessage::ResponseRestoreRequest(r) => r,
+                    other => panic!("expected ResponseRestoreRequest, got {other:?}"),
+                };
+                verify(&req.payload, &req.signatures[0].signature, &vk).expect("signed");
+                match &req.payload.extra {
+                    OperationExtra::ResponseRestore(e) => {
+                        assert_eq!(e.vault_id, "ab".repeat(16));
+                        assert_eq!(e.to.as_deref(), Some("/tmp/out"));
+                    }
+                    other => panic!("extra {other:?}"),
+                }
+                server_write_frame(
+                    stream,
+                    &AdminMessage::ResponseRestoreResponse(
+                        common::wire::admin_protocol::ResponseRestoreResponse {
+                            result: AdminResult::Success,
+                            restored: true,
+                            path: "/tmp/out".to_string(),
+                            message: "restored".to_string(),
+                        },
+                    ),
+                );
+            },
+            || {
+                run_response_restore(
+                    &socket_for_client,
+                    &key,
+                    &agent_id_path,
+                    "ab".repeat(16),
+                    Some("/tmp/out".to_string()),
+                )
+            },
+        );
+        let o = outcome.expect("client should not error");
+        assert!(o.done);
+        assert_eq!(o.path.as_deref(), Some("/tmp/out"));
     }
 
     /// Required A9 test 2 (server quorum-not-met → client outcome):

@@ -631,6 +631,16 @@ pub struct StatusResponse {
     /// `(ring name, dropped)` for the rings that dropped something.
     #[serde(default)]
     pub ringbuf_drops: Option<Vec<(String, u64)>>,
+    /// External audit CMB-016: the COMBAT ladder's stage (`INVESTIGATE` /
+    /// `NEUTRALIZE` / `ISOLATE`) while an episode is open, else `None`.
+    /// `None` also from an agent older than the field.
+    #[serde(default)]
+    pub combat_stage: Option<String>,
+    /// External audit CMB-016: whether the COMBAT is locked (it then needs
+    /// a signed `unlock`; an unlocked one decays on its own). `None` from
+    /// an agent older than the field.
+    #[serde(default)]
+    pub combat_locked: Option<bool>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -701,6 +711,95 @@ pub struct ConfigOverlaySetRequest {
 pub struct ConfigOverlaySetResponse {
     pub result: AdminResult,
     pub stored: bool,
+    pub message: String,
+}
+
+// ── External audit CMB-016 — undoing a response ───────────────────
+//
+// Three signed verbs, 1-of-N: `response status` (read-only, `audit-read`),
+// `response release` and `response restore` (`response-manage`). The agent runs them; nothing is done by the CLI.
+
+/// Most rows of each list a [`ResponseStatusResponse`] carries (the
+/// newest); the totals say how many there are.
+pub const MAX_RESPONSE_STATUS_ROWS: usize = 100;
+
+/// Signed `response status` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseStatusRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// One process the agent moved into its `blocked` or `throttled` scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainedProcessWire {
+    pub pid: u32,
+    /// `blocked` or `throttled`.
+    pub scope: String,
+    /// The cgroup it came from (`/system.slice/foo.service`).
+    pub origin: String,
+    /// Unix time of the move.
+    pub since: u64,
+    /// The pid still names the process that was moved (same start time).
+    pub running: bool,
+}
+
+/// One entry of the quarantine vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantinedFileWire {
+    pub vault_id: String,
+    pub original_path: String,
+    pub size_bytes: u64,
+    pub captured_at: u64,
+}
+
+/// Reply to [`ResponseStatusRequest`]. The lists are empty unless
+/// `result` is `Success`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseStatusResponse {
+    pub result: AdminResult,
+    pub contained: Vec<ContainedProcessWire>,
+    pub contained_total: u32,
+    pub quarantined: Vec<QuarantinedFileWire>,
+    pub quarantined_total: u32,
+    /// As in [`StatusResponse::combat_stage`].
+    pub combat_stage: Option<String>,
+    /// As in [`StatusResponse::combat_locked`].
+    pub combat_locked: Option<bool>,
+}
+
+/// Signed `response release` request (`ResponseReleaseExtra { pid }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseReleaseRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Reply to [`ResponseReleaseRequest`]. `released` is true when the
+/// process went back to the cgroup it came from; `message` says what was
+/// done, or why not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseReleaseResponse {
+    pub result: AdminResult,
+    pub released: bool,
+    pub message: String,
+}
+
+/// Signed `response restore` request (`ResponseRestoreExtra { vault_id,
+/// to }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseRestoreRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Reply to [`ResponseRestoreRequest`]. `path` is where the file was
+/// written when `restored`; `message` says why not otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseRestoreResponse {
+    pub result: AdminResult,
+    pub restored: bool,
+    pub path: String,
     pub message: String,
 }
 
@@ -845,6 +944,21 @@ pub enum AdminMessage {
     ConfigOverlaySetRequest(ConfigOverlaySetRequest),
     /// Reply to [`AdminMessage::ConfigOverlaySetRequest`].
     ConfigOverlaySetResponse(ConfigOverlaySetResponse),
+    /// External audit CMB-016 — signed read of what the response layer
+    /// holds. Triggers [`AdminMessage::ResponseStatusResponse`].
+    ResponseStatusRequest(ResponseStatusRequest),
+    /// Reply to [`AdminMessage::ResponseStatusRequest`].
+    ResponseStatusResponse(ResponseStatusResponse),
+    /// External audit CMB-016 — signed release of a contained process.
+    /// Triggers [`AdminMessage::ResponseReleaseResponse`].
+    ResponseReleaseRequest(ResponseReleaseRequest),
+    /// Reply to [`AdminMessage::ResponseReleaseRequest`].
+    ResponseReleaseResponse(ResponseReleaseResponse),
+    /// External audit CMB-016 — signed restore of a quarantined file.
+    /// Triggers [`AdminMessage::ResponseRestoreResponse`].
+    ResponseRestoreRequest(ResponseRestoreRequest),
+    /// Reply to [`AdminMessage::ResponseRestoreRequest`].
+    ResponseRestoreResponse(ResponseRestoreResponse),
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -1173,6 +1287,8 @@ mod tests {
             last_admin_action_secs_ago: Some(42),
             ringbuf_drops_total: None,
             ringbuf_drops: None,
+            combat_stage: None,
+            combat_locked: None,
         }));
     }
 
@@ -1184,6 +1300,8 @@ mod tests {
             last_admin_action_secs_ago: None,
             ringbuf_drops_total: None,
             ringbuf_drops: None,
+            combat_stage: None,
+            combat_locked: None,
         }));
     }
 
@@ -1319,7 +1437,13 @@ mod tests {
                 | AdminMessage::DetectionSetStatusRequest(_)
                 | AdminMessage::DetectionSetStatusResponse(_)
                 | AdminMessage::ConfigOverlaySetRequest(_)
-                | AdminMessage::ConfigOverlaySetResponse(_) => {}
+                | AdminMessage::ConfigOverlaySetResponse(_)
+                | AdminMessage::ResponseStatusRequest(_)
+                | AdminMessage::ResponseStatusResponse(_)
+                | AdminMessage::ResponseReleaseRequest(_)
+                | AdminMessage::ResponseReleaseResponse(_)
+                | AdminMessage::ResponseRestoreRequest(_)
+                | AdminMessage::ResponseRestoreResponse(_) => {}
             }
         }
     }
@@ -1328,6 +1452,94 @@ mod tests {
     /// survives a wire round-trip. The signed pre-image is re-serialised
     /// before verify, so a field-order drift would silently break
     /// signature verification — this anchors the CBOR/postcard shape.
+    /// External audit CMB-016: the COMBAT fields survive the wire.
+    #[test]
+    fn roundtrip_status_response_with_combat_stage() {
+        roundtrip(AdminMessage::StatusResponse(StatusResponse {
+            posture: PostureKind::Combat,
+            network_isolation_engaged: false,
+            last_admin_action_secs_ago: None,
+            ringbuf_drops_total: Some(0),
+            ringbuf_drops: Some(Vec::new()),
+            combat_stage: Some("NEUTRALIZE".to_string()),
+            combat_locked: Some(true),
+        }));
+    }
+
+    /// External audit CMB-016: the three response verbs and their replies
+    /// survive a wire round-trip, signed extras included.
+    #[test]
+    fn roundtrip_response_verbs() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        let sigs = vec![KeyedSignature {
+            signature: [0x66; 64],
+        }];
+        roundtrip(AdminMessage::ResponseStatusRequest(ResponseStatusRequest {
+            payload: SignedPayload::new_response_status([0x44; 32], 1_700_000_000, [0x55; 16]),
+            signatures: sigs.clone(),
+        }));
+        roundtrip(AdminMessage::ResponseStatusResponse(
+            ResponseStatusResponse {
+                result: AdminResult::Success,
+                contained: vec![ContainedProcessWire {
+                    pid: 4242,
+                    scope: "blocked".to_string(),
+                    origin: "/system.slice/foo.service".to_string(),
+                    since: 1_700_000_000,
+                    running: true,
+                }],
+                contained_total: 1,
+                quarantined: vec![QuarantinedFileWire {
+                    vault_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    original_path: "/tmp/payload".to_string(),
+                    size_bytes: 12,
+                    captured_at: 1_700_000_001,
+                }],
+                quarantined_total: 1,
+                combat_stage: Some("INVESTIGATE".to_string()),
+                combat_locked: Some(false),
+            },
+        ));
+        roundtrip(AdminMessage::ResponseReleaseRequest(
+            ResponseReleaseRequest {
+                payload: SignedPayload::new_response_release(
+                    [0x44; 32],
+                    1_700_000_000,
+                    [0x55; 16],
+                    4242,
+                ),
+                signatures: sigs.clone(),
+            },
+        ));
+        roundtrip(AdminMessage::ResponseReleaseResponse(
+            ResponseReleaseResponse {
+                result: AdminResult::Success,
+                released: false,
+                message: "pid 4242 is not contained by this agent".to_string(),
+            },
+        ));
+        roundtrip(AdminMessage::ResponseRestoreRequest(
+            ResponseRestoreRequest {
+                payload: SignedPayload::new_response_restore(
+                    [0x44; 32],
+                    1_700_000_000,
+                    [0x55; 16],
+                    "0123456789abcdef0123456789abcdef".to_string(),
+                    None,
+                ),
+                signatures: sigs,
+            },
+        ));
+        roundtrip(AdminMessage::ResponseRestoreResponse(
+            ResponseRestoreResponse {
+                result: AdminResult::RoleDenied,
+                restored: false,
+                path: String::new(),
+                message: String::new(),
+            },
+        ));
+    }
+
     #[test]
     fn roundtrip_trusted_installer_grant_request() {
         use crate::wire::admin_signed_payload::SignedPayload;

@@ -21,7 +21,9 @@
 //! - Per-file nonce: 96 random bits, fresh per encryption.
 //!
 //! [`restore`] reverses the operation: decrypts the vault file and
-//! writes it back to a caller-provided path.
+//! writes it to a new file (never over an existing one, never through a
+//! link), after checking it against the SHA-256 recorded at capture.
+//! The vault entry stays.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -278,14 +280,95 @@ pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> 
     }
 }
 
-/// Decrypt a previously-quarantined file back to `out_path`.
-/// Restores file mode 0644 (the original's exact mode is captured
-/// in the metadata for future use; for Tappa 5 we keep restore
-/// permissive to ease forensic review).
+/// External audit CMB-026: a vault id is the 32 hex digits the
+/// quarantine mints (`Uuid::simple`). Anything else — a `/`, a `..` — would
+/// name a file outside the vault.
+pub fn is_valid_vault_id(vault_id: &str) -> bool {
+    vault_id.len() == 32 && vault_id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn invalid(msg: &str) -> std::io::Error {
+    std::io::Error::new(ErrorKind::InvalidInput, msg.to_string())
+}
+
+/// External audit CMB-026: where a restore may write. An absolute path
+/// with a file name, no `.` or `..` component, outside the prefixes the
+/// quarantine never touches ([`is_quarantine_denied`]: system binaries and
+/// libraries, `/etc`, the agent's binaries and state). A file the
+/// quarantine took cannot come from there, so the default destination —
+/// the original path — always passes.
+pub fn check_restore_destination(path: &Path) -> std::io::Result<()> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(invalid("the destination must be an absolute path"));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(invalid("the destination must not contain `.` or `..`"));
+    }
+    if path.file_name().is_none() {
+        return Err(invalid("the destination must name a file"));
+    }
+    if is_quarantine_denied(path) {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "the destination is under a protected prefix",
+        ));
+    }
+    Ok(())
+}
+
+/// External audit CMB-016: restore a vault entry for `nn-admin response
+/// restore` — to `to` when given, else to the path it was taken from (its
+/// `.meta`). Returns the path written.
+pub fn restore_entry(
+    vault_id: &str,
+    to: Option<&str>,
+    cfg: &ExecutorConfig,
+) -> std::io::Result<PathBuf> {
+    if !is_valid_vault_id(vault_id) {
+        return Err(invalid("a vault id is 32 hex digits"));
+    }
+    let dest = match to {
+        Some(t) => PathBuf::from(t),
+        None => {
+            let meta = vault_meta(vault_id, cfg)
+                .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no such vault entry"))?;
+            PathBuf::from(meta["original_path"].as_str().ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidData, "the entry records no original path")
+            })?)
+        }
+    };
+    restore(vault_id, &dest, cfg)?;
+    Ok(dest)
+}
+
+/// Decrypt a quarantined file to `out_path`.
+///
+/// External audit CMB-026: the vault id must be one the quarantine mints
+/// ([`is_valid_vault_id`]), the destination must pass
+/// [`check_restore_destination`], and the plaintext must match the
+/// `sha256` its `.meta` recorded at capture. The file is created, never
+/// replaced: `O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600, under its parent
+/// directory opened once (through the host's view, as the quarantine
+/// removes — review 87) and judged again by the denylist where it really
+/// is, so a directory of the path swapped for a link cannot place it in
+/// `/etc`. The directory must exist. The vault entry stays.
 pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io::Result<()> {
+    if !is_valid_vault_id(vault_id) {
+        return Err(invalid("a vault id is 32 hex digits"));
+    }
+    check_restore_destination(out_path)?;
     let vault_dir = cfg.quarantine_dir.join("vault");
     let bin_path = vault_dir.join(format!("{vault_id}.bin"));
-    let meta_path = vault_dir.join(format!("{vault_id}.meta"));
+    let meta = vault_meta(vault_id, cfg)
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no such vault entry"))?;
+    let want_sha = meta["sha256"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "the entry records no sha256"))?
+        .to_ascii_lowercase();
 
     let mut bin = fs::read(&bin_path)?;
     if bin.len() < NONCE_LEN {
@@ -300,28 +383,83 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
     let master = load_or_init_master_key(cfg)?;
     let key = derive_file_key(&master, vault_id);
     let cipher = Aes256Gcm::new((&*key).into());
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce_bytes),
-            Payload {
-                msg: &ciphertext,
-                aad: vault_id.as_bytes(),
-            },
-        )
-        .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?;
-
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).ok();
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &ciphertext,
+                    aad: vault_id.as_bytes(),
+                },
+            )
+            .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?,
+    );
+    let got_sha = format!("{:x}", Sha256::digest(&*plaintext));
+    if got_sha != want_sha {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("sha256 mismatch: the entry recorded {want_sha}, the content is {got_sha}"),
+        ));
     }
-    fs::write(out_path, &plaintext)?;
-    let _ = fs::set_permissions(out_path, fs::Permissions::from_mode(0o644));
+
+    let (Some(parent), Some(name)) = (out_path.parent(), out_path.file_name()) else {
+        return Err(invalid("the destination must name a file"));
+    };
+    let dir = super::on_host_path(parent, |p| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(p)
+    })?;
+    if let Ok(real) = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
+        let real = match real.strip_prefix("/proc/1/root") {
+            Ok(rel) => Path::new("/").join(rel),
+            Err(_) => real,
+        };
+        if is_quarantine_denied(&real.join(name)) || is_quarantine_denied(&real) {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "the destination directory is {} — under a protected prefix",
+                    real.display()
+                ),
+            ));
+        }
+    }
+    let cname = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| invalid("the destination contains a NUL byte"))?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: a valid directory fd and a NUL-terminated name; the returned
+    // fd is owned by the File below.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            flags,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat and is owned by nobody else.
+    let mut out = unsafe { fs::File::from_raw_fd(fd) };
+    let written = out
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .and_then(|()| out.write_all(&plaintext))
+        .and_then(|()| out.sync_all());
+    if let Err(e) = written {
+        drop(out);
+        // SAFETY: the same directory fd and name as the openat above.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
+        return Err(e);
+    }
 
     info!(
         vault_id,
         out = %out_path.display(),
         size = plaintext.len(),
-        meta = %meta_path.display(),
-        "restored quarantined file"
+        "restored quarantined file (mode 0600)"
     );
     Ok(())
 }
@@ -523,6 +661,9 @@ pub fn take_index_notes() -> Vec<String> {
 /// The `.meta` of a vault entry: what was quarantined (path, size,
 /// sha256, time).
 pub fn vault_meta(vault_id: &str, cfg: &ExecutorConfig) -> Option<serde_json::Value> {
+    if !is_valid_vault_id(vault_id) {
+        return None;
+    }
     let s = fs::read_to_string(
         cfg.quarantine_dir
             .join("vault")
@@ -530,6 +671,37 @@ pub fn vault_meta(vault_id: &str, cfg: &ExecutorConfig) -> Option<serde_json::Va
     )
     .ok()?;
     serde_json::from_str(&s).ok()
+}
+
+/// One entry of the vault, as `index.json` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultEntry {
+    pub vault_id: String,
+    pub original_path: String,
+    pub size_bytes: u64,
+    pub captured_at: u64,
+}
+
+/// External audit CMB-016: the vault's entries, oldest first — from
+/// `index.json`, or rebuilt from the `.meta` files when the index is
+/// missing or does not parse (read-only: the index is left as it is).
+pub fn list_vault(cfg: &ExecutorConfig) -> Vec<VaultEntry> {
+    let entries: Vec<serde_json::Value> =
+        match fs::read_to_string(cfg.quarantine_dir.join("index.json")) {
+            Ok(s) => {
+                serde_json::from_str(&s).unwrap_or_else(|_| index_from_meta(&cfg.quarantine_dir))
+            }
+            Err(_) => index_from_meta(&cfg.quarantine_dir),
+        };
+    entries
+        .iter()
+        .map(|e| VaultEntry {
+            vault_id: e["vault_id"].as_str().unwrap_or_default().to_string(),
+            original_path: e["original_path"].as_str().unwrap_or_default().to_string(),
+            size_bytes: e["size_bytes"].as_u64().unwrap_or(0),
+            captured_at: e["captured_at"].as_u64().unwrap_or(0),
+        })
+        .collect()
 }
 
 /// The index entries rebuilt from the vault's `.meta` files, oldest first.
@@ -589,12 +761,16 @@ fn update_index(
         Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
-    entries.push(serde_json::json!({
-        "vault_id": vault_id,
-        "original_path": original_path,
-        "size_bytes": size,
-        "captured_at": current_timestamp(),
-    }));
+    // A rebuild from the vault already holds this entry (its `.meta` is
+    // written first): listed once (found in lab PR 123).
+    if !entries.iter().any(|e| e["vault_id"] == vault_id) {
+        entries.push(serde_json::json!({
+            "vault_id": vault_id,
+            "original_path": original_path,
+            "size_bytes": size,
+            "captured_at": current_timestamp(),
+        }));
+    }
 
     let serialized = serde_json::to_string_pretty(&entries).map_err(std::io::Error::other)?;
     let mut tmp = OpenOptions::new()
@@ -947,7 +1123,12 @@ mod tests {
         let cfg = cfg_for(&tmp);
         let vault = cfg.quarantine_dir.join("vault");
         std::fs::create_dir_all(&vault).unwrap();
-        for (id, t) in [("aaa", 10u64), ("bbb", 20)] {
+        for (id, t) in [
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 10u64),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 20),
+            // the entry being added: its `.meta` is written before the index
+            ("cccccccccccccccccccccccccccccccc", 30),
+        ] {
             std::fs::write(
                 vault.join(format!("{id}.meta")),
                 serde_json::json!({"vault_id": id, "original_path": format!("/tmp/{id}"), "size_bytes": 3, "sha256": "x", "captured_at": t}).to_string(),
@@ -956,7 +1137,13 @@ mod tests {
         }
         std::fs::write(cfg.quarantine_dir.join("index.json"), b"{ not json").unwrap();
         let _ = take_index_notes();
-        update_index(&cfg.quarantine_dir, "ccc", "/tmp/ccc", 3).unwrap();
+        update_index(
+            &cfg.quarantine_dir,
+            "cccccccccccccccccccccccccccccccc",
+            "/tmp/cccccccccccccccccccccccccccccccc",
+            3,
+        )
+        .unwrap();
         let index: Vec<serde_json::Value> = serde_json::from_str(
             &std::fs::read_to_string(cfg.quarantine_dir.join("index.json")).unwrap(),
         )
@@ -965,7 +1152,15 @@ mod tests {
             .iter()
             .map(|e| e["vault_id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["aaa", "bbb", "ccc"]);
+        assert_eq!(
+            ids,
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "cccccccccccccccccccccccccccccccc"
+            ],
+            "the entry being added is listed once"
+        );
         let kept: Vec<_> = std::fs::read_dir(&cfg.quarantine_dir)
             .unwrap()
             .flatten()
@@ -978,13 +1173,133 @@ mod tests {
         assert_eq!(kept.len(), 1, "the corrupt index is kept aside");
         let notes = take_index_notes();
         assert!(
-            notes.len() == 1 && notes[0].contains("rebuilt from 2"),
+            notes.len() == 1 && notes[0].contains("rebuilt from 3"),
             "{notes:?}"
         );
         assert_eq!(
-            vault_meta("aaa", &cfg).unwrap()["original_path"],
-            "/tmp/aaa"
+            vault_meta("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &cfg).unwrap()["original_path"],
+            "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    /// A vaulted file under `tmp` (the original removed), and its id.
+    fn vaulted(tmp: &TempDir, cfg: &ExecutorConfig, content: &[u8]) -> (PathBuf, String) {
+        let p = tmp.path().join("payload.bin");
+        fs::write(&p, content).unwrap();
+        let id = quarantine_file(&ExeHandle::open(&p).unwrap(), cfg).expect("quarantine");
+        (p, id)
+    }
+
+    /// External audit CMB-026: a vault id that is not 32 hex digits is
+    /// refused before any path is built from it.
+    #[test]
+    fn restore_rejects_a_traversing_vault_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let out = tmp.path().join("out");
+        for id in [
+            "../../etc/shadow",
+            "",
+            "0123456789abcdef0123456789abcde/",
+            "0123456789abcdef0123456789abcdefaa",
+        ] {
+            let e = restore(id, &out, &cfg).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{id}");
+            let e = restore_entry(id, None, &cfg).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{id}");
+        }
+        assert!(vault_meta("../../etc/shadow", &cfg).is_none());
+        assert!(!out.exists());
+    }
+
+    /// External audit CMB-026: the output is created, never opened through
+    /// a link — a symlink at the destination (dangling or not) is refused
+    /// and its target untouched.
+    #[test]
+    fn restore_refuses_to_follow_a_symlink_output() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let (_, id) = vaulted(&tmp, &cfg, b"malware");
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(restore(&id, &link, &cfg).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        let dangling = tmp.path().join("dangling");
+        let nowhere = tmp.path().join("nowhere");
+        std::os::unix::fs::symlink(&nowhere, &dangling).unwrap();
+        assert!(restore(&id, &dangling, &cfg).is_err());
+        assert!(!nowhere.exists());
+    }
+
+    /// External audit CMB-026: an existing file is never overwritten, and a
+    /// missing directory is not created.
+    #[test]
+    fn restore_refuses_an_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let (_, id) = vaulted(&tmp, &cfg, b"malware");
+        let existing = tmp.path().join("existing");
+        fs::write(&existing, b"keep me").unwrap();
+        let e = restore(&id, &existing, &cfg).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&existing).unwrap(), b"keep me");
+        let e = restore(&id, &tmp.path().join("no/such/dir/f"), &cfg).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        assert!(!tmp.path().join("no").exists());
+        // relative, `..`, protected: refused before anything is decrypted
+        for bad in ["relative/f", "/tmp/../etc/cron.d/x", "/etc/cron.d/x"] {
+            assert!(restore(&id, Path::new(bad), &cfg).is_err(), "{bad}");
+        }
+    }
+
+    /// External audit CMB-026: a plaintext that does not match the
+    /// `sha256` recorded at capture is not written.
+    #[test]
+    fn restore_checks_the_sha256() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let (_, id) = vaulted(&tmp, &cfg, b"malware");
+        let meta_path = cfg.quarantine_dir.join("vault").join(format!("{id}.meta"));
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(b"other")));
+        fs::write(&meta_path, meta.to_string()).unwrap();
+        let out = tmp.path().join("out");
+        let e = restore(&id, &out, &cfg).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+        assert!(!out.exists());
+    }
+
+    /// External audit CMB-016: quarantine, list, restore to the original
+    /// path (mode 0600), and the entry stays in the vault.
+    #[test]
+    fn quarantine_then_restore_to_the_original_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let (original, id) = vaulted(&tmp, &cfg, b"payload bytes");
+        assert!(!original.exists());
+        let listed = list_vault(&cfg);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].vault_id, id);
+        assert_eq!(listed[0].original_path, original.to_string_lossy());
+        assert_eq!(listed[0].size_bytes, 13);
+
+        let written = restore_entry(&id, None, &cfg).unwrap();
+        assert_eq!(written, original);
+        assert_eq!(fs::read(&original).unwrap(), b"payload bytes");
+        assert_eq!(
+            fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // a second restore to the same place is refused; the vault keeps it
+        assert!(restore_entry(&id, None, &cfg).is_err());
+        assert_eq!(list_vault(&cfg).len(), 1);
+        let elsewhere = tmp.path().join("copy");
+        let to = elsewhere.to_string_lossy().into_owned();
+        assert_eq!(restore_entry(&id, Some(&to), &cfg).unwrap(), elsewhere);
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"payload bytes");
     }
 
     #[test]

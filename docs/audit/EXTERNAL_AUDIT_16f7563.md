@@ -191,7 +191,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-145 | CMB-013 | Combat response | S | fixed (lab PR 121) |
 | NN-AUD-146 | CMB-014 | Combat response | S | fixed (lab PR 119) |
 | NN-AUD-147 | CMB-015 | Combat response | S | fixed (lab PR 121) |
-| NN-AUD-148 | CMB-016 | Combat response | M | open |
+| NN-AUD-148 | CMB-016 | Combat response | M | fixed (lab PR 123) |
 | NN-AUD-149 | CMB-017 | Combat response | S | fixed (lab PR 121) |
 | NN-AUD-150 | CMB-019 | Combat response | M | fixed (lab PR 120) |
 | NN-AUD-151 | LLMP-003 | LLM prompts | S | open |
@@ -2208,3 +2208,58 @@ the audit did not report, noted with the fix that takes them.
     `net_outbound_connect_records_flow_with_dns_attribution` (no network
     code in this lot), 2 of 3 reruns 7/7, the third the same flake. The
     anti-tamper suite: OK. Host: 1743 passed, 0 failed.
+- **NN-AUD-148 (CMB-016), with CMB-026 (Low, not in the table), lab PR
+  123.** Undoing a response.
+  - CMB-016: an operator had no way to undo a response short of a root
+    shell: no verb to see what the agent held, to release a blocked or
+    throttled process, or to get a quarantined file back. Three signed
+    verbs, 1-of-N, run by the agent over the admin socket and recorded in
+    the signed audit log with the signer (`response_status`,
+    `response_release`, `response_restore`; a verified request that did
+    nothing is `failure: rejected (<why>)`, not a success).
+    `nn-admin response status` (`audit-read`): the containment record (pid,
+    scope, the cgroup it came from, since, whether the pid still names that
+    process — start ticks compared), the vault (newest 100 of each, with the
+    totals), the COMBAT stage and lock. `response release --pid`
+    (`response-manage`): through the record, `release_blocked_pid` /
+    `throttle::release_pid` — back to the origin cgroup, never the root
+    cgroup; a pid without a record is `not contained by this agent`.
+    `response restore --vault-id [--to]` (`response-manage`): to the
+    original path by default. `response-manage` is a new role (wire byte
+    16), never in a default allowlist; ops 22-24 appended. `nn-admin status`
+    gains `combat_stage` / `combat_locked` (`serde(default)`).
+  - CMB-026: `quarantine::restore` built the vault path from the id as
+    given (`../../x` read outside the vault), wrote with `fs::write`
+    (followed a link, replaced an existing file), created missing
+    directories, set 0644 and never checked the content. Now: the id must
+    be 32 hex digits (`InvalidInput`); the destination absolute, without
+    `.`/`..`, outside the quarantine's protected prefixes — judged again on
+    the directory as opened, so a linked directory cannot lead to `/etc`;
+    the plaintext must match the `.meta` SHA-256 before anything is
+    written; the file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`, 0600,
+    under its parent opened through the host's view (`on_host_path`, the
+    unit is `ProtectSystem=strict`); the parent must exist. The vault keeps
+    the entry. Tests: a traversing id, a symlink output (dangling or not),
+    an existing file, a SHA-256 mismatch, quarantine then restore to the
+    original path; dispatch tests per verb (role denied, accepted,
+    mismatched extra), wire round-trips, op and role numbering.
+  - Found by the lab: after an index rebuilt from the vault (lab PR 121)
+    the entry being added was listed twice — its `.meta` is written before
+    the index, so the rebuild held it already. Listed once.
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `respond123-probe.sh`. Before (main):
+    no verb — a quarantined binary could be recovered only by code using
+    the master key, a process blocked before an agent restart only by
+    hand. After: without `response-manage` a release is refused (role
+    denied); with it, a neutralized offender's binary is restored to its
+    path (mode 0600, SHA-256 equal to the original); a traversing vault
+    id, a protected destination, an existing file and a symlink to
+    `/etc/cron.d` are refused (nothing written there); a unit's blocked
+    process is released to its unit while COMBAT stays engaged, a second
+    release says it is not contained; `response status` lists it, the
+    vault and the stage; `status` shows `INVESTIGATE (locked)`; each
+    operation is a signed audit entry. Privileged gate: Ubuntu 24.04 29
+    suites, 77 passed, 0 failed; Debian 12 29 suites, 76 passed, 1 failed
+    — the src_port-0 flake of
+    `net_outbound_connect_records_flow_with_dns_attribution`, which fails
+    on main as well (2 of 3 runs on Debian): the network batch. The
+    anti-tamper suite: OK. Host: 1758 passed, 0 failed.
