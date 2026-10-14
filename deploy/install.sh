@@ -821,7 +821,7 @@ install -d -m 0700 -o root -g root "$STATE_DIR"
 # "Operation not permitted". Lift it here; the agent re-applies it on
 # its next start. (With the agent RUNNING the LSM hooks still deny
 # these writes — stop it first, or upgrade through the signed
-# FS_PROTECT_OVERRIDE window.)
+# trusted-installer window, FS_GRANT.)
 if command -v lsattr >/dev/null 2>&1 && lsattr -d "$STATE_DIR" 2>/dev/null | awk '{print $1}' | grep -q i; then
     echo "install.sh: $STATE_DIR is immutable (chattr +i from a previous agent run) — lifting for the install"
     chattr -i "$STATE_DIR"

@@ -3031,6 +3031,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    // External audit ATP-003: the trusted-installer window is closed — and
+    // its close recorded — at its deadline, not at the next event. The
+    // kernel grant ends at the same deadline by itself; this keeps the
+    // in-memory state, the PID-1 stop grant and the audit chain on time,
+    // and retries a zeroing that failed.
+    let installer_ticker = installer_override.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            installer_ticker.close_if_expired(Instant::now());
+        }
+    });
+
     // Install the three shutdown signals up front, before the loop.
     // Re-creating the future inside `select!` every iteration (the
     // old `signal::ctrl_c()` shorthand) re-runs handler registration

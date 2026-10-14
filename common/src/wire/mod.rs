@@ -537,6 +537,33 @@ impl KillGrant {
     }
 }
 
+/// External audit ATP-003: the one slot of the pinned `FS_GRANT` map —
+/// the kernel half of the trusted-installer window. While active, the
+/// filesystem deny hooks (and the kexec refusal, and the pin root's)
+/// let a protected inode be changed. It replaces `FS_PROTECT_OVERRIDE`,
+/// whose value was the session nonce alone: zeroing it on expiry was the
+/// agent's job, done on the event path — a host whose events had stopped
+/// kept every file unprotected past the deadline. The hooks now test the
+/// deadline themselves (`bpf_ktime_get_ns`, CLOCK_MONOTONIC), as for
+/// [`KillGrant`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct FsGrant {
+    pub nonce: u32,
+    pub _pad: u32,
+    pub expires_ns: u64,
+}
+
+impl FsGrant {
+    /// Whether the window is open at monotonic `now_ns` under session
+    /// `session` — the kernel hooks' test, kept here so it is unit-tested
+    /// once.
+    pub fn active(&self, now_ns: u64, session: u32) -> bool {
+        self.nonce != 0 && self.nonce == session && now_ns < self.expires_ns
+    }
+}
+
 // Tappa 7 filesystem-protection denial codes. The eBPF inode hooks
 // write one of these into `FsProtectDenialRaw.operation` when they
 // return `-EPERM`. Userland inflates the byte into the typed
@@ -1459,6 +1486,24 @@ mod tests {
             !KillGrant::default().allows(15, 0, 0),
             "the zeroed slot grants nothing"
         );
+    }
+    /// External audit ATP-003: the window is bounded by its session and
+    /// its deadline in the kernel itself.
+    #[test]
+    fn fs_grant_inactive_after_expiry_or_other_session() {
+        let g = FsGrant {
+            nonce: 0xABCD,
+            _pad: 0,
+            expires_ns: 1_000,
+        };
+        assert!(g.active(999, 0xABCD), "inside the window");
+        assert!(!g.active(1_000, 0xABCD), "expired");
+        assert!(!g.active(0, 0x1234), "another boot's session");
+        assert!(
+            !FsGrant::default().active(0, 0),
+            "the zeroed slot grants nothing"
+        );
+        assert_eq!(core::mem::size_of::<FsGrant>(), 16);
     }
     use core::mem::{align_of, size_of};
 

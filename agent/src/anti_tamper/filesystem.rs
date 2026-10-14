@@ -326,7 +326,7 @@ pub const ETC_PROTECTED_TEMPLATES: &[&str] = &[
 /// eBPF-only, NO `chattr +i`: the `+i` belt-and-suspenders stays the
 /// state dir's. These use the file-LSM mechanism for consistency with
 /// the /etc identity files — and so a signed self-upgrade can replace
-/// them during an armed `FS_PROTECT_OVERRIDE` window (a global deny
+/// them during an armed trusted-installer window (`FS_GRANT`) (a global deny
 /// suspension) without first having to clear a per-inode immutable
 /// bit.
 pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
@@ -522,7 +522,7 @@ pub(crate) fn attach(
     // warn rather than aborting arming. The caller-side PROTECTED_PIDS
     // exemption already lets the agent re-exec itself and the watchdog
     // re-install; a signed installer replaces these during an armed
-    // FS_PROTECT_OVERRIDE window.
+    // trusted-installer window (FS_GRANT).
     if let Err(e) = register_binary_and_units(ebpf) {
         warn!(
             error = %e,
@@ -613,7 +613,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     // old_dir/new_dir checks in inode_rename, every rename into or out
     // of it by a non-protected pid. The agent's own rotate-keys rename
     // is exempt via PROTECTED_PIDS; operator edits go through the signed
-    // FS_PROTECT_OVERRIDE window, exactly like /var/lib/northnarrow.
+    // trusted-installer window (FS_GRANT), exactly like /var/lib/northnarrow.
     match std::fs::metadata(etc_dir) {
         Ok(meta) if meta.is_dir() => {
             let key = InodeKey {
@@ -1064,7 +1064,7 @@ pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
     }
     for (path, key) in resolved {
         // at-authz-1: the agent/watchdog images + units are agent-written
-        // (signed self-upgrade, exempt via FS_PROTECT_OVERRIDE) — WRITE+MUTATE.
+        // (signed self-upgrade, exempt via the trusted-installer window, FS_GRANT) — WRITE+MUTATE.
         register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
