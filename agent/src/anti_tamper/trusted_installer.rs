@@ -1,18 +1,18 @@
 //! FIM-009 self-upgrade (§15.1) — userland half of the trusted-installer
 //! FS-pin override.
 //!
-//! The kernel half already exists: `agent-ebpf/src/inode_protect.rs`
-//! short-circuits its deny hooks to ALLOW when
+//! The kernel half: `agent-ebpf/src/inode_protect.rs` short-circuits its
+//! deny hooks to ALLOW when
 //! [`override_active`](../../../agent-ebpf/src/inode_protect.rs) reads a
-//! non-zero `FS_PROTECT_OVERRIDE[0]` that matches this boot's
-//! `AGENT_SESSION[0]` session nonce. This module is the userland arming
-//! path that was a stub until now.
+//! `FS_GRANT[0]` whose nonce matches this boot's `AGENT_SESSION[0]` and
+//! whose deadline has not passed. This module is the userland arming path.
 //!
 //! ## What an armed override does
 //!
 //! While a grant window is open:
-//! - **Prevention half (kernel):** `FS_PROTECT_OVERRIDE[0]` carries the
-//!   session nonce, so every `inode_protect` deny hook passes through —
+//! - **Prevention half (kernel):** `FS_GRANT[0]` carries the session
+//!   nonce and the deadline, so every `inode_protect` deny hook passes
+//!   through until then —
 //!   a trusted local installer can rewrite the agent's protected binary
 //!   / protected `/etc/northnarrow` files without the EPERM (BUG-020).
 //! - **Detection half (userland):** [`Self::is_window_open`] is `true`,
@@ -27,20 +27,24 @@
 //!
 //! ## Invariants
 //!
-//! - **boot-zero.** The agent boot-zeroes `FS_PROTECT_OVERRIDE` and
-//!   rolls a fresh `AGENT_SESSION` nonce on every start
-//!   (`super::boot_zero_fs_override` + `super::arm_session`), and
+//! - **boot-zero.** The agent boot-zeroes `FS_GRANT` and rolls a fresh
+//!   `AGENT_SESSION` nonce on every start (`super::boot_zero_fs_grant` +
+//!   `super::arm_session`), and
 //!   this struct constructs disarmed. A grant NEVER survives a restart;
 //!   it must be re-presented. Even if the boot-zero map write is lost,
 //!   the kernel's session-nonce compare rejects a stale pinned value.
 //! - **TTL.** A grant carries an operator-chosen `window_secs`, clamped
 //!   to [`MAX_TRUSTED_INSTALLER_WINDOW_SECS`]. The window expires at a
 //!   real-time deadline (monotonic [`Instant`], NOT the event stream —
-//!   a security grant must expire even on a silent host). Expiry is
-//!   evaluated LAZILY: the detection half flips back to `KillProcess`
-//!   the instant [`Self::is_window_open`] is consulted past the
-//!   deadline, and the kernel map is zeroed on the next event-path
-//!   sweep ([`Self::close_if_expired`]) or the next boot — no timer.
+//!   a security grant must expire even on a silent host). The detection
+//!   half flips back to `KillProcess` the instant
+//!   [`Self::is_window_open`] is consulted past the deadline; the kernel
+//!   half ends at the same deadline by itself (external audit ATP-003:
+//!   the grant carries it, as `KILL_GRANT` does — before, the slot was
+//!   zeroed only by an event-path sweep, and a host whose events had
+//!   stopped kept the files, the pin root and the kexec refusal open).
+//!   A one-second ticker closes the window on time and records it
+//!   ([`Self::close_if_expired`]).
 //! - **anti-replay.** The signed grant is verified through the standard
 //!   `verify_signed_payload_quorum` path (single-use challenge nonce +
 //!   `agent_id` binding + skew), so a captured grant cannot be replayed
@@ -49,7 +53,7 @@
 //!
 //! ## Scope note (resolved in recon)
 //!
-//! The kernel `FS_PROTECT_OVERRIDE` short-circuit is GLOBAL — while
+//! The kernel `FS_GRANT` short-circuit is GLOBAL — while
 //! armed, EVERY protected inode is writable, not just the agent's own
 //! paths. That is the accepted beta posture (bounded by auth + a short
 //! TTL + audit + the operator-driven window); per-path scoping of the
@@ -68,10 +72,10 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use super::{
-    AyaKillGrant, AGENT_SESSION_MAP_NAME, FS_PROTECT_OVERRIDE_MAP_NAME, KILL_GRANT_MAP_NAME,
+    AyaFsGrant, AyaKillGrant, AGENT_SESSION_MAP_NAME, FS_GRANT_MAP_NAME, KILL_GRANT_MAP_NAME,
 };
 use crate::audit::{AuditEntryDraft, AuditLog};
-use common::wire::KillGrant;
+use common::wire::{FsGrant, KillGrant};
 
 /// Hard ceiling on a grant window. A grant whose `window_secs` exceeds
 /// this is clamped down — a captured or fat-fingered grant can never
@@ -109,12 +113,12 @@ pub struct TrustedInstallerOverride {
     /// that follows expiry. Lets the hot event path skip the mutex.
     armed: AtomicBool,
     inner: Mutex<Inner>,
-    /// bpffs root for opening the pinned `FS_PROTECT_OVERRIDE` map.
+    /// bpffs root for opening the pinned `FS_GRANT` map.
     /// `None` ⇒ no bpffs this boot ⇒ the kernel FS suspension is
     /// unavailable (the in-memory detection downgrade still works).
     bpffs_root: Option<PathBuf>,
-    /// This boot's `AGENT_SESSION[0]` nonce. Written into
-    /// `FS_PROTECT_OVERRIDE[0]` on arm so the kernel compare matches.
+    /// This boot's `AGENT_SESSION[0]` nonce. Written into `FS_GRANT[0]` on
+    /// arm so the kernel compare matches.
     /// `0` ⇒ session unavailable ⇒ FS suspension stays dormant.
     session_nonce: u32,
     /// Chain-log writer for the close/expiry record. The ARM record is
@@ -181,7 +185,7 @@ impl TrustedInstallerOverride {
 
     /// Production constructor. Reads this boot's session nonce from the
     /// pinned `AGENT_SESSION` map and belt-and-suspenders boot-zeroes
-    /// `FS_PROTECT_OVERRIDE` (the kernel attach path also zeroes it; this
+    /// `FS_GRANT` (the kernel attach path also zeroes it; this
     /// guarantees the in-memory state and the map agree at construction).
     /// Constructs disarmed.
     pub fn boot(bpffs_root: Option<PathBuf>, audit: Option<Arc<Mutex<AuditLog>>>) -> Arc<Self> {
@@ -198,12 +202,12 @@ impl TrustedInstallerOverride {
             );
         }
         // Belt-and-suspenders boot-zero of the in-mem-visible map.
-        if let Err(e) = write_fs_override(bpffs_root.as_deref(), 0) {
+        if let Err(e) = write_fs_grant(bpffs_root.as_deref(), FsGrant::default()) {
             warn!(
                 target: "anti_tamper.trusted_installer",
                 error = %e,
-                "boot-zero of FS_PROTECT_OVERRIDE from userland failed (kernel attach path \
-                 also zeroes it; continuing)"
+                "boot-zero of FS_GRANT from userland failed (kernel attach path also zeroes \
+                 it; continuing)"
             );
         }
         Arc::new(Self::new(
@@ -215,8 +219,9 @@ impl TrustedInstallerOverride {
     }
 
     /// Arm the override for `window_secs` (clamped to `[1, max]`) as of
-    /// `now`. Writes the session nonce into `FS_PROTECT_OVERRIDE[0]` so
-    /// the kernel FS pin is suspended, then opens the in-memory window.
+    /// `now`. Writes the session nonce and the deadline into `FS_GRANT[0]`
+    /// so the kernel FS pin is suspended until then, then opens the
+    /// in-memory window.
     /// Returns the effective (clamped) window so the caller can log it.
     ///
     /// The ARM is recorded in the audit chain by the dispatch path
@@ -232,8 +237,15 @@ impl TrustedInstallerOverride {
         // the agent killing the installer). A failed FS suspension is
         // self-evident at install time (install.sh EPERMs on a protected
         // path) and is logged loudly here.
+        // One deadline for both kernel grants and the in-memory window.
+        let expires_ns = monotonic_ns().saturating_add(window.as_nanos() as u64);
         let fs_pin_suspended = if self.session_nonce != 0 {
-            match write_fs_override(self.bpffs_root.as_deref(), self.session_nonce) {
+            let grant = FsGrant {
+                nonce: self.session_nonce,
+                _pad: 0,
+                expires_ns,
+            };
+            match write_fs_grant(self.bpffs_root.as_deref(), grant) {
                 Ok(()) => self.bpffs_root.is_some(),
                 Err(e) => {
                     warn!(
@@ -263,7 +275,7 @@ impl TrustedInstallerOverride {
             let grant = KillGrant {
                 nonce: self.session_nonce,
                 sig_mask: KillGrant::STOP_SIGNALS,
-                expires_ns: monotonic_ns().saturating_add(window.as_nanos() as u64),
+                expires_ns,
             };
             match write_kill_grant(self.bpffs_root.as_deref(), grant) {
                 Ok(()) => self.bpffs_root.is_some(),
@@ -337,17 +349,34 @@ impl TrustedInstallerOverride {
     /// Close the window: clear the in-memory deadline, zero the kernel
     /// map (re-engage the FS pin), and append a close record to the
     /// audit chain. Idempotent — a second call is a cheap no-op.
+    ///
+    /// External audit ATP-012: a zeroing that failed, or that a read-back
+    /// does not show, is recorded as such (`close_failed`), not as
+    /// "closed"; the kernel's own deadline still ends the window.
     pub fn close(&self, reason: &str) {
         let was_armed = self.armed.swap(false, Ordering::SeqCst);
         self.inner.lock().deadline = None;
-        if let Err(e) = write_fs_override(self.bpffs_root.as_deref(), 0) {
-            warn!(
-                target: "anti_tamper.trusted_installer",
-                error = %e,
-                "disarm of FS_PROTECT_OVERRIDE failed — FS pin may stay suspended until \
-                 next boot-zero (kernel session-nonce compare still bounds it to this boot)"
-            );
-        }
+        let zeroed =
+            write_fs_grant(self.bpffs_root.as_deref(), FsGrant::default()).and_then(|()| {
+                match read_fs_grant(self.bpffs_root.as_deref()) {
+                    Some(g) if g != FsGrant::default() => {
+                        anyhow::bail!("FS_GRANT still holds a grant after zeroing")
+                    }
+                    _ => Ok(()),
+                }
+            });
+        let close_failed = match &zeroed {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::error!(
+                    target: "anti_tamper.trusted_installer",
+                    error = %format!("{e:#}"),
+                    "disarm of FS_GRANT failed — the FS pin stays suspended until the grant's \
+                     own deadline"
+                );
+                Some(format!("{e:#}"))
+            }
+        };
         if let Err(e) = write_kill_grant(self.bpffs_root.as_deref(), KillGrant::default()) {
             warn!(
                 target: "anti_tamper.trusted_installer",
@@ -359,24 +388,35 @@ impl TrustedInstallerOverride {
             info!(
                 target: "anti_tamper.trusted_installer",
                 reason,
+                close_failed = close_failed.is_some(),
                 "trusted-installer override CLOSED (FIM-009 §15.1)"
             );
-            self.audit_close(reason);
+            self.audit_close(reason, close_failed.as_deref());
         }
     }
 
-    fn audit_close(&self, reason: &str) {
+    fn audit_close(&self, reason: &str, close_failed: Option<&str>) {
         let audit = self.audit.lock().clone();
         let Some(audit) = audit else {
             return;
         };
+        let (extra, result) = match close_failed {
+            None => (
+                serde_json::json!({ "reason": reason }),
+                format!("closed: {reason}"),
+            ),
+            Some(error) => (
+                serde_json::json!({ "reason": reason, "error": error }),
+                format!("close_failed: {reason} (the kernel grant ends at its own deadline)"),
+            ),
+        };
         let draft = AuditEntryDraft {
             op: "trusted_installer_window_close".to_string(),
-            extra: serde_json::json!({ "reason": reason }),
+            extra,
             // Agent-initiated (TTL/forced), not an operator signature.
             key_fp: "(agent)".to_string(),
             cosigner_fps: Vec::new(),
-            result: format!("closed: {reason}"),
+            result,
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
@@ -392,26 +432,36 @@ impl TrustedInstallerOverride {
     }
 }
 
-/// Write `value` to slot 0 of the pinned `FS_PROTECT_OVERRIDE` map.
-/// `bpffs_root: None` ⇒ no-op success (no pinned map this boot; the
-/// in-memory detection state still governs the downgrade). Mirrors the
-/// `ProtectedObserversHandle::open` pinned-map idiom.
-fn write_fs_override(bpffs_root: Option<&Path>, value: u32) -> Result<()> {
+/// Write `grant` to slot 0 of the pinned `FS_GRANT` map (a zeroed grant
+/// closes the window). `bpffs_root: None` ⇒ no-op success (no pinned map
+/// this boot; the in-memory detection state still governs the
+/// downgrade). Mirrors the `ProtectedObserversHandle::open` pinned-map
+/// idiom.
+fn write_fs_grant(bpffs_root: Option<&Path>, grant: FsGrant) -> Result<()> {
     let Some(root) = bpffs_root else {
         return Ok(());
     };
-    let pin_path = root.join(FS_PROTECT_OVERRIDE_MAP_NAME);
+    let pin_path = root.join(FS_GRANT_MAP_NAME);
     let map_data = MapData::from_pin(&pin_path).with_context(|| {
         format!(
-            "opening pinned {FS_PROTECT_OVERRIDE_MAP_NAME} at {}",
+            "opening pinned {FS_GRANT_MAP_NAME} at {}",
             pin_path.display()
         )
     })?;
-    let mut arr: AyaArray<_, u32> = AyaArray::try_from(AyaMap::Array(map_data))
-        .with_context(|| format!("{FS_PROTECT_OVERRIDE_MAP_NAME} is not an Array<u32>"))?;
-    arr.set(0, value, 0)
-        .with_context(|| format!("setting {FS_PROTECT_OVERRIDE_MAP_NAME}[0] = {value}"))?;
+    let mut arr: AyaArray<_, AyaFsGrant> = AyaArray::try_from(AyaMap::Array(map_data))
+        .with_context(|| format!("{FS_GRANT_MAP_NAME} is not an Array<FsGrant>"))?;
+    arr.set(0, AyaFsGrant(grant), 0)
+        .with_context(|| format!("setting {FS_GRANT_MAP_NAME}[0]"))?;
     Ok(())
+}
+
+/// External audit ATP-012: what `FS_GRANT[0]` holds now — the read-back
+/// after a close. `None` without a bpffs or when the pin cannot be read.
+fn read_fs_grant(bpffs_root: Option<&Path>) -> Option<FsGrant> {
+    let pin_path = bpffs_root?.join(FS_GRANT_MAP_NAME);
+    let map_data = MapData::from_pin(&pin_path).ok()?;
+    let arr: AyaArray<_, AyaFsGrant> = AyaArray::try_from(AyaMap::Array(map_data)).ok()?;
+    arr.get(&0, 0).ok().map(|g| g.0)
 }
 
 /// External audit EBPF-001: write the pinned `KILL_GRANT` slot (a zeroed
@@ -508,6 +558,42 @@ mod tests {
         // instantly-stale, but technically-armed, window).
         let window = ov.arm(0, Instant::now());
         assert_eq!(window, Duration::from_secs(1));
+    }
+
+    /// External audit ATP-012: a close whose zeroing of the kernel grant
+    /// failed is recorded as `close_failed`, not as "closed".
+    #[test]
+    fn close_with_unwritable_map_is_recorded_as_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let log = AuditLog::open(&dir.path().join("audit.log"), key, [1u8; 16]).unwrap();
+        // a bpffs root without the FS_GRANT pin, and a session: every map
+        // write fails
+        let empty_root = dir.path().join("bpffs");
+        std::fs::create_dir(&empty_root).unwrap();
+        let ov = TrustedInstallerOverride::new(
+            Some(empty_root),
+            0xABCD,
+            Some(Arc::new(Mutex::new(log))),
+            Duration::from_secs(600),
+        );
+        ov.arm(30, Instant::now());
+        ov.close("ttl_expired");
+        let text = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["op"], "trusted_installer_window_close");
+        assert!(
+            last["result"].as_str().unwrap().starts_with("close_failed"),
+            "{last}"
+        );
+        // and once: a second close finds nothing armed
+        ov.close("ttl_expired");
+        let n = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("trusted_installer_window_close"))
+            .count();
+        assert_eq!(n, 1);
     }
 
     #[test]

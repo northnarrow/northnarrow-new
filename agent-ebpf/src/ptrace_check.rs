@@ -82,7 +82,7 @@ const EPERM: c_int = 1;
 /// agent restarts. External audit EBPF-003: the agent zeroes it on boot,
 /// and the hook honours it only when it carries this boot's session nonce
 /// (`task_kill::AGENT_SESSION`), like `KILL_OVERRIDE` and
-/// `FS_PROTECT_OVERRIDE` — a value left in the map, by an earlier install
+/// `FS_GRANT` — a value left in the map, by an earlier install
 /// or through a map handle, is inert.
 #[map]
 pub static PTRACE_OVERRIDE: Array<u32> = Array::pinned(1, 0);

@@ -11,7 +11,7 @@
 //!
 //! - All LSM programs and anti-tamper maps (`PROTECTED_PIDS`,
 //!   `KILL_GRANT`, `PTRACE_OVERRIDE`, `PROTECTED_INODES`,
-//!   `FS_PROTECT_OVERRIDE`, `FS_PROTECT_EVENTS`) live in the same
+//!   `FS_GRANT`, `FS_PROTECT_EVENTS`) live in the same
 //!   eBPF object as the sensors. Loading that object twice would
 //!   create two independent kernel copies of `PROTECTED_PIDS`, only
 //!   one of which the in-kernel hooks would read, so attaching
@@ -46,7 +46,7 @@ pub mod combat_allow;
 pub mod filesystem;
 pub mod network_isolate;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
-/// trusted-installer FS-pin override (fills the `FS_PROTECT_OVERRIDE`
+/// trusted-installer FS-pin override (fills the `FS_GRANT`
 /// stub the recon flagged).
 pub mod trusted_installer;
 
@@ -67,7 +67,7 @@ use aya::{
     maps::{Array as AyaArray, MapData},
     Btf, Ebpf,
 };
-use common::wire::{InodeKey, KillGrant};
+use common::wire::{FsGrant, InodeKey, KillGrant};
 use rand::RngCore;
 use tracing::{debug, error, info, warn};
 
@@ -159,7 +159,7 @@ pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
     }
 }
 
-// The override maps (`FS_PROTECT_OVERRIDE`, `PTRACE_OVERRIDE`) and
+// The override maps (`FS_GRANT`, `PTRACE_OVERRIDE`) and
 // `KILL_GRANT` are pinned by name, so slot 0 survives an agent restart:
 // [`arm_session`] rolls a fresh per-boot `AGENT_SESSION` nonce, and every
 // slot is zeroed at boot and only honoured by the hooks while it carries
@@ -172,15 +172,16 @@ pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
 pub(crate) const KILL_GRANT_MAP_NAME: &str = "KILL_GRANT";
 pub(crate) const SHUTDOWN_EXE_MAP_NAME: &str = "SHUTDOWN_EXE";
 pub(crate) const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
-/// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
-/// map (mirrors `#[map] pub static FS_PROTECT_OVERRIDE` in
-/// `agent-ebpf/src/inode_protect.rs`). Boot-zeroed + pinned by-name in
-/// [`boot_zero_fs_override`]; armed/disarmed cross-task by
+/// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin grant map
+/// (mirrors `#[map] pub static FS_GRANT` in
+/// `agent-ebpf/src/inode_protect.rs`; external audit ATP-003 — it carries
+/// the deadline). Boot-zeroed + pinned by-name in
+/// [`boot_zero_fs_grant`]; armed/disarmed cross-task by
 /// [`trusted_installer::TrustedInstallerOverride`] via its bpffs path.
-pub(crate) const FS_PROTECT_OVERRIDE_MAP_NAME: &str = "FS_PROTECT_OVERRIDE";
+pub(crate) const FS_GRANT_MAP_NAME: &str = "FS_GRANT";
 /// External audit EBPF-003: the ptrace override map (mirrors `#[map] pub
 /// static PTRACE_OVERRIDE` in `agent-ebpf/src/ptrace_check.rs`). Boot-zeroed
-/// and pinned like [`FS_PROTECT_OVERRIDE_MAP_NAME`].
+/// and pinned like [`FS_GRANT_MAP_NAME`].
 const PTRACE_OVERRIDE_MAP_NAME: &str = "PTRACE_OVERRIDE";
 
 /// Names mirroring `#[lsm(hook = "…")]` declarations in
@@ -320,16 +321,16 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
         );
     }
 
-    // FIM-009 self-upgrade (§15.1): boot-zero + pin FS_PROTECT_OVERRIDE
-    // AFTER arm_session (which rolls AGENT_SESSION) so the override
-    // starts dormant this boot and the kernel's session-nonce compare in
+    // FIM-009 self-upgrade (§15.1): boot-zero + pin FS_GRANT AFTER
+    // arm_session (which rolls AGENT_SESSION) so the window starts closed
+    // this boot and the kernel's session compare in
     // inode_protect::override_active has a fresh nonce to anchor against.
-    if let Err(e) = boot_zero_fs_override(ebpf) {
+    if let Err(e) = boot_zero_fs_grant(ebpf) {
         warn!(
             error = %e,
-            "anti-tamper: FS_PROTECT_OVERRIDE boot-zero/pin FAILED — trusted-installer \
-             override may carry a stale value this boot (FIM-009 §15.1; kernel session-nonce \
-             compare still bounds any stale value to a prior boot)"
+            "anti-tamper: FS_GRANT boot-zero/pin FAILED — the trusted-installer window may \
+             carry a stale grant this boot (FIM-009 §15.1; the kernel's session compare and \
+             deadline still bound it)"
         );
     }
     // External audit EBPF-003: the same for the ptrace override. It was
@@ -688,19 +689,49 @@ pub(crate) struct AyaKillGrant(pub(crate) KillGrant);
 // every bit pattern valid; `AyaKillGrant` is `#[repr(transparent)]`.
 unsafe impl aya::Pod for AyaKillGrant {}
 
+/// aya view of [`FsGrant`].
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct AyaFsGrant(pub(crate) FsGrant);
+
+// SAFETY: `FsGrant` is `#[repr(C)]` over u32, u32, u64 — no padding,
+// every bit pattern valid; `AyaFsGrant` is `#[repr(transparent)]`.
+unsafe impl aya::Pod for AyaFsGrant {}
+
 /// FIM-009 self-upgrade (§15.1): boot-zero + pin the trusted-installer
-/// FS-pin override map. Writing slot 0 to zero on every boot guarantees
-/// the override NEVER survives a restart — the exact caveat the original
-/// `FS_PROTECT_OVERRIDE` stub flagged ("must be zeroed on boot"). A
-/// grant must be re-presented after a reboot. Pinning by-name lets the
-/// `trusted_installer` userland arm/disarm the SAME kernel object via
+/// FS grant map. A zeroed slot on every boot guarantees a window NEVER
+/// survives a restart; a grant must be re-presented. Pinning by name lets
+/// the `trusted_installer` userland arm/disarm the SAME kernel object via
 /// its bpffs path after boot, without re-borrowing the `Ebpf` instance.
 ///
 /// MUST run after [`arm_session`] (which rolls AGENT_SESSION): the
-/// kernel `override_active` compares `FS_PROTECT_OVERRIDE[0]` against the
+/// kernel `override_active` compares the grant's nonce against the
 /// session nonce, so a fresh nonce must already be in place.
-fn boot_zero_fs_override(ebpf: &mut Ebpf) -> Result<()> {
-    boot_zero_override(ebpf, FS_PROTECT_OVERRIDE_MAP_NAME)
+fn boot_zero_fs_grant(ebpf: &mut Ebpf) -> Result<()> {
+    {
+        let map = ebpf
+            .map_mut(FS_GRANT_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {FS_GRANT_MAP_NAME} missing from eBPF object"))?;
+        let mut arr: AyaArray<_, AyaFsGrant> = AyaArray::try_from(map)
+            .with_context(|| format!("{FS_GRANT_MAP_NAME} is not an Array<FsGrant>"))?;
+        arr.set(0, AyaFsGrant(FsGrant::default()), 0)
+            .with_context(|| format!("boot-zeroing {FS_GRANT_MAP_NAME}[0]"))?;
+    }
+    if let Some(root) = prepare_pin_root() {
+        let map_pin_path = root.join(FS_GRANT_MAP_NAME);
+        purge_stale_pin(&map_pin_path);
+        ebpf.map_mut(FS_GRANT_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {FS_GRANT_MAP_NAME} missing from eBPF object"))?
+            .pin(&map_pin_path)
+            .with_context(|| {
+                format!("pinning {FS_GRANT_MAP_NAME} to {}", map_pin_path.display())
+            })?;
+    }
+    info!(
+        map = FS_GRANT_MAP_NAME,
+        "anti-tamper: trusted-installer grant map boot-zeroed + pinned"
+    );
+    Ok(())
 }
 
 /// Zero slot 0 of the override map `map_name` and pin it by name, so an

@@ -24,7 +24,7 @@
 //! Identity policy: each LSM-chain prev-retval is honoured at
 //! `arg(N)` where N = number of kernel args (2 / 2 / 4 / 3 / 3);
 //! a non-zero prior verdict is propagated unchanged. The
-//! [`FS_PROTECT_OVERRIDE`] map is the Tappa 8 escape hatch
+//! [`FS_GRANT`] map is the Tappa 8 escape hatch
 //! (Ed25519-signed admin grant), shipped empty in the Tappa 7 ELF.
 
 use aya_ebpf::{
@@ -46,7 +46,7 @@ use aya_ebpf::{
 // agent host. Do not put printk back in a hot hook; count in a map instead.
 
 use northnarrow_common::wire::{
-    FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
+    FsGrant, FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
     FS_OP_SETATTR, FS_OP_UNLINK, FS_OP_WRITE, FS_PROTECT_MUTATE, FS_PROTECT_READ,
     FS_PROTECT_WRITE, READ_PROTECTED_SLOTS,
 };
@@ -102,12 +102,14 @@ pub static PROTECTED_INODES: HashMap<InodeKey, u8> = HashMap::pinned(1024, 0);
 #[map]
 pub static READ_PROTECTED_INOS: Array<u64> = Array::pinned(READ_PROTECTED_SLOTS, 0);
 
-/// Tappa 8 stub: Ed25519-signed override capability for FS
-/// modification. Non-zero slot 0 = active admin grant, hooks
-/// pass-through. Empty in Tappa 7. Pinned by-name; Tappa-8 caveat:
-/// slot 0 persists across restart and must be zeroed on boot.
+/// The trusted-installer window's kernel half (external audit ATP-003):
+/// slot 0 carries this boot's session nonce and the window's deadline,
+/// written by the agent for a signed grant and zeroed when it closes and
+/// at every boot. Pinned by name. A new map, not `FS_PROTECT_OVERRIDE`
+/// grown to 16 bytes: aya reuses a by-name pin at load, and a 4-byte pin
+/// left by an older agent would fail every deny hook's verification.
 #[map]
-pub static FS_PROTECT_OVERRIDE: Array<u32> = Array::pinned(1, 0);
+pub static FS_GRANT: Array<FsGrant> = Array::pinned(1, 0);
 
 /// Audit ringbuffer for denials. 64 KiB ≈ ~1100
 /// [`FsProtectDenialRaw`] (56 B each). Denials are by definition
@@ -180,32 +182,26 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
 }
 
 /// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
-/// is active iff `FS_PROTECT_OVERRIDE[0]` is non-zero AND equals this
-/// boot's session nonce in [`crate::task_kill::AGENT_SESSION`]`[0]`.
+/// is active while [`FS_GRANT`]`[0]` carries this boot's session nonce
+/// ([`crate::task_kill::AGENT_SESSION`]`[0]`) and its deadline has not
+/// passed ([`FsGrant::active`]).
 ///
-/// Mirrors the `task_kill` PID-1 carve-out shape. The userland agent
-/// arms the override by writing the per-boot session nonce (see
-/// `agent/src/anti_tamper/trusted_installer.rs`) and boot-zeroes
-/// `FS_PROTECT_OVERRIDE` on every start. The session-nonce compare is
-/// the anti-stale-pin backstop: a leftover `FS_PROTECT_OVERRIDE` value
-/// pinned by a PRIOR install cannot re-open the FS pin for THIS boot,
-/// because the freshly-rolled `AGENT_SESSION` nonce won't match it.
-/// (A bare `!= 0` check would honour such a stale value — the original
-/// stub's documented "must be zeroed on boot" caveat, now closed.)
+/// The session compare keeps a grant pinned by an earlier boot from
+/// reopening the pin; the deadline (external audit ATP-003) closes the
+/// window on time even when the agent cannot — before, the slot stayed
+/// armed until an event reached the agent's sweep, and a host whose
+/// event path had stalled kept every protected file, the pin root and
+/// the kexec refusal open past the deadline.
 #[inline(always)]
 pub(crate) fn override_active() -> bool {
-    let ov = match FS_PROTECT_OVERRIDE.get(0) {
-        Some(v) => *v,
-        None => 0,
-    };
-    if ov == 0 {
-        return false;
-    }
     let session = match crate::task_kill::AGENT_SESSION.get(0) {
         Some(v) => *v,
-        None => 0,
+        None => return false,
     };
-    ov == session
+    match FS_GRANT.get(0) {
+        Some(g) => g.active(unsafe { bpf_ktime_get_ns() }, session),
+        None => false,
+    }
 }
 
 /// `(caller tgid << 8) | op` → monotonic ns of the last task-denial record
@@ -537,7 +533,7 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
 /// returns `-EACCES` otherwise), which this deny refuses. Reads
 /// (`FMODE_READ` only — the agent's own O_RDONLY admin.pub load, `cat`,
 /// the init system reading a unit) pass through. Routes through the
-/// shared `deny_if_protected`, so the FS_PROTECT_OVERRIDE +
+/// shared `deny_if_protected`, so the FS_GRANT +
 /// PROTECTED_PIDS exemptions (the agent's own rename-based rotation /
 /// chain-log appends / signed self-upgrade) are inherited, not
 /// re-implemented.

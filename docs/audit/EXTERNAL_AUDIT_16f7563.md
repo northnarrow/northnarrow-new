@@ -137,12 +137,12 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-091 | MAIN-006 | Agent main | M | open |
 | NN-AUD-092 | MAIN-007 | Agent main | M | open |
 | NN-AUD-093 | MAIN-008 | Agent main | S | open |
-| NN-AUD-094 | ATP-003 | Anti-tamper | S | open |
+| NN-AUD-094 | ATP-003 | Anti-tamper | S | fixed (lab PR 114) |
 | NN-AUD-095 | ATP-005 | Anti-tamper | S | open |
 | NN-AUD-096 | ATP-008 | Anti-tamper | M | fixed (lab PR 113) |
 | NN-AUD-097 | ATP-009 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-098 | ATP-010 | Anti-tamper | M | open |
-| NN-AUD-099 | ATP-012 | Anti-tamper | S | open |
+| NN-AUD-099 | ATP-012 | Anti-tamper | S | fixed (lab PR 114) |
 | NN-AUD-100 | ATP-013 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-101 | EBPF-004 | eBPF kernel | M | fixed (lab PR 112) |
 | NN-AUD-102 | EBPF-008 | eBPF kernel | S | fixed (lab PR 113) |
@@ -1744,3 +1744,30 @@ the audit did not report, noted with the fix that takes them.
     in three new tamper-check cases — C44 and C45 with
     `deploy/lab/adversarial/fsxattr-probe.c`, C46 the append — and the
     anti-tamper suite OK.
+- **NN-AUD-094 (ATP-003), NN-AUD-099 (ATP-012), lab PR 114.** The
+  trusted-installer window's kernel half had no deadline. The hooks read
+  `FS_PROTECT_OVERRIDE`, which held the session nonce alone; only the
+  agent's sweep on the event path zeroed it, so a host whose events had
+  stopped (a saturated ring, a dead pump, the telemetry probe off, an
+  agent that died in the window) kept every protected file — and, since
+  review 82, the kexec refusal and the pin root's protection — open past
+  the deadline. And a close whose zeroing failed was recorded as "closed".
+  - `FsGrant { nonce, expires_ns }` in a new pinned map `FS_GRANT` (a new
+    name: aya reuses a by-name pin at load, and an older agent's 4-byte
+    `FS_PROTECT_OVERRIDE` pin would fail the hooks' verification). The
+    hooks test the session and the deadline themselves
+    (`FsGrant::active`, `bpf_ktime_get_ns`), as for `KILL_GRANT`; the
+    window's one deadline is written into both grants.
+  - A one-second ticker closes the window — and records it — at the
+    deadline, not at the next event, and retries a failed zeroing.
+  - ATP-012: a close is read back; a zeroing that failed, or that the map
+    does not show, is an ERROR and a signed `close_failed` entry (the
+    kernel's deadline still ends the window).
+  - Lab, Debian 12 (6.1): a 20-s window, then a process started inside it
+    opens `agent_id` for writing at t=25 s, executing nothing in between.
+    Before: allowed — the window was still open in the kernel 5 s past
+    its deadline, closed only when an event reached the agent. After: the
+    ticker closed it at t≈20.8 s with a signed `closed: ttl_expired`, and
+    the open was refused. With the agent's cgroup frozen for the whole
+    window (no ticker, no event path): allowed at t=10 s, refused at
+    t=25 s — the kernel's deadline alone.

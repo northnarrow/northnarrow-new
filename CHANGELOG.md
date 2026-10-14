@@ -6,6 +6,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the trusted-installer window (Medium ATP-003,
+  ATP-012): the window ends at its deadline in the kernel itself — before,
+  a host whose events had stopped kept every protected file, the kexec
+  refusal and the pin root's protection open until something reached the
+  agent. The agent closes and records it on time, and a close that failed
+  is recorded as failed.
 - External audit, Wave 2, the filesystem deny (Medium EBPF-008, ATP-008):
   root could clear the immutable flag of the state directory, or make
   `audit.log` append-only to the agent, through the fsxattr interface

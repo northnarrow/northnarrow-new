@@ -92,7 +92,7 @@ pub static SHUTDOWN_EXE: Array<InodeKey> = Array::pinned(1, 0);
 /// BUG-010 (PHASE 15.1): per-boot session nonce. The agent picks a
 /// fresh random u32 at boot and writes it here before LSM attach. Every
 /// override and grant the hooks honour ([`KILL_GRANT`],
-/// `FS_PROTECT_OVERRIDE`, `PTRACE_OVERRIDE`) must carry it, so a value
+/// `FS_GRANT`, `PTRACE_OVERRIDE`) must carry it, so a value
 /// pinned by an earlier run is dead after a restart.
 #[map]
 pub static AGENT_SESSION: Array<u32> = Array::pinned(1, 0);
