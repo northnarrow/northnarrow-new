@@ -957,8 +957,14 @@ fn a_model_that_fails_to_load_leaves_the_ade_off() {
     let tmp = tempfile::TempDir::new().unwrap();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let model = tmp.path().join("m.gguf");
+    let tokenizer = tmp.path().join("m.tokenizer.json");
     std::fs::write(&model, b"junk").unwrap();
-    std::fs::write(tmp.path().join("m.tokenizer.json"), b"{}").unwrap();
+    std::fs::write(&tokenizer, b"{}").unwrap();
+    // The mode, not the umask (0002 in a login shell on Ubuntu), decides
+    // whether the trust check lets the load reach the GGUF parser.
+    for p in [&model, &tokenizer] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
     let cfg = AdeConfig::default().with_model_path(model);
     match build_default_backend(&cfg) {
         Err(AdeError::Backend(why)) => assert!(why.contains("GGUF"), "{why}"),

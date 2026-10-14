@@ -67,5 +67,5 @@ test-privileged = []
 [dev-dependencies]
 tempfile = "3"
 # External audit WDG-001: tests sign shutdown markers as the admins do.
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 hex = "0.4"

@@ -1119,11 +1119,20 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
         Ok(m) => m,
         Err(r) => return refuse(c, &raw, r.to_string()),
     };
+    // External audit AUT-004: the agent's key set — a malformed line costs
+    // its own key, as in the agent, so both judge the marker with the same
+    // keys.
     let keys = match std::fs::read_to_string(c.admin_pub)
-        .map_err(|e| e.to_string())
-        .and_then(|body| common::admin_quorum::parse_admin_pub(&body))
+        .map(|body| common::admin_quorum::parse_admin_pub_lenient(&body).keys)
     {
-        Ok(k) => k,
+        Ok(k) if !k.is_empty() => k,
+        Ok(_) => {
+            return refuse(
+                c,
+                &raw,
+                format!("{}: no valid admin key", c.admin_pub.display()),
+            )
+        }
         Err(e) => return refuse(c, &raw, format!("{}: {e}", c.admin_pub.display())),
     };
     let agent_id = match std::fs::read_to_string(c.agent_id_file)

@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the admin key files (Medium AUT-003, AUT-004,
+  MAIN-005, AUT-002): a link planted in `/etc/northnarrow` no longer makes
+  the agent write through it when it replaces `admin.pub` or a signed
+  overlay — a key rotation could truncate the audit log. A malformed line
+  in `admin.pub` costs its own key, recorded, instead of the admin socket.
+  `nn-admin verify-keys` accepts the `admin.pub` install.sh writes and
+  shows each key's roles; the CLI refuses an admin private key others can
+  read.
 - External audit, Wave 2, the trusted-installer window (Medium ATP-003,
   ATP-012): the window ends at its deadline in the kernel itself — before,
   a host whose events had stopped kept every protected file, the kexec

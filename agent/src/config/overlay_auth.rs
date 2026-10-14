@@ -22,7 +22,6 @@
 //! anyway, still reported, and is itself a weakening-environment finding.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -147,19 +146,10 @@ pub fn store(path: &Path, content: &str, sig: &OverlaySignature) -> Result<PathB
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("bad file name {}", target.display()))?;
-        let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(body.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &target)
-            .with_context(|| format!("renaming {} → {}", tmp.display(), target.display()))?;
+        // External audit AUT-003: never through a link planted at the
+        // temporary name (the agent writes where nobody else may).
+        crate::atomic_file::replace(&target, body.as_bytes(), 0o644)
+            .with_context(|| format!("replacing {} in {}", name, dir.display()))?;
         if let Err(e) = crate::anti_tamper::filesystem::reregister_protected_file(
             crate::anti_tamper::prepare_pin_root(),
             &target,

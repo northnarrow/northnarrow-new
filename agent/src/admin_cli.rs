@@ -17,7 +17,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -114,6 +114,12 @@ pub struct StatusOutcome {
 #[derive(Debug)]
 pub struct VerifyKeysOutcome {
     pub fingerprints: Vec<String>,
+    /// External audit MAIN-005: each key's roles, as the agent reads them
+    /// (parallel to `fingerprints`).
+    pub roles: Vec<String>,
+    /// `(line number, reason)` of the lines that are not a key — the agent
+    /// skips them (external audit AUT-004).
+    pub skipped: Vec<(usize, String)>,
 }
 
 #[derive(Debug)]
@@ -134,9 +140,13 @@ pub fn run_init(priv_out: &Path, pub_append: &Path, force: bool) -> Result<InitO
     let fp = pubkey_fingerprint(&verifying);
 
     // Private key: 64 hex chars + newline. Mode 0600. create_new
-    // unless --force overrides; if --force, truncate.
+    // unless --force overrides; if --force, truncate — never through a
+    // link, and with the mode reset (external audit AUT-002: an existing
+    // 0644 file kept its mode).
     let mut opts = OpenOptions::new();
-    opts.write(true).mode(0o600);
+    opts.write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     if force {
         opts.create(true).truncate(true);
     } else {
@@ -145,8 +155,10 @@ pub fn run_init(priv_out: &Path, pub_append: &Path, force: bool) -> Result<InitO
     let mut f = opts
         .open(priv_out)
         .with_context(|| format!("writing private key to {}", priv_out.display()))?;
-    let priv_hex = hex::encode(signing.to_bytes());
-    writeln!(f, "{priv_hex}").context("writing private key bytes")?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting mode 0600 on {}", priv_out.display()))?;
+    let priv_hex = zeroize::Zeroizing::new(hex::encode(signing.to_bytes()));
+    writeln!(f, "{}", priv_hex.as_str()).context("writing private key bytes")?;
     drop(f);
 
     // Public key: append-or-create with mode 0644. We do NOT chmod
@@ -442,29 +454,31 @@ pub fn run_force_posture(
 pub fn run_verify_keys(path: &Path) -> Result<VerifyKeysOutcome> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut fingerprints = Vec::new();
-    for (idx, raw) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.len() != 64 {
-            bail!(
-                "{}:{}: pub key must be 64 hex chars (got {})",
-                path.display(),
-                line_no,
-                line.len()
-            );
-        }
-        let bytes = hex::decode(line)
-            .map_err(|e| anyhow!("{}:{}: invalid hex ({e})", path.display(), line_no))?;
-        let arr: [u8; 32] = bytes.try_into().expect("hex pre-validated");
-        let vk = VerifyingKey::from_bytes(&arr)
-            .map_err(|e| anyhow!("{}:{}: not a valid pubkey ({e})", path.display(), line_no))?;
-        fingerprints.push(pubkey_fingerprint(&vk));
-    }
-    Ok(VerifyKeysOutcome { fingerprints })
+    // External audit MAIN-005: the agent's own parser — a key line may carry
+    // its role list (`<hex> unlock,audit-read`, as install.sh writes it),
+    // which a check for exactly 64 characters refused.
+    let parsed = common::admin_quorum::parse_admin_pub_lenient(&content);
+    let fingerprints = parsed
+        .keys
+        .iter()
+        .map(|k| pubkey_fingerprint(&k.key))
+        .collect();
+    let roles = parsed
+        .keys
+        .iter()
+        .map(|k| {
+            k.roles
+                .iter()
+                .map(|r| crate::anti_tamper::admin_auth::role_keyword(*r))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    Ok(VerifyKeysOutcome {
+        fingerprints,
+        roles,
+        skipped: parsed.skipped,
+    })
 }
 
 // ── Tappa 8 A13 — rotate-keys add / revoke ──────────────────────────
@@ -1670,9 +1684,41 @@ pub fn pubkey_fingerprint(vk: &VerifyingKey) -> String {
     hex::encode(&digest[..4])
 }
 
+/// External audit AUT-002: an admin key file group- or other-accessible,
+/// or owned by another user, is refused — OpenSSH's rule for identity
+/// files. `NN_ADMIN_ALLOW_LOOSE_KEY=1` accepts it anyway: a key on a vfat
+/// stick shows 0644/0755, and COMBAT recovery must not stop at a mode bit.
+pub const ALLOW_LOOSE_KEY_ENV: &str = "NN_ADMIN_ALLOW_LOOSE_KEY";
+
 fn read_priv_key(path: &Path) -> Result<SigningKey> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading private key {}", path.display()))?;
+    use std::os::unix::fs::MetadataExt;
+    use zeroize::Zeroizing;
+    if std::env::var(ALLOW_LOOSE_KEY_ENV).as_deref() != Ok("1") {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("reading private key {}", path.display()))?;
+        if meta.mode() & 0o077 != 0 {
+            bail!(
+                "private key {} is accessible to group or others (mode {:o}): `chmod 600` it \
+                 (or set {ALLOW_LOOSE_KEY_ENV}=1 for read-only media)",
+                path.display(),
+                meta.mode() & 0o7777
+            );
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            bail!(
+                "private key {} belongs to uid {}, not to this user (uid {euid})",
+                path.display(),
+                meta.uid()
+            );
+        }
+    }
+    // The key's bytes are wiped when these go out of scope.
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading private key {}", path.display()))?,
+    );
     let line = raw
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -1685,8 +1731,11 @@ fn read_priv_key(path: &Path) -> Result<SigningKey> {
             path.display()
         );
     }
-    let bytes = hex::decode(line).map_err(|e| anyhow!("private key hex decode failed: {e}"))?;
-    let arr: [u8; 32] = bytes.try_into().expect("hex pre-validated");
+    let bytes = Zeroizing::new(
+        hex::decode(line).map_err(|e| anyhow!("private key hex decode failed: {e}"))?,
+    );
+    let mut arr = Zeroizing::new([0u8; 32]);
+    arr.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&arr))
 }
 
@@ -2491,6 +2540,13 @@ pub fn run_config_overlay_sign(
 mod tests {
     use super::*;
 
+    /// A private key file as `nn-admin init` and install.sh leave it: 0600
+    /// (external audit AUT-002: `read_priv_key` refuses anything looser).
+    fn write_priv_key_file(path: &Path, key: &SigningKey) {
+        std::fs::write(path, format!("{}\n", hex::encode(key.to_bytes()))).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     /// External audit EVD-001: the verifier reads the published public
     /// half; without it, a host from before parses the key; it never mints
     /// one.
@@ -2621,12 +2677,69 @@ mod tests {
     }
 
     #[test]
-    fn cli_verify_keys_errors_on_malformed_hex() {
+    fn cli_verify_keys_reports_bad_line_keeps_others() {
         let dir = TempDir::new().unwrap();
         let pub_path = dir.path().join("admin.pub");
-        std::fs::write(&pub_path, "not-64-hex-chars\n").unwrap();
-        let err = run_verify_keys(&pub_path).unwrap_err();
-        assert!(err.to_string().contains(":1:"), "got: {err}");
+        let good = hex::encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        std::fs::write(&pub_path, format!("not-64-hex-chars\n{good}\n")).unwrap();
+        let out = run_verify_keys(&pub_path).expect("verify");
+        assert_eq!(out.fingerprints.len(), 1);
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].0, 1, "names the line");
+    }
+
+    /// External audit AUT-002.
+    #[test]
+    fn read_priv_key_refuses_group_readable() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("admin.key");
+        let k = SigningKey::generate(&mut OsRng);
+        std::fs::write(&p, format!("{}\n", hex::encode(k.to_bytes()))).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_priv_key(&p).unwrap_err();
+        assert!(err.to_string().contains("chmod 600"), "{err}");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_priv_key(&p).unwrap().to_bytes(), k.to_bytes());
+    }
+
+    /// External audit AUT-002: `init --force` over a 0644 file leaves a
+    /// 0600 one, and never writes through a link.
+    #[test]
+    fn run_init_force_resets_mode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("admin.key");
+        std::fs::write(&key, "old").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        run_init(&key, &dir.path().join("admin.pub"), true).unwrap();
+        assert_eq!(std::fs::metadata(&key).unwrap().mode() & 0o7777, 0o600);
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "KEEP").unwrap();
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(run_init(&link, &dir.path().join("admin2.pub"), true).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "KEEP");
+    }
+
+    /// External audit MAIN-005: the line shape install.sh writes.
+    #[test]
+    fn cli_verify_keys_accepts_role_token_and_prints_roles() {
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("admin.pub");
+        let k = hex::encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        std::fs::write(
+            &pub_path,
+            format!("{k} unlock,audit-read,trusted-installer\n"),
+        )
+        .unwrap();
+        let out = run_verify_keys(&pub_path).expect("verify");
+        assert_eq!(out.fingerprints.len(), 1);
+        assert!(out.skipped.is_empty());
+        assert!(
+            out.roles[0].contains("trusted-installer"),
+            "{:?}",
+            out.roles
+        );
     }
 
     // ── socket commands (mock server) ──────────────────────────────
@@ -2674,7 +2787,7 @@ mod tests {
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
         let signing = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_path, &signing);
 
         let vk = signing.verifying_key();
         let nonce = [0x11u8; 32];
@@ -2719,7 +2832,7 @@ mod tests {
         let priv_path = dir.path().join("admin.key");
         let agent_id_path = dir.path().join("agent_id");
         let signing = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_path, &signing);
         let vk = signing.verifying_key();
         let nonce = [0x33u8; 32];
 
@@ -2766,7 +2879,7 @@ mod tests {
         let priv_path = dir.path().join("admin.key");
         let agent_id_path = dir.path().join("agent_id");
         let signing = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_path, &signing);
 
         let server = spawn_mock_server(&socket, move |stream| {
             let _ = server_read_frame(stream); // ChallengeRequest
@@ -2793,7 +2906,7 @@ mod tests {
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
         let signing = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_path, &signing);
 
         let server = spawn_mock_server(&socket, move |stream| {
             match server_read_frame(stream) {
@@ -2829,7 +2942,7 @@ mod tests {
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
         let signing = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_path, format!("{}\n", hex::encode(signing.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_path, &signing);
 
         let server = spawn_mock_server(&socket, move |stream| {
             let _ = server_read_frame(stream);
@@ -2931,8 +3044,8 @@ mod tests {
         let priv_b = dir.path().join("admin_b.key");
         let signing_a = SigningKey::generate(&mut OsRng);
         let signing_b = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_a, format!("{}\n", hex::encode(signing_a.to_bytes()))).unwrap();
-        std::fs::write(&priv_b, format!("{}\n", hex::encode(signing_b.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_a, &signing_a);
+        write_priv_key_file(&priv_b, &signing_b);
         let agent_id: [u8; 16] = [0x9Au8; 16];
         let agent_id_path = write_agent_id_file(&dir, &agent_id);
 
@@ -2999,8 +3112,8 @@ mod tests {
         let priv_b = dir.path().join("admin_b.key");
         let signing_a = SigningKey::generate(&mut OsRng);
         let signing_b = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_a, format!("{}\n", hex::encode(signing_a.to_bytes()))).unwrap();
-        std::fs::write(&priv_b, format!("{}\n", hex::encode(signing_b.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_a, &signing_a);
+        write_priv_key_file(&priv_b, &signing_b);
         let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
 
         let socket_for_client = socket.clone();
@@ -3046,8 +3159,8 @@ mod tests {
         let priv_b = dir.path().join("admin_b.key");
         let signing_a = SigningKey::generate(&mut OsRng);
         let signing_b = SigningKey::generate(&mut OsRng);
-        std::fs::write(&priv_a, format!("{}\n", hex::encode(signing_a.to_bytes()))).unwrap();
-        std::fs::write(&priv_b, format!("{}\n", hex::encode(signing_b.to_bytes()))).unwrap();
+        write_priv_key_file(&priv_a, &signing_a);
+        write_priv_key_file(&priv_b, &signing_b);
         let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
 
         let socket_for_client = socket.clone();

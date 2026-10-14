@@ -195,6 +195,8 @@ pub struct AdminAuth {
     /// the agent uses, not a file re-read at request time (a bind mount
     /// or a rewrite could present a one-key file).
     loaded_admin_pub: RwLock<Vec<u8>>,
+    /// External audit AUT-004: the lines of that file that are not a key.
+    skipped_lines: RwLock<Vec<(usize, String)>>,
     /// External audit ATP-004: a second key was added once (the signed
     /// audit chain shows a `rotate_keys_add`, or this run added one): the
     /// 1-of-N bootstrap relaxation never applies again.
@@ -235,28 +237,33 @@ impl AdminAuth {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
 
-        let mut pub_keys = Vec::new();
-        for (idx, raw) in content.lines().enumerate() {
-            let line_no = idx + 1;
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let entry = parse_admin_line(line)
-                .map_err(|e| anyhow!("{}:{}: {e}", config_path.display(), line_no))?;
-            pub_keys.push(entry);
-        }
+        // External audit AUT-004: a malformed line costs its own key, not
+        // the admin socket.
+        let parsed = admin_quorum::parse_admin_pub_lenient(&content);
+        report_skipped(config_path, &parsed.skipped);
+        let pub_keys = parsed.keys;
 
         if pub_keys.is_empty() {
+            let skipped: Vec<String> = parsed
+                .skipped
+                .iter()
+                .map(|(n, why)| format!("{}:{n}: {why}", config_path.display()))
+                .collect();
             return Err(anyhow!(
-                "{}: no admin pub keys found (need at least one)",
-                config_path.display()
+                "{}: no admin pub keys found (need at least one){}",
+                config_path.display(),
+                if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!("; skipped {}", skipped.join("; "))
+                }
             ));
         }
 
         let mut auth =
             Self::build_entries_with_agent_id(pub_keys, DEFAULT_RATE_LIMIT_WINDOW, agent_id);
         *auth.loaded_admin_pub.write() = content.as_bytes().to_vec();
+        *auth.skipped_lines.write() = parsed.skipped;
         // A13: remember the file we loaded from so the
         // rotate-keys dispatcher can atomically rewrite + reload
         // without an extra path threading through `dispatch()`.
@@ -289,17 +296,9 @@ impl AdminAuth {
     pub fn reload(&self, config_path: &Path) -> Result<()> {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading {}", config_path.display()))?;
-        let mut new_keys = Vec::new();
-        for (idx, raw) in content.lines().enumerate() {
-            let line_no = idx + 1;
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let entry = parse_admin_line(line)
-                .map_err(|e| anyhow!("{}:{}: {e}", config_path.display(), line_no))?;
-            new_keys.push(entry);
-        }
+        let parsed = admin_quorum::parse_admin_pub_lenient(&content);
+        report_skipped(config_path, &parsed.skipped);
+        let new_keys = parsed.keys;
         if new_keys.is_empty() {
             return Err(anyhow!(
                 "{}: refusing to reload an empty admin.pub (would soft-brick the agent)",
@@ -308,7 +307,14 @@ impl AdminAuth {
         }
         *self.pub_keys.write() = new_keys;
         *self.loaded_admin_pub.write() = content.into_bytes();
+        *self.skipped_lines.write() = parsed.skipped;
         Ok(())
+    }
+
+    /// External audit AUT-004: the `admin.pub` lines the last load or
+    /// reload skipped, `(line number, reason)` — for the signed record.
+    pub fn skipped_lines(&self) -> Vec<(usize, String)> {
+        self.skipped_lines.read().clone()
     }
 
     /// Test-only: snapshot the current in-memory key fingerprints.
@@ -368,6 +374,7 @@ impl AdminAuth {
             agent_id,
             config_path: None,
             loaded_admin_pub: RwLock::new(Vec::new()),
+            skipped_lines: RwLock::new(Vec::new()),
             bootstrap_consumed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1034,6 +1041,18 @@ impl AdminAuth {
 // (§3.2). Helpers consumed by AdminAuth::load above.
 // ────────────────────────────────────────────────────────────────────
 
+/// External audit AUT-004: a skipped `admin.pub` line is an ERROR, each.
+fn report_skipped(config_path: &Path, skipped: &[(usize, String)]) {
+    for (line, reason) in skipped {
+        tracing::error!(
+            path = %config_path.display(),
+            line,
+            reason = %reason,
+            "admin.pub line skipped — its key is not loaded (the other keys are)"
+        );
+    }
+}
+
 /// Parse one already-trimmed, non-comment, non-blank admin.pub
 /// line into a [`KeyEntry`] ([`admin_quorum::parse_admin_line`]).
 fn parse_admin_line(line: &str) -> Result<KeyEntry> {
@@ -1231,25 +1250,10 @@ pub fn role_keyword(r: Role) -> &'static str {
 }
 
 fn write_admin_pub_atomically(config_path: &Path, body: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut tmp = config_path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp_path = PathBuf::from(tmp);
-    {
-        // 0644 matches the pre-rotation admin.pub layout (design
-        // §6.5 / §8.1: world-readable so non-root admin tools can
-        // inspect, root-only writable).
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(&tmp_path)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, config_path)
+    // 0644 matches the pre-rotation admin.pub layout (design §6.5 / §8.1:
+    // world-readable so non-root admin tools can inspect, root-only
+    // writable). External audit AUT-003: never through a planted link.
+    crate::atomic_file::replace(config_path, body.as_bytes(), 0o644)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1449,14 +1453,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_malformed_line_with_line_number() {
+    fn load_skips_malformed_line_keeps_valid_keys() {
         let (_, vk) = make_keypair();
         let good = hex::encode(vk.to_bytes());
-        // Comment + good + bad on line 3
+        // Comment + good + bad on line 3: external audit AUT-004 — the bad
+        // line costs its own key, not the admin socket.
         let f = write_config(&["# header", &good, "not-hex-at-all-zz"]);
-        let err = AdminAuth::load(f.path()).unwrap_err();
-        let s = err.to_string();
-        assert!(s.contains(":3:"), "expected line 3 in error, got: {s}");
+        let auth = AdminAuth::load(f.path()).expect("the good key loads");
+        assert_eq!(auth.pub_keys.read().len(), 1);
+        let skipped = auth.skipped_lines();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, 3, "names line 3");
     }
 
     #[test]
