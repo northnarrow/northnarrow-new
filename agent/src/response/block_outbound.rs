@@ -107,8 +107,9 @@ pub fn block_outbound_for_pid(
         return io_failed(pid, "apply_block_ruleset", &e);
     }
     // External audit CMB-011: a process already in the scope (a child
-    // forked after its parent was moved) needs no write.
-    if pid_in_blocked_scope(pid, cfg) {
+    // forked after its parent was moved) needs no write — nor one in a
+    // kill cgroup below it (CMB-019): moving it would take it out of a kill.
+    if pid_under_blocked_scope(pid, cfg) {
         debug!(pid, "already in the blocked scope");
         return ExecutionOutcome::Blocked { pid };
     }
@@ -167,6 +168,21 @@ pub fn pid_in_blocked_scope(pid: u32, cfg: &ExecutorConfig) -> bool {
         .is_ok_and(|c| cgroup_is(&c, &cfg.blocked_cgroup_match()))
 }
 
+/// Whether the process is in the blocked scope or in a cgroup below it (a
+/// kill cgroup, `neutralize-*`): the drop holds in both.
+pub fn pid_under_blocked_scope(pid: u32, cfg: &ExecutorConfig) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .is_ok_and(|c| cgroup_is_or_below(&c, &cfg.blocked_cgroup_match()))
+}
+
+fn cgroup_is_or_below(proc_cgroup: &str, rel: &str) -> bool {
+    cgroup_is(proc_cgroup, rel)
+        || proc_cgroup.lines().any(|l| {
+            l.strip_prefix("0::")
+                .is_some_and(|path| path.contains(&format!("/{rel}/")))
+        })
+}
+
 /// Whether a `/proc/<pid>/cgroup` text puts the process in the cgroup v2
 /// path that ends with `rel` (`northnarrow.slice/blocked.scope`).
 fn cgroup_is(proc_cgroup: &str, rel: &str) -> bool {
@@ -177,21 +193,7 @@ fn cgroup_is(proc_cgroup: &str, rel: &str) -> bool {
     })
 }
 
-/// `starttime` (field 22 of `/proc/<pid>/stat`, after the `(comm)` field,
-/// which may hold spaces or parentheses): with the PID, the process.
-pub fn proc_start_ticks(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat_start_ticks(&stat)
-}
-
-fn stat_start_ticks(stat: &str) -> Option<u64> {
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
-}
+pub use super::proc_ref::proc_start_ticks;
 
 /// Construct the canonical idempotent ruleset for the block chain.
 /// Pure: takes only the config and returns a string. Unit-tested
@@ -391,6 +393,19 @@ mod tests {
         assert!(!cgroup_is("0::/system.slice/ssh.service\n", rel));
         assert!(!cgroup_is("0::/\n", rel));
         assert!(!cgroup_is("0::/northnarrow.slice/blocked.scope.bak\n", rel));
+        // a kill cgroup below the scope: under it, not in it (a release
+        // does not take it out of a kill)
+        let kill = "0::/northnarrow.slice/blocked.scope/neutralize-7-0\n";
+        assert!(!cgroup_is(kill, rel));
+        assert!(cgroup_is_or_below(kill, rel));
+        assert!(cgroup_is_or_below(
+            "0::/northnarrow.slice/blocked.scope\n",
+            rel
+        ));
+        assert!(!cgroup_is_or_below(
+            "0::/northnarrow.slice/blocked.scope.bak/x\n",
+            rel
+        ));
         // our own process is in none of the agent's scopes
         let cfg = ExecutorConfig {
             dry_run: false,
@@ -401,14 +416,6 @@ mod tests {
             release_blocked_pid(me, proc_start_ticks(me), &cfg).unwrap(),
             Release::Skipped("not in the blocked scope")
         );
-    }
-
-    #[test]
-    fn start_ticks_survive_a_comm_with_spaces_and_parens() {
-        let stat = "42 (a b) c) S 1 42 42 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 98765 1000 100";
-        assert_eq!(stat_start_ticks(stat), Some(98765));
-        let me = std::process::id();
-        assert!(proc_start_ticks(me).is_some());
     }
 
     #[test]

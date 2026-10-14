@@ -96,6 +96,15 @@ impl ExecutorConfig {
 
     /// Cgroup-v2 socket-match name for the blocked scope, relative
     /// to the cgroup root, as nftables expects it.
+    /// External audit CMB-019: the cgroup a tree is moved into to be
+    /// frozen and killed — under `blocked.scope`, so the soft egress drop
+    /// (`socket cgroupv2 level 2`, which matches every cgroup below the
+    /// scope) still holds while it is killed.
+    pub fn kill_cgroup_dir(&self, n: u64) -> PathBuf {
+        self.blocked_cgroup_dir()
+            .join(format!("neutralize-{}-{n}", std::process::id()))
+    }
+
     pub fn blocked_cgroup_match(&self) -> String {
         format!("{}/blocked.scope", self.cgroup_slice)
     }

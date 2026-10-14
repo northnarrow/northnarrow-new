@@ -181,7 +181,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-135 | POS-005 | Posture | M | open |
 | NN-AUD-136 | POS-009 | Posture | M | open |
 | NN-AUD-137 | POS-015 | Posture | M | open |
-| NN-AUD-138 | CMB-004 | Combat response | L | open |
+| NN-AUD-138 | CMB-004 | Combat response | L | fixed (lab PR 120) |
 | NN-AUD-139 | CMB-007 | Combat response | M | fixed (lab PR 119) |
 | NN-AUD-140 | CMB-008 | Combat response | M | already fixed (lab PR 77; lab PR 100, with NN-AUD-046) |
 | NN-AUD-141 | CMB-009 | Combat response | S | already fixed (lab PR 103, with NN-AUD-050) |
@@ -193,7 +193,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-147 | CMB-015 | Combat response | S | open |
 | NN-AUD-148 | CMB-016 | Combat response | M | open |
 | NN-AUD-149 | CMB-017 | Combat response | S | open |
-| NN-AUD-150 | CMB-019 | Combat response | M | open |
+| NN-AUD-150 | CMB-019 | Combat response | M | fixed (lab PR 120) |
 | NN-AUD-151 | LLMP-003 | LLM prompts | S | open |
 | NN-AUD-152 | LLMP-004 | LLM prompts | S | open |
 | NN-AUD-153 | LLMP-006 | LLM prompts | S | open |
@@ -2055,3 +2055,94 @@ the audit did not report, noted with the fix that takes them.
       the per-child case above. The anti-tamper suite: OK.
       Privileged gate: Ubuntu 24.04 (6.8) and Debian 12 (6.1), 29
       suites, 74 passed, 0 failed each.
+- **NN-AUD-138 (CMB-004), NN-AUD-150 (CMB-019), lab PR 120.** Process
+  identity in kills.
+  - CMB-004: the response paths held bare PIDs — the ladder's offenders (a
+    `BTreeSet<u32>` killed up to 30 s after the attribution), the tree
+    kill's `/proc` snapshot, the verdict paths — and signalled them with
+    `kill(2)`. A process that exits frees its PID for the next one. A
+    `ProcRef` (`response/proc_ref.rs`) captures a process when it is
+    attributed: a pidfd and its start time, checked against what the
+    event says about it — the exec's `start_ns`, or, for an event without
+    it, the event's time (a process that started after the event holds a
+    reused PID). Kills go through `pidfd_send_signal(2)` and wait for the
+    death by polling the pidfd; the ladder's offenders, its soft blocks and
+    its releases are captured processes; the rule and ADE verdicts capture
+    the process their event names (the ADE verdict comes seconds after its
+    event). The watchdog keeps its own copy of the three syscalls
+    (`common` is shared with the no_std eBPF crate).
+  - CMB-004, the lookups by PID behind the kills (found re-checking this
+    lot, with an independent review): a walk for the descendants of a root
+    that has exited found those of the process holding its PID by then
+    (the root's own were reparented) and killed them; the walk now counts
+    only while the PID still names the captured root, checked after it.
+    The ladder took a process spawned by any holder of an offender's PID
+    for the offender's child, and a connection by it for exfiltration: the
+    parent is matched by the captured identity — alive, or by its start
+    (`parent_start_ns` against the start captured, the zombie's included,
+    or its exec's), or started by a time the offender was running (the
+    event that attributed it: the PID was the offender's then). A new process of the tree
+    on the PID of an offender that has exited is attributed in its place.
+    An offender that has exited is gone before the host-critical guard,
+    which looks at the PID: one now held by an sshd child was "spared",
+    and the ladder isolated the host for it. A process that cannot be
+    captured (`pidfd_open` out of descriptors) is reported failed —
+    NEUTRALIZE escalates — not gone.
+  - CMB-019, worse than reported: the tree was snapshotted once and killed
+    PID by PID, root first; a tree that keeps forking left survivors that
+    were not in the snapshot (their parent killed, they are reparented and
+    no later walk finds them), and NEUTRALIZE reported it contained. The
+    tree is now moved into `northnarrow.slice/blocked.scope/neutralize-<n>`
+    (below the blocked scope: the egress drop still holds), walking `/proc`
+    again until no descendant is left outside (a child forked by a moved
+    process is born inside), then frozen (`cgroup.freeze`), swept again
+    until nothing more moves, and killed (`cgroup.kill`, kernel 5.14+).
+    Each member is then checked by its identity, not by `cgroup.procs`: one
+    still running — moved out before the kill, by a concurrent action or by
+    itself — is killed on its own, or reported failed. The waits are short
+    (100 ms for the freeze, 500 ms for the kill): a rule's kill is waited
+    for in the event loop. A descendant not captured, not moved, or a walk
+    that failed is reported, not dropped. A kill cgroup is never reused,
+    and the ones an agent left in the middle of a kill are finished and
+    removed at start; a block verdict does not move a process out of one.
+    Without cgroup v2 at the configured root or without `cgroup.kill`, the
+    per-process path runs, each descendant by the start time it had in the
+    snapshot. The walk is depth-first; the doc said breadth-first.
+  - A walk that reaches its limit (65,536 descendants in the cgroup path)
+    leaves the rest outside the cgroup: the outcome says `TreeTruncated`
+    and NEUTRALIZE escalates, as the per-process path already did.
+  - Found by the lab: a pidfd per offender is a descriptor, and the agent
+    ran with the default soft `RLIMIT_NOFILE` of 1024 — 900 attributed
+    children took it to 1012 and the quarantine failed with EMFILE. The
+    agent raises the soft limit to the hard one (at most 65,536) at start,
+    and the ladder drops the pidfd of an offender that has exited (the
+    identity is kept, so it is never matched again by PID alone).
+  - Found on the way: `kill_tree_guard_spares_descendants` used the test
+    runner itself as the tree root and killed the children of the tests
+    running beside it (a flaky NEUTRALIZE test); it has a tree of its own.
+    `a_start_from_another_process_captures_nothing` took "an hour before
+    the start" — 0, "unknown", on a host up for less than an hour (a CI
+    runner): it takes an hour after.
+  - Residual: a child forked by a thread of an offender other than its
+    main one names the thread's start (`parent_start_ns` reads
+    `real_parent->start_time`); once that offender has exited, the child
+    is matched only by time — not when the thread started after the
+    offender was attributed. Reading the group leader's start in eBPF is a
+    follow-up (the lineage tracker keys on the same field).
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `kill120-probe.sh`. Before (main): an
+    offender exits and a harmless `sleep` takes its PID — killed at
+    NEUTRALIZE; a harmless shell with two children takes the PID — taken
+    for the offender's child (lateral spread) and killed at once with its
+    children; a tree that keeps forking — 16 survivors, "verified
+    contained". The lot's first build, 900 attributed children: the agent
+    at 1012 descriptors (soft limit 1024), the quarantine failed with
+    EMFILE. After: the `sleep`, the shell and both its children alive,
+    no spread, the offender AlreadyGone; the fork tree frozen and killed
+    in its cgroup (270 processes, 128 ms, 0 survivors); 900 children:
+    limit 65,536, peak 252 descriptors, 0 EMFILE, 900 killed in the
+    cgroup. Privileged gate: Debian 12 (6.1) 29 suites, 76 passed, 0
+    failed; Ubuntu 24.04 (6.8) 29 suites, 75 passed, 1 failed — the
+    known `net_outbound_connect_records_flow_with_dns_attribution` flake
+    (src_port 0 on an abortive close, the network batch), its suite then
+    7/7 three times with the installed agent stopped as in the gate. The
+    anti-tamper suite: OK. Host: 1734 passed, 0 failed.

@@ -16,6 +16,7 @@ pub mod executor;
 pub mod file_caps;
 pub mod kill;
 pub mod network_isolation;
+pub mod proc_ref;
 pub mod quarantine;
 pub mod throttle;
 

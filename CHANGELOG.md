@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, process identity in kills (Medium CMB-004,
+  CMB-019): a kill could reach a process that had taken the PID of an
+  offender since it was attributed; the COMBAT ladder and the rule and ADE
+  verdicts now capture the process (a pidfd and its start time, checked
+  against what the event says about it) and signal it through the pidfd. A tree that keeps forking is no longer killed from a
+  one-time snapshot that misses its new children: it is moved into a
+  cgroup of its own, frozen and killed as a whole. The agent raises its
+  open-files limit at start (a large episode holds one pidfd per offender).
 - External audit, Wave 2, the COMBAT ladder's execution model (Medium
   CMB-007, CMB-011, CMB-012, CMB-014; CMB-010 stop-gap): the ladder's side
   effects — `nft`, cgroup writes, kills, quarantine, iptables — ran on the

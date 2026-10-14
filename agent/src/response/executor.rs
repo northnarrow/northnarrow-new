@@ -11,7 +11,8 @@ use common::ResponseAction;
 use tracing::warn;
 
 use super::{
-    block_outbound, kill, quarantine, throttle, ExecutionOutcome, ExecutionReport, ExecutorConfig,
+    block_outbound, kill, proc_ref::ProcRef, quarantine, throttle, ExecutionOutcome,
+    ExecutionReport, ExecutorConfig,
 };
 
 /// Hard floor on PIDs we're willing to touch. Anything below this is
@@ -105,8 +106,24 @@ impl Executor {
         target_pid: u32,
         filename: &str,
     ) -> ExecutionReport {
+        self.execute_for_started(action, target_pid, 0, 0, filename)
+    }
+
+    /// [`Self::execute_for`] for the process the verdict's event reported:
+    /// started at `start_ns` (an exec), or, that unknown, by `seen_ns` (the
+    /// event's time) — `CLOCK_MONOTONIC`, 0 = unknown. External audit
+    /// CMB-004: a kill does not reach a process that took the PID after the
+    /// event.
+    pub fn execute_for_started(
+        &self,
+        action: ResponseAction,
+        target_pid: u32,
+        start_ns: u64,
+        seen_ns: u64,
+        filename: &str,
+    ) -> ExecutionReport {
         if !matches!(action, ResponseAction::StripFileCapability) || self.config.dry_run {
-            return self.execute(action, target_pid);
+            return self.execute_started(action, target_pid, start_ns, seen_ns);
         }
         let start = Instant::now();
         ExecutionReport {
@@ -135,8 +152,49 @@ impl Executor {
         }
     }
 
-    /// Run `action` against `target_pid`. Always returns; never panics.
+    /// Run `action` against `target_pid` — the process it names now.
+    /// Always returns; never panics.
     pub fn execute(&self, action: ResponseAction, target_pid: u32) -> ExecutionReport {
+        self.execute_started(action, target_pid, 0, 0)
+    }
+
+    /// [`Self::execute`] for the process its event reported: started at
+    /// `start_ns` (an exec), or, that unknown, by `seen_ns` (the event's
+    /// time) — `CLOCK_MONOTONIC`, 0 = unknown. External audit CMB-004: a
+    /// kill does not reach a process that took the PID after the event.
+    pub fn execute_started(
+        &self,
+        action: ResponseAction,
+        target_pid: u32,
+        start_ns: u64,
+        seen_ns: u64,
+    ) -> ExecutionReport {
+        let target = Self::capture(&action, target_pid, start_ns, seen_ns);
+        self.execute_on(action, &target)
+    }
+
+    /// A kill acts on a process captured by its pidfd (external audit
+    /// CMB-004); the other actions on the PID. `start_ns` / `seen_ns` (the
+    /// event's, `CLOCK_MONOTONIC`; 0 = unknown): a PID that names a process
+    /// with another start, or one started after the event, by now is not
+    /// the target.
+    fn capture(action: &ResponseAction, pid: u32, start_ns: u64, seen_ns: u64) -> ProcRef {
+        if matches!(
+            action,
+            ResponseAction::KillProcess | ResponseAction::KillProcessTree
+        ) && pid > 1
+        {
+            ProcRef::open_for_event(pid, start_ns, seen_ns)
+        } else {
+            ProcRef::unopened(pid)
+        }
+    }
+
+    /// Run `action` against the process `target` holds (external audit
+    /// CMB-004: the COMBAT ladder captures its offenders when it
+    /// attributes them). Always returns; never panics.
+    pub fn execute_on(&self, action: ResponseAction, target: &ProcRef) -> ExecutionReport {
+        let target_pid = target.pid();
         let start = Instant::now();
         let mut additional: Vec<ExecutionOutcome> = Vec::new();
 
@@ -220,6 +278,19 @@ impl Executor {
                 pid: target_pid,
                 reason: "PID below protection floor (kernel thread / core service)",
             }
+        } else if matches!(
+            action,
+            ResponseAction::KillProcess | ResponseAction::KillProcessTree
+        ) && target_pid != 0
+            && !target.is_live()
+            && target.capture_errno().is_none()
+        {
+            // External audit CMB-004: a kill target that has exited is gone
+            // — decided before the guard, which looks at the PID: by now it
+            // may name a protected process (an sshd child, a restarted
+            // watchdog), and a refusal would read as an offender that
+            // could not be contained.
+            ExecutionOutcome::AlreadyGone { pid: target_pid }
         } else if let Some(reason) =
             spared(target_pid).filter(|_| acts_on_process && target_pid != 0)
         {
@@ -233,12 +304,16 @@ impl Executor {
                     pid: target_pid,
                     reason: "Log action — no execution required",
                 },
-                ResponseAction::KillProcess => kill::kill_process(target_pid, &self.protected),
+                ResponseAction::KillProcess => kill::kill_ref(target, &self.protected),
                 ResponseAction::KillProcessTree => {
                     // The same guard for every pid the walk reaps, not
                     // only for the attributed root (combat-avail-2).
-                    let (p, kids) =
-                        kill::kill_process_tree_guarded(target_pid, &self.protected, &spared);
+                    // External audit CMB-019: through a cgroup of its own.
+                    static KILL_CGROUPS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = KILL_CGROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let scope = self.config.kill_cgroup_dir(n);
+                    let (p, kids) = kill::kill_tree(target, &self.protected, &spared, Some(&scope));
                     additional = kids;
                     p
                 }
