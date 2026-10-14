@@ -185,14 +185,14 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-139 | CMB-007 | Combat response | M | fixed (lab PR 119) |
 | NN-AUD-140 | CMB-008 | Combat response | M | already fixed (lab PR 77; lab PR 100, with NN-AUD-046) |
 | NN-AUD-141 | CMB-009 | Combat response | S | already fixed (lab PR 103, with NN-AUD-050) |
-| NN-AUD-142 | CMB-010 | Combat response | M | partial: stop-gap (lab PR 119), full fix with B5 |
+| NN-AUD-142 | CMB-010 | Combat response | M | fixed (lab PR 121; stop-gap in 119) |
 | NN-AUD-143 | CMB-011 | Combat response | M | fixed (lab PR 119) |
 | NN-AUD-144 | CMB-012 | Combat response | M | fixed (lab PR 119) |
-| NN-AUD-145 | CMB-013 | Combat response | S | open |
+| NN-AUD-145 | CMB-013 | Combat response | S | fixed (lab PR 121) |
 | NN-AUD-146 | CMB-014 | Combat response | S | fixed (lab PR 119) |
-| NN-AUD-147 | CMB-015 | Combat response | S | open |
+| NN-AUD-147 | CMB-015 | Combat response | S | fixed (lab PR 121) |
 | NN-AUD-148 | CMB-016 | Combat response | M | open |
-| NN-AUD-149 | CMB-017 | Combat response | S | open |
+| NN-AUD-149 | CMB-017 | Combat response | S | fixed (lab PR 121) |
 | NN-AUD-150 | CMB-019 | Combat response | M | fixed (lab PR 120) |
 | NN-AUD-151 | LLMP-003 | LLM prompts | S | open |
 | NN-AUD-152 | LLMP-004 | LLM prompts | S | open |
@@ -2146,3 +2146,65 @@ the audit did not report, noted with the fix that takes them.
     (src_port 0 on an abortive close, the network batch), its suite then
     7/7 three times with the installed agent stopped as in the gate. The
     anti-tamper suite: OK. Host: 1734 passed, 0 failed.
+- **NN-AUD-142 (CMB-010), NN-AUD-149 (CMB-017), NN-AUD-145 (CMB-013),
+  NN-AUD-147 (CMB-015), lab PR 121.** Containment state and recovery.
+  - CMB-010, full fix (the stop-gap of lab PR 119 released only what the
+    episode blocked, still to the root cgroup): a released process left its
+    systemd unit for the root cgroup — its accounting and limits gone,
+    `systemctl status` no longer listing it, a stop reaching only a main
+    process (the lab: a unit's main process was still stopped) — and its
+    unit was never recorded. Every move into the blocked or throttled scope
+    is now recorded first in `/run/northnarrow/containment.json`
+    (`response/containment.rs`, atomic: temporary file, fsync, rename; on
+    tmpfs, as long-lived as the cgroups it describes — the state directory
+    is `chattr +i` and takes no new file, found in the lab): the process's
+    start time and its cgroup as `/proc/<pid>/cgroup` showed it. A release writes it back
+    to that cgroup while it is still the process that was moved; when the
+    cgroup is gone or no longer takes processes, or there is no record, it
+    stays contained and the release says why. Nothing is written to the
+    root cgroup. At boot the record is reconciled: exited processes are
+    dropped, still-contained ones reported (no automatic release after a
+    restart: lab PR 123 adds the operator's verbs). Moves and releases are
+    signed audit entries (`response_contain`, `response_release`).
+  - CMB-017: a quarantine index that did not parse was replaced by an
+    empty one — the record of every earlier quarantine gone — and
+    quarantines were not in the signed chain. The index is kept aside
+    (`index.json.corrupt-<ts>`) and rebuilt from the vault's `.meta`
+    files, recorded as a signed `integrity_drift`
+    (`quarantine_index_rebuilt`); every quarantine is a signed
+    `response_quarantine` entry (vault id, path, SHA-256, size, process).
+  - CMB-013: the throttle reported its constants whatever the scope held
+    (a missing knob or an unsupported controller counted as success). The
+    limits are read back and parsed (`cpu.max` pair, `io.weight` as
+    `default N`, `memory.high`); `Throttled` carries what is in force
+    (`None` where a limit could not be set); a scope where none could be
+    set is `Failed` (EOPNOTSUPP) and the process is not moved; a controller
+    that cannot be enabled is a warning. A process under the blocked scope
+    (blocked, or in a kill cgroup, lab PR 120) is not moved: the throttle
+    would lift its egress drop, or take it out of the kill.
+  - CMB-015: the carve-out file, the runbook and the module docs still said
+    COMBAT isolation is IPv4-only (IPv6 is isolated and carved out since
+    BUG-031), the file's header invited a hand edit (refused since ATP-001
+    unless signed), and the runbook said COMBAT isolates at once with no
+    exit (the ladder runs first; an unlocked COMBAT decays, POS-001).
+    Corrected, with two tests: the shipped file with an IPv6 line yields
+    the ip6tables ACCEPT rules; the shipped texts no longer say
+    "IPv4-only".
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `contain121-probe.sh`, before = main
+    with lab PR 120. A unit's process (systemd-run) attributed, blocked,
+    then the signed unlock: before, released to `/` (out of its unit);
+    after, back in `/system.slice/nnx-victim121.service`, the signed
+    `response_contain` / `response_release` entries written. The agent
+    restarted while it was blocked: before, nothing said; after, the new
+    agent reports it contained by an earlier run (origin, since). The
+    quarantine index overwritten with garbage, then a NEUTRALIZE: before,
+    13 entries became 1, nothing kept, nothing audited; after, rebuilt
+    from the vault (17 entries), the corrupt file kept aside, a signed
+    `quarantine_index_rebuilt`. Found by the lab: the first build wrote
+    the record into the `chattr +i` state directory — EPERM, every
+    release left the process blocked; the record is on `/run`. Privileged
+    gate: Ubuntu 24.04 29 suites, 77 passed, 0 failed; Debian 12 29
+    suites, 76 passed, 1 failed — the known src_port-0 flake of
+    `net_outbound_connect_records_flow_with_dns_attribution` (no network
+    code in this lot), 2 of 3 reruns 7/7, the third the same flake. The
+    anti-tamper suite: OK. Host: 1743 passed, 0 failed.

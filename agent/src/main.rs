@@ -1366,6 +1366,17 @@ async fn main() -> Result<()> {
             );
         }
     }
+    // External audit CMB-010: the processes an earlier run moved into the
+    // blocked / throttled scopes — the gone ones dropped from the record,
+    // the still-contained ones reported (no automatic release after a
+    // restart).
+    let contained = northnarrow_agent::response::containment::reconcile(executor.config());
+    if !contained.still_contained.is_empty() {
+        warn!(
+            count = contained.still_contained.len(),
+            "processes contained by an earlier run are still in the blocked / throttled scopes"
+        );
+    }
     if detect_only {
         warn!(
             "DETECT-ONLY mode active (--detect-only / NN_DETECT_ONLY / NORTHNARROW_DRY_RUN): \
@@ -1930,6 +1941,10 @@ async fn main() -> Result<()> {
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
     // Tappa 10.8 — overlay decisions taken before the audit log existed.
     overlay_gate.attach_audit_log(audit_log.clone());
+    // External audit CMB-017: quarantines are recorded in the signed chain.
+    if let Some(audit) = audit_log.as_ref() {
+        executor.set_audit_log(Arc::clone(audit));
+    }
     // Tappa 10.8 telemetry probe: known events on each sensor, every minute.
     northnarrow_agent::telemetry_probe::spawn(audit_log.clone());
     // Tappa 10.8 adversarial findings: drop-ins, set-property, oom_score_adj, mounts.

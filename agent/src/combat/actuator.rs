@@ -216,8 +216,12 @@ impl CombatActuator for SystemActuator {
             info!(target: "combat.actuator", pid, "soft egress not released: the process has exited");
             return;
         }
-        match block_outbound::release_blocked_pid(pid, target.start_ticks(), self.executor.config())
-        {
+        let released =
+            block_outbound::release_blocked_pid(pid, target.start_ticks(), self.executor.config());
+        if let Ok(r) = &released {
+            self.executor.record_release(pid, "blocked", r);
+        }
+        match released {
             Ok(block_outbound::Release::Released) => {
                 info!(target: "combat.actuator", pid, "soft egress released")
             }

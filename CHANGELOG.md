@@ -6,6 +6,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, containment state and recovery (Medium CMB-010,
+  CMB-017, CMB-013, CMB-015): a released process goes back to its systemd
+  unit (recorded when it was contained), never to the root cgroup — before,
+  it left its unit's accounting and limits for good; an agent restart
+  reconciles the record. A corrupt quarantine index is rebuilt from the vault instead of
+  being replaced by an empty one, and every quarantine, containment and
+  release is in the signed audit log. The throttle reports the limits it
+  actually set and does not move a process when it could set none. The
+  carve-out docs describe IPv6 isolation as it is.
 - External audit, Wave 2, process identity in kills (Medium CMB-004,
   CMB-019): a kill could reach a process that had taken the PID of an
   offender since it was attributed; the COMBAT ladder and the rule and ADE

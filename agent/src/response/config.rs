@@ -33,6 +33,10 @@ pub struct ExecutorConfig {
     /// (external audit CMB-006): removed at start
     /// ([`super::network_isolation::retire_legacy`]).
     pub isolation_flag_file: PathBuf,
+    /// External audit CMB-010: the record of the processes moved into the
+    /// blocked / throttled scopes and the cgroup each came from — on tmpfs,
+    /// as the cgroups (`/run/northnarrow`).
+    pub containment_file: PathBuf,
 
     /// **The agent-wide detect-only / no-enforcement gate.** When
     /// `true`, NOTHING touches the system: the [`Executor`](super::Executor)
@@ -70,6 +74,7 @@ impl ExecutorConfig {
             quarantine_dir: tmp_root.join("quarantine"),
             master_key_file: tmp_root.join("master.key"),
             isolation_flag_file: tmp_root.join("isolated"),
+            containment_file: tmp_root.join("containment.json"),
             cgroup_root: tmp_root.join("cgroup"),
             cgroup_slice: "northnarrow.slice".into(),
             nft_table: "northnarrow_test".into(),
@@ -120,6 +125,7 @@ impl Default for ExecutorConfig {
             cgroup_slice: "northnarrow.slice".into(),
             nft_table: "northnarrow".into(),
             isolation_flag_file: PathBuf::from("/var/lib/northnarrow/isolated"),
+            containment_file: PathBuf::from("/run/northnarrow/containment.json"),
             dry_run: false,
         }
     }
