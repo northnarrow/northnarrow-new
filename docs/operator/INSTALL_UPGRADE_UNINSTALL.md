@@ -300,7 +300,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view) |
 | `bpffs_mount` | a bpffs outside `/sys/fs/bpf` (WARN: Cilium does this legitimately) |
 | `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |
-| `weakening_env` | the agent started with a variable that turns a protection off (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, …) |
+| `weakening_env` | the agent started with a variable that turns a protection off or cuts the evidence it keeps (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, `NN_DETECT_ONLY=1/true/yes`, `NN_ADE_ALLOW_MOCK=1`, a `NN_TELEMETRY_PROBE_SECS` of 0 or above 60, any `NN_*_CAP_BYTES` override, …) |
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
 
 **How the previous run ended.** Some kills cannot be refused at all: a write

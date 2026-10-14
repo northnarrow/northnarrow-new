@@ -1310,6 +1310,14 @@ async fn main() -> Result<()> {
         exec_cfg.dry_run = true;
     }
     let detect_only = exec_cfg.dry_run;
+    // External audit MAIN-008: the signed agent_boot entry says where
+    // detect-only came from.
+    let detect_only_source: Option<String> = if cli.detect_only {
+        Some("--detect-only".to_string())
+    } else {
+        northnarrow_agent::response::config::detect_only_env()
+            .map(|(name, v)| format!("{name}={v}"))
+    };
     // External audit CMB-006: an older agent's host-wide nftables blackout
     // (no carve-out, no release, no status) is removed before anything
     // else; host-wide isolation is the COMBAT ladder's alone.
@@ -1815,8 +1823,11 @@ async fn main() -> Result<()> {
                         // External audit LLMR-014: the rollback floor's
                         // reset / anchor come first in this boot's entries.
                         overlay_gate.attest_floor(&mut log);
-                        match log.boot_probe(detect_only, integrity.label(), integrity.provenance())
-                        {
+                        match log.boot_probe(
+                            detect_only_source.as_deref(),
+                            integrity.label(),
+                            integrity.provenance(),
+                        ) {
                             Ok(entry) => {
                                 info!(
                                     path = %cli.audit_log_file.display(),
@@ -1840,7 +1851,6 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                                    detect_only,
                                     std::env::var(
                                         northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV,
                                     )
@@ -1857,7 +1867,7 @@ async fn main() -> Result<()> {
                                 if fatal {
                                     anyhow::bail!(
                                     "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
-                                     set {}=1 to start anyway, or use --detect-only.",
+                                     set {}=1 to start anyway.",
                                     cli.audit_log_file.display(),
                                     northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
                                 );
@@ -1868,7 +1878,6 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                            detect_only,
                             std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
                                 .ok()
                                 .as_deref(),
@@ -1876,7 +1885,7 @@ async fn main() -> Result<()> {
                         error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
                         if fatal {
                             anyhow::bail!(
-                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway, or use --detect-only.",
+                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway.",
                                 cli.audit_log_file.display(),
                                 northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
                             );
@@ -2148,17 +2157,13 @@ async fn main() -> Result<()> {
     // Test/ops knob: NN_FIM_DRIFT_CAP_BYTES overrides the fim_drift active-file
     // rotation cap (default 32 MiB) so rotation can be validated without
     // generating 32 MiB of drift. Unset = default; still gated by rotation_on.
+    // External audit MAIN-004: never below 1 MiB, every override logged
+    // (and reported as weakening_env by the self-integrity check).
     const FIM_DRIFT_CAP_DEFAULT: u64 = 32 * 1024 * 1024;
-    let fim_drift_cap = std::env::var("NN_FIM_DRIFT_CAP_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(FIM_DRIFT_CAP_DEFAULT);
-    if fim_drift_cap != FIM_DRIFT_CAP_DEFAULT {
-        warn!(
-            cap_bytes = fim_drift_cap,
-            "fim_drift rotation cap OVERRIDDEN via NN_FIM_DRIFT_CAP_BYTES (test/ops knob)"
-        );
-    }
+    let fim_drift_cap = northnarrow_agent::chainlog::cap_from_env(
+        northnarrow_agent::chainlog::FIM_DRIFT_CAP_ENV,
+        FIM_DRIFT_CAP_DEFAULT,
+    );
     let fim_drift_rotation = northnarrow_agent::chainlog::RotationConfig {
         size_cap_bytes: cap(fim_drift_cap),
         max_archives: 8,
@@ -2179,10 +2184,10 @@ async fn main() -> Result<()> {
     // The writer JoinHandle is detached on drop (tokio keeps the task
     // running); the sink is threaded into the event loop.
     let detection_sink: Option<northnarrow_agent::detection_store::DetectionSink> = {
-        let cap_bytes = std::env::var("NN_DETECTIONS_CAP_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(northnarrow_agent::detection_store::DEFAULT_DETECTIONS_CAP_BYTES);
+        let cap_bytes = northnarrow_agent::chainlog::cap_from_env(
+            northnarrow_agent::chainlog::DETECTIONS_CAP_ENV,
+            northnarrow_agent::detection_store::DEFAULT_DETECTIONS_CAP_BYTES,
+        );
         let detections_rotation = northnarrow_agent::chainlog::RotationConfig {
             size_cap_bytes: cap(cap_bytes),
             max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
@@ -2225,10 +2230,10 @@ async fn main() -> Result<()> {
     // means "no triage status changes this boot" (the `detections` read
     // still works, showing initial Open), never an agent abort.
     let detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>> = {
-        let cap_bytes = std::env::var("NN_STATUS_EVENTS_CAP_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(northnarrow_agent::detection_store::DEFAULT_STATUS_EVENTS_CAP_BYTES);
+        let cap_bytes = northnarrow_agent::chainlog::cap_from_env(
+            northnarrow_agent::chainlog::STATUS_EVENTS_CAP_ENV,
+            northnarrow_agent::detection_store::DEFAULT_STATUS_EVENTS_CAP_BYTES,
+        );
         let status_rotation = northnarrow_agent::chainlog::RotationConfig {
             size_cap_bytes: cap(cap_bytes),
             max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
@@ -2571,8 +2576,9 @@ async fn main() -> Result<()> {
                             // Review 76: only package-manager drift is paced.
                             let lineage_for_drain = lineage.clone();
                             let event_tx = sensor.event_tx();
+                            let audit_for_drain = audit_log.clone();
                             let handle = tokio::spawn(async move {
-                                if let Err(e) = drain_loop(
+                                let outcome = drain_loop(
                                     rb,
                                     inode_map_for_drain,
                                     baseline_cache_for_drain,
@@ -2583,14 +2589,8 @@ async fn main() -> Result<()> {
                                     lineage_for_drain,
                                     event_tx,
                                 )
-                                .await
-                                {
-                                    warn!(
-                                        target: "fim.drain",
-                                        error = %e,
-                                        "fim drain loop exited"
-                                    );
-                                }
+                                .await;
+                                drain_ended("fim", outcome, audit_for_drain.as_ref());
                             });
                             sensor.register_pump_handle(handle);
                             info!("fim: drain loop spawned");
@@ -2971,8 +2971,9 @@ async fn main() -> Result<()> {
             let close_rb = net_bufs.close_rb;
             let listen_rb = net_bufs.listen_rb;
             let udp_rb = net_bufs.udp_rb;
+            let audit_for_drain = audit_log.clone();
             let handle = tokio::spawn(async move {
-                if let Err(e) = drain_loop(
+                let outcome = drain_loop(
                     close_rb,
                     listen_rb,
                     udp_rb,
@@ -2982,10 +2983,8 @@ async fn main() -> Result<()> {
                     listener_db,
                     event_tx,
                 )
-                .await
-                {
-                    warn!(target: "net.drain", error = %e, "net drain loop exited");
-                }
+                .await;
+                drain_ended("net", outcome, audit_for_drain.as_ref());
             });
             sensor.register_pump_handle(handle);
             info!("net: drain loop spawned (NET_FLOW_CLOSE_EVENTS + NET_LISTEN_EVENTS)");
@@ -4125,12 +4124,23 @@ fn attest_degraded(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     detail: &str,
 ) {
+    attest_degraded_at(audit_log, detail, true);
+}
+
+/// [`attest_degraded`] for a subsystem that stopped after boot (external
+/// audit MAIN-007: a drain loop that returns ends a telemetry stream for
+/// the rest of the run).
+fn attest_degraded_at(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    detail: &str,
+    at_boot: bool,
+) {
     let Some(log) = audit_log else {
         return;
     };
     let draft = northnarrow_agent::audit::AuditEntryDraft {
         op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
-        extra: serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": true }),
+        extra: serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": at_boot }),
         key_fp: "agent-self".to_string(),
         cosigner_fps: Vec::new(),
         result: "detected".to_string(),
@@ -4141,6 +4151,31 @@ fn attest_degraded(
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "attesting a degraded subsystem failed");
     }
+}
+
+/// A drain loop returned: its telemetry stream is gone for the rest of
+/// this run. Per-event errors never end a drain (they are logged and the
+/// loop goes on), so this is a tokio I/O failure — recorded in the signed
+/// chain, not only as a journal line (external audit MAIN-007).
+fn drain_ended(
+    stream: &str,
+    outcome: std::io::Result<()>,
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+) {
+    let why = match outcome {
+        Ok(()) => "returned".to_string(),
+        Err(e) => format!("failed: {e}"),
+    };
+    error!(
+        stream,
+        reason = %why,
+        "drain loop ended — this telemetry stream stops until the agent restarts"
+    );
+    attest_degraded_at(
+        audit_log,
+        &format!("{stream} drain loop ended ({why}): no {stream} telemetry until restart"),
+        false,
+    );
 }
 
 /// External audit LLMR-016: a default list that could not be read, and

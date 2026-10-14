@@ -132,11 +132,11 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-086 | AUT-003 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-087 | AUT-004 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-088 | AUT-009 | Admin auth | M | open |
-| NN-AUD-089 | MAIN-004 | Agent main | S | open |
+| NN-AUD-089 | MAIN-004 | Agent main | S | fixed (lab PR 118) |
 | NN-AUD-090 | MAIN-005 | Agent main | S | fixed (lab PR 115) |
 | NN-AUD-091 | MAIN-006 | Agent main | M | open |
-| NN-AUD-092 | MAIN-007 | Agent main | M | open |
-| NN-AUD-093 | MAIN-008 | Agent main | S | open |
+| NN-AUD-092 | MAIN-007 | Agent main | M | narrowed, residual fixed (lab PR 118) |
+| NN-AUD-093 | MAIN-008 | Agent main | S | fixed (lab PR 118) |
 | NN-AUD-094 | ATP-003 | Anti-tamper | S | fixed (lab PR 114) |
 | NN-AUD-095 | ATP-005 | Anti-tamper | S | open |
 | NN-AUD-096 | ATP-008 | Anti-tamper | M | fixed (lab PR 113) |
@@ -1933,3 +1933,57 @@ the audit did not report, noted with the fix that takes them.
     chain in 17 ms and anchored it; the restarts after it verified 9 to 13
     entries (1 ms), the warm ones with `agent.sig.pub`. The anti-tamper
     suite: OK.
+- **NN-AUD-093 (MAIN-008), NN-AUD-089 (MAIN-004), NN-AUD-092 (MAIN-007),
+  lab PR 118.** The variables that weaken the agent.
+  - MAIN-008, worse than reported: detect-only is `--detect-only` or
+    `NN_DETECT_ONLY` / `NORTHNARROW_DRY_RUN` set to `1`, `true` or `yes`,
+    but `WEAKENING_ENV` matched `1` only, so `NN_DETECT_ONLY=yes` switched
+    the response off with no `weakening_env` finding — the audit's
+    verification note took the finding for granted. And
+    `audit_failure_is_fatal(detect_only, …)` let a detect-only agent run
+    without a writable audit chain, so the one variable also lifted the
+    fail-closed gate (the refusal even suggested `--detect-only`). The
+    gate now needs `NN_AUDIT_ALLOW_UNWRITABLE=1` whatever the mode; each
+    `WEAKENING_ENV` entry carries the test its consumer applies
+    (`response::config::is_truthy` for the detect-only pair); `agent_boot`
+    records `detect_only_source` (`--detect-only` or `NAME=value`).
+  - MAIN-004: `NN_FIM_DRIFT_CAP_BYTES`, `NN_DETECTIONS_CAP_BYTES` and
+    `NN_STATUS_EVENTS_CAP_BYTES` took any `u64` (1 rotated the signed
+    evidence after every row), and only the first one logged.
+    `chainlog::cap_from_env` raises a value below 1 MiB to 1 MiB, keeps the
+    default for a value that does not parse, and logs every override; the
+    three names are in `WEAKENING_ENV` (any value), so an override is a
+    signed `integrity_drift`.
+  - MAIN-007, narrowed: per-event errors never ended either drain loop
+    (FIM logs "event dropped, drain continues", netflow keeps the event),
+    and the ladder tick and posture decay have no exit (a panic aborts the
+    process, so the watchdog respawns it and the chain records
+    `previous_run: Abrupt`). What is left — a tokio I/O failure (an
+    `AsyncFd` that cannot be set up or polled) ending a drain — is now an
+    ERROR and a signed `subsystem_degraded` record (`at_boot: false`)
+    naming the stream, instead of a WARN.
+  - Found on the way: `NN_TELEMETRY_PROBE_SECS` was reported only for the
+    exact text `0`, while the probe is off for any spelling of 0 (`00`,
+    ` 0`) and an interval of hours thins it out to nothing; a value of 0
+    or above the 60 s default is reported now. `NN_ADE_ALLOW_MOCK=1` (the
+    mock backend answers for a model that failed to load) was not in the
+    list.
+  - Lab: Lab, Ubuntu 24.04 (6.8), the build of main before, the
+    guests under QEMU for Windows + WHPX (KVM is unavailable in WSL since
+    KB5127648, microsoft/WSL#41918). A drop-in
+    `Environment=NN_DETECT_ONLY=yes NN_DETECTIONS_CAP_BYTES=16384
+    NN_TELEMETRY_PROBE_SECS=00`, laid down offline (`envweak-probe.sh`):
+    before, detect-only on, `agent_boot` with `detect_only: true` and no
+    `weakening_env` record — the 16 KiB cap and the probe switched off taken
+    silently; after, three signed `weakening_env` records (the three
+    variables), "rotation cap override below the floor — raised to the
+    floor" (1 048 576), and `detect_only_source: "NN_DETECT_ONLY=yes"`. The
+    same drop-in with `audit.log` replaced by a directory: before, the agent
+    started, detect-only and unaudited, its admin socket up; after, it
+    refuses ("Refusing to run unaudited; set NN_AUDIT_ALLOW_UNWRITABLE=1 to
+    start anyway"). Recovering from that refusal takes the documented path
+    (no admin socket for a window, the pins still protect `/etc/northnarrow`:
+    units disabled, guest restarted, files fixed). A drain that ends needs a
+    tokio I/O failure and was not provoked in the lab. The anti-tamper
+    suite: OK. Privileged gate: Ubuntu 24.04 (6.8) and Debian 12 (6.1), 29
+    suites, 74 passed, 0 failed each.

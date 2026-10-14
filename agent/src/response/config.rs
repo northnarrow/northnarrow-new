@@ -56,7 +56,7 @@ impl ExecutorConfig {
         // main; here we honour the canonical `NN_DETECT_ONLY` and the
         // legacy `NORTHNARROW_DRY_RUN` alias. Either one now suppresses
         // ALL enforcement (kill + COMBAT included).
-        let dry_run = env_flag("NN_DETECT_ONLY") || env_flag("NORTHNARROW_DRY_RUN");
+        let dry_run = detect_only_env().is_some();
         Self {
             dry_run,
             ..Self::default()
@@ -116,12 +116,26 @@ impl Default for ExecutorConfig {
     }
 }
 
-/// True when env `var` is set to a truthy value (`1` / `true` / `yes`).
-/// Shared by the detect-only inputs so `NN_DETECT_ONLY` and the legacy
-/// `NORTHNARROW_DRY_RUN` parse identically.
-fn env_flag(var: &str) -> bool {
-    matches!(
-        std::env::var(var).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
+/// The environment variables that switch the agent to detect-only, in the
+/// order they are looked at: the canonical name, then the legacy alias.
+pub const DETECT_ONLY_ENVS: [&str; 2] = ["NN_DETECT_ONLY", "NORTHNARROW_DRY_RUN"];
+
+/// The values a detect-only variable is honoured with (`1` / `true` /
+/// `yes`). External audit MAIN-008: the self-integrity check reports the
+/// variable with this same predicate — it used to match `1` only, so
+/// `NN_DETECT_ONLY=yes` disarmed the response without a finding.
+pub fn is_truthy(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes")
+}
+
+/// The variable (name, value) that switches this process to detect-only,
+/// if any. Recorded in the signed `agent_boot` entry, so the chain shows
+/// where a detect-only boot came from.
+pub fn detect_only_env() -> Option<(&'static str, String)> {
+    DETECT_ONLY_ENVS.into_iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| is_truthy(v))
+            .map(|v| (name, v))
+    })
 }
