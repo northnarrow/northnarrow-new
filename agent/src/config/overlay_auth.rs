@@ -1095,7 +1095,7 @@ mod tests {
         let signing = crate::audit::AgentSigningKey::load_or_bootstrap(&agent_key).unwrap();
         let mut log = AuditLog::open(&audit, signing, AGENT).unwrap();
         gate.attest_floor(&mut log);
-        log.boot_probe(false, "verified", "installed").unwrap();
+        log.boot_probe(None, "verified", "installed").unwrap();
         gate.attach_audit_log(Some(Arc::new(Mutex::new(log))));
         let ops: Vec<(String, String)> = std::fs::read_to_string(&audit)
             .unwrap()

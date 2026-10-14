@@ -692,9 +692,11 @@ impl AuditLog {
     /// `integrity` / `provenance` come from the install-manifest check
     /// (`crate::install_manifest`): what the installer could verify about
     /// the release and whether the binaries running now still match it.
+    /// `detect_only`: where detect-only mode came from (`--detect-only` or
+    /// `NAME=value` of the variable), `None` when the agent enforces.
     pub fn boot_probe(
         &mut self,
-        detect_only: bool,
+        detect_only: Option<&str>,
         integrity: &str,
         provenance: &str,
     ) -> Result<AuditEntry> {
@@ -702,7 +704,9 @@ impl AuditLog {
             op: "agent_boot".to_string(),
             extra: serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
-                "detect_only": detect_only,
+                "detect_only": detect_only.is_some(),
+                // External audit MAIN-008: the source, not only the bool.
+                "detect_only_source": detect_only,
                 "binary_integrity": integrity,
                 "install_provenance": provenance,
                 "previous_run": self.previous_run.to_json(),
@@ -745,12 +749,14 @@ pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 /// Escape hatch: run with an unwritable / unopenable audit log.
 pub const AUDIT_ALLOW_UNWRITABLE_ENV: &str = "NN_AUDIT_ALLOW_UNWRITABLE";
 
-/// Is an audit-log failure at boot fatal? Enforcement mode without the
-/// explicit override → yes: an audit chain that silently stops is a
-/// silently absent control (same posture as the LSM deny-hook
-/// shortfall, `ebpf-lsm-1`). Detect-only mode only warns.
-pub fn audit_failure_is_fatal(detect_only: bool, allow_env: Option<&str>) -> bool {
-    !detect_only && allow_env != Some("1")
+/// Is an audit-log failure at boot fatal? Yes unless the operator set the
+/// explicit override: an audit chain that silently stops is a silently
+/// absent control (same posture as the LSM deny-hook shortfall,
+/// `ebpf-lsm-1`). External audit MAIN-008: detect-only no longer implies
+/// the override — one variable used to disarm the response and lift this
+/// gate together.
+pub fn audit_failure_is_fatal(allow_env: Option<&str>) -> bool {
+    allow_env != Some("1")
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -1077,7 +1083,7 @@ mod tests {
         // first boot: nothing before it
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         assert_eq!(log.previous_run(), &PreviousRun::None);
-        let boot = log.boot_probe(false, "verified", "source-tree").unwrap();
+        let boot = log.boot_probe(None, "verified", "source-tree").unwrap();
         assert_eq!(boot.extra["previous_run"]["ended"], "none");
         log.append(sample_draft(1)).unwrap();
         // killed: reopen without a stop entry
@@ -1092,7 +1098,7 @@ mod tests {
             }
             other => panic!("expected Abrupt, got {other:?}"),
         }
-        let boot2 = log.boot_probe(false, "verified", "source-tree").unwrap();
+        let boot2 = log.boot_probe(None, "verified", "source-tree").unwrap();
         assert_eq!(boot2.extra["previous_run"]["ended"], "abrupt");
         log.stop_entry("sigterm", 42).unwrap();
         // clean stop
@@ -1294,9 +1300,7 @@ mod tests {
         let path = dir.path().join("audit.log");
         let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
-        let e = log
-            .boot_probe(false, "verified", "attested")
-            .expect("probe");
+        let e = log.boot_probe(None, "verified", "attested").expect("probe");
         assert_eq!(e.op, "agent_boot");
         assert_eq!(e.key_fp, "agent-self");
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1315,14 +1319,30 @@ mod tests {
             Ok(l) => l,
             Err(_) => return, // open itself refusing is the same signal
         };
-        assert!(log.boot_probe(false, "verified", "attested").is_err());
+        assert!(log.boot_probe(None, "verified", "attested").is_err());
     }
 
     #[test]
     fn audit_failure_policy() {
-        assert!(audit_failure_is_fatal(false, None));
-        assert!(audit_failure_is_fatal(false, Some("0")));
-        assert!(!audit_failure_is_fatal(false, Some("1")));
-        assert!(!audit_failure_is_fatal(true, None));
+        assert!(audit_failure_is_fatal(None));
+        assert!(audit_failure_is_fatal(Some("0")));
+        assert!(audit_failure_is_fatal(Some("yes")));
+        assert!(!audit_failure_is_fatal(Some("1")));
+    }
+
+    #[test]
+    fn boot_probe_records_where_detect_only_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
+        let e = log
+            .boot_probe(Some("NN_DETECT_ONLY=yes"), "verified", "attested")
+            .unwrap();
+        assert_eq!(e.extra["detect_only"], true);
+        assert_eq!(e.extra["detect_only_source"], "NN_DETECT_ONLY=yes");
+        let e = log.boot_probe(None, "verified", "attested").unwrap();
+        assert_eq!(e.extra["detect_only"], false);
+        assert!(e.extra["detect_only_source"].is_null());
     }
 }

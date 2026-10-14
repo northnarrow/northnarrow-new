@@ -174,6 +174,16 @@ pub fn interval_from_env() -> Option<Duration> {
     }
 }
 
+/// Does this value of [`INTERVAL_ENV`] weaken the probe? It does when it
+/// switches the probe off (any spelling of 0) or spaces the rounds out
+/// beyond the default; a value that does not parse keeps the default.
+pub fn interval_weakens(value: &str) -> bool {
+    value
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|secs| secs == 0 || secs > DEFAULT_INTERVAL_SECS)
+}
+
 /// Start the periodic probe (from `main`, once the audit log exists).
 pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) {
     let Some(every) = interval_from_env() else {

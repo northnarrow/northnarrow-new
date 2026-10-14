@@ -6,6 +6,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the variables that weaken the agent (Medium
+  MAIN-008, MAIN-004, MAIN-007): `NN_DETECT_ONLY=yes` (or `true`) switched
+  the response off without the integrity finding `=1` gets, and detect-only
+  also let the agent run without a writable audit log — the audit gate now
+  needs its own override (`NN_AUDIT_ALLOW_UNWRITABLE=1`), and `agent_boot`
+  records where detect-only came from. The evidence logs' rotation caps
+  read from the environment have a 1 MiB floor and every override is
+  logged and reported; the mock ADE backend and a telemetry probe switched
+  off or thinned out are reported too. A drain loop that ends is an ERROR
+  and a signed `subsystem_degraded` record.
 - External audit, Wave 2, the overlays' rollback floor (Medium LLMR-014):
   the newest accepted signature of each overlay was read from `audit.log`
   as plain JSON, and a missing log gave no floor — removing the log

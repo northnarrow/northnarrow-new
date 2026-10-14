@@ -363,6 +363,61 @@ impl ProtectionManager for NoProtection {
 
 // ── rotating writer ─────────────────────────────────────────────────
 
+/// Environment overrides of the evidence logs' active-file caps
+/// (test/ops knobs for rotation checks).
+pub const FIM_DRIFT_CAP_ENV: &str = "NN_FIM_DRIFT_CAP_BYTES";
+pub const DETECTIONS_CAP_ENV: &str = "NN_DETECTIONS_CAP_BYTES";
+pub const STATUS_EVENTS_CAP_ENV: &str = "NN_STATUS_EVENTS_CAP_BYTES";
+
+/// Lowest cap an environment override may set. External audit MAIN-004:
+/// any `u64` used to be taken, so a one-line drop-in could rotate the
+/// signed evidence away after every row.
+pub const MIN_ENV_CAP_BYTES: u64 = 1024 * 1024;
+
+/// The active-file cap for `env`: `default` unless the variable is set,
+/// never below [`MIN_ENV_CAP_BYTES`]. Every override is logged; the
+/// self-integrity check also records it in the signed chain.
+pub fn cap_from_env(env: &str, default: u64) -> u64 {
+    cap_from_value(env, std::env::var(env).ok().as_deref(), default)
+}
+
+fn cap_from_value(env: &str, raw: Option<&str>, default: u64) -> u64 {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Err(_) => {
+            warn!(
+                env,
+                value = raw,
+                default_bytes = default,
+                "rotation cap override does not parse — the default applies"
+            );
+            default
+        }
+        Ok(bytes) if bytes < MIN_ENV_CAP_BYTES => {
+            warn!(
+                env,
+                requested_bytes = bytes,
+                cap_bytes = MIN_ENV_CAP_BYTES,
+                "rotation cap override below the floor — raised to the floor"
+            );
+            MIN_ENV_CAP_BYTES
+        }
+        Ok(bytes) => {
+            if bytes != default {
+                warn!(
+                    env,
+                    cap_bytes = bytes,
+                    default_bytes = default,
+                    "rotation cap OVERRIDDEN (test/ops knob)"
+                );
+            }
+            bytes
+        }
+    }
+}
+
 /// Size + retention policy for one log.
 #[derive(Debug, Clone, Copy)]
 pub struct RotationConfig {
@@ -1545,6 +1600,18 @@ fn verify_manifest_evictions(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cap_from_env_clamps_below_floor_and_keeps_bad_values_at_default() {
+        let d = 16 * 1024 * 1024;
+        assert_eq!(cap_from_value("X", None, d), d);
+        assert_eq!(cap_from_value("X", Some("1"), d), MIN_ENV_CAP_BYTES);
+        assert_eq!(cap_from_value("X", Some("16384"), d), MIN_ENV_CAP_BYTES);
+        assert_eq!(cap_from_value("X", Some("1MiB"), d), d);
+        assert_eq!(cap_from_value("X", Some(""), d), d);
+        assert_eq!(cap_from_value("X", Some(" 2097152 "), d), 2 * 1024 * 1024);
+        assert_eq!(cap_from_value("X", Some("67108864"), d), 64 * 1024 * 1024);
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestPayload {

@@ -75,18 +75,42 @@ const KNOWN_DROPINS: &[(&str, &str)] = &[(
     include_str!("../../deploy/systemd/10-debian-perf-paranoid.conf"),
 )];
 
-/// Environment variables that switch a protection off or into observe
-/// mode; `None` = any value counts.
-pub const WEAKENING_ENV: &[(&str, Option<&str>)] = &[
-    ("NN_ANTI_TAMPER_ALLOW_DEGRADED", None),
-    ("NN_BPF_DEFENSE_OBSERVE", Some("1")),
-    ("NN_ALLOW_UNVERIFIED_BINARY", Some("1")),
-    ("NN_AUDIT_ALLOW_UNWRITABLE", None),
-    ("NN_TELEMETRY_PROBE_SECS", Some("0")),
-    ("NN_DETECT_ONLY", Some("1")),
-    ("NORTHNARROW_DRY_RUN", Some("1")),
-    ("NN_OVERLAY_ALLOW_UNSIGNED", Some("1")),
+/// Environment variables that switch a protection off, into observe mode,
+/// or cut the evidence the agent keeps. Each comes with the test its
+/// consumer applies (external audit MAIN-008: a narrower test here let a
+/// value the consumer honours pass unreported).
+pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
+    ("NN_ANTI_TAMPER_ALLOW_DEGRADED", any_value),
+    ("NN_BPF_DEFENSE_OBSERVE", is_one),
+    ("NN_ALLOW_UNVERIFIED_BINARY", is_one),
+    ("NN_AUDIT_ALLOW_UNWRITABLE", any_value),
+    (
+        crate::telemetry_probe::INTERVAL_ENV,
+        crate::telemetry_probe::interval_weakens,
+    ),
+    ("NN_DETECT_ONLY", crate::response::config::is_truthy),
+    ("NORTHNARROW_DRY_RUN", crate::response::config::is_truthy),
+    ("NN_OVERLAY_ALLOW_UNSIGNED", is_one),
+    // External audit: the mock ADE backend answers instead of a model
+    // that failed to load.
+    ("NN_ADE_ALLOW_MOCK", is_one),
+    // External audit MAIN-004: the evidence logs' rotation caps; any
+    // override changes how much evidence survives.
+    (crate::chainlog::FIM_DRIFT_CAP_ENV, any_value),
+    (crate::chainlog::DETECTIONS_CAP_ENV, any_value),
+    (crate::chainlog::STATUS_EVENTS_CAP_ENV, any_value),
 ];
+
+/// Does this value of the variable weaken the agent?
+pub type WeakensWith = fn(&str) -> bool;
+
+fn any_value(_: &str) -> bool {
+    true
+}
+
+fn is_one(value: &str) -> bool {
+    value == "1"
+}
 
 /// Host paths a mount must not cover (prefix match on the mount point).
 const PROTECTED_MOUNT_PREFIXES: &[&str] = &[
@@ -145,9 +169,9 @@ pub fn jittered(base: Duration) -> Duration {
 /// Environment variables of this process that weaken it.
 pub fn weakening_env(vars: &[(String, String)]) -> Vec<Finding> {
     let mut out = Vec::new();
-    for (name, want) in WEAKENING_ENV {
+    for (name, weakens) in WEAKENING_ENV {
         if let Some((_, v)) = vars.iter().find(|(k, _)| k == name) {
-            if want.map(|w| v == w).unwrap_or(true) {
+            if weakens(v) {
                 out.push(Finding {
                     kind: "weakening_env",
                     detail: format!("{name}={v}"),
@@ -687,6 +711,39 @@ mod tests {
                 "NN_BPF_DEFENSE_OBSERVE=1"
             ]
         );
+    }
+
+    #[test]
+    fn weakening_env_matches_what_the_consumers_honour() {
+        // External audit MAIN-008: `yes` / `true` switch detect-only on, so
+        // they are reported like `1`; `no` does not, so it is not.
+        let pairs = [
+            ("NN_DETECT_ONLY", "yes", true),
+            ("NN_DETECT_ONLY", "true", true),
+            ("NN_DETECT_ONLY", "no", false),
+            ("NORTHNARROW_DRY_RUN", "yes", true),
+            // the probe is off with any spelling of 0, and a longer
+            // interval than the default thins it out
+            ("NN_TELEMETRY_PROBE_SECS", "00", true),
+            ("NN_TELEMETRY_PROBE_SECS", " 0", true),
+            ("NN_TELEMETRY_PROBE_SECS", "86400", true),
+            ("NN_TELEMETRY_PROBE_SECS", "60", false),
+            ("NN_TELEMETRY_PROBE_SECS", "30", false),
+            ("NN_ADE_ALLOW_MOCK", "1", true),
+            ("NN_ADE_ALLOW_MOCK", "0", false),
+            // MAIN-004: any rotation-cap override is reported
+            ("NN_DETECTIONS_CAP_BYTES", "16384", true),
+            ("NN_STATUS_EVENTS_CAP_BYTES", "1", true),
+            ("NN_FIM_DRIFT_CAP_BYTES", "33554432", true),
+        ];
+        for (name, value, reported) in pairs {
+            let f = weakening_env(&[(name.to_string(), value.to_string())]);
+            assert_eq!(f.len() == 1, reported, "{name}={value}");
+            if reported {
+                assert_eq!(f[0].kind, "weakening_env");
+                assert_eq!(f[0].detail, format!("{name}={value}"));
+            }
+        }
     }
 
     #[test]
