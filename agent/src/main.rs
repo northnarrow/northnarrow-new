@@ -2950,6 +2950,24 @@ async fn main() -> Result<()> {
     if let Some(iso) = isolator.as_ref() {
         match AdminAuth::load_with_agent_id(&cli.admin_pub, agent_id) {
             Ok(auth) => {
+                // External audit AUT-004: a skipped line is in the signed
+                // chain, not only in the journal.
+                let skipped = auth.skipped_lines();
+                if !skipped.is_empty() {
+                    let lines: Vec<String> = skipped
+                        .iter()
+                        .map(|(n, why)| format!("line {n}: {why}"))
+                        .collect();
+                    attest_degraded(
+                        audit_log.as_ref(),
+                        &format!(
+                            "{}: {} line(s) skipped, their keys not loaded — {}",
+                            cli.admin_pub.display(),
+                            skipped.len(),
+                            lines.join("; ")
+                        ),
+                    );
+                }
                 // External audit ATP-004: the one-key bootstrap is over for
                 // good once the signed chain shows a second key was added.
                 if audit_log
@@ -2998,11 +3016,15 @@ async fn main() -> Result<()> {
                 });
             }
             Err(e) => {
-                warn!(
+                // External audit AUT-004: the agent without its admin
+                // socket cannot be unlocked or upgraded — an ERROR and a
+                // signed record, not a WARN.
+                error!(
                     error = %e,
                     path = %cli.admin_pub.display(),
                     "admin pub key file missing or invalid; admin socket disabled"
                 );
+                attest_degraded(audit_log.as_ref(), &format!("admin socket disabled: {e:#}"));
             }
         }
     } else {

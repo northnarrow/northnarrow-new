@@ -3530,6 +3530,9 @@ mod tests {
         let p = dir.path().join("admin.key");
         let mut f = std::fs::File::create(&p).unwrap();
         writeln!(f, "{}", hex::encode(signing.to_bytes())).unwrap();
+        // The CLI refuses a key group or others can read (external audit
+        // AUT-002), as `nn-admin init` never writes one.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         p
     }
 

@@ -1835,15 +1835,23 @@ fn print_status(out: &StatusOutcome, json: bool) {
 }
 
 fn print_verify_keys(out: &VerifyKeysOutcome) -> ExitCode {
+    for (line, why) in &out.skipped {
+        eprintln!("verify-keys: line {line} is not a key (the agent skips it): {why}");
+    }
     if out.fingerprints.is_empty() {
         eprintln!("verify-keys: no valid pub keys installed");
         return ExitCode::from(1);
     }
     println!("verify-keys: {} valid key(s)", out.fingerprints.len());
-    for fp in &out.fingerprints {
-        println!("  {fp}");
+    for (fp, roles) in out.fingerprints.iter().zip(&out.roles) {
+        println!("  {fp}  {roles}");
     }
-    ExitCode::SUCCESS
+    // A checker: a skipped line is a failure even when other keys load.
+    if out.skipped.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 /// Wrap `s` in an ANSI SGR colour code when stdout is a terminal,

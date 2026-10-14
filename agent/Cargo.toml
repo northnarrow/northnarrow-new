@@ -103,7 +103,7 @@ base64 = "0.23"
 # Tappa 7 task 7 / Tappa 8: nn-admin Ed25519 challenge-response.
 # `std` keeps the regular SignatureError type (no_std mode pares it
 # down); `rand_core` lets us feed rand 0.8's OsRng into key generation.
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 hex = "0.4"
 # <<<VERBATIM — Owner ruling §12.1, 2026-05-17>>>
 # Tappa 6.9.7: tantivy is pinned exact-version to ensure deterministic

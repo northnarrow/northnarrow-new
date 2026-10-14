@@ -128,12 +128,12 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-082 | ASK-008 | Admin socket | S | open |
 | NN-AUD-083 | ASK-010 | Admin socket | S | open |
 | NN-AUD-084 | ASK-011 | Admin socket | M | open |
-| NN-AUD-085 | AUT-002 | Admin auth | S | open |
-| NN-AUD-086 | AUT-003 | Admin auth | S | open |
-| NN-AUD-087 | AUT-004 | Admin auth | S | open |
+| NN-AUD-085 | AUT-002 | Admin auth | S | fixed (lab PR 115) |
+| NN-AUD-086 | AUT-003 | Admin auth | S | fixed (lab PR 115) |
+| NN-AUD-087 | AUT-004 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-088 | AUT-009 | Admin auth | M | open |
 | NN-AUD-089 | MAIN-004 | Agent main | S | open |
-| NN-AUD-090 | MAIN-005 | Agent main | S | open |
+| NN-AUD-090 | MAIN-005 | Agent main | S | fixed (lab PR 115) |
 | NN-AUD-091 | MAIN-006 | Agent main | M | open |
 | NN-AUD-092 | MAIN-007 | Agent main | M | open |
 | NN-AUD-093 | MAIN-008 | Agent main | S | open |
@@ -1771,3 +1771,62 @@ the audit did not report, noted with the fix that takes them.
     the open was refused. With the agent's cgroup frozen for the whole
     window (no ticker, no event path): allowed at t=10 s, refused at
     t=25 s — the kernel's deadline alone.
+- **NN-AUD-086 (AUT-003), NN-AUD-087 (AUT-004), NN-AUD-090 (MAIN-005),
+  NN-AUD-085 (AUT-002), lab PR 115.** The admin key files.
+  - AUT-003, worse than reported: the agent rewrote `admin.pub`
+    (rotate-keys) and the signed overlays (`config overlay set`) through a
+    temporary file at a fixed name, opened with `create(true)
+    .truncate(true)` — no `O_NOFOLLOW`, no `create_new`, no directory
+    fsync. Root may create entries in `/etc/northnarrow` while the agent
+    runs (there is no `inode_create` hook; the directory is
+    MUTATE-protected only), and the agent is the one process its own hooks
+    let write there: a link planted at the temporary name
+    (`.admin.pub.tmp -> audit.log`) made the next legitimate rotation
+    truncate the audit chain — written through by the one process allowed
+    to — and rename the link over `admin.pub`. `atomic_file::replace`
+    removes whatever sits at the temporary name (`unlink` never follows a
+    link), creates it exclusively with `O_NOFOLLOW`, sets the mode on the
+    descriptor, writes, syncs, renames and syncs the directory; `admin.pub`
+    and the overlays go through it.
+  - AUT-004: one malformed line in `admin.pub` made the agent refuse the
+    whole file and run without its admin socket — no unlock, no way out of
+    COMBAT — and the watchdog, as strict, without a key to verify a
+    shutdown marker with. `admin.pub` is now read key by key
+    (`parse_admin_pub_lenient`, shared by the agent, the watchdog and
+    `verify-keys`, so both judge with the same keys): a bad line costs its
+    own key, and is an ERROR and a signed record naming the line. Skipping
+    a line never adds authority. A file with no valid key still disables
+    the socket, now with an ERROR and a signed record instead of a WARN.
+  - MAIN-005: `nn-admin verify-keys` required every line to be exactly 64
+    characters, so it rejected every `admin.pub` install.sh writes (a key
+    and its roles). It parses as the agent does, prints each key's roles
+    and the skipped lines, and exits non-zero when a line was skipped (it
+    is a checker).
+  - AUT-002, narrowed: the CLI read the admin private key whatever its
+    mode or owner. A key group- or other-accessible, or owned by another
+    user, is now refused (OpenSSH's rule for identity files;
+    `NN_ADMIN_ALLOW_LOOSE_KEY=1` accepts one — a key on a vfat stick shows
+    0644, and COMBAT recovery must not stop at a mode bit); the key's text
+    and bytes are wiped after use; `init --force` resets the mode to 0600
+    and never writes through a link. The audit's third point was wrong:
+    `SigningKey` was already wiped on drop (ed25519-dalek's `zeroize`,
+    enabled through `std`); it is now asked for explicitly.
+  - Lab, Debian 12 (6.1), before and after on the same guest. Before: a
+    `config overlay set` with links planted at the temporary names wrote
+    the overlay into the probe's sentinel file and left
+    `mass-write-carveout.local` and its `.sig` as links to it;
+    `verify-keys` refused the installed `admin.pub` (`pub key must be 64
+    hex chars (got 128)`, exit 1); a 0644 copy of the admin key opened a
+    trusted-installer window. After: the sentinel untouched, both files
+    regular (0644), the links at the old names left as they were;
+    `verify-keys` lists the key with its five roles (exit 0); the 0644
+    copy refused (`chmod 600` it), the same copy at 0600 accepted; a
+    malformed line appended to `admin.pub` (inside a window) and the agent
+    restarted: an ERROR and a signed `subsystem_degraded` record naming
+    line 4, the admin socket still answering (status, a new window), and
+    `verify-keys` naming the line with exit 1; the line removed: exit 0.
+    The anti-tamper suite: OK.
+  - Found on the way: `ade::tests::a_model_that_fails_to_load_leaves_the_ade_off`
+    relied on the umask for its files' mode — under umask 0002 (a login
+    shell on Ubuntu) the trust check refused them before the GGUF parser
+    ran. The test sets the mode.

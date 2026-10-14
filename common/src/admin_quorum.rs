@@ -65,6 +65,36 @@ pub fn parse_admin_pub(content: &str) -> Result<Vec<AdminKey>, String> {
     Ok(keys)
 }
 
+/// External audit AUT-004: an `admin.pub` read key by key — what
+/// [`parse_admin_pub_lenient`] returns.
+#[derive(Debug, Default)]
+pub struct AdminPubParse {
+    /// The keys of the lines that parse.
+    pub keys: Vec<AdminKey>,
+    /// `(line number, reason)` of each line that does not.
+    pub skipped: Vec<(usize, String)>,
+}
+
+/// Parse `admin.pub` keeping every line that parses and naming the others.
+/// One malformed line used to refuse the whole file — the agent then ran
+/// without its admin socket, the watchdog without a key to verify a
+/// shutdown with. Skipping a line never adds authority: it only loses the
+/// key that line would have held.
+pub fn parse_admin_pub_lenient(content: &str) -> AdminPubParse {
+    let mut out = AdminPubParse::default();
+    for (idx, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match parse_admin_line(line) {
+            Ok(k) => out.keys.push(k),
+            Err(e) => out.skipped.push((idx + 1, e)),
+        }
+    }
+    out
+}
+
 /// Parse one already-trimmed, non-comment, non-blank `admin.pub` line.
 /// Whitespace-tokenised: the first token is the hex public key, the
 /// optional second token the comma-separated role list. A third token is
@@ -259,6 +289,29 @@ pub fn distinct_matches(per_signature: &[Option<usize>]) -> Vec<usize> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// External audit AUT-004: lines 2 and 6 parse; line 3 (65 hex chars)
+    /// and line 5 (roles not comma-separated) are named, not fatal.
+    #[test]
+    fn parse_admin_pub_reports_skipped_lines_and_keeps_the_rest() {
+        let k = |b: u8| {
+            let sk = SigningKey::from_bytes(&[b; 32]);
+            hex::encode(sk.verifying_key().to_bytes())
+        };
+        let content = format!(
+            "# admins\n{} unlock,audit-read\n{}x unlock\n\n{} unlock audit-read\n{}\n",
+            k(1),
+            k(2),
+            k(3),
+            k(4)
+        );
+        let p = parse_admin_pub_lenient(&content);
+        assert_eq!(p.keys.len(), 2);
+        assert_eq!(
+            p.skipped.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+    }
 
     fn key(seed: u8, roles: &[Role]) -> (SigningKey, AdminKey) {
         let sk = SigningKey::from_bytes(&[seed; 32]);
