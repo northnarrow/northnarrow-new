@@ -843,6 +843,15 @@ async fn main() -> Result<()> {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
 
+    // External audit LLMR-014: the signed overlays' rollback floor, from the
+    // audit chain as this boot found it — verified, and read before the key
+    // and the log below are bootstrapped (a log found missing must not look
+    // like a fresh install).
+    let rollback_floor = northnarrow_agent::config::overlay_floor::RollbackFloor::scan(
+        &cli.audit_log_file,
+        &cli.signing_key_file,
+    );
+
     // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
     // BEFORE the sensor multiplexer attaches the LSM hooks, so the
     // hooks see their inodes in PROTECTED_INODES the moment they
@@ -1014,7 +1023,7 @@ async fn main() -> Result<()> {
     let overlay_gate = Arc::new(northnarrow_agent::config::overlay_auth::OverlayGate::new(
         &cli.admin_pub,
         boot_agent_id,
-        &cli.audit_log_file,
+        rollback_floor,
     ));
     use common::wire::admin_signed_payload::OverlayKind;
 
@@ -1762,6 +1771,7 @@ async fn main() -> Result<()> {
                 if let Ok(mut log) =
                     northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id)
                 {
+                    overlay_gate.attest_floor(&mut log);
                     match log.boot_refused(outcome.label(), outcome.provenance(), &detail) {
                         Ok(e) => {
                             info!(entry_hash = %e.entry_hash, "refused boot recorded in the audit chain")
@@ -1802,6 +1812,9 @@ async fn main() -> Result<()> {
                     // instead of failing silently at the first COMBAT
                     // transition. Fail-closed in enforcement mode.
                     Ok(mut log) => {
+                        // External audit LLMR-014: the rollback floor's
+                        // reset / anchor come first in this boot's entries.
+                        overlay_gate.attest_floor(&mut log);
                         match log.boot_probe(detect_only, integrity.label(), integrity.provenance())
                         {
                             Ok(entry) => {

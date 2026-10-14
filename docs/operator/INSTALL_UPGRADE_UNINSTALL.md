@@ -338,6 +338,18 @@ accepted for that list (no rollback to a retired exemption). Otherwise it
 boots on the shipped defaults (`.v1`) for that list, logs `UNAUTHORIZED
 OVERLAY` and records a signed `integrity_drift` (`unauthorized_overlay`).
 
+That floor is read from the chain the agent verifies at boot (links,
+hashes and signatures after the last `overlay_floor_anchor`). When the
+chain's history is gone — `audit.log` missing or emptied while the agent's
+signing key exists, an entry edited or removed, the key unreadable — the
+floor is reset: no overlay signed before that boot is loaded, then or
+later, the agent logs `OVERLAY ROLLBACK FLOOR RESET` and records an
+`integrity_drift` (`overlay_rollback_floor_unavailable`, the new floor in
+`not_before`). Sign the overlays again (`config overlay set`, then a
+restart) to bring them back. `audit.log` is evidence: do not delete or
+truncate it to reclaim space. `config overlay status` shows a reset to
+come (`rollback-floor`).
+
 | Command | Use |
 |---|---|
 | `nn-admin config overlay set <kind> --file F --key K` | sign over the agent's challenge and store through the running agent (it writes the overlay and its `.sig`); applies at its next start |

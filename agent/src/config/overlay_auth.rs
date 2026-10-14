@@ -10,7 +10,9 @@
 //! content, signed by a key that carries `config-manage` in `admin.pub`
 //! (the private key is meant to live off the host), for this agent's
 //! `agent_id`, and not older than the last signature the audit chain
-//! accepted for that kind (no rollback to a retired exemption).
+//! accepted for that kind (no rollback to a retired exemption) — a floor
+//! read from the verified chain, and reset when its history is gone
+//! ([`super::overlay_floor`], external audit LLMR-014).
 //!
 //! An overlay without a valid signature is not loaded — the agent boots on
 //! the shipped defaults (`.v1`) for that kind — and the refusal is an
@@ -34,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
+use super::overlay_floor::RollbackFloor;
 use crate::anti_tamper::admin_auth::AdminAuth;
 use crate::audit::{AuditEntryDraft, AuditLog};
 
@@ -365,11 +368,13 @@ pub(crate) fn read_overlay(path: &Path) -> std::io::Result<Vec<u8>> {
 /// Boot-time gate for every overlay the agent reads.
 pub struct OverlayGate {
     auth: Option<AdminAuth>,
-    /// kind → (sha256 hex, signed ts) of the newest signature the audit
-    /// chain recorded (accepted at a boot, or stored by `set`).
-    recorded: HashMap<OverlayKind, (String, u64)>,
+    /// External audit LLMR-014: the newest signature per kind the verified
+    /// chain shows, and the floor's reset if its history was gone.
+    floor: RollbackFloor,
     allow_unsigned: bool,
     audit_log: Mutex<Option<Arc<Mutex<AuditLog>>>>,
+    /// The floor's own entries (reset, anchor), first in the chain.
+    floor_pending: Mutex<Vec<AuditEntryDraft>>,
     /// Entries made before the audit log was attached.
     pending: Mutex<Vec<AuditEntryDraft>>,
 }
@@ -384,9 +389,10 @@ impl std::fmt::Debug for OverlayGate {
 
 impl OverlayGate {
     /// `admin_pub` is read once here (an overlay is only as trusted as the
-    /// key set at boot); `audit_log` is scanned for the signatures already
-    /// accepted, to refuse a rollback.
-    pub fn new(admin_pub: &Path, agent_id: [u8; 16], audit_log: &Path) -> Self {
+    /// key set at boot); `floor` is what the verified audit chain says about
+    /// the signatures already accepted ([`RollbackFloor::scan`]), to refuse
+    /// a rollback.
+    pub fn new(admin_pub: &Path, agent_id: [u8; 16], floor: RollbackFloor) -> Self {
         let auth = match AdminAuth::load_with_agent_id(admin_pub, agent_id) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -397,9 +403,20 @@ impl OverlayGate {
         let allow_unsigned = std::env::var(ALLOW_UNSIGNED_ENV)
             .map(|v| v == "1")
             .unwrap_or(false);
+        if let Some(why) = floor.reset() {
+            error!(
+                reason = %why,
+                not_before = ?floor.not_before(),
+                "OVERLAY ROLLBACK FLOOR RESET — no overlay signed before this boot is loaded, now or \
+                 later: sign them again (`nn-admin config overlay set`); recorded as integrity_drift \
+                 {}",
+                super::overlay_floor::DRIFT_KIND
+            );
+        }
         Self {
             auth,
-            recorded: recorded_signatures(audit_log),
+            floor_pending: Mutex::new(floor.entries()),
+            floor,
             allow_unsigned,
             audit_log: Mutex::new(None),
             pending: Mutex::new(Vec::new()),
@@ -504,8 +521,17 @@ impl OverlayGate {
             Ok(fps) => fps,
             Err(e) => return refuse(format!("signature rejected: {e}")),
         };
+        if let Some(not_before) = self.floor.not_before() {
+            if sig.payload.ts < not_before {
+                return refuse(format!(
+                    "signed at {} — before {not_before}, when the rollback floor was reset (the \
+                     audit chain's history was found gone or broken): sign it again",
+                    sig.payload.ts
+                ));
+            }
+        }
         let mut new = true;
-        if let Some((hash, ts)) = self.recorded.get(&kind) {
+        if let Some((hash, ts)) = self.floor.recorded(kind) {
             if sig.payload.ts < *ts {
                 return refuse(format!(
                     "signed at {} — older than the signature accepted at {ts} (rollback)",
@@ -583,13 +609,30 @@ impl OverlayGate {
         })));
     }
 
-    /// Attach the signed audit log: pending entries are written now, later
-    /// ones (FIM recompute, COMBAT engage) as they happen.
+    /// External audit LLMR-014: write the floor's entries (its reset, an
+    /// anchor) as soon as the log opens, before this boot's `agent_boot`: a
+    /// log cut back to any entry of this boot still carries them.
+    pub fn attest_floor(&self, log: &mut AuditLog) {
+        let floor: Vec<_> = std::mem::take(&mut *self.floor_pending.lock());
+        for draft in floor {
+            if let Err(e) = log.append(draft) {
+                warn!(
+                    error = format!("{e:#}"),
+                    "overlay gate: rollback-floor entry failed"
+                );
+            }
+        }
+    }
+
+    /// Attach the signed audit log: pending entries are written now (the
+    /// floor's first, if [`Self::attest_floor`] did not), later ones (FIM
+    /// recompute, COMBAT engage) as they happen.
     pub fn attach_audit_log(&self, log: Option<Arc<Mutex<AuditLog>>>) {
         let Some(log) = log else { return };
         *self.audit_log.lock() = Some(Arc::clone(&log));
+        let floor: Vec<_> = std::mem::take(&mut *self.floor_pending.lock());
         let pending: Vec<_> = std::mem::take(&mut *self.pending.lock());
-        for draft in pending {
+        for draft in floor.into_iter().chain(pending) {
             append(&log, draft);
         }
     }
@@ -653,11 +696,11 @@ fn decision_entry(
 }
 
 /// A signed `integrity_drift` entry.
-fn drift_entry(extra: serde_json::Value) -> AuditEntryDraft {
+pub(crate) fn drift_entry(extra: serde_json::Value) -> AuditEntryDraft {
     entry(crate::self_integrity::AUDIT_OP, "detected", extra)
 }
 
-fn entry(op: &str, result: &str, extra: serde_json::Value) -> AuditEntryDraft {
+pub(crate) fn entry(op: &str, result: &str, extra: serde_json::Value) -> AuditEntryDraft {
     AuditEntryDraft {
         op: op.to_string(),
         extra,
@@ -676,41 +719,6 @@ fn append(log: &Arc<Mutex<AuditLog>>, draft: AuditEntryDraft) {
     }
 }
 
-/// Newest signature per kind already in the audit chain (accepted at a
-/// boot or stored by `set`): `(sha256 hex, signed ts)`.
-fn recorded_signatures(audit_log: &Path) -> HashMap<OverlayKind, (String, u64)> {
-    let mut out: HashMap<OverlayKind, (String, u64)> = HashMap::new();
-    let Ok(body) = std::fs::read_to_string(audit_log) else {
-        return out;
-    };
-    for line in body.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
-        if (op != AUDIT_OP_ACCEPTED && op != AUDIT_OP_SET)
-            || v.get("result").and_then(|r| r.as_str()) != Some("success")
-        {
-            continue;
-        }
-        let extra = &v["extra"];
-        let (Some(kind), Some(sha), Some(ts)) = (
-            extra
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .and_then(OverlayKind::from_keyword),
-            extra.get("sha256").and_then(|s| s.as_str()),
-            extra.get("signed_ts").and_then(|t| t.as_u64()),
-        ) else {
-            continue;
-        };
-        if out.get(&kind).map(|(_, t)| ts >= *t).unwrap_or(true) {
-            out.insert(kind, (sha.to_string(), ts));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,14 +727,39 @@ mod tests {
 
     const AGENT: [u8; 16] = [3; 16];
 
-    fn setup(roles: &str) -> (tempfile::TempDir, SigningKey, PathBuf, PathBuf) {
+    fn setup(roles: &str) -> (tempfile::TempDir, SigningKey, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let key = SigningKey::from_bytes(&[0x21; 32]);
         let pub_hex = hex(key.verifying_key().as_bytes());
         let admin_pub = dir.path().join("admin.pub");
         std::fs::write(&admin_pub, format!("{pub_hex} {roles}\n")).unwrap();
-        let audit = dir.path().join("audit.log");
-        (dir, key, admin_pub, audit)
+        (dir, key, admin_pub)
+    }
+
+    /// The agent's own signed chain in `dir`: `audit.log` holding the
+    /// accepted signatures of `accepted` (kind, signed ts), and the
+    /// signing key that verifies it.
+    fn chain(dir: &Path, accepted: &[(OverlayKind, u64)]) -> (PathBuf, PathBuf) {
+        let audit = dir.join("audit.log");
+        let key = dir.join("agent.sig.key");
+        let signing = crate::audit::AgentSigningKey::load_or_bootstrap(&key).unwrap();
+        let mut log = AuditLog::open(&audit, signing, AGENT).unwrap();
+        for (kind, ts) in accepted {
+            log.append(entry(
+                AUDIT_OP_ACCEPTED,
+                "success",
+                serde_json::json!({ "kind": kind.keyword(), "sha256": "aa", "signed_ts": ts }),
+            ))
+            .unwrap();
+        }
+        (audit, key)
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     fn write_signed(
@@ -760,7 +793,7 @@ mod tests {
 
     #[test]
     fn signed_overlay_is_accepted_and_edits_are_refused() {
-        let (dir, key, admin_pub, audit) = setup("config-manage");
+        let (dir, key, admin_pub) = setup("config-manage");
         let p = write_signed(
             dir.path(),
             &key,
@@ -768,7 +801,7 @@ mod tests {
             "+backupd\n",
             100,
         );
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         match gate.check(OverlayKind::ProcessCommAllowlist, &p) {
             Decision::Accepted { new, signed_ts, .. } => assert!(new && signed_ts == 100),
             other => panic!("{other:?}"),
@@ -800,7 +833,7 @@ mod tests {
     /// nothing (every loader used to read the path again).
     #[test]
     fn the_loader_applies_the_bytes_the_gate_verified() {
-        let (dir, key, admin_pub, audit) = setup("config-manage");
+        let (dir, key, admin_pub) = setup("config-manage");
         let p = write_signed(
             dir.path(),
             &key,
@@ -808,7 +841,7 @@ mod tests {
             "+backupd\n",
             100,
         );
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         let verified = gate.verified(OverlayKind::ProcessCommAllowlist, &p);
         std::fs::write(&p, "+backupd\n+evil-implant\n").unwrap();
         let list = crate::config::comm_allowlist::load_comm_allowlist(
@@ -827,7 +860,7 @@ mod tests {
     /// name is refused, not waited on.
     #[test]
     fn an_overlay_behind_a_link_or_a_fifo_is_refused() {
-        let (dir, key, admin_pub, audit) = setup("config-manage");
+        let (dir, key, admin_pub) = setup("config-manage");
         let signed = write_signed(
             dir.path(),
             &key,
@@ -835,7 +868,7 @@ mod tests {
             "+backupd\n",
             100,
         );
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         let link = dir.path().join("link.local");
         std::os::unix::fs::symlink(&signed, &link).unwrap();
         std::fs::copy(sig_path(&signed), sig_path(&link)).unwrap();
@@ -859,8 +892,8 @@ mod tests {
     /// is a signed record, queued until the audit log is attached.
     #[test]
     fn an_unavailable_default_list_is_recorded() {
-        let (dir, _key, admin_pub, audit) = setup("config-manage");
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let (dir, _key, admin_pub) = setup("config-manage");
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         gate.report_default_unavailable(
             "fim paths-config",
             &dir.path().join("fim-paths.v1"),
@@ -877,8 +910,8 @@ mod tests {
     #[test]
     fn combat_files_are_trusted_as_shipped_or_signed() {
         use crate::anti_tamper::network_isolate::{BUILTIN_RULES_V4, BUILTIN_RULES_V6};
-        let (dir, key, admin_pub, audit) = setup("config-manage");
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let (dir, key, admin_pub) = setup("config-manage");
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         let v4 = dir.path().join(OverlayKind::CombatRulesV4.file_name());
         std::fs::write(&v4, BUILTIN_RULES_V4).unwrap();
         assert_eq!(
@@ -916,7 +949,7 @@ mod tests {
 
     #[test]
     fn unsigned_wrong_kind_wrong_role_wrong_agent_are_refused() {
-        let (dir, key, admin_pub, audit) = setup("unlock,audit-read");
+        let (dir, key, admin_pub) = setup("unlock,audit-read");
         // wrong role
         let p = write_signed(
             dir.path(),
@@ -925,19 +958,19 @@ mod tests {
             "+x\n",
             1,
         );
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         assert!(
             matches!(gate.check(OverlayKind::NetflowCommAllowlist, &p), Decision::Refused { reason, .. } if reason.contains("rejected"))
         );
         // wrong kind: the signature names another overlay
-        let (dir2, key2, admin_pub2, audit2) = setup("config-manage");
+        let (dir2, key2, admin_pub2) = setup("config-manage");
         let p2 = write_signed(dir2.path(), &key2, OverlayKind::FimPaths, "+/srv/app\n", 1);
-        let gate2 = OverlayGate::new(&admin_pub2, AGENT, &audit2);
+        let gate2 = OverlayGate::new(&admin_pub2, AGENT, RollbackFloor::default());
         assert!(
             matches!(gate2.check(OverlayKind::ProcessCommAllowlist, &p2), Decision::Refused { reason, .. } if reason.contains("fim-paths"))
         );
         // wrong agent: same files, another agent_id
-        let gate3 = OverlayGate::new(&admin_pub2, [4; 16], &audit2);
+        let gate3 = OverlayGate::new(&admin_pub2, [4; 16], RollbackFloor::default());
         assert!(matches!(
             gate3.check(OverlayKind::FimPaths, &p2),
             Decision::Refused { .. }
@@ -958,15 +991,16 @@ mod tests {
         );
     }
 
+    /// External audit LLMR-014: the floor read from the agent's signed
+    /// chain still refuses a rollback, and lets a newer signature through.
     #[test]
-    fn rollback_to_an_older_signature_is_refused() {
-        let (dir, key, admin_pub, audit) = setup("config-manage");
+    fn verified_floor_still_blocks_rollback() {
+        let (dir, key, admin_pub) = setup("config-manage");
         // the chain already accepted a signature made at ts 500
-        std::fs::write(
-            &audit,
-            "{\"op\":\"config_overlay_accepted\",\"result\":\"success\",\"extra\":{\"kind\":\"process-comm-allowlist\",\"sha256\":\"aa\",\"signed_ts\":500}}\n",
-        )
-        .unwrap();
+        let (audit, agent_key) = chain(dir.path(), &[(OverlayKind::ProcessCommAllowlist, 500)]);
+        let floor = RollbackFloor::scan(&audit, &agent_key);
+        assert_eq!(floor.reset(), None);
+        let gate = OverlayGate::new(&admin_pub, AGENT, floor);
         let p = write_signed(
             dir.path(),
             &key,
@@ -974,7 +1008,6 @@ mod tests {
             "+old-exemption\n",
             400,
         );
-        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
         assert!(
             matches!(gate.check(OverlayKind::ProcessCommAllowlist, &p), Decision::Refused { reason, .. } if reason.contains("rollback"))
         );
@@ -989,6 +1022,104 @@ mod tests {
             gate.check(OverlayKind::ProcessCommAllowlist, &p),
             Decision::Accepted { new: true, .. }
         ));
+    }
+
+    /// External audit LLMR-014: the log removed while the agent's key stays
+    /// gave no floor, and the retired signature was loaded. Now the floor
+    /// is reset: refused, recorded, and a signature made after it loads.
+    #[test]
+    fn missing_log_refuses_present_overlay() {
+        let (dir, key, admin_pub) = setup("config-manage");
+        let (audit, agent_key) = chain(dir.path(), &[(OverlayKind::ProcessCommAllowlist, 500)]);
+        std::fs::remove_file(&audit).unwrap();
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::scan(&audit, &agent_key));
+        let p = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::ProcessCommAllowlist,
+            "+old-exemption\n",
+            400,
+        );
+        assert!(
+            matches!(gate.check(OverlayKind::ProcessCommAllowlist, &p), Decision::Refused { reason, .. } if reason.contains("rollback floor was reset"))
+        );
+        assert_eq!(
+            gate.verified(OverlayKind::ProcessCommAllowlist, &p),
+            Verified::Refused
+        );
+        let resigned = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::ProcessCommAllowlist,
+            "+old-exemption\n",
+            unix_now() + 5,
+        );
+        assert!(matches!(
+            gate.check(OverlayKind::ProcessCommAllowlist, &resigned),
+            Decision::Accepted { .. }
+        ));
+    }
+
+    /// External audit LLMR-014: a floor entry edited offline breaks the
+    /// chain — the floor is reset, the old signature refused.
+    #[test]
+    fn edited_floor_entry_breaks_chain_and_refuses() {
+        let (dir, key, admin_pub) = setup("config-manage");
+        let (audit, agent_key) = chain(dir.path(), &[(OverlayKind::ProcessCommAllowlist, 500)]);
+        let body = std::fs::read_to_string(&audit).unwrap();
+        std::fs::write(&audit, body.replace("\"signed_ts\":500", "\"signed_ts\":1")).unwrap();
+        let floor = RollbackFloor::scan(&audit, &agent_key);
+        assert!(floor.reset().is_some_and(|r| r.contains("does not verify")));
+        let gate = OverlayGate::new(&admin_pub, AGENT, floor);
+        let p = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::ProcessCommAllowlist,
+            "+old-exemption\n",
+            400,
+        );
+        assert!(matches!(
+            gate.check(OverlayKind::ProcessCommAllowlist, &p),
+            Decision::Refused { .. }
+        ));
+    }
+
+    /// The floor's reset is the first entry this boot writes — before
+    /// `agent_boot` — and is written once.
+    #[test]
+    fn the_floor_is_attested_before_the_boot_entry() {
+        let (dir, _key, admin_pub) = setup("config-manage");
+        let (audit, agent_key) = chain(dir.path(), &[(OverlayKind::ProcessCommAllowlist, 500)]);
+        std::fs::remove_file(&audit).unwrap();
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::scan(&audit, &agent_key));
+        let signing = crate::audit::AgentSigningKey::load_or_bootstrap(&agent_key).unwrap();
+        let mut log = AuditLog::open(&audit, signing, AGENT).unwrap();
+        gate.attest_floor(&mut log);
+        log.boot_probe(false, "verified", "installed").unwrap();
+        gate.attach_audit_log(Some(Arc::new(Mutex::new(log))));
+        let ops: Vec<(String, String)> = std::fs::read_to_string(&audit)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let e: crate::audit::AuditEntry = serde_json::from_str(l).unwrap();
+                let kind = e.extra["kind"].as_str().unwrap_or("").to_string();
+                (e.op, kind)
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                (
+                    crate::self_integrity::AUDIT_OP.to_string(),
+                    super::super::overlay_floor::DRIFT_KIND.to_string()
+                ),
+                (
+                    super::super::overlay_floor::AUDIT_OP_ANCHOR.to_string(),
+                    String::new()
+                ),
+                ("agent_boot".to_string(), String::new()),
+            ]
+        );
     }
 
     #[test]

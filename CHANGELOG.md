@@ -6,6 +6,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, the overlays' rollback floor (Medium LLMR-014):
+  the newest accepted signature of each overlay was read from `audit.log`
+  as plain JSON, and a missing log gave no floor — removing the log
+  offline brought a retired, once legitimately signed exemption back. The
+  floor now comes from the chain the agent verifies, anchored so that a
+  boot checks only the new entries; a log that is gone or does not verify
+  resets it, recorded in the signed chain: no overlay signed before the
+  reset is loaded until it is signed again.
 - External audit, Wave 2, the signed overlays (Medium LLMR-013, LLMR-016):
   what the agent applies is the overlay it verified — the loaders, and
   COMBAT at every engage, read the file a second time, so a root process
