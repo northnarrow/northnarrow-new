@@ -204,7 +204,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-158 | LLMR-008 | LLM runtime | M | open |
 | NN-AUD-159 | LLMR-010 | LLM runtime | S | open |
 | NN-AUD-160 | LLMR-013 | LLM runtime | M | fixed (lab PR 116) |
-| NN-AUD-161 | LLMR-014 | LLM runtime | M | open |
+| NN-AUD-161 | LLMR-014 | LLM runtime | M | fixed (lab PR 117) |
 | NN-AUD-162 | LLMR-016 | LLM runtime | S | fixed (lab PR 116) |
 | NN-AUD-163 | LLMR-017 | LLM runtime | M | open |
 | NN-AUD-164 | NET-006 | Network | M | open |
@@ -1878,3 +1878,58 @@ the audit did not report, noted with the fix that takes them.
     signed `fim-paths.local`: the SHA-256 the journal names as applied is
     the file's and the one its signature covers (`9eed6038…848e`). The
     anti-tamper suite: OK.
+- **NN-AUD-161 (LLMR-014), lab PR 117.** The rollback floor of the signed
+  overlays comes from the verified audit chain.
+  - `recorded_signatures` read `audit.log` line by line as plain JSON — no
+    hash link or signature checked — and a missing or unreadable log gave
+    an empty map: no floor, no log line, and a retired signature (an
+    exemption signed for a maintenance, then superseded) loaded again.
+    `RollbackFloor::scan` (`config/overlay_floor.rs`) reads the chain
+    before the boot bootstraps the key and the log (a log found missing
+    must not look like a fresh install) and verifies every entry after the
+    last anchor: its link, its own hash, the agent's signature (with the
+    public half of the private key, or `agent.sig.pub` when a restart
+    under the previous instance's hooks closes the key). The tail's
+    signature alone would not do: the agent appends to a history it does
+    not verify, so a genuine entry on top of a rehashed history vouches
+    for nothing.
+  - An anchor (`overlay_floor_anchor`, signed by the agent) carries the
+    floor a boot verified and the hash of the entry it verified up to. A
+    boot whose scan verified 256 entries past the last anchor writes one,
+    so the next boot verifies only what came after (on several threads
+    from 1 024 entries): the log is never rotated.
+  - A log missing or empty while the key exists, a chain that does not
+    verify, a key that cannot be read: the floor is reset to the time of
+    that boot (never below the newest signature the chain still shows, so
+    a clock set back does not reopen it), an ERROR, and a signed
+    `integrity_drift` (`overlay_rollback_floor_unavailable`, with
+    `not_before`) written as soon as the log opens, before `agent_boot`: a
+    log cut back to any entry of that boot still carries it. A break with
+    a reset after it is known at the next boots; one without is found
+    again. A signature made after the reset loads: the recovery is
+    `nn-admin config overlay set` (or `sign`) and a restart.
+  - `nn-admin config overlay status` computes the same floor
+    (`--agent-sig-key`) and shows a reset to come (`rollback-floor`).
+  - Residual, as triaged: a log cut back offline to an older prefix that
+    verifies, the key, its public half and the log all removed (what a
+    fresh install looks like), or a chain forged with the key itself — an
+    offline reader of an unencrypted disk has it — cannot be told apart on
+    the host; that takes an anchor off it (Tappa 13).
+  - Lab, Debian 12 (6.1), the build of main before (`floor-probe.sh`). A
+    `process-comm-allowlist` overlay signed and stored, a copy of it and
+    its signature kept, a newer one stored and loaded; then, with agent and
+    watchdog stopped and no pinned hooks (offline), the retired copy put
+    back. With the log as it was: refused before and after (older than the
+    signature accepted). With `audit.log` moved aside: before, the retired
+    exemption loaded (`effective=14`, its SHA-256 `df043379…`) and the new
+    chain began with `agent_boot` and `config_overlay_accepted`, no trace;
+    after, `OVERLAY ROLLBACK FLOOR RESET`, the overlay refused ("signed at
+    1791959516 — before 1791959573, when the rollback floor was reset"),
+    and the new chain begins with the signed
+    `overlay_rollback_floor_unavailable` and its anchor. With the records
+    of the newer signature removed from the log: before, loaded again;
+    after, "entry 1450 does not chain from the one before it", reset,
+    refused. The first boot of the new build verified the lab's 1 444-entry
+    chain in 17 ms and anchored it; the restarts after it verified 9 to 13
+    entries (1 ms), the warm ones with `agent.sig.pub`. The anti-tamper
+    suite: OK.

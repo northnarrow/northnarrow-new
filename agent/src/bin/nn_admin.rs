@@ -456,6 +456,10 @@ enum OverlayCmd {
         agent_id_file: PathBuf,
         #[arg(long = "audit-log", default_value = DEFAULT_AUDIT_LOG_PATH)]
         audit_log: PathBuf,
+        /// The agent's audit signing key the chain is verified with (its
+        /// public half `agent.sig.pub` when the key is closed to readers).
+        #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
+        agent_sig_key: PathBuf,
     },
 }
 
@@ -2119,6 +2123,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
             admin_pub,
             agent_id_file,
             audit_log,
+            agent_sig_key,
         } => {
             let agent_id = match northnarrow_agent::agent_id::load_or_bootstrap(&agent_id_file) {
                 Ok(a) => a,
@@ -2127,7 +2132,23 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                     return ExitCode::from(5);
                 }
             };
-            let gate = OverlayGate::new(&admin_pub, agent_id, &audit_log);
+            // External audit LLMR-014: the floor the verified chain proves.
+            let floor = northnarrow_agent::config::overlay_floor::RollbackFloor::scan(
+                &audit_log,
+                &agent_sig_key,
+            );
+            if let Some(why) = floor.reset() {
+                println!(
+                    "{:<24} reset at the next start: {why} — an overlay signed before it is not loaded",
+                    "rollback-floor"
+                );
+            } else if let Some(not_before) = floor.not_before() {
+                println!(
+                    "{:<24} reset at {not_before} (audit chain found gone or broken): an overlay signed before it is not loaded",
+                    "rollback-floor"
+                );
+            }
+            let gate = OverlayGate::new(&admin_pub, agent_id, floor);
             let mut unsigned = 0;
             for kind in common::wire::admin_signed_payload::OverlayKind::ALL {
                 let path = dir.join(kind.file_name());

@@ -855,7 +855,7 @@ fn build_signed_entry(
 /// stays free of those fields' eventual contents — verifiers
 /// reproduce the same bytes by clearing those fields before
 /// recomputing.
-fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
+pub(crate) fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
     let prev_bytes =
@@ -913,44 +913,56 @@ pub fn verify_chain(entries: &[AuditEntry], pubkey: &VerifyingKey) -> Result<(),
                 expected: expected_prev,
             });
         }
-        // Recompute against a "stripped" copy with both
-        // chain-output fields cleared, matching the pre-image
-        // build_signed_entry hashed.
-        let mut stripped = entry.clone();
-        stripped.entry_hash.clear();
-        stripped.agent_sig.clear();
-        let recomputed =
-            compute_entry_hash(&stripped).map_err(|e| AuditVerifyError::MalformedField {
-                idx,
-                reason: e.to_string(),
-            })?;
-        let recomputed_hex = hex::encode(recomputed);
-        if recomputed_hex != entry.entry_hash {
-            return Err(AuditVerifyError::EntryHashMismatch {
-                idx,
-                recomputed: recomputed_hex,
-                stored: entry.entry_hash.clone(),
-            });
-        }
-        let sig_bytes =
-            B64.decode(&entry.agent_sig)
-                .map_err(|e| AuditVerifyError::MalformedField {
-                    idx,
-                    reason: format!("agent_sig base64 decode: {e}"),
-                })?;
-        if sig_bytes.len() != 64 {
-            return Err(AuditVerifyError::MalformedField {
-                idx,
-                reason: format!("agent_sig length {} (expected 64)", sig_bytes.len()),
-            });
-        }
-        let mut sig_arr = [0u8; 64];
-        sig_arr.copy_from_slice(&sig_bytes);
-        let sig = Signature::from_bytes(&sig_arr);
-        if pubkey.verify(&recomputed, &sig).is_err() {
-            return Err(AuditVerifyError::SignatureInvalid { idx });
-        }
+        verify_entry(idx, entry, pubkey)?;
         expected_prev = entry.entry_hash.clone();
+    }
+    Ok(())
+}
+
+/// One entry on its own (external audit LLMR-014): its `entry_hash`
+/// recomputed from its content and `prev_hash`, its `agent_sig` checked
+/// against `pubkey`. The link to the entry before is the caller's
+/// ([`verify_chain`]); `idx` only labels the error.
+pub fn verify_entry(
+    idx: usize,
+    entry: &AuditEntry,
+    pubkey: &VerifyingKey,
+) -> Result<(), AuditVerifyError> {
+    // Recompute against a "stripped" copy with both chain-output fields
+    // cleared, matching the pre-image build_signed_entry hashed.
+    let mut stripped = entry.clone();
+    stripped.entry_hash.clear();
+    stripped.agent_sig.clear();
+    let recomputed =
+        compute_entry_hash(&stripped).map_err(|e| AuditVerifyError::MalformedField {
+            idx,
+            reason: e.to_string(),
+        })?;
+    let recomputed_hex = hex::encode(recomputed);
+    if recomputed_hex != entry.entry_hash {
+        return Err(AuditVerifyError::EntryHashMismatch {
+            idx,
+            recomputed: recomputed_hex,
+            stored: entry.entry_hash.clone(),
+        });
+    }
+    let sig_bytes = B64
+        .decode(&entry.agent_sig)
+        .map_err(|e| AuditVerifyError::MalformedField {
+            idx,
+            reason: format!("agent_sig base64 decode: {e}"),
+        })?;
+    if sig_bytes.len() != 64 {
+        return Err(AuditVerifyError::MalformedField {
+            idx,
+            reason: format!("agent_sig length {} (expected 64)", sig_bytes.len()),
+        });
+    }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::from_bytes(&sig_arr);
+    if pubkey.verify(&recomputed, &sig).is_err() {
+        return Err(AuditVerifyError::SignatureInvalid { idx });
     }
     Ok(())
 }

@@ -889,7 +889,7 @@ mod tests {
         let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
             &admin_pub,
             [1; 16],
-            &dir.path().join("audit.log"),
+            crate::config::overlay_floor::RollbackFloor::default(),
         ));
         let v4 = dir.path().join("combat-rules.v4");
         let allow = dir.path().join("combat-allow.cidrs");
