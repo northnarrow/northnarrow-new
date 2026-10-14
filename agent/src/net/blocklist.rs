@@ -28,6 +28,17 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 
+use crate::config::overlay::{load_defaults, DefaultsSource};
+use crate::config::overlay_auth::Verified;
+
+/// External audit LLMR-016: the shipped default lists, built in — used
+/// when the `.v1` on disk cannot be read (the blocklists used to be empty
+/// then, with a WARN).
+pub const BUILTIN_NETFLOW_BLOCKLIST_V1: &str =
+    include_str!("../../../configs/netflow-blocklist.v1");
+pub const BUILTIN_JA3_BLOCKLIST_V1: &str =
+    include_str!("../../../configs/netflow-ja3-blocklist.v1");
+
 /// Default deploy path for the IP / CIDR blocklist file.
 pub const DEFAULT_NETFLOW_BLOCKLIST_V1: &str = "/etc/northnarrow/netflow-blocklist.v1";
 /// Operator overlay path.
@@ -129,6 +140,8 @@ fn cidr_contains(net: &IpAddr, prefix: u8, addr: &IpAddr) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetBlocklist {
     entries: BTreeSet<NetBlocklistEntry>,
+    /// Where the defaults came from (external audit LLMR-016).
+    defaults: DefaultsSource,
 }
 
 impl NetBlocklist {
@@ -143,7 +156,14 @@ impl NetBlocklist {
     pub fn from_entries<I: IntoIterator<Item = NetBlocklistEntry>>(iter: I) -> Self {
         Self {
             entries: iter.into_iter().collect(),
+            defaults: DefaultsSource::Disk,
         }
+    }
+
+    /// Where the defaults came from: [`DefaultsSource::BuiltIn`] when the
+    /// `.v1` could not be read (the caller records it).
+    pub fn defaults(&self) -> &DefaultsSource {
+        &self.defaults
     }
 
     /// How many entries the blocklist holds.
@@ -161,28 +181,20 @@ impl NetBlocklist {
         self.entries.iter().any(|e| e.matches(addr))
     }
 
-    /// Production loader. Reads `v1_path` + `local_path`,
-    /// applies the `.local` overlay's `+` / `-` directives,
-    /// emits boot-time WARNs for disabled defaults + unknown
-    /// disables (mirrors the Tappa 9 C7 paths_config WARN
-    /// pattern so operators see all suppressions).
-    pub fn load(v1_path: &Path, local_path: &Path) -> Result<Self> {
-        let defaults = read_v1(v1_path).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                path = %v1_path.display(),
-                "netflow blocklist v1 missing / unreadable — no defaults this boot"
-            );
-            BTreeSet::new()
-        });
-        let (adds, disables) = read_local(local_path).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                path = %local_path.display(),
-                "netflow blocklist .local unreadable — ignoring overlay"
-            );
-            (BTreeSet::new(), BTreeSet::new())
-        });
+    /// Production loader. Reads `v1_path` (or, when it cannot be read,
+    /// the built-in copy), applies the `.local` overlay's `+` / `-`
+    /// directives — `local` is the overlay as the signed-overlay gate
+    /// verified it (external audit LLMR-013) — and emits boot-time WARNs
+    /// for disabled defaults + unknown disables (mirrors the Tappa 9 C7
+    /// paths_config WARN pattern so operators see all suppressions).
+    pub fn load(v1_path: &Path, local: &Verified) -> Result<Self> {
+        let (defaults, source) = load_defaults(
+            "netflow blocklist",
+            v1_path,
+            BUILTIN_NETFLOW_BLOCKLIST_V1,
+            parse_v1_text,
+        );
+        let (adds, disables) = overlay_entries(local, NetBlocklistEntry::parse);
 
         let mut disabled = BTreeSet::new();
         let mut unknown_disable = BTreeSet::new();
@@ -204,21 +216,22 @@ impl NetBlocklist {
             entries.insert(a);
         }
         info!(entries = entries.len(), "netflow blocklist: load complete");
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            defaults: source,
+        })
     }
 }
 
-fn read_v1(path: &Path) -> Result<BTreeSet<NetBlocklistEntry>> {
-    let body =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(each_line(&path.display().to_string(), &body, |t| {
+fn parse_v1_text(label: &str, body: &str) -> BTreeSet<NetBlocklistEntry> {
+    each_line(label, body, |t| {
         if t.starts_with('+') || t.starts_with('-') {
             return Err(anyhow!("default list must not use +/- prefixes"));
         }
         NetBlocklistEntry::parse(t)
     })
     .into_iter()
-    .collect())
+    .collect()
 }
 
 /// External audit NET-002 (NN-AUD-056): a malformed line drops that line,
@@ -272,17 +285,20 @@ fn split_overlay<T: Ord>(lines: Vec<(bool, T)>) -> (BTreeSet<T>, BTreeSet<T>) {
     (adds, disables)
 }
 
-fn read_local(path: &Path) -> Result<(BTreeSet<NetBlocklistEntry>, BTreeSet<NetBlocklistEntry>)> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    };
-    Ok(split_overlay(each_line(
-        &path.display().to_string(),
-        &body,
-        |t| overlay_line(t, NetBlocklistEntry::parse),
-    )))
+/// The overlay's `(adds, disables)`, from the text the signed-overlay gate
+/// verified (external audit LLMR-013); a malformed line is skipped.
+fn overlay_entries<T: Ord>(
+    local: &Verified,
+    parse: impl Fn(&str) -> Result<T>,
+) -> (BTreeSet<T>, BTreeSet<T>) {
+    match (local.text(), local.source()) {
+        (Some(text), Some(path)) => {
+            split_overlay(each_line(&path.display().to_string(), text, |t| {
+                overlay_line(t, &parse)
+            }))
+        }
+        _ => Default::default(),
+    }
 }
 
 /// Text form of the `netflow-blocklist.local` parser (Tappa 10.8: the same
@@ -325,6 +341,8 @@ pub(crate) fn parse_blocklist_overlay_text(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ja3Blocklist {
     hashes: BTreeSet<String>,
+    /// Where the defaults came from (external audit LLMR-016).
+    defaults: DefaultsSource,
 }
 
 impl Ja3Blocklist {
@@ -339,6 +357,7 @@ impl Ja3Blocklist {
     {
         Self {
             hashes: iter.into_iter().map(Into::into).collect(),
+            defaults: DefaultsSource::Disk,
         }
     }
 
@@ -354,23 +373,20 @@ impl Ja3Blocklist {
         self.hashes.contains(hash)
     }
 
-    pub fn load(v1_path: &Path, local_path: &Path) -> Result<Self> {
-        let defaults = read_ja3_v1(v1_path).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                path = %v1_path.display(),
-                "JA3 blocklist v1 missing / unreadable — no defaults this boot"
-            );
-            BTreeSet::new()
-        });
-        let (adds, disables) = read_ja3_local(local_path).unwrap_or_else(|e| {
-            warn!(
-                error = %e,
-                path = %local_path.display(),
-                "JA3 blocklist .local unreadable — ignoring overlay"
-            );
-            (BTreeSet::new(), BTreeSet::new())
-        });
+    /// Where the defaults came from (see [`NetBlocklist::defaults`]).
+    pub fn defaults(&self) -> &DefaultsSource {
+        &self.defaults
+    }
+
+    /// Production loader: as [`NetBlocklist::load`], for JA3 hashes.
+    pub fn load(v1_path: &Path, local: &Verified) -> Result<Self> {
+        let (defaults, source) = load_defaults(
+            "JA3 blocklist",
+            v1_path,
+            BUILTIN_JA3_BLOCKLIST_V1,
+            parse_ja3_v1_text,
+        );
+        let (adds, disables) = overlay_entries(local, parse_ja3_hash);
         let mut hashes: BTreeSet<String> = defaults
             .iter()
             .filter(|h| !disables.contains(*h))
@@ -379,7 +395,10 @@ impl Ja3Blocklist {
         for h in adds {
             hashes.insert(h);
         }
-        Ok(Self { hashes })
+        Ok(Self {
+            hashes,
+            defaults: source,
+        })
     }
 }
 
@@ -393,30 +412,15 @@ fn parse_ja3_hash(s: &str) -> Result<String> {
     Ok(s)
 }
 
-fn read_ja3_v1(path: &Path) -> Result<BTreeSet<String>> {
-    let body =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(each_line(&path.display().to_string(), &body, |t| {
+fn parse_ja3_v1_text(label: &str, body: &str) -> BTreeSet<String> {
+    each_line(label, body, |t| {
         if t.starts_with('+') || t.starts_with('-') {
             return Err(anyhow!("default list must not use +/- prefixes"));
         }
         parse_ja3_hash(t)
     })
     .into_iter()
-    .collect())
-}
-
-fn read_ja3_local(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    };
-    Ok(split_overlay(each_line(
-        &path.display().to_string(),
-        &body,
-        |t| overlay_line(t, parse_ja3_hash),
-    )))
+    .collect()
 }
 
 /// Text form of the `netflow-ja3-blocklist.local` parser (Tappa 10.8).
@@ -485,6 +489,40 @@ mod tests {
         p
     }
 
+    /// The overlay at `path` as a gate that accepts it hands it over.
+    fn verified(path: &Path) -> Verified {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Verified::Content {
+                path: path.to_path_buf(),
+                text,
+            },
+            Err(_) => Verified::Missing,
+        }
+    }
+
+    /// External audit LLMR-016: with the `.v1` unreadable the blocklists
+    /// are the shipped ones built into the agent (they used to be empty),
+    /// and say so.
+    #[test]
+    fn a_missing_v1_uses_the_built_in_lists() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing.v1");
+        let bl = NetBlocklist::load(&missing, &Verified::Missing).unwrap();
+        assert!(matches!(bl.defaults(), DefaultsSource::BuiltIn(_)));
+        assert!(bl.contains(&"192.0.2.1".parse().unwrap()));
+        let ja3 = Ja3Blocklist::load(&missing, &Verified::Missing).unwrap();
+        assert!(matches!(ja3.defaults(), DefaultsSource::BuiltIn(_)));
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs");
+        assert_eq!(
+            std::fs::read_to_string(configs.join("netflow-blocklist.v1")).unwrap(),
+            BUILTIN_NETFLOW_BLOCKLIST_V1
+        );
+        assert_eq!(
+            std::fs::read_to_string(configs.join("netflow-ja3-blocklist.v1")).unwrap(),
+            BUILTIN_JA3_BLOCKLIST_V1
+        );
+    }
+
     /// N6 blocklist test #1 — bare flat list of IPs + CIDRs
     /// parses into the expected entries; `contains` matches
     /// both exact + range.
@@ -497,7 +535,7 @@ mod tests {
             "# header\n1.2.3.4\n10.0.0.0/8\n# comment\n2001:db8::/32\n",
         );
         let local = dir.path().join("netflow-blocklist.local");
-        let bl = NetBlocklist::load(&v1, &local).expect("load");
+        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
         assert_eq!(bl.len(), 3);
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(10, 50, 60, 70))));
@@ -513,7 +551,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\n");
         let local = write_file(&dir, "netflow-blocklist.local", "+2.2.2.2\n3.3.3.3\n");
-        let bl = NetBlocklist::load(&v1, &local).expect("load");
+        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3))));
@@ -526,7 +564,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\n2.2.2.2\n");
         let local = write_file(&dir, "netflow-blocklist.local", "-1.1.1.1\n");
-        let bl = NetBlocklist::load(&v1, &local).expect("load");
+        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
         assert!(!bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
     }
@@ -540,7 +578,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\n");
         let local = write_file(&dir, "netflow-blocklist.local", "-9.9.9.9\n+2.2.2.2\n");
-        let bl = NetBlocklist::load(&v1, &local).expect("load");
+        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
         assert!(!bl.contains(&IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))));
@@ -581,8 +619,7 @@ mod tests {
         // External audit NET-011 (NN-AUD-060): the seed feeds NN-L-NET-001
         // (KillProcessTree); CGNAT and benchmarking space are in daily use.
         let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs/netflow-blocklist.v1");
-        let dir = TempDir::new().unwrap();
-        let bl = NetBlocklist::load(&shipped, &dir.path().join("absent.local")).unwrap();
+        let bl = NetBlocklist::load(&shipped, &Verified::Missing).unwrap();
         for a in [
             "100.64.0.1",
             "100.100.100.100",
@@ -613,7 +650,7 @@ mod tests {
             "netflow-blocklist.local",
             "+4.4.4.4\n+bad\n-1.1.1.1\n",
         );
-        let bl = NetBlocklist::load(&v1, &local).expect("load");
+        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
         assert_eq!(bl.len(), 2, "2.2.2.2 and 4.4.4.4; 1.1.1.1 disabled");
         assert!(bl.contains(&"2.2.2.2".parse().unwrap()));
         assert!(bl.contains(&"4.4.4.4".parse().unwrap()));
@@ -633,7 +670,7 @@ mod tests {
             &format!("{good}\nnot-a-hash\n{other}\n"),
         );
         let local = dir.path().join("netflow-ja3-blocklist.local");
-        let bl = Ja3Blocklist::load(&v1, &local).expect("load");
+        let bl = Ja3Blocklist::load(&v1, &verified(&local)).expect("load");
         assert_eq!(bl.len(), 2);
         assert!(bl.contains(&good) && bl.contains(&other));
         assert!(parse_ja3_overlay_text("x", "+zz\n").is_err());
@@ -653,7 +690,7 @@ mod tests {
             &format!("# header\n{valid}\n"),
         );
         let local = dir.path().join("netflow-ja3-blocklist.local");
-        let bl = Ja3Blocklist::load(&v1, &local).expect("load");
+        let bl = Ja3Blocklist::load(&v1, &verified(&local)).expect("load");
         assert!(bl.contains(valid));
         assert!(!bl.contains("00000000000000000000000000000000"));
     }
@@ -678,8 +715,7 @@ mod tests {
             "configs/netflow-blocklist.v1 must ship in the repo \
              (install.sh deploys this file to /etc/northnarrow/)"
         );
-        let absent_local = v1.with_file_name("netflow-blocklist.local.does-not-exist");
-        let bl = NetBlocklist::load(&v1, &absent_local)
+        let bl = NetBlocklist::load(&v1, &Verified::Missing)
             .expect("shipped configs/netflow-blocklist.v1 must parse clean");
         assert!(
             !bl.is_empty(),
@@ -711,8 +747,7 @@ mod tests {
             "configs/netflow-ja3-blocklist.v1 must ship in the repo \
              (install.sh deploys this file to /etc/northnarrow/)"
         );
-        let absent_local = v1.with_file_name("netflow-ja3-blocklist.local.does-not-exist");
-        let bl = Ja3Blocklist::load(&v1, &absent_local)
+        let bl = Ja3Blocklist::load(&v1, &Verified::Missing)
             .expect("shipped configs/netflow-ja3-blocklist.v1 must parse clean");
         assert!(
             bl.is_empty(),

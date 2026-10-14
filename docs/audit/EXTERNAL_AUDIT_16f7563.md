@@ -203,9 +203,9 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-157 | LLMR-005 | LLM runtime | M | already fixed (lab PR 105, with NN-AUD-053) |
 | NN-AUD-158 | LLMR-008 | LLM runtime | M | open |
 | NN-AUD-159 | LLMR-010 | LLM runtime | S | open |
-| NN-AUD-160 | LLMR-013 | LLM runtime | M | open |
+| NN-AUD-160 | LLMR-013 | LLM runtime | M | fixed (lab PR 116) |
 | NN-AUD-161 | LLMR-014 | LLM runtime | M | open |
-| NN-AUD-162 | LLMR-016 | LLM runtime | S | open |
+| NN-AUD-162 | LLMR-016 | LLM runtime | S | fixed (lab PR 116) |
 | NN-AUD-163 | LLMR-017 | LLM runtime | M | open |
 | NN-AUD-164 | NET-006 | Network | M | open |
 | NN-AUD-165 | NET-009 | Network | L | open |
@@ -1830,3 +1830,51 @@ the audit did not report, noted with the fix that takes them.
     relied on the umask for its files' mode — under umask 0002 (a login
     shell on Ubuntu) the trust check refused them before the GGUF parser
     ran. The test sets the mode.
+- **NN-AUD-160 (LLMR-013), NN-AUD-162 (LLMR-016), lab PR 116.** The overlay
+  gate applies what it verified.
+  - LLMR-013, worse than reported: `OverlayGate::check` read and verified
+    an overlay's bytes, `effective` returned its path, and every loader —
+    the netflow and JA3 blocklists, the comm allowlists, the FIM paths (at
+    boot and at a signed `fim baseline`), the canary readers, the
+    mass-write carve-out (read twice), the escalation allowlist — read the
+    path again. The same shape, in reverse, sat in the Wave 1 COMBAT fix
+    (ATP-001/DEP-003): `trusted_source` read the ruleset, let the gate
+    verify a second read, and applied the first, at every engage. A root
+    process able to pause the agent's `open()` (fanotify permission
+    events) could serve the gate the signed bytes and the loader others.
+    `OverlayGate::verified` reads an overlay once — not through a link,
+    without waiting on a FIFO planted at its name, at most 4 MiB — decides
+    on those bytes and hands over their text (`Verified`); the loaders take
+    that instead of a path, so a second read cannot come back. `effective`
+    and its `/dev/null` stand-in are gone, the journal names the SHA-256
+    applied, and the two unused convenience loaders that read the comm
+    allowlists' default paths themselves, past the gate, are removed.
+  - LLMR-016: a `.v1` default list that could not be read gave an empty
+    list and a WARN — FIM then watched only the overlay's additions, the
+    blocklists blocked nothing. The shipped lists are built into the agent
+    (`include_str!`, pinned to `configs/` by tests); an unreadable `.v1`
+    gives way to that copy, with an ERROR and a signed `integrity_drift`
+    (`default_list_unavailable`).
+  - Found on the way: the gate read with a blocking `open()`, so a FIFO
+    planted by root at an overlay's name stopped the agent's boot there;
+    it is refused now ("not a regular file").
+  - Found in the lab: the integrity check (`self_integrity::config_overlays`)
+    and its known-drop-in comparison read with a blocking `open()` too, so
+    the same FIFO stopped that check for good; they read as the gate does
+    now, and an overlay that cannot be read so is a finding ("not read").
+  - Lab, Debian 12 (6.1) and Ubuntu 24.04 (6.8), the build of main before.
+    A FIFO planted by root at `mass-write-carveout.local`: before, the
+    agent's boot stopped in `open()` — systemd showed it `activating`, no
+    admin socket — until a writer opened the FIFO (the probe's release
+    found the agent waiting), and the agent had registered the FIFO as a
+    protected inode; after, the agent boots at once (UNAUTHORIZED OVERLAY,
+    the socket listening within a second), the integrity check reports
+    `config_overlay … (not read: not a regular file)`, and the release
+    finds nobody waiting. `fim-paths.v1` moved aside: before (24.04),
+    `defaults=0 … effective=0` and "no path to watch — FIM and the
+    anti-tamper baits see nothing", nothing signed; after (Debian), the
+    ERROR "the copy built into the agent is in force", the same 125
+    defaults watched, and a signed `default_list_unavailable` record. A
+    signed `fim-paths.local`: the SHA-256 the journal names as applied is
+    the file's and the one its signature covers (`9eed6038…848e`). The
+    anti-tamper suite: OK.

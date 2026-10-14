@@ -34,6 +34,8 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use tracing::{error, info, warn};
 
+use crate::config::overlay_auth::Verified;
+
 /// Validates a single entry AFTER directive stripping. Returns a
 /// human diagnostic on rejection; the loader wraps it with the
 /// `path:lineno` context so every family gets uniform error
@@ -60,43 +62,73 @@ pub struct OverlayLoad {
     /// surfaced so operators don't think they disabled something
     /// they in fact mistyped.
     pub unknown_disable: BTreeSet<String>,
+    /// Where the defaults came from (external audit LLMR-016).
+    pub defaults: DefaultsSource,
 }
 
-/// Load and merge a `.v1` default and a `.local` overlay. Either or
-/// both being missing is tolerated: a missing `.v1` yields empty
-/// defaults plus a WARN, and a missing `.local` means no overlay.
-/// Errors propagate only on read/parse failure of a file that DID
-/// exist.
+/// Where a list's defaults came from (external audit LLMR-016).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DefaultsSource {
+    /// The `.v1` file on disk.
+    #[default]
+    Disk,
+    /// The copy built into the agent: the file could not be read (why).
+    /// The caller records it ([`crate::config::overlay_auth::OverlayGate::report_default_unavailable`]).
+    BuiltIn(String),
+}
+
+/// The defaults of a list: the `.v1` on disk, or — when it cannot be read
+/// — the copy the agent was built with (external audit LLMR-016: a missing
+/// `fim-paths.v1` used to leave FIM watching only the overlay's additions,
+/// with a WARN). An ERROR either way the file is not there.
+pub fn load_defaults<T>(
+    label: &str,
+    v1_path: &Path,
+    builtin: &str,
+    parse: impl Fn(&str, &str) -> T,
+) -> (T, DefaultsSource) {
+    match std::fs::read_to_string(v1_path) {
+        Ok(body) => (
+            parse(&v1_path.display().to_string(), &body),
+            DefaultsSource::Disk,
+        ),
+        Err(e) => {
+            error!(
+                error = %e,
+                path = %v1_path.display(),
+                "{label}: default list unreadable — the copy built into the agent is in force"
+            );
+            (
+                parse(&format!("{label} (built in)"), builtin),
+                DefaultsSource::BuiltIn(e.to_string()),
+            )
+        }
+    }
+}
+
+/// Load and merge a `.v1` default and a `.local` overlay. A `.v1` that
+/// cannot be read gives way to `builtin`, the copy the agent was built
+/// with ([`OverlayLoad::defaults`] says so); `local` is the overlay as the
+/// signed-overlay gate verified it — its text, never a path to read again
+/// (external audit LLMR-013).
 ///
 /// `label` prefixes every log line (e.g. `"fim paths-config"` or
 /// `"process-comm-allowlist"`) so boot logs name the family.
 pub fn load_flat_list(
     label: &str,
     v1_path: &Path,
-    local_path: &Path,
+    builtin: &str,
+    local: &Verified,
     validate: EntryValidator<'_>,
 ) -> Result<OverlayLoad> {
-    let defaults = match parse_default_list(v1_path, validate) {
-        Ok(set) => set,
-        Err(e) => {
-            warn!(
-                error = %e,
-                path = %v1_path.display(),
-                "{label}: default v1 list missing or unreadable — no defaults this boot"
-            );
-            BTreeSet::new()
+    let (defaults, source) = load_defaults(label, v1_path, builtin, |name, body| {
+        parse_default_text(name, body, validate)
+    });
+    let (adds, disables) = match (local.text(), local.source()) {
+        (Some(text), Some(path)) => {
+            parse_overlay_lines(&path.display().to_string(), text, validate, true)?
         }
-    };
-    let (adds, disables) = match parse_local_overlay(local_path, validate) {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!(
-                error = %e,
-                path = %local_path.display(),
-                "{label}: operator overlay file unreadable — ignoring local overlay this boot"
-            );
-            (BTreeSet::new(), BTreeSet::new())
-        }
+        _ => Default::default(),
     };
 
     // Q7 lock-in: per-disabled WARN at every boot so operators can't
@@ -143,16 +175,30 @@ pub fn load_flat_list(
         added: adds,
         disabled,
         unknown_disable,
+        defaults: source,
     })
 }
 
-/// Parse a `.v1` default list. Missing file → `Err` (the caller in
-/// [`load_flat_list`] turns that into a WARN + empty set). Rejects
-/// `+`/`-` prefixes (those are `.local`-only). Each entry is run
-/// through `validate`.
+/// Parse a `.v1` default list. Missing file → `Err`. Rejects `+`/`-`
+/// prefixes (those are `.local`-only). Each entry is run through
+/// `validate`.
 pub fn parse_default_list(path: &Path, validate: EntryValidator<'_>) -> Result<BTreeSet<String>> {
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading default list {}", path.display()))?;
+    Ok(parse_default_text(
+        &path.display().to_string(),
+        &body,
+        validate,
+    ))
+}
+
+/// Text form of [`parse_default_list`]; `label` names the source in the
+/// line errors.
+pub fn parse_default_text(
+    label: &str,
+    body: &str,
+    validate: EntryValidator<'_>,
+) -> BTreeSet<String> {
     let mut set = BTreeSet::new();
     for (lineno, raw) in body.lines().enumerate() {
         let trimmed = strip_comment(raw).trim();
@@ -166,40 +212,23 @@ pub fn parse_default_list(path: &Path, validate: EntryValidator<'_>) -> Result<B
             error!(
                 "{}:{}: default list must not use +/- prefixes (those are local-overlay only) \
                  — line skipped",
-                path.display(),
+                label,
                 lineno + 1
             );
             continue;
         }
         if let Err(e) = validate(trimmed) {
-            error!("{}:{}: {} — line skipped", path.display(), lineno + 1, e);
+            error!("{}:{}: {} — line skipped", label, lineno + 1, e);
             continue;
         }
         set.insert(trimmed.to_string());
     }
-    Ok(set)
+    set
 }
 
-/// Parse a `.local` overlay. Returns `(adds, disables)`. Missing
-/// file → empty pair (no overlay). Each entry is run through
-/// `validate` after directive stripping.
-fn parse_local_overlay(
-    path: &Path,
-    validate: EntryValidator<'_>,
-) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => {
-            return Err(anyhow!(e).context(format!("reading operator overlay {}", path.display())))
-        }
-    };
-    parse_overlay_lines(&path.display().to_string(), &body, validate, true)
-}
-
-/// Text form of [`parse_local_overlay`] (Tappa 10.8: the same rules
-/// validate an overlay before it is signed or stored). `label` prefixes
-/// the line number in errors.
+/// Parse an overlay's text strictly (Tappa 10.8: the same rules validate
+/// an overlay before it is signed or stored; the boot is lenient, see
+/// [`load_flat_list`]). `label` prefixes the line number in errors.
 pub fn parse_overlay_text(
     label: &str,
     body: &str,
@@ -285,6 +314,17 @@ mod tests {
         Ok(())
     }
 
+    /// The overlay at `path` as a gate that accepts it hands it over.
+    fn verified(path: &Path) -> Verified {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Verified::Content {
+                path: path.to_path_buf(),
+                text,
+            },
+            Err(_) => Verified::Missing,
+        }
+    }
+
     /// D1: a `.v1`-only file with no overlay yields exactly the
     /// bare entries as `effective`; the other fields are empty.
     #[test]
@@ -302,7 +342,8 @@ mod tests {
         )
         .unwrap();
         // local ABSENT — the no-overlay case.
-        let out = load_flat_list("test-allowlist", &v1, &local, &accept_any).expect("load");
+        let out = load_flat_list("test-allowlist", &v1, "", &verified(&local), &accept_any)
+            .expect("load");
         let expected: BTreeSet<String> = ["sshd", "nginx", "curl"]
             .iter()
             .map(|s| s.to_string())
@@ -329,7 +370,8 @@ mod tests {
              -nginx\n",
         )
         .unwrap();
-        let out = load_flat_list("test-allowlist", &v1, &local, &accept_any).expect("load");
+        let out = load_flat_list("test-allowlist", &v1, "", &verified(&local), &accept_any)
+            .expect("load");
 
         let expected: BTreeSet<String> = ["sshd", "curl", "my-deploy-tool", "ci-runner"]
             .iter()
@@ -352,7 +394,8 @@ mod tests {
         let local = dir.path().join("comm.local");
         std::fs::write(&v1, "sshd\nnginx\n").unwrap();
         std::fs::write(&local, "-not-a-default-comm\n").unwrap();
-        let out = load_flat_list("test-allowlist", &v1, &local, &accept_any).expect("load");
+        let out = load_flat_list("test-allowlist", &v1, "", &verified(&local), &accept_any)
+            .expect("load");
 
         // Defaults unchanged (the disable hit nothing).
         let expected: BTreeSet<String> = ["sshd", "nginx"].iter().map(|s| s.to_string()).collect();
@@ -361,19 +404,40 @@ mod tests {
         assert!(out.unknown_disable.contains("not-a-default-comm"));
     }
 
-    /// D1: both files missing → empty load (WARN, not error), so a
-    /// test agent or a host with no config files still boots.
+    /// External audit LLMR-016: a `.v1` that cannot be read gives way to
+    /// the copy built into the agent — the load says so — and the overlay
+    /// still applies on top; a readable `.v1` is the one used.
     #[test]
-    fn allowlist_loader_both_missing_returns_empty() {
+    fn a_missing_default_list_uses_the_built_in_copy() {
         let dir = TempDir::new().unwrap();
         let out = load_flat_list(
             "test-allowlist",
             &dir.path().join("missing.v1"),
-            &dir.path().join("missing.local"),
+            "sshd\nnginx\n",
+            &Verified::Content {
+                path: dir.path().join("comm.local"),
+                text: "-nginx\n+backupd\n".to_string(),
+            },
             &accept_any,
         )
-        .expect("missing files tolerated");
-        assert!(out.effective.is_empty());
+        .expect("a missing default list is tolerated");
+        let expected: BTreeSet<String> =
+            ["sshd", "backupd"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(out.effective, expected);
+        assert!(matches!(out.defaults, DefaultsSource::BuiltIn(_)));
+
+        let v1 = dir.path().join("comm.v1");
+        std::fs::write(&v1, "curl\n").unwrap();
+        let out = load_flat_list(
+            "test-allowlist",
+            &v1,
+            "sshd\n",
+            &Verified::Missing,
+            &accept_any,
+        )
+        .unwrap();
+        assert_eq!(out.defaults, DefaultsSource::Disk);
+        assert_eq!(out.effective.into_iter().collect::<Vec<_>>(), vec!["curl"]);
     }
 
     /// D1: a `.v1` carrying a `+`/`-` directive (a `.local` template

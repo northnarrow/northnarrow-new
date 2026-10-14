@@ -1818,7 +1818,8 @@ impl Rule for NnLNet014DnsTunnelEntropy {
 /// per-family comm allowlist (Tappa 10.5 D4), and freshly-allocated
 /// stateful windows. Production `main.rs` constructs these from disk
 /// via [`NetBlocklist::load`] / [`Ja3Blocklist::load`] /
-/// `load_netflow_comm_allowlist` and shares them via `Arc`.
+/// `comm_allowlist::load_comm_allowlist` (each overlay as the signed-overlay
+/// gate verified it) and shares them via `Arc`.
 ///
 /// Evaluation order: Critical first (never throttled), then the D4
 /// High/Medium additions BEFORE the broad Tappa 10 catch-alls so the

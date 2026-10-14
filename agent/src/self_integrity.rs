@@ -180,8 +180,12 @@ fn unit_dropins_with(roots: &[&Path], known_dropins: &[(&str, &str)]) -> Vec<Fin
                     continue;
                 }
                 let shown = path.to_string_lossy().to_string();
+                // Read as the overlay gate reads (no link, no waiting on a
+                // FIFO): anything else is not the known content.
                 if known_dropins.iter().any(|(known, content)| {
-                    *known == shown && std::fs::read(&path).is_ok_and(|b| b == content.as_bytes())
+                    *known == shown
+                        && crate::config::overlay_auth::read_overlay(&path)
+                            .is_ok_and(|b| b == content.as_bytes())
                 }) {
                     continue;
                 }
@@ -313,8 +317,19 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
         .collect();
     paths.sort();
     for path in paths {
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
+        // External audit LLMR-013: read as the overlay gate reads — once, not
+        // through a link, never waiting on a FIFO planted at the name (that
+        // stopped this check for good); what cannot be read so is reported.
+        let bytes = match crate::config::overlay_auth::read_overlay(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                out.push(Finding {
+                    kind: "config_overlay",
+                    detail: format!("{} (not read: {e})", path.display()),
+                });
+                continue;
+            }
         };
         if let Some(kind) = combat_kind(&path) {
             if crate::config::overlay_auth::shipped_default(kind)
@@ -714,6 +729,24 @@ mod tests {
             f[0],
             "a change is a new finding"
         );
+    }
+
+    /// External audit LLMR-013 (found in the lab): a FIFO planted at an
+    /// overlay's name stopped this check in `open()`; it is reported, not
+    /// waited on, and so is a link.
+    #[test]
+    fn a_fifo_or_a_link_at_an_overlay_name_is_reported_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("mass-write-carveout.local");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "+x\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("fim-paths.local")).unwrap();
+        let f = config_overlays(dir.path());
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f.iter().all(|x| x.detail.contains("(not read: ")), "{f:?}");
     }
 
     #[test]

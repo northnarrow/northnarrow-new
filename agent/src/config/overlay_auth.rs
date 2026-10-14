@@ -45,8 +45,9 @@ pub const ALLOW_UNSIGNED_ENV: &str = "NN_OVERLAY_ALLOW_UNSIGNED";
 pub const AUDIT_OP_ACCEPTED: &str = "config_overlay_accepted";
 /// Audit op of an overlay stored through `nn-admin config overlay set`.
 pub const AUDIT_OP_SET: &str = "config_overlay_set";
-/// Path a refused overlay is replaced with (reads as empty: defaults only).
-pub const EMPTY_OVERLAY: &str = "/dev/null";
+/// Largest overlay the gate reads: an overlay is a list of lines; a larger
+/// file is refused rather than read whole into memory.
+pub const MAX_OVERLAY_BYTES: u64 = 4 << 20;
 
 /// `<overlay>.sig` on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +107,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Overlay paths as configured for this boot (CLI flags can move them);
-/// recorded by [`OverlayGate::effective`] so `config overlay set` writes
+/// recorded by [`OverlayGate::verified`] so `config overlay set` writes
 /// where the next boot will read.
 static CONFIGURED: OnceLock<parking_lot::Mutex<HashMap<OverlayKind, PathBuf>>> = OnceLock::new();
 
@@ -285,6 +286,82 @@ pub enum Decision {
     },
 }
 
+/// What the loader of an overlay gets from [`OverlayGate::verified`]
+/// (external audit LLMR-013). The gate used to hand over a path, and every
+/// loader read the file again after the gate had verified its own read: a
+/// root process able to pause the agent's `open()` could serve the gate
+/// the signed bytes and the loader others. The loaders now take this, and
+/// only the gate makes one: the text is the one the decision was made on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verified {
+    /// No overlay at the path: the shipped defaults only.
+    Missing,
+    /// The file is the content the agent was built with (the COMBAT files).
+    ShippedDefault,
+    /// Present but refused (logged and recorded by the gate): the shipped
+    /// defaults only.
+    Refused,
+    /// The text to apply: signed, or loaded through the escape hatch.
+    Content { path: PathBuf, text: String },
+}
+
+impl Verified {
+    /// The overlay's text, when there is one to apply.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Verified::Content { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Where the applied text was read (for the loaders' logs).
+    pub fn source(&self) -> Option<&Path> {
+        match self {
+            Verified::Content { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+}
+
+/// One read of an overlay, as [`OverlayGate::verified`] decides on it.
+enum Read {
+    Missing,
+    ShippedDefault,
+    /// Present but not usable as text (unreadable, not UTF-8, too large…).
+    Unusable,
+    Text(String),
+}
+
+/// External audit LLMR-013: an overlay is read once, without following a
+/// link (the last component), without blocking on a FIFO planted at its
+/// name, and at most [`MAX_OVERLAY_BYTES`].
+pub(crate) fn read_overlay(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                std::io::Error::other("a symbolic link (an overlay is not read through one)")
+            } else {
+                e
+            }
+        })?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_OVERLAY_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_OVERLAY_BYTES {
+        return Err(std::io::Error::other(format!(
+            "larger than {MAX_OVERLAY_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Boot-time gate for every overlay the agent reads.
 pub struct OverlayGate {
     auth: Option<AdminAuth>,
@@ -293,8 +370,8 @@ pub struct OverlayGate {
     recorded: HashMap<OverlayKind, (String, u64)>,
     allow_unsigned: bool,
     audit_log: Mutex<Option<Arc<Mutex<AuditLog>>>>,
-    /// Decisions made before the audit log was attached.
-    pending: Mutex<Vec<(OverlayKind, PathBuf, Decision)>>,
+    /// Entries made before the audit log was attached.
+    pending: Mutex<Vec<AuditEntryDraft>>,
 }
 
 impl std::fmt::Debug for OverlayGate {
@@ -329,24 +406,56 @@ impl OverlayGate {
         }
     }
 
-    /// The boot decision for `kind` read from `path`.
+    /// The boot decision for `kind` read from `path` — a report (what a
+    /// loader applies comes from [`Self::verified`], on its own read).
     pub fn check(&self, kind: OverlayKind, path: &Path) -> Decision {
-        let bytes = match std::fs::read(path) {
+        self.read_and_check(kind, path).0
+    }
+
+    /// One read of `path`, and the decision made on those bytes.
+    fn read_and_check(&self, kind: OverlayKind, path: &Path) -> (Decision, Read) {
+        let bytes = match read_overlay(path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Decision::Absent,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (Decision::Absent, Read::Missing)
+            }
             Err(e) => {
-                return Decision::Refused {
+                let refused = Decision::Refused {
                     reason: format!("unreadable: {e}"),
                     sha256: None,
-                }
+                };
+                return (refused, Read::Unusable);
             }
         };
         // The shipped COMBAT files are the defaults themselves.
         if shipped_default(kind).is_some_and(|d| d.as_bytes() == bytes.as_slice()) {
-            return Decision::Absent;
+            return (Decision::Absent, Read::ShippedDefault);
         }
         let digest = content_sha256(&bytes);
         let sha_hex = hex(&digest);
+        let decision = self.decide(kind, path, bytes.len(), digest, sha_hex.clone());
+        match String::from_utf8(bytes) {
+            Ok(text) => (decision, Read::Text(text)),
+            Err(_) => {
+                let refused = Decision::Refused {
+                    reason: "not UTF-8 text".to_string(),
+                    sha256: Some(sha_hex),
+                };
+                (refused, Read::Unusable)
+            }
+        }
+    }
+
+    /// The signature check of the overlay at `path`, `len` bytes with
+    /// SHA-256 `digest`.
+    fn decide(
+        &self,
+        kind: OverlayKind,
+        path: &Path,
+        len: usize,
+        digest: [u8; 32],
+        sha_hex: String,
+    ) -> Decision {
         let refuse = |reason: String| Decision::Refused {
             reason,
             sha256: Some(sha_hex.clone()),
@@ -373,7 +482,7 @@ impl OverlayGate {
         if extra.kind != kind {
             return refuse(format!("signature is for `{}`", extra.kind.keyword()));
         }
-        if extra.sha256 != digest || extra.len as usize != bytes.len() {
+        if extra.sha256 != digest || extra.len as usize != len {
             return refuse(
                 "content does not match its signature (edited after signing)".to_string(),
             );
@@ -413,25 +522,36 @@ impl OverlayGate {
         }
     }
 
-    /// The path the loader of `kind` should read: `path` when the overlay
-    /// is signed (or absent), [`EMPTY_OVERLAY`] when it is refused (unless
-    /// the escape hatch is set). Every decision is logged and recorded.
-    pub fn effective(&self, kind: OverlayKind, path: &Path) -> PathBuf {
+    /// What the loader of `kind` applies (external audit LLMR-013): the
+    /// text of the one read the decision was made on — signed, or loaded
+    /// through the escape hatch — else nothing, and the loader runs on the
+    /// shipped defaults. Every decision is logged and recorded.
+    pub fn verified(&self, kind: OverlayKind, path: &Path) -> Verified {
         remember_path(kind, path);
-        let decision = self.check(kind, path);
-        let out = match &decision {
-            Decision::Absent => path.to_path_buf(),
-            Decision::Accepted {
-                sha256, key_fps, ..
-            } => {
-                info!(overlay = kind.keyword(), path = %path.display(), sha256 = %&sha256[..16], keys = ?key_fps, "signed overlay accepted");
-                path.to_path_buf()
+        let (decision, read) = self.read_and_check(kind, path);
+        let out = match (&decision, read) {
+            (_, Read::Missing) => Verified::Missing,
+            (_, Read::ShippedDefault) => Verified::ShippedDefault,
+            (
+                Decision::Accepted {
+                    sha256, key_fps, ..
+                },
+                Read::Text(text),
+            ) => {
+                info!(overlay = kind.keyword(), path = %path.display(), sha256 = %sha256, keys = ?key_fps, "signed overlay accepted — the bytes verified are the bytes applied");
+                Verified::Content {
+                    path: path.to_path_buf(),
+                    text,
+                }
             }
-            Decision::Refused { reason, .. } if self.allow_unsigned => {
-                error!(overlay = kind.keyword(), path = %path.display(), reason = %reason, "UNSIGNED OVERLAY LOADED — {ALLOW_UNSIGNED_ENV}=1 is set");
-                path.to_path_buf()
+            (Decision::Refused { reason, sha256 }, Read::Text(text)) if self.allow_unsigned => {
+                error!(overlay = kind.keyword(), path = %path.display(), reason = %reason, sha256 = ?sha256, "UNSIGNED OVERLAY LOADED — {ALLOW_UNSIGNED_ENV}=1 is set");
+                Verified::Content {
+                    path: path.to_path_buf(),
+                    text,
+                }
             }
-            Decision::Refused { reason, .. } => {
+            (Decision::Refused { reason, .. }, _) => {
                 error!(
                     overlay = kind.keyword(),
                     path = %path.display(),
@@ -439,8 +559,11 @@ impl OverlayGate {
                     "UNAUTHORIZED OVERLAY — not loaded, booting on the shipped defaults for this list \
                      (sign it with `nn-admin config overlay set|sign`)"
                 );
-                PathBuf::from(EMPTY_OVERLAY)
+                Verified::Refused
             }
+            // An unusable read always comes with a refusal, text never
+            // with an absent decision.
+            _ => Verified::Refused,
         };
         if decision != Decision::Absent {
             self.record(kind, path, decision);
@@ -448,22 +571,40 @@ impl OverlayGate {
         out
     }
 
-    /// Attach the signed audit log: pending decisions are written now,
-    /// later ones (FIM recompute) as they happen.
+    /// External audit LLMR-016: a shipped default list (`.v1`) could not be
+    /// read and the copy built into the agent is in force — a signed
+    /// `integrity_drift` (`default_list_unavailable`), like a refused
+    /// overlay: the host no longer runs on the list it was installed with.
+    pub fn report_default_unavailable(&self, list: &str, path: &Path, reason: &str) {
+        self.record_entry(drift_entry(serde_json::json!({
+            "kind": "default_list_unavailable",
+            "detail": format!("{list} ({}): {reason}", path.display()),
+            "at_boot": true,
+        })));
+    }
+
+    /// Attach the signed audit log: pending entries are written now, later
+    /// ones (FIM recompute, COMBAT engage) as they happen.
     pub fn attach_audit_log(&self, log: Option<Arc<Mutex<AuditLog>>>) {
         let Some(log) = log else { return };
         *self.audit_log.lock() = Some(Arc::clone(&log));
         let pending: Vec<_> = std::mem::take(&mut *self.pending.lock());
-        for (kind, path, d) in pending {
-            write_audit(&log, kind, &path, &d, self.allow_unsigned);
+        for draft in pending {
+            append(&log, draft);
         }
     }
 
     fn record(&self, kind: OverlayKind, path: &Path, d: Decision) {
+        if let Some(draft) = decision_entry(kind, path, &d, self.allow_unsigned) {
+            self.record_entry(draft);
+        }
+    }
+
+    fn record_entry(&self, draft: AuditEntryDraft) {
         let log = self.audit_log.lock().clone();
         match log {
-            Some(l) => write_audit(&l, kind, path, &d, self.allow_unsigned),
-            None => self.pending.lock().push((kind, path.to_path_buf(), d)),
+            Some(l) => append(&l, draft),
+            None => self.pending.lock().push(draft),
         }
     }
 
@@ -475,22 +616,22 @@ impl OverlayGate {
     }
 }
 
-fn write_audit(
-    log: &Arc<Mutex<AuditLog>>,
+/// The audit entry a decision makes, if any: a newly accepted signature, or
+/// a refusal.
+fn decision_entry(
     kind: OverlayKind,
     path: &Path,
     d: &Decision,
     allowed: bool,
-) {
-    let (op, result, extra) = match d {
-        Decision::Absent => return,
-        Decision::Accepted { new: false, .. } => return,
+) -> Option<AuditEntryDraft> {
+    match d {
+        Decision::Absent | Decision::Accepted { new: false, .. } => None,
         Decision::Accepted {
             sha256,
             signed_ts,
             key_fps,
             new: true,
-        } => (
+        } => Some(entry(
             AUDIT_OP_ACCEPTED,
             "success",
             serde_json::json!({
@@ -500,20 +641,24 @@ fn write_audit(
                 "signed_ts": signed_ts,
                 "key_fps": key_fps,
             }),
-        ),
-        Decision::Refused { reason, sha256 } => (
-            crate::self_integrity::AUDIT_OP,
-            "detected",
-            serde_json::json!({
-                "kind": "unauthorized_overlay",
-                "detail": format!("{} ({}): {reason}", kind.keyword(), path.display()),
-                "sha256": sha256,
-                "loaded_anyway": allowed,
-                "at_boot": true,
-            }),
-        ),
-    };
-    let draft = AuditEntryDraft {
+        )),
+        Decision::Refused { reason, sha256 } => Some(drift_entry(serde_json::json!({
+            "kind": "unauthorized_overlay",
+            "detail": format!("{} ({}): {reason}", kind.keyword(), path.display()),
+            "sha256": sha256,
+            "loaded_anyway": allowed,
+            "at_boot": true,
+        }))),
+    }
+}
+
+/// A signed `integrity_drift` entry.
+fn drift_entry(extra: serde_json::Value) -> AuditEntryDraft {
+    entry(crate::self_integrity::AUDIT_OP, "detected", extra)
+}
+
+fn entry(op: &str, result: &str, extra: serde_json::Value) -> AuditEntryDraft {
+    AuditEntryDraft {
         op: op.to_string(),
         extra,
         key_fp: "agent-self".to_string(),
@@ -522,7 +667,10 @@ fn write_audit(
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
-    };
+    }
+}
+
+fn append(log: &Arc<Mutex<AuditLog>>, draft: AuditEntryDraft) {
     if let Err(e) = log.lock().append(draft) {
         warn!(error = format!("{e:#}"), "overlay gate: audit entry failed");
     }
@@ -625,16 +773,103 @@ mod tests {
             Decision::Accepted { new, signed_ts, .. } => assert!(new && signed_ts == 100),
             other => panic!("{other:?}"),
         }
-        assert_eq!(gate.effective(OverlayKind::ProcessCommAllowlist, &p), p);
+        assert_eq!(
+            gate.verified(OverlayKind::ProcessCommAllowlist, &p),
+            Verified::Content {
+                path: p.clone(),
+                text: "+backupd\n".to_string()
+            }
+        );
         std::fs::write(&p, "+backupd\n+evil-implant\n").unwrap();
         assert!(matches!(
             gate.check(OverlayKind::ProcessCommAllowlist, &p),
             Decision::Refused { .. }
         ));
         assert_eq!(
-            gate.effective(OverlayKind::ProcessCommAllowlist, &p),
-            PathBuf::from(EMPTY_OVERLAY)
+            gate.verified(OverlayKind::ProcessCommAllowlist, &p),
+            Verified::Refused
         );
+        assert_eq!(
+            gate.verified(OverlayKind::ProcessCommAllowlist, &dir.path().join("none")),
+            Verified::Missing
+        );
+    }
+
+    /// External audit LLMR-013: the loader applies the text the gate
+    /// verified — rewriting the file once the gate has read it changes
+    /// nothing (every loader used to read the path again).
+    #[test]
+    fn the_loader_applies_the_bytes_the_gate_verified() {
+        let (dir, key, admin_pub, audit) = setup("config-manage");
+        let p = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::ProcessCommAllowlist,
+            "+backupd\n",
+            100,
+        );
+        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let verified = gate.verified(OverlayKind::ProcessCommAllowlist, &p);
+        std::fs::write(&p, "+backupd\n+evil-implant\n").unwrap();
+        let list = crate::config::comm_allowlist::load_comm_allowlist(
+            "process-comm-allowlist",
+            &dir.path().join("process-comm-allowlist.v1"),
+            "",
+            &verified,
+        )
+        .unwrap();
+        assert!(list.contains("backupd"));
+        assert!(!list.contains("evil-implant"));
+    }
+
+    /// External audit LLMR-013: an overlay is not read through a link (its
+    /// target is not what was signed into place), and a FIFO planted at its
+    /// name is refused, not waited on.
+    #[test]
+    fn an_overlay_behind_a_link_or_a_fifo_is_refused() {
+        let (dir, key, admin_pub, audit) = setup("config-manage");
+        let signed = write_signed(
+            dir.path(),
+            &key,
+            OverlayKind::ProcessCommAllowlist,
+            "+backupd\n",
+            100,
+        );
+        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        let link = dir.path().join("link.local");
+        std::os::unix::fs::symlink(&signed, &link).unwrap();
+        std::fs::copy(sig_path(&signed), sig_path(&link)).unwrap();
+        assert!(
+            matches!(gate.check(OverlayKind::ProcessCommAllowlist, &link), Decision::Refused { reason, .. } if reason.contains("symbolic link"))
+        );
+        let fifo = dir.path().join("fifo.local");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(
+            matches!(gate.check(OverlayKind::ProcessCommAllowlist, &fifo), Decision::Refused { reason, .. } if reason.contains("not a regular file"))
+        );
+        assert_eq!(
+            gate.verified(OverlayKind::ProcessCommAllowlist, &fifo),
+            Verified::Refused
+        );
+    }
+
+    /// External audit LLMR-016: a default list replaced by the built-in copy
+    /// is a signed record, queued until the audit log is attached.
+    #[test]
+    fn an_unavailable_default_list_is_recorded() {
+        let (dir, _key, admin_pub, audit) = setup("config-manage");
+        let gate = OverlayGate::new(&admin_pub, AGENT, &audit);
+        gate.report_default_unavailable(
+            "fim paths-config",
+            &dir.path().join("fim-paths.v1"),
+            "No such file or directory (os error 2)",
+        );
+        let pending = gate.pending.lock();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(pending[0].extra["kind"], "default_list_unavailable");
     }
 
     /// External audit ATP-001 / DEP-003: the shipped COMBAT files need no

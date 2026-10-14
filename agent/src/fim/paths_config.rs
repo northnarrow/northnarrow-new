@@ -5,7 +5,8 @@
 //! - `/etc/northnarrow/fim-paths.v1` — the curated default list
 //!   shipped by `install.sh` (commit C7 / repo `configs/fim-paths.v1`).
 //!   Format: one absolute path per line, `#` comments, blanks
-//!   ignored. NO directives.
+//!   ignored. NO directives. The agent carries a copy of it
+//!   ([`BUILTIN_PATHS_V1`]) for a host where the file cannot be read.
 //! - `/etc/northnarrow/fim-paths.local` — the operator overlay
 //!   per design §13 Q7. Supports BOTH `add:` and `disable:` over
 //!   the v1 default list. Format: directive-prefixed lines —
@@ -13,7 +14,9 @@
 //!   default. Bare `#` introduces comments; blank lines are
 //!   ignored. Bare path with no prefix is treated as `add` (so
 //!   the file can be a plain extension list without operators
-//!   having to learn the prefix scheme).
+//!   having to learn the prefix scheme). It reaches the loader as
+//!   the signed-overlay gate verified it (Tappa 10.8, external audit
+//!   LLMR-013).
 //!
 //! Design choice: no YAML parser dependency. The two files are
 //! line-oriented + 1-character directive prefix; a hand-rolled
@@ -31,7 +34,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::config::overlay;
+use crate::config::overlay::{self, DefaultsSource};
+use crate::config::overlay_auth::Verified;
 
 /// Default deploy location of the curated paths list. Matches
 /// the path `install.sh` (Tappa 9 C7) drops the repo's
@@ -42,6 +46,11 @@ pub const DEFAULT_PATHS_V1: &str = "/etc/northnarrow/fim-paths.v1";
 /// overlay is OPTIONAL — a missing file means "no add or disable
 /// adjustments" (the v1 list is used as-is).
 pub const DEFAULT_PATHS_LOCAL: &str = "/etc/northnarrow/fim-paths.local";
+
+/// External audit LLMR-016: the shipped default list, built in — used
+/// when `fim-paths.v1` cannot be read (FIM used to watch only the
+/// overlay's additions then).
+pub const BUILTIN_PATHS_V1: &str = include_str!("../../../configs/fim-paths.v1");
 
 /// Outcome of [`load_watched_paths`]. The `effective` set is the
 /// one the agent registers into `WATCHED_PATHS`; the other fields
@@ -63,21 +72,18 @@ pub struct WatchedPathsLoad {
     /// so operators don't think they disabled something when they
     /// in fact targeted an already-absent path.
     pub unknown_disable: BTreeSet<PathBuf>,
+    /// Where the defaults came from (external audit LLMR-016).
+    pub defaults: DefaultsSource,
 }
 
-/// Load + merge the two files. Either or both being missing is
-/// tolerated:
+/// Load + merge the default list and the operator overlay:
 ///
-/// - Missing `fim-paths.v1` → empty default list, only the overlay's
-///   `+` lines populate `effective`. Surfaces a WARN — production
-///   should always have v1 (install.sh drops it). Tests that don't
-///   need v1 just omit the file.
-/// - Missing `fim-paths.local` → no overlay; `effective` equals the
-///   default list.
-///
-/// Errors propagate only on read/parse failures of a file that DID
-/// exist. Missing-file is fine.
-pub fn load_watched_paths(v1_path: &Path, local_path: &Path) -> Result<WatchedPathsLoad> {
+/// - `fim-paths.v1` unreadable → the built-in copy
+///   ([`BUILTIN_PATHS_V1`]), an ERROR, and `defaults` says so (the
+///   caller records it).
+/// - `local` is the overlay as the gate verified it; none → `effective`
+///   equals the default list.
+pub fn load_watched_paths(v1_path: &Path, local: &Verified) -> Result<WatchedPathsLoad> {
     // Tappa 10.5 D1: the directive-parsing + merge + boot-WARN core
     // now lives in the shared `config::overlay` loader; this wrapper
     // adds the FIM-specific absolute-path validation and maps the
@@ -86,7 +92,8 @@ pub fn load_watched_paths(v1_path: &Path, local_path: &Path) -> Result<WatchedPa
     let load = overlay::load_flat_list(
         "fim paths-config",
         v1_path,
-        local_path,
+        BUILTIN_PATHS_V1,
+        local,
         &validate_absolute_path,
     )?;
     Ok(WatchedPathsLoad {
@@ -94,6 +101,7 @@ pub fn load_watched_paths(v1_path: &Path, local_path: &Path) -> Result<WatchedPa
         added: load.added.iter().map(PathBuf::from).collect(),
         disabled: load.disabled.iter().map(PathBuf::from).collect(),
         unknown_disable: load.unknown_disable.iter().map(PathBuf::from).collect(),
+        defaults: load.defaults,
     })
 }
 
@@ -123,6 +131,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The overlay at `path` as a gate that accepts it hands it over.
+    fn verified(path: &Path) -> Verified {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Verified::Content {
+                path: path.to_path_buf(),
+                text,
+            },
+            Err(_) => Verified::Missing,
+        }
+    }
+
     /// C7 #1: a v1-only file with no overlay yields exactly the
     /// v1 paths as `effective`; `added`, `disabled`, and
     /// `unknown_disable` are empty.
@@ -130,7 +149,6 @@ mod tests {
     fn load_v1_only_no_overlay() {
         let dir = TempDir::new().unwrap();
         let v1 = dir.path().join("fim-paths.v1");
-        let local = dir.path().join("fim-paths.local");
         std::fs::write(
             &v1,
             "# header comment\n\
@@ -140,8 +158,8 @@ mod tests {
              /etc/shadow   # inline comment\n",
         )
         .unwrap();
-        // local file ABSENT — that's the no-overlay case.
-        let out = load_watched_paths(&v1, &local).expect("load");
+        // No overlay — the common case.
+        let out = load_watched_paths(&v1, &Verified::Missing).expect("load");
         let expected: BTreeSet<PathBuf> = ["/usr/sbin/sshd", "/etc/passwd", "/etc/shadow"]
             .iter()
             .map(PathBuf::from)
@@ -150,6 +168,7 @@ mod tests {
         assert!(out.added.is_empty());
         assert!(out.disabled.is_empty());
         assert!(out.unknown_disable.is_empty());
+        assert_eq!(out.defaults, DefaultsSource::Disk);
     }
 
     /// C7 #2: operator overlay with both `add:` and `disable:` lines.
@@ -172,7 +191,7 @@ mod tests {
              -/etc/nonexistent          # unknown disable\n",
         )
         .unwrap();
-        let out = load_watched_paths(&v1, &local).expect("load");
+        let out = load_watched_paths(&v1, &verified(&local)).expect("load");
 
         let expected_effective: BTreeSet<PathBuf> = [
             "/usr/sbin/sshd",
@@ -193,20 +212,19 @@ mod tests {
             .contains(&PathBuf::from("/etc/nonexistent")));
     }
 
-    /// C7 #3: missing v1 + missing local → empty load (warn, not
-    /// error). Useful for test agents that don't ship a paths file.
+    /// External audit LLMR-016: with `fim-paths.v1` unreadable, FIM watches
+    /// the shipped list built into the agent (it used to watch only the
+    /// overlay's additions), and the load says so for the signed record.
     #[test]
-    fn load_both_missing_returns_empty() {
+    fn a_missing_v1_uses_the_built_in_list_and_says_so() {
         let dir = TempDir::new().unwrap();
-        let out = load_watched_paths(
-            &dir.path().join("missing.v1"),
-            &dir.path().join("missing.local"),
-        )
-        .expect("missing files tolerated");
-        assert!(out.effective.is_empty());
+        let out = load_watched_paths(&dir.path().join("missing.v1"), &Verified::Missing)
+            .expect("a missing v1 is tolerated");
+        assert!(matches!(out.defaults, DefaultsSource::BuiltIn(_)));
+        assert!(out.effective.contains(&PathBuf::from("/etc/shadow")));
+        assert!(out.effective.contains(&PathBuf::from("/etc/ld.so.preload")));
         assert!(out.added.is_empty());
         assert!(out.disabled.is_empty());
-        assert!(out.unknown_disable.is_empty());
     }
 
     /// Tappa 10.5 D3: the SHIPPED `configs/fim-paths.v1`
@@ -221,8 +239,8 @@ mod tests {
             "/../configs/fim-paths.v1"
         ));
         // No overlay shipped (operator-curated) — exercise v1-only.
-        let local = v1.with_extension("nonexistent.local");
-        let out = load_watched_paths(&v1, &local).expect("shipped fim-paths.v1 must parse clean");
+        let out = load_watched_paths(&v1, &Verified::Missing)
+            .expect("shipped fim-paths.v1 must parse clean");
         for p in [
             "/etc/ld.so.preload",
             "/root/.gnupg",
@@ -235,6 +253,11 @@ mod tests {
                 "shipped fim-paths.v1 should watch {p} (D3)"
             );
         }
+        assert_eq!(
+            std::fs::read_to_string(&v1).unwrap(),
+            BUILTIN_PATHS_V1,
+            "the built-in copy is the shipped file"
+        );
     }
 
     /// C7 #4: a malformed v1 (relative path) is rejected up-front
@@ -274,7 +297,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let v1 = dir.path().join("fim-paths.v1");
         std::fs::write(&v1, "/etc/passwd\nrelative/path\n+/etc/x\n/etc/shadow\n").unwrap();
-        let load = load_watched_paths(&v1, &dir.path().join("none.local")).unwrap();
+        let load = load_watched_paths(&v1, &Verified::Missing).unwrap();
         let got: Vec<String> = load
             .effective
             .iter()

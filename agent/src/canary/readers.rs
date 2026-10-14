@@ -22,10 +22,10 @@
 //! reads every canary without a kill.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
+use crate::config::overlay_auth::Verified;
 use crate::posture::lineage::{in_system_tree, AuthSessionTracker};
 
 /// Programs that read whole trees by design: an entry is a program name
@@ -97,28 +97,28 @@ impl CanaryReaders {
         }
     }
 
-    /// Load the operator's additions from `local` — the path the overlay
-    /// gate admitted (signed), or one that does not exist. A missing file
+    /// Load the operator's additions from `local` — the overlay as the
+    /// signed-overlay gate verified it (external audit LLMR-013). None
     /// adds nothing; a malformed one is refused whole (fail-secure: the
     /// built-in readers only).
-    pub fn load(local: &Path, identity: AuthSessionTracker) -> Self {
-        let extra = match std::fs::read_to_string(local) {
-            Ok(text) => match crate::config::overlay::parse_overlay_text(
+    pub fn load(local: &Verified, identity: AuthSessionTracker) -> Self {
+        let extra = match local.text() {
+            Some(text) => match crate::config::overlay::parse_overlay_text(
                 "canary-readers.local",
-                &text,
+                text,
                 &validate_reader,
             ) {
                 Ok((adds, _disables)) => adds,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        path = %local.display(),
+                        path = ?local.source(),
                         "canary-readers.local refused — built-in readers only"
                     );
                     BTreeSet::new()
                 }
             },
-            Err(_) => BTreeSet::new(),
+            None => BTreeSet::new(),
         };
         if !extra.is_empty() {
             tracing::info!(
@@ -209,15 +209,15 @@ mod tests {
     #[test]
     fn a_missing_or_malformed_overlay_leaves_the_built_ins() {
         let (d, t) = tracker();
-        let r = CanaryReaders::load(&d.path().join("absent.local"), t.clone());
+        let content = |text: &str| Verified::Content {
+            path: d.path().join("canary-readers.local"),
+            text: text.to_string(),
+        };
+        let r = CanaryReaders::load(&Verified::Missing, t.clone());
         assert!(r.extra.is_empty());
-        let bad = d.path().join("bad.local");
-        std::fs::write(&bad, "+tar\n+/home/u/x/\n").unwrap();
-        let r = CanaryReaders::load(&bad, t.clone());
+        let r = CanaryReaders::load(&content("+tar\n+/home/u/x/\n"), t.clone());
         assert!(r.extra.is_empty(), "refused whole");
-        let good = d.path().join("good.local");
-        std::fs::write(&good, "# the nightly backup\n+tar\n").unwrap();
-        let r = CanaryReaders::load(&good, t);
+        let r = CanaryReaders::load(&content("# the nightly backup\n+tar\n"), t);
         assert!(r.extra.contains("tar"));
     }
 }
