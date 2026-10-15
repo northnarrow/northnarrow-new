@@ -10,9 +10,15 @@
 # `process-comm-allowlist.v1` default at boot. Unlike the `.v1` file,
 # entries here carry a prefix:
 #
-#     +name   ADD a program to the allowlist (exempt it from R011..R017
-#             and from the io_uring and BPF rules)
+#     +name   ADD a program to the allowlist
 #     -name   RE-ENABLE detection on a program that `.v1` allowlists
+#
+# What a match does (external audit PROC-008; see the `.v1` header):
+#   - as an ACTOR, R011/R012/R013/R017 record (Log) instead of killing a
+#     root exec of a system-tree program that runs under it — add the
+#     automation that runs the flagged tools (`+my-deploy-tool`);
+#   - as a TARGET, the program itself draws no verdict from R006, R007,
+#     R011..R017 or the io_uring and BPF rules, anywhere on the host.
 #
 # Blank lines and `#` comments are ignored. A name is matched on what
 # the kernel executed: the executable's basename, or the script's an
@@ -32,11 +38,11 @@
 #   R013 (Namespace/escape tooling, MITRE T1611 Escape-to-Host) fires
 #   when `runc` execs from a NON-standard path (a dropped/modified runc
 #   in /tmp, /dev/shm, a writable bundle dir, …) — the exact shape of
-#   the CVE-2019-5736 runc-overwrite breakout. Adding `+runc` below
-#   exempts `runc` from R013 EVERYWHERE on this host, including those
-#   non-standard paths. Only enable it where legitimate container
-#   activity is producing R013 false positives, and prefer tightening
-#   the path set over a blanket exemption if you can.
+#   the CVE-2019-5736 runc-overwrite breakout. Adding `+runc` below is a
+#   TARGET entry: it exempts every `runc` in a root-owned system tree
+#   (/usr/local, /opt, …) from R013 on this host; a copy in a writable
+#   path is still judged. Only enable it where legitimate container
+#   activity is producing R013 false positives.
 #
 #   Note: of the comms below, only `runc` is currently an R013 target;
 #   the others never trip R013 and are listed for parity / forward
@@ -53,9 +59,9 @@
 #+dumb-init
 
 # ─────────────────────────────────────────────────────────────────────
-# SITE-SPECIFIC EXEMPTIONS — add trusted-actor comms here, each with a
-# comment explaining WHY it is trusted (so the next operator/auditor
-# understands the exemption).
+# SITE-SPECIFIC EXEMPTIONS — add trusted ACTORS here (the automation, not
+# the tool it runs), each with a comment explaining WHY it is trusted (so
+# the next operator/auditor understands the exemption).
 # ─────────────────────────────────────────────────────────────────────
 #
 # Example:

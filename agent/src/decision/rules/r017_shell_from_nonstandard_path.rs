@@ -9,11 +9,10 @@
 //! dash} & filename ∉ {/bin, /usr/bin}, gated by the path-derived
 //! check + `process-comm-allowlist`.
 //!
-//! Note on ordering: R001–R010 evaluate first, so a shell under a
-//! staging path already covered by those rules (e.g. `/tmp/bash`
-//! → R001) is attributed there; R017 catches the residual cases
-//! (e.g. `/opt/evil/sh`, `/dev/shm/dash`) not covered by a
-//! path-specific Tappa 2 rule.
+//! Note on ordering (external audit PROC-009): R017 evaluates ahead of
+//! the staging rules R001..R003, so `/tmp/bash` is attributed here
+//! (High) rather than to R001 (Medium); R004 (fileless, Critical), R009
+//! (root from a user path) and R010 (webroot) still come first.
 
 use std::sync::Arc;
 
@@ -104,15 +103,20 @@ impl Rule for R017ShellFromNonstandardPath {
         if !parent_comm.is_empty() {
             reasoning = format!("{reasoning}; spawned by {parent_comm}");
         }
-        Some(judgement.apply(
-            build_verdict(
-                self,
-                event,
-                ResponseAction::KillProcess,
-                Severity::High,
-                &reasoning,
+        // External audit PROC-008: and on the program's lineage.
+        Some(super::judge_actor(
+            &self.allowlist,
+            event,
+            judgement.apply(
+                build_verdict(
+                    self,
+                    event,
+                    ResponseAction::KillProcess,
+                    Severity::High,
+                    &reasoning,
+                ),
+                comm,
             ),
-            comm,
         ))
     }
 }

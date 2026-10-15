@@ -31,12 +31,15 @@ use super::{Rule, RuleEngine};
 /// NN-L-FIM-025 (review 86), 72 after NN-L-NET-021 (external audit
 /// EBPF-013). Each family matches a distinct `Event` variant
 /// set, so the first-match short-circuit is unaffected across families.
+/// External audit PROC-010/PROC-009: R007 is registered twice (its
+/// exact-name pass near the head, its name-fragment pass after the
+/// process kills), so the engine holds 73 rules under 72 ids.
 #[test]
 fn default_engine_has_seventy_two_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
-    // chain 8 + tappa2 10 + process 7 + module-load 1 (R018, BUG-034)
-    //   + FIM 25 + canary 4 + net 17
-    assert_eq!(engine.rule_count(), 8 + 10 + 7 + 1 + 25 + 4 + 17);
+    // chain 8 + tappa2 10 (+ R007's second pass) + process 7
+    //   + module-load 1 (R018, BUG-034) + FIM 25 + canary 4 + net 17
+    assert_eq!(engine.rule_count(), 8 + 10 + 1 + 7 + 1 + 25 + 4 + 17);
 }
 
 #[test]
@@ -133,8 +136,8 @@ fn rules_share_consistent_metadata() {
         Box::new(R003ExecFromVarTmp),
         Box::new(R004ExecFromProcSelfFd::default()),
         Box::new(R005NetcatExec),
-        Box::new(R006ReverseShellTooling),
-        Box::new(R007CryptoMiner),
+        Box::new(R006ReverseShellTooling::new(Default::default())),
+        Box::new(R007CryptoMiner::new(Default::default())),
         Box::new(R008HiddenHomeBinary),
         Box::new(R009RootExecFromUserPath::default()),
         Box::new(R010BinaryInWebroot),
@@ -181,8 +184,18 @@ fn rule_ids_are_pinned() {
         "R004_ExecFromProcSelfFd"
     );
     assert_eq!(R005NetcatExec.id(), "R005_NetcatExec");
-    assert_eq!(R006ReverseShellTooling.id(), "R006_ReverseShellTooling");
-    assert_eq!(R007CryptoMiner.id(), "R007_CryptoMiner");
+    assert_eq!(
+        R006ReverseShellTooling::new(Default::default()).id(),
+        "R006_ReverseShellTooling"
+    );
+    assert_eq!(
+        R007CryptoMiner::new(Default::default()).id(),
+        "R007_CryptoMiner"
+    );
+    assert_eq!(
+        R007CryptoMiner::name_fragments(Default::default()).id(),
+        "R007_CryptoMiner"
+    );
     assert_eq!(R008HiddenHomeBinary.id(), "R008_HiddenHomeBinary");
     assert_eq!(
         R009RootExecFromUserPath::default().id(),
@@ -243,10 +256,16 @@ fn default_engine_pins_all_seventy_two_rule_ids() {
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        72,
-        "engine ships 72 rules after NN-L-NET-021_SensorRecordFlood (external audit EBPF-013)"
+        73,
+        "engine ships 72 rules after NN-L-NET-021_SensorRecordFlood (external audit EBPF-013), \
+         R007 in two passes (external audit PROC-010)"
     );
+    // External audit PROC-010: R007's two passes share its id; no other
+    // id appears twice.
+    let r007 = ids.iter().filter(|id| **id == "R007_CryptoMiner").count();
+    assert_eq!(r007, 2);
     ids.sort_unstable();
+    ids.dedup();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
     assert_eq!(unique.len(), 72, "all rule IDs must be unique");
@@ -328,4 +347,173 @@ fn default_engine_pins_all_seventy_two_rule_ids() {
             "R018_KernelModuleLoad",
         ]
     );
+}
+
+// ── External audit PROC-009 / PROC-010: no record stands in for a kill ──
+
+/// A verdict's strength: its action (record < kill < kill the tree), then
+/// its severity.
+fn strength(v: &common::Verdict) -> (u8, u8) {
+    let action = match v.action {
+        ResponseAction::Log => 0,
+        ResponseAction::KillProcessTree => 2,
+        _ => 1,
+    };
+    (action, v.severity as u8)
+}
+
+/// Every process rule's program names, from every kind of place, as
+/// root, as a service account and as a user.
+fn spawn_fixtures() -> Vec<Event> {
+    let comms = [
+        "insmod",
+        "modprobe",
+        "kmod",
+        "setcap",
+        "nsenter",
+        "unshare",
+        "runc",
+        "at",
+        "batch",
+        "base64",
+        "xxd",
+        "openssl",
+        "gdb",
+        "strace",
+        "ltrace",
+        "sh",
+        "bash",
+        "dash",
+        "socat",
+        "msfvenom",
+        "xmrig",
+        "xmrig-cleanup",
+        "nc",
+        "ncat",
+        "payload",
+        "ls",
+    ];
+    let dirs = [
+        "/tmp/",
+        "/var/tmp/",
+        "/dev/shm/",
+        "/home/alice/",
+        "/home/alice/.hidden/",
+        "/var/www/html/",
+        "/usr/share/nginx/html/",
+        "/usr/bin/",
+        "/usr/local/bin/",
+        "/opt/tools/",
+    ];
+    let mut out = Vec::new();
+    for uid in [0, 998, 1000] {
+        for comm in comms {
+            for dir in dirs {
+                out.push(spawn_as(uid, comm, &format!("{dir}{comm}")));
+            }
+            out.push(spawn_as(uid, comm, "/proc/self/fd/3"));
+        }
+    }
+    out
+}
+
+/// External audit PROC-009: for every exec, the engine's verdict is the
+/// strongest any single rule returns — the strongest action, then the
+/// highest severity. Before, `/tmp/insmod` was R001 (Medium), not R011
+/// (High), and `/home/alice/.hidden/bash` R008's record, not R017's kill.
+#[test]
+fn the_engine_returns_the_strongest_spawn_verdict() {
+    for event in spawn_fixtures() {
+        let got = RuleEngine::with_default_rules().evaluate(&event);
+        let all: Vec<common::Verdict> = super::rules::default_rules()
+            .iter()
+            .filter_map(|r| r.evaluate(&event))
+            .collect();
+        let strongest = all.iter().map(strength).max();
+        assert_eq!(
+            got.as_ref().map(strength),
+            strongest,
+            "{event:?}\n  engine: {:?}\n  rules: {:?}",
+            got.map(|v| v.rule_id),
+            all.iter()
+                .map(|v| (&v.rule_id, &v.action, v.severity))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// External audit PROC-009: a kernel-module tool run from a staging
+/// directory is R011 (High, T1547.006); it was R001 (Medium).
+#[test]
+fn staging_kmod_tool_is_r011() {
+    let engine = RuleEngine::with_default_rules();
+    for path in ["/tmp/insmod", "/var/tmp/insmod"] {
+        let v = engine.evaluate(&spawn("insmod", path)).expect(path);
+        assert_eq!(v.rule_id, "R011_KernelModuleTooling", "{path}");
+        assert_eq!(v.severity, Severity::High, "{path}");
+        assert_eq!(v.action, ResponseAction::KillProcess, "{path}");
+        assert!(v.reasoning.contains("T1547.006"), "{}", v.reasoning);
+    }
+    let v = engine
+        .evaluate(&spawn("nsenter", "/tmp/nsenter"))
+        .expect("fires");
+    assert_eq!(v.rule_id, "R013_NamespaceEscapeTooling");
+}
+
+/// External audit PROC-009: the rules that only record (R014..R016, R005,
+/// R008, R007's name fragments) stay behind the staging kills — the
+/// audit's first proposal, every R011..R017 ahead, would have turned
+/// `/tmp/at` into R014's record.
+#[test]
+fn a_log_rule_never_shadows_a_staging_kill() {
+    let engine = RuleEngine::with_default_rules();
+    for (uid, comm, path, rule) in [
+        (1000, "at", "/tmp/at", "R001_ExecFromTmp"),
+        (998, "base64", "/dev/shm/base64", "R002_ExecFromDevShm"),
+        (998, "gdb", "/var/tmp/gdb", "R003_ExecFromVarTmp"),
+        (1000, "nc", "/tmp/nc", "R001_ExecFromTmp"),
+        (
+            1000,
+            "xmrig-cleanup",
+            "/tmp/xmrig-cleanup",
+            "R001_ExecFromTmp",
+        ),
+        (
+            1000,
+            "bash",
+            "/home/alice/.hidden/bash",
+            "R017_ShellFromNonstandardPath",
+        ),
+    ] {
+        let v = engine
+            .evaluate(&spawn_as(uid, comm, path))
+            .unwrap_or_else(|| panic!("{path}"));
+        assert_eq!(v.rule_id, rule, "{path}");
+        assert_eq!(v.action, ResponseAction::KillProcess, "{path}");
+    }
+}
+
+/// External audit PROC-010: in the engine, a name that only contains a
+/// miner's is recorded where nothing else kills, and the distribution's
+/// socat is recorded.
+#[test]
+fn name_fragments_and_system_socat_are_recorded() {
+    let engine = RuleEngine::with_default_rules();
+    for (comm, path, rule) in [
+        (
+            "xmrig-cleanup",
+            "/usr/local/bin/xmrig-cleanup",
+            "R007_CryptoMiner",
+        ),
+        ("socat", "/usr/bin/socat", "R006_ReverseShellTooling"),
+    ] {
+        let v = engine.evaluate(&spawn(comm, path)).expect(path);
+        assert_eq!(v.rule_id, rule, "{path}");
+        assert_eq!(v.action, ResponseAction::Log, "{path}");
+        assert_eq!(v.severity, Severity::High, "{path}");
+    }
+    let v = engine
+        .evaluate(&spawn("xmrig", "/usr/local/bin/xmrig"))
+        .expect("fires");
+    assert_eq!(v.action, ResponseAction::KillProcessTree);
 }

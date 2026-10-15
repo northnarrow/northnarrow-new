@@ -29,8 +29,9 @@ location — some bundle layouts and older runtimes do.
 R013 is the detection for the **CVE-2019-5736** class of attack: an
 attacker overwrites or drops a modified `runc` binary in a writable
 path and rides it to host root. Adding `+runc` to the allowlist exempts
-`runc` from R013 **everywhere on that host**, including those
-attacker-controlled non-standard paths.
+every `runc` in a root-owned system tree (`/usr/local`, `/opt`, …) from
+R013 **everywhere on that host**; a copy in a writable path is still
+judged (the allowlist reads what the kernel executed, not the name).
 
 So: enabling the overlay trades away escape-to-host detection for
 `runc` in exchange for silencing the false positives. Do it only where

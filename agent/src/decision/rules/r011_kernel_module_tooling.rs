@@ -4,12 +4,12 @@
 //! Modules and Extensions). A process whose `comm` is one of the
 //! kernel-module load/manage tools is a kernel-rootkit / persistence
 //! indicator. The design §7.1 trigger is "comm ∈ {insmod, modprobe,
-//! kmod} & uid ≠ pkg-mgr context"; the package-manager-context guard
-//! needs the parent `comm`, which `Event::ProcessSpawn` does not
-//! carry (deferred to T10.6 per the accepted architectural limit), so
-//! the false-positive guard is the operator `process-comm-allowlist`:
-//! a site that loads modules from trusted automation adds the tool's
-//! comm to the allowlist `.local` overlay.
+//! kmod} & uid ≠ pkg-mgr context". External audit PROC-008: the
+//! package-manager context is the `process-comm-allowlist` read as a
+//! list of trusted ACTORS — a root exec of a system-tree kmod tool whose
+//! lineage holds one (DKMS running modprobe under apt or dpkg) is
+//! recorded instead of killed ([`super::judge_actor`]); an entry naming
+//! the tool itself still exempts it everywhere.
 //!
 //! ## Kernel-driven module load exemption (cluster 15.3)
 //!
@@ -135,15 +135,20 @@ impl Rule for R011KernelModuleTooling {
         if !parent_comm.is_empty() {
             reasoning = format!("{reasoning}; parent={parent_comm}");
         }
-        Some(judgement.apply(
-            build_verdict(
-                self,
-                event,
-                ResponseAction::KillProcess,
-                Severity::High,
-                &reasoning,
+        // External audit PROC-008: and on the program's lineage.
+        Some(super::judge_actor(
+            &self.allowlist,
+            event,
+            judgement.apply(
+                build_verdict(
+                    self,
+                    event,
+                    ResponseAction::KillProcess,
+                    Severity::High,
+                    &reasoning,
+                ),
+                comm,
             ),
-            comm,
         ))
     }
 }
@@ -310,5 +315,160 @@ mod tests {
             rule().evaluate(&ev).is_some(),
             "missing PF_KTHREAD signal must fail-secure and fire"
         );
+    }
+
+    // ─── External audit PROC-008 — the allowlist names actors ────────
+
+    /// The shipped entries (`configs/process-comm-allowlist.v1`), judged
+    /// on exec identity through a fixture lineage cache.
+    fn shipped_with(
+        tracker: crate::posture::lineage::AuthSessionTracker,
+    ) -> R011KernelModuleTooling {
+        let entries = crate::config::comm_allowlist::BUILTIN_PROCESS_COMM_ALLOWLIST_V1
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from);
+        R011KernelModuleTooling::new(Arc::new(
+            CommAllowlist::from_iter_owned(entries).with_identity(tracker),
+        ))
+    }
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// apt → dpkg → a maintainer script → dkms (a bash script): each
+    /// forked after its parent ran its program.
+    fn package_transaction(dir: &std::path::Path) -> crate::posture::lineage::AuthSessionTracker {
+        let t = crate::posture::lineage::AuthSessionTracker::new(dir);
+        t.ingest_exec(100, 1, "/usr/bin/apt", &argv(&["apt", "install"]), 10, 5);
+        t.ingest_exec(
+            200,
+            100,
+            "/usr/bin/dpkg",
+            &argv(&["dpkg", "--configure"]),
+            20,
+            15,
+        );
+        t.ingest_exec(
+            300,
+            200,
+            "/usr/bin/dash",
+            &argv(&[
+                "/bin/sh",
+                "/var/lib/dpkg/info/foo-dkms.postinst",
+                "configure",
+            ]),
+            30,
+            25,
+        );
+        t.ingest_exec(
+            400,
+            300,
+            "/usr/bin/bash",
+            &argv(&["/bin/bash", "/usr/sbin/dkms", "install", "foo/1.0"]),
+            40,
+            35,
+        );
+        t
+    }
+
+    /// A root exec at `exe` (pid 500, forked by dkms at 45) as the
+    /// tracker and the rule see it.
+    fn kmod_exec(t: &crate::posture::lineage::AuthSessionTracker, uid: u32, exe: &str) -> Event {
+        let a = argv(&["modprobe", "foo"]);
+        t.ingest_exec(500, 400, exe, &a, 50, 45);
+        let mut e = crate::decision::rules::testutil::spawn_exe("modprobe", exe, exe, 0);
+        if let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid: u,
+            argv,
+            ..
+        } = &mut e
+        {
+            *pid = 500;
+            *ppid = 400;
+            *u = uid;
+            *argv = a;
+        }
+        e
+    }
+
+    /// External audit PROC-008: DKMS running modprobe in a package
+    /// transaction is recorded, naming the actor — the shipped entries
+    /// used to match no target of R011..R017.
+    #[test]
+    fn kmod_tool_under_apt_is_recorded_not_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = package_transaction(dir.path());
+        let e = kmod_exec(&t, 0, "/usr/sbin/modprobe");
+        let v = shipped_with(t).evaluate(&e).expect("recorded");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::High);
+        assert!(
+            v.reasoning.contains("run under /usr/bin/dpkg"),
+            "{}",
+            v.reasoning
+        );
+    }
+
+    /// External audit PROC-008 with POS-003: a process that forks the
+    /// payload and only then executes apt vouches for nothing.
+    #[test]
+    fn a_forked_payload_that_later_execs_apt_is_still_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(dir.path());
+        t.ingest_exec(600, 1, "/usr/bin/bash", &argv(&["bash"]), 10, 5);
+        // the payload is forked at 30; its parent executes apt at 60
+        t.ingest_exec(600, 1, "/usr/bin/apt", &argv(&["apt", "list"]), 60, 5);
+        let a = argv(&["modprobe", "evil"]);
+        t.ingest_exec(700, 600, "/usr/sbin/modprobe", &a, 70, 30);
+        let mut e = crate::decision::rules::testutil::spawn_exe(
+            "modprobe",
+            "/usr/sbin/modprobe",
+            "/usr/sbin/modprobe",
+            0,
+        );
+        if let Event::ProcessSpawn { pid, ppid, uid, .. } = &mut e {
+            (*pid, *ppid, *uid) = (700, 600, 0);
+        }
+        let v = shipped_with(t).evaluate(&e).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// External audit PROC-008: the lineage vouches only for a root exec
+    /// of a program in a system tree — not for a copy a maintainer script
+    /// dropped where anyone writes, nor for another uid's exec (a pager's
+    /// shell under a user's `apt changelog`).
+    #[test]
+    fn an_actor_does_not_vouch_for_a_staged_copy_or_another_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = package_transaction(dir.path());
+        let staged = kmod_exec(&t, 0, "/var/tmp/modprobe");
+        let v = shipped_with(t.clone()).evaluate(&staged).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        let user = kmod_exec(&t, 1000, "/usr/sbin/modprobe");
+        let v = shipped_with(t).evaluate(&user).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// External audit PROC-008: an entry naming the target still exempts
+    /// it (compatibility), by what the kernel executed.
+    #[test]
+    fn a_target_entry_still_exempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(dir.path());
+        let r = R011KernelModuleTooling::new(Arc::new(
+            CommAllowlist::from_iter_owned(["modprobe".to_string()]).with_identity(t),
+        ));
+        let e = crate::decision::rules::testutil::spawn_exe(
+            "modprobe",
+            "/usr/sbin/modprobe",
+            "/usr/sbin/modprobe",
+            0,
+        );
+        assert!(r.evaluate(&e).is_none());
     }
 }

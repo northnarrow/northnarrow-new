@@ -61,15 +61,20 @@ impl Rule for R012SetcapTooling {
         {
             reasoning = format!("{reasoning} — capability grant in argv ({cap})");
         }
-        Some(judgement.apply(
-            build_verdict(
-                self,
-                event,
-                ResponseAction::KillProcess,
-                Severity::High,
-                &reasoning,
+        // External audit PROC-008: and on the program's lineage.
+        Some(super::judge_actor(
+            &self.allowlist,
+            event,
+            judgement.apply(
+                build_verdict(
+                    self,
+                    event,
+                    ResponseAction::KillProcess,
+                    Severity::High,
+                    &reasoning,
+                ),
+                comm,
             ),
-            comm,
         ))
     }
 }

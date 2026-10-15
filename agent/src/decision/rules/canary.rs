@@ -189,6 +189,60 @@ fn respond(
     canary_verdict(rule, view, reasoning)
 }
 
+/// External audit NETR-006: the response to a trip, decided on the access,
+/// not on the (type, access) pair. Each rule used to require one exact
+/// pair, and nothing answered the others — yet running a File or
+/// Credential decoy (its path is in the exec index) produces
+/// (File|Credential, ProcessExec), and since DEC-004 that unanswered first
+/// access burned the canary: every later access was a Low record.
+///
+/// - Read: [`respond`] with the readers of whole trees spared (DEC-005).
+/// - Executed: [`respond`] — no backup or indexer executes what it reads.
+/// - Connected to: kill, on every connect (NN-L-CANARY-003's response).
+///
+/// The rule id names the canary's type; the reasoning, when the access is
+/// not the one this type expects, names it.
+fn respond_to_access(
+    rule: &dyn Rule,
+    view: &CanaryView<'_>,
+    readers: &CanaryReaders,
+    expected: CanaryAccessKind,
+    expected_reasoning: &str,
+) -> Verdict {
+    let unusual;
+    let reasoning = if view.access_kind == expected {
+        expected_reasoning
+    } else {
+        unusual = format!(
+            "{:?} canary {} — not the access this decoy expects (it is meant to be {}); \
+             intrusion signal; kill the accessor tree",
+            view.canary_type,
+            access_verb(view.access_kind),
+            access_verb(expected),
+        );
+        &unusual
+    };
+    match view.access_kind {
+        CanaryAccessKind::FileOpen => {
+            let reader = view
+                .first_trip
+                .then(|| readers.reader(view.accessor_pid))
+                .flatten();
+            respond(rule, view, reasoning, reader)
+        }
+        CanaryAccessKind::ProcessExec => respond(rule, view, reasoning, None),
+        CanaryAccessKind::NetworkConnect => canary_verdict(rule, view, reasoning),
+    }
+}
+
+fn access_verb(kind: CanaryAccessKind) -> &'static str {
+    match kind {
+        CanaryAccessKind::FileOpen => "read",
+        CanaryAccessKind::ProcessExec => "executed",
+        CanaryAccessKind::NetworkConnect => "connected to",
+    }
+}
+
 // ── NN-L-CANARY-001 — File canary access ───────────────────────────
 
 /// File canary access — the K3 detector observed a
@@ -225,23 +279,14 @@ impl Rule for NnLCanary001FileAccess {
         if view.canary_type != CanaryTypeTag::File {
             return None;
         }
-        // The K3 detector should always pair File canary type
-        // with FileOpen access_kind — defensive check anyway
-        // (any other access_kind means K3-side wire drift,
-        // which we'd rather surface as a missed rule than a
-        // wrong-type fire).
-        if view.access_kind != CanaryAccessKind::FileOpen {
-            return None;
-        }
-        let reader = view
-            .first_trip
-            .then(|| self.readers.reader(view.accessor_pid))
-            .flatten();
-        Some(respond(
+        // External audit NETR-006: any access answers; an exec of the
+        // decoy's path is not a missed rule.
+        Some(respond_to_access(
             self,
             &view,
+            &self.readers,
+            CanaryAccessKind::FileOpen,
             "File canary access — intrusion signal; kill the accessor tree + posture → COMBAT",
-            reader,
         ))
     }
 }
@@ -255,7 +300,17 @@ impl Rule for NnLCanary001FileAccess {
 /// operator workflow ever execs a canary binary; legitimate
 /// operators use `nn-admin`). Always Critical, KillProcessTree
 /// the accessor, posture → COMBAT.
-pub struct NnLCanary002ProcessExec;
+#[derive(Default)]
+pub struct NnLCanary002ProcessExec {
+    /// External audit NETR-006: spared when they read the canary.
+    readers: CanaryReaders,
+}
+
+impl NnLCanary002ProcessExec {
+    pub fn new(readers: CanaryReaders) -> Self {
+        Self { readers }
+    }
+}
 
 impl Rule for NnLCanary002ProcessExec {
     fn id(&self) -> &'static str {
@@ -272,15 +327,13 @@ impl Rule for NnLCanary002ProcessExec {
         if view.canary_type != CanaryTypeTag::Process {
             return None;
         }
-        if view.access_kind != CanaryAccessKind::ProcessExec {
-            return None;
-        }
-        Some(respond(
+        Some(respond_to_access(
             self,
             &view,
+            &self.readers,
+            CanaryAccessKind::ProcessExec,
             "Process canary executed — zero-FP intrusion signal; \
              kill the accessor tree + posture → COMBAT",
-            None,
         ))
     }
 }
@@ -302,7 +355,17 @@ impl Rule for NnLCanary002ProcessExec {
 /// loop. Until then this rule compiles + tests pass with
 /// synthetic events, but production never sees a Network
 /// canary trip.
-pub struct NnLCanary003NetworkConnect;
+#[derive(Default)]
+pub struct NnLCanary003NetworkConnect {
+    /// External audit NETR-006: spared when they read the canary.
+    readers: CanaryReaders,
+}
+
+impl NnLCanary003NetworkConnect {
+    pub fn new(readers: CanaryReaders) -> Self {
+        Self { readers }
+    }
+}
 
 impl Rule for NnLCanary003NetworkConnect {
     fn id(&self) -> &'static str {
@@ -319,12 +382,11 @@ impl Rule for NnLCanary003NetworkConnect {
         if view.canary_type != CanaryTypeTag::Network {
             return None;
         }
-        if view.access_kind != CanaryAccessKind::NetworkConnect {
-            return None;
-        }
-        Some(canary_verdict(
+        Some(respond_to_access(
             self,
             &view,
+            &self.readers,
+            CanaryAccessKind::NetworkConnect,
             "Network canary connected — zero-FP intrusion signal; \
              kill the accessor tree + posture → COMBAT",
         ))
@@ -378,18 +440,12 @@ impl Rule for NnLCanary004CredentialRead {
         if view.canary_type != CanaryTypeTag::Credential {
             return None;
         }
-        if view.access_kind != CanaryAccessKind::FileOpen {
-            return None;
-        }
-        let reader = view
-            .first_trip
-            .then(|| self.readers.reader(view.accessor_pid))
-            .flatten();
-        Some(respond(
+        Some(respond_to_access(
             self,
             &view,
+            &self.readers,
+            CanaryAccessKind::FileOpen,
             "Credential canary read — intrusion signal; kill the accessor tree + posture → COMBAT",
-            reader,
         ))
     }
 }
@@ -397,10 +453,9 @@ impl Rule for NnLCanary004CredentialRead {
 // ── builder ────────────────────────────────────────────────────────
 
 /// Build the K5 canary rule set in evaluation order. Each rule
-/// matches a distinct (canary_type, access_kind) pair so the
-/// order is not load-bearing — they're independent in
-/// practice. Listed in NN-L-CANARY-NNN sequence for operator
-/// readability.
+/// matches a distinct canary type, whatever the access (external audit
+/// NETR-006), so the order is not load-bearing. Listed in
+/// NN-L-CANARY-NNN sequence for operator readability.
 ///
 /// Wired into [`crate::decision::rules::default_rules`] via
 /// `rules.extend(crate::canary::rules::canary_rules())`.
@@ -414,8 +469,8 @@ pub fn canary_rules() -> Vec<Box<dyn Rule>> {
 pub fn canary_rules_with_readers(readers: CanaryReaders) -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(NnLCanary001FileAccess::new(readers.clone())),
-        Box::new(NnLCanary002ProcessExec),
-        Box::new(NnLCanary003NetworkConnect),
+        Box::new(NnLCanary002ProcessExec::new(readers.clone())),
+        Box::new(NnLCanary003NetworkConnect::new(readers.clone())),
         Box::new(NnLCanary004CredentialRead::new(readers)),
     ]
 }
@@ -534,6 +589,135 @@ mod tests {
         assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
+    /// Every canary type and access kind; the `match` stops compiling when
+    /// a variant is added, so the exhaustive test below stays exhaustive.
+    fn all_pairs() -> Vec<(CanaryTypeTag, CanaryAccessKind)> {
+        let types = [
+            CanaryTypeTag::File,
+            CanaryTypeTag::Process,
+            CanaryTypeTag::Network,
+            CanaryTypeTag::Credential,
+        ];
+        let kinds = [
+            CanaryAccessKind::FileOpen,
+            CanaryAccessKind::ProcessExec,
+            CanaryAccessKind::NetworkConnect,
+        ];
+        for t in types {
+            match t {
+                CanaryTypeTag::File
+                | CanaryTypeTag::Process
+                | CanaryTypeTag::Network
+                | CanaryTypeTag::Credential => {}
+            }
+        }
+        for k in kinds {
+            match k {
+                CanaryAccessKind::FileOpen
+                | CanaryAccessKind::ProcessExec
+                | CanaryAccessKind::NetworkConnect => {}
+            }
+        }
+        types
+            .iter()
+            .flat_map(|t| kinds.iter().map(move |k| (*t, *k)))
+            .collect()
+    }
+
+    /// External audit NETR-006: a first trip gets a verdict whatever the
+    /// (type, access) pair — exactly one rule, named by the type, Critical,
+    /// KillProcessTree; the reasoning names an access the type does not
+    /// expect.
+    #[test]
+    fn every_type_and_access_pair_yields_a_verdict() {
+        let rules = canary_rules();
+        for (ty, kind) in all_pairs() {
+            let fired: Vec<Verdict> = rules
+                .iter()
+                .filter_map(|r| r.evaluate(&canary_event(ty, kind)))
+                .collect();
+            assert_eq!(fired.len(), 1, "({ty:?}, {kind:?})");
+            let v = &fired[0];
+            assert_eq!(
+                v.action,
+                ResponseAction::KillProcessTree,
+                "({ty:?}, {kind:?})"
+            );
+            assert_eq!(v.severity, Severity::Critical, "({ty:?}, {kind:?})");
+            let expected = match ty {
+                CanaryTypeTag::File => "NN-L-CANARY-001_FileAccess",
+                CanaryTypeTag::Process => "NN-L-CANARY-002_ProcessExec",
+                CanaryTypeTag::Network => "NN-L-CANARY-003_NetworkConnect",
+                CanaryTypeTag::Credential => "NN-L-CANARY-004_CredentialRead",
+            };
+            assert_eq!(v.rule_id, expected);
+            let usual = matches!(
+                (ty, kind),
+                (CanaryTypeTag::File, CanaryAccessKind::FileOpen)
+                    | (CanaryTypeTag::Process, CanaryAccessKind::ProcessExec)
+                    | (CanaryTypeTag::Network, CanaryAccessKind::NetworkConnect)
+                    | (CanaryTypeTag::Credential, CanaryAccessKind::FileOpen)
+            );
+            assert_eq!(
+                v.reasoning.contains("not the access this decoy expects"),
+                !usual,
+                "({ty:?}, {kind:?}): {}",
+                v.reasoning
+            );
+        }
+    }
+
+    /// External audit NETR-006: running a File decoy's path (root made it
+    /// executable, or a user who owns the directory put a file there) is
+    /// answered on its first trip, not burned.
+    #[test]
+    fn an_exec_of_a_file_canary_kills() {
+        let v = canary_rules()
+            .iter()
+            .find_map(|r| {
+                r.evaluate(&canary_event(
+                    CanaryTypeTag::File,
+                    CanaryAccessKind::ProcessExec,
+                ))
+            })
+            .expect("an exec of a File canary gets a verdict");
+        assert_eq!(v.rule_id, "NN-L-CANARY-001_FileAccess");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(
+            v.reasoning.contains("File canary executed"),
+            "{}",
+            v.reasoning
+        );
+    }
+
+    /// External audit NETR-006 with DEC-005: the readers of whole trees are
+    /// spared when they read a canary, of any type, never when they
+    /// execute one.
+    #[test]
+    fn a_reader_is_spared_only_when_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(dir.path());
+        t.ingest_spawn_with_argv(500, 1, "/usr/bin/restic", &["restic".into()], 1);
+        let rules = canary_rules_with_readers(CanaryReaders::new(Default::default(), t));
+        let verdict = |ty, kind| -> Verdict {
+            rules
+                .iter()
+                .find_map(|r| r.evaluate(&trip(ty, kind, 500, true)))
+                .unwrap()
+        };
+        for ty in [
+            CanaryTypeTag::File,
+            CanaryTypeTag::Process,
+            CanaryTypeTag::Credential,
+        ] {
+            let read = verdict(ty, CanaryAccessKind::FileOpen);
+            assert_eq!(read.action, ResponseAction::Log, "{ty:?}");
+            assert_eq!(read.severity, Severity::High, "{ty:?}");
+            let run = verdict(ty, CanaryAccessKind::ProcessExec);
+            assert_eq!(run.action, ResponseAction::KillProcessTree, "{ty:?}");
+        }
+    }
+
     fn fim_event() -> Event {
         Event::Fim(common::wire::FimEvent {
             timestamp_ns: 1_700_000_000_000_000_000,
@@ -600,7 +784,7 @@ mod tests {
 
     #[test]
     fn canary002_fires_on_process_canary_exec() {
-        let r = NnLCanary002ProcessExec;
+        let r = NnLCanary002ProcessExec::default();
         let v = r
             .evaluate(&canary_event(
                 CanaryTypeTag::Process,
@@ -614,7 +798,7 @@ mod tests {
 
     #[test]
     fn canary002_does_not_fire_on_non_process_canary_types() {
-        let r = NnLCanary002ProcessExec;
+        let r = NnLCanary002ProcessExec::default();
         for canary_type in [
             CanaryTypeTag::File,
             CanaryTypeTag::Network,
@@ -632,7 +816,7 @@ mod tests {
 
     #[test]
     fn canary003_fires_on_network_canary_connect() {
-        let r = NnLCanary003NetworkConnect;
+        let r = NnLCanary003NetworkConnect::default();
         let v = r
             .evaluate(&canary_event(
                 CanaryTypeTag::Network,
@@ -646,7 +830,7 @@ mod tests {
 
     #[test]
     fn canary003_does_not_fire_on_non_network_canary_types() {
-        let r = NnLCanary003NetworkConnect;
+        let r = NnLCanary003NetworkConnect::default();
         for canary_type in [
             CanaryTypeTag::File,
             CanaryTypeTag::Process,

@@ -5,10 +5,12 @@
 //! BARE PROCESS COMM NAMES (basenames, `TASK_COMM_LEN`-truncated as
 //! the kernel reports them) rather than paths:
 //!
-//! - **`process-comm-allowlist`** — comms exempt from the Tappa 10.5
-//!   process detection rules (R011..). A site that legitimately runs
-//!   a flagged tool from automation adds its comm here (via `.local`)
-//!   to silence the rule without a code change.
+//! - **`process-comm-allowlist`** — programs the process rules trust.
+//!   External audit PROC-008: an entry is an ACTOR for R011, R012, R013
+//!   and R017 (a root exec of a system-tree program under it is recorded,
+//!   not killed — [`CommAllowlist::actor_of`]) and a TARGET for those and
+//!   R006, R007, R014..R016 and the io_uring and BPF rules (the program
+//!   itself draws no verdict). The shipped entries are actors.
 //! - **`netflow-comm-allowlist`** — the trusted-actor comms the
 //!   network rules (NN-L-NET-006/007/009 + the Tappa 10.5 additions)
 //!   suppress on. The `.v1` default is seeded from the inline
@@ -145,6 +147,17 @@ impl CommAllowlist {
                 claimed: self.entries.contains(comm),
             }
         }
+    }
+
+    /// External audit PROC-008: an entry as a trusted ACTOR — the nearest
+    /// process in `pid`'s lineage whose exec identity is an entry (as
+    /// [`Self::judge_exec`] judges one), on the lineage walk POS-003
+    /// orders; its executable. `None` without an identity source (tests,
+    /// the boot-time rule set) or when there is none.
+    pub fn actor_of(&self, pid: u32) -> Option<std::path::PathBuf> {
+        let tracker = self.identity.as_ref()?;
+        let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
+        tracker.actor_in_lineage(pid, |id| id.is_client(&entries))
     }
 
     /// [`Self::judge`] with a rule's built-in clients, `known`: program

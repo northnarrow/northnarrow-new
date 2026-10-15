@@ -169,15 +169,15 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-123 | FIMP-011 | FIM pipeline | S | fixed (lab PR 111) |
 | NN-AUD-124 | NETR-004 | Net rules | S | fixed (lab PR 125) |
 | NN-AUD-125 | NETR-005 | Net rules | M | fixed (lab PR 126) |
-| NN-AUD-126 | NETR-006 | Net rules | S | open |
+| NN-AUD-126 | NETR-006 | Net rules | S | fixed (lab PR 140) |
 | NN-AUD-127 | NETR-007 | Net rules | S | fixed (lab PR 126) |
 | NN-AUD-128 | NETR-008 | Net rules | S | fixed (lab PR 126) |
 | NN-AUD-129 | NETR-009 | Net rules | M | fixed (lab PR 125) |
 | NN-AUD-130 | NETR-010 | Net rules | M | fixed (lab PR 125) |
 | NN-AUD-131 | PROC-006 | Process rules | M | already fixed (lab PR 87, with NN-AUD-055) |
-| NN-AUD-132 | PROC-008 | Process rules | S | open |
-| NN-AUD-133 | PROC-009 | Process rules | S | open |
-| NN-AUD-134 | PROC-010 | Process rules | S | open |
+| NN-AUD-132 | PROC-008 | Process rules | S | fixed (lab PR 140) |
+| NN-AUD-133 | PROC-009 | Process rules | S | fixed (lab PR 140) |
+| NN-AUD-134 | PROC-010 | Process rules | S | fixed (lab PR 140) |
 | NN-AUD-135 | POS-005 | Posture | M | open |
 | NN-AUD-136 | POS-009 | Posture | M | open |
 | NN-AUD-137 | POS-015 | Posture | M | open |
@@ -3061,3 +3061,82 @@ the audit did not report, noted with the fix that takes them.
     `net flows` and `net fingerprint` list the flow, test #2 that
     `net listeners` lists the port.
   - Lab: Ubuntu 24.04, readverbs139-probe.sh on main and on this build. A real flow to 127.0.0.2:18140: absent from `net flows` on main (46 entries, the oldest first), line 1 here; `net resolve 127.0.0.2`: "no attribution available" → `probe139.invalid`; `net fingerprint` of the flow: 0 rows → 1 row, a malformed flow id refused; `net listeners` with a listener on :18765: 0 entries → 2 rows; `fim report`: oldest row first → newest first. Gate: Ubuntu 24.04 and Debian 12, 29 suites, 80 passed, 0 failed each; anti-tamper suite OK; host 1907 passed, 0 failed.
+- **NN-AUD-133 (PROC-009), NN-AUD-134 (PROC-010), NN-AUD-132 (PROC-008),
+  NN-AUD-126 (NETR-006), lab PR 140.** Process and canary rule coverage
+  (batch B7). No kernel change.
+  - PROC-009: both builders take the process rules from one function,
+    `spawn_rules`: every rule that can kill before any that only records,
+    a High record before a Medium one — R004, R007 (exact names), R006,
+    R009, R010, R011, R012, R013, R017, R002, R001, R003, then R005, R007
+    (name fragments), R008, R014, R015, R016. `/tmp/insmod` is R011 (High,
+    T1547.006; was R001, Medium), `/tmp/nsenter` R013, a shell in
+    `~/.hidden` R017's kill (was R008's record). R009 stays ahead of the
+    staging rules: its PROC-007 records are deliberate exceptions to them.
+    Not the audit's order (all of R011..R017 ahead): R014..R016 key on
+    `comm` and only record, so `/tmp/at` would have become a record. The
+    same class in the network rules, wider than the triage found: -013,
+    -011 and -007 (records) ran before the kills of -018 and -008 (a
+    staging-dir process reaching port 21 or an internal host was recorded),
+    and -004 (any name over 60 characters, recorded) before -014, which
+    never saw most tunnels' names and never reached its corroborated kill.
+    Now -010, -018, -008, then -011, -013 … -007, -009; -014 before -004
+    and -005 (-005's burst window no longer counts the names -014
+    answers; it never counted -004's). Rule ids and severities change for
+    these cases (detection budgets are per id).
+  - PROC-010: R006 and R007 take the process allowlist (judged on what the
+    kernel executed) in both builders. R007 kills only on an exact miner
+    name in `comm` or in the executed file's basename (a symlink `sysupd`
+    to `xmrig` now counts); a name that only contains one is a record
+    (Log, High), from a second registration of R007 after the process
+    kills — at R007's place it would have recorded `/tmp/xmrig-x` instead
+    of R001 killing it. The engine holds 73 rules under 72 ids. Product
+    decision: R006 records (Log, High) a `socat` in `/usr/bin`, `/bin`,
+    `/usr/sbin` or `/sbin` unless an address runs a shell (`EXEC:`,
+    `SYSTEM:`, `SHELL:` with `sh`, `bash`…); a `socat` elsewhere (a
+    webroot under `/usr/share` included) and the other tools anywhere are
+    still killed. Regression: a miner renamed `xmrig-something`, and the
+    distribution's socat relaying to anything but a shell, are recorded.
+  - PROC-008: the shipped entries are actors. R011, R012, R013 and R017
+    record, naming the actor, a root exec of a program in a root-owned
+    system tree whose lineage holds an entry (`CommAllowlist::actor_of`,
+    `AuthSessionTracker::actor_in_lineage`: the POS-003 walk of
+    `is_system_daemon_mediated`, matched on exec identity, script
+    included, so dnf and unattended-upgrade count). A target entry still
+    exempts. Not vouched for: a program outside a system tree (a payload
+    a maintainer script drops in `/tmp`), another uid's exec (a pager's
+    shell under a user's `apt changelog`), a parent that executes apt
+    after forking the payload. Both config headers say what each kind of
+    match does; `CONTAINER_HOST_DEPLOY.md` no longer says `+runc` exempts
+    copies in writable paths. Not done: ansible's remote modules
+    (`~/.ansible/tmp`) match nothing (workload context, §4.3). Limit, as
+    for R009 and NET-008: a hop evicted from the lineage cache and read
+    from `/proc` without its exec ends the walk, and the kill stands.
+  - NETR-006: each canary rule matches its canary's type and answers on
+    the access: a read goes through DEC-005's readers, an exec kills (no
+    reader is spared), a connect kills every time (as NN-L-CANARY-003
+    did); the reasoning names an access the type does not expect. An
+    exec of a File or Credential decoy's path no longer burns the canary
+    without a verdict. Not done here: a trip never reaches the posture
+    (group C).
+  - Tests: `the_engine_returns_the_strongest_spawn_verdict` (858 execs:
+    every rule's names, from ten kinds of directory and
+    `/proc/self/fd/3`, as uid 0, 998 and 1000), `staging_kmod_tool_is_r011`,
+    `a_log_rule_never_shadows_a_staging_kill`,
+    `name_fragments_and_system_socat_are_recorded`,
+    `no_netflow_record_shadows_a_kill`,
+    `a_beacon_never_shadows_a_lateral_movement_kill`,
+    `a_tunnel_of_long_names_reaches_the_tunnel_kill`,
+    `r007_substring_only_is_recorded`,
+    `r007_exact_name_of_the_executed_file_kills`,
+    `r007_allowlisted_by_identity_is_exempt`,
+    `r006_system_socat_is_recorded_a_copy_is_killed`,
+    `r006_system_socat_running_a_shell_is_killed`,
+    `r006_allowlisted_by_identity_is_exempt`,
+    `kmod_tool_under_apt_is_recorded_not_killed`,
+    `every_type_and_access_pair_yields_a_verdict`,
+    `an_exec_of_a_file_canary_kills`, `a_reader_is_spared_only_when_it_reads`.
+    Each fails with its fix taken out (checked by inverting it);
+    `a_forked_payload_that_later_execs_apt_is_still_killed`,
+    `an_actor_does_not_vouch_for_a_staged_copy_or_another_uid` and
+    `a_target_entry_still_exempts` are guards and pass on both.
+  - Lab: Ubuntu 24.04, proc140-probe.sh on main and on this build. Order: `/var/tmp/insmod` R003 (Medium) → R011 (High), `~/.nnx140/bash` exit 0 with an R008 record → killed by R017, `/var/tmp/at` R003 kill on both. Miner: `xmrig-cleanup` killed by R007 → recorded (Log, High), the symlink `sysupd` → `xmrig` ran → killed (R007 on the executed file). socat: `/usr/bin/socat -V` killed → recorded ("installed by the distribution"), `socat … EXEC:/bin/sh` and a copy in `~/nnx140-bin` killed on both. dkms: `modprobe` in a package's postinst killed → recorded ("run under /usr/bin/dpkg"); `sudo modprobe` from the SSH session killed on both. Canary: an exec of a File decoy's path gave no verdict → NN-L-CANARY-001 KillProcessTree, Critical ("not the access this decoy expects"); the read stays a Low record. Network: a `/var/tmp` dropper's child connecting to 10.254.0.74:8080 (dummy interface) had no network verdict → NN-L-NET-008 KillProcess on the child (the record lands about 7 s after the connect, at the flow's close drain). DNS: a tunnel of 10 long base32 names → NN-L-NET-014 records and its corroborated kill on both, -014 now ahead of -004. Gate: Ubuntu 24.04 and Debian 12, 29 suites, 80 passed, 0 failed each; anti-tamper OK; host 1912 passed, 0 failed.
