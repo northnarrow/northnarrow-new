@@ -10,6 +10,11 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# External audit SUP-002: every action is pinned by commit SHA (the version
+# in the comment); Dependabot (github-actions) proposes updates. Every
+# `cargo install` names a version and --locked. xtask/tests/supply_chain.rs
+# (the test job) fails on a tag-pinned action or an unpinned tool.
+
 jobs:
   userland:
     name: ${{ matrix.task }} (${{ matrix.os }})
@@ -21,7 +26,7 @@ jobs:
         task: [fmt, clippy, build, test]
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -41,7 +46,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -81,7 +86,7 @@ jobs:
     # processes (need root or CAP_KILL). CI cannot run them, but it
     # still verifies they compile so they can never silently rot.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -101,7 +106,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -135,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -155,7 +160,7 @@ jobs:
           rustup component add clippy
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -184,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -203,7 +208,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install stable --profile minimal
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -229,7 +234,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -262,7 +267,7 @@ jobs:
         run: cargo install bpf-linker --version 0.10.3 --locked
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -292,7 +297,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free disk space
         run: |
@@ -302,14 +307,15 @@ jobs:
           df -h / | tail -1
 
       # libFuzzer needs nightly (-Zsanitizer); the same channel as the eBPF
-      # build so one toolchain download serves both.
-      - name: Install nightly toolchain + cargo-fuzz
+      # build so one toolchain download serves both. External audit
+      # SUP-005: cargo-fuzz pinned (the version runs resolved on 2026-10-15).
+      - name: Install nightly toolchain + cargo-fuzz (pinned)
         run: |
           rustup toolchain install nightly-2025-12-01 --profile minimal
-          cargo install cargo-fuzz --locked
+          cargo install cargo-fuzz --version 0.13.2 --locked
 
       - name: Cache cargo registry and fuzz target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -359,7 +365,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install cargo-audit

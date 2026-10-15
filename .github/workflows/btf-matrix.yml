@@ -37,21 +37,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      # .cargo/config.toml builds with target-cpu=native (candle kernels on the
-      # deployment host). On a hosted runner that poisons the cached target
-      # dir: a proc-macro dylib (bytemuck_derive) built on a newer CPU is
+      # A target-cpu=native build poisons the cached target dir on a hosted
+      # runner: a proc-macro dylib (bytemuck_derive) built on a newer CPU is
       # restored on an older one and rustc dies with SIGILL on every run until
-      # the cache key rotates. RUSTFLAGS overrides the config value; v2 is the
-      # floor of every GitHub runner.
+      # the cache key rotates. x86-64-v2, the floor of every GitHub runner, is
+      # also the .cargo/config.toml default since external audit SUP-017; it
+      # stays explicit here so a later change of that default cannot bring
+      # the poisoned cache back.
       RUSTFLAGS: -C target-cpu=x86-64-v2
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -69,7 +70,7 @@ jobs:
         run: cargo build --release -p northnarrow-agent
 
       - name: Cache BTFHub blobs
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/nn-btf-matrix
           key: btfhub-blobs-${{ hashFiles('deploy/btf-matrix/run.sh') }}
@@ -92,7 +93,7 @@ jobs:
 
       - name: Upload the matrix
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: btf-matrix
           path: target/btf-matrix/matrix.md

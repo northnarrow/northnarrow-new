@@ -438,7 +438,8 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 | File | What it is |
 |---|---|
 | `northnarrow-<ver>-x86_64-linux.tar.gz` | the release tree: binaries, eBPF object + provenance stamp, `deploy/` (install/uninstall/units), `configs/`, operator docs, licences. Extract and run `sudo ./deploy/install.sh` (or `--upgrade`) unchanged — every preflight still applies. |
-| `northnarrow_<ver>-<rel>_amd64.deb`, `northnarrow-<ver>-<rel>.x86_64.rpm` | the same binaries as distribution packages (section 6) |
+| `northnarrow_<ver>-<rel>_amd64.deb`, `northnarrow-<ver>-<rel>.x86_64.rpm` | the same binaries as distribution packages (section 6); the `.rpm` is signed (section 6.1) |
+| `RPM-GPG-KEY-northnarrow.asc` | the public key the `.rpm` is signed with (a copy of `deploy/release/RPM-GPG-KEY-northnarrow.asc` at the tag) |
 | `northnarrow-<ver>-x86_64-linux.{agent,watchdog}.sbom.cdx.json` | CycloneDX SBOMs of the two daemons (the agent one covers `nn-admin` too) |
 | `SHA256SUMS` | checksums of the files above |
 
@@ -448,14 +449,32 @@ installing:
 
 ```sh
 sha256sum -c SHA256SUMS
-gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/northnarrow-new
+gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/northnarrow-new \
+  --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
+  --deny-self-hosted-runners
 ```
 
 The attestation binds the file digest to the exact commit, workflow and
 runner that produced it; a tarball rebuilt elsewhere, or modified after
-the fact, fails the check. Pull requests that touch `deploy/`, `xtask/`
-or the workflow run the same job as a dry run (artefacts on the workflow
-run only).
+the fact, fails the check. The identity regex is what makes the check
+mean "a release" (external audit SUP-001): `--repo` alone, or
+`--signer-workflow`, also accepts the attestation of a `workflow_dispatch`
+run of the same workflow on any branch, whose certificate names that
+branch instead of a `v*` tag. `--deny-self-hosted-runners` refuses an
+attestation made on a runner outside GitHub's hosted fleet. With cosign
+and a bundle from `gh attestation download`, use the same regex:
+
+```sh
+cosign verify-blob-attestation --new-bundle-format --bundle <bundle.jsonl> \
+  --certificate-identity-regexp '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com <file>
+```
+
+Pull requests that touch `deploy/`, `xtask/` or the workflow run the same
+job as a dry run (artefacts on the workflow run only). Every action the
+workflows use is pinned by commit SHA, and every tool installed with
+`cargo install` (bpf-linker, cargo-cyclonedx, cargo-fuzz, cargo-audit,
+kani) by version with `--locked` (external audit SUP-002, SUP-005).
 
 ### 5.1 `install.sh` verifies the release itself
 
@@ -471,9 +490,10 @@ performs the checks and refuses to touch the host when one fails:
 3. **SLSA attestation** — with `gh` 2.49+ (online, or offline with
    `--attestation BUNDLE` from `gh attestation download`) or `cosign`
    plus a bundle, the provenance is verified and bound to this
-   repository's release workflow (`--signer-workflow`). Without a
-   verifier the installer says so; `--require-attestation` turns that
-   into a refusal.
+   repository's release workflow run for a `v*` tag (the identity regex
+   above, and `--deny-self-hosted-runners` with gh). An artefact of a
+   dispatch run on a branch fails this step. Without a verifier the
+   installer says so; `--require-attestation` turns that into a refusal.
 
 The strongest level reached — `attested`, `checksums`, `manifest`,
 `source-tree` or `unverified` — is written with the SHA-256 of every
@@ -548,10 +568,9 @@ sudo ./deploy/install.sh --upgrade --tarball /path/to/northnarrow-<ver>-x86_64-l
 nn-admin audit verify --from /etc/northnarrow/audit.log --agent-sig-key /etc/northnarrow/agent.sig.key
 ```
 
-Known limits: one architecture (x86_64) and no `.deb`/`.rpm` yet. The
-tarball itself is not byte-reproducible (file mtimes are preserved because
-the staleness guard needs them); the provenance attestation is the
-integrity anchor instead.
+Known limits: one architecture (x86_64). The tarball itself is not
+byte-reproducible (file mtimes are preserved because the staleness guard
+needs them); the provenance attestation is the integrity anchor instead.
 
 ### Install layout
 
@@ -599,8 +618,12 @@ installed over it. The running units are stopped and restarted, the
 `/usr/local/bin` binaries and the `/etc/systemd/system` units are
 removed, and units that were enabled stay enabled. Keys, `agent_id`, the
 audit chain and the chain logs are kept. The install manifest records
-`"provenance": "package"`; the integrity of the files is the package
-manager's to verify (`dpkg --verify northnarrow`, `rpm -V northnarrow`).
+`"provenance": "package"`: `install.sh` runs inside the package's own
+scripts and cannot tell where the package came from, so check it before
+the package command (section 6.1). `dpkg --verify northnarrow` and
+`rpm -V northnarrow` only compare the installed files with what the
+package database recorded at install time; they say nothing about the
+package's origin.
 
 **Upgrade and removal need the trusted-installer window.** The running
 agent protects its binaries, units and pin root, so the package's hooks
@@ -623,3 +646,48 @@ cleanly and leave the agent running. Neither an attacker nor an
 automatic job can replace or remove the agent through the package manager
 without a key that carries the `trusted-installer` role.
 
+### 6.1 Verify a package before installing it
+
+The package's maintainer scripts run as root as soon as the package
+manager unpacks it, so its origin is checked before the package command
+(external audit DEP-008). Nothing inside the package can do it: a swapped
+package brings its own scripts.
+
+**`.rpm` (RHEL, AlmaLinux).** The release `.rpm` carries an RPM signature
+made in the release workflow, on a `v*` tag only, with the key whose
+public half is committed at `deploy/release/RPM-GPG-KEY-northnarrow.asc`
+(also attached to each release). Import that key once, from the
+repository at the release tag, and compare its fingerprint with the one
+the project publishes; then let rpm or dnf check every package:
+
+```sh
+curl -fsSLo RPM-GPG-KEY-northnarrow.asc \
+  https://raw.githubusercontent.com/northnarrow/northnarrow-new/v<ver>/deploy/release/RPM-GPG-KEY-northnarrow.asc
+gpg --show-keys RPM-GPG-KEY-northnarrow.asc         # compare the fingerprint
+sudo rpm --import RPM-GPG-KEY-northnarrow.asc
+rpm -K northnarrow-<ver>-<rel>.x86_64.rpm           # must print: digests signatures OK
+sudo dnf install --setopt=localpkg_gpgcheck=1 ./northnarrow-<ver>-<rel>.x86_64.rpm
+```
+
+`rpm -K` prints `digests OK` (no `signatures`) for an unsigned package
+and `NOT OK` for a package signed by another key or altered after
+signing; dnf with `localpkg_gpgcheck=1`, or a repository with
+`gpgcheck=1`, refuses both. `rpm -U` on its own refuses them only with
+`%_pkgverify_level signature`. The tag-bound attestation (section 5)
+verifies the signed `.rpm` as well.
+
+**`.deb` (Debian, Ubuntu).** dpkg and apt do not check a signature on a
+single package file; apt authenticates the signed metadata of a
+repository, and NorthNarrow has no apt repository yet. Verify the
+attestation, bound to a release tag, before `dpkg -i` or `apt-get
+install ./…`:
+
+```sh
+gh attestation verify northnarrow_<ver>-<rel>_amd64.deb --repo northnarrow/northnarrow-new \
+  --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
+  --deny-self-hosted-runners
+```
+
+A package copied through an internal mirror or a configuration-management
+cache is checked the same way on the host that installs it, or the mirror
+re-serves it from a repository signed with a key the hosts trust.

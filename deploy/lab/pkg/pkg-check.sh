@@ -13,6 +13,8 @@
 #   6. fresh install: keys bootstrapped, nothing started; start; binary
 #      integrity verified against a "package" install manifest
 #   7. final cleanup so `nn-lab.sh install` can put the lab layout back
+# On rpm guests, step S first checks the release signing path
+# (deploy/release/sign-rpm.sh selftest).
 set -u
 cd ~/northnarrow
 fail=0
@@ -51,6 +53,13 @@ for r in 1 2 3; do
     NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
 done
 pkg() { ls "$PKGDIR"/* | grep -E "[-_]0?[0-9.]+-$1[._]" | head -1; }
+# External audit DEP-008: the signing path the release workflow uses on a
+# tag, checked with this distribution's rpm and throwaway keys on a copy:
+# signed accepted; unsigned, signed by another key, altered refused.
+if [ "$fmt" = rpm ]; then
+    command -v rpmsign >/dev/null 2>&1 || sudo dnf install -y rpm-sign >/dev/null 2>&1 || bad "dnf install rpm-sign"
+    check "S rpm signature: signed accepted; unsigned, other key, altered refused" quiet deploy/release/sign-rpm.sh selftest "$(pkg 1)"
+fi
 if [ "$fmt" = deb ]; then
     # apt's timers (unattended-upgrades) take the dpkg lock now and then: a
     # purge once failed on "dpkg frontend lock was locked by another process"

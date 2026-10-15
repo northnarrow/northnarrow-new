@@ -3919,7 +3919,7 @@ the audit did not report, noted with the fix that takes them.
     `workflows_parse_as_yaml` is a guard and passes on both. `sign-rpm.sh
     selftest` passed on the host with rpm 4.18.2; actionlint 1.7.12: no
     finding. Lab `pkg-check` runs the selftest on the rpm guests (step S).
-  - Lab: @LAB150@
+  - Lab: CI on this PR: the six `xtask/tests/supply_chain.rs` tests (five fail on main), the release workflow's package job in dry run (pinned tool versions, start under qemu Nehalem with `target-cpu=x86-64-v2`, `sign-rpm.sh selftest`: signed accepted; unsigned, other key, altered refused). Ubuntu 24.04: `nn-lab.sh pkg-check` PASS. Not run here (needs a tag or a dispatch): the real rpm signature and a branch attestation refused by install.sh. Maintainer actions before the next tag: the rpm signing key (public half in `deploy/release/RPM-GPG-KEY-northnarrow.asc`), the `release-signing` environment and its secrets, a ruleset on `v*` tags. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
 - **NN-AUD-198 (DEP-007), NN-AUD-200 (DEP-009), NN-AUD-197 (DEP-006), lab
   PR 148.** Install integrity fails closed (batch F1).
   - DEP-007: `verify_release` no longer steps down on its own. A tree

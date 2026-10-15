@@ -1,19 +1,25 @@
 [alias]
 xtask = "run --quiet --package xtask --release --"
 
-# Sub-tappa 6.8: workspace builds opt into target-cpu=native so LLVM
-# can emit FMA fused mul-adds, AVX-512 lanes when present, and any
-# other host-specific instructions candle's CPU kernels rely on for
-# memory-bound LLM decode. The flag inflates the binary's hardware
-# requirement to "the build host or newer": fine for a build on the host
-# that runs it, never for a binary shipped elsewhere. The release workflow
-# (.github/workflows/release.yml) therefore overrides it with x86-64-v2
-# (review 64: a runner with AVX-512 produced releases that died with
-# SIGILL on CPUs without it). `cargo xtask build` passes that per-target
-# override on to the nested build (review 65).
+# External audit SUP-017: the repository default is x86-64-v2 (SSE4.2,
+# POPCNT; every x86_64 server since 2009 and every CI runner), the ISA the
+# release ships. It was target-cpu=native (Sub-tappa 6.8, for candle's CPU
+# kernels), which ties a binary to the build host or newer: a release built
+# on an AVX-512 runner died with SIGILL elsewhere (review 64), and any other
+# build copied to another host could do the same (`cargo xtask build
+# --release`, `--profile release-bench`, the lab and range builds). The release
+# workflow also sets x86-64-v2 explicitly and starts the binaries on a
+# Nehalem CPU under qemu.
+#
+# A build that runs only on the host that compiles it can opt into native
+# (faster LLM decode: FMA, AVX2/AVX-512 in candle's kernels) for the x86_64
+# target only, so the eBPF build keeps its own flags; `cargo xtask build`
+# passes the variable on to the nested build (review 65):
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" cargo xtask build --release
+# Never ship such a binary to another host.
 #
 # `lld` would shave a few seconds off link time but is not available
 # on the production host (Hetzner CCX23, May 2026); leaving the
 # default linker keeps `cargo build --release` self-contained.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

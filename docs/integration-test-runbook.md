@@ -200,8 +200,10 @@ the tree and records `"provenance": "checksums"`; that the agent boots,
 verifies its binaries against that manifest, attaches every deny hook and
 arms the telemetry probe; and that an exec from `/tmp` fires R001. The
 lab's source install is put back at the end. The attestation itself is
-checked off the guest with `gh attestation verify <file> --repo
-northnarrow/northnarrow-new` (gh ≥ 2.49) or cosign.
+checked off the guest (gh ≥ 2.49 or cosign) with the tag-bound command of
+`docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §5: an artefact of a dispatch
+run on a branch fails it by design (external audit SUP-001), so the
+attestation check needs a tag build.
 
 ### Packages and the package manager
 

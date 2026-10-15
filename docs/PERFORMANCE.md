@@ -4,13 +4,23 @@ Three tuning knobs ship in Sub-tappa 6.8. Each addresses a distinct
 bottleneck in the CPU-only inference path on the founder's Hetzner
 CCX23 reference host (see [`PERFORMANCE_HARDWARE.md`](PERFORMANCE_HARDWARE.md)).
 
-## 1. Build flags (`target-cpu=native` + LTO fat)
+## 1. Build flags (`target-cpu` + LTO fat)
 
-`/.cargo/config.toml` opts every crate in this workspace into:
+Sub-tappa 6.8 made `target-cpu=native` the workspace default. Since
+external audit SUP-017 the default in `/.cargo/config.toml` is the ISA the
+release ships, so no build is tied to the host that compiled it:
 
 ```toml
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+```
+
+A build that only ever runs on the host that compiles it (the reference
+host benchmarks below) opts into `native` for the x86_64 target, which
+leaves the eBPF build's flags alone and which `cargo xtask build` passes on:
+
+```bash
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" cargo xtask build --release
 ```
 
 …and `Cargo.toml` upgrades the release profile from `lto = "thin"`
@@ -53,8 +63,10 @@ cargo build --profile release-bench -p northnarrow-agent --example bench_threads
   15 GiB so headroom is ample; downgrade to `lto = "thin"` if a
   smaller deployment OOMs at link time.
 - `target-cpu=native` makes the binary non-portable: it only runs on
-  the build host's exact ISA or newer. Acceptable because we ship
-  per-host builds, not pre-compiled tarballs.
+  the build host's exact ISA or newer (review 64: a release built on an
+  AVX-512 runner died with SIGILL elsewhere). Releases, packages, the lab
+  and the range therefore build for x86-64-v2, and the figures measured
+  there are for that ISA; the `native` figures below need the opt-in.
 
 ## 2. Thread tuning (`--ade-threads N`)
 

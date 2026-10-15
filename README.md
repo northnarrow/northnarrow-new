@@ -152,8 +152,11 @@ LSM enabled (`lsm=…,bpf` on the kernel command line — see
 
 ```sh
 # 1. Download the release tarball + checksums from the Releases page, then verify
+#    (the attestation must come from the release workflow at a v* tag)
 sha256sum -c SHA256SUMS
-gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/northnarrow-new
+gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/northnarrow-new \
+  --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
+  --deny-self-hosted-runners
 
 # 2. Install (does NOT start anything; bootstraps an admin key you must move off-host)
 tar xzf northnarrow-<ver>-x86_64-linux.tar.gz && cd northnarrow-<ver>-x86_64-linux

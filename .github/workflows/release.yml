@@ -4,20 +4,31 @@ name: release
 # --release` with a locked lockfile), packs it as the tarball
 # deploy/install.sh consumes unchanged and as .deb / .rpm packages
 # (deploy/release/mk-packages.sh), emits a CycloneDX SBOM and SHA256SUMS,
-# attaches a SLSA build-provenance attestation to every artefact (verify:
-# `gh attestation verify <file> --repo <owner/repo>`) and, on a tag push,
-# uploads everything to the GitHub release.
+# signs the .rpm on a tag, attaches a SLSA build-provenance attestation to
+# every artefact and, on a tag push, uploads everything to the GitHub
+# release. Verify (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5):
+#   gh attestation verify <file> --repo northnarrow/northnarrow-new \
+#     --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
+#     --deny-self-hosted-runners
+# External audit SUP-001: the identity names this workflow AND a v* tag. A
+# workflow_dispatch run on a branch is attested too, but its certificate
+# names the branch, so its artefacts fail that check.
 #
 # On pull requests that touch the packaging it runs as a DRY RUN: same
-# build, artefacts kept on the workflow run only, nothing attested or
-# published.
+# build, artefacts kept on the workflow run only, nothing signed, attested
+# or published.
 #
-# External audit SUP-003: building and signing are two jobs. `package`
+# External audit SUP-003: building and signing are separate jobs. `package`
 # compiles the whole dependency tree — every build script and proc-macro
 # of ~370 crates runs there — so it holds nothing worth stealing: a
-# read-only token, not persisted in .git/config, and no OIDC token. `sign`
-# compiles nothing and checks nothing out: it downloads the artefacts,
-# attests them and, on a tag, publishes them.
+# read-only token, not persisted in .git/config, and no OIDC token.
+# `rpm-sign` (tags only) holds the rpm signing key and compiles nothing;
+# `sign` holds the OIDC token, compiles nothing and checks nothing out: it
+# downloads the artefacts, attests them and, on a tag, publishes them. The
+# signing key and the OIDC token never share a job.
+#
+# External audit SUP-002: every action is pinned by commit SHA (the
+# version in the comment); Dependabot (github-actions) proposes updates.
 
 on:
   push:
@@ -37,19 +48,21 @@ jobs:
     name: package (x86_64-linux)
     runs-on: ubuntu-latest
     env:
-      # Review 64: .cargo/config.toml builds with target-cpu=native, which
-      # made the release binaries need whatever the runner had. On a runner
-      # with AVX-512 the agent used AVX-512, so it died with SIGILL at start
-      # on a CPU without it (the lab guests; many servers). Releases target
-      # x86-64-v2, the baseline btf-matrix and kani already use. Only the
-      # x86_64 target: RUSTFLAGS would also replace the eBPF build's flags
-      # (debuginfo, --btf). Review 65: xtask passes this variable on to the
-      # nested cargo build; the qemu step below checks the result.
+      # Review 64: a build with target-cpu=native made the release binaries
+      # need whatever the runner had. On a runner with AVX-512 the agent
+      # used AVX-512, so it died with SIGILL at start on a CPU without it
+      # (the lab guests; many servers). Releases target x86-64-v2, which
+      # .cargo/config.toml also defaults to since external audit SUP-017;
+      # set here as well so a local opt-in to native can never reach a
+      # release. Only the x86_64 target: RUSTFLAGS would also replace the
+      # eBPF build's flags (debuginfo, --btf). Review 65: xtask passes this
+      # variable on to the nested cargo build; the qemu step below checks
+      # the result.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v2"
     permissions:
       contents: read         # the build writes nothing and signs nothing
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0     # git describe in README-RELEASE.md
           persist-credentials: false   # no token left in .git/config
@@ -68,13 +81,16 @@ jobs:
           rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
           rustup default stable
 
-      - name: Install bpf-linker (pinned) + cargo-cyclonedx
+      # External audit SUP-005: cargo-cyclonedx writes the SBOM that `sign`
+      # attests, so its version is pinned like every other tool (the version
+      # the runs of 2026-10-15 resolved); --locked pins its dependencies.
+      - name: Install bpf-linker + cargo-cyclonedx (pinned)
         run: |
           cargo install bpf-linker --version 0.10.3 --locked
-          cargo install cargo-cyclonedx --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -120,6 +136,14 @@ jobs:
           test "$(rpm -qp --scripts "$rpm" | grep -c 'scriptlet (using /bin/sh)')" = 4
           "$tmp/usr/bin/northnarrow-agent" --version
 
+      # External audit DEP-008: the rpm-sign job signs the .rpm on a tag with
+      # the release key. The same script runs here on every run, pull
+      # requests included, with throwaway keys on a copy: a signed package
+      # verifies, and an unsigned one, one signed by another key and one
+      # altered after signing are refused. dist/ is not touched.
+      - name: rpm signing path (throwaway keys, on a copy)
+        run: deploy/release/sign-rpm.sh selftest "$(ls dist/northnarrow-*.x86_64.rpm)"
+
       - name: Smoke-test the tree (install.sh preflights from the tarball)
         run: |
           set -e
@@ -164,34 +188,131 @@ jobs:
           echo "no credential in the build job"
 
       - name: Upload workflow artefacts (always)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: northnarrow-release-${{ github.sha }}
           path: dist/
           if-no-files-found: error
 
+  # External audit DEP-008: an RPM signature is what dnf/yum (gpgcheck=1)
+  # and `rpm -K` check on the host before the package's scriptlets run.
+  # Tags only, with the key from the `release-signing` environment, which
+  # the maintainer restricts to v* tags: a branch or dispatch run, even with
+  # an edited workflow, gets no key. The key must be the private half of the
+  # public key committed at the tag (deploy/release/RPM-GPG-KEY-northnarrow.asc),
+  # so changing the secret alone cannot change who signs. A tag without the
+  # key, or without the committed public key, fails here and nothing is
+  # attested or published: a tag release never ships an unsigned .rpm.
+  # (A .deb has no per-package signature dpkg or apt checks; its origin is
+  # the tag-bound attestation.)
+  rpm-sign:
+    name: sign the .rpm (tag only)
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy/release
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: northnarrow-release-${{ github.sha }}
+          path: dist
+
+      - name: Checksums match (as built)
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      - name: Install rpm (rpmsign, rpmkeys)
+        run: sudo apt-get install -y --no-install-recommends rpm >/dev/null
+
+      - name: Sign the .rpm with the release key
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+          RPM_SIGNING_PASSPHRASE: ${{ secrets.RPM_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          pub=deploy/release/RPM-GPG-KEY-northnarrow.asc
+          if [ -z "${RPM_SIGNING_KEY:-}" ]; then
+            echo "::error::RPM_SIGNING_KEY is not set in the release-signing environment; a tag release never ships an unsigned .rpm"
+            exit 1
+          fi
+          if [ ! -s "$pub" ]; then
+            echo "::error::$pub is not committed at this tag; the signing key is checked against it"
+            exit 1
+          fi
+          export GNUPGHOME; GNUPGHOME=$(mktemp -d)
+          trap 'gpgconf --kill gpg-agent >/dev/null 2>&1 || true; rm -rf "$GNUPGHOME"' EXIT
+          pass=""
+          if [ -n "${RPM_SIGNING_PASSPHRASE:-}" ]; then
+            pass=$GNUPGHOME/passphrase
+            printf '%s' "$RPM_SIGNING_PASSPHRASE" > "$pass"
+          fi
+          printf '%s\n' "$RPM_SIGNING_KEY" \
+            | gpg --batch --quiet --pinentry-mode loopback ${pass:+--passphrase-file "$pass"} --import
+          fpr=$(gpg --batch --with-colons --list-secret-keys 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')
+          committed=$(gpg --batch --with-colons --show-keys "$pub" 2>/dev/null | awk -F: '$1=="fpr"{print $10; exit}')
+          if [ -z "$fpr" ] || [ "$fpr" != "$committed" ]; then
+            echo "::error::the signing key ($fpr) is not the private half of $pub ($committed)"
+            exit 1
+          fi
+          echo "rpm signing key: $fpr"
+          NN_RPM_GPG_PASSPHRASE_FILE=$pass deploy/release/sign-rpm.sh sign "$fpr" dist/northnarrow-*.x86_64.rpm
+          # rpm -K against the committed key only: "digests signatures OK"
+          deploy/release/sign-rpm.sh verify "$pub" dist/northnarrow-*.x86_64.rpm
+          cp "$pub" dist/RPM-GPG-KEY-northnarrow.asc
+          # Signing changed the .rpm: its SHA256SUMS line is rewritten here,
+          # before `sign` checks the sums and attests the signed file.
+          cd dist
+          grep -v -E ' \*?(northnarrow-.*\.x86_64\.rpm|RPM-GPG-KEY-northnarrow\.asc)$' SHA256SUMS > SHA256SUMS.new || true
+          sha256sum northnarrow-*.x86_64.rpm RPM-GPG-KEY-northnarrow.asc >> SHA256SUMS.new
+          mv SHA256SUMS.new SHA256SUMS
+          sha256sum -c SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: northnarrow-release-signed-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
   sign:
     name: attest + publish
-    needs: package
-    # A pull request is a dry run: nothing is attested or published.
-    if: github.event_name != 'pull_request'
+    needs: [package, rpm-sign]
+    # A pull request is a dry run: nothing is attested or published. On a
+    # tag the .rpm must have been signed (rpm-sign succeeded); on a
+    # dispatch run rpm-sign is skipped and the packages are attested as
+    # built, unsigned (that attestation is not tag-bound, SUP-001).
+    if: >-
+      github.event_name != 'pull_request' && !cancelled()
+      && needs.package.result == 'success'
+      && (needs.rpm-sign.result == 'success'
+      || (needs.rpm-sign.result == 'skipped' && !startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest
     permissions:
       contents: write        # upload release assets on a tag
       id-token: write        # sign the provenance attestation (OIDC)
       attestations: write
     steps:
-      # No checkout and no build: the artefacts the package job made.
-      - uses: actions/download-artifact@v4
+      # No checkout and no build: the artefacts the package job made, with
+      # the .rpm signed by rpm-sign on a tag.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: northnarrow-release-${{ github.sha }}
+          name: ${{ needs.rpm-sign.result == 'success' && format('northnarrow-release-signed-{0}', github.sha) || format('northnarrow-release-{0}', github.sha) }}
           path: dist
 
       - name: Checksums match
-        run: cd dist && sha256sum -c SHA256SUMS
+        run: |
+          cd dist && sha256sum -c SHA256SUMS
+          if [ "${{ startsWith(github.ref, 'refs/tags/v') }}" = true ] && [ ! -s RPM-GPG-KEY-northnarrow.asc ]; then
+            echo "::error::a tag release without the signed .rpm"; exit 1
+          fi
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             dist/*.tar.gz
