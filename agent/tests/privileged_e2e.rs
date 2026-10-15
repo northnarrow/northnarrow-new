@@ -1211,3 +1211,54 @@ fn audit_verify_e2e() {
         "audit verify output unexpected: {body}"
     );
 }
+
+/// External audit SNS-001 (NN-AUD-184): a dead ring pump is noticed. The
+/// `debug-trigger` hook aborts the `fs_protect` pump; within two liveness
+/// checks (5 s each) the agent writes a signed `subsystem_degraded` naming
+/// the pump and a signed `agent_stop` (`sensor_pump_exited`), and exits
+/// non-zero — under systemd the watchdog then respawns it.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn dead_sensor_pump_stops_the_agent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (installed_agent, installed_admin) = install_priv_bins();
+    let nn_admin = installed_admin.path.clone();
+    std::fs::write(dir.path().join("admin.pub"), "").expect("touch admin.pub");
+    let _ = init_admin_keypair_with_roles(
+        &nn_admin,
+        dir.path(),
+        &dir.path().join("admin.pub"),
+        "admin_a",
+        "unlock",
+    );
+    let (mut guard, paths) =
+        spawn_agent_b5_with_installs(dir.path(), installed_agent, installed_admin);
+
+    std::fs::write(dir.path().join("debug-abort-pump"), "fs_protect\n")
+        .expect("write the abort trigger");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let child = guard.0.as_mut().expect("agent child");
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break st,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            None => panic!("the agent kept running 30 s after its fs_protect pump was aborted"),
+        }
+    };
+    assert!(
+        !status.success(),
+        "a dead pump must end the agent with a failure: {status}"
+    );
+
+    let log = std::fs::read_to_string(&paths.audit_log_file).expect("read audit log");
+    let degraded = log
+        .lines()
+        .find(|l| l.contains("subsystem_degraded") && l.contains("sensor pump exited"))
+        .unwrap_or_else(|| panic!("no signed subsystem_degraded for the pump:\n{log}"));
+    assert!(degraded.contains("fs_protect"), "{degraded}");
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"agent_stop\"") && l.contains("sensor_pump_exited")),
+        "no signed agent_stop sensor_pump_exited:\n{log}"
+    );
+}

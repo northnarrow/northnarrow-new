@@ -37,9 +37,10 @@ use common::wire::{FileCapability, FimEvent, FimOp, InodeKey};
 use common::Event;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::anti_tamper::filesystem::{stat_dev_to_kernel_dev, AyaInodeKey};
+use crate::sensors::reject::RejectThrottle;
 
 /// The ring of interesting opens.
 pub const OPEN_SENSOR_EVENTS_MAP: &str = "OPEN_SENSOR_EVENTS";
@@ -685,6 +686,43 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
     out
 }
 
+/// Ring label of the open-sensor pump (rejected-record counts, pump
+/// liveness).
+pub const PUMP_LABEL: &str = "open_sensor";
+
+/// External audit SNS-008: one ring read, decoded. A record shorter than
+/// [`OpenRecordRaw`] is not decoded; its length is kept in `rejected` so the
+/// pump counts and reports it.
+#[derive(Default)]
+pub(crate) struct BatchDecoder {
+    pub(crate) records: Vec<OpenRecordRaw>,
+    pub(crate) rejected: Vec<usize>,
+}
+
+impl BatchDecoder {
+    pub(crate) fn push(&mut self, item: &[u8]) {
+        let size = std::mem::size_of::<OpenRecordRaw>();
+        if item.len() < size {
+            self.rejected.push(item.len());
+        } else {
+            self.records
+                .push(bytemuck::pod_read_unaligned::<OpenRecordRaw>(&item[..size]));
+        }
+    }
+}
+
+/// [`BatchDecoder`] over a whole batch: `(records, rejected lengths)`.
+#[cfg(test)]
+pub(crate) fn decode_batch<'a>(
+    items: impl IntoIterator<Item = &'a [u8]>,
+) -> (Vec<OpenRecordRaw>, Vec<usize>) {
+    let mut d = BatchDecoder::default();
+    for item in items {
+        d.push(item);
+    }
+    (d.records, d.rejected)
+}
+
 /// Drain the ring into the agent's event channel until the receiver goes
 /// away.
 pub async fn pump(ring: RingBuf<MapData>, tx: mpsc::Sender<Event>) {
@@ -697,6 +735,7 @@ pub async fn pump(ring: RingBuf<MapData>, tx: mpsc::Sender<Event>) {
     };
     let mut mounts = MountTable::load();
     let size = std::mem::size_of::<OpenRecordRaw>();
+    let mut reject = RejectThrottle::new();
     loop {
         let mut guard = match fd.readable_mut().await {
             Ok(g) => g,
@@ -705,19 +744,23 @@ pub async fn pump(ring: RingBuf<MapData>, tx: mpsc::Sender<Event>) {
                 return;
             }
         };
-        let mut batch = Vec::new();
+        let mut batch = BatchDecoder::default();
         {
             let rb = guard.get_inner_mut();
             while let Some(item) = rb.next() {
-                if item.len() < size {
-                    debug!(len = item.len(), "open sensor: short record skipped");
-                    continue;
-                }
-                batch.push(bytemuck::pod_read_unaligned::<OpenRecordRaw>(&item[..size]));
+                batch.push(&item);
             }
         }
         guard.clear_ready();
-        for r in &batch {
+        // External audit SNS-008: a short record is counted and WARNed
+        // (coalesced), like every other pump's, not skipped at debug level.
+        for got in &batch.rejected {
+            reject.record(PUMP_LABEL, size, *got);
+        }
+        if batch.rejected.is_empty() {
+            reject.flush_idle(PUMP_LABEL, size);
+        }
+        for r in &batch.records {
             for ev in events_of(r, &mut mounts) {
                 if tx.send(ev).await.is_err() {
                     return;
@@ -751,6 +794,28 @@ pub fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit SNS-008: a short record is not decoded and its length
+    /// is reported, so the pump counts it (it was a `debug!` and gone).
+    #[test]
+    fn decode_batch_reports_short_records() {
+        let mut rec: OpenRecordRaw = bytemuck::Zeroable::zeroed();
+        rec.pid = 4242;
+        let full = bytemuck::bytes_of(&rec).to_vec();
+        let mut longer = full.clone();
+        longer.extend_from_slice(&[0u8; 8]);
+        let short = vec![0u8; 16];
+        let empty: Vec<u8> = Vec::new();
+        let (records, rejected) = decode_batch([
+            full.as_slice(),
+            short.as_slice(),
+            longer.as_slice(),
+            empty.as_slice(),
+        ]);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.pid == 4242));
+        assert_eq!(rejected, vec![16, 0]);
+    }
 
     #[test]
     fn home_roots_reads_regular_accounts_only() {

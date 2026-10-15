@@ -641,6 +641,14 @@ pub struct StatusResponse {
     /// an agent older than the field.
     #[serde(default)]
     pub combat_locked: Option<bool>,
+    /// External audit SNS-008: malformed ring records the agent rejected
+    /// since boot (a desynced ring), all rings. `None` from an agent older
+    /// than the field.
+    #[serde(default)]
+    pub ringbuf_rejected_total: Option<u64>,
+    /// `(ring, rejected)` for the rings that rejected a record.
+    #[serde(default)]
+    pub ringbuf_rejected: Option<Vec<(String, u64)>>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -1289,6 +1297,8 @@ mod tests {
             ringbuf_drops: None,
             combat_stage: None,
             combat_locked: None,
+            ringbuf_rejected_total: None,
+            ringbuf_rejected: None,
         }));
     }
 
@@ -1302,6 +1312,8 @@ mod tests {
             ringbuf_drops: None,
             combat_stage: None,
             combat_locked: None,
+            ringbuf_rejected_total: None,
+            ringbuf_rejected: None,
         }));
     }
 
@@ -1463,6 +1475,8 @@ mod tests {
             ringbuf_drops: Some(Vec::new()),
             combat_stage: Some("NEUTRALIZE".to_string()),
             combat_locked: Some(true),
+            ringbuf_rejected_total: Some(3),
+            ringbuf_rejected: Some(vec![("open_sensor".to_string(), 3)]),
         }));
     }
 

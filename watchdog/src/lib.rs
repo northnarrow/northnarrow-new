@@ -2608,6 +2608,8 @@ mod tests {
                 ringbuf_drops: None,
                 combat_stage: None,
                 combat_locked: None,
+                ringbuf_rejected_total: None,
+                ringbuf_rejected: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

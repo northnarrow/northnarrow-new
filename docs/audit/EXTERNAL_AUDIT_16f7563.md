@@ -227,14 +227,14 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-181 | XAI-011 | XAI and RAG | S | open |
 | NN-AUD-182 | XAI-013 | XAI and RAG | M | open |
 | NN-AUD-183 | XAI-018 | XAI and RAG | S | open |
-| NN-AUD-184 | SNS-001 | Sensors | M | open |
+| NN-AUD-184 | SNS-001 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-185 | SNS-002 | Sensors | S | open |
 | NN-AUD-186 | SNS-003 | Sensors | M | open |
 | NN-AUD-187 | SNS-005 | Sensors | S | open |
 | NN-AUD-188 | SNS-006 | Sensors | M | open |
 | NN-AUD-189 | SNS-007 | Sensors | M | open |
-| NN-AUD-190 | SNS-008 | Sensors | S | open |
-| NN-AUD-191 | SNS-009 | Sensors | M | open |
+| NN-AUD-190 | SNS-008 | Sensors | S | fixed (lab PR 128) |
+| NN-AUD-191 | SNS-009 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-192 | WDG-006 | Watchdog tooling | S | already fixed (lab PR 89, with NN-AUD-069) |
 | NN-AUD-193 | WDG-009 | Watchdog tooling | M | open |
 | NN-AUD-194 | WDG-011 | Watchdog tooling | S | open |
@@ -2438,3 +2438,58 @@ the audit did not report, noted with the fix that takes them.
     place. Privileged gate: Ubuntu 24.04 and Debian 12, 29 suites, 78
     passed, 0 failed each. The anti-tamper suite: OK. Host: 1797 passed,
     0 failed.
+- **NN-AUD-184 (SNS-001), NN-AUD-190 (SNS-008), NN-AUD-191 (SNS-009), lab
+  PR 128.** Telemetry loss is visible and acted on (batch D, userland part;
+  NN-AUD-103/105, the kernel part, follow).
+  - SNS-001: `next_event()` can never return `None` (the multiplexer and
+    the drains hold senders), so a ring pump that ended went unnoticed and
+    the `sensor_pump_exited` stop was unreachable. Every telemetry task is
+    now registered by label (the nine ring pumps, the open-sensor pump and
+    its rule refresher, the FIM and net drains); the main loop checks
+    `finished_pumps()` every 5 s. A task that ended (returned, failed or
+    panicked) writes a signed `subsystem_degraded` naming it and a signed
+    `agent_stop` (`sensor_pump_exited`), and the agent exits non-zero; the
+    watchdog respawns it, and its ceiling bounds a pump that dies at every
+    start. No in-process restart: it would hide the loss. Since the drains
+    are registered too, a drain that ends (MAIN-007) now also stops the
+    agent, after its own `subsystem_degraded`.
+  - SNS-008: the open-sensor pump skipped short records at debug level.
+    `RejectThrottle` moved to `sensors/reject.rs` and serves every pump,
+    the open sensor's included (coalesced WARN, at most one a second);
+    every rejected record is counted per ring and shown by `nn-admin
+    status` (`ringbuf rejected`, `ringbuf_rejected_total` in the JSON).
+  - SNS-009: a failed read of `RING_DROPS` was read as 0, rewriting the
+    total and skewing the next delta; the slot now keeps its previous total
+    (WARN once until it reads again). Drops reached no trigger: a new
+    `TriggerType::TelemetryLoss` (appended last) targets ALERTED, is a
+    class of its own (`EvidenceClass::Telemetry`) and is never written to
+    the corroboration ledger, so it never vouches for a COMBAT-tier
+    signal. It is raised through `PostureMachine::raise_signal`, which
+    accepts ALERTED-tier triggers only, when a security ring (exec,
+    fs_protect, open_sensor, fim, module_load, bpf) drops more than 64
+    events in one 10-s sample, except during a trusted-installer window or
+    a package transaction (a package manager running as root: an
+    unprivileged `dpkg -l` opens no exemption). The signed `ringbuf_drop`
+    entry is written in every case. A missing or mistyped `RING_DROPS` map
+    is a signed `subsystem_degraded` once the audit log opens.
+  - Tests: `finished_pump_is_reported_by_label`,
+    `decode_batch_reports_short_records`,
+    `every_rejected_record_is_counted_per_ring`,
+    `read_error_keeps_previous_total`,
+    `security_ring_losses_above_threshold_only`,
+    `package_transaction_needs_a_root_package_manager`,
+    `telemetry_loss_targets_alerted_and_never_corroborates`; privileged e2e
+    `dead_sensor_pump_stops_the_agent` (`debug-trigger`: a
+    `debug-abort-pump` file next to the admin socket aborts the named
+    pump).
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `tele128-probe.sh`. The fs_protect
+    pump aborted (the debug build's `debug-abort-pump`): within 5 s the
+    agent recorded the pump in a signed `subsystem_degraded` and a signed
+    `agent_stop` (`sensor_pump_exited`) and exited; the watchdog respawned
+    it 1 s later. Before (main), a pump that ended left the agent running
+    blind with no record. An unprivileged exec burst (512,000 execs in
+    2 minutes) did not overflow a ring on this guest — 0 drops before and
+    after — so the drop → TelemetryLoss path is covered by unit tests
+    only. Privileged gate: Ubuntu 24.04 and Debian 12, 29 suites, 79
+    passed, 0 failed each (the new `dead_sensor_pump_stops_the_agent`).
+    The anti-tamper suite: OK. Host: 1805 passed, 0 failed.

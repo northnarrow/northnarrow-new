@@ -616,7 +616,7 @@ fn start_open_sensor(
         }
     };
     let handle = tokio::spawn(pump(ring, sensor.event_tx()));
-    sensor.register_pump_handle(handle);
+    sensor.register_pump_handle(northnarrow_agent::sensors::open_sensor::PUMP_LABEL, handle);
     if let Err(e) = maps.arm(true) {
         warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
         open_tracepoint_fallback(sensor);
@@ -663,7 +663,7 @@ fn start_open_sensor(
             }
         }
     });
-    sensor.register_pump_handle(refresher);
+    sensor.register_pump_handle("open_sensor_rules", refresher);
 }
 
 #[tokio::main]
@@ -1956,6 +1956,12 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&overlay_gate)),
     );
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
+    // External audit SNS-009: a security ring that loses events raises
+    // ALERTED (TelemetryLoss), outside trusted-installer windows.
+    northnarrow_agent::sensors::ring_drops::set_posture(
+        posture.clone(),
+        Some(Arc::clone(&installer_override)),
+    );
     // Review 75: detections held back by the per-rule budget, reported.
     detection_budget::spawn_reporter(audit_log.clone());
 
@@ -2639,7 +2645,7 @@ async fn main() -> Result<()> {
                                 .await;
                                 drain_ended("fim", outcome, audit_for_drain.as_ref());
                             });
-                            sensor.register_pump_handle(handle);
+                            sensor.register_pump_handle("fim_drain", handle);
                             info!("fim: drain loop spawned");
                         }
                         Err(e) => {
@@ -3035,7 +3041,7 @@ async fn main() -> Result<()> {
                 .await;
                 drain_ended("net", outcome, audit_for_drain.as_ref());
             });
-            sensor.register_pump_handle(handle);
+            sensor.register_pump_handle("net_drain", handle);
             info!("net: drain loop spawned (NET_FLOW_CLOSE_EVENTS + NET_LISTEN_EVENTS)");
         } else {
             warn!(
@@ -3216,6 +3222,11 @@ async fn main() -> Result<()> {
     let loop_started = std::time::Instant::now();
     #[allow(unused_assignments)]
     let mut stop_reason = "unknown";
+    // External audit SNS-001: a telemetry task that ended (a dead ring
+    // pump, a drain, the open-sensor rule refresher) is checked for here;
+    // `next_event()` can never report it.
+    let mut pump_check = tokio::time::interval(PUMP_CHECK_PERIOD);
+    pump_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             evt = sensor.next_event() => match evt {
@@ -3251,6 +3262,32 @@ async fn main() -> Result<()> {
                     break;
                 }
             },
+            _ = pump_check.tick() => {
+                #[cfg(feature = "debug-trigger")]
+                debug_abort_pump(&sensor, &cli.admin_socket);
+                let dead = sensor.finished_pumps();
+                if !dead.is_empty() {
+                    // A blind sensor is not hidden behind a silent restart:
+                    // signed `subsystem_degraded` naming the task, signed
+                    // `agent_stop` (`sensor_pump_exited`), non-zero exit, and
+                    // the watchdog respawns the agent (its ceiling bounds a
+                    // pump that dies at every start).
+                    let names = dead.join(", ");
+                    error!(
+                        pumps = %names,
+                        "sensor pump exited — its telemetry is lost; stopping so the watchdog restarts the agent"
+                    );
+                    attest_degraded_at(
+                        audit_log.as_ref(),
+                        &format!(
+                            "sensor pump exited: {names} (its telemetry was lost; the agent stops for a watchdog restart)"
+                        ),
+                        false,
+                    );
+                    stop_reason = "sensor_pump_exited";
+                    break;
+                }
+            }
             _ = sigint.recv() => {
                 info!("SIGINT received; shutting down");
                 stop_reason = "sigint";
@@ -3367,7 +3404,40 @@ async fn main() -> Result<()> {
     admin_socket::unlink_socket(&cli.admin_socket);
 
     info!("NorthNarrow agent stopped.");
+    if stop_reason == "sensor_pump_exited" {
+        // External audit SNS-001: a failure, not a clean stop.
+        anyhow::bail!("a sensor pump exited; the agent stopped so the watchdog restarts it");
+    }
     Ok(())
+}
+
+/// External audit SNS-001: how often the main loop checks that every
+/// telemetry task still runs.
+const PUMP_CHECK_PERIOD: Duration = Duration::from_secs(5);
+
+/// `debug-trigger` builds only: a file `debug-abort-pump` next to the admin
+/// socket, holding a pump label (`fs_protect`), aborts that pump; the next
+/// liveness check then stops the agent. Lab check of SNS-001 without a
+/// way to kill a task from outside the process.
+#[cfg(feature = "debug-trigger")]
+fn debug_abort_pump(
+    sensor: &northnarrow_agent::sensors::SensorMultiplexer,
+    admin_socket: &std::path::Path,
+) {
+    let Some(dir) = admin_socket.parent() else {
+        return;
+    };
+    let trigger = dir.join("debug-abort-pump");
+    let Ok(label) = std::fs::read_to_string(&trigger) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&trigger);
+    let label = label.trim();
+    let found = sensor.debug_abort_pump(label);
+    warn!(
+        pump = label,
+        found, "debug-trigger: pump aborted on request (lab test of SNS-001)"
+    );
 }
 
 /// External audit LLMR-002: at most one ADE evaluation in flight, off the

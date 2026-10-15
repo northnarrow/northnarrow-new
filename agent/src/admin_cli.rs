@@ -114,6 +114,10 @@ pub struct StatusOutcome {
     pub combat_stage: Option<String>,
     /// Whether the COMBAT is locked (`None`: agent predates the field).
     pub combat_locked: Option<bool>,
+    /// External audit SNS-008: malformed ring records rejected since boot
+    /// (`None`: agent predates the counter).
+    pub ringbuf_rejected_total: Option<u64>,
+    pub ringbuf_rejected: Vec<(String, u64)>,
 }
 
 #[derive(Debug)]
@@ -241,6 +245,8 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         ringbuf_drops: resp.ringbuf_drops.unwrap_or_default(),
         combat_stage: resp.combat_stage,
         combat_locked: resp.combat_locked,
+        ringbuf_rejected_total: resp.ringbuf_rejected_total,
+        ringbuf_rejected: resp.ringbuf_rejected.unwrap_or_default(),
     })
 }
 
@@ -3129,12 +3135,16 @@ mod tests {
                     ringbuf_drops: None,
                     combat_stage: Some("ISOLATE".to_string()),
                     combat_locked: Some(true),
+                    ringbuf_rejected_total: Some(2),
+                    ringbuf_rejected: Some(vec![("open_sensor".to_string(), 2)]),
                 }),
             );
         });
         let out = run_status(&socket).expect("status");
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
+        assert_eq!(out.ringbuf_rejected_total, Some(2));
+        assert_eq!(out.ringbuf_rejected, vec![("open_sensor".to_string(), 2)]);
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);
         assert_eq!(out.last_admin_action_secs_ago, Some(123));

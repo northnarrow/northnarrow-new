@@ -1858,8 +1858,13 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .iter()
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
+        let rejected: Vec<String> = out
+            .ringbuf_rejected
+            .iter()
+            .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
+            .collect();
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
@@ -1879,6 +1884,11 @@ fn print_status(out: &StatusOutcome, json: bool) {
                 Some(l) => l.to_string(),
                 None => "null".to_string(),
             },
+            match out.ringbuf_rejected_total {
+                Some(t) => t.to_string(),
+                None => "null".to_string(),
+            },
+            rejected.join(","),
         );
         return;
     }
@@ -1920,6 +1930,23 @@ fn print_status(out: &StatusOutcome, json: bool) {
                 .collect();
             println!(
                 "ringbuf drops     : {} ({}) — events lost since boot, see the agent WARNs",
+                colorize(&t.to_string(), "31", tty),
+                per.join(", ")
+            );
+        }
+    }
+    // External audit SNS-008: records a pump could not decode.
+    match out.ringbuf_rejected_total {
+        None => println!("ringbuf rejected  : (agent predates the counter)"),
+        Some(0) => println!("ringbuf rejected  : {}", colorize("0", "32", tty)),
+        Some(t) => {
+            let per: Vec<String> = out
+                .ringbuf_rejected
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect();
+            println!(
+                "ringbuf rejected  : {} ({}) — malformed records since boot (a desynced ring), see the agent WARNs",
                 colorize(&t.to_string(), "31", tty),
                 per.join(", ")
             );
