@@ -104,6 +104,12 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     // External audit: the mock ADE backend answers instead of a model
     // that failed to load.
     ("NN_ADE_ALLOW_MOCK", is_one),
+    // Lab PR 134: the ADE is a consultant; this lets a model's verdict —
+    // built from strings an attacker writes — kill, quarantine or block.
+    (
+        crate::ade::advisory::ADE_ENFORCE_ENV,
+        crate::response::config::is_truthy,
+    ),
     // External audit MAIN-004: the evidence logs' rotation caps; any
     // override changes how much evidence survives.
     (crate::chainlog::FIM_DRIFT_CAP_ENV, any_value),

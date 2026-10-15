@@ -4044,7 +4044,9 @@ async fn evaluate_and_respond(
         );
     }
 
-    if !verdict.requires_execution() {
+    use northnarrow_agent::ade::advisory::{self, Disposition};
+    let disposition = advisory::disposition(&verdict, advisory::enforce());
+    if disposition == Disposition::Record {
         info!(action = %verdict.verdict, "ADE verdict logged, no execution needed");
         // Tappa 9.0.a: persist non-benign ADE verdicts even when no
         // response runs. `Allow` is benign ⇒ not a detection.
@@ -4060,6 +4062,31 @@ async fn evaluate_and_respond(
                         suppressed_before,
                     );
                 }
+            }
+        }
+        return;
+    }
+
+    // Lab PR 134: the ADE is a consultant. A verdict that names a response
+    // is recorded as a recommendation — its reasoning in the detection —
+    // and nothing runs: the model's input is attacker-written strings.
+    // `NN_ADE_ENFORCE=1` (a signed weakening) lets it act.
+    if disposition == Disposition::Recommend {
+        warn!(
+            recommended = %verdict.verdict,
+            trace_id = %verdict.trace_id,
+            "ADE advisory: the model recommends a response — recorded, not executed"
+        );
+        if let Some(sink) = detection_sink {
+            let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
+            if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
+                sink.record_ade(
+                    &event,
+                    &verdict,
+                    posture.current_kind(),
+                    advisory::recommended(&verdict),
+                    suppressed_before,
+                );
             }
         }
         return;
@@ -4159,6 +4186,7 @@ async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
                 model_path = %engine.config().model_path.display(),
                 warmup_latency_ms = engine.warmup_latency_ms(),
                 timeout_s = engine.config().timeout.as_secs(),
+                advisory = !northnarrow_agent::ade::advisory::enforce(),
                 "ADE engine ready"
             );
             // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;

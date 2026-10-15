@@ -2829,3 +2829,12 @@ the audit did not report, noted with the fix that takes them.
     trained on the old format. Privileged gate: Ubuntu 24.04 and Debian
     12, 29 suites, 80 passed, 0 failed each. The anti-tamper suite: OK.
     Host: 1840 passed, 0 failed.
+- **Product decision, lab PR 134 (2026-10-15).** The ADE is a
+  consultant. A verdict that names a response is recorded as a
+  recommendation and not executed (`ade::advisory::disposition`); the
+  rules and the COMBAT ladder keep every response. This bounds what a
+  prompt injection can do — the LLMP/LLMR findings above and the
+  remaining ones — to noise: a forced recommendation or a forced human
+  review, never a kill, a quarantine or a block. `NN_ADE_ENFORCE=1`
+  restores the old behaviour and is a weakening variable (signed
+  `integrity_drift` at every boot).

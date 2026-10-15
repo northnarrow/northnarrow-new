@@ -18,6 +18,7 @@
 //!
 //! All public types are re-exported from this module.
 
+pub mod advisory;
 pub mod backend_candle;
 pub mod chain_template;
 pub mod config;
