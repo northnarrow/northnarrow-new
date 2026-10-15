@@ -5,6 +5,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Changed
+- The ADE is a consultant: a model verdict that names a response (Kill,
+  KillTree, Quarantine, BlockNetwork, Isolate) is recorded as a
+  recommendation — a detection with the model's reasoning, response
+  "advisory: … recommended by the model, not executed" — and nothing runs.
+  The model reads strings an attacker writes; responses stay with the
+  deterministic rules and the COMBAT ladder. `NN_ADE_ENFORCE=1` lets the
+  verdicts act again and is reported as a weakening in the signed chain.
+
 ### Fixed
 - External audit, Wave 2, ADE window, prefill, failure evidence, prompt
   (Medium LLMR-008, LLMR-017, LLMR-003, LLMP-013): an over-long prompt
