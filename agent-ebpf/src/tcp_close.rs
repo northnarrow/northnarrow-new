@@ -37,7 +37,7 @@ use northnarrow_common::wire::{
 };
 
 use crate::btf_offsets::{
-    SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET, SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_NUM_OFFSET,
+    INET_SOCK_INET_SPORT_OFFSET, SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET, SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_NUM_OFFSET,
     SOCK_SKC_RCV_SADDR_OFFSET, SOCK_SKC_V6_DADDR_OFFSET, SOCK_SKC_V6_RCV_SADDR_OFFSET,
     SOCK_SK_ERR_OFFSET, TCP_SOCK_BYTES_RECEIVED_OFFSET, TCP_SOCK_BYTES_SENT_OFFSET,
 };
@@ -127,11 +127,21 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
         Ok(v) => v,
         Err(_) => 0,
     };
-    let sport_host: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16)
-    {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
+    let mut sport_host: u16 =
+        match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16) {
+            Ok(v) => v,
+            Err(_) => 0,
+        };
+    // An abortive close (RST, SO_LINGER 0) has released the port by the
+    // fexit — `inet_put_port` zeroes `skc_num` — but `inet_sport` keeps
+    // it (network byte order).
+    if sport_host == 0 {
+        if let Ok(v) = bpf_probe_read_kernel(
+            sk_ptr.add(off!(INET_SOCK_INET_SPORT_OFFSET)) as *const u16,
+        ) {
+            sport_host = u16::from_be(v);
+        }
+    }
     // sk_err — sign-extended i32 stored in network code as positive
     // errno values; treat as u32 for bit math.
     let sk_err_raw: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SK_ERR_OFFSET)) as *const u32)

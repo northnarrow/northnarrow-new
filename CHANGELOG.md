@@ -6,6 +6,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A TCP flow closed abortively (RST, `SO_LINGER` 0) was recorded with
+  source port 0: the close probe read the port after the kernel had
+  released it. It now falls back to the socket's `inet_sport` (a new
+  BTF-revalidated offset).
 - External audit, Wave 2, undoing a response (Medium CMB-016, Low CMB-026):
   three signed admin verbs, run by the agent and recorded in the signed
   audit log. `nn-admin response status` (`audit-read`) lists the contained
