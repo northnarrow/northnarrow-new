@@ -15,6 +15,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, admin read verbs (Medium ASK-006, ASK-007,
+  ASK-008): `fim report`, `net flows` and `canary list` read the active
+  file from its start and stopped at half a frame, so past about fifty rows
+  they answered with the OLDEST rows, and no verb opened a rotated archive:
+  a flood of connections from any user hid the newest flows from
+  `net flows`. They now answer the newest rows first, from the active file
+  then the archives, within the same budget; `truncated` means older rows
+  were left out. The read is bounded per file and per request and opens
+  only regular files, without following a symlink. `fim report` and
+  `net flows` read the built-in paths whatever `--fim-drift-file` and
+  `--netflow-file` said; they read the configured files now.
+  `net listeners`, `net fingerprint` and `net resolve` answered Success with
+  nothing, without reading anything: `net listeners` lists the listener log
+  (listen events, not a snapshot of open sockets), `net fingerprint` the
+  netflow rows of that flow (`ja3`/`ja4`/`sni` null: the TLS capture is not
+  wired yet), `net resolve` the hostname of the newest retained flow to
+  that address; a malformed address or flow id is refused. **Regression:**
+  `fim report`, `canary list`, `net flows` and `net listeners` print the
+  newest row first — a script that read the first line as the oldest must
+  read the last.
 - External audit, Wave 2, inputs trusted but forgeable (Medium ATP-010,
   ATP-005, SNS-002): the tracepoint field offsets came from whatever was
   mounted at `/sys/kernel/tracing` — a tmpfs over it, or a file bound over

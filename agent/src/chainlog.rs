@@ -1023,6 +1023,25 @@ fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
     Ok(list_archive_seqs(active)?.into_iter().max())
 }
 
+/// The sealed archives of `active`, newest first (highest seq first: the
+/// last rotated file holds the newest archived rows). An unreadable
+/// directory yields none. External audit NN-AUD-080: the one lister for
+/// the readers (the detection store and the admin read verbs).
+pub(crate) fn archives_newest_first(active: &Path) -> Vec<PathBuf> {
+    let mut seqs = list_archive_seqs(active).unwrap_or_default();
+    seqs.reverse();
+    seqs.into_iter()
+        .map(|seq| archive_path(active, seq))
+        .collect()
+}
+
+/// Whether a raw line is a [`TerminatorLine`]: its first key is `rotate`
+/// (field order of the struct), which no data line may carry
+/// ([`RESERVED_LINE_KEYS`]).
+pub(crate) fn is_terminator_line(line: &str) -> bool {
+    line.starts_with("{\"rotate\":")
+}
+
 /// Bound on the archive slots one rotation probes past foreign entries.
 const MAX_SLOT_PROBES: u32 = 16;
 

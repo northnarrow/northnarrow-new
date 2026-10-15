@@ -403,11 +403,12 @@ struct Cli {
     /// Tappa 10 N8: configurable path of the chained NetFlow log.
     /// Same per-test override rationale as `--fim-baseline-file` —
     /// tests point this at a tempdir so each run gets a fresh
-    /// chain. The N7 `dispatch_net_flows` admin path reads from
-    /// this file; the future N3 flow_tracker emission commit
-    /// appends to it. N8 (this commit) bootstraps the file
-    /// pre-attach so PROTECTED_INODES has an inode to register
-    /// against before LSM hooks come up.
+    /// chain. The net drain appends one row per closed flow; the
+    /// `net flows`, `net resolve` and `net fingerprint` admin verbs
+    /// read this file and its rotated archives (external audit
+    /// NN-AUD-082: they used to read the built-in path whatever this
+    /// flag said). Bootstrapped pre-attach so PROTECTED_INODES has an
+    /// inode to register against before LSM hooks come up.
     #[arg(
         long = "netflow-file",
         value_name = "PATH",
@@ -420,7 +421,7 @@ struct Cli {
     /// rationale as `--netflow-file` — tests point this at a
     /// tempdir so each run gets a fresh chain. The N9 drain loop
     /// appends one row per observed `inet_csk_listen_start` kernel
-    /// event.
+    /// event; `nn-admin net listeners` reads it.
     #[arg(
         long = "netflow-listeners-file",
         value_name = "PATH",
@@ -3136,6 +3137,13 @@ async fn main() -> Result<()> {
                 let installer_override_for_serve = Some(Arc::clone(&installer_override));
                 // Tappa 9.0.c: detection triage state (status-event chain).
                 let detection_state_for_serve = detection_admin_state.clone();
+                // External audit NN-AUD-082: the read verbs serve the
+                // files the flags name, not the built-in paths.
+                let read_paths_for_serve = Arc::new(admin_socket::AdminReadPaths {
+                    fim_drift: cli.fim_drift_file.clone(),
+                    netflow: cli.netflow_file.clone(),
+                    netflow_listeners: cli.netflow_listeners_file.clone(),
+                });
                 // External audit CMB-016: the response verbs read the
                 // executor's record and vault, and the ladder's stage.
                 let response_state_for_serve = Some(Arc::new(admin_socket::ResponseAdminState {
@@ -3159,6 +3167,7 @@ async fn main() -> Result<()> {
                         installer_override_for_serve,
                         detection_state_for_serve,
                         response_state_for_serve,
+                        read_paths_for_serve,
                     )
                     .await
                     {

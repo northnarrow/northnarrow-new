@@ -17,6 +17,7 @@ pub mod anti_tamper;
 pub mod atomic_file;
 pub mod audit;
 pub mod canary;
+pub(crate) mod chain_tail;
 pub mod chainlog;
 pub mod combat;
 pub mod config;

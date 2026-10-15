@@ -43,7 +43,7 @@
 //! here (9.0.e).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -949,7 +949,7 @@ fn seed_last_id(active_path: &Path) -> u64 {
     if let Some(id) = last_id_in_file(active_path) {
         return id;
     }
-    archive_paths(active_path)
+    crate::chainlog::archives_newest_first(active_path)
         .iter()
         .filter_map(|p| last_id_in_file(p))
         .max()
@@ -968,31 +968,6 @@ fn last_id_in_file(path: &Path) -> Option<u64> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         value.get("id")?.as_u64()
     })
-}
-
-/// Sealed-archive siblings of `active_path`: `<active_file_name>.NNNNNN`
-/// (6-digit zero-padded seq), excluding the manifest.
-fn archive_paths(active_path: &Path) -> Vec<PathBuf> {
-    let Some(dir) = active_path.parent() else {
-        return Vec::new();
-    };
-    let Some(name) = active_path.file_name().and_then(|s| s.to_str()) else {
-        return Vec::new();
-    };
-    let prefix = format!("{name}.");
-    let mut out = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(dir) {
-        for entry in read_dir.flatten() {
-            if let Some(entry_name) = entry.file_name().to_str() {
-                if let Some(suffix) = entry_name.strip_prefix(&prefix) {
-                    if suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_digit()) {
-                        out.push(entry.path());
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 // ── bounded last-N read (9.0.b) ─────────────────────────────────────
@@ -1205,7 +1180,7 @@ pub fn read_last_n(
     let mut collected: Vec<DetectionRecord> = Vec::new();
     collect_matching_from_file(active_path, filter, &mut collected);
     if collected.len() < limit {
-        for archive in archives_newest_first(active_path) {
+        for archive in crate::chainlog::archives_newest_first(active_path) {
             collect_matching_from_file(&archive, filter, &mut collected);
             if collected.len() >= limit {
                 break;
@@ -1245,27 +1220,6 @@ fn collect_matching_from_file(
             }
         }
     }
-}
-
-/// Sealed-archive siblings of `active_path`, ordered newest-sealed-
-/// first (highest 6-digit rotation seq first): the highest seq is the
-/// most recently rotated file, hence the newest archived records.
-fn archives_newest_first(active_path: &Path) -> Vec<PathBuf> {
-    let mut archives = archive_paths(active_path);
-    archives.sort_by_key(|p| std::cmp::Reverse(archive_seq(p)));
-    archives
-}
-
-/// Extract the trailing 6-digit rotation seq from an archive path
-/// (`<base>.NNNNNN`). [`archive_paths`] only yields well-formed
-/// archive names, so the parse always succeeds in practice; a
-/// malformed name sorts as `0`.
-fn archive_seq(path: &Path) -> u64 {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .and_then(|name| name.rsplit('.').next())
-        .and_then(|suffix| suffix.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 // ── Tappa 9.0.c — status-event chain: open + max-id guard + overlay ──
@@ -1381,7 +1335,7 @@ pub fn latest_status_for_ids(
     let mut unresolved: HashSet<u64> = wanted.clone();
     collect_latest_status_from_file(status_events_path, &mut out, &mut unresolved);
     if !unresolved.is_empty() {
-        for archive in archives_newest_first(status_events_path) {
+        for archive in crate::chainlog::archives_newest_first(status_events_path) {
             collect_latest_status_from_file(&archive, &mut out, &mut unresolved);
             if unresolved.is_empty() {
                 break;

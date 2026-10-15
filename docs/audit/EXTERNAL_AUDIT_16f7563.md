@@ -123,9 +123,9 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-077 | ASK-002 | Admin socket | M | open |
 | NN-AUD-078 | ASK-003 | Admin socket | M | open |
 | NN-AUD-079 | ASK-004 | Admin socket | M | open |
-| NN-AUD-080 | ASK-006 | Admin socket | M | open |
-| NN-AUD-081 | ASK-007 | Admin socket | S | open |
-| NN-AUD-082 | ASK-008 | Admin socket | S | open |
+| NN-AUD-080 | ASK-006 | Admin socket | M | fixed (lab PR 139) |
+| NN-AUD-081 | ASK-007 | Admin socket | S | fixed (lab PR 139) |
+| NN-AUD-082 | ASK-008 | Admin socket | S | fixed (lab PR 139) |
 | NN-AUD-083 | ASK-010 | Admin socket | S | open |
 | NN-AUD-084 | ASK-011 | Admin socket | M | open |
 | NN-AUD-085 | AUT-002 | Admin auth | S | fixed (lab PR 115) |
@@ -3009,3 +3009,55 @@ the audit did not report, noted with the fix that takes them.
     DNS escapes are covered by unit tests. Privileged gate: Ubuntu 24.04
     and Debian 12, 29 suites, 80 passed, 0 failed each. The anti-tamper
     suite: OK. Host: 1877 passed, 0 failed.
+- **NN-AUD-080, NN-AUD-081, NN-AUD-082 (ASK-006, ASK-007, ASK-008), lab
+  PR 139.** The admin read verbs (triage A, batch B4). No kernel or wire
+  change.
+  - ASK-006: one reader, `chain_tail::read_chain_tail` (new module), for
+    `fim report`, `net flows`, `canary list` and the net verbs below. Each
+    file is scanned forward with a `VecDeque` bounded at half a frame (and
+    a row budget): the active file, then the archives newest-first while
+    the budget is not full and, with `since`, until a row older than
+    `since`. Rows newest-first; `truncated` means older matching rows were
+    left out. Bounds: the last 64 MiB of a file (above every rotation cap;
+    the listener log and the canary registry do not rotate), 128 MiB per
+    request, a line over the budget never buffered whole. Terminator lines
+    and an unterminated last line are skipped. Files: the active path
+    through the writers' anchored directory fd (review 44), opened
+    `O_NOFOLLOW|O_NONBLOCK`, regular files only, read only after the
+    signature check. The archive lister is `chainlog::archives_newest_first`,
+    also used by `detection_store` (its private copy removed). Not done:
+    `canary list` from `Registry::list()` (the live state) — the output
+    would change shape; the chain is kept, newest first.
+  - ASK-008: `AdminReadPaths { fim_drift, netflow, netflow_listeners }`,
+    built in main.rs from the flags and threaded through
+    `serve_with_marker_path`, `handle_connection` and `dispatch` like the
+    other states (`Default` = the built-in paths, for the legacy entry
+    points and tests). The `--netflow-file` doc corrected.
+  - ASK-007: `net listeners` serves the listener log; its help says these
+    are listen events, not a socket snapshot. `net fingerprint` returns
+    the flow's rows (active file and archives) with `ja3`/`ja4`/`sni` even
+    when null: the ClientHello capture (`FlowTracker::attach_tls`) is not
+    wired, so the triage's filter on a non-null field would always answer
+    empty — a null says "not captured", an empty body "not retained".
+    `net resolve` (not in the finding) answers from the netflow rows: the
+    `resolved_hostname` of the newest retained flow to that address
+    (IPv4-mapped included) and that row's `ts`. A malformed IP or flow id
+    is refused (`UnknownOperation`), so no `AdminResult::Unavailable`.
+    Regression (CHANGELOG): the streaming verbs print newest first.
+  - Tests: `truncation_keeps_newest_rows_first`,
+    `reads_into_archives_newest_first_and_skips_terminators`,
+    `since_stops_at_the_first_older_row`, `keep_predicate_and_row_budget`,
+    `scan_bounds_read_the_tail_and_flag_it`,
+    `oversized_and_unterminated_lines_are_not_returned`,
+    `symlinked_and_special_files_are_not_read`,
+    `real_rotation_terminator_is_skipped`, `fim_report_reads_configured_path`,
+    `fim_report_truncation_keeps_newest`, `net_flows_reads_configured_path`,
+    `net_flows_since_reads_into_archives`,
+    `net_listeners_serves_listener_log`, `net_fingerprint_finds_flow_by_id`,
+    `net_resolve_answers_from_netflow_rows`. With the old reader restored
+    (active file only, from its start) they fail, but `scan_bounds…`, which
+    drives the bounded reader directly; with the dispatchers back on the
+    built-in paths the dispatcher tests fail. `net_privileged_e2e`: test #1 checks that
+    `net flows` and `net fingerprint` list the flow, test #2 that
+    `net listeners` lists the port.
+  - Lab: Ubuntu 24.04, readverbs139-probe.sh on main and on this build. A real flow to 127.0.0.2:18140: absent from `net flows` on main (46 entries, the oldest first), line 1 here; `net resolve 127.0.0.2`: "no attribution available" → `probe139.invalid`; `net fingerprint` of the flow: 0 rows → 1 row, a malformed flow id refused; `net listeners` with a listener on :18765: 0 entries → 2 rows; `fim report`: oldest row first → newest first. Gate: Ubuntu 24.04 and Debian 12, 29 suites, 80 passed, 0 failed each; anti-tamper suite OK; host 1907 passed, 0 failed.

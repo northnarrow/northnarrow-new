@@ -1808,9 +1808,13 @@ fn current_utc_iso8601() -> String {
 //
 //   * `run_net_flows`        — reads the chained `netflow.jsonl`,
 //                              optional `--since-unix` filter.
-//   * `run_net_listeners`    — in-process listener snapshot.
-//   * `run_net_resolve`      — DNS-attribution lookup for an IP.
-//   * `run_net_fingerprint`  — recent JA3/JA4 observations.
+//   * `run_net_listeners`    — the listener log (listen events).
+//   * `run_net_resolve`      — DNS-attribution lookup for an IP,
+//                              from the netflow rows.
+//   * `run_net_fingerprint`  — the netflow rows of one flow_id.
+//
+// The agent returns the newest rows first (external audit
+// NN-AUD-080).
 //
 // All four are 1-of-N quorum, `Role::NetRead`. The CLI streams
 // the JSONL body to stdout + a summary line to stderr (so
@@ -1847,8 +1851,9 @@ pub enum NetJsonlOutcome {
 }
 
 /// Outcome of `nn-admin net resolve <ip>`. Success carries the
-/// resolved hostname + when it was observed; V1.0 always returns
-/// `qname: None` (V1.1 DNS-response observer wire-up).
+/// hostname attributed to the newest retained flow to that IP and
+/// when that flow was recorded; `qname: None` when no retained flow
+/// to it carries a name.
 #[derive(Debug)]
 pub enum NetResolveOutcome {
     Success {
@@ -2156,7 +2161,8 @@ pub fn run_detection_set_status(
     }
 }
 
-/// `nn-admin net listeners` — in-process listener snapshot.
+/// `nn-admin net listeners` — the listener log, newest rows first
+/// (listen events, not a snapshot of open sockets).
 pub fn run_net_listeners(
     socket: &Path,
     key_path: &Path,
@@ -2268,7 +2274,8 @@ pub fn run_net_resolve(
     }
 }
 
-/// `nn-admin net fingerprint --flow-id <hex>` — JA3/JA4 dump.
+/// `nn-admin net fingerprint --flow-id <hex>` — the netflow rows of
+/// that flow, with their JA3/JA4/SNI fields.
 pub fn run_net_fingerprint(
     socket: &Path,
     key_path: &Path,
