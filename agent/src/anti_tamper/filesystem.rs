@@ -2,8 +2,8 @@
 //!
 //! Bootstraps `/var/lib/northnarrow/`, marks it immutable, registers
 //! its `(dev, ino)` in the kernel-side `PROTECTED_INODES` map, then
-//! attaches the five `inode_*` / `file_ioctl` LSM programs that
-//! enforce the policy.
+//! attaches the `inode_*` / `file_ioctl` / `file_open` LSM deny programs
+//! that enforce the policy ([`LSM_PROGRAMS`]).
 //!
 //! Order of operations matters:
 //!
@@ -35,7 +35,8 @@ use aya::{
     Btf, Ebpf,
 };
 use common::wire::{
-    InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_READ, FS_PROTECT_WRITE, READ_PROTECTED_SLOTS,
+    InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_READ, FS_PROTECT_WRITE,
+    READ_PROTECTED_SLOTS,
 };
 
 /// Aya requires its own marker trait [`aya::Pod`] for map K/V types,
@@ -62,11 +63,28 @@ pub const STATE_DIR: &str = "/var/lib/northnarrow";
 /// identity files. Tappa 8 A14 (B4) widens PROTECTED_INODES to
 /// cover this directory's contents so an attacker with root
 /// can't tamper with `admin.pub` / `agent_id` / `audit.log` /
-/// `agent.sig.key` between agent restarts. The directory itself
-/// is not registered (operators legitimately add new files
-/// here — e.g., dropping a fresh pubkey for `rotate-keys add`);
-/// only the individual files are.
+/// `agent.sig.key` between agent restarts. The directory itself is
+/// registered too ([`PROTECTED_DIR_FLAGS`], review `etc-dir-protect-1`,
+/// external audit EBPF-015): the agent writes it, operators change it
+/// through the agent (`rotate-keys`, `config overlay set`) or inside a
+/// trusted-installer window (install.sh).
 pub const CONFIG_DIR: &str = "/etc/northnarrow";
+
+/// External audit EBPF-015: the flags of the agent's own directories —
+/// `/etc/northnarrow`, `/var/lib/northnarrow` and its chain
+/// sub-directories, the unit drop-in directory ([`NOCREATE_UNIT_DIRS`]),
+/// the bpffs pin root. MUTATE (no unlink, rename, chmod, chattr, xattr)
+/// and NOCREATE: no new file, link, symlink, device node or subdirectory
+/// in them from outside the agent's family, outside the window. Never on
+/// a directory the agent shares with the host (`/usr/local/bin`,
+/// `/etc/systemd/system`): only its own files are registered there.
+pub(crate) const PROTECTED_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE;
+
+/// The directories of [`BINARY_AND_UNIT_PATHS`] that take
+/// [`PROTECTED_DIR_FLAGS`]: the agent unit's drop-in directory, which
+/// install.sh creates on a Debian-family host. A new drop-in there could
+/// replace `ExecStart=` or add a skipping `Condition*=` (DEP-002).
+pub const NOCREATE_UNIT_DIRS: &[&str] = &["/etc/systemd/system/northnarrow-agent.service.d"];
 
 /// The files inside [`CONFIG_DIR`] that PROTECTED_INODES covers.
 /// Order is the operator-visible audit order — tests assert it for
@@ -341,8 +359,9 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     // External audit DEP-002: the drop-in install.sh writes on a Debian
     // host (a drop-in can replace ExecStart=, add a Condition*= that skips
     // the start, or set a weakening Environment=), and its directory —
-    // removing or renaming an entry is denied; a new drop-in cannot be
-    // denied (no inode_create hook) and is reported by the integrity check.
+    // removing or renaming an entry is denied, and since EBPF-015 a new
+    // drop-in too (`NOCREATE_UNIT_DIRS`). Where the directory does not
+    // exist, a drop-in made with it is reported by the integrity check.
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
 ];
@@ -360,18 +379,41 @@ const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
 const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
 const FS_IMMUTABLE_FL: libc::c_long = 0x0000_0010;
 
-/// The six LSM deny programs from `agent-ebpf/src/inode_protect.rs`.
-/// First field is the program name in the ELF, second is the LSM
-/// hook name the kernel exposes as `bpf_lsm_<hook>` in vmlinux BTF.
-/// `protected_open_deny` (at-authz-1) is the `file_open` FMODE_WRITE
-/// deny that closes the write-open gap on `FS_PROTECT_WRITE` inodes.
-const LSM_PROGRAMS: &[(&str, &str)] = &[
+/// The LSM deny programs from `agent-ebpf/src/inode_protect.rs` every
+/// supported kernel (5.14+) has a hook for. First field is the program
+/// name in the ELF, second is the LSM hook name the kernel exposes as
+/// `bpf_lsm_<hook>` in vmlinux BTF. `protected_open_deny` (at-authz-1) is
+/// the `file_open` FMODE_WRITE deny that closes the write-open gap on
+/// `FS_PROTECT_WRITE` inodes. External audit EBPF-015 appends the
+/// new-entry denies (NOCREATE directories) and the extended-attribute
+/// denies.
+pub(crate) const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("inode_unlink", "inode_unlink"),
     ("inode_rmdir", "inode_rmdir"),
     ("inode_rename", "inode_rename"),
     ("inode_setattr", "inode_setattr"),
     ("file_ioctl", "file_ioctl"),
     ("protected_open_deny", "file_open"),
+    ("protected_create_deny", "inode_create"),
+    ("protected_mkdir_deny", "inode_mkdir"),
+    ("protected_mknod_deny", "inode_mknod"),
+    ("protected_symlink_deny", "inode_symlink"),
+    ("protected_link_deny", "inode_link"),
+    ("protected_setxattr_deny", "inode_setxattr"),
+    ("protected_removexattr_deny", "inode_removexattr"),
+];
+
+/// External audit EBPF-015: deny programs for hooks only newer kernels
+/// have. Since 6.2 a POSIX ACL (`setfacl`) is changed through
+/// `inode_set_acl` / `inode_remove_acl` instead of `inode_setxattr`
+/// (`system.posix_acl_*`), which the required set covers on 5.15 and 6.1.
+/// Attached where the kernel's BTF has the hook; where it has not, the
+/// program is skipped and not counted as a missing deny hook. A hook the
+/// kernel has but that fails to load or attach is a deny failure like any
+/// other.
+pub(crate) const OPTIONAL_LSM_PROGRAMS: &[(&str, &str)] = &[
+    ("protected_set_acl_deny", "inode_set_acl"),
+    ("protected_remove_acl_deny", "inode_remove_acl"),
 ];
 
 /// BUG-034 module-load observe hooks — `MODULE_LOAD_EVENTS` producers.
@@ -400,6 +442,10 @@ pub(crate) struct FsAttachHealth {
     /// Same for the module-load OBSERVE hooks (BUG-034). Non-empty =
     /// R018 blind, but no deny is missing.
     pub observe_failures: Vec<(&'static str, String)>,
+    /// External audit EBPF-015: the [`OPTIONAL_LSM_PROGRAMS`] whose hook
+    /// this kernel has — attached or failed, they count as expected deny
+    /// hooks.
+    pub optional_present: usize,
 }
 
 pub(crate) fn attach(
@@ -436,10 +482,11 @@ pub(crate) fn attach(
         ino: meta.ino(),
     };
     // The state dir is a directory — a write-open (FMODE_WRITE) of a dir
-    // never happens (open returns EISDIR), so MUTATE-only is the complete
-    // and correct mask for the dir inode itself; the WRITE bit lives on
-    // the chain-log FILES inside it (register_state_files).
-    register_inode(ebpf, &key, FS_PROTECT_MUTATE)?;
+    // never happens (open returns EISDIR), so no WRITE bit; the WRITE bit
+    // lives on the chain-log FILES inside it (register_state_files).
+    // NOCREATE (EBPF-015): `+i` kept new entries out only while root could
+    // not clear it, and the agent lifts it for its own creates.
+    register_inode(ebpf, &key, PROTECTED_DIR_FLAGS)?;
     info!(
         path = %dir.display(),
         st_dev = st_dev, kernel_dev = key.dev, ino = key.ino,
@@ -531,7 +578,7 @@ pub(crate) fn attach(
         );
     }
 
-    // Step 4: attach the five inode_protect deny hooks — the
+    // Step 4: attach the inode_protect deny hooks — the
     // FS_PROTECT_EVENTS producers. BUG-024: these MUST re-attach FRESH
     // every boot (binding to this boot's fresh, process-local ring) rather
     // than reuse the prior boot's pinned link (which kept producing into the
@@ -553,11 +600,34 @@ pub(crate) fn attach(
             }
         }
     }
+    // External audit EBPF-015: the hooks only newer kernels have. Absent
+    // from this kernel's BTF = not expected here (the required set covers
+    // the same change on it); present = expected, like the required ones.
+    for (program, hook) in OPTIONAL_LSM_PROGRAMS {
+        match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
+            Ok(()) => {
+                deny_hooks_attached += 1;
+                health.optional_present += 1;
+            }
+            Err(e) if lsm_hook_absent(&e, hook) => info!(
+                program,
+                hook, "anti-tamper FS: optional deny hook absent on this kernel — not attached"
+            ),
+            Err(e) => {
+                warn!(
+                    program, hook, error = %e,
+                    "anti-tamper FS: LSM hook attach FAILED"
+                );
+                health.optional_present += 1;
+                health.deny_failures.push((program, format!("{e:#}")));
+            }
+        }
+    }
     // at-authz-1 verify-item 3: a machine-detectable attach-health signal
     // (attached vs expected). The fail-closed decision itself is the
     // caller's (anti_tamper::attach, audit ebpf-lsm-1) — it sees this
     // set together with task_kill / ptrace.
-    let deny_hooks_expected = LSM_PROGRAMS.len();
+    let deny_hooks_expected = LSM_PROGRAMS.len() + health.optional_present;
     if deny_hooks_attached == deny_hooks_expected {
         info!(
             deny_hooks_attached,
@@ -589,6 +659,21 @@ pub(crate) fn attach(
     Ok(health)
 }
 
+/// External audit EBPF-015: whether `err`, from attaching the deny
+/// program for `hook`, says the kernel has no such LSM hook
+/// (`bpf_lsm_<hook>` absent from its BTF) — as opposed to a hook it has
+/// failing to load or attach.
+pub(crate) fn lsm_hook_absent(err: &anyhow::Error, hook: &str) -> bool {
+    let want = format!("bpf_lsm_{hook}");
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<aya::programs::ProgramError>(),
+            Some(aya::programs::ProgramError::Btf(aya::BtfError::UnknownBtfTypeName { type_name }))
+                if *type_name == want
+        )
+    })
+}
+
 /// Tappa 8 A14 (B4): register each of the four [`ETC_PROTECTED_FILES`]
 /// in `PROTECTED_INODES` so the same LSM hooks that defend
 /// `/var/lib/northnarrow` also defend admin.pub / agent_id /
@@ -614,13 +699,16 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     // of it by a non-protected pid. The agent's own rotate-keys rename
     // is exempt via PROTECTED_PIDS; operator edits go through the signed
     // trusted-installer window (FS_GRANT), exactly like /var/lib/northnarrow.
+    // External audit EBPF-015: NOCREATE too — root could still add any
+    // file next to the protected ones (a decoy overlay, a planted `.tmp`
+    // name, a second key file).
     match std::fs::metadata(etc_dir) {
         Ok(meta) if meta.is_dir() => {
             let key = InodeKey {
                 dev: stat_dev_to_kernel_dev(meta.dev()),
                 ino: meta.ino(),
             };
-            register_inode(ebpf, &key, FS_PROTECT_MUTATE).with_context(|| {
+            register_inode(ebpf, &key, PROTECTED_DIR_FLAGS).with_context(|| {
                 format!(
                     "registering directory {} in {PROTECTED_INODES_MAP}",
                     etc_dir.display()
@@ -821,7 +909,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
                     dev: stat_dev_to_kernel_dev(meta.dev()),
                     ino: meta.ino(),
                 };
-                register_inode(ebpf, &key, FS_PROTECT_MUTATE).with_context(|| {
+                register_inode(ebpf, &key, PROTECTED_DIR_FLAGS).with_context(|| {
                     format!(
                         "registering subdir {} in {PROTECTED_INODES_MAP}",
                         dir.display()
@@ -1013,7 +1101,9 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
 /// Called once all pins of this boot exist; the next boot's agent is a
 /// protected pid when it purges the stale pins, so the fresh re-attach is
 /// unaffected. `install.sh --upgrade` / `uninstall.sh` open the window
-/// (`--grant-key`) before they purge.
+/// (`--grant-key`) before they purge. The root takes
+/// [`PROTECTED_DIR_FLAGS`] (external audit EBPF-015): a pin by a foreign
+/// process is refused like any new entry.
 pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<usize> {
     let mut registered = 0usize;
     let mut paths: Vec<PathBuf> = vec![pin_root.to_path_buf()];
@@ -1034,7 +1124,15 @@ pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<us
             dev: stat_dev_to_kernel_dev(meta.dev()),
             ino: meta.ino(),
         };
-        register_inode(ebpf, &key, FS_PROTECT_MUTATE).with_context(|| {
+        // External audit EBPF-015: the root also refuses new entries — a
+        // pin (`bpf_obj_pin` creates through `inode_create`) or a directory
+        // planted among the agent's.
+        let flags = if path == pin_root {
+            PROTECTED_DIR_FLAGS
+        } else {
+            FS_PROTECT_MUTATE
+        };
+        register_inode(ebpf, &key, flags).with_context(|| {
             format!(
                 "registering pin {} in {PROTECTED_INODES_MAP}",
                 path.display()
@@ -1045,10 +1143,18 @@ pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<us
     info!(
         registered,
         root = %pin_root.display(),
-        "anti-tamper FS: bpffs pin root and pins registered in {PROTECTED_INODES_MAP} — unlink/rename denied \
-         to foreign callers (trusted-installer window to purge)"
+        "anti-tamper FS: bpffs pin root and pins registered in {PROTECTED_INODES_MAP} — unlink/rename and \
+         new pins denied to foreign callers (trusted-installer window to purge)"
     );
     Ok(registered)
+}
+
+/// The `PROTECTED_INODES` flags of one of [`BINARY_AND_UNIT_PATHS`]:
+/// WRITE+MUTATE, plus NOCREATE for the agent's own drop-in directory
+/// ([`NOCREATE_UNIT_DIRS`], external audit EBPF-015).
+fn binary_or_unit_flags(path: &Path) -> u8 {
+    let nocreate = NOCREATE_UNIT_DIRS.iter().any(|d| path == Path::new(d));
+    FS_PROTECT_MUTATE | FS_PROTECT_WRITE | if nocreate { FS_PROTECT_NOCREATE } else { 0 }
 }
 
 pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
@@ -1065,7 +1171,7 @@ pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
     for (path, key) in resolved {
         // at-authz-1: the agent/watchdog images + units are agent-written
         // (signed self-upgrade, exempt via the trusted-installer window, FS_GRANT) — WRITE+MUTATE.
-        register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
+        register_inode(ebpf, &key, binary_or_unit_flags(&path))
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
         info!(
             path = %path.display(),
@@ -2334,6 +2440,93 @@ mod tests {
             assert!(
                 seen.insert(p),
                 "duplicate entry {p} in BINARY_AND_UNIT_PATHS"
+            );
+        }
+    }
+
+    /// External audit EBPF-015: the deny set covers every way to add an
+    /// entry to a directory (create, mkdir, mknod, symlink, link) and to
+    /// change an extended attribute, each hook once; the ACL hooks of 6.2+
+    /// are optional, and every pin name fits the BPF guard's name window.
+    #[test]
+    fn deny_set_covers_new_entries_and_xattrs() {
+        let hooks: Vec<&str> = LSM_PROGRAMS.iter().map(|(_, h)| *h).collect();
+        for h in [
+            "inode_create",
+            "inode_mkdir",
+            "inode_mknod",
+            "inode_symlink",
+            "inode_link",
+            "inode_setxattr",
+            "inode_removexattr",
+        ] {
+            assert!(hooks.contains(&h), "no deny program on {h}");
+        }
+        let optional: Vec<&str> = OPTIONAL_LSM_PROGRAMS.iter().map(|(_, h)| *h).collect();
+        assert_eq!(optional, ["inode_set_acl", "inode_remove_acl"]);
+        let mut programs = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        for (program, hook) in LSM_PROGRAMS.iter().chain(OPTIONAL_LSM_PROGRAMS) {
+            assert!(programs.insert(*program), "program {program} listed twice");
+            assert!(seen.insert(*hook), "hook {hook} listed twice");
+            let (_, link) = antitamper_bpf::lsm_pin_paths(Path::new("/"), hook);
+            let name = link.file_name().unwrap().len();
+            assert!(name <= 32, "link pin name of {hook} too long for the guard");
+        }
+    }
+
+    /// External audit EBPF-015: a hook the kernel does not have (its
+    /// `bpf_lsm_<hook>` absent from the BTF) is told from a hook that
+    /// failed to load — only the first lets an optional program be skipped.
+    #[test]
+    fn lsm_hook_absent_only_for_that_hook_missing_from_btf() {
+        use aya::programs::ProgramError;
+        let absent = anyhow::Error::from(ProgramError::Btf(aya::BtfError::UnknownBtfTypeName {
+            type_name: "bpf_lsm_inode_set_acl".to_string(),
+        }))
+        .context("verifier rejected LSM program `protected_set_acl_deny`");
+        assert!(lsm_hook_absent(&absent, "inode_set_acl"));
+        assert!(!lsm_hook_absent(&absent, "inode_remove_acl"));
+        let failed = anyhow::Error::from(ProgramError::Btf(aya::BtfError::UnknownBtfTypeName {
+            type_name: "inode".to_string(),
+        }))
+        .context("verifier rejected LSM program `protected_set_acl_deny`");
+        assert!(!lsm_hook_absent(&failed, "inode_set_acl"));
+        let other = anyhow::anyhow!("attaching LSM program `protected_set_acl_deny`");
+        assert!(!lsm_hook_absent(&other, "inode_set_acl"));
+    }
+
+    /// External audit EBPF-015: the agent's directories refuse new
+    /// entries; the files, and the host's shared directories, do not carry
+    /// the flag (a NOCREATE `/usr/local/bin` would refuse every install).
+    #[test]
+    fn only_the_agents_own_directories_refuse_new_entries() {
+        assert_eq!(PROTECTED_DIR_FLAGS, FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE);
+        for d in NOCREATE_UNIT_DIRS {
+            assert!(BINARY_AND_UNIT_PATHS.contains(d), "{d}");
+            assert!(d.contains("northnarrow"), "{d} is not the agent's own");
+            assert_ne!(binary_or_unit_flags(Path::new(d)) & FS_PROTECT_NOCREATE, 0);
+        }
+        for p in BINARY_AND_UNIT_PATHS {
+            let f = binary_or_unit_flags(Path::new(p));
+            assert_eq!(
+                f & (FS_PROTECT_MUTATE | FS_PROTECT_WRITE),
+                FS_PROTECT_MUTATE | FS_PROTECT_WRITE
+            );
+            if !NOCREATE_UNIT_DIRS.contains(p) {
+                assert_eq!(f & FS_PROTECT_NOCREATE, 0, "{p}");
+            }
+        }
+        for shared in [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/etc/systemd/system",
+            "/usr/lib/systemd/system",
+            "/etc",
+        ] {
+            assert_eq!(
+                binary_or_unit_flags(Path::new(shared)) & FS_PROTECT_NOCREATE,
+                0
             );
         }
     }

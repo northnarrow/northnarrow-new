@@ -38,7 +38,9 @@ sudo systemctl daemon-reload
 sudo systemctl start northnarrow-agent; sleep 3; sudo systemctl start northnarrow-watchdog; sleep 25
 check "units active" test "$(systemctl is-active northnarrow-agent northnarrow-watchdog | tr '\n' ' ')" = "active active "
 check "binary integrity verified (checksums manifest)" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'binary integrity verified against the install manifest provenance=\"checksums\"'"
-check "every deny hook attached" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'all LSM hooks attached deny_attached=9'"
+# logged only when every deny hook of this kernel attached (16 on 5.15 and
+# 6.1, 18 where the kernel has the ACL hooks, 6.2+)
+check "every deny hook attached" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'all LSM hooks attached deny_attached='"
 check "telemetry probe armed" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'telemetry probe armed'"
 # a detection end to end: exec from /tmp (R001)
 cp /bin/true /tmp/nn-release-probe && chmod +x /tmp/nn-release-probe

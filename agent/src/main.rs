@@ -933,6 +933,26 @@ async fn main() -> Result<()> {
         &cli.signing_key_file,
     );
 
+    // External audit EBPF-015: the predecessor's pinned deny hooks refuse
+    // a new entry in the agent's directories to a process not yet
+    // registered — the files bootstrapped below when one is missing, a map
+    // pin the eBPF load makes. Register in the pinned PROTECTED_PIDS first;
+    // anti_tamper::attach does it again, with the stale-pid scan.
+    match northnarrow_agent::anti_tamper::preregister_self(std::path::Path::new(
+        northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
+    )) {
+        Ok(true) => info!(
+            "anti-tamper: registered in the pinned PROTECTED_PIDS before the bootstraps \
+             (a previous agent's hooks are attached)"
+        ),
+        Ok(false) => {}
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper: early registration in PROTECTED_PIDS failed — a file or map pin \
+             this boot must recreate before the attach is refused by the previous hooks"
+        ),
+    }
+
     // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
     // BEFORE the sensor multiplexer attaches the LSM hooks, so the
     // hooks see their inodes in PROTECTED_INODES the moment they
@@ -945,8 +965,9 @@ async fn main() -> Result<()> {
         northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
     {
         // External audit EVD-001: on a restart the previous instance's
-        // pinned hooks already close the key to a process not yet
-        // registered; the loads after the attach read it.
+        // pinned hooks close the key to a process not yet registered (the
+        // early registration above failed); the loads after the attach
+        // read it.
         let refused = e
             .root_cause()
             .downcast_ref::<std::io::Error>()

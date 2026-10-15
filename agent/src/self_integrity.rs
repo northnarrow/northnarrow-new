@@ -147,9 +147,11 @@ const BPFFS_ROOT: &str = "/sys/fs/bpf";
 
 /// Operator overlays the agent reads at its next start (`*.local`): an
 /// allowlist overlay exempts a comm from detection, a FIM overlay disables
-/// a watched path. They are legitimate configuration, so they cannot be
-/// denied — but they are reported with their hash when they appear or
-/// change, so a silent exemption is impossible.
+/// a watched path. A new one is refused outside a trusted-installer window
+/// since external audit EBPF-015 (the directory is NOCREATE); an existing
+/// one stays writable in place, legitimate configuration — so overlays
+/// are reported with their hash when they appear or change, and a silent
+/// exemption is impossible.
 pub const CONFIG_DIR: &str = "/etc/northnarrow";
 
 /// A check that runs this much later than scheduled means the agent did not

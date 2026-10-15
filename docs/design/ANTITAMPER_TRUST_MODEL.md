@@ -410,10 +410,74 @@ map lookup; only a match pays for `deny_if_protected`.
 The public half is published by the agent at `agent.sig.pub` (0444,
 write-denied); `nn-admin audit verify` reads it, and never mints a key. On a
 restart the previous instance's pinned hooks close the key to the new process
-until it registers; the loads after the attach read it.
+until it registers — since EBPF-015 it registers through the pinned map
+before it reads anything (below); if that fails, the loads after the attach
+read it.
 
 Not closed: root with the means to bypass the LSM altogether (a kernel
 module, the disk read from another OS). A key that never leaves a TPM or the
 kernel keyring, and chain heads anchored off-host, are the follow-up
 (at-authz-2).
 
+## EBPF-015 — no new entry in the agent's directories
+
+**Goal.** Only the agent's family, or a signed trusted-installer window,
+adds an entry to the directories the agent owns or changes an extended
+attribute of a protected inode — the same principals that may already
+remove or rename one.
+
+**What it closed.** The deny set refused unlink, rmdir, rename, setattr, the
+flag ioctls and write-opens, keyed by inode: root could still add a file, a
+link, a symlink, a device node or a directory to `/etc/northnarrow`, to the
+state directory's chain sub-directory, to the agent's drop-in directory or
+to the pin root (a decoy overlay, a second key file, a name planted where
+the agent would create one, a new drop-in, a pin), and set or remove
+extended attributes of any protected inode.
+
+### Mechanism
+
+- **Flag:** `FS_PROTECT_NOCREATE` (bit 3 of the `PROTECTED_INODES` value),
+  set by userland only on the agent's own directories:
+  `/etc/northnarrow`, `/var/lib/northnarrow` and `detections/`, the
+  Debian drop-in directory (`NOCREATE_UNIT_DIRS`), the pin root. Never on
+  a directory the agent shares with the host (`/usr/local/bin`,
+  `/etc/systemd/system`), where only its own files are registered.
+- **Hooks:** `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`
+  (parent directory, arg 0) and `inode_link` (arg 1) refuse a new entry in
+  a NOCREATE directory (`FS_OP_CREATE`, `MKDIR`, `MKNOD`, `SYMLINK`,
+  `LINK`); a bpffs pin is created through `inode_create`, and an
+  `O_TMPFILE` file gets its name through `inode_link`. `inode_setxattr` and
+  `inode_removexattr` (dentry, arg 1; name, arg 2, after the
+  `user_namespace` / `mnt_idmap` argument of 5.12+) refuse any attribute
+  but `security.selinux` on a MUTATE inode (`FS_OP_XATTR`); on 6.2+ a POSIX
+  ACL no longer passes `inode_setxattr`, so `inode_set_acl` /
+  `inode_remove_acl` are attached where the kernel's BTF has them and
+  skipped, not counted missing, where it has not.
+- **Exemptions:** the existing ones of `deny_if_protected` — the window
+  (`FS_GRANT`), then `PROTECTED_PIDS` — and nothing else. The source of a
+  hard link is not checked: the denies follow the inode to every name.
+- **Cost:** one program per hook, one map lookup like `inode_unlink`, no
+  loop (≈ 410 instructions each, ≈ 480 for the xattr ones, which read the
+  name once into a 24-byte stack buffer).
+
+### Boot order
+
+A restarted agent runs under its predecessor's pinned hooks until it
+registers. It used to create its missing files (key, `audit.log`,
+`agent_id`, a chain log) before registering, and the eBPF load pins any
+map whose pin is missing in the pin root: with NOCREATE these would be
+refused — a missing map pin would keep the agent from starting until a
+reboot. The agent now inserts itself into the pinned `PROTECTED_PIDS`
+first thing (`anti_tamper::preregister_self`: from its main thread, in its
+first minute, the successor right of EBPF-002), and the registration in
+`attach` stays the authoritative one.
+
+### Residual
+
+- A process already in the agent's family, or anything inside the window,
+  is not refused: the window is the install path.
+- Where the agent's drop-in directory does not exist, a drop-in made with
+  it lives in `/etc/systemd/system`, which cannot be NOCREATE; it is
+  reported by the integrity check (`unit_dropin`).
+- Kernel-internal attribute writes (IMA/EVM fix-ups through
+  `__vfs_setxattr_noperm`) do not reach the hook; they are the kernel's.

@@ -71,6 +71,20 @@ impl Rule for NnLAt001AntiTamperDenial {
                 "to read the agent's private signing key (inode {target_dev}:{target_ino}), which \
                  signs every evidence chain"
             ),
+            // External audit EBPF-015: the target of a new entry is the
+            // directory it was to be made in.
+            FsProtectOperation::Create
+            | FsProtectOperation::Link
+            | FsProtectOperation::Symlink
+            | FsProtectOperation::Mkdir
+            | FsProtectOperation::Mknod => format!(
+                "a new entry ({operation}) in the agent's protected directory (inode \
+                 {target_dev}:{target_ino}) outside a trusted-installer window"
+            ),
+            FsProtectOperation::Xattr => format!(
+                "to change an extended attribute or ACL of protected inode \
+                 {target_dev}:{target_ino}"
+            ),
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -128,6 +142,12 @@ mod tests {
             FsProtectOperation::BpfMap,
             FsProtectOperation::BpfLink,
             FsProtectOperation::Kexec,
+            FsProtectOperation::Create,
+            FsProtectOperation::Link,
+            FsProtectOperation::Symlink,
+            FsProtectOperation::Mkdir,
+            FsProtectOperation::Mknod,
+            FsProtectOperation::Xattr,
         ] {
             let v = NnLAt001AntiTamperDenial
                 .evaluate(&denial(op))
@@ -139,6 +159,29 @@ mod tests {
             .evaluate(&denial(FsProtectOperation::Signal))
             .unwrap();
         assert!(v.reasoning.contains("signal 9 to protected pid 709"));
+    }
+
+    /// External audit EBPF-015: a refused new entry names the directory as
+    /// where it was to be made, and the operation by its kernel name.
+    #[test]
+    fn a_refused_new_entry_names_the_directory() {
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::Mkdir))
+            .expect("verdict");
+        assert!(v.reasoning.contains("new entry (mkdir)"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("directory (inode 9:709)"),
+            "{}",
+            v.reasoning
+        );
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::Xattr))
+            .expect("verdict");
+        assert!(
+            v.reasoning.contains("extended attribute"),
+            "{}",
+            v.reasoning
+        );
     }
 
     /// External audit EBPF-001: a signal PID 1 relayed names the request,

@@ -1842,3 +1842,27 @@ fn two_signals_in_one_container_corroborate() {
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert!(!m.is_combat_locked());
 }
+
+/// External audit EBPF-015: a refused new entry in the agent's directories
+/// or a refused extended-attribute change is a tamper the kernel stopped,
+/// decisive like a refused unlink: COMBAT on its own.
+#[test]
+fn a_refused_new_entry_or_xattr_change_reaches_combat() {
+    for op in [
+        common::FsProtectOperation::Create,
+        common::FsProtectOperation::Link,
+        common::FsProtectOperation::Symlink,
+        common::FsProtectOperation::Mkdir,
+        common::FsProtectOperation::Mknod,
+        common::FsProtectOperation::Xattr,
+    ] {
+        let m = PostureMachine::new();
+        let mut denial = super::triggers::testutil::fs_protect_denial(7, 1);
+        if let common::Event::FsProtectDenial { operation, .. } = &mut denial {
+            *operation = op;
+        }
+        let (state, firing) = m.observe(&denial, &[]).expect("posture transitioned");
+        assert_eq!(state.kind(), PostureKind::Combat, "{op}");
+        assert_eq!(firing, Some(TriggerType::AntiTamperDenial), "{op}");
+    }
+}

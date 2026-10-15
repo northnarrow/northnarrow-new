@@ -150,7 +150,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-104 | EBPF-011 | eBPF kernel | M | fixed (lab PR 137) |
 | NN-AUD-105 | EBPF-013 | eBPF kernel | M | fixed (lab PR 129) |
 | NN-AUD-106 | EBPF-014 | eBPF kernel | S | fixed (lab PR 147) |
-| NN-AUD-107 | EBPF-015 | eBPF kernel | M | open |
+| NN-AUD-107 | EBPF-015 | eBPF kernel | M | fixed (lab PR 152) |
 | NN-AUD-108 | EVD-002 | Evidence logs | L | open |
 | NN-AUD-109 | EVD-003 | Evidence logs | M | open |
 | NN-AUD-110 | EVD-004 | Evidence logs | M | fixed (lab PR 131) |
@@ -4569,3 +4569,63 @@ the audit did not report, noted with the fix that takes them.
     systemd); without the conmon mapping the second fails; main's cgroup
     read (unified, else `name=systemd`) fails the v1 test.
   - Lab: Ubuntu 24.04 with Podman 4.9 (an image imported from a local tar, no registry pull), poswl161-probe.sh on main and on this build. rootless: two containers of user nn (loginuid 1000) — one runs `nc` (ExploitAttempt), the other an exfiltration burst to 100.64.0.10–33:443 — main: both in `scope=login uid 1000`, the burst corroborated across containers → COMBAT and NEUTRALIZE; here each in its own `scope=workload …/user@1000.service/user.slice/libpod-<id>.scope`, the burst ENGAGED only (a later second signal inside the same container corroborates, as the control case shows: COMBAT on both builds). shell: nn's shell `nc` then a container's burst — main COMBAT in the login scope; here ENGAGED (shell `login uid 1000`, container its libpod scope). rootful (`sudo podman` from SSH keeps loginuid 1000): main placed the container in `login uid 1000`; here `/machine.slice/libpod-<id>.scope`. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.
+- **NN-AUD-107 (EBPF-015), lab PR 152.** No new entry in the agent's
+  directories and no extended attribute changed on a protected inode.
+  - EBPF-015: the deny set refused unlink, rmdir, rename, setattr, the
+    flag ioctls and write-opens, keyed by inode, so taking an entry out of
+    `/etc/northnarrow` was refused and adding one was not — a decoy
+    overlay, a second key file, a name planted where the agent would
+    create one, a pin in the pin root, a drop-in in the agent's Debian
+    drop-in directory (DEP-002's residual) — and `setfattr` / `setcap` on
+    the agent's files went through. A flag `FS_PROTECT_NOCREATE` (bit 3)
+    is set only on the agent's own directories (`/etc/northnarrow`,
+    `/var/lib/northnarrow` and `detections/`, the drop-in directory, the
+    pin root; never on `/usr/local/bin` or `/etc/systemd/system`). Five
+    programs keyed on the parent directory — `inode_create`,
+    `inode_mkdir`, `inode_mknod`, `inode_symlink` (arg 0), `inode_link`
+    (arg 1) — refuse a new entry there; `inode_setxattr` /
+    `inode_removexattr` (dentry arg 1, name arg 2 after the
+    `user_namespace` / `mnt_idmap` of 5.12+) refuse any attribute but
+    `security.selinux` (restorecon) on a protected inode, and on 6.2+,
+    where `setfacl` no longer passes them, `inode_set_acl` /
+    `inode_remove_acl` are attached when the kernel's BTF has them —
+    skipped, not counted missing, when it has not. All go through
+    `deny_if_protected` (window, then `PROTECTED_PIDS`); the required flag
+    per operation is `common::wire::fs_protect_required`, and the
+    existing six programs are byte-identical. New codes `FS_OP_CREATE`
+    (13) to `FS_OP_XATTR` (18), decoded to their own operation; each
+    refusal is an NN-L-AT-001 detection and a decisive tamper trigger.
+    The source of a hard link is not checked (the audit's verify note:
+    the denies follow the inode). The deny hooks expected are 16 (18 with
+    the ACL hooks); `release-check.sh` no longer hard-codes 9. Each new
+    program: about 410 BPF instructions (480 for the xattr ones), no
+    loop, one map lookup; the verified count is measured in the lab.
+  - Boot order: a restarted agent created a missing key, `audit.log`,
+    `agent_id` or chain log, and the eBPF load a missing map pin, before
+    it registered — under its predecessor's pinned hooks, which would now
+    refuse them (a missing map pin kept the agent from starting until a
+    reboot). It registers itself in the pinned `PROTECTED_PIDS` first
+    (`preregister_self`, the successor right of EBPF-002).
+  - Regression: an overlay dropped in by hand, `systemctl edit` on a
+    Debian host, `nn-admin config overlay sign` writing into
+    `/etc/northnarrow` and `nn-admin init` creating a missing `admin.pub`
+    need a window; install.sh, the packages and uninstall.sh write with
+    the pins purged and are unchanged. Tamper-check: C19 is now refused
+    (`op=create`), C23 writes its unsigned overlay inside a window, C11
+    expects a refusal where the agent registered its drop-in directory;
+    C47-C53 new (mkdir, symlink, hard link, FIFO, the chain directory, the
+    pin root, an xattr on `admin.pub`), C54 the same allowed inside a
+    window.
+  - Tests: `fs_protect_required_matches_each_op_to_its_bit`,
+    `fs_op_codes_are_distinct`, `fs_protect_new_entry_and_xattr_ops_decode`,
+    `deny_set_covers_new_entries_and_xattrs`,
+    `lsm_hook_absent_only_for_that_hook_missing_from_btf`,
+    `only_the_agents_own_directories_refuse_new_entries`,
+    `deny_hooks_expected_include_the_new_entry_and_xattr_denies`,
+    `a_refused_new_entry_names_the_directory`,
+    `a_refused_new_entry_or_xattr_change_reaches_combat`; each fails on
+    main (none of the names it checks exists there). Privileged, ignored:
+    `fs_deny_privileged_e2e` — every new entry and both xattr operations
+    refused with `EPERM` and reported outside a window, allowed inside
+    one.
+  - Lab: Ubuntu 24.04 (6.8), fsdeny152-probe.sh on main and on this build, as root outside a trusted-installer window: a new file, a directory, a symlink, a hard link and a FIFO in `/etc/northnarrow`, a new file in the state chain directory, a directory among the bpffs pins, `user.*` setxattr/removexattr on admin.pub — main: all nine allowed, no denial; here all nine refused with EPERM and an ANTI-TAMPER DENIAL each (`op=create×2 link mkdir×2 mknod symlink xattr×2`, 9 NN-L-AT-001 records), the agent logging `deny_attached=18 deny_expected=18` (the ACL hooks present on 6.8); inside a window all nine allowed with no denial and nothing left behind. Ubuntu 22.04 (5.15): every new program loaded (`deny_attached=16`), `tamper-check` C47–C54 as expected (denied outside the window, allowed inside). Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.

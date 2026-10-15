@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{
     DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_PTRACE, FS_OP_READ,
-    FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_UNLINK, FS_OP_WRITE,
+    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK,
+    FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
+    FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -474,8 +475,6 @@ pub enum FsProtectOperation {
     /// the `file_open` deny that closes the `tee -a admin.pub` /
     /// in-place-`pwrite` gap.
     Write,
-    /// Wire byte the agent does not recognise (forward-compatible
-    /// safety net).
     /// Write handle on one of the agent's own BPF maps (BPF self-defence).
     BpfMap,
     /// A handle to one of the agent's own BPF links (by id or by pin)
@@ -490,6 +489,24 @@ pub enum FsProtectOperation {
     /// External audit EVD-001: an open of the agent's private signing key
     /// by a process outside its family, a read included.
     Read,
+    /// External audit EBPF-015: a new entry in one of the agent's
+    /// directories (`open(O_CREAT)`, `creat`, a bpffs pin); the target is
+    /// the directory.
+    Create,
+    /// A hard link made in one of the agent's directories.
+    Link,
+    /// A symlink made in one of the agent's directories.
+    Symlink,
+    /// A subdirectory made in one of the agent's directories.
+    Mkdir,
+    /// A device node, FIFO or socket made in one of the agent's
+    /// directories.
+    Mknod,
+    /// An extended attribute (or, on 6.2+, a POSIX ACL) set or removed on
+    /// a protected inode; `security.selinux` is not refused.
+    Xattr,
+    /// Wire byte the agent does not recognise (forward-compatible
+    /// safety net).
     Unknown(u8),
 }
 
@@ -508,6 +525,12 @@ impl FsProtectOperation {
             FS_OP_PTRACE => Self::Ptrace,
             FS_OP_KEXEC => Self::Kexec,
             FS_OP_READ => Self::Read,
+            FS_OP_CREATE => Self::Create,
+            FS_OP_LINK => Self::Link,
+            FS_OP_SYMLINK => Self::Symlink,
+            FS_OP_MKDIR => Self::Mkdir,
+            FS_OP_MKNOD => Self::Mknod,
+            FS_OP_XATTR => Self::Xattr,
             other => Self::Unknown(other),
         }
     }
@@ -526,6 +549,12 @@ impl FsProtectOperation {
             Self::Kexec => "kexec",
             Self::Write => "write",
             Self::Read => "read",
+            Self::Create => "create",
+            Self::Link => "link",
+            Self::Symlink => "symlink",
+            Self::Mkdir => "mkdir",
+            Self::Mknod => "mknod",
+            Self::Xattr => "xattr",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -1045,6 +1074,44 @@ pub struct Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit EBPF-015: the six denial codes of the new-entry and
+    /// extended-attribute hooks decode to their own operation (not
+    /// `Unknown`), with the names the journal line and the tamper check
+    /// print.
+    #[test]
+    fn fs_protect_new_entry_and_xattr_ops_decode() {
+        use crate::wire::{
+            FS_OP_CREATE, FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_SYMLINK, FS_OP_XATTR,
+        };
+        let cases = [
+            (FS_OP_CREATE, FsProtectOperation::Create, "create"),
+            (FS_OP_LINK, FsProtectOperation::Link, "link"),
+            (FS_OP_SYMLINK, FsProtectOperation::Symlink, "symlink"),
+            (FS_OP_MKDIR, FsProtectOperation::Mkdir, "mkdir"),
+            (FS_OP_MKNOD, FsProtectOperation::Mknod, "mknod"),
+            (FS_OP_XATTR, FsProtectOperation::Xattr, "xattr"),
+        ];
+        for (byte, op, name) in cases {
+            assert_eq!(FsProtectOperation::from_wire(byte), op);
+            assert_eq!(op.as_str(), name);
+            assert_eq!(op.to_string(), name);
+        }
+        let mut raw = FsProtectDenialRaw::zeroed();
+        raw.operation = FS_OP_MKDIR;
+        raw.target_ino = 42;
+        match Event::from(&raw) {
+            Event::FsProtectDenial {
+                operation,
+                target_ino,
+                ..
+            } => {
+                assert_eq!(operation, FsProtectOperation::Mkdir);
+                assert_eq!(target_ino, 42);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, QNAME_LEN, TASK_COMM_LEN};
 
     #[test]
