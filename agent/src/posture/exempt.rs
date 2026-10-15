@@ -29,10 +29,18 @@
 //! verified PID is held in an [`AtomicU32`] and refreshed on a timer
 //! by `main.rs`; this struct is the cheap, `Clone`-able shared handle
 //! both the timer and the [`super::PostureMachine`] hold.
+//!
+//! External audit POS-009: the exe check runs only at that refresh, every
+//! 30 s, while the exemption was a bare PID compare: a process given the
+//! watchdog's PID in between raised no posture trigger at all, the
+//! decisive `AntiTamperDenial` included. The refresh now records the
+//! watchdog's start time with its PID, and [`ExemptPids::is_exempt`]
+//! re-reads it for the watchdog's PID (one `/proc/<pid>/stat` read per
+//! event that PID owns): a recycled PID starts later and is not exempt.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Fallback install path of the watchdog binary, used to verify a
@@ -76,15 +84,31 @@ struct ExemptInner {
     /// The verified watchdog PID, or 0 when no watchdog is currently
     /// verified (not started, stopped, or failed verification).
     watchdog_pid: AtomicU32,
+    /// External audit POS-009: the verified watchdog's start time (field
+    /// 22 of `/proc/<pid>/stat`, clock ticks since boot). Stored before
+    /// the PID (Release on the PID, Acquire on its load), so a reader that
+    /// sees a PID sees its start or a later one — a torn pair fails toward
+    /// not exempt.
+    watchdog_start: AtomicU64,
+    /// `/proc` (a fixture tree in tests).
+    proc_root: PathBuf,
 }
 
 impl ExemptPids {
     /// Exempt the agent's own PID. The watchdog slot starts empty.
     pub fn with_agent(agent_pid: u32) -> Self {
+        Self::with_agent_on(agent_pid, Path::new("/proc"))
+    }
+
+    /// [`Self::with_agent`], reading the watchdog's start from
+    /// `proc_root` (tests).
+    pub(crate) fn with_agent_on(agent_pid: u32, proc_root: &Path) -> Self {
         Self {
             inner: Some(Arc::new(ExemptInner {
                 agent_pid,
                 watchdog_pid: AtomicU32::new(0),
+                watchdog_start: AtomicU64::new(0),
+                proc_root: proc_root.to_path_buf(),
             })),
         }
     }
@@ -92,28 +116,56 @@ impl ExemptPids {
     /// Is `pid` part of the NorthNarrow stack (agent or verified
     /// watchdog)? PID 0 is never exempt (it is the "no watchdog"
     /// sentinel, and never a real event owner).
+    ///
+    /// External audit POS-009: the watchdog's PID only while the process
+    /// it names has the start time recorded when it was verified — a PID
+    /// recycled between two refreshes is not exempt. A start that cannot
+    /// be read (the process is gone) is not exempt either.
     pub fn is_exempt(&self, pid: u32) -> bool {
         if pid == 0 {
             return false;
         }
-        match &self.inner {
-            None => false,
-            Some(i) => pid == i.agent_pid || i.watchdog_pid.load(Ordering::Relaxed) == pid,
+        let Some(i) = &self.inner else {
+            return false;
+        };
+        if pid == i.agent_pid {
+            return true;
+        }
+        if i.watchdog_pid.load(Ordering::Acquire) != pid {
+            return false;
+        }
+        let start = i.watchdog_start.load(Ordering::Relaxed);
+        proc_start_ticks(&i.proc_root, pid) == Some(start)
+    }
+
+    /// External audit POS-009: `pid` is the agent's own — exempt from
+    /// every trigger, a kernel denial included (a COMBAT against itself
+    /// would be worse than the signal is worth).
+    pub fn is_agent(&self, pid: u32) -> bool {
+        pid != 0 && self.inner.as_ref().is_some_and(|i| i.agent_pid == pid)
+    }
+
+    /// Store the verified watchdog: its PID and the start time it was
+    /// verified with ([`WatchdogResolution::Verified`]). No-op on a
+    /// default (`with_agent` was never called) handle.
+    pub fn set_watchdog(&self, pid: u32, start_ticks: u64) {
+        if let Some(i) = &self.inner {
+            i.watchdog_start.store(start_ticks, Ordering::Relaxed);
+            i.watchdog_pid.store(pid, Ordering::Release);
         }
     }
 
-    /// Store (or clear, with 0) the verified watchdog PID. No-op on a
-    /// default (`with_agent` was never called) handle.
-    pub fn set_watchdog_pid(&self, pid: u32) {
+    /// Clear the watchdog slot: no watchdog is verified.
+    pub fn clear_watchdog(&self) {
         if let Some(i) = &self.inner {
-            i.watchdog_pid.store(pid, Ordering::Relaxed);
+            i.watchdog_pid.store(0, Ordering::Release);
         }
     }
 
     /// Current verified watchdog PID, or `None` when unset.
     pub fn watchdog_pid(&self) -> Option<u32> {
         match &self.inner {
-            Some(i) => match i.watchdog_pid.load(Ordering::Relaxed) {
+            Some(i) => match i.watchdog_pid.load(Ordering::Acquire) {
                 0 => None,
                 p => Some(p),
             },
@@ -122,12 +174,25 @@ impl ExemptPids {
     }
 }
 
+/// `starttime`, field 22 of `<proc_root>/<pid>/stat`, counted after the
+/// `(comm)` field, which may itself hold spaces or parentheses.
+fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 /// Outcome of resolving the watchdog PID from its pidfile + exe check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchdogResolution {
     /// Pidfile present, PID live, and `/proc/<pid>/exe` matched the
-    /// expected binary. Safe to exempt.
-    Verified(u32),
+    /// expected binary. Safe to exempt — that process, the one started at
+    /// `start_ticks` (external audit POS-009).
+    Verified { pid: u32, start_ticks: u64 },
     /// Pidfile absent — watchdog not started or operator-stopped. Not
     /// an error; just nothing to exempt.
     NotPresent,
@@ -182,10 +247,19 @@ pub(crate) fn resolve_with_proc_root(
     // `/proc/<pid>/exe` carries a " (deleted)" suffix if the binary was
     // replaced on disk while running; treat that as a mismatch — a
     // deleted/swapped watchdog binary is exactly what we must not trust.
-    if resolved == expected_exe {
-        WatchdogResolution::Verified(pid)
-    } else {
-        WatchdogResolution::ExeMismatch { pid, resolved }
+    if resolved != expected_exe {
+        return WatchdogResolution::ExeMismatch { pid, resolved };
+    }
+    // External audit POS-009: the start of the process just verified. Read
+    // after the exe: a PID recycled in between starts later, and the
+    // exemption then names a start no process has (fails toward not
+    // exempt) until the next refresh.
+    match proc_start_ticks(proc_root, pid) {
+        Some(start_ticks) => WatchdogResolution::Verified { pid, start_ticks },
+        None => WatchdogResolution::Unverifiable {
+            pid,
+            reason: format!("no start time in {}/{pid}/stat", proc_root.display()),
+        },
     }
 }
 
@@ -194,25 +268,41 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// `<proc_root>/<pid>/stat` with `starttime` (field 22) at `ticks`.
+    fn write_started(proc_root: &Path, pid: u32, ticks: u64) {
+        let dir = proc_root.join(pid.to_string());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("stat"),
+            format!("{pid} (northnarrow-wa) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn default_handle_exempts_nothing() {
         let e = ExemptPids::default();
         assert!(!e.is_exempt(1));
         assert!(!e.is_exempt(4242));
-        e.set_watchdog_pid(99); // no-op on default handle
+        e.set_watchdog(99, 1); // no-op on default handle
         assert_eq!(e.watchdog_pid(), None);
+        assert!(!e.is_agent(4242));
     }
 
     #[test]
     fn agent_pid_always_exempt_watchdog_when_set() {
-        let e = ExemptPids::with_agent(1000);
+        let tmp = tempfile::tempdir().unwrap();
+        write_started(tmp.path(), 2000, 5_000);
+        let e = ExemptPids::with_agent_on(1000, tmp.path());
         assert!(e.is_exempt(1000));
+        assert!(e.is_agent(1000));
         assert!(!e.is_exempt(2000));
-        e.set_watchdog_pid(2000);
+        e.set_watchdog(2000, 5_000);
         assert!(e.is_exempt(2000));
+        assert!(!e.is_agent(2000));
         assert_eq!(e.watchdog_pid(), Some(2000));
         // Clearing the watchdog PID drops the exemption.
-        e.set_watchdog_pid(0);
+        e.clear_watchdog();
         assert!(!e.is_exempt(2000));
         assert!(e.is_exempt(1000));
     }
@@ -221,15 +311,58 @@ mod tests {
     fn pid_zero_never_exempt() {
         let e = ExemptPids::with_agent(1000);
         assert!(!e.is_exempt(0));
+        assert!(!e.is_agent(0));
     }
 
     #[test]
     fn clone_shares_watchdog_slot() {
-        let a = ExemptPids::with_agent(1000);
+        let tmp = tempfile::tempdir().unwrap();
+        write_started(tmp.path(), 3333, 77);
+        let a = ExemptPids::with_agent_on(1000, tmp.path());
         let b = a.clone();
-        a.set_watchdog_pid(3333);
+        a.set_watchdog(3333, 77);
         // The clone sees the update — same Arc-backed atomic.
         assert!(b.is_exempt(3333));
+    }
+
+    /// External audit POS-009: between two 30-s refreshes the slot still
+    /// names the watchdog's PID; a process given that PID since starts
+    /// later and is not exempt, nor is a PID whose process is gone.
+    #[test]
+    fn a_recycled_watchdog_pid_is_not_exempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_started(tmp.path(), 2000, 5_000);
+        let e = ExemptPids::with_agent_on(1000, tmp.path());
+        e.set_watchdog(2000, 5_000);
+        assert!(e.is_exempt(2000), "the verified watchdog");
+        write_started(tmp.path(), 2000, 9_000);
+        assert!(!e.is_exempt(2000), "the same PID, a later process");
+        fs::remove_dir_all(tmp.path().join("2000")).unwrap();
+        assert!(!e.is_exempt(2000), "nothing at that PID");
+        assert!(e.is_exempt(1000), "the agent stays exempt");
+    }
+
+    /// External audit POS-009: the refresh records the start of the
+    /// process whose exe it verified.
+    #[test]
+    fn a_verified_watchdog_carries_its_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        write_started(&proc_root, 2000, 5_000);
+        std::os::unix::fs::symlink(DEFAULT_WATCHDOG_EXE, proc_root.join("2000/exe")).unwrap();
+        let pf = write_pidfile(tmp.path(), "2000");
+        assert_eq!(
+            resolve_with_proc_root(&pf, Path::new(DEFAULT_WATCHDOG_EXE), &proc_root),
+            WatchdogResolution::Verified {
+                pid: 2000,
+                start_ticks: 5_000
+            }
+        );
+        fs::remove_file(proc_root.join("2000/stat")).unwrap();
+        assert!(matches!(
+            resolve_with_proc_root(&pf, Path::new(DEFAULT_WATCHDOG_EXE), &proc_root),
+            WatchdogResolution::Unverifiable { pid: 2000, .. }
+        ));
     }
 
     fn write_pidfile(dir: &Path, pid: &str) -> PathBuf {
@@ -273,7 +406,13 @@ mod tests {
         let pf = write_pidfile(&tmp, &my_pid.to_string());
         let my_exe = fs::read_link("/proc/self/exe").expect("read /proc/self/exe");
         match resolve_verified_watchdog_pid(&pf, &my_exe) {
-            WatchdogResolution::Verified(p) => assert_eq!(p, my_pid),
+            WatchdogResolution::Verified { pid, start_ticks } => {
+                assert_eq!(pid, my_pid);
+                assert_eq!(
+                    Some(start_ticks),
+                    proc_start_ticks(Path::new("/proc"), my_pid)
+                );
+            }
             other => panic!("expected Verified, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&tmp);

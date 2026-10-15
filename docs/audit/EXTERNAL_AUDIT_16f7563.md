@@ -19,8 +19,8 @@ code it cites has changed since. A fix follows the plan's rule: a failing
 regression test first, then the fix, then the privileged suites on at
 least two supported kernels (6.8 and 5.14/5.15).
 
-Status: `open`, `fixed (lab PR N)`, `already fixed (PR)`, or
-`declined (reason)`.
+Status: `open`, `fixed (lab PR N)`, `partial (lab PR N; what remains)`,
+`already fixed (PR)`, or `declined (reason)`.
 
 ## Wave 0
 
@@ -178,9 +178,9 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-132 | PROC-008 | Process rules | S | fixed (lab PR 140) |
 | NN-AUD-133 | PROC-009 | Process rules | S | fixed (lab PR 140) |
 | NN-AUD-134 | PROC-010 | Process rules | S | fixed (lab PR 140) |
-| NN-AUD-135 | POS-005 | Posture | M | open |
-| NN-AUD-136 | POS-009 | Posture | M | open |
-| NN-AUD-137 | POS-015 | Posture | M | open |
+| NN-AUD-135 | POS-005 | Posture | M | partial (lab PR 141; interim scope, the workload-context steps 1–2 remain) |
+| NN-AUD-136 | POS-009 | Posture | M | fixed (lab PR 141) |
+| NN-AUD-137 | POS-015 | Posture | M | fixed (lab PR 141) |
 | NN-AUD-138 | CMB-004 | Combat response | L | fixed (lab PR 120) |
 | NN-AUD-139 | CMB-007 | Combat response | M | fixed (lab PR 119) |
 | NN-AUD-140 | CMB-008 | Combat response | M | already fixed (lab PR 77; lab PR 100, with NN-AUD-046) |
@@ -3259,3 +3259,81 @@ the audit did not report, noted with the fix that takes them.
     before removals, no cgroup share, no class fallback) ten of the new
     tests and the updated one fail.
   - Lab: Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), opensens137 probes on main and on this build. `fork10` (ten processes, four overwrites each): no crossing on main → one cgroup crossing (40, `cgroup_window=true`, ConfirmedIntrusion, ENGAGED); `single`: one per-process crossing on both, no cgroup event; `depth`: a file nine levels below `~/.password-store` seen only to depth 8 on main → `…/h/i/secret.gpg` visible and one depth-cap log line; `make -j` rebuild (300 objects, 4.6 KiB `.d` files rewritten): one per-process crossing on both, no cgroup crossing. Gate: Ubuntu 24.04, Debian 12 and Ubuntu 22.04, 29 suites, 80 passed, 0 failed each (the first 22.04 run stalled: the recreated guest lacked `linux-tools-$(uname -r)`, so the canary e2e could not unprotect its agent — lab tooling, fixed in lab PR 153); anti-tamper suite OK; host 1879 passed, 0 failed.
+- **NN-AUD-135 (POS-005), NN-AUD-137 (POS-015), NN-AUD-136 (POS-009), lab
+  PR 141.** Posture scope and exemptions (batch B6). No kernel or wire
+  change; `TriggerType` gains a variant, appended last.
+  - POS-005 (partial — the triage's interim scope): `Scope` was
+    `Option<u32>`, and every process without a login uid (services,
+    containers, a pid gone with no running ancestor) shared `None`, and
+    with it the POS-001 lock (`has_privileged(None)`). Now
+    `Scope::{Login(uid), Workload(path), Unattributed}`. Without a login
+    uid, `AuthSessionTracker::session_workload` reads `/proc/<pid>/cgroup`
+    (the unified line, else `name=systemd`) of the owner or of its nearest
+    running ancestor, only for an event that raised a trigger. The
+    workload is the path up to its deepest `.service`/`.scope` component
+    (a service with its delegated sub-cgroups, a container's scope), else
+    the whole path. A process in the agent's `/northnarrow.slice`
+    (blocked, throttled, NEUTRALIZE cgroups, which mix workloads) is
+    placed by its nearest running ancestor outside it. Nothing readable:
+    `Unattributed` — recorded (it still holds off the decay of an unlocked
+    COMBAT) but never corroborating, corroborated or privileged. The lock:
+    root's change, this round's or on record, locks COMBAT only when this
+    round's signal is corroborated in its own scope (`corroborated_here`);
+    before, puppet rewriting a unit locked a COMBAT another actor's pair
+    had reached. Pending writers (review 52) are placed with the same
+    scope. A transition logs the scope at INFO (`posture signal scope`).
+    Why `partial`: a login session is not split by workload (two Podman
+    containers one user started share its login uid); the cgroup is read
+    after the event, so a writer whose known ancestors are all gone is
+    `Unattributed` (lost corroboration, never pooling); cgroup v1 is read
+    through `name=systemd` only. Steps 1–2 of
+    `TAPPA10_9_WORKLOAD_CONTEXT_DESIGN.md` (the cgroup id in every record,
+    the ledger scoped by workload) close them.
+  - POS-015: the exec arm of `confirmed_intrusion` fired on the image's
+    directory alone. New `TriggerType::StagingExec`: execution class,
+    ENGAGED, and `is_corroboration()` false, so `observe` never records it
+    (the ledger filter now reads `is_corroboration`). `staging_exec`
+    raises ConfirmedIntrusion instead only with a second factor: exe flags
+    `DELETED` or `MEMFD` (LSM mode), or the mass-write arm fired for the
+    same pid within `MASS_WRITE_WINDOW_NS` of the exec, either side
+    (`MassWriters`, both modes, the arm's lineage gates applied); never
+    under `is_system_daemon_mediated`; not gated by auth lineage. Not
+    done: a mass write read after the exec does not promote it
+    retroactively — it raises its own ConfirmedIntrusion (file system),
+    and R001..R003 kill the exec in the first place. Posture tests that
+    used a `/tmp` exec as the execution half now use `nc` (ExploitAttempt)
+    or an unlinked staged exe.
+  - POS-009: `WatchdogResolution::Verified { pid, start_ticks }` (field 22
+    of `/proc/<pid>/stat`, read after the exe check; unreadable:
+    `Unverifiable`). `ExemptPids::set_watchdog(pid, start)` stores the
+    start before the PID (Release/Acquire), `clear_watchdog` replaces
+    `set_watchdog_pid(0)`, and `is_exempt` re-reads the start for the
+    watchdog's PID only. The refresh stores the start even when the PID
+    is unchanged. `detect` no longer exempts an `FsProtectDenial` from the
+    watchdog's PID (the kernel refuses the registered watchdog nothing);
+    the agent's own PID stays exempt from everything (`is_agent`).
+  - Tests: `two_daemons_do_not_corroborate`,
+    `a_privileged_signal_locks_only_its_own_unit`,
+    `an_unattributed_signal_corroborates_nothing` (ledger);
+    `two_daemons_do_not_corroborate_into_combat`,
+    `a_root_change_locks_only_its_own_units_combat`,
+    `an_unplaced_root_change_corroborates_nothing` (machine);
+    `a_cgroup_path_names_its_deepest_unit`,
+    `the_workload_is_read_from_the_nearest_running_process`,
+    `a_contained_process_is_placed_by_its_parent`;
+    `a_staging_exec_raises_engaged_and_is_not_recorded`,
+    `an_admin_sessions_build_and_upload_stay_engaged`,
+    `a_package_managers_staged_helper_stays_engaged`,
+    `a_deleted_staged_exe_is_confirmed_intrusion`,
+    `a_mass_writer_running_a_staged_exe_is_confirmed_intrusion`,
+    `a_package_managers_staged_helper_is_never_promoted`,
+    `staging_exec_engages_and_is_not_corroboration`;
+    `a_recycled_watchdog_pid_is_not_exempt`,
+    `a_verified_watchdog_carries_its_start`,
+    `a_denial_from_the_watchdog_pid_is_decisive`. Checked by inverting
+    each fix: pooling every process without a login uid in one scope fails
+    the three machine POS-005 tests; the old lock rule fails
+    `a_root_change_locks_only_its_own_units_combat`; the old exec arm
+    fails ten tests, and dropping the second factor five; the bare PID
+    compare with a total exemption fails both POS-009 tests.
+  - Lab: Ubuntu 24.04, posture141-probe.sh on main and on this build, each case on a restarted agent. staging (SSH session): `/tmp/nnx141-conftest` then a three-target SSH fan-out — main ENGAGED (ConfirmedIntrusion), then COMBAT (LateralMovement) and NEUTRALIZE of the fan-out; here ENGAGED (StagingExec, `scope=login uid 1000`), no COMBAT. masswrite: both ENGAGED then COMBAT; here also "staging exec with a second factor … mass_wrote=true". deleted: here "… unlinked=true" (R004 kills the exec on both). scope: a root unit writing a systemd unit, then another unit's fan-out — main COMBAT `locked=true` (unit b locked by unit a); here ENGAGED only, `scope=workload /system.slice/nn141-a.service`. control (one unit, `nc` then the fan-out): COMBAT and NEUTRALIZE on both, the scope line names `/system.slice/nn141-c.service`. watchdog: "watchdog PID verified" now carries `start_ticks=7057672`, equal to field 22 of `/proc/<pid>/stat`. Gate: Ubuntu 24.04 and Debian 12, 29 suites, 80 passed, 0 failed each; anti-tamper OK; host 1911 passed, 0 failed.

@@ -15,6 +15,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, posture scope and exemptions (Medium POS-005,
+  POS-015, POS-009): every process without a login uid — each service,
+  each container, a process already gone — shared one corroboration
+  scope, and with it the lock: puppet or salt rewriting a unit file locked
+  a COMBAT that any other service or container then corroborated. Such a
+  process is now scoped by the systemd unit or container its cgroup names
+  (read, for an event that raised a trigger, from the process or its
+  nearest running ancestor); a signal that cannot be placed is recorded
+  but corroborates nothing and locks nothing, and root's change locks
+  COMBAT only when its own actor's evidence pairs with it. One exec from
+  `/tmp`, `/var/tmp` or `/dev/shm` was a COMBAT-tier signal: a build's
+  `conftest`, then an upload from the same session, reached COMBAT. It now
+  raises `StagingExec` (ENGAGED, never corroboration), and
+  `ConfirmedIntrusion` only when the file was unlinked or a memfd as it
+  ran, or the same process crossed the mass-write threshold within a
+  minute — never under a package manager. The watchdog's exemption from
+  posture triggers was a PID compare refreshed every 30 s: it now ends
+  with the process verified (its start time), and a kernel denial from the
+  watchdog's PID is raised; the agent's own PID stays exempt.
+  **Detection change:** a plain staged binary followed by another signal
+  from the same session stays at ENGAGED (R001..R003 still kill the
+  exec). Scoping login sessions by workload too waits for the
+  workload-context design (steps 1–2).
 - External audit, Wave 2, open-sensor path and classification fidelity
   (Medium SNS-005, SNS-006, SNS-007, EBPF-011): a writer that forked a
   fresh worker every few files never reached the mass-write threshold,

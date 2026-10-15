@@ -97,6 +97,15 @@ pub enum TriggerType {
     // recorded in the corroboration ledger). Appended last to keep variant
     // ordering stable.
     TelemetryLoss,
+
+    // External audit POS-015: a binary run from a staging directory
+    // (`/tmp`, `/var/tmp`, `/dev/shm`) with no second factor — a build's
+    // `conftest`, a self-extracting installer, as well as a dropper. It
+    // raises ENGAGED and is never recorded in the corroboration ledger
+    // ([`TriggerType::is_corroboration`]); with a second factor the agent
+    // observes, the exec raises `ConfirmedIntrusion` instead. Appended last
+    // to keep variant ordering stable.
+    StagingExec,
 }
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
@@ -140,9 +149,10 @@ impl TriggerType {
             | TriggerType::AdjacentCompromise
             | TriggerType::LateralMovement
             | TriggerType::ExfiltrationPattern => EvidenceClass::Network,
-            TriggerType::Lolbas | TriggerType::ExploitAttempt | TriggerType::ConfirmedIntrusion => {
-                EvidenceClass::Execution
-            }
+            TriggerType::Lolbas
+            | TriggerType::ExploitAttempt
+            | TriggerType::ConfirmedIntrusion
+            | TriggerType::StagingExec => EvidenceClass::Execution,
             TriggerType::SensitiveFileAccess
             | TriggerType::CriticalFileModification
             | TriggerType::PersistenceMechanism => EvidenceClass::FileSystem,
@@ -166,7 +176,8 @@ impl TriggerType {
             | TriggerType::AdjacentCompromise
             | TriggerType::HeavyReconnaissance
             | TriggerType::CriticalFileModification
-            | TriggerType::RelayedTamperAttempt => PostureKind::Engaged,
+            | TriggerType::RelayedTamperAttempt
+            | TriggerType::StagingExec => PostureKind::Engaged,
 
             TriggerType::ConfirmedIntrusion
             | TriggerType::PersistenceMechanism
@@ -174,6 +185,16 @@ impl TriggerType {
             | TriggerType::ExfiltrationPattern
             | TriggerType::AntiTamperDenial => PostureKind::Combat,
         }
+    }
+
+    /// Whether a signal of this trigger is recorded in the corroboration
+    /// ledger, where it can vouch for a later COMBAT-tier heuristic of
+    /// another class: ENGAGED tier and above (ALERTED-tier recon and DNS
+    /// are too noisy), except a staging-directory exec without a second
+    /// factor (external audit POS-015: any user, and any build, produces
+    /// one, and it was the cheapest half of a COMBAT pair).
+    pub fn is_corroboration(&self) -> bool {
+        self.target_level() >= PostureKind::Engaged && *self != TriggerType::StagingExec
     }
 
     /// Trust class for COMBAT-targeting triggers (BUG-032). Only
@@ -203,6 +224,7 @@ impl TriggerType {
             TriggerType::AntiTamperDenial => "AntiTamperDenial",
             TriggerType::RelayedTamperAttempt => "RelayedTamperAttempt",
             TriggerType::TelemetryLoss => "TelemetryLoss",
+            TriggerType::StagingExec => "StagingExec",
         }
     }
 }
@@ -265,6 +287,22 @@ mod tests {
         assert_eq!(t.confidence(), Confidence::NeedsCorroboration);
         assert_eq!(t.evidence_class(), EvidenceClass::Telemetry);
         assert_eq!(t.as_str(), "TelemetryLoss");
+    }
+
+    /// External audit POS-015: a staging-directory exec without a second
+    /// factor is execution evidence at ENGAGED tier that never enters the
+    /// ledger; the other ENGAGED-and-above triggers do.
+    #[test]
+    fn staging_exec_engages_and_is_not_corroboration() {
+        let t = TriggerType::StagingExec;
+        assert_eq!(t.target_level(), PostureKind::Engaged);
+        assert_eq!(t.evidence_class(), EvidenceClass::Execution);
+        assert_eq!(t.as_str(), "StagingExec");
+        assert!(!t.is_corroboration());
+        assert!(TriggerType::ConfirmedIntrusion.is_corroboration());
+        assert!(TriggerType::ExploitAttempt.is_corroboration());
+        assert!(!TriggerType::Reconnaissance.is_corroboration());
+        assert!(!TriggerType::TelemetryLoss.is_corroboration());
     }
 
     #[test]
