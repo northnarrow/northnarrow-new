@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, bounded correlation state (Medium NETR-004,
+  NETR-009, NETR-010): the chain rules' correlation store now holds a hard
+  cap of 4096 processes in O(1) per insert — before, every new process above
+  it cost a full scan under the engine's lock, so any user could stall the
+  rule engine with a loop of execs. Processes holding only a `sudo`/`su`
+  precursor are evicted first; losing a blocking chain's precursor is
+  counted and warned about. Precursors and lineage now follow the process
+  incarnation (its start time), so a process that inherits a recycled PID no
+  longer inherits the old holder's precursors or ancestors (a wrong
+  `KillProcessTree`). The ancestry tree keeps live processes under a flood
+  of short-lived ones (second-chance eviction against `/proc`, 65,536
+  edges), and counts and warns when it must drop a live one.
 - A TCP flow closed abortively (RST, `SO_LINGER` 0) was recorded with
   source port 0: the close probe read the port after the kernel had
   released it. It now falls back to the socket's `inet_sport` (a new

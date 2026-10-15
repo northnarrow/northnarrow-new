@@ -199,11 +199,9 @@ impl Rule for NnLChain001CredReadThenEgress {
                 store.record_for_pid(fe.modifier_pid, PrecursorKind::CredRead, fe.timestamp_ns);
                 // Review 70: the read happened before an egress of the same
                 // process that was processed first (another ring).
-                let egress = store.take_egress_after(
-                    ProcKey::unresolved(fe.modifier_pid),
-                    fe.timestamp_ns,
-                    CORRELATION_WINDOW_NS,
-                )?;
+                let key = store.current_key(fe.modifier_pid);
+                let egress =
+                    store.take_egress_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
                 Some(late_chain_verdict(
                     self,
                     &egress,
@@ -226,7 +224,8 @@ impl Rule for NnLChain001CredReadThenEgress {
                     return None;
                 }
                 // Review 70: completed in order; no late read may reuse it.
-                store.claim_egress(ProcKey::unresolved(nf.pid), nf.start_ns);
+                let key = store.current_key(nf.pid);
+                store.claim_egress(key, nf.start_ns);
                 Some(chain_verdict(
                     self,
                     nf,
@@ -285,26 +284,26 @@ impl Rule for NnLChain002TmpExecThenEgress {
             // hosts lineage observation for the whole store. A `/tmp`
             // image additionally records the TmpExec precursor (R001
             // shape). Always returns None (record-only).
+            // External audit NETR-009: keyed with the process's own start
+            // (POS-003), not `parent_start_ns` (the forking thread's).
             Event::ProcessSpawn {
                 pid,
                 ppid,
                 filename,
                 timestamp_ns,
-                parent_start_ns,
+                start_ns,
                 exe,
                 ..
             } => {
                 let mut store = self.buf.lock();
-                store.observe_spawn(
-                    *pid,
-                    crate::decision::correlation::ProcKey {
-                        pid: *ppid,
-                        start_ns: *parent_start_ns,
-                    },
-                );
+                store.observe_spawn(*pid, *ppid, *start_ns);
                 // Review 61: the file the kernel executed.
                 if exe.path_or(filename).starts_with("/tmp/") {
-                    store.record_for_pid(*pid, PrecursorKind::TmpExec, *timestamp_ns);
+                    let key = ProcKey {
+                        pid: *pid,
+                        start_ns: *start_ns,
+                    };
+                    store.record(key, PrecursorKind::TmpExec, *timestamp_ns);
                 }
                 None
             }
@@ -584,8 +583,8 @@ impl Rule for NnLChain007TmpCredExfilSequence {
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
             Event::NetFlow(nf) => {
-                let key = ProcKey::unresolved(nf.pid);
                 let mut store = self.buf.lock();
+                let key = store.current_key(nf.pid);
                 if !store.has_sequence(
                     key,
                     &[PrecursorKind::TmpExec, PrecursorKind::CredRead],
@@ -613,8 +612,8 @@ impl Rule for NnLChain007TmpCredExfilSequence {
             // External audit NETR-001: wide-coverage opens excluded, as in
             // CHAIN-001.
             Event::Fim(fe) if is_credential_store_access(fe) && !fe.wide_coverage => {
-                let key = ProcKey::unresolved(fe.modifier_pid);
                 let mut store = self.buf.lock();
+                let key = store.current_key(fe.modifier_pid);
                 if !store.has_recent(
                     key,
                     PrecursorKind::TmpExec,
@@ -695,11 +694,16 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
                 pid,
                 comm,
                 timestamp_ns,
+                start_ns,
                 ..
             } if PRIVESC_TOOLS.contains(&comm.as_str()) => {
+                let key = ProcKey {
+                    pid: *pid,
+                    start_ns: *start_ns,
+                };
                 self.buf
                     .lock()
-                    .record_for_pid(*pid, PrecursorKind::PrivEsc, *timestamp_ns);
+                    .record(key, PrecursorKind::PrivEsc, *timestamp_ns);
                 None
             }
             // Trigger: a descendant of the sudo/su process leaves the
@@ -1186,6 +1190,44 @@ mod tests {
         // DNS egress from the descendant is the carve-out.
         let dns = fire_ids(&rules, &flow(200, 53, 13 * SEC));
         assert!(!dns.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()));
+    }
+
+    /// A spawn carrying the process's own start (POS-003).
+    fn spawn_at(pid: u32, ppid: u32, filename: &str, start: u64) -> Event {
+        let mut e = proc_spawn(pid, ppid, "p", filename, start);
+        if let Event::ProcessSpawn { start_ns, .. } = &mut e {
+            *start_ns = start;
+        }
+        e
+    }
+
+    /// External audit NETR-009: with starts on the wire, a cross-PID chain
+    /// still completes through the real parent.
+    #[test]
+    fn chain005_fires_with_incarnations() {
+        let rules = chain_rules();
+        fire_ids(&rules, &spawn_at(100, 1, "/tmp/dropper", 10 * SEC));
+        fire_ids(&rules, &spawn_at(200, 100, "/usr/bin/bash", 11 * SEC));
+        let fired = fire_ids(&rules, &flow(200, 4444, 12 * SEC));
+        assert!(
+            fired.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()),
+            "{fired:?}"
+        );
+    }
+
+    /// External audit NETR-009: a harmless process takes the PID of an
+    /// exited process that ran from /tmp; its child's flow is no chain.
+    #[test]
+    fn a_recycled_tmp_pid_gives_its_new_holder_no_chain() {
+        let rules = chain_rules();
+        fire_ids(&rules, &spawn_at(100, 1, "/tmp/dropper", 10 * SEC));
+        // 100 exits; the PID goes to a harmless process, which forks 200.
+        fire_ids(&rules, &spawn_at(100, 1, "/usr/bin/make", 20 * SEC));
+        fire_ids(&rules, &spawn_at(200, 100, "/usr/bin/cc", 21 * SEC));
+        let fired = fire_ids(&rules, &flow(200, 4444, 22 * SEC));
+        assert!(fired.is_empty(), "{fired:?}");
+        let fired = fire_ids(&rules, &flow(100, 4444, 22 * SEC));
+        assert!(fired.is_empty(), "{fired:?}");
     }
 
     #[test]
