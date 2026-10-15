@@ -16,7 +16,14 @@
 //!   first trip,
 //! - `Registry::refresh` correctly clears the tripped flag so a
 //!   subsequent access fires AGAIN as `first_trip = true` (the
-//!   §12 Q2 + §7.4 MANUAL-REFRESH contract).
+//!   §12 Q2 + §7.4 MANUAL-REFRESH contract);
+//! - external audit DEC-011: a trip is recorded in the registry and
+//!   survives an agent restart;
+//! - external audit DEC-010: a decoy changed while the agent is down is
+//!   reported at the next start (signed `integrity_drift`, `decoy_check`
+//!   row);
+//! - external audit DEC-007 / DEC-008: a credential decoy names nothing
+//!   and is a new one at every deploy and refresh.
 //!
 //! Posture transition to COMBAT + the iptables `NORTHNARROW_COMBAT`
 //! chain are NOT asserted here — those are exercised by the existing
@@ -186,6 +193,9 @@ struct CanaryFixture {
     admin_socket: PathBuf,
     /// Chain file the e2e tests assert against.
     canary_access_log: PathBuf,
+    /// The registry chain and the audit log.
+    canary_registry: PathBuf,
+    audit_log: PathBuf,
     /// K8.1 R009 avoidance: the `/usr/local/bin/` installed
     /// nn-admin path. Every nn-admin subprocess spawn (deploy,
     /// refresh, init) routes through this path so R009 doesn't
@@ -376,6 +386,8 @@ impl CanaryFixture {
             agent_id_file: agent_id,
             admin_socket,
             canary_access_log: canary_access,
+            canary_registry,
+            audit_log,
             nn_admin_path,
             agent_bin: installed_agent.path.clone(),
             agent_args,
@@ -389,8 +401,18 @@ impl CanaryFixture {
     /// state (registry, keys, logs) stays, its in-memory indexes and the
     /// kernel watches it registers are rebuilt from it.
     fn restart(&mut self) {
+        self.stop();
+        self.start();
+    }
+
+    /// Stop the agent (its state stays).
+    fn stop(&mut self) {
         drop(std::mem::replace(&mut self._agent_guard, AgentGuard(None)));
         let _ = std::fs::remove_file(&self.admin_socket);
+    }
+
+    /// Start the agent again after [`CanaryFixture::stop`].
+    fn start(&mut self) {
         let child = Command::new("sudo")
             .arg(&self.agent_bin)
             .args(&self.agent_args)
@@ -431,6 +453,45 @@ impl CanaryFixture {
             String::from_utf8_lossy(&out.stdout)
         );
         parse_canary_id(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Submit a signed `nn-admin canary deploy credential --path <file>
+    /// --cred-family <family>`. Returns the canary_id.
+    fn deploy_credential_canary(&self, name: &str, decoy_path: &Path, family: &str) -> String {
+        let out = Command::new(&self.nn_admin_path)
+            .arg("canary")
+            .arg("deploy")
+            .arg("--name")
+            .arg(name)
+            .arg("--key")
+            .arg(&self.admin_priv)
+            .arg("--agent-id-file")
+            .arg(&self.agent_id_file)
+            .arg("--socket")
+            .arg(&self.admin_socket)
+            .arg("credential")
+            .arg("--path")
+            .arg(decoy_path)
+            .arg("--cred-family")
+            .arg(family)
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("spawn nn-admin canary deploy credential");
+        assert!(
+            out.status.success(),
+            "nn-admin canary deploy credential: exit {:?}, stdout {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        parse_canary_id(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// The registry rows of `canary_id`.
+    fn registry_rows(&self, canary_id: &str) -> Vec<serde_json::Value> {
+        read_jsonl(&self.canary_registry)
+            .into_iter()
+            .filter(|r| r["canary_id"].as_str() == Some(canary_id))
+            .collect()
     }
 
     /// Submit a signed `nn-admin canary deploy process --path
@@ -686,6 +747,144 @@ fn file_canary_deployed_at_runtime_survives_an_agent_restart() {
         Some(canary_id.as_str()),
         "a read after the restart must trip the canary again: {rows:?}"
     );
+    // External audit DEC-011: the canary was tripped before the restart
+    // and still is: the read after it is recorded, not responded to again
+    // (the state used to live in memory only).
+    assert_eq!(
+        rows[1]["first_trip"].as_bool(),
+        Some(false),
+        "a canary tripped before the restart is not a first trip after it: {rows:?}"
+    );
+    let trips: Vec<_> = fx
+        .registry_rows(&canary_id)
+        .into_iter()
+        .filter(|r| r["action"].as_str() == Some("trip"))
+        .collect();
+    assert_eq!(trips.len(), 1, "one Trip row: {trips:?}");
+    assert_eq!(
+        trips[0]["first_trip_access_hash"].as_str(),
+        rows[0]["entry_hash"].as_str(),
+        "the Trip row names the access row of the first trip"
+    );
+}
+
+/// External audit DEC-010: a decoy changed while the agent is down is
+/// reported when it starts — an ERROR, a signed `integrity_drift`
+/// (`canary_decoy_tampered`) and a `decoy_check` row the registry (`canary
+/// list`) shows. The boot used to re-arm whatever was at the path. Also
+/// DEC-007: the credential decoy names nothing.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_decoy_changed_while_the_agent_is_down_is_reported() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("decoy tempdir");
+    let decoy = tmp.path().join(".aws").join("credentials");
+    let mut fx = CanaryFixture::setup(&[]);
+    let canary_id = fx.deploy_credential_canary("aws-backup", &decoy, "aws");
+    let deployed = fx.registry_rows(&canary_id);
+    let sha = deployed[0]["contents_sha256"]
+        .as_str()
+        .expect("the deploy row records the decoy's SHA-256")
+        .to_string();
+
+    fx.stop();
+    // Read and changed by other processes, with the agent down.
+    let out = Command::new("cat").arg(&decoy).output().expect("spawn cat");
+    let body = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    assert!(body.contains("aws_access_key_id"), "{body}");
+    for m in ["northnarrow", "canary", "do not use", "decoy", "nn-l-"] {
+        assert!(!body.contains(m), "the decoy carries {m:?}: {body}");
+    }
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("printf '[default]\\n' > \"$1\"")
+        .arg("sh")
+        .arg(&decoy)
+        .status()
+        .expect("spawn sh");
+    assert!(status.success());
+    fx.start();
+
+    let deadline = Instant::now() + ACCESS_LOG_POLL_TIMEOUT;
+    let audit = loop {
+        let found: Vec<_> = read_jsonl(&fx.audit_log)
+            .into_iter()
+            .filter(|r| r["op"].as_str() == Some("integrity_drift"))
+            .filter(|r| r["extra"]["kind"].as_str() == Some("canary_decoy_tampered"))
+            .collect();
+        if !found.is_empty() || Instant::now() > deadline {
+            break found;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    assert_eq!(audit.len(), 1, "one signed integrity_drift: {audit:?}");
+    assert_eq!(
+        audit[0]["extra"]["canary_id"].as_str(),
+        Some(canary_id.as_str())
+    );
+    assert_eq!(audit[0]["extra"]["state"].as_str(), Some("modified"));
+    assert_eq!(
+        audit[0]["extra"]["expected_sha256"].as_str(),
+        Some(sha.as_str())
+    );
+    let checks: Vec<_> = fx
+        .registry_rows(&canary_id)
+        .into_iter()
+        .filter(|r| r["action"].as_str() == Some("decoy_check"))
+        .collect();
+    assert_eq!(checks.len(), 1, "{checks:?}");
+    assert_eq!(checks[0]["decoy_state"].as_str(), Some("modified"));
+
+    // Recorded once: a second start finds what is recorded.
+    fx.restart();
+    std::thread::sleep(Duration::from_secs(2));
+    let n = fx
+        .registry_rows(&canary_id)
+        .iter()
+        .filter(|r| r["action"].as_str() == Some("decoy_check"))
+        .count();
+    assert_eq!(n, 1, "the same state is not recorded again");
+}
+
+/// External audit DEC-008: each deploy and each refresh writes a credential
+/// of its own (the seed was the operator's fingerprint and the path, the
+/// same on every host), recorded in the registry; the bytes on disk are
+/// the ones recorded.
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn credential_decoys_are_new_at_each_deploy_and_refresh() {
+    use sha2::{Digest, Sha256};
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("decoy tempdir");
+    let decoy = tmp.path().join("gcp-sa.json");
+    let mut fx = CanaryFixture::setup(&[]);
+    let first = fx.deploy_credential_canary("gcp-a", &decoy, "gcp");
+    let a = fx.registry_rows(&first)[0].clone();
+    // the same operator, the same path
+    let second = fx.deploy_credential_canary("gcp-b", &decoy, "gcp");
+    let b = fx.registry_rows(&second)[0].clone();
+    assert_ne!(a["contents_sha256"], b["contents_sha256"]);
+    assert_ne!(a["content_seed"], b["content_seed"]);
+    fx.refresh(&second);
+    let rows = fx.registry_rows(&second);
+    let refreshed = rows
+        .iter()
+        .find(|r| r["action"].as_str() == Some("refresh"))
+        .expect("refresh row");
+    assert_ne!(refreshed["contents_sha256"], b["contents_sha256"]);
+    assert_eq!(refreshed["decoy_state"].as_str(), Some("intact"));
+
+    fx.stop();
+    let out = Command::new("cat").arg(&decoy).output().expect("spawn cat");
+    assert_eq!(
+        Some(hex::encode(Sha256::digest(&out.stdout)).as_str()),
+        refreshed["contents_sha256"].as_str(),
+        "the decoy on disk is the one the refresh recorded"
+    );
+    let body = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    for m in ["northnarrow", "canary", "nn-l-"] {
+        assert!(!body.contains(m), "the decoy carries {m:?}");
+    }
 }
 
 // ── Test 2: process canary trip → access-log entry with first_trip ──

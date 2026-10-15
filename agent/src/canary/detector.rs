@@ -23,17 +23,21 @@
 //!   until Tappa 10's `inet_csk_listen` ships and main wires
 //!   `Event::NetFlow` events into `Detector::process_event`.
 //!
-//! When any helper returns `Some(canary_id)`:
+//! When any helper returns `Some(canary_id)`, under the registry lock:
 //!
-//! 1. Detector calls [`crate::canary::registry::Registry::mark_tripped`]
-//!    (idempotent per §12 Q2 single-trip lock-in — returns
-//!    `true` on the FIRST observation, `false` afterward).
+//! 1. Detector asks the registry whether the canary is still armed
+//!    ([`crate::canary::registry::Registry::is_armed`]): this access is
+//!    then the first trip (§12 Q2 single-trip lock-in).
 //! 2. Detector appends a `CanaryAccessEntry` to
 //!    `canary_access.jsonl` via
 //!    [`crate::canary::access_log::CanaryAccessDb::append`]
 //!    (chain captures EVERY access; subsequent rows carry
 //!    `first_trip: false`).
-//! 3. Detector returns `Some(Event::CanaryTripped { … })` to
+//! 3. On a first trip, [`crate::canary::registry::Registry::mark_tripped`]
+//!    appends a signed `Trip` row carrying that access row's
+//!    `entry_hash` (external audit DEC-011: the state survives a
+//!    restart; the hash used to be left empty).
+//! 4. Detector returns `Some(Event::CanaryTripped { … })` to
 //!    the caller. main::process_event REPLACES the source
 //!    event with this and routes through the canary rule
 //!    family (K5 NN-L-CANARY-001..004), skipping the FIM
@@ -60,7 +64,7 @@ use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use common::wire::InodeKey;
 use common::{CanaryAccessKind, CanaryTypeTag, Event};
 use parking_lot::Mutex;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::canary::access_log::{CanaryAccessDb, CanaryAccessDraft};
 use crate::canary::registry::Registry;
@@ -390,56 +394,52 @@ impl Detector {
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
 
-        // Mark tripped (idempotent per §12 Q2 — returns true on
-        // FIRST observation only).
+        // External audit DEC-011: under the registry lock, decide whether
+        // this is the first trip, append the access row (ALWAYS — the
+        // chain captures every access; re-fire suppression lives in
+        // first_trip), then record the trip in the registry with that
+        // row's hash. A failed write is reported and the event is still
+        // emitted.
         let first_trip = {
             let mut reg = self.registry.lock();
-            reg.mark_tripped(&canary_id, String::new())
-        };
-
-        // Append the access entry to the chain (ALWAYS — chain
-        // captures every access; rule re-fire suppression
-        // lives in first_trip semantics).
-        let access_entry_hash = {
-            let mut log = self.access_log.lock();
-            match log.append(CanaryAccessDraft {
-                canary_id: canary_id.clone(),
-                canary_name: canary_name.clone(),
-                canary_type: canary_type_tag,
-                access_kind,
-                accessor_pid,
-                accessor_uid,
-                accessor_comm: accessor_comm.clone(),
-                accessor_exe: accessor_exe.clone(),
-                first_trip,
-            }) {
-                Ok(entry) => entry.entry_hash,
-                Err(e) => {
-                    warn!(
-                        error = %e,
+            let first_trip = reg.is_armed(&canary_id);
+            let access_entry_hash = {
+                let mut log = self.access_log.lock();
+                match log.append(CanaryAccessDraft {
+                    canary_id: canary_id.clone(),
+                    canary_name: canary_name.clone(),
+                    canary_type: canary_type_tag,
+                    access_kind,
+                    accessor_pid,
+                    accessor_uid,
+                    accessor_comm: accessor_comm.clone(),
+                    accessor_exe: accessor_exe.clone(),
+                    first_trip,
+                }) {
+                    Ok(entry) => Some(entry.entry_hash),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            canary_id = %canary_id,
+                            "canary access log append failed — trip event still emitted, \
+                             chain entry missing"
+                        );
+                        None
+                    }
+                }
+            };
+            if first_trip {
+                if let Err(e) = reg.mark_tripped(&canary_id, access_entry_hash) {
+                    error!(
+                        error = %format!("{e:#}"),
                         canary_id = %canary_id,
-                        "canary access log append failed — trip event still emitted, \
-                         chain entry missing"
+                        "canary trip not recorded in the registry — it holds for this run \
+                         only; a restart would re-arm the canary"
                     );
-                    String::new()
                 }
             }
+            first_trip
         };
-
-        // Update the registry's cross-chain reference (only on
-        // first_trip — Registry::mark_tripped already locked
-        // the access_hash on first call; this is a defensive
-        // second pass for the case where the access append
-        // ran AFTER mark_tripped).
-        if first_trip && !access_entry_hash.is_empty() {
-            // Note: mark_tripped above stored an empty
-            // access_hash because we hadn't appended yet. K6
-            // will refactor to do the access append FIRST,
-            // then pass the entry_hash to mark_tripped. For
-            // K3 we accept the empty initial hash; the next
-            // detector wire (K5/K6) tightens this.
-            let _ = access_entry_hash;
-        }
 
         // Return the trip event for main to route through the
         // K5 canary rules.
@@ -523,6 +523,7 @@ mod tests {
                     template: None,
                 },
                 deployed_by_fp: "deadbeef".to_string(),
+                content: None,
             })
             .unwrap();
         let mut idx = CanaryIndexes::new();
@@ -550,6 +551,7 @@ mod tests {
                     fake_arg0: format!("{name} --serve"),
                 },
                 deployed_by_fp: "deadbeef".to_string(),
+                content: None,
             })
             .unwrap()
             .canary_id
@@ -578,6 +580,7 @@ mod tests {
                     template: None,
                 },
                 deployed_by_fp: "ffffffff".to_string(),
+                content: None,
             })
             .unwrap()
             .canary_id
@@ -785,6 +788,58 @@ mod tests {
         assert!(!rows[1].first_trip, "row 1 must be first_trip=false");
     }
 
+    /// External audit DEC-011: the registry's Trip row names the access
+    /// row of the first trip (the hash used to be left empty), and after
+    /// a restart a read of the same canary is not a first trip again.
+    #[test]
+    fn first_trip_hash_is_the_access_row_hash() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        let id = deploy_file_canary(&registry, &detector, "/tmp/decoy.txt", "c");
+        let first = detector.process_event(&fim_event_on("/tmp/decoy.txt", 4242));
+        assert!(matches!(
+            first,
+            Some(Event::CanaryTripped {
+                first_trip: true,
+                ..
+            })
+        ));
+        let access: Vec<crate::canary::access_log::CanaryAccessEntry> =
+            std::fs::read_to_string(dir.path().join("canary_access.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        let state = registry.lock().get(&id).unwrap();
+        assert_eq!(
+            state.first_trip_access_hash.as_deref(),
+            Some(access[0].entry_hash.as_str())
+        );
+        drop(detector);
+        drop(registry);
+
+        // the agent restarts: the registry is read back from its chain
+        let (detector, registry) = build_detector(&dir);
+        assert!(registry.lock().get(&id).unwrap().tripped);
+        {
+            let mut idx = detector.indexes.lock();
+            idx.rebuild_from_registry(&registry.lock(), |_| None);
+            idx.exe_index
+                .insert(PathBuf::from("/tmp/decoy.txt"), id.clone());
+        }
+        let again = detector.process_event(&fim_event_on("/tmp/decoy.txt", 4343));
+        assert!(
+            matches!(
+                again,
+                Some(Event::CanaryTripped {
+                    first_trip: false,
+                    ..
+                })
+            ),
+            "a canary tripped before the restart is not tripped anew: {again:?}"
+        );
+    }
+
     /// K3 detector test #5: hot-path is_canary_inode/exe/port
     /// return `None` for non-canary keys (the negative-case
     /// short-circuit).
@@ -817,6 +872,7 @@ mod tests {
                     fake_arg0: "helper".to_string(),
                 },
                 deployed_by_fp: "ab".to_string(),
+                content: None,
             })
             .unwrap();
             reg.deploy(CanaryTokenDraft {
@@ -827,6 +883,7 @@ mod tests {
                     bind_port: 4444,
                 },
                 deployed_by_fp: "cd".to_string(),
+                content: None,
             })
             .unwrap();
         }
@@ -905,6 +962,7 @@ mod tests {
                     template: None,
                 },
                 deployed_by_fp: format!("{i:08x}"),
+                content: None,
             })
             .unwrap();
             drop(reg);

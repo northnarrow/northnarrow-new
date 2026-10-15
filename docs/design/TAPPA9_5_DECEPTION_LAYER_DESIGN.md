@@ -583,6 +583,15 @@ detect repeat attempts).
 3. Subsequent accesses re-fire the rule + posture
    transition.
 
+External audit DEC-008 / DEC-010 (lab PR 143): a refresh also writes a
+File / Credential decoy again from a new random seed (the same inode when
+the decoy is there) and the `refresh` row records its SHA-256 and seed
+with `decoy_state: intact`; a decoy that cannot be written or watched
+refuses the refresh. Every deploy draws its own seed too: the content no
+longer follows from the operator key and the path, and no decoy names the
+product (DEC-007). At boot the agent compares each decoy with its record;
+a change found is a `decoy_check` row and a signed `integrity_drift`.
+
 ### 7.5 Single-trip lockout window
 
 Per §1 — single-trip semantics. The first access to a
@@ -592,6 +601,11 @@ deployed canary:
 2. Marks the in-memory registry's `tripped: true`.
 3. Appends `CanaryAccessEntry` to
    `canary_access.jsonl`.
+
+External audit DEC-011 (lab PR 143): step 2 is a signed `trip` row in
+`canaries.jsonl` carrying the `entry_hash` of the access row of step 3
+(written first), so the trip survives an agent restart: "the same agent
+session" below holds across sessions until a refresh.
 
 Subsequent accesses to the SAME canary in the same agent
 session:
