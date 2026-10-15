@@ -3,7 +3,7 @@ resolver = "2"
 members = ["agent", "antitamper-bpf", "common", "cli", "ebpf-guard", "watchdog", "xtask"]
 # `agent-ebpf` is a separate cargo project: nightly toolchain,
 # bpfel-unknown-none target, build-std=core. The xtask runner builds it.
-exclude = ["agent-ebpf", "fuzz"]
+exclude = ["agent-ebpf", "fuzz", "vendor/candle-core"]
 
 [workspace.package]
 version = "0.0.1"
@@ -53,3 +53,17 @@ strip = "symbols"
 inherits = "release"
 debug = true
 strip = "none"
+
+# External audit MAIN-006: candle-core 0.10.x (to 0.11.0) depends on
+# `tokenizers` with `features = ["onig"]` unconditionally, so Oniguruma (C,
+# `onig_sys`) was in the agent whatever the agent asked for, and with both
+# backends on, tokenizers uses onig. `vendor/candle-core` is the crates.io
+# 0.10.2 package (sha256 6bd98954…2a4a, the checksum Cargo.lock recorded)
+# with two changes to its Cargo.toml, both marked "NorthNarrow": that
+# dependency asks for `fancy-regex`, and the deprecation warnings of its
+# unchanged code are allowed (a path dependency gets no --cap-lints). Check:
+# `diff -r` against the extracted .crate shows only those lines. A candle
+# bump must redo it: the patch does not apply to another version, and the
+# CI charter step (onig_sys in the graph) fails until it is redone.
+[patch.crates-io]
+candle-core = { path = "vendor/candle-core" }
