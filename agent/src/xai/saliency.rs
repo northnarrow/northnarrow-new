@@ -14,7 +14,12 @@
 //!    exact worst-case inference count (not a loose bound) and refuse
 //!    *before any model call* if it cannot fit the budget. "We knew and
 //!    declined" is a cleaner regulatory posture than "we tried, ran out,
-//!    and returned partial data" — both fail-closed.
+//!    and returned partial data" — both fail-closed. External audit
+//!    XAI-005: the bounded-K cap adapts to the input — the largest
+//!    `K ≤ max_units` whose worst case fits — so that a production-sized
+//!    context (20 correlated events) is explained at a coarser grain
+//!    instead of refused; only a budget that not even `K = 1` fits is
+//!    refused.
 //! 2. **Baseline `V0`** — one deterministic probe of the unperturbed
 //!    inputs. The driver re-derives `V0` itself (it does NOT trust a
 //!    production verdict) so the whole map is computed under one
@@ -92,7 +97,9 @@ use crate::xai::source::{
 /// deliberate commit with fresh provenance, never a silent tweak. It
 /// only ever makes the preflight *more* conservative or less — it never
 /// affects the measured-time [`Clock`] guard, which is the real
-/// fail-closed backstop.
+/// fail-closed backstop. External audit XAI-005: 5 s is optimistic for
+/// an 8B model on CPU; with the adaptive K the preflight plans up to the
+/// whole budget, so a slower model ends in that guard's `Timeout`.
 const EST_INFERENCE_MS: u64 = 5_000;
 
 /// Region evaluation order. Fixed so every derived string (the
@@ -133,7 +140,10 @@ impl Clock for MonotonicClock {
 /// *typical* case sits well inside [`XAI_BUDGET_MS`].
 #[derive(Debug, Clone)]
 pub struct SaliencyConfig {
-    /// Bounded-K cap per refined region (plan §3.4, default 12).
+    /// Bounded-K cap per refined region (plan §3.4, default 12): the
+    /// largest K the driver may use. External audit XAI-005: the K of a
+    /// run is the largest one, at least 1, whose worst case fits the
+    /// budget ([`SaliencyRun::max_units`]).
     pub max_units: u32,
     /// Stage-B refine gate `region_delta >= t * max_region_delta`
     /// (plan §3.4-R3, default 0.3).
@@ -173,6 +183,10 @@ pub struct SaliencyRun {
     /// Inferences actually spent (telemetry; P4 candle-bench input).
     pub inferences: u32,
     pub elapsed_ms: u64,
+    /// External audit XAI-005: the bounded-K cap this run used, at most
+    /// [`SaliencyConfig::max_units`]; the chain records it in
+    /// `method.max_units`.
+    pub max_units: u32,
 }
 
 /// Why no usable explanation could be produced. Guardrail contract (plan
@@ -206,6 +220,22 @@ pub enum XaiUnavailable {
     /// The decision probe (model/backend) failed ⇒ no XAI ⇒ fail-closed.
     #[error(transparent)]
     Probe(#[from] XaiProbeError),
+    /// External audit XAI-011: the sanitizer short-circuits ADE on this
+    /// event (its injection score), so no prompt reaches the model and
+    /// every probe returns the same synthetic Escalate. A map of zero
+    /// deltas would read as "Complete, nothing mattered"; refused before
+    /// any probe.
+    #[error(
+        "injection short-circuit: score {injection_score:.2} keeps the event from the model, \
+         nothing to explain"
+    )]
+    InjectionShortCircuit { injection_score: f32 },
+    /// External audit XAI-011: the prompt does not fit the model's window
+    /// even without its correlated events (LLMR-008), so ADE escalates
+    /// without asking the model. Refused before any probe, like
+    /// [`Self::InjectionShortCircuit`].
+    #[error("the prompt exceeds the model window, nothing to explain")]
+    PromptExceedsWindow,
 }
 
 fn region_word(r: Region) -> &'static str {
@@ -320,21 +350,24 @@ pub async fn explain_saliency_with_clock<P: DecisionProbe, C: Clock>(
         .collect();
 
     // ── R-P3.1 preflight: exact worst-case for THIS input ──
-    // worst = V0 + one block per region + (every region refined and, if
-    // it overflows max_units, +1 tail).
-    let mut worst = 1u32 + regions_present.len() as u32;
-    for r in &regions_present {
-        let n = units.iter().filter(|u| u.region == *r).count() as u32;
-        worst += n.min(cfg.max_units) + u32::from(n > cfg.max_units);
-    }
-    let est_ms = worst as u64 * EST_INFERENCE_MS;
-    if est_ms > cfg.budget_ms {
+    // External audit XAI-005: the largest K ≤ max_units (at least 1)
+    // whose worst case fits the budget. A fixed K = 12 refused every
+    // ProcessSpawn with 4 or more correlated events (19 inferences).
+    let counts: Vec<u32> = regions_present
+        .iter()
+        .map(|r| units.iter().filter(|u| u.region == *r).count() as u32)
+        .collect();
+    let est_ms = |k: u32| u64::from(worst_inferences(&counts, k)) * EST_INFERENCE_MS;
+    let Some(max_units) = (1..=cfg.max_units.max(1))
+        .rev()
+        .find(|&k| est_ms(k) <= cfg.budget_ms)
+    else {
         return Err(XaiUnavailable::PreflightBudgetExceeded {
-            worst_inferences: worst,
-            est_ms,
+            worst_inferences: worst_inferences(&counts, 1),
+            est_ms: est_ms(1),
             budget_ms: cfg.budget_ms,
         });
-    }
+    };
 
     let mut infer: u32 = 0;
     let mut entries: Vec<SaliencyEntry> = Vec::new();
@@ -395,7 +428,7 @@ pub async fn explain_saliency_with_clock<P: DecisionProbe, C: Clock>(
         }
 
         sort_by_priority(*r, &mut region_units);
-        let cut = region_units.len().min(cfg.max_units as usize);
+        let cut = region_units.len().min(max_units as usize);
         let (fine_units, tail_units) = region_units.split_at(cut);
 
         for u in fine_units {
@@ -482,7 +515,16 @@ pub async fn explain_saliency_with_clock<P: DecisionProbe, C: Clock>(
         },
         inferences: infer,
         elapsed_ms: clock.elapsed_ms(),
+        max_units,
     })
+}
+
+/// Worst-case inferences at bounded-K `k` for regions of `counts` units:
+/// `V0`, one block per region, and every region refined — `min(n, k)`
+/// units plus a tail when it overflows.
+fn worst_inferences(counts: &[u32], k: u32) -> u32 {
+    let refined: u32 = counts.iter().map(|&n| n.min(k) + u32::from(n > k)).sum();
+    1 + counts.len() as u32 + refined
 }
 
 #[cfg(test)]
@@ -1026,6 +1068,64 @@ mod tests {
             ),
             XaiStatus::Complete => panic!("expected Degraded"),
         }
+    }
+
+    /// External audit XAI-005: a ProcessSpawn with the 20 correlated
+    /// events the agent selects, under the default config. A fixed K = 12
+    /// needed 28 inferences (140 s against 90 s) and refused at 4 or more
+    /// correlated events; K = 4 fits (18 inferences), the run is Degraded.
+    #[tokio::test]
+    async fn production_shaped_context_explained_degraded() {
+        use crate::correlation::CorrelationBuffer;
+
+        let buf = CorrelationBuffer::with_default_capacity();
+        let t0 = 1_000_000_000_000u64;
+        for i in 0..40u64 {
+            let mut e = dns(&format!("q{i}.example.org"));
+            if let Event::DnsQuery {
+                pid,
+                timestamp_ns,
+                query_name,
+                ..
+            } = &mut e
+            {
+                *pid = 2000 + i as u32;
+                *timestamp_ns = t0 + i * 100_000_000;
+                if i == 30 {
+                    *query_name = "login.c2.evil.net".into();
+                }
+            }
+            buf.push(e);
+        }
+        let mut focal = ps("bash");
+        if let Event::ProcessSpawn { timestamp_ns, .. } = &mut focal {
+            *timestamp_ns = t0 + 4_000_000_001;
+        }
+        buf.push(focal.clone());
+        let recent = buf.get_correlated_default(&focal);
+        assert_eq!(recent.len(), 20);
+
+        let probe = CausalProbe::new();
+        let run = explain_saliency(&SaliencyConfig::default(), &focal, &ctx(recent), &probe)
+            .await
+            .expect("explained, not refused");
+        assert_eq!(run.max_units, 4);
+        assert!(matches!(run.status, XaiStatus::Degraded(_)));
+        assert!(probe.calls.get() <= 18, "{}", probe.calls.get());
+        assert_eq!(run.saliency_map[0].delta.action_flip, 1.0);
+
+        // Worst case (every region refines): exactly the 18 planned.
+        let run = explain_saliency(
+            &SaliencyConfig::default(),
+            &focal,
+            &ctx(buf.get_correlated_default(&focal)),
+            &ConstProbe,
+        )
+        .await
+        .expect("explained, not refused");
+        assert_eq!(run.max_units, 4);
+        assert_eq!(run.inferences, 18);
+        assert!(matches!(run.status, XaiStatus::Degraded(_)));
     }
 
     #[tokio::test]

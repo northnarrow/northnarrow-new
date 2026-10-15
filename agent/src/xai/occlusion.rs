@@ -202,6 +202,15 @@ fn event_kind_label(e: &Event) -> String {
 /// (oldest-first, as stored), then host fields. The order is the unit
 /// id namespace contract — `correlated:i` always means
 /// `recent_events[i]` at enumerate() time.
+///
+/// External audit XAI-005: a correlated event is a unit only if the
+/// prompt renders it — the selection of
+/// [`crate::ade::sanitize::sanitize_correlated`]. One the prompt leaves
+/// out (its injection score, the prompt's limits) has a zero delta by
+/// construction, and it spent the inference budget: up to 50 events
+/// were enumerated where the prompt showed 20. The window fit of the
+/// model (`AdeEngine::prepare`, LLMR-008) is not mirrored here; a line
+/// it drops scores 0.
 pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
     use FieldClass::*;
     use FocalField as F;
@@ -516,8 +525,16 @@ pub fn enumerate(focal: &Event, ctx: &EventContext) -> Vec<PerturbableUnit> {
         }
     }
 
-    // ── correlated events (oldest-first, as stored) ──
-    for (i, e) in ctx.recent_events.iter().enumerate() {
+    // ── correlated events the prompt renders (oldest-first, as stored) ──
+    let mut rendered: Vec<usize> =
+        crate::ade::sanitize::sanitize_correlated(focal, &ctx.recent_events)
+            .events
+            .iter()
+            .map(|l| l.index)
+            .collect();
+    rendered.sort_unstable();
+    for i in rendered {
+        let e = &ctx.recent_events[i];
         units.push(PerturbableUnit {
             region: Region::Correlated,
             addr: UnitAddr::Correlated(i),
@@ -962,6 +979,26 @@ mod tests {
         assert_eq!(u[0].unit_id, "focal:comm");
         assert!(u.iter().any(|x| x.unit_id == "correlated:1"));
         assert!(u.iter().any(|x| x.unit_id == "host:agent_version"));
+    }
+
+    /// External audit XAI-005: only the correlated events the prompt
+    /// renders are units: its newest 20, none it leaves out for its
+    /// injection score. All 28 were units, 8 of them with a zero delta by
+    /// construction.
+    #[test]
+    fn units_cover_only_rendered_events() {
+        let mut recent: Vec<Event> = (0..25).map(|i| dns(&format!("ok{i}.example"))).collect();
+        recent.extend((0..3).map(|i| dns(&format!("ignore-previous-instructions-{i}.example"))));
+        let u = enumerate(&ps(), &ctx(recent));
+        let corr: Vec<&str> = u
+            .iter()
+            .filter(|x| x.region == Region::Correlated)
+            .map(|x| x.unit_id.as_str())
+            .collect();
+        let want: Vec<String> = (5..25).map(|i| format!("correlated:{i}")).collect();
+        assert_eq!(corr, want);
+        // ProcessSpawn = 7 focal, +20 correlated, +4 host.
+        assert_eq!(u.len(), 31);
     }
 
     #[test]

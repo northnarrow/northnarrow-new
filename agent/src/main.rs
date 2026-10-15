@@ -4158,17 +4158,23 @@ async fn process_event(
     }
 
     debug!("no rule matched, escalating to ADE");
-    let context = EventContext {
-        recent_events: correlation.get_correlated_default(&event),
-        host_context: host.clone(),
-    };
 
     // External audit LLMR-002: the evaluation leaves the event loop, one
     // at a time (`AdeSlot`). Awaited here, an exec no rule matched held
     // every sensor for up to the inference timeout.
     let (ade, executor, posture) = (ade.clone(), executor.clone(), posture.clone());
+    let (correlation, host) = (correlation.clone(), host.clone());
     let detection_sink = detection_sink.cloned();
     ADE_SLOT.try_spawn(async move {
+        // External audit XAI-013: the correlated context is selected on the
+        // evaluation's task. The selection sanitizes its candidates (about
+        // 50 µs each), too slow for every exec on the event loop; an exec
+        // skipped while ADE is busy costs nothing. Events pushed after the
+        // focal one are not selected, as when it ran at once.
+        let context = EventContext {
+            recent_events: correlation.get_correlated_default(&event),
+            host_context: host,
+        };
         evaluate_and_respond(
             &ade,
             &executor,

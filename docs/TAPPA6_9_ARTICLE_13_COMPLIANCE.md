@@ -81,11 +81,18 @@ the recorded `method.inference_settings` obtains a **bit-identical**
 "If XAI is unavailable, synthesis is disabled" (roadmap, non-negotiable)
 is enforced structurally: `XaiEngine::explain` returns
 `Result<XaiEvidenceChain, XaiUnavailable>`; every `XaiUnavailable`
-variant (`PreflightBudgetExceeded`, `Timeout`, `Probe`) is a hard stop.
+variant (`PreflightBudgetExceeded`, `Timeout`, `Probe`,
+`InjectionShortCircuit`, `PromptExceedsWindow`) is a hard stop.
 Two-tier defence: the R-P3.1 cost preflight refuses *before any model
 call* on the estimate; the per-call `Clock` guard refuses on *measured*
 elapsed time if the real model is slower. A timed-out partial map is
-discarded, never returned (`agent/src/xai/saliency.rs`).
+discarded, never returned (`agent/src/xai/saliency.rs`). The preflight
+lowers the bounded-K cap to the largest value whose worst case fits the
+budget, recorded in `method.max_units`, and refuses only when not even
+K = 1 fits (external audit XAI-005). An event ADE never shows the model
+(injection short-circuit, or a prompt over the model window) is refused
+before any probe: there is no decision of the model to explain
+(external audit XAI-011).
 
 ---
 
