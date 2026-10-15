@@ -220,7 +220,8 @@ check "$NN_WATCHDOG_UNIT active" "systemctl is-active --quiet '$NN_WATCHDOG_UNIT
 
 MAINPID=$(systemctl show -p MainPID --value "$NN_AGENT_UNIT" 2>/dev/null || echo 0)
 
-# (b) rule count == EXPECTED_RULE_COUNT (69) — engine's own load is truth
+# (b) rule count == EXPECTED_RULE_COUNT (the frozen V2 registry's engine
+#     rows, 00_config.sh) — engine's own load is truth
 RULES=$(journalctl --namespace="$NN_JOURNAL_NS" -u "$NN_AGENT_UNIT" -b 2>/dev/null \
         | grep -v 'event=ProcessSpawn' \
         | grep -oE 'decision engine ready.*rules=[0-9]+' \

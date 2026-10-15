@@ -1,0 +1,91 @@
+# NorthNarrow — V2 validation campaign — pre-registered ATT&CK technique rows.
+# version: 1
+# frozen: 2026-10-15, before any V2 run (external audit NN-AUD-218).
+#
+# The techniques the campaign measures, fixed before it runs: those a
+# shipped rule names, those the design names, and those the external audit
+# (LAB-013) and DETECT_ONLY_VALIDATION_2026-06-05 found without a rule. A
+# technique is covered when every one of its rows has an observed
+# detection, denial or drift, with evidence in evidence/<run-id>/
+# (matrix.md, "Gate formulas").
+# Technique coverage is reported apart from rule coverage and has no gate.
+# A rule with no row here counts for rule coverage only.
+# agent/src/decision/validation_registry.rs checks the rule ids and probes.
+#
+# Columns (tab-separated):
+#   id        row id (TQnn)
+#   technique ATT&CK technique id; a technique may have several rows
+#   name      ATT&CK name, and the scenario when a technique has several rows
+#   rules     the rules expected to fire, comma-separated, or -
+#   source    where the mapping comes from: code (the rule's doc or verdict
+#             names it), design (TAPPA10_5 / TAPPA10_7), audit (external
+#             audit LAB-013 or DETECT_ONLY_VALIDATION_2026-06-05), v2-draft
+#             (the superseded V2 sweep), registry (assigned here from the
+#             ATT&CK definition); joined with + when mixed
+#   expected  rule = a listed rule fires; denial = an anti-tamper hook
+#             refuses the action and NN-L-AT-001 records it; drift = a
+#             signed integrity_drift; known-gap = no detection expected, the
+#             row is run and reported as a gap
+#   probe     an existing lab probe that exercises the row (path::text it
+#             contains), or -
+#   note      free text, or -
+id	technique	name	rules	source	expected	probe	note
+TQ01	T1003.008	OS Credential Dumping: /etc/passwd and /etc/shadow	-	v2-draft	known-gap	-	No rule names it; NN-L-FIM-003 fires on a modification of these files, not a read. DETECT_ONLY_VALIDATION_2026-06-05 could not test a read as written.
+TQ02	T1014	Rootkit	R018_KernelModuleLoad,NN-L-FIM-008_KernelModuleModified,NN-L-BPF-001_BpfProgramLoaded	code	rule	-	-
+TQ03	T1021	Remote Services	NN-L-NET-018_Rfc1918LateralPort	code	rule	-	Ports 445, 3389, 5985, 5900 to an RFC 1918 peer.
+TQ04	T1021.004	Remote Services: SSH	-	audit	known-gap	-	NN-L-NET-018 does not watch port 22.
+TQ05	T1027	Obfuscated Files or Information	R015_EncodingToolingServiceUid	code	rule	-	Encoding tools run under a service uid only.
+TQ06	T1029	Scheduled Transfer	NN-L-NET-013_Beacon	code	rule	-	-
+TQ07	T1033	System Owner/User Discovery	-	audit	known-gap	-	No discovery rule (DETECT_ONLY_VALIDATION_2026-06-05).
+TQ08	T1041	Exfiltration Over C2 Channel	NN-L-CHAIN-001_CredReadThenEgress,NN-L-CHAIN-003_CanaryThenEgress,NN-L-CHAIN-004_CrossPidCredExfil,NN-L-CHAIN-006_CrossPidCanaryExfil,NN-L-CHAIN-007_TmpCredExfilSequence,NN-L-CHAIN-008_CrossPidPrivEscExfil	code	rule	-	-
+TQ09	T1049	System Network Connections Discovery	-	audit	known-gap	-	No discovery rule (DETECT_ONLY_VALIDATION_2026-06-05).
+TQ10	T1053.002	Scheduled Task/Job: At	R014_AtBatchScheduling	code	rule	-	-
+TQ11	T1053.003	Scheduled Task/Job: Cron	NN-L-FIM-007_CronDropInCreated	code	rule	-	The drop-in write; the job's later execution is a process row.
+TQ12	T1053.006	Scheduled Task/Job: Systemd Timers	NN-L-FIM-023_SystemdTimerCreated	code	rule	-	-
+TQ13	T1055.008	Process Injection: Ptrace System Calls (the agent as target)	-	audit	denial	-	The ptrace_access_check hook refuses it; the anti-tamper suite reaches that hook only through /proc/<pid>/mem (see T1055.009).
+TQ14	T1055.008	Process Injection: Ptrace System Calls (another process as target)	-	audit	known-gap	-	No rule; R016_DebuggerServiceUid names debugger tooling under a service uid only (T1622).
+TQ15	T1055.009	Process Injection: Proc Memory (the agent as target)	-	audit	denial	deploy/lab/adversarial/anti-tamper.sh::case C03	-
+TQ16	T1055.009	Process Injection: Proc Memory (another process as target)	-	audit	known-gap	-	No rule.
+TQ17	T1057	Process Discovery	-	audit	known-gap	-	No discovery rule (DETECT_ONLY_VALIDATION_2026-06-05).
+TQ18	T1059	Command and Scripting Interpreter	R001_ExecFromTmp,R002_ExecFromDevShm,R003_ExecFromVarTmp,NN-L-CHAIN-002_TmpExecThenEgress,NN-L-CHAIN-005_CrossPidTmpC2	design+code	rule	deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp	Design §7.1 maps R001-R004 to T1059/T1620.
+TQ19	T1059.004	Command and Scripting Interpreter: Unix Shell	R017_ShellFromNonstandardPath	code	rule	-	-
+TQ20	T1070	Indicator Removal	NN-L-FIM-018_LastlogTampered,NN-L-FIM-019_WtmpBtmpTampered	code	rule	-	-
+TQ21	T1070.002	Indicator Removal: Clear Linux or Mac System Logs	NN-L-FIM-005_LogTruncated	audit	rule	-	-
+TQ22	T1070.003	Indicator Removal: Clear Command History	NN-L-FIM-020_ShellHistoryCleared	code	rule	-	-
+TQ23	T1070.004	Indicator Removal: File Deletion	-	audit	known-gap	-	No rule for a deletion in general; a deleted watched file is a FIM drift row.
+TQ24	T1070.006	Indicator Removal: Timestomp	-	audit	known-gap	-	No rule.
+TQ25	T1071	Application Layer Protocol	NN-L-NET-011_PlaintextCredService,NN-L-NET-013_Beacon	code	rule	-	-
+TQ26	T1071.004	Application Layer Protocol: DNS	NN-L-NET-004_SuspiciousDnsQname,NN-L-NET-005_DnsTxtNullBurst,NN-L-NET-014_DnsTunnelEntropy,NN-L-NET-020_DnsQueryFlood	code+registry	rule	deploy/lab/dns-sensor/dns-sensor-check.sh::NN-L-NET-004_SuspiciousDnsQname	NET-014 and NET-020 name T1071.004 in code; NET-004 and NET-005 are assigned here.
+TQ27	T1082	System Information Discovery	-	audit	known-gap	-	No discovery rule (DETECT_ONLY_VALIDATION_2026-06-05).
+TQ28	T1098.004	Account Manipulation: SSH Authorized Keys	NN-L-FIM-004_AuthorizedKeysModified	code	rule	-	-
+TQ29	T1132	Data Encoding	R015_EncodingToolingServiceUid	code	rule	-	-
+TQ30	T1136	Create Account	NN-L-FIM-003_SensitiveConfigModified	registry	rule	-	Through the write to /etc/passwd and /etc/shadow.
+TQ31	T1480	Execution Guardrails	-	audit	known-gap	-	A check the payload makes of its environment; no host event to judge.
+TQ32	T1486	Data Encrypted for Impact	NN-L-FIM-010_RansomwareExtensionRename	code	rule	-	A rename to a ransomware extension; encryption in place, without a rename, has no rule.
+TQ33	T1496	Resource Hijacking	R007_CryptoMiner	registry	rule	-	-
+TQ34	T1497	Virtualization/Sandbox Evasion	-	audit	known-gap	-	A check the payload makes of its environment; no host event to judge.
+TQ35	T1499	Endpoint Denial of Service (against the agent)	-	audit	known-gap	-	NN-L-NET-020 and NN-L-NET-021 name DNS, listener and io_uring record floods (T1071.004, T1562.006); a flood of exec or open records has no rule.
+TQ36	T1505.003	Server Software Component: Web Shell	R010_BinaryInWebroot	registry	rule	-	-
+TQ37	T1543.002	Create or Modify System Process: Systemd Service	NN-L-FIM-009_SystemdUnitDropped	code	rule	-	-
+TQ38	T1547.006	Boot or Logon Autostart Execution: Kernel Modules and Extensions	R011_KernelModuleTooling,R018_KernelModuleLoad,NN-L-FIM-008_KernelModuleModified	code	rule	deploy/lab/adversarial/anti-tamper.sh::case C16	C16 loads an in-tree module (not R018's Critical branch).
+TQ39	T1547.013	Boot or Logon Autostart Execution: XDG Autostart Entries	-	audit	known-gap	-	~/.config/autostart is not watched (DETECT_ONLY_VALIDATION_2026-06-05).
+TQ40	T1548	Abuse Elevation Control Mechanism	R012_SetcapTooling,NN-L-FIM-025_FileCapabilityGranted,NN-L-CHAIN-008_CrossPidPrivEscExfil	code	rule	-	-
+TQ41	T1548.001	Abuse Elevation Control Mechanism: Setuid and Setgid	NN-L-FIM-002_NewSuidBinary	registry	rule	-	-
+TQ42	T1552.001	Unsecured Credentials: Credentials In Files	NN-L-FIM-011_AwsCredsRead,NN-L-FIM-012_AzureCredsRead,NN-L-FIM-013_GcpCredsRead,NN-L-FIM-014_DockerCredsRead	code	rule	deploy/lab/open-sensor/open-sensor-check.sh::NN-L-FIM-011_AwsCredsRead	-
+TQ43	T1552.004	Unsecured Credentials: Private Keys	NN-L-FIM-017_GpgKeyringAccessed	code	rule	-	-
+TQ44	T1554	Compromise Host Software Binary	NN-L-FIM-001_SystemBinaryModified	registry	rule	-	-
+TQ45	T1555.003	Credentials from Password Stores: Credentials from Web Browsers	NN-L-FIM-015_BrowserCredsAccessed	code	rule	-	-
+TQ46	T1555.005	Credentials from Password Stores: Password Managers	NN-L-FIM-016_PasswordManagerDbAccessed	code	rule	-	-
+TQ47	T1556.003	Modify Authentication Process: Pluggable Authentication Modules	NN-L-FIM-021_PamModuleModified	code	rule	-	-
+TQ48	T1562	Impair Defenses (I/O through io_uring, out of the open and exec sensors)	NN-L-IOU-001_IoUringRingCreated,NN-L-IOU-002_IoUringFileAndNetwork	code	rule	deploy/lab/adversarial/anti-tamper.sh::case C22	-
+TQ49	T1562.001	Impair Defenses: Disable or Modify Tools	NN-L-FIM-024_AntiTamperHoneypotModified,NN-L-AT-001_AntiTamperDenial,NN-L-BPF-002_BpfForeignHandleOrDetach	code+registry	rule	deploy/lab/adversarial/anti-tamper.sh::case C01	FIM-024 names T1562.001 in code; NN-L-AT-001 and NN-L-BPF-002 are assigned here.
+TQ50	T1562.001	Impair Defenses: Disable or Modify Tools (a mount over the agent's files)	-	registry	drift	deploy/lab/adversarial/anti-tamper.sh::case C14	A signed integrity_drift, not a rule.
+TQ51	T1562.004	Impair Defenses: Disable or Modify System Firewall	-	audit	known-gap	-	No rule; whether a flushed COMBAT chain is detected or restored has not been established.
+TQ52	T1562.006	Impair Defenses: Indicator Blocking	NN-L-NET-021_SensorRecordFlood	code	rule	-	-
+TQ53	T1562.012	Impair Defenses: Disable or Modify Linux Audit System	-	audit	known-gap	-	No rule; the agent does not read the Linux audit system.
+TQ54	T1564.001	Hide Artifacts: Hidden Files and Directories	R008_HiddenHomeBinary	registry	rule	-	-
+TQ55	T1571	Non-Standard Port	NN-L-NET-010_OutboundToHighRiskC2Port,NN-L-NET-019_WildcardListener,NN-L-CHAIN-002_TmpExecThenEgress,NN-L-CHAIN-005_CrossPidTmpC2	code	rule	-	-
+TQ56	T1574.006	Hijack Execution Flow: Dynamic Linker Hijacking	NN-L-FIM-022_LdSoPreloadModified	code	rule	-	-
+TQ57	T1611	Escape to Host	R013_NamespaceEscapeTooling	code	rule	-	-
+TQ58	T1620	Reflective Code Loading	R004_ExecFromProcSelfFd	design	rule	deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd	-
+TQ59	T1622	Debugger Evasion	R016_DebuggerServiceUid	code	rule	-	-
