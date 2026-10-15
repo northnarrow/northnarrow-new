@@ -15,6 +15,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, open-sensor path and classification fidelity
+  (Medium SNS-005, SNS-006, SNS-007, EBPF-011): a writer that forked a
+  fresh worker every few files never reached the mass-write threshold,
+  which was counted per process. A second window per cgroup
+  counts overwrites (existing files of 4 KiB or more) of processes that
+  rewrote at least three, with a threshold of 40 a minute; its crossing is
+  file-system evidence that needs corroboration, and a build (one process
+  per output) never enters it. The classification walk goes 16 directories
+  up (was 8) and says when it stopped short. A path under a filesystem
+  root the agent cannot place reads `mnt[<dev>:<ino>]/…` instead of a host
+  path, a path component cut at 31 bytes ends in `…` and an unreadable one
+  is `?`; for such paths the posture uses the kernel's class of the file,
+  so a kernel-classed write there no longer goes unnoticed. The open
+  sensor's rules are written past a full map — stale rules removed first,
+  the posture's own paths before homes and runtime directories, the cache
+  generation always bumped — with an ERROR and one signed
+  `subsystem_degraded` when some do not fit; the maps hold 4096 inode
+  rules (was 1024). The sensor's program now verifies on 5.15 in about
+  460,000 instructions (was 834,000): the record writer and the counts are
+  global BPF functions.
 - External audit, Wave 2, process and canary rule coverage (Medium
   PROC-009, PROC-010, PROC-008, NETR-006): the first rule to match wins,
   and records ran ahead of kills — a shell in a hidden home directory was

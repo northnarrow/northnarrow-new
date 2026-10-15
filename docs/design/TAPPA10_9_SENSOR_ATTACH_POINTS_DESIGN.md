@@ -502,9 +502,10 @@ holds `{class bits, owner uid, generation}`. An open does the following:
 
 1. reads its parent key and looks it up;
 2. on a hit with the current generation, uses the cached bits;
-3. otherwise walks at most 8 ancestors, combining `OPEN_RULES` subtree
-   bits, `CHILD_RULES` and the credential tree names, and caches the
-   result.
+3. otherwise walks at most 16 ancestors (8 before external audit
+   EBPF-011), combining `OPEN_RULES` subtree bits, `CHILD_RULES` and the
+   credential tree names, and caches the result; a walk that stops at the
+   cap before the filesystem root is marked `DEPTH_CAPPED`.
 
 The leaf name is read only when the bits say leaves matter: a
 credential-name parent, or a home tree for the browser and KeePass names.

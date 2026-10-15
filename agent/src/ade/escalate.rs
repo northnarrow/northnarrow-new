@@ -318,6 +318,7 @@ mod tests {
             flags: 0,
             timestamp_ns: 0,
             path_from_user: false,
+            kernel_class: 0,
         };
         let host = host();
         let m = meta(&host);

@@ -84,6 +84,13 @@ pub enum Event {
         /// kernel opened (LSM mode). `false` on older records.
         #[serde(default)]
         path_from_user: bool,
+        /// External audit SNS-005: why the LSM file-open sensor emitted the
+        /// open (`wire::open_sensor::open_reason` bits: the kernel's class of
+        /// the file, by inode). Consumers use it when `filename` cannot be
+        /// compared with a host path (an unplaced mount root, a cut or
+        /// unread component). 0 in tracepoint mode and on older records.
+        #[serde(default)]
+        kernel_class: u32,
     },
     /// Tappa 10.9 step 1: one process crossed the mass-write threshold
     /// (`OPEN_MASS_WRITE_MIN` write-opens within the window), counted in
@@ -106,6 +113,11 @@ pub enum Event {
         /// encryption — not only of write-opens.
         #[serde(default)]
         overwrites: bool,
+        /// External audit EBPF-011: the overwrites crossed the threshold of
+        /// the writer's cgroup — its processes together, each below its own
+        /// — and `count` is the cgroup's overwrites in the window.
+        #[serde(default)]
+        cgroup_window: bool,
     },
     /// Pre-exec event: one per binfmt pass of LSM `bprm_check_security`
     /// (Tappa 10.9 step 2), or one per `execve` in tracepoint mode.
@@ -577,6 +589,7 @@ impl From<&FileOpenRaw> for Event {
             flags: raw.flags,
             timestamp_ns: raw.timestamp_ns,
             path_from_user: true,
+            kernel_class: 0,
         }
     }
 }
