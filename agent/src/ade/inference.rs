@@ -119,6 +119,22 @@ pub trait InferenceBackend: Send + Sync {
         Ok(raw)
     }
 
+    /// External audit LLMR-008: how many tokens `prompt` takes for this
+    /// backend's model, counted the way [`Self::generate`] will count
+    /// them. `None` when the backend does not count tokens (the mock).
+    fn prompt_tokens(&self, _prompt: &str) -> Option<usize> {
+        None
+    }
+
+    /// External audit LLMR-008: the most prompt tokens the backend takes.
+    /// The engine fits the prompt to it (dropping the oldest correlated
+    /// events first, never the system prompt); a longer prompt makes
+    /// `generate` return [`AdeError::PromptExceedsWindow`]. `None`: no
+    /// limit.
+    fn prompt_window(&self) -> Option<usize> {
+        None
+    }
+
     /// Best-effort warmup. Default impl is a no-op; backends that
     /// have a measurable cold start should override it.
     fn warmup(&self) -> Result<(), AdeError> {
@@ -128,8 +144,10 @@ pub trait InferenceBackend: Send + Sync {
 
 /// Deterministic, schema-valid backend used in CI and dev.
 ///
-/// The decision tree mirrors the system prompt's few-shot patterns so
-/// the demo run produces meaningful verdicts without an actual model.
+/// The decision tree matches names (the pre-v1.1 few-shot examples of the
+/// system prompt) so the demo run produces meaningful verdicts without an
+/// actual model; the production prompt decides on behaviour (external
+/// audit LLMP-013).
 /// All outputs are JSON strings that the parser will accept.
 pub struct MockBackend {
     model_id: String,
@@ -208,8 +226,8 @@ impl InferenceBackend for MockBackend {
     }
 }
 
-/// Heuristic synthesis used by `MockBackend`. Pattern-matches the
-/// classic few-shot examples from `dataset/system_prompt_v1.md`.
+/// Heuristic synthesis used by `MockBackend`. Pattern-matches the names
+/// of the pre-v1.1 few-shot examples of `dataset/system_prompt_v1.md`.
 fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdict {
     let now = Utc::now().to_rfc3339();
     let trace_id = Uuid::new_v4().to_string();

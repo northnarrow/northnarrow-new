@@ -59,6 +59,7 @@ pub use dual_verify::{
     is_critical_action, CriticalActionVerifier, DeterministicVerifier, VerificationResult,
 };
 pub use error::AdeError;
+use escalate::truncate_on_char_boundary;
 pub use escalate::{transform_to_escalate, EscalateMeta};
 pub use inference::{InferenceBackend, MockBackend, StreamControl};
 pub use mem_guard::{check_ade_memory, AdeMemCheck};
@@ -70,6 +71,23 @@ pub use stats::{AdeStats, AdeStatsSnapshot};
 pub use streaming_parser::StreamingJsonDetector;
 
 use crate::rag::{RagEngine, RagQuery};
+use sanitize::SanitizedCorrelated;
+
+/// What [`AdeEngine::prepare`] makes of an event.
+enum Prepared {
+    /// The sanitizer's score keeps the event from the model.
+    Rejected(SanitizedEvent),
+    /// The prompt the backend gets, fitted to its window, and the
+    /// sanitized inputs (all the correlated events, sent or not).
+    Prompt {
+        prompt: String,
+        sanitized: SanitizedEvent,
+        correlated: SanitizedCorrelated,
+    },
+    /// External audit LLMR-008: the system prompt, the focal event and the
+    /// task alone exceed the window.
+    TooLong { tokens: usize, window: usize },
+}
 
 /// Public Active Defense Engine handle.
 ///
@@ -168,9 +186,12 @@ impl AdeEngine {
 
     /// Run inference on the focal event with a context bundle.
     ///
-    /// Always returns a schema-valid [`AdeVerdict`]: parse failures
-    /// are folded into an Escalate Tier1 verdict, timeouts and
-    /// backend errors are surfaced as `AdeError`.
+    /// Parse failures, and a prompt that does not fit the model's window
+    /// even without its correlated events, are folded into an Escalate
+    /// Tier1 verdict. Timeouts and backend errors are surfaced as
+    /// `AdeError`, so that a caller can tell them from a verdict (the XAI
+    /// probe does); the agent records them through
+    /// [`Self::escalate_for_error`] (external audit LLMR-003).
     ///
     /// Sub-tappa 6.6 wraps the inference call in four hardening
     /// layers:
@@ -193,47 +214,34 @@ impl AdeEngine {
         event: &Event,
         context: &EventContext,
     ) -> Result<AdeVerdict, AdeError> {
-        let sanitized = sanitize::sanitize_event_for_ade(event);
-        if sanitized.injection_score >= HIGH_INJECTION_SCORE_REJECT {
-            tracing::warn!(
-                score = sanitized.injection_score,
-                flags = %sanitized.flags_summary(),
-                "high injection score, escalating without ADE call"
-            );
-            return Ok(make_escalate_for_injection(
-                event,
-                &sanitized,
-                self.escalate_meta(0),
-            ));
-        }
-
-        // Sub-tappa 6.7: optional RAG retrieval before prompt build.
-        let rag_result: Option<RagResult> = self.inner.rag.as_ref().map(|rag| {
-            let query_text = build_rag_query_from_event(event);
-            let r = rag.retrieve(RagQuery::new(&query_text));
-            tracing::debug!(
-                hits = r.documents.len(),
-                embed_ms = r.query_embedding_ms,
-                retrieve_ms = r.retrieval_ms,
-                "ADE RAG retrieval"
-            );
-            r
-        });
-
-        // External audit LLMP-002: the correlated events are sanitized
-        // like the focal one, and go in their own untrusted block.
-        let correlated = sanitize::sanitize_correlated(&context.recent_events);
-        let parts = structured_prompt::build_structured_prompt_with_rag(
-            &self.inner.system_prompt,
-            &self.inner.config,
-            &sanitized,
-            &correlated,
-            context,
-            rag_result.as_ref(),
-        );
-        let prompt = match self.inner.backend.chat_template() {
-            inference::ChatTemplate::Llama3 => parts.into_llama3_chat(),
-            inference::ChatTemplate::Plain => parts.into_plain_text(),
+        let (prompt, sanitized, correlated) = match self.prepare(event, context) {
+            Prepared::Rejected(sanitized) => {
+                tracing::warn!(
+                    score = sanitized.injection_score,
+                    flags = %sanitized.flags_summary(),
+                    "high injection score, escalating without ADE call"
+                );
+                return Ok(make_escalate_for_injection(
+                    event,
+                    &sanitized,
+                    self.escalate_meta(0),
+                ));
+            }
+            Prepared::TooLong { tokens, window } => {
+                tracing::warn!(
+                    tokens,
+                    window,
+                    "ADE prompt exceeds the model window without correlated events, escalating"
+                );
+                self.inner.stats.record_backend_error();
+                let err = AdeError::PromptExceedsWindow { tokens, window };
+                return Ok(self.escalate_for_error(event, &err));
+            }
+            Prepared::Prompt {
+                prompt,
+                sanitized,
+                correlated,
+            } => (prompt, sanitized, correlated),
         };
 
         let backend = self.inner.backend.clone();
@@ -401,29 +409,130 @@ impl AdeEngine {
     /// behaviour is byte-identical whether or not this is ever called
     /// (it is invoked only by `XaiEngine`). Returns `None` when the
     /// sanitiser would short-circuit `evaluate` to an injection
-    /// Escalate — in that path no prompt is ever produced.
+    /// Escalate, or when the prompt does not fit the model's window
+    /// (external audit LLMR-008) — in those paths no prompt is produced.
     pub fn assembled_prompt(&self, event: &Event, context: &EventContext) -> Option<String> {
+        match self.prepare(event, context) {
+            Prepared::Prompt { prompt, .. } => Some(prompt),
+            Prepared::Rejected(_) | Prepared::TooLong { .. } => None,
+        }
+    }
+
+    /// The prompt for `(event, context)`, fitted to the backend's window:
+    /// the one path from the event to the model, shared by
+    /// [`Self::evaluate`] and [`Self::assembled_prompt`] so that the XAI
+    /// `prompt_sha256` binds the prompt the model saw.
+    ///
+    /// External audit LLMR-008: the backend cut an over-long prompt from the
+    /// front, which is where the system prompt is. The fit drops the oldest
+    /// correlated events first, then the RAG block; the system prompt, the
+    /// focal event and the task are never cut. If they alone do not fit,
+    /// no prompt is produced ([`Prepared::TooLong`]).
+    fn prepare(&self, event: &Event, context: &EventContext) -> Prepared {
         let sanitized = sanitize::sanitize_event_for_ade(event);
         if sanitized.injection_score >= HIGH_INJECTION_SCORE_REJECT {
-            return None;
+            return Prepared::Rejected(sanitized);
         }
-        let rag_result: Option<RagResult> = self.inner.rag.as_ref().map(|rag| {
+
+        // Sub-tappa 6.7: optional RAG retrieval before prompt build.
+        let mut rag_result: Option<RagResult> = self.inner.rag.as_ref().map(|rag| {
             let query_text = build_rag_query_from_event(event);
-            rag.retrieve(RagQuery::new(&query_text))
+            let r = rag.retrieve(RagQuery::new(&query_text));
+            tracing::debug!(
+                hits = r.documents.len(),
+                embed_ms = r.query_embedding_ms,
+                retrieve_ms = r.retrieval_ms,
+                "ADE RAG retrieval"
+            );
+            r
         });
+
+        // External audit LLMP-002: the correlated events are sanitized
+        // like the focal one, and go in their own untrusted block.
         let correlated = sanitize::sanitize_correlated(&context.recent_events);
-        let parts = structured_prompt::build_structured_prompt_with_rag(
-            &self.inner.system_prompt,
-            &self.inner.config,
-            &sanitized,
-            &correlated,
-            context,
-            rag_result.as_ref(),
+        let mut fitted = correlated.clone();
+        let window = self.inner.backend.prompt_window();
+        loop {
+            let parts = structured_prompt::build_structured_prompt_with_rag(
+                &self.inner.system_prompt,
+                &self.inner.config,
+                &sanitized,
+                &fitted,
+                context,
+                rag_result.as_ref(),
+            );
+            let prompt = match self.inner.backend.chat_template() {
+                inference::ChatTemplate::Llama3 => parts.into_llama3_chat(),
+                inference::ChatTemplate::Plain => parts.into_plain_text(),
+            };
+            let over = window.and_then(|window| {
+                self.inner
+                    .backend
+                    .prompt_tokens(&prompt)
+                    .filter(|&tokens| tokens > window)
+                    .map(|tokens| (tokens, window))
+            });
+            let Some((tokens, window)) = over else {
+                let dropped = correlated.events.len() - fitted.events.len();
+                if dropped > 0 {
+                    tracing::debug!(
+                        dropped,
+                        kept = fitted.events.len(),
+                        "ADE prompt fitted to the model window: oldest correlated events dropped"
+                    );
+                }
+                // The sanity check weighs every correlated event the
+                // sanitizer saw, sent or not.
+                return Prepared::Prompt {
+                    prompt,
+                    sanitized,
+                    correlated,
+                };
+            };
+            // `events` is newest first: the oldest goes first.
+            if fitted.events.pop().is_some() {
+                continue;
+            }
+            if rag_result.take().is_some() {
+                continue;
+            }
+            return Prepared::TooLong { tokens, window };
+        }
+    }
+
+    /// External audit LLMR-003: the verdict the agent records when
+    /// [`Self::evaluate`] fails (a timeout, a backend or join error). It
+    /// used to log a warning and drop the event: an unknown binary that
+    /// timed out the model left no detection. Escalate Tier1, kind
+    /// `ade_unavailable`, the error in the package; no response follows.
+    pub fn escalate_for_error(&self, event: &Event, err: &AdeError) -> AdeVerdict {
+        let latency_ms = match err {
+            AdeError::Timeout { .. } => self.inner.config.timeout.as_millis() as u64,
+            _ => 0,
+        };
+        let mut v = transform_to_escalate(
+            event,
+            &err.to_string(),
+            None,
+            &self.escalate_meta(latency_ms),
         );
-        Some(match self.inner.backend.chat_template() {
-            inference::ChatTemplate::Llama3 => parts.into_llama3_chat(),
-            inference::ChatTemplate::Plain => parts.into_plain_text(),
-        })
+        v.threat_classification.kind = "ade_unavailable".into();
+        v.reasoning.step_1_extract =
+            "Synthetic escalation: the ADE model gave no verdict for this event.".into();
+        v.reasoning.step_2_pattern_match = "n/a — no model verdict".into();
+        v.reasoning.step_4_alternative_explanations.legitimate_uses =
+            vec!["slow or overloaded host".into()];
+        v.reasoning.step_5_decision = format!("Escalate Tier1Review. ADE unavailable: {err}");
+        v.evidence.primary_indicators = vec![format!("ade_unavailable: {err}")];
+        v.recommended_action.justification = "No model verdict; escalating to Tier1 review".into();
+        if let Some(pkg) = v.escalation_package.as_mut() {
+            pkg.summary = truncate_on_char_boundary(&format!("ADE unavailable: {err}"), 280).into();
+            pkg.key_questions = vec![
+                "Was the process benign?".into(),
+                "Is the host too slow or too busy for the model?".into(),
+            ];
+        }
+        v
     }
 
     fn escalate_meta(&self, latency_ms: u64) -> EscalateMeta<'_> {
