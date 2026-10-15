@@ -206,6 +206,7 @@ mod tests {
             uid: 1000,
             comm: "evilbin".to_string(),
             exe: Some("/usr/bin/evilbin".to_string()),
+            proc_start_ns: 0,
             bytes_sent: 4096,
             bytes_recv: 128,
             resolved_hostname: Some("exfil.example.org".to_string()),

@@ -111,6 +111,9 @@ pub struct TcpConnectInfo {
     pub uid: u32,
     pub comm: String,
     pub exe: Option<String>,
+    /// External audit NET-016: the connecting process's start, or a time
+    /// before it (`CLOCK_MONOTONIC` ns; 0 unknown), read at connect time.
+    pub proc_start_ns: u64,
 }
 
 /// Input describing a TCP close observation (N2
@@ -166,6 +169,8 @@ pub struct UdpSendInfo {
     pub uid: u32,
     pub comm: String,
     pub exe: Option<String>,
+    /// External audit NET-016: as [`TcpConnectInfo::proc_start_ns`].
+    pub proc_start_ns: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +186,7 @@ struct PendingFlow {
     uid: u32,
     comm: String,
     exe: Option<String>,
+    proc_start_ns: u64,
 }
 
 /// One process's pending connects, oldest first (lazy deletion).
@@ -297,6 +303,7 @@ impl FlowTracker {
                 uid: info.uid,
                 comm: info.comm.clone(),
                 exe: info.exe.clone(),
+                proc_start_ns: info.proc_start_ns,
             },
         );
         self.link(info.pid, key);
@@ -353,6 +360,7 @@ impl FlowTracker {
             uid: pending.uid,
             comm: pending.comm,
             exe: pending.exe,
+            proc_start_ns: pending.proc_start_ns,
             bytes_sent: info.bytes_sent,
             bytes_recv: info.bytes_recv,
             resolved_hostname: None,
@@ -403,6 +411,7 @@ impl FlowTracker {
             uid: info.uid,
             comm: info.comm.clone(),
             exe: None,
+            proc_start_ns: 0,
             bytes_sent: info.bytes_sent,
             bytes_recv: info.bytes_recv,
             resolved_hostname: None,
@@ -442,6 +451,7 @@ impl FlowTracker {
             uid: info.uid,
             comm: info.comm.clone(),
             exe: info.exe.clone(),
+            proc_start_ns: info.proc_start_ns,
             bytes_sent: info.bytes_sent,
             bytes_recv: 0,
             resolved_hostname: None,
@@ -617,6 +627,7 @@ mod tests {
             uid: 1000,
             comm: "curl".to_string(),
             exe: Some("/usr/bin/curl".to_string()),
+            proc_start_ns: start_ns / 2,
         }
     }
 
@@ -721,6 +732,9 @@ mod tests {
         assert_eq!(evt.dst_addr, v4(1, 2, 3, 4));
         assert_eq!(evt.dst_port, 443);
         assert_eq!(evt.flow_id.len(), 32);
+        // external audit NET-016: the connecting process's start, read at
+        // connect time, reaches the row the DNS attribution reads
+        assert_eq!(evt.proc_start_ns, 500_000);
         assert_eq!(t.pending_len(), 0, "pending entry must be drained on close");
     }
 
@@ -803,6 +817,7 @@ mod tests {
             uid: 0,
             comm: "dig".to_string(),
             exe: None,
+            proc_start_ns: 4_000,
         };
         let evt = t.on_udp_send(&udp);
         assert_eq!(evt.proto, 17);
@@ -811,6 +826,7 @@ mod tests {
         assert_eq!(evt.dst_addr, v4(8, 8, 8, 8));
         assert_eq!(evt.start_ns, 5_000);
         assert_eq!(evt.end_ns, 5_000, "UDP record has zero duration in V1.0");
+        assert_eq!(evt.proc_start_ns, 4_000);
         assert_eq!(evt.close_reason, 0);
         assert_eq!(t.pending_len(), 0, "UDP must NOT register a pending entry");
     }
@@ -1056,6 +1072,7 @@ mod tests {
         assert_eq!(evt.start_ns, evt.end_ns);
         assert_eq!(evt.pid, 42);
         assert!(evt.exe.is_none());
+        assert_eq!(evt.proc_start_ns, 0, "start unknown");
         assert_eq!(evt.bytes_sent, 64);
         // The connect that arrives afterwards must not open a pending flow.
         t.on_tcp_connect(&conn);

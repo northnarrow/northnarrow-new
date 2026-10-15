@@ -207,10 +207,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-161 | LLMR-014 | LLM runtime | M | fixed (lab PR 117) |
 | NN-AUD-162 | LLMR-016 | LLM runtime | S | fixed (lab PR 116) |
 | NN-AUD-163 | LLMR-017 | LLM runtime | M | fixed (lab PR 133) |
-| NN-AUD-164 | NET-006 | Network | M | open |
+| NN-AUD-164 | NET-006 | Network | M | fixed (lab PR 146) |
 | NN-AUD-165 | NET-009 | Network | L | fixed (lab PR 142) |
 | NN-AUD-166 | NET-012 | Network | M | fixed (lab PR 142) |
-| NN-AUD-167 | NET-016 | Network | M | open |
+| NN-AUD-167 | NET-016 | Network | M | fixed (lab PR 146) |
 | NN-AUD-168 | NET-019 | Network | L | fixed (lab PR 142) |
 | NN-AUD-169 | DEC-007 | Deception | S | open |
 | NN-AUD-170 | DEC-008 | Deception | M | open |
@@ -3418,3 +3418,57 @@ the audit did not report, noted with the fix that takes them.
     way (the removed scan was correct, only O(n)). The two N3 eviction
     tests now use one pid (FIFO within a process is kept).
   - Lab: Ubuntu 24.04, ndrain142-probe.sh on main and on this build, each case on a restarted agent. flood (one unprivileged loop, connect + abortive close to 100.64.142.1:8142 at 5,000/s for 120 s): main dropped 504,533 `tcp_close` events during the flood (638,474 by the end, WARN "ring-buffer events DROPPED" every 10 s) and the two probes launched mid-flood — a connect to port 4444 (NN-L-NET-010) and one to 192.0.2.142 (NN-L-NET-001) — were still alive after 20 s; here no drop, the probes killed after 107 ms and 106 ms. Row accounting (20 s at 5,000/s as one process name): main wrote 9,015 rows of 99,999 connects, and only within 10 s of the end; here 99,999 at once, 95,000 of them `decision_engine_skipped` (per-uid pacing), the killing rows evaluated. leak (70,000 unclosed connects held 20 s): main dropped 1,882 closes during the hold and 135,474 after; here none during the hold, 1,625 after, `nn-admin net status` naming the 4,464 pending connects evicted at capacity (the kernel's 4,096-socket `FLOW_SOCK_MAP`, noted above). ja3: a one-entry list → a signed `subsystem_degraded` "NN-L-NET-003 inactive" at boot. Gate: the integration tree of lab PRs 142–147 and 151 (this change with 146, 143, 144, 145, 147, 151 on top), Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
+- **NN-AUD-167 (NET-016), NN-AUD-164 (NET-006), lab PR 146.** DNS
+  attribution identity (batch B9). No kernel change.
+  - NET-016: `lookup_for_connect` took the newest query the PID had made
+    in 300 s, whoever made it. A process holding a reused PID — resolving
+    through Varlink/`nss-resolve` (no UDP/53 of its own) or connecting to
+    a bare address — got the previous holder's name in the signed row,
+    and NN-L-NET-002 killed it for a `.onion` it never asked for. The TCP
+    connect pump and the UDP drain now read the connecting process's
+    start next to the NETR-008 `exe`
+    (`AuthSessionTracker::start_floor_ns`): the exec's start from the
+    spawn cache when it still describes the process, else
+    `/proc/<pid>/stat`'s start less the host's suspended time
+    (`CLOCK_BOOTTIME` − `CLOCK_MONOTONIC`) and two ticks — never later
+    than the real start. `NetFlowEvent::proc_start_ns` (serde default 0)
+    carries it to the close, and the lookup ignores the queries older
+    than it. The cache stays keyed by
+    PID: the filter is applied at lookup, so an earlier holder's own
+    pending flow keeps its name.
+  - Choices: an unknown start (0: the process gone before the connect
+    pump read it, a row synthesised at close) leaves the PID alone to
+    decide, as before — toward detection. The `/proc` bound lets an
+    earlier holder's query count when made within the suspended time plus
+    about 20 ms of the new start (a server: about 20 ms; a laptop that
+    slept: wider, unless the exec is in the spawn cache). A PID reused
+    between the connect and the pump's read (milliseconds) gives the newer
+    start: the row loses its name, as `exe` already names the newer image.
+    The signed `netflow.jsonl` payload is unchanged (the start is on the
+    event).
+  - NET-006: `originator_for` returned the newest other PID that had sent
+    `q == qname` within 2 s. The reverse index now keeps each query's
+    destination. A candidate must have sent to a loopback address
+    (`127/8`, `::1`, the mapped form), its name matches ignoring ASCII
+    case (DNS 0x20), and a second distinct candidate → `None` →
+    `DnsAttribution::Downgrade` (Log). One PID asking twice (A + AAAA, a
+    retry) stays one originator. An originator reaching the resolver on a
+    non-loopback address (a container through its bridge), or the last
+    leg of chained forwarders, is now logged, not acted on.
+    `NN-L-NET-004_dns_originator_attribution.md` §6.3 updated.
+  - Not done: a network verdict's kill still captures the process its PID
+    names at kill time — `event_owner_pid` has no `NetFlow` arm, so the
+    CMB-004 start/seen check does not reach NN-L-NET-002 (B4's;
+    `proc_start_ns` is on the event for it). Cost: one `/proc/<pid>/stat`
+    read per connect, and per UDP record, in the pumps.
+  - Tests: `a_recycled_pid_does_not_inherit_queries`,
+    `a_query_at_the_start_counts_and_an_unknown_start_falls_back`,
+    `ambiguous_originator_downgrades`, `originator_ignores_case`,
+    `originator_requires_a_stub_query`,
+    `the_start_floor_is_the_current_process_start_or_below_it`,
+    `a_connect_carries_the_connecting_process_start`; the connect→close
+    tracker test and the `NetFlowEvent` serde round trip extended.
+    `originator_for_picks_most_recent_other_pid`, which pinned the
+    newest-wins rule, is replaced by `ambiguous_originator_downgrades`.
+    With each fix reverted the matching test fails.
+  - Lab: Debian 12, dnsid146-probe.sh on main and on this build. recycle: a process of user nn asked for `nn146….onion` (UDP/53 to 100.64.0.53) and exited; ≥ 3 s later root set `ns_last_pid` so a new process got the same pid and connected to 100.64.0.146:8146 by address — main: the new process KILLED by signal 9, its row `resolved_hostname nn146ubucir.onion`; here: exit 0, no verdict, `resolved_hostname` null. control (a process that asks for the `.onion` itself, then connects): killed with the name in its row on both. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.

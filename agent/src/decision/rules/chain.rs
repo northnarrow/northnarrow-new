@@ -934,6 +934,7 @@ mod tests {
             uid: 1000,
             comm: "evilbin".to_string(),
             exe: Some("/usr/bin/evilbin".to_string()),
+            proc_start_ns: 0,
             bytes_sent: 1024,
             bytes_recv: 2048,
             resolved_hostname: None,

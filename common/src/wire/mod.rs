@@ -1423,6 +1423,13 @@ pub struct NetFlowEvent {
     pub comm: alloc::string::String,
     /// `/proc/<pid>/exe` at connect time, if resolvable.
     pub exe: Option<alloc::string::String>,
+    /// External audit NET-016: the start of the process `pid` named at
+    /// connect time (`CLOCK_MONOTONIC` ns), or a time before it when only
+    /// `/proc` knows it; 0 = unknown (the process gone before the connect
+    /// was read, a row synthesised at close). The DNS attribution ignores
+    /// queries older than this: a previous holder of the PID made them.
+    #[serde(default)]
+    pub proc_start_ns: u64,
     /// Bytes sent on this socket (tcp_close `tp->bytes_sent`).
     /// 0 for UDP and for open snapshots.
     pub bytes_sent: u64,
@@ -1913,6 +1920,7 @@ mod tests {
             uid: 0,
             comm: "curl".to_string(),
             exe: Some("/usr/bin/curl".to_string()),
+            proc_start_ns: 1_699_999_990_000_000_000,
             bytes_sent: 1234,
             bytes_recv: 5678,
             resolved_hostname: Some("example.com".to_string()),
@@ -1943,6 +1951,12 @@ mod tests {
             json.contains("\"tls_fingerprint\""),
             "tls_fingerprint must appear: {json}"
         );
+        // External audit NET-016: a record written before the field
+        // reads back with the start unknown.
+        let older = json.replace("\"proc_start_ns\":1699999990000000000,", "");
+        assert_ne!(older, json);
+        let restored: NetFlowEvent = serde_json::from_str(&older).expect("older record");
+        assert_eq!(restored.proc_start_ns, 0);
     }
 
     /// N1 test #3: [`NetListenerEvent`] serde JSON round-trip.

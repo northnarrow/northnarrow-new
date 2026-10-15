@@ -612,6 +612,9 @@ async fn process_close_record(
                 // the tracker's lock (a datagram record is emitted while
                 // its sender runs).
                 exe: lineage.image_path(raw.pid),
+                // External audit NET-016: who holds the PID, for the DNS
+                // attribution below.
+                proc_start_ns: lineage.start_floor_ns(raw.pid).unwrap_or(0),
             };
             flow_tracker.lock().on_udp_send(&info)
         }
@@ -627,8 +630,11 @@ async fn process_close_record(
     // DNS attribution — back-correlate the (pid, recent-query)
     // window per design §6.2. Hit populates `resolved_hostname`;
     // miss leaves it None (IP-literal destination, or DNS query
-    // never observed within the TTL).
-    if let Some(qname) = dns_cache.lookup_for_connect(event.pid, event.start_ns) {
+    // never observed within the TTL). External audit NET-016: only the
+    // queries made since the connecting process started.
+    if let Some(qname) =
+        dns_cache.lookup_for_connect(event.pid, event.start_ns, event.proc_start_ns)
+    {
         event.resolved_hostname = Some(qname);
     }
 
@@ -807,6 +813,7 @@ mod tests {
             uid: 1000,
             comm: "curl".to_string(),
             exe: Some("/usr/bin/curl".to_string()),
+            proc_start_ns: 0,
             bytes_sent: 100,
             bytes_recv: 200,
             resolved_hostname: Some("example.com".to_string()),
