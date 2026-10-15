@@ -15,6 +15,30 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, anti-tamper suite correctness and coverage
+  (Medium LAB-003, LAB-004, LAB-005, LAB-007): `tamper-check` could kill
+  its own session: C02 signalled whatever `systemctl show -p MainPID`
+  printed, `kill -9 0` when the watchdog was down, and later cases reused
+  a PID read once from a possibly stale pidfile. Every signal now goes to
+  a process checked by comm and start time, through a pidfd; a watchdog or
+  agent that is not there reads "target absent", a deviation. A case's
+  outcome was the English text of its error: the run is in the C locale,
+  the helpers report the errno, and a refusal counts as "denied" only if
+  the end state held too (same process alive and running, same inode,
+  file not shrunk, pins kept, `+i` kept): `rm -rf` of the pins that
+  removes some of them is "partial". The mounts over `/etc/northnarrow`
+  and `/sys/kernel/btf` are undone by a trap on exit, Ctrl-C, a lost
+  session or an `umount` that failed; one left after its case fails and
+  stops the run. New cases: the seven other signals from a root shell
+  (C55a-g), a binary replaced by rename or unlink (C56a-b), audit.log
+  truncated and detections.jsonl emptied (C57a-b), a renamed module tool
+  (C58, R018 expected), write/unlink/rename through io_uring (C59a-c), a
+  runtime mask of the watchdog (C60, reported as `unit_shadowed`),
+  PROTECTED_PIDS across a restart (C61, observe builds); the journal
+  vacuum is listed as a known gap (C57c). `anti-tamper.sh --persistence`
+  checks the hooks, pins and `+i` after a reboot (C62a-e), and
+  `--selftest` checks the helpers without root. **Regression:** the run
+  deletes the agent journal namespace's archived files (C57c).
 - External audit, Wave 2, lab host hygiene and lab supply chain (Medium
   LAB-008, LAB-009, LAB-002, LAB-015; Low LAB-010): lab scripts that run as
   root on a guest worked at fixed paths under `/tmp` and `/var/tmp` that any
