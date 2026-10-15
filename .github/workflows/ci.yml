@@ -373,3 +373,26 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      # External audit MAIN-006: no C in production (VISION_TECHNICAL.md,
+      # rule 1), checked rather than stated. Oniguruma (`onig_sys`, through
+      # tokenizers' `onig` feature) and zstd (`zstd-sys`, through tantivy's
+      # default features) are the C libraries the agent has pulled in or
+      # nearly did; neither may be in its normal dependency graph, for any
+      # target or feature. The listing is matched, not `cargo tree -i`'s
+      # exit status: that fails both for a crate outside the graph and for
+      # any other error, so a gate on it would pass when cargo cannot run.
+      - name: "Charter: no onig_sys or zstd-sys in the agent's dependency graph"
+        run: |
+          set -euo pipefail
+          deps=$(cargo tree --locked -p northnarrow-agent -e normal --all-features \
+            --target all --prefix none --format '{p}' | sort -u)
+          bad=$(printf '%s\n' "$deps" | awk '$1 == "onig_sys" || $1 == "zstd-sys"')
+          if [ -n "$bad" ]; then
+            echo "::error::C library crate in the agent's dependency graph: $bad"
+            for c in $(printf '%s\n' "$bad" | awk '{print $1}' | sort -u); do
+              cargo tree --locked -p northnarrow-agent -e normal --all-features \
+                --target all -i "$c"
+            done
+            exit 1
+          fi
+          echo "onig_sys, zstd-sys: absent ($(printf '%s\n' "$deps" | wc -l) packages checked)"

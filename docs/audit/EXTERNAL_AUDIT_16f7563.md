@@ -131,10 +131,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-085 | AUT-002 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-086 | AUT-003 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-087 | AUT-004 | Admin auth | S | fixed (lab PR 115) |
-| NN-AUD-088 | AUT-009 | Admin auth | M | open |
+| NN-AUD-088 | AUT-009 | Admin auth | M | already fixed (lab PR 117, with NN-AUD-161); tests (lab PR 151) |
 | NN-AUD-089 | MAIN-004 | Agent main | S | fixed (lab PR 118) |
 | NN-AUD-090 | MAIN-005 | Agent main | S | fixed (lab PR 115) |
-| NN-AUD-091 | MAIN-006 | Agent main | M | open |
+| NN-AUD-091 | MAIN-006 | Agent main | M | fixed (lab PR 151) |
 | NN-AUD-092 | MAIN-007 | Agent main | M | narrowed, residual fixed (lab PR 118) |
 | NN-AUD-093 | MAIN-008 | Agent main | S | fixed (lab PR 118) |
 | NN-AUD-094 | ATP-003 | Anti-tamper | S | fixed (lab PR 114) |
@@ -3751,3 +3751,86 @@ the audit did not report, noted with the fix that takes them.
     still built; now `cargo check -p northnarrow-agent` stops on "eBPF
     OBJECT DOES NOT MATCH ITS STAMP", and a v1 stamp on "UNSTAMPED".
   - Lab: Debian 12, feas147-probe.sh: as user nn, `/dev/shm/nn-feasibility-true` planted as a symlink to a file of the user's and `/var/tmp/nn-feasibility/nn147-marker` created, then `nn-lab.sh sensor-feasibility` (root). main: both plants gone after the run (root removed the user's directory and link; the copy through the link was refused by `protected_symlinks`); here: the run passes with its fixtures in `mkdtemp` directories (`/dev/shm/nn-feasibility.QA696o/true` executed), the link, its target and the marker untouched. EBPF-014 on the host: a one-byte change to the `.o` passed `cargo check` on main and fails here ("eBPF OBJECT DOES NOT MATCH ITS STAMP"). Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
+- **NN-AUD-091 (MAIN-006), NN-AUD-088 (AUT-009), lab PR 151.** C code in
+  the agent; a torn audit log and the rollback floor.
+  - MAIN-006, wider than reported: `agent/Cargo.toml` asked `tokenizers`
+    for `onig`, but switching it to `fancy-regex` alone changes nothing.
+    candle-core 0.10.0 to 0.11.0 depends on `tokenizers` with
+    `features = ["onig"]` on every non-wasm target, and with both features
+    on, tokenizers 0.22 selects Oniguruma (`utils/mod.rs`). So Oniguruma
+    (`onig` 6.5.3, `onig_sys` 69.9.3, built with `cc`), the only C build in
+    the agent, split every ADE prompt — strings the observed processes
+    chose — inside the root agent, and a search error in it was a panic
+    (`onig` 6.5.3 panics, `panic = "abort"` in release).
+  - Fix: the agent asks for `fancy-regex`, and the root `Cargo.toml`
+    patches candle-core with `vendor/candle-core`: the crates.io 0.10.2
+    package (sha256 `6bd98954…2a4a`, the checksum Cargo.lock had) with two
+    changes to its `Cargo.toml`, marked "NorthNarrow": that dependency
+    asks for `fancy-regex`, and `[lints.rust] deprecated = "allow"` (a path
+    dependency gets no `--cap-lints`, and CI builds with `-D warnings`; its
+    four `f64::INFINITY` warnings would fail it). Cargo.lock: `onig`,
+    `onig_sys` and `pkg-config` out, `fancy-regex` 0.14.0 in (0.17.0 stays
+    for candle-transformers), candle-core a path package; nothing else
+    moves. The cost, accepted: a candle bump must redo the vendored copy
+    (the CI step below fails until it is); `cargo audit` still matches it by
+    name and version (rustsec compares sources only for a registry
+    package). The fuzz workspace keeps Oniguruma (not production; no fuzz
+    target reaches the tokenizer); its `Cargo.lock` was already stale on
+    main (procfs 0.17 against the agent's 0.18) and is left alone.
+  - The tokenization. The backend only decides where the Llama 3.1
+    `Split` regex cuts (`\p{L}`, `\p{N}`, `(?i:'s|…)`, `\s+(?!\S)`); BPE,
+    the added tokens and the template do not use it. No production
+    `tokenizer.json` on the dev host (not in `~/models`,
+    `/var/lib/northnarrow/models` or a Hugging Face cache), so
+    `ade::tokenizer_golden` builds one with the production pre-tokenizer,
+    post-processor and decoder and a small BPE vocabulary. Its golden
+    (`agent/src/ade/testdata/tokenizer_golden.json`, 30 inputs: the
+    contractions in any case and with `'ſ`, Italian and a dozen scripts,
+    emoji and joiners, Unicode digits, every whitespace class — `\v`,
+    `\f`, NEL, NBSP, U+1680, U+2000–200A, U+2028/2029, U+202F, U+205F,
+    U+3000 are `\s`; the C0 separators, U+180E, U+200B and the BOM are not
+    — letters added in Unicode 15 to 16, long argv, paths, DNS names,
+    base64, an ADE-shaped prompt, nine hostile runs) was recorded with
+    Oniguruma before the switch: `fancy-regex` gives the same pieces and
+    the same ids. Dropping `(?!\S)` from the pattern fails it. To repeat
+    with the model's own tokenizer on a host that has it:
+    `ignored_real_tokenizer_matches_its_golden` (record with the
+    candle-core patch commented out, which brings Oniguruma back; compare
+    with it restored) — not done here.
+  - Time (release with LTO off, test vocabulary, median of 30, two runs
+    after the switch): a full prompt (`system_prompt_v1.md` and a 20-event
+    user part, 14 KB) pre-tokenizes in 4.9–5.3 ms (Oniguruma 3.6) and
+    encodes in 7.2–7.9 ms (6.2). 64 KiB hostile runs (spaces, `' \n'`,
+    `'   a'`, digits, NBSP): the slowest, `'   a'`, encodes in 51–55 ms
+    (35), with the same digest of pieces and ids under both
+    backends. The fit loop tokenizes at most 22 times per verdict, and the
+    sanitizer caps the untrusted fields (argv 1 KiB); generation takes
+    seconds.
+  - CI: a step of the `cargo audit` job lists the agent's normal
+    dependency graph (`cargo tree --locked -p northnarrow-agent -e normal
+    --all-features --target all`) and fails, printing the path, when
+    `onig_sys` or `zstd-sys` is in it. It matches the listing rather than
+    testing `cargo tree -i`: that fails (101) both for a crate outside the
+    graph and for any other error (a stale lock, no registry), so a gate on
+    its status would pass on an error; a failing listing fails the step. On
+    main it fails (`onig_sys` through tokenizers ← candle-core and the
+    agent); here it passes.
+  - AUT-009: the premise does not hold — `audit.log` is never rotated
+    (`audit.rs`, "No rotation"), so no rotation resets the floor, and a
+    floor kept elsewhere adds nothing against whoever can remove the log
+    (they can rewrite `admin.pub` too). The residual the triage kept was
+    already fixed: `recorded_signatures` read the log with `read_to_string`
+    before `AuditLog::open` repaired a torn tail, so a last write cut
+    inside a multi-byte character (serde_json writes non-ASCII unescaped)
+    or any read error emptied the floor for that boot, silently. Since
+    LLMR-014 (lab PR 117) `RollbackFloor::scan` reads bytes, leaves the
+    fragment out as `repair_torn_tail` drops it, and resets the floor on a
+    read error (ERROR and a signed `integrity_drift`). No code change here;
+    two tests pin it.
+  - Tests: `the_rust_regex_backend_splits_and_encodes_like_onig`,
+    `the_test_tokenizer_has_the_production_shape` (guards: they pass on
+    both backends by design; the check that fails on main is the CI step),
+    `the_floor_survives_a_torn_utf8_tail` (fails when the floor is read
+    with `read_to_string`, checked by inverting it),
+    `an_unreadable_log_resets_the_floor`.
+  - Lab: `cargo tree -p northnarrow-agent -e normal -i onig_sys` on main: `onig_sys` via `onig` ← `tokenizers` ← `candle-core`; here: not in the graph (the CI step fails on main and passes here), and the agent built in the Ubuntu 24.04 guest holds no `oniguruma` string. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.

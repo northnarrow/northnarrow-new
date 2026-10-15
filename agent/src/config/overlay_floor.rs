@@ -757,6 +757,56 @@ mod tests {
         assert!(c.scan().reset().is_some());
     }
 
+    /// External audit AUT-009, the residual the triage kept
+    /// (`recorded_signatures_survives_torn_utf8_tail`): the floor was read
+    /// with `read_to_string` before the log's torn tail was repaired, so a
+    /// last write cut inside a multi-byte character emptied it for that
+    /// boot, without a word. serde_json leaves non-ASCII text unescaped, so
+    /// such a cut is a power loss away. The floor is read as bytes and the
+    /// fragment left out, as the repair drops it.
+    #[test]
+    fn the_floor_survives_a_torn_utf8_tail() {
+        let c = Chain::new();
+        c.append(
+            AUDIT_OP_ACCEPTED,
+            serde_json::json!({
+                "kind": PCA.keyword(), "sha256": "aa", "signed_ts": 500,
+                "note": "perché è già così",
+            }),
+        );
+        let mut torn = std::fs::read(&c.audit).unwrap();
+        assert!(!torn.is_ascii(), "the entry is stored with its accents");
+        // the next write cut between the two bytes of "è" (0xC3 0xA8)
+        torn.extend_from_slice(b"{\"ts\":\"2026-10-15T00:00:00Z\",\"note\":\"gi");
+        torn.push(0xC3);
+        std::fs::write(&c.audit, &torn).unwrap();
+        assert!(std::str::from_utf8(&torn).is_err());
+        let f = c.scan();
+        assert_eq!(f.reset(), None, "{f:?}");
+        assert_eq!(f.recorded(PCA).map(|r| r.1), Some(500));
+        // once the log opens (the fragment dropped, the repair recorded),
+        // the floor is the same
+        drop(c.open());
+        assert!(std::fs::read_to_string(&c.audit).is_ok());
+        let after = c.scan();
+        assert_eq!(after.reset(), None, "{after:?}");
+        assert_eq!(after.recorded(PCA).map(|r| r.1), Some(500));
+    }
+
+    /// A log that is there but cannot be read resets the floor (an ERROR
+    /// and a signed record at the boot), never leaves it empty in silence.
+    #[test]
+    fn an_unreadable_log_resets_the_floor() {
+        let c = Chain::new();
+        c.accepted(PCA, 500);
+        std::fs::remove_file(&c.audit).unwrap();
+        std::fs::create_dir(&c.audit).unwrap();
+        let f = c.scan();
+        assert!(f.reset().is_some_and(|r| r.contains("unreadable")), "{f:?}");
+        assert_eq!(f.not_before(), Some(NOW));
+        assert!(f.entries().iter().any(|e| e.extra["kind"] == DRIFT_KIND));
+    }
+
     /// The anchor carries the floor it verified: a boot verifies only what
     /// came after it, and an edit before it changes nothing.
     #[test]

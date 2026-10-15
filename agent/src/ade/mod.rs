@@ -43,6 +43,8 @@ pub mod structured_prompt;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tokenizer_golden;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

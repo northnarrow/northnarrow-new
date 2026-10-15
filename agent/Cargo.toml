@@ -94,7 +94,15 @@ num_cpus = "1.16"
 candle-core = { version = "0.10", default-features = false }
 candle-transformers = { version = "0.10", default-features = false }
 candle-nn = { version = "0.10", default-features = false }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# CHARTER (external audit MAIN-006): the regex backend is `fancy-regex`
+# (Rust). `onig` (tokenizers' default) builds Oniguruma, a C library
+# (`onig_sys`), into the agent, the same class of dependency as zstd-sys
+# below. candle-core 0.10 asks for `onig` too, and with both features on
+# tokenizers uses it: the root Cargo.toml patches candle-core
+# (`vendor/candle-core`). CI fails if `onig_sys` or `zstd-sys` enters the
+# agent's graph; `ade::tokenizer_golden` pins the tokenization (recorded
+# with Oniguruma).
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
 # Sub-tappa 6.6: ADE prompt-injection hardening (base64 encoding of
 # untrusted strings inside the structured prompt).

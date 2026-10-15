@@ -15,6 +15,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, C code in the agent (Medium MAIN-006): the ADE
+  tokenizer split every prompt — strings the observed processes chose —
+  with Oniguruma, a C regex library (`onig_sys`), inside the root agent,
+  against the no-C rule the same manifest applied to zstd. Asking
+  `tokenizers` for `fancy-regex` was not enough: candle-core 0.10 requires
+  its `onig` feature, and with both on, tokenizers uses Oniguruma.
+  candle-core 0.10.2 is now patched (`vendor/candle-core`: the crates.io
+  package, its tokenizers dependency asking for `fancy-regex`) and the
+  backend is `fancy-regex` (Rust). A golden test recorded with Oniguruma
+  first (Unicode, every whitespace class, long argv, DNS names, an
+  ADE-shaped prompt, hostile runs) gives the same pieces and token ids; a
+  full prompt tokenizes in about 7.5 ms instead of 6. A CI step fails when
+  `onig_sys` or `zstd-sys` enters the agent's dependency graph. AUT-009:
+  the rollback-floor residual (a log cut inside a UTF-8 character emptying
+  the floor for a boot) was already gone with LLMR-014; two tests pin it.
 - External audit, Wave 2, lab and build tooling (Medium SNS-003, EBPF-014):
   the sensor-feasibility runner of lab builds (`--sensor-feasibility`,
   feature `test-privileged`) ran as root on fixed names in world-writable
