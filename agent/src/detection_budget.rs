@@ -234,13 +234,21 @@ pub fn admit(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) ->
 }
 
 /// Report held-back detections every [`REPORT_SECS`]: one WARN per
-/// (rule, uid) and one signed audit entry for all of them.
-pub fn spawn_reporter(audit_log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
+/// (rule, uid) and one signed audit entry for all of them. External audit
+/// NN-AUD-111: in the same window, the records the detection store's queue
+/// dropped ([`crate::detection_store::DetectionSink::report_drops`]).
+pub fn spawn_reporter(
+    audit_log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>,
+    detection_sink: Option<crate::detection_store::DetectionSink>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(REPORT_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            if let Some(sink) = &detection_sink {
+                sink.report_drops(audit_log.as_deref());
+            }
             let held = BUDGET.take_held();
             if held.is_empty() {
                 continue;

@@ -1962,8 +1962,6 @@ async fn main() -> Result<()> {
         posture.clone(),
         Some(Arc::clone(&installer_override)),
     );
-    // Review 75: detections held back by the per-rule budget, reported.
-    detection_budget::spawn_reporter(audit_log.clone());
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
     // the trusted-installer override so its close/expiry records chain.
@@ -2274,6 +2272,11 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // Review 75: detections held back by the per-rule budget, reported.
+    // External audit NN-AUD-111: started once the detection store exists,
+    // so the same task records the store's queue drops.
+    detection_budget::spawn_reporter(audit_log.clone(), detection_sink.clone());
 
     // Tappa 9.0.c: open the status-event chainlog + build the detection
     // admin state for the admin socket (set-status writes here; the

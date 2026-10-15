@@ -12,12 +12,22 @@
 //! jitter, so a change cannot be timed between two checks) it compares
 //! these against what it saw at boot and against what the install laid
 //! down, and every new finding is an ERROR in the journal and a signed
-//! audit entry (`integrity_drift`, `kind` + `detail`), once per finding.
+//! audit entry (`integrity_drift`, `kind` + `detail`).
 //! Weakening environment variables are reported once at boot. An admin
 //! private key left on the host (external audit DEP-001) is reported the
 //! same way: it is a credential for whoever is root here.
+//!
+//! External audit NN-AUD-114: what a round recomputes (drop-ins, shadows,
+//! overlays, mounts, admin keys, limits) is a set of active findings, not
+//! a "seen once, silent forever" set. A finding that goes away is recorded
+//! (`integrity_drift_cleared`, signed); one that comes back is reported
+//! again, at most once per [`REREPORT_SECS`] with the number of times it
+//! came back in between. Each kind is capped at [`MAX_PER_KIND`] findings
+//! per round. External audit NN-AUD-113: the boot round compares the
+//! limits with what the units set, and a limit that appears or vanishes
+//! after the baseline is drift too.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -139,6 +149,29 @@ pub const CONFIG_DIR: &str = "/etc/northnarrow";
 /// A check that runs this much later than scheduled means the agent did not
 /// run in between (cgroup freezer, a stopped VM, starvation).
 pub const STALL_SLACK_SECS: u64 = 15;
+
+/// Audit op of a recomputed finding that went away (external audit NN-AUD-114).
+pub const CLEARED_OP: &str = "integrity_drift_cleared";
+
+/// External audit NN-AUD-114: a finding that clears and comes back is
+/// reported again at most once per this many seconds.
+pub const REREPORT_SECS: u64 = 600;
+
+/// External audit NN-AUD-114: findings of one kind listed per round; the
+/// rest become one "N more" finding.
+pub const MAX_PER_KIND: usize = 64;
+
+/// External audit NN-AUD-113: the units as installed, for the limits they
+/// set (`KNOWN_DROPINS` embeds the drop-in the same way).
+const AGENT_UNIT: &str = include_str!("../../deploy/systemd/northnarrow-agent.service");
+const WATCHDOG_UNIT: &str = include_str!("../../deploy/systemd/northnarrow-watchdog.service");
+
+/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
+const AGENT_UNIT_CGROUP: &str = "/system.slice/northnarrow-agent.service";
+
+/// Limit names as [`limits`] reports them.
+const LIMIT_CGROUP: &str = "agent cgroup";
+const LIMIT_WATCHDOG_OOM: &str = "watchdog oom_score_adj";
 
 /// One finding: `kind` groups, `detail` is what changed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -390,7 +423,7 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
     }
     if let Some(pid) = read_trim(watchdog_pidfile).and_then(|p| p.parse::<u32>().ok()) {
         if let Some(x) = read_trim(&PathBuf::from(format!("/proc/{pid}/oom_score_adj"))) {
-            v.push(("watchdog oom_score_adj".to_string(), x));
+            v.push((LIMIT_WATCHDOG_OOM.to_string(), x));
         }
     }
     if let Some(cg) = std::fs::read_to_string("/proc/self/cgroup")
@@ -400,6 +433,9 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
                 .find_map(|l| l.strip_prefix("0::").map(str::to_string))
         })
     {
+        // External audit NN-AUD-113: the path itself, so a move to another
+        // cgroup (the root has none of the files below) is drift.
+        v.push((LIMIT_CGROUP.to_string(), cg.clone()));
         let base = PathBuf::from("/sys/fs/cgroup").join(cg.trim_start_matches('/'));
         for f in [
             "memory.max",
@@ -443,38 +479,396 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
         .collect()
 }
 
+/// The last `key=value` of a unit's `[Service]` section, comments skipped.
+fn unit_directive<'a>(unit: &'a str, key: &str) -> Option<&'a str> {
+    let mut in_service = false;
+    let mut found = None;
+    for line in unit.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_service = line == "[Service]";
+            continue;
+        }
+        if !in_service || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                found = Some(v.trim());
+            }
+        }
+    }
+    found
+}
+
+/// A systemd byte size (`9G`, `512M`, `4096`; base 1024) as the cgroup
+/// file shows it. `infinity` is `max`.
+fn systemd_bytes(v: &str) -> Option<String> {
+    if v == "infinity" {
+        return Some("max".to_string());
+    }
+    let (num, mult) = match v.chars().last()? {
+        'K' => (&v[..v.len() - 1], 1u64 << 10),
+        'M' => (&v[..v.len() - 1], 1 << 20),
+        'G' => (&v[..v.len() - 1], 1 << 30),
+        'T' => (&v[..v.len() - 1], 1 << 40),
+        c if c.is_ascii_digit() => (v, 1),
+        _ => return None,
+    };
+    num.parse::<u64>()
+        .ok()?
+        .checked_mul(mult)
+        .map(|b| b.to_string())
+}
+
+/// One limit the units set, as [`limits`] names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedLimit {
+    name: String,
+    value: String,
+    /// Absent at boot is itself a finding. `false`: compared only when
+    /// the file exists at boot (`cpu.max` needs the cpu controller).
+    required: bool,
+}
+
+/// External audit NN-AUD-113: the limits the shipped units set. A
+/// directive the parser does not understand is left out (never a guess).
+fn expected_limits() -> Vec<ExpectedLimit> {
+    let mut out = Vec::new();
+    let mut push = |name: &str, value: Option<String>, required: bool| {
+        if let Some(value) = value {
+            out.push(ExpectedLimit {
+                name: name.to_string(),
+                value,
+                required,
+            });
+        }
+    };
+    push(LIMIT_CGROUP, Some(AGENT_UNIT_CGROUP.to_string()), true);
+    push(
+        "agent oom_score_adj",
+        unit_directive(AGENT_UNIT, "OOMScoreAdjust").map(str::to_string),
+        true,
+    );
+    push(
+        "agent memory.high",
+        unit_directive(AGENT_UNIT, "MemoryHigh").and_then(systemd_bytes),
+        true,
+    );
+    push(
+        "agent memory.max",
+        unit_directive(AGENT_UNIT, "MemoryMax").and_then(systemd_bytes),
+        true,
+    );
+    push(
+        "agent pids.max",
+        unit_directive(AGENT_UNIT, "TasksMax")
+            .filter(|v| v.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string),
+        true,
+    );
+    // No CPUQuota= in the agent's unit: no quota, the kernel's default
+    // period.
+    if unit_directive(AGENT_UNIT, "CPUQuota").is_none() {
+        push("agent cpu.max", Some("max 100000".to_string()), false);
+    }
+    // The watchdog registers later: compared when it first can be read.
+    push(
+        LIMIT_WATCHDOG_OOM,
+        unit_directive(WATCHDOG_UNIT, "OOMScoreAdjust").map(str::to_string),
+        false,
+    );
+    out
+}
+
+/// External audit NN-AUD-113: `oom_score_adj` and cgroup limits against a
+/// baseline. With the unit's expectations (the agent runs in its unit's
+/// cgroup), the baseline holds what the units set, so a value changed
+/// before the first round is drift too (`limit_unexpected`). Otherwise it
+/// is what the first round saw. A limit that appears or vanishes after
+/// the baseline is drift (`limit_appeared` / `limit_removed`), except the
+/// watchdog's `oom_score_adj`: its process comes and goes with the
+/// watchdog, so its absence is not drift and its first value is compared
+/// with the unit's (or adopted, without the unit's expectations).
+#[derive(Default)]
+struct LimitWatch {
+    baseline: BTreeMap<String, String>,
+    from_unit: BTreeSet<String>,
+    /// Limits the unit does not require (`cpu.max`): the controller comes
+    /// and goes with systemd's delegation (a daemon-reload, a sibling's
+    /// accounting) — its absence is not drift, a different value is.
+    optional: BTreeSet<String>,
+    armed: bool,
+}
+
+impl LimitWatch {
+    /// The limit findings for `now`. The first call takes the baseline.
+    fn observe(&mut self, now: &[(String, String)], expected: &[ExpectedLimit]) -> Vec<Finding> {
+        let now: BTreeMap<String, String> = now.iter().cloned().collect();
+        if !self.armed {
+            self.armed = true;
+            self.baseline = now.clone();
+            for e in expected {
+                if !e.required && e.name != LIMIT_WATCHDOG_OOM {
+                    self.optional.insert(e.name.clone());
+                }
+                if e.required || e.name == LIMIT_WATCHDOG_OOM || now.contains_key(&e.name) {
+                    self.baseline.insert(e.name.clone(), e.value.clone());
+                    self.from_unit.insert(e.name.clone());
+                }
+            }
+        }
+        let names: BTreeSet<String> = self.baseline.keys().chain(now.keys()).cloned().collect();
+        let mut out = Vec::new();
+        for name in names {
+            let before = self.baseline.get(&name).cloned();
+            let after = now.get(&name).cloned();
+            if before == after {
+                continue;
+            }
+            if after.is_none() && self.optional.contains(&name) {
+                continue;
+            }
+            if name == LIMIT_WATCHDOG_OOM {
+                let Some(after) = &after else { continue };
+                if before.is_none() {
+                    self.baseline.insert(name, after.clone());
+                    continue;
+                }
+            }
+            let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "absent".to_string());
+            let finding = if self.from_unit.contains(&name) {
+                Finding {
+                    kind: "limit_unexpected",
+                    detail: format!(
+                        "{name}: expected {} (unit), found {}",
+                        shown(&before),
+                        shown(&after)
+                    ),
+                }
+            } else {
+                let kind = match (&before, &after) {
+                    (None, _) => "limit_appeared",
+                    (_, None) => "limit_removed",
+                    _ => "limit_changed",
+                };
+                Finding {
+                    kind,
+                    detail: format!("{name}: {} → {}", shown(&before), shown(&after)),
+                }
+            };
+            out.push(finding);
+        }
+        out
+    }
+}
+
+/// What one round records for a recomputed finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Emit {
+    /// Present and reported; `reappeared`: times it came back since the
+    /// previous report, while the re-report was held back.
+    Detected { f: Finding, reappeared: u32 },
+    /// Gone. `reappeared` as above, when the comebacks were never reported.
+    Cleared { f: Finding, reappeared: u32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct History {
+    last_report: Option<u64>,
+    /// Comebacks since `last_report`, not reported yet.
+    suppressed: u32,
+    /// The present occurrence has been reported (so its end is recorded).
+    reported: bool,
+}
+
+/// External audit NN-AUD-114: the findings a round recomputes, as a set
+/// diffed from round to round, instead of a set of everything ever seen.
+#[derive(Default)]
+struct ActiveSet {
+    active: HashSet<Finding>,
+    history: HashMap<Finding, History>,
+}
+
+impl ActiveSet {
+    /// Diff `current` (already capped, [`cap_per_kind`]) against the
+    /// previous round, at unix second `now`.
+    fn update(&mut self, current: HashSet<Finding>, now: u64) -> Vec<Emit> {
+        let mut out = Vec::new();
+        let mut gone: Vec<&Finding> = self.active.difference(&current).collect();
+        gone.sort_by(|a, b| (a.kind, &a.detail).cmp(&(b.kind, &b.detail)));
+        for f in gone {
+            if let Some(h) = self.history.get_mut(f) {
+                if h.reported {
+                    h.reported = false;
+                    out.push(Emit::Cleared {
+                        f: f.clone(),
+                        reappeared: 0,
+                    });
+                }
+            }
+        }
+        let mut present: Vec<&Finding> = current.iter().collect();
+        present.sort_by(|a, b| (a.kind, &a.detail).cmp(&(b.kind, &b.detail)));
+        for f in present {
+            let h = self.history.entry(f.clone()).or_insert(History {
+                last_report: None,
+                suppressed: 0,
+                reported: false,
+            });
+            if h.reported {
+                continue;
+            }
+            let due = h
+                .last_report
+                .is_none_or(|t| now.saturating_sub(t) >= REREPORT_SECS);
+            if !due {
+                // came back inside the back-off window: counted, held back
+                if !self.active.contains(f) {
+                    h.suppressed = h.suppressed.saturating_add(1);
+                }
+            } else {
+                out.push(Emit::Detected {
+                    f: f.clone(),
+                    reappeared: h.suppressed,
+                });
+                h.last_report = Some(now);
+                h.suppressed = 0;
+                h.reported = true;
+            }
+        }
+        // Forget what is gone and out of its back-off window; comebacks
+        // that were held back and never reported are recorded first.
+        let mut expired: Vec<(Finding, u32)> = Vec::new();
+        self.history.retain(|f, h| {
+            let keep = current.contains(f)
+                || h.last_report
+                    .is_some_and(|t| now.saturating_sub(t) < REREPORT_SECS);
+            if !keep && h.suppressed > 0 {
+                expired.push((f.clone(), h.suppressed));
+            }
+            keep
+        });
+        expired.sort_by(|a, b| (a.0.kind, &a.0.detail).cmp(&(b.0.kind, &b.0.detail)));
+        out.extend(
+            expired
+                .into_iter()
+                .map(|(f, reappeared)| Emit::Cleared { f, reappeared }),
+        );
+        self.active = current;
+        out
+    }
+}
+
+/// External audit NN-AUD-114: at most [`MAX_PER_KIND`] findings of each
+/// kind (the first by detail, so the same ones are listed every round),
+/// then one finding that counts the rest.
+fn cap_per_kind(findings: Vec<Finding>) -> HashSet<Finding> {
+    let mut by_kind: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for f in findings {
+        by_kind.entry(f.kind).or_default().insert(f.detail);
+    }
+    let mut out = HashSet::new();
+    for (kind, details) in by_kind {
+        let n = details.len();
+        for detail in details.into_iter().take(MAX_PER_KIND) {
+            out.insert(Finding { kind, detail });
+        }
+        if n > MAX_PER_KIND {
+            out.insert(Finding {
+                kind,
+                detail: format!(
+                    "{} more {kind} findings not listed (cap {MAX_PER_KIND} per round)",
+                    n - MAX_PER_KIND
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// One-shot findings remembered at most (a bounded dedup; see
+/// [`Checker::report_once`]).
+const MAX_ONCE: usize = 1024;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 struct Checker {
-    seen: HashSet<Finding>,
+    /// One-shot findings already reported (weakening environment, refused
+    /// shutdown markers, stalls): they are events, not state, so they are
+    /// never "cleared" (external audit NN-AUD-114).
+    once: HashSet<Finding>,
+    /// External audit NN-AUD-114: the findings each round recomputes.
+    active: ActiveSet,
     /// Signed overlays are configuration, not drift (Tappa 10.8).
     overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
-    baseline: Vec<(String, String)>,
+    limits: LimitWatch,
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
 }
 
 impl Checker {
-    fn report(&mut self, f: Finding, at_boot: bool) {
-        if !self.seen.insert(f.clone()) {
+    /// A one-shot finding, reported once.
+    fn report_once(&mut self, f: Finding, at_boot: bool) {
+        if self.once.contains(&f) {
             return;
         }
+        if self.once.len() >= MAX_ONCE {
+            self.once.clear();
+        }
+        self.once.insert(f.clone());
+        self.record_detected(&f, at_boot, 0);
+    }
+
+    fn record_detected(&self, f: &Finding, at_boot: bool, reappeared: u32) {
         if f.kind == "bpffs_mount" {
-            warn!(kind = f.kind, detail = %f.detail, at_boot, "integrity: bpffs mounted outside /sys/fs/bpf");
+            warn!(kind = f.kind, detail = %f.detail, at_boot, reappeared, "integrity: bpffs mounted outside /sys/fs/bpf");
         } else {
             error!(
                 kind = f.kind,
                 detail = %f.detail,
                 at_boot,
+                reappeared,
                 "INTEGRITY DRIFT — systemd/kernel state around the agent changed outside the agent"
             );
         }
+        let mut extra =
+            serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        if reappeared > 0 {
+            extra["reappeared"] = reappeared.into();
+        }
+        self.append(AUDIT_OP, extra, "detected");
+    }
+
+    fn record_cleared(&self, f: &Finding, at_boot: bool, reappeared: u32) {
+        warn!(
+            kind = f.kind,
+            detail = %f.detail,
+            reappeared,
+            "integrity drift cleared — the state reported earlier is gone"
+        );
+        let mut extra =
+            serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        if reappeared > 0 {
+            extra["reappeared"] = reappeared.into();
+        }
+        self.append(CLEARED_OP, extra, "cleared");
+    }
+
+    fn append(&self, op: &str, extra: serde_json::Value, result: &str) {
         let Some(log) = &self.audit_log else { return };
         let draft = AuditEntryDraft {
-            op: AUDIT_OP.to_string(),
-            extra: serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot }),
+            op: op.to_string(),
+            extra,
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
-            result: "detected".to_string(),
+            result: result.to_string(),
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
@@ -504,35 +898,20 @@ impl Checker {
         gate.is_signed(kind, path)
     }
 
-    fn round(&mut self, at_boot: bool) {
+    /// The state findings of this round (everything but one-shot events).
+    fn collect_round(&mut self) -> Vec<Finding> {
+        let mut c = Vec::new();
         let roots: Vec<&Path> = DROPIN_ROOTS.iter().map(Path::new).collect();
-        for f in unit_dropins(&roots) {
-            self.report(f, at_boot);
-        }
+        c.extend(unit_dropins(&roots));
         let search: Vec<&Path> = UNIT_SEARCH_PATH.iter().map(Path::new).collect();
-        for f in unit_shadows(&search) {
-            self.report(f, at_boot);
-        }
-        for f in config_overlays(Path::new(CONFIG_DIR)) {
-            if self.overlay_is_signed(&f) {
-                continue;
-            }
-            self.report(f, at_boot);
-        }
+        c.extend(unit_shadows(&search));
+        c.extend(
+            config_overlays(Path::new(CONFIG_DIR))
+                .into_iter()
+                .filter(|f| !self.overlay_is_signed(f)),
+        );
         if let Ok(mi) = std::fs::read_to_string("/proc/1/mountinfo") {
-            for f in mount_findings(&mi, &self.own_files) {
-                self.report(f, at_boot);
-            }
-        }
-        // External audit WDG-001: shutdown markers the watchdog refused
-        // (forged, replayed or stale) while the agent was down.
-        let rejected = Path::new(common::shutdown_marker::REJECTED_PATH);
-        let found = rejected_shutdowns(rejected);
-        if !found.is_empty() {
-            for f in found {
-                self.report(f, at_boot);
-            }
-            let _ = std::fs::remove_file(rejected);
+            c.extend(mount_findings(&mi, &self.own_files));
         }
         // External audit DEP-001: an admin private key on the host (the
         // bootstrap key install.sh writes, until the operator moves it
@@ -545,37 +924,61 @@ impl Checker {
             Path::new("/")
         };
         for path in crate::host_hardening::admin_keys_on_host(root) {
-            self.report(
-                Finding {
-                    kind: "admin_key_on_host",
-                    detail: format!(
-                        "{path}: an admin private key on this host lets root release COMBAT, \
-                         open trusted-installer windows and sign overlays — move it offline"
-                    ),
-                },
-                at_boot,
-            );
+            c.push(Finding {
+                kind: "admin_key_on_host",
+                detail: format!(
+                    "{path}: an admin private key on this host lets root release COMBAT, \
+                     open trusted-installer windows and sign overlays — move it offline"
+                ),
+            });
         }
+        // External audit NN-AUD-113: the units' limits apply when the agent
+        // runs as its unit — in its cgroup, or moved out of it while the
+        // unit's cgroup exists. A manual run elsewhere keeps the observed
+        // baseline (and cgroup v1 hosts read no cgroup metrics).
         let now = limits(&self.watchdog_pidfile);
-        if at_boot {
-            self.baseline = now;
-            return;
-        }
-        for (name, value) in &now {
-            let before = self
-                .baseline
+        let expected = if self.limits.armed {
+            Vec::new()
+        } else {
+            let in_unit = now
                 .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.as_str());
-            if before.is_some() && before != Some(value.as_str()) {
-                self.report(
-                    Finding {
-                        kind: "limit_changed",
-                        detail: format!("{name}: {} → {value}", before.unwrap_or("?")),
-                    },
-                    false,
-                );
+                .any(|(n, v)| n == LIMIT_CGROUP && v == AGENT_UNIT_CGROUP);
+            let unit_exists = Path::new("/sys/fs/cgroup")
+                .join(AGENT_UNIT_CGROUP.trim_start_matches('/'))
+                .is_dir();
+            if in_unit || unit_exists {
+                expected_limits()
+            } else {
+                Vec::new()
             }
+        };
+        c.extend(self.limits.observe(&now, &expected));
+        c
+    }
+
+    /// Diff this round's state findings against the last round's and
+    /// record what appeared and what went away.
+    fn apply(&mut self, findings: Vec<Finding>, now: u64, at_boot: bool) {
+        for e in self.active.update(cap_per_kind(findings), now) {
+            match e {
+                Emit::Detected { f, reappeared } => self.record_detected(&f, at_boot, reappeared),
+                Emit::Cleared { f, reappeared } => self.record_cleared(&f, at_boot, reappeared),
+            }
+        }
+    }
+
+    fn round(&mut self, at_boot: bool) {
+        let findings = self.collect_round();
+        self.apply(findings, unix_now(), at_boot);
+        // External audit WDG-001: shutdown markers the watchdog refused
+        // (forged, replayed or stale) while the agent was down.
+        let rejected = Path::new(common::shutdown_marker::REJECTED_PATH);
+        let found = rejected_shutdowns(rejected);
+        if !found.is_empty() {
+            for f in cap_per_kind(found) {
+                self.report_once(f, at_boot);
+            }
+            let _ = std::fs::remove_file(rejected);
         }
     }
 }
@@ -596,15 +999,16 @@ pub fn spawn(
         }
     }
     let mut checker = Checker {
-        seen: HashSet::new(),
+        once: HashSet::new(),
+        active: ActiveSet::default(),
         overlay_gate,
-        baseline: Vec::new(),
+        limits: LimitWatch::default(),
         watchdog_pidfile,
         own_files,
         audit_log,
     };
     for f in weakening_env(&vars) {
-        checker.report(f, true);
+        checker.report_once(f, true);
     }
     info!(
         every_secs = BASE_SECS,
@@ -627,7 +1031,7 @@ pub fn spawn(
                     .map(|d| d.as_secs())
                     .unwrap_or(0)
                     .saturating_sub(late.as_secs());
-                checker.report(
+                checker.report_once(
                     Finding {
                         kind: "agent_stalled",
                         detail: format!("did not run for ~{} s (from unix {at}): cgroup freeze, stopped VM or starvation", late.as_secs()),
@@ -879,5 +1283,349 @@ mod tests {
         let f = unit_dropins_with(&[root.path()], &known);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].detail.contains("10-debian-perf-paranoid.conf"));
+    }
+
+    fn finding(kind: &'static str, detail: &str) -> Finding {
+        Finding {
+            kind,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn set(fs: &[&Finding]) -> HashSet<Finding> {
+        fs.iter().map(|f| (*f).clone()).collect()
+    }
+
+    /// External audit NN-AUD-114: a drop-in reported, removed, then put
+    /// back identically (same path and mtime) is reported again, and its
+    /// removal is recorded. Before the fix the second occurrence was
+    /// silent for the life of the process (`seen` was never cleared).
+    #[test]
+    fn a_finding_that_clears_and_reappears_is_reported_again() {
+        let f = finding(
+            "unit_dropin",
+            "/etc/systemd/system/northnarrow-agent.service.d/zz.conf (mtime 1700000000)",
+        );
+        let mut a = ActiveSet::default();
+        let t0 = 1_800_000_000;
+        assert_eq!(
+            a.update(set(&[&f]), t0),
+            vec![Emit::Detected {
+                f: f.clone(),
+                reappeared: 0
+            }]
+        );
+        // still there: nothing new
+        assert!(a.update(set(&[&f]), t0 + 30).is_empty());
+        // removed: recorded
+        assert_eq!(
+            a.update(HashSet::new(), t0 + 60),
+            vec![Emit::Cleared {
+                f: f.clone(),
+                reappeared: 0
+            }]
+        );
+        // back after the back-off window: reported again at once
+        let t1 = t0 + REREPORT_SECS + 60;
+        assert_eq!(
+            a.update(set(&[&f]), t1),
+            vec![Emit::Detected {
+                f: f.clone(),
+                reappeared: 0
+            }]
+        );
+        // flapping inside the window: held back, counted, and reported
+        // when the window ends if it is still there
+        assert_eq!(
+            a.update(HashSet::new(), t1 + 30),
+            vec![Emit::Cleared {
+                f: f.clone(),
+                reappeared: 0
+            }]
+        );
+        assert!(a.update(set(&[&f]), t1 + 60).is_empty());
+        assert!(a.update(HashSet::new(), t1 + 90).is_empty());
+        assert!(a.update(set(&[&f]), t1 + 120).is_empty());
+        assert_eq!(
+            a.update(set(&[&f]), t1 + REREPORT_SECS),
+            vec![Emit::Detected {
+                f: f.clone(),
+                reappeared: 2
+            }]
+        );
+        // held-back comebacks of a finding that is gone by the end of the
+        // window are recorded when it is forgotten
+        let t2 = t1 + REREPORT_SECS;
+        a.update(HashSet::new(), t2 + 30);
+        assert!(a.update(set(&[&f]), t2 + 60).is_empty());
+        assert!(a.update(HashSet::new(), t2 + 90).is_empty());
+        assert_eq!(
+            a.update(HashSet::new(), t2 + REREPORT_SECS),
+            vec![Emit::Cleared {
+                f: f.clone(),
+                reappeared: 1
+            }]
+        );
+        assert!(a.history.is_empty(), "nothing kept for what is gone");
+    }
+
+    fn checker_with_log(dir: &Path) -> (Checker, PathBuf) {
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.join("agent.key")).unwrap();
+        let path = dir.join("audit.log");
+        let log = AuditLog::open(&path, key, [0u8; 16]).unwrap();
+        let checker = Checker {
+            once: HashSet::new(),
+            active: ActiveSet::default(),
+            overlay_gate: None,
+            limits: LimitWatch::default(),
+            watchdog_pidfile: dir.join("watchdog.pid"),
+            own_files: Vec::new(),
+            audit_log: Some(Arc::new(Mutex::new(log))),
+        };
+        (checker, path)
+    }
+
+    fn audit_ops(path: &Path) -> Vec<(String, String)> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                (
+                    v["op"].as_str().unwrap().to_string(),
+                    v["extra"]["kind"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// External audit NN-AUD-114: an environment variable is a property of
+    /// this process, not state a round recomputes: reported once, never
+    /// "cleared" by a round that does not see it.
+    #[test]
+    fn weakening_env_is_reported_once_and_never_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut c, path) = checker_with_log(dir.path());
+        let env = weakening_env(&[("NN_DETECT_ONLY".to_string(), "1".to_string())]);
+        assert_eq!(env.len(), 1);
+        for f in env.iter().chain(env.iter()) {
+            c.report_once(f.clone(), true);
+        }
+        let drop_in = finding("unit_dropin", "/x.conf (mtime 1)");
+        c.apply(vec![drop_in.clone()], 1_000, true);
+        c.apply(Vec::new(), 1_030, false);
+        c.apply(Vec::new(), 1_060, false);
+        assert_eq!(
+            audit_ops(&path),
+            vec![
+                (AUDIT_OP.to_string(), "weakening_env".to_string()),
+                (AUDIT_OP.to_string(), "unit_dropin".to_string()),
+                (CLEARED_OP.to_string(), "unit_dropin".to_string()),
+            ]
+        );
+    }
+
+    /// External audit NN-AUD-114: a directory of rewritten overlays cannot
+    /// grow the state or the audit log without bound.
+    #[test]
+    fn findings_per_kind_are_capped() {
+        let mut v: Vec<Finding> = (0..200)
+            .map(|i| Finding {
+                kind: "config_overlay",
+                detail: format!("/etc/northnarrow/f{i:03}.local (1 bytes, sha256 00…)"),
+            })
+            .collect();
+        v.push(finding("unit_dropin", "/a.conf (mtime 1)"));
+        let capped = cap_per_kind(v);
+        let overlays: Vec<&Finding> = capped
+            .iter()
+            .filter(|f| f.kind == "config_overlay")
+            .collect();
+        assert_eq!(overlays.len(), MAX_PER_KIND + 1);
+        assert!(capped.contains(&finding(
+            "config_overlay",
+            &format!(
+                "{} more config_overlay findings not listed (cap {MAX_PER_KIND} per round)",
+                200 - MAX_PER_KIND
+            )
+        )));
+        // the same ones are listed every round: the first by detail
+        assert!(capped
+            .iter()
+            .any(|f| f.detail.starts_with("/etc/northnarrow/f000.local")));
+        assert!(!capped
+            .iter()
+            .any(|f| f.detail.starts_with("/etc/northnarrow/f199.local")));
+        assert!(capped.contains(&finding("unit_dropin", "/a.conf (mtime 1)")));
+    }
+
+    fn lim(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// External audit NN-AUD-113: a limit that appears or vanishes after
+    /// the baseline is drift. Before the fix only a value present in both
+    /// was compared, so a move to the root cgroup (every cgroup file gone)
+    /// was silent.
+    #[test]
+    fn limit_appearing_or_vanishing_after_baseline_is_reported() {
+        let mut w = LimitWatch::default();
+        let boot = lim(&[
+            ("agent oom_score_adj", "-500"),
+            ("agent cgroup", "/user.slice/x.scope"),
+            ("agent memory.max", "max"),
+        ]);
+        assert!(w.observe(&boot, &[]).is_empty());
+        let moved = lim(&[
+            ("agent oom_score_adj", "-500"),
+            ("agent cgroup", "/"),
+            ("agent pids.max", "512"),
+        ]);
+        let f = w.observe(&moved, &[]);
+        let got: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("limit_changed", "agent cgroup: /user.slice/x.scope → /"),
+                ("limit_removed", "agent memory.max: max → absent"),
+                ("limit_appeared", "agent pids.max: absent → 512"),
+            ]
+        );
+        // back to the baseline: nothing
+        assert!(w.observe(&boot, &[]).is_empty());
+    }
+
+    /// External audit NN-AUD-113: the shipped units' values are parsed as
+    /// the cgroup files show them.
+    /// Lab PR 130: `cpu.max` vanished when systemd dropped the cpu
+    /// controller after a daemon-reload — not drift; a changed value is.
+    #[test]
+    fn an_optional_limit_vanishing_is_not_drift() {
+        let expected = vec![ExpectedLimit {
+            name: "agent cpu.max".to_string(),
+            value: "max 100000".to_string(),
+            required: false,
+        }];
+        let mut w = LimitWatch::default();
+        let seen = |v: &str| vec![("agent cpu.max".to_string(), v.to_string())];
+        assert!(w.observe(&seen("max 100000"), &expected).is_empty());
+        assert!(w.observe(&[], &expected).is_empty(), "absent: not drift");
+        let f = w.observe(&seen("50000 100000"), &expected);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].kind, "limit_unexpected");
+    }
+
+    #[test]
+    fn expected_limits_match_the_shipped_units() {
+        let e: Vec<(String, String, bool)> = expected_limits()
+            .into_iter()
+            .map(|e| (e.name, e.value, e.required))
+            .collect();
+        let want = |n: &str, v: &str, r: bool| (n.to_string(), v.to_string(), r);
+        assert_eq!(
+            e,
+            vec![
+                want("agent cgroup", AGENT_UNIT_CGROUP, true),
+                want("agent oom_score_adj", "-500", true),
+                want("agent memory.high", "9663676416", true),
+                want("agent memory.max", "11811160064", true),
+                want("agent pids.max", "512", true),
+                want("agent cpu.max", "max 100000", false),
+                want("watchdog oom_score_adj", "-900", false),
+            ]
+        );
+        assert_eq!(systemd_bytes("64M").as_deref(), Some("67108864"));
+        assert_eq!(systemd_bytes("infinity").as_deref(), Some("max"));
+        assert_eq!(systemd_bytes("10%"), None);
+    }
+
+    /// External audit NN-AUD-113: a limit changed in the 15 s before the
+    /// first round (the lab probe: `echo 100M >` the agent cgroup's
+    /// `memory.max`, bypassing systemd) is compared with the unit, not
+    /// taken as the baseline. Before the fix the boot round only stored it.
+    #[test]
+    fn boot_limits_differing_from_the_unit_are_reported() {
+        let mut w = LimitWatch::default();
+        let boot = lim(&[
+            ("agent oom_score_adj", "-500"),
+            ("agent cgroup", AGENT_UNIT_CGROUP),
+            ("agent memory.max", "104857600"),
+            ("agent memory.high", "9663676416"),
+            ("agent pids.max", "512"),
+            ("agent cpu.max", "max 100000"),
+            ("agent cgroup.freeze", "0"),
+        ]);
+        let f = w.observe(&boot, &expected_limits());
+        let got: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![(
+                "limit_unexpected",
+                "agent memory.max: expected 11811160064 (unit), found 104857600"
+            )]
+        );
+        // put back as the unit sets it: the finding goes away
+        let mut fixed = boot.clone();
+        fixed[2].1 = "11811160064".to_string();
+        assert!(w.observe(&fixed, &[]).is_empty());
+        // without the cpu controller cpu.max is not required
+        let mut w = LimitWatch::default();
+        let no_cpu: Vec<_> = fixed
+            .iter()
+            .filter(|(n, _)| n != "agent cpu.max")
+            .cloned()
+            .collect();
+        assert!(w.observe(&no_cpu, &expected_limits()).is_empty());
+    }
+
+    /// External audit NN-AUD-113: the watchdog registers after the agent;
+    /// its value is compared with its unit's at the first readable round,
+    /// its absence is not drift, and without the unit's expectations its
+    /// first value is adopted.
+    #[test]
+    fn watchdog_oom_is_baselined_late_against_expected() {
+        let base = [
+            ("agent oom_score_adj", "-500"),
+            ("agent cgroup", AGENT_UNIT_CGROUP),
+        ];
+        let mut w = LimitWatch::default();
+        let full = |extra: &[(&str, &str)]| {
+            let mut v = lim(&base);
+            v.extend(lim(&[
+                ("agent memory.max", "11811160064"),
+                ("agent memory.high", "9663676416"),
+                ("agent pids.max", "512"),
+            ]));
+            v.extend(lim(extra));
+            v
+        };
+        assert!(w.observe(&full(&[]), &expected_limits()).is_empty());
+        let f = w.observe(&full(&[("watchdog oom_score_adj", "1000")]), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "limit_unexpected");
+        assert_eq!(
+            f[0].detail,
+            "watchdog oom_score_adj: expected -900 (unit), found 1000"
+        );
+        assert!(w
+            .observe(&full(&[("watchdog oom_score_adj", "-900")]), &[])
+            .is_empty());
+        assert!(
+            w.observe(&full(&[]), &[]).is_empty(),
+            "a restarting watchdog is not drift"
+        );
+
+        // manual run: adopted at first sight, then compared
+        let mut w = LimitWatch::default();
+        assert!(w.observe(&lim(&base), &[]).is_empty());
+        let mut v = lim(&base);
+        v.extend(lim(&[("watchdog oom_score_adj", "-900")]));
+        assert!(w.observe(&v, &[]).is_empty());
+        v[2].1 = "1000".to_string();
+        let f = w.observe(&v, &[]);
+        assert_eq!(f[0].kind, "limit_changed");
     }
 }
