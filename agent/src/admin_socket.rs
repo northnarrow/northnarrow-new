@@ -2782,22 +2782,57 @@ pub fn canary_path(
     }
 }
 
-/// External audit DEC-001: watch a decoy's inode through the FIM.
-fn watch_decoy(state: &CanaryAdminState, key: common::wire::InodeKey, path: &str) {
+/// External audit DEC-001: watch a decoy's inode through the FIM. External
+/// audit NN-AUD-120 (FIMP-008): `false` when it cannot be — the kernel
+/// watch map refused it (full of entries that are never evicted, or
+/// absent), or the FIM is not running — and the deploy is refused: a decoy
+/// whose opens are not seen never trips, and the deploy used to answer
+/// Success with only a WARN in the journal.
+fn watch_decoy(state: &CanaryAdminState, key: common::wire::InodeKey, path: &str) -> bool {
     match &state.fim_watch {
         Some(watch) => {
-            if !watch.watch(key, path) {
-                warn!(
-                    path,
-                    "canary: the kernel watch map refused the decoy (full, or absent) — \
-                     its opens will not be seen"
-                );
+            if watch.watch(key, path, crate::fim::drain::WatchClass::Decoy) {
+                return true;
             }
+            tracing::error!(
+                path,
+                "canary: the kernel watch map refused the decoy (full, or absent) — its opens \
+                 would not be seen; deploy refused"
+            );
+            false
         }
-        None => warn!(
-            path,
-            "canary: FIM is not running — the decoy's opens will not be seen"
-        ),
+        None => {
+            tracing::error!(
+                path,
+                "canary: FIM is not running — the decoy's opens would not be seen; deploy refused"
+            );
+            false
+        }
+    }
+}
+
+/// What a decoy's inode was watched as before the deploy watched it: a
+/// decoy written over a watched file (a credential canary at a watched
+/// credential path) keeps that file's inode.
+type PriorWatch = Option<(String, crate::fim::drain::WatchClass)>;
+
+fn prior_watch(state: &CanaryAdminState, key: common::wire::InodeKey) -> PriorWatch {
+    let watch = state.fim_watch.as_ref()?;
+    Some((watch.path_map.lookup(&key)?, watch.path_map.class_of(&key)?))
+}
+
+/// Undo the watch of a decoy the deploy did not keep: the inode goes back
+/// to what it was watched as, or stops being watched (the drain must not
+/// name an inode the kernel does not report).
+fn undo_decoy_watch(state: &CanaryAdminState, key: common::wire::InodeKey, prior: PriorWatch) {
+    let Some(watch) = &state.fim_watch else {
+        return;
+    };
+    match prior {
+        Some((path, class)) => {
+            let _ = watch.path_map.insert_as(key, path, class);
+        }
+        None => watch.unwatch(key),
     }
 }
 
@@ -2885,6 +2920,27 @@ fn dispatch_canary_deploy(
         }
     };
 
+    // External audit DEC-001: have the kernel report the decoy's opens,
+    // and the drain name them — a decoy outside the FIM path list was
+    // never watched, so it never tripped. NN-AUD-120: watched before it is
+    // registered; one that cannot be watched is refused, not registered.
+    let prior = decoy.and_then(|key| prior_watch(state, key));
+    if let (Some(key), Some(path)) = (decoy, canary_path(&extra.deployment)) {
+        if !watch_decoy(state, key, path) {
+            undo_decoy_watch(state, key, prior.clone());
+            warn!(
+                signer_fp = %primary_fp,
+                path,
+                "canary-deploy: REFUSED — the decoy cannot be watched; the file written at the \
+                 path is left in place (remove it, or deploy again once the FIM watches)"
+            );
+            return CanaryDeployResponse {
+                result: AdminResult::UnknownOperation,
+                canary_id: String::new(),
+            };
+        }
+    }
+
     // Deploy via the K2 registry. Allocates the canary_id +
     // appends the Deploy row to the chain.
     let draft = CanaryTokenDraft {
@@ -2899,6 +2955,10 @@ fn dispatch_canary_deploy(
             Ok(e) => e,
             Err(e) => {
                 warn!(error = %e, "canary registry deploy failed");
+                // not a canary: its decoy is not watched as one either
+                if let Some(key) = decoy {
+                    undo_decoy_watch(state, key, prior);
+                }
                 return CanaryDeployResponse {
                     result: AdminResult::UnknownOperation,
                     canary_id: String::new(),
@@ -2907,12 +2967,6 @@ fn dispatch_canary_deploy(
         }
     };
 
-    // External audit DEC-001: have the kernel report the decoy's opens,
-    // and the drain name them — a decoy outside the FIM path list was
-    // never watched, so it never tripped.
-    if let (Some(key), Some(path)) = (decoy, canary_path(&extra.deployment)) {
-        watch_decoy(state, key, path);
-    }
     // Refresh the K3 detector's hot-path indexes so the new
     // canary is visible to the next inbound event.
     rebuild_canary_indexes(state);

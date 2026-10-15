@@ -21,8 +21,10 @@
 //!   TWO `BaselineEntryDraft`s per call when the path is a
 //!   symlink (Q1 two-row semantics: one is_symlink=true row
 //!   for the link metadata, one is_symlink=false row for the
-//!   resolved target content; auto-resolution depth capped
-//!   at 1 hop).
+//!   resolved target content). External audit NN-AUD-122: the
+//!   content row records the canonical target, and
+//!   [`symlink_chain`] names the links and the target the FIM
+//!   watches behind the path (at most [`SYMLINK_CHAIN_MAX_HOPS`]).
 //! - `BaselineDb::open` — opens the JSONL log, walks any
 //!   existing entries to recover the chain tail-hash.
 //!   Missing file is treated as empty (chain starts at
@@ -80,12 +82,61 @@ const BASELINE_FILE_MODE: u32 = 0o644;
 /// rows still parse cleanly.
 pub const FIM_BASELINE_FORMAT_VERSION: u32 = 1;
 
-/// Auto-resolution depth cap for symlinks, per §13 Q1
-/// resolution. A watched symlink `/a -> /b` emits two
-/// BaselineEntry rows; if `/b` is itself a symlink, only
-/// `/a` and the immediate target `/b` are auto-added (deeper
-/// rebinds rely on `/b`'s normal watch entry).
-pub const SYMLINK_RESOLVE_DEPTH_HOPS: u32 = 1;
+/// External audit NN-AUD-122 (FIMP-010): the most links [`symlink_chain`]
+/// follows behind a watched path. The §13 Q1 one-hop cap it replaces had
+/// no consumer: the content was hashed through the whole chain while only
+/// the first link's inode was watched, so neither the further links
+/// (`/etc/alternatives/nc`) nor the final target (`python3.12`) were.
+pub const SYMLINK_CHAIN_MAX_HOPS: usize = 8;
+
+/// External audit NN-AUD-122 (FIMP-010): the paths behind a symlinked
+/// watched path, in order — each further link, then the final target — as
+/// `readlink` names them. A relative target is joined to its link's
+/// directory and not normalised (the kernel resolves `..` through the real
+/// directory, which a lexical clean-up would not). Empty when `path` is not
+/// a symlink; the last entry may not exist (a broken link). A link met
+/// twice, or more than [`SYMLINK_CHAIN_MAX_HOPS`] links, is an error.
+pub fn symlink_chain(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut chain: Vec<PathBuf> = Vec::new();
+    let mut links: Vec<(u64, u64)> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        let meta = match fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            // the last link points at nothing
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !chain.is_empty() => {
+                return Ok(chain)
+            }
+            Err(e) => return Err(anyhow!(e)).with_context(|| format!("lstat {}", cur.display())),
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(chain);
+        }
+        let id = (meta.dev(), meta.ino());
+        if links.contains(&id) {
+            return Err(anyhow!(
+                "{}: symlink loop at {}",
+                path.display(),
+                cur.display()
+            ));
+        }
+        if links.len() == SYMLINK_CHAIN_MAX_HOPS {
+            return Err(anyhow!(
+                "{}: more than {SYMLINK_CHAIN_MAX_HOPS} symlinks in the chain",
+                path.display()
+            ));
+        }
+        links.push(id);
+        let target = fs::read_link(&cur).with_context(|| format!("readlink {}", cur.display()))?;
+        let next = if target.is_absolute() {
+            target
+        } else {
+            cur.parent().unwrap_or_else(|| Path::new("/")).join(target)
+        };
+        chain.push(next.clone());
+        cur = next;
+    }
+}
 
 // ── on-disk schema ──────────────────────────────────────────────────
 
@@ -120,6 +171,13 @@ pub struct BaselineEntry {
     /// deserialise to `false` (regular-file row).
     #[serde(default)]
     pub is_symlink: bool,
+    /// External audit NN-AUD-122 (FIMP-010): on the content row of a
+    /// symlinked path, the canonical file its content was read from, so a
+    /// re-pointed link is visible off-host too. Absent on every other row,
+    /// and on rows written before it existed, which serialise (and verify)
+    /// as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub agent_id: String,
     pub prev_hash: String,
     pub entry_hash: String,
@@ -139,6 +197,8 @@ pub struct BaselineEntryDraft {
     pub gid: u32,
     pub size_bytes: u64,
     pub is_symlink: bool,
+    /// See [`BaselineEntry::target`].
+    pub target: Option<String>,
 }
 
 // ── compute ─────────────────────────────────────────────────────────
@@ -179,6 +239,7 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
             gid: lmeta.gid(),
             size_bytes: lmeta.size(),
             is_symlink: true,
+            target: None,
         };
 
         // Q1 row #2: follow ONE hop, then content-hash whatever
@@ -211,6 +272,10 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
                     gid: tmeta.gid(),
                     size_bytes: tmeta.size(),
                     is_symlink: false,
+                    // External audit NN-AUD-122: where the content came from.
+                    target: fs::canonicalize(path)
+                        .ok()
+                        .map(|t| t.to_string_lossy().into_owned()),
                 };
                 Ok(vec![link_draft, content_draft])
             }
@@ -235,6 +300,7 @@ pub fn compute_baseline(path: &Path) -> Result<Vec<BaselineEntryDraft>> {
             gid: lmeta.gid(),
             size_bytes: lmeta.size(),
             is_symlink: false,
+            target: None,
         }])
     } else {
         // Directories, fifos, sockets, etc. — V1.0 watches
@@ -638,6 +704,7 @@ fn build_signed_entry(
         gid: draft.gid,
         size_bytes: draft.size_bytes,
         is_symlink: draft.is_symlink,
+        target: draft.target.clone(),
         agent_id: hex::encode(agent_id),
         prev_hash: prev_hash.to_string(),
         // Filled below — empty here so the pre-image
@@ -870,6 +937,7 @@ mod tests {
             gid: 0,
             size_bytes: 1024 * seq as u64,
             is_symlink: false,
+            target: None,
         }
     }
 
@@ -1119,6 +1187,7 @@ mod tests {
                 gid: 0,
                 size_bytes: 100,
                 is_symlink: false,
+                target: None,
             })
             .unwrap();
         let second = db
@@ -1130,6 +1199,7 @@ mod tests {
                 gid: 0,
                 size_bytes: 105,
                 is_symlink: false,
+                target: None,
             })
             .unwrap();
         // And one for a different path.
@@ -1142,6 +1212,7 @@ mod tests {
                 gid: 0,
                 size_bytes: 200,
                 is_symlink: false,
+                target: None,
             })
             .unwrap();
         let cache = BaselineCache::load_from_log(&log_path).unwrap();
@@ -1175,6 +1246,7 @@ mod tests {
                 gid: 0,
                 size_bytes: 50,
                 is_symlink: true,
+                target: None,
             })
             .unwrap();
         let content = db
@@ -1186,6 +1258,7 @@ mod tests {
                 gid: 0,
                 size_bytes: 900_000,
                 is_symlink: false,
+                target: None,
             })
             .unwrap();
         let cache = BaselineCache::load_from_log(&log_path).unwrap();
@@ -1211,6 +1284,7 @@ mod tests {
             gid: 0,
             size_bytes: 100,
             is_symlink: false,
+            target: None,
             agent_id: "00".repeat(16),
             prev_hash: GENESIS_PREV_HASH.to_string(),
             entry_hash: "11".repeat(32),
@@ -1281,5 +1355,98 @@ mod tests {
         // Hashing the special file directly is refused, without blocking.
         assert!(sha256_of_file_content(&fifo).is_err());
         assert!(sha256_of_file_content(Path::new("/dev/zero")).is_err());
+    }
+    /// External audit NN-AUD-122 (FIMP-010): the chain behind a watched
+    /// link is every further link and the final target, in order; a loop
+    /// and an over-long chain are refused, a broken one ends at the
+    /// missing name.
+    #[test]
+    fn symlink_chain_resolves_hops_and_rejects_loops() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path();
+        // /usr/bin/nc -> /etc/alternatives/nc -> nc.openbsd (relative)
+        std::fs::create_dir(d.join("alternatives")).unwrap();
+        std::fs::write(d.join("nc.openbsd"), b"ELF").unwrap();
+        symlink("../nc.openbsd", d.join("alternatives/nc")).unwrap();
+        symlink(d.join("alternatives/nc"), d.join("nc")).unwrap();
+        let chain = symlink_chain(&d.join("nc")).unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                d.join("alternatives/nc"),
+                d.join("alternatives").join("../nc.openbsd")
+            ]
+        );
+        assert_eq!(
+            std::fs::canonicalize(chain.last().unwrap()).unwrap(),
+            std::fs::canonicalize(d.join("nc.openbsd")).unwrap()
+        );
+        // not a link: nothing behind it
+        assert!(symlink_chain(&d.join("nc.openbsd")).unwrap().is_empty());
+        // broken: ends at the missing name
+        symlink(d.join("gone"), d.join("broken")).unwrap();
+        assert_eq!(
+            symlink_chain(&d.join("broken")).unwrap(),
+            vec![d.join("gone")]
+        );
+        // a loop
+        symlink(d.join("loop-b"), d.join("loop-a")).unwrap();
+        symlink(d.join("loop-a"), d.join("loop-b")).unwrap();
+        assert!(format!("{:#}", symlink_chain(&d.join("loop-a")).unwrap_err()).contains("loop"));
+        // SYMLINK_CHAIN_MAX_HOPS links are followed, one more is refused
+        std::fs::write(d.join("end"), b"x").unwrap();
+        let mut next = d.join("end");
+        for i in 0..=SYMLINK_CHAIN_MAX_HOPS {
+            let link = d.join(format!("hop{i}"));
+            symlink(&next, &link).unwrap();
+            next = link;
+        }
+        let at_cap = d.join(format!("hop{}", SYMLINK_CHAIN_MAX_HOPS - 1));
+        assert_eq!(
+            symlink_chain(&at_cap).unwrap().len(),
+            SYMLINK_CHAIN_MAX_HOPS
+        );
+        assert!(symlink_chain(&next).is_err(), "one link over the cap");
+        // the path itself missing is an error, not an empty chain
+        assert!(symlink_chain(&d.join("absent")).is_err());
+    }
+
+    /// External audit NN-AUD-122 (FIMP-010): the content row of a symlinked
+    /// path names the file its content came from, and a row without the
+    /// field — every row written before it — still verifies.
+    #[test]
+    fn symlinked_content_row_records_its_target_and_old_rows_verify() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("python3.12");
+        std::fs::write(&target, b"ELF").unwrap();
+        let link = dir.path().join("python3");
+        symlink("python3.12", &link).unwrap();
+        let drafts = compute_baseline(&link).unwrap();
+        assert_eq!(drafts[0].target, None, "the link row");
+        assert_eq!(
+            drafts[1].target.as_deref(),
+            Some(
+                std::fs::canonicalize(&target)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let mut rows = vec![db.append(sample_draft(1)).unwrap()];
+        for d in drafts {
+            rows.push(db.append(d).unwrap());
+        }
+        verify_chain(&rows, &pubkey).expect("rows with and without a target verify");
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            !lines[0].contains("\"target\""),
+            "absent, not null: {}",
+            lines[0]
+        );
+        assert!(lines[2].contains("\"target\""));
     }
 }

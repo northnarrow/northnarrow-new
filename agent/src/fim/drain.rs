@@ -71,7 +71,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -119,68 +119,298 @@ pub const DEFAULT_DRIFT_LOG_PATH: &str = "/var/lib/northnarrow/fim_drift.jsonl";
 
 // ── userland inode → path map ──────────────────────────────────────
 
-/// Userland `(dev, ino)` → absolute path resolver. Populated by
-/// C7 deploy bootstrap from the BaselineDb when the agent
-/// starts; consulted by [`process_drift`] to turn a kernel-side
-/// `FimDriftRaw` into a userland [`FimEvent`] with an absolute
-/// path.
-///
-/// Lookup-only struct — operators don't mutate this at runtime
-/// (re-baselining via `nn-admin fim rebaseline` rebuilds it
-/// atomically). Thread-safety: the type is `Send + Sync` via
-/// `RwLock` so the async drain loop + future operator-driven
-/// rebaseline can share it.
-#[derive(Debug, Default)]
+/// External audit NN-AUD-120 (FIMP-008): why an inode is watched. Only a
+/// runtime child is ever evicted; the others are what the operator
+/// configured or deployed, and a full map must not cost them their watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchClass {
+    /// A file dropped into a watched directory, enrolled at runtime
+    /// (BUG-022). At most [`RUNTIME_CHILD_CAP`]; the oldest makes room.
+    RuntimeChild,
+    /// A link or the final target behind a symlinked watched path,
+    /// named by that path (NN-AUD-122).
+    ChainHop,
+    /// A canary decoy (DEC-001).
+    Decoy,
+    /// A path of the watch list — at boot, re-baselined, or back after a
+    /// rename — or one of the agent's control-surface baits.
+    Configured,
+}
+
+impl WatchClass {
+    /// Which class keeps an inode claimed twice: a runtime child never
+    /// takes over a hop, a hop never takes over a configured path or a
+    /// decoy.
+    fn rank(self) -> u8 {
+        match self {
+            Self::RuntimeChild => 0,
+            Self::ChainHop => 1,
+            Self::Decoy | Self::Configured => 2,
+        }
+    }
+}
+
+/// External audit NN-AUD-120 (FIMP-008): the most runtime children watched
+/// at once — half of `WATCHED_PATHS`, the rest kept for the configured
+/// paths, the symlink hops, the decoys and the re-baselines. Every new
+/// child of a watched directory used to take a slot for good (a lost
+/// Deleted event, a directory removed with its files), and a full map
+/// refused even a canary decoy with only a WARN.
+pub const RUNTIME_CHILD_CAP: usize = crate::fim::attach::WATCHED_PATHS_CAPACITY / 2;
+
+/// Userland `(dev, ino)` → absolute path resolver. Populated at boot from
+/// the watch list ([`crate::fim::attach::populate_watched_paths`]) and at
+/// runtime by the drain (children of watched directories, renames,
+/// re-baselines) and the canaries; consulted by [`process_drift`] to turn
+/// a kernel-side `FimDriftRaw` into a userland [`FimEvent`] with an
+/// absolute path. Each inode carries its [`WatchClass`]; runtime children
+/// are kept within a cap, oldest out first.
+#[derive(Debug)]
 pub struct InodePathMap {
-    inner: parking_lot::RwLock<HashMap<InodeKey, String>>,
+    inner: parking_lot::RwLock<PathMapInner>,
+    child_cap: usize,
+}
+
+#[derive(Debug, Default)]
+struct PathMapInner {
+    entries: HashMap<InodeKey, Watched>,
+    /// Runtime children, oldest first. A key removed or re-classed since
+    /// stays until it reaches the front (skipped there) or a compaction.
+    children: std::collections::VecDeque<InodeKey>,
+    child_count: usize,
+    /// External audit NN-AUD-122: the hop inodes watched behind each
+    /// symlinked path.
+    chains: HashMap<String, Vec<InodeKey>>,
+}
+
+#[derive(Debug, Clone)]
+struct Watched {
+    path: String,
+    class: WatchClass,
+}
+
+impl PathMapInner {
+    /// Take the oldest runtime child other than `except` out of the map.
+    fn take_oldest_child(&mut self, except: Option<InodeKey>) -> Option<(InodeKey, String)> {
+        let mut i = 0;
+        while i < self.children.len() {
+            let k = self.children[i];
+            let live =
+                matches!(self.entries.get(&k), Some(w) if w.class == WatchClass::RuntimeChild);
+            if !live {
+                self.children.remove(i);
+                continue;
+            }
+            if Some(k) == except {
+                i += 1;
+                continue;
+            }
+            self.children.remove(i);
+            let w = self.entries.remove(&k)?;
+            self.child_count -= 1;
+            return Some((k, w.path));
+        }
+        None
+    }
+
+    /// Drop the queue's dead and repeated keys once it is twice the cap.
+    fn compact_children(&mut self, cap: usize) {
+        if self.children.len() <= 2 * cap.max(16) {
+            return;
+        }
+        let entries = &self.entries;
+        let mut seen = std::collections::HashSet::new();
+        self.children.retain(|k| {
+            matches!(entries.get(k), Some(w) if w.class == WatchClass::RuntimeChild)
+                && seen.insert(*k)
+        });
+    }
+}
+
+impl Default for InodePathMap {
+    fn default() -> Self {
+        Self::with_child_cap(RUNTIME_CHILD_CAP)
+    }
 }
 
 impl InodePathMap {
-    /// Empty map. C7 populates from BaselineDb at boot.
+    /// Empty map, with the [`RUNTIME_CHILD_CAP`].
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Insert/replace a `(dev, ino) → path` mapping. Idempotent
-    /// over the value (last write wins) — re-baseline of a path
-    /// that already maps just refreshes the lookup.
+    /// Empty map holding at most `child_cap` runtime children.
+    pub fn with_child_cap(child_cap: usize) -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(PathMapInner::default()),
+            child_cap,
+        }
+    }
+
+    /// Map a configured path: [`Self::insert_as`] with
+    /// [`WatchClass::Configured`].
     pub fn insert(&self, key: InodeKey, path: String) {
-        self.inner.write().insert(key, path);
+        let _ = self.insert_as(key, path, WatchClass::Configured);
+    }
+
+    /// Map `key` to `path` as `class`. An inode already held by a class
+    /// that outranks `class` keeps its path and class. Returns the runtime
+    /// child evicted to keep within the cap (the caller stops the kernel
+    /// watching it), if any.
+    pub fn insert_as(
+        &self,
+        key: InodeKey,
+        path: String,
+        class: WatchClass,
+    ) -> Option<(InodeKey, String)> {
+        let mut g = self.inner.write();
+        let inner = &mut *g;
+        if let Some(cur) = inner.entries.get(&key).map(|w| w.class) {
+            if cur.rank() > class.rank() {
+                return None;
+            }
+            if cur == WatchClass::RuntimeChild && class != WatchClass::RuntimeChild {
+                inner.child_count -= 1;
+            }
+            inner.entries.insert(key, Watched { path, class });
+            return None;
+        }
+        inner.entries.insert(key, Watched { path, class });
+        if class != WatchClass::RuntimeChild {
+            return None;
+        }
+        inner.child_count += 1;
+        inner.children.push_back(key);
+        let evicted = if inner.child_count > self.child_cap {
+            inner.take_oldest_child(Some(key))
+        } else {
+            None
+        };
+        inner.compact_children(self.child_cap);
+        evicted
     }
 
     /// Look up a path by inode key. Returns owned `String` so
     /// the read lock is dropped immediately — avoids holding a
     /// read lock across the (slow) baseline rehash that follows.
     pub fn lookup(&self, key: &InodeKey) -> Option<String> {
-        self.inner.read().get(key).cloned()
+        self.inner.read().entries.get(key).map(|w| w.path.clone())
+    }
+
+    /// Why `key` is watched.
+    pub fn class_of(&self, key: &InodeKey) -> Option<WatchClass> {
+        self.inner.read().entries.get(key).map(|w| w.class)
     }
 
     /// Forget an inode whose file is gone (review 57).
     pub fn remove(&self, key: &InodeKey) {
-        self.inner.write().remove(key);
+        let mut g = self.inner.write();
+        if let Some(w) = g.entries.remove(key) {
+            if w.class == WatchClass::RuntimeChild {
+                g.child_count -= 1;
+            }
+        }
     }
 
-    /// Every inode mapped to `path` (external audit FIMP-004: a path whose
-    /// file was replaced may still hold its old inode's entry).
+    /// Every inode mapped to `path` as its own file (external audit
+    /// FIMP-004: a path whose file was replaced may still hold its old
+    /// inode's entry). The links and target behind a symlinked path,
+    /// named by it too, are not its own (see [`Self::chain`]).
     pub fn keys_for_path(&self, path: &str) -> Vec<InodeKey> {
         self.inner
             .read()
+            .entries
             .iter()
-            .filter(|(_, p)| p.as_str() == path)
+            .filter(|(_, w)| w.path == path && w.class != WatchClass::ChainHop)
             .map(|(k, _)| *k)
             .collect()
+    }
+
+    /// Take the oldest runtime child other than `except` out of the map
+    /// (to make room in a full kernel map).
+    pub fn evict_oldest_child(&self, except: Option<InodeKey>) -> Option<(InodeKey, String)> {
+        self.inner.write().take_oldest_child(except)
+    }
+
+    /// The runtime children, for the periodic sweep of those gone.
+    pub fn runtime_children(&self) -> Vec<(InodeKey, String)> {
+        self.inner
+            .read()
+            .entries
+            .iter()
+            .filter(|(_, w)| w.class == WatchClass::RuntimeChild)
+            .map(|(k, w)| (*k, w.path.clone()))
+            .collect()
+    }
+
+    /// How many runtime children are mapped.
+    pub fn child_count(&self) -> usize {
+        self.inner.read().child_count
+    }
+
+    /// The most runtime children this map keeps.
+    pub fn child_cap(&self) -> usize {
+        self.child_cap
+    }
+
+    /// External audit NN-AUD-122: record the hop inodes watched behind
+    /// `owner`.
+    pub fn set_chain(&self, owner: &str, keys: Vec<InodeKey>) {
+        self.inner.write().chains.insert(owner.to_string(), keys);
+    }
+
+    /// The hop inodes watched behind `owner`.
+    pub fn chain(&self, owner: &str) -> Vec<InodeKey> {
+        self.inner
+            .read()
+            .chains
+            .get(owner)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// `key` is no longer behind `owner`. Another watched link still
+    /// passing through it keeps it (named by that link); otherwise the
+    /// entry goes and `true` tells the caller to stop the kernel watching
+    /// it. Never touches an entry of another class.
+    pub fn release_hop(&self, owner: &str, key: InodeKey) -> bool {
+        let mut g = self.inner.write();
+        if !matches!(g.entries.get(&key), Some(w) if w.class == WatchClass::ChainHop) {
+            return false;
+        }
+        let other = g
+            .chains
+            .iter()
+            .find(|(o, keys)| o.as_str() != owner && keys.contains(&key))
+            .map(|(o, _)| o.clone());
+        match other {
+            Some(o) => {
+                g.entries.insert(
+                    key,
+                    Watched {
+                        path: o,
+                        class: WatchClass::ChainHop,
+                    },
+                );
+                false
+            }
+            None => {
+                g.entries.remove(&key);
+                true
+            }
+        }
     }
 
     /// Number of mapped inodes. Useful for `nn-admin fim
     /// status` (C6) summary output.
     pub fn len(&self) -> usize {
-        self.inner.read().len()
+        self.inner.read().entries.len()
     }
 
     /// True if no inodes are mapped (fresh boot, baseline
     /// hasn't run yet).
     pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
+        self.inner.read().entries.is_empty()
     }
 }
 
@@ -645,23 +875,209 @@ fn reconstruct_child_path(dir: &str, raw: &FimDriftRaw) -> Option<String> {
     Some(format!("{}/{}", dir.trim_end_matches('/'), leaf))
 }
 
-/// Review 58: children whose create or rename event was handled before
-/// the file existed at its final path. The LSM hooks fire before the
-/// operation, and a fast drain used to `stat` too early and skip the
-/// enrollment for good, so the dropped file's later in-place edits went
-/// unseen. The drain loop retries them for [`ENROLL_RETRY_FOR`].
-static PENDING_ENROLL: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
-    std::sync::Mutex::new(Vec::new());
-const ENROLL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// The drain's pending work, between events. External audit NN-AUD-119
+/// (FIMP-007): every retry queue is keyed — one entry per path or inode —
+/// and capped where it grows.
+struct DrainQueues {
+    /// Review 58: children whose create or rename event was handled
+    /// before the file existed at its final path. The LSM hooks fire
+    /// before the operation, and a fast drain used to `stat` too early and
+    /// skip the enrollment for good, so the dropped file's later in-place
+    /// edits went unseen. Retried for [`ENROLL_RETRY_FOR`]. NN-AUD-119: a
+    /// burst of short-lived files grew this queue without bound, a path
+    /// once per creation.
+    enroll: RetryQueue<String, Instant>,
+    /// External audit FIMP-005: watched inodes renamed away from their
+    /// path, waiting for the rename to land (the LSM hook fires before
+    /// it). See [`settle_rename`].
+    rename: RetryQueue<InodeKey, PendingRename>,
+    /// External audit NN-AUD-122 (FIMP-010): symlinked watched paths whose
+    /// chain an event may have changed — a link or the target behind them
+    /// unlinked, renamed or replaced — waiting for the change to land, with
+    /// the event (its writer is the change's).
+    chain: RetryQueue<String, (Instant, FimDriftRaw)>,
+    /// See [`queue_replacement`].
+    replacements: Vec<(String, FimDriftRaw)>,
+    /// See [`settle_rename`] and [`returned_paths`].
+    awaiting_return: Vec<(String, WatchClass)>,
+    /// See [`await_chain_repair`].
+    chain_awaiting: Vec<String>,
+}
 
-/// External audit FIMP-005: watched inodes renamed away from their path,
-/// waiting for the rename to land (the LSM hook fires before it). See
-/// [`settle_rename`].
-static PENDING_RENAME: std::sync::Mutex<Vec<PendingRename>> = std::sync::Mutex::new(Vec::new());
+impl DrainQueues {
+    fn new() -> Self {
+        Self {
+            enroll: RetryQueue::new("child enrollment", PENDING_MAX),
+            rename: RetryQueue::new("rename", PENDING_MAX),
+            chain: RetryQueue::new("symlink chain", PENDING_MAX),
+            replacements: Vec::new(),
+            awaiting_return: Vec::new(),
+            chain_awaiting: Vec::new(),
+        }
+    }
+}
 
-/// A watched inode renamed away, and — external audit FIMR-004 — the
-/// renamer's event when the rename put another file over it.
-type PendingRename = (InodeKey, String, std::time::Instant, Option<FimDriftRaw>);
+#[cfg(not(test))]
+static QUEUES: LazyLock<parking_lot::Mutex<DrainQueues>> =
+    LazyLock::new(|| parking_lot::Mutex::new(DrainQueues::new()));
+
+// Tests drive the drain functions in parallel, each with its own map: one
+// set of queues per test thread, so one test's retry pass does not settle
+// another's entries against the wrong map.
+#[cfg(test)]
+thread_local! {
+    static QUEUES: std::cell::RefCell<DrainQueues> = std::cell::RefCell::new(DrainQueues::new());
+}
+
+/// Work on the drain's queues. External audit NN-AUD-119: never across a
+/// `stat` — entries are taken out, worked on, and put back.
+fn queues<R>(f: impl FnOnce(&mut DrainQueues) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut QUEUES.lock())
+    }
+    #[cfg(test)]
+    {
+        QUEUES.with(|q| f(&mut q.borrow_mut()))
+    }
+}
+
+const ENROLL_RETRY_FOR: Duration = Duration::from_secs(2);
+
+/// External audit NN-AUD-119 (FIMP-007): the cap of each retry queue.
+const PENDING_MAX: usize = 1024;
+
+/// External audit NN-AUD-119 (FIMP-007): the retry pass runs at most this
+/// often. It ran at the top of every loop turn — since review 75 after
+/// every event that emits — so a burst of creations cost one `stat` per
+/// queued entry per event, on the only reader of the FIM ring.
+const RETRY_EVERY: Duration = Duration::from_millis(5);
+
+/// A watched inode renamed away: its path, why it was watched, since when,
+/// and — external audit FIMR-004 — the renamer's event when the rename put
+/// another file over it.
+#[derive(Debug, Clone)]
+struct PendingRename {
+    path: String,
+    class: WatchClass,
+    since: Instant,
+    replaced: Option<FimDriftRaw>,
+}
+
+/// External audit NN-AUD-119 (FIMP-007): a retry queue keyed by what it
+/// retries — one entry per key — with a hard cap applied where it grows.
+/// An entry over the cap is dropped, counted, and reported (WARN, at most
+/// once a minute): the pre-review-58 behaviour for that file, now visible.
+struct RetryQueue<K, V> {
+    name: &'static str,
+    entries: HashMap<K, V>,
+    cap: usize,
+    dropped: u64,
+    warned: Option<Instant>,
+}
+
+impl<K: Eq + std::hash::Hash, V> RetryQueue<K, V> {
+    fn new(name: &'static str, cap: usize) -> Self {
+        Self {
+            name,
+            entries: HashMap::new(),
+            cap,
+            dropped: 0,
+            warned: None,
+        }
+    }
+
+    /// Queue `value` under `key`; an entry already queued is merged with
+    /// it (`merge(queued, new)`). `false` when the queue is full: the entry
+    /// is dropped and counted.
+    fn push_with(&mut self, key: K, value: V, merge: impl FnOnce(&mut V, V)) -> bool {
+        if let Some(queued) = self.entries.get_mut(&key) {
+            merge(queued, value);
+            return true;
+        }
+        if self.entries.len() >= self.cap {
+            self.overflow();
+            return false;
+        }
+        self.entries.insert(key, value);
+        true
+    }
+
+    /// Queue `value` under `key`; an entry already queued is kept as it is.
+    fn push(&mut self, key: K, value: V) -> bool {
+        self.push_with(key, value, |_, _| {})
+    }
+
+    /// Every entry, taken out of the queue to be worked on without its lock.
+    fn take(&mut self) -> HashMap<K, V> {
+        std::mem::take(&mut self.entries)
+    }
+
+    /// Put back the entries still pending after a pass. One queued since
+    /// is kept as it is; the cap holds.
+    fn put_back(&mut self, pending: impl IntoIterator<Item = (K, V)>) {
+        for (k, v) in pending {
+            if !self.entries.contains_key(&k) && self.entries.len() >= self.cap {
+                self.overflow();
+                continue;
+            }
+            self.entries.entry(k).or_insert(v);
+        }
+    }
+
+    fn overflow(&mut self) {
+        self.dropped += 1;
+        if self
+            .warned
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+        {
+            self.warned = Some(Instant::now());
+            warn!(
+                target: "fim.drain",
+                queue = self.name,
+                cap = self.cap,
+                dropped_total = self.dropped,
+                "FIM retry queue full — entries over the cap are dropped: a file dropped into a \
+                 watched directory may stay unwatched, a rename or a symlink change unchecked"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// External audit NN-AUD-119 (FIMP-007): a periodic step of the drain loop,
+/// run at most once per `every` however often the loop turns.
+#[derive(Debug)]
+struct Pacer {
+    every: Duration,
+    last: Option<Instant>,
+}
+
+impl Pacer {
+    fn new(every: Duration) -> Self {
+        Self { every, last: None }
+    }
+
+    /// Whether the step is due at `now` (and, if so, that it ran then).
+    fn due(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) < self.every)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
 
 /// External audit FIMR-004: watched paths whose file another one replaced
 /// by a rename over it (`mv` of a prepared file onto a binary, a PAM
@@ -670,75 +1086,137 @@ type PendingRename = (InodeKey, String, std::time::Instant, Option<FimDriftRaw>)
 /// only the rename rules; every rule guarding the path's content watches
 /// modifications. Each is checked as one: the new file against the
 /// baseline, attributed to the renamer.
-static REPLACEMENTS: std::sync::Mutex<Vec<(String, FimDriftRaw)>> =
-    std::sync::Mutex::new(Vec::new());
 const REPLACEMENTS_MAX: usize = 1024;
 
 fn queue_replacement(path: &str, renamed: &FimDriftRaw) {
-    let Ok(mut q) = REPLACEMENTS.lock() else {
-        return;
-    };
-    if q.len() < REPLACEMENTS_MAX {
-        q.push((path.to_string(), *renamed));
-    } else {
-        warn!(target: "fim.drain", path, "replacement checks queue full — this replacement is not checked");
-    }
+    queues(|q| {
+        if q.replacements.len() < REPLACEMENTS_MAX {
+            q.replacements.push((path.to_string(), *renamed));
+        } else {
+            warn!(target: "fim.drain", path, "replacement checks queue full — this replacement is not checked");
+        }
+    });
 }
 
 /// The queued replacements as modification events of the file now at each
 /// path, by the renamer. A path holding nothing any more is dropped.
 fn replacement_raws() -> Vec<FimDriftRaw> {
-    let queued = match REPLACEMENTS.lock() {
-        Ok(mut q) => std::mem::take(&mut *q),
-        Err(_) => return Vec::new(),
-    };
+    let queued = queues(|q| std::mem::take(&mut q.replacements));
     queued
         .into_iter()
-        .filter_map(|(path, mut raw)| {
-            let key = key_for_path(Path::new(&path)).ok()?;
-            // the rename has landed: read what is there now
-            raw.timestamp_ns = monotonic_ns();
-            raw.target_dev = key.dev;
-            raw.target_ino = key.ino;
-            raw.op = FimOp::Modified as u8;
-            raw.op_flags = 0;
-            raw.dest_dev = 0;
-            raw.dest_ino = 0;
-            raw.child_name = [0u8; FIM_CHILD_NAME_LEN];
-            raw.child_name_flags = 0;
-            Some(raw)
-        })
+        .filter_map(|(path, raw)| replacement_raw(&path, raw))
         .collect()
 }
 
-/// Retry the pending enrollments and renames; `true` while some are still
-/// waiting.
+/// A replacement as a modification event of the file now at `path`.
+fn replacement_raw(path: &str, mut raw: FimDriftRaw) -> Option<FimDriftRaw> {
+    let key = key_for_path(Path::new(path)).ok()?;
+    // the rename has landed: read what is there now
+    raw.timestamp_ns = monotonic_ns();
+    raw.target_dev = key.dev;
+    raw.target_ino = key.ino;
+    raw.op = FimOp::Modified as u8;
+    raw.op_flags = 0;
+    raw.dest_dev = 0;
+    raw.dest_ino = 0;
+    raw.child_name = [0u8; FIM_CHILD_NAME_LEN];
+    raw.child_name_flags = 0;
+    Some(raw)
+}
+
+/// What a retry pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryPass {
+    /// Entries are still waiting.
+    waiting: bool,
+    /// Entries looked at (each costs a `stat` or more).
+    examined: usize,
+}
+
+/// Retry the pending renames, enrollments and symlink-chain checks.
+/// External audit NN-AUD-119 (FIMP-007): each queue is taken out under its
+/// lock and worked on without it — the `stat`s ran under the lock, entry
+/// by entry — and what is still pending is put back.
 fn retry_pending_enrollments(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
-) -> bool {
-    let renames_waiting = match PENDING_RENAME.lock() {
-        Ok(mut pending) => {
-            pending.retain(|(key, path, since, replaced)| {
-                if settle_rename(key, path, path_map, watched_paths) {
-                    if let Some(raw) = replaced {
-                        queue_replacement(path, raw);
-                    }
-                    return false;
-                }
-                since.elapsed() < ENROLL_RETRY_FOR
-            });
-            !pending.is_empty()
+) -> RetryPass {
+    let mut examined = 0;
+    let renames = queues(|q| q.rename.take());
+    examined += renames.len();
+    let mut left = Vec::new();
+    for (key, p) in renames {
+        if settle_rename(&key, &p.path, p.class, path_map, watched_paths) {
+            if let Some(raw) = &p.replaced {
+                queue_replacement(&p.path, raw);
+            }
+        } else if p.since.elapsed() < ENROLL_RETRY_FOR {
+            left.push((key, p));
         }
-        Err(_) => false,
-    };
-    let Ok(mut pending) = PENDING_ENROLL.lock() else {
-        return renames_waiting;
-    };
-    pending.retain(|(path, since)| {
-        !enroll_child(path, path_map, watched_paths) && since.elapsed() < ENROLL_RETRY_FOR
+    }
+    let renames_waiting = queues(|q| {
+        q.rename.put_back(left);
+        !q.rename.is_empty()
     });
-    renames_waiting || !pending.is_empty()
+    let enrolls_waiting = retry_enrollments(path_map, watched_paths, &mut examined);
+    let chains_waiting = retry_chain_checks(path_map, watched_paths, &mut examined);
+    RetryPass {
+        waiting: renames_waiting || enrolls_waiting || chains_waiting,
+        examined,
+    }
+}
+
+/// The waiting child enrollments; `true` while some still wait.
+fn retry_enrollments(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+    examined: &mut usize,
+) -> bool {
+    let todo = queues(|q| q.enroll.take());
+    *examined += todo.len();
+    let left: Vec<(String, Instant)> = todo
+        .into_iter()
+        .filter(|(path, since)| {
+            !enroll_path(path, WatchClass::RuntimeChild, path_map, watched_paths)
+                && since.elapsed() < ENROLL_RETRY_FOR
+        })
+        .collect();
+    queues(|q| {
+        q.enroll.put_back(left);
+        !q.enroll.is_empty()
+    })
+}
+
+/// External audit NN-AUD-122 (FIMP-010): the symlink chains an event may
+/// have changed, re-resolved. One that changed is watched anew and its path
+/// checked against the baseline, attributed to the event's writer — as a
+/// file renamed over a watched one is (FIMR-004). One unchanged after
+/// [`ENROLL_RETRY_FOR`] was not changed (the operation was refused).
+fn retry_chain_checks(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+    examined: &mut usize,
+) -> bool {
+    let todo = queues(|q| q.chain.take());
+    *examined += todo.len();
+    let mut left = Vec::new();
+    for (owner, (since, raw)) in todo {
+        if chain_keys_now(&owner) != path_map.chain(&owner) {
+            enroll_chain(&owner, path_map, watched_paths);
+            queue_replacement(&owner, &raw);
+        } else if since.elapsed() < ENROLL_RETRY_FOR {
+            left.push((owner, (since, raw)));
+        }
+    }
+    queues(|q| {
+        q.chain.put_back(left);
+        !q.chain.is_empty()
+    })
+}
+
+/// `true` while a retry queue holds entries.
+fn retries_waiting() -> bool {
+    queues(|q| !q.rename.is_empty() || !q.enroll.is_empty() || !q.chain.is_empty())
 }
 
 /// External audit FIMP-005: a watched file renamed away keeps its inode,
@@ -746,12 +1224,13 @@ fn retry_pending_enrollments(
 /// moved file was reported under the watched name (`mv authorized_keys
 /// authorized_keys.bak`, then an edit of the copy, drew the
 /// authorized_keys rule's kill). Once the path no longer resolves to
-/// `key`, forget `key` and watch whatever now lives at the path. `false`
-/// while the path still resolves to `key`: the rename has not landed yet,
-/// or was refused.
+/// `key`, forget `key` and watch whatever now lives at the path, as
+/// `class`. `false` while the path still resolves to `key`: the rename has
+/// not landed yet, or was refused.
 fn settle_rename(
     key: &InodeKey,
     path: &str,
+    class: WatchClass,
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> bool {
@@ -760,27 +1239,35 @@ fn settle_rename(
     }
     forget_if_gone(key, path, path_map, watched_paths);
     // A replacement may already sit at the path (rename-over). If nothing
-    // does, wait for one: see AWAITING_RETURN.
-    if !enroll_child(path, path_map, watched_paths) {
-        if let Ok(mut awaiting) = AWAITING_RETURN.lock() {
-            if !awaiting.iter().any(|p| p == path) && awaiting.len() < AWAITING_RETURN_MAX {
-                awaiting.push(path.to_string());
-            }
-        }
+    // does, wait for one: see [`returned_paths`]. External audit NN-AUD-119:
+    // not for a runtime child — a file put back in a watched directory is
+    // enrolled by the directory's own event, and children renamed away
+    // (`crontab`'s temporary file) filled the list for good.
+    if !enroll_path(path, class, path_map, watched_paths) && class != WatchClass::RuntimeChild {
+        await_return(path, class);
     }
     true
 }
 
+/// Wait for a file to come back at `path`, watched as `class`.
+fn await_return(path: &str, class: WatchClass) {
+    queues(|q| {
+        let awaiting = &mut q.awaiting_return;
+        if !awaiting.iter().any(|(p, _)| p == path) && awaiting.len() < AWAITING_RETURN_MAX {
+            awaiting.push((path.to_string(), class));
+        }
+    });
+}
+
 /// External audit FIMP-005: watched paths whose file was renamed away and
-/// not replaced. The kernel watches inodes, and nothing tells the drain
-/// when a file comes back to a path no watched inode holds — `mv` back,
-/// or a new file put there. The drain looks once a second
-/// ([`AWAITING_RETURN_EVERY`]); a file back at its path is watched again
-/// and checked against the baseline as a creation: a replacement is a
-/// change of the watched file.
-static AWAITING_RETURN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// not replaced, with why they were watched. The kernel watches inodes, and
+/// nothing tells the drain when a file comes back to a path no watched
+/// inode holds — `mv` back, or a new file put there. The drain looks once a
+/// second ([`AWAITING_RETURN_EVERY`]); a file back at its path is watched
+/// again and checked against the baseline as a creation: a replacement is
+/// a change of the watched file.
 const AWAITING_RETURN_MAX: usize = 256;
-const AWAITING_RETURN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+const AWAITING_RETURN_EVERY: Duration = Duration::from_secs(1);
 
 /// Paths back at their place since the last look: enrolled again, and
 /// returned with their new inode for a drift check.
@@ -788,25 +1275,60 @@ fn returned_paths(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> Vec<InodeKey> {
+    let todo = queues(|q| std::mem::take(&mut q.awaiting_return));
     let mut back = Vec::new();
-    if let Ok(mut awaiting) = AWAITING_RETURN.lock() {
-        awaiting.retain(|path| match key_for_path(Path::new(path)) {
-            Ok(key) if enroll_child(path, path_map, watched_paths) => {
-                back.push(key);
-                false
-            }
-            _ => true,
-        });
+    for (path, class) in todo {
+        match key_for_path(Path::new(&path)) {
+            Ok(key) if enroll_path(&path, class, path_map, watched_paths) => back.push(key),
+            _ => await_return(&path, class),
+        }
     }
     back
 }
 
-/// `true` while a renamed-away path waits for its file.
+/// External audit NN-AUD-122 (FIMP-010): symlinked watched paths whose
+/// final target is missing. Nothing the kernel watches tells the drain when
+/// it is back — a re-created `/etc/alternatives/nc` touches no watched
+/// inode — so the drain looks with the renamed-away paths, once a second,
+/// and checks the path as a creation once its chain is whole.
+const CHAIN_AWAITING_MAX: usize = 256;
+
+/// Wait for the final target behind `owner` to exist again.
+pub(crate) fn await_chain_repair(owner: &str) {
+    queues(|q| {
+        let awaiting = &mut q.chain_awaiting;
+        if !awaiting.iter().any(|p| p == owner) && awaiting.len() < CHAIN_AWAITING_MAX {
+            awaiting.push(owner.to_string());
+        }
+    });
+}
+
+/// Symlinked paths whose chain is whole again: watched anew, and returned
+/// with their own inode for a drift check. A path gone itself is dropped
+/// (its own rename or deletion handling covers it).
+fn repaired_chains(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> Vec<InodeKey> {
+    let todo = queues(|q| std::mem::take(&mut q.chain_awaiting));
+    let mut back = Vec::new();
+    for owner in todo {
+        match crate::fim::attach::plan_path_watches(Path::new(&owner)) {
+            Ok(plan) if !plan.broken => {
+                enroll_chain(&owner, path_map, watched_paths);
+                back.push(plan.own);
+            }
+            Ok(_) => await_chain_repair(&owner),
+            Err(_) => {}
+        }
+    }
+    back
+}
+
+/// `true` while a renamed-away path waits for its file, or a symlinked one
+/// for its target.
 fn awaiting_returns() -> bool {
-    AWAITING_RETURN
-        .lock()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false)
+    queues(|q| !q.awaiting_return.is_empty() || !q.chain_awaiting.is_empty())
 }
 
 /// External audit FIMP-005: the drift record for a file back at a watched
@@ -825,7 +1347,9 @@ fn returned_raw(key: InodeKey) -> FimDriftRaw {
 /// path added to the overlay) wrote the chain but left the kernel watching
 /// the inode of boot time, or nothing. Inodes the path held before are
 /// forgotten (map and `WATCHED_PATHS`), so an old file elsewhere does not
-/// answer for it. `false` when nothing is at the path.
+/// answer for it. External audit NN-AUD-122: behind a symlink, the links
+/// and the target are watched as they are now. `false` when nothing is at
+/// the path.
 pub fn reenroll_path(
     path: &str,
     path_map: &InodePathMap,
@@ -842,38 +1366,277 @@ pub fn reenroll_path(
             }
         }
     }
-    enroll_child(path, path_map, watched_paths)
+    enroll_path(path, WatchClass::Configured, path_map, watched_paths)
 }
 
-/// BUG-022 — enroll a freshly-dropped child of a watched directory
-/// into the userland [`InodePathMap`] AND (when a handle is wired) the
-/// kernel `WATCHED_PATHS` map, so a later in-place edit of the dropped
-/// file is observed directly by the BUG-023 write-then-close hook. The
-/// child is stat'd for its kernel-form `(dev,ino)`; `false` when it is
-/// not there (yet: the caller queues it for a retry, review 58). A full
-/// `WATCHED_PATHS` (8192 cap) is logged LOUD — a silently-dropped
-/// enroll must not masquerade as coverage.
-fn enroll_child(
-    child_path: &str,
+/// Watch whatever is at `path` now, as `class` — BUG-022: a file dropped
+/// into a watched directory, so a later in-place edit is observed directly
+/// by the BUG-023 write-then-close hook. For a configured path, the links
+/// and the target behind it too (NN-AUD-122). `false` when nothing is at
+/// the path (yet: a child is queued for a retry, review 58).
+fn enroll_path(
+    path: &str,
+    class: WatchClass,
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> bool {
-    let key = match key_for_path(Path::new(child_path)) {
-        Ok(k) => k,
-        Err(_) => return false,
+    let Ok(key) = key_for_path(Path::new(path)) else {
+        return false;
     };
-    path_map.insert(key, child_path.to_string());
-    if let Some(wp) = watched_paths {
-        if !wp.lock().enroll(key) {
-            warn!(
-                target: "fim.drain",
-                path = %child_path,
-                "BUG-022: WATCHED_PATHS full (8192 cap) — dropped child NOT enrolled; \
-                 its later in-place edits stay unobserved until a re-baseline"
-            );
-        }
+    watch_inode(key, path, class, path_map, watched_paths);
+    if class == WatchClass::Configured {
+        enroll_chain(path, path_map, watched_paths);
     }
     true
+}
+
+/// External audit NN-AUD-122 (FIMP-010): watch the links and the target
+/// behind `owner` as they are now, named by `owner`. Those no longer behind
+/// it stop being watched, unless another watched link passes through them.
+/// A chain whose final target is missing waits for it
+/// ([`await_chain_repair`]).
+fn enroll_chain(
+    owner: &str,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) {
+    let plan = crate::fim::attach::plan_path_watches(Path::new(owner)).ok();
+    let hops: Vec<InodeKey> = plan
+        .as_ref()
+        .map(|p| p.hops.iter().map(|(_, k)| *k).collect())
+        .unwrap_or_default();
+    let broken = plan.as_ref().is_some_and(|p| p.broken);
+    let before = path_map.chain(owner);
+    if hops.is_empty() && before.is_empty() && !broken {
+        // not a symlink, and never was one here
+        return;
+    }
+    path_map.set_chain(owner, hops.clone());
+    for old in before {
+        if !hops.contains(&old) && path_map.release_hop(owner, old) {
+            if let Some(w) = watched_paths {
+                w.lock().unenroll(old);
+            }
+        }
+    }
+    for key in hops {
+        watch_inode(key, owner, WatchClass::ChainHop, path_map, watched_paths);
+    }
+    if broken {
+        await_chain_repair(owner);
+    }
+}
+
+/// The hop inodes behind `owner` now: empty when it is not a symlink, or
+/// its chain cannot be followed.
+fn chain_keys_now(owner: &str) -> Vec<InodeKey> {
+    crate::fim::attach::plan_path_watches(Path::new(owner))
+        .map(|p| p.hops.into_iter().map(|(_, k)| k).collect())
+        .unwrap_or_default()
+}
+
+/// External audit NN-AUD-120 (FIMP-008): how many runtime children
+/// [`watch_inode`] evicts, at most, to make room in a full kernel map.
+const MAKE_ROOM_TRIES: usize = 8;
+
+/// External audit NN-AUD-120 (FIMP-008): watch inode `key` as `path` of
+/// `class`, in the drain's map and in the kernel's `WATCHED_PATHS`. A
+/// runtime child over [`RUNTIME_CHILD_CAP`] evicts the oldest one; a full
+/// kernel map evicts the oldest runtime children to make room — never an
+/// entry of another class, whatever is enrolled. An eviction or a refusal
+/// is an ERROR and a signed `subsystem_degraded` (`fim_watch_map_full`,
+/// rate-limited: [`WatchPressure`]); a full map used to refuse everything,
+/// a canary decoy included, with a WARN. `true` when the kernel watches
+/// `key` (always without a kernel map: nothing there refuses).
+pub fn watch_inode(
+    key: InodeKey,
+    path: &str,
+    class: WatchClass,
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> bool {
+    let mut evicted = 0u64;
+    if let Some((old, _)) = path_map.insert_as(key, path.to_string(), class) {
+        if let Some(wp) = watched_paths {
+            wp.lock().unenroll(old);
+        }
+        evicted += 1;
+    }
+    let mut watched = true;
+    if let Some(wp) = watched_paths {
+        let mut wp = wp.lock();
+        watched = wp.enroll(key);
+        for _ in 0..MAKE_ROOM_TRIES {
+            if watched {
+                break;
+            }
+            let Some((old, _)) = path_map.evict_oldest_child(Some(key)) else {
+                break;
+            };
+            wp.unenroll(old);
+            evicted += 1;
+            watched = wp.enroll(key);
+        }
+    }
+    if !watched && class == WatchClass::RuntimeChild {
+        // not watched: not counted as watched either
+        path_map.remove(&key);
+    }
+    if evicted > 0 || !watched {
+        note_watch_pressure(evicted, u64::from(!watched), path, path_map);
+    }
+    watched
+}
+
+/// External audit NN-AUD-120 (FIMP-008): runtime children evicted and
+/// watches refused since boot. Reported as an ERROR at most once per
+/// [`PRESSURE_LOG_EVERY`], and as a signed `subsystem_degraded`
+/// (`fim_watch_map_full`) at most once per [`PRESSURE_ATTEST_EVERY`], each
+/// with the totals.
+#[derive(Debug)]
+struct WatchPressure {
+    evicted: u64,
+    refused: u64,
+    logged: Option<Instant>,
+    attested: Option<Instant>,
+}
+
+const PRESSURE_LOG_EVERY: Duration = Duration::from_secs(60);
+const PRESSURE_ATTEST_EVERY: Duration = Duration::from_secs(3600);
+
+impl WatchPressure {
+    const fn new() -> Self {
+        Self {
+            evicted: 0,
+            refused: 0,
+            logged: None,
+            attested: None,
+        }
+    }
+
+    /// Count `evicted` and `refused` at `now`: whether the ERROR and the
+    /// signed record are due.
+    fn note(&mut self, evicted: u64, refused: u64, now: Instant) -> (bool, bool) {
+        self.evicted += evicted;
+        self.refused += refused;
+        let due = |last: Option<Instant>, every: Duration| {
+            last.is_none_or(|t| now.saturating_duration_since(t) >= every)
+        };
+        let log = due(self.logged, PRESSURE_LOG_EVERY);
+        if log {
+            self.logged = Some(now);
+        }
+        let attest = due(self.attested, PRESSURE_ATTEST_EVERY);
+        if attest {
+            self.attested = Some(now);
+        }
+        (log, attest)
+    }
+}
+
+static WATCH_PRESSURE: parking_lot::Mutex<WatchPressure> =
+    parking_lot::Mutex::new(WatchPressure::new());
+
+/// The signed audit log, for [`note_watch_pressure`].
+static FIM_AUDIT_LOG: OnceLock<Arc<parking_lot::Mutex<crate::audit::AuditLog>>> = OnceLock::new();
+
+/// Hand the signed audit log to the FIM (from `main`, once it exists): a
+/// full watch set is recorded there (external audit NN-AUD-120).
+pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<crate::audit::AuditLog>>>) {
+    if let Some(l) = log {
+        let _ = FIM_AUDIT_LOG.set(l);
+    }
+}
+
+fn note_watch_pressure(evicted: u64, refused: u64, path: &str, path_map: &InodePathMap) {
+    let (log, attest, evicted_total, refused_total) = {
+        let mut p = WATCH_PRESSURE.lock();
+        let (log, attest) = p.note(evicted, refused, Instant::now());
+        (log, attest, p.evicted, p.refused)
+    };
+    let children = path_map.child_count();
+    let cap = path_map.child_cap();
+    if log {
+        tracing::error!(
+            target: "fim.drain",
+            path,
+            evicted_total,
+            refused_total,
+            runtime_children = children,
+            runtime_child_cap = cap,
+            capacity = crate::fim::attach::WATCHED_PATHS_CAPACITY,
+            "FIM WATCH SET FULL: runtime children evicted or watches refused — the oldest files \
+             dropped into watched directories are no longer watched for in-place edits; a \
+             refused path is not watched at all"
+        );
+    }
+    if attest {
+        if let Some(log) = FIM_AUDIT_LOG.get() {
+            let draft = watch_map_full_draft(evicted_total, refused_total, children, cap);
+            if let Err(e) = log.lock().append(draft) {
+                warn!(
+                    error = format!("{e:#}"),
+                    "attesting the full FIM watch set failed"
+                );
+            }
+        }
+    }
+}
+
+/// The signed `subsystem_degraded` record of a full FIM watch set.
+fn watch_map_full_draft(
+    evicted: u64,
+    refused: u64,
+    children: usize,
+    cap: usize,
+) -> crate::audit::AuditEntryDraft {
+    let detail = format!(
+        "fim_watch_map_full: {evicted} runtime child watch(es) evicted and {refused} watch(es) \
+         refused since boot ({children}/{cap} runtime children watched) — not every file \
+         dropped into a watched directory is watched"
+    );
+    crate::audit::AuditEntryDraft {
+        op: crate::self_integrity::AUDIT_OP.to_string(),
+        extra: serde_json::json!({
+            "kind": "subsystem_degraded",
+            "detail": detail,
+            "at_boot": false,
+            "reason": "fim_watch_map_full",
+            "evicted": evicted,
+            "refused": refused,
+            "runtime_children": children,
+            "runtime_child_cap": cap,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    }
+}
+
+/// External audit NN-AUD-120 (FIMP-008): runtime children whose file is
+/// gone stop being watched — a Deleted event the ring dropped, a directory
+/// removed with its files: removal was only ever on a processed event.
+/// Every [`CHILD_GC_EVERY`]; returns how many went.
+const CHILD_GC_EVERY: Duration = Duration::from_secs(60);
+
+fn gc_runtime_children(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> usize {
+    let mut gone = 0;
+    for (key, path) in path_map.runtime_children() {
+        if !matches!(key_for_path(Path::new(&path)), Ok(k) if k == key) {
+            path_map.remove(&key);
+            if let Some(wp) = watched_paths {
+                wp.lock().unenroll(key);
+            }
+            gone += 1;
+        }
+    }
+    gone
 }
 
 /// Review 57: once a watched file is deleted its inode number is free, and
@@ -887,12 +1650,26 @@ fn forget_if_gone(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) {
-    if matches!(key_for_path(Path::new(path)), Ok(k) if k == *key) {
+    let now = key_for_path(Path::new(path));
+    if matches!(now, Ok(k) if k == *key) {
+        return;
+    }
+    // External audit NN-AUD-120: the inode is named by another path since
+    // — a file renamed within watched directories (`tmp.X` to its final
+    // name), enrolled under the new name by the directory's event before
+    // the rename of the old name was settled. It is live there.
+    if path_map.lookup(key).is_some_and(|p| p != path) {
         return;
     }
     path_map.remove(key);
     if let Some(wp) = watched_paths {
         wp.lock().unenroll(*key);
+    }
+    // External audit NN-AUD-122: a symlinked path gone takes the links and
+    // the target behind it out of the watch (they were named by it); they
+    // are watched again with it, when it is back.
+    if now.is_err() && !path_map.chain(path).is_empty() {
+        enroll_chain(path, path_map, watched_paths);
     }
 }
 
@@ -957,6 +1734,7 @@ pub fn process_drift(
         }
     };
     let op = FimOp::try_from(raw.op).map_err(|e| anyhow!("decoding raw.op: {e}"))?;
+    let class = path_map.class_of(&key).unwrap_or(WatchClass::RuntimeChild);
 
     // BUG-022 — child-leaf reconstruction. When the kernel carried a
     // child leaf (a Create in, or a rename INTO, a watched DIRECTORY),
@@ -972,10 +1750,8 @@ pub fn process_drift(
             match reconstruct_child_path(&path, raw) {
                 Some(child) => {
                     let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
-                    if !enroll_child(&child, path_map, watched_paths) {
-                        if let Ok(mut pending) = PENDING_ENROLL.lock() {
-                            pending.push((child.clone(), std::time::Instant::now()));
-                        }
+                    if !enroll_path(&child, WatchClass::RuntimeChild, path_map, watched_paths) {
+                        queues(|q| q.enroll.push(child.clone(), Instant::now()));
                     }
                     // A rename INTO a watched dir is a drop → present as Created
                     // (single userland normalization point; the dir-class rules
@@ -987,6 +1763,17 @@ pub fn process_drift(
         } else {
             (path, op, false)
         };
+    // External audit NN-AUD-122 (FIMP-010): a link or the target behind a
+    // watched symlink unlinked, renamed away or replaced — what the watched
+    // path reaches may have changed. Its chain is resolved again once the
+    // change has landed (the hooks fire before it), watched anew, and the
+    // path checked against its baseline, attributed to this writer.
+    if class == WatchClass::ChainHop
+        && (op == FimOp::Deleted || (op == FimOp::Renamed && raw.child_name[0] == 0))
+    {
+        queues(|q| q.chain.push(path.clone(), (Instant::now(), *raw)));
+        return Ok(false);
+    }
     if op == FimOp::Deleted {
         forget_if_gone(&key, &path, path_map, watched_paths);
     }
@@ -995,12 +1782,24 @@ pub fn process_drift(
     // renamed over it — checked as a modification once the rename lands.
     if op == FimOp::Renamed && raw.child_name[0] == 0 {
         let replaced = (raw.op_flags & FIM_RENAME_REPLACED != 0).then_some(*raw);
-        if settle_rename(&key, &path, path_map, watched_paths) {
+        if settle_rename(&key, &path, class, path_map, watched_paths) {
             if let Some(r) = &replaced {
                 queue_replacement(&path, r);
             }
-        } else if let Ok(mut pending) = PENDING_RENAME.lock() {
-            pending.push((key, path.clone(), std::time::Instant::now(), replaced));
+        } else {
+            let pending = PendingRename {
+                path: path.clone(),
+                class,
+                since: Instant::now(),
+                replaced,
+            };
+            queues(|q| {
+                q.rename.push_with(key, pending, |queued, new| {
+                    if queued.replaced.is_none() {
+                        queued.replaced = new.replaced;
+                    }
+                })
+            });
         }
     }
 
@@ -1134,6 +1933,45 @@ pub fn process_drift(
     // entry in this set.
     let suppress_on_match = matches!(op, FimOp::Modified | FimOp::Created | FimOp::Linked);
     if !real_drift && suppress_on_match {
+        // External audit NN-AUD-121 (FIMP-009): the kernel saw a write, and
+        // the re-hash — which runs after it — found the baseline content: a
+        // touch, or a write undone before the drain looked (write, use,
+        // restore). On a path a Critical rule guards that is not dropped
+        // silently: a drift row flagged `content_restored`, kept from the
+        // rules (no verdict on content that matches), counted per path.
+        // Everywhere else the no-op suppression against touch noise stays.
+        if crate::fim::rules::is_critical_rule_path(&path) {
+            let restored = note_content_restored(&path);
+            if restored.is_power_of_two() {
+                warn!(
+                    target: "fim.drain",
+                    path = %path,
+                    ?op,
+                    modifier_pid = raw.modifier_pid,
+                    modifier_comm = %comm_to_string(&raw.modifier_comm),
+                    restored_writes = restored,
+                    "FIM: a write on a critical path left its content as baselined — recorded \
+                     as content_restored (a touch, or a change undone before the re-hash)"
+                );
+            }
+            let draft = FimDriftDraft {
+                path: path.clone(),
+                op,
+                baseline_sha256: baseline_sha256.clone(),
+                new_sha256: new_sha256.clone(),
+                modifier_pid: raw.modifier_pid,
+                modifier_uid: raw.modifier_uid,
+                modifier_comm: comm_to_string(&raw.modifier_comm),
+                severity: classifier.classify(op, &path),
+                decision_engine_skipped: true,
+                skip_reason: CONTENT_RESTORED.to_string(),
+                attrs: None,
+            };
+            if let Err(e) = drift_db.append_drift(draft).context("append to drift DB") {
+                report_evidence_loss(&path, &e);
+            }
+            return Ok(false);
+        }
         debug!(
             target: "fim.drain",
             path = %path,
@@ -1237,6 +2075,27 @@ pub fn process_drift(
     }
     Ok(true)
 }
+
+/// External audit NN-AUD-121 (FIMP-009): the `skip_reason` of a drift row
+/// whose re-hash found the baseline content on a critical path.
+pub const CONTENT_RESTORED: &str = "content_restored";
+
+/// External audit NN-AUD-121 (FIMP-009): writes seen on each critical path
+/// whose re-hash found the baseline content, since boot (at most
+/// [`RESTORED_PATHS_MAX`] paths; the count starts over beyond). Returns the
+/// count for `path`, this one included.
+fn note_content_restored(path: &str) -> u64 {
+    static RESTORED: LazyLock<parking_lot::Mutex<HashMap<String, u64>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    let mut counts = RESTORED.lock();
+    if counts.len() >= RESTORED_PATHS_MAX && !counts.contains_key(path) {
+        counts.clear();
+    }
+    let n = counts.entry(path.to_string()).or_insert(0);
+    *n += 1;
+    *n
+}
+const RESTORED_PATHS_MAX: usize = 1024;
 
 /// The mode, owner or group of `now` where they differ from `base`.
 fn attr_change(base: &BaselineEntry, now: &Content) -> Option<FileAttrChange> {
@@ -1352,7 +2211,14 @@ pub async fn drain_loop(
     // flood of events (an unprivileged loop of reads was enough) filled it:
     // the FIM kill rules never saw a persistence write (review 75).
     let mut outbox: Vec<Event> = Vec::new();
-    let mut returns_checked = std::time::Instant::now();
+    // External audit NN-AUD-119 / NN-AUD-120: the periodic steps, each at
+    // most once per period however often the loop turns.
+    let mut retry_pacer = Pacer::new(RETRY_EVERY);
+    let mut returns_pacer = Pacer::new(AWAITING_RETURN_EVERY);
+    let mut gc_pacer = Pacer::new(CHILD_GC_EVERY);
+    // the first sweep a period after boot
+    let _ = returns_pacer.due(Instant::now());
+    let _ = gc_pacer.due(Instant::now());
     // One event through the pipeline: the baseline looked up by the watched
     // path, the hash and the rules' input built off the runtime's threads,
     // the drift log locked for its append only (external audit FIMP-003).
@@ -1378,17 +2244,44 @@ pub async fn drain_loop(
         })
     };
     loop {
+        let now = Instant::now();
         // Review 58: while children wait for their file to appear, wake up
-        // every few milliseconds to retry them.
-        let waiting = retry_pending_enrollments(inode_map.as_ref(), watched_paths.as_deref());
+        // every few milliseconds to retry them. External audit NN-AUD-119:
+        // at most once per RETRY_EVERY (it ran after every emitted event),
+        // and its `stat`s off the runtime's threads.
+        let waiting = if retry_pacer.due(now) {
+            off_the_runtime(|| {
+                retry_pending_enrollments(inode_map.as_ref(), watched_paths.as_deref())
+            })
+            .waiting
+        } else {
+            retries_waiting()
+        };
         // External audit FIMP-005: a file back at a watched path it was
         // renamed away from is watched again and checked as a creation.
-        if returns_checked.elapsed() >= AWAITING_RETURN_EVERY && awaiting_returns() {
-            returns_checked = std::time::Instant::now();
-            for key in returned_paths(inode_map.as_ref(), watched_paths.as_deref()) {
+        // NN-AUD-122: so is a symlinked path whose target is back.
+        if awaiting_returns() && returns_pacer.due(now) {
+            let back = off_the_runtime(|| {
+                let mut back = returned_paths(inode_map.as_ref(), watched_paths.as_deref());
+                back.extend(repaired_chains(
+                    inode_map.as_ref(),
+                    watched_paths.as_deref(),
+                ));
+                back
+            });
+            for key in back {
                 if let Err(e) = check(&returned_raw(key), &mut outbox) {
                     warn!(target: "fim.drain", error = %format!("{e:#}"), "drift check of a returned file failed");
                 }
+            }
+        }
+        // External audit NN-AUD-120: runtime children whose file is gone.
+        if gc_pacer.due(now) {
+            let gone = off_the_runtime(|| {
+                gc_runtime_children(inode_map.as_ref(), watched_paths.as_deref())
+            });
+            if gone > 0 {
+                debug!(target: "fim.drain", gone, "runtime children gone from disk no longer watched");
             }
         }
         // External audit FIMR-004: files renamed over watched ones, landed.
@@ -1403,18 +2296,15 @@ pub async fn drain_loop(
             }
         }
         let wake_after = if waiting {
-            Some(std::time::Duration::from_millis(5))
+            RETRY_EVERY
         } else if awaiting_returns() {
-            Some(AWAITING_RETURN_EVERY)
+            AWAITING_RETURN_EVERY
         } else {
-            None
+            CHILD_GC_EVERY
         };
-        let mut guard = match wake_after {
-            Some(after) => match tokio::time::timeout(after, async_fd.readable_mut()).await {
-                Ok(g) => g?,
-                Err(_) => continue,
-            },
-            None => async_fd.readable_mut().await?,
+        let mut guard = match tokio::time::timeout(wake_after, async_fd.readable_mut()).await {
+            Ok(g) => g?,
+            Err(_) => continue,
         };
         let inner = guard.get_inner_mut();
         let mut drained = 0u32;
@@ -1943,6 +2833,7 @@ mod tests {
             gid: 0,
             size_bytes: 11,
             is_symlink: false,
+            target: None,
             agent_id: "00".repeat(16),
             prev_hash: GENESIS_PREV_HASH.to_string(),
             entry_hash: "deadbeef".repeat(8),
@@ -2532,7 +3423,11 @@ mod tests {
 
         // Moved back: the file is watched again (and drift-checked as a
         // creation) once the drain looks for returns.
-        assert!(AWAITING_RETURN.lock().unwrap().contains(&watched_str));
+        assert!(queues(|q| {
+            q.awaiting_return
+                .iter()
+                .any(|(p, c)| *p == watched_str && *c == WatchClass::Configured)
+        }));
         std::fs::rename(dir.path().join("authorized_keys.bak"), &watched).unwrap();
         let back = key_for_path(&watched).unwrap();
         assert!(returned_paths(&path_map, None).contains(&back));
@@ -2540,7 +3435,10 @@ mod tests {
             path_map.lookup(&back).as_deref(),
             Some(watched_str.as_str())
         );
-        assert!(!AWAITING_RETURN.lock().unwrap().contains(&watched_str));
+        assert!(!queues(|q| q
+            .awaiting_return
+            .iter()
+            .any(|(p, _)| *p == watched_str)));
         let raw = returned_raw(back);
         assert_eq!(raw.op, FimOp::Created as u8);
         assert_eq!((raw.target_dev, raw.target_ino), (back.dev, back.ino));
@@ -3066,5 +3964,667 @@ mod tests {
             }
             other => panic!("expected Event::Fim, got {other:?}"),
         }
+    }
+
+    fn drift_db_in(dir: &TempDir) -> FimDriftDb {
+        FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            fresh_signing_key(dir),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn drift_rows(dir: &TempDir) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.path().join("drift.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn content_baseline(path: &str) -> BaselineEntry {
+        let row = compute_baseline(Path::new(path))
+            .unwrap()
+            .into_iter()
+            .find(|d| !d.is_symlink)
+            .unwrap();
+        let mut b = dummy_baseline(path, &row.sha256);
+        b.mode = row.mode;
+        b.uid = row.uid;
+        b.gid = row.gid;
+        b.size_bytes = row.size_bytes;
+        b
+    }
+
+    /// External audit NN-AUD-119 (FIMP-007): a path queued again is one
+    /// entry, the queue stops at its cap (the rest counted), and putting
+    /// entries back after a pass keeps the cap.
+    #[test]
+    fn pending_queues_are_deduplicated_and_capped() {
+        let mut q: RetryQueue<String, Instant> = RetryQueue::new("test", PENDING_MAX);
+        let t0 = Instant::now();
+        for _ in 0..10_000 {
+            assert!(q.push("/etc/cron.d/tmp.same".to_string(), t0));
+        }
+        assert_eq!(q.len(), 1, "one entry per path");
+        for i in 0..10_000 {
+            q.push(format!("/etc/cron.d/tmp.{i}"), t0);
+        }
+        assert_eq!(q.len(), PENDING_MAX, "capped where it grows");
+        assert_eq!(q.dropped, 10_001 - PENDING_MAX as u64);
+        let taken = q.take();
+        assert!(q.is_empty());
+        q.push("/etc/cron.d/new".to_string(), t0);
+        q.put_back(taken);
+        assert_eq!(q.len(), PENDING_MAX, "put back within the cap");
+
+        // the drain's own queues: a child whose file is not there yet,
+        // reported twice, waits once; a rename seen twice merges the
+        // replacement the second one carries
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let watched_dir = dir.path().join("cron.d");
+        std::fs::create_dir(&watched_dir).unwrap();
+        let dir_key = InodeKey { dev: 0x77, ino: 70 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, watched_dir.to_string_lossy().into_owned());
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        raw.child_name[..6].copy_from_slice(b"tmp.ab");
+        for _ in 0..3 {
+            process_drift(
+                &raw,
+                &path_map,
+                None,
+                &mut db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(queues(|q| q.enroll.len()), 1);
+        let watched = dir.path().join("sshd_config");
+        std::fs::write(&watched, b"x").unwrap();
+        let key = key_for_path(&watched).unwrap();
+        path_map.insert(key, watched.to_string_lossy().into_owned());
+        let plain = fake_raw(key.dev, key.ino, FimOp::Renamed as u8);
+        let mut over = plain;
+        over.op_flags = FIM_RENAME_REPLACED;
+        for r in [&plain, &over, &plain] {
+            process_drift(
+                r,
+                &path_map,
+                None,
+                &mut db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let renames = queues(|q| q.rename.take());
+        assert_eq!(renames.len(), 1, "one entry per inode");
+        assert!(renames[&key].replaced.is_some(), "the replacement is kept");
+        let _ = queues(|q| q.enroll.take());
+    }
+
+    /// External audit NN-AUD-119 (FIMP-007): however many events a burst
+    /// brings, the retry pass — one `stat` per waiting entry — runs at
+    /// most once per RETRY_EVERY. It ran once per loop turn, and the loop
+    /// turns after every event that emits.
+    #[test]
+    fn retry_pass_runs_at_most_every_5ms() {
+        let dir = TempDir::new().unwrap();
+        let path_map = InodePathMap::new();
+        let t0 = Instant::now();
+        queues(|q| {
+            for i in 0..100 {
+                let gone = dir.path().join(format!("short-lived.{i}"));
+                q.enroll.push(gone.to_string_lossy().into_owned(), t0);
+            }
+        });
+        let mut pacer = Pacer::new(RETRY_EVERY);
+        let mut examined = 0;
+        let mut turn = |now: Instant, examined: &mut usize| {
+            if pacer.due(now) {
+                *examined += retry_pending_enrollments(&path_map, None).examined;
+            }
+        };
+        // 10 000 events within one millisecond: one pass
+        for i in 0..10_000u32 {
+            turn(t0 + Duration::from_nanos(u64::from(i) * 100), &mut examined);
+        }
+        assert_eq!(
+            examined, 100,
+            "one pass over the 100 entries, not one per event"
+        );
+        // the next one is due RETRY_EVERY after the first
+        turn(t0 + RETRY_EVERY - Duration::from_micros(1), &mut examined);
+        assert_eq!(examined, 100);
+        turn(t0 + RETRY_EVERY, &mut examined);
+        assert_eq!(examined, 200);
+        let _ = queues(|q| q.enroll.take());
+    }
+
+    /// External audit NN-AUD-120 (FIMP-008): with the kernel map full,
+    /// room is made by evicting the oldest runtime children — never a
+    /// configured path, a symlink hop or a decoy — and a watch that cannot
+    /// be placed is refused (reported), not silently dropped.
+    #[test]
+    fn configured_and_decoy_entries_are_never_evicted() {
+        let key = |i: u64| InodeKey { dev: 9, ino: i };
+        let path_map = InodePathMap::with_child_cap(4);
+        let wp = parking_lot::Mutex::new(WatchedPathsHandle::fake(8));
+        let protected = [
+            (1, WatchClass::Configured),
+            (2, WatchClass::Configured),
+            (3, WatchClass::Configured),
+            (4, WatchClass::ChainHop),
+            (5, WatchClass::Decoy),
+        ];
+        for (i, class) in protected {
+            assert!(watch_inode(
+                key(i),
+                &format!("/p/{i}"),
+                class,
+                &path_map,
+                Some(&wp)
+            ));
+        }
+        for i in 100..120 {
+            assert!(
+                watch_inode(
+                    key(i),
+                    &format!("/d/{i}"),
+                    WatchClass::RuntimeChild,
+                    &path_map,
+                    Some(&wp)
+                ),
+                "a new child makes room for itself"
+            );
+        }
+        for (i, _) in protected {
+            assert!(path_map.lookup(&key(i)).is_some() && wp.lock().holds(&key(i)));
+        }
+        // the 3 newest children hold the 3 free slots
+        assert_eq!(path_map.child_count(), 3);
+        assert!((117..120).all(|i| wp.lock().holds(&key(i))));
+        assert!(!wp.lock().holds(&key(116)) && path_map.lookup(&key(116)).is_none());
+        // a decoy deployed now evicts a child, not a configured path
+        assert!(watch_inode(
+            key(6),
+            "/p/decoy2",
+            WatchClass::Decoy,
+            &path_map,
+            Some(&wp)
+        ));
+        assert!(!wp.lock().holds(&key(117)), "the oldest child made room");
+        // only protected entries left once the children are gone: refused
+        assert!(watch_inode(
+            key(7),
+            "/p/7",
+            WatchClass::Configured,
+            &path_map,
+            Some(&wp)
+        ));
+        assert!(watch_inode(
+            key(8),
+            "/p/8",
+            WatchClass::Configured,
+            &path_map,
+            Some(&wp)
+        ));
+        assert_eq!(path_map.child_count(), 0);
+        let refused_before = WATCH_PRESSURE.lock().refused;
+        assert!(!watch_inode(
+            key(9),
+            "/p/decoy3",
+            WatchClass::Decoy,
+            &path_map,
+            Some(&wp)
+        ));
+        assert!(WATCH_PRESSURE.lock().refused > refused_before, "counted");
+        for (i, _) in protected {
+            assert!(wp.lock().holds(&key(i)), "never evicted");
+        }
+        // a refused child is not kept as if it were watched
+        assert!(!watch_inode(
+            key(200),
+            "/d/200",
+            WatchClass::RuntimeChild,
+            &path_map,
+            Some(&wp)
+        ));
+        assert!(path_map.lookup(&key(200)).is_none());
+        // a child never takes over an inode a configured path holds
+        let _ = path_map.insert_as(key(1), "/d/x".into(), WatchClass::RuntimeChild);
+        assert_eq!(path_map.lookup(&key(1)).as_deref(), Some("/p/1"));
+        assert_eq!(path_map.class_of(&key(1)), Some(WatchClass::Configured));
+    }
+
+    /// External audit NN-AUD-120 (FIMP-008): runtime children are held
+    /// within their cap, oldest out first (out of the kernel map too), and
+    /// the periodic sweep drops those whose file is gone — a Deleted event
+    /// lost in the ring left them watched for good.
+    #[test]
+    fn runtime_children_are_capped_and_gcd() {
+        let dir = TempDir::new().unwrap();
+        let path_map = InodePathMap::with_child_cap(4);
+        let wp = parking_lot::Mutex::new(WatchedPathsHandle::fake(64));
+        let conf = dir.path().join("sshd_config");
+        std::fs::write(&conf, b"x").unwrap();
+        assert!(enroll_path(
+            &conf.to_string_lossy(),
+            WatchClass::Configured,
+            &path_map,
+            Some(&wp)
+        ));
+        let mut kids = Vec::new();
+        for i in 0..6 {
+            let f = dir.path().join(format!("drop.{i}"));
+            std::fs::write(&f, b"payload").unwrap();
+            assert!(enroll_path(
+                &f.to_string_lossy(),
+                WatchClass::RuntimeChild,
+                &path_map,
+                Some(&wp)
+            ));
+            kids.push(key_for_path(&f).unwrap());
+        }
+        assert_eq!(path_map.child_count(), 4);
+        for k in &kids[..2] {
+            assert!(
+                path_map.lookup(k).is_none() && !wp.lock().holds(k),
+                "oldest out"
+            );
+        }
+        for k in &kids[2..] {
+            assert!(path_map.lookup(k).is_some() && wp.lock().holds(k));
+        }
+        std::fs::remove_file(dir.path().join("drop.2")).unwrap();
+        std::fs::remove_file(dir.path().join("drop.3")).unwrap();
+        std::fs::remove_file(&conf).unwrap();
+        assert_eq!(gc_runtime_children(&path_map, Some(&wp)), 2);
+        assert_eq!(path_map.child_count(), 2);
+        assert!(!wp.lock().holds(&kids[2]) && !wp.lock().holds(&kids[3]));
+        assert!(wp.lock().holds(&kids[4]) && wp.lock().holds(&kids[5]));
+        // the sweep is for runtime children only
+        assert!(path_map
+            .lookup(&key_for_path(dir.path()).unwrap())
+            .is_none());
+        assert_eq!(path_map.len(), 3, "the configured path stays");
+    }
+
+    /// External audit NN-AUD-120 (FIMP-008): a full watch set is an ERROR
+    /// at most once a minute and a signed record at most once an hour, each
+    /// with the totals since boot.
+    #[test]
+    fn full_map_is_attested_once_per_hour() {
+        let mut p = WatchPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.note(1, 0, t0), (true, true), "the first one says so");
+        assert_eq!(p.note(1, 0, t0 + Duration::from_secs(30)), (false, false));
+        assert_eq!(p.note(0, 1, t0 + Duration::from_secs(61)), (true, false));
+        for m in 2..60 {
+            let (_, attest) = p.note(1, 0, t0 + Duration::from_secs(m * 60));
+            assert!(!attest, "minute {m}");
+        }
+        assert_eq!(p.note(0, 1, t0 + Duration::from_secs(3600)), (true, true));
+        assert_eq!((p.evicted, p.refused), (60, 2), "totals since boot");
+        // the signed record names the condition and carries the counts
+        let draft = watch_map_full_draft(60, 2, 4096, 4096);
+        assert_eq!(draft.op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(draft.extra["kind"], "subsystem_degraded");
+        assert_eq!(draft.extra["reason"], "fim_watch_map_full");
+        assert_eq!(draft.extra["evicted"], 60);
+        assert_eq!(draft.extra["refused"], 2);
+        assert!(draft.extra["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("fim_watch_map_full"));
+    }
+
+    /// A regular, readable file a Critical rule guards (a system binary).
+    fn critical_system_file() -> String {
+        ["/usr/bin/env", "/usr/bin/true", "/bin/true"]
+            .iter()
+            .find(|p| {
+                crate::fim::rules::is_critical_rule_path(p)
+                    && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+            })
+            .expect("a system binary to read")
+            .to_string()
+    }
+
+    /// External audit NN-AUD-121 (FIMP-009): a write on a critical path
+    /// whose re-hash finds the baseline content — the shape of a change
+    /// undone before the drain looked — leaves a flagged row, not nothing;
+    /// still no verdict.
+    #[test]
+    fn unchanged_hash_on_a_critical_path_is_still_recorded() {
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let path = critical_system_file();
+        let baseline = content_baseline(&path);
+        let key = InodeKey { dev: 0x51, ino: 5 };
+        let path_map = InodePathMap::new();
+        path_map.insert(key, path.clone());
+        let mut out = Vec::new();
+        for op in [FimOp::Modified, FimOp::Modified, FimOp::Created] {
+            let emitted = process_drift(
+                &fake_raw(key.dev, key.ino, op as u8),
+                &path_map,
+                Some(&baseline),
+                &mut db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            assert!(!emitted, "no verdict on content that matches");
+        }
+        assert!(out.is_empty());
+        let rows = drift_rows(&dir);
+        assert_eq!(rows.len(), 3, "one row per write");
+        for row in &rows {
+            assert_eq!(row["path"], path.as_str());
+            assert_eq!(row["skip_reason"], CONTENT_RESTORED);
+            assert_eq!(row["decision_engine_skipped"], true);
+            assert_eq!(row["new_sha256"], row["baseline_sha256"]);
+        }
+    }
+
+    /// External audit NN-AUD-121 (FIMP-009): elsewhere a write that leaves
+    /// the content as baselined (a `touch`) stays the no-op it was.
+    #[test]
+    fn touch_on_a_non_critical_path_is_still_suppressed() {
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let f = dir.path().join("hosts.allow");
+        std::fs::write(&f, b"sshd: 10.0.0.0/8\n").unwrap();
+        let path = f.to_string_lossy().into_owned();
+        assert!(!crate::fim::rules::is_critical_rule_path(&path));
+        let key = key_for_path(&f).unwrap();
+        let path_map = InodePathMap::new();
+        path_map.insert(key, path.clone());
+        let emitted = process_drift(
+            &fake_raw(key.dev, key.ino, FimOp::Modified as u8),
+            &path_map,
+            Some(&content_baseline(&path)),
+            &mut db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!emitted);
+        assert!(drift_rows(&dir).is_empty(), "no row for a touch");
+    }
+
+    /// External audit NN-AUD-122 (FIMP-010): an in-place edit of the file
+    /// behind a watched symlink (`python3` -> `python3.12`) is drift of the
+    /// watched path, compared with its content row. Only the link's inode
+    /// was watched, so the edit produced no event at all.
+    #[test]
+    fn an_edit_of_the_target_behind_a_watched_link_is_drift_of_the_link() {
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let target = dir.path().join("python3.12");
+        std::fs::write(&target, b"ELF 3.12").unwrap();
+        let link = dir.path().join("python3");
+        std::os::unix::fs::symlink("python3.12", &link).unwrap();
+        let link_s = link.to_string_lossy().into_owned();
+        let path_map = InodePathMap::new();
+        let wp = parking_lot::Mutex::new(WatchedPathsHandle::fake(64));
+        assert!(enroll_path(
+            &link_s,
+            WatchClass::Configured,
+            &path_map,
+            Some(&wp)
+        ));
+        let tkey = key_for_path(&target).unwrap();
+        assert!(wp.lock().holds(&tkey), "the target is watched");
+        assert_eq!(path_map.lookup(&tkey).as_deref(), Some(link_s.as_str()));
+        assert_eq!(path_map.class_of(&tkey), Some(WatchClass::ChainHop));
+        let baseline = content_baseline(&link_s);
+        // append a byte in place
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&target)
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        let mut out = Vec::new();
+        let emitted = process_drift(
+            &fake_raw(tkey.dev, tkey.ino, FimOp::Modified as u8),
+            &path_map,
+            Some(&baseline),
+            &mut db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            Some(&wp),
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(emitted);
+        let Event::Fim(fe) = &out[0] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(fe.path, link_s);
+        assert_eq!(fe.op, FimOp::Modified);
+        assert_eq!(fe.new_sha256, Some(Sha256::digest(b"ELF 3.12X").into()));
+    }
+
+    /// External audit NN-AUD-122 (FIMP-010): a link in the middle of the
+    /// chain re-pointed (`ln -sfn` over `/etc/alternatives/nc`) is drift of
+    /// the watched path once it has landed, attributed to the writer; the
+    /// new chain is watched and the old link no longer is. A target removed
+    /// and put back is watched again when it is back.
+    #[test]
+    fn a_repointed_link_in_the_chain_is_drift_of_the_watched_path() {
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let d = dir.path();
+        std::fs::create_dir(d.join("alternatives")).unwrap();
+        std::fs::write(d.join("nc.openbsd"), b"netcat").unwrap();
+        std::fs::write(d.join("evil"), b"a backdoor").unwrap();
+        std::os::unix::fs::symlink(d.join("nc.openbsd"), d.join("alternatives/nc")).unwrap();
+        std::os::unix::fs::symlink(d.join("alternatives/nc"), d.join("nc")).unwrap();
+        let nc = d.join("nc").to_string_lossy().into_owned();
+        let path_map = InodePathMap::new();
+        let wp = parking_lot::Mutex::new(WatchedPathsHandle::fake(64));
+        assert!(enroll_path(
+            &nc,
+            WatchClass::Configured,
+            &path_map,
+            Some(&wp)
+        ));
+        let baseline = content_baseline(&nc);
+        let old_alt = key_for_path(&d.join("alternatives/nc")).unwrap();
+        let old_target = key_for_path(&d.join("nc.openbsd")).unwrap();
+        assert_eq!(path_map.chain(&nc), vec![old_alt, old_target]);
+
+        // ln -sfn: a new link renamed over the old one; the hook fires
+        // before the rename lands
+        let mut raw = fake_raw(old_alt.dev, old_alt.ino, FimOp::Renamed as u8);
+        raw.op_flags = FIM_RENAME_REPLACED;
+        raw.modifier_pid = 4343;
+        raw.modifier_comm = *b"ln\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let run = |raw: &FimDriftRaw, db: &mut FimDriftDb, out: &mut Vec<Event>| {
+            process_drift(
+                raw,
+                &path_map,
+                Some(&baseline),
+                db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                Some(&wp),
+                None,
+                Some(out),
+            )
+            .unwrap()
+        };
+        let mut out = Vec::new();
+        assert!(!run(&raw, &mut db, &mut out), "checked once it has landed");
+        assert!(
+            retry_pending_enrollments(&path_map, Some(&wp)).waiting,
+            "not landed yet"
+        );
+        assert!(replacement_raws().is_empty());
+        std::os::unix::fs::symlink(d.join("evil"), d.join("alternatives/nc.tmp")).unwrap();
+        std::fs::rename(d.join("alternatives/nc.tmp"), d.join("alternatives/nc")).unwrap();
+        retry_pending_enrollments(&path_map, Some(&wp));
+        let new_alt = key_for_path(&d.join("alternatives/nc")).unwrap();
+        let evil = key_for_path(&d.join("evil")).unwrap();
+        assert_eq!(path_map.chain(&nc), vec![new_alt, evil], "the new chain");
+        assert!(wp.lock().holds(&new_alt) && wp.lock().holds(&evil));
+        assert!(!wp.lock().holds(&old_alt) && path_map.lookup(&old_alt).is_none());
+        assert!(
+            !wp.lock().holds(&old_target),
+            "nc.openbsd is no longer behind it"
+        );
+        let checks = replacement_raws();
+        assert_eq!(checks.len(), 1);
+        assert!(run(&checks[0], &mut db, &mut out));
+        let Event::Fim(fe) = &out[0] else {
+            panic!("{out:?}")
+        };
+        assert_eq!((fe.path.as_str(), fe.op), (nc.as_str(), FimOp::Modified));
+        assert_eq!((fe.modifier_pid, fe.modifier_comm.as_str()), (4343, "ln"));
+        assert_eq!(fe.new_sha256, Some(Sha256::digest(b"a backdoor").into()));
+
+        // the target removed: drift (nothing is reachable), and watched
+        // again once it is back
+        std::fs::remove_file(d.join("evil")).unwrap();
+        assert!(!run(
+            &fake_raw(evil.dev, evil.ino, FimOp::Deleted as u8),
+            &mut db,
+            &mut out
+        ));
+        retry_pending_enrollments(&path_map, Some(&wp));
+        assert_eq!(path_map.chain(&nc), vec![new_alt]);
+        assert!(awaiting_returns(), "waits for the target");
+        std::fs::write(d.join("evil"), b"back").unwrap();
+        let back = repaired_chains(&path_map, Some(&wp));
+        assert_eq!(back, vec![key_for_path(&d.join("nc")).unwrap()]);
+        let evil = key_for_path(&d.join("evil")).unwrap();
+        assert!(wp.lock().holds(&evil));
+        assert!(!awaiting_returns());
+        let _ = replacement_raws();
+
+        // the watched link itself removed: the chain behind it goes too,
+        // and comes back with it
+        let own = key_for_path(&d.join("nc")).unwrap();
+        std::fs::remove_file(d.join("nc")).unwrap();
+        run(
+            &fake_raw(own.dev, own.ino, FimOp::Deleted as u8),
+            &mut db,
+            &mut out,
+        );
+        assert!(path_map.chain(&nc).is_empty());
+        assert!(!wp.lock().holds(&evil) && !wp.lock().holds(&new_alt));
+        std::os::unix::fs::symlink(d.join("alternatives/nc"), d.join("nc")).unwrap();
+        assert!(enroll_path(
+            &nc,
+            WatchClass::Configured,
+            &path_map,
+            Some(&wp)
+        ));
+        assert_eq!(path_map.chain(&nc), vec![new_alt, evil]);
+    }
+
+    /// External audit NN-AUD-122 (FIMP-010): two watched links through one
+    /// target (`iptables`, `ip6tables` -> `xtables-nft-multi`): one
+    /// re-pointed away leaves the target watched for the other.
+    #[test]
+    fn a_target_shared_by_two_watched_links_stays_watched() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("xtables-nft-multi"), b"ELF").unwrap();
+        std::fs::write(d.join("other"), b"ELF2").unwrap();
+        std::os::unix::fs::symlink(d.join("xtables-nft-multi"), d.join("iptables")).unwrap();
+        std::os::unix::fs::symlink(d.join("xtables-nft-multi"), d.join("ip6tables")).unwrap();
+        let path_map = InodePathMap::new();
+        let wp = parking_lot::Mutex::new(WatchedPathsHandle::fake(64));
+        for l in ["iptables", "ip6tables"] {
+            assert!(enroll_path(
+                &d.join(l).to_string_lossy(),
+                WatchClass::Configured,
+                &path_map,
+                Some(&wp)
+            ));
+        }
+        let shared = key_for_path(&d.join("xtables-nft-multi")).unwrap();
+        std::fs::remove_file(d.join("ip6tables")).unwrap();
+        std::os::unix::fs::symlink(d.join("other"), d.join("ip6tables")).unwrap();
+        enroll_chain(&d.join("ip6tables").to_string_lossy(), &path_map, Some(&wp));
+        assert!(wp.lock().holds(&shared), "still behind iptables");
+        assert_eq!(
+            path_map.lookup(&shared).as_deref(),
+            Some(d.join("iptables").to_string_lossy().as_ref())
+        );
+    }
+
+    /// External audit NN-AUD-120 (FIMP-008): a file renamed within a
+    /// watched directory (`tmp.X` to its final name) is enrolled under the
+    /// new name by the directory's event; settling the rename of the old
+    /// name afterwards used to drop the inode, so the file's later in-place
+    /// edits went unseen.
+    #[test]
+    fn a_child_renamed_within_a_watched_directory_stays_watched() {
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let watched_dir = dir.path().join("system");
+        std::fs::create_dir(&watched_dir).unwrap();
+        let dir_key = InodeKey { dev: 0x88, ino: 8 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, watched_dir.to_string_lossy().into_owned());
+        let created = |leaf: &[u8], op: FimOp| {
+            let mut raw = fake_raw(dir_key.dev, dir_key.ino, op as u8);
+            raw.child_name[..leaf.len()].copy_from_slice(leaf);
+            raw
+        };
+        let run = |raw: &FimDriftRaw, db: &mut FimDriftDb| {
+            process_drift(
+                raw,
+                &path_map,
+                None,
+                db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        std::fs::write(watched_dir.join("tmp.X"), b"[Service]\n").unwrap();
+        run(&created(b"tmp.X", FimOp::Created), &mut db);
+        let key = key_for_path(&watched_dir.join("tmp.X")).unwrap();
+        assert_eq!(path_map.class_of(&key), Some(WatchClass::RuntimeChild));
+        // the rename of the watched child, seen before it lands
+        run(&fake_raw(key.dev, key.ino, FimOp::Renamed as u8), &mut db);
+        std::fs::rename(watched_dir.join("tmp.X"), watched_dir.join("evil.service")).unwrap();
+        // the directory's event for the new name, then the retry
+        run(&created(b"evil.service", FimOp::Renamed), &mut db);
+        retry_pending_enrollments(&path_map, None);
+        assert_eq!(
+            path_map.lookup(&key).as_deref(),
+            Some(watched_dir.join("evil.service").to_string_lossy().as_ref()),
+            "still watched under its new name"
+        );
     }
 }
