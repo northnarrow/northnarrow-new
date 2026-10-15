@@ -13,16 +13,21 @@
 //! Exit 0 when every required property holds, 1 when one does not, 2 when
 //! the run could not start (not root, no embedded eBPF object). The probes
 //! only look at this process and its children: nothing else on the host is
-//! observed or slowed down. The fixtures live in `/var/tmp/nn-feasibility`;
-//! `NN_FEASIBILITY_BASE=<dir>` puts them in `<dir>/nn-feasibility` instead,
-//! to run the file checks on another filesystem.
+//! observed or slowed down. The fixtures live in a fresh directory
+//! `/var/tmp/nn-feasibility.XXXXXX` made by `mkdtemp(3)` (mode 0700, a name
+//! no one can predict); `NN_FEASIBILITY_BASE=<dir>` puts it under `<dir>`
+//! instead, to run the file checks on another filesystem. The tmpfs exec
+//! case copies `/usr/bin/true` into another such directory under `/dev/shm`.
+//! The runner runs as root: it never creates, removes or executes a file at
+//! a fixed name in a world-writable directory (external audit SNS-003).
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::UdpSocket;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,11 +54,16 @@ use crate::telemetry_probe::dns_query_packet;
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 /// Maps the object pins by name land here, away from the agent's pin root.
 const PIN_DIR: &str = "/sys/fs/bpf/nn-feasibility";
-/// Fixtures go in `<base>/nn-feasibility`; `NN_FEASIBILITY_BASE` moves them
-/// to another filesystem (only that subdirectory is ever removed).
+/// Fixtures go in a fresh `<base>/nn-feasibility.XXXXXX` (`mkdtemp`);
+/// `NN_FEASIBILITY_BASE` moves it to another filesystem. Only that
+/// directory, made by this run, is ever removed.
 const WORK_BASE: &str = "/var/tmp";
-const WORK_SUBDIR: &str = "nn-feasibility";
-const SHM_COPY: &str = "/dev/shm/nn-feasibility-true";
+const WORK_PREFIX: &str = "nn-feasibility";
+/// The tmpfs exec case: `/usr/bin/true` copied into a fresh
+/// `/dev/shm/nn-feasibility.XXXXXX/true`.
+const SHM_BASE: &str = "/dev/shm";
+/// Owner every file the runner executes must have (it runs as root).
+const ROOT_UID: u32 = 0;
 const TRUE_BIN: &str = "/usr/bin/true";
 const DNS_NAME: &str = "nn-feasibility.example";
 const TOCTOU_OPENS: usize = 200;
@@ -100,32 +110,28 @@ pub fn run() -> i32 {
         );
         return 2;
     }
-    let work = work_dir();
     let _ = fs::remove_dir_all(PIN_DIR);
-    let _ = fs::remove_dir_all(&work);
     let mut rep = Report {
         kernel: fs::read_to_string("/proc/sys/kernel/osrelease")
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "unknown".into()),
         ..Report::default()
     };
-    // A BASE that does not exist would silently put the fixtures on the
-    // root filesystem instead of the one being tested.
-    let bench = bench_opens_requested().map(|n| (n, work.join("unwatched/bench")));
-    let outcome = match work.parent() {
-        Some(base) if !base.is_dir() => Err(anyhow!(
-            "NN_FEASIBILITY_BASE {} is not a directory",
-            base.display()
-        )),
-        _ => execute(&mut rep, &work),
+    let work = work_dir();
+    let outcome = match &work {
+        Ok(w) => execute(&mut rep, w.path()),
+        Err(e) => Err(anyhow!("{e:#}")),
     };
     let _ = fs::remove_dir_all(PIN_DIR);
     // The programs are gone with the object: the baseline.
-    if let Some((n, path)) = bench.filter(|(_, p)| p.exists()) {
-        p_bench(&mut rep, "no program", &path, n);
+    if let (Some(n), Ok(w)) = (bench_opens_requested(), &work) {
+        let path = w.path().join("unwatched/bench");
+        if path.exists() {
+            p_bench(&mut rep, "no program", &path, n);
+        }
     }
-    let _ = fs::remove_dir_all(&work);
-    let _ = fs::remove_file(SHM_COPY);
+    // Removes the fixtures' directory, and only it.
+    drop(work);
     if let Err(e) = outcome {
         rep.check("the run completed", true, false, format!("{e:#}"));
     }
@@ -137,10 +143,77 @@ pub fn run() -> i32 {
     }
 }
 
-fn work_dir() -> PathBuf {
+/// The fixtures' directory, fresh and private: `<base>/nn-feasibility.XXXXXX`.
+fn work_dir() -> Result<PrivateDir> {
     let base = std::env::var_os("NN_FEASIBILITY_BASE")
         .map_or_else(|| PathBuf::from(WORK_BASE), PathBuf::from);
-    base.join(WORK_SUBDIR)
+    // A BASE that does not exist would silently put the fixtures on the
+    // root filesystem instead of the one being tested.
+    if !base.is_dir() {
+        bail!("NN_FEASIBILITY_BASE {} is not a directory", base.display());
+    }
+    PrivateDir::create(&base, WORK_PREFIX)
+}
+
+/// A directory made by `mkdtemp(3)`: created by this call (never one that
+/// already existed), under a name no one can predict, mode 0700 and owned by
+/// this process's user. Removed with its contents on drop.
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn create(base: &Path, prefix: &str) -> Result<Self> {
+        let template = base.join(format!("{prefix}.XXXXXX"));
+        let mut buf =
+            CString::new(template.into_os_string().into_encoded_bytes())?.into_bytes_with_nul();
+        // SAFETY: `buf` is a writable, NUL-terminated template that outlives
+        // the call; mkdtemp only rewrites the trailing `XXXXXX` in place.
+        if unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) }.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("mkdtemp under {}", base.display()));
+        }
+        buf.pop();
+        let dir = Self(PathBuf::from(OsString::from_vec(buf)));
+        // mkdtemp made it with mode 0700; the umask can only narrow that.
+        let m = fs::symlink_metadata(&dir.0)?;
+        if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+            bail!(
+                "{} is not a private directory (mode {:o}, uid {})",
+                dir.0.display(),
+                m.mode() & 0o7777,
+                m.uid()
+            );
+        }
+        Ok(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Create `path`, which must not exist yet (`O_CREAT|O_EXCL`), never through
+/// a symlink (`O_NOFOLLOW`).
+fn create_private(path: &Path, mode: u32) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(path)
+}
+
+/// Copy `/usr/bin/true` to `to`, a new file (0700). The writable descriptor
+/// is closed on return, so the copy can be executed (no `ETXTBSY`).
+fn copy_true(to: &Path) -> Result<()> {
+    create_private(to, 0o700)
+        .and_then(|mut f| f.write_all(&fs::read(TRUE_BIN)?))
+        .with_context(|| format!("copying {TRUE_BIN} to {}", to.display()))
 }
 
 /// An error and its sources, `a: b: c` — the kernel's errno is usually the
@@ -297,7 +370,7 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
         ),
     );
 
-    let fx = Fixtures::create(work).context("creating the fixtures")?;
+    let fx = Fixtures::create(work, Path::new(SHM_BASE)).context("creating the fixtures")?;
     rep.notes.push(format!(
         "fixtures under {} (filesystem magic {})",
         work.display(),
@@ -505,11 +578,15 @@ struct Fixtures {
     /// Read-only descriptor of a memfd holding `/usr/bin/true`.
     memfd: Option<File>,
     memfd_note: String,
-    shm_copy: bool,
+    /// `/usr/bin/true` copied to tmpfs, in its own private directory: held
+    /// here so the copy lives until the exec case. Or why there is none.
+    shm: std::result::Result<(PrivateDir, PathBuf), String>,
 }
 
 impl Fixtures {
-    fn create(root: &Path) -> Result<Self> {
+    /// `root` is the private work directory; the tmpfs copy goes in a
+    /// private directory of its own under `shm_base`.
+    fn create(root: &Path, shm_base: &Path) -> Result<Self> {
         let root = root.to_path_buf();
         for d in [
             "watched",
@@ -532,11 +609,17 @@ impl Fixtures {
             "home/.gnupg/private-keys-v1.d/x.key",
             "home/notgnupg/x.key",
         ] {
-            fs::write(root.join(f), f)?;
+            create_private(&root.join(f), 0o600)?.write_all(f.as_bytes())?;
         }
-        let shm_copy = fs::copy(TRUE_BIN, SHM_COPY).is_ok();
+        let shm = PrivateDir::create(shm_base, WORK_PREFIX)
+            .and_then(|dir| {
+                let copy = dir.path().join("true");
+                copy_true(&copy)?;
+                Ok((dir, copy))
+            })
+            .map_err(|e| format!("{e:#}"));
         let del_path = root.join("deleted-true");
-        fs::copy(TRUE_BIN, &del_path)?;
+        copy_true(&del_path)?;
         let deleted = File::open(&del_path)?;
         fs::remove_file(&del_path)?;
         let (memfd, memfd_note) = match memfd_with_true() {
@@ -548,7 +631,7 @@ impl Fixtures {
             deleted,
             memfd,
             memfd_note,
-            shm_copy,
+            shm,
         })
     }
 
@@ -1017,9 +1100,47 @@ enum Launch {
     Execveat(i32),
 }
 
-struct ExecCase {
+/// The file a case executes, as checked just before the exec.
+enum ExecTarget<'a> {
+    /// A name: `lstat`, so a symlink is refused.
+    Path(PathBuf),
+    /// An open descriptor: `fstat`.
+    File(&'a File),
+}
+
+/// Checked right before each exec, on the file itself: a regular file owned
+/// by `owner` with exactly `nlink` links (1 for a copy this run made, so no
+/// second name exists that someone else holds; 0 for a deleted file or a
+/// memfd). A named file must also be writable by its owner only; a memfd is
+/// 0777 by construction but has no name anyone could open it by.
+fn vet_exec_target(target: &ExecTarget<'_>, owner: u32, nlink: u64) -> Result<(), String> {
+    let m = match target {
+        ExecTarget::Path(p) => fs::symlink_metadata(p),
+        ExecTarget::File(f) => f.metadata(),
+    }
+    .map_err(|e| format!("stat: {e}"))?;
+    if !m.file_type().is_file() {
+        return Err("not a regular file".into());
+    }
+    if m.uid() != owner {
+        return Err(format!("owned by uid {}, expected {owner}", m.uid()));
+    }
+    if m.nlink() != nlink {
+        return Err(format!("{} link(s), expected {nlink}", m.nlink()));
+    }
+    if matches!(target, ExecTarget::Path(_)) && m.mode() & 0o022 != 0 {
+        return Err(format!(
+            "mode {:o} is writable by group or others",
+            m.mode() & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+struct ExecCase<'a> {
     label: &'static str,
     launch: Launch,
+    target: ExecTarget<'a>,
     /// `bprm->filename` as the kernel builds it.
     filename: String,
     expect_ino: u64,
@@ -1037,29 +1158,41 @@ fn exercise_exec(p: &mut Probes, rep: &mut Report, fx: &Fixtures) -> Result<()> 
     cases.push(ExecCase {
         label: "/usr/bin/true",
         launch: Launch::Path(TRUE_BIN.into()),
+        target: ExecTarget::Path(TRUE_BIN.into()),
         filename: TRUE_BIN.into(),
         expect_ino: m.ino(),
         expect_dev: stat_dev_to_kernel_dev(m.dev()),
         deleted: false,
         tmpfs: false,
     });
-    if fx.shm_copy {
-        let m = fs::metadata(SHM_COPY)?;
-        cases.push(ExecCase {
-            label: "a copy in /dev/shm",
-            launch: Launch::Path(SHM_COPY.into()),
-            filename: SHM_COPY.into(),
-            expect_ino: m.ino(),
-            expect_dev: stat_dev_to_kernel_dev(m.dev()),
-            deleted: false,
-            tmpfs: true,
-        });
+    match &fx.shm {
+        Ok((_, copy)) => {
+            let m = fs::symlink_metadata(copy)?;
+            let name = copy.to_string_lossy().into_owned();
+            cases.push(ExecCase {
+                label: "a copy in /dev/shm",
+                launch: Launch::Path(name.clone()),
+                target: ExecTarget::Path(copy.clone()),
+                filename: name,
+                expect_ino: m.ino(),
+                expect_dev: stat_dev_to_kernel_dev(m.dev()),
+                deleted: false,
+                tmpfs: true,
+            });
+        }
+        Err(e) => rep.check(
+            "exec of a copy in /dev/shm",
+            false,
+            false,
+            format!("copy not created: {e}"),
+        ),
     }
     let m = fx.deleted.metadata()?;
     let path = format!("/proc/{me}/fd/{}", fx.deleted.as_raw_fd());
     cases.push(ExecCase {
         label: "a deleted file (through /proc/<pid>/fd)",
         launch: Launch::Path(path.clone()),
+        target: ExecTarget::File(&fx.deleted),
         filename: path,
         expect_ino: m.ino(),
         expect_dev: stat_dev_to_kernel_dev(m.dev()),
@@ -1074,6 +1207,7 @@ fn exercise_exec(p: &mut Probes, rep: &mut Report, fx: &Fixtures) -> Result<()> 
             cases.push(ExecCase {
                 label: "a memfd (through /proc/<pid>/fd)",
                 launch: Launch::Path(path.clone()),
+                target: ExecTarget::File(memfd),
                 filename: path,
                 expect_ino: m.ino(),
                 expect_dev: stat_dev_to_kernel_dev(m.dev()),
@@ -1083,6 +1217,7 @@ fn exercise_exec(p: &mut Probes, rep: &mut Report, fx: &Fixtures) -> Result<()> 
             cases.push(ExecCase {
                 label: "a memfd with execveat(fd, \"\", AT_EMPTY_PATH) (fexecve)",
                 launch: Launch::Execveat(fd),
+                target: ExecTarget::File(memfd),
                 filename: format!("/dev/fd/{fd}"),
                 expect_ino: m.ino(),
                 expect_dev: stat_dev_to_kernel_dev(m.dev()),
@@ -1100,12 +1235,14 @@ fn exercise_exec(p: &mut Probes, rep: &mut Report, fx: &Fixtures) -> Result<()> 
 
     for c in &cases {
         p.begin();
-        let started = match &c.launch {
-            Launch::Path(path) => Command::new(path).spawn().and_then(|mut child| {
+        let vetted = vet_exec_target(&c.target, ROOT_UID, if c.deleted { 0 } else { 1 });
+        let started = match (&c.launch, vetted) {
+            (_, Err(why)) => Err(std::io::Error::other(format!("refused: {why}"))),
+            (Launch::Path(path), Ok(())) => Command::new(path).spawn().and_then(|mut child| {
                 let pid = child.id();
                 child.wait().map(|st| (pid, st.success()))
             }),
-            Launch::Execveat(fd) => fexecve_child(*fd),
+            (Launch::Execveat(fd), Ok(())) => fexecve_child(*fd),
         };
         let evs = p.drain();
         let (child, status) = match &started {
@@ -1509,5 +1646,116 @@ impl Report {
             if self.passed() { "PASS" } else { "FAIL" },
             required.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn euid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    /// External audit SNS-003: the runner used fixed names in world-writable
+    /// directories (`<base>/nn-feasibility`, `/dev/shm/nn-feasibility-true`),
+    /// removed and re-created them as root, then executed the copy.
+    #[test]
+    fn fixtures_are_private_and_fresh() {
+        let base = tempfile::tempdir().unwrap();
+        let shm_base = tempfile::tempdir().unwrap();
+        // The old fixed names, pre-created by someone else.
+        let old_work = base.path().join("nn-feasibility");
+        fs::create_dir(&old_work).unwrap();
+        fs::write(old_work.join("plain"), b"planted").unwrap();
+        let old_shm = shm_base.path().join("nn-feasibility-true");
+        fs::write(&old_shm, b"planted").unwrap();
+
+        let a = PrivateDir::create(base.path(), WORK_PREFIX).unwrap();
+        let b = PrivateDir::create(base.path(), WORK_PREFIX).unwrap();
+        assert_ne!(a.path(), b.path(), "every run gets a fresh directory");
+        for d in [&a, &b] {
+            assert_eq!(d.path().parent(), Some(base.path()));
+            assert_ne!(d.path(), old_work.as_path());
+            let m = fs::symlink_metadata(d.path()).unwrap();
+            assert!(m.is_dir());
+            assert_eq!(m.uid(), euid());
+            assert_eq!(m.mode() & 0o077, 0, "no access for group or others");
+        }
+
+        let fx = Fixtures::create(a.path(), shm_base.path()).unwrap();
+        let plain = fs::symlink_metadata(fx.path("plain")).unwrap();
+        assert!(plain.is_file());
+        assert_eq!(plain.mode() & 0o077, 0);
+        let (shm_dir, copy) = fx.shm.as_ref().expect("tmpfs copy created");
+        assert_eq!(shm_dir.path().parent(), Some(shm_base.path()));
+        assert_ne!(copy.as_path(), old_shm.as_path());
+        let m = fs::symlink_metadata(shm_dir.path()).unwrap();
+        assert_eq!(m.mode() & 0o077, 0);
+        // What exercise_exec checks before each exec (owner: this user).
+        assert_eq!(
+            vet_exec_target(&ExecTarget::Path(copy.clone()), euid(), 1),
+            Ok(())
+        );
+        assert_eq!(
+            vet_exec_target(&ExecTarget::File(&fx.deleted), euid(), 0),
+            Ok(())
+        );
+
+        // The old names are left alone, before and after the cleanup.
+        let (work, shm) = (a.path().to_path_buf(), shm_dir.path().to_path_buf());
+        drop(fx);
+        drop(a);
+        assert!(!work.exists() && !shm.exists(), "own directories removed");
+        assert!(b.path().is_dir(), "another run's directory kept");
+        assert_eq!(fs::read(old_work.join("plain")).unwrap(), b"planted");
+        assert_eq!(fs::read(&old_shm).unwrap(), b"planted");
+    }
+
+    #[test]
+    fn fixture_files_are_never_reused_or_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        fs::write(&existing, b"keep").unwrap();
+        assert!(create_private(&existing, 0o600).is_err());
+        let link = dir.path().join("link");
+        symlink(&existing, &link).unwrap();
+        assert!(create_private(&link, 0o600).is_err());
+        assert!(copy_true(&link).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn exec_target_is_vetted_before_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = |name: &str| {
+            let p = dir.path().join(name);
+            create_private(&p, 0o700).unwrap();
+            p
+        };
+        let ok = own("ok");
+        assert_eq!(
+            vet_exec_target(&ExecTarget::Path(ok.clone()), euid(), 1),
+            Ok(())
+        );
+        // Another owner.
+        assert!(vet_exec_target(&ExecTarget::Path(ok.clone()), euid() + 1, 1).is_err());
+        // A symlink to a good file.
+        let link = dir.path().join("link");
+        symlink(&ok, &link).unwrap();
+        assert!(vet_exec_target(&ExecTarget::Path(link), euid(), 1).is_err());
+        // A second name for the file.
+        let linked = own("linked");
+        fs::hard_link(&linked, dir.path().join("second-name")).unwrap();
+        assert!(vet_exec_target(&ExecTarget::Path(linked), euid(), 1).is_err());
+        // Writable by the group.
+        let shared = own("shared");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(vet_exec_target(&ExecTarget::Path(shared), euid(), 1).is_err());
+        // Not a regular file.
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        assert!(vet_exec_target(&ExecTarget::Path(sub), euid(), 1).is_err());
     }
 }

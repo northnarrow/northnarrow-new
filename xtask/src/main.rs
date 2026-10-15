@@ -272,15 +272,24 @@ fn build_ebpf(release: bool) -> Result<()> {
     // agent ever embeds; a `--release=false` eBPF build is a manual
     // inspection aid and intentionally leaves no stamp (so a userland
     // build against it trips the guard).
+    //
+    // The stamp also records the SHA-256 of the object just built
+    // (external audit EBPF-014): `agent/build.rs` refuses a `.o` whose
+    // bytes differ, i.e. one rebuilt outside xtask or replaced later.
     if release {
         let source_hash = ebpf_guard::ebpf_source_hash(&root)
             .with_context(|| "hashing the eBPF source closure for the build stamp")?;
-        ebpf_guard::write_stamp(&root, &source_hash)
+        let artifact = ebpf_guard::ebpf_artifact_path(&root);
+        let object = std::fs::read(&artifact)
+            .with_context(|| format!("reading {} for the build stamp", artifact.display()))?;
+        let object_sha = ebpf_guard::sha256_hex(&object);
+        ebpf_guard::write_stamp(&root, &source_hash, &object_sha)
             .with_context(|| "writing the eBPF build stamp")?;
         println!(
-            "xtask: build stamp {} = {}",
+            "xtask: build stamp {} = source {}, object {}",
             ebpf_guard::ebpf_stamp_path(&root).display(),
-            source_hash
+            source_hash,
+            object_sha
         );
     }
     Ok(())

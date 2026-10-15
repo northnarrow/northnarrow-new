@@ -13,11 +13,14 @@
 //!
 //! The guard, implemented here + in the shared [`ebpf_guard`] crate:
 //!   * `cargo xtask build-ebpf` writes a provenance *stamp* (a hash of
-//!     the eBPF source closure) next to the `.o`.
-//!   * This script recomputes that hash over the current tree and
-//!     **fails the build, loudly**, if the `.o` is present but its
-//!     stamp is missing or does not match. So a stale object can no
-//!     longer be embedded — the build stops instead.
+//!     the eBPF source closure, and the SHA-256 of the object it just
+//!     built) next to the `.o`.
+//!   * This script recomputes the source hash over the current tree,
+//!     hashes the object bytes it is about to embed, and **fails the
+//!     build, loudly**, if the `.o` is present but its stamp is missing
+//!     or either hash does not match. So a stale object, or one that is
+//!     not the object xtask stamped, can no longer be embedded — the
+//!     build stops instead.
 //!   * If the `.o` is entirely absent (CI userland job, IDE `cargo
 //!     check`), we fall back to an empty placeholder so those builds
 //!     stay green; the agent then *refuses to start* at runtime (its
@@ -83,18 +86,24 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/refs/heads/");
 
     if ebpf_artifact.is_file() {
-        // The object exists → it MUST be provably fresh. Compute the
-        // current source-closure hash and compare against the stamp the
-        // eBPF build wrote.
+        // The object exists → it MUST be provably fresh. Read it once:
+        // the bytes checked against the stamp are the bytes staged for
+        // `include_bytes!`, and the runtime preflight re-derives their
+        // sha to catch post-build corruption / object swap.
+        let bytes = fs::read(&ebpf_artifact)
+            .unwrap_or_else(|e| panic!("reading eBPF artifact {}: {e}", ebpf_artifact.display()));
+        let obj_sha = ebpf_guard::sha256_hex(&bytes);
         let current = ebpf_guard::ebpf_source_hash(&repo_root).unwrap_or_else(|e| {
             panic!("ebpf-guard: failed to hash the eBPF source closure: {e}");
         });
-        match ebpf_guard::read_stamp(&repo_root) {
-            // Fresh: stamp matches the current source. Fall through to
-            // embed it.
-            Ok(Some(stamped)) if stamped == current => {}
+        let stamp = ebpf_guard::read_stamp(&repo_root)
+            .unwrap_or_else(|e| panic!("ebpf-guard: failed to read the eBPF build stamp: {e}"));
+        match ebpf_guard::verdict(stamp.as_ref(), &current, &obj_sha) {
+            // Fresh: built from the current source, and these are the
+            // bytes xtask stamped. Fall through to embed them.
+            ebpf_guard::Verdict::Fresh => {}
             // Present but STALE: the .o was built from different source.
-            Ok(Some(stamped)) => panic!(
+            ebpf_guard::Verdict::StaleSource { stamped, current } => panic!(
                 "\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
                   STALE eBPF OBJECT — refusing to embed (agent/build.rs staleness guard)\n\
@@ -113,33 +122,45 @@ fn main() {
                 ═══════════════════════════════════════════════════════════════════════\n",
                 artifact = ebpf_artifact.display(),
             ),
+            // Same source, other bytes: not the object xtask stamped
+            // (rebuilt outside xtask, or replaced after the stamp).
+            ebpf_guard::Verdict::ObjectMismatch { stamped, actual } => panic!(
+                "\n\
+                ═══════════════════════════════════════════════════════════════════════\n\
+                  eBPF OBJECT DOES NOT MATCH ITS STAMP — refusing to embed (agent/build.rs)\n\
+                ═══════════════════════════════════════════════════════════════════════\n\
+                The compiled eBPF object at\n    {artifact}\n\
+                is not the object `cargo xtask build-ebpf` stamped:\n    \
+                    stamped object sha256 : {stamped}\n    \
+                    actual object sha256  : {actual}\n\n\
+                It was rebuilt outside xtask (other flags or toolchain, an IDE, a plain\n\
+                `cargo build` in agent-ebpf/) or replaced after the stamp was written.\n\n\
+                Fix — rebuild it through xtask so it is stamped:\n\
+                    cargo xtask build --release      (or: cargo xtask build-ebpf)\n\
+                ═══════════════════════════════════════════════════════════════════════\n",
+                artifact = ebpf_artifact.display(),
+            ),
             // Present but UNSTAMPED: provenance unknown (pre-guard build,
-            // or hand-copied). Cannot prove freshness → refuse.
-            Ok(None) => panic!(
+            // a stamp of an older format, or hand-copied). Cannot prove
+            // freshness → refuse.
+            ebpf_guard::Verdict::Unstamped => panic!(
                 "\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
                   UNSTAMPED eBPF OBJECT — refusing to embed (agent/build.rs guard)\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
                 The compiled eBPF object at\n    {artifact}\n\
-                has no provenance stamp ({stamp}), so its freshness cannot be proven.\n\
-                It was produced by a pre-guard build or copied in by hand.\n\n\
+                has no usable provenance stamp ({stamp}), so its freshness cannot be\n\
+                proven. It was produced by a pre-guard build, stamped in an older format\n\
+                (a one-time rebuild after an upgrade), or copied in by hand.\n\n\
                 Fix — rebuild it through xtask so it is stamped:\n\
                     cargo xtask build --release      (or: cargo xtask build-ebpf)\n\
                 ═══════════════════════════════════════════════════════════════════════\n",
                 artifact = ebpf_artifact.display(),
                 stamp = stamp_path.display(),
             ),
-            Err(e) => panic!("ebpf-guard: failed to read the eBPF build stamp: {e}"),
         }
 
-        // Fresh — embed it. Read once so the recorded object hash is of
-        // exactly the bytes we stage (and that `include_bytes!` will
-        // capture); the runtime preflight re-derives this sha to catch
-        // post-build corruption / object swap.
-        let bytes = fs::read(&ebpf_artifact)
-            .unwrap_or_else(|e| panic!("reading eBPF artifact {}: {e}", ebpf_artifact.display()));
         fs::write(&dst, &bytes).expect("copy eBPF object into OUT_DIR");
-        let obj_sha = ebpf_guard::sha256_hex(&bytes);
         println!("cargo:rustc-env=NN_EBPF_EMBEDDED=1");
         println!("cargo:rustc-env=NN_EBPF_OBJECT_SHA={obj_sha}");
         println!("cargo:rustc-env=NN_EBPF_BUILD_HASH={current}");
