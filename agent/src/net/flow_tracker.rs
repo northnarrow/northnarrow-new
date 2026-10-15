@@ -47,22 +47,44 @@
 //! ## Bounded memory
 //!
 //! Per §6.1: a `PendingFlow` open > 24 h gets emitted as a
-//! long-lived snapshot. V1.0 ships a simpler "FIFO eviction
-//! when over capacity" bound — the 24-hour snapshot is N3.1.
-//! Eviction order is insertion-time (oldest evicted first).
-//! Default capacity = 65,536 pending flows — generous enough
-//! that ordinary hosts never evict, small enough that pathological
-//! kernel-leak / sk_ptr-reuse scenarios stay bounded.
+//! long-lived snapshot (N3.1, not done). V1.0 bounds the pending
+//! map at a capacity instead. Default capacity = 65,536 pending
+//! flows — generous enough that ordinary hosts never evict, small
+//! enough that pathological kernel-leak / sk_ptr-reuse scenarios
+//! stay bounded.
+//!
+//! External audit NET-012: past the capacity the eviction takes the
+//! oldest pending connect of the process holding the most (ties: the
+//! process that connected last), so a flood of unclosed connects
+//! evicts its own entries, not another process's long session. It
+//! used to take the oldest entry of the whole map: exactly the
+//! long-lived flow (a C2 channel, an interactive session), whose row
+//! then lost its start time. Each process's connects are held in a
+//! [`LazyLru`]: a close removes its entry in O(1) (a linear scan of
+//! up to 65,536 entries under the tracker's lock before) and the
+//! eviction skips the closed ones.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::wire::{NetFlowEvent, TlsFingerprint};
 use sha2::{Digest, Sha256};
+use tracing::warn;
+
+use crate::decision::bounded::{LazyLru, LossCounter};
 
 /// Default ceiling on simultaneous in-flight (connect-seen,
-/// close-not-yet) flows. Eviction is FIFO past this point.
+/// close-not-yet) flows. Past it a connect evicts one (module docs).
 pub const DEFAULT_PENDING_CAPACITY: usize = 65_536;
+
+/// Pending connects evicted at capacity since boot, all trackers.
+static PENDING_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Pending connects evicted at capacity since boot (status surface).
+pub fn pending_evictions_total() -> u64 {
+    PENDING_EVICTIONS.load(Ordering::Relaxed)
+}
 
 /// Canonical correlation key — exactly the 16 bytes the N2
 /// `tcp_close` fexit emits. Same shape on the connect side
@@ -161,24 +183,43 @@ struct PendingFlow {
     exe: Option<String>,
 }
 
+/// One process's pending connects, oldest first (lazy deletion).
+struct PidPending {
+    order: LazyLru<CorrId>,
+    /// Sequence number of this process's latest connect.
+    last_seq: u64,
+}
+
 /// In-process tracker for TCP flow correlation + UDP per-send
 /// emission. Holds a bounded map of `corr_id → PendingFlow`
-/// plus a FIFO eviction queue. Single-threaded today; callers
-/// that need cross-thread access wrap it in
-/// `Arc<parking_lot::Mutex<FlowTracker>>` (the future N7
-/// admin-CLI `net flows` path will).
-#[derive(Debug)]
+/// plus, per process, the order of its pending connects.
+/// Single-threaded today; callers that need cross-thread access
+/// wrap it in `Arc<parking_lot::Mutex<FlowTracker>>`.
 pub struct FlowTracker {
     pending: HashMap<CorrId, PendingFlow>,
-    /// Insertion-order queue for FIFO eviction past `capacity`.
-    /// Held alongside `pending`; both invariants checked in
-    /// [`Self::evict_to_capacity`].
-    eviction: VecDeque<CorrId>,
+    /// Every pending entry, under the pid of its connect.
+    by_pid: HashMap<u32, PidPending>,
+    /// `(pending connects, latest connect seq, pid)` for each process
+    /// in `by_pid`: the last element is the process an eviction takes
+    /// from.
+    weight: BTreeSet<(usize, u64, u32)>,
+    next_seq: u64,
     capacity: usize,
     /// corr_ids whose row was synthesised at close time because no
     /// pending connect existed yet; a connect arriving afterwards for
     /// one of these must not open a pending entry that never closes.
     recent_synth: VecDeque<CorrId>,
+    evicted: LossCounter,
+}
+
+impl std::fmt::Debug for FlowTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlowTracker")
+            .field("pending", &self.pending.len())
+            .field("pids", &self.by_pid.len())
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 impl Default for FlowTracker {
@@ -191,10 +232,18 @@ impl FlowTracker {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             pending: HashMap::new(),
-            eviction: VecDeque::new(),
+            by_pid: HashMap::new(),
+            weight: BTreeSet::new(),
+            next_seq: 0,
             recent_synth: VecDeque::new(),
             capacity,
+            evicted: LossCounter::new(&PENDING_EVICTIONS),
         }
+    }
+
+    /// Pending connects this tracker evicted at capacity.
+    pub fn evictions(&self) -> u64 {
+        self.evicted.count()
     }
 
     /// How many flows are currently waiting for a close event.
@@ -218,7 +267,7 @@ impl FlowTracker {
 
     /// Register a TCP connect observation. The pending entry
     /// stays in the map until a matching [`Self::on_tcp_close`]
-    /// arrives (or FIFO eviction kicks in past `capacity`).
+    /// arrives (or an eviction takes it past `capacity`).
     pub fn on_tcp_connect(&mut self, info: &TcpConnectInfo) {
         let key = Self::corr_id(info.start_ns, info.sk_ptr);
         if self.recent_synth.contains(&key) {
@@ -226,14 +275,13 @@ impl FlowTracker {
             // `on_tcp_close`): a pending entry now would never close.
             return;
         }
-        let key = Self::corr_id(info.start_ns, info.sk_ptr);
         // If the same corr_id is re-inserted (kernel sk_ptr
         // re-use + same start_ns — extremely unlikely but
-        // possible), replace + don't double-enqueue: pull the
-        // prior position out so the queue stays in correct
-        // FIFO order.
-        if self.pending.contains_key(&key) {
-            self.eviction.retain(|k| k != &key);
+        // possible), replace it: its old position goes, under the
+        // pid it was filed under.
+        if let Some(old) = self.pending.get(&key) {
+            let old_pid = old.pid;
+            self.unlink(old_pid, &key);
         }
         self.pending.insert(
             key,
@@ -251,7 +299,7 @@ impl FlowTracker {
                 exe: info.exe.clone(),
             },
         );
-        self.eviction.push_back(key);
+        self.link(info.pid, key);
         self.evict_to_capacity();
     }
 
@@ -259,7 +307,7 @@ impl FlowTracker {
     /// `Some(NetFlowEvent)` on a successful correlation; `None`
     /// when the close has no matching pending entry (orphan
     /// close — happens at agent boot when the connect predated
-    /// the agent, or after FIFO eviction). Defensive callers
+    /// the agent, or after an eviction). Defensive callers
     /// log + drop the orphan.
     pub fn on_tcp_close(&mut self, info: &TcpCloseInfo) -> Option<NetFlowEvent> {
         // Zero corr_id = kernel-side FLOW_SOCK_MAP lookup miss
@@ -280,11 +328,8 @@ impl FlowTracker {
         } else {
             (pending.src_addr, pending.src_port)
         };
-        // Pull the corr_id out of the eviction queue so it
-        // doesn't carry a phantom slot. Linear scan but only
-        // runs at close time + the queue is bounded by
-        // `capacity`.
-        self.eviction.retain(|k| k != &info.corr_id);
+        // External audit NET-012: O(1); the queue entry goes lazily.
+        self.unlink(pending.pid, &info.corr_id);
         let flow_id = canonical_flow_id(
             pending.start_ns,
             pending.family,
@@ -322,8 +367,9 @@ impl FlowTracker {
     /// flow, loopback connect+close in well under the pipeline latency).
     /// Build the row from what the close hook carries — the full
     /// 5-tuple, owner and byte counters — with `start_ns = end_ns`
-    /// (duration unknown) and no exe/hostname enrichment, and remember
-    /// the corr_id so the late connect is ignored. Without this every
+    /// (duration unknown) and no exe/hostname enrichment (the drain
+    /// names the image, external audit NET-012), and remember the
+    /// corr_id so the late connect is ignored. Without this every
     /// connect-and-close-at-once flow (reverse-shell probes, scanners,
     /// the CHAIN-007 egress leg) vanished from netflow.jsonl.
     fn synthesise_from_close(&mut self, info: &TcpCloseInfo) -> Option<NetFlowEvent> {
@@ -422,14 +468,72 @@ impl FlowTracker {
         event.tls_fingerprint = Some(fp);
     }
 
+    /// File `key` under `pid` as its latest connect.
+    fn link(&mut self, pid: u32, key: CorrId) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let entry = self.by_pid.entry(pid).or_insert_with(|| PidPending {
+            // Small queues, one per process (as NETR-005's windows).
+            order: LazyLru::with_compact_floor(4),
+            last_seq: 0,
+        });
+        if !entry.order.is_empty() {
+            self.weight
+                .remove(&(entry.order.len(), entry.last_seq, pid));
+        }
+        entry.order.touch(key);
+        entry.last_seq = seq;
+        self.weight.insert((entry.order.len(), seq, pid));
+    }
+
+    /// Take `key` out of `pid`'s pending connects.
+    fn unlink(&mut self, pid: u32, key: &CorrId) {
+        let Some(entry) = self.by_pid.get_mut(&pid) else {
+            return;
+        };
+        if !entry.order.contains(key) {
+            return;
+        }
+        self.weight
+            .remove(&(entry.order.len(), entry.last_seq, pid));
+        entry.order.remove(key);
+        if entry.order.is_empty() {
+            self.by_pid.remove(&pid);
+        } else {
+            self.weight.insert((entry.order.len(), entry.last_seq, pid));
+        }
+    }
+
+    /// External audit NET-012: past the capacity, evict the oldest
+    /// pending connect of the process holding the most (ties: the
+    /// process that connected last).
     fn evict_to_capacity(&mut self) {
         while self.pending.len() > self.capacity {
-            // Drop the oldest entry. `pop_front` matches the
-            // FIFO contract callers + tests rely on.
-            if let Some(oldest) = self.eviction.pop_front() {
-                self.pending.remove(&oldest);
-            } else {
+            let Some(&(count, last_seq, pid)) = self.weight.iter().next_back() else {
                 break;
+            };
+            self.weight.remove(&(count, last_seq, pid));
+            let Some(entry) = self.by_pid.get_mut(&pid) else {
+                continue;
+            };
+            let victim = entry.order.pop_oldest();
+            if entry.order.is_empty() {
+                self.by_pid.remove(&pid);
+            } else {
+                self.weight.insert((entry.order.len(), last_seq, pid));
+            }
+            let Some(victim) = victim else {
+                continue;
+            };
+            if self.pending.remove(&victim).is_some() && self.evicted.bump() {
+                warn!(
+                    pid,
+                    pending = count,
+                    evicted = self.evicted.count(),
+                    capacity = self.capacity,
+                    "flow tracker full: evicted the oldest pending connect of the process \
+                     holding the most; its close is recorded without its start time"
+                );
             }
         }
     }
@@ -756,16 +860,17 @@ mod tests {
         assert_eq!(evt.close_reason, 0);
     }
 
-    /// N3 test #12 — past capacity, the oldest pending entry
-    /// is evicted first. A subsequent close on the evicted
-    /// flow returns `None` (correctly reported as an orphan);
-    /// the NEWER flow still correlates.
+    /// N3 test #12 — past capacity, the oldest pending entry of
+    /// the process holding the most is evicted first (one process
+    /// here). A subsequent close on the evicted flow returns `None`
+    /// (correctly reported as an orphan); the NEWER flow still
+    /// correlates.
     #[test]
     fn flow_tracker_bounded_memory_evicts_oldest_when_full() {
         let mut t = FlowTracker::with_capacity(2);
-        let c1 = connect_fixture(1, 1, 1, v4(1, 1, 1, 1), 80);
-        let c2 = connect_fixture(2, 2, 2, v4(2, 2, 2, 2), 80);
-        let c3 = connect_fixture(3, 3, 3, v4(3, 3, 3, 3), 80);
+        let c1 = connect_fixture(1, 1, 7, v4(1, 1, 1, 1), 80);
+        let c2 = connect_fixture(2, 2, 7, v4(2, 2, 2, 2), 80);
+        let c3 = connect_fixture(3, 3, 7, v4(3, 3, 3, 3), 80);
         t.on_tcp_connect(&c1);
         t.on_tcp_connect(&c2);
         t.on_tcp_connect(&c3); // evicts c1
@@ -780,15 +885,13 @@ mod tests {
         assert!(t.on_tcp_close(&close_fixture(10, corr3, 0, 0, 0)).is_some());
     }
 
-    /// N3 test #13 — eviction preserves the more recent
-    /// entries; it must not knock out a brand-new pending
-    /// flow added concurrently with an at-capacity buffer.
-    /// Anchors the FIFO contract.
+    /// N3 test #13 — within one process, eviction preserves the
+    /// more recent entries (oldest first).
     #[test]
     fn flow_tracker_eviction_preserves_recent_pending() {
         let mut t = FlowTracker::with_capacity(3);
         for i in 1..=5 {
-            let c = connect_fixture(i, i, i as u32, v4(i as u8, 0, 0, 1), 80);
+            let c = connect_fixture(i, i, 9, v4(i as u8, 0, 0, 1), 80);
             t.on_tcp_connect(&c);
         }
         assert_eq!(t.pending_len(), 3);
@@ -801,6 +904,103 @@ mod tests {
                 "recent flow {i} should still correlate"
             );
         }
+    }
+
+    /// External audit NET-012: a flood of unclosed connects from one
+    /// process evicts its own entries, never another process's long
+    /// session (the oldest entry of the map, which FIFO took first).
+    #[test]
+    fn a_connect_flood_evicts_the_flooders_entries_first() {
+        let mut t = FlowTracker::with_capacity(8);
+        let long = connect_fixture(1, 1, 100, v4(1, 2, 3, 4), 443);
+        t.on_tcp_connect(&long);
+        let other = connect_fixture(2, 2, 200, v4(5, 6, 7, 8), 22);
+        t.on_tcp_connect(&other);
+        for i in 10..1_000u64 {
+            t.on_tcp_connect(&connect_fixture(i, i, 666, v4(10, 255, 0, 1), 80));
+        }
+        assert_eq!(t.pending_len(), 8);
+        assert_eq!(t.evictions(), 1_000 - 10 + 2 - 8);
+        for (c, end) in [(&long, 5_000), (&other, 5_001)] {
+            let corr = FlowTracker::corr_id(c.start_ns, c.sk_ptr);
+            let evt = t
+                .on_tcp_close(&close_fixture(end, corr, 1, 1, 0))
+                .expect("the long session is still pending");
+            assert_eq!(evt.start_ns, c.start_ns, "its start time is kept");
+            assert_eq!(evt.exe.as_deref(), Some("/usr/bin/curl"));
+        }
+        // The flooder kept its most recent connects.
+        let newest = FlowTracker::corr_id(999, 999);
+        assert!(t
+            .on_tcp_close(&close_fixture(6_000, newest, 0, 0, 0))
+            .is_some());
+    }
+
+    /// The same with one connect per process (a fork per connect): at
+    /// equal counts the process that connected last gives way, so the
+    /// long session of an earlier process survives (the shape of the
+    /// audit's `long_lived_flow_survives_a_connect_flood`).
+    #[test]
+    fn a_fork_flood_does_not_evict_an_earlier_long_session() {
+        let mut t = FlowTracker::with_capacity(8);
+        let long = connect_fixture(1, 1, 1, v4(1, 2, 3, 4), 443);
+        t.on_tcp_connect(&long);
+        for i in 2..100u64 {
+            t.on_tcp_connect(&connect_fixture(i, i, i as u32, v4(9, 9, 9, 9), 80));
+        }
+        let corr = FlowTracker::corr_id(1, 1);
+        let evt = t
+            .on_tcp_close(&close_fixture(10_000, corr, 1, 1, 0))
+            .expect("the long session is still pending");
+        assert!(evt.exe.is_some());
+        assert!(evt.end_ns > evt.start_ns);
+    }
+
+    /// External audit NET-012: a close leaves its queue entry behind
+    /// (no scan); the eviction skips it and takes the oldest connect
+    /// still pending, and the queues stay bounded under churn.
+    #[test]
+    fn evict_to_capacity_skips_closed_entries() {
+        let mut t = FlowTracker::with_capacity(2);
+        let a = connect_fixture(1, 1, 7, v4(1, 1, 1, 1), 80);
+        let b = connect_fixture(2, 2, 7, v4(2, 2, 2, 2), 80);
+        let c = connect_fixture(3, 3, 7, v4(3, 3, 3, 3), 80);
+        let d = connect_fixture(4, 4, 7, v4(4, 4, 4, 4), 80);
+        t.on_tcp_connect(&a);
+        t.on_tcp_connect(&b);
+        let corr = |c: &TcpConnectInfo| FlowTracker::corr_id(c.start_ns, c.sk_ptr);
+        assert!(t
+            .on_tcp_close(&close_fixture(9, corr(&a), 0, 0, 0))
+            .is_some());
+        t.on_tcp_connect(&c);
+        assert_eq!(t.evictions(), 0);
+        t.on_tcp_connect(&d); // over capacity: `a` is closed, `b` goes
+        assert_eq!(t.evictions(), 1);
+        assert!(t
+            .on_tcp_close(&close_fixture(9, corr(&b), 0, 0, 0))
+            .is_none());
+        assert!(t
+            .on_tcp_close(&close_fixture(9, corr(&c), 0, 0, 0))
+            .is_some());
+        assert!(t
+            .on_tcp_close(&close_fixture(9, corr(&d), 0, 0, 0))
+            .is_some());
+        assert!(t.by_pid.is_empty() && t.weight.is_empty());
+
+        // Churn beside one long session: the queue holds the live entry
+        // and a bounded number of closed ones.
+        let mut t = FlowTracker::with_capacity(16);
+        t.on_tcp_connect(&connect_fixture(1, 1, 7, v4(1, 1, 1, 1), 443));
+        for i in 2..50_000u64 {
+            let c = connect_fixture(i, i, 7, v4(2, 2, 2, 2), 80);
+            t.on_tcp_connect(&c);
+            assert!(t
+                .on_tcp_close(&close_fixture(i, corr(&c), 0, 0, 0))
+                .is_some());
+        }
+        assert_eq!(t.pending_len(), 1);
+        assert!(t.by_pid[&7].order.queue_len() <= 9);
+        assert_eq!(t.weight.len(), 1);
     }
 
     /// N3 test #14 — a second close for the same corr_id

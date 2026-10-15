@@ -23,6 +23,16 @@
 //! sees `Event::NetFlow` / `Event::NetListener` items via the
 //! existing `process_event` path (`main::process_event` already
 //! has match arms for both — added in N6).
+//!
+//! External audit NET-019: the rows are written as they come and made
+//! durable together, by one fsync at most every
+//! [`NETFLOW_SYNC_INTERVAL`] (a group commit; one fsync per row before,
+//! which a connect/close loop turned into ring drops). A crash of the
+//! host can lose the rows of the last interval, or tear the last one,
+//! which the next open cuts and attests; the agent stopping or crashing
+//! loses nothing (the rows are in the page cache). The rows handed to
+//! the rules are paced per uid ([`crate::net::limiter`]); a row held
+//! back is still written, flagged `decision_engine_skipped`.
 
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -30,6 +40,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use aya::maps::{ring_buf::RingBuf, MapData};
@@ -48,6 +59,11 @@ use tracing::{debug, warn};
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpCloseInfo, UdpSendInfo};
+use crate::net::limiter::RuleGate;
+
+/// External audit NET-019: the longest a netflow or listener row waits for
+/// its fsync (the group commit's period; module docs).
+pub const NETFLOW_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Default on-disk location of the chained NetListener log
 /// (design §6.4). Mirrors `admin_socket::DEFAULT_NETFLOW_JSONL_PATH`
@@ -108,8 +124,10 @@ pub struct NetFlowEntry {
 /// therefore serialises BYTE-FOR-BYTE identically to a legacy v1
 /// `NetFlowEntry`, so an existing on-disk `netflow.jsonl` still verifies
 /// under the rotation-aware reader (proven by
-/// `bug026_legacy_v1_netflow_line_still_verifies`). No field carries
-/// `#[serde(default)]`/`skip`, so the mirror is exact.
+/// `bug026_legacy_v1_netflow_line_still_verifies`). The one field the
+/// legacy row lacks, `decision_engine_skipped`, is absent when `false`
+/// (`skip_serializing_if`), so the mirror stays exact for every row
+/// written before it and every row the rules evaluated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetFlowPayload {
     pub ts: String,
@@ -134,6 +152,12 @@ pub struct NetFlowPayload {
     pub sni: Option<String>,
     pub close_reason: u8,
     pub agent_id: String,
+    /// External audit NET-019 (design §6.5, lock-in Q4): the row was held
+    /// back from the rules by the per-uid pacing (`net::limiter`) and not
+    /// evaluated. Written only when `true`; a row without it was handed
+    /// to the rules.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_engine_skipped: bool,
 }
 
 /// One on-disk JSONL row in `netflow_listeners.jsonl`. Same chain
@@ -165,6 +189,8 @@ pub struct NetListenerEntry {
 pub struct NetFlowDb {
     inner: crate::chainlog::RotatingChainLog<NetFlowPayload>,
     agent_id: [u8; 16],
+    /// External audit NET-019: when the last group commit ran.
+    last_sync: Instant,
 }
 
 impl NetFlowDb {
@@ -177,12 +203,20 @@ impl NetFlowDb {
     ) -> Result<Self> {
         let inner =
             crate::chainlog::RotatingChainLog::<NetFlowPayload>::open(path, key, cfg, protection)?;
-        Ok(Self { inner, agent_id })
+        Ok(Self {
+            inner,
+            agent_id,
+            last_sync: Instant::now(),
+        })
     }
 
     /// Append one closed-flow row as a signed chainlog data line
     /// (rotating at the size cap). Returns the new line's `entry_hash`.
-    pub fn append(&mut self, ev: &NetFlowEvent) -> Result<String> {
+    /// External audit NET-019: the row is written, not fsynced —
+    /// [`Self::sync_if_due`] commits the rows of the last
+    /// [`NETFLOW_SYNC_INTERVAL`] together. `skipped`: the row was held
+    /// back from the rules (`decision_engine_skipped`).
+    pub fn append(&mut self, ev: &NetFlowEvent, skipped: bool) -> Result<String> {
         let payload = NetFlowPayload {
             ts: format_ts(Utc::now()),
             flow_id: ev.flow_id.clone(),
@@ -206,8 +240,27 @@ impl NetFlowDb {
             sni: ev.tls_fingerprint.as_ref().and_then(|fp| fp.sni.clone()),
             close_reason: ev.close_reason,
             agent_id: hex::encode(self.agent_id),
+            decision_engine_skipped: skipped,
         };
-        self.inner.append(payload)
+        self.inner.append_deferred(payload)
+    }
+
+    /// External audit NET-019: fsync the rows written since the last
+    /// commit once [`NETFLOW_SYNC_INTERVAL`] has passed since it. `true`
+    /// when an fsync ran. A failed one is retried after the interval.
+    pub fn sync_if_due(&mut self, now: Instant) -> Result<bool> {
+        if !self.inner.has_unsynced()
+            || now.saturating_duration_since(self.last_sync) < NETFLOW_SYNC_INTERVAL
+        {
+            return Ok(false);
+        }
+        self.last_sync = now;
+        self.inner.sync().map(|()| true)
+    }
+
+    /// fsyncs of the log by this writer (tests).
+    pub fn fsyncs(&self) -> u64 {
+        self.inner.fsyncs()
     }
 
     pub fn last_hash(&self) -> &str {
@@ -223,6 +276,10 @@ pub struct NetListenerDb {
     agent_id: [u8; 16],
     last_hash: String,
     tail_repair: Option<crate::chainlog::TailRepair>,
+    /// External audit NET-019: rows written since the last fsync, and
+    /// when it ran (the same group commit as `netflow.jsonl`).
+    unsynced: bool,
+    last_sync: Instant,
 }
 
 impl NetListenerDb {
@@ -240,6 +297,8 @@ impl NetListenerDb {
             agent_id,
             last_hash,
             tail_repair,
+            unsynced: false,
+            last_sync: Instant::now(),
         })
     }
 
@@ -289,10 +348,26 @@ impl NetListenerDb {
                 self.path.display()
             )
         })?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        // External audit NET-019: committed by `sync_if_due`.
+        self.unsynced = true;
         self.last_hash = entry.entry_hash.clone();
         Ok(entry)
+    }
+
+    /// As [`NetFlowDb::sync_if_due`].
+    pub fn sync_if_due(&mut self, now: Instant) -> Result<bool> {
+        if !self.unsynced || now.saturating_duration_since(self.last_sync) < NETFLOW_SYNC_INTERVAL {
+            return Ok(false);
+        }
+        self.last_sync = now;
+        let f = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {} for fsync", self.path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", self.path.display()))?;
+        self.unsynced = false;
+        Ok(true)
     }
 
     pub fn last_hash(&self) -> &str {
@@ -326,6 +401,8 @@ pub async fn drain_loop(
     listener_db: Option<Arc<Mutex<NetListenerDb>>>,
     // External audit NETR-008: names the sender's image on a UDP record.
     lineage: crate::posture::lineage::AuthSessionTracker,
+    // External audit NET-019: which rows reach the rules.
+    mut gate: RuleGate,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut close_fd = AsyncFd::new(close_rb)?;
@@ -333,8 +410,14 @@ pub async fn drain_loop(
     // Review 73: the UDP flow records have their own ring, so a UDP flood
     // cannot erase the TCP closes; they are processed the same way.
     let mut udp_fd = AsyncFd::new(udp_rb)?;
+    // External audit NET-019: commits the rows of a quiet period too.
+    let mut commit_tick = tokio::time::interval(NETFLOW_SYNC_INTERVAL);
+    commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = commit_tick.tick() => {
+                group_commit(&netflow_db, listener_db.as_ref());
+            }
             r = udp_fd.readable_mut() => {
                 let mut guard = r?;
                 let inner = guard.get_inner_mut();
@@ -347,9 +430,11 @@ pub async fn drain_loop(
                         &dns_cache,
                         &netflow_db,
                         &lineage,
+                        &mut gate,
                         &event_tx,
                     )
                     .await;
+                    group_commit(&netflow_db, listener_db.as_ref());
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -368,9 +453,11 @@ pub async fn drain_loop(
                         &dns_cache,
                         &netflow_db,
                         &lineage,
+                        &mut gate,
                         &event_tx,
                     )
                     .await;
+                    group_commit(&netflow_db, listener_db.as_ref());
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -384,6 +471,7 @@ pub async fn drain_loop(
                 while let Some(item) = inner.next() {
                     drained += 1;
                     process_listen_record(item.as_ref(), listener_db.as_ref(), &event_tx).await;
+                    group_commit(&netflow_db, listener_db.as_ref());
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -394,12 +482,29 @@ pub async fn drain_loop(
     }
 }
 
+/// External audit NET-019: one fsync for the netflow rows, and one for the
+/// listener rows, written since their last commit, at most every
+/// [`NETFLOW_SYNC_INTERVAL`]. Called after each record and on a timer, so
+/// no row waits longer than the interval (plus one record's processing).
+fn group_commit(netflow_db: &Mutex<NetFlowDb>, listener_db: Option<&Arc<Mutex<NetListenerDb>>>) {
+    let now = Instant::now();
+    if let Err(e) = netflow_db.lock().sync_if_due(now) {
+        warn!(error = %format!("{e:#}"), "netflow log: group commit (fsync) failed; retried");
+    }
+    if let Some(db) = listener_db {
+        if let Err(e) = db.lock().sync_if_due(now) {
+            warn!(error = %format!("{e:#}"), "netflow_listeners log: group commit (fsync) failed; retried");
+        }
+    }
+}
+
 async fn process_close_record(
     bytes: &[u8],
     flow_tracker: &Arc<Mutex<FlowTracker>>,
     dns_cache: &Arc<DnsCache>,
     netflow_db: &Arc<Mutex<NetFlowDb>>,
     lineage: &crate::posture::lineage::AuthSessionTracker,
+    gate: &mut RuleGate,
     event_tx: &mpsc::Sender<Event>,
 ) {
     let raw: &NetFlowCloseRaw = match bytemuck::try_from_bytes(bytes) {
@@ -433,8 +538,18 @@ async fn process_close_record(
                     .trim_end_matches('\0')
                     .to_string(),
             };
-            match flow_tracker.lock().on_tcp_close(&info) {
-                Some(e) => e,
+            let closed = flow_tracker.lock().on_tcp_close(&info);
+            match closed {
+                Some(mut e) => {
+                    // External audit NET-012: a row the close synthesised
+                    // (its connect not seen yet, or evicted at capacity)
+                    // names the image as a UDP row does; read after the
+                    // tracker's lock.
+                    if e.exe.is_none() {
+                        e.exe = lineage.image_path(e.pid);
+                    }
+                    e
+                }
                 None => {
                     // Orphan close. Two very different cases:
                     //  * corr_id all-zero = the kernel-side FLOW_SOCK_MAP
@@ -444,8 +559,8 @@ async fn process_close_record(
                     //    agent — debug-level, or a busy server would log a
                     //    WARN per inbound connection.
                     //  * corr_id present = the connect kprobe recorded the
-                    //    flow but userland has no pending entry (FIFO
-                    //    eviction, ringbuf drop, drain restart). That is a
+                    //    flow but userland has no pending entry (eviction
+                    //    at capacity, ringbuf drop, drain restart). That is a
                     //    genuine gap in netflow.jsonl: WARN with the
                     //    5-tuple (review entry 18).
                     let kernel_lookup_miss = raw.flow_id == [0u8; 16];
@@ -517,13 +632,21 @@ async fn process_close_record(
         event.resolved_hostname = Some(qname);
     }
 
+    // External audit NET-019 (design §6.5): past its uid's budget a row
+    // is held back from the rules — never one a killing rule could match
+    // or one of a process with a chain precursor (`net::limiter`).
+    let skipped = gate.hold_back(&event, Instant::now());
+
     // Persist BEFORE emitting to the bus — design §6.5 evidence-
     // preservation contract (the on-disk row is the IR-grade
     // record; the rule engine emission is the live-defense path).
     // Append failures are warn-logged + we still emit on the bus
     // so the deterministic rule never silently misses a flow.
-    if let Err(e) = netflow_db.lock().append(&event) {
+    if let Err(e) = netflow_db.lock().append(&event, skipped) {
         warn!(error = %e, "appending NetFlowEntry to netflow log failed");
+    }
+    if skipped {
+        return;
     }
 
     if event_tx.send(Event::NetFlow(event)).await.is_err() {
@@ -797,6 +920,7 @@ mod tests {
                 sni: legacy.sni.clone(),
                 close_reason: legacy.close_reason,
                 agent_id: legacy.agent_id.clone(),
+                decision_engine_skipped: false,
             },
             fmt_ver: None,
             prev_hash: legacy.prev_hash.clone(),
@@ -843,7 +967,7 @@ mod tests {
         )
         .unwrap();
         let ev = test_event();
-        let entry_hash = db.append(&ev).unwrap();
+        let entry_hash = db.append(&ev, false).unwrap();
 
         // Read the PERSISTED row and assert the SAME body properties the
         // pre-migration test checked — now on the ChainLine payload — plus
@@ -887,10 +1011,10 @@ mod tests {
             RotationConfig::default(),
         )
         .unwrap();
-        let h1 = db.append(&test_event()).unwrap();
+        let h1 = db.append(&test_event(), false).unwrap();
         let mut ev2 = test_event();
         ev2.flow_id = "def".to_string();
-        let h2 = db.append(&ev2).unwrap();
+        let h2 = db.append(&ev2, false).unwrap();
         assert_ne!(h1, h2, "two distinct rows have distinct entry hashes");
         assert_eq!(db.last_hash(), h2);
 
@@ -937,7 +1061,7 @@ mod tests {
             RotationConfig::default(),
         )
         .unwrap();
-        let h1 = db.append(&test_event()).unwrap();
+        let h1 = db.append(&test_event(), false).unwrap();
         drop(db);
 
         let key2 = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
@@ -952,7 +1076,7 @@ mod tests {
         assert_eq!(db.last_hash(), h1, "reopen must resume from the prior tail");
         let mut ev2 = test_event();
         ev2.flow_id = "next".to_string();
-        let h2 = db.append(&ev2).unwrap();
+        let h2 = db.append(&ev2, false).unwrap();
 
         // The post-reopen append must chain off the prior run's last row,
         // and the whole (across-reopen) chain must verify.
@@ -994,7 +1118,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             alpn: vec!["h2".to_string()],
         });
-        db.append(&ev).unwrap();
+        db.append(&ev, false).unwrap();
 
         // Assert the persisted ROW preserves every fingerprint field.
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1003,6 +1127,175 @@ mod tests {
         assert_eq!(line.payload.ja3, Some("deadbeef".to_string()));
         assert_eq!(line.payload.ja4, Some("t13d1517h2".to_string()));
         assert_eq!(line.payload.sni, Some("example.com".to_string()));
+    }
+
+    /// A netflow log signed with the key at `<dir>/k.sig`.
+    fn open_db(path: &Path) -> NetFlowDb {
+        NetFlowDb::open(
+            path,
+            AgentSigningKey::load_or_bootstrap(&path.with_file_name("k.sig")).unwrap(),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// External audit NET-019: the rows are fsynced together, at most
+    /// every 100 ms, not one fsync per row; the chain verifies.
+    #[test]
+    fn group_commit_fsyncs_at_most_every_100ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow.jsonl");
+        let mut db = open_db(&path);
+        let t0 = Instant::now();
+        for i in 0..1_000 {
+            let mut ev = test_event();
+            ev.flow_id = format!("f{i}");
+            db.append(&ev, false).unwrap();
+            assert!(!db.sync_if_due(t0 + Duration::from_millis(1)).unwrap());
+        }
+        assert_eq!(db.fsyncs(), 0, "no fsync per row");
+        assert!(db.sync_if_due(t0 + NETFLOW_SYNC_INTERVAL).unwrap());
+        assert_eq!(db.fsyncs(), 1);
+        // Nothing written since: no fsync, whatever the time.
+        assert!(!db.sync_if_due(t0 + Duration::from_secs(5)).unwrap());
+        db.append(&test_event(), false).unwrap();
+        assert!(!db.sync_if_due(t0 + Duration::from_millis(150)).unwrap());
+        assert!(db.sync_if_due(t0 + Duration::from_millis(200)).unwrap());
+        assert_eq!(db.fsyncs(), 2);
+        let report =
+            crate::chainlog::verify_log_set::<NetFlowPayload>(&path, &fresh_key_pk(dir.path()))
+                .unwrap_or_else(|_| panic!("verifies"));
+        assert_eq!(report.total_records, 1_001);
+    }
+
+    /// The listener log uses the same group commit.
+    #[test]
+    fn listener_rows_are_committed_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow_listeners.jsonl");
+        let mut db = NetListenerDb::open(&path, fresh_key(), [0u8; 16]).unwrap();
+        let ev = NetListenerEvent {
+            timestamp_ns: 1,
+            family: 2,
+            bind_addr: "0.0.0.0".parse().unwrap(),
+            bind_port: 8080,
+            proto: 6,
+            pid: 42,
+            uid: 0,
+            comm: "nc".to_string(),
+            exe: None,
+        };
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            db.append(&ev).unwrap();
+            assert!(!db.sync_if_due(t0).unwrap());
+        }
+        assert!(db.sync_if_due(t0 + NETFLOW_SYNC_INTERVAL).unwrap());
+        assert!(!db.sync_if_due(t0 + Duration::from_secs(1)).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 10);
+    }
+
+    /// The verifying key of the logs `open_db` opens in `dir`.
+    fn fresh_key_pk(dir: &Path) -> ed25519_dalek::VerifyingKey {
+        AgentSigningKey::load_or_bootstrap(&dir.join("k.sig"))
+            .unwrap()
+            .verifying_key()
+    }
+
+    fn close_raw(uid: u32, pid: u32, dst: [u8; 4], dport: u16, corr: u8) -> Vec<u8> {
+        let mut raw = NetFlowCloseRaw::zeroed();
+        raw.timestamp_ns = 5_000_000_000 + u64::from(corr);
+        raw.flow_id = [corr; 16];
+        raw.pid = pid;
+        raw.uid = uid;
+        raw.src_addr[..4].copy_from_slice(&[100, 64, 0, 2]);
+        raw.dst_addr[..4].copy_from_slice(&dst);
+        raw.comm[..7].copy_from_slice(b"nnflood");
+        raw.family = 2;
+        raw.proto = IPPROTO_TCP;
+        raw.src_port = 40_000;
+        raw.dst_port = dport;
+        bytemuck::bytes_of(&raw).to_vec()
+    }
+
+    /// External audit NET-019 + NET-012 through the drain's record path:
+    /// past the uid's budget a row is written with
+    /// `decision_engine_skipped` and not sent to the rules; a blocklisted
+    /// destination from the same uid still is; a row the close
+    /// synthesised names its image.
+    #[tokio::test]
+    async fn suppressed_flow_is_still_persisted_and_marked() {
+        use crate::decision::correlation::CorrelationStore;
+        use crate::net::limiter::UidPacer;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("netflow.jsonl");
+        let key_path = dir.path().join("k.sig");
+        let db = Arc::new(Mutex::new(
+            NetFlowDb::open(
+                &path,
+                AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap(),
+        ));
+        let tracker = Arc::new(Mutex::new(FlowTracker::default()));
+        let dns = Arc::new(DnsCache::default());
+        let proc_root = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(proc_root.path());
+        lineage.ingest_spawn_with_argv(4242, 1, "/opt/nnx/nnflood", &["nnflood".to_string()], 1);
+        let bl = crate::net::blocklist::NetBlocklist::from_entries([
+            crate::net::blocklist::NetBlocklistEntry::Cidr {
+                net: "192.0.2.0".parse().unwrap(),
+                prefix: 24,
+            },
+        ]);
+        let mut gate = RuleGate::with_pacer(
+            Arc::new(bl),
+            Arc::new(Mutex::new(CorrelationStore::new())),
+            UidPacer::with_rate(2, 1),
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        for corr in 1..=5u8 {
+            let raw = close_raw(1000, 4242, [100, 64, 0, 1], 8080, corr);
+            process_close_record(&raw, &tracker, &dns, &db, &lineage, &mut gate, &tx).await;
+        }
+        let raw = close_raw(1000, 4242, [192, 0, 2, 10], 8080, 6);
+        process_close_record(&raw, &tracker, &dns, &db, &lineage, &mut gate, &tx).await;
+        drop(tx);
+        let mut sent = Vec::new();
+        while let Some(Event::NetFlow(nf)) = rx.recv().await {
+            sent.push(nf.dst_addr.to_string());
+        }
+        assert_eq!(
+            sent,
+            ["100.64.0.1", "100.64.0.1", "192.0.2.10"],
+            "the burst, then only the blocklisted row"
+        );
+        let rows: Vec<crate::chainlog::ChainLine<NetFlowPayload>> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 6, "every row is written");
+        let skipped: Vec<bool> = rows
+            .iter()
+            .map(|r| r.payload.decision_engine_skipped)
+            .collect();
+        assert_eq!(skipped, [false, false, true, true, true, false]);
+        assert!(rows
+            .iter()
+            .all(|r| r.payload.exe.as_deref() == Some("/opt/nnx/nnflood")));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("\"decision_engine_skipped\":true").count(), 3);
+        assert_eq!(body.matches("decision_engine_skipped").count(), 3);
+        let pk = AgentSigningKey::load_or_bootstrap(&key_path)
+            .unwrap()
+            .verifying_key();
+        crate::chainlog::verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
     }
 
     /// N9 drain test #5 — `NetListenerDb::append` produces a

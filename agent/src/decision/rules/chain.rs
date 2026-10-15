@@ -58,9 +58,11 @@
 //! ## Rate limiting (§13 Q4)
 //!
 //! All chain rules are Critical and fire the deterministic
-//! `KillProcessTree` unconditionally — never throttled. They carry a
-//! `chain_*` category (not a `net_*` tier), so the future §6.5
-//! NetFlow rate-limit bucket does not even scope them.
+//! `KillProcessTree` unconditionally — never throttled. The §6.5
+//! netflow pacing (external audit NET-019, `net::limiter`) never holds
+//! back a flow of a process that holds, or whose ancestors hold, a
+//! precursor in the store, and notes the flows it holds back as egresses
+//! for a precursor processed later.
 //!
 //! The one exception is NN-L-CHAIN-008 (sudo/su then egress): it is
 //! informational (`Medium` + `Log`) and is registered LAST in the
@@ -811,7 +813,16 @@ pub fn chain_rule_set() -> ChainRuleSet {
 /// package-manager carve-out (external audit NETR-008). Production passes
 /// the shared tracker.
 pub fn chain_rule_set_with(lineage: Option<AuthSessionTracker>) -> ChainRuleSet {
-    let store = Arc::new(Mutex::new(CorrelationStore::new()));
+    chain_rule_set_over(Arc::new(Mutex::new(CorrelationStore::new())), lineage)
+}
+
+/// [`chain_rule_set_with`] over a store the caller also holds: production
+/// passes the one the netflow limiter reads (external audit NET-019 — a
+/// process with a precursor in it always has its flows evaluated).
+pub fn chain_rule_set_over(
+    store: Arc<Mutex<CorrelationStore>>,
+    lineage: Option<AuthSessionTracker>,
+) -> ChainRuleSet {
     ChainRuleSet {
         head: vec![
             // CHAIN-007 (3-step same-PID) first: the richest verdict wins

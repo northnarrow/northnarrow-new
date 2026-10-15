@@ -59,6 +59,9 @@ impl RuleEngine {
         // External audit DEC-005: the readers the File / Credential canary
         // rules record instead of killing.
         canary_readers: crate::canary::readers::CanaryReaders,
+        // External audit NET-019: the chain rules' correlation store, which
+        // the netflow limiter reads too.
+        correlation: Arc<Mutex<super::correlation::CorrelationStore>>,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -72,6 +75,7 @@ impl RuleEngine {
             installer_override,
             lineage,
             canary_readers,
+            correlation,
         ) {
             e.add_rule(r);
         }

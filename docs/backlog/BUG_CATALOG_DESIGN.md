@@ -1217,6 +1217,7 @@ The journal caps + rotates at the ceiling instead of growing unbounded, and sysl
 
 - **Severity:** Medium (false coverage — a Critical/KillProcessTree rule that can never fire; operators get zero JA3 detection).
 - **Status:** **Discovered (static + adversarial refutation) — VM-validation PENDING.**
+- **Reported, not fixed (external audit NET-009 / NN-AUD-165, lab PR 142):** the producer is still missing. A JA3 list with entries is now an ERROR and a signed `subsystem_degraded` at boot, `nn-admin net status` lists NN-L-NET-003 as inactive, and the shipped `.v1` says so (`TLS_FINGERPRINT_PRODUCER` in `net/blocklist.rs`).
 
 **Symptom.** Operators populate `/etc/northnarrow/netflow-ja3-blocklist.{v1,local}` and get ZERO detection.
 

@@ -208,10 +208,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-162 | LLMR-016 | LLM runtime | S | fixed (lab PR 116) |
 | NN-AUD-163 | LLMR-017 | LLM runtime | M | fixed (lab PR 133) |
 | NN-AUD-164 | NET-006 | Network | M | open |
-| NN-AUD-165 | NET-009 | Network | L | open |
-| NN-AUD-166 | NET-012 | Network | M | open |
+| NN-AUD-165 | NET-009 | Network | L | fixed (lab PR 142) |
+| NN-AUD-166 | NET-012 | Network | M | fixed (lab PR 142) |
 | NN-AUD-167 | NET-016 | Network | M | open |
-| NN-AUD-168 | NET-019 | Network | L | open |
+| NN-AUD-168 | NET-019 | Network | L | fixed (lab PR 142) |
 | NN-AUD-169 | DEC-007 | Deception | S | open |
 | NN-AUD-170 | DEC-008 | Deception | M | open |
 | NN-AUD-171 | DEC-009 | Deception | S | already fixed (lab PR 84, with NN-AUD-062) |
@@ -3337,3 +3337,84 @@ the audit did not report, noted with the fix that takes them.
     fails ten tests, and dropping the second factor five; the bare PID
     compare with a total exemption fails both POS-009 tests.
   - Lab: Ubuntu 24.04, posture141-probe.sh on main and on this build, each case on a restarted agent. staging (SSH session): `/tmp/nnx141-conftest` then a three-target SSH fan-out — main ENGAGED (ConfirmedIntrusion), then COMBAT (LateralMovement) and NEUTRALIZE of the fan-out; here ENGAGED (StagingExec, `scope=login uid 1000`), no COMBAT. masswrite: both ENGAGED then COMBAT; here also "staging exec with a second factor … mass_wrote=true". deleted: here "… unlinked=true" (R004 kills the exec on both). scope: a root unit writing a systemd unit, then another unit's fan-out — main COMBAT `locked=true` (unit b locked by unit a); here ENGAGED only, `scope=workload /system.slice/nn141-a.service`. control (one unit, `nc` then the fan-out): COMBAT and NEUTRALIZE on both, the scope line names `/system.slice/nn141-c.service`. watchdog: "watchdog PID verified" now carries `start_ticks=7057672`, equal to field 22 of `/proc/<pid>/stat`. Gate: Ubuntu 24.04 and Debian 12, 29 suites, 80 passed, 0 failed each; anti-tamper OK; host 1911 passed, 0 failed.
+- **NN-AUD-168 (NET-019), NN-AUD-166 (NET-012), NN-AUD-165 (NET-009), lab
+  PR 142.** Netflow drain throughput and honest coverage (batch B8 of
+  wave 2, group D).
+  - NET-019, group commit: `RotatingChainLog::append_deferred` writes a
+    line without the fsync and `sync` fsyncs what is pending (a durable
+    append and a rotation's terminator cover the lines before them);
+    `fsyncs()` counts them. `NetFlowDb::append` uses it and
+    `sync_if_due` commits at most every `NETFLOW_SYNC_INTERVAL` = 100 ms;
+    the drain calls it after each record and on a 100 ms tick. The
+    listener log does the same (`NetListenerDb::sync_if_due`). Bound: a
+    host crash loses at most the last 100 ms of rows or tears the last
+    one, cut and attested at the next open; an agent stop or crash loses
+    nothing (page cache).
+  - NET-019, pacing (design §6.5 as built, `net/limiter.rs`): a token
+    bucket per uid (`BURST` 1,000, then `REFILL_PER_SEC` 200; 4,096 uids
+    at most, a new uid that finds no room is not paced), between the
+    tracker and the bus. A row past it is written with
+    `decision_engine_skipped: true` (`NetFlowPayload`, absent when false,
+    so v1 rows and evaluated rows serialise as before) and not sent.
+    Never held back, checked before the bucket: a row that meets the
+    predicate of a killing NetFlow rule, allowlists aside
+    (`rules::net::may_meet_a_kill_rule`: NN-L-NET-001 blocklist, -002 TLD,
+    -003 any fingerprint, -008 staging image, -010 C2 port, -018 internal
+    lateral port — the per-tier design cannot work before a rule has run,
+    and a bucket that holds back a kill is the review-76 suppression
+    window), and a row of a process that holds, or whose ancestors hold, a
+    chain precursor (`CorrelationStore::has_precursor_in_lineage`, read
+    only; the store is now created in `main` and shared by the chain
+    rules and the drain, `chain_rule_set_over`). A row held back is noted
+    as an egress, as CHAIN-007 notes every flow, so a precursor processed
+    later still completes its chain (review 70). One WARN per uid when its
+    bucket runs out after a full refill; `limiter::rows_skipped_total`.
+    What a held-back row misses: the Log rules and posture signals of the
+    flooding uid's flows while it floods. The bus `send().await` is
+    unchanged for the rows that are sent.
+  - NET-012: `FlowTracker` keeps, per pid, a `LazyLru` of its pending
+    connects (compact floor 4) and a `BTreeSet` of (count, latest connect,
+    pid); a close is O(1) (was `VecDeque::retain` over up to 65,536 under
+    the tracker lock). Past capacity the oldest connect of the process
+    holding the most goes, ties to the process that connected last, so
+    a fork-per-connect flood evicts its own newcomers; an eviction is a
+    WARN at most once a minute and `pending_evictions_total`. The drain
+    fills `exe` from the lineage cache on a row the close synthesised
+    (connect not seen yet, or evicted), as on UDP rows. Residual, not in
+    this batch: the kernel's `FLOW_SOCK_MAP` is an LRU of 4,096 sockets;
+    beyond 4,096 pending connects it forgets the least recently used one
+    (a long session first) and that socket's close is never recorded,
+    whatever the tracker does; its pending entry then stays until evicted
+    (by this policy, from the process holding the most).
+  - NET-009: `TLS_FINGERPRINT_PRODUCER = false` and
+    `ja3_coverage_gap` (`net/blocklist.rs`): a JA3 list with entries is
+    an ERROR at load and a signed `subsystem_degraded` once the audit log
+    opens. `configs/netflow-ja3-blocklist.v1` no longer says NN-L-NET-003
+    "stays functional". The producer stays BUG-025 (L), whose catalog
+    entry says so.
+  - `nn-admin net status` (new, no key: it reads the unauthenticated
+    `status` reply): rows held back, pending evictions, the network
+    rings' drops and the inactive network rules (`--json`).
+    `StatusResponse` gains `netflow_rows_skipped_total`,
+    `netflow_pending_evicted_total` and `net_inactive_rules`, appended
+    (CMB-016 precedent).
+  - Tests: `group_commit_fsyncs_at_most_every_100ms`,
+    `deferred_lines_wait_for_one_sync_and_verify`,
+    `listener_rows_are_committed_together`,
+    `suppressed_flow_is_still_persisted_and_marked`,
+    `the_bucket_lets_a_burst_through_then_paces_per_uid`,
+    `the_uid_table_is_bounded`,
+    `a_flood_is_held_back_but_never_a_row_a_kill_or_chain_needs`,
+    `a_held_back_row_is_noted_for_a_late_precursor`,
+    `every_killing_netflow_verdict_is_guarded`,
+    `a_connect_flood_evicts_the_flooders_entries_first`,
+    `a_fork_flood_does_not_evict_an_earlier_long_session`,
+    `evict_to_capacity_skips_closed_entries`,
+    `a_ja3_list_without_a_fingerprint_producer_is_reported`,
+    `the_shipped_ja3_list_states_the_rule_is_inactive`. Each fails with
+    its fix taken out (checked by inverting it), except
+    `listener_rows_are_committed_together` and the queue-bound half of
+    `evict_to_capacity_skips_closed_entries`, guards that pass either
+    way (the removed scan was correct, only O(n)). The two N3 eviction
+    tests now use one pid (FIFO within a process is kept).
+  - Lab: Ubuntu 24.04, ndrain142-probe.sh on main and on this build, each case on a restarted agent. flood (one unprivileged loop, connect + abortive close to 100.64.142.1:8142 at 5,000/s for 120 s): main dropped 504,533 `tcp_close` events during the flood (638,474 by the end, WARN "ring-buffer events DROPPED" every 10 s) and the two probes launched mid-flood — a connect to port 4444 (NN-L-NET-010) and one to 192.0.2.142 (NN-L-NET-001) — were still alive after 20 s; here no drop, the probes killed after 107 ms and 106 ms. Row accounting (20 s at 5,000/s as one process name): main wrote 9,015 rows of 99,999 connects, and only within 10 s of the end; here 99,999 at once, 95,000 of them `decision_engine_skipped` (per-uid pacing), the killing rows evaluated. leak (70,000 unclosed connects held 20 s): main dropped 1,882 closes during the hold and 135,474 after; here none during the hold, 1,625 after, `nn-admin net status` naming the 4,464 pending connects evicted at capacity (the kernel's 4,096-socket `FLOW_SOCK_MAP`, noted above). ja3: a one-entry list → a signed `subsystem_degraded` "NN-L-NET-003 inactive" at boot. Gate: the integration tree of lab PRs 142–147 and 151 (this change with 146, 143, 144, 145, 147, 151 on top), Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.

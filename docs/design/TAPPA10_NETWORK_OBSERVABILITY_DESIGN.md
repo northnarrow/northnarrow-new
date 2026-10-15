@@ -541,6 +541,17 @@ When a tier's bucket is exhausted, the flow_tracker:
 
 `nn-admin net status` surfaces the current bucket state.
 
+> **As built (external audit NET-019, lab PR 142).** The pacing sits in
+> the net drain, before any rule runs, so it cannot know a verdict's
+> tier: it is a token bucket **per uid** (1,000 rows, then 200 a
+> second). A row is never held back when it meets the predicate of a
+> rule that kills (NN-L-NET-001, -002, -003, -008, -010, -018,
+> allowlists aside) or comes from a process that holds, or whose
+> ancestors hold, a chain precursor; a row held back is noted as an
+> egress in the correlation store. Rows are written with a group
+> commit (one fsync at most every 100 ms). `nn-admin net status`
+> shows the rows held back since boot, not the buckets.
+
 ---
 
 ## 7. Detection rules — NN-L-NET-001 through NN-L-NET-009

@@ -1239,6 +1239,21 @@ async fn main() -> Result<()> {
         &cli.netflow_ja3_blocklist_v1,
         ja3_blocklist.defaults(),
     );
+    // External audit NET-009 (BUG-025): no sensor produces TLS
+    // fingerprints, so a JA3 list with entries protects nothing. Said at
+    // boot, and in the signed chain once the audit log is open (below).
+    northnarrow_agent::net::blocklist::note_ja3_entries(ja3_blocklist.len());
+    let ja3_gap = northnarrow_agent::net::blocklist::ja3_coverage_gap(
+        ja3_blocklist.len(),
+        northnarrow_agent::net::blocklist::TLS_FINGERPRINT_PRODUCER,
+    );
+    if let Some(gap) = &ja3_gap {
+        error!(
+            v1 = %cli.netflow_ja3_blocklist_v1.display(),
+            local = %cli.netflow_ja3_blocklist_local.display(),
+            "{gap}"
+        );
+    }
     let burst_window = Arc::new(parking_lot::Mutex::new(
         northnarrow_agent::decision::rules::net::DnsBurstWindow::new(),
     ));
@@ -1320,6 +1335,12 @@ async fn main() -> Result<()> {
             None,
         );
 
+    // External audit NET-019: the chain rules' correlation store, shared
+    // with the netflow limiter (a process with a chain precursor always
+    // has its flows evaluated).
+    let chain_store = Arc::new(parking_lot::Mutex::new(
+        northnarrow_agent::decision::correlation::CorrelationStore::new(),
+    ));
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
     #[cfg(not(feature = "demo-tappa5"))]
@@ -1347,6 +1368,7 @@ async fn main() -> Result<()> {
             ),
             lineage.clone(),
         ),
+        Arc::clone(&chain_store),
     );
     info!(
         rules = engine.rule_count(),
@@ -2198,6 +2220,10 @@ async fn main() -> Result<()> {
     }
     if let Some(detail) = &tracepoint_degraded {
         attest_degraded(audit_log.as_ref(), detail);
+    }
+    // External audit NET-009: the JA3 list with no producer (see its load).
+    if let Some(gap) = &ja3_gap {
+        attest_degraded(audit_log.as_ref(), gap);
     }
     // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
     // without what the socket-buffer programs need, or `--dns-sensor
@@ -3117,6 +3143,12 @@ async fn main() -> Result<()> {
             let listen_rb = net_bufs.listen_rb;
             let udp_rb = net_bufs.udp_rb;
             let audit_for_drain = audit_log.clone();
+            // External audit NET-019: the per-uid pacing of the rows handed
+            // to the rules, with its exemptions (blocklist, chain store).
+            let gate = northnarrow_agent::net::limiter::RuleGate::new(
+                Arc::clone(&netflow_blocklist),
+                Arc::clone(&chain_store),
+            );
             let handle = tokio::spawn(async move {
                 let outcome = drain_loop(
                     close_rb,
@@ -3127,6 +3159,7 @@ async fn main() -> Result<()> {
                     netflow_db,
                     listener_db,
                     lineage_for_net,
+                    gate,
                     event_tx,
                 )
                 .await;

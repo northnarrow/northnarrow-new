@@ -313,6 +313,15 @@ fn to_jsonl<T: Serialize>(line: &T) -> Result<String> {
 
 /// Append a pre-serialised line to `path` (create if missing) + fsync.
 fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
+    let f = append_line(path, line, mode)?;
+    f.sync_all()
+        .with_context(|| format!("fsync {}", path.display()))?;
+    Ok(())
+}
+
+/// Append a pre-serialised line to `path` (create if missing), without
+/// waiting for the disk. Returns the open file.
+fn append_line(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
@@ -321,9 +330,7 @@ fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
         .with_context(|| format!("opening chainlog {} for append", path.display()))?;
     f.write_all(line.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
-    f.sync_all()
-        .with_context(|| format!("fsync {}", path.display()))?;
-    Ok(())
+    Ok(f)
 }
 
 // ── protection manager (the +i dance hook) ──────────────────────────
@@ -499,6 +506,11 @@ pub struct RotatingChainLog<P> {
     /// retries only the finish step; sealing again would put a second
     /// terminator in one file, which fails `verify_one_file`.
     pending_seal: Option<PendingSeal>,
+    /// External audit NET-019: lines written by [`Self::append_deferred`]
+    /// that no fsync has covered yet.
+    unsynced: bool,
+    /// fsyncs of the active file by this writer (introspection, tests).
+    fsyncs: u64,
     _marker: std::marker::PhantomData<P>,
 }
 
@@ -545,6 +557,8 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             active_records: 0,
             next_seq,
             pending_seal: None,
+            unsynced: false,
+            fsyncs: 0,
             _marker: std::marker::PhantomData,
         };
 
@@ -630,8 +644,65 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
 
     /// Append one payload as a signed data line, rotating first if it
     /// would push the active file past the size cap. Returns the new
-    /// line's `entry_hash`.
+    /// line's `entry_hash`. The line is on disk (fsync) when this returns.
     pub fn append(&mut self, payload: P) -> Result<String> {
+        self.append_with(payload, true)
+    }
+
+    /// External audit NET-019: [`Self::append`] without the fsync, for a
+    /// group commit. The line is written (other readers see it); it is on
+    /// disk at the next [`Self::sync`] or rotation. Until then a crash of
+    /// the host can lose it, or tear it — the next open cuts a torn tail
+    /// and attests the repair (`repair_torn_tail`), so the chain stays
+    /// verifiable. The caller bounds how long lines wait.
+    pub fn append_deferred(&mut self, payload: P) -> Result<String> {
+        self.append_with(payload, false)
+    }
+
+    /// External audit NET-019: fsync the lines [`Self::append_deferred`]
+    /// wrote. A no-op when there are none.
+    pub fn sync(&mut self) -> Result<()> {
+        if !self.unsynced {
+            return Ok(());
+        }
+        let f = OpenOptions::new()
+            .append(true)
+            .open(&self.active_path)
+            .with_context(|| {
+                format!("opening chainlog {} for fsync", self.active_path.display())
+            })?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", self.active_path.display()))?;
+        self.unsynced = false;
+        self.fsyncs += 1;
+        Ok(())
+    }
+
+    /// Whether lines written by [`Self::append_deferred`] wait for an fsync.
+    pub fn has_unsynced(&self) -> bool {
+        self.unsynced
+    }
+
+    /// fsyncs of the active file by this writer since it was opened.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs
+    }
+
+    /// Write `bytes` to the active file, with or without an fsync.
+    fn write_active(&mut self, bytes: &str, durable: bool) -> Result<()> {
+        if durable {
+            append_and_fsync(&self.active_path, bytes, self.cfg.file_mode)?;
+            // The fsync covers the earlier deferred lines of this file.
+            self.unsynced = false;
+            self.fsyncs += 1;
+        } else {
+            append_line(&self.active_path, bytes, self.cfg.file_mode)?;
+            self.unsynced = true;
+        }
+        Ok(())
+    }
+
+    fn append_with(&mut self, payload: P, durable: bool) -> Result<String> {
         check_reserved_keys(&payload)?;
         // External audit NN-AUD-115: a previous rotation sealed the active
         // file but could not rename it. Retry only the finish step.
@@ -652,13 +723,13 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             // it off the new tail (the terminator hash / meta-chain link).
             let line = ChainLine::sealed(line.payload, &self.key, &self.last_hash)?;
             let bytes = to_jsonl(&line)?;
-            append_and_fsync(&self.active_path, &bytes, self.cfg.file_mode)?;
+            self.write_active(&bytes, durable)?;
             self.last_hash = line.entry_hash.clone();
             self.active_bytes += bytes.len() as u64;
             self.active_records += 1;
             return Ok(line.entry_hash);
         }
-        append_and_fsync(&self.active_path, &bytes, self.cfg.file_mode)?;
+        self.write_active(&bytes, durable)?;
         self.last_hash = line.entry_hash.clone();
         self.active_bytes += bytes.len() as u64;
         self.active_records += 1;
@@ -698,6 +769,9 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         // `+i` dance — appending to an *existing* file is allowed under an
         // immutable dir; only NEW/renamed dir entries need the lift.
         append_and_fsync(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
+        // The terminator's fsync covers the deferred lines before it.
+        self.unsynced = false;
+        self.fsyncs += 1;
         self.pending_seal = Some(PendingSeal {
             seq,
             terminator_hash: terminator_hash.clone(),
@@ -2065,6 +2139,46 @@ mod tests {
             seq: i,
             data: format!("record-number-{i}-with-some-bulk-to-grow-the-file"),
         }
+    }
+
+    /// External audit NET-019: deferred lines are written but not fsynced
+    /// until `sync` (or a durable append, or a rotation's terminator);
+    /// the chain verifies across a rotation of deferred lines.
+    #[test]
+    fn deferred_lines_wait_for_one_sync_and_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("log.jsonl");
+        let k = key();
+        let pk = k.verifying_key();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(4096, 64),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        for i in 0..10 {
+            log.append_deferred(payload(i)).unwrap();
+        }
+        assert_eq!(log.fsyncs(), 0);
+        assert!(log.has_unsynced());
+        assert_eq!(data_lines(&active), 10, "written before the fsync");
+        log.sync().unwrap();
+        assert_eq!(log.fsyncs(), 1);
+        assert!(!log.has_unsynced());
+        log.sync().unwrap();
+        assert_eq!(log.fsyncs(), 1, "nothing to sync");
+        // Past the cap: the terminator's fsync covers the sealed file.
+        for i in 10..200 {
+            log.append_deferred(payload(i)).unwrap();
+        }
+        let rotations = list_archive_seqs(&active).unwrap().len() as u64;
+        assert!(rotations > 1, "rotated");
+        // One fsync per terminator, none per line.
+        assert_eq!(log.fsyncs(), 1 + rotations);
+        log.sync().unwrap();
+        let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(report.total_records, 200);
     }
 
     /// REAL rotation: a small byte cap makes a handful of appends spill
