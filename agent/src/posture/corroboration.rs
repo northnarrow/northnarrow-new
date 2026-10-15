@@ -40,15 +40,53 @@ const LEDGER_CAP: usize = 64;
 pub const SUSTAINED_SAME_TYPE_PROMOTES: bool = false;
 const SUSTAINED_SAME_TYPE_MIN: usize = 2;
 
-/// Which "actor" a signal belongs to, for corroboration purposes
-/// (review `posture-ledger-scope-1`). `Some(loginuid)` = a PAM login
-/// session; `None` = host-level (daemon/kernel activity with no login
-/// uid, or an event type with no owning pid). Signals corroborate each
-/// other only within the same scope: two weak signals from two unrelated
-/// users or containers no longer add up to a host-wide COMBAT.
-pub type Scope = Option<u32>;
+/// Which "actor" a signal belongs to, for corroboration purposes (review
+/// `posture-ledger-scope-1`). Signals corroborate each other only within
+/// the same scope: two weak signals from two unrelated users, services or
+/// containers do not add up to a host-wide COMBAT.
+///
+/// External audit POS-005: every process without a login uid — each
+/// daemon, each container — used to share one host-level scope (`None`),
+/// and with it the lock: a root daemon changing a unit file locked a
+/// COMBAT that any other daemon or container then corroborated. Interim,
+/// without a wire change: a process with no login uid is scoped by the
+/// workload its cgroup names; the full fix is the workload-context design
+/// (`TAPPA10_9_WORKLOAD_CONTEXT_DESIGN.md` §4.3), which carries the cgroup
+/// id in every record and scopes a login session by workload too.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// A PAM login session: its login uid (inherited by everything the
+    /// session runs, `sudo` included).
+    Login(u32),
+    /// No login uid: the workload the process's cgroup names — a systemd
+    /// unit or a container — as the cgroup path up to that unit
+    /// (`/system.slice/puppet.service`, `/system.slice/docker-<id>.scope`).
+    Workload(String),
+    /// Neither could be read: no owning pid, or the owner and every
+    /// ancestor the spawn cache knows have exited. Recorded, but it never
+    /// corroborates, is never corroborated and never locks COMBAT: a
+    /// signal that cannot be placed must not vouch for any actor.
+    Unattributed,
+}
 
-#[derive(Clone, Copy)]
+impl Scope {
+    /// Signals in this scope may corroborate each other.
+    pub fn is_attributed(&self) -> bool {
+        !matches!(self, Scope::Unattributed)
+    }
+}
+
+impl core::fmt::Display for Scope {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Scope::Login(uid) => write!(f, "login uid {uid}"),
+            Scope::Workload(w) => write!(f, "workload {w}"),
+            Scope::Unattributed => f.write_str("unattributed"),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct LedgerEntry {
     trigger: TriggerType,
     /// External audit POS-001: the kind of evidence it is.
@@ -101,7 +139,7 @@ impl CorroborationLedger {
     /// sufficiently-repeated SAME signal also corroborates.
     ///
     /// Caller must [`prune`](Self::prune) first.
-    pub fn corroborated(&self, current: TriggerType, scope: Scope) -> bool {
+    pub fn corroborated(&self, current: TriggerType, scope: &Scope) -> bool {
         self.corroborated_as(current, current.evidence_class(), scope)
     }
 
@@ -111,13 +149,18 @@ impl CorroborationLedger {
         &self,
         current: TriggerType,
         class: EvidenceClass,
-        scope: Scope,
+        scope: &Scope,
     ) -> bool {
+        // External audit POS-005: a signal that cannot be placed is
+        // corroborated by nothing.
+        if !scope.is_attributed() {
+            return false;
+        }
         // posture-ledger-scope-1: only same-scope entries count.
         let same_scope = self
             .entries
             .iter()
-            .filter(|e| e.scope == scope && e.pending_writer.is_none());
+            .filter(|e| e.scope == *scope && e.pending_writer.is_none());
         // External audit POS-001 (NN-AUD-002): a different kind of
         // evidence, not merely a different trigger of the same kind.
         if same_scope.clone().any(|e| e.class != class) {
@@ -155,10 +198,13 @@ impl CorroborationLedger {
     }
 
     /// External audit POS-001: a privileged signal is on record in `scope`.
-    pub fn has_privileged(&self, scope: Scope) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.scope == scope && e.privileged && e.pending_writer.is_none())
+    /// External audit POS-005: never in [`Scope::Unattributed`].
+    pub fn has_privileged(&self, scope: &Scope) -> bool {
+        scope.is_attributed()
+            && self
+                .entries
+                .iter()
+                .any(|e| e.scope == *scope && e.privileged && e.pending_writer.is_none())
     }
 
     /// External audit POS-001: when the newest signal was recorded (any
@@ -240,40 +286,57 @@ impl CorroborationLedger {
 mod tests {
     use super::*;
 
+    fn unit(name: &str) -> Scope {
+        Scope::Workload(format!("/system.slice/{name}"))
+    }
+
     /// Review 52: a pending configuration change corroborates nothing
     /// until it is placed; placed as an admin session it is dropped, as
     /// anything else it counts.
     #[test]
     fn pending_writer_counts_only_once_placed_outside_an_admin_session() {
         let now = Instant::now();
+        let host = unit("x.service");
         let mut l = CorroborationLedger::new();
-        l.record_pending(TriggerType::CriticalFileModification, now, None, 42, false);
-        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
+        l.record_pending(
+            TriggerType::CriticalFileModification,
+            now,
+            host.clone(),
+            42,
+            false,
+        );
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, &host));
         l.resolve_pending(|_| None);
         assert!(l.has_pending());
-        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
-        l.resolve_pending(|_| Some((true, Some(1000))));
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, &host));
+        l.resolve_pending(|_| Some((true, Scope::Login(1000))));
         assert!(l.is_empty(), "an admin change is dropped");
 
         // Placed outside an admin session, in the scope of its session.
         // External audit POS-001: it corroborates evidence of another
         // kind, and a root change counts as privileged only once placed.
-        l.record_pending(TriggerType::CriticalFileModification, now, None, 43, true);
-        assert!(!l.has_privileged(None), "not before it is placed");
-        l.resolve_pending(|_| Some((false, Some(1000))));
+        l.record_pending(
+            TriggerType::CriticalFileModification,
+            now,
+            host.clone(),
+            43,
+            true,
+        );
+        assert!(!l.has_privileged(&host), "not before it is placed");
+        l.resolve_pending(|_| Some((false, Scope::Login(1000))));
         assert!(!l.has_pending());
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
-        assert!(l.corroborated(TriggerType::ExfiltrationPattern, Some(1000)));
-        assert!(!l.corroborated(TriggerType::PersistenceMechanism, Some(1000)));
-        assert!(l.has_privileged(Some(1000)));
-        assert!(!l.has_privileged(None));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &host));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Login(1000)));
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, &Scope::Login(1000)));
+        assert!(l.has_privileged(&Scope::Login(1000)));
+        assert!(!l.has_privileged(&host));
     }
 
     #[test]
     fn lone_signal_is_not_corroborated() {
         let l = CorroborationLedger::new();
         // empty ledger: nothing corroborates the first firing.
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &unit("x.service")));
     }
 
     /// External audit POS-001: a prior signal of another kind of evidence
@@ -281,10 +344,11 @@ mod tests {
     #[test]
     fn prior_signal_of_another_class_corroborates() {
         let now = Instant::now();
+        let s = unit("x.service");
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::ConfirmedIntrusion, now, None);
-        assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
-        assert!(l.corroborated(TriggerType::PersistenceMechanism, None));
+        l.record(TriggerType::ConfirmedIntrusion, now, s.clone());
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, &s));
+        assert!(l.corroborated(TriggerType::PersistenceMechanism, &s));
     }
 
     /// External audit POS-001 (NN-AUD-002): two network patterns are one
@@ -294,15 +358,16 @@ mod tests {
     #[test]
     fn same_class_pair_does_not_corroborate() {
         let now = Instant::now();
+        let s = Scope::Login(1000);
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::LateralMovement, now, None);
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        l.record(TriggerType::LateralMovement, now, s.clone());
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &s));
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::CriticalFileModification, now, None);
-        assert!(!l.corroborated(TriggerType::PersistenceMechanism, None));
+        l.record(TriggerType::CriticalFileModification, now, s.clone());
+        assert!(!l.corroborated(TriggerType::PersistenceMechanism, &s));
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::ExploitAttempt, now, None);
-        assert!(!l.corroborated(TriggerType::ConfirmedIntrusion, None));
+        l.record(TriggerType::ExploitAttempt, now, s.clone());
+        assert!(!l.corroborated(TriggerType::ConfirmedIntrusion, &s));
     }
 
     #[test]
@@ -310,22 +375,24 @@ mod tests {
         // Default SUSTAINED_SAME_TYPE_PROMOTES = false: a repeated SAME
         // signal does NOT promote (the documented single-vector limit).
         let now = Instant::now();
+        let s = Scope::Login(1000);
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::ExfiltrationPattern, now, None);
+        l.record(TriggerType::ExfiltrationPattern, now, s.clone());
         const _: () = assert!(!SUSTAINED_SAME_TYPE_PROMOTES, "guard: knob default");
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &s));
     }
 
     #[test]
     fn prune_drops_out_of_window_entries() {
         let base = Instant::now();
+        let s = Scope::Login(1000);
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::LateralMovement, base, None);
+        l.record(TriggerType::LateralMovement, base, s.clone());
         // Advance well past the window.
         let later = base + CORROBORATION_WINDOW + Duration::from_secs(1);
         l.prune(later);
         assert_eq!(l.len(), 0, "stale entry pruned");
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &s));
     }
 
     #[test]
@@ -333,23 +400,90 @@ mod tests {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
         for _ in 0..(LEDGER_CAP + 50) {
-            l.record(TriggerType::ExfiltrationPattern, now, None);
+            l.record(TriggerType::ExfiltrationPattern, now, Scope::Login(1000));
         }
         l.prune(now);
         assert!(l.len() <= LEDGER_CAP, "size cap holds under a flood");
     }
 
     /// posture-ledger-scope-1: signals from different scopes (two login
-    /// sessions, or a session vs host-level) do not corroborate.
+    /// sessions, or a session and a service) do not corroborate.
     #[test]
     fn different_scopes_do_not_corroborate() {
         let now = Instant::now();
         let mut l = CorroborationLedger::new();
-        l.record(TriggerType::ConfirmedIntrusion, now, Some(1000));
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, Some(1001)));
-        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, None));
-        assert!(l.corroborated(TriggerType::ExfiltrationPattern, Some(1000)));
-        l.record(TriggerType::ConfirmedIntrusion, now, None);
-        assert!(l.corroborated(TriggerType::ExfiltrationPattern, None));
+        l.record(TriggerType::ConfirmedIntrusion, now, Scope::Login(1000));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Login(1001)));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &unit("x.service")));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Login(1000)));
+        l.record(TriggerType::ConfirmedIntrusion, now, unit("x.service"));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, &unit("x.service")));
+    }
+
+    /// External audit POS-005: two services (or two containers) without a
+    /// login uid are two actors — they used to share the host-level scope;
+    /// two signals inside one of them still corroborate.
+    #[test]
+    fn two_daemons_do_not_corroborate() {
+        let now = Instant::now();
+        let puppet = unit("puppet.service");
+        let container = Scope::Workload("/system.slice/docker-0123abcd.scope".into());
+        let mut l = CorroborationLedger::new();
+        l.record_with(
+            TriggerType::PersistenceMechanism,
+            EvidenceClass::FileSystem,
+            now,
+            puppet.clone(),
+            true,
+        );
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &container));
+        assert!(!l.has_privileged(&container));
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, &puppet));
+        l.record(TriggerType::ExploitAttempt, now, container.clone());
+        assert!(l.corroborated(TriggerType::ExfiltrationPattern, &container));
+    }
+
+    /// External audit POS-005: a root change recorded for one unit is
+    /// privileged evidence in that unit only.
+    #[test]
+    fn a_privileged_signal_locks_only_its_own_unit() {
+        let now = Instant::now();
+        let mut l = CorroborationLedger::new();
+        l.record_with(
+            TriggerType::CriticalFileModification,
+            EvidenceClass::FileSystem,
+            now,
+            unit("salt-minion.service"),
+            true,
+        );
+        assert!(l.has_privileged(&unit("salt-minion.service")));
+        assert!(!l.has_privileged(&unit("nginx.service")));
+        assert!(!l.has_privileged(&Scope::Login(0)));
+        assert!(!l.has_privileged(&Scope::Unattributed));
+    }
+
+    /// External audit POS-005: a signal that cannot be placed is recorded
+    /// (it keeps an unlocked COMBAT from decaying) but corroborates
+    /// nothing, is corroborated by nothing — not even another unplaced
+    /// signal — and never counts as privileged.
+    #[test]
+    fn an_unattributed_signal_corroborates_nothing() {
+        let now = Instant::now();
+        let mut l = CorroborationLedger::new();
+        l.record_with(
+            TriggerType::PersistenceMechanism,
+            EvidenceClass::FileSystem,
+            now,
+            Scope::Unattributed,
+            true,
+        );
+        assert_eq!(l.len(), 1, "recorded");
+        assert_eq!(l.newest(), Some(now));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Unattributed));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &unit("x.service")));
+        assert!(!l.has_privileged(&Scope::Unattributed));
+        // Nor is an unplaced signal vouched for by a placed one.
+        l.record(TriggerType::ExploitAttempt, now, unit("x.service"));
+        assert!(!l.corroborated(TriggerType::ExfiltrationPattern, &Scope::Unattributed));
     }
 }

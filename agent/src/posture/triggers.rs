@@ -29,9 +29,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::posture_types::{EvidenceClass, TriggerType};
+use common::wire::exe::exe_flags;
 use common::wire::open_sensor::open_reason;
 use common::Event;
 
+use super::corroboration::Scope;
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::lineage::AuthSessionTracker;
@@ -306,14 +308,15 @@ pub struct TriggerDetector {
     /// T7.13 (Beta Step 5) — sudo-mediated process lineage tracker.
     /// Consulted ONLY by `sensitive_file_access` and the mass-write
     /// arm of `confirmed_intrusion` (and, review 52, by
-    /// [`Self::is_admin_change`], which decides what corroborates, never
-    /// what fires); every other COMBAT-tier trigger
+    /// [`Self::admin_change_status`], which decides what corroborates,
+    /// never what fires); every other COMBAT-tier trigger
     /// (FsProtectDenial, exec from /tmp, persistence_mechanism,
     /// critical_file_modification, lateral_movement,
     /// exfiltration_pattern, exploit_attempt, lolbas_pattern) fires
     /// unchanged so admin sudo activity that is *actually* malicious
     /// — dropping a /tmp payload, tampering with agent state — is
-    /// still caught.
+    /// still caught. (External audit POS-015: a /tmp exec under a
+    /// package manager's lineage is never promoted past `StagingExec`.)
     auth: AuthSessionTracker,
     /// BUG-017 P-8 — operator-supplemental mass-write path-prefix
     /// carve-out, layered on top of [`MASS_WRITE_CARVEOUT_PREFIXES`].
@@ -332,6 +335,36 @@ pub struct TriggerDetector {
     /// Loaded from `/etc/northnarrow/escalation-allow.local` at boot.
     /// Empty by default (fail-secure).
     escalation_allow: Arc<EscalationAllowList>,
+    /// External audit POS-015: pid → monotonic ns of the last time the
+    /// mass-write arm fired for it — the second factor that makes a
+    /// staging exec by the same process `ConfirmedIntrusion`.
+    mass_writers: MassWriters,
+}
+
+/// External audit POS-015: when the mass-write arm last fired for a pid
+/// (once per event; pruned of pids older than a window past 1,024).
+#[derive(Debug, Default, Clone)]
+struct MassWriters(Arc<parking_lot::Mutex<HashMap<u32, u64>>>);
+
+impl MassWriters {
+    fn record(&self, pid: u32, ts_ns: u64) {
+        let mut g = self.0.lock();
+        if g.len() > 1024 {
+            let cutoff = ts_ns.saturating_sub(MASS_WRITE_WINDOW_NS);
+            g.retain(|_, t| *t >= cutoff);
+        }
+        g.insert(pid, ts_ns);
+    }
+
+    /// The arm fired for `pid` within a mass-write window of `ts_ns`, on
+    /// either side: the rings are drained apart, so the burst of a payload
+    /// that runs and then encrypts may be read before its exec.
+    fn wrote_near(&self, pid: u32, ts_ns: u64) -> bool {
+        self.0
+            .lock()
+            .get(&pid)
+            .is_some_and(|t| t.abs_diff(ts_ns) <= MASS_WRITE_WINDOW_NS)
+    }
 }
 
 impl TriggerDetector {
@@ -349,6 +382,7 @@ impl TriggerDetector {
             mass_write_extras: Arc::new(Vec::new()),
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
+            mass_writers: MassWriters::default(),
         }
     }
 
@@ -362,6 +396,7 @@ impl TriggerDetector {
             mass_write_extras: Arc::new(Vec::new()),
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
+            mass_writers: MassWriters::default(),
         }
     }
 
@@ -376,6 +411,7 @@ impl TriggerDetector {
             mass_write_extras: Arc::new(Vec::new()),
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
+            mass_writers: MassWriters::default(),
         }
     }
 
@@ -396,16 +432,28 @@ impl TriggerDetector {
         self
     }
 
-    /// Inspect `(event, recent)` and return every trigger raised.
-    ///
-    /// The result is in escalation order (the strongest trigger
-    /// last) so the caller can `iter().last()` for the dominant
-    /// signal or fold them all into the audit log.
     /// Corroboration scope of `event` (review `posture-ledger-scope-1`):
-    /// the login uid of the owning pid, or `None` for host-level
-    /// activity / events with no owning pid.
-    pub fn session_scope(&self, event: &Event) -> super::corroboration::Scope {
-        event_owner_pid(event).and_then(|pid| self.auth.session_loginuid(pid))
+    /// the login uid of the owning pid, or of its nearest running ancestor
+    /// once it has exited. External audit POS-005: without a login uid,
+    /// the workload its cgroup names (a systemd unit, a container), so two
+    /// daemons or two containers are two actors; [`Scope::Unattributed`]
+    /// when neither can be read, or for an event with no owning pid. Read
+    /// only for an event that raised a trigger.
+    pub fn session_scope(&self, event: &Event) -> Scope {
+        match event_owner_pid(event) {
+            Some(pid) => self.scope_of(pid),
+            None => Scope::Unattributed,
+        }
+    }
+
+    fn scope_of(&self, pid: u32) -> Scope {
+        if let Some(uid) = self.auth.session_loginuid(pid) {
+            return Scope::Login(uid);
+        }
+        match self.auth.session_workload(pid) {
+            Some(workload) => Scope::Workload(workload),
+            None => Scope::Unattributed,
+        }
     }
 
     /// Review 52: whether `event` is a write-open by an administrator's
@@ -427,12 +475,17 @@ impl TriggerDetector {
     /// Review 52: a pending writer placed —
     /// [`AuthSessionTracker::interactive_admin_status`] and its session's
     /// scope — or `None` while it still cannot be.
-    pub fn place_writer(&self, pid: u32) -> Option<(bool, super::corroboration::Scope)> {
+    pub fn place_writer(&self, pid: u32) -> Option<(bool, Scope)> {
         self.auth
             .interactive_admin_status(pid)
-            .map(|admin| (admin, self.auth.session_loginuid(pid)))
+            .map(|admin| (admin, self.scope_of(pid)))
     }
 
+    /// Inspect `(event, recent)` and return every trigger raised.
+    ///
+    /// The result is in escalation order (the strongest trigger
+    /// last) so the caller can `iter().last()` for the dominant
+    /// signal or fold them all into the audit log.
     pub fn detect<'a>(&self, event: &Event, recent: impl Into<Recent<'a>>) -> Vec<TriggerType> {
         let recent = recent.into();
         // T7.13: ingest ProcessSpawn into the auth-lineage tracker
@@ -476,8 +529,17 @@ impl TriggerDetector {
         // `recent` is left untouched — the per-pid counters inside the
         // heuristics only ever match the focal pid, so a stack-owned
         // event in `recent` cannot inflate a non-stack focal's count.
+        //
+        // External audit POS-009: except a kernel denial from the
+        // watchdog's PID. The verified watchdog is in PROTECTED_PIDS, so
+        // the kernel refuses it nothing in normal operation; a denial there
+        // comes from a process the slot no longer describes, or from a
+        // watchdog that misbehaves. The agent's own PID stays exempt from
+        // everything: a COMBAT against itself would be worse.
         if let Some(pid) = event_owner_pid(event) {
-            if self.exempt.is_exempt(pid) {
+            let watchdog_denial =
+                matches!(event, Event::FsProtectDenial { .. }) && !self.exempt.is_agent(pid);
+            if self.exempt.is_exempt(pid) && !watchdog_denial {
                 return Vec::new();
             }
         }
@@ -526,6 +588,11 @@ impl TriggerDetector {
                 TriggerType::CriticalFileModification
             });
         }
+        // External audit POS-015: a binary run from a staging directory.
+        let staged = staging_exec(event, &self.auth, &self.mass_writers);
+        if staged == Some(StagedExec::Plain) {
+            hits.push(TriggerType::StagingExec);
+        }
 
         // ENGAGED -> COMBAT tier
         // BUG-032: a denied anti-tamper attempt is kernel-adjudicated
@@ -546,13 +613,19 @@ impl TriggerDetector {
                 TriggerType::AntiTamperDenial
             });
         }
-        if confirmed_intrusion(
+        let mass_write = confirmed_intrusion(
             event,
             recent,
             &self.auth,
             &self.mass_write_extras,
             &self.mass_write_warned,
-        ) {
+        );
+        if mass_write {
+            if let (Some(pid), (_, ts)) = (event_owner_pid(event), event_owner_seen(event)) {
+                self.mass_writers.record(pid, ts);
+            }
+        }
+        if mass_write || staged == Some(StagedExec::Confirmed) {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event, &self.auth) {
@@ -889,6 +962,82 @@ fn critical_file_modification(focal: &Event) -> bool {
         || kernel_class_says(filename, *kernel_class, open_reason::CRITICAL)
 }
 
+/// External audit POS-015: how a binary run from a staging directory is
+/// judged ([`staging_exec`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedExec {
+    /// No second factor: [`TriggerType::StagingExec`].
+    Plain,
+    /// A second factor the agent observed: [`TriggerType::ConfirmedIntrusion`].
+    Confirmed,
+}
+
+/// External audit POS-015: a binary run from `/tmp`, `/var/tmp` or
+/// `/dev/shm` (the shared staging set, external audit NETR-008), judged on
+/// the file the kernel executed (Tappa 10.9 step 2, review 61).
+///
+/// The directory alone does not tell a build's `conftest` (pip, configure,
+/// a CI job, a self-extracting installer) from a payload, and as
+/// `ConfirmedIntrusion` it was the cheapest COMBAT-tier half any user could
+/// produce: one exec, then any signal of another kind from the same
+/// session reached COMBAT. It raises `StagingExec` (ENGAGED, never
+/// recorded as corroboration), and `ConfirmedIntrusion` only with a second
+/// factor the agent observes:
+/// - the executed file was unlinked, or is a memfd, when the kernel ran it
+///   (the exe flags; zero in tracepoint mode);
+/// - the mass-write arm fired for the same process within a mass-write
+///   window (its lineage gates applied).
+///
+/// Never promoted under a package manager's lineage: maintainer scripts
+/// and scriptlets run helpers they unpack in `/tmp`. Not gated by the auth
+/// lineage: a sudo-spawned process running `/tmp/payload` is raised like
+/// any other. R001..R003 still kill the exec, whatever the posture.
+fn staging_exec(
+    focal: &Event,
+    auth: &AuthSessionTracker,
+    mass_writers: &MassWriters,
+) -> Option<StagedExec> {
+    let (pid, filename, exe, ts) = match focal {
+        Event::ProcessSpawn {
+            pid,
+            filename,
+            exe,
+            timestamp_ns,
+            ..
+        }
+        | Event::ExecCheck {
+            pid,
+            filename,
+            exe,
+            timestamp_ns,
+            ..
+        } => (*pid, filename, exe, *timestamp_ns),
+        _ => return None,
+    };
+    let image = exe.path_or(filename);
+    if !crate::decision::rules::is_staging_path(image) {
+        return None;
+    }
+    if auth.is_system_daemon_mediated(pid) {
+        return Some(StagedExec::Plain);
+    }
+    let unlinked = exe.has(exe_flags::DELETED) || exe.has(exe_flags::MEMFD);
+    let mass_wrote = mass_writers.wrote_near(pid, ts);
+    if !unlinked && !mass_wrote {
+        return Some(StagedExec::Plain);
+    }
+    tracing::warn!(
+        pid,
+        image = %image,
+        unlinked,
+        mass_wrote,
+        "staging exec with a second factor — raising ConfirmedIntrusion"
+    );
+    Some(StagedExec::Confirmed)
+}
+
+/// The mass-write arm of `ConfirmedIntrusion` (the exec arm is
+/// [`staging_exec`]).
 fn confirmed_intrusion(
     focal: &Event,
     recent: Recent<'_>,
@@ -901,20 +1050,6 @@ fn confirmed_intrusion(
     // kernel-adjudicated denial is straight-to-COMBAT, distinct from
     // these heuristic arms which now require corroboration.
     //
-    // Exec from /tmp, /var/tmp or /dev/shm: an admin does not legitimately
-    // run binaries out of these paths. NOT gated by auth-lineage —
-    // a sudo-spawned process exec'ing /tmp/payload is exactly the
-    // post-compromise pattern we want to catch.
-    //
-    // Tappa 10.9 step 2: on the file the kernel executed (review 61).
-    if let Event::ProcessSpawn { filename, exe, .. } | Event::ExecCheck { filename, exe, .. } =
-        focal
-    {
-        // External audit NETR-008: the shared staging set (adds /var/tmp).
-        if crate::decision::rules::is_staging_path(exe.path_or(filename)) {
-            return true;
-        }
-    }
     // Mass-write counted in the kernel (Tappa 10.9 step 1): one event per
     // burst, carve-outs (pseudo-filesystems, /run/systemd, the journal,
     // the operator's extras, the writer's own runtime dir) already
@@ -1011,8 +1146,8 @@ fn confirmed_intrusion(
             // apt, mandb) atomic-churn state files / caches well past
             // the threshold during routine maintenance; same exe-path
             // lineage keying. Only the mass-write arm is gated here;
-            // FsProtectDenial and exec-from-/tmp above still fire for
-            // these PIDs.
+            // FsProtectDenial and the staging exec still fire for these
+            // PIDs.
             // FP-2 — `npm install` unpacks a package tarball (+ writes
             // the ~/.npm content cache) well past the threshold. npm is
             // a `#!/usr/bin/env node` script, so the writer's exe is the
@@ -1414,6 +1549,17 @@ pub(super) mod testutil {
         }
     }
 
+    /// A spawn of `path` as the kernel executed it, with the exe `flags`
+    /// (`exe_flags`; `KNOWN` added: the LSM program filled them).
+    pub fn spawn_exe_flags(pid: u32, ppid: u32, path: &str, flags: u32, ts: u64) -> Event {
+        let mut e = spawn(pid, ppid, "x", path, ts);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.path = path.into();
+            exe.flags = flags | exe_flags::KNOWN;
+        }
+        e
+    }
+
     /// A v6 `TcpConnect` (family = AF_INET6 = 10) with a 16-byte dst
     /// (BUG-039 detection tests).
     pub fn tcp_v6(pid: u32, comm: &str, dst: [u8; 16], dst_port: u16, ts: u64) -> Event {
@@ -1558,25 +1704,90 @@ mod tests {
         assert!(!hits.contains(&TriggerType::CriticalFileModification));
     }
 
+    /// External audit POS-015: a binary run from /tmp with no second
+    /// factor is a staging exec (ENGAGED), not ConfirmedIntrusion.
     #[test]
-    fn confirmed_intrusion_fires_on_exec_from_tmp() {
-        let det = TriggerDetector::new();
+    fn staging_exec_fires_on_exec_from_tmp() {
+        let det = detector_with_empty_proc();
         let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
         let hits = det.detect(&focal, &[]);
-        assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+        assert_eq!(hits, vec![TriggerType::StagingExec]);
     }
 
     /// External audit NETR-008: the shared staging set, /var/tmp included;
-    /// /run/user stays out.
+    /// /run/user stays out. Before the exec (`ExecCheck`) as well.
     #[test]
-    fn confirmed_intrusion_fires_on_exec_from_every_staging_dir() {
-        let det = TriggerDetector::new();
+    fn staging_exec_fires_on_exec_from_every_staging_dir() {
+        let det = detector_with_empty_proc();
         for path in ["/var/tmp/evil", "/dev/shm/evil"] {
             let hits = det.detect(&spawn(42, 1, "evil", path, 1), &[]);
-            assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{path}");
+            assert_eq!(hits, vec![TriggerType::StagingExec], "{path}");
         }
+        let check = Event::ExecCheck {
+            pid: 44,
+            ppid: 1,
+            uid: 1000,
+            comm: "sh".into(),
+            filename: "/tmp/evil".into(),
+            timestamp_ns: 1,
+            exe: Default::default(),
+        };
+        assert_eq!(det.detect(&check, &[]), vec![TriggerType::StagingExec]);
         let hits = det.detect(&spawn(43, 1, "app", "/run/user/1000/app", 1), &[]);
-        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion));
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    /// External audit POS-015: an executable unlinked (or a memfd) when the
+    /// kernel ran it from a staging directory is the second factor.
+    #[test]
+    fn a_deleted_staged_exe_is_confirmed_intrusion() {
+        use common::wire::exe::exe_flags::{DELETED, MEMFD, TMPFS};
+        let det = detector_with_empty_proc();
+        for flags in [DELETED, MEMFD, DELETED | TMPFS] {
+            let hits = det.detect(&spawn_exe_flags(42, 1, "/tmp/.x", flags, 1), &[]);
+            assert_eq!(hits, vec![TriggerType::ConfirmedIntrusion], "{flags:#x}");
+        }
+        // A file on tmpfs that is still linked: no second factor.
+        let hits = det.detect(&spawn_exe_flags(43, 1, "/dev/shm/x", TMPFS, 1), &[]);
+        assert_eq!(hits, vec![TriggerType::StagingExec]);
+    }
+
+    /// External audit POS-015: the mass-write arm fired for the same
+    /// process within a window, before or after its exec is read. Another
+    /// process, or a burst a window away, is not a second factor.
+    #[test]
+    fn a_mass_writer_running_a_staged_exe_is_confirmed_intrusion() {
+        const S: u64 = 1_000_000_000;
+        let det = detector_with_empty_proc();
+        let hits = det.detect(&mass_write(900, true, 100 * S), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        let staged = |pid, ts| det.detect(&spawn(pid, 1, "x", "/tmp/x", ts), &[]);
+        assert_eq!(staged(900, 130 * S), vec![TriggerType::ConfirmedIntrusion]);
+        assert_eq!(staged(900, 90 * S), vec![TriggerType::ConfirmedIntrusion]);
+        assert_eq!(staged(901, 130 * S), vec![TriggerType::StagingExec]);
+        assert_eq!(staged(900, 200 * S), vec![TriggerType::StagingExec]);
+
+        // A burst the mass-write arm does not count — new files written by
+        // a session's process (a build, an archive extracted) — is no
+        // factor either.
+        let _ = det.detect(&spawn_with_exe(950, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(951, 950, "/usr/bin/bash", 2), &[]);
+        assert!(det.detect(&mass_write(951, false, 100 * S), &[]).is_empty());
+        assert_eq!(staged(951, 101 * S), vec![TriggerType::StagingExec]);
+    }
+
+    /// External audit POS-015: a package manager's maintainer scripts run
+    /// helpers they unpacked in /tmp; never promoted, whatever the flags.
+    #[test]
+    fn a_package_managers_staged_helper_is_never_promoted() {
+        use common::wire::exe::exe_flags::DELETED;
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(100, 1, "/usr/bin/dpkg", 1), &[]);
+        let hits = det.detect(
+            &spawn_exe_flags(101, 100, "/tmp/postinst-helper", DELETED, 2),
+            &[],
+        );
+        assert_eq!(hits, vec![TriggerType::StagingExec]);
     }
 
     /// Lab finding (EBPF-001 work): systemd writing `/dev/console` at
@@ -1699,6 +1910,61 @@ mod tests {
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "a non-agent mass-write must still fire: {hits:?}"
         );
+    }
+
+    /// External audit POS-009: the watchdog's PID is exempt from every
+    /// heuristic but not from a kernel denial; a PID recycled since its
+    /// verification is exempt from nothing. The agent's own PID stays
+    /// exempt from everything.
+    #[test]
+    fn a_denial_from_the_watchdog_pid_is_decisive() {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        const WATCHDOG: u32 = 2000;
+        let proc_root = tempfile::tempdir().unwrap();
+        let started = |ticks: u64| {
+            let d = proc_root.path().join(WATCHDOG.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{WATCHDOG} (northnarrow-wa) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0\n"),
+            )
+            .unwrap();
+        };
+        started(5_000);
+        let exempt = ExemptPids::with_agent_on(AGENT_PID, proc_root.path());
+        exempt.set_watchdog(WATCHDOG, 5_000);
+        let det = TriggerDetector::with_exempt_and_auth(
+            exempt,
+            AuthSessionTracker::new("/this/path/does/not/exist"),
+        );
+        let denial = |pid: u32| Event::FsProtectDenial {
+            pid,
+            uid: 0,
+            comm: "northnarrow-wa".into(),
+            target_dev: 64_770,
+            target_ino: 12345,
+            operation: common::FsProtectOperation::Unlink,
+            timestamp_ns: 1,
+        };
+        assert_eq!(
+            det.detect(&denial(WATCHDOG), &[]),
+            vec![TriggerType::AntiTamperDenial]
+        );
+        let (focal, recent) = self_write_burst(WATCHDOG);
+        assert!(
+            det.detect(&focal, &recent).is_empty(),
+            "its reads and writes"
+        );
+        assert!(
+            det.detect(&denial(AGENT_PID), &[]).is_empty(),
+            "the agent's own"
+        );
+
+        // The PID recycled between two refreshes: nothing is exempt.
+        started(9_000);
+        let hits = det.detect(&focal, &recent);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
     }
 
     #[test]
@@ -2401,16 +2667,22 @@ mod tests {
     // ── Test #6: sudo subprocess exec'ing /tmp still trips ──────────
     #[test]
     fn exec_from_tmp_not_exempt_for_sudo_subprocess() {
+        use common::wire::exe::exe_flags::DELETED;
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
         // sudo's child exec'es /tmp/payload — exactly the
-        // post-compromise pattern this arm exists to catch.
+        // post-compromise pattern this arm exists to catch. External audit
+        // POS-015: a staging exec, and with a second factor
+        // ConfirmedIntrusion, sudo or not.
         let evil = spawn_with_exe(200, 100, "/tmp/payload", 2);
         let hits = det.detect(&evil, &[]);
         assert!(
-            hits.contains(&TriggerType::ConfirmedIntrusion),
+            hits.contains(&TriggerType::StagingExec),
             "exec-from-/tmp must fire even under sudo lineage, got {hits:?}"
         );
+        let unlinked = spawn_exe_flags(201, 100, "/tmp/payload", DELETED, 3);
+        let hits = det.detect(&unlinked, &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
     }
 
     // ── Test #7: sudo subprocess FsProtectDenial still trips ────────

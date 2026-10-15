@@ -327,8 +327,9 @@ impl PostureMachine {
             return None;
         }
         // Review `posture-ledger-scope-1`: corroboration is per actor
-        // scope (login session); a weak signal from one user/container
-        // never vouches for a blunt signal from another.
+        // scope; a weak signal from one user, service or container never
+        // vouches for a blunt signal from another (external audit POS-005:
+        // a process with no login uid is scoped by its workload).
         let scope = self.inner.triggers.session_scope(event);
         // Review 52, read before the state lock (they read `/proc`); see
         // the recording below.
@@ -348,11 +349,12 @@ impl PostureMachine {
         // BUG-032 — escalation signals (ENGAGED-tier and above) this
         // round. They seed the ledger for LATER rounds (never this one,
         // see posture-1 below); ALERTED-tier recon/DNS is too noisy to
-        // count as corroboration.
+        // count as corroboration, and so is a staging-directory exec with
+        // no second factor (external audit POS-015).
         let escalation_now: Vec<TriggerType> = hits
             .iter()
             .copied()
-            .filter(|t| t.target_level() >= PostureKind::Engaged)
+            .filter(TriggerType::is_corroboration)
             .collect();
 
         // Effective level: a blunt (NeedsCorroboration) COMBAT-tier
@@ -377,7 +379,7 @@ impl PostureMachine {
                 let level = if t.target_level() == PostureKind::Combat
                     && t.confidence() == Confidence::NeedsCorroboration
                 {
-                    if ledger.corroborated_as(t, triggers::evidence_class(t, event), scope) {
+                    if ledger.corroborated_as(t, triggers::evidence_class(t, event), &scope) {
                         PostureKind::Combat
                     } else {
                         PostureKind::Engaged
@@ -391,6 +393,13 @@ impl PostureMachine {
         // Strongest EFFECTIVE level decides the destination. Equal-level
         // triggers collapse to a single transition.
         leveled.sort_by_key(|(_, level)| *level);
+        // External audit POS-005: this round's signal is corroborated in its
+        // own scope — by an earlier signal of another kind from the same
+        // actor — whatever its tier (a root `sshd_config` edit is ENGAGED
+        // tier).
+        let corroborated_here = escalation_now
+            .iter()
+            .any(|t| ledger.corroborated_as(*t, triggers::evidence_class(*t, event), &scope));
 
         let before = guard.kind();
         let mut current = (*guard).clone();
@@ -410,6 +419,12 @@ impl PostureMachine {
         // interactive session. COMBAT reached on heuristics alone (two
         // patterns any user can trigger) is unlocked: the ladder stays at
         // the process level and the posture decays once quiet.
+        //
+        // External audit POS-005: root's change locks COMBAT only when its
+        // own actor's evidence pairs with it — this round's signal
+        // corroborated in its scope. A root daemon rewriting a unit file
+        // (puppet, salt) while another actor's COMBAT ran unlocked used to
+        // lock it: no decay, and isolation if NEUTRALIZE failed.
         let file_system =
             |t: &TriggerType| triggers::evidence_class(*t, event) == EvidenceClass::FileSystem;
         let root_change =
@@ -420,8 +435,7 @@ impl PostureMachine {
             let was_locked = matches!(*guard, PostureState::Combat { locked: true, .. });
             let locked = was_locked
                 || hits.iter().any(|t| t.confidence() == Confidence::Decisive)
-                || privileged_now
-                || ledger.has_privileged(scope);
+                || (corroborated_here && (privileged_now || ledger.has_privileged(&scope)));
             lock_acquired = locked && !was_locked && before == PostureKind::Combat;
             current = PostureState::Combat { since, locked };
         }
@@ -451,14 +465,18 @@ impl PostureMachine {
                 triggers::event_owner_pid(event),
             ) {
                 (true, Some(true), _) => {}
-                (true, None, Some(writer)) => {
-                    ledger.record_pending(*t, now, scope, writer, root_change && file_system(t))
-                }
+                (true, None, Some(writer)) => ledger.record_pending(
+                    *t,
+                    now,
+                    scope.clone(),
+                    writer,
+                    root_change && file_system(t),
+                ),
                 _ => ledger.record_with(
                     *t,
                     triggers::evidence_class(*t, event),
                     now,
-                    scope,
+                    scope.clone(),
                     privileged_now && file_system(t),
                 ),
             }
@@ -471,12 +489,21 @@ impl PostureMachine {
         if lock_acquired {
             tracing::warn!(
                 triggers = %describe_triggers(&hits),
+                %scope,
                 "COMBAT locked: evidence an unprivileged user cannot produce — the ladder may \
                  isolate the host, and only a signed release ends COMBAT"
             );
         }
 
         if after != before {
+            // External audit POS-005: whose signal moved the posture.
+            tracing::info!(
+                from = %before,
+                to = %after,
+                triggers = %describe_triggers(&hits),
+                %scope,
+                "posture signal scope"
+            );
             self.log_transition(before, after, firing, describe_triggers(&hits));
             // Combat-entry edge — fire the hook exactly once per
             // upward crossing. We deliberately check `before` so a

@@ -417,6 +417,41 @@ pub(crate) fn in_system_tree(path: &str) -> bool {
         && !path.ends_with(" (deleted)")
 }
 
+/// External audit POS-005: the agent's own containment cgroups — the slice
+/// `response::config::ExecutorConfig` moves processes into
+/// (`blocked.scope`, `throttled.scope`, and the NEUTRALIZE cgroups below
+/// the former). A process there shows the agent's cgroup, not its own
+/// workload's, and contained processes of unrelated workloads share it.
+const AGENT_CONTAINMENT_SLICE: &str = "/northnarrow.slice";
+
+fn in_agent_containment(path: &str) -> bool {
+    path.strip_prefix(AGENT_CONTAINMENT_SLICE)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// External audit POS-005: the workload a cgroup path names — the path up
+/// to its deepest systemd unit (`….service`, `….scope`): a service together
+/// with the cgroups it delegates below it, a container's scope
+/// (`docker-<id>.scope`, `libpod-<id>.scope`, `cri-containerd-<id>.scope`,
+/// `crio-<id>.scope`), a `systemd-run` unit. A path that names no unit
+/// (the cgroupfs drivers' `/docker/<id>`, `/kubepods/…/<id>`, the root
+/// cgroup) is a workload of its own.
+fn workload_of_cgroup(path: &str) -> String {
+    let mut end = None;
+    let mut at = 0;
+    for seg in path.split('/') {
+        at += seg.len();
+        if seg.ends_with(".service") || seg.ends_with(".scope") {
+            end = Some(at);
+        }
+        at += 1;
+    }
+    match end {
+        Some(end) => path[..end].to_string(),
+        None => path.to_string(),
+    }
+}
+
 /// Mutex-shielded state. A single lock guards both the map and the
 /// FIFO eviction queue so the two never observe each other in an
 /// inconsistent state mid-ingest.
@@ -675,6 +710,63 @@ impl AuthSessionTracker {
     /// corroboration ledger.
     pub fn session_loginuid(&self, pid: u32) -> Option<u32> {
         self.loginuid_of(self.nearest_running(pid)?)
+    }
+
+    /// External audit POS-005: the workload `pid` runs in — the systemd
+    /// unit or container its cgroup names ([`workload_of_cgroup`]) — read
+    /// from `/proc/<pid>/cgroup` of `pid` or, once it has exited, of its
+    /// nearest running ancestor (a child starts in its parent's cgroup). A
+    /// process the agent moved into its own containment cgroups
+    /// ([`AGENT_CONTAINMENT_SLICE`]) no longer shows the workload it ran in:
+    /// it is placed by its nearest running ancestor outside them. `None`
+    /// when nothing running can be read (past PID 1, a cache miss, the
+    /// depth cap). Read only for an event that raised a trigger.
+    pub fn session_workload(&self, pid: u32) -> Option<String> {
+        let mut cur = pid;
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            let live = self.nearest_running(cur)?;
+            if let Some(path) = self.cgroup_path(live) {
+                if !in_agent_containment(&path) {
+                    return Some(workload_of_cgroup(&path));
+                }
+            }
+            // Contained by the agent, or gone since: its parent's.
+            let ppid = self
+                .lookup_cache(live)
+                .map(|(ppid, _)| ppid)
+                .or_else(|| self.proc_ppid(live))?;
+            if ppid == live {
+                return None;
+            }
+            cur = ppid;
+        }
+        None
+    }
+
+    /// The cgroup path of `pid`: the unified hierarchy's (`0::/…`), or
+    /// systemd's own on a v1 host (`name=systemd`).
+    fn cgroup_path(&self, pid: u32) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        let text =
+            fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+        let path = text
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .or_else(|| {
+                text.lines()
+                    .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p))
+            })?
+            .trim();
+        path.starts_with('/').then(|| path.to_string())
+    }
+
+    /// `PPid:` of `/proc/<pid>/status`.
+    fn proc_ppid(&self, pid: u32) -> Option<u32> {
+        let text =
+            fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status")).ok()?;
+        parse_ppid(&text)
     }
 
     /// Review 52: [`Self::is_interactive_admin`] for the posture's
@@ -2214,5 +2306,113 @@ mod tests {
         assert!(!id("/usr/lib/systemd/systemd-logindx").is_client(&["systemd-logind"]));
         assert!(!id("/tmp/systemd-networkd").is_client(&["systemd-network"]));
         assert!(!id("/tmp/systemd-networkd").is_known_binary(&["systemd-network"]));
+    }
+
+    /// `/proc/<pid>/cgroup` with the unified hierarchy's line.
+    fn write_cgroup(dir: &Path, pid: u32, path: &str) {
+        let pid_dir = dir.join(pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("cgroup"), format!("0::{path}\n")).unwrap();
+    }
+
+    /// External audit POS-005: a workload is its unit — a service with
+    /// what it delegates below it, a container's scope — or, without a
+    /// unit in the path, the path itself.
+    #[test]
+    fn a_cgroup_path_names_its_deepest_unit() {
+        for (path, workload) in [
+            ("/system.slice/puppet.service", "/system.slice/puppet.service"),
+            (
+                "/system.slice/containerd.service/payload",
+                "/system.slice/containerd.service",
+            ),
+            (
+                "/system.slice/docker-0123abcd.scope",
+                "/system.slice/docker-0123abcd.scope",
+            ),
+            (
+                "/machine.slice/libpod-0123abcd.scope/container",
+                "/machine.slice/libpod-0123abcd.scope",
+            ),
+            (
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-ab.scope",
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-ab.scope",
+            ),
+            ("/docker/0123abcd", "/docker/0123abcd"),
+            ("/", "/"),
+        ] {
+            assert_eq!(workload_of_cgroup(path), workload, "{path}");
+        }
+        assert_ne!(
+            workload_of_cgroup("/system.slice/docker-aaaa.scope"),
+            workload_of_cgroup("/system.slice/docker-bbbb.scope"),
+            "two containers are two workloads"
+        );
+    }
+
+    /// External audit POS-005: a running process answers for itself; an
+    /// exited one through its nearest running ancestor (it started in its
+    /// parent's cgroup); nothing running to read leaves it unplaced. A v1
+    /// host's `name=systemd` hierarchy is read when there is no unified one.
+    #[test]
+    fn the_workload_is_read_from_the_nearest_running_process() {
+        let tmp = TempDir::new().unwrap();
+        write_cgroup(tmp.path(), 300, "/system.slice/salt-minion.service");
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(300, 1, "/usr/bin/python3", 1);
+        t.ingest_spawn(301, 300, "/usr/bin/sh", 2); // exited
+        t.ingest_spawn(400, 1, "/usr/bin/sh", 3); // exited, parent init
+        assert_eq!(
+            t.session_workload(300).as_deref(),
+            Some("/system.slice/salt-minion.service")
+        );
+        assert_eq!(
+            t.session_workload(301).as_deref(),
+            Some("/system.slice/salt-minion.service")
+        );
+        assert_eq!(t.session_workload(400), None);
+        assert_eq!(t.session_workload(999), None, "never seen");
+
+        let pid_dir = tmp.path().join("500");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(
+            pid_dir.join("cgroup"),
+            "12:pids:/system.slice/cron.service\n1:name=systemd:/system.slice/cron.service\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.session_workload(500).as_deref(),
+            Some("/system.slice/cron.service")
+        );
+    }
+
+    /// External audit POS-005: the agent's containment cgroups hold
+    /// processes of unrelated workloads; a process there is placed by its
+    /// nearest running ancestor outside them, or not at all.
+    #[test]
+    fn a_contained_process_is_placed_by_its_parent() {
+        let tmp = TempDir::new().unwrap();
+        write_cgroup(tmp.path(), 600, "/system.slice/nginx.service");
+        write_cgroup(tmp.path(), 601, "/northnarrow.slice/blocked.scope");
+        write_cgroup(
+            tmp.path(),
+            602,
+            "/northnarrow.slice/blocked.scope/neutralize-77-1",
+        );
+        write_cgroup(tmp.path(), 700, "/northnarrow.slice/throttled.scope");
+        write_status(tmp.path(), 602, 601);
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_spawn(600, 1, "/usr/sbin/nginx", 1);
+        t.ingest_spawn(601, 600, "/usr/bin/sh", 2);
+        t.ingest_spawn(700, 1, "/usr/bin/sh", 3);
+        for pid in [601, 602] {
+            assert_eq!(
+                t.session_workload(pid).as_deref(),
+                Some("/system.slice/nginx.service"),
+                "{pid}"
+            );
+        }
+        assert_eq!(t.session_workload(700), None, "no ancestor outside it");
+        assert!(!in_agent_containment("/northnarrow.slice-other/x.scope"));
     }
 }

@@ -315,7 +315,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         link_exe(tmp.path(), 4300, WD_EXE); // the watchdog's verified binary
         let stack = ExemptPids::with_agent(4242);
-        stack.set_watchdog_pid(4300);
+        stack.set_watchdog(4300, 1);
         let g = guard(tmp.path(), 4242, stack);
         assert_eq!(g.protected_reason(1), Some(ProtectedReason::Init));
         assert_eq!(g.protected_reason(4242), Some(ProtectedReason::AgentSelf));
@@ -333,10 +333,10 @@ mod tests {
         // No watchdog verified yet → PID 5000 is fair game.
         assert_eq!(g.protected_reason(5000), None);
         // Refresh task verifies the watchdog → it becomes protected.
-        stack.set_watchdog_pid(5000);
+        stack.set_watchdog(5000, 1);
         assert_eq!(g.protected_reason(5000), Some(ProtectedReason::Watchdog));
         // Watchdog restart clears the slot → old PID is fair game again.
-        stack.set_watchdog_pid(0);
+        stack.clear_watchdog();
         assert_eq!(g.protected_reason(5000), None);
     }
 
@@ -348,7 +348,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         link_exe(tmp.path(), 5000, "/usr/bin/attacker");
         let stack = ExemptPids::with_agent(10);
-        stack.set_watchdog_pid(5000);
+        stack.set_watchdog(5000, 1);
         let g = guard(tmp.path(), 10, stack);
         assert_eq!(
             g.protected_reason(5000),
@@ -362,7 +362,7 @@ mod tests {
     fn watchdog_pid_with_no_proc_entry_is_not_protected() {
         let tmp = TempDir::new().unwrap();
         let stack = ExemptPids::with_agent(10);
-        stack.set_watchdog_pid(5000); // nothing linked at <tmp>/5000/exe
+        stack.set_watchdog(5000, 1); // nothing linked at <tmp>/5000/exe
         let g = guard(tmp.path(), 10, stack);
         assert_eq!(g.protected_reason(5000), None);
     }

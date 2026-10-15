@@ -4644,10 +4644,16 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
             tick.tick().await;
             let resolution = resolve_verified_watchdog_pid(&pidfile, &expected_exe);
             let new_pid = match &resolution {
-                WatchdogResolution::Verified(p) => Some(*p),
+                WatchdogResolution::Verified { pid, .. } => Some(*pid),
                 _ => None,
             };
             if new_pid == last {
+                // External audit POS-009: the posture exemption follows the
+                // start of the process verified now (a restart that drew the
+                // same PID).
+                if let WatchdogResolution::Verified { pid, start_ticks } = &resolution {
+                    exempt.set_watchdog(*pid, *start_ticks);
+                }
                 continue; // no change — stay quiet on the hot path
             }
             // External audit EBPF-002: one watchdog at a time. While the
@@ -4690,8 +4696,13 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                 }
             }
             match &resolution {
-                WatchdogResolution::Verified(p) => {
-                    exempt.set_watchdog_pid(*p);
+                WatchdogResolution::Verified {
+                    pid: p,
+                    start_ticks,
+                } => {
+                    // External audit POS-009: with its start time — the
+                    // exemption ends with that process, not with its PID.
+                    exempt.set_watchdog(*p, *start_ticks);
                     // BUG-011: register the verified watchdog PID
                     // in PROTECTED_OBSERVERS so the kernel
                     // ptrace_access_check hook allows it to read
@@ -4719,6 +4730,7 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                     ) {
                         Ok(()) => info!(
                             watchdog_pid = *p,
+                            start_ticks = *start_ticks,
                             exe = %expected_exe.display(),
                             "watchdog PID verified; exempting it from posture triggers + \
                              registering in PROTECTED_OBSERVERS (BUG-011)"
@@ -4732,7 +4744,7 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                     }
                 }
                 WatchdogResolution::NotPresent => {
-                    exempt.set_watchdog_pid(0);
+                    exempt.clear_watchdog();
                     // BUG-011: withdraw observer rights on watchdog
                     // teardown so a recycled PID can't inherit them.
                     if let Some(prev) = last {
@@ -4746,7 +4758,7 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                     );
                 }
                 WatchdogResolution::InvalidPidfile { reason } => {
-                    exempt.set_watchdog_pid(0);
+                    exempt.clear_watchdog();
                     if let Some(prev) = last {
                         let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
                             bpffs_root, prev,
@@ -4755,7 +4767,7 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                     warn!(%reason, "watchdog pidfile unparseable; watchdog exemption cleared");
                 }
                 WatchdogResolution::Unverifiable { pid, reason } => {
-                    exempt.set_watchdog_pid(0);
+                    exempt.clear_watchdog();
                     if let Some(prev) = last {
                         let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
                             bpffs_root, prev,
@@ -4764,7 +4776,7 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
                     warn!(pid, %reason, "watchdog exe verification failed; exemption cleared");
                 }
                 WatchdogResolution::ExeMismatch { pid, resolved } => {
-                    exempt.set_watchdog_pid(0);
+                    exempt.clear_watchdog();
                     if let Some(prev) = last {
                         let _ = northnarrow_agent::anti_tamper::evict_protected_observer(
                             bpffs_root, prev,

@@ -11,8 +11,36 @@ use common::ade_types::{
 use common::posture_types::{PostureKind, TriggerType};
 use common::Event;
 
-use super::triggers::testutil::{file_open, fs_protect_denial, spawn, tcp_v4};
+use super::triggers::testutil::{file_open, fs_protect_denial, spawn, spawn_exe_flags, tcp_v4};
 use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
+
+/// External audit POS-005: `/proc/<pid>` of a process with no login uid
+/// whose cgroup is `cgroup` (a systemd service, a container).
+fn workload_proc(dir: &std::path::Path, pid: u32, cgroup: &str) {
+    let d = dir.join(pid.to_string());
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+    std::fs::write(d.join("loginuid"), "4294967295").unwrap();
+}
+
+/// A machine reading the fixture `/proc` at `dir`.
+fn machine_on(dir: &std::path::Path) -> PostureMachine {
+    PostureMachine::new_with_hooks_and_exempt_and_auth(
+        Arc::new(|| {}),
+        Arc::new(|_| {}),
+        ExemptPids::default(),
+        AuthSessionTracker::new(dir),
+    )
+}
+
+/// External audit POS-005: a machine whose pid 42 runs in one service
+/// (a signal that cannot be placed corroborates nothing).
+fn machine_with_pid_42_in_a_unit() -> (tempfile::TempDir, PostureMachine) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 42, "/system.slice/app.service");
+    let m = machine_on(tmp.path());
+    (tmp, m)
+}
 
 /// BUG-032 — an exfiltration burst: 21 connects (focal + 20) by one pid
 /// to a public dst on 443 → `ExfiltrationPattern` (a NeedsCorroboration
@@ -410,7 +438,7 @@ fn telemetry_loss_targets_alerted_and_never_corroborates() {
 /// user produces — are one kind of behaviour and stay at ENGAGED.
 #[test]
 fn unprivileged_pair_does_not_reach_combat() {
-    let m = PostureMachine::new();
+    let (_tmp, m) = machine_with_pid_42_in_a_unit();
     let (ef, er) = exfil_burst(42);
     m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
@@ -424,13 +452,13 @@ fn unprivileged_pair_does_not_reach_combat() {
     );
 }
 
-/// External audit POS-001: evidence of another kind — a binary run from
-/// /tmp, then an exfiltration burst — still corroborates to COMBAT, but
-/// an unlocked one: heuristics alone never let the ladder isolate.
+/// External audit POS-001: evidence of another kind — an offensive tool
+/// run, then an exfiltration burst — still corroborates to COMBAT, but an
+/// unlocked one: heuristics alone never let the ladder isolate.
 #[test]
 fn cross_class_pair_reaches_unlocked_combat() {
-    let m = PostureMachine::new();
-    m.observe(&spawn(42, 1, "evil", "/tmp/evil", 1), &[]);
+    let (_tmp, m) = machine_with_pid_42_in_a_unit();
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 
     let (ef, er) = exfil_burst(42);
@@ -457,8 +485,8 @@ fn decisive_plus_heuristic_reaches_combat() {
 /// unprivileged user cannot produce arrives — here a kernel denial.
 #[test]
 fn unlocked_combat_locks_on_decisive_evidence() {
-    let m = PostureMachine::new();
-    m.observe(&spawn(42, 1, "evil", "/tmp/evil", 1), &[]);
+    let (_tmp, m) = machine_with_pid_42_in_a_unit();
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
     let (ef, er) = exfil_burst(42);
     m.observe(&ef, &er);
     assert!(!m.is_combat_locked());
@@ -476,9 +504,11 @@ fn root_system_file_change_locks_combat() {
         (0, "/etc/systemd/system/evil.service", true),
         (1000, "/var/spool/cron/crontabs/u", false),
     ] {
-        let m = machine_with_isolated_auth();
+        let tmp = tempfile::TempDir::new().unwrap();
+        workload_proc(tmp.path(), 900, "/system.slice/cryptor.service");
+        let m = machine_on(tmp.path());
         let _ = m.observe(&spawn(900, 1, "cryptor", "/usr/local/bin/cryptor", 1), &[]);
-        let _ = m.observe(&spawn(901, 900, "x", "/tmp/x", 2), &[]);
+        let _ = m.observe(&spawn(901, 900, "nc", "/usr/bin/nc", 2), &[]);
         assert_eq!(m.current_kind(), PostureKind::Engaged);
         let _ = m.observe(&file_open(900, uid, path, 1, 300), &[]);
         assert_eq!(m.current_kind(), PostureKind::Combat, "{path}");
@@ -496,13 +526,13 @@ fn unlocked_combat_decays_once_quiet() {
 
     use super::transitions::COMBAT_QUIET_WINDOW;
 
-    let m = PostureMachine::new();
+    let (_tmp, m) = machine_with_pid_42_in_a_unit();
     let decays = Arc::new(AtomicUsize::new(0));
     let d = Arc::clone(&decays);
     m.on_combat_decay(Arc::new(move || {
         d.fetch_add(1, Ordering::SeqCst);
     }));
-    m.observe(&spawn(42, 1, "evil", "/tmp/evil", 1), &[]);
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
     let (ef, er) = exfil_burst(42);
     m.observe(&ef, &er);
     assert_eq!(m.current_kind(), PostureKind::Combat);
@@ -796,12 +826,11 @@ fn sudo_cascade_e2e_stays_at_observing() {
     );
 }
 
-/// Test #16 — exec-from-/tmp still escalates (now to ENGAGED).
+/// Test #16 — exec-from-/tmp still escalates (to ENGAGED).
 /// Negative control: a non-auth-mediated exec from /tmp must still
-/// trip ConfirmedIntrusion via the exec-from-/tmp arm — the lineage
-/// gate must NOT be too broad. BUG-032: as a single NeedsCorroboration
-/// signal it now caps at ENGAGED (alert); COMBAT needs a second
-/// distinct signal (see `corroborated_pair_reaches_combat`).
+/// raise the posture — the lineage gate must NOT be too broad. External
+/// audit POS-015: it is a staging exec (ENGAGED); with a second factor it
+/// is ConfirmedIntrusion, which also stops at ENGAGED alone (BUG-032).
 #[test]
 fn ransomware_shape_reaches_engaged_alone() {
     let m = machine_with_isolated_auth();
@@ -842,7 +871,9 @@ fn mass_write_alone_from_non_auth_pid_reaches_engaged() {
 /// signals do not corroborate each other; only a prior ledger entry does.
 #[test]
 fn two_blunt_combat_signals_in_one_round_cap_at_engaged() {
-    let m = machine_with_isolated_auth();
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 900, "/system.slice/zsh-job.service");
+    let m = machine_on(tmp.path());
     let _ = m.observe(&spawn(900, 1, "zsh", "/usr/bin/zsh", 1), &[]);
     assert_eq!(m.current_kind(), PostureKind::Observing);
 
@@ -872,8 +903,10 @@ fn two_blunt_combat_signals_in_one_round_cap_at_engaged() {
     let _ = m.observe(&focal2, &recent);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
     // …while evidence of another kind, with the earlier rounds' signals in
-    // the ledger, is the legitimate corroboration path and reaches COMBAT.
-    let _ = m.observe(&spawn(901, 900, "x", "/tmp/x", 400), &[]);
+    // the ledger, is the legitimate corroboration path and reaches COMBAT
+    // (external audit POS-015: a staged binary unlinked as it ran).
+    let deleted = common::wire::exe::exe_flags::DELETED;
+    let _ = m.observe(&spawn_exe_flags(901, 900, "/tmp/x", deleted, 400), &[]);
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
@@ -958,12 +991,12 @@ fn corroboration_is_scoped_to_the_login_session() {
         )
     };
 
-    // Session A (uid 1000): a binary run from /tmp → ENGAGED, ledger
-    // entry scoped to 1000. Session B (uid 1001): a $HOME burst — evidence
-    // of another kind (external audit POS-001) — must NOT be vouched for
-    // by A's signal.
+    // Session A (uid 1000): an offensive tool run → ENGAGED, ledger entry
+    // scoped to 1000. Session B (uid 1001): a $HOME burst — evidence of
+    // another kind (external audit POS-001) — must NOT be vouched for by
+    // A's signal.
     let m = mk();
-    m.observe(&spawn(900, 1, "x", "/tmp/x", 50), &[]);
+    m.observe(&spawn(900, 1, "nc", "/usr/bin/nc", 50), &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
     let (recent, focal) = burst(901, "/home/b", 300);
     m.observe(&focal, &recent);
@@ -975,7 +1008,7 @@ fn corroboration_is_scoped_to_the_login_session() {
 
     // Same session for both rounds: legitimate corroboration → COMBAT.
     let m = mk();
-    m.observe(&spawn(900, 1, "x", "/tmp/x", 50), &[]);
+    m.observe(&spawn(900, 1, "nc", "/usr/bin/nc", 50), &[]);
     let (recent, focal) = burst(900, "/home/a", 300);
     m.observe(&focal, &recent);
     assert_eq!(m.current_kind(), PostureKind::Combat);
@@ -1177,11 +1210,14 @@ fn snapd_refresh_e2e_stays_at_observing() {
 /// NON-daemon pid still raises both signals. External audit POS-001: they
 /// are one kind of evidence (file system), so together they stay at
 /// ENGAGED; evidence of another kind from the same actor — a binary run
-/// from /tmp — then reaches COMBAT, locked because root changed a system
-/// file outside an administrator's session.
+/// from /tmp and unlinked as it ran (external audit POS-015: a plain /tmp
+/// exec is no longer enough) — then reaches COMBAT, locked because root
+/// changed a system file outside an administrator's session.
 #[test]
 fn non_daemon_masswrite_plus_persistence_reaches_combat() {
-    let m = machine_with_isolated_auth();
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 900, "/system.slice/cryptor.service");
+    let m = machine_on(tmp.path());
     // Non-daemon writer, clean lineage (parent = init).
     let _ = m.observe(&spawn(900, 1, "cryptor", "/usr/local/bin/cryptor", 1), &[]);
 
@@ -1200,13 +1236,18 @@ fn non_daemon_masswrite_plus_persistence_reaches_combat() {
     let _ = m.observe(&unit, &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
 
-    // 3. the writer runs a binary from /tmp → evidence of another kind.
-    let r = m.observe(&spawn(901, 900, "x", "/tmp/x", 400), &[]);
+    // 3. the writer runs a binary from /tmp: a staging exec, which is no
+    //    corroboration…
+    let _ = m.observe(&spawn(901, 900, "x", "/tmp/x", 400), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    // …and one unlinked as it ran → evidence of another kind.
+    let deleted = common::wire::exe::exe_flags::DELETED;
+    let r = m.observe(&spawn_exe_flags(902, 900, "/tmp/x", deleted, 450), &[]);
     assert!(r.is_some(), "exec from /tmp must transition");
     assert_eq!(
         m.current_kind(),
         PostureKind::Combat,
-        "file-system evidence + an exec from /tmp must corroborate to COMBAT"
+        "file-system evidence + an unlinked exec from /tmp must corroborate to COMBAT"
     );
     assert!(m.is_combat_locked(), "root wrote the unit: locked");
 }
@@ -1460,4 +1501,168 @@ fn a_refused_read_of_the_signing_key_alerts_without_combat() {
     }
     m.observe(&read, &[]);
     assert_eq!(m.current_kind(), PostureKind::Alerted);
+}
+
+// ─── External audit POS-015 — a staging-directory exec ──────────────
+
+/// A build in a login session: pip's sdist runs configure, whose
+/// `conftest` runs from /tmp; then the session uploads the result. The
+/// exec raises ENGAGED as a `StagingExec`, is not recorded, and the
+/// upload is not corroborated by it (was: COMBAT, and NEUTRALIZE killed
+/// the upload).
+#[test]
+fn a_staging_exec_raises_engaged_and_is_not_recorded() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    session_proc(tmp.path(), 700, 1);
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(700, 1, "bash", "/usr/bin/bash", 1), &[]);
+    let _ = m.observe(&spawn(770, 700, "twine", "/usr/bin/python3", 2), &[]);
+    let conftest = spawn(760, 700, "conftest", "/tmp/pip-install-x/pkg/conftest", 3);
+    let r = m.observe(&conftest, &[]);
+    assert_eq!(
+        r.map(|(state, firing)| (state.kind(), firing)),
+        Some((PostureKind::Engaged, Some(TriggerType::StagingExec)))
+    );
+    assert_eq!(m.corroboration_len(), 0, "a staging exec is not recorded");
+    let (ef, er) = exfil_burst(770);
+    assert!(m.observe(&ef, &er).is_none());
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// The same build run through sudo in an administrator's terminal: sudo
+/// gives no free pass, and no extra weight either.
+#[test]
+fn an_admin_sessions_build_and_upload_stay_engaged() {
+    let (_tmp, m) = admin_session_machine();
+    let _ = m.observe(&spawn(750, 710, "make", "/usr/bin/make", 1), &[]);
+    let r = m.observe(
+        &spawn(751, 750, "conftest", "/tmp/cc-build/conftest", 2),
+        &[],
+    );
+    assert_eq!(
+        r.and_then(|(_, firing)| firing),
+        Some(TriggerType::StagingExec)
+    );
+    let (ef, er) = exfil_burst(810);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// A package manager's maintainer script runs a helper it unpacked in /tmp
+/// (unlinked as it runs), then the same unit downloads: ENGAGED only.
+#[test]
+fn a_package_managers_staged_helper_stays_engaged() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let unit = "/system.slice/unattended-upgrades.service";
+    for pid in [300, 310] {
+        workload_proc(tmp.path(), pid, unit);
+    }
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(300, 1, "dpkg", "/usr/bin/dpkg", 1), &[]);
+    let deleted = common::wire::exe::exe_flags::DELETED;
+    let r = m.observe(
+        &spawn_exe_flags(301, 300, "/tmp/dpkg-helper", deleted, 2),
+        &[],
+    );
+    assert_eq!(
+        r.and_then(|(_, firing)| firing),
+        Some(TriggerType::StagingExec)
+    );
+    let _ = m.observe(
+        &spawn(310, 1, "https", "/usr/lib/apt/methods/https", 3),
+        &[],
+    );
+    let (ef, er) = exfil_burst(310);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+// ─── External audit POS-005 — scope of a process without a login uid ──
+
+/// puppet (a root daemon, no administrator's session) rewrites a unit:
+/// privileged file-system evidence in `puppet.service` → ENGAGED.
+fn puppet_wrote_a_unit() -> (tempfile::TempDir, PostureMachine) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 300, "/system.slice/puppet.service");
+    for pid in [400, 401] {
+        workload_proc(tmp.path(), pid, "/system.slice/docker-0123abcd.scope");
+    }
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(300, 1, "ruby", "/usr/bin/ruby", 1), &[]);
+    let _ = m.observe(&spawn(400, 1, "python3", "/usr/bin/python3", 2), &[]);
+    let _ = m.observe(
+        &file_open(300, 0, "/etc/systemd/system/backup.service", 1, 10),
+        &[],
+    );
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    (tmp, m)
+}
+
+/// A container's exfiltration burst is another actor's: it is not
+/// corroborated by puppet's change (was: COMBAT, locked by it). Two
+/// signals of the container itself still corroborate — unlocked.
+#[test]
+fn two_daemons_do_not_corroborate_into_combat() {
+    let (_tmp, m) = puppet_wrote_a_unit();
+    let (ef, er) = exfil_burst(400);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    let _ = m.observe(&spawn(401, 400, "nc", "/usr/bin/nc", 20), &[]);
+    let (ef, er) = exfil_burst(400);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(
+        !m.is_combat_locked(),
+        "the container did not change a system file"
+    );
+}
+
+/// With the container's COMBAT running unlocked, puppet rewriting another
+/// unit does not lock it — nothing of puppet's pairs with that change
+/// (was: locked, no decay, isolation if NEUTRALIZE failed). puppet's own
+/// burst then pairs with its root change: locked.
+#[test]
+fn a_root_change_locks_only_its_own_units_combat() {
+    let (_tmp, m) = puppet_wrote_a_unit();
+    let _ = m.observe(&spawn(401, 400, "nc", "/usr/bin/nc", 20), &[]);
+    let (ef, er) = exfil_burst(400);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+
+    let _ = m.observe(
+        &file_open(300, 0, "/etc/systemd/system/backup2.service", 1, 30),
+        &[],
+    );
+    assert!(!m.is_combat_locked(), "another unit's root change");
+    let (ef, er) = exfil_burst(300);
+    let _ = m.observe(&ef, &er);
+    assert!(
+        m.is_combat_locked(),
+        "puppet's own pair, with its root change"
+    );
+}
+
+/// A root change whose writer and every ancestor the agent knows have
+/// exited cannot be placed: recorded, but it corroborates nothing and
+/// locks nothing.
+#[test]
+fn an_unplaced_root_change_corroborates_nothing() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 400, "/system.slice/docker-0123abcd.scope");
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(500, 1, "sh", "/usr/bin/sh", 1), &[]);
+    let _ = m.observe(&file_open(500, 0, "/etc/cron.d/job", 1, 2), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    assert_eq!(m.corroboration_len(), 1, "recorded");
+    let (ef, er) = exfil_burst(400);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (ef, er) = exfil_burst(501);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "nor another unplaced one"
+    );
 }
