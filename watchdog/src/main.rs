@@ -32,8 +32,10 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    agent_argv_from_proc, classify_ping_error, respawn_agent, select_backend, systemd_is_booted,
-    PingFailure, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER, SYSTEMD_RUNTIME_DIR,
+    agent_argv_from_proc, classify_ping_error, hold_record_path, off_runtime, ping_ticker,
+    record_hold, respawn_agent_off_runtime, select_backend, systemctl_unit_state,
+    systemd_is_booted, PingFailure, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
+    SYSTEMD_RUNTIME_DIR, UNIT_STATE_TIMEOUT,
 };
 use northnarrow_watchdog::{
     check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
@@ -126,7 +128,14 @@ async fn run(cli: Cli) -> Result<()> {
         cli.respawn_backend,
         systemd_is_booted(std::path::Path::new(SYSTEMD_RUNTIME_DIR)),
         &cli.agent_unit,
-        || exec_argv(agent_pid, cli.agent_bin.as_deref(), &cli.agent_pidfile),
+        || {
+            exec_argv(
+                agent_pid,
+                cli.agent_bin.as_deref(),
+                &agent_bin,
+                &cli.agent_pidfile,
+            )
+        },
     )?;
 
     write_pidfile_atomic(&cli.pidfile, own_pid)
@@ -318,12 +327,21 @@ async fn run(cli: Cli) -> Result<()> {
                     } => {
                         log_tamper_suspected(attempts_in_window, window);
                         // External audit WDG-004: hold, never exit 0.
+                        let held = Hold {
+                            why: "agent restart ceiling tripped (tamper suspected)",
+                            detail: format!(
+                                "{attempts_in_window} restarts in the last {} s",
+                                window.as_secs()
+                            ),
+                            agent_pid,
+                        };
                         match hold(
                             &cli,
+                            &backend,
                             &mut sigint,
                             &mut sigterm,
                             &mut stuck_rx,
-                            "agent restart ceiling tripped (tamper suspected)",
+                            held,
                             &agent_bin,
                         )
                         .await
@@ -359,15 +377,27 @@ async fn run(cli: Cli) -> Result<()> {
                 // doesn't immediately read the dead PID.
                 let _ = std::fs::remove_file(&cli.agent_pidfile);
 
-                match respawn_cycle(
-                    &backend,
-                    &cli.agent_pidfile,
-                    &cli.bpffs_root,
-                    attempt,
-                    &agent_bin,
-                )
-                .await
-                {
+                // External audit WDG-009: a stop request is honoured while
+                // the respawn runs (the start job, then up to 30 s for the
+                // new agent's pidfile), not after it.
+                let respawned = tokio::select! {
+                    r = respawn_cycle(
+                        &backend,
+                        &cli.agent_pidfile,
+                        &cli.bpffs_root,
+                        attempt,
+                        &agent_bin,
+                    ) => r,
+                    _ = sigint.recv() => {
+                        info!(target: "watchdog", signal = "SIGINT", "shutting down during respawn");
+                        break 'restart_loop;
+                    }
+                    _ = sigterm.recv() => {
+                        info!(target: "watchdog", signal = "SIGTERM", "shutting down during respawn");
+                        break 'restart_loop;
+                    }
+                };
+                match respawned {
                     Ok((new_pid, new_fd)) => {
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
@@ -391,12 +421,18 @@ async fn run(cli: Cli) -> Result<()> {
                         // WDG-004: hold until the agent runs again,
                         // rather than exit 0 and leave the host with
                         // neither agent nor watchdog.
+                        let held = Hold {
+                            why: "agent respawn failed",
+                            detail: format!("{e:#}"),
+                            agent_pid,
+                        };
                         match hold(
                             &cli,
+                            &backend,
                             &mut sigint,
                             &mut sigterm,
                             &mut stuck_rx,
-                            "agent respawn failed",
+                            held,
                             &agent_bin,
                         )
                         .await
@@ -459,30 +495,18 @@ enum SelectOutcome {
     StaleStuck(u32),
 }
 
-/// Reconstruct the agent's argv from its running PID. For W4
-/// without systemd `ExecStart=` introspection (that lands in
-/// W7), we capture the binary path from `/proc/<pid>/exe`
-/// realpath + emit a minimal `--pid-file` argv so the respawned
-/// agent writes to the same pidfile we'll wait on. Future W7
-/// commit reads the systemd unit's actual ExecStart.
-///
-/// BUG-011 (PHASE 15.1): the readlink can fail with EACCES until
-/// the agent's `spawn_watchdog_exempt_refresh` timer has
-/// registered the watchdog PID into PROTECTED_OBSERVERS.
-/// Retry with a 1 s cadence for up to 60 s before giving up —
-/// the agent's timer fires every 30 s, so 60 s is two ticks of
-/// budget. Production systemd units pass `--agent-bin` to skip
-/// this path entirely; the retry is the safety net for dev /
-/// manual installs.
 /// Argv for the exec backend: the agent's full `/proc/<pid>/cmdline`
 /// (with `--agent-bin` overriding argv[0]); if /proc is unreadable
 /// (observer registration not yet arrived), fall back to the legacy
 /// minimal reconstruction so a non-systemd host still gets SOME
 /// respawn rather than none — logged loudly, because that argv drops
-/// every flag.
+/// every flag. External audit WDG-009: the fallback names `verified_bin`,
+/// the binary the agent was just verified to run (WDG-003); it no longer
+/// re-reads `/proc/<pid>/exe` in a 60 s `std::thread::sleep` loop.
 fn exec_argv(
     agent_pid: u32,
     agent_bin: Option<&std::path::Path>,
+    verified_bin: &std::path::Path,
     pidfile: &std::path::Path,
 ) -> Result<Vec<String>> {
     match agent_argv_from_proc(agent_pid, agent_bin) {
@@ -494,46 +518,11 @@ fn exec_argv(
                 "full argv capture from /proc failed — falling back to minimal argv \
                  (flags such as --detect-only / --admin-pub will NOT survive a respawn)"
             );
-            match agent_bin {
-                Some(bin) => Ok(vec![
-                    bin.to_string_lossy().into_owned(),
-                    "--pid-file".to_string(),
-                    pidfile.to_string_lossy().into_owned(),
-                ]),
-                None => derive_agent_argv(agent_pid, pidfile),
-            }
-        }
-    }
-}
-
-fn derive_agent_argv(agent_pid: u32, pidfile: &std::path::Path) -> Result<Vec<String>> {
-    let exe_path = format!("/proc/{agent_pid}/exe");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        match std::fs::read_link(&exe_path) {
-            Ok(exe) => {
-                let bin = exe.to_string_lossy().into_owned();
-                return Ok(vec![
-                    bin,
-                    "--pid-file".to_string(),
-                    pidfile.to_string_lossy().into_owned(),
-                ]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "reading {exe_path} for argv reconstruction: EACCES persisted past 60s \
-                         deadline (agent's PROTECTED_OBSERVERS registration did not arrive — \
-                         pass --agent-bin in the systemd unit to bypass)"
-                    ));
-                }
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("reading {exe_path} for argv reconstruction"))
-            }
+            Ok(vec![
+                verified_bin.to_string_lossy().into_owned(),
+                "--pid-file".to_string(),
+                pidfile.to_string_lossy().into_owned(),
+            ])
         }
     }
 }
@@ -560,12 +549,28 @@ async fn respawn_cycle(
     // handle dropped (death is observed via the new pidfd, never
     // waitpid — Child::drop is a no-op on Unix). Either way readiness
     // is the pidfile below, written after every LSM hook is attached.
-    respawn_agent(backend)?;
+    // External audit WDG-009: off the runtime's only thread.
+    respawn_agent_off_runtime(backend)
+        .await
+        .context("starting the agent")?;
 
     // External audit WDG-003: the new agent is verified before it is
-    // protected or watched.
+    // protected or watched. External audit DEP-004: a queued start job
+    // proves nothing — the unit may fail its bpffs pre-flight, be skipped or
+    // be stopped before it runs; the missing pidfile is what says so.
     let (new_pid, new_fd) =
-        open_agent_pidfd_with_retry(pidfile, NEW_AGENT_PIDFILE_DEADLINE, agent_bin).await?;
+        open_agent_pidfd_with_retry(pidfile, NEW_AGENT_PIDFILE_DEADLINE, agent_bin)
+            .await
+            .with_context(|| match backend {
+                RespawnBackend::SystemdUnit { unit } => format!(
+                    "start job for {unit} queued, but no agent within {} s",
+                    NEW_AGENT_PIDFILE_DEADLINE.as_secs()
+                ),
+                RespawnBackend::ForkExec { .. } => format!(
+                    "agent spawned, but no verified pidfile within {} s",
+                    NEW_AGENT_PIDFILE_DEADLINE.as_secs()
+                ),
+            })?;
 
     // Defensive reinsert — never for an agent that already exited (its pid
     // would wait in PROTECTED_PIDS for reuse). Failure here just widens
@@ -590,6 +595,15 @@ async fn respawn_cycle(
     Ok((new_pid, new_fd))
 }
 
+/// Why the watchdog holds ([`hold`]).
+struct Hold {
+    why: &'static str,
+    /// The error or count behind it.
+    detail: String,
+    /// The last agent supervised.
+    agent_pid: u32,
+}
+
 /// External audit WDG-004: the watchdog never exits on the restart
 /// ceiling or a failed respawn. It exited 0 there, and the unit's
 /// `Restart=on-failure` neither restarted it nor marked it failed: agent
@@ -597,25 +611,75 @@ async fn respawn_cycle(
 /// PROTECTED_PIDS, `DEGRADED` in `systemctl status` — until an operator
 /// starts the agent again, then supervises it with a fresh restart
 /// window. `None` when the watchdog is told to stop meanwhile.
+///
+/// External audit DEP-004: each hold is also recorded for the agent's
+/// signed audit chain ([`record_hold`]) — with the agent unit's state on a
+/// systemd host — and signed as an `integrity_drift` (`watchdog_hold`) at
+/// the agent's next start. The journal line alone stayed on this host.
 async fn hold(
     cli: &Cli,
+    backend: &RespawnBackend,
     sigint: &mut Signal,
     sigterm: &mut Signal,
     stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
-    why: &str,
+    held: Hold,
     agent_bin: &std::path::Path,
 ) -> Option<(u32, OwnedFd)> {
+    let why = held.why;
     // Once the dead agent's PID is reused its pidfile would read as live.
     let _ = std::fs::remove_file(&cli.agent_pidfile);
     sd_notify_status(&format!(
         "DEGRADED: {why} — not respawning the agent; start northnarrow-agent once investigated"
     ));
+    let unit_state = match backend {
+        RespawnBackend::SystemdUnit { unit } => {
+            let unit = unit.clone();
+            match tokio::time::timeout(
+                UNIT_STATE_TIMEOUT,
+                off_runtime(move || systemctl_unit_state(&unit)),
+            )
+            .await
+            {
+                Ok(Ok(state)) => Some(state),
+                Ok(Err(e)) => {
+                    warn!(target: "watchdog", error = %e, "agent unit state unavailable");
+                    None
+                }
+                Err(_) => {
+                    warn!(target: "watchdog", "systemctl show timed out; hold recorded without the unit state");
+                    None
+                }
+            }
+        }
+        RespawnBackend::ForkExec { .. } => None,
+    };
     error!(
         target: "watchdog.tamper",
         why,
+        detail = %held.detail,
+        unit_state = unit_state.as_deref().unwrap_or("-"),
         "watchdog HOLDING: alive and protected, not respawning the agent until an operator \
          starts it"
     );
+    let record = common::watchdog_hold::HoldRecord {
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        agent_pid: held.agent_pid,
+        reason: why.to_string(),
+        detail: held.detail,
+        unit_state,
+    };
+    let path = hold_record_path(&cli.shutdown_marker);
+    if let Err(e) = record_hold(&path, &record) {
+        warn!(
+            target: "watchdog.tamper",
+            error = %e,
+            path = %path.display(),
+            "could not record the hold for the agent's audit chain; the journal line above is the only trace"
+        );
+    }
     let shutdown = async {
         tokio::select! {
             _ = sigint.recv() => "SIGINT",
@@ -685,7 +749,9 @@ async fn run_ping_loop(
     stuck_tx: tokio::sync::mpsc::Sender<u32>,
     mut agent: tokio::sync::watch::Receiver<u32>,
 ) {
-    let mut tick = tokio::time::interval(STATUS_PING_INTERVAL);
+    // External audit WDG-009: `Delay`, so a stall never fires two pings
+    // back to back.
+    let mut tick = ping_ticker(STATUS_PING_INTERVAL);
     // `interval()` fires immediately on first tick — skip that
     // so the watchdog isn't immediately pinging the agent
     // mid-boot (before the agent's admin socket is even bound).

@@ -321,6 +321,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |
 | `weakening_env` | the agent started with a variable that turns a protection off or cuts the evidence it keeps (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, `NN_DETECT_ONLY=1/true/yes`, `NN_ADE_ALLOW_MOCK=1`, a `NN_TELEMETRY_PROBE_SECS` of 0 or above 60, any `NN_*_CAP_BYTES` override, …) |
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
+| `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004) |
 
 **How the previous run ended.** Some kills cannot be refused at all: a write
 to the unit's `cgroup.kill`, the OOM killer — and a crash or a power loss look

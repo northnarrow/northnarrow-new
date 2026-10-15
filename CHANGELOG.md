@@ -15,6 +15,41 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, agent start and watchdog respawn; RAG and ADE
+  tooling (Medium DEP-004, WDG-009, WDG-011, WDG-R01): the agent unit's
+  bpffs pre-flight was a `ConditionPathIsMountPoint`. Without bpffs at
+  `/sys/fs/bpf` systemd skipped the agent and reported its start job done
+  — "inactive (dead)", nothing in `systemctl --failed` — and the
+  watchdog's `systemctl start --no-block` succeeded the same way. It is now
+  `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf`: the unit fails
+  (`Result: exit-code`), is listed by `systemctl --failed` and the system
+  reads degraded (an `AssertPathIsMountPoint`, the audit's proposal, fails
+  the start job but leaves the unit inactive). Every watchdog hold — a start that brought no agent back within 30 s, a failed
+  `systemctl start`, the restart ceiling — is recorded with the unit's
+  systemd state at `/run/northnarrow/watchdog.hold`, and the agent signs
+  it as an `integrity_drift` (`watchdog_hold`) at its next start; it was a
+  journal line only. **Regression:** a host without bpffs shows a failed
+  agent unit instead of a skipped one, and a host without
+  `/usr/bin/mountpoint` (util-linux) cannot start the agent. The watchdog ran `systemctl start`
+  on its runtime's only thread, so a busy PID 1 stopped the STATUS ping and
+  every timer for up to the D-Bus timeout, and after any stall the ping
+  interval fired its missed ticks back to back: "two timeouts 60 s apart"
+  could be two pings 2 s apart. The respawn now runs on the blocking pool,
+  a stop request is honoured while it runs, missed ping ticks are delayed,
+  and the fallback argv no longer re-reads `/proc/<pid>/exe` in a 60 s
+  blocking sleep. `cargo xtask rag-kb` parsed what it downloaded or found
+  in `--mirror` unchecked, fetched the ATT&CK bundle and licence by tag and
+  the DRL licence from `master`, and labelled the commit-pinned Sigma
+  tarball `master`. Every input is now fetched by commit and must match a
+  pinned SHA-256 before it is parsed, in both modes; `provenance.json`
+  records `input_sha256`; a rebuild whose dumps differ from the committed
+  anchors writes nothing unless `--update-anchors`. The anchors were
+  rebuilt from the verified inputs: the dumps are byte-identical; the Sigma
+  `pin` is now its commit, so `kb_index_hash` changed (`4d335aed…` →
+  `b6cd7d32…`). `ade_attacks` with `NN_ADE_ALLOW_MOCK=1` and a model that
+  did not load scored the mock backend, which never reads the prompt
+  (100 %): it now exits non-zero naming the mock, and the report names the
+  backend next to the rate.
 - External audit, Wave 2, install integrity fails closed (Medium DEP-007,
   DEP-009, DEP-006): `install.sh` stepped its release checks down on its
   own — a tree without `MANIFEST.sha256` installed as a "source tree", so

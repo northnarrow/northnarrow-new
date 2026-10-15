@@ -11,19 +11,15 @@ Documentation=https://github.com/northnarrow/northnarrow-new
 # with an /etc/fstab entry. So `Requires=sys-fs-bpf.mount` and
 # `After=…sys-fs-bpf.mount` are permanently unsatisfiable and abort the
 # start job with "Unit sys-fs-bpf.mount not found". bpffs is always
-# present by the time this unit runs; the ConditionPathIsMountPoint
-# guard below is the real safety check.
+# present by the time this unit runs; the ExecStartPre= mountpoint
+# check in [Service] is the real safety check.
 After=network-online.target
 # Review 82: the agent refuses kexec images; kdump loads its crash kernel
 # first (ignored where kdump is not installed).
 After=kdump.service
 Wants=network-online.target
-# ConditionPathIsMountPoint is a soft pre-flight — units skip
-# their ExecStart if the condition is unmet rather than failing.
-# Pairs with the agent's own warn-and-continue when bpffs isn't
-# usable, so an operator misconfig produces a clear systemd
-# "skipped" status instead of a startup crash.
-ConditionPathIsMountPoint=/sys/fs/bpf
+# External audit DEP-004: no Condition*/Assert* bpffs pre-flight here —
+# see ExecStartPre= in [Service].
 # Respawn v2: the watchdog restarts this unit with `systemctl start`
 # under its own 5-in-60 s backoff ceiling. systemd's default start-rate
 # limiter (5 starts / 10 s) must never veto that, so it is disabled
@@ -51,6 +47,19 @@ Type=notify
 # amplification vectors with one knob, zero customer config. Read NN logs:
 #   journalctl --namespace=northnarrow -u northnarrow-agent
 LogNamespace=northnarrow
+# External audit DEP-004: the bpffs pre-flight fails the unit. It was
+# ConditionPathIsMountPoint=/sys/fs/bpf: unmet, systemd skipped the agent
+# and reported its start job done — "inactive (dead)", nothing in
+# `systemctl --failed`, the system "running" — and the watchdog's
+# `systemctl start --no-block` succeeded the same way. AssertPathIsMountPoint
+# fails the start job but still leaves the unit inactive (dead) (checked on
+# systemd 255), so the check is a command: without bpffs the unit is failed
+# (Result: exit-code), listed by `systemctl --failed`, the system degraded.
+# Without bpffs the agent would run with its anti-tamper maps unpinned.
+# No OnFailure=: no handler unit ships. The watchdog holds when a queued
+# start brings no agent back, and the agent signs that record at its next
+# start.
+ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf
 ExecStart=/usr/local/bin/northnarrow-agent \
     --combat-rules /etc/northnarrow/combat-rules.v4 \
     --combat-rules-v6 /etc/northnarrow/combat-rules.v6 \

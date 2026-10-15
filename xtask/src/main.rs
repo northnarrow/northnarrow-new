@@ -81,6 +81,11 @@ enum Cmd {
         /// Output dir for the (gitignored) canonical JSONL dumps.
         #[arg(long, default_value = "target/kb")]
         out: PathBuf,
+        /// Accept dumps that differ from the committed anchors in
+        /// docs/kb-sources/ and rewrite them (external audit WDG-011:
+        /// without it such a build writes nothing).
+        #[arg(long)]
+        update_anchors: bool,
     },
 }
 
@@ -119,9 +124,13 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
         Cmd::AdeDemo => ade_demo()?,
-        Cmd::RagKb { mirror, out } => {
+        Cmd::RagKb {
+            mirror,
+            out,
+            update_anchors,
+        } => {
             let root = repo_root()?;
-            rag_kb::build(&root, mirror.as_deref(), &out)?;
+            rag_kb::build(&root, mirror.as_deref(), &out, update_anchors)?;
         }
     }
     Ok(())

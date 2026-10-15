@@ -12,7 +12,7 @@ This product's RAG knowledge base is distilled from the pinned third-party sourc
 ## SigmaHQ detection rules (Linux subset, distilled)
 
 - Source: https://github.com/SigmaHQ/sigma
-- Pin: master (commit df5c6a6ecc149e05cb4dea306012668fb2ae5a12)
+- Pin: commit df5c6a6ecc149e05cb4dea306012668fb2ae5a12
 - License: Detection Rule License (DRL) 1.1 — `LICENSES/SIGMA_DRL-1.1.md`
 - Rules are distilled (modified form); per-rule `author` attribution is preserved in the canonical dump's `author` field.
 - Aggregate rule authors (DRL-1.1 attribution):

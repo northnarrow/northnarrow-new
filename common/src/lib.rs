@@ -57,6 +57,9 @@ pub mod rag_types;
 #[cfg(feature = "std")]
 pub mod shutdown_marker;
 
+#[cfg(feature = "std")]
+pub mod watchdog_hold;
+
 /// XAI Saliency Mapping forensic evidence schema (Tappa 6.9, v1.0.0).
 #[cfg(feature = "std")]
 pub mod xai_types;

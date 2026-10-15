@@ -236,10 +236,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-190 | SNS-008 | Sensors | S | fixed (lab PR 128) |
 | NN-AUD-191 | SNS-009 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-192 | WDG-006 | Watchdog tooling | S | already fixed (lab PR 89, with NN-AUD-069) |
-| NN-AUD-193 | WDG-009 | Watchdog tooling | M | open |
-| NN-AUD-194 | WDG-011 | Watchdog tooling | S | open |
-| NN-AUD-195 | WDG-R01 | Watchdog tooling | S | open |
-| NN-AUD-196 | DEP-004 | Deploy | S | open |
+| NN-AUD-193 | WDG-009 | Watchdog tooling | M | fixed (lab PR 149) |
+| NN-AUD-194 | WDG-011 | Watchdog tooling | S | fixed (lab PR 149) |
+| NN-AUD-195 | WDG-R01 | Watchdog tooling | S | fixed (lab PR 149) |
+| NN-AUD-196 | DEP-004 | Deploy | S | fixed (lab PR 149) |
 | NN-AUD-197 | DEP-006 | Deploy | M | fixed (lab PR 148) |
 | NN-AUD-198 | DEP-007 | Deploy | M | fixed (lab PR 148) |
 | NN-AUD-199 | DEP-008 | Deploy | M | fixed (lab PR 150), residual: the rpm signing key and a signed apt repository (operational) |
@@ -3990,3 +3990,79 @@ the audit did not report, noted with the fix that takes them.
     under a user namespace (4 cases); on the base scripts the downgrade
     and foreign-LSM cases fail.
   - Lab: Ubuntu 24.04, install148-probe.sh on main and on this build. DEP-007: a release tree without `MANIFEST.sha256` installed silently as `source-tree` (rc 0) → refused (rc 1) unless `--source-tree`, recorded as `verify_override` and a host-check WARN; manifest-only provenance rc 0 → refused unless `--allow-manifest-only`. DEP-009: the install manifest moved away inside a window → boot `success no-manifest` → `refused no-manifest` ("removed after a verified boot of this install"), exit 78; the documented recovery verified. DEP-006 (Debian 12, a do-nothing `lsm/file_open` program of another vendor loaded with bpftool): main: with that program loaded, `upgrade-check` (rc 1, the drain gave up with the units stopped), `uninstall-check` (FAIL: binaries left) and `pkg-check` (FAIL) all failed; here all three OK and the foreign program still loaded after each. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-196 (DEP-004), NN-AUD-193 (WDG-009), NN-AUD-194 (WDG-011),
+  NN-AUD-195 (WDG-R01), lab PR 149.** The agent start is never skipped
+  silently, the watchdog's respawn path does not block its only thread,
+  and the RAG and ADE tooling measures what it says (batches 2 and 10).
+  - DEP-004: `deploy/systemd/northnarrow-agent.service` checks bpffs with
+    `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` (was
+    `ConditionPathIsMountPoint`): without it the unit is `failed`
+    (`Result: exit-code`), in `systemctl --failed`, the system degraded;
+    it was "inactive (dead)" with the start job reported done. Not the
+    `AssertPathIsMountPoint` the audit and the triage proposed: checked on
+    systemd 255 (user manager, transient and file units), an unmet `Assert*`
+    fails the start job (`JOB_RESULT=assert`, warning "Assertion failed",
+    `systemctl start` exit 1) but leaves the unit inactive (dead), not in
+    `--failed`; the condition skip is an info line with `JOB_RESULT=done`.
+    Regression: a host without `/usr/bin/mountpoint` (util-linux) cannot
+    start the agent. No `OnFailure=` (no handler unit ships). The watchdog's
+    `systemctl start --no-block` still succeeds at enqueue, so the evidence
+    is the hold that follows: the respawn error now says "start job for
+    northnarrow-agent.service queued, but no agent within 30 s", and every
+    hold (that one, a failed `systemctl start`, the restart ceiling) is
+    appended as a JSON line (`common::watchdog_hold::HoldRecord`: time, last
+    agent pid, reason, error, and on a systemd host `systemctl show`'s
+    `ActiveState SubState Result ConditionResult AssertResult`, 5 s bound)
+    at `/run/northnarrow/watchdog.hold`, 0600, `O_NOFOLLOW` — the WDG-001
+    `agent.shutdown_rejected` pattern. The self-integrity check reads it
+    each round, signs one `integrity_drift` (`watchdog_hold`) per line and
+    removes it. The file is on tmpfs: a reboot before the agent runs again
+    drops it. Not covered: a watchdog that finds no agent at its own start
+    (boot without bpffs) still exits and is restarted by systemd, with the
+    agent unit now `failed`.
+  - WDG-009: `respawn_agent` (the `systemctl` call or the fork-exec) runs on
+    tokio's blocking pool (`off_runtime`, `spawn_blocking`; the `rt` feature
+    already has it). The respawn is raced against SIGINT/SIGTERM like the
+    backoff sleep, so a stop is honoured during the start job and the 30 s
+    pidfile wait (an in-flight `systemctl` still finishes on its thread).
+    The STATUS-ping interval comes from `ping_ticker`, `MissedTickBehavior::
+    Delay`. `derive_agent_argv` (a 60 s `std::thread::sleep` loop over
+    `/proc/<pid>/exe`) is removed: the exec-backend fallback argv names the
+    binary the agent was just verified to run (WDG-003). Reduced already by
+    lab PR 89 (WDG-002), as the triage says.
+  - WDG-011: each input (ATT&CK bundle and licence, Sigma tarball, DRL
+    licence) is a `Pinned { url, mirror_file, sha256 }`: URLs by commit
+    (`7ad8a86f…`, `df5c6a6e…`, Detection-Rule-License `bcbdc605…`, where the
+    old `master` URL redirected to `main`), and `obtain()` refuses bytes
+    whose SHA-256 differs, fetched or from `--mirror`, before parsing.
+    `SIGMA_PIN` is the commit; `provenance.json` gains `input_sha256`;
+    `build()` computes everything first and writes nothing (dumps
+    included) when a recomputed `canonical_dump_sha256` differs from
+    `docs/kb-sources/kb_index.json`, unless `--update-anchors`. The digests
+    were taken once from the commit URLs; the two licences match the
+    committed `LICENSES/` byte for byte, and the tag `v18.1` resolves to
+    `7ad8a86f…` with the same bundle bytes. A `--mirror` run on those inputs
+    reproduced both committed dump digests; the anchors were rewritten from
+    it (Sigma `pin` → commit, so `kb_index_hash` `4d335aed…` → `b6cd7d32…`;
+    NOTICES "Pin: commit …"). No change under `agent/src/rag/`.
+  - WDG-R01: `agent/examples/ade_attacks.rs` exits non-zero when the engine
+    came up on the mock backend (`NN_ADE_ALLOW_MOCK=1` and a model that did
+    not load) and prints the backend and model next to the success rate.
+  - Tests: `agent_unit_asserts_bpffs` (no `Condition*` in either unit, no
+    `AssertPathIsMountPoint`, the `ExecStartPre=` check, no `OnFailure=`),
+    `ping_ticker_delays_missed_ticks`,
+    `ping_ticks_stay_an_interval_apart_after_a_stall` (paused clock, a
+    stall of three intervals), `off_runtime_keeps_the_runtime_thread_free`,
+    `systemctl_show_command_shape`, `unit_state_from_show_is_one_bounded_line`,
+    `record_hold_appends_one_line_per_hold`, `watchdog_holds_become_findings`,
+    `obtain_rejects_digest_mismatch`, `inputs_are_pinned_by_commit_and_digest`,
+    `rebuilt_dumps_must_match_the_committed_anchors`,
+    `committed_anchors_are_readable`. The unit, ticker, blocking-pool and
+    digest tests fail with their fix taken out (checked by inverting it).
+    Checked by hand: a `--mirror` directory with one byte appended to the
+    DRL licence, and `kb_index.json` with one dump digest changed, each
+    stop `rag-kb` before it writes anything; `ade_attacks` with a 4-byte
+    stand-in GGUF and `NN_ADE_ALLOW_MOCK=1`, `ATTACK_LIMIT=2`: before,
+    "BLOCKED+PARTIAL success rate: 100.0%" and exit 0; after, exit 1,
+    "ADE backend is `mock`".
+  - Lab: Ubuntu 24.04, wdg149-probe.sh on main and on this build. skip (a drop-in points the unit's bpffs check at `/mnt/nn149-not-a-mount`, then the agent is SIGKILLed through a trusted-installer window): main "skipped because of an unmet condition check (ConditionPathIsMountPoint…)", `ConditionResult=no`, the watchdog's respawn "opening pidfd … timed out", no hold record; here `ExecStartPre=/usr/bin/mountpoint` exits 32, "failed (Result: exit-code)", the agent in `systemctl --failed`, the watchdog "start job … queued, but no agent within 30 s" and a JSON line in `/run/northnarrow/watchdog.hold`; restore: a signed `integrity_drift` `watchdog_hold` (none on main). stall (agent and watchdog frozen 100 s, the watchdog thawed 12 s first): main two "STATUS ping failed" 2 s apart, threshold tripped, stuck recovery and a new agent pid; here one failed ping, the same pid. `nn-lab.sh respawn-check` OK. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.

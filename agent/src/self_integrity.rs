@@ -506,6 +506,47 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
         .collect()
 }
 
+/// External audit DEP-004: the holds the watchdog recorded while the agent
+/// was down ([`common::watchdog_hold::HoldRecord`], one JSON line each) at
+/// `path` — a respawn that brought no agent back (a start job queued for a
+/// unit that then failed or was skipped) or the restart ceiling.
+pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let detail = match serde_json::from_str::<common::watchdog_hold::HoldRecord>(l) {
+                Ok(r) => {
+                    let mut d = format!(
+                        "the watchdog stopped respawning the agent at {} (last agent pid {}): {}: {}",
+                        r.at,
+                        r.agent_pid,
+                        r.reason,
+                        r.detail.chars().take(400).collect::<String>()
+                    );
+                    if let Some(state) = r.unit_state {
+                        d.push_str(&format!(
+                            " [unit: {}]",
+                            state.chars().take(256).collect::<String>()
+                        ));
+                    }
+                    d
+                }
+                Err(_) => format!(
+                    "the watchdog recorded a hold: {}",
+                    l.chars().take(300).collect::<String>()
+                ),
+            };
+            Finding {
+                kind: "watchdog_hold",
+                detail,
+            }
+        })
+        .collect()
+}
+
 /// The last `key=value` of a unit's `[Service]` section, comments skipped.
 fn unit_directive<'a>(unit: &'a str, key: &str) -> Option<&'a str> {
     let mut in_service = false;
@@ -1007,6 +1048,16 @@ impl Checker {
             }
             let _ = std::fs::remove_file(rejected);
         }
+        // External audit DEP-004: the watchdog's holds (no agent after a
+        // respawn, or the restart ceiling) while the agent was down.
+        let holds = Path::new(common::watchdog_hold::HOLD_PATH);
+        let found = watchdog_holds(holds);
+        if !found.is_empty() {
+            for f in cap_per_kind(found) {
+                self.report_once(f, at_boot);
+            }
+            let _ = std::fs::remove_file(holds);
+        }
     }
 }
 
@@ -1096,6 +1147,56 @@ mod tests {
         assert!(f.iter().all(|x| x.kind == "shutdown_marker_rejected"));
         assert!(f[0].detail.contains("agent pid 4242"), "{}", f[0].detail);
         assert!(f[1].detail.contains("not json"), "{}", f[1].detail);
+    }
+
+    /// External audit DEP-004: a hold the watchdog recorded becomes a
+    /// finding, with the unit state that tells a failed or skipped start.
+    #[test]
+    fn watchdog_holds_become_findings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("watchdog.hold");
+        assert!(watchdog_holds(&path).is_empty());
+        let rec = common::watchdog_hold::HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 4242,
+            reason: "agent respawn failed".to_string(),
+            detail: "start job for northnarrow-agent.service queued, but no agent within 30 s"
+                .to_string(),
+            unit_state: Some("ActiveState=failed SubState=failed Result=exit-code".to_string()),
+        };
+        let bare = common::watchdog_hold::HoldRecord {
+            unit_state: None,
+            ..rec.clone()
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\nnot json\n",
+                serde_json::to_string(&rec).unwrap(),
+                serde_json::to_string(&bare).unwrap()
+            ),
+        )
+        .unwrap();
+        let f = watchdog_holds(&path);
+        assert_eq!(f.len(), 3);
+        assert!(f.iter().all(|x| x.kind == "watchdog_hold"));
+        assert!(
+            f[0].detail.contains("last agent pid 4242"),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail.contains("queued, but no agent"),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail.contains("[unit: ActiveState=failed"),
+            "{}",
+            f[0].detail
+        );
+        assert!(!f[1].detail.contains("[unit:"), "{}", f[1].detail);
+        assert!(f[2].detail.contains("not json"), "{}", f[2].detail);
     }
 
     /// External audit ATP-001 / DEP-003: a COMBAT file is reported once it
