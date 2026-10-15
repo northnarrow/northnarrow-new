@@ -45,7 +45,7 @@
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
-#   deploy/lab/nn-lab.sh respawn-check # kill -9 the agent, assert respawn v2 invariants
+#   deploy/lab/nn-lab.sh respawn-check # agent death via systemd in a window, assert respawn v2 invariants
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
 #   deploy/lab/nn-lab.sh snapshot NAME | restore NAME   (guest must be down)
 #   deploy/lab/nn-lab.sh status | down | destroy
@@ -232,6 +232,7 @@ EOF
     fi
     whpx_forward
     wait_ssh "${NN_LAB_BOOT_TIMEOUT:-900}"
+    guest_provision_bpftool
     cmd_check
 }
 
@@ -323,6 +324,7 @@ cmd_up() {
         -display none -serial "file:$SERIAL" -monitor none \
         -daemonize -pidfile "$PIDFILE"
     wait_ssh "${NN_LAB_BOOT_TIMEOUT:-900}"
+    guest_provision_bpftool
     cmd_check
 }
 
@@ -336,10 +338,45 @@ echo "lsm         : $(cat /sys/kernel/security/lsm)"
 grep -q '\bbpf\b' /sys/kernel/security/lsm && echo "bpf-lsm     : OK" || { echo "bpf-lsm     : MISSING"; exit 1; }
 mount | grep -q ' /sys/fs/bpf ' && echo "bpffs       : mounted" || echo "bpffs       : NOT mounted"
 command -v iptables-restore >/dev/null && echo "iptables    : $(iptables --version)" || { echo "iptables    : MISSING"; exit 1; }
-command -v bpftool >/dev/null && echo "bpftool     : $(bpftool version 2>/dev/null | head -1)" || echo "bpftool     : missing (linux-tools-$(uname -r)?)"
+# `command -v` is not enough: Ubuntu's bpftool is a wrapper that fails
+# without linux-tools-$(uname -r).
+if bv=$(sudo bpftool version 2>/dev/null) && [ -n "$bv" ]; then
+    echo "bpftool     : $(echo "$bv" | head -1)"
+else
+    echo "bpftool     : missing ('bpftool version' fails; Ubuntu: linux-tools-$(uname -r))"
+fi
 source ~/.cargo/env 2>/dev/null && echo "cargo       : $(cargo --version)" || { echo "cargo       : MISSING"; exit 1; }
 echo "mem         : $(free -g | awk '/Mem:/ {print $2}') GiB, cpus: $(nproc)"
 REMOTE
+}
+
+# The privileged fixtures stop their agents by evicting them from
+# PROTECTED_PIDS with bpftool. Ubuntu's /usr/sbin/bpftool (linux-tools-common)
+# is only a wrapper around linux-tools-$(uname -r): without that package the
+# eviction failed unnoticed on a 22.04 guest, the refused SIGQUIT sent the
+# agent into COMBAT and it killed the test runner, then the next test
+# binaries (lab PR 153). Installed by `up` (and again after a kernel change);
+# the test suites refuse to start without a working bpftool.
+guest_provision_bpftool() {
+    vssh bash -s <<'REMOTE'
+export PATH="$PATH:/usr/sbin:/sbin"
+sudo bpftool version >/dev/null 2>&1 && exit 0
+. /etc/os-release
+[ "${ID:-}" = ubuntu ] || exit 0
+pkg="linux-tools-$(uname -r)"
+echo "nn-lab: bpftool does not run — installing $pkg" >&2
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$pkg" >/dev/null 2>&1 \
+    || { sudo apt-get update -qq >/dev/null 2>&1 \
+         && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$pkg" >/dev/null 2>&1; } \
+    || echo "nn-lab: apt-get install $pkg failed" >&2
+exit 0
+REMOTE
+}
+
+guest_require_bpftool() {
+    guest_provision_bpftool
+    vssh 'export PATH="$PATH:/usr/sbin:/sbin"; sudo bpftool version >/dev/null 2>&1' \
+        || die "'sudo bpftool version' fails in the guest: the privileged fixtures could not stop their agents — refusing to start (Ubuntu: sudo apt-get install linux-tools-\$(uname -r))"
 }
 
 cmd_sync() {
@@ -500,6 +537,7 @@ cmd_test_e2e() {
     # The anti-tamper hooks outlive the agent on purpose (pinned links) and
     # the e2e fixtures' agents are foreign to a stopped enforce agent's map
     # guard: purge the pin root first, the operator way (see lab_purge_pins).
+    guest_require_bpftool
     lab_purge_pins
     vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
     # The four FIM e2e tests are plain `#[test]` (not ignored), so neither
@@ -513,6 +551,7 @@ cmd_test_e2e() {
 
 cmd_test_ignored() {
     vm_running || die "guest is not running"
+    guest_require_bpftool
     # Installed units hold the bpffs pins + iptables chain the tests expect
     # to own, and the enforcing agent kills `sudo cargo` (R009: root exec
     # from ~/.cargo/bin). Stop them first — watchdog first, or it respawns
@@ -581,6 +620,7 @@ cmd_respawn_check() {
     # come back under its OWN unit with its own caps/cgroup.
     vssh bash -s <<'REMOTE'
 set -e
+fail=0
 old=$(sudo cat /run/northnarrow/agent.pid)
 echo "agent pid before: $old"
 # A plain `kill -9` from a root shell is DENIED by the task_kill LSM
@@ -590,16 +630,21 @@ echo "agent pid before: $old"
 # lab key and deliver the SIGKILL through systemd: no shutdown marker is
 # written (that is the signed nn-admin path only), hence the watchdog
 # treats it as a crash. The respawned agent boots with the window closed.
+# External audit TST-002: either refusal missing is a FAIL (it was a WARN);
+# the respawn is still checked after it (the agent died either way).
 if sudo kill -9 "$old" 2>/dev/null; then
-    echo "WARN: plain kill -9 from a root shell succeeded — task_kill deny hook NOT active?"
+    echo "FAIL: plain kill -9 from a root shell succeeded — task_kill deny hook not active, or the agent's pid not in PROTECTED_PIDS"
+    fail=1
 else
     echo "kill -9 from a root shell: denied (task_kill LSM hook OK)"
     nn_admin=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
     if sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service 2>/dev/null; then
-        echo "WARN: systemctl kill outside a trusted-installer window succeeded — PID-1 grant NOT enforced?"
+        echo "FAIL: systemctl kill outside a trusted-installer window succeeded — PID-1 grant not enforced"
+        fail=1
     else
         echo "systemctl kill outside a window: refused — opening the window, then systemctl kill"
         key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+        [[ -n "$key" ]] || { echo "FAIL: no lab admin key to open the window"; exit 1; }
         sudo "$nn_admin" trusted-installer-grant --key "$key" --window-secs 120 >/dev/null
         sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service
     fi
@@ -632,11 +677,10 @@ capeff=$(grep CapEff /proc/$new/status | awk '{print $2}')
 echo "CapEff          : $capeff"
 wd=$(systemctl is-active northnarrow-watchdog || true)
 echo "watchdog active : $wd"
-fail=0
 [[ "$act" == active ]] || { echo "FAIL: agent unit not active (respawned outside its unit?)"; fail=1; }
 [[ "$cg" == *northnarrow-agent.service* ]] || { echo "FAIL: new agent is not in the agent unit's cgroup"; fail=1; }
 (( (0x$capeff >> 5) & 1 )) || { echo "FAIL: CAP_KILL (bit 5) missing from CapEff"; fail=1; }
-[[ "$wd" == active ]] || { echo "FAIL: watchdog not active after respawn (BindsTo regression?)"; fail=1; }
+[[ "$wd" == active ]] || { echo "FAIL: watchdog not active after respawn"; fail=1; }
 (( fail == 0 )) && echo "respawn-check: OK"
 exit $fail
 REMOTE

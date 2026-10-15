@@ -54,18 +54,16 @@ fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
 }
 
-/// RAII child-process guard: SIGQUIT on drop so a failed test never
-/// leaks a daemon. The agent's Tappa 7 LSM hook blocks SIGKILL and
-/// SIGTERM from userland; SIGQUIT is the documented escape hatch
-/// (see agent/src/anti_tamper/* docstrings).
+/// RAII child-process guard: stops the agent on drop so a failed test
+/// never leaks a daemon. The task_kill hook refuses every signal from the
+/// (unprotected) test runner while the agent is in PROTECTED_PIDS, so
+/// `common::quit_agent` evicts the sudo subtree first, then SIGQUITs it —
+/// possible only while the BPF guard observes (`debug-trigger` builds),
+/// and a failure fails the test (external audit TST-010).
 struct AgentGuard(Option<Child>);
 impl Drop for AgentGuard {
     fn drop(&mut self) {
         if let Some(mut c) = self.0.take() {
-            // SIGQUIT(3) — bypasses the LSM kill block for the agent
-            // process. `kill -QUIT $pid` is the supported shutdown.
-            // Unprotect + SIGQUIT the whole sudo subtree, bounded wait
-            // (sudo 1.9.9 does not relay our signal, see common::quit_agent).
             common::quit_agent(&mut c);
         }
     }
@@ -108,6 +106,7 @@ fn spawn_agent(tempdir: &Path) -> (AgentGuard, AgentHandles) {
     // R009. AgentGuard's SIGQUIT-on-drop still works against
     // the root subprocess because the kill comes from the test
     // process (also root via the outer `sudo cargo test`).
+    common::require_bpftool();
     let child = Command::new("sudo")
         .arg(&installed_agent.path)
         .arg("--combat-rules")
@@ -678,6 +677,7 @@ fn spawn_agent_b5_with_installs(
     // R009. AgentGuard's SIGQUIT-on-drop still works against
     // the root subprocess because the kill comes from the test
     // process which is also root via the outer sudo.
+    common::require_bpftool();
     let child = Command::new("sudo")
         .arg(&paths._installed_agent.path)
         .arg("--combat-rules")
@@ -1261,4 +1261,410 @@ fn dead_sensor_pump_stops_the_agent() {
             .any(|l| l.contains("\"agent_stop\"") && l.contains("sensor_pump_exited")),
         "no signed agent_stop sensor_pump_exited:\n{log}"
     );
+}
+
+// ── External audit TST-001 / TST-010 (lab PR 153): the guard in enforce ──
+//
+// Every other fixture stops its agent by evicting it from PROTECTED_PIDS
+// with bpftool (`common::quit_agent`), which works only because a
+// `debug-trigger` build runs the BPF map guard in observe mode. This test
+// forces enforce (`NN_BPF_DEFENSE_ENFORCE=1`, the production default) and
+// asserts what root gets: the eviction and the kill refused, the fixtures'
+// teardown failing and saying why, the signed shutdown as the way out.
+// `--detect-only`: the refused attempts are tamper attempts and put the
+// agent in COMBAT, and no response may act on the test runner (lab PR
+// 153: a COMBAT agent killed the runner, then the next test binaries).
+//
+// The guard outlives its agent (pinned link) and goes on enforcing. The
+// next fixture's agent is another installed copy, another inode, so it is
+// foreign to the guard and would be refused its own registration. Drop
+// therefore starts the same installed binary once more without the
+// variable — the successor the guard admits in its first minute — which
+// re-arms the guard in observe mode, and stops it.
+
+#[cfg(feature = "debug-trigger")]
+const GUARD_STOP_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(feature = "debug-trigger")]
+const GUARD_LOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `s` without ANSI escape sequences (the agent colours its log unless
+/// `NO_COLOR` is set).
+#[cfg(feature = "debug-trigger")]
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if ('@'..='~').contains(&d) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "debug-trigger")]
+fn read_agent_log(path: &Path) -> String {
+    strip_ansi(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+#[cfg(feature = "debug-trigger")]
+fn log_tail(path: &Path) -> String {
+    let log = read_agent_log(path);
+    let lines: Vec<&str> = log.lines().collect();
+    format!(
+        "--- {} (tail) ---\n{}",
+        path.display(),
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    )
+}
+
+/// First line of the agent log holding every needle, waiting up to `timeout`.
+#[cfg(feature = "debug-trigger")]
+fn wait_for_log_line(path: &Path, needles: &[&str], timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(l) = read_agent_log(path)
+            .lines()
+            .find(|l| needles.iter().all(|n| l.contains(n)))
+        {
+            return Some(l.to_string());
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// One agent process of [`GuardFixture`].
+#[cfg(feature = "debug-trigger")]
+struct GuardRun {
+    name: &'static str,
+    child: Child,
+    socket: PathBuf,
+    pid_file: PathBuf,
+    log: PathBuf,
+}
+
+/// Wait until the agent's pid file and socket exist; returns its pid. The
+/// pid file is written once every hook is attached and the pid is in
+/// PROTECTED_PIDS (`--pid-file`, main.rs).
+#[cfg(feature = "debug-trigger")]
+fn wait_ready(run: &mut GuardRun) -> Result<u32, String> {
+    let deadline = Instant::now() + SOCKET_POLL_TIMEOUT;
+    loop {
+        if run.pid_file.exists() && run.socket.exists() {
+            let body = std::fs::read_to_string(&run.pid_file)
+                .map_err(|e| format!("reading {}: {e}", run.pid_file.display()))?;
+            return body
+                .trim()
+                .parse()
+                .map_err(|e| format!("pid file {body:?}: {e}"));
+        }
+        match run.child.try_wait() {
+            Ok(Some(st)) => {
+                return Err(format!(
+                    "the {} agent exited at boot ({st})\n{}",
+                    run.name,
+                    log_tail(&run.log)
+                ))
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait on the {} agent: {e}", run.name)),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the {} agent was not ready within {SOCKET_POLL_TIMEOUT:?}\n{}",
+                run.name,
+                log_tail(&run.log)
+            ));
+        }
+        std::thread::sleep(SOCKET_POLL_INTERVAL);
+    }
+}
+
+#[cfg(feature = "debug-trigger")]
+struct GuardFixture {
+    dir: tempfile::TempDir,
+    nn_admin: PathBuf,
+    agent: PathBuf,
+    admin_pub: PathBuf,
+    agent_id_file: PathBuf,
+    key_a: PathBuf,
+    key_b: PathBuf,
+    enforce_run: Option<GuardRun>,
+    // Removed only after `drop` ran: the restore run needs this binary.
+    _installed_agent: InstalledBin,
+    _installed_admin: InstalledBin,
+}
+
+#[cfg(feature = "debug-trigger")]
+impl GuardFixture {
+    /// Installed agent + nn-admin, two keys with the `shutdown` role.
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (installed_agent, installed_admin) = install_priv_bins();
+        let nn_admin = installed_admin.path.clone();
+        let admin_pub = dir.path().join("admin.pub");
+        std::fs::write(&admin_pub, "").expect("touch admin.pub");
+        let (key_a, _) = init_admin_keypair_with_roles(
+            &nn_admin,
+            dir.path(),
+            &admin_pub,
+            "admin_a",
+            "unlock,shutdown",
+        );
+        let (key_b, _) = init_admin_keypair_with_roles(
+            &nn_admin,
+            dir.path(),
+            &admin_pub,
+            "admin_b",
+            "unlock,shutdown",
+        );
+        std::fs::copy(combat_rules_path(), dir.path().join("combat-rules.v4"))
+            .expect("copy combat rules");
+        Self {
+            agent_id_file: dir.path().join("agent_id"),
+            agent: installed_agent.path.clone(),
+            dir,
+            nn_admin,
+            admin_pub,
+            key_a,
+            key_b,
+            enforce_run: None,
+            _installed_agent: installed_agent,
+            _installed_admin: installed_admin,
+        }
+    }
+
+    /// Start the installed agent; `enforce` forces the guard's deny mode.
+    fn spawn(&self, name: &'static str, enforce: bool) -> Result<GuardRun, String> {
+        let d = self.dir.path();
+        let log = d.join(format!("{name}.log"));
+        let out = std::fs::File::create(&log).map_err(|e| format!("create {name}.log: {e}"))?;
+        let err = out
+            .try_clone()
+            .map_err(|e| format!("clone {name}.log: {e}"))?;
+        let socket = d.join(format!("{name}.sock"));
+        let pid_file = d.join(format!("{name}.pid"));
+        let mut cmd = Command::new("sudo");
+        // sudo resets the environment: the variables go through env(1).
+        cmd.arg("env").arg("NO_COLOR=1");
+        if enforce {
+            cmd.arg(format!(
+                "{}=1",
+                northnarrow_agent::anti_tamper::bpf_defense::ENFORCE_ENV
+            ));
+        }
+        cmd.arg(&self.agent)
+            .arg("--combat-rules")
+            .arg(d.join("combat-rules.v4"))
+            .arg("--admin-pub")
+            .arg(&self.admin_pub)
+            .arg("--admin-socket")
+            .arg(&socket)
+            .arg("--agent-id-file")
+            .arg(&self.agent_id_file)
+            .arg("--signing-key-file")
+            .arg(d.join(format!("{name}.sig.key")))
+            .arg("--audit-log-file")
+            .arg(d.join(format!("{name}.audit.log")))
+            .arg("--shutdown-marker-file")
+            .arg(d.join(format!("{name}.shutdown_authorised")))
+            .arg("--pid-file")
+            .arg(&pid_file)
+            .arg("--no-ade")
+            .arg("--detect-only")
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err));
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn the {name} agent: {e}"))?;
+        Ok(GuardRun {
+            name,
+            child,
+            socket,
+            pid_file,
+            log,
+        })
+    }
+
+    fn signed<'a>(&'a self, socket: &'a Path) -> common::SignedShutdown<'a> {
+        common::SignedShutdown {
+            nn_admin: &self.nn_admin,
+            key: &self.key_a,
+            cosign_key: &self.key_b,
+            agent_id_file: &self.agent_id_file,
+            socket,
+        }
+    }
+
+    /// A run of the same binary without the variable: the guard re-armed
+    /// in observe mode. Stopped signed, else by the fixtures' eviction
+    /// (which observe mode allows).
+    fn restore_observe(&self) -> Result<(), String> {
+        let mut run = self.spawn("restore", false)?;
+        let ready = wait_ready(&mut run).and_then(|_| {
+            let reg = wait_for_log_line(&run.log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+                .ok_or("no BPF self-defence registration line")?;
+            if reg.contains("mode=\"observe\"") {
+                Ok(())
+            } else {
+                Err(format!("the guard re-armed in another mode: {reg}"))
+            }
+        });
+        let stopped = common::shutdown_signed(
+            &mut run.child,
+            &self.signed(&run.socket),
+            GUARD_STOP_TIMEOUT,
+        )
+        .or_else(|e| {
+            common::try_quit_agent(&mut run.child, common::QUIT_TIMEOUT)
+                .map_err(|q| format!("{e}; then {q}"))
+        });
+        match (ready, stopped) {
+            (Ok(()), Ok(())) => Ok(()),
+            (r, s) => Err(format!(
+                "{}{}\n{}",
+                r.err().unwrap_or_default(),
+                s.err().map(|e| format!(" (stop: {e})")).unwrap_or_default(),
+                log_tail(&run.log)
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "debug-trigger")]
+impl Drop for GuardFixture {
+    fn drop(&mut self) {
+        if let Some(mut run) = self.enforce_run.take() {
+            if let Err(e) = common::shutdown_signed(
+                &mut run.child,
+                &self.signed(&run.socket),
+                GUARD_STOP_TIMEOUT,
+            ) {
+                common::fail_teardown(&format!(
+                    "guard e2e: the enforce-mode agent could not be stopped ({e}). It keeps \
+                     running and its guard refuses the next fixtures' agents: restart the host.\n{}",
+                    log_tail(&run.log)
+                ));
+                return;
+            }
+        }
+        if let Err(e) = self.restore_observe() {
+            common::fail_teardown(&format!(
+                "guard e2e: the BPF guard could not be put back in observe mode ({e}). The next \
+                 fixtures' agents (other binaries) are refused their registration until the pin \
+                 root is purged or the host restarted (nn-lab.sh: lab_purge_pins restarts the guest)."
+            ));
+        }
+    }
+}
+
+/// External audit TST-001 (NN-AUD-224) and TST-010 (NN-AUD-231): with the
+/// BPF guard in enforce mode root can neither evict the agent from
+/// PROTECTED_PIDS nor signal it, the fixtures' teardown recipe fails and
+/// says so, and the signed 2-of-N shutdown stops the agent. Fails if the
+/// guard does not enforce (the mode line, then the eviction succeeds).
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn bpf_guard_enforce_refuses_protected_pids_write() {
+    // As root, or the refusals below would prove nothing.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    common::require_bpftool();
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("enforce", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    let pid = wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+
+    // 1. The mode is read from the agent, not assumed.
+    let reg = wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard did not start in enforce mode: {reg}"
+    );
+
+    // 2. The eviction the fixtures' teardown and the old runbook relied on.
+    let del = Command::new("sudo")
+        .args(["bpftool", "map", "delete", "pinned"])
+        .arg(common::protected_pids_pin())
+        .arg("key")
+        .args(common::pid_key_bytes(pid))
+        .output()
+        .expect("spawn bpftool");
+    let del_err = String::from_utf8_lossy(&del.stderr);
+    assert!(
+        !del.status.success(),
+        "evicting the agent (pid {pid}) from PROTECTED_PIDS succeeded in enforce mode: \
+         root can disarm the anti-tamper"
+    );
+    assert!(
+        del_err.contains("Operation not permitted"),
+        "bpftool map delete failed, but not with EPERM: {del_err}"
+    );
+
+    // 3. Still protected: the kill a root shell tries next is refused.
+    let kill = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .expect("spawn kill");
+    assert!(
+        !kill.status.success()
+            && String::from_utf8_lossy(&kill.stderr).contains("Operation not permitted"),
+        "kill -9 of the agent from root was not refused: {kill:?}"
+    );
+    let alive = |fx: &mut GuardFixture| {
+        let run = fx.enforce_run.as_mut().expect("enforce run");
+        matches!(run.child.try_wait(), Ok(None)) && Path::new(&format!("/proc/{pid}")).exists()
+    };
+    assert!(alive(&mut fx), "the agent is gone after the refused kill");
+
+    // 4. The agent saw both refusals.
+    for op in ["op=bpf_map", "op=signal"] {
+        assert!(
+            wait_for_log_line(&log, &["ANTI-TAMPER DENIAL", op], GUARD_LOG_TIMEOUT).is_some(),
+            "no ANTI-TAMPER DENIAL {op} in the agent log\n{}",
+            log_tail(&log)
+        );
+    }
+
+    // 5. TST-010: the fixtures' teardown fails and names the refusal; the
+    //    agent is untouched.
+    let quit = common::try_quit_agent(
+        &mut fx.enforce_run.as_mut().expect("enforce run").child,
+        Duration::from_secs(3),
+    );
+    let msg = quit.expect_err("the fixtures' eviction + SIGQUIT stopped an enforce-mode agent");
+    assert!(
+        msg.contains("PROTECTED_PIDS") && msg.contains("Operation not permitted"),
+        "teardown failure does not name the refusal: {msg}"
+    );
+    assert!(
+        alive(&mut fx),
+        "the agent is gone after the refused teardown"
+    );
+
+    // 6. The authorised stop: a 2-of-N signed shutdown. Drop then puts
+    //    the guard back in observe mode.
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
 }

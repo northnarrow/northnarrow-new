@@ -32,6 +32,11 @@ write_files:
     content: |
       GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=lockdown,capability,landlock,yama,apparmor,bpf"
 runcmd:
+  # Ubuntu's bpftool (linux-tools-common) is a wrapper; the tool itself is
+  # in linux-tools-<running kernel>. The privileged fixtures need it to stop
+  # their agents (lab PR 153). nn-lab.sh installs it again after a kernel
+  # change.
+  - 'DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-tools-$(uname -r)"'
   - update-grub
   # rustup (stable, minimal) for the guest-side userland build.
   - su - nn -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable'

@@ -162,8 +162,10 @@ fn install_to_priv_bin(src: &Path) -> InstalledBin {
     InstalledBin { path: dst }
 }
 
-/// SIGQUIT-on-drop guard (Tappa 7 LSM blocks SIGKILL + SIGTERM from
-/// userland; SIGQUIT is the documented shutdown signal).
+/// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
+/// from PROTECTED_PIDS, then SIGQUITs it; the task_kill hook refuses every
+/// signal from the test runner while the pid is protected). An agent that
+/// survives fails the test.
 struct AgentGuard(Option<Child>);
 
 impl Drop for AgentGuard {
@@ -300,6 +302,7 @@ impl NetFixture {
         let netflow_log = dir.join("netflow.jsonl");
         let netflow_listeners_log = dir.join("netflow_listeners.jsonl");
 
+        common::require_bpftool();
         let child = Command::new("sudo")
             .arg(&installed_agent.path)
             .arg("--combat-rules")

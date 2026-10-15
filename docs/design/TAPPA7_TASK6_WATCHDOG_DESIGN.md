@@ -228,14 +228,18 @@ custom socket. Smaller surface, less to harden, less to audit.
 | Watchdog observes | Interpretation | Action |
 |---|---|---|
 | pidfd POLLIN | agent dead (crash, OOM, panic, signal-induced exit) | restart path (§5) immediately after PID eviction (§6) |
-| STATUS reply timeout × 2 | agent stuck / deadlocked | **send SIGINT** (the only hook-passing stop, per `docs/verify-2b.sh:48-51`), wait `HARDKILL_GRACE` = 5 s, then if still alive, evict its own PID from `PROTECTED_PIDS` (race-free hard-kill recipe from `verify-2b.sh:57-63`) and `SIGKILL`. The subsequent pidfd POLLIN then triggers the restart path. |
+| STATUS reply timeout × 2 | agent stuck / deadlocked | **send SIGINT** (the watchdog is a protected pid, so the task_kill hook lets its signals through), wait `HARDKILL_GRACE` = 5 s, then if still alive, evict the agent's PID from `PROTECTED_PIDS` (best effort) and `SIGKILL`. The subsequent pidfd POLLIN then triggers the restart path. |
 | STATUS reply timeout × 1 only | transient | log WARN, continue |
 | pidfd POLLIN within 5 s of watchdog startup | agent never came up | restart with backoff but ALERT loudly — the agent failed to boot, not crashed mid-run |
 
-The "stuck → SIGINT → unprotect → SIGKILL" recipe is **the same
-sequence** the verify harness uses (`docs/verify-2b.sh:361-386`)
-because it is the only sequence that works against a healthy
-LSM-protected agent. Reusing it keeps one canonical kill path.
+The "stuck → SIGINT → evict → SIGKILL" sequence was first the stop
+path of the #2b verify harness (`docs/verify-2b.sh`). Since
+`task-kill-signals-1` the hook refuses every signal to a protected pid
+unless the sender is protected too, so the sequence works for the
+watchdog only. The harness, which ran as an unprotected root shell and
+made the eviction its normal stop, was retired (external audit LAB-001,
+lab PR 153); an outside stop is the signed `nn-admin shutdown`, or
+`systemctl kill` inside a trusted-installer window.
 
 ---
 
@@ -733,8 +737,8 @@ it has not, add ~2 days for the merge resolution.
 - `agent/src/main.rs:145-160` (Tappa 7 anti-tamper bring-up;
   comment on widening to include the watchdog).
 - `agent/src/sensors/multiplexer.rs:133` (`pids` slice plumbing).
-- `docs/verify-2b.sh:14-73` (canonical signal/stop semantics —
-  watchdog reuses the SIGINT-then-unprotect-then-SIGKILL recipe).
+- `docs/verify-2b.sh:14-73` (signal/stop semantics at the time; the
+  harness was retired in lab PR 153, external audit LAB-001).
 - `docs/TAPPA7_PREREQ.md:149-152` (original Task 6 spec — "Daemon
   separato, Rust standard (non eBPF). Monitora agent principale.
   Riavvia se cade.").

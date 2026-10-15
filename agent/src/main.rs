@@ -1406,8 +1406,9 @@ async fn main() -> Result<()> {
     // it knows every hook is attached and self-protection is live.
     //
     // The agent writing its OWN pid is immune to the failure class that
-    // sank three external-resolution strategies in docs/verify-2b.sh
-    // (989c292 pgrep -P / -x, 6e746c6 /proc/*/exe diff): the sudo+exec
+    // sank three external-resolution strategies in the retired #2b
+    // harness, docs/verify-2b.sh (989c292 pgrep -P / -x, 6e746c6
+    // /proc/*/exe diff): the sudo+exec
     // process-tree race, TASK_COMM_LEN comm truncation, and pgrep
     // quirks. A write failure here is FATAL by design — a harness or
     // supervisor that asked for a PID file cannot proceed without it,
