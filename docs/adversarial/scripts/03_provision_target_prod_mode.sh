@@ -29,7 +29,7 @@ fi
 # 2. Install via the real deploy path (idempotent installer).
 log "Installing via deploy/install.sh (real systemd unit + $NN_ETC_DIR config)..."
 if [ -f deploy/install.sh ]; then
-    bash deploy/install.sh
+    bash deploy/install.sh --source-tree
 else
     warn "deploy/install.sh missing — falling back to manual unit enable"
 fi

@@ -14,8 +14,11 @@
 //! binary that runs a month later is not the one that was verified —
 //! this is the "binding runtime" half of the supply chain (ROADMAP,
 //! Tappa 10.8). A mismatch is fatal in enforcement mode unless
-//! [`ALLOW_UNVERIFIED_ENV`] is set; a missing manifest (a source-tree
-//! install, the lab) is reported, not punished.
+//! [`ALLOW_UNVERIFIED_ENV`] is set. `install.sh` writes the manifest on
+//! every install, source trees included, so a missing one is fatal too
+//! once the signed audit chain holds a boot that verified against it
+//! (external audit DEP-009, [`BootHistory`]); before that (a developer run,
+//! an install older than the manifest) it is reported, not punished.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -38,8 +41,14 @@ pub struct InstallManifest {
     pub version: String,
     #[serde(default)]
     pub installed_at: String,
-    /// `attested` | `checksums` | `manifest` | `source-tree` | `unverified`.
+    /// `attested` | `checksums` | `manifest` | `source-tree` | `unverified`
+    /// | `package`.
     pub provenance: String,
+    /// External audit DEP-007: the `install.sh` flag that accepted a level
+    /// below `checksums` (`--allow-manifest-only`, `--source-tree`,
+    /// `--no-verify`); absent when none was needed.
+    #[serde(default)]
+    pub verify_override: Option<String>,
     /// Directory the binaries were installed into.
     pub bin_dir: String,
     /// `name → sha256 hex`. Names: `northnarrow-agent`, `northnarrow-watchdog`,
@@ -63,8 +72,9 @@ pub struct Mismatch {
 /// Result of the boot-time check.
 #[derive(Debug, Clone)]
 pub enum IntegrityOutcome {
-    /// No manifest at the path: a source-tree install (the lab) or an
-    /// installer older than this check.
+    /// No manifest at the path: a binary not installed by `install.sh` (a
+    /// developer run), an install older than this check — or a manifest
+    /// that was removed ([`BootHistory`] tells them apart).
     NoManifest { path: PathBuf },
     /// A manifest exists but this binary does not run from its `bin_dir`
     /// (a test fixture, a developer build started by hand): the recorded
@@ -105,13 +115,37 @@ impl IntegrityOutcome {
     /// A mismatch is fatal unless the operator set [`ALLOW_UNVERIFIED_ENV`]
     /// to `1`. An unreadable manifest is fatal too: under `inode_protect`
     /// it cannot be corrupted by accident, so a broken one is a signal.
-    pub fn is_fatal(&self, allow_env: Option<&str>) -> bool {
+    /// External audit DEP-009: so is a missing one, unless the audit chain
+    /// shows this install never had a verified boot — deleting the file
+    /// used to switch the whole check off, where editing it refused the
+    /// boot.
+    pub fn is_fatal(&self, allow_env: Option<&str>, history: BootHistory) -> bool {
         let allowed = allow_env == Some("1");
         match self {
             IntegrityOutcome::Mismatch { .. } | IntegrityOutcome::Unreadable { .. } => !allowed,
+            IntegrityOutcome::NoManifest { .. } => {
+                history != BootHistory::NeverVerified && !allowed
+            }
             _ => false,
         }
     }
+}
+
+/// External audit DEP-009: what the signed audit chain says about the
+/// earlier boots of this install — the sentinel that tells a manifest that
+/// never existed from one that was removed. Read only when the manifest is
+/// missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootHistory {
+    /// No earlier `agent_boot` verified the binaries against a manifest:
+    /// a fresh chain, a developer run, an install older than the manifest.
+    NeverVerified,
+    /// An earlier `agent_boot` recorded `binary_integrity = verified`: the
+    /// manifest existed, so its absence now means it was removed.
+    VerifiedBefore,
+    /// The chain could not be read: nothing shows the manifest never
+    /// existed, so its absence counts as a removal.
+    Unknown,
 }
 
 /// Hash a file with SHA-256 (hex, lowercase) in 64 KiB chunks.
@@ -267,7 +301,7 @@ mod tests {
             }
             other => panic!("expected Verified, got {other:?}"),
         }
-        assert!(!out.is_fatal(None));
+        assert!(!out.is_fatal(None, BootHistory::VerifiedBefore));
         assert_eq!(out.label(), "verified");
     }
 
@@ -294,9 +328,9 @@ mod tests {
             }
             other => panic!("expected Mismatch, got {other:?}"),
         }
-        assert!(out.is_fatal(None));
-        assert!(out.is_fatal(Some("0")));
-        assert!(!out.is_fatal(Some("1")));
+        assert!(out.is_fatal(None, BootHistory::NeverVerified));
+        assert!(out.is_fatal(Some("0"), BootHistory::NeverVerified));
+        assert!(!out.is_fatal(Some("1"), BootHistory::NeverVerified));
         assert_eq!(out.label(), "mismatch");
     }
 
@@ -313,7 +347,7 @@ mod tests {
             matches!(out, IntegrityOutcome::NotApplicable { .. }),
             "{out:?}"
         );
-        assert!(!out.is_fatal(None));
+        assert!(!out.is_fatal(None, BootHistory::VerifiedBefore));
         assert_eq!(out.label(), "not-applicable");
         // same directory, different name (an e2e fixture copy): not compared either
         let fixture = write(dir.path(), "northnarrow-agent-e2etest-1-2", b"fixture");
@@ -324,13 +358,50 @@ mod tests {
         );
     }
 
+    /// External audit DEP-009: a binary that never ran against a manifest
+    /// (a developer run, an install older than the manifest) still boots.
     #[test]
-    fn missing_manifest_is_reported_not_fatal() {
+    fn missing_manifest_on_fresh_chain_is_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let out = check(&dir.path().join("nope.json"), Path::new("/bin/true"), "x");
         assert!(matches!(out, IntegrityOutcome::NoManifest { .. }));
-        assert!(!out.is_fatal(None));
+        assert!(!out.is_fatal(None, BootHistory::NeverVerified));
         assert_eq!(out.provenance(), "none");
+        assert_eq!(out.label(), "no-manifest");
+    }
+
+    /// External audit DEP-009: once a boot verified against the manifest,
+    /// its absence is a removal — refused like an unreadable one, with the
+    /// same development override. A chain that cannot be read proves
+    /// nothing either way and refuses too.
+    #[test]
+    fn missing_manifest_after_verified_boot_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = check(&dir.path().join("nope.json"), Path::new("/bin/true"), "x");
+        assert!(matches!(out, IntegrityOutcome::NoManifest { .. }));
+        assert!(out.is_fatal(None, BootHistory::VerifiedBefore));
+        assert!(out.is_fatal(Some("0"), BootHistory::VerifiedBefore));
+        assert!(!out.is_fatal(Some("1"), BootHistory::VerifiedBefore));
+        assert!(out.is_fatal(None, BootHistory::Unknown));
+        assert!(!out.is_fatal(Some("1"), BootHistory::Unknown));
+    }
+
+    /// External audit DEP-007: the flag that accepted a weaker level is
+    /// read back; manifests written before it have none.
+    #[test]
+    fn verify_override_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_json(dir.path(), "00", "11", "22", "33");
+        let parsed: InstallManifest = serde_json::from_str(&m).unwrap();
+        assert_eq!(parsed.verify_override, None);
+        let with = m.replacen(
+            r#""provenance":"attested","#,
+            r#""provenance":"source-tree","verify_override":"--source-tree","#,
+            1,
+        );
+        let parsed: InstallManifest = serde_json::from_str(&with).unwrap();
+        assert_eq!(parsed.provenance, "source-tree");
+        assert_eq!(parsed.verify_override.as_deref(), Some("--source-tree"));
     }
 
     #[test]
@@ -339,7 +410,7 @@ mod tests {
         let mp = write(dir.path(), "install-manifest.json", b"{not json");
         let out = check(&mp, Path::new("/bin/true"), "x");
         assert!(matches!(out, IntegrityOutcome::Unreadable { .. }));
-        assert!(out.is_fatal(None));
-        assert!(!out.is_fatal(Some("1")));
+        assert!(out.is_fatal(None, BootHistory::NeverVerified));
+        assert!(!out.is_fatal(Some("1"), BootHistory::NeverVerified));
     }
 }

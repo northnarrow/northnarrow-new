@@ -8,8 +8,10 @@
 #   2. drop the bpffs pin root — the LSM programs (task_kill, ptrace,
 #      inode_* deny hooks, FIM observers) stay attached only through their
 #      pinned links, so removing /sys/fs/bpf/northnarrow detaches them;
-#      wait until the kernel reports 0 LSM programs (anything still
-#      holding an fd keeps denying the unlinks below);
+#      wait until the agent's own programs (the ids it lists in
+#      /run/northnarrow/bpf-own-ids) are unloaded — anything still holding
+#      an fd keeps denying the unlinks below. Other products' BPF-LSM
+#      programs are not waited for (external audit DEP-006);
 #   3. lift chattr +i from the state directory (the agent sets it at boot);
 #   4. remove binaries, units, the journald namespace config, /run and the
 #      10 inert control-surface bait files;
@@ -45,6 +47,9 @@ RUN_DIR=${RUN_DIR:-/run/northnarrow}
 BPFFS_ROOT=${BPFFS_ROOT:-/sys/fs/bpf/northnarrow}
 JOURNALD_NS_CONF=/etc/systemd/journald@northnarrow.conf
 LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
+# External audit DEP-006: the ids of the agent's loaded BPF programs, written
+# by the agent next to its pid file (anti_tamper/bpf_defense.rs).
+OWN_IDS_FILE=${OWN_IDS_FILE:-$RUN_DIR/bpf-own-ids}
 
 PURGE=0
 YES=0
@@ -107,6 +112,30 @@ if (( ! YES )); then
     [[ "$ans" == y || "$ans" == Y ]] || { echo "aborted"; exit 1; }
 fi
 
+# External audit DEP-006: the drain gate used to wait for "no LSM program on
+# the host", a count that includes every other product's BPF-LSM programs:
+# on such a host it never reached 0 and the uninstall stopped halfway. It
+# waits for the agent's own program ids now, read before the stop.
+# Numeric first fields only: the list goes to bpftool as arguments.
+read_own_prog_ids() {
+    [[ -r "$OWN_IDS_FILE" ]] || return 0
+    awk '$1 ~ /^[0-9]+$/ {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '
+}
+# The ids among $1 still loaded. Only "No such file or directory" counts as
+# unloaded; any other bpftool error keeps the id on the list.
+own_progs_loaded() {
+    local id out left=()
+    for id in $1; do
+        if out=$(LC_ALL=C bpftool prog show id "$id" 2>&1); then
+            left+=("$id")
+        elif [[ "$out" != *"No such file or directory"* ]]; then
+            left+=("$id")
+        fi
+    done
+    echo "${left[*]:-}"
+}
+own_ids=$(read_own_prog_ids)
+
 # ── 1. units ──────────────────────────────────────────────────────────
 # The pin root is protected by the running agent (review entry 39): open the
 # trusted-installer window first, while the agent still answers.
@@ -135,7 +164,36 @@ if [[ -d "$BPFFS_ROOT" ]]; then
         echo "uninstall.sh: package removal continues; the pins detach at the next reboot" >&2
     fi
 fi
-if command -v bpftool >/dev/null 2>&1; then
+if ! command -v bpftool >/dev/null 2>&1; then
+    # The units' processes and the pin root are the only holders.
+    for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
+        nn_unit_has_procs northnarrow-agent || nn_unit_has_procs northnarrow-watchdog || break
+        sleep 1
+    done
+    if nn_unit_has_procs northnarrow-agent || nn_unit_has_procs northnarrow-watchdog; then
+        echo "uninstall.sh: a NorthNarrow unit still has processes after ${LSM_DRAIN_TIMEOUT}s — stop them and re-run" >&2
+        (( PACKAGE )) || exit 1
+    fi
+    log "bpftool not found — the agent and watchdog exited and the pin root is gone (the only holders of the"
+    log "LSM programs); the unload itself cannot be confirmed"
+elif [[ -n "$own_ids" ]]; then
+    log "waiting for NorthNarrow's BPF programs to unload (ids: $own_ids)"
+    left=$own_ids
+    for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
+        left=$(own_progs_loaded "$own_ids")
+        [[ -z "$left" ]] && break
+        sleep 1
+    done
+    if [[ -n "$left" ]]; then
+        echo "uninstall.sh: NorthNarrow BPF program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s: ids $left" >&2
+        echo "uninstall.sh: (bpftool prog show id <id>) — a NorthNarrow process still holds them" >&2
+        echo "uninstall.sh: (ps aux | grep northnarrow). Stop it and re-run." >&2
+        (( PACKAGE )) || exit 1
+    fi
+else
+    # An agent older than the list (or none ever ran): every LSM program on
+    # the host, as before, naming what is left.
+    log "no $OWN_IDS_FILE — waiting for every LSM program on the host to detach"
     for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
         n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
         [[ "$n" == 0 ]] && break
@@ -144,12 +202,12 @@ if command -v bpftool >/dev/null 2>&1; then
     done
     n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
     if [[ "$n" != 0 ]]; then
-        echo "uninstall.sh: $n LSM program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s — a NorthNarrow process" >&2
-        echo "uninstall.sh: still holds them (ps aux | grep northnarrow). Stop it and re-run." >&2
+        echo "uninstall.sh: $n LSM program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s:" >&2
+        bpftool prog show 2>/dev/null | grep " lsm " | sed 's/^/uninstall.sh:   /' >&2
+        echo "uninstall.sh: if they are NorthNarrow's, a NorthNarrow process still holds them" >&2
+        echo "uninstall.sh: (ps aux | grep northnarrow). Stop it and re-run." >&2
         (( PACKAGE )) || exit 1
     fi
-else
-    log "bpftool not found — cannot confirm the LSM programs detached; continuing"
 fi
 
 # ── 3. immutable flags ────────────────────────────────────────────────

@@ -511,7 +511,12 @@ impl AuditLog {
         let repair = crate::chainlog::repair_torn_tail(path, |l| {
             serde_json::from_slice::<AuditEntry>(l).is_ok()
         })?;
-        let (last_hash, previous_run, second_key_added) = read_tail(path)?;
+        let ChainTail {
+            last_hash,
+            previous_run,
+            second_key_added,
+            ..
+        } = read_tail(path)?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
         // `/etc/northnarrow/` install.
@@ -759,17 +764,42 @@ pub fn audit_failure_is_fatal(allow_env: Option<&str>) -> bool {
     allow_env != Some("1")
 }
 
+/// External audit DEP-009: does the chain at `path` hold a successful
+/// `agent_boot` whose binaries matched the install manifest
+/// (`binary_integrity` = `verified`)? Then this host was installed with a
+/// manifest, and a missing one was removed. A missing or empty file is a
+/// fresh chain (`false`); a line that does not parse is an error — the
+/// caller cannot tell. Read-only, without the torn-tail repair of
+/// [`AuditLog::open`].
+pub fn verified_boot_recorded(path: &Path) -> Result<bool> {
+    Ok(read_tail(path)?.verified_boot)
+}
+
+/// What one pass over the chain finds.
+struct ChainTail {
+    last_hash: String,
+    previous_run: PreviousRun,
+    second_key_added: bool,
+    /// External audit DEP-009, see [`verified_boot_recorded`].
+    verified_boot: bool,
+}
+
 /// Read the final `entry_hash` from `path`, or
 /// [`GENESIS_PREV_HASH`] if the file is missing / empty. Errors
 /// on a malformed final line — that is exactly the corruption
 /// signal A12's verify-on-read flow surfaces, but for the
 /// agent's write path the early failure is preferable to
 /// chaining off garbage.
-fn read_tail(path: &Path) -> Result<(String, PreviousRun, bool)> {
+fn read_tail(path: &Path) -> Result<ChainTail> {
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((GENESIS_PREV_HASH.to_string(), PreviousRun::None, false));
+            return Ok(ChainTail {
+                last_hash: GENESIS_PREV_HASH.to_string(),
+                previous_run: PreviousRun::None,
+                second_key_added: false,
+                verified_boot: false,
+            });
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
@@ -778,6 +808,7 @@ fn read_tail(path: &Path) -> Result<(String, PreviousRun, bool)> {
     let mut last_ts = String::new();
     let mut previous = PreviousRun::None;
     let mut second_key_added = false;
+    let mut verified_boot = false;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -787,6 +818,12 @@ fn read_tail(path: &Path) -> Result<(String, PreviousRun, bool)> {
             .with_context(|| format!("parsing audit-log line: {line}"))?;
         match entry.op.as_str() {
             "agent_boot" => {
+                if entry.result == "success"
+                    && entry.extra.get("binary_integrity").and_then(|v| v.as_str())
+                        == Some("verified")
+                {
+                    verified_boot = true;
+                }
                 previous = PreviousRun::Abrupt {
                     booted_at: entry.ts.clone(),
                     last_entry_at: entry.ts.clone(),
@@ -812,11 +849,12 @@ fn read_tail(path: &Path) -> Result<(String, PreviousRun, bool)> {
     if let PreviousRun::Abrupt { last_entry_at, .. } = &mut previous {
         *last_entry_at = last_ts;
     }
-    Ok((
-        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
-        previous,
+    Ok(ChainTail {
+        last_hash: last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+        previous_run: previous,
         second_key_added,
-    ))
+        verified_boot,
+    })
 }
 
 /// Pure helper: compute `entry_hash` + signature for a draft
@@ -1108,6 +1146,31 @@ mod tests {
             other => panic!("expected Clean, got {other:?}"),
         }
         assert!(verify_chain_ok(&log_path));
+    }
+
+    /// External audit DEP-009: only a successful boot whose binaries matched
+    /// the install manifest marks the install as verified — not a boot
+    /// without a manifest, not a refused one, not another entry naming it.
+    #[test]
+    fn verified_boot_is_found_in_the_chain() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        assert!(!verified_boot_recorded(&log_path).unwrap(), "no file yet");
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.boot_probe(None, "no-manifest", "none").unwrap();
+        log.boot_probe(None, "not-applicable", "none").unwrap();
+        log.boot_refused("mismatch", "source-tree", "nn-admin: expected 00 got 11")
+            .unwrap();
+        let mut other = sample_draft(1);
+        other.extra = serde_json::json!({ "binary_integrity": "verified" });
+        log.append(other).unwrap();
+        assert!(!verified_boot_recorded(&log_path).unwrap());
+        log.boot_probe(None, "verified", "source-tree").unwrap();
+        log.stop_entry("sigterm", 1).unwrap();
+        assert!(verified_boot_recorded(&log_path).unwrap());
+        // a corrupt line: the caller cannot tell
+        std::fs::write(&log_path, b"{not json}\n").unwrap();
+        assert!(verified_boot_recorded(&log_path).is_err());
     }
 
     fn verify_chain_ok(path: &Path) -> bool {

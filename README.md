@@ -171,7 +171,9 @@ sudo ./deploy/uninstall.sh [--purge]    # the only order the anti-tamper layer a
 ```
 
 Building from source: `cargo xtask build --release` (compiles the eBPF object with a
-pinned nightly toolchain and embeds it, provenance-stamped, into the agent). Operator
+pinned nightly toolchain and embeds it, provenance-stamped, into the agent), then
+`sudo ./deploy/install.sh --source-tree` — a tree without the release's `MANIFEST.sha256`
+is refused otherwise, and the flag is recorded. Operator
 guides: [`docs/operator/`](docs/operator/) — install/upgrade/uninstall, COMBAT recovery,
 FIM trust model, container hosts, honeypots. Lab and test runbook:
 [`docs/integration-test-runbook.md`](docs/integration-test-runbook.md).

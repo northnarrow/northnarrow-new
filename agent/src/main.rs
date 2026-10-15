@@ -281,7 +281,9 @@ struct Cli {
     audit_log_file: PathBuf,
     /// Install manifest written by `install.sh` (provenance level + hashes
     /// of the installed binaries and eBPF object); the agent re-verifies
-    /// itself against it at every boot. Absent = source-tree install.
+    /// itself against it at every boot. Absent: not installed by
+    /// `install.sh`, or removed — refused once a boot of this install has
+    /// verified against it (external audit DEP-009).
     #[arg(
         long = "install-manifest",
         value_name = "PATH",
@@ -1136,6 +1138,20 @@ async fn main() -> Result<()> {
     );
     // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
     northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
+    // External audit DEP-006: the previous boot's program-id list goes before
+    // this boot loads anything — its programs are replaced now, and a list
+    // that cannot be rewritten must not outlive them (the scripts then fall
+    // back to their host-wide wait).
+    let own_prog_ids_file = own_prog_ids_file(&cli);
+    if let Some(path) = own_prog_ids_file.as_deref() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "stale BPF program-id list not removed")
+            }
+        }
+    }
     let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
@@ -1182,6 +1198,8 @@ async fn main() -> Result<()> {
                  refusing to start with a silently-absent protection"
         )
     })?;
+    // External audit DEP-006: the ids install.sh / uninstall.sh wait for.
+    record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
 
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
@@ -1841,13 +1859,36 @@ async fn main() -> Result<()> {
     // ones install.sh verified and recorded. Checked before the audit
     // log opens so the agent_boot entry carries the result.
     let integrity = {
-        use northnarrow_agent::install_manifest::{self, IntegrityOutcome, ALLOW_UNVERIFIED_ENV};
+        use northnarrow_agent::install_manifest::{
+            self, BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
+        };
         let own_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
         let outcome = install_manifest::check(
             &cli.install_manifest,
             &own_exe,
             northnarrow_agent::sensors::ebpf_object::OBJECT_SHA,
         );
+        // External audit DEP-009: a missing manifest is a removal once a
+        // boot of this install verified against it — the signed chain is
+        // the sentinel, read (only in that case) before the decision.
+        let history = match &outcome {
+            IntegrityOutcome::NoManifest { .. } => {
+                match northnarrow_agent::audit::verified_boot_recorded(&cli.audit_log_file) {
+                    Ok(true) => BootHistory::VerifiedBefore,
+                    Ok(false) => BootHistory::NeverVerified,
+                    Err(e) => {
+                        error!(
+                            error = format!("{e:#}"),
+                            path = %cli.audit_log_file.display(),
+                            "audit chain unreadable — cannot show that this install never had a \
+                             verified boot; the missing install manifest counts as removed"
+                        );
+                        BootHistory::Unknown
+                    }
+                }
+            }
+            _ => BootHistory::NeverVerified,
+        };
         match &outcome {
             IntegrityOutcome::Verified {
                 provenance,
@@ -1858,9 +1899,17 @@ async fn main() -> Result<()> {
                 manifest = %cli.install_manifest.display(),
                 "binary integrity verified against the install manifest"
             ),
-            IntegrityOutcome::NoManifest { path } => info!(
+            IntegrityOutcome::NoManifest { path } if history == BootHistory::NeverVerified => {
+                info!(
+                    path = %path.display(),
+                    "no install manifest and no verified boot in the audit chain — not installed \
+                     by install.sh (a developer run): binaries not re-verified at boot"
+                )
+            }
+            IntegrityOutcome::NoManifest { path } => error!(
                 path = %path.display(),
-                "no install manifest — source-tree install, binaries not re-verified at boot"
+                "install manifest MISSING after a verified boot of this install — it was removed \
+                 (install.sh writes it on every install, source trees included)"
             ),
             IntegrityOutcome::NotApplicable { own_exe, bin_dir } => info!(
                 own_exe = %own_exe.display(),
@@ -1890,7 +1939,7 @@ async fn main() -> Result<()> {
             }
         }
         let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
-        if outcome.is_fatal(allow.as_deref()) {
+        if outcome.is_fatal(allow.as_deref(), history) {
             error!(
                 "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
                  override on a dev host; re-run install.sh to restore a verified install)",
@@ -1904,6 +1953,15 @@ async fn main() -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("; "),
                 IntegrityOutcome::Unreadable { reason, .. } => reason.clone(),
+                IntegrityOutcome::NoManifest { path } => format!(
+                    "{} missing ({}) — re-run install.sh",
+                    path.display(),
+                    if history == BootHistory::VerifiedBefore {
+                        "removed after a verified boot of this install"
+                    } else {
+                        "audit chain unreadable"
+                    }
+                ),
                 _ => String::new(),
             };
             if let Ok(key) =
@@ -1928,7 +1986,9 @@ async fn main() -> Result<()> {
         } else if matches!(
             outcome,
             IntegrityOutcome::Mismatch { .. } | IntegrityOutcome::Unreadable { .. }
-        ) {
+        ) || (matches!(outcome, IntegrityOutcome::NoManifest { .. })
+            && history != BootHistory::NeverVerified)
+        {
             warn!(
                 "install-manifest check = {} but {ALLOW_UNVERIFIED_ENV}=1 — continuing (dev override)",
                 outcome.label()
@@ -2608,6 +2668,7 @@ async fn main() -> Result<()> {
                          agent's own — the guard does not refuse handles to them"
                     ),
                 }
+                record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
                 let inode_map = match populate_watched_paths(
                     sensor.ebpf_mut(),
                     &watched_paths_load.effective,
@@ -4997,6 +5058,38 @@ fn audit_combat_reconcile(rules_removed: usize) {
     let res = open_res.and_then(|mut f| writeln!(f, "{line}"));
     if let Err(e) = res {
         warn!(error = %e, path = PATH, "could not write COMBAT reconcile audit line (non-fatal)");
+    }
+}
+
+/// External audit DEP-006: where the ids of the agent's loaded BPF programs
+/// go — next to `--pid-file` (the unit: `/run/northnarrow/bpf-own-ids`).
+/// Without `--pid-file` (the e2e fixtures, a manual run) nothing is
+/// written, so the installed agent's list is never overwritten by another.
+fn own_prog_ids_file(cli: &Cli) -> Option<PathBuf> {
+    cli.pid_file
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join(northnarrow_agent::anti_tamper::bpf_defense::OWN_IDS_FILE_NAME))
+}
+
+/// Write the program-id list (see [`own_prog_ids_file`]); a failure is a
+/// WARN: the scripts then fall back to their older, host-wide wait.
+fn record_own_prog_ids(path: Option<&std::path::Path>, ebpf: &aya::Ebpf) {
+    let Some(path) = path else {
+        return;
+    };
+    match northnarrow_agent::anti_tamper::bpf_defense::write_own_prog_ids(ebpf, path) {
+        Ok(n) => debug!(
+            path = %path.display(),
+            programs = n,
+            "own BPF program ids recorded (install.sh / uninstall.sh wait for them)"
+        ),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            path = %path.display(),
+            "own BPF program ids NOT recorded — install.sh --upgrade and uninstall.sh wait on the \
+             list written earlier this boot, or fall back to waiting for no LSM program on the host"
+        ),
     }
 }
 
