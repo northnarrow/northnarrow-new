@@ -23,19 +23,29 @@
 //! | `docker` | `~/.docker/config.json` shape: registry auths   |
 //! | `generic`| OAuth bearer-token .env shape                   |
 //!
-//! ## Determinism (§12 Q5 Level A)
+//! ## Content says nothing about what it is (external audit DEC-007)
 //!
-//! Render output is DETERMINISTIC per `canary_id`. The same
-//! canary_id always renders the same bytes — so the chained
-//! `canaries.jsonl` registry can record a stable
-//! `contents_hash` field for the deployment AND an operator
-//! re-rendering with the same canary_id (e.g. after a
-//! disaster-recovery restore) gets identical content.
+//! What lands on disk is read by the attacker: the templates and the
+//! File canary body carry no product name, no "do not use" comment, no
+//! rule id and no operator fingerprint. Which files are canaries is
+//! recorded only in the signed registry (`/var/lib/northnarrow`, 0700).
+//! The default names are neutral; an operator who wants the decoys to
+//! look like the site (its domains, project names) edits the copies in
+//! `/etc/northnarrow/canary-templates/` (comments there would be copied
+//! into the decoy, so the templates have none).
 //!
-//! Random-ish field values come from
-//! `SHA-256(canary_id || ":" || field_name)` truncated +
-//! alphabet-mapped — no `rand` RNG state, no chrono, no
-//! workspace-state dependency. Pure function of canary_id.
+//! ## Seed (external audit DEC-008)
+//!
+//! Every value is derived from a seed: `SHA-256(seed || ":" || field)`,
+//! truncated and mapped to the family's alphabet. The deploy (and a
+//! refresh) draws a fresh 32-byte seed from the OS RNG
+//! ([`new_content_seed`]) and records it in the registry row with the
+//! SHA-256 of the bytes written, so two deploys never render the same
+//! content and a decoy can be re-rendered from its row. The seed used to
+//! be `"<operator key fingerprint>:<path>"`: the fingerprint appeared in
+//! clear in the decoy (`short_id` was the seed's first 8 characters) and
+//! every host with the same path got the same credential. `short_id` is
+//! now hashed from the seed, never a prefix of it.
 //!
 //! ## Template lookup
 //!
@@ -46,16 +56,18 @@
 //! `fim-paths.v1`). The renderer:
 //!
 //! 1. Tries the operator override at
-//!    `/etc/northnarrow/canary-templates/<family>.tmpl` first.
+//!    `/etc/northnarrow/canary-templates/<family>.tmpl` first —
+//!    unless it is byte-identical to a template an earlier release
+//!    shipped ([`SUPERSEDED_TEMPLATE_SHA256`]), which named the
+//!    product: `install.sh` replaces those, and the agent does not
+//!    use one left behind.
 //! 2. Falls back to the built-in default compiled in via
 //!    `include_str!` (zero-disk-dep tests; production
 //!    operators get the file too via install.sh).
 //!
 //! Operator overrides let high-value sites tune deception
 //! content to their specific environment without recompiling
-//! the agent. K2 audit chain captures every deploy op so the
-//! template-version-in-effect at deploy time is recoverable
-//! via the deployment row.
+//! the agent.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -148,10 +160,64 @@ pub enum RenderError {
     UnresolvedPlaceholder(String),
 }
 
-/// Pure renderer. Given a `canary_id` (the K2 stable-ID hex
-/// string), produce the canary's file content for `family`.
-/// Output is deterministic per canary_id — same canary_id
-/// always renders the same bytes.
+/// SHA-256 (hex) of each template an earlier release shipped (external
+/// audit DEC-007): they named the product (`NorthNarrow XDR`, `DO NOT
+/// USE`, `northnarrow.io`). `install.sh` replaces an on-disk copy that is
+/// byte-identical to one of these and keeps an operator's edit;
+/// [`render`] does not use one it still finds.
+pub const SUPERSEDED_TEMPLATE_SHA256: &[(&str, &str)] = &[
+    (
+        "aws",
+        "cd728e77335951708ad263d4e2d52f808cd9522d1a63546f6621a8e33b15af79",
+    ),
+    (
+        "azure",
+        "1f2676fce70db95d9f2aeaf2a2c2628dd7211cf75d8464329acb208b9350ae04",
+    ),
+    (
+        "docker",
+        "c203d592a626a1ce6fa2ff74ac0935c454eda83060ba67242aa19906a662078d",
+    ),
+    (
+        "gcp",
+        "61f3817c87f6ca8892072a60f459b577ebcb98903b50aec9cdff6ec2c9e8c63a",
+    ),
+    (
+        "generic",
+        "b888d4187b100e984aac3c6f701d9ba649e67d76e55774a768d80ef4ee7be88a",
+    ),
+];
+
+/// A fresh content seed (external audit DEC-008): 32 bytes from the OS
+/// RNG, hex. One per deploy and per refresh, recorded in the registry row.
+pub fn new_content_seed() -> String {
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    hex::encode(seed)
+}
+
+/// The body of a File canary (external audit DEC-007): bytes derived from
+/// `seed`, 512 to 4095 of them — no marker, no fingerprint, no rule id,
+/// and no size or content shared by every decoy. It used to be three
+/// comment lines naming the product, the operator key and the rule.
+pub fn render_file_body(seed: &str) -> Vec<u8> {
+    let n = derive_bytes(seed, "file_len");
+    let len = 512 + usize::from(u16::from_be_bytes([n[0], n[1]])) % 3584;
+    let mut out = Vec::with_capacity(len + 32);
+    let mut block = 0u32;
+    while out.len() < len {
+        out.extend_from_slice(&derive_bytes(seed, &format!("file_body/{block}")));
+        block += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+/// Pure renderer. Given a content `seed` (see [`new_content_seed`]),
+/// produce the canary's file content for `family`. Output is
+/// deterministic per seed — the same seed always renders the same
+/// bytes, so a row's recorded seed re-renders its decoy.
 ///
 /// `template_dir` lets the caller override the operator
 /// directory for tests; production callers pass
@@ -159,11 +225,11 @@ pub enum RenderError {
 /// override lookup entirely (built-in templates only).
 pub fn render(
     family: CredFamily,
-    canary_id: &str,
+    seed: &str,
     template_dir: Option<&std::path::Path>,
 ) -> Result<String, RenderError> {
     let template = load_template(family, template_dir)?;
-    let placeholders = build_placeholders(family, canary_id);
+    let placeholders = build_placeholders(family, seed);
     substitute(&template, &placeholders)
 }
 
@@ -177,6 +243,16 @@ fn load_template(
     if let Some(dir) = template_dir {
         let candidate = dir.join(format!("{}.tmpl", family.as_wire()));
         match std::fs::read_to_string(&candidate) {
+            Ok(body) if is_superseded(family, &body) => {
+                // External audit DEC-007: an earlier release's template left
+                // on disk (an upgrade that did not run install.sh) named the
+                // product; the built-in one replaces it.
+                tracing::warn!(
+                    path = %candidate.display(),
+                    "canary template is the one an earlier release shipped (it names the \
+                     product) — the built-in template is used; install.sh --upgrade replaces it"
+                );
+            }
             Ok(body) => return Ok(body),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Fall through to the built-in default.
@@ -192,12 +268,24 @@ fn load_template(
     Ok(family.builtin_template().to_string())
 }
 
+/// `body` is byte-identical to the template an earlier release shipped
+/// for `family`.
+fn is_superseded(family: CredFamily, body: &str) -> bool {
+    let sha = hex::encode(Sha256::digest(body.as_bytes()));
+    SUPERSEDED_TEMPLATE_SHA256
+        .iter()
+        .any(|(f, h)| *f == family.as_wire() && *h == sha)
+}
+
 /// Build the per-family placeholder map. Every value is a
-/// deterministic function of `canary_id` via SHA-256, mapped
+/// deterministic function of `seed` via SHA-256, mapped
 /// to the format the family's spec requires (AKIA prefix,
 /// GUID shape, base64 token shape, etc.).
-fn build_placeholders(family: CredFamily, canary_id: &str) -> HashMap<&'static str, String> {
+fn build_placeholders(family: CredFamily, seed: &str) -> HashMap<&'static str, String> {
     let mut m = HashMap::new();
+    // Every family: an operator template may use it (it was offered to
+    // azure / gcp / docker before).
+    m.insert("short_id", short_id(seed));
     match family {
         CredFamily::Aws => {
             // AWS Access Key ID: 16-char base32 body (uppercase
@@ -207,7 +295,7 @@ fn build_placeholders(family: CredFamily, canary_id: &str) -> HashMap<&'static s
             // long-lived-key shape attackers expect to find.
             m.insert(
                 "access_key_id",
-                format!("AKIA{}", derive_base32(canary_id, "akia_body", 16)),
+                format!("AKIA{}", derive_base32(seed, "akia_body", 16)),
             );
             // AWS Secret Access Key: 40 base64-ish chars
             // (no padding, no '/' or '+' surprises — AWS
@@ -215,7 +303,7 @@ fn build_placeholders(family: CredFamily, canary_id: &str) -> HashMap<&'static s
             // for cleaner regex-match in test grep).
             m.insert(
                 "secret_access_key",
-                derive_base64ish(canary_id, "secret_body", 40),
+                derive_base64ish(seed, "secret_body", 40),
             );
         }
         CredFamily::Azure => {
@@ -223,14 +311,13 @@ fn build_placeholders(family: CredFamily, canary_id: &str) -> HashMap<&'static s
             // shape with the 4xxx + yxxx variant bits set per
             // RFC 4122). Plus a password that looks like a
             // 40-char base64 secret.
-            m.insert("app_id", derive_guid(canary_id, "app_id"));
-            m.insert("tenant_id", derive_guid(canary_id, "tenant_id"));
-            m.insert("object_id", derive_guid(canary_id, "object_id"));
-            m.insert(
-                "password",
-                derive_base64ish(canary_id, "azure_password", 40),
-            );
-            m.insert("short_id", short_id(canary_id));
+            m.insert("app_id", derive_guid(seed, "app_id"));
+            m.insert("tenant_id", derive_guid(seed, "tenant_id"));
+            m.insert("object_id", derive_guid(seed, "object_id"));
+            m.insert("password", derive_base64ish(seed, "azure_password", 40));
+            // `az ad sp create-for-rbac` names a principal
+            // `azure-cli-YYYY-MM-DD-HH-MM-SS` by default.
+            m.insert("az_stamp", derive_stamp(seed, "az_stamp"));
         }
         CredFamily::Gcp => {
             // GCP service-account JSON shape (real format per
@@ -240,33 +327,33 @@ fn build_placeholders(family: CredFamily, canary_id: &str) -> HashMap<&'static s
             // cryptographically valid (no real RSA key gen at
             // render time; that'd require the openssl crate
             // which violates the Tappa 0 minimal-dep charter).
-            m.insert(
-                "private_key_id",
-                derive_hex(canary_id, "private_key_id", 40),
-            );
+            m.insert("private_key_id", derive_hex(seed, "private_key_id", 40));
             m.insert(
                 "private_key_body",
-                derive_pem_body(canary_id, "private_key_body"),
+                derive_pem_body(seed, "private_key_body"),
             );
-            m.insert("client_id", derive_decimal(canary_id, "client_id", 21));
-            m.insert("short_id", short_id(canary_id));
+            m.insert("client_id", derive_decimal(seed, "client_id", 21));
+            // A generated project id: a name plus six digits.
+            m.insert(
+                "project_id",
+                format!("prod-platform-{}", derive_decimal(seed, "project_id", 6)),
+            );
         }
         CredFamily::Docker => {
             // Docker config.json: each registry's `auth` is the
             // base64-encoded "user:password" pair. Real Docker
             // login writes this exact shape; format checkers
             // (skopeo, docker-credential-helper) accept it.
-            m.insert("basic_auth", derive_basic_auth(canary_id, "registry"));
-            m.insert("ghcr_auth", derive_basic_auth(canary_id, "ghcr"));
-            m.insert("short_id", short_id(canary_id));
+            m.insert("basic_auth", derive_basic_auth(seed, "registry"));
+            m.insert("ghcr_auth", derive_basic_auth(seed, "ghcr"));
         }
         CredFamily::Generic => {
             // OAuth bearer-token .env shape. The token itself
             // is a 60-char base64-ish blob (matches the
             // standard OAuth opaque-token shape from RFC 6749
             // §1.5).
-            m.insert("bearer_token", derive_base64ish(canary_id, "bearer", 60));
-            m.insert("tenant_id", derive_guid(canary_id, "tenant_id"));
+            m.insert("bearer_token", derive_base64ish(seed, "bearer", 60));
+            m.insert("tenant_id", derive_guid(seed, "tenant_id"));
         }
     }
     m
@@ -296,12 +383,12 @@ fn substitute(template: &str, placeholders: &HashMap<&str, String>) -> Result<St
 
 // ── deterministic derivation helpers ────────────────────────────────
 
-/// SHA-256(canary_id || ":" || field) → raw 32 bytes. The
-/// `:` separator prevents collision between e.g. `canary_id =
-/// "x"` + `field = "y"` and `canary_id = "x:y"` + `field = ""`.
-fn derive_bytes(canary_id: &str, field: &str) -> [u8; 32] {
+/// SHA-256(seed || ":" || field) → raw 32 bytes. The
+/// `:` separator prevents collision between e.g. `seed =
+/// "x"` + `field = "y"` and `seed = "x:y"` + `field = ""`.
+fn derive_bytes(seed: &str, field: &str) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(canary_id.as_bytes());
+    h.update(seed.as_bytes());
     h.update(b":");
     h.update(field.as_bytes());
     h.finalize().into()
@@ -314,9 +401,9 @@ const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 /// Map `len` bytes from the SHA-256 digest into base-32
 /// characters. `len` MUST be ≤ 32 (we never need more than
 /// 16 for AWS keys).
-fn derive_base32(canary_id: &str, field: &str, len: usize) -> String {
+fn derive_base32(seed: &str, field: &str, len: usize) -> String {
     debug_assert!(len <= 32);
-    let bytes = derive_bytes(canary_id, field);
+    let bytes = derive_bytes(seed, field);
     bytes[..len]
         .iter()
         .map(|b| BASE32[(*b as usize) % 32] as char)
@@ -327,13 +414,13 @@ fn derive_base32(canary_id: &str, field: &str, len: usize) -> String {
 /// base64 alphabet but skips `/` and `+` so the resulting
 /// string is grep-friendly + matches the cleaner shape AWS
 /// secret keys + most OAuth tokens use in the wild.
-fn derive_base64ish(canary_id: &str, field: &str, len: usize) -> String {
+fn derive_base64ish(seed: &str, field: &str, len: usize) -> String {
     // Hash a couple of times so we have ≥ len/1.3 raw bytes
     // (base64 expands 3→4). For len up to 60 + a small
     // safety margin, two rounds is plenty.
     let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&derive_bytes(canary_id, &format!("{field}/0")));
-    buf.extend_from_slice(&derive_bytes(canary_id, &format!("{field}/1")));
+    buf.extend_from_slice(&derive_bytes(seed, &format!("{field}/0")));
+    buf.extend_from_slice(&derive_bytes(seed, &format!("{field}/1")));
     let encoded = B64.encode(&buf);
     let trimmed: String = encoded
         .chars()
@@ -345,7 +432,7 @@ fn derive_base64ish(canary_id: &str, field: &str, len: usize) -> String {
         // too many chars. Shouldn't happen for len ≤ 60 + 2
         // hash rounds, but defend against base64's '+' / '/'
         // edge case.
-        let extra = derive_bytes(canary_id, &format!("{field}/pad"));
+        let extra = derive_bytes(seed, &format!("{field}/pad"));
         let mut padded = trimmed;
         for b in extra {
             if padded.len() >= len {
@@ -361,18 +448,18 @@ fn derive_base64ish(canary_id: &str, field: &str, len: usize) -> String {
 }
 
 /// Generate a hex string of `len` chars (≤ 64).
-fn derive_hex(canary_id: &str, field: &str, len: usize) -> String {
+fn derive_hex(seed: &str, field: &str, len: usize) -> String {
     debug_assert!(len <= 64);
-    let bytes = derive_bytes(canary_id, field);
+    let bytes = derive_bytes(seed, field);
     hex::encode(bytes).chars().take(len).collect()
 }
 
 /// Generate a decimal string of `len` digits (≤ 38 — u128
 /// max). Used for the GCP `client_id` which is a 21-digit
 /// integer.
-fn derive_decimal(canary_id: &str, field: &str, len: usize) -> String {
+fn derive_decimal(seed: &str, field: &str, len: usize) -> String {
     debug_assert!(len <= 38);
-    let bytes = derive_bytes(canary_id, field);
+    let bytes = derive_bytes(seed, field);
     // Treat the first 16 bytes as a u128, format as decimal,
     // truncate/pad to len.
     let mut arr = [0u8; 16];
@@ -395,12 +482,12 @@ fn derive_decimal(canary_id: &str, field: &str, len: usize) -> String {
 }
 
 /// Generate an RFC 4122 v4 UUID (random shape) deterministically
-/// from canary_id + field. Sets the version (0b0100xxxx in
+/// from seed + field. Sets the version (0b0100xxxx in
 /// byte 6) + variant (0b10xxxxxx in byte 8) bits per the
 /// spec so the result passes UUID-format checkers (Azure
 /// SDK, .NET Guid.Parse, etc.).
-fn derive_guid(canary_id: &str, field: &str) -> String {
-    let mut bytes = derive_bytes(canary_id, field);
+fn derive_guid(seed: &str, field: &str) -> String {
+    let mut bytes = derive_bytes(seed, field);
     // Version 4 in the high nibble of byte 6.
     bytes[6] = (bytes[6] & 0x0F) | 0x40;
     // Variant 10xx in the high two bits of byte 8.
@@ -417,6 +504,21 @@ fn derive_guid(canary_id: &str, field: &str) -> String {
     )
 }
 
+/// A `YYYY-MM-DD-HH-MM-SS` stamp in 2023–2025 derived from seed +
+/// field (the Azure CLI's default service-principal name suffix).
+fn derive_stamp(seed: &str, field: &str) -> String {
+    let b = derive_bytes(seed, field);
+    format!(
+        "{}-{:02}-{:02}-{:02}-{:02}-{:02}",
+        2023 + u32::from(b[0] % 3),
+        1 + b[1] % 12,
+        1 + b[2] % 28,
+        b[3] % 24,
+        b[4] % 60,
+        b[5] % 60
+    )
+}
+
 /// Generate a PEM-parseable private-key body block (30 lines
 /// of 64-char base64). NOT a valid RSA key (the bytes are
 /// SHA-derived noise, not a DER-encoded RSAPrivateKey), but
@@ -424,10 +526,10 @@ fn derive_guid(canary_id: &str, field: &str) -> String {
 /// and reports "unable to load Private Key" on the body
 /// (FORMAT check passes; cryptographic check fails — Level A
 /// per §12 Q5, exactly the operator-controlled shape).
-fn derive_pem_body(canary_id: &str, field: &str) -> String {
+fn derive_pem_body(seed: &str, field: &str) -> String {
     let mut buf = Vec::with_capacity(64 * 30);
     for i in 0..15 {
-        buf.extend_from_slice(&derive_bytes(canary_id, &format!("{field}/{i}")));
+        buf.extend_from_slice(&derive_bytes(seed, &format!("{field}/{i}")));
     }
     let encoded = B64.encode(&buf);
     // Wrap to 64-char lines per PEM convention. The GCP
@@ -449,19 +551,18 @@ fn derive_pem_body(canary_id: &str, field: &str) -> String {
 /// shape. Real Docker login writes the same shape; the
 /// `docker login --username-stdin` flow's output dropped
 /// straight into `~/.docker/config.json`.
-fn derive_basic_auth(canary_id: &str, field: &str) -> String {
-    let user = format!("deploy-{}", short_id(canary_id));
-    let pass = derive_base64ish(canary_id, field, 32);
+fn derive_basic_auth(seed: &str, field: &str) -> String {
+    let user = format!("deploy-{}", short_id(seed));
+    let pass = derive_base64ish(seed, field, 32);
     B64.encode(format!("{user}:{pass}").as_bytes())
 }
 
-/// Short 8-char hex prefix of `canary_id`. Used in
-/// human-readable identifiers (`deploy-<short>`,
-/// `northnarrow-prod-<short>`) to thread visual continuity
-/// without exposing the full 32-char canary_id in every
-/// field.
-fn short_id(canary_id: &str) -> String {
-    canary_id.chars().take(8).collect()
+/// Short 8-hex-char identifier used in human-readable names
+/// (`deploy-<short>`). External audit DEC-008: hashed from the
+/// seed, never a prefix of it — the seed used to start with the
+/// operator key fingerprint, which this printed into the decoy.
+fn short_id(seed: &str) -> String {
+    derive_hex(seed, "short_id", 8)
 }
 
 #[cfg(test)]
@@ -469,10 +570,116 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Stable canary_id for deterministic-output assertions.
-    /// Real K2 IDs are SHA-256(name||":"||deployed_at)[..16] —
-    /// 32 hex chars; this fixture mirrors the shape.
+    /// Stable seed for deterministic-output assertions (a real one is
+    /// 64 hex chars from [`new_content_seed`]).
     const TEST_ID: &str = "9f3c8a01b2c3d4e5f6a7b8c9d0e1f2a3";
+
+    const FAMILIES: [CredFamily; 5] = [
+        CredFamily::Aws,
+        CredFamily::Azure,
+        CredFamily::Gcp,
+        CredFamily::Docker,
+        CredFamily::Generic,
+    ];
+
+    /// What would tell an attacker the file is a canary, or whose.
+    const MARKERS: [&str; 5] = ["northnarrow", "canary", "do not use", "decoy", "nn-l-"];
+
+    fn assert_no_marker(what: &str, body: &str) {
+        let lower = body.to_lowercase();
+        for m in MARKERS {
+            assert!(!lower.contains(m), "{what} carries {m:?}: {body}");
+        }
+    }
+
+    /// External audit DEC-007: no template, built in or rendered, names
+    /// the product or says what the file is.
+    #[test]
+    fn credential_templates_have_no_product_marker() {
+        for family in FAMILIES {
+            assert_no_marker(family.as_wire(), family.builtin_template());
+            for seed in [TEST_ID, "0", "deadbeef:/home/u/.aws/credentials"] {
+                let body = render(family, seed, None).expect("render");
+                assert_no_marker(family.as_wire(), &body);
+                assert!(!body.contains("{{"), "{family:?} left a placeholder");
+            }
+        }
+    }
+
+    /// External audit DEC-007: the File canary body carries no marker and
+    /// no fingerprint, and neither its content nor its size is the same on
+    /// every decoy.
+    #[test]
+    fn file_canary_body_has_no_marker_or_fingerprint() {
+        let a = render_file_body(&new_content_seed());
+        let b = render_file_body(&new_content_seed());
+        for body in [&a, &b] {
+            assert!((512..4096).contains(&body.len()));
+            assert_no_marker("file body", &String::from_utf8_lossy(body));
+            assert!(!String::from_utf8_lossy(body).contains("deadbeef"));
+        }
+        assert_ne!(a, b, "two deploys, two bodies");
+        let seed = "5a".repeat(32);
+        assert_eq!(render_file_body(&seed), render_file_body(&seed));
+    }
+
+    /// External audit DEC-008: the seed used to be `<operator fp>:<path>`
+    /// and `short_id` its first 8 characters, so the fingerprint was
+    /// printed into the azure, gcp and docker decoys.
+    #[test]
+    fn short_id_never_contains_the_operator_fp() {
+        let fp = "deadbeef";
+        let seed = format!("{fp}:/home/u/.config/creds.json");
+        assert_ne!(short_id(&seed), fp);
+        for family in FAMILIES {
+            let body = render(family, &seed, None).expect("render");
+            let decoded: String = body
+                .split('"')
+                .filter_map(|t| B64.decode(t).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .collect();
+            assert!(
+                !body.contains(fp) && !decoded.contains(fp),
+                "{family:?} carries the operator fingerprint"
+            );
+        }
+    }
+
+    /// External audit DEC-008: every deploy draws its own seed.
+    #[test]
+    fn content_seeds_are_fresh() {
+        let (a, b) = (new_content_seed(), new_content_seed());
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+        for family in FAMILIES {
+            assert_ne!(
+                render(family, &a, None).unwrap(),
+                render(family, &b, None).unwrap()
+            );
+        }
+    }
+
+    /// External audit DEC-007: an upgraded host keeps the template copied
+    /// under `/etc` by an earlier release when install.sh did not replace
+    /// it; that one named the product, and the built-in one is used.
+    #[test]
+    fn a_superseded_shipped_template_on_disk_is_not_used() {
+        let old_aws = "[default]\naws_access_key_id = {{access_key_id}}\naws_secret_access_key = \
+                       {{secret_access_key}}\nregion = us-east-1\n\n# Canary credential \u{2014} DO NOT \
+                       USE. NorthNarrow XDR sovereign\n# deception layer. Any access to this file is, \
+                       by construction,\n# evidence of intrusion (see \
+                       docs/operator/TAPPA9_5_CANARY_*.md).\n";
+        assert!(is_superseded(CredFamily::Aws, old_aws), "the shipped bytes");
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("aws.tmpl"), old_aws).unwrap();
+        let body = render(CredFamily::Aws, TEST_ID, Some(dir.path())).unwrap();
+        assert_no_marker("aws", &body);
+        assert_eq!(body, render(CredFamily::Aws, TEST_ID, None).unwrap());
+        // an operator's edit of it is the operator's
+        std::fs::write(dir.path().join("aws.tmpl"), format!("{old_aws}# edited\n")).unwrap();
+        let body = render(CredFamily::Aws, TEST_ID, Some(dir.path())).unwrap();
+        assert!(body.contains("# edited"));
+    }
 
     // ── K4 test #1: AWS format-validity ─────────────────────
 
@@ -607,10 +814,10 @@ mod tests {
             serde_json::from_str(&body).expect("Docker template must be valid JSON");
         let auths = parsed.get("auths").expect("auths field present");
         assert!(auths.is_object());
-        // At least the registry.northnarrow.io entry exists.
+        // The Docker Hub entry `docker login` writes.
         let registry = auths
-            .get("registry.northnarrow.io")
-            .expect("registry.northnarrow.io entry present");
+            .get("https://index.docker.io/v1/")
+            .expect("Docker Hub entry present");
         let auth = registry["auth"].as_str().unwrap();
         // The `auth` field is base64-encoded "user:password";
         // decoding must succeed AND contain a ":" separator.
@@ -626,12 +833,11 @@ mod tests {
 
     // ── K4 test #5: determinism ──────────────────────────────
 
-    /// Same canary_id renders identical bytes across calls.
-    /// The K2 deployment can record a stable contents_hash;
-    /// disaster-recovery re-renders produce the same content
-    /// the original deploy did.
+    /// The same seed renders identical bytes across calls, so a
+    /// decoy can be re-rendered from the seed its registry row
+    /// records (disaster recovery).
     #[test]
-    fn render_with_same_canary_id_is_deterministic() {
+    fn render_with_same_seed_is_deterministic() {
         for family in [
             CredFamily::Aws,
             CredFamily::Azure,
@@ -641,12 +847,12 @@ mod tests {
         ] {
             let a = render(family, TEST_ID, None).expect("render");
             let b = render(family, TEST_ID, None).expect("render");
-            assert_eq!(a, b, "{family:?} must be deterministic on canary_id");
-            // Different canary_id → different content.
+            assert_eq!(a, b, "{family:?} must be deterministic on the seed");
+            // Different seed → different content.
             let c = render(family, "deadbeefcafebabe1234567890abcdef", None).expect("render");
             assert_ne!(
                 a, c,
-                "{family:?} must produce different content for different canary_id"
+                "{family:?} must produce different content for different seeds"
             );
         }
     }

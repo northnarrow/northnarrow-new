@@ -1149,6 +1149,16 @@ fail=0
 n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
 (( n >= 7 )) || { echo "FAIL: only $n LSM programs after upgrade"; fail=1; }
 sudo ls /sys/fs/bpf/northnarrow/PROTECTED_PIDS >/dev/null || { echo "FAIL: PROTECTED_PIDS not re-pinned"; fail=1; }
+# External audit DEC-007: a template an earlier release shipped named the
+# product in every decoy rendered from it; the upgrade replaces it (an
+# operator's edit is kept) and closes the directory to other users.
+for t in aws azure docker gcp generic; do
+    f=/etc/northnarrow/canary-templates/$t.tmpl
+    if sudo grep -qiE 'northnarrow|do not use' "$f"; then echo "FAIL: $f still names the product"; fail=1; fi
+    sudo cmp -s "$f" "configs/canary-templates/$t.tmpl" || echo "note: $f differs from the shipped template (operator copy kept)"
+    m=$(sudo stat -c %a "$f"); [[ "$m" == 640 ]] || { echo "FAIL: $f mode $m (want 640)"; fail=1; }
+done
+m=$(sudo stat -c %a /etc/northnarrow/canary-templates); [[ "$m" == 750 ]] || { echo "FAIL: canary-templates mode $m (want 750)"; fail=1; }
 (( fail == 0 )) && echo "upgrade-check: OK"
 exit $fail
 REMOTE

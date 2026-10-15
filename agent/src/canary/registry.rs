@@ -22,8 +22,8 @@
 //!   C3's `BaselineEntryDraft`).
 //! - [`RegistryAction`] — discriminated union of registry
 //!   actions persisted to the chain: `Deploy` / `Burn` /
-//!   `Refresh`. The chain captures EVERY state transition for
-//!   audit-grade traceability.
+//!   `Refresh` / `Trip` / `DecoyCheck`. The chain captures EVERY
+//!   state transition for audit-grade traceability.
 //! - [`Registry::open`] — opens the JSONL log, walks any
 //!   existing entries to recover the in-memory state (which
 //!   canaries are live, which are tripped, the chain tail-
@@ -36,10 +36,19 @@
 //!   cloned snapshot of every active canary (`burn` rows
 //!   remove from the live set; `refresh` resets `tripped`).
 //! - [`Registry::mark_tripped`] — called by the K3 detector
-//!   on first access. Updates the in-memory state + emits a
-//!   `Refresh`-style row (NO; trip rows live in the SEPARATE
-//!   `canary_access.jsonl` chain that K3 writes — this
-//!   registry chain captures DEPLOYMENT lifecycle only).
+//!   on first access. External audit DEC-011: appends a `Trip`
+//!   row carrying the `entry_hash` of the access row (in the
+//!   SEPARATE `canary_access.jsonl` chain K3 writes), so a
+//!   tripped canary stays tripped across a restart until an
+//!   operator refreshes it (§12 Q2). It used to change the
+//!   in-memory state only: every restart re-armed the K5
+//!   response for a canary already tripped.
+//! - External audit DEC-010: a File / Credential row carries the
+//!   SHA-256 of the decoy written and the seed it was rendered
+//!   from; at boot [`check_decoy`] compares the file with it, and
+//!   a change of what the boot found is a `DecoyCheck` row, so
+//!   `nn-admin canary list` shows a decoy modified, removed or
+//!   replaced while the agent was down.
 //! - [`verify_chain`] — pure off-host verifier symmetric to
 //!   `crate::audit::verify_chain` + `crate::fim::baseline::
 //!   verify_chain`. Replays a sequence of [`CanaryToken`]
@@ -76,6 +85,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
+use common::wire::InodeKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -103,11 +113,11 @@ pub const CANARY_REGISTRY_FORMAT_VERSION: u32 = 1;
 
 // ── on-disk schema ──────────────────────────────────────────────────
 
-/// Discriminator for the THREE kinds of state-transition rows
-/// the registry chain captures. The on-disk format embeds this
+/// Discriminator for the kinds of state-transition rows the
+/// registry chain captures. The on-disk format embeds this
 /// tag so a single replay loop can dispatch correctly across
-/// deploy / burn / refresh actions. Variant order MUST stay
-/// stable (the serde representation drives wire-byte semantics).
+/// actions. Variant order MUST stay stable and new variants are
+/// appended (the serde representation drives wire-byte semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryAction {
@@ -124,8 +134,56 @@ pub enum RegistryAction {
     /// (`nn-admin canary refresh <id>`). In-memory `tripped`
     /// flag clears; subsequent accesses re-fire the rule
     /// (§12 Q2 single-trip lock-in respected via operator-
-    /// intent audit row, not magic auto-state-change).
+    /// intent audit row, not magic auto-state-change). A File /
+    /// Credential decoy is written again with a new seed; the row
+    /// carries its content and `decoy_state: intact`.
     Refresh,
+    /// External audit DEC-011: the first access the K3 detector saw.
+    /// `first_trip_access_hash` is the access row's `entry_hash`. An
+    /// agent older than this row skips it as unreadable (DEC-006).
+    Trip,
+    /// External audit DEC-010: the boot found the decoy in a state other
+    /// than the one last recorded (`decoy_state`).
+    DecoyCheck,
+}
+
+/// External audit DEC-010: what the boot found at a File / Credential
+/// canary's path, against the content its row records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoyState {
+    /// The file written at deploy or refresh (or, for a row recorded
+    /// before content hashes, a regular file).
+    Intact,
+    /// A regular file with other content.
+    Modified,
+    /// Nothing at the path.
+    Missing,
+    /// A symlink, FIFO, directory, socket or device at the path.
+    NotRegular,
+    /// Present but not readable.
+    Unreadable,
+}
+
+impl DecoyState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecoyState::Intact => "intact",
+            DecoyState::Modified => "modified",
+            DecoyState::Missing => "missing",
+            DecoyState::NotRegular => "not_regular",
+            DecoyState::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// External audit DEC-010 / DEC-008: what a File / Credential decoy was
+/// written with — the SHA-256 of its bytes and the seed they were rendered
+/// from (agent-only: the registry lives in `/var/lib/northnarrow`, 0700).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoyContent {
+    pub contents_sha256: String,
+    pub content_seed: Option<String>,
 }
 
 /// One on-disk JSONL row per design §4.1. Field order MATTERS
@@ -181,6 +239,19 @@ pub struct CanaryToken {
     /// `canary_access.jsonl` chain (K3-side), for cross-chain
     /// reference. `None` until the first trip.
     pub first_trip_access_hash: Option<String>,
+    /// External audit DEC-010: SHA-256 (hex) of the decoy bytes written
+    /// at deploy or the last refresh, on every row of a File /
+    /// Credential canary. Absent on rows written before it (they
+    /// serialise as they did, so their hashes verify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents_sha256: Option<String>,
+    /// External audit DEC-008: the seed the decoy was rendered from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_seed: Option<String>,
+    /// External audit DEC-010: on `DecoyCheck` rows, what the boot found;
+    /// on `Refresh` rows that wrote the decoy again, `intact`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoy_state: Option<DecoyState>,
     /// Chain integrity (Tappa 8 B1 shape).
     pub agent_id: String,
     pub prev_hash: String,
@@ -205,6 +276,9 @@ pub struct CanaryTokenDraft {
     /// dispatch (K6) computes this from the verified
     /// `KeyedSignature` and passes it in.
     pub deployed_by_fp: String,
+    /// What the File / Credential decoy was written with (`None` for
+    /// Process / Network canaries).
+    pub content: Option<DecoyContent>,
 }
 
 /// Live in-memory state for a single deployed canary. Distilled
@@ -223,6 +297,10 @@ pub struct CanaryLiveState {
     pub deployed_by_fp: String,
     pub tripped: bool,
     pub first_trip_access_hash: Option<String>,
+    /// External audit DEC-010: what the decoy was written with.
+    pub content: Option<DecoyContent>,
+    /// External audit DEC-010: the decoy state last recorded.
+    pub decoy_state: DecoyState,
 }
 
 // ── registry ────────────────────────────────────────────────────────
@@ -309,35 +387,20 @@ impl Registry {
                 "canary_id collision: id={canary_id} already in live set"
             ));
         }
-        let entry = build_signed_entry(
-            RegistryAction::Deploy,
-            &canary_id,
-            &draft.name,
-            draft.canary_type,
-            &draft.deployment,
+        let state = CanaryLiveState {
+            name: draft.name,
+            canary_id: canary_id.clone(),
+            canary_type: draft.canary_type,
+            deployment: draft.deployment,
             deployed_at_unix,
-            &draft.deployed_by_fp,
-            false,
-            None,
-            &self.key,
-            &self.agent_id,
-            &self.last_hash,
-        )?;
-        self.append_row(&entry)?;
-        self.last_hash = entry.entry_hash.clone();
-        self.live.insert(
-            canary_id.clone(),
-            CanaryLiveState {
-                name: draft.name,
-                canary_id,
-                canary_type: draft.canary_type,
-                deployment: draft.deployment,
-                deployed_at_unix,
-                deployed_by_fp: draft.deployed_by_fp,
-                tripped: false,
-                first_trip_access_hash: None,
-            },
-        );
+            deployed_by_fp: draft.deployed_by_fp.clone(),
+            tripped: false,
+            first_trip_access_hash: None,
+            content: draft.content,
+            decoy_state: DecoyState::Intact,
+        };
+        let entry = self.append(RegistryAction::Deploy, &state, &draft.deployed_by_fp, None)?;
+        self.live.insert(canary_id, state);
         Ok(entry)
     }
 
@@ -357,22 +420,7 @@ impl Registry {
             .get(canary_id)
             .ok_or(RegistryError::CanaryIdNotFound)?
             .clone();
-        let entry = build_signed_entry(
-            RegistryAction::Burn,
-            canary_id,
-            &state.name,
-            state.canary_type,
-            &state.deployment,
-            state.deployed_at_unix,
-            burned_by_fp,
-            state.tripped,
-            state.first_trip_access_hash.clone(),
-            &self.key,
-            &self.agent_id,
-            &self.last_hash,
-        )?;
-        self.append_row(&entry)?;
-        self.last_hash = entry.entry_hash.clone();
+        let entry = self.append(RegistryAction::Burn, &state, burned_by_fp, None)?;
         self.live.remove(canary_id);
         Ok(entry)
     }
@@ -383,60 +431,92 @@ impl Registry {
     /// `first_trip_access_hash` in the live set. Returns the
     /// persisted Refresh row.
     ///
+    /// `content` is what the decoy was written with again (external
+    /// audit DEC-008: a new seed), recorded with `decoy_state: intact`;
+    /// `None` (a Process / Network canary) keeps the content recorded.
+    ///
     /// Errors with `CanaryIdNotFound` if `canary_id` isn't in
     /// the live set. A refresh on a NOT-tripped canary is
     /// allowed (no-op semantically; the chain still captures
     /// operator intent — useful for explicit lifecycle markers).
-    pub fn refresh(&mut self, canary_id: &str, refreshed_by_fp: &str) -> Result<CanaryToken> {
-        let state = self
+    pub fn refresh(
+        &mut self,
+        canary_id: &str,
+        refreshed_by_fp: &str,
+        content: Option<DecoyContent>,
+    ) -> Result<CanaryToken> {
+        let mut state = self
             .live
             .get(canary_id)
             .ok_or(RegistryError::CanaryIdNotFound)?
             .clone();
-        let entry = build_signed_entry(
-            RegistryAction::Refresh,
-            canary_id,
-            &state.name,
-            state.canary_type,
-            &state.deployment,
-            state.deployed_at_unix,
-            refreshed_by_fp,
-            false,
-            None,
-            &self.key,
-            &self.agent_id,
-            &self.last_hash,
-        )?;
-        self.append_row(&entry)?;
-        self.last_hash = entry.entry_hash.clone();
-        if let Some(s) = self.live.get_mut(canary_id) {
-            s.tripped = false;
-            s.first_trip_access_hash = None;
+        state.tripped = false;
+        state.first_trip_access_hash = None;
+        let rewritten = content.is_some();
+        if let Some(c) = content {
+            state.content = Some(c);
+            state.decoy_state = DecoyState::Intact;
         }
+        let decoy_state = rewritten.then_some(DecoyState::Intact);
+        let entry = self.append(
+            RegistryAction::Refresh,
+            &state,
+            refreshed_by_fp,
+            decoy_state,
+        )?;
+        self.live.insert(canary_id.to_string(), state);
         Ok(entry)
     }
 
-    /// Mark a canary as tripped (called by the K3 detector on
-    /// first access). Updates the in-memory state ONLY — the
-    /// trip itself is recorded in the SEPARATE
-    /// `canary_access.jsonl` chain that K3 writes. The
-    /// `first_trip_access_hash` argument is the entry_hash of
-    /// THAT chain's first-trip row, so a future
-    /// `nn-admin canary list` can cross-reference.
+    /// `true` when `canary_id` is deployed and not tripped: its next
+    /// access is the first trip.
+    pub fn is_armed(&self, canary_id: &str) -> bool {
+        self.live.get(canary_id).is_some_and(|s| !s.tripped)
+    }
+
+    /// Mark a canary as tripped (called by the K3 detector on its
+    /// first access, after the access row is appended).
+    /// `access_hash` is the `entry_hash` of THAT row in the
+    /// `canary_access.jsonl` chain, recorded for cross-reference.
     ///
-    /// Idempotent: a second `mark_tripped` on an already-
-    /// tripped canary is a no-op (returns `false` — the rule
+    /// External audit DEC-011: appends a signed `Trip` row, so the
+    /// state survives a restart. The in-memory state is set first:
+    /// if the row cannot be written, this boot still responds to the
+    /// first access only, and the error is returned for the caller to
+    /// report.
+    ///
+    /// Idempotent: on a canary already tripped (or not deployed)
+    /// nothing is written and `Ok(false)` is returned — the rule
     /// engine's "subsequent accesses don't re-fire" guarantee
-    /// per §12 Q2 single-trip lock-in).
-    pub fn mark_tripped(&mut self, canary_id: &str, access_hash: String) -> bool {
-        match self.live.get_mut(canary_id) {
+    /// per §12 Q2 single-trip lock-in.
+    pub fn mark_tripped(&mut self, canary_id: &str, access_hash: Option<String>) -> Result<bool> {
+        let state = match self.live.get_mut(canary_id) {
             Some(s) if !s.tripped => {
                 s.tripped = true;
-                s.first_trip_access_hash = Some(access_hash);
-                true
+                s.first_trip_access_hash = access_hash;
+                s.clone()
             }
-            _ => false,
-        }
+            _ => return Ok(false),
+        };
+        self.append(RegistryAction::Trip, &state, AGENT_ACTOR, None)
+            .context("recording the first trip in the canary registry")?;
+        Ok(true)
+    }
+
+    /// External audit DEC-010: record what the boot found at a decoy,
+    /// when it differs from the state last recorded (a `DecoyCheck`
+    /// row). `Ok(true)` when the state changed (and was recorded),
+    /// `Ok(false)` when it is the one recorded, or the canary is not
+    /// deployed.
+    pub fn record_decoy_state(&mut self, canary_id: &str, found: DecoyState) -> Result<bool> {
+        let mut state = match self.live.get(canary_id) {
+            Some(s) if s.decoy_state != found => s.clone(),
+            _ => return Ok(false),
+        };
+        state.decoy_state = found;
+        self.append(RegistryAction::DecoyCheck, &state, AGENT_ACTOR, Some(found))?;
+        self.live.insert(canary_id.to_string(), state);
+        Ok(true)
     }
 
     /// Operator-facing read API. Returns a cloned snapshot of
@@ -472,6 +552,29 @@ impl Registry {
     /// Test helper + future cross-chain reference primitive.
     pub fn last_hash(&self) -> &str {
         &self.last_hash
+    }
+
+    /// Build, sign and append the row of `action` for `state`, and
+    /// advance the tail. The live set is the caller's to update.
+    fn append(
+        &mut self,
+        action: RegistryAction,
+        state: &CanaryLiveState,
+        actor_fp: &str,
+        decoy_state: Option<DecoyState>,
+    ) -> Result<CanaryToken> {
+        let entry = build_signed_entry(
+            action,
+            state,
+            actor_fp,
+            decoy_state,
+            &self.key,
+            &self.agent_id,
+            &self.last_hash,
+        )?;
+        self.append_row(&entry)?;
+        self.last_hash = entry.entry_hash.clone();
+        Ok(entry)
     }
 
     /// Internal: append one signed row to the JSONL log via
@@ -516,7 +619,9 @@ pub enum RegistryError {
 /// Walk the existing chain to (a) find the tail hash and
 /// (b) reconstruct the in-memory live-set. Each Deploy row
 /// inserts; each Burn row removes; each Refresh row clears
-/// the tripped flag for the matching canary_id. Missing file
+/// the tripped flag for the matching canary_id (and records the
+/// decoy written again); each Trip row sets it; each DecoyCheck
+/// row records what the boot found at the decoy. Missing file
 /// → empty (genesis tail + empty live set). Errors propagate
 /// on malformed lines so a corrupted chain surfaces at open
 /// time rather than at first append.
@@ -541,6 +646,13 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
             skipped += 1;
             continue;
         };
+        let content = entry
+            .contents_sha256
+            .clone()
+            .map(|contents_sha256| DecoyContent {
+                contents_sha256,
+                content_seed: entry.content_seed.clone(),
+            });
         match entry.action {
             RegistryAction::Deploy => {
                 live.insert(
@@ -554,6 +666,8 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
                         deployed_by_fp: entry.deployed_by_fp.clone(),
                         tripped: entry.tripped,
                         first_trip_access_hash: entry.first_trip_access_hash.clone(),
+                        content,
+                        decoy_state: DecoyState::Intact,
                     },
                 );
             }
@@ -564,6 +678,24 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
                 if let Some(s) = live.get_mut(&entry.canary_id) {
                     s.tripped = false;
                     s.first_trip_access_hash = None;
+                    if content.is_some() {
+                        s.content = content;
+                    }
+                    if let Some(d) = entry.decoy_state {
+                        s.decoy_state = d;
+                    }
+                }
+            }
+            // External audit DEC-011: a trip survives the restart.
+            RegistryAction::Trip => {
+                if let Some(s) = live.get_mut(&entry.canary_id) {
+                    s.tripped = true;
+                    s.first_trip_access_hash = entry.first_trip_access_hash.clone();
+                }
+            }
+            RegistryAction::DecoyCheck => {
+                if let (Some(s), Some(d)) = (live.get_mut(&entry.canary_id), entry.decoy_state) {
+                    s.decoy_state = d;
                 }
             }
         }
@@ -576,22 +708,20 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
     ))
 }
 
+/// The actor of the rows the agent writes on its own (Trip, DecoyCheck),
+/// as in the audit log.
+pub const AGENT_ACTOR: &str = "agent-self";
+
 /// Pure helper: compute `entry_hash` + signature for a chain
-/// row against a given `prev_hash` and signing key. Extracted
-/// from [`Registry::deploy`] / `burn` / `refresh` so
-/// [`verify_chain`] can recompute the same bytes for cross-
-/// check. Symmetric to `crate::fim::baseline::build_signed_entry`.
-#[allow(clippy::too_many_arguments)]
+/// row against a given `prev_hash` and signing key. Every row
+/// carries the canary's current state (chain rows are
+/// self-contained). Symmetric to
+/// `crate::fim::baseline::build_signed_entry`.
 fn build_signed_entry(
     action: RegistryAction,
-    canary_id: &str,
-    name: &str,
-    canary_type: CanaryTypeWire,
-    deployment: &CanaryDeploymentWire,
-    deployed_at_unix: u64,
+    state: &CanaryLiveState,
     actor_fp: &str,
-    tripped: bool,
-    first_trip_access_hash: Option<String>,
+    decoy_state: Option<DecoyState>,
     key: &AgentSigningKey,
     agent_id: &[u8; 16],
     prev_hash: &str,
@@ -600,14 +730,17 @@ fn build_signed_entry(
     let mut entry = CanaryToken {
         ts,
         action,
-        canary_id: canary_id.to_string(),
-        name: name.to_string(),
-        canary_type,
-        deployment: deployment.clone(),
-        deployed_at_unix,
+        canary_id: state.canary_id.clone(),
+        name: state.name.clone(),
+        canary_type: state.canary_type,
+        deployment: state.deployment.clone(),
+        deployed_at_unix: state.deployed_at_unix,
         deployed_by_fp: actor_fp.to_string(),
-        tripped,
-        first_trip_access_hash,
+        tripped: state.tripped,
+        first_trip_access_hash: state.first_trip_access_hash.clone(),
+        contents_sha256: state.content.as_ref().map(|c| c.contents_sha256.clone()),
+        content_seed: state.content.as_ref().and_then(|c| c.content_seed.clone()),
+        decoy_state,
         agent_id: hex::encode(agent_id),
         prev_hash: prev_hash.to_string(),
         // Filled below — empty here so the pre-image
@@ -669,6 +802,94 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ── decoy check (external audit DEC-010) ───────────────────────────
+
+/// A decoy larger than this is not read: it is not what a deploy writes.
+pub const MAX_DECOY_BYTES: u64 = 1 << 20;
+
+/// What [`check_decoy`] found at a decoy's path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoyCheck {
+    pub state: DecoyState,
+    /// SHA-256 (hex) of the regular file read, when it was read.
+    pub found_sha256: Option<String>,
+    /// The kernel `(dev, ino)` of the regular file checked: the inode to
+    /// watch. `None` unless the path holds a regular file.
+    pub key: Option<InodeKey>,
+}
+
+/// External audit DEC-010: compare the file at a File / Credential
+/// canary's `path` with the SHA-256 its row records (`None` for a row
+/// written before content hashes: a regular file then counts as intact).
+///
+/// The path is examined without following a link and without opening
+/// anything but a regular file (a FIFO would block, a device could act on
+/// the open); the file is opened `O_NOFOLLOW|O_NONBLOCK` and must be the
+/// inode examined. The agent's own read is not reported by the FIM (its
+/// PID is exempt). Before this, the boot re-armed whatever was at the
+/// path: a decoy emptied or replaced while the agent was down was adopted
+/// in silence.
+pub fn check_decoy(path: &Path, expected_sha256: Option<&str>) -> DecoyCheck {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let found = |state, found_sha256, key| DecoyCheck {
+        state,
+        found_sha256,
+        key,
+    };
+    let lmeta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return found(DecoyState::Missing, None, None)
+        }
+        Err(_) => return found(DecoyState::Unreadable, None, None),
+    };
+    if !lmeta.file_type().is_file() {
+        return found(DecoyState::NotRegular, None, None);
+    }
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return found(DecoyState::Missing, None, None)
+        }
+        Err(_) => return found(DecoyState::Unreadable, None, None),
+    };
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(_) => return found(DecoyState::Unreadable, None, None),
+    };
+    if !meta.is_file() || meta.ino() != lmeta.ino() || meta.dev() != lmeta.dev() {
+        // replaced between the two looks
+        return found(DecoyState::NotRegular, None, None);
+    }
+    let key = Some(InodeKey {
+        dev: crate::fim::attach::stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    });
+    if meta.len() > MAX_DECOY_BYTES {
+        return found(DecoyState::Modified, None, key);
+    }
+    let mut body = Vec::with_capacity(meta.len() as usize);
+    if file
+        .take(MAX_DECOY_BYTES + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        return found(DecoyState::Unreadable, None, key);
+    }
+    let sha = hex::encode(Sha256::digest(&body));
+    let state = match expected_sha256 {
+        Some(want) if want != sha => DecoyState::Modified,
+        _ => DecoyState::Intact,
+    };
+    found(state, Some(sha), key)
 }
 
 // ── off-host verifier ───────────────────────────────────────────────
@@ -787,6 +1008,7 @@ mod tests {
                 template: None,
             },
             deployed_by_fp: format!("{seq:08x}"),
+            content: None,
         }
     }
 
@@ -872,11 +1094,13 @@ mod tests {
         let log_path = dir.path().join("canaries.jsonl");
         let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
         let deploy = reg.deploy(sample_draft(2)).unwrap();
-        assert!(reg.mark_tripped(&deploy.canary_id, "abc123".to_string()));
+        assert!(reg
+            .mark_tripped(&deploy.canary_id, Some("abc123".to_string()))
+            .unwrap());
         let state_pre = reg.get(&deploy.canary_id).unwrap();
         assert!(state_pre.tripped);
         assert_eq!(state_pre.first_trip_access_hash.as_deref(), Some("abc123"));
-        let refresh = reg.refresh(&deploy.canary_id, "11111111").unwrap();
+        let refresh = reg.refresh(&deploy.canary_id, "11111111", None).unwrap();
         assert_eq!(refresh.action, RegistryAction::Refresh);
         assert_eq!(refresh.deployed_by_fp, "11111111");
         let state_post = reg.get(&deploy.canary_id).unwrap();
@@ -887,8 +1111,8 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(rows.len(), 2);
-        verify_chain(&rows, &pubkey).expect("deploy + refresh chain verifies");
+        assert_eq!(rows.len(), 3, "deploy, trip, refresh");
+        verify_chain(&rows, &pubkey).expect("deploy + trip + refresh chain verifies");
     }
 
     // ── K2 test #4: mark_tripped is idempotent (§12 Q2 lock-in) ───
@@ -900,12 +1124,18 @@ mod tests {
         let log_path = dir.path().join("canaries.jsonl");
         let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
         let deploy = reg.deploy(sample_draft(3)).unwrap();
-        assert!(reg.mark_tripped(&deploy.canary_id, "first".to_string()));
+        assert!(reg
+            .mark_tripped(&deploy.canary_id, Some("first".to_string()))
+            .unwrap());
         // Second + third calls: return false (single-trip
         // semantics — no re-fire). first_trip_access_hash stays
         // the ORIGINAL value.
-        assert!(!reg.mark_tripped(&deploy.canary_id, "second".to_string()));
-        assert!(!reg.mark_tripped(&deploy.canary_id, "third".to_string()));
+        assert!(!reg
+            .mark_tripped(&deploy.canary_id, Some("second".to_string()))
+            .unwrap());
+        assert!(!reg
+            .mark_tripped(&deploy.canary_id, Some("third".to_string()))
+            .unwrap());
         let state = reg.get(&deploy.canary_id).unwrap();
         assert!(state.tripped);
         assert_eq!(
@@ -1063,5 +1293,264 @@ mod tests {
         assert!(reg2.get(&id1).is_some());
         let chain_rows = std::fs::read_to_string(&log_path).unwrap().lines().count();
         assert_eq!(chain_rows, 3);
+    }
+
+    fn rows(path: &Path) -> Vec<CanaryToken> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn reopen(dir: &TempDir, log_path: &Path) -> Registry {
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        Registry::open(log_path, key, [0u8; 16]).unwrap()
+    }
+
+    /// External audit DEC-011: a trip is a signed row, and the canary is
+    /// still tripped (with the access row's hash) after a restart — it
+    /// used to come back armed, and the K5 response fired again.
+    #[test]
+    fn tripped_state_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let id = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            assert!(reg.is_armed(&id));
+            assert!(reg.mark_tripped(&id, Some("acc0".to_string())).unwrap());
+            assert!(!reg.is_armed(&id));
+            id
+        };
+        let all = rows(&log_path);
+        assert_eq!(all[1].action, RegistryAction::Trip);
+        assert!(all[1].tripped);
+        assert_eq!(all[1].deployed_by_fp, AGENT_ACTOR);
+        verify_chain(&all, &pubkey).expect("deploy + trip verifies");
+        let mut reg = reopen(&dir, &log_path);
+        let state = reg.get(&id).unwrap();
+        assert!(state.tripped, "still tripped after the restart");
+        assert_eq!(state.first_trip_access_hash.as_deref(), Some("acc0"));
+        assert!(!reg.is_armed(&id));
+        assert!(!reg.mark_tripped(&id, Some("acc1".to_string())).unwrap());
+        assert_eq!(rows(&log_path).len(), 2, "a later access writes no row");
+    }
+
+    /// External audit DEC-011: a refresh re-arms the canary for good.
+    #[test]
+    fn refresh_clears_trip_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let id = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            reg.mark_tripped(&id, Some("acc0".to_string())).unwrap();
+            reg.refresh(&id, "11111111", None).unwrap();
+            id
+        };
+        let reg = reopen(&dir, &log_path);
+        let state = reg.get(&id).unwrap();
+        assert!(!state.tripped);
+        assert!(state.first_trip_access_hash.is_none());
+        assert!(reg.is_armed(&id));
+    }
+
+    /// External audit DEC-011: a chain written before Trip rows (deploys
+    /// only — the trips lived in memory) opens with its canaries armed.
+    #[test]
+    fn legacy_chain_without_trip_rows_opens_untripped() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let id = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            reg.deploy(sample_draft(1)).unwrap().canary_id
+        };
+        let mut reg = reopen(&dir, &log_path);
+        assert!(reg.is_armed(&id));
+        assert_eq!(reg.take_open_findings().1, 0, "nothing unreadable");
+    }
+
+    /// External audit DEC-010: a File / Credential deploy row records the
+    /// SHA-256 of the decoy and its seed; a row written before the fields
+    /// existed re-serialises byte for byte, so it still verifies.
+    #[test]
+    fn deploy_row_carries_contents_sha256_and_legacy_rows_verify() {
+        /// The row as agents before DEC-010 / DEC-011 wrote it.
+        #[derive(Serialize)]
+        struct LegacyRow<'a> {
+            ts: &'a str,
+            action: RegistryAction,
+            canary_id: &'a str,
+            name: &'a str,
+            canary_type: CanaryTypeWire,
+            deployment: CanaryDeploymentWire,
+            deployed_at_unix: u64,
+            deployed_by_fp: &'a str,
+            tripped: bool,
+            first_trip_access_hash: Option<String>,
+            agent_id: String,
+            prev_hash: &'a str,
+            entry_hash: String,
+            agent_sig: String,
+        }
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let mut legacy = LegacyRow {
+            ts: "2026-10-01T10:00:00.000000Z",
+            action: RegistryAction::Deploy,
+            canary_id: "00112233445566778899aabbccddeeff",
+            name: "old",
+            canary_type: CanaryTypeWire::File,
+            deployment: CanaryDeploymentWire::File {
+                path: "/home/u/old.txt".to_string(),
+                template: None,
+            },
+            deployed_at_unix: 1_790_000_000,
+            deployed_by_fp: "deadbeef",
+            tripped: false,
+            first_trip_access_hash: None,
+            agent_id: hex::encode([0u8; 16]),
+            prev_hash: GENESIS_PREV_HASH,
+            entry_hash: String::new(),
+            agent_sig: String::new(),
+        };
+        let mut h = Sha256::new();
+        h.update(hex::decode(GENESIS_PREV_HASH).unwrap());
+        h.update(serde_json::to_vec(&legacy).unwrap());
+        let digest: [u8; 32] = h.finalize().into();
+        legacy.entry_hash = hex::encode(digest);
+        legacy.agent_sig = B64.encode(key.sign(&digest).to_bytes());
+        std::fs::write(
+            &log_path,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        assert!(reg.get(legacy.canary_id).unwrap().content.is_none());
+        let mut draft = sample_draft(2);
+        draft.content = Some(DecoyContent {
+            contents_sha256: "ab".repeat(32),
+            content_seed: Some("cd".repeat(32)),
+        });
+        let row = reg.deploy(draft).unwrap();
+        assert_eq!(
+            row.contents_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert_eq!(row.content_seed.as_deref(), Some("cd".repeat(32).as_str()));
+        let all = rows(&log_path);
+        let raw = std::fs::read_to_string(&log_path).unwrap();
+        let first_line = raw.lines().next().unwrap();
+        assert!(!first_line.contains("contents_sha256"));
+        assert_eq!(serde_json::to_string(&all[0]).unwrap(), first_line);
+        verify_chain(&all, &pubkey).expect("a legacy row and a new one verify");
+        // a burn carries the content too (rows are self-contained)
+        let burn = reg.burn(&row.canary_id, "ffffffff").unwrap();
+        assert_eq!(burn.contents_sha256, row.contents_sha256);
+        let reg = reopen(&dir, &log_path);
+        assert!(reg.get(&row.canary_id).is_none());
+    }
+
+    /// External audit DEC-010: what the boot reports at a decoy's path.
+    #[test]
+    fn decoy_check_reports_modified_missing_not_regular() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("decoy.txt");
+        std::fs::write(&p, b"abc").unwrap();
+        let sha = hex::encode(Sha256::digest(b"abc"));
+        let c = check_decoy(&p, Some(&sha));
+        assert_eq!(c.state, DecoyState::Intact);
+        assert_eq!(c.found_sha256.as_deref(), Some(sha.as_str()));
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(c.key.unwrap().ino, std::fs::metadata(&p).unwrap().ino());
+        // a row written before content hashes: present is all it can say
+        assert_eq!(check_decoy(&p, None).state, DecoyState::Intact);
+
+        std::fs::write(&p, b"").unwrap();
+        let c = check_decoy(&p, Some(&sha));
+        assert_eq!(c.state, DecoyState::Modified, "emptied");
+        assert!(c.key.is_some(), "a modified regular file is still watched");
+
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(check_decoy(&p, Some(&sha)).state, DecoyState::Missing);
+
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"abc").unwrap();
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let c = check_decoy(&p, Some(&sha));
+        assert_eq!(c.state, DecoyState::NotRegular, "a link to the same bytes");
+        assert!(c.key.is_none());
+        std::fs::remove_file(&p).unwrap();
+
+        let fifo = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo on a NUL-terminated path in our temp dir.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert_eq!(check_decoy(&p, Some(&sha)).state, DecoyState::NotRegular);
+        std::fs::remove_file(&p).unwrap();
+
+        std::fs::create_dir(&p).unwrap();
+        assert_eq!(check_decoy(&p, Some(&sha)).state, DecoyState::NotRegular);
+        std::fs::remove_dir(&p).unwrap();
+
+        std::fs::write(&p, vec![b'x'; (MAX_DECOY_BYTES + 1) as usize]).unwrap();
+        let c = check_decoy(&p, Some(&sha));
+        assert_eq!(c.state, DecoyState::Modified, "too large to be the decoy");
+        assert!(c.found_sha256.is_none(), "not read");
+    }
+
+    /// External audit DEC-010: a decoy state is a row when it changes, not
+    /// at every boot, and `canary list` (the chain) shows it.
+    #[test]
+    fn a_decoy_state_is_recorded_once_per_change() {
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let id = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            assert!(!reg.record_decoy_state(&id, DecoyState::Intact).unwrap());
+            assert!(reg.record_decoy_state(&id, DecoyState::Modified).unwrap());
+            id
+        };
+        let mut reg = reopen(&dir, &log_path);
+        assert_eq!(reg.get(&id).unwrap().decoy_state, DecoyState::Modified);
+        assert!(!reg.record_decoy_state(&id, DecoyState::Modified).unwrap());
+        // a refresh writes the decoy again
+        reg.refresh(
+            &id,
+            "11111111",
+            Some(DecoyContent {
+                contents_sha256: "ef".repeat(32),
+                content_seed: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(reg.get(&id).unwrap().decoy_state, DecoyState::Intact);
+        let all = rows(&log_path);
+        let actions: Vec<_> = all.iter().map(|r| r.action).collect();
+        assert_eq!(
+            actions,
+            [
+                RegistryAction::Deploy,
+                RegistryAction::DecoyCheck,
+                RegistryAction::Refresh
+            ]
+        );
+        assert_eq!(all[1].decoy_state, Some(DecoyState::Modified));
+        assert!(serde_json::to_string(&all[1])
+            .unwrap()
+            .contains("\"decoy_state\":\"modified\""));
+        assert_eq!(all[2].decoy_state, Some(DecoyState::Intact));
+        verify_chain(&all, &pubkey).unwrap();
+        let reg = reopen(&dir, &log_path);
+        let state = reg.get(&id).unwrap();
+        assert_eq!(state.decoy_state, DecoyState::Intact);
+        assert_eq!(state.content.unwrap().contents_sha256, "ef".repeat(32));
     }
 }

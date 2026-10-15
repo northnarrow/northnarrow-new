@@ -212,11 +212,11 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-166 | NET-012 | Network | M | fixed (lab PR 142) |
 | NN-AUD-167 | NET-016 | Network | M | fixed (lab PR 146) |
 | NN-AUD-168 | NET-019 | Network | L | fixed (lab PR 142) |
-| NN-AUD-169 | DEC-007 | Deception | S | open |
-| NN-AUD-170 | DEC-008 | Deception | M | open |
+| NN-AUD-169 | DEC-007 | Deception | S | fixed (lab PR 143) |
+| NN-AUD-170 | DEC-008 | Deception | M | fixed (lab PR 143) |
 | NN-AUD-171 | DEC-009 | Deception | S | already fixed (lab PR 84, with NN-AUD-062) |
-| NN-AUD-172 | DEC-010 | Deception | M | open |
-| NN-AUD-173 | DEC-011 | Deception | M | open |
+| NN-AUD-172 | DEC-010 | Deception | M | fixed (lab PR 143) |
+| NN-AUD-173 | DEC-011 | Deception | M | fixed (lab PR 143) |
 | NN-AUD-174 | DEC-018 | Deception | L | open |
 | NN-AUD-175 | XAI-001 | XAI and RAG | M | open |
 | NN-AUD-176 | XAI-002 | XAI and RAG | M | open |
@@ -3561,7 +3561,7 @@ the audit did not report, noted with the fix that takes them.
     (`check_decoy`, `render_file_body`, the row fields) have no old
     counterpart; `refresh_clears_trip_across_reopen` and the legacy-chain
     test are guards and pass on both.
-  - Lab: @LAB143@
+  - Lab: Debian 12, decep143-probe.sh (role, content, trip; upgrade on Ubuntu 24.04) on main and on this build. content: the docker, aws and File decoys held two marker lines ("NorthNarrow" / "DO NOT USE") each and the operator's key fingerprint (3 times in the docker one) → no marker, no fingerprint, sizes of real files (270, 135, 692 bytes); a refresh left the docker decoy byte-identical → new content (sha `a3bd7695…` → `2429c8d2…`, a `refresh` row with `decoy_state: intact`); deploy rows without → with `contents_sha256` and `content_seed`; the aws decoy rewritten and the File decoy removed while the agent was down: a WARN for the missing one only → ERROR for each, signed `integrity_drift` `canary_decoy_tampered` / `canary_decoy_missing` and `decoy_check` rows. trip: a reader killed (137), agent restarted, a second read killed again on main (`first_trip: true` twice) → exit 0, `first_trip: false`, a signed `trip` row naming the first access row. upgrade (24.04): templates 0644 with marker lines → 0640 without, directory 0750; `nn-lab.sh upgrade-check` OK. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
 - **NN-AUD-177 (XAI-004), NN-AUD-182 (XAI-013), NN-AUD-178 (XAI-005),
   NN-AUD-181 (XAI-011), lab PR 144.** Correlation context and XAI
   readiness (`agent/src/correlation/mod.rs`, `ade/sanitize.rs`,

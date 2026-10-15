@@ -2980,25 +2980,67 @@ async fn main() -> Result<()> {
                         // rebuild_from_registry directly).
                         let fim_watch = fim_admin_state.as_ref().map(|f| f.watch.clone());
                         {
-                            let reg = registry.lock();
+                            use northnarrow_agent::canary::registry::{check_decoy, DecoyState};
+                            let mut reg = registry.lock();
                             let mut idx = indexes.lock();
                             // External audit DEC-003: inodes resolved at
                             // boot too — they feed read-forward.
                             idx.rebuild_live(&reg);
                             // External audit DEC-001: the FIM boot keeps only
                             // the watches it registers, so the decoys are
-                            // watched again here, every boot.
-                            let mut missing: Vec<String> = Vec::new();
+                            // watched again here, every boot. External audit
+                            // DEC-010: each decoy is first compared with what
+                            // its row says was written. One modified, removed
+                            // or replaced while the agent was down used to be
+                            // adopted in silence: it is an ERROR, and when its
+                            // state changed a DecoyCheck row (shown by `canary
+                            // list`) and a signed `integrity_drift`. Only a
+                            // regular file is watched.
+                            let mut unverified = 0usize;
                             for canary in reg.list() {
                                 let Some(path) = admin_socket::canary_path(&canary.deployment)
                                 else {
                                     continue;
                                 };
-                                let key = northnarrow_agent::fim::attach::key_for_path(
-                                    std::path::Path::new(path),
-                                );
-                                match (key, &fim_watch) {
-                                    (Ok(key), Some(watch)) => {
+                                let expected =
+                                    canary.content.as_ref().map(|c| c.contents_sha256.as_str());
+                                unverified += usize::from(expected.is_none());
+                                let check = check_decoy(std::path::Path::new(path), expected);
+                                if check.state != DecoyState::Intact {
+                                    error!(
+                                        canary_id = %canary.canary_id,
+                                        name = %canary.name,
+                                        path,
+                                        state = check.state.as_str(),
+                                        "canary: the decoy is not what was deployed — changed, \
+                                         removed or replaced while the agent was not watching it; \
+                                         `nn-admin canary refresh` writes it again"
+                                    );
+                                }
+                                match reg.record_decoy_state(&canary.canary_id, check.state) {
+                                    Ok(true) => attest_decoy_state(
+                                        audit_log.as_ref(),
+                                        &canary,
+                                        path,
+                                        &check,
+                                    ),
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            error = %format!("{e:#}"),
+                                            path,
+                                            "canary: recording the decoy state failed"
+                                        );
+                                        attest_decoy_state(
+                                            audit_log.as_ref(),
+                                            &canary,
+                                            path,
+                                            &check,
+                                        );
+                                    }
+                                }
+                                match (check.key, &fim_watch) {
+                                    (Some(key), Some(watch)) => {
                                         // External audit NN-AUD-120: a decoy is
                                         // never evicted; a refusal is attested.
                                         if !watch.watch(
@@ -3013,18 +3055,20 @@ async fn main() -> Result<()> {
                                             );
                                         }
                                     }
-                                    (Ok(_), None) => warn!(
+                                    (Some(_), None) => warn!(
                                         path,
                                         "canary: FIM is not running — decoy opens unseen"
                                     ),
-                                    (Err(_), _) => missing.push(path.to_string()),
+                                    // nothing to watch: reported above
+                                    (None, _) => {}
                                 }
                             }
-                            if !missing.is_empty() {
+                            if unverified > 0 {
                                 warn!(
-                                    decoys = ?missing,
-                                    "canary: decoy missing on disk — its reads cannot be seen \
-                                     until it is redeployed"
+                                    decoys = unverified,
+                                    "canary: decoys deployed before their content was recorded — \
+                                     only their presence is checked; `nn-admin canary refresh` \
+                                     writes them again and records it"
                                 );
                             }
                             let read_forward = northnarrow_agent::canary::read_forward::len();
@@ -4470,6 +4514,63 @@ fn attest_bait_integrity(
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "recording the control-surface file check failed");
+    }
+}
+
+/// External audit DEC-010: a decoy found at boot in a state other than
+/// the one recorded, in the signed audit chain: `integrity_drift`
+/// (`canary_decoy_missing`, or `canary_decoy_tampered` for a decoy
+/// modified, replaced by something not a regular file, or unreadable), and
+/// `integrity_drift_cleared` when it is intact again.
+fn attest_decoy_state(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    canary: &northnarrow_agent::canary::registry::CanaryLiveState,
+    path: &str,
+    check: &northnarrow_agent::canary::registry::DecoyCheck,
+) {
+    use northnarrow_agent::canary::registry::DecoyState;
+    let Some(log) = audit_log else {
+        return;
+    };
+    let kind = |s: DecoyState| match s {
+        DecoyState::Missing => "canary_decoy_missing",
+        _ => "canary_decoy_tampered",
+    };
+    let (op, kind, result) = if check.state == DecoyState::Intact {
+        (
+            northnarrow_agent::self_integrity::CLEARED_OP,
+            kind(canary.decoy_state),
+            "cleared",
+        )
+    } else {
+        (
+            northnarrow_agent::self_integrity::AUDIT_OP,
+            kind(check.state),
+            "detected",
+        )
+    };
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: op.to_string(),
+        extra: serde_json::json!({
+            "kind": kind,
+            "canary_id": canary.canary_id,
+            "name": canary.name,
+            "path": path,
+            "state": check.state.as_str(),
+            "recorded_state": canary.decoy_state.as_str(),
+            "expected_sha256": canary.content.as_ref().map(|c| c.contents_sha256.as_str()),
+            "found_sha256": check.found_sha256,
+            "at_boot": true,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: result.to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "recording the decoy check failed");
     }
 }
 

@@ -913,20 +913,46 @@ fi
 # /etc/northnarrow/canary-templates/. Templates are read by the
 # K4 renderer at `nn-admin canary deploy` time; PROTECTED_INODES
 # covers each individual .tmpl per ETC_PROTECTED_TEMPLATES.
-# Idempotent per file: an existing operator-customised template
-# is left untouched (the source-of-truth for any one family is
-# the file on the operator host once installed; the next agent
-# upgrade ships fresh templates only when the family didn't
-# already exist on the host).
-echo "install.sh: ensuring $ETC_DIR/canary-templates (mode 0755, root:root)"
-install -d -m 0755 -o root -g root "$ETC_DIR/canary-templates"
+# An operator-customised template is left untouched. External audit
+# DEC-007: the templates of earlier releases named the product ("NorthNarrow
+# XDR ... DO NOT USE", northnarrow.io) in what lands in the decoy, and an
+# upgrade kept them; a copy byte-identical to one of those (its SHA-256
+# below, as SUPERSEDED_TEMPLATE_SHA256 in agent/src/canary/templates.rs) is
+# replaced, an edited one is kept and reported if it still names the
+# product. The directory and the templates are closed to other users (0750 /
+# 0640): they describe the decoys.
+declare -A CANARY_TEMPLATE_SUPERSEDED=(
+    [aws.tmpl]="cd728e77335951708ad263d4e2d52f808cd9522d1a63546f6621a8e33b15af79"
+    [azure.tmpl]="1f2676fce70db95d9f2aeaf2a2c2628dd7211cf75d8464329acb208b9350ae04"
+    [docker.tmpl]="c203d592a626a1ce6fa2ff74ac0935c454eda83060ba67242aa19906a662078d"
+    [gcp.tmpl]="61f3817c87f6ca8892072a60f459b577ebcb98903b50aec9cdff6ec2c9e8c63a"
+    [generic.tmpl]="b888d4187b100e984aac3c6f701d9ba649e67d76e55774a768d80ef4ee7be88a"
+)
+echo "install.sh: ensuring $ETC_DIR/canary-templates (mode 0750, root:root)"
+install -d -m 0750 -o root -g root "$ETC_DIR/canary-templates"
+chmod 0750 "$ETC_DIR/canary-templates"
 
 for tmpl in aws.tmpl azure.tmpl docker.tmpl gcp.tmpl generic.tmpl; do
-    if [[ -f "$ETC_DIR/canary-templates/$tmpl" ]]; then
-        echo "install.sh: $ETC_DIR/canary-templates/$tmpl already present — leaving operator copy untouched"
+    src="$CANARY_TEMPLATES_SRC_DIR/$tmpl"
+    dst="$ETC_DIR/canary-templates/$tmpl"
+    if [[ -f "$dst" && ! -L "$dst" ]]; then
+        on_disk=$(sha256sum "$dst" | cut -d' ' -f1)
+        if cmp -s "$src" "$dst"; then
+            echo "install.sh: $dst already current"
+        elif [[ " ${CANARY_TEMPLATE_SUPERSEDED[$tmpl]} " == *" $on_disk "* ]]; then
+            echo "install.sh: replacing $dst — the template an earlier release shipped (it named the product)"
+            install -m 0640 -o root -g root "$src" "$dst"
+        else
+            echo "install.sh: $dst differs from the shipped template — leaving the operator copy untouched"
+            if grep -qiE 'northnarrow|do not use|canary' "$dst"; then
+                echo "install.sh: WARNING: $dst names the product or says what the file is; every decoy rendered from it does too (external audit DEC-007)" >&2
+            fi
+        fi
+        chown root:root "$dst"
+        chmod 0640 "$dst"
     else
         echo "install.sh: copying canary template $tmpl"
-        install -m 0644 -o root -g root "$CANARY_TEMPLATES_SRC_DIR/$tmpl" "$ETC_DIR/canary-templates/$tmpl"
+        install -m 0640 -o root -g root "$src" "$dst"
     fi
 done
 

@@ -51,7 +51,9 @@ use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::canary::detector::CanaryIndexes;
-use crate::canary::registry::{CanaryTokenDraft, Registry, RegistryError};
+use crate::canary::registry::{
+    CanaryToken, CanaryTokenDraft, DecoyContent, Registry, RegistryError,
+};
 use crate::chainlog::RotatingChainLog;
 use crate::detection_store::{Principal, StatusEvent};
 use crate::fim::drain::DriftRateLimiter;
@@ -2931,8 +2933,8 @@ fn dispatch_canary_deploy(
     // on the resulting inode (after rebuild_canary_indexes
     // stats it).
     let primary_fp = fps_out.first().cloned().unwrap_or_default();
-    let decoy = match materialise_canary_file(&extra.deployment, state, &primary_fp) {
-        Ok(decoy) => decoy,
+    let (decoy, content) = match materialise_canary_file(&extra.deployment, state) {
+        Ok(m) => m,
         Err(e) => {
             warn!(
                 error = %format!("{e:#}"),
@@ -2974,6 +2976,7 @@ fn dispatch_canary_deploy(
         canary_type: extra.canary_type,
         deployment: extra.deployment.clone(),
         deployed_by_fp: primary_fp.clone(),
+        content,
     };
     let entry = {
         let mut reg = state.registry.lock();
@@ -3010,64 +3013,77 @@ fn dispatch_canary_deploy(
     }
 }
 
-/// Write the canary file to its deployment path. For
-/// `Credential` types, renders the K4 template content for
-/// the operator's chosen `cred_family`. For plain `File`
-/// types, writes a placeholder body that operators can
-/// later override via a future K6.1 `--content-file` flag —
-/// V1.0 ships an explicit marker so the operator's `cat`
-/// of the file (which would trip the canary) shows a
-/// readable "this is a NorthNarrow canary" comment.
-/// Process + Network canaries return Ok(()) — they don't
-/// materialise a file at deploy time.
+/// Write the canary file to its deployment path: for a `Credential`
+/// canary the K4 template of its `cred_family`, for a `File` canary
+/// [`crate::canary::templates::render_file_body`]. Both from a fresh
+/// random seed (external audit DEC-008: it used to be `<operator key
+/// fingerprint>:<path>`, which printed the fingerprint into the decoy
+/// and gave every host the same credential), with no marker in the bytes
+/// (DEC-007: the File body used to name the product, the operator key
+/// and the rule). Returns the decoy's inode and what it was written with
+/// — its SHA-256 and seed, for the registry row (DEC-010). Process +
+/// Network canaries write nothing: `(None, None)`.
 fn materialise_canary_file(
     deployment: &common::wire::admin_signed_payload::CanaryDeploymentWire,
     state: &CanaryAdminState,
-    deployed_by_fp: &str,
-) -> Result<Option<common::wire::InodeKey>> {
-    use crate::canary::templates::{render, CredFamily};
+) -> Result<(Option<common::wire::InodeKey>, Option<DecoyContent>)> {
+    use crate::canary::templates::{new_content_seed, render, render_file_body, CredFamily};
     use common::wire::admin_signed_payload::CanaryDeploymentWire;
-    match deployment {
-        CanaryDeploymentWire::File { path, .. } => {
-            // File canary content placeholder. Operator can
-            // overwrite via a future --content-file flag. K7
-            // install.sh will ship a sample template
-            // `configs/canary-templates/file_placeholder.tmpl`
-            // for operators who want richer content.
-            let body = format!(
-                "# NorthNarrow XDR canary file.\n\
-                 # Deployed by operator key fp {deployed_by_fp}.\n\
-                 # Any access to this file triggers NN-L-CANARY-001.\n"
-            );
-            // canary-path-1: a signed deploy must not become "write a
-            // root-owned file anywhere" — policy check + O_NOFOLLOW write.
-            // canary-path-1 / external audit DEC-002: policy check, then a
-            // walk that follows no symlink (write_canary_checked).
-            let decoy = crate::canary::path_policy::write_canary_checked(path, body.as_bytes())?;
-            Ok(Some(decoy_key(&decoy)?))
-        }
+    let seed = new_content_seed();
+    let (path, body) = match deployment {
+        CanaryDeploymentWire::File { path, .. } => (path, render_file_body(&seed)),
         CanaryDeploymentWire::Credential { path, cred_family } => {
             let family = CredFamily::from_wire(cred_family)
                 .map_err(|e| anyhow::anyhow!("unknown cred_family `{cred_family}`: {e}"))?;
-            // Render with the future canary_id (the registry's
-            // compute_canary_id is deterministic per (name +
-            // deployed_at_unix); we can't predict deployed_at_unix
-            // pre-deploy, so use the deployed_by_fp + path as a
-            // stable seed surrogate). K2 registry will re-seed
-            // with the real canary_id post-deploy; the on-disk
-            // content uses this earlier seed but the K3 detector
-            // matches on inode/path not on content.
-            let seed = format!("{deployed_by_fp}:{path}");
             let body = render(family, &seed, state.template_dir.as_deref())
                 .map_err(|e| anyhow::anyhow!("rendering cred canary: {e}"))?;
-            let decoy = crate::canary::path_policy::write_canary_checked(path, body.as_bytes())?;
-            Ok(Some(decoy_key(&decoy)?))
+            (path, body.into_bytes())
         }
         // Process + Network canaries: no file materialisation
         // at deploy time. K7 install.sh / K8 e2e set up the
         // binary placement + listener spawn separately.
-        CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => Ok(None),
+        CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => {
+            return Ok((None, None))
+        }
+    };
+    // canary-path-1 / external audit DEC-002: policy check, then a walk
+    // that follows no symlink (write_canary_checked).
+    let decoy = crate::canary::path_policy::write_canary_checked(path, &body)?;
+    let content = DecoyContent {
+        contents_sha256: hex::encode(Sha256::digest(&body)),
+        content_seed: Some(seed),
+    };
+    Ok((Some(decoy_key(&decoy)?), Some(content)))
+}
+
+/// `nn-admin canary refresh`: re-arm the canary, and write its File /
+/// Credential decoy again from a new seed (external audit DEC-008: a
+/// refresh used to leave a burned credential in place). The write goes
+/// to the same inode when the decoy is there (`O_TRUNC`), else creates
+/// it, and the decoy is watched before the Refresh row records it — as
+/// a deploy (NN-AUD-120). A decoy that cannot be written or watched
+/// refuses the refresh: the canary stays as recorded.
+fn refresh_canary(
+    state: &CanaryAdminState,
+    canary_id: &str,
+    refreshed_by_fp: &str,
+) -> Result<CanaryToken> {
+    let deployment = state
+        .registry
+        .lock()
+        .get(canary_id)
+        .ok_or(RegistryError::CanaryIdNotFound)?
+        .deployment;
+    let (decoy, content) = materialise_canary_file(&deployment, state)?;
+    if let (Some(key), Some(path)) = (decoy, canary_path(&deployment)) {
+        if !watch_decoy(state, key, path) {
+            anyhow::bail!("the decoy written again at {path} cannot be watched");
+        }
     }
+    state
+        .registry
+        .lock()
+        .refresh(canary_id, refreshed_by_fp, content)
 }
 
 /// External audit DEC-001: the kernel's `(dev, ino)` of the decoy just
@@ -3239,9 +3255,9 @@ fn dispatch_canary_burn(
 }
 
 /// dispatch_canary_refresh — verify 1-of-N quorum with
-/// `Role::CanaryManage`, call Registry::refresh, rebuild
-/// indexes (the registry mutation isn't index-shape-changing
-/// but we rebuild for consistency).
+/// `Role::CanaryManage`, write the decoy again and call
+/// Registry::refresh ([`refresh_canary`]), rebuild indexes (the
+/// decoy may be a new inode).
 fn dispatch_canary_refresh(
     req: CanaryRefreshRequest,
     auth: &AdminAuth,
@@ -3280,10 +3296,7 @@ fn dispatch_canary_refresh(
         }
     };
     let primary_fp = fps_out.first().cloned().unwrap_or_default();
-    let result = {
-        let mut reg = state.registry.lock();
-        reg.refresh(&canary_id, &primary_fp)
-    };
+    let result = refresh_canary(state, &canary_id, &primary_fp);
     match result {
         Ok(_) => {
             rebuild_canary_indexes(state);
@@ -3291,7 +3304,7 @@ fn dispatch_canary_refresh(
                 target: "admin.canary_refresh",
                 signer_fp = %primary_fp,
                 canary_id = %canary_id,
-                "canary refreshed (tripped flag cleared)"
+                "canary refreshed (tripped flag cleared; a file decoy written again)"
             );
             AdminResult::Success
         }
@@ -3299,7 +3312,7 @@ fn dispatch_canary_refresh(
             if let Some(RegistryError::CanaryIdNotFound) = e.downcast_ref::<RegistryError>() {
                 AdminResult::UnknownOperation
             } else {
-                warn!(error = %e, "canary registry refresh failed");
+                warn!(error = %format!("{e:#}"), "canary refresh failed");
                 AdminResult::UnknownOperation
             }
         }
@@ -5188,6 +5201,158 @@ mod tests {
         .unwrap();
         let auth = AdminAuth::load_with_agent_id(&pub_path, agent_id).unwrap();
         (auth, dir)
+    }
+
+    /// A canary state over a temp registry and a FIM watch backed by a
+    /// stand-in kernel map.
+    fn canary_state(dir: &TempDir) -> CanaryAdminState {
+        let key =
+            crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key"))
+                .unwrap();
+        let registry_log_path = dir.path().join("canaries.jsonl");
+        let registry = Registry::open(&registry_log_path, key, [0u8; 16]).unwrap();
+        CanaryAdminState {
+            fim_watch: Some(crate::fim::attach::FimWatch {
+                path_map: Arc::new(crate::fim::drain::InodePathMap::new()),
+                watched_paths: Some(Arc::new(Mutex::new(
+                    crate::fim::attach::WatchedPathsHandle::fake(64),
+                ))),
+            }),
+            registry: Arc::new(Mutex::new(registry)),
+            indexes: Arc::new(Mutex::new(CanaryIndexes::new())),
+            registry_log_path,
+            template_dir: None,
+        }
+    }
+
+    /// What `dispatch_canary_deploy` does after the signature check.
+    fn deploy_canary(
+        state: &CanaryAdminState,
+        deployment: common::wire::admin_signed_payload::CanaryDeploymentWire,
+    ) -> CanaryToken {
+        use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
+        let canary_type = match &deployment {
+            CanaryDeploymentWire::Credential { .. } => CanaryTypeWire::Credential,
+            _ => CanaryTypeWire::File,
+        };
+        let (decoy, content) = materialise_canary_file(&deployment, state).unwrap();
+        assert!(watch_decoy(
+            state,
+            decoy.unwrap(),
+            canary_path(&deployment).unwrap()
+        ));
+        state
+            .registry
+            .lock()
+            .deploy(CanaryTokenDraft {
+                // the id is the name and the second: one name per deploy
+                name: crate::canary::templates::new_content_seed()[..12].to_string(),
+                canary_type,
+                deployment,
+                deployed_by_fp: "deadbeef".to_string(),
+                content,
+            })
+            .unwrap()
+    }
+
+    /// External audit DEC-008: the content seed was `<operator fp>:<path>`,
+    /// so the same operator deploying at the same path — on this host or
+    /// any other — wrote the same credential, and the fingerprint into it.
+    /// DEC-010: the row records the SHA-256 of what was written.
+    #[test]
+    fn two_deploys_same_operator_same_path_render_differently() {
+        use common::wire::admin_signed_payload::CanaryDeploymentWire;
+        let dir = TempDir::new().unwrap();
+        let state = canary_state(&dir);
+        let path = dir.path().join("home/u/.docker/config.json");
+        let path_s = path.to_string_lossy().to_string();
+        for deployment in [
+            CanaryDeploymentWire::Credential {
+                path: path_s.clone(),
+                cred_family: "docker".to_string(),
+            },
+            CanaryDeploymentWire::File {
+                path: path_s.clone(),
+                template: None,
+            },
+        ] {
+            let first = deploy_canary(&state, deployment.clone());
+            let body1 = std::fs::read(&path).unwrap();
+            let second = deploy_canary(&state, deployment);
+            let body2 = std::fs::read(&path).unwrap();
+            assert_ne!(body1, body2, "two deploys, two contents");
+            assert_ne!(first.content_seed, second.content_seed);
+            assert_eq!(
+                second.contents_sha256.as_deref(),
+                Some(hex::encode(Sha256::digest(&body2)).as_str())
+            );
+            for body in [&body1, &body2] {
+                let text = String::from_utf8_lossy(body).to_lowercase();
+                for m in ["deadbeef", "northnarrow", "canary", "nn-l-"] {
+                    assert!(!text.contains(m), "decoy carries {m:?}");
+                }
+            }
+        }
+    }
+
+    /// External audit DEC-008: a refresh writes the decoy again from a new
+    /// seed, in place (the inode, which is what is watched, stays), and
+    /// the Refresh row records it; it used to leave a burned credential
+    /// in place.
+    #[test]
+    fn refresh_rotates_credential_content() {
+        use common::wire::admin_signed_payload::CanaryDeploymentWire;
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let state = canary_state(&dir);
+        let path = dir.path().join("creds");
+        let deployed = deploy_canary(
+            &state,
+            CanaryDeploymentWire::Credential {
+                path: path.to_string_lossy().to_string(),
+                cred_family: "aws".to_string(),
+            },
+        );
+        let id = deployed.canary_id.clone();
+        let (body1, ino1) = (
+            std::fs::read(&path).unwrap(),
+            std::fs::metadata(&path).unwrap().ino(),
+        );
+        state
+            .registry
+            .lock()
+            .mark_tripped(&id, Some("acc".to_string()))
+            .unwrap();
+        let row = refresh_canary(&state, &id, "11111111").unwrap();
+        let body2 = std::fs::read(&path).unwrap();
+        assert_ne!(body1, body2, "the credential is a new one");
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino1, "same inode");
+        assert_eq!(
+            row.contents_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(&body2)).as_str())
+        );
+        assert_ne!(row.content_seed, deployed.content_seed);
+        assert_eq!(
+            row.decoy_state,
+            Some(crate::canary::registry::DecoyState::Intact)
+        );
+        assert!(state.registry.lock().is_armed(&id));
+
+        // a decoy gone since is written again, and watched
+        std::fs::remove_file(&path).unwrap();
+        refresh_canary(&state, &id, "11111111").unwrap();
+        let key = crate::fim::attach::key_for_path(&path).unwrap();
+        let watch = state.fim_watch.as_ref().unwrap();
+        assert_eq!(
+            watch.path_map.class_of(&key),
+            Some(crate::fim::drain::WatchClass::Decoy)
+        );
+        // an unknown canary is refused as before
+        let err = refresh_canary(&state, "nope", "11111111").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<RegistryError>(),
+            Some(RegistryError::CanaryIdNotFound)
+        ));
     }
 
     /// K6 dispatch test #1: dispatch_canary_deploy short-circuits
