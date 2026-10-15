@@ -27,9 +27,9 @@
 //! only if it is a regular file: a symlink at an archive name cannot make a
 //! read verb serve another file, and a FIFO cannot stall the socket.
 //!
-//! The rows are not signature-verified here (`nn-admin audit verify` does
-//! that), as for `detections`. Terminator lines of sealed archives are not
-//! rows and are skipped.
+//! The rows are not signature-verified here (`nn-admin chain verify` does
+//! that; `detections` checks the rows it serves since lab PR 160).
+//! Terminator lines of sealed archives are not rows and are skipped.
 
 use std::collections::VecDeque;
 use std::fs::File;

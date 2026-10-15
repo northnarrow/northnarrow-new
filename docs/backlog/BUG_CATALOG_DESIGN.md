@@ -1324,6 +1324,8 @@ Surfaced 2026-05-30 while building the BUG-022/023 FIM fix (commit `bf4dc59`). *
 
 **Fix direction.** Migrate the three onto the `chainlog` core (rotation + O(1) `recover_tail` + repair + manifest-attested truncation), and give `audit.log` the rotation policy its §54 defers. Design the attestation channel first (shared repair-journal vs audit-log attestation). Until then they stay fail-closed (safe, not self-healing) — do NOT add recover-only.
 
+**Update (lab PR 160, external audit NN-AUD-108 / NN-AUD-174).** The attestation channel exists: what the opens of `audit.log` and the canary chains find (rows that do not verify, row numbers broken, a head cut) is a signed `integrity_drift` in `audit.log`, and their heads are anchored in `chain_heads.json` (`docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`). The O(n) walk at open and the absence of `audit.log` rotation remain.
+
 **References.** Surfaced by the [[BUG-026]] O(1)-open fix (VM Validation Log, 2026-05-31). Sibling of BUG-026 (same O(n)-open class) and BUG-028 (same "simple chains on legacy writers" cluster).
 
 ---

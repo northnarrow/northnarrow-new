@@ -151,11 +151,11 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-105 | EBPF-013 | eBPF kernel | M | fixed (lab PR 129) |
 | NN-AUD-106 | EBPF-014 | eBPF kernel | S | fixed (lab PR 147) |
 | NN-AUD-107 | EBPF-015 | eBPF kernel | M | fixed (lab PR 152) |
-| NN-AUD-108 | EVD-002 | Evidence logs | L | open |
-| NN-AUD-109 | EVD-003 | Evidence logs | M | open |
+| NN-AUD-108 | EVD-002 | Evidence logs | L | fixed (lab PR 160) |
+| NN-AUD-109 | EVD-003 | Evidence logs | M | fixed (lab PR 160) |
 | NN-AUD-110 | EVD-004 | Evidence logs | M | fixed (lab PR 131) |
 | NN-AUD-111 | EVD-006 | Evidence logs | M | fixed (lab PR 130) |
-| NN-AUD-112 | EVD-009 | Evidence logs | M | open |
+| NN-AUD-112 | EVD-009 | Evidence logs | M | fixed (lab PR 160) |
 | NN-AUD-113 | EVD-012 | Evidence logs | S | fixed (lab PR 130) |
 | NN-AUD-114 | EVD-013 | Evidence logs | M | fixed (lab PR 130) |
 | NN-AUD-115 | EVD-018 | Evidence logs | S | fixed (lab PR 131) |
@@ -217,7 +217,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-171 | DEC-009 | Deception | S | already fixed (lab PR 84, with NN-AUD-062) |
 | NN-AUD-172 | DEC-010 | Deception | M | fixed (lab PR 143) |
 | NN-AUD-173 | DEC-011 | Deception | M | fixed (lab PR 143) |
-| NN-AUD-174 | DEC-018 | Deception | L | open |
+| NN-AUD-174 | DEC-018 | Deception | L | fixed (lab PR 160) |
 | NN-AUD-175 | XAI-001 | XAI and RAG | M | fixed (lab PR 145) |
 | NN-AUD-176 | XAI-002 | XAI and RAG | M | fixed (lab PR 145) |
 | NN-AUD-177 | XAI-004 | XAI and RAG | S | fixed (lab PR 144) |
@@ -4629,3 +4629,92 @@ the audit did not report, noted with the fix that takes them.
     refused with `EPERM` and reported outside a window, allowed inside
     one.
   - Lab: Ubuntu 24.04 (6.8), fsdeny152-probe.sh on main and on this build, as root outside a trusted-installer window: a new file, a directory, a symlink, a hard link and a FIFO in `/etc/northnarrow`, a new file in the state chain directory, a directory among the bpffs pins, `user.*` setxattr/removexattr on admin.pub — main: all nine allowed, no denial; here all nine refused with EPERM and an ANTI-TAMPER DENIAL each (`op=create×2 link mkdir×2 mknod symlink xattr×2`, 9 NN-L-AT-001 records), the agent logging `deny_attached=18 deny_expected=18` (the ACL hooks present on 6.8); inside a window all nine allowed with no denial and nothing left behind. Ubuntu 22.04 (5.15): every new program loaded (`deny_attached=16`), `tamper-check` C47–C54 as expected (denied outside the window, allowed inside). Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.
+- **NN-AUD-108, NN-AUD-109, NN-AUD-112, NN-AUD-174 (EVD-002, EVD-003,
+  EVD-009, DEC-018), lab PR 160.** Evidence completeness (triage C, batch
+  B6). One format for every chain, designed once
+  (`docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`, new module
+  `chain_anchor`). No kernel or wire change.
+  - Row numbers and domains (EVD-002, DEC-018): `seq: Option<u64>` (serde
+    default, skipped when `None`, before `prev_hash`) on `AuditEntry`,
+    `CanaryToken`, `CanaryAccessEntry`: the row's position. Legacy rows keep
+    their bytes and pre-image; numbering starts at their count; from the
+    first numbered row `seq == position` and no un-numbered row after
+    (`RowSeq`, in the three `verify_chain`s and at open). A numbered row's
+    hash is `SHA-256(domain ‖ prev ‖ row)`, one domain per chain. The
+    triage proposed declining domain separation alone; it rides on the
+    same versioned pre-image change, as it suggested.
+  - Heads and anchors: a file head is (bytes, `entry_hash`) of the last
+    genuine line, checked in O(window). `RotatingChainLog` writes
+    `ManifestEvent::ActiveCheckpoint {seq, bytes, tail_hash}` (every 1000
+    records, every 10 minutes while appending, at open; the manifest is
+    created inside the `+i` dance). The signed two-slot anchor
+    `/etc/northnarrow/chain_heads.json` (next to the audit log, so a test
+    agent with its own audit log has its own; appended to
+    `ETC_PROTECTED_FILES` and `ETC_WRITE_DENY_FILES`, bootstrapped
+    pre-attach) holds every chain's and
+    manifest's head and the ATP-004 flag; written at start before any
+    append, every 5 minutes when a head moved, at stop after `agent_stop`;
+    each head also a `chain.head` journal line. The first snapshot is
+    followed by a `chain_numbering_started` audit row (the legacy heads):
+    after it a missing anchor is reported. Not the triage's pinned map:
+    the maintenance path removes the pins.
+  - Boot check (pre-attach, before any writer): the snapshot's heads, each
+    rotating log's newest checkpoint, an active file missing after a
+    recorded `Rotated` row → ERROR + signed `integrity_drift`
+    (`chain_truncated`, `chain_rewritten`, `chain_missing`,
+    `chain_archives_missing`, `active_file_missing`,
+    `chain_heads_unverified`/`_missing`). On the audit chain: the overlay
+    rollback floor is reset (`RollbackFloor::reset_because`) and the
+    one-key bootstrap closed (the triage's "additional impact").
+  - EVD-003: `verify_log_set` reads the manifest whole, requires every
+    checkpoint reachable (`CheckpointUnreachable`) and the active file
+    present once the newest archive's `Rotated` row exists (`ActiveMissing`;
+    the rename/create crash window stays accepted); `LogSetReport` gains
+    `checkpoints_verified`. A manifest that is not a regular file now fails
+    verification (`rotation_survives_manifest_failure…` adjusted).
+  - EVD-009: `nn-admin chain verify [--log …]` (all chains in full, then the
+    anchor; exit 8; `examples/verify_chainlog.rs` reads `agent.sig.pub` and
+    points to it); `nn-admin audit verify --expect-head/--min-seq`; a
+    background `verify_recent` of each rotating log's last 4 MiB with a
+    signed `chain_verify` entry; `nn-admin detections` serves only rows
+    whose hash and signature verify (the newest `limit`, at most 1000
+    failures tried), the others an ERROR and `chain_lines_unverified`.
+  - DEC-018: `Registry::open` verifies every row (not applied when it fails,
+    chain continued from the last genuine row; link and number breaks
+    reported); `CanaryAccessDb::open` verifies the last 256 rows; findings
+    attested by main.rs (`take_chain_findings`). The false doc comment on
+    `verify_chain` is corrected.
+  - Touch points shared with lots in flight: `canary/registry.rs` gains the
+    `seq` field, a trailing `seq` argument to `build_signed_entry` at its
+    three call sites, `append_row(&mut self)`, the row check in
+    `read_chain`, `take_chain_findings`; `audit.rs` gains the `seq` field
+    and a `TailState` from `read_tail` (a reader of `AuditEntry` rows, such
+    as lot 148's `verified_boot_recorded`, is unaffected).
+  - Residual: a cut between anchors after a kill (no stop snapshot); an
+    older genuine snapshot put back with the chains cut back to it, or a
+    rollback to before numbering (the journal heads kept off the host
+    catch it); `netflow_listeners.jsonl` and `fim_baseline.jsonl` are not
+    anchored; `fim report`/`net flows`/`canary list` do not verify rows.
+  - Tests: `a_cut_audit_log_is_found_at_the_next_boot`,
+    `a_cut_canary_chain_is_found_at_the_next_boot`,
+    `an_emptied_active_file_is_found_at_the_next_boot`,
+    `a_deleted_active_file_is_found_at_the_next_boot`,
+    `emptying_the_active_file_after_a_checkpoint_is_detected`,
+    `deleting_the_active_file_with_archives_is_detected`,
+    `deleting_the_newest_archive_and_the_active_is_detected`,
+    `verify_recent_checks_the_tail_and_finds_a_forged_line`,
+    `read_last_n_skips_unsigned_lines`,
+    `registry_open_ignores_an_unsigned_burn_row`,
+    `access_log_open_flags_a_bad_tail_row`,
+    `seq_gap_or_regression_fails_verify_chain_and_is_reported_at_open`,
+    `a_numbered_row_hashed_for_another_domain_is_rejected`,
+    `a_registry_row_signed_for_another_domain_is_rejected`,
+    `legacy_rows_without_seq_verify_and_new_rows_are_numbered_after_them`
+    (and the registry/access-log twins),
+    `audit_verify_finds_a_cut_below_an_expected_head`,
+    `the_heads_store_keeps_the_previous_snapshot_when_a_write_is_torn`.
+    With the head check, the checkpoint/active checks, the row
+    verification, the domain tag, the read-path check or the `seq` check
+    disabled, the matching tests fail (13); `post_rename_crash_recovers…`
+    and the `fresh_seq0` paths unchanged.
+  - Lab: Ubuntu 24.04, evid160-probe.sh, evidence chains reset first (`evidence-reset.sh`: the gate runs leave rows signed by test keys in the guest's logs). main: three rows cut from the end of `audit.log` — no ERROR, no drift, `audit verify` "hash chain intact"; the registry's last row cut — the second canary gone from the live set without a word; `netflow.jsonl` emptied — no alarm. This change, installed over main (rows written by main, lab PR 143's included, verify: "16 in the old format then numbered", the registry's "2 rows in the old format" OK): each cut → ERROR "chain integrity: evidence missing or altered" and a signed `integrity_drift` `chain_truncated` (chain audit, canary_registry, netflow), `nn-admin chain verify` BROKEN with exit 8 on the cut chain. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.

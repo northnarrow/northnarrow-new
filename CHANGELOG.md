@@ -15,6 +15,33 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, evidence completeness (Medium EVD-002, EVD-003,
+  EVD-009, DEC-018): a signed chain proved its rows were not changed, not
+  that none were removed. `audit.log` or a canary chain cut at its end, or
+  deleted and restarted, verified; an emptied or deleted active file of a
+  rotating log passed `verify_log_set`; nothing verified a chain in
+  production (the canary chains were only parsed at open — an unsigned
+  `Burn` row retired a canary — and `nn-admin detections` served any
+  well-formed line); the chains shared one key with no domain separation.
+  Now rows of `audit.log` and the canary chains carry their position
+  (`seq`) and a per-chain domain tag in their hash; the rotating logs
+  checkpoint their active file in their signed manifest; the heads of all
+  chains are anchored in the signed `/etc/northnarrow/chain_heads.json`
+  (at start, every 5 minutes, at stop; each also an INFO `chain.head`
+  journal line). Every start compares the files with them before anything
+  opens and reports a cut, emptied, deleted or rewritten chain as an ERROR
+  and a signed `integrity_drift` (`chain_truncated`, …); a cut audit chain
+  also resets the overlay rollback floor and closes the one-key bootstrap.
+  The canary registry verifies every row at open (one that fails is not
+  applied), the access log its last 256; the rotating logs' last 4 MiB are
+  verified in the background (`chain_verify`); `nn-admin detections` leaves
+  out rows that do not verify. New: `nn-admin chain verify` (every chain in
+  full, against the anchor; exit 8) and `nn-admin audit verify
+  --expect-head/--min-seq`. Existing chains keep verifying unchanged and
+  are numbered from their current length; the switch is recorded
+  (`chain_numbering_started`). **Regression:** an `nn-admin` older than
+  the agent reports numbered rows as broken; downgrading the agent is not
+  supported. Runbook: `docs/operator/EVIDENCE_CHAINS.md`.
 - External audit, Wave 2, new entries in the agent's directories (Medium
   EBPF-015): the filesystem deny refused removing or renaming an entry of
   `/etc/northnarrow`, the state directory or the pin root, not adding one —

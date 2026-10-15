@@ -1240,20 +1240,61 @@ impl DetectionRecord {
 /// envelope fields (`prev_hash` / `entry_hash` / `agent_sig` /
 /// `fmt_ver`) are flattened siblings and are simply ignored, while a
 /// terminator / manifest / torn line (which carries no `id`) fails to
-/// parse and is skipped. The chain is NOT signature-verified here:
-/// this is an on-host read of an LSM-protected file; integrity
-/// verification is the dedicated `verify_log_set` / `nn-admin audit
-/// verify` path, not every dashboard query.
+/// parse and is skipped. This entry point does not verify the rows; the
+/// admin read path uses [`read_last_n_verified`].
 pub fn read_last_n(
     active_path: &Path,
     limit: usize,
     filter: &DetectionFilter,
 ) -> Vec<DetectionRecord> {
-    let mut collected: Vec<DetectionRecord> = Vec::new();
-    collect_matching_from_file(active_path, filter, &mut collected);
+    read_last_n_verified(active_path, limit, filter, None).0
+}
+
+/// [`read_last_n`], and with `pubkey` every row returned is checked
+/// first: its `entry_hash` recomputes and its signature verifies (external
+/// audit NN-AUD-112: any well-formed JSON line in `detections.jsonl` was
+/// served as a detection). A row that fails is left out and counted (the
+/// second value). Only the rows returned are checked (at most `limit`, a
+/// few milliseconds); the chain's links are `nn-admin chain verify`'s.
+pub fn read_last_n_verified(
+    active_path: &Path,
+    limit: usize,
+    filter: &DetectionFilter,
+    pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> (Vec<DetectionRecord>, usize) {
+    // (record, raw line, already verified)
+    let mut collected: Vec<(DetectionRecord, String, bool)> = Vec::new();
+    let mut unverified = 0usize;
+    let mut fill = |collected: &mut Vec<(DetectionRecord, String, bool)>, path: &Path| {
+        let mut found = Vec::new();
+        collect_matching_from_file(path, filter, &mut found);
+        collected.extend(found.into_iter().map(|(r, l)| (r, l, false)));
+        // Newest first; with a key, keep the newest `limit` rows that
+        // verify (a forged row does not count towards `limit`). At most
+        // MAX_UNVERIFIED_PER_READ failures are tried, so a flood of forged
+        // lines cannot make one read verify the whole file.
+        collected.sort_by_key(|(r, _, _)| std::cmp::Reverse(r.id));
+        let Some(pk) = pubkey else {
+            collected.truncate(limit);
+            return;
+        };
+        let mut kept = Vec::with_capacity(limit.min(collected.len()));
+        for (r, line, checked) in collected.drain(..) {
+            if kept.len() >= limit || unverified >= MAX_UNVERIFIED_PER_READ {
+                break;
+            }
+            if checked || crate::chainlog::line_is_genuine::<DetectionRecord>(line.as_bytes(), pk) {
+                kept.push((r, line, true));
+            } else {
+                unverified += 1;
+            }
+        }
+        *collected = kept;
+    };
+    fill(&mut collected, active_path);
     if collected.len() < limit {
         for archive in crate::chainlog::archives_newest_first(active_path) {
-            collect_matching_from_file(&archive, filter, &mut collected);
+            fill(&mut collected, &archive);
             if collected.len() >= limit {
                 break;
             }
@@ -1261,20 +1302,24 @@ pub fn read_last_n(
     }
     // Monotonic id ⇒ id-desc is newest-first across every file we
     // touched; bound to the requested N.
-    collected.sort_by_key(|r| std::cmp::Reverse(r.id));
-    collected.truncate(limit);
-    collected
+    (
+        collected.into_iter().map(|(r, _, _)| r).collect(),
+        unverified,
+    )
 }
 
+/// Rows that fail verification tried by one [`read_last_n_verified`].
+const MAX_UNVERIFIED_PER_READ: usize = 1000;
+
 /// Append the matching [`DetectionRecord`]s from one chainlog file
-/// (active or sealed archive) to `out`. Best-effort: a missing /
-/// unreadable file contributes nothing; lines that don't parse as a
-/// `DetectionRecord` (terminators, blanks) are skipped. The file is
-/// size-capped (≤ rotation cap), so this is a bounded read.
+/// (active or sealed archive) to `out`, each with its raw line. Best-
+/// effort: a missing / unreadable file contributes nothing; lines that
+/// don't parse as a `DetectionRecord` (terminators, blanks) are skipped.
+/// The file is size-capped (≤ rotation cap), so this is a bounded read.
 fn collect_matching_from_file(
     path: &Path,
     filter: &DetectionFilter,
-    out: &mut Vec<DetectionRecord>,
+    out: &mut Vec<(DetectionRecord, String)>,
 ) {
     use std::io::{BufRead, BufReader};
     let f = match std::fs::OpenOptions::new().read(true).open(path) {
@@ -1288,7 +1333,7 @@ fn collect_matching_from_file(
         }
         if let Ok(record) = serde_json::from_str::<DetectionRecord>(&line) {
             if record.matches(filter) {
-                out.push(record);
+                out.push((record, line));
             }
         }
     }
@@ -1358,6 +1403,18 @@ pub fn read_last_n_overlaid(
     limit: usize,
     filter: &DetectionFilter,
 ) -> Vec<DetectionRecord> {
+    read_last_n_overlaid_verified(detections_path, status_events_path, limit, filter, None).0
+}
+
+/// [`read_last_n_overlaid`] over [`read_last_n_verified`]: with `pubkey`,
+/// detection rows that do not verify are left out and counted.
+pub fn read_last_n_overlaid_verified(
+    detections_path: &Path,
+    status_events_path: &Path,
+    limit: usize,
+    filter: &DetectionFilter,
+    pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> (Vec<DetectionRecord>, usize) {
     let mut base_filter = filter.clone();
     let status_target = base_filter.status.take();
 
@@ -1369,7 +1426,8 @@ pub fn read_last_n_overlaid(
     } else {
         limit
     };
-    let mut records = read_last_n(detections_path, scan_limit, &base_filter);
+    let (mut records, unverified) =
+        read_last_n_verified(detections_path, scan_limit, &base_filter, pubkey);
 
     // Overlay current status for just the window's ids (bounded).
     let ids: HashSet<u64> = records.iter().map(|r| r.id).collect();
@@ -1385,7 +1443,7 @@ pub fn read_last_n_overlaid(
         records.retain(|r| r.status == target);
     }
     records.truncate(limit);
-    records
+    (records, unverified)
 }
 
 /// Build a `{detection_id -> current status}` map for exactly the ids
@@ -2756,6 +2814,47 @@ mod tests {
             vec![3, 2, 1],
             "payloads parsed, terminator skipped"
         );
+    }
+
+    /// External audit NN-AUD-112: before lab PR 160 any well-formed JSON
+    /// line in `detections.jsonl` was served as a detection. With the agent
+    /// key the read leaves out a line that does not verify, and counts it.
+    #[test]
+    fn read_last_n_skips_unsigned_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let key = test_key();
+        let pk = key.verifying_key();
+        {
+            let mut log = RotatingChainLog::<DetectionRecord>::open(
+                &path,
+                key,
+                RotationConfig::default(),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
+            log.append(mk_id(1)).unwrap();
+            log.append(mk_id(2)).unwrap();
+        }
+        // A fabricated detection, chain-shaped but signed by no one.
+        let mut fake = serde_json::to_value(mk_id(3)).unwrap();
+        fake["fmt_ver"] = serde_json::json!(2);
+        fake["prev_hash"] = serde_json::json!("00".repeat(32));
+        fake["entry_hash"] = serde_json::json!("11".repeat(32));
+        fake["agent_sig"] = serde_json::json!("AAAA");
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body.push_str(&serde_json::to_string(&fake).unwrap());
+        body.push('\n');
+        std::fs::write(&path, body).unwrap();
+
+        let filter = DetectionFilter::default();
+        assert_eq!(ids(&read_last_n(&path, 10, &filter)), vec![3, 2, 1]);
+        let (got, unverified) = read_last_n_verified(&path, 10, &filter, Some(&pk));
+        assert_eq!(ids(&got), vec![2, 1], "the fabricated row is not served");
+        assert_eq!(unverified, 1);
+        // the bound still holds: limit 1 serves the newest genuine row
+        let (got, _) = read_last_n_verified(&path, 1, &filter, Some(&pk));
+        assert_eq!(ids(&got), vec![2]);
     }
 
     #[test]

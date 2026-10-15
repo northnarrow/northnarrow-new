@@ -254,6 +254,12 @@ pub struct CanaryToken {
     pub decoy_state: Option<DecoyState>,
     /// Chain integrity (Tappa 8 B1 shape).
     pub agent_id: String,
+    /// External audit NN-AUD-174: the row's 0-based position in the file,
+    /// on rows written from lab PR 160 on (pre-image domain-tagged with
+    /// [`crate::chain_anchor::CANARY_REGISTRY_DOMAIN_V2`]); absent on older
+    /// rows, which keep their bytes and pre-image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub prev_hash: String,
     pub entry_hash: String,
     pub agent_sig: String,
@@ -321,6 +327,10 @@ pub struct Registry {
     live: BTreeMap<String, CanaryLiveState>,
     tail_repair: Option<crate::chainlog::TailRepair>,
     skipped_lines: usize,
+    /// External audit NN-AUD-174: rows in the file (the next `seq`) and
+    /// what the open's verification found.
+    rows: u64,
+    chain_findings: Vec<crate::chain_anchor::ChainFinding>,
 }
 
 impl Registry {
@@ -338,17 +348,27 @@ impl Registry {
         let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
             serde_json::from_slice::<CanaryToken>(l).is_ok()
         })?;
-        let (last_hash, live, skipped_lines) = read_chain(path)?;
+        // External audit NN-AUD-174: every row is verified at open.
+        let read = read_chain(path, &key.verifying_key())?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
             path: crate::anchored::anchor(path),
             key,
             agent_id,
-            last_hash,
-            live,
+            last_hash: read.last_hash,
+            live: read.live,
             tail_repair,
-            skipped_lines,
+            skipped_lines: read.skipped,
+            rows: read.seq.rows(),
+            chain_findings: read.findings,
         })
+    }
+
+    /// External audit NN-AUD-174: what the open's verification found (rows
+    /// that do not verify, row numbers or links broken), for the caller to
+    /// attest once.
+    pub fn take_chain_findings(&mut self) -> Vec<crate::chain_anchor::ChainFinding> {
+        std::mem::take(&mut self.chain_findings)
     }
 
     /// What the open found wrong, for the caller to attest once: the
@@ -571,6 +591,7 @@ impl Registry {
             &self.key,
             &self.agent_id,
             &self.last_hash,
+            self.rows,
         )?;
         self.append_row(&entry)?;
         self.last_hash = entry.entry_hash.clone();
@@ -581,7 +602,7 @@ impl Registry {
     /// `O_APPEND` + fsync. The in-memory tail advance + live-
     /// set mutation happen in the caller after this returns
     /// `Ok(())`.
-    fn append_row(&self, entry: &CanaryToken) -> Result<()> {
+    fn append_row(&mut self, entry: &CanaryToken) -> Result<()> {
         let mut line =
             serde_json::to_string(entry).map_err(|e| anyhow!("serialising canary entry: {e}"))?;
         line.push('\n');
@@ -600,6 +621,7 @@ impl Registry {
             .with_context(|| format!("appending canary entry to {}", self.path.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync {}", self.path.display()))?;
+        self.rows += 1;
         Ok(())
     }
 }
@@ -616,6 +638,15 @@ pub enum RegistryError {
 
 // ── chain helpers ───────────────────────────────────────────────────
 
+/// What [`read_chain`] recovers.
+struct ChainRead {
+    last_hash: String,
+    live: BTreeMap<String, CanaryLiveState>,
+    skipped: usize,
+    seq: crate::chain_anchor::RowSeq,
+    findings: Vec<crate::chain_anchor::ChainFinding>,
+}
+
 /// Walk the existing chain to (a) find the tail hash and
 /// (b) reconstruct the in-memory live-set. Each Deploy row
 /// inserts; each Burn row removes; each Refresh row clears
@@ -625,11 +656,24 @@ pub enum RegistryError {
 /// → empty (genesis tail + empty live set). Errors propagate
 /// on malformed lines so a corrupted chain surfaces at open
 /// time rather than at first append.
-fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>, usize)> {
+///
+/// External audit NN-AUD-174: every row is verified against `pubkey`
+/// (the registry is small). A row that does not verify is not applied —
+/// an unsigned `Burn` no longer removes a canary, which stays armed — and
+/// the chain is not continued from it; broken row numbers or links are
+/// reported. Unlike the FIM baseline, nothing before a bad row is dropped.
+fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
+    let mut seq = crate::chain_anchor::RowSeq::default();
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((GENESIS_PREV_HASH.to_string(), BTreeMap::new(), 0));
+            return Ok(ChainRead {
+                last_hash: GENESIS_PREV_HASH.to_string(),
+                live: BTreeMap::new(),
+                skipped: 0,
+                seq,
+                findings: Vec::new(),
+            });
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
@@ -637,6 +681,8 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
     let mut last: Option<String> = None;
     let mut live: BTreeMap<String, CanaryLiveState> = BTreeMap::new();
     let mut skipped = 0usize;
+    let mut unverified = 0usize;
+    let mut breaks: Vec<String> = Vec::new();
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -644,8 +690,23 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
         }
         let Ok(entry) = serde_json::from_str::<CanaryToken>(&line) else {
             skipped += 1;
+            seq.skip();
             continue;
         };
+        let row = seq.rows();
+        if let Err(b) = seq.push(entry.seq) {
+            breaks.push(b.to_string());
+        }
+        if verify_row(&entry, pubkey).is_err() {
+            unverified += 1;
+            continue;
+        }
+        let expected = last.as_deref().unwrap_or(GENESIS_PREV_HASH);
+        if entry.prev_hash != expected {
+            breaks.push(format!(
+                "row {row} does not chain from the genuine row before it: rows were removed"
+            ));
+        }
         let content = entry
             .contents_sha256
             .clone()
@@ -701,11 +762,33 @@ fn read_chain(path: &Path) -> Result<(String, BTreeMap<String, CanaryLiveState>,
         }
         last = Some(entry.entry_hash);
     }
-    Ok((
-        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+    let mut findings = Vec::new();
+    if unverified > 0 {
+        findings.push(crate::chain_anchor::ChainFinding::new(
+            "canary_registry",
+            path,
+            "chain_lines_unverified",
+            format!(
+                "{unverified} row(s) fail hash or signature verification: not applied (a canary \
+                 they would retire stays armed)"
+            ),
+        ));
+    }
+    if let Some(first) = breaks.first() {
+        findings.push(crate::chain_anchor::ChainFinding::new(
+            "canary_registry",
+            path,
+            "chain_sequence_broken",
+            format!("{first} ({} break(s) in all)", breaks.len()),
+        ));
+    }
+    Ok(ChainRead {
+        last_hash: last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         live,
         skipped,
-    ))
+        seq,
+        findings,
+    })
 }
 
 /// The actor of the rows the agent writes on its own (Trip, DecoyCheck),
@@ -717,6 +800,7 @@ pub const AGENT_ACTOR: &str = "agent-self";
 /// carries the canary's current state (chain rows are
 /// self-contained). Symmetric to
 /// `crate::fim::baseline::build_signed_entry`.
+#[allow(clippy::too_many_arguments)]
 fn build_signed_entry(
     action: RegistryAction,
     state: &CanaryLiveState,
@@ -725,6 +809,7 @@ fn build_signed_entry(
     key: &AgentSigningKey,
     agent_id: &[u8; 16],
     prev_hash: &str,
+    seq: u64,
 ) -> Result<CanaryToken> {
     let ts = format_ts(Utc::now());
     let mut entry = CanaryToken {
@@ -742,6 +827,7 @@ fn build_signed_entry(
         content_seed: state.content.as_ref().and_then(|c| c.content_seed.clone()),
         decoy_state,
         agent_id: hex::encode(agent_id),
+        seq: Some(seq),
         prev_hash: prev_hash.to_string(),
         // Filled below — empty here so the pre-image
         // serialisation excludes them.
@@ -762,18 +848,53 @@ fn build_signed_entry(
 /// stays free of those fields' eventual contents — verifiers
 /// reproduce the same bytes by clearing those fields before
 /// recomputing.
+///
+/// External audit NN-AUD-174: a numbered row (`seq` set) prefixes the
+/// pre-image with [`crate::chain_anchor::CANARY_REGISTRY_DOMAIN_V2`].
 fn compute_entry_hash(entry: &CanaryToken) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
-    let prev_bytes =
-        hex::decode(&entry.prev_hash).map_err(|e| anyhow!("prev_hash is not valid hex: {e}"))?;
     let body =
         serde_json::to_vec(entry).map_err(|e| anyhow!("serialising canary pre-image: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&prev_bytes);
-    hasher.update(&body);
-    let digest: [u8; 32] = hasher.finalize().into();
-    Ok(digest)
+    let domain = entry
+        .seq
+        .map(|_| crate::chain_anchor::CANARY_REGISTRY_DOMAIN_V2);
+    crate::chain_anchor::flat_digest(domain, &entry.prev_hash, &body)
+}
+
+/// External audit NN-AUD-174: one row's own hash and signature.
+fn verify_row(entry: &CanaryToken, pubkey: &VerifyingKey) -> Result<(), RegistryVerifyError> {
+    use ed25519_dalek::Verifier;
+    let idx = 0;
+    let mut stripped = entry.clone();
+    stripped.entry_hash.clear();
+    stripped.agent_sig.clear();
+    let recomputed =
+        compute_entry_hash(&stripped).map_err(|e| RegistryVerifyError::MalformedField {
+            idx,
+            reason: e.to_string(),
+        })?;
+    if hex::encode(recomputed) != entry.entry_hash {
+        return Err(RegistryVerifyError::EntryHashMismatch {
+            idx,
+            recomputed: hex::encode(recomputed),
+            stored: entry.entry_hash.clone(),
+        });
+    }
+    let sig = B64
+        .decode(&entry.agent_sig)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .ok_or(RegistryVerifyError::SignatureInvalid { idx })?;
+    pubkey
+        .verify(&recomputed, &Signature::from_bytes(&sig))
+        .map_err(|_| RegistryVerifyError::SignatureInvalid { idx })
+}
+
+/// External audit NN-AUD-174: whether one raw line is a genuine registry
+/// row.
+pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
+    serde_json::from_slice::<CanaryToken>(line).is_ok_and(|e| verify_row(&e, pubkey).is_ok())
 }
 
 /// Per-canary stable ID — `SHA-256(name || ":" ||
@@ -917,21 +1038,32 @@ pub enum RegistryVerifyError {
     SignatureInvalid { idx: usize },
     #[error("entry {idx}: malformed field — {reason}")]
     MalformedField { idx: usize, reason: String },
+    /// External audit NN-AUD-174: a numbered row out of place.
+    #[error("entry {idx}: {reason}")]
+    Sequence {
+        idx: usize,
+        reason: crate::chain_anchor::SeqBreak,
+    },
 }
 
 /// Replay `entries` in order, recomputing each `entry_hash`
 /// and checking each `agent_sig` against `pubkey`. Returns
-/// `Ok(())` on a fully-intact chain. Used by the agent's own
-/// [`Registry::open`] path (which uses it for boot-time
-/// integrity validation) and exposed for the future K6
-/// `nn-admin canary verify` reader.
+/// `Ok(())` on a fully-intact chain. External audit NN-AUD-174: this is
+/// the full off-host check (`nn-admin chain verify --log
+/// canary-registry`); [`Registry::open`] verifies each row on its own
+/// (hash, signature, link, number) and reports instead of refusing.
+/// Rows without `seq` verify as before; from the first numbered row on,
+/// each must carry its position.
 pub fn verify_chain(
     entries: &[CanaryToken],
     pubkey: &VerifyingKey,
 ) -> Result<(), RegistryVerifyError> {
     use ed25519_dalek::Verifier;
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
+    let mut seq = crate::chain_anchor::RowSeq::default();
     for (idx, entry) in entries.iter().enumerate() {
+        seq.push(entry.seq)
+            .map_err(|reason| RegistryVerifyError::Sequence { idx, reason })?;
         if entry.prev_hash != expected_prev {
             return Err(RegistryVerifyError::PrevHashMismatch {
                 idx,
@@ -1232,13 +1364,18 @@ mod tests {
             .collect();
         // Attacker drops entry 1, leaving entry 2 with a
         // prev_hash that points at entry 0's tail rather than
-        // entry 1's tail. Verify must reject at idx=1.
+        // entry 1's tail. Verify must reject at idx=1 — on numbered
+        // rows (NN-AUD-174) the row number names the gap first.
         entries.remove(1);
         let err = verify_chain(&entries, &pubkey)
             .expect_err("dropped-entry chain must fail prev_hash check");
         assert!(
-            matches!(err, RegistryVerifyError::PrevHashMismatch { idx: 1, .. }),
-            "expected PrevHashMismatch on entry 1; got: {err:?}"
+            matches!(
+                err,
+                RegistryVerifyError::PrevHashMismatch { idx: 1, .. }
+                    | RegistryVerifyError::Sequence { idx: 1, .. }
+            ),
+            "expected a break on entry 1; got: {err:?}"
         );
     }
 
@@ -1552,5 +1689,133 @@ mod tests {
         let state = reg.get(&id).unwrap();
         assert_eq!(state.decoy_state, DecoyState::Intact);
         assert_eq!(state.content.unwrap().contents_sha256, "ef".repeat(32));
+    }
+
+    // ── External audit NN-AUD-174 (lab PR 160) ──────────────────────
+
+    /// Before lab PR 160 `read_chain` applied any row that parsed: an
+    /// unsigned `Burn` written into the file (no key needed) retired a
+    /// canary silently at the next start. Now the row does not verify, is
+    /// not applied, and is reported.
+    #[test]
+    fn registry_open_ignores_an_unsigned_burn_row() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        let deployed = {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            reg.deploy(sample_draft(1)).unwrap()
+        };
+        let mut burn = deployed.clone();
+        burn.action = RegistryAction::Burn;
+        burn.seq = Some(1);
+        burn.prev_hash = deployed.entry_hash.clone();
+        burn.entry_hash = "ab".repeat(32);
+        burn.agent_sig = B64.encode([7u8; 64]);
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        body.push_str(&serde_json::to_string(&burn).unwrap());
+        body.push('\n');
+        std::fs::write(&log_path, body).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        assert_eq!(reg.list().len(), 1, "the canary stays armed");
+        let found = reg.take_chain_findings();
+        assert!(
+            found.iter().any(|f| f.kind == "chain_lines_unverified"),
+            "{found:?}"
+        );
+        // the chain continues from the last genuine row
+        assert_eq!(reg.last_hash(), deployed.entry_hash);
+        let next = reg.refresh(&deployed.canary_id, "00000000", None).unwrap();
+        assert_eq!(next.seq, Some(2), "positions count the forged row");
+    }
+
+    /// Rows written before lab PR 160 (no `seq`, untagged pre-image) open
+    /// and verify as before; numbering starts at their count.
+    #[test]
+    fn legacy_registry_rows_verify_and_numbering_starts_after_them() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut body = String::new();
+        for i in 0..2 {
+            let d = sample_draft(i);
+            let state = CanaryLiveState {
+                name: d.name.clone(),
+                canary_id: compute_canary_id(&d.name, 1),
+                canary_type: d.canary_type,
+                deployment: d.deployment.clone(),
+                deployed_at_unix: 1,
+                deployed_by_fp: d.deployed_by_fp.clone(),
+                tripped: false,
+                first_trip_access_hash: None,
+                content: None,
+                decoy_state: DecoyState::Intact,
+            };
+            let mut e = build_signed_entry(
+                RegistryAction::Deploy,
+                &state,
+                &d.deployed_by_fp,
+                None,
+                &key,
+                &[0u8; 16],
+                &prev,
+                0,
+            )
+            .unwrap();
+            e.seq = None;
+            e.entry_hash.clear();
+            e.agent_sig.clear();
+            let h = compute_entry_hash(&e).unwrap();
+            e.entry_hash = hex::encode(h);
+            e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+            body.push_str(&serde_json::to_string(&e).unwrap());
+            body.push('\n');
+            prev = e.entry_hash;
+        }
+        std::fs::write(&log_path, &body).unwrap();
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        assert!(reg.take_chain_findings().is_empty());
+        assert_eq!(reg.len(), 2);
+        let row = reg.deploy(sample_draft(5)).unwrap();
+        assert_eq!(row.seq, Some(2));
+        let rows: Vec<CanaryToken> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        verify_chain(&rows, &pk).expect("old rows then numbered rows verify");
+    }
+
+    /// External audit NN-AUD-174: the same key signs every chain; a numbered
+    /// registry row whose hash was made for the access-log domain (or
+    /// untagged) is refused here.
+    #[test]
+    fn a_registry_row_signed_for_another_domain_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        let good = reg.deploy(sample_draft(1)).unwrap();
+        verify_chain(std::slice::from_ref(&good), &pk).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        for domain in [None, Some(crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2)] {
+            let mut e = good.clone();
+            e.entry_hash.clear();
+            e.agent_sig.clear();
+            let body = serde_json::to_vec(&e).unwrap();
+            let h = crate::chain_anchor::flat_digest(domain, &e.prev_hash, &body).unwrap();
+            e.entry_hash = hex::encode(h);
+            e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+            assert!(matches!(
+                verify_chain(&[e.clone()], &pk),
+                Err(RegistryVerifyError::EntryHashMismatch { idx: 0, .. })
+            ));
+            assert!(!row_is_genuine(
+                serde_json::to_string(&e).unwrap().as_bytes(),
+                &pk
+            ));
+        }
     }
 }

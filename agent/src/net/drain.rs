@@ -1156,7 +1156,10 @@ mod tests {
         let path = dir.path().join("netflow.jsonl");
         let mut db = open_db(&path);
         let t0 = Instant::now();
-        for i in 0..1_000 {
+        // 500 rows: clear of the active checkpoint every 1000 records
+        // (NN-AUD-109), which makes its rows durable first, an fsync of
+        // its own.
+        for i in 0..500 {
             let mut ev = test_event();
             ev.flow_id = format!("f{i}");
             db.append(&ev, false).unwrap();
@@ -1174,7 +1177,7 @@ mod tests {
         let report =
             crate::chainlog::verify_log_set::<NetFlowPayload>(&path, &fresh_key_pk(dir.path()))
                 .unwrap_or_else(|_| panic!("verifies"));
-        assert_eq!(report.total_records, 1_001);
+        assert_eq!(report.total_records, 501);
     }
 
     /// The listener log uses the same group commit.

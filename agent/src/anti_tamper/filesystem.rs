@@ -178,6 +178,9 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // External audit EVD-001: the signing key's public half, written by
     // the agent; what `nn-admin audit verify` reads.
     "agent.sig.pub",
+    // External audit NN-AUD-108 (lab PR 160): the signed head anchor of the
+    // chains (`crate::chain_anchor`), next to the audit log it anchors.
+    "chain_heads.json",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -204,6 +207,8 @@ pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     // External audit EVD-001: the public half, written by the agent at
     // start; what `nn-admin audit verify` reads.
     "agent.sig.pub",
+    // Lab PR 160: the head anchor, written only by the agent.
+    "chain_heads.json",
     // written only by install.sh with the units stopped; an append at
     // runtime corrupts the boot-time integrity check (observed on the
     // lab guest: `echo x >>` went through while MUTATE-only).
@@ -1225,6 +1230,28 @@ pub fn bootstrap_canary_log(canary_log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// External audit NN-AUD-108 (lab PR 160): bootstrap the empty head
+/// anchor (`chain_heads.json`, next to the audit log) so
+/// `PROTECTED_INODES` has its inode at attach time. Same contract as
+/// [`bootstrap_audit_log`]: a present file is left untouched.
+pub fn bootstrap_chain_heads(heads_path: &Path) -> Result<()> {
+    if heads_path.exists() {
+        return Ok(());
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o644)
+        .open(heads_path)
+        .with_context(|| format!("creating chain heads {}", heads_path.display()))?;
+    info!(
+        path = %heads_path.display(),
+        "anti-tamper FS: chain heads bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
+    );
+    Ok(())
+}
+
 /// Tappa 10 N9: bootstrap an empty NetListener log file
 /// (`netflow_listeners.jsonl`) if it doesn't exist yet, so
 /// PROTECTED_INODES has an inode to register at attach time.
@@ -1998,11 +2025,18 @@ mod tests {
                 "canary-readers.local",
                 "canary-readers.local.sig",
                 "agent.sig.pub",
+                "chain_heads.json",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"
         );
         assert_eq!(CONFIG_DIR, "/etc/northnarrow");
+        // Lab PR 160: the head anchor lives next to the audit log.
+        assert_eq!(
+            crate::chain_anchor::DEFAULT_HEADS_PATH,
+            format!("{CONFIG_DIR}/{}", crate::chain_anchor::HEADS_FILE_NAME)
+        );
+        assert!(ETC_WRITE_DENY_FILES.contains(&crate::chain_anchor::HEADS_FILE_NAME));
     }
 
     /// External audit ATP-008 (with FIMR-001): every shipped `.v1` list is

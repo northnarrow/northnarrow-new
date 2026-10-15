@@ -1,0 +1,1819 @@
+//! Completeness of the signed chains: row numbers, file heads and the head
+//! anchor (external audit NN-AUD-108, NN-AUD-109, NN-AUD-112, NN-AUD-174;
+//! lab PR 160).
+//!
+//! A hash chain proves that the rows it holds were not changed. It cannot
+//! prove that none were cut from its end, that a file was not emptied or
+//! deleted, or that rows were not removed from a chain nobody re-reads.
+//! This module holds the one design shared by every chain for that:
+//!
+//! - **Row numbers** on the flat chains (`audit.log`, `canaries.jsonl`,
+//!   `canary_access.jsonl`): a row written by this version carries `seq`,
+//!   its 0-based position in the file ([`RowSeq`]). Rows written before
+//!   carry none and verify exactly as before; numbering starts at the
+//!   number of rows already there, so the first numbered row also proves
+//!   that no older row was removed. Once a numbered row exists, every later
+//!   row must be numbered.
+//! - **Domain separation**: a numbered row's `entry_hash` is
+//!   `SHA-256(domain ‖ prev_hash ‖ row)`, with one domain per chain
+//!   ([`AUDIT_DOMAIN_V2`], [`CANARY_REGISTRY_DOMAIN_V2`],
+//!   [`CANARY_ACCESS_DOMAIN_V2`]); the same agent key signs them all, and a
+//!   signature made for one chain no longer verifies in another. Rows
+//!   without `seq` keep the untagged pre-image.
+//! - **File heads** ([`FileHead`]): the byte length up to the end of the
+//!   last complete, genuine line of an append-only chain file and that
+//!   line's `entry_hash`. A head is checked in O(1) ([`check_head`]): the
+//!   file must still be at least that long and the line ending there must
+//!   carry that hash. The rotating logs also anchor their active file in
+//!   their own manifest ([`crate::chainlog::ManifestEvent::ActiveCheckpoint`]).
+//! - **The head anchor** (`chain_heads.json` next to `audit.log`,
+//!   [`HeadsStore`]): a signed
+//!   snapshot of every chain's head, written when the agent starts, every
+//!   [`ANCHOR_SECS`] when a head moved, and when it stops. It is two
+//!   fixed-size slots written in turn, so a write cut short leaves the
+//!   previous snapshot readable and the file never grows. The anchor also
+//!   carries the sticky facts read from the audit chain that a cut would
+//!   otherwise erase (a second admin key added, external audit ATP-004).
+//! - **The boot check** ([`boot_check`]): before any writer opens, every
+//!   head of the last snapshot and the newest checkpoint of every rotating
+//!   log are checked against the files. A chain shorter than its anchored
+//!   head, rewritten under it, deleted, or a rotating log missing its
+//!   active file or archives is a signed `integrity_drift` at this boot
+//!   ([`ChainFinding`]).
+//!
+//! Every head is also written to the journal (`chain.head` target) when it
+//! is anchored, for an operator who forwards the journal off the host and
+//! checks it later with `nn-admin audit verify --expect-head`.
+//!
+//! Residual (documented in the runbook): an attacker who can write these
+//! files can also put back an older, genuine snapshot together with
+//! chains cut back to it, or roll every file back to before this version
+//! numbered anything. On the host that cannot be told from the real past;
+//! the journal heads forwarded off the host can.
+
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::{error, info, warn};
+
+use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+
+/// Pre-image prefix of a numbered `audit.log` row.
+pub const AUDIT_DOMAIN_V2: &[u8] = b"northnarrow/audit/v2\0";
+/// Pre-image prefix of a numbered `canaries.jsonl` row.
+pub const CANARY_REGISTRY_DOMAIN_V2: &[u8] = b"northnarrow/canary-registry/v2\0";
+/// Pre-image prefix of a numbered `canary_access.jsonl` row.
+pub const CANARY_ACCESS_DOMAIN_V2: &[u8] = b"northnarrow/canary-access/v2\0";
+/// Prefix of the digest a heads snapshot is signed over.
+const HEADS_DOMAIN: &[u8] = b"northnarrow/chain-heads/v1\0";
+
+/// Default location of the head anchor: next to the audit log it anchors
+/// (a test agent with its own audit log gets its own anchor).
+pub const DEFAULT_HEADS_PATH: &str = "/etc/northnarrow/chain_heads.json";
+/// File name of the head anchor (next to the audit log).
+pub const HEADS_FILE_NAME: &str = "chain_heads.json";
+
+/// How often the running agent re-reads the heads and anchors the ones
+/// that moved.
+pub const ANCHOR_SECS: u64 = 300;
+
+/// Audit op of the one-time record of where numbering starts.
+pub const NUMBERING_STARTED_OP: &str = "chain_numbering_started";
+
+/// Largest window read backwards from a head looking for its line.
+const HEAD_WINDOW: u64 = 64 * 1024;
+const HEAD_WINDOW_MAX: u64 = 8 * 1024 * 1024;
+
+/// One slot of the heads file. Two slots, written in turn.
+const SLOT_BYTES: u64 = 8192;
+
+/// Chain-shaped lines checked from the end before a file is said to have
+/// no genuine head (bounds the signature work on a tail of forged lines).
+const MAX_HEAD_PROBES: usize = 64;
+
+// ── row numbers ─────────────────────────────────────────────────────
+
+/// What is wrong with a row's `seq`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SeqBreak {
+    #[error("row {row} carries seq {seq}: rows before it were removed or inserted")]
+    Mismatch { row: u64, seq: u64 },
+    #[error("row {row} carries no seq after numbered rows: a row in the old format was inserted")]
+    Missing { row: u64 },
+}
+
+/// Row-number bookkeeping for a flat chain, fed one row at a time in file
+/// order (empty lines excluded).
+#[derive(Debug, Clone, Default)]
+pub struct RowSeq {
+    rows: u64,
+    numbered: bool,
+}
+
+impl RowSeq {
+    /// The next row (at position [`Self::rows`]) carries `seq`.
+    pub fn push(&mut self, seq: Option<u64>) -> Result<(), SeqBreak> {
+        let row = self.rows;
+        self.rows += 1;
+        match seq {
+            Some(seq) => {
+                self.numbered = true;
+                if seq == row {
+                    Ok(())
+                } else {
+                    Err(SeqBreak::Mismatch { row, seq })
+                }
+            }
+            None if self.numbered => Err(SeqBreak::Missing { row }),
+            None => Ok(()),
+        }
+    }
+
+    /// A line that cannot be read still takes a position.
+    pub fn skip(&mut self) {
+        self.rows += 1;
+    }
+
+    /// Rows seen: the `seq` the next row is written with.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// A numbered row was seen.
+    pub fn numbered(&self) -> bool {
+        self.numbered
+    }
+}
+
+/// `SHA-256(domain? ‖ prev_hash ‖ body)`: the pre-image of a flat-chain
+/// row; `domain` is set for numbered rows only.
+pub fn flat_digest(domain: Option<&[u8]>, prev_hash: &str, body: &[u8]) -> Result<[u8; 32]> {
+    let prev = hex::decode(prev_hash).map_err(|e| anyhow!("prev_hash is not valid hex: {e}"))?;
+    let mut h = Sha256::new();
+    if let Some(d) = domain {
+        h.update(d);
+    }
+    h.update(&prev);
+    h.update(body);
+    Ok(h.finalize().into())
+}
+
+/// `entry_hash` shape every chain writes: 64 lowercase hex characters.
+pub fn is_chain_hash(h: &str) -> bool {
+    h.len() == 64
+        && h.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Check `sig_b64` over `digest` with `pk`.
+pub fn signature_ok(digest: &[u8; 32], sig_b64: &str, pk: &VerifyingKey) -> bool {
+    B64.decode(sig_b64)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .is_some_and(|b| pk.verify(digest, &Signature::from_bytes(&b)).is_ok())
+}
+
+// ── file heads ──────────────────────────────────────────────────────
+
+/// The head of an append-only chain file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHead {
+    /// Offset just past the head line's newline.
+    pub bytes: u64,
+    /// The head line's `entry_hash`.
+    pub tail_hash: String,
+    /// The head line's `seq`, when it carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+/// Whether one raw line is a genuine row of its chain (decodes, its hash
+/// recomputes, its signature verifies).
+pub type LineCheck = fn(&[u8], &VerifyingKey) -> bool;
+
+/// The head of `path`: its newest complete line that `genuine` accepts,
+/// looked for in a bounded window from the end. `None` when the file is
+/// missing, empty, or holds no such line in the window.
+pub fn read_file_head(
+    path: &Path,
+    genuine: &dyn Fn(&[u8]) -> bool,
+) -> std::io::Result<Option<FileHead>> {
+    let mut f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let size = f.metadata()?.len();
+    if size == 0 {
+        return Ok(None);
+    }
+    let mut window = HEAD_WINDOW.min(size);
+    loop {
+        let start = size - window;
+        let mut buf = vec![0u8; window as usize];
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf)?;
+        let mut probes = 0usize;
+        // Complete lines only: a trailing fragment without '\n' is skipped.
+        let nls: Vec<usize> = buf
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &c)| (c == b'\n').then_some(i))
+            .collect();
+        for k in (0..nls.len()).rev() {
+            let line_start = if k == 0 {
+                if start != 0 {
+                    break; // head of this line is outside the window
+                }
+                0
+            } else {
+                nls[k - 1] + 1
+            };
+            let line = &buf[line_start..nls[k]];
+            if line.is_empty() {
+                continue;
+            }
+            let Some((hash, seq)) = hash_and_seq(line) else {
+                continue;
+            };
+            probes += 1;
+            if probes > MAX_HEAD_PROBES {
+                return Ok(None);
+            }
+            if genuine(line) {
+                return Ok(Some(FileHead {
+                    bytes: start + nls[k] as u64 + 1,
+                    tail_hash: hash,
+                    seq,
+                }));
+            }
+        }
+        if start == 0 || window >= HEAD_WINDOW_MAX {
+            return Ok(None);
+        }
+        window = window.saturating_mul(4).min(size);
+    }
+}
+
+/// `entry_hash` (chain-shaped) and `seq` of a raw line.
+fn hash_and_seq(line: &[u8]) -> Option<(String, Option<u64>)> {
+    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let h = v.get("entry_hash")?.as_str()?;
+    if !is_chain_hash(h) {
+        return None;
+    }
+    Some((h.to_string(), v.get("seq").and_then(|s| s.as_u64())))
+}
+
+/// How a file compares with a head anchored earlier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadCheck {
+    /// The anchored line is still there, at the same offset.
+    Intact,
+    /// The file is gone.
+    Missing,
+    /// The file ends before the anchored line does.
+    Shorter { len: u64 },
+    /// The file is long enough, but no line with the anchored hash ends
+    /// at the anchored offset.
+    Changed,
+}
+
+/// Compare `path` with `head` in O(window).
+pub fn check_head(path: &Path, head: &FileHead) -> std::io::Result<HeadCheck> {
+    let mut f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HeadCheck::Missing),
+        // A symlink put where the chain file was is not the chain.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(HeadCheck::Changed),
+        Err(e) => return Err(e),
+    };
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Ok(HeadCheck::Changed);
+    }
+    let len = meta.len();
+    if head.bytes == 0 {
+        return Ok(HeadCheck::Intact);
+    }
+    if len < head.bytes {
+        return Ok(HeadCheck::Shorter { len });
+    }
+    let end = head.bytes;
+    let mut window = HEAD_WINDOW.min(end);
+    loop {
+        let start = end - window;
+        let mut buf = vec![0u8; window as usize];
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf)?;
+        if buf.last() != Some(&b'\n') {
+            return Ok(HeadCheck::Changed);
+        }
+        let body = &buf[..buf.len() - 1];
+        if let Some(nl) = body.iter().rposition(|&c| c == b'\n') {
+            return Ok(line_has_hash(&body[nl + 1..], &head.tail_hash));
+        }
+        if start == 0 {
+            return Ok(line_has_hash(body, &head.tail_hash));
+        }
+        if window >= HEAD_WINDOW_MAX {
+            return Ok(HeadCheck::Changed);
+        }
+        window = window.saturating_mul(4).min(end);
+    }
+}
+
+fn line_has_hash(line: &[u8], want: &str) -> HeadCheck {
+    match hash_and_seq(line) {
+        Some((h, _)) if h == want => HeadCheck::Intact,
+        _ => HeadCheck::Changed,
+    }
+}
+
+// ── chains the agent anchors ────────────────────────────────────────
+
+/// How a chain is laid out on disk.
+#[derive(Clone, Copy)]
+pub enum ChainKind {
+    /// One append-only file.
+    Flat,
+    /// A [`crate::chainlog::RotatingChainLog`]: active file, archives,
+    /// manifest.
+    Rotating,
+}
+
+/// One chain the agent anchors.
+#[derive(Clone)]
+pub struct ChainTarget {
+    /// Stable name (`audit`, `canary_registry`, `detections`, …).
+    pub chain: &'static str,
+    /// The file (the active file of a rotating log).
+    pub path: PathBuf,
+    pub kind: ChainKind,
+    /// Genuineness of one data line.
+    pub genuine: LineCheck,
+    /// Rotating logs: the bounded boot verification
+    /// ([`crate::chainlog::verify_recent`] for the log's payload type).
+    pub recent: Option<RecentCheck>,
+    /// The full verification (`nn-admin chain verify`): a one-line
+    /// summary, or why the chain is broken.
+    pub full: FullCheck,
+}
+
+/// Full verification of one chain.
+pub type FullCheck = fn(&Path, &VerifyingKey) -> Result<String, String>;
+
+/// [`crate::chainlog::verify_log_set`] for one payload type.
+fn full_rotating<P: Serialize + serde::de::DeserializeOwned>(
+    active: &Path,
+    pk: &VerifyingKey,
+) -> Result<String, String> {
+    crate::chainlog::verify_log_set::<P>(active, pk)
+        .map(|r| {
+            format!(
+                "{} records, {} archive(s) from seq {}, {} checkpoint(s) reachable",
+                r.total_records,
+                r.archives_verified,
+                r.earliest_retained_seq,
+                r.checkpoints_verified
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// The rows of a flat chain file; a line that does not parse is an error.
+fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("unreadable: {e}")),
+    };
+    body.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(i, l)| serde_json::from_str(l).map_err(|e| format!("line {}: {e}", i + 1)))
+        .collect()
+}
+
+fn full_audit(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
+    let rows: Vec<crate::audit::AuditEntry> = flat_rows(path)?;
+    crate::audit::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
+    Ok(numbered_summary(
+        rows.len(),
+        rows.iter().position(|r| r.seq.is_some()),
+    ))
+}
+
+fn full_canary_registry(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
+    let rows: Vec<crate::canary::registry::CanaryToken> = flat_rows(path)?;
+    crate::canary::registry::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
+    Ok(numbered_summary(
+        rows.len(),
+        rows.iter().position(|r| r.seq.is_some()),
+    ))
+}
+
+fn full_canary_access(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
+    let rows: Vec<crate::canary::access_log::CanaryAccessEntry> = flat_rows(path)?;
+    crate::canary::access_log::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
+    Ok(numbered_summary(
+        rows.len(),
+        rows.iter().position(|r| r.seq.is_some()),
+    ))
+}
+
+fn numbered_summary(rows: usize, first_numbered: Option<usize>) -> String {
+    match first_numbered {
+        Some(0) => format!("{rows} rows, all numbered"),
+        Some(n) => format!("{rows} rows, {n} in the old format then numbered"),
+        None => format!("{rows} rows in the old format"),
+    }
+}
+
+/// [`crate::chainlog::verify_recent`] for one payload type.
+pub type RecentCheck = fn(
+    &Path,
+    &VerifyingKey,
+    u64,
+) -> Result<crate::chainlog::RecentReport, crate::chainlog::LogSetError>;
+
+/// Where the agent's chains live (the CLI flags; `Default`: built-ins).
+#[derive(Debug, Clone)]
+pub struct ChainPaths {
+    pub audit: PathBuf,
+    pub canary_registry: PathBuf,
+    pub canary_access: PathBuf,
+    pub detections: PathBuf,
+    pub status_events: PathBuf,
+    pub netflow: PathBuf,
+    pub fim_drift: PathBuf,
+}
+
+impl Default for ChainPaths {
+    fn default() -> Self {
+        Self {
+            audit: crate::audit::DEFAULT_AUDIT_LOG_PATH.into(),
+            canary_registry: crate::canary::registry::DEFAULT_REGISTRY_PATH.into(),
+            canary_access: crate::canary::access_log::DEFAULT_ACCESS_LOG_PATH.into(),
+            detections: crate::detection_store::DEFAULT_DETECTIONS_LOG_PATH.into(),
+            status_events: crate::detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH.into(),
+            netflow: crate::admin_socket::DEFAULT_NETFLOW_JSONL_PATH.into(),
+            fim_drift: crate::fim::drain::DEFAULT_DRIFT_LOG_PATH.into(),
+        }
+    }
+}
+
+impl ChainPaths {
+    /// Every chain the agent anchors, in a fixed order.
+    pub fn targets(&self) -> Vec<ChainTarget> {
+        use crate::chainlog::{line_is_genuine, verify_recent};
+        let flat = |chain, path: &PathBuf, genuine, full| ChainTarget {
+            chain,
+            path: path.clone(),
+            kind: ChainKind::Flat,
+            genuine,
+            recent: None,
+            full,
+        };
+        let rotating = |chain, path: &PathBuf, genuine, recent, full| ChainTarget {
+            chain,
+            path: path.clone(),
+            kind: ChainKind::Rotating,
+            genuine,
+            recent: Some(recent),
+            full,
+        };
+        vec![
+            flat(
+                "audit",
+                &self.audit,
+                crate::audit::row_is_genuine,
+                full_audit,
+            ),
+            flat(
+                "canary_registry",
+                &self.canary_registry,
+                crate::canary::registry::row_is_genuine,
+                full_canary_registry,
+            ),
+            flat(
+                "canary_access",
+                &self.canary_access,
+                crate::canary::access_log::row_is_genuine,
+                full_canary_access,
+            ),
+            rotating(
+                "detections",
+                &self.detections,
+                line_is_genuine::<crate::detection_store::DetectionRecord>,
+                verify_recent::<crate::detection_store::DetectionRecord>,
+                full_rotating::<crate::detection_store::DetectionRecord>,
+            ),
+            rotating(
+                "status_events",
+                &self.status_events,
+                line_is_genuine::<crate::detection_store::StatusEvent>,
+                verify_recent::<crate::detection_store::StatusEvent>,
+                full_rotating::<crate::detection_store::StatusEvent>,
+            ),
+            rotating(
+                "netflow",
+                &self.netflow,
+                line_is_genuine::<crate::net::drain::NetFlowPayload>,
+                verify_recent::<crate::net::drain::NetFlowPayload>,
+                full_rotating::<crate::net::drain::NetFlowPayload>,
+            ),
+            rotating(
+                "fim_drift",
+                &self.fim_drift,
+                line_is_genuine::<crate::fim::drain::FimDriftPayload>,
+                verify_recent::<crate::fim::drain::FimDriftPayload>,
+                full_rotating::<crate::fim::drain::FimDriftPayload>,
+            ),
+        ]
+    }
+}
+
+// ── the head anchor ─────────────────────────────────────────────────
+
+/// One anchored head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchoredHead {
+    /// [`ChainTarget::chain`], with `.manifest` for a rotating log's
+    /// manifest.
+    pub chain: String,
+    pub path: String,
+    /// Rotating active file: the archive seq it becomes when sealed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(flatten)]
+    pub head: FileHead,
+}
+
+/// What the head anchor holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadsSnapshot {
+    /// Incremented at every write; picks the slot.
+    pub counter: u64,
+    pub ts: String,
+    pub agent_id: String,
+    /// The audit chain showed a successful `rotate_keys_add` (ATP-004).
+    pub second_key_added: bool,
+    pub heads: Vec<AnchoredHead>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SignedSlot {
+    snapshot: HeadsSnapshot,
+    sig: String,
+}
+
+/// What a read of the head anchor found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadsRead {
+    /// No file.
+    Missing,
+    /// A file with no snapshot written yet.
+    Empty,
+    /// The newest genuine snapshot.
+    Valid(HeadsSnapshot),
+    /// A file that holds no genuine snapshot.
+    Invalid(String),
+}
+
+fn snapshot_digest(s: &HeadsSnapshot) -> Result<[u8; 32]> {
+    let json = serde_json::to_vec(s).map_err(|e| anyhow!("serialising heads snapshot: {e}"))?;
+    let mut h = Sha256::new();
+    h.update(HEADS_DOMAIN);
+    h.update(&json);
+    Ok(h.finalize().into())
+}
+
+/// The two-slot signed head anchor.
+pub struct HeadsStore;
+
+impl HeadsStore {
+    /// The newest genuine snapshot in `path`.
+    pub fn read(path: &Path, pk: &VerifyingKey) -> HeadsRead {
+        let bytes = match read_bounded(path, 2 * SLOT_BYTES) {
+            Ok(Some(b)) => b,
+            Ok(None) => return HeadsRead::Missing,
+            Err(e) => return HeadsRead::Invalid(format!("unreadable: {e}")),
+        };
+        if bytes.iter().all(|&c| c == 0 || c == b' ' || c == b'\n') {
+            return HeadsRead::Empty;
+        }
+        let mut best: Option<HeadsSnapshot> = None;
+        let mut why = Vec::new();
+        for (i, slot) in bytes.chunks(SLOT_BYTES as usize).enumerate() {
+            let text = slot
+                .iter()
+                .copied()
+                .take_while(|&c| c != 0)
+                .collect::<Vec<u8>>();
+            let text = String::from_utf8_lossy(&text);
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SignedSlot>(text) {
+                Ok(s) => match snapshot_digest(&s.snapshot) {
+                    Ok(d) if signature_ok(&d, &s.sig, pk) => {
+                        if best.as_ref().is_none_or(|b| s.snapshot.counter > b.counter) {
+                            best = Some(s.snapshot);
+                        }
+                    }
+                    _ => why.push(format!("slot {i}: signature does not verify")),
+                },
+                Err(e) => why.push(format!("slot {i}: {e}")),
+            }
+        }
+        match best {
+            Some(s) => HeadsRead::Valid(s),
+            None => HeadsRead::Invalid(why.join("; ")),
+        }
+    }
+
+    /// Write `snapshot` (its `counter` picks the slot) and fsync. The file
+    /// is created if missing (`O_NOFOLLOW`, never truncated).
+    pub fn write(path: &Path, key: &AgentSigningKey, snapshot: &HeadsSnapshot) -> Result<()> {
+        let digest = snapshot_digest(snapshot)?;
+        let slot = SignedSlot {
+            snapshot: snapshot.clone(),
+            sig: B64.encode(key.sign(&digest).to_bytes()),
+        };
+        let mut text = serde_json::to_vec(&slot)?;
+        if text.len() as u64 >= SLOT_BYTES {
+            return Err(anyhow!(
+                "heads snapshot is {} bytes, over the {SLOT_BYTES}-byte slot",
+                text.len()
+            ));
+        }
+        text.resize(SLOT_BYTES as usize - 1, b' ');
+        text.push(b'\n');
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let offset = (snapshot.counter % 2) * SLOT_BYTES;
+        f.write_all_at(&text, offset)
+            .with_context(|| format!("writing {}", path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", path.display()))?;
+        Ok(())
+    }
+}
+
+fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// The heads of every target, read from disk now.
+pub fn collect_heads(targets: &[ChainTarget], pk: &VerifyingKey) -> Vec<AnchoredHead> {
+    let mut out = Vec::new();
+    for t in targets {
+        let genuine = |l: &[u8]| (t.genuine)(l, pk);
+        let head = |path: &Path, check: &dyn Fn(&[u8]) -> bool| match read_file_head(path, check) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "chain head: file not read");
+                None
+            }
+        };
+        match t.kind {
+            ChainKind::Flat => {
+                if let Some(h) = head(&t.path, &genuine) {
+                    out.push(AnchoredHead {
+                        chain: t.chain.to_string(),
+                        path: t.path.display().to_string(),
+                        generation: None,
+                        head: h,
+                    });
+                }
+            }
+            ChainKind::Rotating => {
+                // A rotation between reading the generation and the head
+                // would anchor the head under the wrong file: the
+                // generation must be the same before and after.
+                let stable = (0..3).find_map(|_| {
+                    let before = crate::chainlog::current_generation(&t.path);
+                    let h = head(&t.path, &genuine);
+                    (crate::chainlog::current_generation(&t.path) == before).then_some((before, h))
+                });
+                if let Some((generation, Some(h))) = stable {
+                    out.push(AnchoredHead {
+                        chain: t.chain.to_string(),
+                        path: t.path.display().to_string(),
+                        generation: Some(generation),
+                        head: h,
+                    });
+                }
+                let manifest = crate::chainlog::manifest_path(&t.path);
+                let mcheck = |l: &[u8]| crate::chainlog::manifest_line_is_genuine(l, pk);
+                if let Some(h) = head(&manifest, &mcheck) {
+                    out.push(AnchoredHead {
+                        chain: format!("{}.manifest", t.chain),
+                        path: manifest.display().to_string(),
+                        generation: None,
+                        head: h,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── findings ────────────────────────────────────────────────────────
+
+/// A completeness problem found in a chain, reported as a signed
+/// `integrity_drift` with this `kind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainFinding {
+    /// The chain (`audit`, `canary_access`, `detections`, …).
+    pub chain: String,
+    pub file: PathBuf,
+    /// `chain_truncated`, `chain_rewritten`, `chain_missing`,
+    /// `chain_archives_missing`, `active_file_missing`,
+    /// `chain_sequence_broken`, `chain_lines_unverified`,
+    /// `chain_verify_failed`, `chain_heads_missing`,
+    /// `chain_heads_unverified`.
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+impl ChainFinding {
+    pub fn new(
+        chain: impl Into<String>,
+        file: &Path,
+        kind: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            chain: chain.into(),
+            file: file.to_path_buf(),
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    /// The signed `integrity_drift` entry.
+    pub fn draft(&self) -> AuditEntryDraft {
+        AuditEntryDraft {
+            op: crate::self_integrity::AUDIT_OP.to_string(),
+            extra: serde_json::json!({
+                "kind": self.kind,
+                "chain": self.chain,
+                "file": self.file.display().to_string(),
+                "detail": self.detail,
+                "at_boot": true,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        }
+    }
+
+    /// ERROR in the journal, then the signed entry.
+    pub fn attest(&self, log: Option<&mut AuditLog>) {
+        error!(
+            kind = self.kind,
+            chain = %self.chain,
+            file = %self.file.display(),
+            detail = %self.detail,
+            "chain integrity: evidence missing or altered — see the runbook (chain verification failed)"
+        );
+        if let Some(log) = log {
+            if let Err(e) = log.append(self.draft()) {
+                warn!(error = %format!("{e:#}"), "attesting a chain finding failed");
+            }
+        }
+    }
+
+    /// Whether this finding means the audit chain lost history.
+    fn audit_history(&self) -> bool {
+        (self.chain == "audit" && self.kind != "chain_lines_unverified")
+            || self.kind == "chain_heads_missing"
+            || self.kind == "chain_heads_unverified"
+    }
+}
+
+/// What [`boot_check`] found.
+#[derive(Debug, Clone, Default)]
+pub struct BootCheck {
+    pub findings: Vec<ChainFinding>,
+    /// The newest genuine snapshot, if any.
+    pub previous: Option<HeadsSnapshot>,
+    /// No head anchor file, or one never written.
+    heads_absent: bool,
+}
+
+impl BootCheck {
+    /// The head anchor is absent although the audit chain records that
+    /// anchoring started ([`NUMBERING_STARTED_OP`], written only after the
+    /// first snapshot was on disk): it was removed. Fails ATP-004 closed.
+    pub fn heads_missing(
+        &mut self,
+        heads_file: &Path,
+        anchoring_started: bool,
+    ) -> Option<ChainFinding> {
+        if !(self.heads_absent && anchoring_started) {
+            return None;
+        }
+        let f = ChainFinding::new(
+            "chain_heads",
+            heads_file,
+            "chain_heads_missing",
+            "the audit chain records that head anchoring started, but the head anchor is missing \
+             or empty: it was removed",
+        );
+        self.findings.push(f.clone());
+        Some(f)
+    }
+
+    /// Why the audit chain's history cannot be trusted to be complete:
+    /// it is shorter than its anchored head, or the anchor itself was
+    /// removed or replaced. `None` when nothing says so.
+    pub fn audit_history_lost(&self) -> Option<String> {
+        let lost: Vec<String> = self
+            .findings
+            .iter()
+            .filter(|f| f.audit_history())
+            .map(|f| format!("{}: {}", f.kind, f.detail))
+            .collect();
+        (!lost.is_empty()).then(|| lost.join("; "))
+    }
+
+    /// The anchored sticky flag (ATP-004), or `true` when the audit
+    /// history was lost and the flag cannot be known (fail closed).
+    pub fn second_key_added(&self) -> bool {
+        self.previous.as_ref().is_some_and(|p| p.second_key_added)
+            || self.audit_history_lost().is_some()
+    }
+}
+
+/// Load the verifying key the way the boot does before the attach: the
+/// signing key if readable, else its published public half.
+pub fn boot_verifying_key(signing_key_file: &Path) -> Option<VerifyingKey> {
+    match crate::audit::read_signing_key(signing_key_file) {
+        Ok(k) => Some(k.verifying_key()),
+        Err(_) => {
+            crate::audit::read_verifying_key(&crate::audit::verifying_key_path(signing_key_file))
+                .ok()
+        }
+    }
+}
+
+/// Compare the chains with what was anchored: every head of the last
+/// snapshot in `heads_file`, and the newest manifest checkpoint of every
+/// rotating log. O(1) reads per file; run before any writer opens.
+pub fn boot_check(targets: &[ChainTarget], heads_file: &Path, pk: &VerifyingKey) -> BootCheck {
+    let mut out = BootCheck::default();
+    match HeadsStore::read(heads_file, pk) {
+        HeadsRead::Valid(s) => out.previous = Some(s),
+        HeadsRead::Invalid(why) => out.findings.push(ChainFinding::new(
+            "chain_heads",
+            heads_file,
+            "chain_heads_unverified",
+            format!("the head anchor holds no genuine snapshot ({why})"),
+        )),
+        // Whether one should exist is known once the audit log is open
+        // ([`BootCheck::heads_missing`]).
+        HeadsRead::Missing | HeadsRead::Empty => out.heads_absent = true,
+    }
+    if let Some(prev) = &out.previous {
+        for h in &prev.heads {
+            check_anchored(h, &prev.ts, targets, &mut out.findings);
+        }
+    }
+    for t in targets
+        .iter()
+        .filter(|t| matches!(t.kind, ChainKind::Rotating))
+    {
+        check_rotating(t, pk, &mut out.findings);
+    }
+    // One finding per file and kind is enough.
+    let mut seen = std::collections::HashSet::new();
+    out.findings
+        .retain(|f| seen.insert((f.file.clone(), f.kind)));
+    out
+}
+
+/// Which file holds a head anchored at `generation` of the rotating log
+/// `active`, now: the active file, an archive, or nothing.
+enum Holder {
+    File(PathBuf),
+    /// Archived then dropped by retention (the verifier checks the
+    /// manifest's `Evicted` rows).
+    Evicted,
+    /// Generations past what is on disk.
+    RolledBack {
+        now: u64,
+    },
+}
+
+fn holder(active: &Path, generation: u64) -> Holder {
+    let now = crate::chainlog::current_generation(active);
+    if generation == now {
+        return Holder::File(active.to_path_buf());
+    }
+    if generation > now {
+        return Holder::RolledBack { now };
+    }
+    let archive = crate::chainlog::archive_path_for(active, generation);
+    if archive.exists() {
+        return Holder::File(archive);
+    }
+    let earliest = crate::chainlog::earliest_archive(active);
+    if earliest.is_some_and(|e| generation < e) {
+        Holder::Evicted
+    } else {
+        Holder::File(archive)
+    }
+}
+
+fn check_anchored(
+    h: &AnchoredHead,
+    anchored_at: &str,
+    targets: &[ChainTarget],
+    findings: &mut Vec<ChainFinding>,
+) {
+    let base = h.chain.trim_end_matches(".manifest");
+    let Some(t) = targets.iter().find(|t| t.chain == base) else {
+        return; // a chain this build no longer anchors
+    };
+    let path = if h.chain.ends_with(".manifest") {
+        crate::chainlog::manifest_path(&t.path)
+    } else {
+        match (t.kind, h.generation) {
+            (ChainKind::Rotating, Some(g)) => match holder(&t.path, g) {
+                Holder::File(p) => p,
+                Holder::Evicted => return,
+                Holder::RolledBack { now } => {
+                    findings.push(ChainFinding::new(
+                        h.chain.clone(),
+                        &t.path,
+                        "chain_archives_missing",
+                        format!(
+                            "the head anchored at {anchored_at} is in generation {g}, but only \
+                             {} archive(s) are on disk: the newest archives were removed",
+                            now.saturating_sub(1)
+                        ),
+                    ));
+                    return;
+                }
+            },
+            _ => t.path.clone(),
+        }
+    };
+    report_head(
+        &h.chain,
+        &path,
+        &h.head,
+        &format!("anchored at {anchored_at}"),
+        findings,
+    );
+}
+
+fn report_head(
+    chain: &str,
+    path: &Path,
+    head: &FileHead,
+    source: &str,
+    findings: &mut Vec<ChainFinding>,
+) {
+    let row = head.seq.map(|s| format!("row {s}, ")).unwrap_or_default();
+    let what = format!(
+        "the head {source} ends at byte {} ({row}entry_hash {})",
+        head.bytes, head.tail_hash
+    );
+    let finding = match check_head(path, head) {
+        Ok(HeadCheck::Intact) => return,
+        Ok(HeadCheck::Missing) => ("chain_missing", format!("the file is gone; {what}")),
+        Ok(HeadCheck::Shorter { len }) => (
+            "chain_truncated",
+            format!("the file is {len} bytes; {what}: rows were cut from its end"),
+        ),
+        Ok(HeadCheck::Changed) => (
+            "chain_rewritten",
+            format!("no line with that hash ends there; {what}: the file was rewritten"),
+        ),
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "chain head: file not checked");
+            return;
+        }
+    };
+    findings.push(ChainFinding::new(chain, path, finding.0, finding.1));
+}
+
+/// The newest manifest checkpoint, and a missing active file, of one
+/// rotating log.
+fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFinding>) {
+    let tail = crate::chainlog::manifest_tail_events(&t.path, pk);
+    if let Some((seq, head)) = tail.iter().find_map(|e| match e {
+        crate::chainlog::ManifestEvent::ActiveCheckpoint {
+            seq,
+            bytes,
+            tail_hash,
+        } => Some((
+            *seq,
+            FileHead {
+                bytes: *bytes,
+                tail_hash: tail_hash.clone(),
+                seq: None,
+            },
+        )),
+        _ => None,
+    }) {
+        match holder(&t.path, seq) {
+            Holder::File(p) => report_head(
+                t.chain,
+                &p,
+                &head,
+                &format!("checkpointed in the manifest (generation {seq})"),
+                findings,
+            ),
+            Holder::Evicted => {}
+            Holder::RolledBack { now } => findings.push(ChainFinding::new(
+                t.chain,
+                &t.path,
+                "chain_archives_missing",
+                format!(
+                    "the manifest checkpoints generation {seq}, but only {} archive(s) are on \
+                     disk: the newest archives were removed",
+                    now.saturating_sub(1)
+                ),
+            )),
+        }
+    }
+    if let Some(why) = crate::chainlog::active_missing(&t.path, &tail) {
+        findings.push(ChainFinding::new(
+            t.chain,
+            &t.path,
+            "active_file_missing",
+            why,
+        ));
+    }
+}
+
+// ── the anchor writer ───────────────────────────────────────────────
+
+/// Writes the head anchor for the running agent.
+pub struct Anchor {
+    file: PathBuf,
+    key: AgentSigningKey,
+    agent_id: [u8; 16],
+    targets: Vec<ChainTarget>,
+    last: Option<HeadsSnapshot>,
+    second_key_added: bool,
+    /// Registers the file when it is created at run time (and creates it
+    /// inside the `+i` dance if a direct create is refused).
+    protection: Option<Arc<dyn crate::chainlog::ProtectionManager>>,
+    /// The audit chain does not record yet that anchoring started.
+    marker_pending: bool,
+}
+
+impl Anchor {
+    /// `previous`: the snapshot the boot check read (its counter and
+    /// sticky flag carry over). `anchoring_started`: the audit chain
+    /// already holds the [`NUMBERING_STARTED_OP`] row.
+    pub fn new(
+        file: PathBuf,
+        key: AgentSigningKey,
+        agent_id: [u8; 16],
+        targets: Vec<ChainTarget>,
+        previous: Option<HeadsSnapshot>,
+        anchoring_started: bool,
+    ) -> Self {
+        let second_key_added = previous.as_ref().is_some_and(|p| p.second_key_added);
+        Self {
+            file,
+            key,
+            agent_id,
+            targets,
+            last: previous,
+            second_key_added,
+            protection: None,
+            marker_pending: !anchoring_started,
+        }
+    }
+
+    /// Use `protection` to create the file when it is missing.
+    pub fn set_protection(&mut self, protection: Arc<dyn crate::chainlog::ProtectionManager>) {
+        self.protection = Some(protection);
+    }
+
+    /// The sticky ATP-004 flag as anchored.
+    pub fn second_key_added(&self) -> bool {
+        self.second_key_added
+    }
+
+    /// Once a snapshot is on disk: the one-time audit row that records
+    /// where numbering and anchoring start (the legacy head of every flat
+    /// chain). `None` once taken, or before the first write.
+    pub fn take_marker(&mut self) -> Option<AuditEntryDraft> {
+        if !self.marker_pending {
+            return None;
+        }
+        let snapshot = self.last.as_ref()?;
+        self.marker_pending = false;
+        Some(numbering_started_draft(snapshot, &self.file))
+    }
+
+    /// Create the file if missing: directly, or inside the `+i` dance.
+    fn ensure_file(&self) -> Result<()> {
+        if std::fs::symlink_metadata(&self.file).is_ok() {
+            return Ok(());
+        }
+        let create = |path: &Path| -> Result<()> {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(path)
+            {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(anyhow!(e).context(format!("creating {}", path.display()))),
+            }
+        };
+        let Some(p) = &self.protection else {
+            return create(&self.file);
+        };
+        if create(&self.file).is_err() {
+            let file = self.file.clone();
+            p.with_mutable_dir(&mut || create(&file))?;
+        }
+        if let Err(e) = p.register_active(&self.file) {
+            warn!(error = %format!("{e:#}"), path = %self.file.display(),
+                "chain heads: anchor file not registered in PROTECTED_INODES");
+        }
+        Ok(())
+    }
+
+    /// Re-read every head; write a snapshot when `force` or one moved
+    /// (or the sticky flag turned on). Returns the heads that moved.
+    pub fn refresh(&mut self, force: bool, second_key_added: bool) -> Result<Vec<AnchoredHead>> {
+        let heads = collect_heads(&self.targets, &self.key.verifying_key());
+        let flag = self.second_key_added || second_key_added;
+        // Sticky in memory even if the write below fails.
+        self.second_key_added = flag;
+        let moved: Vec<AnchoredHead> = match &self.last {
+            Some(last) => heads
+                .iter()
+                .filter(|h| !last.heads.contains(h))
+                .cloned()
+                .collect(),
+            None => heads.clone(),
+        };
+        let unchanged = self
+            .last
+            .as_ref()
+            .is_some_and(|l| l.heads == heads && l.second_key_added == flag);
+        if unchanged && !force {
+            return Ok(Vec::new());
+        }
+        let snapshot = HeadsSnapshot {
+            counter: self.last.as_ref().map_or(1, |l| l.counter + 1),
+            ts: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string(),
+            agent_id: hex::encode(self.agent_id),
+            second_key_added: flag,
+            heads,
+        };
+        self.ensure_file()?;
+        HeadsStore::write(&self.file, &self.key, &snapshot)?;
+        for h in &moved {
+            info!(
+                target: "chain.head",
+                chain = %h.chain,
+                file = %h.path,
+                generation = ?h.generation,
+                seq = ?h.head.seq,
+                bytes = h.head.bytes,
+                entry_hash = %h.head.tail_hash,
+                "chain head anchored"
+            );
+        }
+        self.second_key_added = flag;
+        self.last = Some(snapshot);
+        Ok(moved)
+    }
+}
+
+/// Bytes of each rotating log's active file the boot verification covers.
+pub const BOOT_VERIFY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Audit op of the boot verification's result.
+pub const CHAIN_VERIFY_OP: &str = "chain_verify";
+
+/// External audit NN-AUD-112: the signed chains were never verified in
+/// production. After the start, in the background, every rotating log's
+/// last [`BOOT_VERIFY_BYTES`] are verified (hash, signature, link); the
+/// result is one signed `chain_verify` entry, and each failure an ERROR and
+/// a signed `integrity_drift` (`chain_verify_failed`). The flat chains are
+/// verified when they open (canary chains) or by the overlay floor scan
+/// (audit log); `nn-admin chain verify` checks everything in full.
+pub fn spawn_boot_verify(
+    targets: Vec<ChainTarget>,
+    pk: VerifyingKey,
+    audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>,
+) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let results = tokio::task::spawn_blocking(move || {
+            targets
+                .iter()
+                .filter_map(|t| t.recent.map(|r| (t, r)))
+                .map(|(t, recent)| {
+                    (
+                        t.chain,
+                        t.path.clone(),
+                        recent(&t.path, &pk, BOOT_VERIFY_BYTES),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let Ok(results) = results else {
+            warn!("chain verify: the boot verification task failed");
+            return;
+        };
+        let mut logs = Vec::new();
+        let mut failures = Vec::new();
+        for (chain, path, r) in results {
+            match r {
+                Ok(rep) => logs.push(serde_json::json!({
+                    "chain": chain,
+                    "file": path.display().to_string(),
+                    "lines": rep.lines,
+                    "bytes": rep.bytes,
+                    "whole_file": rep.whole_file,
+                    "result": "ok",
+                })),
+                Err(e) => {
+                    logs.push(serde_json::json!({
+                        "chain": chain,
+                        "file": path.display().to_string(),
+                        "result": "broken",
+                        "error": e.to_string(),
+                    }));
+                    failures.push(ChainFinding::new(
+                        chain,
+                        &path,
+                        "chain_verify_failed",
+                        format!("the last {BOOT_VERIFY_BYTES} bytes do not verify: {e}"),
+                    ));
+                }
+            }
+        }
+        let result = if failures.is_empty() { "ok" } else { "broken" };
+        info!(
+            result,
+            ms = started.elapsed().as_millis() as u64,
+            logs = logs.len(),
+            "chain verify: boot verification of the rotating logs done"
+        );
+        let Some(log) = audit_log else {
+            for f in &failures {
+                f.attest(None);
+            }
+            return;
+        };
+        let mut log = log.lock();
+        if let Err(e) = log.append(AuditEntryDraft {
+            op: CHAIN_VERIFY_OP.to_string(),
+            extra: serde_json::json!({
+                "scope": format!("last {BOOT_VERIFY_BYTES} bytes of each rotating log's active file"),
+                "logs": logs,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: result.to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        }) {
+            warn!(error = %format!("{e:#}"), "chain verify: result not recorded");
+        }
+        for f in &failures {
+            f.attest(Some(&mut log));
+        }
+    });
+}
+
+/// The signed audit log, for [`report_unverified_rows`].
+static READ_AUDIT_LOG: std::sync::OnceLock<Arc<parking_lot::Mutex<AuditLog>>> =
+    std::sync::OnceLock::new();
+/// Last count reported per file, so a dashboard polling the same forged
+/// rows does not write one entry per query.
+static REPORTED: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Hand the signed audit log to the read paths (from `main`).
+pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<AuditLog>>>) {
+    if let Some(l) = log {
+        let _ = READ_AUDIT_LOG.set(l);
+    }
+}
+
+/// External audit NN-AUD-112: a read verb left out `count` rows of `file`
+/// that do not verify. ERROR in the journal every time; a signed
+/// `integrity_drift` (`chain_lines_unverified`) when the count for that
+/// file changed since the last one.
+pub fn report_unverified_rows(chain: &str, file: &Path, count: usize) {
+    let finding = ChainFinding::new(
+        chain,
+        file,
+        "chain_lines_unverified",
+        format!(
+            "{count} row(s) served by a read verb fail hash or signature verification: left out"
+        ),
+    );
+    let fresh = REPORTED
+        .lock()
+        .map(|mut m| {
+            let m = m.get_or_insert_with(Default::default);
+            m.insert(file.to_path_buf(), count) != Some(count)
+        })
+        .unwrap_or(true);
+    if !fresh {
+        error!(chain, file = %file.display(), count, "read verb: rows that do not verify left out");
+        return;
+    }
+    match READ_AUDIT_LOG.get() {
+        Some(log) => finding.attest(Some(&mut log.lock())),
+        None => finding.attest(None),
+    }
+}
+
+/// Re-anchor every [`ANCHOR_SECS`] the heads that moved.
+pub fn spawn(
+    anchor: Arc<parking_lot::Mutex<Anchor>>,
+    audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(ANCHOR_SECS));
+        tick.tick().await; // the boot already anchored
+        loop {
+            tick.tick().await;
+            let second = audit_log
+                .as_ref()
+                .is_some_and(|l| l.lock().second_key_added());
+            let a = Arc::clone(&anchor);
+            let r = tokio::task::spawn_blocking(move || {
+                let mut a = a.lock();
+                a.refresh(false, second).map(|_| a.take_marker())
+            })
+            .await;
+            match r {
+                Ok(Ok(marker)) => {
+                    if let (Some(d), Some(log)) = (marker, audit_log.as_ref()) {
+                        if let Err(e) = log.lock().append(d) {
+                            warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
+                        }
+                    }
+                }
+                Ok(Err(e)) => warn!(error = %format!("{e:#}"), "chain heads: anchor not written"),
+                Err(e) => warn!(error = %e, "chain heads: anchor task failed"),
+            }
+        }
+    });
+}
+
+/// The one-time record, in the audit chain, of where numbering and head
+/// anchoring start: the head of every flat chain in the first snapshot.
+/// Rows after these heads carry `seq` and a domain-tagged hash; the rows up
+/// to them verify in the old format.
+pub fn numbering_started_draft(first: &HeadsSnapshot, heads_file: &Path) -> AuditEntryDraft {
+    let chains: Vec<serde_json::Value> = first
+        .heads
+        .iter()
+        .filter(|h| h.generation.is_none() && !h.chain.ends_with(".manifest"))
+        .map(|h| {
+            serde_json::json!({
+                "chain": h.chain,
+                "file": h.path,
+                "bytes": h.head.bytes,
+                "entry_hash": h.head.tail_hash,
+                "seq": h.head.seq,
+            })
+        })
+        .collect();
+    AuditEntryDraft {
+        op: NUMBERING_STARTED_OP.to_string(),
+        extra: serde_json::json!({
+            "detail": "rows written after these heads carry seq and a domain-tagged hash; rows \
+                       up to them verify in the old format; the heads are anchored in heads_file",
+            "heads_file": heads_file.display().to_string(),
+            "chains": chains,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "success".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    }
+}
+
+/// Append raw bytes to `path` (tests only).
+#[cfg(test)]
+pub(crate) fn append_raw(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut f = OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(bytes).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+    use tempfile::TempDir;
+
+    fn draft(n: u32) -> AuditEntryDraft {
+        AuditEntryDraft {
+            op: format!("op_{n}"),
+            extra: serde_json::json!({ "n": n }),
+            key_fp: "00000000".to_string(),
+            cosigner_fps: vec![],
+            result: "success".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "t".to_string(),
+        }
+    }
+
+    fn key(dir: &TempDir) -> AgentSigningKey {
+        AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap()
+    }
+
+    fn paths(dir: &TempDir) -> ChainPaths {
+        let p = |n: &str| dir.path().join(n);
+        ChainPaths {
+            audit: p("audit.log"),
+            canary_registry: p("canaries.jsonl"),
+            canary_access: p("canary_access.jsonl"),
+            detections: p("detections.jsonl"),
+            status_events: p("status_events.jsonl"),
+            netflow: p("netflow.jsonl"),
+            fim_drift: p("fim_drift.jsonl"),
+        }
+    }
+
+    #[test]
+    fn row_seq_starts_after_legacy_rows_and_rejects_gaps_and_old_rows() {
+        let mut s = RowSeq::default();
+        s.push(None).unwrap();
+        s.push(None).unwrap();
+        s.push(Some(2)).unwrap();
+        s.skip();
+        s.push(Some(4)).unwrap();
+        assert_eq!(s.rows(), 5);
+        assert!(s.numbered());
+        assert_eq!(
+            s.clone().push(Some(9)),
+            Err(SeqBreak::Mismatch { row: 5, seq: 9 })
+        );
+        assert_eq!(s.push(None), Err(SeqBreak::Missing { row: 5 }));
+        let mut legacy = RowSeq::default();
+        legacy.push(None).unwrap();
+        assert_eq!(
+            legacy.push(Some(0)),
+            Err(SeqBreak::Mismatch { row: 1, seq: 0 })
+        );
+    }
+
+    #[test]
+    fn a_head_is_found_and_checked_in_place() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let path = dir.path().join("audit.log");
+        let mut log = AuditLog::open(&path, k, [1; 16]).unwrap();
+        for n in 0..5 {
+            log.append(draft(n)).unwrap();
+        }
+        let ok = |l: &[u8]| crate::audit::row_is_genuine(l, &pk);
+        let head = read_file_head(&path, &ok).unwrap().unwrap();
+        assert_eq!(head.seq, Some(4));
+        assert_eq!(head.bytes, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Intact);
+        // growth keeps it intact
+        log.append(draft(9)).unwrap();
+        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Intact);
+        // a forged trailing line is not a head
+        append_raw(&path, b"{\"entry_hash\":\"");
+        append_raw(&path, "ab".repeat(32).as_bytes());
+        append_raw(&path, b"\"}\n");
+        let again = read_file_head(&path, &ok).unwrap().unwrap();
+        assert_eq!(again.seq, Some(5));
+        // cut below the head
+        let body = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &body[..head.bytes as usize - 10]).unwrap();
+        assert!(matches!(
+            check_head(&path, &head).unwrap(),
+            HeadCheck::Shorter { .. }
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Missing);
+    }
+
+    #[test]
+    fn the_heads_store_keeps_the_previous_snapshot_when_a_write_is_torn() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let file = dir.path().join(HEADS_FILE_NAME);
+        assert_eq!(HeadsStore::read(&file, &pk), HeadsRead::Missing);
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(HeadsStore::read(&file, &pk), HeadsRead::Empty);
+        let mut s = HeadsSnapshot {
+            counter: 1,
+            ts: "t1".into(),
+            agent_id: "00".into(),
+            second_key_added: false,
+            heads: vec![],
+        };
+        HeadsStore::write(&file, &k, &s).unwrap();
+        s.counter = 2;
+        s.ts = "t2".into();
+        HeadsStore::write(&file, &k, &s).unwrap();
+        assert!(matches!(HeadsStore::read(&file, &pk), HeadsRead::Valid(v) if v.counter == 2));
+        // slot of counter 2 torn: counter 1 is still there
+        let f = OpenOptions::new().write(true).open(&file).unwrap();
+        f.write_all_at(b"{\"torn", 0).unwrap();
+        assert!(matches!(HeadsStore::read(&file, &pk), HeadsRead::Valid(v) if v.counter == 1));
+        // another key's snapshot is not genuine
+        let other = AgentSigningKey::load_or_bootstrap(&dir.path().join("other")).unwrap();
+        HeadsStore::write(&file, &other, &s).unwrap();
+        s.counter = 3;
+        HeadsStore::write(&file, &other, &s).unwrap();
+        assert!(matches!(
+            HeadsStore::read(&file, &pk),
+            HeadsRead::Invalid(_)
+        ));
+    }
+
+    /// External audit NN-AUD-108: on the code before lab PR 160 a cut
+    /// audit log reopened and verified with nothing to say. The head
+    /// anchor written before the cut names it at the next boot.
+    #[test]
+    fn a_cut_audit_log_is_found_at_the_next_boot() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let p = paths(&dir);
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let mut log = AuditLog::open(&p.audit, key(&dir), [1; 16]).unwrap();
+        for n in 0..10 {
+            log.append(draft(n)).unwrap();
+        }
+        let mut anchor = Anchor::new(heads.clone(), k, [1; 16], p.targets(), None, false);
+        anchor.refresh(true, false).unwrap();
+        log.append(anchor.take_marker().expect("first snapshot written"))
+            .unwrap();
+        assert!(anchor.take_marker().is_none());
+        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
+        // cut the last rows; the chain that is left verifies
+        let body = std::fs::read_to_string(&p.audit).unwrap();
+        let full = body.clone();
+        let keep: String = body.lines().take(7).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&p.audit, keep).unwrap();
+        let rows: Vec<crate::audit::AuditEntry> = std::fs::read_to_string(&p.audit)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        crate::audit::verify_chain(&rows, &pk).expect("what is left still verifies");
+        let found = boot_check(&p.targets(), &heads, &pk);
+        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+        assert_eq!(found.findings[0].kind, "chain_truncated");
+        assert_eq!(found.findings[0].chain, "audit");
+        assert!(found.findings[0].detail.contains("row 9"));
+        assert!(found.audit_history_lost().is_some());
+        assert!(found.second_key_added(), "fails closed");
+        // the heads file removed after anchoring started
+        std::fs::write(&p.audit, full).unwrap();
+        std::fs::remove_file(&heads).unwrap();
+        let mut found = boot_check(&p.targets(), &heads, &pk);
+        assert!(found.findings.is_empty());
+        let started = AuditLog::open(&p.audit, key(&dir), [1; 16])
+            .unwrap()
+            .anchoring_started();
+        assert!(started);
+        let f = found.heads_missing(&heads, started).expect("reported");
+        assert_eq!(f.kind, "chain_heads_missing");
+    }
+
+    #[test]
+    fn a_fresh_or_legacy_install_has_nothing_to_report() {
+        let dir = TempDir::new().unwrap();
+        let pk = key(&dir).verifying_key();
+        let p = paths(&dir);
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
+        // legacy rows only, no anchor yet: the upgrade itself
+        std::fs::write(&p.audit, "").unwrap();
+        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct P {
+        ts: String,
+        n: u64,
+    }
+
+    fn rotating_target(path: &Path) -> ChainTarget {
+        ChainTarget {
+            chain: "test_log",
+            path: path.to_path_buf(),
+            kind: ChainKind::Rotating,
+            genuine: crate::chainlog::line_is_genuine::<P>,
+            recent: Some(crate::chainlog::verify_recent::<P>),
+            full: full_rotating::<P>,
+        }
+    }
+
+    fn rotating_log(
+        path: &Path,
+        key: AgentSigningKey,
+        cap: u64,
+    ) -> crate::chainlog::RotatingChainLog<P> {
+        crate::chainlog::RotatingChainLog::<P>::open(
+            path,
+            key,
+            crate::chainlog::RotationConfig {
+                size_cap_bytes: cap,
+                max_archives: 50,
+                file_mode: 0o600,
+            },
+            Arc::new(crate::chainlog::NoProtection),
+        )
+        .unwrap()
+    }
+
+    fn p(n: u64) -> P {
+        P {
+            ts: format!("2026-10-15T00:00:{n:02}.000000Z"),
+            n,
+        }
+    }
+
+    /// External audit NN-AUD-174: before lab PR 160 a canary access log cut
+    /// at its end reopened without a word.
+    #[test]
+    fn a_cut_canary_chain_is_found_at_the_next_boot() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let paths = paths(&dir);
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let mut db = crate::canary::access_log::CanaryAccessDb::open(
+            &paths.canary_access,
+            key(&dir),
+            [1; 16],
+        )
+        .unwrap();
+        for n in 0..5 {
+            db.append(crate::canary::access_log::CanaryAccessDraft {
+                canary_id: format!("c{n}"),
+                canary_name: "decoy".into(),
+                canary_type: common::CanaryTypeTag::File,
+                access_kind: common::CanaryAccessKind::FileOpen,
+                accessor_pid: 1,
+                accessor_uid: 0,
+                accessor_comm: "cat".into(),
+                accessor_exe: None,
+                first_trip: n == 0,
+            })
+            .unwrap();
+        }
+        drop(db);
+        Anchor::new(heads.clone(), k, [1; 16], paths.targets(), None, false)
+            .refresh(true, false)
+            .unwrap();
+        let body = std::fs::read_to_string(&paths.canary_access).unwrap();
+        let keep: String = body.lines().take(3).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&paths.canary_access, keep).unwrap();
+        let found = boot_check(&paths.targets(), &heads, &pk);
+        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+        assert_eq!(found.findings[0].chain, "canary_access");
+        assert_eq!(found.findings[0].kind, "chain_truncated");
+        assert!(found.audit_history_lost().is_none(), "not the audit chain");
+    }
+
+    /// External audit NN-AUD-109: an active file emptied while the agent is
+    /// down is found at the next start — from the manifest checkpoint, and
+    /// from the anchor written at stop when no checkpoint covers it.
+    #[test]
+    fn an_emptied_active_file_is_found_at_the_next_boot() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        // (a) the checkpoint the open wrote
+        let active = dir.path().join("a.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        for n in 0..4 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        drop(rotating_log(&active, key(&dir), 1 << 30));
+        std::fs::write(&active, b"").unwrap();
+        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+        assert_eq!(found.findings[0].kind, "chain_truncated");
+        // (b) no checkpoint yet: the snapshot taken at stop
+        let active = dir.path().join("b.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        for n in 0..3 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        assert!(crate::chainlog::manifest_tail_events(&active, &pk).is_empty());
+        Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        )
+        .refresh(true, false)
+        .unwrap();
+        assert!(boot_check(&[rotating_target(&active)], &heads, &pk)
+            .findings
+            .is_empty());
+        std::fs::write(&active, b"").unwrap();
+        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
+        assert_eq!(found.findings[0].kind, "chain_truncated");
+        assert_eq!(found.findings[0].chain, "test_log");
+    }
+
+    /// External audit NN-AUD-109: the active file deleted after a
+    /// completed rotation; the crash window (no `Rotated` row yet) is not
+    /// reported.
+    #[test]
+    fn a_deleted_active_file_is_found_at_the_next_boot() {
+        let dir = TempDir::new().unwrap();
+        let pk = key(&dir).verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("c.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 400);
+        for n in 0..10 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        assert!(crate::chainlog::current_generation(&active) > 1);
+        std::fs::remove_file(&active).unwrap();
+        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        assert!(
+            found
+                .findings
+                .iter()
+                .any(|f| f.kind == "active_file_missing"),
+            "{:?}",
+            found.findings
+        );
+        // full verification agrees
+        assert!((rotating_target(&active).full)(&active, &pk).is_err());
+    }
+}
