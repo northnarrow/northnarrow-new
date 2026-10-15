@@ -64,6 +64,12 @@ pub enum ValidationError {
 
     #[error("rule violation: confidence must have at most 2 decimal places, got {got}")]
     InvalidConfidencePrecision { got: f64 },
+
+    #[error("rule violation: confidence must be within [0.0, 1.0], got {got}")]
+    ConfidenceOutOfRange { got: f64 },
+
+    #[error("rule violation: threat_classification.novelty must be within [0.0, 1.0], got {got}")]
+    NoveltyOutOfRange { got: f64 },
 }
 
 /// Validates parsed [`AdeVerdict`] instances.
@@ -117,6 +123,17 @@ impl VerdictParser {
         // 13. confidence precision
         if !has_at_most_two_decimals(v.confidence) {
             return Err(ValidationError::InvalidConfidencePrecision { got: v.confidence });
+        }
+
+        // 13b. External audit LLMP-006: confidence and novelty within
+        //      [0, 1]. Every threshold downstream is a lower bound, so a
+        //      Kill at confidence 5.00 cleared them all.
+        if !(0.0..=1.0).contains(&v.confidence) {
+            return Err(ValidationError::ConfidenceOutOfRange { got: v.confidence });
+        }
+        let novelty = v.threat_classification.novelty;
+        if !(0.0..=1.0).contains(&novelty) {
+            return Err(ValidationError::NoveltyOutOfRange { got: novelty });
         }
 
         // 2. confidence < 0.40 ⇒ verdict = Escalate
@@ -580,6 +597,62 @@ mod tests {
             err,
             ValidationError::InvalidConfidencePrecision { .. }
         ));
+    }
+
+    /// External audit LLMP-006: a Kill at confidence 5.00 has two
+    /// decimals and cleared every lower-bound threshold.
+    #[test]
+    fn confidence_above_one_rejected() {
+        let mut v = base_verdict();
+        v.verdict = AdeAction::Kill;
+        v.recommended_action.action = AdeAction::Kill;
+        v.severity = AdeSeverity::High;
+        v.confidence = 5.00;
+        let err = parser().validate(&v).unwrap_err();
+        assert!(matches!(err, ValidationError::ConfidenceOutOfRange { .. }));
+        v.confidence = 1.01;
+        let err = parser().validate(&v).unwrap_err();
+        assert!(matches!(err, ValidationError::ConfidenceOutOfRange { .. }));
+        v.confidence = 1.00;
+        parser().validate(&v).expect("1.00 is in range");
+    }
+
+    #[test]
+    fn negative_confidence_rejected() {
+        let mut v = base_verdict();
+        v.verdict = AdeAction::Escalate;
+        v.recommended_action.action = AdeAction::Escalate;
+        v.escalation_tier = Some(EscalationTier::Tier1Review);
+        v.escalation_package = Some(EscalationPackage {
+            summary: "x".into(),
+            key_questions: vec![],
+            raw_model_output: None,
+            source_event_pid: None,
+            source_event_filename: None,
+        });
+        v.confidence = -0.50;
+        let err = parser().validate(&v).unwrap_err();
+        assert!(matches!(err, ValidationError::ConfidenceOutOfRange { .. }));
+        v.confidence = 0.00;
+        parser().validate(&v).expect("0.00 is in range");
+    }
+
+    #[test]
+    fn novelty_out_of_range_rejected() {
+        for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let mut v = base_verdict();
+            v.threat_classification.novelty = bad;
+            let err = parser().validate(&v).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::NoveltyOutOfRange { .. }),
+                "{bad}: {err}"
+            );
+        }
+        for good in [0.0, 1.0] {
+            let mut v = base_verdict();
+            v.threat_classification.novelty = good;
+            parser().validate(&v).expect("novelty in range");
+        }
     }
 
     #[test]

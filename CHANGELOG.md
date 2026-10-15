@@ -6,6 +6,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, ADE sanitizer score and coherence matrix
+  (Medium LLMP-003, LLMP-011, LLMR-010, LLMP-004, LLMP-006): every event
+  string was scored twice and before deduplication, and the keyword
+  matchers were too broad, so one DNS lookup of `admin.<domain>`, a
+  systemd `override.conf`, `react-assets` or a path in Russian forced an
+  Escalate (or skipped the model). Each string is now scored once on the
+  deduplicated flags, and one strong signal (a chat-template token, an
+  explicit "ignore previous instructions" or role switch) still forces an
+  Escalate on its own; `system`, `admin` and `override` are no longer
+  separator variants (their hostile forms stay keywords), the product's
+  own names raise nothing, and `act as` matches whole words only. A high
+  injection score now overrides any verdict but Escalate (a hostile
+  correlated string could sit behind a Kill), and a severe indicator with
+  an Allow is escalated; a correlated event too hostile for the prompt
+  still weighs. The prompt no longer echoes decoded ROT13 text,
+  and a confidence or novelty outside [0, 1] is a parse error (a Kill at
+  confidence 5.00 ran).
 - External audit, Wave 2, signed evidence logs (Medium EVD-004,
   EVD-018): one forged line at the end of a signed log (detections,
   status, FIM drift, NetFlow) could force a spurious rotation and then
