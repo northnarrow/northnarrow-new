@@ -495,12 +495,40 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     report_lsm_health(deny_expected, &deny_failures, &observe_failures)
 }
 
-/// Deny hooks expected on a healthy boot of every supported kernel:
-/// task_kill + ptrace, the `inode_protect` programs of
-/// [`filesystem::LSM_PROGRAMS`] (thirteen since external audit EBPF-015),
-/// and the BPF map guard. The optional ones a kernel has
-/// ([`filesystem::OPTIONAL_LSM_PROGRAMS`]) come on top.
-const LSM_DENY_HOOKS_EXPECTED: usize = 2 + filesystem::LSM_PROGRAMS.len() + 1;
+/// The LSM hooks of the deny set, by the hook name their pins carry
+/// (`prog_<hook>` / `link_<hook>`, [`lsm_pin_paths`]): task_kill and
+/// ptrace, the thirteen `inode_protect` programs of
+/// [`filesystem::LSM_PROGRAMS`] (`protected_open_deny` sits on
+/// `file_open`; the create/link/xattr ones since external audit
+/// EBPF-015) and the BPF map guard. External audit TST-009: the
+/// privileged restart test asserts exactly these pins, where it counted
+/// seven LSM programs anywhere on the host.
+pub const DENY_HOOKS: [&str; 16] = [
+    TASK_KILL_HOOK,
+    PTRACE_HOOK,
+    "inode_unlink",
+    "inode_rmdir",
+    "inode_rename",
+    "inode_setattr",
+    "file_ioctl",
+    "file_open",
+    "inode_create",
+    "inode_mkdir",
+    "inode_mknod",
+    "inode_symlink",
+    "inode_link",
+    "inode_setxattr",
+    "inode_removexattr",
+    bpf_defense::GUARD_HOOK,
+];
+
+/// Deny hooks attached only where the kernel has them
+/// ([`filesystem::OPTIONAL_LSM_PROGRAMS`]: the ACL hooks, 6.2 and later).
+pub const OPTIONAL_DENY_HOOKS: [&str; 2] = ["inode_set_acl", "inode_remove_acl"];
+
+/// Deny hooks expected on a healthy boot of every supported kernel; the
+/// optional ones a kernel has come on top.
+const LSM_DENY_HOOKS_EXPECTED: usize = DENY_HOOKS.len();
 
 /// Escape hatch for a host where a deny hook is known not to attach
 /// (e.g. a kernel the eBPF half has not been validated against) and the

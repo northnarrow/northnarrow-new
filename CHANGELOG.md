@@ -15,6 +15,30 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, privileged fixture hygiene (Medium TST-011,
+  TST-012, TST-009): the two iptables self-tests of the shared fixture
+  module ran in each of the eight test binaries that include it, and the
+  clean-state one first deleted the production `NORTHNARROW_COMBAT` chain
+  and its INPUT jump, whoever owned them. They are in one binary,
+  `fixture_selftest`, and refuse to start while a NorthNarrow agent or
+  watchdog runs or when the chain exists. The honeypot e2e suite rewrites
+  the real bait files (the agent has no flag to move them): it overwrote
+  and deleted the baits of an installed, stopped agent without putting
+  them back, and removed the pin root first. It now refuses to run
+  without root, outside an nn-lab guest (`/var/lib/nn-lab-provisioned`,
+  written by the lab's cloud-init) unless `NN_TEST_DISPOSABLE_HOST=1`,
+  and while an agent or watchdog runs; it records each bait's content,
+  mode, owner and mtime, and when a test ends, pass or fail, puts back
+  every bait that existed and checks it; it no longer touches the pin
+  root. The map-pin restart test counted every LSM program on the host
+  against `>= 7` while the agent attaches nine deny hooks: it now reads
+  the agent's own pins for each hook of the new `anti_tamper::DENY_HOOKS`
+  (an LSM program and its link pinned, task_kill and ptrace bound to
+  the pinned `PROTECTED_PIDS`, the same objects after the agent exits, a
+  fresh program for every hook after the restart) and the agent's
+  `deny_attached=N deny_expected=N` line (sixteen deny hooks with lab PR
+  152, plus the ACL hooks on 6.2 and later). No change to the agent's
+  behaviour.
 - External audit, Wave 2, evidence completeness (Medium EVD-002, EVD-003,
   EVD-009, DEC-018): a signed chain proved its rows were not changed, not
   that none were removed. `audit.log` or a canary chain cut at its end, or

@@ -273,10 +273,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-227 | TST-005 | Privileged tests | M | fixed (lab PR 155) |
 | NN-AUD-228 | TST-006 | Privileged tests | M | fixed (lab PR 155) |
 | NN-AUD-229 | TST-008 | Privileged tests | S | fixed (lab PR 155) |
-| NN-AUD-230 | TST-009 | Privileged tests | M | open |
+| NN-AUD-230 | TST-009 | Privileged tests | M | fixed (lab PR 158) |
 | NN-AUD-231 | TST-010 | Privileged tests | S | fixed (lab PR 153) |
-| NN-AUD-232 | TST-011 | Privileged tests | S | open |
-| NN-AUD-233 | TST-012 | Privileged tests | M | open |
+| NN-AUD-232 | TST-011 | Privileged tests | S | fixed (lab PR 158) |
+| NN-AUD-233 | TST-012 | Privileged tests | M | fixed (lab PR 158) |
 | NN-AUD-234 | TST-018 | Privileged tests | L | fixed (lab PR 155) |
 | NN-AUD-235 | TST-019 | Privileged tests | M | fixed (lab PR 159) |
 
@@ -4718,3 +4718,72 @@ the audit did not report, noted with the fix that takes them.
     disabled, the matching tests fail (13); `post_rename_crash_recovers…`
     and the `fresh_seq0` paths unchanged.
   - Lab: Ubuntu 24.04, evid160-probe.sh, evidence chains reset first (`evidence-reset.sh`: the gate runs leave rows signed by test keys in the guest's logs). main: three rows cut from the end of `audit.log` — no ERROR, no drift, `audit verify` "hash chain intact"; the registry's last row cut — the second canary gone from the live set without a word; `netflow.jsonl` emptied — no alarm. This change, installed over main (rows written by main, lab PR 143's included, verify: "16 in the old format then numbered", the registry's "2 rows in the old format" OK): each cut → ERROR "chain integrity: evidence missing or altered" and a signed `integrity_drift` `chain_truncated` (chain audit, canary_registry, netflow), `nn-admin chain verify` BROKEN with exit 8 on the cut chain. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.
+- **NN-AUD-232 (TST-011), NN-AUD-233 (TST-012), NN-AUD-230 (TST-009), lab
+  PR 158.** Privileged fixture hygiene (triage F, batch 9). Test code, and
+  one exported constant in the agent.
+  - TST-011: the two iptables self-tests left `common/mod.rs`, where every
+    binary with `mod common;` ran them, for `agent/tests/fixture_selftest.rs`
+    (`#[ignore]`, feature `test-privileged`): `cargo test -- --list` shows
+    each once (sixteen entries before, in eight binaries). Before touching
+    iptables they call `common::require_root`,
+    `common::refuse_if_northnarrow_running` (any process whose exe or comm
+    is a NorthNarrow agent or watchdog, the fixtures' copies included) and
+    `common::combat_chain_present`, which reads `iptables -S` strictly: "No
+    chain/target/match" is absent, any other failure is unknown and
+    refused. The clean-state test no longer deletes the chain; its absence
+    is a precondition checked, not made. The binary also holds the
+    helpers' unprivileged tests, which run in `cargo test --workspace`.
+  - TST-012: the agent watches the hard-coded bait paths and has no flag to
+    move them, so baits under a temporary root would test nothing; the
+    suite keeps the real paths and guards them. `RealBaitGuard::capture`
+    refuses without root, without the lab marker `/var/lib/nn-lab-provisioned`
+    (`touch`ed by all three `user-data*.tmpl`; `nn-lab.sh up` waits for it)
+    unless `NN_TEST_DISPOSABLE_HOST=1`, while any agent or watchdog runs,
+    and when a bait is not a regular file. It records each bait as a
+    `common::PathState` (content, mode, owner, mtime). On drop
+    `common::restore_path` puts back and re-reads every bait that existed
+    (rewritten in place, recreated if deleted, a link found in its place
+    removed and never written through), and the test fails if one does not
+    match. A bait or directory the run created is removed; one the test
+    agent's own protection keeps (`/var/lib/northnarrow` is `+i` and in
+    PROTECTED_INODES while its pins live) is reported, not failed: it holds
+    the inert content an install writes. While an agent still runs nothing
+    is written (it would answer the restore as a tamper of its baits) and
+    the test fails with what is left to put back. Departures from the
+    triage: an installed unit is not refused, because the nightly runs the
+    suites on a guest with a stopped install and the suite would leave the
+    gate; its baits are restored instead, which is the triage's own check.
+    `wipe_pin_tree` is removed rather than checked: since review entry 39 an
+    earlier fixture's pins are protected and the runner's unlink is refused
+    (`nn-lab.sh` says so for the map-pin test), so failing on a surviving
+    pin would fail every test after the first; the fixture's agent purges
+    stale pins at boot as a protected pid. Where pins are not protected,
+    the wipe is what detached a stopped install's hooks.
+  - TST-009: `anti_tamper::DENY_HOOKS`, the nine deny-hook names
+    (`LSM_DENY_HOOKS_EXPECTED` is its length), with a unit test that it is
+    the set `attach` counts
+    (`filesystem::tests::deny_hooks_are_the_hooks_attach_counts`).
+    `privileged_map_pin` reads, per hook, `bpftool prog show pinned
+    …/prog_<hook>` (type `lsm`) and checks that `link_<hook>` is pinned
+    (by its presence: lab-found, the agent's BPF guard refuses a foreign
+    handle on its pinned links, so `bpftool link show pinned` cannot open
+    them while the hooks are attached); task_kill and ptrace must list the pinned
+    `PROTECTED_PIDS` id in `map_ids`; the agent log (a file now,
+    `NO_COLOR=1`) must hold `deny_attached=N deny_expected=N` (N = the
+    sixteen of `DENY_HOOKS` since lab PR 152, plus the optional ACL hooks
+    the kernel has). After boot 1 exits the pins name the same objects; after the restart the map
+    id is the same and every deny hook runs a new program (checked before
+    for task_kill and ptrace only, by program name). Nothing is counted
+    host-wide. The parsers and the log match have unprivileged tests.
+  - Here (WSL2, no BPF-LSM, no root) only the build checks ran: fmt, clippy
+    (workspace; agent with `test-privileged,debug-trigger`), the workspace
+    tests (`fixture_selftest`: 11 tests), and the unprivileged tests of
+    `privileged_map_pin` with the features. On the base, the map-pin test
+    passes with a deny hook missing as long as any seven LSM programs are
+    loaded, the clean-state self-test deletes a live chain, and a stopped
+    install's baits stay deleted after the honeypot suite. To check in the
+    lab: `fixture_selftest` (both ignored tests, with no chain), the
+    honeypot suite with the baits' sha256 unchanged on a guest with a
+    stopped install, `privileged_map_pin` (it fails naming the hook when
+    one deny-hook pin is renamed in a scratch build).
+  - Lab: The gate: `fixture_selftest` (the guard self-tests on their own chain, run first), `honeypot_tamper_e2e` (refuses off an nn-lab guest; the baits restored and re-checked) and `privileged_map_pin` (the sixteen deny hooks' programs, task_kill and ptrace bound to PROTECTED_PIDS, fresh programs after the restart) pass on Ubuntu 24.04 and 22.04. Found by the gates and fixed here: the agent's BPF guard refuses a foreign handle on its pinned links, so their presence is checked; on Debian 12, iptables-nft 1.8.9 answers `-S` for a chain that does not exist with "incompatible", so the whole-table listing decides. With the final version of this change, Debian 12: 35 suites, 79 passed, 0 failed. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 79 passed, 0 failed (final run); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.
