@@ -6,6 +6,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, signed evidence logs (Medium EVD-004,
+  EVD-018): one forged line at the end of a signed log (detections,
+  status, FIM drift, NetFlow) could force a spurious rotation and then
+  make every later append fail, at every boot; a forged line in its
+  manifest kept the log from opening. A file planted at the next archive
+  name made the next rotation erase the sealed file. Tail lines are now
+  checked (format, hash, signature) before the chain continues from them;
+  a bad one is cut and recorded in the signed manifest. A rotation never
+  replaces or truncates an existing file: it moves to the next free name
+  and records the foreign entry.
 - External audit, Wave 2, self-integrity and detection-store evidence
   (Medium EVD-013, EVD-012, EVD-006): a drop-in reported once, removed and
   put back identically was never reported again. The self-integrity check

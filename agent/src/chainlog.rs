@@ -164,6 +164,27 @@ pub enum ManifestEvent {
         /// SHA-256 (hex) of the discarded bytes.
         dropped_sha256: String,
     },
+    /// External audit NN-AUD-110: the tail line adopted at open is
+    /// well-formed and its hash recomputes, but it could not be fully
+    /// verified (`reason`: its signature does not match this agent's key,
+    /// or too many trailing lines failed verification to cut them all).
+    /// It was kept, not truncated; the verifier will flag it if forged.
+    TailUnverified {
+        /// `"active"` or `"manifest"`.
+        role: String,
+        entry_hash: String,
+        reason: String,
+    },
+    /// External audit NN-AUD-115: a rotation found a name it did not create
+    /// at the archive slot `seq` and archived into the next free slot
+    /// instead. The foreign entry is left in place, untouched
+    /// (`entry_type`: `file`, `symlink`, `dir` or `other`; `bytes`: its
+    /// lstat size).
+    ForeignArchive {
+        seq: u64,
+        entry_type: String,
+        bytes: u64,
+    },
 }
 
 /// A manifest line: the entry nested under `manifest` (keyed, like the
@@ -441,6 +462,15 @@ impl Default for RotationConfig {
     }
 }
 
+/// A sealed active file waiting for its rename (see `pending_seal`).
+#[derive(Debug, Clone)]
+struct PendingSeal {
+    seq: u64,
+    terminator_hash: String,
+    bytes: u64,
+    records: u64,
+}
+
 /// Append-only, rotation-aware, signed chain writer for one log.
 pub struct RotatingChainLog<P> {
     active_path: PathBuf,
@@ -464,6 +494,11 @@ pub struct RotatingChainLog<P> {
     active_records: u64,
     /// Seq the NEXT rotation assigns to the sealed file.
     next_seq: u64,
+    /// External audit NN-AUD-115: the active file is already sealed (its
+    /// terminator is on disk) but the rename did not happen. The next append
+    /// retries only the finish step; sealing again would put a second
+    /// terminator in one file, which fails `verify_one_file`.
+    pending_seal: Option<PendingSeal>,
     _marker: std::marker::PhantomData<P>,
 }
 
@@ -484,10 +519,16 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         let active_path = anchored.as_path();
         let manifest_path = manifest_path_for(active_path);
         let next_seq = scan_max_archive_seq(active_path)?.map_or(1, |m| m + 1);
+        // External audit NN-AUD-110: the adopted tail line must recompute
+        // to its own `entry_hash` (and is signature-checked) before the
+        // chain continues from it or a rotation is completed on its word.
+        let pubkey = key.verifying_key();
+        let check_active = |l: &[u8]| check_active_line::<P>(l, &pubkey);
+        let check_manifest = |l: &[u8]| check_manifest_line(l, &pubkey);
         // Recover the manifest tail O(1). If a prior crash tore its last
         // line, truncate the fragment so the next manifest line can't fuse
         // with it; the repair is attested below (once the log can sign one).
-        let manifest_rec = recover_tail(&manifest_path)?;
+        let manifest_rec = recover_tail(&manifest_path, &check_manifest)?;
         if manifest_rec.torn {
             truncate_file(&manifest_path, manifest_rec.clean_len)?;
         }
@@ -499,10 +540,11 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             cfg,
             protection,
             last_hash: GENESIS_PREV_HASH.to_string(),
-            manifest_last_hash: manifest_rec.tail_hash,
+            manifest_last_hash: manifest_rec.tail_hash.clone(),
             active_bytes: 0,
             active_records: 0,
             next_seq,
+            pending_seal: None,
             _marker: std::marker::PhantomData,
         };
 
@@ -513,15 +555,18 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
                 "manifest",
                 manifest_rec.clean_len,
                 manifest_rec.dropped_bytes,
-                manifest_rec.dropped_sha256,
+                manifest_rec.dropped_sha256.clone(),
             )?;
+        }
+        if let Some(reason) = &manifest_rec.unverified {
+            log.attest_tail_unverified("manifest", &manifest_rec.tail_hash, reason);
         }
 
         // Recover the active file's tail O(1) — replaces the unbounded
         // whole-file walk that was the BUG-026 boot hang. Repair + attest a
         // torn tail the same way (the agent is exempt from its own LSM
         // setattr deny, so the in-place truncate is allowed).
-        let active_rec = recover_tail(active_path)?;
+        let active_rec = recover_tail(active_path, &check_active)?;
         if active_rec.torn {
             truncate_file(active_path, active_rec.clean_len)?;
             log.attest_torn_repair(
@@ -531,13 +576,26 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
                 active_rec.dropped_sha256.clone(),
             )?;
         }
-        if active_rec.sealed {
+        if let Some(reason) = &active_rec.unverified {
+            log.attest_tail_unverified("active", &active_rec.tail_hash, reason);
+        }
+        if let Some(this_seq) = active_rec.sealed_seq {
             // Crash recovery: the active file was sealed (terminator
             // written) but the rename never completed. Finish it so the
             // invariant "the active file has no terminator" is restored.
+            // External audit NN-AUD-110: only a fully decoded, verified
+            // terminator gets here, and its own `this_seq` names the slot.
             log.last_hash = active_rec.tail_hash; // terminator hash → meta-chain link
             log.active_bytes = active_rec.clean_len;
-            log.complete_interrupted_rotation()?;
+            if let Err(e) = log.complete_interrupted_rotation(this_seq) {
+                // External audit NN-AUD-115: keep the log usable; the next
+                // append retries the finish step (never a second seal).
+                error!(
+                    error = %format!("{e:#}"),
+                    log = %log.active_path.display(),
+                    "chainlog: could not finish an interrupted rotation at open; will retry"
+                );
+            }
         } else {
             log.last_hash = if active_rec.clean_len == 0 {
                 // Fresh seq-0 file roots at GENESIS; a fresh post-rotation
@@ -548,7 +606,7 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
                 } else {
                     // Empty active after rotation: its first line must
                     // chain off the prior archive's terminator.
-                    prior_terminator_hash(active_path, next_seq - 1)?
+                    log.prior_link_or_genesis(next_seq - 1)
                 }
             } else {
                 active_rec.tail_hash
@@ -575,6 +633,11 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
     /// line's `entry_hash`.
     pub fn append(&mut self, payload: P) -> Result<String> {
         check_reserved_keys(&payload)?;
+        // External audit NN-AUD-115: a previous rotation sealed the active
+        // file but could not rename it. Retry only the finish step.
+        if let Some(p) = self.pending_seal.clone() {
+            self.finish_rotation(p.seq, p.terminator_hash, p.bytes, p.records)?;
+        }
         let line = ChainLine::sealed(payload, &self.key, &self.last_hash)?;
         let bytes = to_jsonl(&line)?;
         // Guard on `active_bytes` (recovered from the file length at open),
@@ -605,7 +668,18 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
     /// Seal the active file, archive it, open a fresh active, and evict
     /// the oldest archive(s) beyond the retention budget.
     fn rotate(&mut self) -> Result<()> {
-        let seq = self.next_seq;
+        // External audit NN-AUD-115: the archive slot is free in every state
+        // this writer produces, so an occupied slot is a foreign entry. Pick
+        // the next free slot before sealing, so the terminator names the
+        // archive it will really become (lstat: a symlink counts as taken).
+        let mut seq = self.next_seq;
+        for _ in 0..MAX_SLOT_PROBES {
+            if slot_kind(&archive_path(&self.active_path, seq)).is_none() {
+                break;
+            }
+            seq = next_free_candidate(&self.active_path, seq);
+        }
+        self.next_seq = seq;
         let term = TerminatorLine::sealed(
             RotateTerminator {
                 fmt_ver: CHAINLOG_FMT_V2,
@@ -624,6 +698,12 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         // `+i` dance — appending to an *existing* file is allowed under an
         // immutable dir; only NEW/renamed dir entries need the lift.
         append_and_fsync(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
+        self.pending_seal = Some(PendingSeal {
+            seq,
+            terminator_hash: terminator_hash.clone(),
+            bytes: sealed_bytes,
+            records: sealed_records,
+        });
         self.finish_rotation(seq, terminator_hash, sealed_bytes, sealed_records)
     }
 
@@ -633,7 +713,8 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
     /// crash). BUG-030 — failure-atomic, and EVERY dir-entry mutation runs
     /// INSIDE the `+i` dance:
     ///
-    /// 1. **rename** active → `.NNNNNN` (idempotent: skipped if already done).
+    /// 1. **rename** active → `.NNNNNN`, never over an existing name (an
+    ///    occupied slot is foreign: skipped and attested, NN-AUD-115).
     /// 2. **advance** `next_seq` + reset counters IMMEDIATELY — the archive
     ///    is now committed on disk, so NO later failure in this function can
     ///    re-rotate into `seq` and overwrite the sealed archive (the bug-2
@@ -653,7 +734,6 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         sealed_records: u64,
     ) -> Result<()> {
         let active = self.active_path.clone();
-        let archive = archive_path(&active, seq);
         let file_mode = self.cfg.file_mode;
         let max_archives = self.cfg.max_archives;
         // Receiver clone + a second clone for register_active, so the dance
@@ -662,11 +742,39 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         let protection = std::sync::Arc::clone(&self.protection);
         let protection_inner = std::sync::Arc::clone(&self.protection);
         protection.with_mutable_dir(&mut || -> Result<()> {
-            // 1. RENAME (idempotent: a crash may have renamed but not finished).
-            if !archive.exists() {
-                fs::rename(&active, &archive).with_context(|| {
-                    format!("sealing {} → {}", active.display(), archive.display())
-                })?;
+            // 1. RENAME without replacing anything. External audit NN-AUD-115:
+            //    this used to skip the rename when the archive name existed
+            //    and then truncate the active anyway, destroying the sealed
+            //    file. The slot is free in every state this writer produces,
+            //    so an occupied one is foreign: leave it untouched, attest it
+            //    below and archive into the next free slot.
+            let mut seq = seq;
+            let mut foreign: Vec<(u64, &'static str, u64)> = Vec::new();
+            let mut attempts = 0;
+            loop {
+                let archive = archive_path(&active, seq);
+                match rename_noreplace(&active, &archive) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let (kind, bytes) = slot_kind(&archive).unwrap_or(("other", 0));
+                        foreign.push((seq, kind, bytes));
+                        attempts += 1;
+                        if attempts >= MAX_SLOT_PROBES {
+                            return Err(anyhow!(
+                                "sealing {}: {attempts} archive slots taken by foreign entries",
+                                active.display()
+                            ));
+                        }
+                        seq = next_free_candidate(&active, seq);
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(e).context(format!(
+                            "sealing {} → {}",
+                            active.display(),
+                            archive.display()
+                        )))
+                    }
+                }
             }
             // 2. COMMIT POINT — advance seq + reset counters immediately. The
             //    archive is now on disk; from here no failure may re-rotate
@@ -675,14 +783,10 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             self.active_bytes = 0;
             self.active_records = 0;
             self.next_seq = seq + 1;
-            // 3. Fresh empty active + register its inode.
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(file_mode)
-                .open(&active)
-                .with_context(|| format!("creating fresh active {}", active.display()))?;
+            self.pending_seal = None;
+            // 3. Fresh empty active (O_EXCL: never truncate or follow a name
+            //    that appeared after the rename) + register its inode.
+            create_fresh_active(&active, file_mode)?;
             protection_inner.register_active(&active)?;
             // 4. Manifest + eviction — NON-FATAL (archive already committed).
             let evicted = evict_excess_archives(&active, max_archives, protection_inner.as_ref())
@@ -714,6 +818,20 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
                      intact; manifest row missing but recoverable (BUG-030 degrade)"
                 );
             }
+            for (fseq, kind, bytes) in foreign.drain(..) {
+                error!(
+                    seq = fseq, kind, bytes,
+                    log = %active.display(),
+                    "chainlog: a foreign entry holds an archive slot; archived to the next free slot"
+                );
+                if let Err(e) = self.manifest_append(ManifestEvent::ForeignArchive {
+                    seq: fseq,
+                    entry_type: kind.to_string(),
+                    bytes,
+                }) {
+                    error!(error = %e, fseq, "chainlog: manifest ForeignArchive append failed (continuing)");
+                }
+            }
             for (eseq, ehash) in evicted {
                 if let Err(e) = self.manifest_append(ManifestEvent::Evicted {
                     seq: eseq,
@@ -727,16 +845,21 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
     }
 
     /// Finish a rotation that crashed after the seal but before/at the
-    /// rename. The active file currently ends in a terminator for
-    /// `next_seq`; [`finish_rotation`] renames it to its archive (idempotent)
-    /// and opens a fresh active. `self.last_hash` is already the terminator
+    /// rename. The active file currently ends in a verified terminator for
+    /// `seq` (its `this_seq`); [`finish_rotation`] renames it to its archive
+    /// (never over an existing name) and opens a fresh active. `self.last_hash` is already the terminator
     /// hash (set by `open` from the recovered tail), so it is the meta-chain
     /// link for the fresh active's first line.
-    fn complete_interrupted_rotation(&mut self) -> Result<()> {
-        let seq = self.next_seq;
+    fn complete_interrupted_rotation(&mut self, seq: u64) -> Result<()> {
         let terminator_hash = self.last_hash.clone();
         let sealed_bytes = self.active_bytes;
         let sealed_records = self.active_records;
+        self.pending_seal = Some(PendingSeal {
+            seq,
+            terminator_hash: terminator_hash.clone(),
+            bytes: sealed_bytes,
+            records: sealed_records,
+        });
         self.finish_rotation(seq, terminator_hash, sealed_bytes, sealed_records)
     }
 
@@ -767,6 +890,56 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             dropped_bytes,
             dropped_sha256,
         })
+    }
+
+    /// The terminator hash of archive `seq`, which a fresh empty active
+    /// chains off. External audit NN-AUD-110: a newest archive without a
+    /// well-formed terminator (a foreign file, or a forged non-hex hash)
+    /// made `open` fail, or every append fail on `hex::decode`, at every
+    /// boot. It is attested as foreign instead and the active roots at
+    /// GENESIS; the verifier still flags the archive.
+    fn prior_link_or_genesis(&mut self, seq: u64) -> String {
+        let reason = match prior_terminator_hash(&self.active_path, seq) {
+            Ok(h) if is_chain_hash(&h) => return h,
+            Ok(h) => format!("terminator entry_hash {h:?} is not a chain hash"),
+            Err(e) => format!("{e:#}"),
+        };
+        let (kind, bytes) =
+            slot_kind(&archive_path(&self.active_path, seq)).unwrap_or(("other", 0));
+        error!(
+            log = %self.active_path.display(),
+            seq,
+            reason = %reason,
+            "chainlog: newest archive has no usable terminator; rooting the active at GENESIS"
+        );
+        if let Err(e) = self.manifest_append(ManifestEvent::ForeignArchive {
+            seq,
+            entry_type: kind.to_string(),
+            bytes,
+        }) {
+            error!(error = %format!("{e:#}"), seq, "chainlog: manifest ForeignArchive append failed");
+        }
+        GENESIS_PREV_HASH.to_string()
+    }
+
+    /// External audit NN-AUD-110: record that the tail adopted at open was
+    /// kept without full verification (see [`ManifestEvent::TailUnverified`]).
+    /// Non-fatal: a failed attestation must not keep the log closed.
+    fn attest_tail_unverified(&mut self, role: &str, entry_hash: &str, reason: &str) {
+        warn!(
+            log = %self.active_path.display(),
+            role,
+            entry_hash,
+            reason,
+            "chainlog: tail line kept without full verification; attesting it in the manifest"
+        );
+        if let Err(e) = self.manifest_append(ManifestEvent::TailUnverified {
+            role: role.to_string(),
+            entry_hash: entry_hash.to_string(),
+            reason: reason.to_string(),
+        }) {
+            error!(error = %format!("{e:#}"), role, "chainlog: manifest TailUnverified append failed");
+        }
     }
 
     fn manifest_append(&mut self, event: ManifestEvent) -> Result<()> {
@@ -848,6 +1021,85 @@ fn list_archive_seqs(active: &Path) -> Result<Vec<u64>> {
 
 fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
     Ok(list_archive_seqs(active)?.into_iter().max())
+}
+
+/// Bound on the archive slots one rotation probes past foreign entries.
+const MAX_SLOT_PROBES: u32 = 16;
+
+/// What occupies `path`, by `lstat` (a symlink is reported, never
+/// followed): `None` if the name is free.
+fn slot_kind(path: &Path) -> Option<(&'static str, u64)> {
+    let m = fs::symlink_metadata(path).ok()?;
+    let ft = m.file_type();
+    let kind = if ft.is_symlink() {
+        "symlink"
+    } else if ft.is_file() {
+        "file"
+    } else if ft.is_dir() {
+        "dir"
+    } else {
+        "other"
+    };
+    Some((kind, m.len()))
+}
+
+/// The next archive slot to try after `taken`: past every archive name on
+/// disk, so a foreign entry is never reused or overwritten.
+fn next_free_candidate(active: &Path, taken: u64) -> u64 {
+    let max = scan_max_archive_seq(active).ok().flatten().unwrap_or(0);
+    max.max(taken) + 1
+}
+
+/// `rename(from, to)` that fails with `AlreadyExists` instead of replacing
+/// `to` (`renameat2(RENAME_NOREPLACE)`). External audit NN-AUD-115. On a
+/// filesystem without the flag, fall back to an `lstat` check then a
+/// plain rename (the window is inside the rotation's `+i` dance).
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (f, t) = (cstr(from)?, cstr(to)?);
+    // SAFETY: two NUL-terminated paths that outlive the call; renameat2
+    // only reads them.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOSYS) => {
+            if fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(from, to)
+        }
+        _ => Err(err),
+    }
+}
+
+/// Create the fresh, empty active file after a rotation. External audit
+/// NN-AUD-115: `O_CREAT|O_EXCL` (which also refuses a dangling symlink), so
+/// a name that appeared after the rename is an error, never truncated or
+/// followed.
+fn create_fresh_active(active: &Path, mode: u32) -> Result<()> {
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .open(active)
+        .with_context(|| format!("creating fresh active {}", active.display()))?;
+    Ok(())
 }
 
 /// Drop oldest archives beyond `max_archives`, returning the
@@ -1004,9 +1256,13 @@ struct TailRecovery {
     /// trailing fragment (or unparseable trailing line) was discarded.
     /// This is the byte count the rotation trigger keys on.
     clean_len: u64,
-    /// The last complete line is a rotation terminator (crash-recovery:
-    /// a rotation that sealed but didn't finish the rename).
-    sealed: bool,
+    /// The last complete line is a verified rotation terminator (crash
+    /// recovery: a rotation that sealed but didn't finish the rename);
+    /// carries its `this_seq`.
+    sealed_seq: Option<u64>,
+    /// External audit NN-AUD-110: the adopted tail was kept without full
+    /// verification (why); the caller attests it.
+    unverified: Option<String>,
     /// A trailing byte run past `clean_len` was discarded; the caller MUST
     /// truncate the file to `clean_len` before appending (so the torn bytes
     /// never land mid-chain → would fail `verify_log_set`) AND attest it.
@@ -1025,7 +1281,8 @@ impl TailRecovery {
         Self {
             tail_hash: GENESIS_PREV_HASH.to_string(),
             clean_len: 0,
-            sealed: false,
+            sealed_seq: None,
+            unverified: None,
             torn: false,
             dropped_bytes: 0,
             dropped_sha256: String::new(),
@@ -1060,7 +1317,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// a trailing fragment with no terminating newline, or a final line that
 /// fails to parse, is discarded and the tail is taken from the last line
 /// that *does* parse (`torn` is set so the caller can truncate it away).
-fn recover_tail(path: &Path) -> Result<TailRecovery> {
+///
+/// External audit NN-AUD-110: a candidate line must carry a 64-character
+/// lowercase hex `entry_hash` (else it is skipped like a torn one) and pass
+/// `check`, the typed hash/signature check of the caller. See
+/// [`scan_back_for_tail`] for how a failed check is handled.
+fn recover_tail(path: &Path, check: &dyn Fn(&[u8]) -> LineCheck) -> Result<TailRecovery> {
     let mut f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TailRecovery::empty()),
@@ -1080,7 +1342,7 @@ fn recover_tail(path: &Path) -> Result<TailRecovery> {
         let mut buf = vec![0u8; window as usize];
         f.read_exact(&mut buf)
             .with_context(|| format!("reading tail window of {}", path.display()))?;
-        if let Some(rec) = scan_back_for_tail(&buf, start, start == 0, size) {
+        if let Some(rec) = scan_back_for_tail(&buf, start, start == 0, size, check) {
             return Ok(rec);
         }
         if start == 0 {
@@ -1090,7 +1352,8 @@ fn recover_tail(path: &Path) -> Result<TailRecovery> {
             return Ok(TailRecovery {
                 tail_hash: GENESIS_PREV_HASH.to_string(),
                 clean_len: 0,
-                sealed: false,
+                sealed_seq: None,
+                unverified: None,
                 torn: true,
                 dropped_bytes: size,
                 dropped_sha256: sha256_hex(&buf),
@@ -1107,22 +1370,145 @@ fn recover_tail(path: &Path) -> Result<TailRecovery> {
     }
 }
 
-/// Find the last complete, parseable line in `buf` (= file bytes
+/// Outcome of the typed check of one candidate tail line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LineCheck {
+    /// Decodes, its `entry_hash` recomputes, its signature verifies.
+    /// `Some(this_seq)` for a rotation terminator.
+    Verified { terminator_seq: Option<u64> },
+    /// Decodes and its hash recomputes, but the signature does not verify
+    /// with this agent's key (for example a regenerated key).
+    BadSignature,
+    /// Does not decode as its line type, or its hash does not recompute.
+    Invalid,
+}
+
+/// Most trailing lines a recovery cuts for failing [`LineCheck`]. Past it
+/// the failure is systematic (a schema or key problem), not a forged tail.
+const MAX_TAIL_REJECTS: usize = 16;
+
+/// `entry_hash` shape this writer produces: 64 lowercase hex characters.
+fn is_chain_hash(h: &str) -> bool {
+    h.len() == 64
+        && h.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Recompute `stored` from the stripped line and verify `sig` over it.
+fn check_digest(digest: Result<[u8; 32]>, stored: &str, sig: &str, pk: &VerifyingKey) -> LineCheck {
+    let Ok(digest) = digest else {
+        return LineCheck::Invalid;
+    };
+    if hex::encode(digest) != stored {
+        return LineCheck::Invalid;
+    }
+    let sig_ok = B64
+        .decode(sig)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .is_some_and(|b| pk.verify(&digest, &Signature::from_bytes(&b)).is_ok());
+    if sig_ok {
+        LineCheck::Verified {
+            terminator_seq: None,
+        }
+    } else {
+        LineCheck::BadSignature
+    }
+}
+
+/// Typed check of an active-file line (data line or terminator), with the
+/// same pre-image rule as [`verify_one_file`].
+fn check_active_line<P: Serialize + DeserializeOwned>(line: &[u8], pk: &VerifyingKey) -> LineCheck {
+    let is_terminator = serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .is_some_and(|v| v.get("rotate").is_some());
+    if is_terminator {
+        let Ok(mut t) = serde_json::from_slice::<TerminatorLine>(line) else {
+            return LineCheck::Invalid;
+        };
+        let (stored, sig) = (
+            std::mem::take(&mut t.entry_hash),
+            std::mem::take(&mut t.agent_sig),
+        );
+        match check_digest(chain_digest(&t, &t.prev_hash), &stored, &sig, pk) {
+            LineCheck::Verified { .. } => LineCheck::Verified {
+                terminator_seq: Some(t.rotate.this_seq),
+            },
+            other => other,
+        }
+    } else {
+        let Ok(mut d) = serde_json::from_slice::<ChainLine<P>>(line) else {
+            return LineCheck::Invalid;
+        };
+        let (stored, sig) = (
+            std::mem::take(&mut d.entry_hash),
+            std::mem::take(&mut d.agent_sig),
+        );
+        check_digest(chain_digest(&d, &d.prev_hash), &stored, &sig, pk)
+    }
+}
+
+/// Typed check of a manifest line.
+fn check_manifest_line(line: &[u8], pk: &VerifyingKey) -> LineCheck {
+    let Ok(mut m) = serde_json::from_slice::<ManifestLine>(line) else {
+        return LineCheck::Invalid;
+    };
+    let (stored, sig) = (
+        std::mem::take(&mut m.entry_hash),
+        std::mem::take(&mut m.agent_sig),
+    );
+    check_digest(chain_digest(&m, &m.prev_hash), &stored, &sig, pk)
+}
+
+/// Find the last complete, chain-shaped line in `buf` (= file bytes
 /// `[buf_start, file_size)`), scanning newest→oldest. `at_bof` means
 /// `buf_start == 0`, so the buffer's first segment is a genuine line start
-/// rather than a window-split fragment. Returns `None` if no complete
-/// parseable line is fully contained in `buf` (caller widens the window).
+/// rather than a window-split fragment. Returns `None` if no acceptable
+/// line is fully contained in `buf` (caller widens the window).
+///
+/// External audit NN-AUD-110 — what is adopted:
+/// - a line without a 64-hex `entry_hash` is skipped like a torn one;
+/// - a line that fails `check` ([`LineCheck::Invalid`]) is skipped too, so
+///   it is truncated and attested — but at most [`MAX_TAIL_REJECTS`] of
+///   them, and never all the chain-shaped lines of a file: past either
+///   bound the newest chain-shaped line is kept, marked `unverified`;
+/// - a line whose only fault is its signature is kept, marked
+///   `unverified` (a regenerated key must not cut a line at every boot);
+/// - `sealed_seq` is set only for a terminator that fully verifies.
 fn scan_back_for_tail(
     buf: &[u8],
     buf_start: u64,
     at_bof: bool,
     file_size: u64,
+    check: &dyn Fn(&[u8]) -> LineCheck,
 ) -> Option<TailRecovery> {
     let nls: Vec<usize> = buf
         .iter()
         .enumerate()
         .filter_map(|(i, &c)| (c == b'\n').then_some(i))
         .collect();
+    let adopt = |nl: usize, h: &str, sealed_seq: Option<u64>, unverified: Option<String>| {
+        let clean_len = buf_start + nl as u64 + 1; // include the '\n'
+        let torn = clean_len < file_size;
+        let dropped = &buf[(nl + 1)..]; // bytes past the adopted line
+        TailRecovery {
+            tail_hash: h.to_string(),
+            clean_len,
+            sealed_seq,
+            unverified,
+            torn,
+            dropped_bytes: dropped.len() as u64,
+            dropped_sha256: if torn {
+                sha256_hex(dropped)
+            } else {
+                String::new()
+            },
+        }
+    };
+    // Newest chain-shaped line that failed `check`: kept as an unverified
+    // tail if the walk hits one of the bounds above.
+    let mut newest_rejected: Option<(usize, String)> = None;
+    let mut rejects = 0usize;
     // Bytes after the final '\n' are an un-terminated trailing fragment;
     // they are never a candidate (no terminating newline). Walk the
     // newline-terminated lines from the end.
@@ -1144,31 +1530,51 @@ fn scan_back_for_tail(
         if line.is_empty() {
             continue;
         }
-        // Parse generically: every line type (data / terminator / manifest)
-        // carries a top-level `entry_hash`; a terminator also has `rotate`.
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-            if let Some(h) = v.get("entry_hash").and_then(|h| h.as_str()) {
-                let clean_len = buf_start + nl as u64 + 1; // include the '\n'
-                let torn = clean_len < file_size;
-                let dropped = &buf[(nl + 1)..]; // bytes past the last good line
-                return Some(TailRecovery {
-                    tail_hash: h.to_string(),
-                    clean_len,
-                    sealed: v.get("rotate").is_some(),
-                    torn,
-                    dropped_bytes: dropped.len() as u64,
-                    dropped_sha256: if torn {
-                        sha256_hex(dropped)
-                    } else {
-                        String::new()
-                    },
-                });
-            }
-            // Parsed but not a chain line (no entry_hash) → keep walking back.
+        // Every line type (data / terminator / manifest) carries a
+        // top-level `entry_hash`; anything else is torn/corrupt/foreign.
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(h) = v.get("entry_hash").and_then(|h| h.as_str()) else {
+            continue;
+        };
+        if !is_chain_hash(h) {
+            continue;
         }
-        // Parse failed (torn/corrupt) → discard, keep walking back.
+        match check(line) {
+            LineCheck::Verified { terminator_seq } => {
+                return Some(adopt(nl, h, terminator_seq, None));
+            }
+            LineCheck::BadSignature => {
+                return Some(adopt(
+                    nl,
+                    h,
+                    None,
+                    Some("signature does not verify with this agent's key".to_string()),
+                ));
+            }
+            LineCheck::Invalid => {
+                if newest_rejected.is_none() {
+                    newest_rejected = Some((nl, h.to_string()));
+                }
+                rejects += 1;
+                if rejects > MAX_TAIL_REJECTS {
+                    break;
+                }
+            }
+        }
     }
-    None
+    // Reached BOF (or the reject bound) without a verified line: keep the
+    // newest chain-shaped line rather than cut a whole run of them.
+    let (nl, h) = newest_rejected?;
+    Some(adopt(
+        nl,
+        &h,
+        None,
+        Some(format!(
+            "{rejects} trailing line(s) fail hash verification; none cut"
+        )),
+    ))
 }
 
 /// Truncate `path` to `len` bytes (+ fsync) to drop a torn trailing fragment
@@ -2514,5 +2920,455 @@ mod tests {
         let e = dir.path().join("empty");
         fs::write(&e, "").unwrap();
         assert_eq!(repair_torn_tail(&e, parses).unwrap(), None);
+    }
+
+    // ── External audit NN-AUD-110 / NN-AUD-115 ──
+
+    fn open_log(active: &Path, kp: &Path, cap: u64) -> RotatingChainLog<TestPayload> {
+        open_log_with(active, kp, cap, std::sync::Arc::new(NoProtection))
+    }
+
+    fn open_log_with(
+        active: &Path,
+        kp: &Path,
+        cap: u64,
+        prot: std::sync::Arc<dyn ProtectionManager>,
+    ) -> RotatingChainLog<TestPayload> {
+        RotatingChainLog::<TestPayload>::open(active, key_at(kp), cfg(cap, 50), prot).unwrap()
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    fn manifest_events(active: &Path) -> Vec<ManifestEvent> {
+        fs::read_to_string(manifest_path_for(active))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<ManifestLine>(l)
+                    .unwrap()
+                    .manifest
+                    .event
+            })
+            .collect()
+    }
+
+    fn data_lines(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains("\"rotate\""))
+            .count()
+    }
+
+    /// External audit NN-AUD-110: a one-line forged tail with a non-hex
+    /// `entry_hash` and a bare `rotate` key used to trigger a spurious
+    /// rotation and then fail every append (`prev_hash not hex`).
+    #[test]
+    fn a_non_hex_forged_tail_is_cut_and_attested() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        let forged = b"{\"rotate\":{},\"entry_hash\":\"b\"}\n";
+        append_raw(&active, forged);
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(3)).expect("appends must keep working");
+        drop(log);
+        assert!(
+            list_archive_seqs(&active).unwrap().is_empty(),
+            "no spurious rotation"
+        );
+        assert!(manifest_events(&active).iter().any(|e| matches!(e,
+            ManifestEvent::TornTailRepaired { role, dropped_sha256, .. }
+                if role == "active" && *dropped_sha256 == sha256_hex(forged))));
+        let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(report.total_records, 4);
+    }
+
+    /// External audit NN-AUD-110: `sealed` needs a terminator that decodes
+    /// and verifies, not the mere presence of a `rotate` key.
+    #[test]
+    fn a_rotate_key_on_a_non_terminator_does_not_rotate() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        let forged = format!(
+            "{{\"rotate\":{{\"seq\":1}},\"prev_hash\":\"a\",\"entry_hash\":\"{}\",\"agent_sig\":\"c\"}}\n",
+            "b".repeat(64)
+        );
+        append_raw(&active, forged.as_bytes());
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(3)).unwrap();
+        drop(log);
+        assert!(
+            list_archive_seqs(&active).unwrap().is_empty(),
+            "archive count unchanged"
+        );
+        assert_eq!(
+            verify_log_set::<TestPayload>(&active, &pk)
+                .unwrap()
+                .total_records,
+            4
+        );
+    }
+
+    /// External audit NN-AUD-110: a hash-valid terminator signed by another
+    /// key is kept (attested, never cut) but never completes a rotation.
+    #[test]
+    fn a_terminator_signed_by_another_key_does_not_rotate() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let tail = {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+            log.last_hash().to_string()
+        };
+        let other = key_at(&dir.path().join("other"));
+        let term = TerminatorLine::sealed(
+            RotateTerminator {
+                fmt_ver: CHAINLOG_FMT_V2,
+                this_seq: 7,
+                next_seq: 8,
+                record_count: 3,
+                bytes: 0,
+            },
+            &other,
+            &tail,
+        )
+        .unwrap();
+        append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(3)).unwrap();
+        drop(log);
+        assert!(list_archive_seqs(&active).unwrap().is_empty());
+        assert!(manifest_events(&active).iter().any(|e| matches!(e,
+            ManifestEvent::TailUnverified { role, entry_hash, .. }
+                if role == "active" && *entry_hash == term.entry_hash)));
+        assert_eq!(data_lines(&active), 4, "nothing cut");
+    }
+
+    /// External audit NN-AUD-110: a forged manifest tail made the torn-tail
+    /// attestation fail on `hex::decode`, so `open` failed every boot.
+    #[test]
+    fn a_forged_manifest_tail_does_not_fail_open() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        {
+            let mut log = open_log(&active, &kp, 2000);
+            for i in 0..12 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        assert!(!list_archive_seqs(&active).unwrap().is_empty());
+        let forged = b"{\"manifest\":{},\"entry_hash\":\"zz\"}\n";
+        append_raw(&manifest_path_for(&active), forged);
+        let mut log = open_log(&active, &kp, 2000);
+        log.append(payload(12)).unwrap();
+        drop(log);
+        assert!(manifest_events(&active).iter().any(|e| matches!(e,
+            ManifestEvent::TornTailRepaired { role, .. } if role == "manifest")));
+        verify_manifest_evictions(&active, &pk).expect("manifest chain intact");
+        assert_eq!(
+            verify_log_set::<TestPayload>(&active, &pk)
+                .unwrap()
+                .total_records,
+            13
+        );
+    }
+
+    /// External audit NN-AUD-110: chain-shaped lines whose hash does not
+    /// recompute are cut and attested, within a bound; a longer run (a
+    /// schema or key problem, not a forged tail) is kept and attested, and
+    /// no recovery empties a file.
+    #[test]
+    fn hash_invalid_tail_lines_are_cut_within_a_bound() {
+        let forged = |i: u64| {
+            format!(
+                "{{\"ts\":\"x\",\"seq\":{i},\"data\":\"forged\",\"prev_hash\":\"{z}\",\"entry_hash\":\"{h:064x}\",\"agent_sig\":\"\"}}\n",
+                z = "0".repeat(64),
+                h = i + 1
+            )
+        };
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        // A short run is cut.
+        let a = dir.path().join("a.jsonl");
+        {
+            let mut log = open_log(&a, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        for i in 0..2 {
+            append_raw(&a, forged(i).as_bytes());
+        }
+        open_log(&a, &kp, 1 << 30).append(payload(3)).unwrap();
+        assert_eq!(
+            verify_log_set::<TestPayload>(&a, &pk)
+                .unwrap()
+                .total_records,
+            4
+        );
+        // A run past the bound is kept, not cut.
+        let b = dir.path().join("b.jsonl");
+        {
+            let mut log = open_log(&b, &kp, 1 << 30);
+            log.append(payload(0)).unwrap();
+        }
+        for i in 0..=(MAX_TAIL_REJECTS as u64) {
+            append_raw(&b, forged(i).as_bytes());
+        }
+        drop(open_log(&b, &kp, 1 << 30));
+        assert_eq!(data_lines(&b), MAX_TAIL_REJECTS + 2);
+        assert!(manifest_events(&b)
+            .iter()
+            .any(|e| matches!(e, ManifestEvent::TailUnverified { .. })));
+        // A file of nothing but such lines is never emptied.
+        let c = dir.path().join("c.jsonl");
+        fs::write(&c, forged(0) + &forged(1)).unwrap();
+        drop(open_log(&c, &kp, 1 << 30));
+        assert_eq!(data_lines(&c), 2);
+    }
+
+    /// External audit NN-AUD-110: an interrupted rotation completes into the
+    /// slot its verified terminator names (`this_seq`), not `next_seq`.
+    #[test]
+    fn an_interrupted_rotation_uses_the_terminator_this_seq() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let tail = {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            log.append(payload(0)).unwrap();
+            log.last_hash().to_string()
+        };
+        let term = TerminatorLine::sealed(
+            RotateTerminator {
+                fmt_ver: CHAINLOG_FMT_V2,
+                this_seq: 3,
+                next_seq: 4,
+                record_count: 1,
+                bytes: 0,
+            },
+            &key_at(&kp),
+            &tail,
+        )
+        .unwrap();
+        append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
+        drop(open_log(&active, &kp, 1 << 30));
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![3]);
+    }
+
+    /// External audit NN-AUD-115: a foreign file at the archive slot used to
+    /// skip the rename and then truncate the sealed active file.
+    #[test]
+    fn a_foreign_file_at_the_archive_slot_never_truncates_the_active() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let slot = archive_path(&active, 1);
+        let mut log = open_log(&active, &kp, 2000);
+        fs::write(&slot, b"foreign\n").unwrap();
+        let n = 8;
+        for i in 0..n {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        assert_eq!(
+            fs::read(&slot).unwrap(),
+            b"foreign\n",
+            "foreign entry untouched"
+        );
+        let seqs = list_archive_seqs(&active).unwrap();
+        assert!(
+            seqs.len() >= 2 && seqs[0] == 1,
+            "rotated past the slot: {seqs:?}"
+        );
+        let kept: usize = seqs[1..]
+            .iter()
+            .map(|&s| data_lines(&archive_path(&active, s)))
+            .sum::<usize>()
+            + data_lines(&active);
+        assert_eq!(kept as u64, n, "every signed record survives");
+        // The terminator names the slot the file really became.
+        let t: TerminatorLine = serde_json::from_str(
+            fs::read_to_string(archive_path(&active, seqs[1]))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(t.rotate.this_seq, seqs[1]);
+        // The foreign archive is still flagged by the verifier.
+        let pk = key_at(&kp).verifying_key();
+        assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
+    }
+
+    /// External audit NN-AUD-110: a newest archive with no usable
+    /// terminator (foreign file, or a forged non-hex hash) used to fail
+    /// `open`, or every append, at every boot.
+    #[test]
+    fn a_newest_archive_without_a_usable_terminator_does_not_block_the_log() {
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        for (name, body) in [
+            ("a.jsonl", "foreign\n".to_string()),
+            (
+                "b.jsonl",
+                "{\"rotate\":{},\"entry_hash\":\"b\"}\n".to_string(),
+            ),
+        ] {
+            let active = dir.path().join(name);
+            fs::write(archive_path(&active, 1), body).unwrap();
+            let mut log = open_log(&active, &kp, 1 << 30);
+            log.append(payload(0)).expect("appends must keep working");
+            drop(log);
+            assert!(manifest_events(&active)
+                .iter()
+                .any(|e| matches!(e, ManifestEvent::ForeignArchive { seq: 1, .. })));
+        }
+    }
+
+    /// External audit NN-AUD-115: the slot check is an lstat, and the rename
+    /// never replaces: a symlink at the slot is neither followed nor
+    /// overwritten, even when it appears after the seal (interrupted
+    /// rotation completed at open).
+    #[test]
+    fn a_symlink_at_the_slot_of_an_interrupted_rotation_is_left_alone() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let tail = {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+            log.last_hash().to_string()
+        };
+        let term = TerminatorLine::sealed(
+            RotateTerminator {
+                fmt_ver: CHAINLOG_FMT_V2,
+                this_seq: 1,
+                next_seq: 2,
+                record_count: 3,
+                bytes: 0,
+            },
+            &key_at(&kp),
+            &tail,
+        )
+        .unwrap();
+        append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        let slot = archive_path(&active, 1);
+        std::os::unix::fs::symlink(&victim, &slot).unwrap();
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(3)).unwrap();
+        drop(log);
+        assert!(fs::symlink_metadata(&slot)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        let archived = archive_path(&active, 2);
+        assert_eq!(data_lines(&archived), 3, "sealed file archived intact");
+        assert_eq!(data_lines(&active), 1);
+        assert!(manifest_events(&active).iter().any(|e| matches!(e,
+            ManifestEvent::ForeignArchive { seq: 1, entry_type, .. } if entry_type == "symlink")));
+    }
+
+    /// External audit NN-AUD-115: the fresh active is created with O_EXCL —
+    /// an existing file is not truncated and a symlink is not followed.
+    #[test]
+    fn fresh_active_is_created_exclusively() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join("existing");
+        fs::write(&existing, b"keep").unwrap();
+        assert!(create_fresh_active(&existing, 0o600).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(create_fresh_active(&link, 0o600).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(create_fresh_active(&dangling, 0o600).is_err());
+        assert!(!dir.path().join("nowhere").exists());
+        let fresh = dir.path().join("fresh");
+        create_fresh_active(&fresh, 0o600).unwrap();
+        assert_eq!(fs::metadata(&fresh).unwrap().len(), 0);
+    }
+
+    /// External audit NN-AUD-115: when the finish step fails after the seal,
+    /// the next append retries only the finish step; it used to seal again,
+    /// leaving two terminators in one file.
+    #[test]
+    fn a_failed_rename_does_not_seal_twice() {
+        struct FailOnce(std::sync::atomic::AtomicBool);
+        impl ProtectionManager for FailOnce {
+            fn with_mutable_dir(&self, f: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+                if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(anyhow!("simulated dance failure"));
+                }
+                f()
+            }
+            fn register_active(&self, _path: &Path) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let prot = std::sync::Arc::new(FailOnce(std::sync::atomic::AtomicBool::new(false)));
+        let mut log = open_log_with(&active, &kp, 2000, prot.clone());
+        let mut i = 0;
+        while log.active_bytes + 400 < 2000 {
+            log.append(payload(i)).unwrap();
+            i += 1;
+        }
+        prot.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            log.append(payload(i)).is_err(),
+            "the first finish step fails"
+        );
+        log.append(payload(i + 1)).unwrap();
+        drop(log);
+        let seqs = list_archive_seqs(&active).unwrap();
+        assert_eq!(seqs, vec![1]);
+        let terminators = fs::read_to_string(archive_path(&active, 1))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"rotate\""))
+            .count();
+        assert_eq!(terminators, 1, "sealed exactly once");
+        let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(report.total_records, i + 1);
     }
 }

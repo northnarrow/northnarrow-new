@@ -153,12 +153,12 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-107 | EBPF-015 | eBPF kernel | M | open |
 | NN-AUD-108 | EVD-002 | Evidence logs | L | open |
 | NN-AUD-109 | EVD-003 | Evidence logs | M | open |
-| NN-AUD-110 | EVD-004 | Evidence logs | M | open |
+| NN-AUD-110 | EVD-004 | Evidence logs | M | fixed (lab PR 131) |
 | NN-AUD-111 | EVD-006 | Evidence logs | M | fixed (lab PR 130) |
 | NN-AUD-112 | EVD-009 | Evidence logs | M | open |
 | NN-AUD-113 | EVD-012 | Evidence logs | S | fixed (lab PR 130) |
 | NN-AUD-114 | EVD-013 | Evidence logs | M | fixed (lab PR 130) |
-| NN-AUD-115 | EVD-018 | Evidence logs | S | open |
+| NN-AUD-115 | EVD-018 | Evidence logs | S | fixed (lab PR 131) |
 | NN-AUD-116 | FIMR-007 | FIM rules | S | fixed (lab PR 111) |
 | NN-AUD-117 | FIMR-008 | FIM rules | M | fixed (lab PR 111) |
 | NN-AUD-118 | FIMR-009 | FIM rules | S | fixed (lab PR 111) |
@@ -2617,3 +2617,58 @@ the audit did not report, noted with the fix that takes them.
     re-reporting of NN-AUD-114 are covered by unit tests. Privileged gate:
     Ubuntu 24.04 and Debian 12, 29 suites, 79 passed, 0 failed each. The
     anti-tamper suite: OK. Host: 1821 passed, 0 failed.
+- **NN-AUD-110 (EVD-004), NN-AUD-115 (EVD-018), lab PR 131.** Opening and
+  rotating a signed chain log (`agent/src/chainlog.rs`; batch B4). Both need
+  a window in which the logs or the state directory are writable (the
+  `NoProtection` fallback, or the `+i` dance), but the damage was permanent.
+  - EVD-004: at open, the tail was any JSON line with a string `entry_hash`,
+    and a `rotate` key alone marked the file as sealed. One appended line
+    `{"rotate":{},"entry_hash":"b"}` forced a rotation and then failed every
+    append (`prev_hash not hex`), at every boot; a forged manifest tail
+    made `open` fail. A tail line now needs a 64-character lowercase hex
+    `entry_hash`, must decode as its line type and recompute to that hash
+    (signature checked with the agent's key); a line that fails is cut and
+    attested (`torn_tail_repaired`), the existing path. Only a terminator
+    that fully verifies completes an interrupted rotation, into its own
+    `this_seq`. Cautious choices: a line whose only fault is the signature
+    is kept and attested (`tail_unverified`), so a regenerated key does not
+    cut a line at every boot; at most 16 failing lines are cut, and never
+    all of a file (past that, a schema or key problem: kept, attested). A
+    newest archive with no usable terminator (foreign or forged) no longer
+    blocks the log: it is attested (`foreign_archive`) and the empty active
+    roots at GENESIS; the verifier still flags the archive.
+  - EVD-018: `finish_rotation` skipped the rename when the archive name
+    existed (`exists()` follows symlinks) and still opened the active with
+    `O_TRUNC`, destroying the sealed file and writing a `Rotated` row. The
+    slot is checked with `lstat` before sealing and an occupied one is
+    skipped; the rename is `renameat2(RENAME_NOREPLACE)` and moves to the
+    next free slot on `EEXIST`, leaving the foreign entry untouched and
+    attested (`foreign_archive`); the fresh active is created with
+    `O_CREAT|O_EXCL`. A finish step that fails after the seal (rename or
+    dance) is retried on the next append, or at open, without sealing
+    again (it used to write a second terminator into the same file).
+  - Two new manifest event kinds (`tail_unverified`, `foreign_archive`): an
+    older verifier reading a manifest that holds one fails to decode it.
+  - Tests: `a_non_hex_forged_tail_is_cut_and_attested`,
+    `a_rotate_key_on_a_non_terminator_does_not_rotate`,
+    `a_terminator_signed_by_another_key_does_not_rotate`,
+    `a_forged_manifest_tail_does_not_fail_open`,
+    `hash_invalid_tail_lines_are_cut_within_a_bound`,
+    `an_interrupted_rotation_uses_the_terminator_this_seq`,
+    `a_newest_archive_without_a_usable_terminator_does_not_block_the_log`,
+    `a_foreign_file_at_the_archive_slot_never_truncates_the_active`,
+    `a_symlink_at_the_slot_of_an_interrupted_rotation_is_left_alone`,
+    `fresh_active_is_created_exclusively`,
+    `a_failed_rename_does_not_seal_twice`; each fails with the fix
+    reverted. `interrupted_rotation_recovers_cleanly_on_open` and
+    `post_rename_crash_recovers_with_active_absent` stay green.
+  - Lab: none beyond the gate: the change is file logic in `chainlog.rs`,
+    covered by 11 unit tests on real anchored paths (forged tails —
+    non-hex, hash-mismatched, a forged manifest tail —, an archive slot
+    taken by a foreign file or a symlink, an interrupted rotation, the
+    exclusive creation of the fresh active file, a failed rename sealing
+    once); with the fixes reverted 10 of them fail. The state directory's
+    `chattr +i` dance is unchanged around the new `renameat2(
+    RENAME_NOREPLACE)` (with an lstat-then-rename fallback). Privileged
+    gate: Ubuntu 24.04 and Debian 12, 29 suites, 79 passed, 0 failed each.
+    The anti-tamper suite: OK. Host: 1822 passed, 0 failed.
