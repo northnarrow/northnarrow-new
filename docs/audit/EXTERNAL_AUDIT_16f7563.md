@@ -138,10 +138,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-092 | MAIN-007 | Agent main | M | narrowed, residual fixed (lab PR 118) |
 | NN-AUD-093 | MAIN-008 | Agent main | S | fixed (lab PR 118) |
 | NN-AUD-094 | ATP-003 | Anti-tamper | S | fixed (lab PR 114) |
-| NN-AUD-095 | ATP-005 | Anti-tamper | S | open |
+| NN-AUD-095 | ATP-005 | Anti-tamper | S | fixed (lab PR 136) |
 | NN-AUD-096 | ATP-008 | Anti-tamper | M | fixed (lab PR 113) |
 | NN-AUD-097 | ATP-009 | Anti-tamper | S | fixed (lab PR 112) |
-| NN-AUD-098 | ATP-010 | Anti-tamper | M | open |
+| NN-AUD-098 | ATP-010 | Anti-tamper | M | fixed (lab PR 136) |
 | NN-AUD-099 | ATP-012 | Anti-tamper | S | fixed (lab PR 114) |
 | NN-AUD-100 | ATP-013 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-101 | EBPF-004 | eBPF kernel | M | fixed (lab PR 112) |
@@ -228,7 +228,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-182 | XAI-013 | XAI and RAG | M | open |
 | NN-AUD-183 | XAI-018 | XAI and RAG | S | open |
 | NN-AUD-184 | SNS-001 | Sensors | M | fixed (lab PR 128) |
-| NN-AUD-185 | SNS-002 | Sensors | S | open |
+| NN-AUD-185 | SNS-002 | Sensors | S | fixed (lab PR 136) |
 | NN-AUD-186 | SNS-003 | Sensors | M | open |
 | NN-AUD-187 | SNS-005 | Sensors | S | open |
 | NN-AUD-188 | SNS-006 | Sensors | M | open |
@@ -2943,3 +2943,69 @@ the audit did not report, noted with the fix that takes them.
     (`fim_watch_map_full`). Privileged gate: Ubuntu 24.04 and Debian 12,
     29 suites, 80 passed, 0 failed each. The anti-tamper suite: OK. Host:
     1875 passed, 0 failed.
+- **NN-AUD-098 (ATP-010), NN-AUD-095 (ATP-005), NN-AUD-185 (SNS-002), lab
+  PR 136.** Inputs the agent trusted that root, an operator's typo or any
+  sender can shape (batch E). No kernel change.
+  - ATP-010: the tracepoint field offsets (exec filename, `sys_enter_*` in
+    tracepoint mode, io_uring) were read from whatever `/sys/kernel/tracing`
+    held. (a) A primary event whose format lacks the field now tries
+    `alt_event` (`continue`, was `break 'roots`). (b) A root is used only
+    if `statfs` says tracefs, and each `format` file only if `fstatfs` on
+    the open file does (a file bound over one `format` passes the root
+    check; tracefs has no links, the open uses `O_NOFOLLOW|O_NONBLOCK`).
+    `statfs` moved to `agent/src/fs_type.rs`, shared with the feasibility
+    report. A new self-integrity rule, `tracefs_mount`: anything at a
+    tracefs root that is not a whole tracefs, and any mount below one (a
+    tracefs file bound over another `format` passes `fstatfs`). (c) The
+    `size:` is parsed: a field must have the width the program reads
+    (`TracepointFieldSpec::size`, new), lie past the `common_*` header and
+    end within `TRACEPOINT_RECORD_MAX` = 512 bytes (the records read end by
+    byte 64 on 5.14 el9 to 6.8). (d) A field left on its compiled offset
+    (absent, refused, root skipped) is a signed `subsystem_degraded` once
+    the audit log opens; not fail-closed (review 35). A mount over an
+    ancestor (`/sys/kernel`) is not a `tracefs_mount`, but the roots below
+    it then fail (b).
+  - ATP-005: `validate_entry` refuses a prefix wider than `MIN_PREFIX_V4` =
+    /8 or `MIN_PREFIX_V6` = /48, and the unspecified or a multicast address
+    or network (`0.1.2.3/8` is the network `0.0.0.0/8`). Per line and
+    non-fatal as before (a narrower carve-out); `validate_content` refuses
+    it at `config overlay set|sign`. Regression: a carve-out signed before
+    loses such a line at engage with a WARN; `config overlay status` says
+    which ("N lines skipped at COMBAT engage", same line, install.sh reads
+    the first two words); CHANGELOG and COMBAT_RECOVERY say so. Module doc:
+    "a typo can only remove an ACCEPT" corrected; the IPv6 claim was
+    already fixed (CMB-015). Side finding: `trusted_allow` goes through the
+    gate whenever there is one (no `exists()` check before an ungated read).
+    The shipped `configs/combat-allow.cidrs` is unchanged (its bytes are the
+    built-in default).
+  - SNS-002: `decode_dns_qname` uses RFC 4343 numeric escapes: `.` in a
+    label is `\046`, `\` is `\092`, an unprintable byte `\DDD` (was `?`).
+    Distinct wire names decode distinct; ordinary names are unchanged.
+    Only abnormal names change (DnsCache key, `hash_qname`, `len()`). Not
+    done: the optional Log-level signal for a dotted label (the escaped
+    label already reads as one long label to NET-004/014 and `looks_dga`).
+  - Tests: `alt_event_tried_when_primary_lacks_field`,
+    `non_tracefs_root_is_skipped`, `offset_beyond_record_is_rejected`,
+    `format_file_on_another_filesystem_is_rejected`,
+    `stock_layouts_pass_the_plausibility_checks`,
+    `mount_findings_flags_tmpfs_over_tracefs`,
+    `rejects_prefixes_below_the_floor`, `rejects_unspecified_and_multicast`,
+    `wide_carveout_refused_at_signing`,
+    `missing_allow_file_is_never_read_ungated`,
+    `decode_escapes_dot_inside_label`, `distinct_wire_names_decode_distinct`,
+    `ordinary_names_unchanged`. With each fix reverted the matching test
+    fails (`ordinary_names_unchanged` and the stock-layout test are guards
+    and pass on both).
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `tracefs136-probe.sh` variant c: a
+    forged `io_uring_create/format` (sq_entries offset 24 → 28, benign)
+    bind-mounted over the real one, the agent restarted. Before (main):
+    "tracepoint field offset resolved from tracefs … compiled=24
+    runtime=28" and nothing in the audit log — the forged offset was used.
+    After: no runtime=28 (the bound file refused by fstatfs, the debug root
+    answering) and a signed `integrity_drift` `tracefs_mount` naming the
+    file. (Variant a — a tmpfs over the whole tracefs root — also stops the
+    tracepoints from attaching, on main and after: the agent does not
+    start; recorded, not a regression.) The carve-out prefix floor and the
+    DNS escapes are covered by unit tests. Privileged gate: Ubuntu 24.04
+    and Debian 12, 29 suites, 80 passed, 0 failed each. The anti-tamper
+    suite: OK. Host: 1877 passed, 0 failed.

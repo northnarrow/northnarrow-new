@@ -398,7 +398,8 @@ impl NetworkIsolator {
             warn!(
                 allow_file = %self.allow_cidrs_path.display(),
                 reject = %w,
-                "COMBAT carve-out: skipping malformed allow entry (fail-secure — entry ignored)"
+                "COMBAT carve-out: skipping an allow entry, malformed or too wide (fail-secure — \
+                 entry ignored; external audit NN-AUD-095)"
             );
         }
         // BUG-031: IPv6 carve-out entries are no longer inert — they are
@@ -436,9 +437,15 @@ impl NetworkIsolator {
 
     /// The management carve-out, vouched for like the rulesets: an
     /// unsigned change spares no network (the built-in list is empty).
+    ///
+    /// External audit NN-AUD-095: with a gate, the file is read only
+    /// through it. A file absent at an `exists()` check used to be read
+    /// ungated, so one created between the check and the read was applied
+    /// unsigned; the gate already answers a missing file with the built-in
+    /// list.
     fn trusted_allow(&self) -> combat_allow::AllowLoad {
         use common::wire::admin_signed_payload::OverlayKind;
-        if self.gate.is_none() || !self.allow_cidrs_path.exists() {
+        if self.gate.is_none() {
             return combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
         }
         let text = self.trusted_source(
@@ -930,6 +937,46 @@ mod tests {
         assert!(validate_ruleset("*filter\n:NORTHNARROW_COMBAT - [0:0]\nCOMMIT\n").is_err());
     }
 
+    /// External audit NN-AUD-095: with a gate, a carve-out file that is
+    /// missing is answered by the gate (the built-in, empty list), not by
+    /// the ungated loader — whose read would apply a file created after
+    /// the old `exists()` check without a signature. The ungated loader's
+    /// mark is its `read_error` for the missing file.
+    #[test]
+    fn missing_allow_file_is_never_read_ungated() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        std::fs::write(&admin_pub, format!("{} config-manage\n", "00".repeat(32))).unwrap();
+        let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
+            &admin_pub,
+            [1; 16],
+            crate::config::overlay_floor::RollbackFloor::default(),
+        ));
+        let allow = dir.path().join("combat-allow.cidrs");
+        let ungated = NetworkIsolator::new_with_bin(
+            combat_rules_path(),
+            PathBuf::from("/usr/bin/cat"),
+            PathBuf::from("/bin/true"),
+        )
+        .unwrap()
+        .with_allow_cidrs_path(allow.clone());
+        assert!(
+            ungated.trusted_allow().read_error.is_some(),
+            "without a gate the file is read directly"
+        );
+        let gated = ungated.with_overlay_gate(gate);
+        let load = gated.trusted_allow();
+        assert!(
+            load.read_error.is_none(),
+            "read outside the gate: {:?}",
+            load.read_error
+        );
+        assert!(load.entries.is_empty() && load.warnings.is_empty());
+        // and once the file appears, unsigned, it spares nothing either
+        std::fs::write(&allow, "203.0.113.0/24\n").unwrap();
+        assert!(gated.trusted_allow().entries.is_empty());
+    }
+
     #[test]
     fn engage_is_idempotent_with_mock_bin() {
         // /usr/bin/cat reads stdin to EOF and exits 0 — a faithful
@@ -1089,7 +1136,7 @@ mod tests {
         };
         // Point the isolator at a temp allow file with one v4 CIDR.
         let tmp = std::env::temp_dir().join(format!("nn-allow-{}.cidrs", std::process::id()));
-        std::fs::write(&tmp, "# mgmt\n10.10.0.0/16\n2001:db8::/32\n").unwrap();
+        std::fs::write(&tmp, "# mgmt\n10.10.0.0/16\n2001:db8::/48\n").unwrap();
         let iso = iso.with_allow_cidrs_path(tmp.clone());
         let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
         assert_eq!(

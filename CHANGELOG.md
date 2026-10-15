@@ -15,6 +15,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, inputs trusted but forgeable (Medium ATP-010,
+  ATP-005, SNS-002): the tracepoint field offsets came from whatever was
+  mounted at `/sys/kernel/tracing` — a tmpfs over it, or a file bound over
+  one `format`, chose where the exec, open and io_uring tracepoint sensors
+  read, silently. A root and each file are now used only on tracefs; a
+  field must have the width the sensor reads, lie past the common header
+  and end within 512 bytes; a field missing from the io_uring submit event
+  now tries its other name. A field left on its compiled offset is a
+  signed `subsystem_degraded`, and a mount over or under the tracefs roots
+  a signed `integrity_drift` (`tracefs_mount`). The COMBAT carve-out took
+  any prefix: `10.0.0.0/0`, a typo for `/8`, spared every address and
+  COMBAT isolated nothing. A line wider than /8 (IPv4) or /48 (IPv6), or
+  naming the unspecified or a multicast address, is now skipped with a
+  WARN and refused by `config overlay set|sign`; with the overlay gate, a
+  carve-out file missing at a check is no longer read unsigned a moment
+  later. **Regression:** a signed carve-out with such a line loses that
+  line at the next COMBAT engage; `nn-admin config overlay status` names
+  it. A `.` inside a DNS label read as a separator, so one label passed for
+  several or spelled a well-known host: query names now use RFC 4343
+  escapes (`\046`, `\092`, `\DDD` for unprintable bytes, which were all
+  `?`); ordinary names are unchanged.
 - External audit, Wave 2, FIM watch set (Medium FIMP-007, FIMP-008,
   FIMP-010, FIMP-009): the FIM drain's retry queues had no cap and no
   de-duplication, and their pass (one `stat` per entry, under a lock, on a

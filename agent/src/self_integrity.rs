@@ -314,8 +314,9 @@ pub fn unit_shadows(roots: &[&Path]) -> Vec<Finding> {
     out
 }
 
-/// Mounts in a `mountinfo` text that cover a protected path, or a bpffs
-/// outside the canonical root.
+/// Mounts in a `mountinfo` text that cover a protected path, a bpffs
+/// outside the canonical root, or the tracefs the agent reads its
+/// tracepoint offsets from.
 pub fn mount_findings(mountinfo: &str, extra_files: &[String]) -> Vec<Finding> {
     let mut out = Vec::new();
     for line in mountinfo.lines() {
@@ -343,9 +344,29 @@ pub fn mount_findings(mountinfo: &str, extra_files: &[String]) -> Vec<Finding> {
                 kind: "bpffs_mount",
                 detail: mp,
             });
+        } else if covers_tracefs(&mp, root, fstype) {
+            out.push(Finding {
+                kind: "tracefs_mount",
+                detail: format!("{mp} ({fstype}, source root {root})"),
+            });
         }
     }
     out
+}
+
+/// External audit NN-AUD-098: a mount that changes what the agent reads
+/// at a tracefs root (`btf_revalidate::TRACEFS_ROOTS`) — anything but a
+/// whole tracefs at the root itself, or anything mounted below it (a file
+/// over one `format`, even from tracefs). The offsets the tracepoint
+/// sensors read come from there at the next start.
+fn covers_tracefs(mp: &str, source_root: &str, fstype: &str) -> bool {
+    crate::anti_tamper::btf_revalidate::TRACEFS_ROOTS
+        .iter()
+        .any(|r| match mp.strip_prefix(r) {
+            Some("") => fstype != "tracefs" || source_root != "/",
+            Some(rest) => rest.starts_with('/'),
+            None => false,
+        })
 }
 
 fn unescape(s: &str) -> String {
@@ -1178,6 +1199,42 @@ mod tests {
         assert!(kinds[3]
             .1
             .starts_with("/etc/systemd/system/northnarrow-agent.service"));
+    }
+
+    /// External audit NN-AUD-098: the tracefs a stock host mounts (and the
+    /// debugfs automount) is not drift; a tmpfs over it, a file mounted
+    /// over one `format`, or a tracefs subtree bound at the root is.
+    #[test]
+    fn mount_findings_flags_tmpfs_over_tracefs() {
+        let mi = "\
+24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+35 23 0:12 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:17 - tracefs tracefs rw
+36 23 0:7 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:18 - debugfs debugfs rw
+37 36 0:12 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:19 - tracefs tracefs rw
+95 35 0:60 / /sys/kernel/tracing rw,relatime shared:60 - tmpfs tmpfs rw
+96 35 0:61 /f /sys/kernel/tracing/events/sched/sched_process_exec/format rw shared:61 - tmpfs tmpfs rw
+97 37 0:12 /instances/x /sys/kernel/debug/tracing rw shared:62 - tracefs tracefs rw
+98 24 8:1 / /sys/kernel/tracing-not rw shared:63 - ext4 /dev/sda1 rw
+";
+        let f = mount_findings(mi, &[]);
+        let kinds: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    "tracefs_mount",
+                    "/sys/kernel/tracing (tmpfs, source root /)"
+                ),
+                (
+                    "tracefs_mount",
+                    "/sys/kernel/tracing/events/sched/sched_process_exec/format (tmpfs, source root /f)"
+                ),
+                (
+                    "tracefs_mount",
+                    "/sys/kernel/debug/tracing (tracefs, source root /instances/x)"
+                ),
+            ]
+        );
     }
 
     #[test]

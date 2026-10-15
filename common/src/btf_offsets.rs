@@ -1371,6 +1371,10 @@ pub struct TracepointFieldSpec {
     /// tracepoint `io_uring_submit_sqe` → `io_uring_submit_req`; RHEL 9
     /// backported the new name onto 5.14.
     pub alt_event: &'static str,
+    /// External audit NN-AUD-098: the field's width in bytes, the one the
+    /// eBPF program reads (`read_at::<T>`). A `format` file that gives
+    /// another width is not used: the compiled offset stays.
+    pub size: u32,
 }
 
 /// The tracepoint fields read with a fixed offset in `agent-ebpf`.
@@ -1382,6 +1386,8 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "filename",
         compiled: TP_SCHED_EXEC_FILENAME_OFFSET as u32,
         alt_event: "",
+        // the `__data_loc` word
+        size: 4,
     },
     TracepointFieldSpec {
         name: "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET",
@@ -1390,6 +1396,8 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "filename",
         compiled: TP_SYS_ENTER_EXECVE_FILENAME_OFFSET as u32,
         alt_event: "",
+        // a syscall argument is 8 bytes in tracefs, whatever its C type
+        size: 8,
     },
     TracepointFieldSpec {
         name: "TP_SYS_ENTER_OPENAT_FILENAME_OFFSET",
@@ -1398,6 +1406,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "filename",
         compiled: TP_SYS_ENTER_OPENAT_FILENAME_OFFSET as u32,
         alt_event: "",
+        size: 8,
     },
     TracepointFieldSpec {
         name: "TP_SYS_ENTER_OPENAT_FLAGS_OFFSET",
@@ -1406,6 +1415,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "flags",
         compiled: TP_SYS_ENTER_OPENAT_FLAGS_OFFSET as u32,
         alt_event: "",
+        size: 8,
     },
     // io_uring (Tappa 10.8, the blind channel): opcode and sq_thread of a
     // submission, fd / sq_entries / flags of a ring creation. Compiled
@@ -1418,6 +1428,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "opcode",
         compiled: TP_IOURING_SUBMIT_OPCODE_OFFSET as u32,
         alt_event: "io_uring_submit_sqe",
+        size: 1,
     },
     TracepointFieldSpec {
         name: "TP_IOURING_SUBMIT_SQ_THREAD_OFFSET",
@@ -1426,6 +1437,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "sq_thread",
         compiled: TP_IOURING_SUBMIT_SQ_THREAD_OFFSET as u32,
         alt_event: "io_uring_submit_sqe",
+        size: 1,
     },
     TracepointFieldSpec {
         name: "TP_IOURING_CREATE_FD_OFFSET",
@@ -1434,6 +1446,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "fd",
         compiled: TP_IOURING_CREATE_FD_OFFSET as u32,
         alt_event: "",
+        size: 4,
     },
     TracepointFieldSpec {
         name: "TP_IOURING_CREATE_SQ_ENTRIES_OFFSET",
@@ -1442,6 +1455,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "sq_entries",
         compiled: TP_IOURING_CREATE_SQ_ENTRIES_OFFSET as u32,
         alt_event: "",
+        size: 4,
     },
     TracepointFieldSpec {
         name: "TP_IOURING_CREATE_FLAGS_OFFSET",
@@ -1450,6 +1464,7 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
         field: "flags",
         compiled: TP_IOURING_CREATE_FLAGS_OFFSET as u32,
         alt_event: "",
+        size: 4,
     },
 ];
 

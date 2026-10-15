@@ -714,6 +714,10 @@ async fn main() -> Result<()> {
     northnarrow_agent::sensors::ebpf_object::preflight()
         .context("eBPF object boot preflight failed — refusing to start")?;
 
+    // External audit NN-AUD-098: tracepoint fields left on their compiled
+    // offset, attested once the audit log is open.
+    let mut tracepoint_degraded: Option<String> = None;
+
     // BUG-036: revalidate every compiled-in kernel struct offset against
     // the RUNNING kernel's BTF before attaching any program. aya-ebpf has
     // no CO-RE, so these offsets are baked into the eBPF half; if the
@@ -782,6 +786,14 @@ async fn main() -> Result<()> {
                     "tracepoint field offset resolved from tracefs — differs from the build kernel"
                 );
             }
+            for (root, reason) in &tp.skipped_roots {
+                warn!(
+                    root = %root,
+                    reason = %reason,
+                    "tracefs root not used for tracepoint offsets — the filesystem there is not \
+                     tracefs (external audit NN-AUD-098)"
+                );
+            }
             for (name, reason) in &tp.unresolved {
                 warn!(
                     offset = name,
@@ -790,6 +802,7 @@ async fn main() -> Result<()> {
                      with a different tracepoint header the exec/open sensors read wrong bytes"
                 );
             }
+            tracepoint_degraded = tp.degraded_detail();
             r.values.extend(tp.values);
             publish_resolved(r);
         }
@@ -2126,6 +2139,9 @@ async fn main() -> Result<()> {
     );
     if legacy_isolation_removed {
         attest_legacy_isolation_removed(audit_log.as_ref());
+    }
+    if let Some(detail) = &tracepoint_degraded {
+        attest_degraded(audit_log.as_ref(), detail);
     }
     // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
     // without what the socket-buffer programs need, or `--dns-sensor

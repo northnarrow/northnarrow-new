@@ -2414,9 +2414,10 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                         signed_ts, key_fps, ..
                     } => {
                         println!(
-                            "{:<24} signed (ts {signed_ts}, keys {})",
+                            "{:<24} signed (ts {signed_ts}, keys {}){}",
                             kind.keyword(),
-                            key_fps.join(",")
+                            key_fps.join(","),
+                            carveout_lines_dropped(kind, &path)
                         )
                     }
                     Decision::Refused { reason, .. } => {
@@ -2441,6 +2442,32 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
+    }
+}
+
+/// External audit NN-AUD-095: a carve-out signed before the prefix floor
+/// keeps its signature, but COMBAT skips each line the floor refuses —
+/// said here, on the same status line (install.sh reads its first two
+/// words).
+fn carveout_lines_dropped(
+    kind: common::wire::admin_signed_payload::OverlayKind,
+    path: &std::path::Path,
+) -> String {
+    if kind != common::wire::admin_signed_payload::OverlayKind::CombatAllow {
+        return String::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let load = northnarrow_agent::anti_tamper::combat_allow::parse_allow_text(&text);
+    match load.warnings.as_slice() {
+        [] => String::new(),
+        [only] => format!(" — 1 line skipped at COMBAT engage: {only}"),
+        [first, rest @ ..] => format!(
+            " — {} lines skipped at COMBAT engage: {first} (and {} more)",
+            rest.len() + 1,
+            rest.len()
+        ),
     }
 }
 

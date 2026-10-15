@@ -881,6 +881,15 @@ impl From<&DnsQueryRaw> for Event {
 /// returned with a trailing `…`. Compression doesn't appear in
 /// outbound queries from glibc/getaddrinfo, so this is fine for
 /// Tappa 4 telemetry.
+///
+/// External audit NN-AUD-185: a label may hold any byte, `.` included.
+/// Copied verbatim, one label read as several (the label `a.b` as the
+/// labels `a` and `b`, a whole well-known host name in one label), and
+/// every unprintable byte became the same `?`. Distinct names on the wire
+/// now decode to distinct strings, in the presentation form of RFC 4343
+/// §2.1: `.` inside a label is `\046`, `\` is `\092`, a byte outside
+/// printable ASCII is `\DDD` (decimal). Numeric, not `\.`: the consumers
+/// split on `.`. Ordinary names are unchanged.
 pub fn decode_dns_qname(buf: &[u8]) -> String {
     let mut out = String::new();
     for label in QnameLabels::new(buf) {
@@ -891,11 +900,11 @@ pub fn decode_dns_qname(buf: &[u8]) -> String {
                     out.push('.');
                 }
                 for &b in bytes {
-                    out.push(if (32..127).contains(&b) {
-                        b as char
+                    if (32..=126).contains(&b) && b != b'.' && b != b'\\' {
+                        out.push(b as char);
                     } else {
-                        '?'
-                    });
+                        out.push_str(&format!("\\{b:03}"));
+                    }
                 }
             }
         }
@@ -1038,6 +1047,90 @@ mod tests {
         assert_eq!(decode_dns_qname(buf), "");
     }
 
+    /// External audit NN-AUD-185: a `.` inside a label is not a separator —
+    /// the consumers that split on `.` see one long label, as on the wire.
+    #[test]
+    fn decode_escapes_dot_inside_label() {
+        let buf = b"\x18aaaa.bbbb.cccc.dddd.eeee\x07example\x03com\x00";
+        let name = decode_dns_qname(buf);
+        assert_eq!(name, "aaaa\\046bbbb\\046cccc\\046dddd\\046eeee.example.com");
+        let first = name.split('.').next().unwrap();
+        assert!(first.len() >= 20, "{first}");
+        assert_eq!(name.split('.').count(), 3);
+        // one label spelling a well-known host does not read as that host
+        let spoof = decode_dns_qname(b"\x0dlogin.bank.io\x08attacker\x03net\x00");
+        assert_eq!(spoof, "login\\046bank\\046io.attacker.net");
+        assert!(!spoof.starts_with("login.bank.io"));
+    }
+
+    /// External audit NN-AUD-185: distinct wire names decode to distinct
+    /// strings — dots, backslashes and unprintable bytes inside labels
+    /// included (every name of up to two labels of one or two bytes over
+    /// an alphabet of such bytes).
+    #[test]
+    fn distinct_wire_names_decode_distinct() {
+        assert_ne!(
+            decode_dns_qname(b"\x03a.b\x03com\x00"),
+            decode_dns_qname(b"\x01a\x01b\x03com\x00")
+        );
+        assert_ne!(
+            decode_dns_qname(b"\x02a\x01\x00"),
+            decode_dns_qname(b"\x02a\x02\x00")
+        );
+        assert_ne!(
+            decode_dns_qname(b"\x05a\\046\x00"),
+            decode_dns_qname(b"\x02a.\x00")
+        );
+        let alphabet = [b'a', b'.', b'\\', b'0', b'4', 0x01, 0x7f, 0xff];
+        let mut labels: Vec<Vec<u8>> = alphabet.iter().map(|&b| vec![b]).collect();
+        for &x in &alphabet {
+            for &y in &alphabet {
+                labels.push(vec![x, y]);
+            }
+        }
+        let mut seen = std::collections::HashMap::new();
+        let mut names: Vec<Vec<Vec<u8>>> = labels.iter().map(|l| vec![l.clone()]).collect();
+        for a in &labels {
+            for b in &labels {
+                names.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        for name in names {
+            let mut wire = Vec::new();
+            for l in &name {
+                wire.push(l.len() as u8);
+                wire.extend_from_slice(l);
+            }
+            wire.push(0);
+            let decoded = decode_dns_qname(&wire);
+            if let Some(other) = seen.insert(decoded.clone(), name.clone()) {
+                panic!("{name:?} and {other:?} both decode to {decoded:?}");
+            }
+        }
+    }
+
+    /// External audit NN-AUD-185: the escapes touch only what a stub
+    /// resolver never sends.
+    #[test]
+    fn ordinary_names_unchanged() {
+        for (wire, name) in [
+            (&b"\x03www\x07example\x03com\x00"[..], "www.example.com"),
+            (
+                b"\x04_sip\x04_tcp\x07example\x03org\x00",
+                "_sip._tcp.example.org",
+            ),
+            (b"\x0dxn--bcher-kva\x07example\x00", "xn--bcher-kva.example"),
+            (b"\x03a-b\x03c_d\x01e\x00", "a-b.c_d.e"),
+            (
+                b"\x011\x010\x03168\x03192\x07in-addr\x04arpa\x00",
+                "1.0.168.192.in-addr.arpa",
+            ),
+            (b"\x07example\x03com", "example.com"),
+        ] {
+            assert_eq!(decode_dns_qname(wire), name);
+        }
+    }
+
     #[test]
     fn decode_dns_qname_handles_compression_pointer_gracefully() {
         // Label "ns" then a compression pointer (bit 0xC0 set).
@@ -1168,7 +1261,9 @@ mod tests {
         let raw = skb_raw(b"\x05ab\x00cd\x04evil\x00\x00\x01\x00\x01");
         assert_eq!(
             dns_fields(Event::from(&raw)),
-            ("ab?cd.evil".into(), 1, false)
+            // External audit NN-AUD-185: `\000`, not a `?` shared by every
+            // unprintable byte
+            ("ab\\000cd.evil".into(), 1, false)
         );
     }
 
