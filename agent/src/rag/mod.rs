@@ -30,7 +30,9 @@
 //! transition** path. The production path is the deterministic BM25
 //! index ([`index_tantivy`]) over the pinned canonical KB (MITRE
 //! ATT&CK v18.1 + SigmaHQ Linux, acquired by `cargo xtask rag-kb`)
-//! **plus** the retained 6.7 [`kb_seed`] notes. The swap is behind the
+//! **plus** the retained 6.7 [`kb_seed`] notes, opened only when the
+//! dumps match the manifest built into the binary ([`kb_manifest`]) and
+//! indexed in memory at every start. The swap is behind the
 //! unchanged [`RagEngine`] / [`RagQuery`] / `RagResult` API (plan §0):
 //! [`RagEngine::with_seed`] = legacy embedding; [`RagEngine::open_index`]
 //! = BM25. `rag: None` still reproduces pre-6.7 behaviour byte-for-byte
@@ -48,17 +50,22 @@ pub mod bench;
 pub mod canary;
 pub mod embedder;
 pub mod index_tantivy;
+pub mod kb_manifest;
 pub mod kb_seed;
 pub mod retrieval;
 pub mod store;
 
 pub use bench::{golden_cases, run_bench, run_golden, BenchReport, GoldenReport, LatencyStats};
-pub use canary::{env_rag_enabled, env_truthy, open_index_from_env, rag_canary};
+pub use canary::{
+    env_rag_enabled, env_truthy, open_index_from_env, rag_canary, rag_canary_with_manifest,
+    RagCanary,
+};
 pub use embedder::{cosine_similarity, RagEmbedder};
 pub use index_tantivy::{
-    analyze, bm25_query, bm25_search, build_index, load_records, open_or_build, source_fingerprint,
-    Bm25Hit, CanonLine, SEC_ANALYZER,
+    analyze, bm25_query, bm25_search, build_index_in_ram, load_verified_records,
+    source_fingerprint, Bm25Hit, CanonLine, SEC_ANALYZER,
 };
+pub use kb_manifest::{KbManifest, KbRefusal};
 pub use retrieval::{RagEngine, RagQuery, DEFAULT_MIN_SIMILARITY, DEFAULT_TOP_K};
 pub use store::{RagStore, StoreHit};
 

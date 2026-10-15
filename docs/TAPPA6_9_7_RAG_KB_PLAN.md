@@ -257,6 +257,15 @@ A P2 unit test locks this with fixture digests (tamper-sensitive, like
    ingested alongside the P2 JSONL dumps. (The 6.7 seed retains an
    in-repo curated `lolbas_certutil`-style note — that is the
    repo-licensed seed, NOT the dropped GPL-3.0 LOLBAS upstream.)
+   **Superseded (external audit XAI-002, lab PR 145):** the on-disk
+   index was opened whenever its marker matched, and the marker is
+   public, so a planted index was served as is. The index is now built
+   in memory at every open from the verified dumps (about 0.4 s at
+   agent start); `NN_ADE_RAG_INDEX_DIR` is ignored with a WARN. The
+   source fingerprint stays, as the corpus identity bound into the XAI
+   `environment_hash` (XAI-010). The dumps themselves are opened only
+   when they match `docs/kb-sources/kb_index.json`, built into the
+   agent (XAI-001/XAI-009).
 
 Validated end-to-end: real-corpus smoke over 964 records (691 ATT&CK
 v18.1 + 243 Sigma Linux + 30 seed) — the owner's 5 golden queries all
@@ -625,6 +634,24 @@ retrieval log is a Tappa 13 deliverable referenced in P7 docs
 closeout as a follow-on.
 
 <<<END VERBATIM>>>
+
+> **Correction to pillar 1 (external audit XAI-018, lab PR 145,
+> 2026-10-15).** Since P5.1 (§5.2.1) the prompt carries the compact
+> `RAG_CONTEXT:` block — one line per retrieved document with its title
+> and, for a Sigma rule, its severity — not the
+> `=== RELEVANT CYBERSEC KNOWLEDGE ===` block with document text.
+> `prompt_sha256` therefore commits exactly what retrieval put in front
+> of the model (titles and Sigma severities), not the snippets: which
+> documents were retrieved, and their bodies, are not in the chain.
+> Per-document identity stays the Tappa 13 log's job (pillar 3), and
+> Art. 13(3)(c) is covered only in part until then. The loaded corpus
+> is now bound ex ante: the agent opens only the dumps pinned by
+> `docs/kb-sources/kb_index.json` (built into the binary; external audit
+> XAI-001/XAI-009), rebuilds the index in memory at every start
+> (XAI-002), and `environment_hash` includes the loaded corpus
+> fingerprint (XAI-010). Dossier §8 has the full text. A per-line
+> digest in the block was declined: the line shape is the training
+> contract of §5.2.1. Option A (XAI 1.0.0) is unchanged.
 
 ### 5.2 AS BUILT (P5) — Option A confirmed + Q4(a) format freeze
 

@@ -688,15 +688,20 @@ async fn with_rag_splices_block_into_assembled_prompt() {
     // Fixture KB whose content matches the ProcessSpawn-derived rag
     // query ("process {comm} from {filename}").
     let jl = tempfile::tempdir().unwrap();
-    std::fs::write(
-        jl.path().join("fix.jsonl"),
-        "{\"author\":null,\"category\":\"mitre_technique\",\"content\":\"zqxjproc suspicious process technique\",\"id\":\"attack:T9999\",\"platform\":\"\",\"severity\":\"\",\"source_ref\":\"attack:T9999\",\"title\":\"ZQXJ Proc\"}\n",
-    )
-    .unwrap();
-    let ix = tempfile::tempdir().unwrap();
-    let rag =
-        super::super::rag::rag_canary(true, jl.path(), ix.path()).expect("valid paths ⇒ Some");
+    let dump = "{\"author\":null,\"category\":\"mitre_technique\",\"content\":\"zqxjproc suspicious process technique\",\"id\":\"attack:T9999\",\"platform\":\"\",\"severity\":\"\",\"source_ref\":\"attack:T9999\",\"title\":\"ZQXJ Proc\"}\n";
+    std::fs::write(jl.path().join("fix.jsonl"), dump).unwrap();
+    let manifest = super::super::rag::KbManifest::for_dumps(&[("fix.jsonl", dump.as_bytes())]);
+    let rag = super::super::rag::rag_canary_with_manifest(true, jl.path(), &manifest)
+        .into_engine()
+        .expect("pinned fixture ⇒ Some");
+    let fingerprint = rag.corpus_fingerprint().to_string();
+    assert!(
+        engine.rag_fingerprint().is_none(),
+        "no RAG ⇒ no fingerprint"
+    );
     let engine = engine.with_rag(Arc::new(rag));
+    // External audit XAI-010: the XAI environment_hash reads it here.
+    assert_eq!(engine.rag_fingerprint(), Some(fingerprint.as_str()));
 
     let event = Event::ProcessSpawn {
         pid: 4242,

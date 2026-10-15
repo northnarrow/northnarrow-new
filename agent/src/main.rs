@@ -1528,6 +1528,9 @@ async fn main() -> Result<()> {
         "response executor ready (KillProcess + KillProcessTree active)"
     );
 
+    // External audit XAI-001/XAI-009: a RAG canary refused at the ADE load
+    // (corpus missing or altered) is recorded once the audit log is open.
+    let mut rag_refused: Option<String> = None;
     let ade_engine = if cli.no_ade {
         info!("ADE disabled by --no-ade");
         None
@@ -1571,7 +1574,7 @@ async fn main() -> Result<()> {
                 if let AdeMemCheck::Unknown { reason } = &check {
                     warn!(%reason, "ADE memory pre-check inconclusive; attempting load anyway");
                 }
-                load_ade_engine(cfg).await
+                load_ade_engine(cfg, &mut rag_refused).await
             }
         }
     };
@@ -2224,6 +2227,9 @@ async fn main() -> Result<()> {
     // External audit NET-009: the JA3 list with no producer (see its load).
     if let Some(gap) = &ja3_gap {
         attest_degraded(audit_log.as_ref(), gap);
+    }
+    if let Some(detail) = &rag_refused {
+        attest_degraded(audit_log.as_ref(), detail);
     }
     // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
     // without what the socket-buffer programs need, or `--dns-sensor
@@ -4362,7 +4368,8 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
 
 /// Construct the single shared [`AdeEngine`], applying the optional
 /// env-driven RAG overlay. Returns `None` (rule-only fallback) if the
-/// model fails to load.
+/// model fails to load. A RAG canary that was requested but refused
+/// leaves its reason in `rag_refused`, for the signed audit log.
 ///
 /// Sub-tappa 6.8 audit: this is the ONLY `AdeEngine::new` call in the
 /// agent's hot path — model weights, tokenizer, KV state machine and
@@ -4371,7 +4378,10 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
 /// clone). Any future change that constructs a new engine inside the
 /// event loop would silently re-pay the ~5 GiB GGUF mmap and the
 /// warmup pass, so guard this invariant in review.
-async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
+async fn load_ade_engine(
+    cfg: AdeConfig,
+    rag_refused: &mut Option<String>,
+) -> Option<Arc<AdeEngine>> {
     match AdeEngine::new(cfg).await {
         Ok(engine) => {
             info!(
@@ -4385,7 +4395,10 @@ async fn load_ade_engine(cfg: AdeConfig) -> Option<Arc<AdeEngine>> {
             // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
             // graceful no-RAG fallback). Uses the existing 6.7
             // `with_rag` seam; logging is inside `open_index_from_env`.
-            let engine = match northnarrow_agent::rag::open_index_from_env() {
+            // External audit XAI-001/XAI-009: only the pinned corpus opens.
+            let canary = northnarrow_agent::rag::open_index_from_env();
+            *rag_refused = canary.refusal().map(str::to_string);
+            let engine = match canary.into_engine() {
                 Some(rag) => engine.with_rag(Arc::new(rag)),
                 None => engine,
             };

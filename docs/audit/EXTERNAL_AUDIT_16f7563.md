@@ -218,15 +218,15 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-172 | DEC-010 | Deception | M | fixed (lab PR 143) |
 | NN-AUD-173 | DEC-011 | Deception | M | fixed (lab PR 143) |
 | NN-AUD-174 | DEC-018 | Deception | L | open |
-| NN-AUD-175 | XAI-001 | XAI and RAG | M | open |
-| NN-AUD-176 | XAI-002 | XAI and RAG | M | open |
+| NN-AUD-175 | XAI-001 | XAI and RAG | M | fixed (lab PR 145) |
+| NN-AUD-176 | XAI-002 | XAI and RAG | M | fixed (lab PR 145) |
 | NN-AUD-177 | XAI-004 | XAI and RAG | S | fixed (lab PR 144) |
 | NN-AUD-178 | XAI-005 | XAI and RAG | M | fixed (lab PR 144) |
-| NN-AUD-179 | XAI-009 | XAI and RAG | S | open |
-| NN-AUD-180 | XAI-010 | XAI and RAG | S | open |
+| NN-AUD-179 | XAI-009 | XAI and RAG | S | fixed (lab PR 145) |
+| NN-AUD-180 | XAI-010 | XAI and RAG | S | fixed (lab PR 145) |
 | NN-AUD-181 | XAI-011 | XAI and RAG | S | fixed (lab PR 144) |
 | NN-AUD-182 | XAI-013 | XAI and RAG | M | fixed (lab PR 144) |
-| NN-AUD-183 | XAI-018 | XAI and RAG | S | open |
+| NN-AUD-183 | XAI-018 | XAI and RAG | S | fixed (lab PR 145) |
 | NN-AUD-184 | SNS-001 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-185 | SNS-002 | Sensors | S | fixed (lab PR 136) |
 | NN-AUD-186 | SNS-003 | Sensors | M | fixed (lab PR 147) |
@@ -3702,7 +3702,7 @@ the audit did not report, noted with the fix that takes them.
     triage's `pinned_dumps_open`) now open `target/kb` through the pinned
     manifest; that corpus was not on the development host, so they did
     not run there.
-  - Lab: @LAB145@
+  - Lab: Debian 12, rag145-probe.sh on main and on this build, the agent on the mock ADE backend with `NN_ADE_RAG_ENABLED=1`, the pinned dumps rebuilt on the host with `cargo xtask rag-kb` (digests equal to `kb_index.json`) in `/var/lib/nn145-kb`. main: "RAG construction failed" in every case — its on-disk index could not be created under the unit's sandbox (`ProtectSystem=strict`), so it never ran in production and could not be shown accepting a tampered corpus. This build: the pinned corpus → "RAG enabled docs=970" with its `corpus_fingerprint`; one forged line in `sigma.jsonl` → "failed its integrity check … does not match the pinned digest"; a planted `planted.jsonl` → "unlisted dump"; an empty directory → "canonical corpus missing"; each a signed `subsystem_degraded` ("RAG requested but not started"); `NN_ADE_RAG_INDEX_DIR` pointing at a prebuilt index → WARN "is ignored", the index built in memory from the verified corpus. Golden bench on the host (`target/kb`): 28/30 on main and here, retrieval p50 708 µs → 87 µs. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
 - **NN-AUD-186 (SNS-003), NN-AUD-106 (EBPF-014), lab PR 147.** Lab and
   build tooling (batch G). Neither reaches an installed agent: the runner
   exists only in `test-privileged` builds, and the stamp lives on the build

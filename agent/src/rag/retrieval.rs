@@ -21,7 +21,8 @@ use anyhow::Result;
 use common::rag_types::{KbCategory, RagDocument, RagResult};
 
 use super::embedder::RagEmbedder;
-use super::index_tantivy::{self, bm25_query};
+use super::index_tantivy::{self, bm25_query, CanonLine};
+use super::kb_manifest::KbManifest;
 use super::kb_seed;
 use super::store::RagStore;
 
@@ -79,6 +80,9 @@ impl<'a> RagQuery<'a> {
 #[derive(Debug, Clone)]
 pub struct RagEngine {
     backend: Backend,
+    /// `source_fingerprint` of the records this engine retrieves from,
+    /// taken at open (external audit XAI-010).
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +111,9 @@ impl RagEngine {
         let embedder = RagEmbedder::new(model_path);
         let mut store = RagStore::new();
         let docs = kb_seed::seed_documents();
+        let fingerprint = index_tantivy::source_fingerprint(
+            &docs.iter().map(CanonLine::from_kb).collect::<Vec<_>>(),
+        );
         let doc_count = docs.len();
         let texts: Vec<&str> = docs.iter().map(|d| d.content.as_str()).collect();
         let embeddings = embedder.embed_batch(&texts);
@@ -118,24 +125,48 @@ impl RagEngine {
         );
         Ok(Self {
             backend: Backend::Embedding { embedder, store },
+            fingerprint,
         })
     }
 
-    /// Tappa 6.9.7 P4 — open (lazy-build + persist) the deterministic
-    /// BM25 index over the P2 canonical JSONL dumps in `jsonl_dir`
-    /// **plus** the 6.7 in-repo curated notes, reusing/refreshing the
-    /// on-disk tantivy index at `index_dir` (rebuilt iff the source
-    /// fingerprint changed). The `retrieve` API is unchanged — this is
-    /// the plan §0 mechanism swap behind the existing seam.
-    pub fn open_index(jsonl_dir: &Path, index_dir: &Path) -> Result<Self> {
+    /// Tappa 6.9.7 P4 — the deterministic BM25 index over the P2
+    /// canonical JSONL dumps in `jsonl_dir` **plus** the 6.7 in-repo
+    /// curated notes. The `retrieve` API is unchanged — this is the plan
+    /// §0 mechanism swap behind the existing seam.
+    ///
+    /// External audit XAI-001/XAI-009/XAI-002: the dumps must be exactly
+    /// those the manifest built into the binary pins (no other `*.jsonl`,
+    /// none missing, same digests), and the index is built in memory from
+    /// them at every open — nothing on disk is trusted.
+    pub fn open_index(jsonl_dir: &Path) -> Result<Self> {
+        Self::open_index_with_manifest(jsonl_dir, &KbManifest::pinned()?)
+    }
+
+    /// [`Self::open_index`] against `manifest` instead of the pinned one
+    /// (tests use fixture dumps).
+    pub fn open_index_with_manifest(jsonl_dir: &Path, manifest: &KbManifest) -> Result<Self> {
         let seed = kb_seed::seed_documents();
-        let records = index_tantivy::load_records(jsonl_dir, &seed)?;
-        let index = index_tantivy::open_or_build(&records, index_dir)?;
+        let records = index_tantivy::load_verified_records(jsonl_dir, &seed, manifest)?;
+        let fingerprint = index_tantivy::source_fingerprint(&records);
+        let index = index_tantivy::build_index_in_ram(&records)?;
         let doc_count = index.reader()?.searcher().num_docs() as usize;
-        tracing::info!(docs = doc_count, "RagEngine opened tantivy BM25 index");
+        tracing::info!(
+            docs = doc_count,
+            kb_index_hash = manifest.kb_index_hash(),
+            corpus_fingerprint = %fingerprint,
+            "RagEngine built the BM25 index from the verified corpus"
+        );
         Ok(Self {
             backend: Backend::Bm25 { index, doc_count },
+            fingerprint,
         })
+    }
+
+    /// `source_fingerprint` of the corpus this engine was opened on (for
+    /// the legacy seed path, of the seed). Computed once, at open; the XAI
+    /// `environment_hash` binds it (external audit XAI-010).
+    pub fn corpus_fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// Number of indexed documents.
@@ -422,20 +453,21 @@ mod tests {
 
     // ── Tappa 6.9.7 P4 — BM25 backend behind the unchanged API ──
 
-    fn fixture_jsonl(dir: &std::path::Path) {
-        // One synthetic 8-key canonical line with a unique marker token
-        // so the assertion is deterministic regardless of the 6.7 seed
-        // that `open_index` also ingests.
+    /// One synthetic 8-key canonical line with a unique marker token so
+    /// the assertion is deterministic regardless of the 6.7 seed that
+    /// `open_index` also ingests. Returns the manifest pinning it.
+    fn fixture_jsonl(dir: &std::path::Path) -> KbManifest {
         let line = r#"{"author":null,"category":"mitre_technique","content":"synthetic marker zqxjmarker powershell T1059.001 command execution","id":"attack:T1059.001","platform":"","severity":"","source_ref":"attack:T1059.001","title":"PowerShell Marker"}"#;
-        std::fs::write(dir.join("fix.jsonl"), format!("{line}\n")).unwrap();
+        let dump = format!("{line}\n");
+        std::fs::write(dir.join("fix.jsonl"), &dump).unwrap();
+        KbManifest::for_dumps(&[("fix.jsonl", dump.as_bytes())])
     }
 
     #[test]
     fn open_index_retrieves_via_bm25_with_normalised_similarity() {
         let jl = tempfile::tempdir().unwrap();
-        let ix = tempfile::tempdir().unwrap();
-        fixture_jsonl(jl.path());
-        let e = RagEngine::open_index(jl.path(), ix.path()).expect("open_index");
+        let m = fixture_jsonl(jl.path());
+        let e = RagEngine::open_index_with_manifest(jl.path(), &m).expect("open_index");
         assert!(e.document_count() >= 1);
         let r = e.retrieve(RagQuery {
             query_text: "zqxjmarker",
@@ -467,9 +499,8 @@ mod tests {
     #[test]
     fn bm25_min_similarity_floor_is_post_normalisation_and_conservative() {
         let jl = tempfile::tempdir().unwrap();
-        let ix = tempfile::tempdir().unwrap();
-        fixture_jsonl(jl.path());
-        let e = RagEngine::open_index(jl.path(), ix.path()).unwrap();
+        let m = fixture_jsonl(jl.path());
+        let e = RagEngine::open_index_with_manifest(jl.path(), &m).unwrap();
         // Floor above the normalised max (1.0) ⇒ everything dropped ⇒
         // empty RagResult (the 6.7 conservative no-match contract).
         let r = e.retrieve(RagQuery {
@@ -485,5 +516,25 @@ mod tests {
             min_similarity: 0.99,
         });
         assert!(r2.documents.iter().any(|d| d.id == "attack:T1059.001"));
+    }
+
+    #[test]
+    fn corpus_fingerprint_follows_the_records() {
+        let jl = tempfile::tempdir().unwrap();
+        let m = fixture_jsonl(jl.path());
+        let a = RagEngine::open_index_with_manifest(jl.path(), &m).unwrap();
+        let b = RagEngine::open_index_with_manifest(jl.path(), &m).unwrap();
+        assert_eq!(a.corpus_fingerprint(), b.corpus_fingerprint());
+        assert_eq!(a.corpus_fingerprint().len(), 64);
+        let seed = RagEngine::with_seed(None).unwrap();
+        assert_ne!(a.corpus_fingerprint(), seed.corpus_fingerprint());
+        // Another pinned corpus ⇒ another fingerprint.
+        let line = r#"{"author":null,"category":"mitre_technique","content":"other","id":"attack:T1","platform":"","severity":"","source_ref":"attack:T1","title":"Other"}"#;
+        let dump = format!("{line}\n");
+        let jl2 = tempfile::tempdir().unwrap();
+        std::fs::write(jl2.path().join("o.jsonl"), &dump).unwrap();
+        let m2 = KbManifest::for_dumps(&[("o.jsonl", dump.as_bytes())]);
+        let c = RagEngine::open_index_with_manifest(jl2.path(), &m2).unwrap();
+        assert_ne!(a.corpus_fingerprint(), c.corpus_fingerprint());
     }
 }

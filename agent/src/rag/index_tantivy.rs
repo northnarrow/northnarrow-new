@@ -1,6 +1,6 @@
 //! Tappa 6.9.7 P3 — deterministic BM25 index over the canonical KB.
 //!
-//! Builds an on-disk `tantivy` index from the P2 canonical JSONL dumps
+//! Builds an in-memory `tantivy` index from the P2 canonical JSONL dumps
 //! (MITRE ATT&CK v18.1 + SigmaHQ Linux) **plus** the 6.7 in-repo
 //! curated notes (`kb_seed`), under the R3 **security-token-preserving
 //! analyzer** so identifiers an English tokenizer would shred
@@ -11,9 +11,11 @@
 //! (the default `columnar-zstd-compression` pulls `zstd-sys` C-FFI —
 //! forbidden); the pure-Rust `mmap` + `lz4-compression` set is used.
 //!
-//! P3 owns the schema, the analyzer, build/open/persist + rebuild-on
-//! -source-change, and golden retrieval fixtures. Wiring this behind
-//! `RagEngine::retrieve` / a canary flag is P4/P5 — NOT here.
+//! The dumps are read only through [`super::kb_manifest`]: the pinned
+//! names and digests built into the binary (external audit XAI-001,
+//! XAI-009). The index is rebuilt in memory at every open and never
+//! persisted (external audit XAI-002): an index on disk was trusted on a
+//! marker anyone could forge, and served whatever documents it held.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -31,13 +33,11 @@ use tantivy::{Index, TantivyDocument, Term};
 
 use common::rag_types::KbDocument;
 
-/// Registered name of the R3 analyzer (persisted in the schema; must be
-/// re-registered on every open — tantivy stores the name, not the impl).
-pub const SEC_ANALYZER: &str = "nn_sec";
+use super::kb_manifest::KbManifest;
 
-/// Marker file (next to the index) holding the source fingerprint, so
-/// the index is rebuilt iff the ingested corpus changed.
-const FINGERPRINT_FILE: &str = ".nn_kb_source_sha256";
+/// Registered name of the R3 analyzer (recorded in the schema; tantivy
+/// stores the name, not the implementation).
+pub const SEC_ANALYZER: &str = "nn_sec";
 
 // ── R3 security-token-preserving tokenizer ─────────────────────────────
 
@@ -130,7 +130,7 @@ impl Tokenizer for SecurityTokenizer {
     }
 }
 
-fn analyzer() -> TextAnalyzer {
+pub(crate) fn analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(SecurityTokenizer)
         .filter(LowerCaser)
         .build()
@@ -198,7 +198,7 @@ impl CanonLine {
     /// Map a 6.7 in-repo curated note into the canonical shape (author
     /// `null` — covered wholesale by the repo license; `tags` folded
     /// into `content` for retrievability).
-    fn from_kb(d: &KbDocument) -> Self {
+    pub(crate) fn from_kb(d: &KbDocument) -> Self {
         let mut content = d.content.clone();
         if !d.tags.is_empty() {
             content.push_str(&format!("\nTags: {}", d.tags.join(", ")));
@@ -256,36 +256,34 @@ pub fn build_schema() -> (Schema, KbFields) {
 
 // ── source loading + fingerprint ───────────────────────────────────────
 
-/// Load all `*.jsonl` canonical dumps in `jsonl_dir` (P2 output) plus
-/// the 6.7 in-repo notes, into one record set.
-pub fn load_records(jsonl_dir: &Path, seed: &[KbDocument]) -> Result<Vec<CanonLine>> {
+/// Load the canonical dumps in `jsonl_dir` that `manifest` pins, plus the
+/// 6.7 in-repo notes, into one record set. Fails unless the directory
+/// holds exactly the pinned dumps with their pinned digests
+/// ([`KbManifest::read_verified`]); a `KbRefusal` stays downcastable
+/// from the returned error.
+pub fn load_verified_records(
+    jsonl_dir: &Path,
+    seed: &[KbDocument],
+    manifest: &KbManifest,
+) -> Result<Vec<CanonLine>> {
     let mut out: Vec<CanonLine> = seed.iter().map(CanonLine::from_kb).collect();
-    if jsonl_dir.is_dir() {
-        let mut files: Vec<_> = std::fs::read_dir(jsonl_dir)
-            .with_context(|| format!("read_dir {}", jsonl_dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-            .collect();
-        files.sort();
-        for f in files {
-            let text =
-                std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?;
-            for (n, line) in text.lines().enumerate() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let rec = CanonLine::from_json(line)
-                    .with_context(|| format!("{}:{}", f.display(), n + 1))?;
-                out.push(rec);
+    for (name, bytes) in manifest.read_verified(jsonl_dir)? {
+        let text = std::str::from_utf8(&bytes).with_context(|| format!("{name}: not UTF-8"))?;
+        for (n, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
             }
+            let rec = CanonLine::from_json(line).with_context(|| format!("{name}:{}", n + 1))?;
+            out.push(rec);
         }
     }
     Ok(out)
 }
 
 /// Deterministic fingerprint over the *ingested corpus* (dedup by id,
-/// sorted) — drives rebuild-on-change. Independent of tantivy's
-/// (non-deterministic) segment bytes.
+/// sorted). Independent of tantivy's (non-deterministic) segment bytes.
+/// `RagEngine` keeps it from open; it enters the XAI `environment_hash`
+/// (external audit XAI-010).
 pub fn source_fingerprint(records: &[CanonLine]) -> String {
     let mut ids: Vec<&CanonLine> = Vec::new();
     let mut seen = BTreeSet::new();
@@ -344,14 +342,12 @@ fn index_doc(f: &KbFields, r: &CanonLine) -> TantivyDocument {
     d
 }
 
-/// (Re)build the index in `dir` from `records` (dir is wiped first).
-pub fn build_index(records: &[CanonLine], dir: &Path) -> Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir).with_context(|| format!("rm -rf {}", dir.display()))?;
-    }
-    std::fs::create_dir_all(dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
+/// Build the index in memory from `records` (dedup by id, id order). No
+/// state is read from or written to disk: every open rebuilds from the
+/// verified records (about 0.4 s for the 964-document corpus).
+pub fn build_index_in_ram(records: &[CanonLine]) -> Result<Index> {
     let (schema, f) = build_schema();
-    let index = Index::create_in_dir(dir, schema).context("create tantivy index")?;
+    let index = Index::create_in_ram(schema);
     index.tokenizers().register(SEC_ANALYZER, analyzer());
     let mut writer = index.writer(50_000_000).context("tantivy writer")?;
     let mut seen = BTreeSet::new();
@@ -366,24 +362,6 @@ pub fn build_index(records: &[CanonLine], dir: &Path) -> Result<()> {
             .context("add_document")?;
     }
     writer.commit().context("commit")?;
-    std::fs::write(dir.join(FINGERPRINT_FILE), source_fingerprint(records))
-        .with_context(|| "write fingerprint marker")?;
-    Ok(())
-}
-
-/// Open the index in `dir`, rebuilding iff it is absent or the source
-/// fingerprint changed (lazy-load + rebuild-on-source-change). The R3
-/// analyzer is re-registered on every open (tantivy persists only the
-/// name).
-pub fn open_or_build(records: &[CanonLine], dir: &Path) -> Result<Index> {
-    let fp_now = source_fingerprint(records);
-    let fp_old = std::fs::read_to_string(dir.join(FINGERPRINT_FILE)).ok();
-    let fresh = fp_old.as_deref() == Some(fp_now.as_str()) && dir.join("meta.json").is_file();
-    if !fresh {
-        build_index(records, dir)?;
-    }
-    let index = Index::open_in_dir(dir).context("open tantivy index")?;
-    index.tokenizers().register(SEC_ANALYZER, analyzer());
     Ok(index)
 }
 
@@ -409,7 +387,7 @@ pub struct Bm25Hit {
 /// internal segment/DocId order, which is not stable across rebuilds.
 /// We re-sort the collected hits by **score descending, then `id`
 /// ascending** so equal-score retrieval is deterministic (DocId order
-/// ≈ id order here anyway — `build_index` inserts id-sorted — but the
+/// ≈ id order here anyway — `build_index_in_ram` inserts id-sorted — but the
 /// explicit re-sort is the contract).
 pub fn bm25_query(index: &Index, query: &str, k: usize) -> Result<Vec<Bm25Hit>> {
     let schema = index.schema();
@@ -563,8 +541,7 @@ mod tests {
 
     #[test]
     fn golden_retrieval_previews() {
-        let dir = tempfile::tempdir().unwrap();
-        let idx = open_or_build(&corpus(), dir.path()).unwrap();
+        let idx = build_index_in_ram(&corpus()).unwrap();
         let top = |q: &str| -> Vec<String> {
             bm25_search(&idx, q, 5)
                 .unwrap()
@@ -585,14 +562,13 @@ mod tests {
     fn r1_tie_break_is_id_ascending_for_equal_scores() {
         // Identical content+title ⇒ identical BM25 (tf/idf/fieldnorm)
         // ⇒ a score tie; R1 must order by id ascending, deterministically.
-        let dir = tempfile::tempdir().unwrap();
         let same = "process injection technique";
         let recs = vec![
             rec("z-dup", same, same, None),
             rec("a-dup", same, same, None),
             rec("m-dup", same, same, None),
         ];
-        let idx = open_or_build(&recs, dir.path()).unwrap();
+        let idx = build_index_in_ram(&recs).unwrap();
         let hits = bm25_query(&idx, "process injection technique", 10).unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(
@@ -608,17 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn persistence_reopen_yields_same_results() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = {
-            let idx = open_or_build(&corpus(), dir.path()).unwrap();
-            bm25_search(&idx, "/etc/shadow", 5).unwrap()
-        };
-        // Reopen the SAME dir (no rebuild — fingerprint matches).
-        let idx2 = open_or_build(&corpus(), dir.path()).unwrap();
-        let b = bm25_search(&idx2, "/etc/shadow", 5).unwrap();
-        assert_eq!(a, b, "reopen must yield identical ranked results");
-        assert!(dir.path().join(FINGERPRINT_FILE).is_file());
+    fn rebuild_yields_same_results() {
+        // Every open rebuilds in memory: two builds of the same records
+        // rank identically.
+        let a = bm25_search(&build_index_in_ram(&corpus()).unwrap(), "/etc/shadow", 5).unwrap();
+        let b = bm25_search(&build_index_in_ram(&corpus()).unwrap(), "/etc/shadow", 5).unwrap();
+        assert_eq!(a, b, "a rebuild must yield identical ranked results");
     }
 
     #[test]
@@ -629,7 +600,7 @@ mod tests {
         let mut shuffled = c.clone();
         shuffled.reverse();
         assert_eq!(source_fingerprint(&c), source_fingerprint(&shuffled));
-        // content change ⇒ different fingerprint ⇒ triggers rebuild.
+        // content change ⇒ different fingerprint.
         let mut changed = c.clone();
         changed[0].content.push_str(" extra");
         assert_ne!(source_fingerprint(&c), source_fingerprint(&changed));
@@ -651,10 +622,14 @@ mod tests {
             eprintln!("target/kb absent — run `cargo xtask rag-kb` first");
             return;
         }
-        let recs = load_records(&kb, &crate::rag::kb_seed::seed_documents()).unwrap();
+        let recs = load_verified_records(
+            &kb,
+            &crate::rag::kb_seed::seed_documents(),
+            &KbManifest::pinned().unwrap(),
+        )
+        .unwrap();
         eprintln!("real corpus: {} records (attack+sigma+seed)", recs.len());
-        let dir = tempfile::tempdir().unwrap();
-        let idx = open_or_build(&recs, dir.path()).unwrap();
+        let idx = build_index_in_ram(&recs).unwrap();
         for q in [
             "T1059.001 powershell",
             "/etc/shadow",
@@ -672,23 +647,22 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_on_source_change() {
-        let dir = tempfile::tempdir().unwrap();
-        open_or_build(&corpus(), dir.path()).unwrap();
-        let fp1 = std::fs::read_to_string(dir.path().join(FINGERPRINT_FILE)).unwrap();
-        let mut c2 = corpus();
-        c2.push(rec(
-            "sigma:new-1",
-            "New Rule",
-            "a brand new linux rule",
-            None,
+    fn verified_records_include_seed_and_pinned_dump() {
+        let line = r#"{"author":["A"],"category":"sigma_rule","content":"c","id":"sigma:x","platform":"linux","severity":"high","source_ref":"sigma:x","title":"T"}"#;
+        let dump = format!("{line}\n");
+        let jl = tempfile::tempdir().unwrap();
+        std::fs::write(jl.path().join("s.jsonl"), &dump).unwrap();
+        let seed = crate::rag::kb_seed::seed_documents();
+        let m = KbManifest::for_dumps(&[("s.jsonl", dump.as_bytes())]);
+        let recs = load_verified_records(jl.path(), &seed, &m).unwrap();
+        assert_eq!(recs.len(), seed.len() + 1);
+        assert_eq!(recs.last().unwrap().author, Some(vec!["A".to_string()]));
+        // A refusal survives as a typed error.
+        std::fs::write(jl.path().join("s.jsonl"), "{}\n").unwrap();
+        let e = load_verified_records(jl.path(), &seed, &m).unwrap_err();
+        assert!(matches!(
+            e.downcast_ref::<crate::rag::kb_manifest::KbRefusal>(),
+            Some(crate::rag::kb_manifest::KbRefusal::Mismatch { .. })
         ));
-        let idx = open_or_build(&c2, dir.path()).unwrap();
-        let fp2 = std::fs::read_to_string(dir.path().join(FINGERPRINT_FILE)).unwrap();
-        assert_ne!(fp1, fp2, "fingerprint marker must update on rebuild");
-        assert!(bm25_search(&idx, "brand new linux", 5)
-            .unwrap()
-            .iter()
-            .any(|(_, id)| id == "sigma:new-1"));
     }
 }

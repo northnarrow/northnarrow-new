@@ -145,19 +145,31 @@ fn canonical_hostname() -> String {
 /// combat_rules_sha256          (32 bytes, fixed)
 /// u32_be(hostname.len()) || hostname_utf8
 /// u32_be(build_sha.len()) || build_sha_utf8
+/// u32_be(rag_fp.len())    || rag_fp_utf8
 /// ```
+///
+/// `rag_fp` (external audit XAI-010) is the fingerprint of the RAG
+/// corpus the explained engine retrieves from
+/// ([`AdeEngine::rag_fingerprint`]), empty when RAG is off: two chains
+/// with one `environment_hash` were produced over the same knowledge
+/// base. It is taken from the engine, not declared by the caller, so it
+/// names the corpus actually loaded.
 ///
 /// F3 (audit) — chose option (a)'s mechanism *without* its schema bump:
 /// the three leading digests are self-delimiting (fixed 32 B), and the
-/// two trailing variable fields are u32-BE length-prefixed so the
+/// trailing variable fields are u32-BE length-prefixed so the
 /// preimage is unambiguous by construction — the residual
 /// hostname‖build_sha boundary collision is *eliminated*, not merely
 /// documented as accepted risk (option b). No `XAI_SCHEMA_VERSION` bump:
 /// `environment_hash` is a plain `String` field, this preimage is not
 /// part of the JSON schema, and no chains are shipped, so 1.0.0 ships
 /// unchanged. Computed once at [`XaiEngine::new`], cached into every
-/// chain.
-pub fn compute_environment_hash(env: &EnvironmentInputs) -> std::io::Result<String> {
+/// chain: the RAG corpus is opened once, at agent start, so it cannot go
+/// stale; a corpus reloaded at run time would need a new `XaiEngine`.
+pub fn compute_environment_hash(
+    env: &EnvironmentInputs,
+    rag_fingerprint: Option<&str>,
+) -> std::io::Result<String> {
     let agent_binary = std::env::current_exe()?;
     let mut h = Sha256::new();
     h.update(sha256_file(&agent_binary)?);
@@ -169,6 +181,9 @@ pub fn compute_environment_hash(env: &EnvironmentInputs) -> std::io::Result<Stri
     let build_sha = env!("BUILD_SHA");
     h.update((build_sha.len() as u32).to_be_bytes());
     h.update(build_sha.as_bytes());
+    let rag = rag_fingerprint.unwrap_or("");
+    h.update((rag.len() as u32).to_be_bytes());
+    h.update(rag.as_bytes());
     Ok(hex::encode(h.finalize()))
 }
 
@@ -193,18 +208,20 @@ pub struct XaiEngine<S: EvidenceSigner> {
 
 impl<S: EvidenceSigner> XaiEngine<S> {
     /// `engine` MUST have been built from [`deterministic_ade_config`]
-    /// (R1). Computes + caches the deployment `environment_hash`.
+    /// (R1). Computes + caches the deployment `environment_hash`, over the
+    /// engine's own RAG corpus fingerprint.
     pub fn new(
         engine: AdeEngine,
         signer: S,
         saliency_cfg: SaliencyConfig,
         env: &EnvironmentInputs,
     ) -> std::io::Result<Self> {
+        let environment_hash = compute_environment_hash(env, engine.rag_fingerprint())?;
         Ok(Self {
             engine,
             signer,
             saliency_cfg,
-            environment_hash: compute_environment_hash(env)?,
+            environment_hash,
             inference_settings: deterministic_inference_settings(),
         })
     }
@@ -376,8 +393,8 @@ mod tests {
         let rules = temp_with(b"combat-rules-v4");
         let e = env_inputs(model.path(), rules.path());
 
-        let h1 = compute_environment_hash(&e).unwrap();
-        let h2 = compute_environment_hash(&e).unwrap();
+        let h1 = compute_environment_hash(&e, None).unwrap();
+        let h2 = compute_environment_hash(&e, None).unwrap();
         assert_eq!(h1, h2, "same inputs ⇒ same hash");
         assert_eq!(h1.len(), 64);
         assert!(h1
@@ -386,15 +403,24 @@ mod tests {
 
         // Flip one combat-rules byte ⇒ the deployment identity changes.
         let rules2 = temp_with(b"combat-rules-v5");
-        let h3 = compute_environment_hash(&env_inputs(model.path(), rules2.path())).unwrap();
+        let h3 = compute_environment_hash(&env_inputs(model.path(), rules2.path()), None).unwrap();
         assert_ne!(h1, h3);
+
+        // External audit XAI-010: the RAG corpus is part of the identity —
+        // RAG on differs from RAG off, and one corpus from another.
+        let fp_a = "a".repeat(64);
+        let fp_b = "b".repeat(64);
+        let on_a = compute_environment_hash(&e, Some(&fp_a)).unwrap();
+        let on_b = compute_environment_hash(&e, Some(&fp_b)).unwrap();
+        assert_ne!(h1, on_a, "RAG on ⇒ another environment_hash than RAG off");
+        assert_ne!(on_a, on_b, "another corpus ⇒ another environment_hash");
     }
 
     #[test]
     fn environment_hash_errors_when_a_file_is_missing() {
         let model = temp_with(b"m");
         let e = env_inputs(model.path(), Path::new("/no/such/combat-rules"));
-        assert!(compute_environment_hash(&e).is_err());
+        assert!(compute_environment_hash(&e, None).is_err());
     }
 
     #[tokio::test]

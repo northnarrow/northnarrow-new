@@ -84,8 +84,9 @@ pub struct XaiEvidenceChain {
     pub model: XaiModelRef,
     pub method: XaiMethod,
     pub input_snapshot: XaiInputSnapshot,
-    /// Deployment identity hash. Computed at AdeEngine init and cached;
-    /// embedded into every chain produced under this binary+model+rules+host.
+    /// Deployment identity hash. Computed at `XaiEngine::new` and cached;
+    /// embedded into every chain produced under this
+    /// binary+model+rules+host+RAG corpus.
     ///
     /// ```text
     /// environment_hash = lower_hex(sha256(
@@ -93,9 +94,14 @@ pub struct XaiEvidenceChain {
     ///     model_file_sha256_bytes   ||                       // 32 B, fixed
     ///     combat_rules_sha256_bytes ||                       // 32 B, fixed
     ///     u32_be(hostname.len())  || hostname_canonical_utf8 ||
-    ///     u32_be(build_sha.len()) || agent_build_commit_sha_utf8
+    ///     u32_be(build_sha.len()) || agent_build_commit_sha_utf8 ||
+    ///     u32_be(rag_fp.len())    || rag_corpus_fingerprint_utf8
     /// ))
     /// ```
+    ///
+    /// `rag_corpus_fingerprint` is the `source_fingerprint` of the RAG
+    /// corpus the explained engine loaded (64 hex), empty with RAG off
+    /// (external audit XAI-010).
     ///
     /// `hostname_canonical` is the trimmed `/proc/sys/kernel/hostname`
     /// (the agent-wide canonical source, matching `HostContext`; the
@@ -104,7 +110,7 @@ pub struct XaiEvidenceChain {
     /// agent's host identity), with a fixed `"unknown"` fallback.
     /// `build_sha` is the compile-time `BUILD_SHA` env (git `HEAD`, or
     /// `"unknown"` for non-git builds). The three leading digests are
-    /// self-delimiting (fixed 32 B); the two trailing variable fields
+    /// self-delimiting (fixed 32 B); the three trailing variable fields
     /// are u32-BE length-prefixed, so the preimage is unambiguous by
     /// construction (no boundary-collision). This preimage is **not**
     /// part of the JSON schema — evolving it needs no

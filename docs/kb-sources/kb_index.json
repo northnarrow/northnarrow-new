@@ -5,11 +5,13 @@
   "sources": [
     {
       "canonical_dump_sha256": "c5bfbb28203657cb79de2390163a0cc825f871a3303bff966e25a8d5d1f76f7b",
+      "file": "mitre-attack.jsonl",
       "pin": "v18.1",
       "source": "mitre-attack-stix-data"
     },
     {
       "canonical_dump_sha256": "34c7707d2e1a3195e4de0af7c9da3a3579b945c5e870ebb5dd3c749ba7af9d67",
+      "file": "sigma.jsonl",
       "pin": "master",
       "source": "sigma-hq-rules"
     }

@@ -75,10 +75,10 @@ pub struct BenchReport {
     pub doc_count: usize,
 }
 
-pub fn run_bench(jsonl_dir: &Path, index_dir: &Path, n: usize) -> anyhow::Result<BenchReport> {
+pub fn run_bench(jsonl_dir: &Path, n: usize) -> anyhow::Result<BenchReport> {
     let rss0 = vm_rss_kib().unwrap_or(0);
     let t = Instant::now();
-    let engine = RagEngine::open_index(jsonl_dir, index_dir)?;
+    let engine = RagEngine::open_index(jsonl_dir)?;
     let open_cold = t.elapsed();
     let rss1 = vm_rss_kib().unwrap_or(0);
     let mut samples = Vec::with_capacity(n * bench_queries().len());
@@ -295,10 +295,12 @@ mod tests {
     use super::*;
 
     /// `target/kb` as produced by `cargo xtask rag-kb`. Review entry 21
-    /// (`rag-golden-no-corpus-1`): `open_index` silently falls back to
-    /// the built-in seed when the dir is missing, so the release gates
-    /// used to run against ~30 seed docs and report a meaningless
-    /// 36.7 % "golden" rate. Fail fast with the fix instead.
+    /// (`rag-golden-no-corpus-1`): `open_index` used to fall back to the
+    /// built-in seed when the dir was missing, so the release gates ran
+    /// against ~30 seed docs and reported a meaningless 36.7 % "golden"
+    /// rate. `open_index` now refuses a corpus that does not match the
+    /// pinned manifest (external audit XAI-009); this check keeps the
+    /// message that says how to get the corpus.
     fn real_kb() -> std::path::PathBuf {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -345,8 +347,7 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(1000);
-        let ix = tempfile::tempdir().unwrap();
-        let rep = run_bench(&real_kb(), ix.path(), n).unwrap();
+        let rep = run_bench(&real_kb(), n).unwrap();
         eprintln!(
             "BENCH docs={} open_cold={:?} retrieve(n={}) p50={}us p95={}us p99={}us max={}us rss_delta={}KiB",
             rep.doc_count, rep.open_cold, rep.retrieve.n, rep.retrieve.p50_us,
@@ -368,8 +369,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/kb (cargo xtask rag-kb); release-gate golden"]
     fn golden_suite_real_corpus() {
-        let ix = tempfile::tempdir().unwrap();
-        let engine = RagEngine::open_index(&real_kb(), ix.path()).unwrap();
+        let engine = RagEngine::open_index(&real_kb()).unwrap();
         let rep = run_golden(&engine);
         eprintln!(
             "GOLDEN {}/{} = {:.1}%",
@@ -395,8 +395,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/kb (cargo xtask rag-kb)"]
     fn end_to_end_format_rag_block_real_corpus() {
-        let ix = tempfile::tempdir().unwrap();
-        let engine = RagEngine::open_index(&real_kb(), ix.path()).unwrap();
+        let engine = RagEngine::open_index(&real_kb()).unwrap();
         let r = engine.retrieve(RagQuery {
             query_text: "powershell encoded command",
             top_k: 3,
