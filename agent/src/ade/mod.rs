@@ -426,9 +426,11 @@ impl AdeEngine {
     ///
     /// External audit LLMR-008: the backend cut an over-long prompt from the
     /// front, which is where the system prompt is. The fit drops the oldest
-    /// correlated events first, then the RAG block; the system prompt, the
-    /// focal event and the task are never cut. If they alone do not fit,
-    /// no prompt is produced ([`Prepared::TooLong`]).
+    /// correlated events first (those that share no key with the focal
+    /// event before the others, external audit XAI-013), then the RAG
+    /// block; the system prompt, the focal event and the task are never
+    /// cut. If they alone do not fit, no prompt is produced
+    /// ([`Prepared::TooLong`]).
     fn prepare(&self, event: &Event, context: &EventContext) -> Prepared {
         let sanitized = sanitize::sanitize_event_for_ade(event);
         if sanitized.injection_score >= HIGH_INJECTION_SCORE_REJECT {
@@ -450,7 +452,7 @@ impl AdeEngine {
 
         // External audit LLMP-002: the correlated events are sanitized
         // like the focal one, and go in their own untrusted block.
-        let correlated = sanitize::sanitize_correlated(&context.recent_events);
+        let correlated = sanitize::sanitize_correlated(event, &context.recent_events);
         let mut fitted = correlated.clone();
         let window = self.inner.backend.prompt_window();
         loop {
@@ -479,7 +481,7 @@ impl AdeEngine {
                     tracing::debug!(
                         dropped,
                         kept = fitted.events.len(),
-                        "ADE prompt fitted to the model window: oldest correlated events dropped"
+                        "ADE prompt fitted to the model window: least related correlated events dropped"
                     );
                 }
                 // The sanity check weighs every correlated event the
@@ -490,8 +492,9 @@ impl AdeEngine {
                     correlated,
                 };
             };
-            // `events` is newest first: the oldest goes first.
-            if fitted.events.pop().is_some() {
+            // External audit XAI-013: the oldest nearby event goes first,
+            // a keyed one (a possible precursor) only after them.
+            if fitted.drop_least_related() {
                 continue;
             }
             if rag_result.take().is_some() {

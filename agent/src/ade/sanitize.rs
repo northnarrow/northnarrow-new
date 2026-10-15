@@ -146,6 +146,9 @@ const SECTION_MARKER: &str = "===";
 /// External audit LLMP-002: correlated events the prompt carries at most.
 pub const CORRELATED_MAX: usize = 20;
 
+/// External audit LLMP-002: bytes the correlated-events block may take.
+pub const CORRELATED_BLOCK_CAP: usize = 4096;
+
 /// Hard caps applied during sanitization.
 pub const FILENAME_CAP: usize = 256;
 pub const ARGV_PER_ITEM_CAP: usize = 256;
@@ -492,22 +495,68 @@ pub fn sanitize_event_for_ade(event: &Event) -> SanitizedEvent {
 /// like the focal one before any of their strings reaches the model.
 #[derive(Debug, Clone, Default)]
 pub struct SanitizedCorrelated {
-    /// Newest first, at most [`CORRELATED_MAX`], each scoring below
-    /// [`super::HIGH_INJECTION_SCORE_REJECT`].
-    pub events: Vec<SanitizedEvent>,
+    /// The lines the prompt renders, newest first: at most
+    /// [`CORRELATED_MAX`], each scoring below
+    /// [`super::HIGH_INJECTION_SCORE_REJECT`], within
+    /// [`CORRELATED_BLOCK_CAP`].
+    pub events: Vec<CorrelatedLine>,
     /// Events left out of the prompt for their injection score.
     pub omitted: usize,
+    /// Lines left out because the block was full.
+    pub truncated: usize,
     /// The highest injection score among the sanitized events, the
     /// omitted ones included (External audit LLMR-010).
     pub max_score: f32,
 }
 
-/// Sanitize the newest [`CORRELATED_MAX`] of `recent` (oldest first, as
-/// the correlation buffer holds them). An event whose own score would
-/// have kept it from the model as a focal event is left out and counted.
-pub fn sanitize_correlated(recent: &[Event]) -> SanitizedCorrelated {
+/// One line of the correlated block.
+#[derive(Debug, Clone)]
+pub struct CorrelatedLine {
+    pub event: SanitizedEvent,
+    /// The event's index in `EventContext::recent_events` (external audit
+    /// XAI-005: the XAI unit `correlated:<index>`).
+    pub index: usize,
+    /// It shares a pid, a parent pid or a filename with the focal event.
+    pub keyed: bool,
+}
+
+impl SanitizedCorrelated {
+    /// External audit LLMR-008 window fit: removes the oldest line that
+    /// only shares the time window with the focal event, else the oldest
+    /// keyed one (external audit XAI-013). `false` when none is left.
+    pub fn drop_least_related(&mut self) -> bool {
+        let at = self
+            .events
+            .iter()
+            .rposition(|l| !l.keyed)
+            .or_else(|| self.events.len().checked_sub(1));
+        at.map(|i| self.events.remove(i)).is_some()
+    }
+}
+
+/// External audit XAI-013: the bytes `event` takes in the correlated
+/// block, or `None` when its injection score leaves it out of the prompt.
+/// The correlation buffer selects with it, so that the prompt renders its
+/// selection whole.
+pub fn correlated_line_cost(event: &Event) -> Option<usize> {
+    let s = sanitize_event_for_ade(event);
+    (s.injection_score < super::HIGH_INJECTION_SCORE_REJECT)
+        .then(|| super::structured_prompt::format_correlated_line(&s).len() + 1)
+}
+
+/// Sanitize `recent` (oldest first, as the correlation buffer holds them)
+/// for the prompt about `focal`. An event whose own score would have kept
+/// it from the model as a focal event is left out and counted; it takes
+/// no slot (external audit XAI-013). The newest [`CORRELATED_MAX`] of the
+/// others are kept; then, if their lines exceed [`CORRELATED_BLOCK_CAP`],
+/// the keyed ones are fitted first, so that the cap never cuts them for a
+/// nearby event. The agent's selection
+/// ([`crate::correlation::CorrelationBuffer::get_correlated`]) already
+/// fits both limits; they bind only for a context built otherwise.
+pub fn sanitize_correlated(focal: &Event, recent: &[Event]) -> SanitizedCorrelated {
     let mut out = SanitizedCorrelated::default();
-    for e in recent.iter().rev().take(CORRELATED_MAX) {
+    let mut lines: Vec<CorrelatedLine> = Vec::new();
+    for (index, e) in recent.iter().enumerate().rev() {
         let s = sanitize_event_for_ade(e);
         // External audit LLMR-010: an omitted event still weighs in the
         // sanity check; leaving it out of the prompt must not let a
@@ -517,8 +566,33 @@ pub fn sanitize_correlated(recent: &[Event]) -> SanitizedCorrelated {
             out.omitted += 1;
             continue;
         }
-        out.events.push(s);
+        if lines.len() < CORRELATED_MAX {
+            lines.push(CorrelatedLine {
+                keyed: crate::correlation::shares_key(focal, e),
+                event: s,
+                index,
+            });
+        }
     }
+
+    let mut fits = vec![false; lines.len()];
+    let mut used = 0usize;
+    for keyed in [true, false] {
+        for (i, l) in lines.iter().enumerate().filter(|(_, l)| l.keyed == keyed) {
+            let cost = super::structured_prompt::format_correlated_line(&l.event).len() + 1;
+            if used + cost <= CORRELATED_BLOCK_CAP {
+                used += cost;
+                fits[i] = true;
+            } else {
+                out.truncated += 1;
+            }
+        }
+    }
+    out.events = lines
+        .into_iter()
+        .zip(fits)
+        .filter_map(|(l, fits)| fits.then_some(l))
+        .collect();
     out
 }
 

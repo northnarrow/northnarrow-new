@@ -1278,6 +1278,42 @@ async fn an_overlong_prompt_drops_the_oldest_correlated_events_not_the_system_pr
     );
 }
 
+/// External audit XAI-013: the window fit drops the events that only share
+/// the time window with the focal one before a keyed one (here a process of
+/// the same parent), however old. It used to drop the oldest first.
+#[tokio::test]
+async fn the_window_fit_drops_nearby_events_before_a_keyed_precursor() {
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let cfg = cfg_with(prompt.path(), model.path());
+    let backend = Arc::new(WindowedBackend::new(800));
+    let engine = AdeEngine::new_with_backend(cfg, backend.clone())
+        .await
+        .unwrap();
+
+    // Oldest first: the precursor, then 19 DNS queries of other processes.
+    let mut recent = vec![spawn_event(500, "stage1", "/tmp/stage1")];
+    recent.extend(
+        (0..19).map(|i| dns_event(6000 + i, &format!("{}{i:02}.example.net", "q".repeat(120)))),
+    );
+    let event = spawn_event(4242, "x", "/usr/local/bin/x");
+    let ctx = EventContext {
+        recent_events: recent,
+        host_context: HostContext::discover(),
+    };
+
+    engine.evaluate(&event, &ctx).await.unwrap();
+    let seen = backend.seen.lock().clone().expect("generate was called");
+    assert!(seen.len() / 4 <= 800);
+    assert!(seen.contains(r#"filename="/tmp/stage1""#), "{seen}");
+    let kept: Vec<u32> = (0..19)
+        .filter(|i| seen.contains(&format!("q{i:02}.example.net")))
+        .collect();
+    assert!(kept.len() < 19, "{kept:?}");
+    // Among the nearby events, the newest stay.
+    assert_eq!(kept, (kept[0]..19).collect::<Vec<_>>());
+}
+
 /// External audit LLMR-008: when the system prompt, the focal event and the
 /// task alone exceed the window, no prompt reaches the model and the event
 /// is escalated.

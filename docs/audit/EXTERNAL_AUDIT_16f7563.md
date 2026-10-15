@@ -220,12 +220,12 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-174 | DEC-018 | Deception | L | open |
 | NN-AUD-175 | XAI-001 | XAI and RAG | M | open |
 | NN-AUD-176 | XAI-002 | XAI and RAG | M | open |
-| NN-AUD-177 | XAI-004 | XAI and RAG | S | open |
-| NN-AUD-178 | XAI-005 | XAI and RAG | M | open |
+| NN-AUD-177 | XAI-004 | XAI and RAG | S | fixed (lab PR 144) |
+| NN-AUD-178 | XAI-005 | XAI and RAG | M | fixed (lab PR 144) |
 | NN-AUD-179 | XAI-009 | XAI and RAG | S | open |
 | NN-AUD-180 | XAI-010 | XAI and RAG | S | open |
-| NN-AUD-181 | XAI-011 | XAI and RAG | S | open |
-| NN-AUD-182 | XAI-013 | XAI and RAG | M | open |
+| NN-AUD-181 | XAI-011 | XAI and RAG | S | fixed (lab PR 144) |
+| NN-AUD-182 | XAI-013 | XAI and RAG | M | fixed (lab PR 144) |
 | NN-AUD-183 | XAI-018 | XAI and RAG | S | open |
 | NN-AUD-184 | SNS-001 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-185 | SNS-002 | Sensors | S | fixed (lab PR 136) |
@@ -3628,7 +3628,7 @@ the audit did not report, noted with the fix that takes them.
     inverted, all 11 fail. `correlated_finds_same_pid` and `_ppid` moved
     their events inside the keyed window (it was unbounded); the first also
     checks that a stale keyed event is left out.
-  - Lab: @LAB144@
+  - Lab: Debian 12, ade144-probe.sh on main and on this build (mock ADE backend, `RUST_LOG` debug, the agent idle before the probe's exec): on both, "no rule matched, escalating to ADE", "ADE inference started", completed in 120 ms, "VERDICT (ADE) action=Escalate … logged, no execution needed" — the context is now built inside the ADE slot's task and the path runs end to end at the same latency. The probe's `lockbit*` process itself was not the one evaluated on either build: the single ADE slot (LLMR-002) takes the exec's `ExecCheck`, which carries the parent's comm, and the child's `ProcessSpawn` microseconds later is counted and dropped (a follow-up, not this batch). The selection itself is covered by the unit and scripted-backend tests listed above. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
 - **NN-AUD-175 (XAI-001), NN-AUD-179 (XAI-009), NN-AUD-176 (XAI-002),
   NN-AUD-180 (XAI-010), NN-AUD-183 (XAI-018), lab PR 145.** RAG corpus
   integrity and provenance (batch D), before the canary flip. Dormant:
