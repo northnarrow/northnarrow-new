@@ -789,7 +789,7 @@ cmd_sensor_feasibility() {
     # `build` first). The installed agent is stopped and its pin root purged
     # first, then started again; the report lands under $LAB_DIR/reports.
     # BASE (a directory in the guest) runs the file checks on another
-    # filesystem: the fixtures go in BASE/nn-feasibility.
+    # filesystem: the fixtures go in a fresh BASE/nn-feasibility.XXXXXX.
     vm_running || die "guest is not running"
     local base=${1:-}
     local out

@@ -231,7 +231,7 @@ root exec from a user-writable path (R009).
 ```
 deploy/lab/nn-lab.sh build                          # the runner is in the lab build only
 deploy/lab/nn-lab.sh sensor-feasibility             # ~/.cache/nn-lab/<distro>/reports/sensor-feasibility-<distro>-<stamp>.md
-deploy/lab/nn-lab.sh sensor-feasibility /mnt/other  # the file checks on another filesystem (fixtures in /mnt/other/nn-feasibility)
+deploy/lab/nn-lab.sh sensor-feasibility /mnt/other  # the file checks on another filesystem (fixtures in /mnt/other/nn-feasibility.XXXXXX)
 ```
 
 Loads the throw-away probes of `agent-ebpf/src/sensor_probe.rs` on the

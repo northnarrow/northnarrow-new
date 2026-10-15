@@ -51,13 +51,22 @@ failure mode), plus the eBPF crate's `Cargo.toml` / `Cargo.lock` /
 `rust-toolchain.toml` / `.cargo/config.toml` and `common`'s manifest.
 
 - `cargo xtask build-ebpf` writes that hash to a **stamp** sidecar
-  (`…/northnarrow-agent-ebpf.buildhash`) right after a verified compile.
-- `agent/build.rs` recomputes the hash over the *current* tree and:
+  (`…/northnarrow-agent-ebpf.buildhash`) right after a verified compile,
+  with the SHA-256 of the object it just built (stamp v2,
+  `<version>\n<source_hash>\n<object_sha>\n`; external audit EBPF-014).
+- `agent/build.rs` reads the object once, recomputes the hash over the
+  *current* tree and:
   - **STALE** (stamp present, ≠ current) → `panic!` → the whole build
     fails with the stamped-vs-current diff and the `cargo xtask build`
     remedy.
-  - **UNSTAMPED** (`.o` present, no stamp) → `panic!` → provenance
-    unknown, refuse.
+  - **OBJECT MISMATCH** (sources match, the object's SHA-256 ≠ the
+    stamped one) → `panic!`: the `.o` is not the one xtask stamped
+    (rebuilt outside xtask with other flags or toolchain, or replaced
+    after the stamp). Not an authentication: whoever can write the `.o`
+    can rewrite the stamp beside it; releases build from a clean
+    checkout and are attested.
+  - **UNSTAMPED** (`.o` present, no stamp, or a stamp of an older
+    format) → `panic!` → provenance unknown, refuse.
   - **FRESH** (match) → embed it; record `NN_EBPF_OBJECT_SHA` +
     `NN_EBPF_BUILD_HASH` + `NN_EBPF_EMBEDDED=1` as compile-time env.
   - **ABSENT** (`.o` not built) → empty placeholder + `cargo:warning`,

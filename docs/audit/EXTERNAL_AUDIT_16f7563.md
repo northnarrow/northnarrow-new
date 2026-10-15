@@ -149,7 +149,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-103 | EBPF-009 | eBPF kernel | S | fixed (lab PR 129) |
 | NN-AUD-104 | EBPF-011 | eBPF kernel | M | fixed (lab PR 137) |
 | NN-AUD-105 | EBPF-013 | eBPF kernel | M | fixed (lab PR 129) |
-| NN-AUD-106 | EBPF-014 | eBPF kernel | S | open |
+| NN-AUD-106 | EBPF-014 | eBPF kernel | S | fixed (lab PR 147) |
 | NN-AUD-107 | EBPF-015 | eBPF kernel | M | open |
 | NN-AUD-108 | EVD-002 | Evidence logs | L | open |
 | NN-AUD-109 | EVD-003 | Evidence logs | M | open |
@@ -229,7 +229,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-183 | XAI-018 | XAI and RAG | S | open |
 | NN-AUD-184 | SNS-001 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-185 | SNS-002 | Sensors | S | fixed (lab PR 136) |
-| NN-AUD-186 | SNS-003 | Sensors | M | open |
+| NN-AUD-186 | SNS-003 | Sensors | M | fixed (lab PR 147) |
 | NN-AUD-187 | SNS-005 | Sensors | S | fixed (lab PR 137) |
 | NN-AUD-188 | SNS-006 | Sensors | M | fixed (lab PR 137) |
 | NN-AUD-189 | SNS-007 | Sensors | M | fixed (lab PR 137) |
@@ -3472,3 +3472,282 @@ the audit did not report, noted with the fix that takes them.
     newest-wins rule, is replaced by `ambiguous_originator_downgrades`.
     With each fix reverted the matching test fails.
   - Lab: Debian 12, dnsid146-probe.sh on main and on this build. recycle: a process of user nn asked for `nn146….onion` (UDP/53 to 100.64.0.53) and exited; ≥ 3 s later root set `ns_last_pid` so a new process got the same pid and connected to 100.64.0.146:8146 by address — main: the new process KILLED by signal 9, its row `resolved_hostname nn146ubucir.onion`; here: exit 0, no verdict, `resolved_hostname` null. control (a process that asks for the `.onion` itself, then connects): killed with the name in its row on both. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
+- **NN-AUD-169 (DEC-007), NN-AUD-170 (DEC-008), NN-AUD-172 (DEC-010),
+  NN-AUD-173 (DEC-011), lab PR 143.** Deception content and state (batch
+  B5 of wave 2, group C).
+  - DEC-007: the five templates are rewritten with no comment and no
+    product name: Docker Hub and `ghcr.io` entries (`deploy-<short_id>`
+    users), `API_URL`/`API_TOKEN`/`TENANT_ID`, `azure-cli-<date>` (the
+    Azure CLI's default name, `az_stamp`), a GCP `prod-platform-<6
+    digits>` project (`project_id`); `short_id` is offered to every
+    family, so an operator template that used it keeps rendering. The
+    File canary body (`templates::render_file_body`) is 512 to 4095 bytes
+    derived from the seed (an empty file would have been a size every
+    decoy shared). Upgrade trap: `install.sh` replaces an installed
+    template whose SHA-256 is the shipped one of earlier releases (one
+    version each, from git history), keeps any other (a WARNING if it
+    matches `northnarrow|do not use|canary`), and sets 0640 on the five
+    and 0750 on the directory, on every run (not only `--upgrade`: a
+    package configure runs it too). The agent ignores such a template if
+    it is still on disk (`SUPERSEDED_TEMPLATE_SHA256`, WARN, built-in
+    used). Lab `upgrade-check` asserts no template names the product and
+    the modes after the upgrade.
+  - DEC-008: `materialise_canary_file` draws a 32-byte `OsRng` seed per
+    deploy (`templates::new_content_seed`) and returns the decoy's inode
+    and `DecoyContent` (SHA-256 of the bytes written, seed) for the
+    Deploy row; `short_id` is `SHA-256(seed:short_id)[..8]`, never a
+    prefix of the seed. The seed was `<operator fp>:<path>`; the "K2
+    re-seed" its comment announced never existed. `canary refresh`
+    (`refresh_canary`, the dispatcher's one call changed) writes the decoy
+    again from a new seed through `write_canary_checked` (same inode when
+    the decoy is there: `O_TRUNC`; re-created and watched when it is not),
+    watches it, then appends the Refresh row with the new content and
+    `decoy_state: intact`; a write or watch failure refuses the refresh
+    (`UnknownOperation`, as deploy). Not done: an operator-set domain
+    placeholder (no configuration surface for it; editing the template is
+    the way, said in the module doc).
+  - DEC-010: `CanaryToken` gains `contents_sha256`, `content_seed`,
+    `decoy_state`, all `skip_serializing_if = None`: rows written before
+    re-serialise byte for byte and verify (test with a row built in the
+    old field set). Not added to `CanaryDeploymentWire` (operator-signed,
+    nn-admin does not know the bytes). Every row carries the canary's
+    current content (rows stay self-contained). At boot,
+    `registry::check_decoy` looks at the path with `lstat`, opens only a
+    regular file (`O_NOFOLLOW|O_NONBLOCK`, same inode as the `lstat`),
+    reads at most 1 MiB (larger is `modified`, unread) and compares the
+    hash; the agent's read is not reported (PROTECTED_PIDS). Outcome
+    `intact|modified|missing|not_regular|unreadable`: anything but intact
+    is an ERROR at every boot; a change of the recorded state is a
+    `DecoyCheck` row (`Registry::record_decoy_state`, so `canary list`,
+    which prints the chain, shows it) and a signed `integrity_drift`
+    (`canary_decoy_tampered`, or `canary_decoy_missing`; expected and
+    found SHA-256 in `extra`), `integrity_drift_cleared` when it is intact
+    again. The decoy is watched by the inode checked, and only a regular
+    file (a link or FIFO at the path was watched by its own inode before).
+    A row without a hash (deployed before) is checked for presence only,
+    with one WARN counting them; refresh records a hash.
+  - DEC-011: `RegistryAction::Trip` and `::DecoyCheck` appended to the
+    enum. The detector, under the registry lock, asks `is_armed`, appends
+    the access row with that `first_trip`, then on a first trip
+    `mark_tripped(id, Some(access_entry_hash))` (now `Result<bool>`)
+    sets the state and appends the Trip row (`deployed_by_fp:
+    "agent-self"`); a failed write is an ERROR and the event is still
+    emitted, the state held in memory for the run. `read_chain` applies
+    Trip and DecoyCheck rows; Refresh clears the trip. Downgrade: an older
+    agent skips these rows as unreadable (DEC-006 path), re-arms the
+    canary, and chains its next row to the last one it read (an off-host
+    verification of the registry then fails there); CHANGELOG says so.
+    Behaviour change, release-noted: a tripped canary stays Log-only
+    across restarts until `canary refresh` (§12 Q2).
+  - Tests: `credential_templates_have_no_product_marker`,
+    `file_canary_body_has_no_marker_or_fingerprint`,
+    `short_id_never_contains_the_operator_fp`, `content_seeds_are_fresh`,
+    `a_superseded_shipped_template_on_disk_is_not_used`,
+    `two_deploys_same_operator_same_path_render_differently`,
+    `refresh_rotates_credential_content`,
+    `deploy_row_carries_contents_sha256_and_legacy_rows_verify`,
+    `decoy_check_reports_modified_missing_not_regular`,
+    `a_decoy_state_is_recorded_once_per_change`,
+    `tripped_state_survives_reopen`, `refresh_clears_trip_across_reopen`,
+    `legacy_chain_without_trip_rows_opens_untripped`,
+    `first_trip_hash_is_the_access_row_hash`; privileged
+    (`canary_privileged_e2e`): `a_decoy_changed_while_the_agent_is_down_is_reported`,
+    `credential_decoys_are_new_at_each_deploy_and_refresh`, and
+    `file_canary_deployed_at_runtime_survives_an_agent_restart` now
+    asserts `first_trip: false` after the restart and the Trip row's hash.
+    Checked by inverting each fix (old templates, prefix `short_id`, no
+    superseded check, fixed seed, refresh without rewrite, Trip rows not
+    read, empty access hash): the matching tests fail. The new functions
+    (`check_decoy`, `render_file_body`, the row fields) have no old
+    counterpart; `refresh_clears_trip_across_reopen` and the legacy-chain
+    test are guards and pass on both.
+  - Lab: @LAB143@
+- **NN-AUD-177 (XAI-004), NN-AUD-182 (XAI-013), NN-AUD-178 (XAI-005),
+  NN-AUD-181 (XAI-011), lab PR 144.** Correlation context and XAI
+  readiness (`agent/src/correlation/mod.rs`, `ade/sanitize.rs`,
+  `ade/structured_prompt.rs`, `ade/mod.rs`, `xai/occlusion.rs`,
+  `xai/saliency.rs`, `xai/engine.rs`, `main.rs`; batch E of triage E).
+  - XAI-004: `get_correlated` excluded the focal event with `ptr::eq`; the
+    agent pushes a clone and queries with the original, so the clone came
+    back every time (its pid matched) and took a slot and part of the 4 KiB
+    in the untrusted correlated block. The newest event of the same variant,
+    pid and timestamp is now the copy: it is excluded, and so is anything
+    pushed after it (the query now runs a moment later, see XAI-013; the
+    context stays what it was when the event arrived). An ExecCheck and the
+    ProcessSpawn of the same exec differ in variant: the other one stays.
+    Not done: a push sequence number (it would change the type of
+    `with_recent`, which the posture uses).
+  - XAI-013: `get_correlated` selects in two tiers: keyed events (same pid,
+    ppid or filename) within 10 × the window (5 minutes by default), newest
+    first, up to half of `CORRELATED_MAX` = 20; then nearby events (time
+    window only), newest first; then the remaining keyed ones. An event
+    left out for its injection score (≥ 0.90) takes no slot and rides
+    along, at most 20, so the sanity check still weighs it (LLMR-010). Each
+    line's bytes count against the 4 KiB block cap during the selection,
+    so the prompt renders it whole (≤ 20 events; it was the newest 50, of
+    which the prompt kept the newest 20 and the cap the newest of those).
+    `sanitize_correlated(focal, recent)` keeps the newest 20 events not
+    left out and, if the cap binds (a context built otherwise), fits the
+    keyed lines first; the LLMR-008 window fit (`drop_least_related`) drops
+    the oldest nearby line before a keyed one. Cost: the selection
+    sanitizes its candidates (about 50 µs each, release build), at most
+    2 × 20 per tier, cloned under the lock; so it runs on the ADE slot's
+    task, not on the event loop (an exec skipped while ADE is busy costs
+    nothing). Residual: siblings of the same parent are keyed too and can
+    fill the keyed half; more than 20 injection-flagged events in a tier
+    fill fewer slots, but hold the verdict at Escalate (LLMR-010).
+    Regression: the model sees a different context; `ade_attacks` before
+    and after, on a model host, not measured.
+  - XAI-005: `occlusion::enumerate` makes a unit only of the correlated
+    events the prompt renders (`CorrelatedLine::index`; the id stays
+    `correlated:<index in recent_events>`). Not mirrored: the model-window
+    fit (a line it drops scores 0). The preflight takes the largest
+    K ≤ `max_units`, at least 1, whose worst case at 5 s per inference fits
+    the budget, and refuses only if K = 1 does not: a ProcessSpawn with 20
+    correlated events runs at K = 4, 18 inferences, Degraded (it was
+    refused from 4 correlated events, 19 inferences). The K used is
+    `SaliencyRun::max_units`, recorded in `method.max_units`. The 5 s
+    estimate is optimistic on CPU; the measured-time guard stays the
+    backstop. Art. 13 dossier §4 updated.
+  - XAI-011: `explain` computes `assembled_prompt` first. Without one it
+    returns `XaiUnavailable::InjectionShortCircuit { injection_score }`
+    (score ≥ 0.90) or `PromptExceedsWindow` (beyond the triage: the LLMR-008
+    escalation without a prompt is the same case), before any probe; the
+    prompt is reused for `prompt_sha256` (one RAG retrieval, not two).
+    `explain_with` takes the probe (test seam).
+  - Tests: `focal_clone_excluded_exec_check_kept`,
+    `focal_appears_once_in_the_prompt`, `keyed_precursor_survives_burst`,
+    `omitted_events_do_not_consume_slots`,
+    `omitted_correlated_events_take_no_line`,
+    `byte_cap_keeps_keyed_lines_first`,
+    `the_window_fit_drops_nearby_events_before_a_keyed_precursor`,
+    `units_cover_only_rendered_events`,
+    `production_shaped_context_explained_degraded`,
+    `chain_records_the_adaptive_k`,
+    `injection_short_circuit_refuses_before_any_probe`; with each fix
+    inverted, all 11 fail. `correlated_finds_same_pid` and `_ppid` moved
+    their events inside the keyed window (it was unbounded); the first also
+    checks that a stale keyed event is left out.
+  - Lab: @LAB144@
+- **NN-AUD-175 (XAI-001), NN-AUD-179 (XAI-009), NN-AUD-176 (XAI-002),
+  NN-AUD-180 (XAI-010), NN-AUD-183 (XAI-018), lab PR 145.** RAG corpus
+  integrity and provenance (batch D), before the canary flip. Dormant:
+  `NN_ADE_RAG_ENABLED` is off by default and no installer creates
+  `/var/lib/northnarrow/rag`.
+  - XAI-001: new `agent/src/rag/kb_manifest.rs`. `kb_index.json` is built
+    in with `include_str!` (`PINNED_KB_INDEX`); xtask writes each dump's
+    `file` name next to its `canonical_dump_sha256` (the committed file
+    gained the two names; `kb_index_hash` and its preimage are
+    unchanged). `KbManifest::read_verified` lists the directory, refuses
+    any `*.jsonl` not listed, then reads each pinned dump once (regular
+    file, `O_NONBLOCK`, at most 64 MiB), hashes it and compares by name;
+    the records are parsed from those same bytes
+    (`load_verified_records`, replacing `load_records`). Matching by
+    name, not position; plain digest compare (public values). The
+    revised fix's audit record: the ADE loads before the audit log
+    opens, so `load_ade_engine` hands the refusal to main.rs, which
+    writes a signed `subsystem_degraded` naming the cause once the log
+    is open. Seam for tests: `open_index_with_manifest`,
+    `rag_canary_with_manifest`.
+  - XAI-009: covered by the manifest — a missing directory, an empty one
+    or a pinned dump absent is `KbRefusal::Missing`; the canary logs "RAG
+    requested but the canonical corpus is missing — running without
+    RAG" (an altered corpus: "... failed its integrity check ...") and
+    returns `RagCanary::Refused` (no engine), the documented parity
+    path.
+  - XAI-002: `build_index_in_ram` (`Index::create_in_ram`) at every
+    open; `open_or_build`, the on-disk `build_index` and the
+    `.nn_kb_source_sha256` marker are gone. `NN_ADE_RAG_INDEX_DIR` is
+    read only to WARN that it is ignored; a directory left from before is
+    not read, nor deleted. The tantivy `mmap` feature stays (only tests
+    use it now; dropping it is a Cargo change for later).
+  - XAI-010: `RagEngine` keeps `source_fingerprint(records)` from open
+    (`corpus_fingerprint`; for the legacy seed engine, of the seed), and
+    `AdeEngine::rag_fingerprint()` exposes it. Deviation from the triage:
+    `compute_environment_hash(env, rag_fingerprint)` takes it as an
+    argument, and `XaiEngine::new` passes the wrapped engine's own value,
+    instead of a caller-filled `EnvironmentInputs` field that could name
+    another corpus. The preimage appends `u32_be(len) ‖ fp`, empty with
+    RAG off (the `xai_types` doc updated); computed once, in
+    `XaiEngine::new` (documented). No chain had been produced in
+    production (XAI not wired, Tappa 10.5).
+  - XAI-018: dossier §8 rewritten as the triage asks (`RAG_CONTEXT:`
+    titles plus Sigma severity bound by `prompt_sha256`, bodies never in
+    the prompt, per-document identity the Tappa 13 log's job, Art.
+    13(3)(c) only partly covered, reference to XAI-010), §2 rows
+    13(3)(a)/(d) updated, and a new §9: the ADE is advisory (lab PR 134;
+    `NN_ADE_ENFORCE=1` re-enables execution and is a signed weakening).
+    The plan §5.1 pillar 1 (owner verbatim, left intact) gets a
+    correction note below it, §3.2 item 6 a superseded note;
+    `ADE_DOCTRINE.md` updated. No change to the `RAG_CONTEXT:` line
+    shape (training contract).
+  - Tests: `tampered_dump_refused`, `unlisted_jsonl_refused`,
+    `canary_on_with_empty_jsonl_dir_falls_back_to_none`,
+    `planted_index_dir_ignored` (a forged marker and a real tantivy index
+    with another title under the same id: the results come from the
+    records), `tampered_dump_is_a_mismatch`, `unlisted_jsonl_is_refused`,
+    `missing_dump_or_dir_is_missing`,
+    `fifo_under_a_dump_name_does_not_block`,
+    `malformed_manifests_are_refused`,
+    `pinned_manifest_names_both_canonical_dumps`,
+    `verified_records_include_seed_and_pinned_dump`,
+    `corpus_fingerprint_follows_the_records`, the extended
+    `environment_hash_is_deterministic_and_tamper_sensitive` (RAG on vs
+    off, two corpora) and `rag_fingerprint` asserts in
+    `with_rag_splices_block_into_assembled_prompt`. With each fix
+    reverted (digest compare, unlisted check, missing tolerated, the
+    planted index opened when its marker matches, the fingerprint left
+    out of the preimage) the matching tests fail. The release-gate
+    benches (`golden_suite_real_corpus`, `latency_bench_real_corpus`, the
+    triage's `pinned_dumps_open`) now open `target/kb` through the pinned
+    manifest; that corpus was not on the development host, so they did
+    not run there.
+  - Lab: @LAB145@
+- **NN-AUD-186 (SNS-003), NN-AUD-106 (EBPF-014), lab PR 147.** Lab and
+  build tooling (batch G). Neither reaches an installed agent: the runner
+  exists only in `test-privileged` builds, and the stamp lives on the build
+  machine. No kernel change.
+  - SNS-003: `--sensor-feasibility` (root) removed and re-created
+    `<base>/nn-feasibility`, wrote the fixtures with `fs::write`, copied
+    `/usr/bin/true` to `/dev/shm/nn-feasibility-true` with `fs::copy` (which
+    follows a symlink and keeps a planted file's owner) and executed that
+    path. The fixtures now go in a `mkdtemp` directory
+    `<base>/nn-feasibility.XXXXXX` (0700, owner and mode checked;
+    `NN_FEASIBILITY_BASE` kept), the tmpfs copy in another one under
+    `/dev/shm`, held in `Fixtures` until the exec case; both are removed on
+    drop and the old names are never touched. Every fixture file is
+    created with `O_CREAT|O_EXCL|O_NOFOLLOW` (copies 0700, data files
+    0600). Before each exec the target is checked (`lstat` for a name,
+    `fstat` for a descriptor): regular, uid 0, `nlink` 1 for a named copy
+    and 0 for the deleted file and the memfd, and for a named file not
+    writable by group or others (a memfd is 0777 by construction and has
+    no name). A refused target fails its case ("not executed: refused").
+    Cautious choices: the work directory is held by `run()`, not
+    `Fixtures`, because the "no program" bench baseline runs after the
+    probes are gone; a `/dev/shm` copy that cannot be made is now an
+    informational line instead of a silently skipped case.
+  - EBPF-014: stamp v2 (`nn-ebpf-buildhash-v2`):
+    `<version>\n<source_hash>\n<object_sha>\n`, both 64-character
+    lowercase hex (the writer refuses anything else, the reader treats it
+    as absent). xtask hashes the release object it just built;
+    `agent/build.rs` reads the object once, and `ebpf_guard::verdict`
+    returns `Fresh`, `StaleSource`, `ObjectMismatch` or `Unstamped`; only
+    `Fresh` embeds, and the bytes embedded are the bytes checked. As the
+    triage says, this catches a `.o` rebuilt outside xtask or replaced
+    after the stamp, not an actor who can rewrite the stamp beside it.
+    `install.sh`, `mk-tarball.sh`, `mk-packages.sh` and `nn-lab.sh sync`
+    only test the stamp's presence and mtime and are unchanged; the lab
+    builds the object on the host and syncs object and stamp together, so
+    the guest's build sees the same bytes. One forced rebuild: a v1 stamp
+    reads as absent (CHANGELOG).
+  - Tests: `stamp_v2_round_trip`, `object_swapped_after_stamp_is_refused`
+    (ebpf-guard), `fixtures_are_private_and_fresh`,
+    `fixture_files_are_never_reused_or_followed`,
+    `exec_target_is_vetted_before_exec` (agent, `--features
+    test-privileged`). With the old stamp format or a verdict that ignores
+    the object hash the two ebpf-guard tests fail; with the fixed name and
+    `fs::copy` the first two feasibility tests fail. Build: on the starting
+    code an object changed by one byte after `cargo xtask build-ebpf`
+    still built; now `cargo check -p northnarrow-agent` stops on "eBPF
+    OBJECT DOES NOT MATCH ITS STAMP", and a v1 stamp on "UNSTAMPED".
+  - Lab: Debian 12, feas147-probe.sh: as user nn, `/dev/shm/nn-feasibility-true` planted as a symlink to a file of the user's and `/var/tmp/nn-feasibility/nn147-marker` created, then `nn-lab.sh sensor-feasibility` (root). main: both plants gone after the run (root removed the user's directory and link; the copy through the link was refused by `protected_symlinks`); here: the run passes with its fixtures in `mkdtemp` directories (`/dev/shm/nn-feasibility.QA696o/true` executed), the link, its target and the marker untouched. EBPF-014 on the host: a one-byte change to the `.o` passed `cargo check` on main and fails here ("eBPF OBJECT DOES NOT MATCH ITS STAMP"). Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.

@@ -15,6 +15,105 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, lab and build tooling (Medium SNS-003, EBPF-014):
+  the sensor-feasibility runner of lab builds (`--sensor-feasibility`,
+  feature `test-privileged`) ran as root on fixed names in world-writable
+  directories: it removed and re-created `/var/tmp/nn-feasibility`, wrote
+  its fixtures there and copied `/usr/bin/true` to
+  `/dev/shm/nn-feasibility-true`, then executed that copy, so a local user
+  who prepared those names could have root run their file. Each run now
+  works in fresh `mkdtemp` directories (0700, `<base>/nn-feasibility.XXXXXX`
+  and `/dev/shm/nn-feasibility.XXXXXX`; `NN_FEASIBILITY_BASE` kept),
+  creates every file with `O_CREAT|O_EXCL|O_NOFOLLOW`, checks each file it
+  is about to execute (regular, owned by root, the expected link count, a
+  named copy writable by root only), and never touches the old names. The
+  eBPF build stamp recorded only the source hash, so an object rebuilt
+  outside `cargo xtask` from the same sources (other flags, another
+  toolchain, an IDE) or replaced after the stamp was embedded as fresh.
+  The stamp (`nn-ebpf-buildhash-v2`) now also holds the SHA-256 of the
+  object xtask built, and `agent/build.rs` refuses an object whose bytes
+  differ. **One forced rebuild:** a stamp written before this change reads
+  as absent and the agent build stops on "UNSTAMPED eBPF OBJECT" until
+  `cargo xtask build-ebpf` (or `cargo xtask build --release`) runs once.
+- External audit, Wave 2, RAG corpus integrity and provenance (Medium
+  XAI-001, XAI-009, XAI-002, XAI-010, XAI-018; dormant while
+  `NN_ADE_RAG_ENABLED` is off): the RAG canary indexed every `*.jsonl` in
+  its directory, unchecked, into the trusted part of the ADE prompt; an
+  empty or missing directory gave RAG on the ~36 built-in seed notes,
+  logged as "RAG enabled"; and an index on disk was opened whenever its
+  marker file, forgeable by whoever could write there, matched. The
+  agent now embeds
+  `docs/kb-sources/kb_index.json`, which names each canonical dump with its
+  SHA-256 (`cargo xtask rag-kb` writes the names), and starts RAG only when
+  the directory holds exactly those dumps, byte for byte; otherwise it
+  runs without RAG, with a WARN and a signed `subsystem_degraded` naming
+  the cause. The index is built in memory at every start (about 0.4 s);
+  `NN_ADE_RAG_INDEX_DIR` is ignored with a WARN. The XAI `environment_hash`
+  now includes the loaded corpus fingerprint (an empty field with RAG
+  off). The Article 13 dossier §8 no longer claims that the signed chain
+  commits every retrieved snippet: the prompt carries only the titles and
+  Sigma severities, and which documents were retrieved is covered only in
+  part until the Tappa 13 log; a new §9 records that the ADE is advisory.
+  **Regression:** a knowledge-base update needs an agent release.
+- External audit, Wave 2, correlation context and XAI readiness (Medium
+  XAI-004, XAI-013, XAI-005, XAI-011): the focal event sat in its own
+  correlated context — the agent pushed a copy into the buffer and excluded
+  it by address, which never matched — so the model read it twice, once as
+  untrusted correlated data. The copy is now excluded (same variant, pid
+  and timestamp; the ExecCheck of the same exec stays). About 20 unrelated
+  events in the 30 s window (DNS queries) pushed a precursor of the same
+  process, parent or file out of what the model saw: up to half of the 20
+  correlated slots now go to events sharing a key with the focal one,
+  within 5 minutes, before nearby events; an event left out for its
+  injection score takes no slot; the 4 KiB block cap and the model-window
+  fit drop nearby events before keyed ones. The selection runs on the ADE
+  evaluation's task, not on the event loop. XAI (not wired yet): the
+  preflight refused every ProcessSpawn with 4 or more correlated events;
+  the bounded-K cap now adapts to the budget (20 correlated events: K = 4,
+  a Degraded chain) and is recorded in `method.max_units`, and only the
+  correlated events the prompt renders are units. An event ADE keeps from
+  the model (injection score, a prompt over the window) no longer yields a
+  signed "Complete" chain of zero deltas over the hash of an empty prompt:
+  it is refused before any probe. **Regression:** the model sees a
+  different correlated context (at most 20 events, keyed first).
+- External audit, Wave 2, deception content and state (Medium DEC-007,
+  DEC-008, DEC-010, DEC-011): what the decoys held told an attacker what
+  they were — the credential templates said "Canary credential — DO NOT
+  USE. NorthNarrow XDR", used `northnarrow.io` names and
+  `NORTHNARROW_API_TOKEN`, a File canary was three comment lines naming the
+  product, the operator key and the rule — so one `grep -ri northnarrow`
+  found every decoy on every host. The templates are now neutral (no
+  comment, Docker Hub and ghcr.io entries, `API_TOKEN`, `azure-cli-<date>`,
+  a generated GCP project id) and a File canary holds 512 to 4095 bytes
+  derived from its seed. `install.sh` replaces an installed template that
+  is byte-identical to the one an earlier release shipped, keeps an edited
+  one (with a WARNING if it still names the product) and installs them
+  0640 in a 0750 directory; the agent does not use a shipped template of an
+  earlier release it still finds. The content was rendered from the
+  operator key fingerprint and the path: the fingerprint was printed into
+  the azure, gcp and docker decoys and every host got the same credential
+  for the same path. Each deploy now draws a random 32-byte seed, recorded
+  in the registry with the SHA-256 of the bytes written, and `nn-admin
+  canary refresh` writes the decoy again from a new seed (in place, the
+  same inode), recorded too; a refresh whose decoy cannot be written or
+  watched is refused. At boot each decoy is compared with its record: one
+  modified, removed or replaced (a link, a FIFO) while the agent was down
+  used to be re-armed in silence; it is now an ERROR and, when its state
+  changed, a signed `integrity_drift` (`canary_decoy_tampered` or
+  `canary_decoy_missing`) and a `decoy_check` row that `nn-admin canary
+  list` shows; only a regular file is watched. A trip lived in memory only:
+  every restart re-armed the response for a canary already tripped. It is
+  now a signed `trip` row naming the access row (that hash was always
+  empty), read back at boot. **Regression:** a tripped canary stays tripped
+  (recorded, not responded to) across restarts until `nn-admin canary
+  refresh`, as the design's manual refresh intends. Decoys deployed before
+  keep their content, which names the product, and cannot be checked
+  beyond their presence (a WARN at boot): refresh them, or burn and
+  deploy again. Reading a decoy trips it: `nn-admin canary list` is the
+  inventory. An older agent (downgrade) skips `trip` and `decoy_check`
+  rows as unreadable, re-arms tripped canaries, and chains its next row
+  to the last row it could read, which an off-host check of the registry
+  then reports as broken.
 - External audit, Wave 2, DNS attribution identity (Medium NET-016,
   NET-006): a connect took the last name its PID had asked for in the
   past 300 s, whoever held the PID then. A process that inherited the PID

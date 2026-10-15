@@ -31,10 +31,19 @@
 //!   (the eBPF crate's sources + manifests + toolchain pin, plus the
 //!   shared `common/` wire crate the `.o` compiles in).
 //! - `cargo xtask build-ebpf` calls [`write_stamp`] right after a
-//!   successful compile.
-//! - `agent/build.rs` calls [`read_stamp`] + [`ebpf_source_hash`] and
-//!   compares; mismatch (or a present-but-unstamped `.o`) is a hard
-//!   build failure.
+//!   successful compile, with that hash and the SHA-256 of the object
+//!   it just built.
+//! - `agent/build.rs` reads the object once, then [`verdict`] compares
+//!   the stamp ([`read_stamp`]) with the current [`ebpf_source_hash`]
+//!   and with the SHA-256 of those bytes; anything but
+//!   [`Verdict::Fresh`] is a hard build failure.
+//!
+//! The object hash catches a `.o` that is not the one `xtask` stamped:
+//! one rebuilt outside `xtask` from the same sources (other flags,
+//! another toolchain, an IDE, a plain `cargo build` in `agent-ebpf/`),
+//! or replaced after the stamp. It is not authentication: whoever can
+//! write the `.o` can rewrite the stamp next to it. Releases build from
+//! a clean checkout and are attested.
 //!
 //! Both sides MUST compute the hash byte-for-byte identically, which
 //! is the entire reason this is one shared crate rather than two
@@ -65,7 +74,10 @@ pub const STAMP_RELPATH: &str =
 /// invalidates every existing stamp, which forces a clean eBPF rebuild
 /// rather than risking a hash that means different things across agent
 /// versions.
-pub const STAMP_VERSION: &str = "nn-ebpf-buildhash-v1";
+///
+/// v2 (external audit EBPF-014) adds the object's own SHA-256 as a
+/// third line; a v1 stamp reads as absent.
+pub const STAMP_VERSION: &str = "nn-ebpf-buildhash-v2";
 
 /// Absolute path to the compiled eBPF object, given the repo root.
 pub fn ebpf_artifact_path(repo_root: &Path) -> PathBuf {
@@ -161,33 +173,52 @@ pub fn ebpf_source_hash(repo_root: &Path) -> io::Result<String> {
     Ok(to_hex(&hasher.finalize()))
 }
 
+/// What a stamp records: the source closure the object was built from,
+/// and the SHA-256 of the object bytes `xtask` produced from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pub source_hash: String,
+    pub object_sha: String,
+}
+
 /// Write the provenance stamp next to the `.o`, atomically (write to a
 /// temp sibling, then rename). Called by `cargo xtask build-ebpf`
 /// after a verified-successful compile. The file is human-inspectable:
-/// `<STAMP_VERSION>\n<hash>\n`.
-pub fn write_stamp(repo_root: &Path, source_hash: &str) -> io::Result<()> {
+/// `<STAMP_VERSION>\n<source_hash>\n<object_sha>\n`. Both values must be
+/// lowercase hex SHA-256 digests; anything else is refused here rather
+/// than written as a stamp that [`read_stamp`] would treat as absent.
+pub fn write_stamp(repo_root: &Path, source_hash: &str, object_sha: &str) -> io::Result<()> {
+    for (what, value) in [("source hash", source_hash), ("object sha", object_sha)] {
+        if !is_sha256_hex(value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{what} is not a lowercase hex SHA-256: {value:?}"),
+            ));
+        }
+    }
     let stamp = ebpf_stamp_path(repo_root);
     let parent = stamp
         .parent()
         .ok_or_else(|| io::Error::other("stamp path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let contents = format!("{STAMP_VERSION}\n{source_hash}\n");
+    let contents = format!("{STAMP_VERSION}\n{source_hash}\n{object_sha}\n");
     let tmp = stamp.with_extension("buildhash.tmp");
     fs::write(&tmp, contents.as_bytes())?;
     fs::rename(&tmp, &stamp)?;
     Ok(())
 }
 
-/// Read the source hash recorded in the stamp, if present and valid.
+/// Read the stamp, if present and valid.
 ///
 /// - `Ok(None)`  — no stamp on disk (the `.o` was built by an unknown
 ///   path, or there is no `.o` at all).
-/// - `Ok(Some(h))` — the recorded source hash.
-/// - `Err`/`Ok(None)` on a malformed or wrong-version stamp: a stamp
-///   whose first line is not the current [`STAMP_VERSION`] is treated
+/// - `Ok(Some(stamp))` — the recorded source hash and object sha.
+/// - `Ok(None)` also for a malformed or wrong-version stamp: a stamp
+///   whose first line is not the current [`STAMP_VERSION`], or that
+///   does not hold exactly two SHA-256 hex lines after it, is treated
 ///   as absent so a format bump forces a clean rebuild rather than a
 ///   confusing compare against an incompatible value.
-pub fn read_stamp(repo_root: &Path) -> io::Result<Option<String>> {
+pub fn read_stamp(repo_root: &Path) -> io::Result<Option<Stamp>> {
     let stamp = ebpf_stamp_path(repo_root);
     let raw = match fs::read_to_string(&stamp) {
         Ok(s) => s,
@@ -195,14 +226,58 @@ pub fn read_stamp(repo_root: &Path) -> io::Result<Option<String>> {
         Err(e) => return Err(e),
     };
     let mut lines = raw.lines();
-    match (lines.next(), lines.next()) {
-        (Some(ver), Some(hash)) if ver == STAMP_VERSION && !hash.trim().is_empty() => {
-            Ok(Some(hash.trim().to_string()))
+    match (lines.next(), lines.next(), lines.next(), lines.next()) {
+        (Some(ver), Some(src), Some(obj), None)
+            if ver == STAMP_VERSION && is_sha256_hex(src) && is_sha256_hex(obj) =>
+        {
+            Ok(Some(Stamp {
+                source_hash: src.to_string(),
+                object_sha: obj.to_string(),
+            }))
         }
         // Present but unreadable / stale-format: surface as "no usable
         // stamp" so the caller's present-but-unstamped path fires.
         _ => Ok(None),
     }
+}
+
+/// `agent/build.rs`'s decision on the object it is about to embed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Built from the current sources, and these are the bytes `xtask`
+    /// stamped.
+    Fresh,
+    /// The stamp names other sources: the `.o` is stale.
+    StaleSource { stamped: String, current: String },
+    /// The sources match, but the bytes are not the ones `xtask`
+    /// stamped: rebuilt outside `xtask`, or replaced after the stamp.
+    ObjectMismatch { stamped: String, actual: String },
+    /// No usable stamp: provenance unknown.
+    Unstamped,
+}
+
+/// Compare a stamp with the current source hash and with the SHA-256 of
+/// the object bytes the caller holds (and will embed). A stale source
+/// is reported first: rebuilding through `xtask` is the remedy for both.
+pub fn verdict(stamp: Option<&Stamp>, current_source: &str, object_sha: &str) -> Verdict {
+    match stamp {
+        None => Verdict::Unstamped,
+        Some(s) if s.source_hash != current_source => Verdict::StaleSource {
+            stamped: s.source_hash.clone(),
+            current: current_source.to_string(),
+        },
+        Some(s) if s.object_sha != object_sha => Verdict::ObjectMismatch {
+            stamped: s.object_sha.clone(),
+            actual: object_sha.to_string(),
+        },
+        Some(_) => Verdict::Fresh,
+    }
+}
+
+/// 64 lowercase hex characters: the encoding [`sha256_hex`] and
+/// [`ebpf_source_hash`] produce.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Recursively collect `*.rs` files under `dir` into `out`. A missing
@@ -289,23 +364,95 @@ mod tests {
     }
 
     #[test]
-    fn stamp_round_trips_and_rejects_wrong_version() {
+    fn stamp_v2_round_trip() {
         let dir = tempdir();
         let root = dir.path();
         // No stamp yet.
         assert_eq!(read_stamp(root).unwrap(), None);
 
-        write_stamp(root, "deadbeef").unwrap();
-        assert_eq!(read_stamp(root).unwrap(), Some("deadbeef".to_string()));
-
-        // A stamp written with a different version line reads as absent.
-        let stamp = ebpf_stamp_path(root);
-        fs::write(&stamp, b"some-other-version\ndeadbeef\n").unwrap();
+        let src = sha256_hex(b"sources");
+        let obj = sha256_hex(b"object");
+        write_stamp(root, &src, &obj).unwrap();
         assert_eq!(
             read_stamp(root).unwrap(),
-            None,
-            "wrong-version stamp must read as absent (forces clean rebuild)"
+            Some(Stamp {
+                source_hash: src.clone(),
+                object_sha: obj.clone(),
+            })
         );
+        assert_eq!(
+            fs::read_to_string(ebpf_stamp_path(root)).unwrap(),
+            format!("{STAMP_VERSION}\n{src}\n{obj}\n")
+        );
+
+        // Anything but the current version with two digests reads as
+        // absent: a v1 stamp (no object line), another version, a
+        // missing or extra line, a value that is not a digest.
+        let stamp = ebpf_stamp_path(root);
+        for bad in [
+            format!("nn-ebpf-buildhash-v1\n{src}\n"),
+            format!("some-other-version\n{src}\n{obj}\n"),
+            format!("{STAMP_VERSION}\n{src}\n"),
+            format!("{STAMP_VERSION}\n{src}\n{obj}\n{obj}\n"),
+            format!("{STAMP_VERSION}\n{src}\ndeadbeef\n"),
+            format!("{STAMP_VERSION}\n{src}\n{}\n", obj.to_uppercase()),
+        ] {
+            fs::write(&stamp, bad.as_bytes()).unwrap();
+            assert_eq!(
+                read_stamp(root).unwrap(),
+                None,
+                "must read as absent: {bad:?}"
+            );
+        }
+
+        // The writer refuses a value the reader would not accept.
+        assert!(write_stamp(root, &src, "deadbeef").is_err());
+        assert!(write_stamp(root, "", &obj).is_err());
+    }
+
+    #[test]
+    fn object_swapped_after_stamp_is_refused() {
+        let dir = tempdir();
+        let root = dir.path();
+        write(root, "agent-ebpf/src/main.rs", b"fn main() {}");
+        write(root, "common/src/lib.rs", b"// wire");
+        write(root, ARTIFACT_RELPATH, b"\x7fELF built by xtask");
+
+        // What xtask does after a compile.
+        let source = ebpf_source_hash(root).unwrap();
+        let built = fs::read(ebpf_artifact_path(root)).unwrap();
+        write_stamp(root, &source, &sha256_hex(&built)).unwrap();
+
+        // What build.rs does: the stamped bytes are fresh.
+        let stamp = read_stamp(root).unwrap();
+        assert_eq!(
+            verdict(stamp.as_ref(), &source, &sha256_hex(&built)),
+            Verdict::Fresh
+        );
+
+        // Same sources, other bytes (another build, or a swap): refused.
+        write(root, ARTIFACT_RELPATH, b"\x7fELF built elsewhere");
+        let swapped = fs::read(ebpf_artifact_path(root)).unwrap();
+        assert_eq!(ebpf_source_hash(root).unwrap(), source);
+        assert_eq!(
+            verdict(stamp.as_ref(), &source, &sha256_hex(&swapped)),
+            Verdict::ObjectMismatch {
+                stamped: sha256_hex(&built),
+                actual: sha256_hex(&swapped),
+            }
+        );
+
+        // A source change still reads as stale, whatever the bytes.
+        write(root, "common/src/lib.rs", b"// wire CHANGED");
+        let current = ebpf_source_hash(root).unwrap();
+        assert_eq!(
+            verdict(stamp.as_ref(), &current, &sha256_hex(&built)),
+            Verdict::StaleSource {
+                stamped: source,
+                current,
+            }
+        );
+        assert_eq!(verdict(None, "x", "y"), Verdict::Unstamped);
     }
 
     // ── tiny std-only test helpers (no tempfile dep in this crate) ──
