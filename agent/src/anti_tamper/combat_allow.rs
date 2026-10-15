@@ -18,8 +18,12 @@
 //!   next (idempotent) engage picks it up.
 //! - **Fail-secure.** An unreadable file yields an EMPTY allowlist
 //!   (full isolation), never an open one. Individual malformed lines
-//!   are skipped with a warning — a typo can only *remove* an ACCEPT,
-//!   never widen one.
+//!   are skipped with a warning. A prefix is a typo away from the whole
+//!   address space (`10.0.0.0/0` for `/8`), which would make COMBAT
+//!   isolate nothing; external audit NN-AUD-095: a line wider than
+//!   [`MIN_PREFIX_V4`] / [`MIN_PREFIX_V6`], or naming the unspecified or a
+//!   multicast address, is skipped the same way. A skipped line narrows
+//!   the carve-out, never widens it; `config overlay set` refuses it.
 //! - **No SSH-source auto-detect.** The operator must declare the admin
 //!   CIDR explicitly; we never infer it from the live SSH session
 //!   (that would let an attacker mid-session carve themselves out).
@@ -55,6 +59,12 @@ pub struct AllowLoad {
     pub read_error: Option<String>,
 }
 
+/// External audit NN-AUD-095: the widest IPv4 carve-out, a /8.
+pub const MIN_PREFIX_V4: u8 = 8;
+/// External audit NN-AUD-095: the widest IPv6 carve-out, a /48 (one
+/// site); a /32 is a whole provider allocation.
+pub const MIN_PREFIX_V6: u8 = 48;
+
 /// Validate one line as a bare IP or `IP/prefix` CIDR.
 pub fn validate_entry(line: &str) -> Result<AllowCidr, String> {
     let (addr_str, prefix) = match line.split_once('/') {
@@ -69,19 +79,56 @@ pub fn validate_entry(line: &str) -> Result<AllowCidr, String> {
     let addr: IpAddr = addr_str
         .parse()
         .map_err(|_| format!("invalid IP address in `{line}`"))?;
+    let family = if addr.is_ipv6() { "IPv6" } else { "IPv4" };
     let max_prefix = if addr.is_ipv6() { 128 } else { 32 };
-    if let Some(p) = prefix {
-        if p > max_prefix {
-            return Err(format!(
-                "prefix /{p} out of range for {} in `{line}` (max /{max_prefix})",
-                if addr.is_ipv6() { "IPv6" } else { "IPv4" }
-            ));
-        }
+    let min_prefix = if addr.is_ipv6() {
+        MIN_PREFIX_V6
+    } else {
+        MIN_PREFIX_V4
+    };
+    let p = prefix.unwrap_or(max_prefix);
+    if p > max_prefix {
+        return Err(format!(
+            "prefix /{p} out of range for {family} in `{line}` (max /{max_prefix})"
+        ));
+    }
+    // External audit NN-AUD-095: the ACCEPT rules go ahead of the DROP, so
+    // a wide entry undoes the isolation.
+    if p < min_prefix {
+        return Err(format!(
+            "prefix /{p} too wide for a management carve-out in `{line}` (at most /{min_prefix} \
+             for {family}): it would undo COMBAT isolation"
+        ));
+    }
+    let network = mask(addr, p);
+    if addr.is_unspecified() || network.is_unspecified() {
+        return Err(format!(
+            "unspecified address in `{line}`: not a management network"
+        ));
+    }
+    if addr.is_multicast() || network.is_multicast() {
+        return Err(format!(
+            "multicast address in `{line}`: not a management network"
+        ));
     }
     Ok(AllowCidr {
         raw: line.to_string(),
         is_ipv6: addr.is_ipv6(),
     })
+}
+
+/// `addr` with the host bits past `prefix` cleared.
+fn mask(addr: IpAddr, prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(a) => {
+            let m = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            IpAddr::V4((u32::from(a) & m).into())
+        }
+        IpAddr::V6(a) => {
+            let m = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            IpAddr::V6((u128::from(a) & m).into())
+        }
+    }
 }
 
 /// Parse allow-file text (blank lines + `#` comments ignored).
@@ -182,8 +229,64 @@ mod tests {
 
     #[test]
     fn validates_ipv6() {
-        let c = validate_entry("2001:db8::/32").unwrap();
+        let c = validate_entry("2001:db8:10::/48").unwrap();
         assert!(c.is_ipv6);
+        assert!(validate_entry("2001:db8::7").unwrap().is_ipv6);
+    }
+
+    /// External audit NN-AUD-095: a prefix wider than the floor is refused
+    /// (`10.0.0.0/0` for `/8` would carve out every address); the floor
+    /// itself and anything narrower pass.
+    #[test]
+    fn rejects_prefixes_below_the_floor() {
+        for wide in [
+            "10.0.0.0/0",
+            "10.0.0.0/1",
+            "10.0.0.0/7",
+            "128.0.0.0/1",
+            "2001:db8::/0",
+            "2001:db8::/32",
+            "2001:db8::/47",
+        ] {
+            let e = validate_entry(wide).expect_err(wide);
+            assert!(e.contains("too wide"), "{wide}: {e}");
+        }
+        for ok in [
+            "10.0.0.0/8",
+            "10.0.0.0/24",
+            "192.168.1.10",
+            "198.51.100.7/32",
+            "2001:db8:10::/48",
+            "2001:db8:10::/64",
+        ] {
+            assert!(validate_entry(ok).is_ok(), "{ok}");
+        }
+    }
+
+    /// External audit NN-AUD-095: the unspecified address (with or without
+    /// a prefix, or as the network a prefix leaves) and multicast are not
+    /// management networks.
+    #[test]
+    fn rejects_unspecified_and_multicast() {
+        for bad in [
+            "0.0.0.0",
+            "0.0.0.0/0",
+            "0.0.0.0/8",
+            "0.1.2.3/8",
+            "::",
+            "::/0",
+            "::/64",
+            "224.0.0.1",
+            "239.1.0.0/16",
+            "ff02::1",
+            "ff00::/48",
+        ] {
+            assert!(validate_entry(bad).is_err(), "{bad}");
+        }
+        assert!(parse_allow_text("0.0.0.0/0\n::/0\n10.0.0.0/8\n")
+            .entries
+            .iter()
+            .all(|e| e.raw == "10.0.0.0/8"));
     }
 
     #[test]
@@ -261,13 +364,13 @@ garbage-line\n\
 
     #[test]
     fn generate_v6_emits_two_rules_per_ipv6_none_for_ipv4() {
-        let entries = parse_allow_text("10.0.0.0/24\nfd00::/8\n").entries;
+        let entries = parse_allow_text("10.0.0.0/24\nfd00:1:2::/48\n").entries;
         let rules = generate_accept_rules_v6(&entries, "NORTHNARROW_COMBAT");
         let lines: Vec<&str> = rules.lines().collect();
         assert_eq!(lines.len(), 2, "v6 → -s + -d; v4 → nothing");
-        assert_eq!(lines[0], "-A NORTHNARROW_COMBAT -s fd00::/8 -j ACCEPT");
-        assert_eq!(lines[1], "-A NORTHNARROW_COMBAT -d fd00::/8 -j ACCEPT");
-        assert_eq!(ipv6_raw(&entries), vec!["fd00::/8".to_string()]);
+        assert_eq!(lines[0], "-A NORTHNARROW_COMBAT -s fd00:1:2::/48 -j ACCEPT");
+        assert_eq!(lines[1], "-A NORTHNARROW_COMBAT -d fd00:1:2::/48 -j ACCEPT");
+        assert_eq!(ipv6_raw(&entries), vec!["fd00:1:2::/48".to_string()]);
     }
 
     #[test]

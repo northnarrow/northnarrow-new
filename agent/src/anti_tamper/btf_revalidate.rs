@@ -388,6 +388,16 @@ fn resolve_with(
 /// tracefs roots tried in order for the tracepoint `format` files.
 pub const TRACEFS_ROOTS: &[&str] = &["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
 
+/// External audit NN-AUD-098: where the fixed part of a tracepoint record
+/// may end at most. A resolved field must end within it; past it the
+/// program would read bytes outside the record. The records the sensors
+/// read end by byte 64 on every kernel seen (5.14 el9 to 6.8); this
+/// leaves eight times that.
+pub const TRACEPOINT_RECORD_MAX: u32 = 512;
+
+/// Largest `format` file read (they are a few hundred bytes).
+const FORMAT_FILE_MAX: u64 = 64 * 1024;
+
 /// Outcome of [`resolve_tracepoint_fields`]: one `(slot, offset)` per
 /// [`TRACEPOINT_FIELDS`] entry (the compiled value when tracefs could not
 /// answer), plus what differed and what could not be read.
@@ -396,8 +406,53 @@ pub struct TracepointOffsets {
     pub values: Vec<(u32, u32)>,
     /// `(name, compiled, runtime)` for fields whose offset differs.
     pub drifted: Vec<(&'static str, u32, u32)>,
-    /// `(name, reason)` for fields left at the compiled value.
+    /// `(name, reason)` for fields left at the compiled value: not found,
+    /// or found and rejected (external audit NN-AUD-098).
     pub unresolved: Vec<(&'static str, String)>,
+    /// External audit NN-AUD-098: `(root, reason)` for roots not used
+    /// because they are not tracefs.
+    pub skipped_roots: Vec<(String, String)>,
+}
+
+impl TracepointOffsets {
+    /// External audit NN-AUD-098: the detail of the signed
+    /// `subsystem_degraded` entry when a field kept its compiled value
+    /// (`None` when every field was resolved).
+    pub fn degraded_detail(&self) -> Option<String> {
+        const MAX: usize = 2048;
+        if self.unresolved.is_empty() {
+            return None;
+        }
+        let fields: Vec<String> = self
+            .unresolved
+            .iter()
+            .map(|(name, why)| format!("{name} ({why})"))
+            .collect();
+        let mut detail = format!(
+            "tracepoint field offsets: {} of {} on the compiled value, the build kernel's \
+             layout — on another layout the tracepoint sensors read wrong bytes: {}",
+            self.unresolved.len(),
+            self.values.len(),
+            fields.join("; ")
+        );
+        if !self.skipped_roots.is_empty() {
+            let roots: Vec<String> = self
+                .skipped_roots
+                .iter()
+                .map(|(root, why)| format!("{root} ({why})"))
+                .collect();
+            detail.push_str(&format!("; tracefs roots not used: {}", roots.join(", ")));
+        }
+        if detail.len() > MAX {
+            let mut cut = MAX;
+            while !detail.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            detail.truncate(cut);
+            detail.push('…');
+        }
+        Some(detail)
+    }
 }
 
 /// Resolve the tracepoint field offsets the eBPF programs read with
@@ -407,40 +462,68 @@ pub struct TracepointOffsets {
 /// compiled-in offset silently reads the wrong bytes there — the exec
 /// sensor then reports an empty filename. A field that cannot be read
 /// keeps its compiled value and is reported in `unresolved` (the caller
-/// warns; the rules treat an empty filename as "unknown", never as
-/// "non-standard").
+/// warns and attests it; the rules treat an empty filename as "unknown",
+/// never as "non-standard").
+///
+/// External audit NN-AUD-098: the files are root-writable input only if
+/// they are not tracefs — a tmpfs mounted over `/sys/kernel/tracing`, or a
+/// file bind-mounted over one `format`, would choose where the sensors
+/// read. A root and each file are used only on tracefs.
 pub fn resolve_tracepoint_fields() -> TracepointOffsets {
-    resolve_tracepoint_fields_from(TRACEFS_ROOTS)
+    resolve_tracepoint_fields_from(TRACEFS_ROOTS, crate::fs_type::TRACEFS_MAGIC)
 }
 
-/// [`resolve_tracepoint_fields`] over explicit tracefs roots (tests).
-pub fn resolve_tracepoint_fields_from(roots: &[&str]) -> TracepointOffsets {
+/// [`resolve_tracepoint_fields`] over explicit roots, whose files must be
+/// on a filesystem of type `fs_magic` (tests pass their temporary
+/// directory's type).
+pub fn resolve_tracepoint_fields_from(roots: &[&str], fs_magic: u64) -> TracepointOffsets {
     use common::btf_offsets::{TRACEPOINT_FIELDS, TRACEPOINT_SLOT_TABLE};
     let mut out = TracepointOffsets::default();
+    // External audit NN-AUD-098: a root that is not tracefs is not used.
+    let mut usable: Vec<&str> = Vec::new();
+    let mut root_errors: Vec<String> = Vec::new();
+    for root in roots {
+        match crate::fs_type::magic_of_path(std::path::Path::new(root)) {
+            Some(m) if m == fs_magic => usable.push(root),
+            Some(m) => {
+                let why = format!("filesystem type {m:#x}, not tracefs");
+                root_errors.push(format!("{root}: {why}"));
+                out.skipped_roots.push((root.to_string(), why));
+            }
+            None => root_errors.push(format!("{root}: unavailable")),
+        }
+    }
     for (spec, (name, slot)) in TRACEPOINT_FIELDS.iter().zip(TRACEPOINT_SLOT_TABLE) {
         debug_assert_eq!(spec.name, *name);
         let mut found: Option<u32> = None;
-        let mut last_err = String::from("no tracefs root readable");
+        let mut reasons: Vec<String> = root_errors.clone();
         let events: &[&str] = if spec.alt_event.is_empty() {
             &[spec.event]
         } else {
             &[spec.event, spec.alt_event]
         };
-        'roots: for root in roots {
+        'roots: for root in &usable {
             for event in events {
                 let path = format!("{root}/events/{}/{event}/format", spec.category);
-                match fs::read_to_string(&path) {
-                    Ok(text) => match parse_format_field_offset(&text, spec.field) {
-                        Some(off) => {
+                let text = match read_format_file(&path, fs_magic) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        reasons.push(format!("{path}: {e}"));
+                        continue;
+                    }
+                };
+                // External audit NN-AUD-098: a format without the field
+                // tries the next event (`alt_event`), it does not end the
+                // search; a field that fails the checks is not used.
+                match parse_format_field(&text, spec.field) {
+                    Some(field) => match check_format_field(&text, spec, field) {
+                        Ok(off) => {
                             found = Some(off);
                             break 'roots;
                         }
-                        None => {
-                            last_err = format!("{path}: field `{}` not in format", spec.field);
-                            break 'roots;
-                        }
+                        Err(why) => reasons.push(format!("{path}: {why}")),
                     },
-                    Err(e) => last_err = format!("{path}: {e}"),
+                    None => reasons.push(format!("{path}: field `{}` not in format", spec.field)),
                 }
             }
         }
@@ -452,7 +535,10 @@ pub fn resolve_tracepoint_fields_from(roots: &[&str]) -> TracepointOffsets {
                 out.values.push((*slot, off));
             }
             None => {
-                out.unresolved.push((spec.name, last_err));
+                if reasons.is_empty() {
+                    reasons.push("no tracefs root".to_string());
+                }
+                out.unresolved.push((spec.name, reasons.join("; ")));
                 out.values.push((*slot, spec.compiled));
             }
         }
@@ -460,33 +546,120 @@ pub fn resolve_tracepoint_fields_from(roots: &[&str]) -> TracepointOffsets {
     out
 }
 
-/// `offset:` of `field` in a tracefs `format` file body. Field lines look
+/// A tracefs `format` file, read only if it is on a filesystem of type
+/// `fs_magic` (external audit NN-AUD-098: checked on the open file, so a
+/// file mounted over one path is caught whatever its root is).
+fn read_format_file(path: &str, fs_magic: u64) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    match crate::fs_type::magic_of_file(&file) {
+        Some(m) if m == fs_magic => {}
+        Some(m) => {
+            return Err(std::io::Error::other(format!(
+                "filesystem type {m:#x}, not tracefs"
+            )))
+        }
+        None => return Err(std::io::Error::last_os_error()),
+    }
+    let mut text = String::new();
+    file.take(FORMAT_FILE_MAX).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// One `field:` line of a tracefs `format` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatField<'a> {
+    pub name: &'a str,
+    pub offset: Option<u32>,
+    pub size: Option<u32>,
+}
+
+/// The `field:` lines of a tracefs `format` file body. Field lines look
 /// like `\tfield:__data_loc char[] filename;\toffset:8;\tsize:4;\tsigned:1;`;
 /// the name is the last token of the declaration, with any `[…]` stripped
 /// (`char comm[TASK_COMM_LEN]`).
-pub fn parse_format_field_offset(text: &str, field: &str) -> Option<u32> {
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("field:") else {
-            continue;
-        };
+pub fn format_fields(text: &str) -> impl Iterator<Item = FormatField<'_>> {
+    text.lines().filter_map(|line| {
+        let rest = line.trim().strip_prefix("field:")?;
         let mut parts = rest.split(';');
         let decl = parts.next()?.trim();
         let name = decl
             .rsplit(|c: char| c.is_whitespace() || c == '*')
             .next()?;
         let name = name.split('[').next()?;
-        if name != field {
-            continue;
-        }
+        let (mut offset, mut size) = (None, None);
         for part in parts {
-            if let Some(v) = part.trim().strip_prefix("offset:") {
-                return v.trim().parse::<u32>().ok();
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("offset:") {
+                offset = offset.or(Some(v.trim().parse::<u32>().ok()));
+            } else if let Some(v) = part.strip_prefix("size:") {
+                size = size.or(Some(v.trim().parse::<u32>().ok()));
             }
         }
-        return None;
+        Some(FormatField {
+            name,
+            offset: offset.flatten(),
+            size: size.flatten(),
+        })
+    })
+}
+
+/// The first `field:` line named `field`.
+pub fn parse_format_field<'a>(text: &'a str, field: &str) -> Option<FormatField<'a>> {
+    format_fields(text).find(|f| f.name == field)
+}
+
+/// `offset:` of `field` in a tracefs `format` file body.
+pub fn parse_format_field_offset(text: &str, field: &str) -> Option<u32> {
+    parse_format_field(text, field)?.offset
+}
+
+/// External audit NN-AUD-098: the offset of `field` if it is plausible —
+/// the width the program reads, past the common header (the `common_*`
+/// fields), and ending within [`TRACEPOINT_RECORD_MAX`].
+fn check_format_field(
+    text: &str,
+    spec: &common::btf_offsets::TracepointFieldSpec,
+    field: FormatField<'_>,
+) -> Result<u32, String> {
+    let Some(offset) = field.offset else {
+        return Err(format!("field `{}` has no offset", spec.field));
+    };
+    let Some(size) = field.size else {
+        return Err(format!("field `{}` has no size", spec.field));
+    };
+    if size != spec.size {
+        return Err(format!(
+            "field `{}` is {size} bytes wide, the sensor reads {}",
+            spec.field, spec.size
+        ));
     }
-    None
+    if offset
+        .checked_add(size)
+        .is_none_or(|end| end > TRACEPOINT_RECORD_MAX)
+    {
+        return Err(format!(
+            "field `{}` at {offset} (+{size}) ends past the record (at most {TRACEPOINT_RECORD_MAX} \
+             bytes)",
+            spec.field
+        ));
+    }
+    let header_end = format_fields(text)
+        .filter(|f| f.name.starts_with("common_"))
+        .filter_map(|f| f.offset?.checked_add(f.size?))
+        .max()
+        .unwrap_or(0);
+    if offset < header_end {
+        return Err(format!(
+            "field `{}` at {offset} lies inside the common header (ends at {header_end})",
+            spec.field
+        ));
+    }
+    Ok(offset)
 }
 
 /// Fuzzing entry (see `crate::fuzz_api`): parse + resolve, never panic.
@@ -1120,7 +1293,7 @@ mod tests {
         let sqe = root.join("events/io_uring/io_uring_submit_sqe");
         fs::create_dir_all(&sqe).unwrap();
         fs::write(sqe.join("format"), "format:\n\tfield:void * ctx;\toffset:8;\tsize:8;\tsigned:0;\n\tfield:void * req;\toffset:16;\tsize:8;\tsigned:0;\n\tfield:u8 opcode;\toffset:24;\tsize:1;\tsigned:0;\n\tfield:u64 user_data;\toffset:32;\tsize:8;\tsigned:0;\n\tfield:u32 flags;\toffset:40;\tsize:4;\tsigned:0;\n\tfield:bool force_nonblock;\toffset:44;\tsize:1;\tsigned:0;\n\tfield:bool sq_thread;\toffset:45;\tsize:1;\tsigned:0;\n").unwrap();
-        let r = resolve_tracepoint_fields_from(&[root.to_str().unwrap()]);
+        let r = resolve_in(root);
         assert!(r
             .values
             .contains(&(slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24)));
@@ -1148,7 +1321,7 @@ mod tests {
         fs::create_dir_all(&openat).unwrap();
         fs::write(openat.join("format"), RHEL9_OPENAT_FORMAT).unwrap();
         // sys_enter_execve deliberately absent
-        let r = resolve_tracepoint_fields_from(&[root.to_str().unwrap()]);
+        let r = resolve_in(root);
         assert_eq!(r.values.len(), common::btf_offsets::TRACEPOINT_FIELDS.len());
         assert!(r
             .values
@@ -1171,9 +1344,231 @@ mod tests {
             .values
             .contains(&(slot::TP_SYS_ENTER_EXECVE_FILENAME_OFFSET, 16)));
         // no readable root at all: every slot keeps its compiled value
-        let none = resolve_tracepoint_fields_from(&["/nonexistent/tracefs"]);
+        let none = resolve_tracepoint_fields_from(
+            &["/nonexistent/tracefs"],
+            crate::fs_type::TRACEFS_MAGIC,
+        );
         assert_eq!(none.unresolved.len(), none.values.len());
         assert!(none.drifted.is_empty());
+    }
+
+    /// [`resolve_tracepoint_fields_from`] over a temporary tree, accepted
+    /// as "tracefs" by its own filesystem type.
+    fn resolve_in(root: &std::path::Path) -> TracepointOffsets {
+        let magic = crate::fs_type::magic_of_path(root).expect("statfs on a temp dir");
+        resolve_tracepoint_fields_from(&[root.to_str().unwrap()], magic)
+    }
+
+    fn write_format(root: &std::path::Path, category: &str, event: &str, body: &str) {
+        let dir = root.join("events").join(category).join(event);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("format"), body).unwrap();
+    }
+
+    const SQE_FORMAT: &str = "format:\n\tfield:void * ctx;\toffset:8;\tsize:8;\tsigned:0;\n\tfield:void * req;\toffset:16;\tsize:8;\tsigned:0;\n\tfield:u8 opcode;\toffset:24;\tsize:1;\tsigned:0;\n\tfield:u64 user_data;\toffset:32;\tsize:8;\tsigned:0;\n\tfield:u32 flags;\toffset:40;\tsize:4;\tsigned:0;\n\tfield:bool force_nonblock;\toffset:44;\tsize:1;\tsigned:0;\n\tfield:bool sq_thread;\toffset:45;\tsize:1;\tsigned:0;\n";
+
+    /// External audit NN-AUD-098 (a): the primary event exists but lacks
+    /// the field — the alternative event is still tried. Before the fix
+    /// the search ended there and the compiled 32 / 48 stayed.
+    #[test]
+    fn alt_event_tried_when_primary_lacks_field() {
+        use common::btf_offsets::slot;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_format(
+            root,
+            "io_uring",
+            "io_uring_submit_req",
+            "format:\n\tfield:void * ctx;\toffset:8;\tsize:8;\tsigned:0;\n\tfield:void * req;\toffset:16;\tsize:8;\tsigned:0;\n",
+        );
+        write_format(root, "io_uring", "io_uring_submit_sqe", SQE_FORMAT);
+        let r = resolve_in(root);
+        assert!(
+            r.values
+                .contains(&(slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24)),
+            "{r:?}"
+        );
+        assert!(r
+            .values
+            .contains(&(slot::TP_IOURING_SUBMIT_SQ_THREAD_OFFSET, 45)));
+        assert!(!r
+            .unresolved
+            .iter()
+            .any(|(n, _)| n.starts_with("TP_IOURING_SUBMIT")));
+    }
+
+    /// External audit NN-AUD-098 (b, d): a root that is not tracefs (here a
+    /// temporary directory, with a well-formed tree in it) is not read;
+    /// every field keeps its compiled value and the reason is attested.
+    #[test]
+    fn non_tracefs_root_is_skipped() {
+        use common::btf_offsets::{slot, TRACEPOINT_FIELDS};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_format(root, "sched", "sched_process_exec", RHEL9_EXEC_FORMAT);
+        assert_ne!(
+            crate::fs_type::magic_of_path(root),
+            Some(crate::fs_type::TRACEFS_MAGIC)
+        );
+        let r = resolve_tracepoint_fields_from(
+            &[root.to_str().unwrap()],
+            crate::fs_type::TRACEFS_MAGIC,
+        );
+        assert!(
+            r.values.contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 8)),
+            "the compiled offset, not the tree's 12: {r:?}"
+        );
+        assert!(r.drifted.is_empty());
+        assert_eq!(r.unresolved.len(), TRACEPOINT_FIELDS.len());
+        assert_eq!(r.skipped_roots.len(), 1);
+        assert_eq!(r.skipped_roots[0].0, root.to_str().unwrap());
+        assert!(r.skipped_roots[0].1.contains("not tracefs"));
+        let detail = r.degraded_detail().expect("attested");
+        assert!(detail.contains("9 of 9 on the compiled value"), "{detail}");
+        assert!(detail.contains("TP_SCHED_EXEC_FILENAME_OFFSET"), "{detail}");
+        assert!(
+            detail.contains(&format!("tracefs roots not used: {}", root.display())),
+            "{detail}"
+        );
+        // the same tree accepted as the expected type: resolved, nothing to attest
+        let ok = resolve_in(root);
+        assert!(ok
+            .values
+            .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 12)));
+        assert!(ok.skipped_roots.is_empty());
+    }
+
+    /// External audit NN-AUD-098 (b): the check is made on each open file,
+    /// so a `format` on another filesystem under an accepted root (a bind
+    /// mount in the field; a directory link to `/dev/shm` here) is refused.
+    #[test]
+    fn format_file_on_another_filesystem_is_rejected() {
+        use common::btf_offsets::slot;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let Ok(shm) = tempfile::tempdir_in("/dev/shm") else {
+            eprintln!("no /dev/shm; skipping");
+            return;
+        };
+        let (Some(here), Some(there)) = (
+            crate::fs_type::magic_of_path(root),
+            crate::fs_type::magic_of_path(shm.path()),
+        ) else {
+            return;
+        };
+        if here == there {
+            eprintln!("temp dir and /dev/shm on the same filesystem type; skipping");
+            return;
+        }
+        write_format(shm.path(), "sched", "sched_process_exec", RHEL9_EXEC_FORMAT);
+        std::os::unix::fs::symlink(shm.path().join("events"), root.join("events")).unwrap();
+        let r = resolve_in(root);
+        assert!(r.values.contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 8)));
+        let (_, why) = r
+            .unresolved
+            .iter()
+            .find(|(n, _)| *n == "TP_SCHED_EXEC_FILENAME_OFFSET")
+            .expect("unresolved");
+        assert!(why.contains("not tracefs"), "{why}");
+    }
+
+    /// External audit NN-AUD-098 (c): an offset past the record, a width
+    /// other than the one the program reads, or an offset inside the
+    /// common header is not used — the compiled value stays and the
+    /// reason is reported. Before the fix each was written to the map.
+    #[test]
+    fn offset_beyond_record_is_rejected() {
+        use common::btf_offsets::slot;
+        let header = "format:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n";
+        let cases = [
+            (
+                "\tfield:__data_loc char[] filename;\toffset:4096;\tsize:4;\tsigned:1;\n",
+                "ends past the record",
+            ),
+            (
+                "\tfield:__data_loc char[] filename;\toffset:509;\tsize:4;\tsigned:1;\n",
+                "ends past the record",
+            ),
+            (
+                "\tfield:__data_loc char[] filename;\toffset:4294967295;\tsize:4;\tsigned:1;\n",
+                "ends past the record",
+            ),
+            (
+                "\tfield:char * filename;\toffset:16;\tsize:8;\tsigned:0;\n",
+                "8 bytes wide, the sensor reads 4",
+            ),
+            (
+                "\tfield:__data_loc char[] filename;\toffset:16;\tsigned:1;\n",
+                "has no size",
+            ),
+            (
+                "\tfield:__data_loc char[] filename;\toffset:4;\tsize:4;\tsigned:1;\n",
+                "inside the common header (ends at 8)",
+            ),
+        ];
+        for (line, why) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write_format(
+                dir.path(),
+                "sched",
+                "sched_process_exec",
+                &format!("{header}\n{line}"),
+            );
+            let r = resolve_in(dir.path());
+            assert!(
+                r.values.contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 8)),
+                "{line}: {r:?}"
+            );
+            assert!(r.drifted.is_empty(), "{line}");
+            let (_, reason) = r
+                .unresolved
+                .iter()
+                .find(|(n, _)| *n == "TP_SCHED_EXEC_FILENAME_OFFSET")
+                .expect("rejected");
+            assert!(reason.contains(why), "{line}: {reason}");
+        }
+        // the record's last plausible bytes are still accepted
+        let dir = tempfile::tempdir().unwrap();
+        write_format(
+            dir.path(),
+            "sched",
+            "sched_process_exec",
+            &format!(
+                "{header}\n\tfield:__data_loc char[] filename;\toffset:508;\tsize:4;\tsigned:1;\n"
+            ),
+        );
+        assert!(resolve_in(dir.path())
+            .values
+            .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 508)));
+    }
+
+    /// Stock layouts pass the checks of NN-AUD-098 unchanged: upstream 6.8
+    /// and RHEL 9 exec, RHEL 9 openat, 5.15 io_uring submit.
+    #[test]
+    fn stock_layouts_pass_the_plausibility_checks() {
+        use common::btf_offsets::slot;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_format(root, "sched", "sched_process_exec", UPSTREAM_EXEC_FORMAT);
+        write_format(root, "syscalls", "sys_enter_openat", RHEL9_OPENAT_FORMAT);
+        write_format(root, "io_uring", "io_uring_submit_sqe", SQE_FORMAT);
+        let r = resolve_in(root);
+        for (s, v) in [
+            (slot::TP_SCHED_EXEC_FILENAME_OFFSET, 8),
+            (slot::TP_SYS_ENTER_OPENAT_FILENAME_OFFSET, 24),
+            (slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 32),
+            (slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24),
+        ] {
+            assert!(r.values.contains(&(s, v)), "slot {s}: {r:?}");
+        }
+        assert_eq!(
+            parse_format_field(RHEL9_EXEC_FORMAT, "filename"),
+            Some(FormatField {
+                name: "filename",
+                offset: Some(12),
+                size: Some(4)
+            })
+        );
     }
 
     /// Minimal BTF encoder for hermetic, kernel-independent tests.

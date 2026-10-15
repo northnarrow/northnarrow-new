@@ -2701,6 +2701,34 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    /// External audit NN-AUD-095: a carve-out line wider than the floor is
+    /// refused when it would be signed — offline (`config overlay sign`)
+    /// and over the socket (`config overlay set`, same `validate_content`).
+    #[test]
+    fn wide_carveout_refused_at_signing() {
+        use common::wire::admin_signed_payload::OverlayKind;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("combat-allow.cidrs");
+        for wide in [
+            "10.0.0.0/0\n",
+            "# mgmt\n10.0.0.0/8\n0.0.0.0/0\n",
+            "2001:db8::/32\n",
+        ] {
+            std::fs::write(&file, wide).unwrap();
+            let e = read_overlay_for_signing(OverlayKind::CombatAllow, &file)
+                .expect_err(wide)
+                .root_cause()
+                .to_string();
+            assert!(e.contains("too wide"), "{wide}: {e}");
+            assert!(
+                crate::config::overlay_auth::validate_content(OverlayKind::CombatAllow, wide)
+                    .is_err()
+            );
+        }
+        std::fs::write(&file, "10.0.0.0/8\n2001:db8:10::/48\n").unwrap();
+        assert!(read_overlay_for_signing(OverlayKind::CombatAllow, &file).is_ok());
+    }
+
     /// External audit EVD-001: the verifier reads the published public
     /// half; without it, a host from before parses the key; it never mints
     /// one.

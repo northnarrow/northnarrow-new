@@ -129,6 +129,14 @@ earlier release with the grant key.
   key on removable media) and it applies the next time isolation engages.
 - **Fail-secure**: a malformed line is skipped (and logged), never
   widened; an unreadable file applies no carve-out.
+- **At most a /8 (IPv4) or a /48 (IPv6)** per line, and never the
+  unspecified (`0.0.0.0`, `::`) or a multicast address (external audit
+  NN-AUD-095): a typo such as `10.0.0.0/0` would carve out every address
+  and COMBAT would isolate nothing. `config overlay set` refuses such a
+  line. In a carve-out signed before this rule it stays signed but is
+  skipped at every engage with a WARN, and `nn-admin config overlay
+  status` shows it ("N lines skipped at COMBAT engage") — sign the file
+  again without it.
 - It is protected against deletion and replacement, and its content is
   vouched for by the signature, not by file permissions.
 

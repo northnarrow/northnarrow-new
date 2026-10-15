@@ -25,6 +25,7 @@ pub mod decision;
 pub mod detection_budget;
 pub mod detection_store;
 pub mod fim;
+pub mod fs_type;
 #[doc(hidden)]
 pub mod fuzz_api;
 pub mod host_hardening;

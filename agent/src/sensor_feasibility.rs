@@ -143,13 +143,6 @@ fn work_dir() -> PathBuf {
     base.join(WORK_SUBDIR)
 }
 
-/// `statfs` type of the filesystem holding `path`.
-fn fs_magic(path: &Path) -> Option<u64> {
-    let c = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0).then_some(st.f_type as u64)
-}
-
 /// An error and its sources, `a: b: c` — the kernel's errno is usually the
 /// last link.
 fn chain(e: &dyn std::error::Error) -> String {
@@ -308,7 +301,8 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
     rep.notes.push(format!(
         "fixtures under {} (filesystem magic {})",
         work.display(),
-        fs_magic(work).map_or_else(|| "unknown".to_string(), |m| format!("{m:#x}"))
+        crate::fs_type::magic_of_path(work)
+            .map_or_else(|| "unknown".to_string(), |m| format!("{m:#x}"))
     ));
     let mut probes = Probes::new(ebpf)?;
     probes.fill_tables(&fx)?;
