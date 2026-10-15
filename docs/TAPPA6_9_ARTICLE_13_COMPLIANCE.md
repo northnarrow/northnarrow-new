@@ -35,11 +35,11 @@ cites file + stable symbol; "Verification" cites the test that locks it.
 |---|---|---|---|
 | **13(1)** operational transparency | deployer can interpret and appropriately use the output | `common/src/xai_types.rs` — `XaiEvidenceChain.input_snapshot` (anonymised focal/recent/host JSON + literal-prompt SHA-256) + `saliency_map` (ranked causal attribution) + `method` | `agent/src/xai/engine.rs` — `explain_assembles_signs_and_verifies_a_full_chain` |
 | **13(2)** operating instructions | concise/complete/correct instructions for use | *Out of scope of 6.9.* The chain is the **evidence** artifact; the operator runbook (separate) references this dossier. | n/a — documented scope boundary |
-| **13(3)(a)** provider identity | identity of the provider | `XaiModelRef` (model_id/quantization/backend, from `AdeMetadata`) + `environment_hash` (agent binary ‖ model ‖ combat-rules ‖ host ‖ build-SHA) | `agent/src/xai/engine.rs` — `environment_hash_is_deterministic_and_tamper_sensitive` |
+| **13(3)(a)** provider identity | identity of the provider | `XaiModelRef` (model_id/quantization/backend, from `AdeMetadata`) + `environment_hash` (agent binary ‖ model ‖ combat-rules ‖ host ‖ build-SHA ‖ RAG corpus fingerprint, empty with RAG off — §8) | `agent/src/xai/engine.rs` — `environment_hash_is_deterministic_and_tamper_sensitive` |
 | **13(3)(b)(i)** intended purpose | the system's intended purpose | `method.kind = "perturbation/occlusion"` + `ADE_DOCTRINE.md` / plan cross-ref | `common/src/xai_types.rs` — `enum_canonical_tags_are_locked` |
 | **13(3)(b)(iv)** performance & accuracy | level of accuracy / known limitations | `saliency_coverage` + `status` (`Complete` / `Degraded(reason)` honesty pair, never silent); `method.inference_settings` (R1 deterministic decoding recorded verbatim) | `agent/src/xai/saliency.rs` — `coverage_and_degraded_reason_are_exact_and_deterministic` |
 | **13(3)(c)** identifiable output | the output is identifiable | `xai_trace_id` (UUIDv4) + `ade_trace_id` FK → `AdeVerdict.trace_id` | `agent/src/xai/engine.rs` — `explain_assembles_signs_and_verifies_a_full_chain` (asserts FK) |
-| **13(3)(d)** human oversight prerequisite | enable effective human oversight | Mandatory guardrail: any `Err(XaiUnavailable)` ⇒ synthesis disabled — an unexplained rule can never deploy (fail-closed) | `agent/src/xai/saliency.rs` — `guardrail_contract_refuses_on_any_err_but_not_on_degraded`, `preflight_refuses_before_any_inference`, `mid_run_timeout_is_fail_closed` |
+| **13(3)(d)** human oversight prerequisite | enable effective human oversight | Mandatory guardrail: any `Err(XaiUnavailable)` ⇒ synthesis disabled — an unexplained rule can never deploy (fail-closed). The ADE is advisory: a verdict that names a response is recorded as a recommendation for the operator and not executed (§9) | `agent/src/xai/saliency.rs` — `guardrail_contract_refuses_on_any_err_but_not_on_degraded`, `preflight_refuses_before_any_inference`, `mid_run_timeout_is_fail_closed`; `agent/src/ade/advisory.rs` — `disposition` tests |
 
 ---
 
@@ -154,40 +154,107 @@ fields (hostname, host_id, paths). Posture:
 
 ---
 
-## 8. Two-artifact traceability model (added Tappa 6.9.7 P7)
+## 8. Two-artifact traceability model (added Tappa 6.9.7 P7; corrected 2026-10-15)
 
-Tappa 6.9.7 wired a local RAG knowledge base into the ADE prompt. The
-Article-13 traceability story is therefore **two artifacts**, by
-deliberate design (plan §5 Option A — `XAI_SCHEMA_VERSION` stays
-1.0.0, no schema mutation):
+Tappa 6.9.7 wired a local RAG knowledge base into the ADE prompt. RAG
+is off by default (`NN_ADE_RAG_ENABLED` unset); everything in this
+section applies only to a deployment that turns it on. The Article-13
+traceability story is **two artifacts**, by deliberate design (plan §5
+Option A — `XAI_SCHEMA_VERSION` stays 1.0.0, no schema mutation):
 
 **(a) Signed XAI evidence chain — 6.9, IMPLEMENTED.** Answers *"what
 did the AI explain, and why"*. Ed25519-signed; `prompt_sha256` binds
-the **entire assembled prompt**, which — when RAG is enabled —
-*includes* the `=== RELEVANT CYBERSEC KNOWLEDGE ===` block verbatim.
-So every retrieved snippet that influenced a verdict is already
-cryptographically committed. Consequence (intentional, not a
-regression): a RAG-on chain is only reproducible RAG-on with the same
-`kb_index_hash`; the `rag:None` canary path keeps every RAG-off chain
-reproducible. Art. 13 §3(c) "what was explained" is fully covered here.
+the **entire assembled prompt**. With RAG on, that prompt includes the
+`RAG_CONTEXT:` block produced by `format_rag_block`
+(`agent/src/ade/rag_integration.rs`): one line per retrieved document,
+holding only its title and, for a Sigma rule, the severity read from
+its `Level:` line — `Sigma Intel (<severity> severity): <title>.`,
+`Sigma Intel: <title>.` or `Intel: <title>.`. The rest of each
+document — its body, identifier and retrieval score — never reaches
+the model; its category shows only as the `Sigma Intel` / `Intel`
+prefix. So `prompt_sha256` commits
+everything retrieval put in front of the model, and nothing else: it
+does not say which documents produced those lines. Two documents with
+the same title and severity give the same line, and a change to a
+document's body that leaves the retrieved lines unchanged leaves the
+hash unchanged (the model's input is then unchanged too).
+
+The corpus behind the block is pinned and bound ex ante (external
+audit XAI-001, XAI-002, XAI-009, XAI-010; lab PR 145):
+
+- The agent opens RAG only over the canonical dumps that
+  `docs/kb-sources/kb_index.json` names, each with its SHA-256; that
+  file is built into the agent binary. A dump that is missing or
+  altered, or any other `*.jsonl` in the corpus directory, means RAG is
+  not started: a WARN, and an `integrity_drift` entry of kind
+  `subsystem_degraded` naming the cause in the agent's signed audit log.
+  The agent never runs RAG on a partial corpus.
+- The search index is rebuilt in memory from the verified dumps at
+  every start; no index stored on disk is read.
+- `environment_hash` (§2, 13(3)(a)) includes the fingerprint of the
+  corpus actually loaded (the pinned dumps plus the built-in seed
+  notes), and an empty field with RAG off. Two chains with the same
+  `environment_hash` were produced over the same knowledge base, and a
+  RAG-off chain never shares its `environment_hash` with a RAG-on one.
+  The value is computed once, when the XAI engine is built; the corpus
+  is opened once, at agent start.
+
+Consequence (intentional, not a regression): a RAG-on chain is
+reproducible only RAG-on, by the agent build at the recorded
+`environment_hash` over the same pinned corpus (`kb_index_hash`); the
+`rag: None` canary path keeps every RAG-off chain reproducible.
 
 **(b) Hash-chained RAG retrieval log — Tappa 13 SaaS Backend
-follow-on, NOT YET BUILT.** Answers *"what context was retrieved at
-decision time, at what granularity"*: a separate, unsigned,
+follow-on, NOT YET BUILT.** Answers *"which documents were retrieved
+at decision time, with what scores"*: a separate, unsigned,
 append-only hash-chained log of `{ade_trace_id, kb_index_hash,
-retrieved doc ids + scores, prev_entry_sha256}`. It gives per-query
-retrieval provenance *separable* from the signed prompt without
-mutating the closed XAI schema. Scope/justification: plan §5.1
-(explicitly a Tappa 13 deliverable; the §5.1 5-pillar ruling stands).
-Until it ships, retrieval provenance is the in-repo `kb_index_hash`
-anchor (`docs/kb-sources/`, byte-reproducible) plus the signed
-prompt's transitive binding of the RAG block.
+retrieved doc ids + scores, prev_entry_sha256}`. It gives per-query,
+per-document retrieval provenance *separable* from the signed prompt
+without mutating the closed XAI schema. Scope/justification: plan §5.1
+(explicitly a Tappa 13 deliverable). Until it ships, the agent does
+not record per-document identity: the signed chain binds the
+retrieved titles (and Sigma severities) through `prompt_sha256` and the
+loaded corpus through `environment_hash`, not the identity of each
+retrieved document.
 
-Net Art. 13 §3(c): the signed chain carries *"what the AI explained"*;
-the (future) hash-chained log carries *"what context was retrieved"* —
-cross-linked by `ade_trace_id`.
+Net Art. 13(3)(c): the signed chain carries *"what the AI explained"*
+and the exact retrieval context the model saw; *"which documents were
+retrieved"* is covered **only in part** until the Tappa 13 log ships.
+The two artifacts will be cross-linked by `ade_trace_id`. (A per-line
+document digest in the prompt was considered and declined: the
+`RAG_CONTEXT:` line shape is a training contract locked by
+`format_rag_block_byte_stable_phase_abcd_contract`.)
 
-## 9. Change log
+---
+
+## 9. ADE decisions are advisory (lab PR 134, 2026-10-15)
+
+The model's input includes strings an attacker controls (command
+lines, file names, DNS names), and no prompt hardening makes it safe
+to let such a verdict act on its own. Since 2026-10-15 the ADE is
+therefore a consultant (`agent/src/ade/advisory.rs`):
+
+- A verdict that names a response (`Kill`, `KillTree`, `Quarantine`,
+  `BlockNetwork`, `Isolate`) is recorded as a recommendation — a
+  detection carrying the model's reasoning, with the response field
+  `advisory: <action> recommended by the model, not executed` — and
+  nothing is executed. Verdicts that name no response (`Allow`,
+  `Monitor`, `Alert`, `Escalate`) are recorded as before (`Allow` is
+  not a detection).
+- Responses stay with the deterministic detection rules and the COMBAT
+  ladder, which can be verified.
+- `NN_ADE_ENFORCE=1` (also `true` or `yes`) lets ADE verdicts execute
+  their response again. It is a weakening setting: at every start the
+  agent records it in its signed audit log (an `integrity_drift` entry
+  of kind `weakening_env`).
+
+For Article 13 this means that, by default, an ADE output — and so
+what an XAI chain explains — is a recommendation to a human operator,
+who decides whether to act on it (13(3)(d)). A deployer who sets
+`NN_ADE_ENFORCE` takes that decision away from the operator, and the
+signed audit log shows that it did.
+
+## 10. Change log
 
 - **2026-05-17 — initial (Tappa 6.9 P0→P5).** §1–§7 above.
 - **2026-05-17 (Tappa 6.9.7 P7).** RAG-local-KB integration
@@ -195,3 +262,15 @@ cross-linked by `ade_trace_id`.
   frozen — XAI 1.0.0 untouched; hash-chained RAG log scoped to
   Tappa 13 per plan §5.1). No change to the §2 conformance matrix or
   the §3 reproducibility basis.
+- **2026-10-15 (external audit XAI-018, with XAI-001/002/009/010; lab
+  PR 145).** §8 corrected: the prompt has carried the compact
+  `RAG_CONTEXT:` block (titles and Sigma severity only) since Tappa
+  6.9.7.1 P5.1, not the retired `=== RELEVANT CYBERSEC KNOWLEDGE ===`
+  block with document text; the earlier claim that every retrieved
+  snippet was committed, and that Art. 13(3)(c) was fully covered, is
+  withdrawn. §8 now describes the pinned corpus, the in-memory index and
+  the RAG corpus fingerprint in `environment_hash` (§2 row 13(3)(a)
+  updated); that preimage gained one length-prefixed field, before any
+  chain had been produced in production (XAI is not wired yet, Tappa
+  10.5). New §9: the ADE is advisory (lab PR 134); §2 row 13(3)(d)
+  updated. The former §9 is now §10.

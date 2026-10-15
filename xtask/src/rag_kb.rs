@@ -6,6 +6,8 @@
 //! deterministic canonical JSONL dumps (sorted by `id`, sorted keys,
 //! LF), per-source provenance sidecars (plan §4.2.2), the top-level
 //! `kb_index_hash` (plan §3.1.1), verbatim `LICENSES/`, and `NOTICES.md`.
+//! `kb_index.json` is built into the agent, which opens only the dumps it
+//! names, with the digests it records.
 //!
 //! Build-time mode fetches the pinned refs over HTTPS (ureq, rustls —
 //! no FFI); install-time mode (`--mirror DIR`) reads the same artifacts
@@ -50,6 +52,12 @@ const SIGMA_TARBALL_FILE: &str = "sigma-df5c6a6e.tar.gz";
 const SIGMA_LICENSE_URL: &str =
     "https://raw.githubusercontent.com/SigmaHQ/Detection-Rule-License/master/LICENSE.Detection.Rules.md";
 const SIGMA_LICENSE_FILE: &str = "LICENSES/SIGMA_DRL-1.1.md";
+
+// Dump file names in `out`. `kb_index.json` records them next to each
+// digest: the agent embeds that file and opens only these dumps, matched
+// by name (external audit XAI-001).
+const ATTACK_DUMP_FILE: &str = "mitre-attack.jsonl";
+const SIGMA_DUMP_FILE: &str = "sigma.jsonl";
 
 /// §3.1.1 domain separator (versioned; a layout change bumps `-v1`).
 const KB_CANON_DOMAIN: &[u8] = b"NN-RAG-KB-CANON-v1\0";
@@ -504,7 +512,7 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
     eprintln!("  attack: {} techniques", attack_records.len());
     let attack_dump = canonical_jsonl(attack_records)?;
     let attack_dump_sha = sha256_hex(&attack_dump);
-    write_file(&out.join("mitre-attack.jsonl"), &attack_dump)?;
+    write_file(&out.join(ATTACK_DUMP_FILE), &attack_dump)?;
 
     // ── SigmaHQ ──
     eprintln!("  sigma: obtaining pinned tarball…");
@@ -520,7 +528,7 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
     }
     let sigma_dump = canonical_jsonl(sigma_records)?;
     let sigma_dump_sha = sha256_hex(&sigma_dump);
-    write_file(&out.join("sigma.jsonl"), &sigma_dump)?;
+    write_file(&out.join(SIGMA_DUMP_FILE), &sigma_dump)?;
 
     // ── verbatim LICENSES/ (from the exact pinned refs) ──
     let attack_license = obtain(mirror, ATTACK_LICENSE_URL, "MITRE_ATTACK_ToU.md")?;
@@ -583,8 +591,8 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
         "domain": "NN-RAG-KB-CANON-v1",
         "kb_index_hash": kb_hash,
         "sources": [
-            { "source": ATTACK_SOURCE_ID, "pin": ATTACK_PIN, "canonical_dump_sha256": attack_dump_sha },
-            { "source": SIGMA_SOURCE_ID, "pin": SIGMA_PIN, "canonical_dump_sha256": sigma_dump_sha },
+            { "source": ATTACK_SOURCE_ID, "pin": ATTACK_PIN, "file": ATTACK_DUMP_FILE, "canonical_dump_sha256": attack_dump_sha },
+            { "source": SIGMA_SOURCE_ID, "pin": SIGMA_PIN, "file": SIGMA_DUMP_FILE, "canonical_dump_sha256": sigma_dump_sha },
         ],
         "note": "LOLBAS excluded (GPL-3.0, plan §4.2.3). 6.7 in-repo notes merged at index build (P3/P4), not acquired here.",
     });

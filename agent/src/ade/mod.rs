@@ -185,6 +185,13 @@ impl AdeEngine {
         self.inner.rag.is_some()
     }
 
+    /// The fingerprint of the corpus the wired RAG engine retrieves from,
+    /// `None` without RAG. The XAI `environment_hash` binds it (external
+    /// audit XAI-010).
+    pub fn rag_fingerprint(&self) -> Option<&str> {
+        self.inner.rag.as_deref().map(RagEngine::corpus_fingerprint)
+    }
+
     /// Run inference on the focal event with a context bundle.
     ///
     /// Parse failures, and a prompt that does not fit the model's window

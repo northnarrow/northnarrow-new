@@ -260,10 +260,17 @@ toward curated evidence. Plan of record:
   within-result normalisation); canary-gated via `NN_ADE_RAG_ENABLED`
   (default **OFF**, beta-safe — §13 default-flip checklist). `rag:None`
   is byte-identical to pre-6.7 (protects RAG-off XAI determinism).
-- **Article 13.** The RAG block is part of the assembled prompt, so it
-  is already bound by the signed `prompt_sha256` (XAI 1.0.0 schema
-  untouched — plan §5 Option A); the separate hash-chained RAG
-  retrieval log is a Tappa 13 follow-on.
+- **Integrity.** The agent opens only the dumps that
+  `docs/kb-sources/kb_index.json` pins (built into the binary): a
+  missing, altered or unlisted dump leaves RAG off, with a WARN and a
+  signed audit entry. The index is built in memory at every start
+  (external audit XAI-001, XAI-002, XAI-009).
+- **Article 13.** The RAG block is part of the assembled prompt, so the
+  signed `prompt_sha256` binds it — the retrieved titles and Sigma
+  severities, which is all the model sees of the documents (XAI 1.0.0
+  schema untouched — plan §5 Option A). `environment_hash` binds the
+  loaded corpus (XAI-010). Which documents were retrieved is the
+  separate hash-chained RAG retrieval log, a Tappa 13 follow-on.
 - **Operational metrics** (real 964-doc corpus): `retrieve` p95
   **2.2 ms** (≤ 50 ms budget, ~23× margin), cold `open_index`
   **707 ms** (≤ 5 s). Golden suite 22/24 (cross-source Sigma
