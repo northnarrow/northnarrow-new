@@ -1023,6 +1023,14 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: false,
     },
+    OffsetSpec {
+        name: "INODE_I_SIZE_OFFSET",
+        struct_name: "inode",
+        field_path: &["i_size"],
+        expected: INODE_I_SIZE_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1126,16 +1134,17 @@ pub mod slot {
     pub const FILE_PRIVATE_DATA_OFFSET: u32 = 74;
     pub const BPF_LINK_ID_OFFSET: u32 = 75;
     pub const INET_SOCK_INET_SPORT_OFFSET: u32 = 76;
-    // enum slots 77–78 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 79;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 80;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 81;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 82;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 83;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 84;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 85;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 86;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 87;
+    pub const INODE_I_SIZE_OFFSET: u32 = 77;
+    // enum slots 78–79 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 80;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 81;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 82;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 83;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 84;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 85;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 86;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 87;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 88;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -1217,6 +1226,7 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("FILE_PRIVATE_DATA_OFFSET", 74),
     ("BPF_LINK_ID_OFFSET", 75),
     ("INET_SOCK_INET_SPORT_OFFSET", 76),
+    ("INODE_I_SIZE_OFFSET", 77),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1257,6 +1267,10 @@ pub const BTRFS_ROOT_ANON_DEV_OFFSET: usize = 888;
 /// its directory-class cache on directory renames only (`S_ISDIR`).
 /// Byte 0 on every supported kernel.
 pub const INODE_I_MODE_OFFSET: usize = 0;
+/// `inode.i_size` — the file-open sensor counts as an overwrite only an
+/// existing file of a few KiB, read at open, before any `O_TRUNC`.
+/// `bits_offset=768` = byte 96 on 6.8 (80 on 6.1, resolved at boot).
+pub const INODE_I_SIZE_OFFSET: usize = 96;
 /// `task_struct.loginuid` — the mass-write counter skips a writer's own
 /// runtime directory (`/run/user/<loginuid>`), as the posture arm did.
 /// Optional: a kernel without `CONFIG_AUDIT` has no login uid, and that
@@ -1441,24 +1455,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 79),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 80),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 81),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 82),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 83),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 84),
-    ("TP_IOURING_CREATE_FD_OFFSET", 85),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 86),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 87),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 80),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 81),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 82),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 83),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 84),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 85),
+    ("TP_IOURING_CREATE_FD_OFFSET", 86),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 87),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 88),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 77), ("ITER_IOVEC_VALUE", 78)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 78), ("ITER_IOVEC_VALUE", 79)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 77;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 78;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 78;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 79;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -1476,7 +1490,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 76, "REVALIDATE must cover all 76 offsets");
+        assert_eq!(REVALIDATE.len(), 77, "REVALIDATE must cover all 77 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1496,7 +1510,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 88);
+        assert_eq!(BTF_OFFSETS_SLOTS, 89);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1526,8 +1540,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 79);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 82);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 80);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 83);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }

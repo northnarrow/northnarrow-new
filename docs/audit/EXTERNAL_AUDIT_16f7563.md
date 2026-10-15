@@ -2411,3 +2411,30 @@ the audit did not report, noted with the fix that takes them.
     beacon still logged by NET-013. Privileged gate: Ubuntu 24.04 and
     Debian 12, 29 suites, 78 passed, 0 failed each. The anti-tamper
     suite: OK. Host: 1797 passed, 0 failed.
+- **Lab-found, lab PR 127 (a false positive of the POS-002 fix).** A
+  `cargo` build was taken for ransomware.
+  - The open sensor counts, per process, the write-opens of files that
+    existed (no `FMODE_CREATED`) — the shape of encryption in place, and
+    counted for a session's processes since lab PR 101. A build rewrites
+    its own outputs: `cargo xtask build` in the lab guest crossed 20
+    overwrites a minute (fingerprints, `invoked.timestamp`, `.d` files),
+    raised ConfirmedIntrusion and, with other alerts of the same session in
+    the window, reached COMBAT: NEUTRALIZE killed cargo and quarantined
+    `cargo` and `rustc` (twice; the guest's toolchain looked corrupted).
+  - Measured (strace, a full workspace rebuild): up to 17 overwrites per
+    process, at most 4 of 4 KiB or more. An overwrite now counts only for
+    an existing file of at least 4 KiB, read from `inode.i_size` at open,
+    before `O_TRUNC` — a new revalidated BTF offset (`INODE_I_SIZE_OFFSET`,
+    byte 96 on 6.8, 80 on 6.1, inside the inode window the sensor already
+    reads; slot 77, the enum and tracepoint slots after it renumbered).
+    Documents are rarely smaller; encrypting only files under 4 KiB would
+    gain an attacker little. Tracepoint mode (no file at hand) is unchanged.
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `build127-probe.sh`: a process of an
+    SSH session rewrites 30 existing files in a few seconds. Before
+    (main): 200-byte files — ConfirmedIntrusion_MassWrite (overwrites,
+    20 in the window); 64 KiB files — the same. After: 200-byte files —
+    nothing; 64 KiB files — ConfirmedIntrusion_MassWrite, as before. An
+    install (a release build in the guest) left `cargo` and `rustc` in
+    place. Privileged gate: Ubuntu 24.04 and Debian 12, 29 suites, 78
+    passed, 0 failed each. The anti-tamper suite: OK. Host: 1797 passed,
+    0 failed.
