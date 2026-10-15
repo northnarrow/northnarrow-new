@@ -44,6 +44,7 @@ use crate::posture::lineage::AuthSessionTracker;
 /// single embed site + boot preflight). Re-used here so this loader and
 /// the Tappa 1 [`super::exec`] loader load byte-identical bytes.
 use crate::sensors::ebpf_object::EBPF_BYTES;
+use crate::sensors::reject::RejectThrottle;
 
 /// Channel between the per-ringbuf pumps and the agent main loop.
 const CHANNEL_CAPACITY: usize = 4096;
@@ -78,7 +79,11 @@ pub struct NetRingBufs {
 /// multiplexer detaches everything and aborts the pump tasks.
 pub struct SensorMultiplexer {
     ebpf: Ebpf,
-    pumps: Vec<JoinHandle<()>>,
+    /// Every long-lived task that moves telemetry (ring pumps, drains, the
+    /// open-sensor rule refresher), by label. External audit SNS-001: the
+    /// main loop polls [`Self::finished_pumps`]; a task that ended is a
+    /// blind spot and stops the agent.
+    pumps: Vec<(&'static str, JoinHandle<()>)>,
     rx: mpsc::Receiver<Event>,
     /// Tappa 9 C8: cloneable handle to the same `Event` channel
     /// the sensor pumps feed. The FIM drain loop (also spawned at
@@ -296,15 +301,42 @@ impl SensorMultiplexer {
         let dns_cache_for_dns = net.as_ref().map(|w| Arc::clone(&w.dns_cache));
 
         let pumps = vec![
-            spawn_pump::<ProcessSpawnRaw>("process_spawn", process_spawn_rb, tx.clone()),
-            spawn_pump::<FileOpenRaw>("file_open", file_open_rb, tx.clone()),
-            spawn_pump::<ExecCheckRaw>("exec_check", exec_check_rb, tx.clone()),
-            spawn_tcp_connect_pump(tcp_connect_rb, flow_tracker_for_tcp, tx.clone()),
-            spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
-            spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
-            spawn_module_load_pump(module_load_rb, tx.clone()),
-            spawn_pump::<IoUringRaw>("io_uring", iouring_rb, tx.clone()),
-            spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
+            (
+                "process_spawn",
+                spawn_pump::<ProcessSpawnRaw>("process_spawn", process_spawn_rb, tx.clone()),
+            ),
+            (
+                "file_open",
+                spawn_pump::<FileOpenRaw>("file_open", file_open_rb, tx.clone()),
+            ),
+            (
+                "exec_check",
+                spawn_pump::<ExecCheckRaw>("exec_check", exec_check_rb, tx.clone()),
+            ),
+            (
+                "tcp_connect",
+                spawn_tcp_connect_pump(tcp_connect_rb, flow_tracker_for_tcp, tx.clone()),
+            ),
+            (
+                "dns_query",
+                spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
+            ),
+            (
+                "fs_protect",
+                spawn_pump::<FsProtectDenialRaw>("fs_protect", fs_protect_rb, tx.clone()),
+            ),
+            (
+                "module_load",
+                spawn_module_load_pump(module_load_rb, tx.clone()),
+            ),
+            (
+                "io_uring",
+                spawn_pump::<IoUringRaw>("io_uring", iouring_rb, tx.clone()),
+            ),
+            (
+                "bpf_syscall",
+                spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
+            ),
         ];
 
         Ok((
@@ -334,14 +366,40 @@ impl SensorMultiplexer {
         self.event_tx.clone()
     }
 
-    /// Tappa 9 C8 — register the spawned FIM drain task with the
-    /// multiplexer so `Drop` aborts it alongside the sensor pumps.
-    pub fn register_pump_handle(&mut self, handle: JoinHandle<()>) {
-        self.pumps.push(handle);
+    /// Tappa 9 C8 — register a spawned telemetry task (the FIM and net
+    /// drains, the open-sensor pump and its rule refresher) with the
+    /// multiplexer so `Drop` aborts it alongside the sensor pumps, and
+    /// [`Self::finished_pumps`] reports it if it ends.
+    pub fn register_pump_handle(&mut self, label: &'static str, handle: JoinHandle<()>) {
+        self.pumps.push((label, handle));
     }
 
-    /// Drain the next event. Returns `None` when every pump task has
-    /// exited (which only happens at shutdown).
+    /// External audit SNS-001: the labels of the telemetry tasks that have
+    /// ended (returned, failed or panicked). They never end while the agent
+    /// runs, so any entry is a sensor gone blind. `next_event()` cannot
+    /// tell: this struct and the drains hold senders of the channel.
+    pub fn finished_pumps(&self) -> Vec<&'static str> {
+        finished(&self.pumps)
+    }
+
+    /// `debug-trigger` builds only: abort the task registered as `label`,
+    /// so the lab can check that a dead pump stops the agent. `false` when
+    /// no task has that label.
+    #[cfg(feature = "debug-trigger")]
+    pub fn debug_abort_pump(&self, label: &str) -> bool {
+        let mut found = false;
+        for (l, h) in &self.pumps {
+            if *l == label {
+                h.abort();
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// Drain the next event. In practice never `None`: this struct and the
+    /// drains hold senders (a dead pump is caught by
+    /// [`Self::finished_pumps`] instead).
     pub async fn next_event(&mut self) -> Option<Event> {
         self.rx.recv().await
     }
@@ -366,10 +424,20 @@ impl SensorMultiplexer {
 
 impl Drop for SensorMultiplexer {
     fn drop(&mut self) {
-        for h in self.pumps.drain(..) {
+        for (_, h) in self.pumps.drain(..) {
             h.abort();
         }
     }
+}
+
+/// Labels of the finished handles (a dead pump, see
+/// [`SensorMultiplexer::finished_pumps`]).
+fn finished(pumps: &[(&'static str, JoinHandle<()>)]) -> Vec<&'static str> {
+    pumps
+        .iter()
+        .filter(|(_, h)| h.is_finished())
+        .map(|(l, _)| *l)
+        .collect()
 }
 
 /// Load `program_name` once and attach it to the first of `names` that
@@ -493,64 +561,6 @@ where
             error!(label, error = %e, "ringbuf pump failed");
         }
     })
-}
-
-/// Coalesces malformed-ringbuf-entry WARNs to at most one per second with a
-/// running dropped-count. A desynced / garbage ring — e.g. the
-/// FS_PROTECT_EVENTS pinned-reuse desync (catalog BUG-024) — otherwise rejects
-/// every entry and floods the journal at hundreds/sec, filling the
-/// LogNamespace `SystemMaxUse` cap and vacuuming real telemetry out of the
-/// retention window. A sensor fault must never DoS its own log. Used by every
-/// ringbuf pump below.
-struct RejectThrottle {
-    count: u64,
-    last_log: Option<std::time::Instant>,
-    last_got: usize,
-}
-
-impl RejectThrottle {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            last_log: None,
-            last_got: 0,
-        }
-    }
-
-    /// Record one rejected entry; emit a coalesced WARN at most 1/sec.
-    fn record(&mut self, label: &str, expected: usize, got: usize) {
-        self.count += 1;
-        self.last_got = got;
-        if self.due() {
-            self.emit(label, expected);
-        }
-    }
-
-    /// Flush a residual count once the ring goes quiet, so a final burst is
-    /// not silently dropped from the log.
-    fn flush_idle(&mut self, label: &str, expected: usize) {
-        if self.count > 0 && self.due() {
-            self.emit(label, expected);
-        }
-    }
-
-    fn due(&self) -> bool {
-        self.last_log
-            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-    }
-
-    fn emit(&mut self, label: &str, expected: usize) {
-        warn!(
-            label,
-            rejected = self.count,
-            expected,
-            got = self.last_got,
-            "ringbuf entries rejected (malformed; rate-limited to <=1/s — a sustained \
-             count means a desynced ring, e.g. BUG-024 FS_PROTECT_EVENTS)"
-        );
-        self.count = 0;
-        self.last_log = Some(std::time::Instant::now());
-    }
 }
 
 async fn pump<T>(
@@ -870,6 +880,26 @@ mod module_path_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit SNS-001: a pump that ends — returned, failed or
+    /// panicked — is reported by its label; running ones are not.
+    #[tokio::test]
+    async fn finished_pump_is_reported_by_label() {
+        let running = tokio::spawn(std::future::pending::<()>());
+        let returned = tokio::spawn(async {});
+        let panicked = tokio::spawn(async { panic!("pump panicked") });
+        let pumps = vec![
+            ("exec_check", running),
+            ("fs_protect", returned),
+            ("open_sensor", panicked),
+        ];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while finished(&pumps).len() < 2 && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(finished(&pumps), vec!["fs_protect", "open_sensor"]);
+        pumps[0].1.abort();
+    }
 
     /// External audit NETR-008: the connect row names the connecting
     /// process's image — the spawn cache first, `/proc` for a process with

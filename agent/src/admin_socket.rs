@@ -1222,6 +1222,9 @@ fn dispatch(
             // External audit CMB-016: where the COMBAT ladder stands.
             combat_stage: response_state.and_then(|s| (s.combat_stage)()),
             combat_locked: Some(posture.is_combat_locked()),
+            // External audit SNS-008: malformed records the pumps rejected.
+            ringbuf_rejected_total: Some(crate::sensors::reject::total()),
+            ringbuf_rejected: Some(crate::sensors::reject::snapshot()),
         }),
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
@@ -4572,6 +4575,8 @@ mod tests {
             ringbuf_drops: None,
             combat_stage: None,
             combat_locked: None,
+            ringbuf_rejected_total: None,
+            ringbuf_rejected: None,
         });
         emit_audit_for(
             &status_req,

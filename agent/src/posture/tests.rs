@@ -366,6 +366,45 @@ fn single_blunt_combat_signal_caps_at_engaged() {
     );
 }
 
+/// External audit SNS-009: a ring that lost events raises ALERTED, is never
+/// recorded as corroboration, and a lone COMBAT-tier heuristic after it
+/// still stops at ENGAGED. Nothing stronger than ALERTED can be raised
+/// without an event.
+#[test]
+fn telemetry_loss_targets_alerted_and_never_corroborates() {
+    let m = PostureMachine::new();
+    let out = m.raise_signal(TriggerType::TelemetryLoss, "exec ring dropped 500 events");
+    assert_eq!(out.map(|s| s.kind()), Some(PostureKind::Alerted));
+    assert_eq!(m.current_kind(), PostureKind::Alerted);
+    assert_eq!(
+        m.corroboration_len(),
+        0,
+        "telemetry loss must not enter the ledger"
+    );
+    let last = m.transition_log().pop().expect("transition recorded");
+    assert_eq!(last.trigger, Some(TriggerType::TelemetryLoss));
+
+    // A second loss at the same level only re-arms the decay.
+    assert!(m
+        .raise_signal(TriggerType::TelemetryLoss, "again")
+        .is_none());
+
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Engaged,
+        "telemetry loss must not corroborate a COMBAT-tier heuristic"
+    );
+
+    // Escalation without an event is refused.
+    let fresh = PostureMachine::new();
+    assert!(fresh
+        .raise_signal(TriggerType::AntiTamperDenial, "forged")
+        .is_none());
+    assert_eq!(fresh.current_kind(), PostureKind::Observing);
+}
+
 /// External audit POS-001 (NN-AUD-002): an update's HTTPS burst, then
 /// three internal SSH sessions — two network patterns any unprivileged
 /// user produces — are one kind of behaviour and stay at ENGAGED.

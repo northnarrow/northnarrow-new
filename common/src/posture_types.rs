@@ -89,6 +89,14 @@ pub enum TriggerType {
     // COMBAT with init as the offender (whose only containment would be
     // ISOLATE). Appended last to keep variant ordering stable.
     RelayedTamperAttempt,
+
+    // External audit SNS-009: a security ring buffer lost events (the
+    // kernel could not reserve an entry). A blind spot, not behaviour: it
+    // raises ALERTED and never corroborates a COMBAT-tier signal (its
+    // evidence class is `Telemetry`, and an ALERTED-tier trigger is never
+    // recorded in the corroboration ledger). Appended last to keep variant
+    // ordering stable.
+    TelemetryLoss,
 }
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
@@ -117,6 +125,9 @@ pub enum EvidenceClass {
     Execution,
     FileSystem,
     Kernel,
+    /// External audit SNS-009: a loss of visibility, not evidence of
+    /// behaviour. Never corroborates anything.
+    Telemetry,
 }
 
 impl TriggerType {
@@ -138,6 +149,7 @@ impl TriggerType {
             TriggerType::AntiTamperDenial | TriggerType::RelayedTamperAttempt => {
                 EvidenceClass::Kernel
             }
+            TriggerType::TelemetryLoss => EvidenceClass::Telemetry,
         }
     }
 
@@ -147,7 +159,8 @@ impl TriggerType {
             TriggerType::Reconnaissance
             | TriggerType::SuspiciousDns
             | TriggerType::SensitiveFileAccess
-            | TriggerType::Lolbas => PostureKind::Alerted,
+            | TriggerType::Lolbas
+            | TriggerType::TelemetryLoss => PostureKind::Alerted,
 
             TriggerType::ExploitAttempt
             | TriggerType::AdjacentCompromise
@@ -189,6 +202,7 @@ impl TriggerType {
             TriggerType::ExfiltrationPattern => "ExfiltrationPattern",
             TriggerType::AntiTamperDenial => "AntiTamperDenial",
             TriggerType::RelayedTamperAttempt => "RelayedTamperAttempt",
+            TriggerType::TelemetryLoss => "TelemetryLoss",
         }
     }
 }
@@ -240,6 +254,17 @@ mod tests {
             TriggerType::ConfirmedIntrusion.target_level(),
             PostureKind::Combat
         );
+    }
+
+    /// External audit SNS-009: a ring that lost events raises ALERTED only,
+    /// and is a class of its own (it corroborates nothing).
+    #[test]
+    fn telemetry_loss_targets_alerted_in_its_own_class() {
+        let t = TriggerType::TelemetryLoss;
+        assert_eq!(t.target_level(), PostureKind::Alerted);
+        assert_eq!(t.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(t.evidence_class(), EvidenceClass::Telemetry);
+        assert_eq!(t.as_str(), "TelemetryLoss");
     }
 
     #[test]

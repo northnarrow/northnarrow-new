@@ -494,6 +494,33 @@ impl PostureMachine {
         }
     }
 
+    /// External audit SNS-009: raise a trigger that no event carries (a
+    /// ring buffer that lost events). Only ALERTED-tier triggers are
+    /// accepted: they move the posture up to their level (or re-arm its
+    /// decay) and are never written to the corroboration ledger, so they
+    /// can never vouch for a COMBAT-tier heuristic. Anything stronger is
+    /// refused (`None`, nothing changes): escalation must come from an
+    /// event the trigger detector adjudicated.
+    pub fn raise_signal(&self, trigger: TriggerType, reason: &str) -> Option<PostureState> {
+        if trigger.target_level() > PostureKind::Alerted {
+            tracing::warn!(%trigger, "raise_signal refused: only ALERTED-tier signals are accepted");
+            return None;
+        }
+        let now = Instant::now();
+        let mut guard = self.inner.state.write();
+        let before = guard.kind();
+        let next = transitions::apply_to_level(&guard, trigger.target_level(), now);
+        let after = next.kind();
+        *guard = next.clone();
+        drop(guard);
+        if after != before {
+            self.log_transition(before, after, Some(trigger), format!("{trigger}: {reason}"));
+            Some(next)
+        } else {
+            None
+        }
+    }
+
     /// Modulate `verdict` according to the current posture. See
     /// [`modulation`] for the table.
     pub fn modulate_verdict(&self, verdict: AdeVerdict) -> AdeVerdict {

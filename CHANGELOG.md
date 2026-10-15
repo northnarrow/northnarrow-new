@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, telemetry loss (Medium SNS-001, SNS-008,
+  SNS-009): a ring-buffer pump that died went unnoticed — the agent kept
+  running blind on that sensor. Every telemetry task is now watched: one
+  that ends is recorded in the signed audit log, the agent stops
+  (`sensor_pump_exited`, non-zero exit) and the watchdog restarts it.
+  Malformed records of the open sensor are counted and shown by `nn-admin
+  status` (`ringbuf rejected`), like every other ring's. A security ring
+  losing more than 64 events in 10 s raises the posture to ALERTED
+  (`TelemetryLoss`, never corroboration for COMBAT; not during a package
+  transaction or a trusted-installer window), and an unreadable drop
+  counter keeps its last value instead of reading as zero.
 - A build rewriting its own outputs (`cargo build`: fingerprints,
   timestamps, `.d` files) was counted as encryption in place: with another
   alert in the session it reached COMBAT, which killed cargo and

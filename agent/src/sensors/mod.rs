@@ -15,6 +15,7 @@ pub mod exe_identity;
 pub mod exec;
 pub mod multiplexer;
 pub mod open_sensor;
+pub mod reject;
 pub mod ring_drops;
 
 pub use ebpf_object::EBPF_BYTES;
