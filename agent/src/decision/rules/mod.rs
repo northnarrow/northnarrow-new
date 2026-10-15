@@ -39,6 +39,21 @@ mod r018_kernel_module_load;
 #[cfg(feature = "demo-tappa5")]
 pub mod test_actions;
 
+/// World-writable staging directories a dropper runs from: the one set
+/// NN-L-NET-008, NN-L-CHAIN-002 (and through its precursor CHAIN-005/007)
+/// and the posture's exec arm judge an image by.
+///
+/// External audit NETR-008: each of them used to check `/tmp/` only (the
+/// posture `/tmp/` and `/dev/shm/`), so a payload staged in `/dev/shm` or
+/// `/var/tmp` evaded the network correlation. `/run/user/` and home
+/// directories stay out: user services and confined packages run from them.
+pub const STAGING_PREFIXES: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/"];
+
+/// `true` when `path` lies under one of [`STAGING_PREFIXES`].
+pub fn is_staging_path(path: &str) -> bool {
+    STAGING_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
 pub use r001_exec_from_tmp::R001ExecFromTmp;
 pub use r002_exec_from_dev_shm::R002ExecFromDevShm;
 pub use r003_exec_from_var_tmp::R003ExecFromVarTmp;
@@ -145,7 +160,7 @@ pub fn default_rules_with_net(
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
-    let chains = chain::chain_rule_set();
+    let chains = chain::chain_rule_set_with(Some(lineage.clone()));
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
     let tappa2: Vec<Box<dyn Rule>> = vec![
         Box::new(R004ExecFromProcSelfFd::new(lineage.clone())),
@@ -193,6 +208,7 @@ pub fn default_rules_with_net(
         netflow_comm_allowlist,
         beacon_window,
         dns_cache,
+        Some(lineage.clone()),
     ));
     // Informational chains (NN-L-CHAIN-008) go LAST so their Log
     // verdict never shadows a blocking rule on the same event.

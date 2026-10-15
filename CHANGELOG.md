@@ -6,6 +6,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, network rule state and addressing (Medium
+  NETR-005, NETR-007, NETR-008): NN-L-NET-008 (outbound from a staged
+  binary) never fired — no flow row carried the process's executable. The
+  image is now named at connect time (lineage cache, `/proc` as fallback,
+  a deleted image included), so a dropper's forked child that never execs
+  is killed when it calls out; NET-008, CHAIN-002/005/007 and the posture's
+  exec arm share one staging set (`/tmp`, `/var/tmp`, `/dev/shm`), with a
+  package transaction's processes recorded, not killed. NN-L-NET-007/018
+  treat IPv6 unique-local and link-local peers as internal: SMB, RDP, WinRM
+  or VNC over them now draws the same verdict as over RFC 1918. The DNS
+  burst, beacon and DNS-tunnel windows have hard caps in O(1) per event —
+  before, a connection or DNS spray by any user grew them for up to an hour
+  with a full scan per event, and a spray of 4096 parent domains switched
+  off NN-L-NET-014's tunnel kill for every other process. At a cap the
+  least recently updated key goes (a beacon's or a tunnel's keys last),
+  counted and warned about; a process reaching more than 256 destinations
+  in an hour is held to its own quota.
 - External audit, Wave 2, bounded correlation state (Medium NETR-004,
   NETR-009, NETR-010): the chain rules' correlation store now holds a hard
   cap of 4096 processes in O(1) per insert — before, every new process above

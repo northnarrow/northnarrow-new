@@ -324,6 +324,8 @@ pub async fn drain_loop(
     // External audit NET-003: `None` when the listener log cannot be
     // opened — listener events still reach the rules, unpersisted.
     listener_db: Option<Arc<Mutex<NetListenerDb>>>,
+    // External audit NETR-008: names the sender's image on a UDP record.
+    lineage: crate::posture::lineage::AuthSessionTracker,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut close_fd = AsyncFd::new(close_rb)?;
@@ -344,6 +346,7 @@ pub async fn drain_loop(
                         &flow_tracker,
                         &dns_cache,
                         &netflow_db,
+                        &lineage,
                         &event_tx,
                     )
                     .await;
@@ -364,6 +367,7 @@ pub async fn drain_loop(
                         &flow_tracker,
                         &dns_cache,
                         &netflow_db,
+                        &lineage,
                         &event_tx,
                     )
                     .await;
@@ -395,6 +399,7 @@ async fn process_close_record(
     flow_tracker: &Arc<Mutex<FlowTracker>>,
     dns_cache: &Arc<DnsCache>,
     netflow_db: &Arc<Mutex<NetFlowDb>>,
+    lineage: &crate::posture::lineage::AuthSessionTracker,
     event_tx: &mpsc::Sender<Event>,
 ) {
     let raw: &NetFlowCloseRaw = match bytemuck::try_from_bytes(bytes) {
@@ -488,7 +493,10 @@ async fn process_close_record(
                 pid: raw.pid,
                 uid: raw.uid,
                 comm: comm_to_string(&raw.comm),
-                exe: None,
+                // External audit NETR-008: the sender's image, read before
+                // the tracker's lock (a datagram record is emitted while
+                // its sender runs).
+                exe: lineage.image_path(raw.pid),
             };
             flow_tracker.lock().on_udp_send(&info)
         }

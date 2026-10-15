@@ -5,7 +5,8 @@
 //! at all) and lost state without a trace. [`LazyLru`] gives O(1)
 //! amortised recency order with lazy deletion; [`LossCounter`] counts
 //! evictions of state that still mattered and rate-limits the WARN about
-//! them. NETR-005 and NET-012 are meant to reuse both.
+//! them. NETR-005 (the network rule windows) reuses both; NET-012 is meant
+//! to.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -30,6 +31,7 @@ pub struct LazyLru<K> {
     queue: VecDeque<(K, u64)>,
     live: HashMap<K, u64>,
     next_stamp: u64,
+    compact_floor: usize,
 }
 
 impl<K> Default for LazyLru<K> {
@@ -38,6 +40,7 @@ impl<K> Default for LazyLru<K> {
             queue: VecDeque::new(),
             live: HashMap::new(),
             next_stamp: 0,
+            compact_floor: COMPACT_FLOOR,
         }
     }
 }
@@ -45,6 +48,16 @@ impl<K> Default for LazyLru<K> {
 impl<K: Copy + Eq + Hash> LazyLru<K> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A queue compacted from `floor` live keys up. For many small
+    /// instances (one per process), where the default floor's stale
+    /// entries would add up (external audit NETR-005).
+    pub fn with_compact_floor(floor: usize) -> Self {
+        Self {
+            compact_floor: floor.max(1),
+            ..Self::default()
+        }
     }
 
     /// Live keys.
@@ -91,7 +104,7 @@ impl<K: Copy + Eq + Hash> LazyLru<K> {
     }
 
     fn maybe_compact(&mut self) {
-        if self.queue.len() > 2 * self.live.len().max(COMPACT_FLOOR) {
+        if self.queue.len() > 2 * self.live.len().max(self.compact_floor) {
             let live = &self.live;
             self.queue.retain(|(k, s)| live.get(k) == Some(s));
         }
@@ -167,6 +180,16 @@ mod tests {
         }
         assert_eq!(l.len(), 1);
         assert!(l.queue_len() <= 2 * COMPACT_FLOOR + 1, "{}", l.queue_len());
+    }
+
+    #[test]
+    fn a_small_floor_keeps_a_small_queue() {
+        let mut l = LazyLru::with_compact_floor(4);
+        for _ in 0..1000 {
+            l.touch(1u32);
+        }
+        assert_eq!(l.len(), 1);
+        assert!(l.queue_len() <= 9, "{}", l.queue_len());
     }
 
     #[test]

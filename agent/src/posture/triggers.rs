@@ -882,7 +882,7 @@ fn confirmed_intrusion(
     // kernel-adjudicated denial is straight-to-COMBAT, distinct from
     // these heuristic arms which now require corroboration.
     //
-    // Exec from /tmp or /dev/shm: an admin does not legitimately
+    // Exec from /tmp, /var/tmp or /dev/shm: an admin does not legitimately
     // run binaries out of these paths. NOT gated by auth-lineage —
     // a sudo-spawned process exec'ing /tmp/payload is exactly the
     // post-compromise pattern we want to catch.
@@ -891,8 +891,8 @@ fn confirmed_intrusion(
     if let Event::ProcessSpawn { filename, exe, .. } | Event::ExecCheck { filename, exe, .. } =
         focal
     {
-        let path = exe.path_or(filename);
-        if path.starts_with("/tmp/") || path.starts_with("/dev/shm/") {
+        // External audit NETR-008: the shared staging set (adds /var/tmp).
+        if crate::decision::rules::is_staging_path(exe.path_or(filename)) {
             return true;
         }
     }
@@ -1257,12 +1257,6 @@ fn exfiltration_pattern(focal: &Event, recent: Recent<'_>, allow: &EscalationAll
     count >= EXFIL_MIN_EVENTS
 }
 
-fn is_rfc1918(addr: &[u8; 16]) -> bool {
-    let a = addr[0];
-    let b = addr[1];
-    matches!((a, b), (10, _) | (172, 16..=31) | (192, 168))
-}
-
 /// AF_INET (2) or AF_INET6 (10) — the families the network heuristics
 /// consider (BUG-039). Other families (e.g. AF_UNIX) are ignored.
 fn is_inet_family(family: u8) -> bool {
@@ -1271,27 +1265,16 @@ fn is_inet_family(family: u8) -> bool {
 
 /// Is `addr` (a 16-byte wire address) internal/private for its `family`?
 /// v4: RFC1918. v6: ULA (`fc00::/7`) or link-local (`fe80::/10`).
-/// (BUG-039 — the v6 sibling of `is_rfc1918`; exfil's "public dst" and
-/// lateral's "internal dst" both need the v6 notion.)
+/// (BUG-039 — exfil's "public dst" and lateral's "internal dst" both need
+/// the v6 notion.)
 ///
 /// External audit NET-001: an IPv4-mapped IPv6 address (a dual-stack
 /// socket reaching an IPv4 peer) is judged as the IPv4 address it maps.
+/// External audit NETR-007: the predicate lives in `common::netaddr`, shared
+/// with NN-L-NET-007/018.
 fn is_internal(addr: &[u8; 16], family: u8) -> bool {
-    match family {
-        2 => is_rfc1918(addr),
-        10 => match common::netaddr::canonical_ip(family, addr) {
-            std::net::IpAddr::V4(v4) => {
-                let mut b = [0u8; 16];
-                b[..4].copy_from_slice(&v4.octets());
-                is_rfc1918(&b)
-            }
-            std::net::IpAddr::V6(_) => {
-                (addr[0] & 0xfe) == 0xfc // fc00::/7 — unique-local (ULA)
-                    || (addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80) // fe80::/10 — link-local
-            }
-        },
-        _ => false,
-    }
+    is_inet_family(family)
+        && common::netaddr::is_internal(common::netaddr::canonical_ip(family, addr))
 }
 
 fn is_write_open(flags: u32) -> bool {
@@ -1551,6 +1534,19 @@ mod tests {
         let focal = spawn(42, 1, "evil", "/tmp/evil", 1);
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// External audit NETR-008: the shared staging set, /var/tmp included;
+    /// /run/user stays out.
+    #[test]
+    fn confirmed_intrusion_fires_on_exec_from_every_staging_dir() {
+        let det = TriggerDetector::new();
+        for path in ["/var/tmp/evil", "/dev/shm/evil"] {
+            let hits = det.detect(&spawn(42, 1, "evil", path, 1), &[]);
+            assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{path}");
+        }
+        let hits = det.detect(&spawn(43, 1, "app", "/run/user/1000/app", 1), &[]);
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion));
     }
 
     /// Lab finding (EBPF-001 work): systemd writing `/dev/console` at
