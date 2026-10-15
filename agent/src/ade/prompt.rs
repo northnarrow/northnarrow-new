@@ -13,9 +13,11 @@
 //! See [`PromptParts::into_llama3_chat`] and
 //! [`PromptParts::into_plain_text`].
 //!
-//! Truncation strategy when the prompt grows past
-//! `max_context_tokens`: drop oldest correlated events first; never
-//! truncate the system prompt or the focal event itself.
+//! When the prompt grows past the backend's window
+//! ([`super::InferenceBackend::prompt_window`]) the engine drops the
+//! oldest correlated events first, then the RAG block; it never cuts the
+//! system prompt or the focal event (external audit LLMR-008: the backend
+//! used to cut the prompt's head, which is the system prompt).
 
 use std::fs;
 use std::path::Path;

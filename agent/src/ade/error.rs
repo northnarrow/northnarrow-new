@@ -29,6 +29,12 @@ pub enum AdeError {
     #[error("{0}")]
     ModelUntrusted(String),
 
+    /// External audit LLMR-008: the prompt does not fit the model's window.
+    /// The backend refuses it rather than cut it: a cut from the front
+    /// removed the system prompt, the model's instructions.
+    #[error("prompt exceeds the model window ({tokens} tokens > {window})")]
+    PromptExceedsWindow { tokens: usize, window: usize },
+
     #[error("backend join error: {0}")]
     BackendJoin(String),
 

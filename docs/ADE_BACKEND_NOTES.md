@@ -96,16 +96,34 @@ breaking validation.
 
 ## Prompt window + output budget
 
-- `MAX_PROMPT_TOKENS = 4096` — Foundation-Sec advertises 128 K
-  context, but on CPU each kilo-token of prompt costs roughly half a
-  second of prefill time. 4 K is the sweet spot for the 5-example
-  few-shot block + correlated events + focal event.
+- Positions: candle's quantized Llama precomputes its rotary table for
+  `MAX_SEQ_LEN = 4096` positions, prompt and output together (the
+  model's advertised 128 K does not apply). A position past it fails
+  the forward pass.
+- `MAX_PROMPT_TOKENS = 4096 - 768 = 3328` — the prompt window
+  (`InferenceBackend::prompt_window`); 768 positions stay for the
+  output (a verdict takes about 450 tokens), and the decode stops at
+  the last position the table covers.
 - `MAX_OUTPUT_TOKENS_HARD_CAP = 2048` — bounded so the engine's
   15 s timeout actually fires when the model misbehaves.
+- Prefill in chunks of 256 tokens, the time budget checked between
+  them (external audit LLMR-017): it overruns the budget by at most
+  one chunk instead of holding the weights for the whole prompt.
 
-If the assembled prompt exceeds the cap, the backend truncates from
-the **front** to preserve the focal event (which is appended last in
-`build_event_prompt`).
+External audit LLMR-008: the backend used to cut an over-long prompt
+from the **front**, which is where the system prompt is. Now the
+engine fits the prompt (`AdeEngine::prepare`, shared by `evaluate` and
+the XAI `assembled_prompt`): it drops the oldest correlated events,
+then the RAG block; the system prompt, the focal event and the task
+are never cut. If they alone do not fit, the event is escalated
+("prompt exceeds the model window"). The backend refuses a prompt over
+the window (`AdeError::PromptExceedsWindow`) and never drains it.
+
+The v1.1 system prompt (three few-shot examples, 7.7 KB) is estimated
+at 1.9–2.4 K tokens, leaving the user turn about 0.9–1.4 K. These are
+estimates (no tokenizer on the dev host): measure on a model host with
+`cargo test -p northnarrow-agent --release -- --ignored --nocapture
+ade::tests::ignored_model_host_prompt_tokens`.
 
 ## Performance — measured on the dev VM
 

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_transformers::models::quantized_llama::{ModelWeights, MAX_SEQ_LEN};
 use parking_lot::Mutex;
 use tokenizers::Tokenizer;
 
@@ -54,13 +54,24 @@ pub const CANDLE_LOGITS_SEED: u64 = 0x00C0_FFEE;
 /// the caller asks for more than the engine can deliver in 15 s.
 const MAX_OUTPUT_TOKENS_HARD_CAP: usize = 2048;
 
-/// Soft cap on the prompt window we hand to the model.
+/// The prompt window: the most prompt tokens a generation takes.
 ///
-/// Foundation-Sec-8B-Reasoning advertises 128K context, but on CPU
-/// every additional kilo-token of prompt costs roughly half a second
-/// of wall time, and the few-shot block already lives near 1.5 K
-/// tokens. A 4 K hard cap keeps p95 latency in the budget.
-const MAX_PROMPT_TOKENS: usize = 4096;
+/// External audit LLMR-008: candle's quantized Llama precomputes its
+/// rotary table for [`MAX_SEQ_LEN`] (4096) positions, prompt and output
+/// together, whatever the model advertises (128K); a position past it
+/// fails the forward pass. The window leaves [`OUTPUT_RESERVE`] of them to
+/// the verdict. A longer prompt is refused, never cut: the engine fits it
+/// (oldest correlated events first) and the system prompt always stays.
+pub(crate) const MAX_PROMPT_TOKENS: usize = MAX_SEQ_LEN - OUTPUT_RESERVE;
+
+/// Positions kept for the output. A verdict takes about 450 tokens (the
+/// few-shot outputs of `dataset/system_prompt_v1.md`).
+const OUTPUT_RESERVE: usize = 768;
+
+/// External audit LLMR-017: tokens per prefill forward pass. The time
+/// budget is checked between chunks, so the prefill overruns it by at
+/// most one chunk.
+const PREFILL_CHUNK: usize = 256;
 
 /// Generation budget when the engine sets none (tests, tools).
 const DEFAULT_BUDGET: Duration = Duration::from_secs(120);
@@ -218,6 +229,15 @@ impl CandleBackend {
         &self.model_path
     }
 
+    /// The prompt's tokens, as a generation feeds them to the model.
+    fn encode(&self, prompt: &str) -> Result<Vec<u32>, AdeError> {
+        let encoded = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| AdeError::Backend(format!("tokenize prompt: {e}")))?;
+        Ok(encoded.get_ids().to_vec())
+    }
+
     fn run_inference(
         &self,
         prompt: &str,
@@ -249,21 +269,23 @@ impl CandleBackend {
         let started = Instant::now();
         let max_tokens = max_tokens.min(MAX_OUTPUT_TOKENS_HARD_CAP);
 
-        let encoded = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| AdeError::Backend(format!("tokenize prompt: {e}")))?;
-        let mut prompt_tokens: Vec<u32> = encoded.get_ids().to_vec();
+        let prompt_tokens = self.encode(prompt)?;
+        // External audit LLMR-008: refused, never cut. Dropping the head
+        // (as this did, under a comment saying the opposite) removed the
+        // system prompt: the model then read the observed strings without
+        // its instructions.
         if prompt_tokens.len() > MAX_PROMPT_TOKENS {
-            // Drop oldest tokens — preserve the system prompt by
-            // keeping the suffix. The prompt is built such that the
-            // focal event lives at the end, so this is safe.
-            let drop = prompt_tokens.len() - MAX_PROMPT_TOKENS;
-            prompt_tokens.drain(0..drop);
+            return Err(AdeError::PromptExceedsWindow {
+                tokens: prompt_tokens.len(),
+                window: MAX_PROMPT_TOKENS,
+            });
         }
         if prompt_tokens.is_empty() {
             return Err(AdeError::Backend("empty prompt after tokenisation".into()));
         }
+        // External audit LLMR-008: the output stops at the last position
+        // the rotary table covers, instead of failing the forward pass.
+        let max_tokens = max_tokens.min(MAX_SEQ_LEN - prompt_tokens.len());
 
         let sampling = if temperature <= 0.0 {
             Sampling::ArgMax
@@ -290,19 +312,30 @@ impl CandleBackend {
         let mut decoded_text_len: usize = 0;
         let mut early_stop = false;
 
-        // 1) Pre-fill: hand the whole prompt to the model in one shot
-        //    and sample the first response token. The KV cache after
-        //    this call holds positions 0..prompt_len.
+        // 1) Pre-fill: hand the prompt to the model and sample the first
+        //    response token. The KV cache after this holds positions
+        //    0..prompt_len. External audit LLMR-017: in chunks of
+        //    PREFILL_CHUNK, the budget checked between them — one forward
+        //    pass over the whole prompt held the weights (and the engine's
+        //    ADE slot) for as long as it took, timeout or not.
         let prefill_started = Instant::now();
         tracing::debug!(prompt_tokens = prompt_len, "candle prefill starting");
         {
-            let input = Tensor::new(prompt_tokens.as_slice(), &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| AdeError::Backend(format!("prompt tensor: {e}")))?;
-            let logits = weights
-                .weights
-                .forward(&input, 0)
-                .map_err(|e| AdeError::Backend(format!("prompt forward: {e}")))?;
+            let device = &self.device;
+            let logits = prefill_chunked(
+                &prompt_tokens,
+                PREFILL_CHUNK,
+                started + budget,
+                |chunk, index_pos| {
+                    let input = Tensor::new(chunk, device)
+                        .and_then(|t| t.unsqueeze(0))
+                        .map_err(|e| AdeError::Backend(format!("prompt tensor: {e}")))?;
+                    weights
+                        .weights
+                        .forward(&input, index_pos)
+                        .map_err(|e| AdeError::Backend(format!("prompt forward: {e}")))
+                },
+            )?;
             let logits = logits
                 .squeeze(0)
                 .map_err(|e| AdeError::Backend(format!("squeeze: {e}")))?;
@@ -420,6 +453,34 @@ impl CandleBackend {
     }
 }
 
+/// External audit LLMR-017: run `forward` over `tokens` in chunks of
+/// `chunk`, each at its position in the sequence, and return what the last
+/// chunk's pass returned (the logits of the prompt's last token). Past
+/// `deadline` no further chunk starts, so the prefill overruns the budget
+/// by at most one chunk. A chunk with `index_pos > 0` attends to the KV
+/// cache the earlier chunks filled (candle-transformers 0.10.2 builds the
+/// rectangular mask for it).
+fn prefill_chunked<T>(
+    tokens: &[u32],
+    chunk: usize,
+    deadline: Instant,
+    mut forward: impl FnMut(&[u32], usize) -> Result<T, AdeError>,
+) -> Result<T, AdeError> {
+    let chunk = chunk.max(1);
+    let mut last = None;
+    for (i, piece) in tokens.chunks(chunk).enumerate() {
+        if Instant::now() >= deadline {
+            return Err(AdeError::Backend(format!(
+                "prefill stopped at its time budget after {} of {} prompt tokens",
+                i * chunk,
+                tokens.len()
+            )));
+        }
+        last = Some(forward(piece, i * chunk)?);
+    }
+    last.ok_or_else(|| AdeError::Backend("empty prompt after tokenisation".into()))
+}
+
 /// Incremental decode helper: produces only the *new* suffix added
 /// by the latest token, advancing `decoded_text_len` to match. Returns
 /// `None` when the BPE has not yet committed to a stable boundary
@@ -458,6 +519,14 @@ impl InferenceBackend for CandleBackend {
     }
     fn chat_template(&self) -> ChatTemplate {
         ChatTemplate::Llama3
+    }
+
+    fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
+        self.encode(prompt).ok().map(|t| t.len())
+    }
+
+    fn prompt_window(&self) -> Option<usize> {
+        Some(MAX_PROMPT_TOKENS)
     }
 
     fn generate(
@@ -524,5 +593,57 @@ impl InferenceBackend for CandleBackend {
 impl CandleBackend {
     pub fn end_of_think_token(&self) -> Option<u32> {
         self.end_of_think
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// External audit LLMR-017: a prefill whose forward pass is slow stops
+    /// at the deadline, overrunning it by at most one chunk, and never
+    /// starts a chunk after it.
+    #[test]
+    fn chunked_prefill_overruns_the_deadline_by_at_most_one_chunk() {
+        let tokens: Vec<u32> = (0..1000).collect();
+        let step = Duration::from_millis(20);
+        let budget = Duration::from_millis(50);
+        let started = Instant::now();
+        let mut calls = Vec::new();
+        let err = prefill_chunked(&tokens, 100, started + budget, |chunk, pos| {
+            calls.push((pos, chunk.len()));
+            std::thread::sleep(step);
+            Ok(())
+        })
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, AdeError::Backend(ref m) if m.contains("time budget")),
+            "{err:?}"
+        );
+        assert!(elapsed < budget + step * 2, "{elapsed:?}");
+        assert!(calls.len() < 10, "{calls:?}");
+        // Each chunk ran at its position in the sequence.
+        for (i, (pos, len)) in calls.iter().enumerate() {
+            assert_eq!((*pos, *len), (i * 100, 100));
+        }
+    }
+
+    /// The chunks cover the prompt in order and the last chunk's result is
+    /// the prefill's.
+    #[test]
+    fn chunked_prefill_covers_the_prompt_and_returns_the_last_chunk() {
+        let tokens: Vec<u32> = (0..600).collect();
+        let far = Instant::now() + Duration::from_secs(60);
+        let mut seen = Vec::new();
+        let last = prefill_chunked(&tokens, 256, far, |chunk, pos| {
+            assert_eq!(chunk[0] as usize, pos);
+            seen.extend_from_slice(chunk);
+            Ok(pos + chunk.len())
+        })
+        .unwrap();
+        assert_eq!(seen, tokens);
+        assert_eq!(last, 600);
+        assert!(prefill_chunked(&[], 256, far, |_, _| Ok(())).is_err());
     }
 }

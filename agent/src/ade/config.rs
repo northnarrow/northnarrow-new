@@ -18,6 +18,9 @@ use std::time::Duration;
 pub struct AdeConfig {
     pub model_path: PathBuf,
     pub system_prompt_path: PathBuf,
+    /// Not read: the prompt window is the backend's
+    /// ([`super::InferenceBackend::prompt_window`], external audit
+    /// LLMR-008).
     pub max_context_tokens: usize,
     pub max_output_tokens: usize,
     pub temperature: f32,

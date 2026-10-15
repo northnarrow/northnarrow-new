@@ -4007,9 +4007,13 @@ async fn evaluate_and_respond(
     info!("ADE inference started");
     let verdict = match ade.evaluate(&event, &context).await {
         Ok(v) => v,
+        // External audit LLMR-003: a timeout or a backend error is recorded
+        // as an Escalate (`ade_unavailable`), with no response. It used to
+        // leave only this journal line: an event the model never judged
+        // left no detection.
         Err(e) => {
-            warn!(?e, "ADE error, defaulting to log-only");
-            return;
+            warn!(?e, "ADE error, recording an Escalate with no response");
+            ade.escalate_for_error(&event, &e)
         }
     };
 
