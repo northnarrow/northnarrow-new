@@ -167,13 +167,13 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-121 | FIMP-009 | FIM pipeline | M | open |
 | NN-AUD-122 | FIMP-010 | FIM pipeline | M | open |
 | NN-AUD-123 | FIMP-011 | FIM pipeline | S | fixed (lab PR 111) |
-| NN-AUD-124 | NETR-004 | Net rules | S | open |
+| NN-AUD-124 | NETR-004 | Net rules | S | fixed (lab PR 125) |
 | NN-AUD-125 | NETR-005 | Net rules | M | open |
 | NN-AUD-126 | NETR-006 | Net rules | S | open |
 | NN-AUD-127 | NETR-007 | Net rules | S | open |
 | NN-AUD-128 | NETR-008 | Net rules | S | open |
-| NN-AUD-129 | NETR-009 | Net rules | M | open |
-| NN-AUD-130 | NETR-010 | Net rules | M | open |
+| NN-AUD-129 | NETR-009 | Net rules | M | fixed (lab PR 125) |
+| NN-AUD-130 | NETR-010 | Net rules | M | fixed (lab PR 125) |
 | NN-AUD-131 | PROC-006 | Process rules | M | already fixed (lab PR 87, with NN-AUD-055) |
 | NN-AUD-132 | PROC-008 | Process rules | S | open |
 | NN-AUD-133 | PROC-009 | Process rules | S | open |
@@ -2281,3 +2281,60 @@ the audit did not report, noted with the fix that takes them.
     gate Ubuntu 24.04 29 suites 77 passed 0 failed, Debian 12 29 suites 77
     passed 0 failed — the first clean pair of this wave. The anti-tamper
     suite: OK. Host: 1758 passed, 0 failed.
+- **NN-AUD-124 (NETR-004), NN-AUD-129 (NETR-009), NN-AUD-130 (NETR-010),
+  lab PR 125.** Bounded correlation state.
+  - NETR-004: the correlation store's 4096-process cap was not a cap — a new
+    key above it paid an O(n) `prune_stale` under the engine's mutex and was
+    inserted anyway, and the eviction queue was never popped; `note_egress`
+    ran an O(n) `min_by_key` per new key. Any user could make the rule
+    engine quadratic with a loop of `/tmp` or `sudo`-named execs. The cap is
+    now hard and O(1): two lazy-deletion recency queues
+    (`decision/bounded.rs`, `LazyLru`, compacted past twice the live keys),
+    keys holding only `PrivEsc` (CHAIN-008, which only logs) evicted before
+    keys holding a `CredRead`, `TmpExec` or `CanaryTrip`. Evicting one of
+    the latter while in window is counted (`lost_precursor_keys_total`) with
+    a WARN at most once a minute. Stale keys are swept every 256 new keys,
+    not on insert. The egress notes have the same cap and queue.
+  - NETR-009: lineage queries dropped the incarnation (`start_ns` 0), and
+    the only PID-reuse guard depended on the reused PID's edge still being
+    in the tree. Each tree edge now records the child's own start
+    (`ProcessSpawn::start_ns`, POS-003). Exec precursors are recorded with
+    it; FIM and canary precursors, and every query, take the PID's current
+    incarnation; an unknown one is 0 and matches only 0, so processes
+    started before the agent keep the PID-only behaviour. The ancestor walk
+    keys each hop with its own recorded start (not `parent_start_ns`, the
+    forking thread's) and stops at a hop that started after its child. A
+    new incarnation takes over what its PID recorded at or after its start
+    (an event processed before its exec, another ring); the rest is
+    dropped. A re-exec of the same process keeps its state.
+  - NETR-010: the tree evicted its oldest edge whether alive or not, so
+    about 10,000 short-lived processes erased the `sshd → bash` lineage of
+    CHAIN-004..006/008 without a trace. Second-chance eviction, cap 65,536:
+    when full, up to 8 edges from the front are checked against
+    `/proc/<pid>/stat` (gone, or a different start: dropped; live:
+    re-queued); only when all 8 are live is the oldest evicted, counted
+    (`live_edge_evictions_total`) with a WARN at most once a minute. A
+    re-observed PID moves to the back; the `retain`s on reuse are gone.
+  - Not done: the two counters are readable in the agent but not yet in
+    `nn-admin status` (a wire field). A fork-only child (no exec) carries no
+    incarnation of its own: a reuse of its PID is caught only by the
+    liveness check when its edge reaches the front.
+  - Tests: 24 unit tests (`decision/bounded.rs`,
+    `decision/correlation/{store,ancestry}.rs`, `rules/chain.rs`): 100,000
+    live keys stay at the cap (0.5 s in a debug build), PrivEsc-first eviction,
+    live lineage surviving a flood of dead edges, a reused PID inheriting
+    neither precursors nor ancestors, a later hop ending the walk, liveness
+    against the real `/proc`; `a_really_reused_pid_is_dead_for_the_tree`
+    is privileged (`ns_last_pid`).
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `corr125-probe.sh`. A `sudo` (the
+    PrivEsc precursor) starts a long-lived bash; 12,000 short execs; that
+    bash's child connects off-host (100.64.0.74, not in the shipped
+    blocklist). Before (main): CHAIN-008 silent (0 verdicts; 1 without
+    the flood — the lineage erased without a trace). After: 1 verdict.
+    20,000 execs of a `sudo`-named binary (a PrivEsc key each): agent CPU
+    7.55 s before, 2.18 s after; the verdict latency of a `/tmp` probe
+    stayed at 2–4 ms in both (the quadratic cost was CPU, not yet a
+    stall, at this size). Privileged gate: Ubuntu 24.04 and Debian 12, 29
+    suites, 78 passed, 0 failed each (with the new
+    `a_really_reused_pid_is_dead_for_the_tree`, `ns_last_pid`). The
+    anti-tamper suite: OK. Host: 1781 passed, 0 failed.
