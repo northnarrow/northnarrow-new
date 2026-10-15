@@ -15,6 +15,38 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, admin socket connections and roles (Medium
+  ASK-002, ASK-003, ASK-004, ASK-010, ASK-011): the admin socket's accept
+  loop ended on any `accept()` error — an EMFILE, which a root process
+  holding a few hundred idle connections could cause, left the agent
+  without unlock, shutdown or key rotation until a restart — and it served
+  any number of connections, each waiting on its peer for ever. A
+  transient accept error (EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED,
+  EINTR) now backs off and retries; at most 32 connections are served at
+  once, a full table closing the one that has waited longest on its peer;
+  a peer gets 10 s to send each request and 5 s to take each reply; if the
+  loop still ends, an ERROR and a signed `subsystem_degraded`. The
+  challenge was one slot for the whole agent: any client asking for one
+  broke a concurrent `unlock`, `shutdown` or `trusted-installer-grant`
+  (`NonceMismatch`), a polling dashboard included, and three bad
+  signatures from anyone blocked every client for five minutes. The
+  challenge and the failure count now belong to the connection: the third
+  failed signature on a connection is answered `RateLimited` and the
+  connection closed; other connections are not affected. A key with only
+  `force-posture` could leave COMBAT and release the isolation like
+  `unlock`: leaving COMBAT now also needs a signer holding `unlock`
+  (`RoleDenied`, posture untouched); forcing COMBAT is unchanged.
+  `rotate-keys add` gave the new key whatever roles it was asked for — a
+  `rotate-keys`-only quorum, or the bootstrap key alone, could mint an
+  `all` key: each role of the new key must now be held by a signer (`all`
+  only by a signer holding `all`; an omitted list counts as
+  `unlock,audit-read`), else `RoleDenied` and `admin.pub` untouched.
+  **Regression:** a `force-posture`-only key can no longer leave COMBAT
+  (use `nn-admin unlock`, or add `unlock` to the key); a key holding only
+  `rotate-keys` can no longer add keys with roles it lacks
+  (COMBAT_RECOVERY §1.1); a client must send its signed request on the
+  connection that fetched the challenge, within 10 s (every nn-admin verb
+  does).
 - External audit, Wave 2, validation methodology (Medium LAB-012, LAB-013,
   TST-019): the adversarial campaign's coverage gates could not fail — a
   miss triaged after the run as N/A or as a sensor gap left the

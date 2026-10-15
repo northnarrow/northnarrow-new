@@ -691,7 +691,7 @@ fn admin_force_state_with_token_any_to_any() {
             assert_eq!(m.current_kind(), from);
             let token = crate::anti_tamper::_test_mint_unlock_token();
             let next = m
-                .admin_force_state_with_token(token, to)
+                .admin_force_state_with_token(token, to, true)
                 .expect("any-to-any allowed");
             assert_eq!(next.kind(), to);
             assert_eq!(m.current_kind(), to);
@@ -717,7 +717,7 @@ fn admin_force_state_with_token_non_combat_to_combat_fires_entry_hook() {
 
     let token = crate::anti_tamper::_test_mint_unlock_token();
     let _ = m
-        .admin_force_state_with_token(token, PostureKind::Combat)
+        .admin_force_state_with_token(token, PostureKind::Combat, true)
         .expect("Observing → Combat allowed");
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert_eq!(
@@ -748,7 +748,7 @@ fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
 
     let token = crate::anti_tamper::_test_mint_unlock_token();
     let _ = m
-        .admin_force_state_with_token(token, PostureKind::Observing)
+        .admin_force_state_with_token(token, PostureKind::Observing, true)
         .expect("Combat → Observing allowed");
     assert_eq!(m.current_kind(), PostureKind::Observing);
     assert_eq!(
@@ -756,6 +756,52 @@ fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
         1,
         "combat_release_hook should fire exactly once on Combat → non-Combat"
     );
+}
+
+/// External audit NN-AUD-083: without `may_release` (no signer holding
+/// `unlock`), COMBAT → non-COMBAT is refused with the state, the lock and
+/// the corroboration ledger untouched and no release hook fired; entering
+/// COMBAT and moving between non-COMBAT states need no such signer.
+#[test]
+fn admin_force_state_out_of_combat_needs_may_release() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let released = Arc::new(AtomicU32::new(0));
+    let r = Arc::clone(&released);
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+        r.fetch_add(1, Ordering::SeqCst);
+    });
+    let m = PostureMachine::new_with_hooks(Arc::new(|| {}), release_hook);
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    m.admin_force_state_with_token(token, PostureKind::Alerted, false)
+        .expect("a lateral move needs no unlock");
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    m.admin_force_state_with_token(token, PostureKind::Combat, false)
+        .expect("entering COMBAT needs no unlock");
+    assert!(m.is_combat_locked());
+    let transitions = m.transition_log().len();
+
+    for target in [
+        PostureKind::Observing,
+        PostureKind::Alerted,
+        PostureKind::Engaged,
+    ] {
+        let token = crate::anti_tamper::_test_mint_unlock_token();
+        assert_eq!(
+            m.admin_force_state_with_token(token, target, false)
+                .unwrap_err(),
+            AdminReleaseError::NeedsUnlock
+        );
+        assert_eq!(m.current_kind(), PostureKind::Combat);
+        assert!(m.is_combat_locked());
+    }
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+    assert_eq!(m.transition_log().len(), transitions);
+
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    m.admin_force_state_with_token(token, PostureKind::Engaged, true)
+        .expect("with an unlock signer the release goes through");
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
 }
 
 // ─── T7.13 (Beta Step 5) — end-to-end lineage exemption tests ──────
@@ -1406,7 +1452,7 @@ fn admin_force_state_with_token_same_state_is_noop() {
 
     let token = crate::anti_tamper::_test_mint_unlock_token();
     let _ = m
-        .admin_force_state_with_token(token, PostureKind::Observing)
+        .admin_force_state_with_token(token, PostureKind::Observing, true)
         .expect("idempotent same-state allowed");
 
     assert_eq!(m.current_kind(), PostureKind::Observing);

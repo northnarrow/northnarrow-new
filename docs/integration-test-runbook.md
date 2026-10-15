@@ -144,7 +144,7 @@ that sleeps, trigger it from Windows Task Scheduler instead:
 After a WSL restart `/dev/kvm` must be writable again (`kvm` group
 membership, or `sudo chmod 666 /dev/kvm`). `NN_LAB_NIGHTLY_DOWN=1` powers
 the guest off at the end; `NN_LAB_NIGHTLY_SKIP="test-ignored"` skips a
-step (the ignored suite includes the 5-minute rate-limit test).
+step.
 
 ### Soak test (hours of synthetic load)
 
@@ -449,7 +449,7 @@ Flags:
 - `--nocapture` is optional but very helpful — failures otherwise
   swallow the agent's stderr.
 
-Expected: **8 tests passing, 3 ignored** (the two COMBAT tests each wait
+Expected: **9 tests passing, 2 ignored** (the two COMBAT tests each wait
 for the graduated ladder to reach ISOLATE — ~30 s investigate window —
 before checking the iptables chain). The excerpt below predates the later
 tests:
@@ -459,7 +459,7 @@ running 4 tests
 test e2e_status_no_admin_action_initially ... ok
 test e2e_force_combat_then_unlock_via_cli ... ok
 test e2e_unlock_with_wrong_key ... ok
-test e2e_rate_limit_via_full_stack ... ignored, 5-min production rate-limit window too long for CI; run manually or after V1.1 adds a runtime override (see runbook)
+test e2e_failures_on_other_connections_do_not_rate_limit ... ok
 ```
 
 `bpf_guard_enforce_refuses_protected_pids_write` (external audit TST-001,
@@ -480,13 +480,11 @@ stops its agent with `common::quit_agent`, which only a `debug-trigger`
 build (guard in observe mode) allows, and which now fails the test when
 the agent survives (it used to print a line and leave the agent running).
 
-`e2e_rate_limit_via_full_stack` is `#[ignore]` because AdminAuth's
-production rate-limit window is hard-coded at 5 minutes with no
-runtime override; the test's loop would block CI for that long. The
-skeleton is already in place — when V1.1 adds an environment-variable
-or CLI override (`NN_ADMIN_RATE_LIMIT_WINDOW_SECS=10`, say), drop the
-`#[ignore]` and replace the commented-out final `assert_eq!` near
-the end of the test body.
+`e2e_failures_on_other_connections_do_not_rate_limit` replaced the
+ignored `e2e_rate_limit_via_full_stack` (external audit NN-AUD-079):
+signature failures now count per connection, and a connection is closed
+after three, so there is no agent-wide five-minute window left to wait
+for.
 
 ## Troubleshooting
 
@@ -584,8 +582,6 @@ sudo iptables -S NORTHNARROW_COMBAT  # → "No chain by that name"
   `combat-rules.v4` or `admin.pub` produces a WARN and the agent
   continues without isolation; production deployment configs will
   want the inverse default.
-- **Runtime rate-limit window override** for the e2e rate-limit test;
-  see the `#[ignore]` reason in `privileged_e2e.rs`.
 - **Small-order Ed25519 signature fixture test** for
   `AdminAuth::verify_unlock` — deferred from commit #4 because
   constructing a known small-order curve point as a test fixture is

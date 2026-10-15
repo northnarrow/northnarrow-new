@@ -245,6 +245,14 @@ fn e2e_force_combat_then_unlock_via_cli() {
     let _eni = EniIptablesGuard::install();
     let dir = tempfile::tempdir().expect("tempdir");
     let priv_key = init_admin_keypair(dir.path());
+    // External audit NN-AUD-083: a second key holding only `force-posture`.
+    let (force_only_key, _) = init_admin_keypair_with_roles(
+        Path::new(nn_admin_bin()),
+        dir.path(),
+        &dir.path().join("admin.pub"),
+        "force_only",
+        "force-posture",
+    );
     let (_guard, handles) = spawn_agent(dir.path());
     let nn = handles.nn_admin_path.as_path();
     let socket = handles.socket.as_path();
@@ -297,6 +305,40 @@ fn e2e_force_combat_then_unlock_via_cli() {
         .iter()
         .any(|r| joined.contains(r)),
         "expected loopback ACCEPT/RETURN in chain, got: {joined}"
+    );
+
+    // External audit NN-AUD-083: the `force-posture`-only key cannot leave
+    // COMBAT (it used to release the containment like `unlock`): role
+    // denied (exit 7), posture and DROP chain unchanged.
+    let out = run_nn_admin_at(
+        nn,
+        &[
+            "force-posture",
+            "engaged",
+            "--key",
+            force_only_key.to_str().unwrap(),
+            "--socket",
+            socket.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "force-posture out of COMBAT without unlock must be role-denied: stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        list_combat_chain_rules().join("\n").contains("-j DROP"),
+        "the isolation chain must stay in place"
+    );
+    let out = run_nn_admin_at(
+        nn,
+        &["status", "--socket", socket.to_str().unwrap(), "--json"],
+    );
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("\"posture\":\"Combat\""),
+        "status body: {body}"
     );
 
     // Sign + submit; should win.
@@ -427,42 +469,22 @@ fn e2e_unlock_with_wrong_key() {
     );
 }
 
+/// External audit NN-AUD-079: failed signatures count per connection,
+/// and every nn-admin call is a connection of its own — wrong-key unlocks
+/// never rate-limit a later call, nor the right key. (The agent-wide
+/// five-minute window this test could not exercise is gone.) No COMBAT is
+/// needed: an unlock outside COMBAT answers success.
 #[test]
-#[ignore = "5-min production rate-limit window too long for CI; run \
-            manually or after V1.1 adds a runtime override (see runbook)"]
-fn e2e_rate_limit_via_full_stack() {
-    // The CLI/socket path itself works fine; the limitation is that
-    // AdminAuth's rate-limit window is `pub const
-    // DEFAULT_RATE_LIMIT_WINDOW = Duration::from_secs(5 * 60)` with
-    // no runtime override (only the `#[cfg(test)] new_with_window`
-    // constructor takes a custom Duration, and that's inaccessible
-    // from an external integration test). Documenting and ignoring
-    // until V1.1 introduces NN_ADMIN_RATE_LIMIT_WINDOW_SECS or a
-    // CLI flag. The skeleton below is the shape the unignored
-    // version will take.
-    let _eni = EniIptablesGuard::install();
+fn e2e_failures_on_other_connections_do_not_rate_limit() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let _correct_priv = init_admin_keypair(dir.path());
+    let correct_priv = init_admin_keypair(dir.path());
     let other = tempfile::tempdir().expect("tempdir2");
     let other_priv = init_admin_keypair(other.path());
     let (_guard, handles) = spawn_agent(dir.path());
     let nn = handles.nn_admin_path.as_path();
     let socket = handles.socket.as_path();
 
-    // Force Combat.
-    let _ = run_nn_admin_at(
-        nn,
-        &[
-            "debug",
-            "force-posture",
-            "combat",
-            "--socket",
-            socket.to_str().unwrap(),
-        ],
-    );
-
-    // Three failures.
-    for _ in 0..3 {
+    for attempt in 1..=4 {
         let out = run_nn_admin_at(
             nn,
             &[
@@ -473,25 +495,30 @@ fn e2e_rate_limit_via_full_stack() {
                 socket.to_str().unwrap(),
             ],
         );
-        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "wrong-key unlock #{attempt} must be InvalidSignature (2), never RateLimited (4): \
+             stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-
-    // Fourth attempt would be RateLimited if window were short
-    // enough; with the 5-minute production window the 4th call
-    // still succeeds at the challenge step. Re-enable assertion
-    // after the V1.1 override lands.
     let out = run_nn_admin_at(
         nn,
         &[
             "unlock",
             "--key",
-            other_priv.to_str().unwrap(),
+            correct_priv.to_str().unwrap(),
             "--socket",
             socket.to_str().unwrap(),
         ],
     );
-    // V1.1: assert_eq!(out.status.code(), Some(4));
-    let _ = out;
+    assert!(
+        out.status.success(),
+        "the right key is not rate-limited: code={:?} stderr={:?}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -1055,6 +1082,50 @@ fn rotate_keys_round_trip() {
         audit_body.contains("\"op\":\"unlock\""),
         "audit log should also have the unlock entry: {audit_body}"
     );
+
+    // External audit NN-AUD-084: the two `unlock,rotate-keys` signers
+    // cannot mint a key with a role they lack (`all`, `shutdown`): role
+    // denied (exit 7), admin.pub unchanged.
+    for roles in ["all", "unlock,shutdown"] {
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        let (_, hex) = init_admin_keypair_with_roles(
+            &nn_admin,
+            scratch.path(),
+            &scratch.path().join("scratch.pub"),
+            "too_strong",
+            "unlock",
+        );
+        let out = Command::new(&paths.nn_admin_path)
+            .args([
+                "rotate-keys",
+                "add",
+                "--new-pubkey",
+                &hex,
+                "--new-roles",
+                roles,
+                "--key",
+                priv_a.to_str().unwrap(),
+                "--cosign-key",
+                priv_b.to_str().unwrap(),
+                "--agent-id-file",
+                paths.agent_id_file.to_str().unwrap(),
+                "--socket",
+                paths.socket.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn nn-admin rotate-keys add");
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "rotate-keys add --new-roles {roles} must be role-denied: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let body = std::fs::read_to_string(&paths.admin_pub).expect("admin.pub readable");
+        assert!(
+            !body.contains(&hex),
+            "admin.pub must not gain {hex}: {body}"
+        );
+    }
 }
 
 /// PHASE_D_003 test #3 — audit-verify e2e (design §9 + B2

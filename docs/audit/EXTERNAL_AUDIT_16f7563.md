@@ -120,14 +120,14 @@ the audit did not report, noted with the fix that takes them.
 
 | ID | Audit ref | Area | Effort | Status |
 |---|---|---|---|---|
-| NN-AUD-077 | ASK-002 | Admin socket | M | open |
-| NN-AUD-078 | ASK-003 | Admin socket | M | open |
-| NN-AUD-079 | ASK-004 | Admin socket | M | open |
+| NN-AUD-077 | ASK-002 | Admin socket | M | fixed (lab PR 138) |
+| NN-AUD-078 | ASK-003 | Admin socket | M | fixed (lab PR 138) |
+| NN-AUD-079 | ASK-004 | Admin socket | M | fixed (lab PR 138) |
 | NN-AUD-080 | ASK-006 | Admin socket | M | fixed (lab PR 139) |
 | NN-AUD-081 | ASK-007 | Admin socket | S | fixed (lab PR 139) |
 | NN-AUD-082 | ASK-008 | Admin socket | S | fixed (lab PR 139) |
-| NN-AUD-083 | ASK-010 | Admin socket | S | open |
-| NN-AUD-084 | ASK-011 | Admin socket | M | open |
+| NN-AUD-083 | ASK-010 | Admin socket | S | fixed (lab PR 138) |
+| NN-AUD-084 | ASK-011 | Admin socket | M | fixed (lab PR 138) |
 | NN-AUD-085 | AUT-002 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-086 | AUT-003 | Admin auth | S | fixed (lab PR 115) |
 | NN-AUD-087 | AUT-004 | Admin auth | S | fixed (lab PR 115) |
@@ -4433,3 +4433,74 @@ the audit did not report, noted with the fix that takes them.
     cells do not support, a frozen file edited without its hash, or a
     family without a benign control.
   - Lab: No lab run: methodology and its registry. `validation_registry` tests pass on the tree with lab PRs 140–158 (77 rules, R007's two registrations accepted; every evidence cell resolves to a test or probe that exists). Two Critical rules of the sub-gate cannot fire today (NN-L-NET-003: no TLS fingerprint producer; NN-L-CANARY-003: `is_canary_port` has no caller): the 100 % Critical gate cannot pass before they are wired or retired. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-077 (ASK-002), NN-AUD-078 (ASK-003), NN-AUD-079 (ASK-004),
+  NN-AUD-083 (ASK-010), NN-AUD-084 (ASK-011), lab PR 138.** Admin socket
+  connections and challenge state, and admin role confinement (batches B3
+  and B5 of wave 2, group A).
+  - ASK-002: the accept loop backs off on EMFILE, ENFILE, ENOBUFS, ENOMEM,
+    ECONNABORTED and EINTR (100 ms doubling to 1 s, a WARN at most every
+    10 s) and returns only on another error; `main.rs` then logs an ERROR
+    and writes a signed `subsystem_degraded`. Connections live in a table
+    of 32 (`ConnSlots`). Deviation from the triage's semaphore that drops
+    newcomers: 32 idle peers would then lock nn-admin and the watchdog out
+    until the idle timeout, and root can refill the table as fast as it is
+    closed, so a full table makes room by closing the connection that has
+    waited longest on its peer (for a request, or to take a reply); only
+    when all 32 are mid-dispatch is the newcomer dropped. A peer gets 10 s
+    to send each frame (header and body) and 5 s to take each reply.
+    Not done: the optional re-bind when `admin.sock` is unlinked, and a
+    `LimitNOFILE` in the unit (the table bounds the admin plane's share).
+  - ASK-003, ASK-004: `AdminAuth` keeps no challenge and no failure count;
+    `ConnAuth`, built per connection in `handle_connection`, holds both
+    and is the only way to verify a live request (the `*_with_nonce`
+    verifies are private to the module; it derefs to `AdminAuth` for the
+    key-set accessors). The dispatchers take `&ConnAuth`, bodies
+    unchanged. What counts as a failure is unchanged (invalid signature,
+    nonce, `agent_id` or op mismatch; not a missing challenge, a quorum
+    shortfall, a role refusal or clock skew). The third failure is
+    answered `RateLimited` (`retry_after_secs` 1, only the connection is
+    closed) and the server closes the connection after the reply; a
+    success no longer resets the count (the budget is the connection's).
+    The air-gapped split flow (V1.1) will need a bounded nonce map then.
+  - ASK-010: `verify_signed_payload_quorum_keys` returns the matched keys
+    with their roles (`VerifiedSigners`), read under the same lock as the
+    signature scan; `dispatch_force_posture` passes `may_release` (a
+    signer authorises `unlock`) and `admin_force_state_with_token` refuses
+    COMBAT → non-COMBAT without it under its state write lock
+    (`AdminReleaseError::NeedsUnlock`, state, lock, ledger and hooks
+    untouched), answered `RoleDenied`, the signer still on the audit row.
+    1-of-N entry into COMBAT stays (POS-001).
+  - ASK-011: `dispatch_rotate_keys_add` refuses a role no matched signer
+    authorises (`role_beyond_signers`, `AdminKey::authorizes`), before
+    admin.pub is touched, bootstrap 1-of-N included. Found while fixing:
+    an empty role list is written as a pubkey-only line, which loads as
+    `unlock,audit-read`, so the check runs on those defaults (else an
+    empty list slipped past a plain subset test). nn-admin's role-denied
+    messages and COMBAT_RECOVERY §1.1 say so; design doc §6.4 and §11
+    (A11, A12, A15) updated.
+  - Tests: `challenge_on_other_connection_does_not_invalidate_mine` (unit
+    and socket), `challenge_flood_does_not_break_signed_request`,
+    `third_failure_exhausts_the_connection`,
+    `third_failure_closes_connection_and_spares_others`,
+    `failures_on_one_connection_do_not_rate_limit_another`,
+    `operator_ux_errors_do_not_count_against_the_connection`,
+    `idle_connection_closed_after_timeout`,
+    `reply_never_taken_closes_after_write_timeout`,
+    `connections_over_cap_evict_idle_status_still_answers`, the
+    `ConnSlots` unit tests, `admin_socket_survives_emfile` (its own
+    binary: lowers `RLIMIT_NOFILE` and fills the fd table),
+    `force_posture_from_combat_needs_unlock_role`,
+    `force_posture_into_combat_with_force_posture_only_key`,
+    `admin_force_state_out_of_combat_needs_may_release`,
+    `rotate_keys_add_refuses_roles_beyond_signers`,
+    `rotate_keys_add_all_needs_all_signer`,
+    `bootstrap_add_delegates_signer_roles`. The socket, dispatch and EMFILE
+    tests were run against main's code: each fails there except the
+    COMBAT-entry guard; the timeouts and the posture gate were checked by
+    inverting them. The global rate-limit tests are replaced. Privileged
+    e2e: `e2e_force_combat_then_unlock_via_cli` (a `force-posture`-only
+    key is role-denied out of COMBAT, the DROP chain stays) and
+    `rotate_keys_round_trip` (`all` and `shutdown` refused) extended;
+    `e2e_failures_on_other_connections_do_not_rate_limit` replaces the
+    ignored five-minute test.
+  - Lab: Debian 12, adminconn138-probe.sh (run as root in the guest) on main and on this build. flood (a raw client sending ChallengeRequest in a loop while `nn-admin unlock` runs): unlocks 0/20 on main — the flood's failures tripped the agent-wide 5-minute rate limit, which then also refused the probe's force/rotate cases (so those two show the after side only, the unit tests the main side) — here 20/20. ratelimit (three wrong-key unlocks, then the right key): main RateLimited → here the right key succeeds (failures count per connection, three close it). slow (2,000 idle connections for 40 s): `status` answered on both, the agent's fds 2,146 on main → 175 then 144 here ("admin connection table full: closed the longest-waiting connections", max 32). force (a key holding only `force-posture`): into COMBAT allowed, out of COMBAT refused ("it needs the unlock role"). rotate (two `unlock,rotate-keys` keys asking for a key with `all` or `shutdown`): refused, "the new key would hold a role none of its signers holds". Debian gate of this change on its own: 30 suites, 80 passed, 0 failed. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.

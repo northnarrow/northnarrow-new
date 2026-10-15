@@ -15,11 +15,21 @@
 //! closes the stream. The `nn-admin unlock` flow performs a second
 //! request on the same stream (challenge → unlock), so the handler
 //! loops on EOF instead of close-after-first-reply.
+//!
+//! External audit NN-AUD-077: a transient `accept()` error (EMFILE,
+//! ECONNABORTED, …) backs off and retries instead of ending the admin
+//! plane; at most [`MAX_ADMIN_CONNECTIONS`] connections are served at
+//! once, and a full table makes room by closing the connection that has
+//! waited longest on its peer; a peer gets [`FRAME_READ_TIMEOUT`] to send
+//! each request and [`FRAME_WRITE_TIMEOUT`] to take each reply. External
+//! audit NN-AUD-078 / NN-AUD-079: the challenge and the failure count live
+//! with the connection ([`ConnAuth`]).
 
+use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -46,7 +56,7 @@ use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
-use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError};
+use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::audit::{AuditEntryDraft, AuditLog};
@@ -283,8 +293,9 @@ impl Default for AdminReadPaths {
 }
 
 /// Bind the admin socket and run the accept loop forever. Returns
-/// only on a fatal listener error (`accept()` returning `Err`); the
-/// agent's main loop is expected to also exit on the same condition.
+/// only on a listener error that is not transient (external audit
+/// NN-AUD-077: EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED and EINTR
+/// back off and retry); the caller records that the admin plane is gone.
 ///
 /// On startup an existing socket file at `socket_path` is silently
 /// removed before `bind` — the previous agent process may have died
@@ -483,11 +494,46 @@ pub async fn serve_with_marker_path(
         "admin socket listening (mode 0600)"
     );
 
+    // External audit NN-AUD-077: a bounded table of connections, and an
+    // accept loop that outlives a transient error.
+    let slots = ConnSlots::new(ConnLimits::DEFAULT);
+    let mut accept_backoff = AcceptBackoff::default();
+    let mut refused_log = LogEvery::new(LOG_EVERY);
+    let mut evicted_log = LogEvery::new(LOG_EVERY);
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("accepting admin connection")?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => {
+                accept_backoff.reset();
+                stream
+            }
+            Err(e) if accept_error_is_transient(&e) => {
+                accept_backoff.pause(&e).await;
+                continue;
+            }
+            Err(e) => return Err(e).context("accepting admin connection"),
+        };
+        let Some(slot) = slots.admit() else {
+            // Every slot is mid-request (none is waiting on its peer):
+            // drop the newcomer rather than grow without bound.
+            if let Some(suppressed) = refused_log.ready() {
+                warn!(
+                    max = MAX_ADMIN_CONNECTIONS,
+                    suppressed, "admin connection refused: every slot is serving a request"
+                );
+            }
+            drop(stream);
+            continue;
+        };
+        if slot.made_room {
+            if let Some(suppressed) = evicted_log.ready() {
+                warn!(
+                    max = MAX_ADMIN_CONNECTIONS,
+                    closed = suppressed + 1,
+                    "admin connection table full: closed the longest-waiting connections \
+                     to admit new ones"
+                );
+            }
+        }
         let auth = Arc::clone(&auth);
         let posture = Arc::clone(&posture);
         let isolator = Arc::clone(&isolator);
@@ -503,6 +549,7 @@ pub async fn serve_with_marker_path(
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
+                slot,
                 &auth,
                 &posture,
                 &isolator,
@@ -534,13 +581,263 @@ pub fn unlink_socket(path: &Path) {
     }
 }
 
+/// External audit NN-AUD-077: connections served at once. nn-admin and
+/// the watchdog open one at a time; 32 leaves room for a dashboard and
+/// operators while bounding the fds and buffers the admin plane can take
+/// from the agent (systemd's default soft limit is 1024).
+const MAX_ADMIN_CONNECTIONS: usize = 32;
+
+/// Time a peer gets to send each request. nn-admin and the watchdog send
+/// at once (nn-admin's own timeout is 5 s); an interactive or hardware-token
+/// signing flow would need a longer one.
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time a peer gets to take each reply.
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a repeated accept or refusal warning is logged.
+const LOG_EVERY: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy)]
+struct ConnLimits {
+    max_conns: usize,
+    read_timeout: Duration,
+    write_timeout: Duration,
+}
+
+impl ConnLimits {
+    const DEFAULT: Self = Self {
+        max_conns: MAX_ADMIN_CONNECTIONS,
+        read_timeout: FRAME_READ_TIMEOUT,
+        write_timeout: FRAME_WRITE_TIMEOUT,
+    };
+}
+
+/// External audit NN-AUD-077: the table of live admin connections.
+///
+/// A plain semaphore would let [`MAX_ADMIN_CONNECTIONS`] connections that
+/// never send anything lock nn-admin and the watchdog out until the read
+/// timeout — and a root peer can reconnect as fast as they are closed. So
+/// a full table makes room for a newcomer by closing the connection that
+/// has waited longest on its peer (to send a request, or to take a reply).
+/// A legitimate client waits on itself only for microseconds; a slow or
+/// idle one is the first to go. Only when every connection is mid-request
+/// is the newcomer refused.
+struct ConnSlots {
+    limits: ConnLimits,
+    table: Mutex<SlotTable>,
+}
+
+#[derive(Default)]
+struct SlotTable {
+    next_id: u64,
+    live: HashMap<u64, SlotEntry>,
+}
+
+struct SlotEntry {
+    /// `Some(since)` while the connection waits on its peer; `None` while
+    /// it serves a request.
+    waiting_since: Option<Instant>,
+    evict: Arc<Notify>,
+}
+
+impl ConnSlots {
+    fn new(limits: ConnLimits) -> Arc<Self> {
+        Arc::new(Self {
+            limits,
+            table: Mutex::new(SlotTable::default()),
+        })
+    }
+
+    /// A slot for a new connection, closing the longest-waiting one when
+    /// the table is full; `None` when every connection is mid-request.
+    fn admit(self: &Arc<Self>) -> Option<ConnSlot> {
+        let mut table = self.table.lock();
+        let made_room = table.live.len() >= self.limits.max_conns;
+        if made_room {
+            let (_, victim) = table
+                .live
+                .iter()
+                .filter_map(|(id, e)| e.waiting_since.map(|since| (since, *id)))
+                .min()?;
+            if let Some(entry) = table.live.remove(&victim) {
+                entry.evict.notify_one();
+            }
+        }
+        let id = table.next_id;
+        table.next_id = table.next_id.wrapping_add(1);
+        let evict = Arc::new(Notify::new());
+        table.live.insert(
+            id,
+            SlotEntry {
+                waiting_since: Some(Instant::now()),
+                evict: Arc::clone(&evict),
+            },
+        );
+        Some(ConnSlot {
+            id,
+            slots: Arc::clone(self),
+            evict,
+            made_room,
+        })
+    }
+
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.table.lock().live.len()
+    }
+}
+
+/// One connection's place in [`ConnSlots`]; leaving the table on drop.
+struct ConnSlot {
+    id: u64,
+    slots: Arc<ConnSlots>,
+    evict: Arc<Notify>,
+    /// Another connection was closed to admit this one.
+    made_room: bool,
+}
+
+impl ConnSlot {
+    fn limits(&self) -> ConnLimits {
+        self.slots.limits
+    }
+
+    /// From now on the connection waits on its peer — evictable. `false`
+    /// when it was already evicted.
+    fn waiting(&self) -> bool {
+        self.set_waiting(Some(Instant::now()))
+    }
+
+    /// The connection serves a request — not evictable. `false` when it
+    /// was already evicted.
+    fn busy(&self) -> bool {
+        self.set_waiting(None)
+    }
+
+    fn set_waiting(&self, since: Option<Instant>) -> bool {
+        match self.slots.table.lock().live.get_mut(&self.id) {
+            Some(entry) => {
+                entry.waiting_since = since;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resolves when a newcomer took this connection's place.
+    async fn evicted(&self) {
+        self.evict.notified().await;
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.slots.table.lock().live.remove(&self.id);
+    }
+}
+
+/// External audit NN-AUD-077: the `accept()` errors that say nothing about
+/// the listener — the fd table or kernel memory is short, or one peer gave
+/// up — and must not end the admin plane.
+fn accept_error_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::EINTR
+        )
+    )
+}
+
+/// Back-off for a failing `accept()`: 100 ms doubling to 1 s, reset by the
+/// next accepted connection; the warning is logged at most every
+/// [`LOG_EVERY`].
+struct AcceptBackoff {
+    delay: Duration,
+    log: LogEvery,
+}
+
+impl AcceptBackoff {
+    const FIRST: Duration = Duration::from_millis(100);
+    const MAX: Duration = Duration::from_secs(1);
+
+    async fn pause(&mut self, e: &std::io::Error) {
+        if let Some(suppressed) = self.log.ready() {
+            warn!(
+                error = %e,
+                retry_in_ms = self.delay.as_millis() as u64,
+                suppressed,
+                "admin socket accept failed; backing off — the socket stays open"
+            );
+        }
+        tokio::time::sleep(self.delay).await;
+        self.delay = (self.delay * 2).min(Self::MAX);
+    }
+
+    fn reset(&mut self) {
+        self.delay = Self::FIRST;
+    }
+}
+
+impl Default for AcceptBackoff {
+    fn default() -> Self {
+        Self {
+            delay: Self::FIRST,
+            log: LogEvery::new(LOG_EVERY),
+        }
+    }
+}
+
+/// At most one log line per `every`; [`Self::ready`] returns how many
+/// were suppressed since the last one.
+struct LogEvery {
+    every: Duration,
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl LogEvery {
+    fn new(every: Duration) -> Self {
+        Self {
+            every,
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    fn ready(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < self.every)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
 /// Drive one connection until the client closes the stream. Each
 /// iteration reads exactly one frame and writes exactly one reply;
 /// the `nn-admin unlock` flow uses two iterations (challenge then
 /// unlock) and then closes.
+///
+/// External audit NN-AUD-077: the peer gets the slot's read timeout to
+/// send each request and its write timeout to take each reply, and the
+/// connection ends when a newcomer evicts it. External audit NN-AUD-078 /
+/// NN-AUD-079: the connection's challenge and failure count live in a
+/// [`ConnAuth`]; a connection that used up its failures is closed after
+/// the reply.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
+    slot: ConnSlot,
     auth: &AdminAuth,
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
@@ -559,15 +856,46 @@ async fn handle_connection(
     // never changes peers mid-stream (SO_PEERCRED is fixed at
     // accept time).
     let client = peer_creds(&stream);
+    let auth = ConnAuth::new(auth);
+    let limits = slot.limits();
     loop {
-        let msg = match read_frame(&mut stream).await? {
-            Some(m) => m,
-            None => return Ok(()),
+        if !slot.waiting() {
+            return Ok(());
+        }
+        let read = tokio::time::timeout(limits.read_timeout, read_frame(&mut stream));
+        let msg = tokio::select! {
+            () = slot.evicted() => {
+                // Logged, rate-limited, by the accept loop.
+                tracing::debug!(
+                    client_pid = client.pid,
+                    "admin connection closed to make room for a new one"
+                );
+                return Ok(());
+            }
+            read = read => match read {
+                Err(_) => {
+                    // Debug: a peer opening connections at will must not
+                    // turn each into a journal line.
+                    tracing::debug!(
+                        client_pid = client.pid,
+                        timeout_secs = limits.read_timeout.as_secs(),
+                        "admin connection closed: no request within the timeout"
+                    );
+                    return Ok(());
+                }
+                Ok(frame) => match frame? {
+                    Some(m) => m,
+                    None => return Ok(()),
+                },
+            },
         };
+        if !slot.busy() {
+            return Ok(());
+        }
         let mut matched_fps: Vec<String> = Vec::new();
         let reply = dispatch(
             msg.clone(),
-            auth,
+            &auth,
             posture,
             isolator,
             marker_path,
@@ -582,7 +910,29 @@ async fn handle_connection(
             &mut matched_fps,
         );
         emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
-        write_frame(&mut stream, &reply).await?;
+        if !slot.waiting() {
+            return Ok(());
+        }
+        // Biased to the write: a reply the peer can take at once is
+        // delivered even if a newcomer is evicting this connection.
+        let write = tokio::time::timeout(limits.write_timeout, write_frame(&mut stream, &reply));
+        tokio::select! {
+            biased;
+            written = write => {
+                written.map_err(|_| {
+                    anyhow::anyhow!("admin reply not taken within {:?}", limits.write_timeout)
+                })??;
+            }
+            () = slot.evicted() => return Ok(()),
+        }
+        if auth.exhausted() {
+            warn!(
+                client_pid = client.pid,
+                client_comm = %client.comm,
+                "admin connection closed after repeated signature failures"
+            );
+            return Ok(());
+        }
     }
 }
 
@@ -1150,7 +1500,7 @@ fn audit_result_str(r: AdminResult) -> String {
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     msg: AdminMessage,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     marker_path: &Path,
@@ -1454,7 +1804,7 @@ fn dispatch(
 // signed action.
 fn dispatch_shutdown(
     req: ShutdownRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     marker_path: &Path,
     shutdown_signal: Option<&ShutdownSignal>,
     fps_out: &mut Vec<String>,
@@ -1575,23 +1925,31 @@ fn dispatch_shutdown(
 /// [`OperationCode::ForcePosture`]. The signed payload's `extra`
 /// MUST be [`OperationExtra::ForcePosture { target }`]; any other
 /// extra variant trips the op/extra invariant check inside
-/// [`crate::anti_tamper::admin_auth::AdminAuth::verify_signed_payload_quorum`]
+/// [`crate::anti_tamper::admin_auth::ConnAuth::verify_signed_payload_quorum`]
 /// (Tappa 8 A7) and surfaces as `UnknownOperation` on the wire.
 ///
 /// On verify success, mutates the posture machine to the requested
 /// target via [`PostureMachine::admin_force_state_with_token`]
 /// (Tappa 8 A10), which fires the COMBAT entry/release hooks per
 /// §12.2 if the direction crosses the COMBAT boundary.
+///
+/// External audit NN-AUD-083: leaving COMBAT this way releases the
+/// containment exactly like `unlock`, so it also needs a signer that
+/// holds [`Role::Unlock`]. The posture machine checks it under its own
+/// state lock (an autonomous COMBAT entry may land between this
+/// dispatcher and the transition); a refusal answers `RoleDenied`.
+/// Entering COMBAT stays 1-of-N `force-posture` (POS-001: the
+/// administrator forces it).
 fn dispatch_force_posture(
     req: ForcePostureRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     posture: &PostureMachine,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
 
-    let verify_outcome = auth.verify_signed_payload_quorum(
+    let verify_outcome = auth.verify_signed_payload_quorum_keys(
         &req.payload,
         &sigs,
         1, // 1-of-N per §3.3
@@ -1600,8 +1958,8 @@ fn dispatch_force_posture(
         server_now,
     );
 
-    let (token, matched_fps) = match verify_outcome {
-        Ok(t) => t,
+    let signers = match verify_outcome {
+        Ok(v) => v,
         Err(AdminAuthError::NoPendingChallenge) => return AdminResult::NoPendingChallenge,
         Err(AdminAuthError::NonceMismatch) => return AdminResult::InvalidSignature,
         Err(AdminAuthError::UnknownOperation { .. }) => return AdminResult::UnknownOperation,
@@ -1628,7 +1986,9 @@ fn dispatch_force_posture(
             return AdminResult::InvalidSignature;
         }
     };
-    *fps_out = matched_fps;
+    *fps_out = signers.fingerprints;
+    // External audit NN-AUD-083: may this request release COMBAT?
+    let may_release = signers.keys.iter().any(|k| k.authorizes(Role::Unlock));
 
     // Extract the target from the verified payload. The op/extra
     // invariant inside verify_signed_payload_quorum already
@@ -1650,11 +2010,10 @@ fn dispatch_force_posture(
 
     // Drive the posture mutation through the capability-gated path.
     // `admin_force_state_with_token` consumes the token, fires
-    // hooks per §12.2, and returns the post-transition state.
-    // Today the method's signature is infallible (no error variant
-    // produced — any → any is allowed) but we map any future error
-    // shape to InvalidSignature defensively.
-    match posture.admin_force_state_with_token(token, target) {
+    // hooks per §12.2, and returns the post-transition state. It
+    // refuses COMBAT → non-COMBAT without `may_release`; any other
+    // error shape maps to InvalidSignature defensively.
+    match posture.admin_force_state_with_token(signers.token, target, may_release) {
         Ok(state) => {
             info!(
                 target: "admin.force_posture",
@@ -1663,6 +2022,15 @@ fn dispatch_force_posture(
                 "production force-posture applied"
             );
             AdminResult::Success
+        }
+        Err(AdminReleaseError::NeedsUnlock) => {
+            warn!(
+                target: "admin.force_posture",
+                to = ?target,
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                "force-posture out of COMBAT refused: no signer holds the `unlock` role"
+            );
+            AdminResult::RoleDenied
         }
         Err(e) => {
             warn!(
@@ -1710,7 +2078,7 @@ fn reregister_admin_pub_after_rotate(
 /// reads it at boot. Takes effect at the next agent start.
 fn dispatch_config_overlay_set(
     req: ConfigOverlaySetRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> ConfigOverlaySetResponse {
     use crate::config::overlay_auth;
@@ -1812,9 +2180,13 @@ fn dispatch_config_overlay_set(
 /// that go through `build_*` don't, and trying to rotate keys
 /// against an in-memory-only auth surfaces as a clear log line
 /// + `AdminResult::UnknownOperation`.
+///
+/// External audit NN-AUD-084: the new key's roles must be a subset of
+/// what the matched signers hold, else `AdminResult::RoleDenied` and
+/// admin.pub is untouched.
 fn dispatch_rotate_keys_add(
     req: RotateKeysAddRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
     // BUG-013 (PHASE 15.1): bootstrap-mode 1-of-N gate. Consulted
@@ -1850,7 +2222,7 @@ fn dispatch_rotate_keys_add(
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
 
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+    let signers = match auth.verify_signed_payload_quorum_keys(
         &req.payload,
         &sigs,
         min_distinct, // 2-of-N normally; 1-of-N when bootstrap-armed (BUG-013)
@@ -1858,10 +2230,10 @@ fn dispatch_rotate_keys_add(
         OperationCode::RotateKeysAdd,
         server_now,
     ) {
-        Ok(t) => t,
+        Ok(v) => v,
         Err(e) => return map_admin_auth_error(e, "rotate-keys-add"),
     };
-    *fps_out = matched_fps;
+    *fps_out = signers.fingerprints;
 
     let (new_pubkey_bytes, roles) = match &req.payload.extra {
         OperationExtra::RotateKeysAdd(extra) => (extra.new_pubkey, extra.roles.clone()),
@@ -1873,6 +2245,20 @@ fn dispatch_rotate_keys_add(
             return AdminResult::UnknownOperation;
         }
     };
+
+    // External audit NN-AUD-084: the new key may hold only roles its
+    // signers hold, the bootstrap 1-of-N path included — a key with only
+    // `rotate-keys` used to mint an `all` key.
+    if let Some(beyond) = role_beyond_signers(&roles, &signers.keys) {
+        warn!(
+            target: "admin.rotate_keys",
+            role = ?beyond,
+            requested = ?roles,
+            bootstrap_armed,
+            "rotate-keys add refused: the new key would hold a role none of its signers holds"
+        );
+        return AdminResult::RoleDenied;
+    }
 
     let Some(config_path) = auth.config_path() else {
         warn!(
@@ -1960,6 +2346,27 @@ fn dispatch_rotate_keys_add(
     AdminResult::Success
 }
 
+/// External audit NN-AUD-084: the first role a key added with `roles`
+/// would hold that none of `signers` holds ([`AdminKey::authorizes`], so
+/// `all` needs a signer holding `all`). An empty list is written as a
+/// pubkey-only line, which loads with the default roles — those are
+/// checked.
+///
+/// [`AdminKey::authorizes`]: common::admin_quorum::AdminKey::authorizes
+fn role_beyond_signers(roles: &[Role], signers: &[common::admin_quorum::AdminKey]) -> Option<Role> {
+    let defaults;
+    let granted = if roles.is_empty() {
+        defaults = common::admin_quorum::default_roles();
+        &defaults[..]
+    } else {
+        roles
+    };
+    granted
+        .iter()
+        .copied()
+        .find(|role| !signers.iter().any(|k| k.authorizes(*role)))
+}
+
 /// Tappa 8 A13 — handle one [`RotateKeysRevokeRequest`] (design
 /// §7.2 + §7.3). Symmetric to [`dispatch_rotate_keys_add`]: 2-of-N
 /// quorum with `Role::RotateKeys`, atomic file rewrite removing
@@ -1969,7 +2376,7 @@ fn dispatch_rotate_keys_add(
 /// variant; the operator-facing detail is in the agent's own log).
 fn dispatch_rotate_keys_revoke(
     req: RotateKeysRevokeRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
     let server_now = now_unix_secs();
@@ -2070,7 +2477,7 @@ fn dispatch_rotate_keys_revoke(
 /// for next restart") so legacy unit-test fixtures stay green.
 fn dispatch_fim_baseline(
     req: FimBaselineRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     fim_state: Option<&FimAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
@@ -2139,7 +2546,7 @@ fn dispatch_fim_baseline(
 /// touching this dispatcher.
 fn dispatch_trusted_installer_grant(
     req: TrustedInstallerGrantRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     installer_override: Option<&TrustedInstallerOverride>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
@@ -2209,7 +2616,7 @@ fn dispatch_trusted_installer_grant(
 /// `serve_with_fim_state`.
 fn dispatch_fim_status(
     req: FimStatusRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     fim_state: Option<&FimAdminState>,
     fps_out: &mut Vec<String>,
 ) -> FimStatusResponse {
@@ -2349,7 +2756,7 @@ fn count_and_last_ts_jsonl(path: &Path) -> (u32, String) {
 /// rotated archives included ([`read_tail_jsonl`]).
 fn dispatch_fim_report(
     req: FimReportRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> FimReportResponse {
@@ -2483,7 +2890,7 @@ fn empty_response_status(result: AdminResult) -> ResponseStatusResponse {
 /// undo.
 fn dispatch_response_status(
     req: ResponseStatusRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     posture: &PostureMachine,
     state: Option<&ResponseAdminState>,
     fps_out: &mut Vec<String>,
@@ -2560,7 +2967,7 @@ fn dispatch_response_status(
 /// still names the process moved). `response-manage`.
 fn dispatch_response_release(
     req: ResponseReleaseRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     state: Option<&ResponseAdminState>,
     fps_out: &mut Vec<String>,
 ) -> ResponseReleaseResponse {
@@ -2660,7 +3067,7 @@ fn dispatch_response_release(
 /// stays in the vault. `response-manage`: a restore can put malware back.
 fn dispatch_response_restore(
     req: ResponseRestoreRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     state: Option<&ResponseAdminState>,
     fps_out: &mut Vec<String>,
 ) -> ResponseRestoreResponse {
@@ -2880,7 +3287,7 @@ fn rebuild_canary_indexes(state: &CanaryAdminState) {
 /// get on-host (no default deployments).
 fn dispatch_canary_deploy(
     req: CanaryDeployRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> CanaryDeployResponse {
@@ -3105,7 +3512,7 @@ fn decoy_key(decoy: &std::fs::File) -> Result<common::wire::InodeKey> {
 /// hides the latest deploy, trip or burn.
 fn dispatch_canary_list(
     req: CanaryListRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> CanaryListResponse {
@@ -3176,7 +3583,7 @@ fn dispatch_canary_list(
 /// so the K3 detector stops matching on the burned canary.
 fn dispatch_canary_burn(
     req: CanaryBurnRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
@@ -3260,7 +3667,7 @@ fn dispatch_canary_burn(
 /// decoy may be a new inode).
 fn dispatch_canary_refresh(
     req: CanaryRefreshRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
@@ -3343,7 +3750,7 @@ pub const DEFAULT_NETFLOW_JSONL_PATH: &str = "/var/lib/northnarrow/netflow.jsonl
 /// archives, newest first (NN-AUD-080).
 fn dispatch_net_flows(
     req: NetFlowsRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFlowsResponse {
@@ -3426,7 +3833,7 @@ fn empty_detections(result: AdminResult) -> DetectionsResponse {
 /// threaded.
 fn dispatch_detections(
     req: DetectionsRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     det_state: Option<&DetectionAdminState>,
     fps_out: &mut Vec<String>,
 ) -> DetectionsResponse {
@@ -3583,7 +3990,7 @@ fn fail_set_status(result: AdminResult, id: u64) -> DetectionSetStatusResponse {
 /// status is event-sourced and derived at read time.
 fn dispatch_detection_set_status(
     req: DetectionSetStatusRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     det_state: Option<&DetectionAdminState>,
     client: &AuditClient,
     fps_out: &mut Vec<String>,
@@ -3703,7 +4110,7 @@ fn dispatch_detection_set_status(
 /// the log was being written.
 fn dispatch_net_listeners(
     req: NetListenersRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetListenersResponse {
@@ -3781,7 +4188,7 @@ fn netflow_row_view(line: &str) -> Option<NetflowRowView> {
 /// address carries a name. An address that does not parse is refused.
 fn dispatch_net_resolve(
     req: NetResolveRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetResolveResponse {
@@ -3872,7 +4279,7 @@ fn dispatch_net_resolve(
 /// 1 to 64 hex digits is refused.
 fn dispatch_net_fingerprint(
     req: NetFingerprintRequest,
-    auth: &AdminAuth,
+    auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFingerprintResponse {
@@ -3943,7 +4350,6 @@ fn dispatch_net_fingerprint(
 mod tests {
     use super::*;
     use crate::admin_cli::{run_status, run_unlock, run_verify_keys};
-    use crate::anti_tamper::admin_auth::DEFAULT_RATE_LIMIT_WINDOW;
     use common::posture_types::PostureKind;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -3987,7 +4393,6 @@ mod tests {
         )
         .unwrap();
         let auth = Arc::new(AdminAuth::load(&pub_path).unwrap());
-        let _ = DEFAULT_RATE_LIMIT_WINDOW; // keep import alive for non-rate-limit tests
 
         // NetworkIsolator with mock binaries — no root needed.
         let isolator = Arc::new(
@@ -5371,6 +5776,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xa0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_canary_deploy(
             nonce,
@@ -5404,6 +5810,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xb0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_canary_list(nonce, now_unix_secs(), agent_id);
         let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
@@ -5427,6 +5834,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xc0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_canary_burn(
             nonce,
@@ -5454,6 +5862,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xd0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_canary_refresh(
             nonce,
@@ -5496,7 +5905,7 @@ mod tests {
 
     fn status_req(
         signing: &SigningKey,
-        auth: &AdminAuth,
+        auth: &ConnAuth<'_>,
         agent_id: [u8; 16],
     ) -> ResponseStatusRequest {
         use common::wire::admin_signed_payload::SignedPayload;
@@ -5514,7 +5923,7 @@ mod tests {
 
     fn release_req(
         signing: &SigningKey,
-        auth: &AdminAuth,
+        auth: &ConnAuth<'_>,
         agent_id: [u8; 16],
         pid: u32,
     ) -> ResponseReleaseRequest {
@@ -5534,7 +5943,7 @@ mod tests {
 
     fn restore_req(
         signing: &SigningKey,
-        auth: &AdminAuth,
+        auth: &ConnAuth<'_>,
         agent_id: [u8; 16],
         vault_id: &str,
         to: Option<String>,
@@ -5564,6 +5973,7 @@ mod tests {
         let state = response_state(&dir);
         let posture = PostureMachine::new();
         let (auth, _d) = build_auth_with_roles(&signing, "unlock,force-posture", agent_id);
+        let auth = ConnAuth::new(&auth);
         let r = dispatch_response_status(
             status_req(&signing, &auth, agent_id),
             &auth,
@@ -5576,6 +5986,7 @@ mod tests {
 
         for role in ["audit-read", "response-manage,audit-read", "all"] {
             let (auth, _d) = build_auth_with_roles(&signing, role, agent_id);
+            let auth = ConnAuth::new(&auth);
             let mut fps = Vec::new();
             let r = dispatch_response_status(
                 status_req(&signing, &auth, agent_id),
@@ -5589,6 +6000,7 @@ mod tests {
         }
         // no state wired: UnknownOperation, as the canary verbs
         let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let r = dispatch_response_status(
             status_req(&signing, &auth, agent_id),
             &auth,
@@ -5642,6 +6054,7 @@ mod tests {
         ));
 
         let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let r = dispatch_response_status(
             status_req(&signing, &auth, agent_id),
             &auth,
@@ -5675,6 +6088,7 @@ mod tests {
         let state = response_state(&dir);
         for role in ["audit-read", "unlock", "canary-manage"] {
             let (auth, _d) = build_auth_with_roles(&signing, role, agent_id);
+            let auth = ConnAuth::new(&auth);
             let r = dispatch_response_release(
                 release_req(&signing, &auth, agent_id, 4242),
                 &auth,
@@ -5697,6 +6111,7 @@ mod tests {
         std::fs::create_dir_all(&state.config.cgroup_root).unwrap();
         std::fs::write(state.config.cgroup_root.join("cgroup.procs"), b"").unwrap();
         let (auth, _d) = build_auth_with_roles(&signing, "response-manage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let mut fps = Vec::new();
         let r = dispatch_response_release(
             release_req(&signing, &auth, agent_id, 4242),
@@ -5759,6 +6174,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = response_state(&dir);
         let (auth, _d) = build_auth_with_roles(&signing, "all", agent_id);
+        let auth = ConnAuth::new(&auth);
         let mut payload = SignedPayload::new_response_release(
             auth.issue_challenge().unwrap(),
             now_unix_secs(),
@@ -5824,6 +6240,7 @@ mod tests {
         assert!(!payload.exists());
 
         let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let r = dispatch_response_restore(
             restore_req(&signing, &auth, agent_id, &vault_id, None),
             &auth,
@@ -5834,6 +6251,7 @@ mod tests {
         assert!(!payload.exists(), "nothing restored without the role");
 
         let (auth, _d) = build_auth_with_roles(&signing, "response-manage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let r = dispatch_response_restore(
             restore_req(&signing, &auth, agent_id, "../../etc/shadow", None),
             &auth,
@@ -5910,6 +6328,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xAA; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "net-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, None);
         let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
@@ -5938,6 +6357,7 @@ mod tests {
         let agent_id = [0xBB; 16];
         // Key carries `unlock` only — not `net-read`.
         let (auth, _dir) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, None);
         let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
@@ -6011,12 +6431,11 @@ mod tests {
     }
 
     /// A key with `roles` and a fresh challenge nonce.
-    fn read_verb_key(roles: &str) -> (SigningKey, AdminAuth, TempDir, [u8; 16], [u8; 32]) {
+    fn read_verb_key(roles: &str) -> (SigningKey, AdminAuth, TempDir, [u8; 16]) {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x39; 16];
         let (auth, dir) = build_auth_with_roles(&signing, roles, agent_id);
-        let nonce = auth.issue_challenge().unwrap();
-        (signing, auth, dir, agent_id, nonce)
+        (signing, auth, dir, agent_id)
     }
 
     fn one_sig(
@@ -6030,7 +6449,9 @@ mod tests {
 
     fn net_flows(dir: &Path, since: Option<u64>) -> NetFlowsResponse {
         use common::wire::admin_signed_payload::SignedPayload;
-        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let (signing, auth, _k, agent_id) = read_verb_key("net-read");
+        let auth = ConnAuth::new(&auth);
+        let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, since);
         let req = NetFlowsRequest {
             signatures: one_sig(&payload, &signing),
@@ -6041,7 +6462,9 @@ mod tests {
 
     fn fim_report(dir: &Path) -> FimReportResponse {
         use common::wire::admin_signed_payload::SignedPayload;
-        let (signing, auth, _k, agent_id, nonce) = read_verb_key("fim-read");
+        let (signing, auth, _k, agent_id) = read_verb_key("fim-read");
+        let auth = ConnAuth::new(&auth);
+        let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_fim_report(nonce, now_unix_secs(), agent_id, None);
         let req = FimReportRequest {
             signatures: one_sig(&payload, &signing),
@@ -6145,7 +6568,9 @@ mod tests {
                 )
             }),
         );
-        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let (signing, auth, _k, agent_id) = read_verb_key("net-read");
+        let auth = ConnAuth::new(&auth);
+        let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_listeners(nonce, now_unix_secs(), agent_id);
         let req = NetListenersRequest {
             signatures: one_sig(&payload, &signing),
@@ -6161,7 +6586,9 @@ mod tests {
 
     fn net_fingerprint(dir: &Path, flow_id: &str) -> NetFingerprintResponse {
         use common::wire::admin_signed_payload::SignedPayload;
-        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let (signing, auth, _k, agent_id) = read_verb_key("net-read");
+        let auth = ConnAuth::new(&auth);
+        let nonce = auth.issue_challenge().unwrap();
         let payload =
             SignedPayload::new_net_fingerprint(nonce, now_unix_secs(), agent_id, flow_id.into());
         let req = NetFingerprintRequest {
@@ -6208,7 +6635,9 @@ mod tests {
 
     fn net_resolve(dir: &Path, ip: &str) -> NetResolveResponse {
         use common::wire::admin_signed_payload::SignedPayload;
-        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let (signing, auth, _k, agent_id) = read_verb_key("net-read");
+        let auth = ConnAuth::new(&auth);
+        let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_resolve(nonce, now_unix_secs(), agent_id, ip.into());
         let req = NetResolveRequest {
             signatures: one_sig(&payload, &signing),
@@ -6291,6 +6720,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xE0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "telemetry-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
@@ -6311,6 +6741,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xE1; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
@@ -6326,6 +6757,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xE2; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "fim-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
@@ -6340,6 +6772,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xE3; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "all", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
@@ -6355,6 +6788,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xE4; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_detections_req(&signing, nonce, agent_id);
         let mut fps = Vec::new();
@@ -6441,6 +6875,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xF0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let (state, _sdir) = detection_state_with_max_id(3);
 
         let nonce = auth.issue_challenge().unwrap();
@@ -6482,6 +6917,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xF1; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "telemetry-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let (state, _sdir) = detection_state_with_max_id(3);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_set_status_req(&signing, nonce, agent_id, 2, "resolved");
@@ -6498,6 +6934,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xF2; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
         let (state, _sdir) = detection_state_with_max_id(3);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_set_status_req(&signing, nonce, agent_id, 1, "acknowledged");
@@ -6515,6 +6952,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xF3; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let (state, _sdir) = detection_state_with_max_id(3);
         let nonce = auth.issue_challenge().unwrap();
         // id 99 > max id 3 → not found.
@@ -6536,6 +6974,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xF4; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let (state, _sdir) = detection_state_with_max_id(3);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_set_status_req(&signing, nonce, agent_id, 0, "resolved");
@@ -6554,6 +6993,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xF5; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "triage", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_set_status_req(&signing, nonce, agent_id, 1, "resolved");
         let mut fps = Vec::new();
@@ -6598,6 +7038,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1a; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
         let ov = test_override();
@@ -6625,6 +7066,7 @@ mod tests {
         let other = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1b; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         // Signed by `other` — valid op/nonce/agent_id, but no admin key matches.
         let req = signed_grant_req(&other, nonce, agent_id, 120, now_unix_secs());
@@ -6647,6 +7089,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1c; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         // Payload binds a DIFFERENT agent_id (and is validly signed over it).
         let req = signed_grant_req(&signing, nonce, [0xff; 16], 120, now_unix_secs());
@@ -6667,6 +7110,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1d; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let now = now_unix_secs();
         let ov = test_override();
@@ -6693,6 +7137,7 @@ mod tests {
         let agent_id = [0x1e; 16];
         // Key carries `audit-read` only.
         let (auth, _dir) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
         let ov = test_override();
@@ -6711,6 +7156,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1f; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         // 100_000s in the past — well outside the ±60s window.
         let skewed_ts = now_unix_secs().saturating_sub(100_000);
@@ -6731,6 +7177,7 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x20; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let req = signed_grant_req(&signing, nonce, agent_id, 120, now_unix_secs());
         let mut fps = Vec::new();
@@ -6774,5 +7221,619 @@ mod tests {
         assert_eq!(entries[0].key_fp, "aabbccdd");
         assert_eq!(entries[0].extra["entries_count"], 3);
         assert_eq!(entries[0].extra["since_unix_ts"], 1_700_000);
+    }
+
+    // ── External audit NN-AUD-077: connection limits ───────────────
+
+    #[test]
+    fn full_slot_table_evicts_the_longest_waiting_connection() {
+        let slots = ConnSlots::new(ConnLimits {
+            max_conns: 2,
+            ..ConnLimits::DEFAULT
+        });
+        let a = slots.admit().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let b = slots.admit().unwrap();
+        assert!(b.busy(), "b is serving a request");
+        let c = slots.admit().expect("a waiting connection makes room");
+        assert!(c.made_room && !b.made_room);
+        assert!(!a.waiting(), "a, the only waiting one, was evicted");
+        assert!(b.busy() && c.waiting());
+        assert_eq!(slots.live(), 2);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), a.evicted())
+                .await
+                .expect("the evicted connection is told");
+        });
+        drop(c);
+        assert_eq!(slots.live(), 1);
+    }
+
+    #[test]
+    fn full_slot_table_of_busy_connections_refuses_a_newcomer() {
+        let slots = ConnSlots::new(ConnLimits {
+            max_conns: 1,
+            ..ConnLimits::DEFAULT
+        });
+        let a = slots.admit().unwrap();
+        assert!(a.busy());
+        assert!(slots.admit().is_none());
+        drop(a);
+        assert!(slots.admit().is_some(), "a dropped slot is free again");
+    }
+
+    #[test]
+    fn transient_accept_errors_are_the_documented_set() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::EINTR,
+        ] {
+            assert!(accept_error_is_transient(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        assert!(!accept_error_is_transient(
+            &std::io::Error::from_raw_os_error(libc::EBADF)
+        ));
+        assert!(!accept_error_is_transient(
+            &std::io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+    }
+
+    /// `handle_connection` on one end of a socket pair, with `limits`.
+    fn spawn_conn_handler(
+        limits: ConnLimits,
+    ) -> (
+        tokio::net::UnixStream,
+        JoinHandle<Result<()>>,
+        Arc<ConnSlots>,
+    ) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let slots = ConnSlots::new(limits);
+        let slot = slots.admit().unwrap();
+        let task = tokio::spawn(async move {
+            let dir = TempDir::new().unwrap();
+            let pub_path = dir.path().join("admin.pub");
+            let signing = SigningKey::generate(&mut OsRng);
+            std::fs::write(
+                &pub_path,
+                format!("{}\n", hex::encode(signing.verifying_key().to_bytes())),
+            )
+            .unwrap();
+            let auth = AdminAuth::load(&pub_path).unwrap();
+            let isolator = NetworkIsolator::new(rules_path()).unwrap();
+            let posture = PostureMachine::new();
+            let marker = dir.path().join("marker");
+            handle_connection(
+                server,
+                slot,
+                &auth,
+                &posture,
+                &isolator,
+                &marker,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &AdminReadPaths::default(),
+            )
+            .await
+        });
+        (client, task, slots)
+    }
+
+    /// External audit NN-AUD-077: a peer that sends nothing, or announces
+    /// a frame and stalls, is closed after the read timeout (it used to
+    /// hold its fd and buffer forever).
+    #[tokio::test]
+    async fn idle_connection_closed_after_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let limits = ConnLimits {
+            read_timeout: Duration::from_millis(200),
+            ..ConnLimits::DEFAULT
+        };
+        for stall_mid_frame in [false, true] {
+            let (mut client, task, slots) = spawn_conn_handler(limits);
+            if stall_mid_frame {
+                client.write_all(&100u32.to_be_bytes()).await.unwrap();
+                client.write_all(&[0u8; 10]).await.unwrap();
+            }
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("the server must close a connection that sends no request")
+                .unwrap();
+            assert_eq!(n, 0, "EOF (stall_mid_frame={stall_mid_frame})");
+            task.await
+                .unwrap()
+                .expect("a timed-out peer is not an error");
+            assert_eq!(slots.live(), 0, "the slot is free again");
+        }
+    }
+
+    /// External audit NN-AUD-077: a peer that sends requests but never
+    /// takes the replies is closed after the write timeout.
+    #[tokio::test]
+    async fn reply_never_taken_closes_after_write_timeout() {
+        use tokio::io::AsyncWriteExt;
+        let limits = ConnLimits {
+            write_timeout: Duration::from_millis(200),
+            ..ConnLimits::DEFAULT
+        };
+        let (client, task, slots) = spawn_conn_handler(limits);
+        let (_read_half, mut write_half) = client.into_split();
+        let frame = encode_frame(&AdminMessage::Status(
+            common::wire::admin_protocol::StatusRequest {},
+        ))
+        .unwrap();
+        let writer = tokio::spawn(async move {
+            for _ in 0..20_000 {
+                if write_half.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the handler must give up on a peer that takes no reply")
+            .unwrap();
+        let err = outcome.expect_err("a reply not taken ends the connection");
+        assert!(format!("{err:#}").contains("not taken"), "{err:#}");
+        assert_eq!(slots.live(), 0);
+        writer.abort();
+    }
+
+    fn connect_retrying(socket: &Path) -> std::os::unix::net::UnixStream {
+        for _ in 0..50 {
+            if let Ok(s) = std::os::unix::net::UnixStream::connect(socket) {
+                s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("cannot connect to {}", socket.display());
+    }
+
+    /// `true` when the server has closed `stream` (EOF or reset).
+    fn peer_closed(stream: &std::os::unix::net::UnixStream) -> bool {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        match (&*stream).read(&mut buf) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        }
+    }
+
+    /// External audit NN-AUD-077: more idle connections than the table
+    /// holds do not lock out a legitimate client — the longest-waiting
+    /// ones are closed to make room, so the agent never holds more than
+    /// MAX_ADMIN_CONNECTIONS of them.
+    #[tokio::test]
+    async fn connections_over_cap_evict_idle_status_still_answers() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let h = spawn_server(&signing).await;
+        let socket = h.socket.clone();
+        tokio::task::spawn_blocking(move || {
+            let extra = 8;
+            let idle: Vec<_> = (0..MAX_ADMIN_CONNECTIONS + extra)
+                .map(|_| connect_retrying(&socket))
+                .collect();
+            std::thread::sleep(Duration::from_millis(300));
+            let status =
+                run_status(&socket).expect("status answers while idle peers fill the table");
+            assert_eq!(status.posture, PostureKind::Observing);
+            let closed = idle.iter().filter(|s| peer_closed(s)).count();
+            assert!(
+                closed > extra,
+                "the {extra} over the cap and one more for status are closed, got {closed}"
+            );
+            assert!(idle.len() - closed <= MAX_ADMIN_CONNECTIONS);
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── External audit NN-AUD-078 / NN-AUD-079: per-connection auth ─
+
+    fn sync_challenge(stream: &mut std::os::unix::net::UnixStream) -> [u8; 32] {
+        sync_write_frame(
+            stream,
+            &AdminMessage::ChallengeRequest(common::wire::admin_protocol::ChallengeRequest {}),
+        );
+        match sync_read_frame(stream) {
+            AdminMessage::Challenge(c) => c.nonce,
+            other => panic!("expected Challenge, got {other:?}"),
+        }
+    }
+
+    fn sync_unlock(
+        stream: &mut std::os::unix::net::UnixStream,
+        signing: &SigningKey,
+        nonce: &[u8; 32],
+    ) -> UnlockResult {
+        use ed25519_dalek::Signer;
+        sync_write_frame(
+            stream,
+            &AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+                signature: signing.sign(nonce).to_bytes(),
+            }),
+        );
+        match sync_read_frame(stream) {
+            AdminMessage::UnlockResult(r) => r,
+            other => panic!("expected UnlockResult, got {other:?}"),
+        }
+    }
+
+    /// External audit NN-AUD-078: two clients interleaving challenge and
+    /// signed request on their own connections both succeed (the shared
+    /// slot used to give the first `InvalidSignature` and the second
+    /// `NoPendingChallenge`).
+    #[tokio::test]
+    async fn challenge_on_other_connection_does_not_invalidate_mine() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let h = spawn_server(&signing).await;
+        let socket = h.socket.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut a = connect_retrying(&socket);
+            let mut b = connect_retrying(&socket);
+            let nonce_a = sync_challenge(&mut a);
+            let nonce_b = sync_challenge(&mut b);
+            assert!(matches!(
+                sync_unlock(&mut a, &signing, &nonce_a),
+                UnlockResult::Success
+            ));
+            assert!(matches!(
+                sync_unlock(&mut b, &signing, &nonce_b),
+                UnlockResult::Success
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    /// External audit NN-AUD-078: a client flooding unauthenticated
+    /// `ChallengeRequest`s (and burning its own challenge) does not break
+    /// a concurrent 2-of-N signed request.
+    #[tokio::test]
+    async fn challenge_flood_does_not_break_signed_request() {
+        let (_dir, socket, marker_path, signing_a, signing_b, agent_id, task) =
+            spawn_shutdown_server().await;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut operator = connect_retrying(&socket);
+            let mut flooder = connect_retrying(&socket);
+            let nonce = sync_challenge(&mut operator);
+            for _ in 0..50 {
+                sync_challenge(&mut flooder);
+            }
+            // The flooder consumes its own challenge with a bogus request.
+            let bogus = SignedPayload::new_shutdown([0u8; 32], now_unix_secs(), agent_id, 30);
+            sync_write_frame(
+                &mut flooder,
+                &AdminMessage::ShutdownRequest(ShutdownRequest {
+                    payload: bogus,
+                    signatures: vec![KeyedSignature { signature: [0; 64] }],
+                }),
+            );
+            let _ = sync_read_frame(&mut flooder);
+
+            let payload = SignedPayload::new_shutdown(nonce, now_unix_secs(), agent_id, 30);
+            sync_write_frame(
+                &mut operator,
+                &AdminMessage::ShutdownRequest(ShutdownRequest {
+                    signatures: vec![
+                        KeyedSignature {
+                            signature: sign(&payload, &signing_a).unwrap(),
+                        },
+                        KeyedSignature {
+                            signature: sign(&payload, &signing_b).unwrap(),
+                        },
+                    ],
+                    payload,
+                }),
+            );
+            let reply = sync_read_frame(&mut operator);
+            assert!(
+                matches!(reply, AdminMessage::ShutdownResult(AdminResult::Success)),
+                "{reply:?}"
+            );
+            assert!(marker_path.exists());
+        })
+        .await;
+        task.abort();
+        result.expect("test panic");
+    }
+
+    /// External audit NN-AUD-079: the third failed signature on one
+    /// connection is answered `RateLimited` and the connection is closed;
+    /// another connection is not rate-limited (the agent-wide counter used
+    /// to block every client for five minutes).
+    #[tokio::test]
+    async fn third_failure_closes_connection_and_spares_others() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let stranger = SigningKey::generate(&mut OsRng);
+        let h = spawn_server(&signing).await;
+        let socket = h.socket.clone();
+        tokio::task::spawn_blocking(move || {
+            use crate::anti_tamper::admin_auth::MAX_AUTH_FAILURES_PER_CONNECTION;
+            let mut hostile = connect_retrying(&socket);
+            for attempt in 1..=MAX_AUTH_FAILURES_PER_CONNECTION {
+                let nonce = sync_challenge(&mut hostile);
+                let r = sync_unlock(&mut hostile, &stranger, &nonce);
+                if attempt < MAX_AUTH_FAILURES_PER_CONNECTION {
+                    assert!(matches!(r, UnlockResult::InvalidSignature), "{r:?}");
+                } else {
+                    assert!(matches!(r, UnlockResult::RateLimited { .. }), "{r:?}");
+                }
+            }
+            // A further request on that connection gets no reply.
+            use std::io::Write;
+            let frame = encode_frame(&AdminMessage::ChallengeRequest(
+                common::wire::admin_protocol::ChallengeRequest {},
+            ))
+            .unwrap();
+            let _ = hostile.write_all(&frame);
+            assert!(peer_closed(&hostile), "the connection is closed");
+
+            let mut operator = connect_retrying(&socket);
+            let nonce = sync_challenge(&mut operator);
+            assert!(matches!(
+                sync_unlock(&mut operator, &signing, &nonce),
+                UnlockResult::Success
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── External audit NN-AUD-083: force-posture out of COMBAT ─────
+
+    fn force_posture_req(
+        auth: &ConnAuth<'_>,
+        signing: &SigningKey,
+        agent_id: [u8; 16],
+        target: PostureKind,
+    ) -> ForcePostureRequest {
+        let payload = SignedPayload::new_force_posture(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+            target,
+        );
+        let signatures = keyed(&payload, signing);
+        ForcePostureRequest {
+            payload,
+            signatures,
+        }
+    }
+
+    /// POS-001's path stays: a `force-posture`-only key may still force
+    /// COMBAT (1-of-N).
+    #[test]
+    fn force_posture_into_combat_with_force_posture_only_key() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x83; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "force-posture", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let posture = PostureMachine::new();
+        let r = dispatch_force_posture(
+            force_posture_req(&auth, &signing, agent_id, PostureKind::Combat),
+            &auth,
+            &posture,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, AdminResult::Success), "{r:?}");
+        assert_eq!(posture.current_kind(), PostureKind::Combat);
+        assert!(posture.is_combat_locked());
+    }
+
+    /// External audit NN-AUD-083: a key with only `force-posture` cannot
+    /// leave COMBAT (it released the containment like `unlock`); a key
+    /// that also holds `unlock` can.
+    #[test]
+    fn force_posture_from_combat_needs_unlock_role() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x83; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "force-posture", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let posture = PostureMachine::new();
+        let r = dispatch_force_posture(
+            force_posture_req(&auth, &signing, agent_id, PostureKind::Combat),
+            &auth,
+            &posture,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, AdminResult::Success), "{r:?}");
+
+        for target in [
+            PostureKind::Observing,
+            PostureKind::Alerted,
+            PostureKind::Engaged,
+        ] {
+            let mut fps = Vec::new();
+            let r = dispatch_force_posture(
+                force_posture_req(&auth, &signing, agent_id, target),
+                &auth,
+                &posture,
+                &mut fps,
+            );
+            assert!(matches!(r, AdminResult::RoleDenied), "{target:?}: {r:?}");
+            assert_eq!(posture.current_kind(), PostureKind::Combat);
+            assert!(posture.is_combat_locked());
+            assert_eq!(fps.len(), 1, "the refused signer is on the audit row");
+        }
+        assert!(!auth.exhausted(), "a role refusal is not a failure");
+
+        let (auth, _d) = build_auth_with_roles(&signing, "force-posture,unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let r = dispatch_force_posture(
+            force_posture_req(&auth, &signing, agent_id, PostureKind::Engaged),
+            &auth,
+            &posture,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, AdminResult::Success), "{r:?}");
+        assert_eq!(posture.current_kind(), PostureKind::Engaged);
+    }
+
+    // ── External audit NN-AUD-084: rotate-keys add confinement ─────
+
+    /// admin.pub in a tempdir with two signers carrying `roles_a` and
+    /// `roles_b`.
+    fn rotate_keys_fixture(
+        roles_a: &str,
+        roles_b: &str,
+        agent_id: [u8; 16],
+    ) -> (TempDir, PathBuf, SigningKey, SigningKey, AdminAuth) {
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("admin.pub");
+        let a = SigningKey::generate(&mut OsRng);
+        let b = SigningKey::generate(&mut OsRng);
+        std::fs::write(
+            &pub_path,
+            format!(
+                "{} {roles_a}\n{} {roles_b}\n",
+                hex::encode(a.verifying_key().to_bytes()),
+                hex::encode(b.verifying_key().to_bytes()),
+            ),
+        )
+        .unwrap();
+        let auth = AdminAuth::load_with_agent_id(&pub_path, agent_id).unwrap();
+        (dir, pub_path, a, b, auth)
+    }
+
+    fn rotate_add_req(
+        auth: &ConnAuth<'_>,
+        signers: [&SigningKey; 2],
+        agent_id: [u8; 16],
+        roles: Vec<Role>,
+    ) -> RotateKeysAddRequest {
+        let new_key = SigningKey::generate(&mut OsRng);
+        let payload = SignedPayload::new_rotate_keys_add(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+            new_key.verifying_key().to_bytes(),
+            roles,
+        );
+        let signatures = signers
+            .iter()
+            .map(|s| KeyedSignature {
+                signature: sign(&payload, s).unwrap(),
+            })
+            .collect();
+        RotateKeysAddRequest {
+            payload,
+            signatures,
+        }
+    }
+
+    /// External audit NN-AUD-084: two `unlock,rotate-keys` signers cannot
+    /// give the new key a role neither holds — not even through an empty
+    /// list, which loads as `unlock,audit-read` — and admin.pub is left
+    /// as it was; a subset goes through.
+    #[test]
+    fn rotate_keys_add_refuses_roles_beyond_signers() {
+        let agent_id = [0x84; 16];
+        let (_dir, pub_path, a, b, auth) =
+            rotate_keys_fixture("unlock,rotate-keys", "unlock,rotate-keys", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let before = std::fs::read_to_string(&pub_path).unwrap();
+        for roles in [
+            vec![Role::Unlock, Role::Shutdown],
+            vec![Role::TrustedInstaller],
+            vec![Role::All],
+            vec![],
+        ] {
+            let r = dispatch_rotate_keys_add(
+                rotate_add_req(&auth, [&a, &b], agent_id, roles.clone()),
+                &auth,
+                &mut Vec::new(),
+            );
+            assert!(matches!(r, AdminResult::RoleDenied), "{roles:?}: {r:?}");
+            assert_eq!(std::fs::read_to_string(&pub_path).unwrap(), before);
+        }
+        let r = dispatch_rotate_keys_add(
+            rotate_add_req(
+                &auth,
+                [&a, &b],
+                agent_id,
+                vec![Role::Unlock, Role::RotateKeys],
+            ),
+            &auth,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, AdminResult::Success), "{r:?}");
+        assert_eq!(auth.key_fingerprints_snapshot().len(), 3);
+    }
+
+    /// External audit NN-AUD-084: `all` needs a signer that holds `all`;
+    /// holding every other role is not enough.
+    #[test]
+    fn rotate_keys_add_all_needs_all_signer() {
+        let agent_id = [0x84; 16];
+        let every_role = "unlock,shutdown,force-posture,rotate-keys,audit-read,trusted-installer,\
+                          config-manage,response-manage";
+        let (_dir, pub_path, a, b, auth) = rotate_keys_fixture(every_role, "rotate-keys", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let before = std::fs::read_to_string(&pub_path).unwrap();
+        let r = dispatch_rotate_keys_add(
+            rotate_add_req(&auth, [&a, &b], agent_id, vec![Role::All]),
+            &auth,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, AdminResult::RoleDenied), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&pub_path).unwrap(), before);
+
+        let (_dir, _pub_path, a, b, auth) = rotate_keys_fixture("all", "rotate-keys", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let r = dispatch_rotate_keys_add(
+            rotate_add_req(&auth, [&a, &b], agent_id, vec![Role::All]),
+            &auth,
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, AdminResult::Success), "{r:?}");
+    }
+
+    /// External audit NN-AUD-084: no bootstrap exception — the 1-of-N
+    /// bootstrap signer goes through the same check (it has no branch on
+    /// the gate) and delegates the roles it holds, nothing more.
+    #[test]
+    fn bootstrap_add_delegates_signer_roles() {
+        let signer = common::admin_quorum::AdminKey {
+            key: SigningKey::generate(&mut OsRng).verifying_key(),
+            roles: vec![Role::Unlock, Role::RotateKeys, Role::TrustedInstaller],
+        };
+        let one = std::slice::from_ref(&signer);
+        assert_eq!(
+            role_beyond_signers(&[Role::Unlock, Role::TrustedInstaller], one),
+            None
+        );
+        assert_eq!(role_beyond_signers(&[Role::RotateKeys], one), None);
+        assert_eq!(role_beyond_signers(&[Role::All], one), Some(Role::All));
+        assert_eq!(
+            role_beyond_signers(&[Role::Shutdown], one),
+            Some(Role::Shutdown)
+        );
+        // A pubkey-only line loads as `unlock,audit-read`.
+        assert_eq!(role_beyond_signers(&[], one), Some(Role::AuditRead));
     }
 }

@@ -614,7 +614,7 @@ impl PostureMachine {
     /// kept around so `agent/examples/posture_demo.rs` and the older
     /// unit tests keep building; production code uses
     /// [`Self::admin_release_combat_with_token`], wired from
-    /// `AdminAuth::verify_unlock` in `main.rs`.
+    /// `ConnAuth::verify_unlock` in the admin socket.
     // NOTE: this bool stub is the Sub-tappa 6.5 placeholder.
     // Production code uses `admin_release_combat_with_token`. We
     // intentionally do NOT add a `#[deprecated]` attribute today —
@@ -651,7 +651,7 @@ impl PostureMachine {
     }
 
     /// Production path out of Combat — invoked from the agent's
-    /// admin socket handler after `AdminAuth::verify_unlock` returns
+    /// admin socket handler after `ConnAuth::verify_unlock` returns
     /// a token. Drops the posture down to `Alerted` (NOT `Engaged`
     /// like the legacy bool stub), then fires the combat-release
     /// hook with the consumed token so `NetworkIsolator::release`
@@ -771,17 +771,32 @@ impl PostureMachine {
     /// [`Self::last_admin_action_secs_ago`] for `nn-admin status`.
     ///
     /// Returns the post-transition [`PostureState`] (or the unchanged
-    /// state when before == target). Never errors today — every
-    /// `target` is a valid PostureKind and the type-system gate on
-    /// `UnlockToken` is the only authorisation check.
+    /// state when before == target).
+    ///
+    /// External audit NN-AUD-083: COMBAT → non-COMBAT releases the
+    /// containment exactly like an unlock, so it needs `may_release`
+    /// (a signer holding the `unlock` role). Without it the call returns
+    /// [`AdminReleaseError::NeedsUnlock`] and leaves the state untouched.
+    /// The check runs under the state write lock: a check by the caller
+    /// before the call would race with an autonomous COMBAT entry.
     pub fn admin_force_state_with_token(
         &self,
         token: UnlockToken,
         target: PostureKind,
+        may_release: bool,
     ) -> Result<PostureState, AdminReleaseError> {
         let now = Instant::now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
+        if before == PostureKind::Combat && target != PostureKind::Combat && !may_release {
+            drop(guard);
+            let _ = token;
+            tracing::warn!(
+                to = ?target,
+                "force-posture out of COMBAT refused: it needs the unlock role"
+            );
+            return Err(AdminReleaseError::NeedsUnlock);
+        }
         let next = match target {
             PostureKind::Observing => PostureState::Observing,
             PostureKind::Alerted => PostureState::Alerted {
@@ -926,11 +941,15 @@ impl Default for PostureMachine {
     }
 }
 
-/// Reasons [`PostureMachine::admin_release_combat`] can refuse.
+/// Reasons [`PostureMachine::admin_release_combat`] and
+/// [`PostureMachine::admin_force_state_with_token`] can refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminReleaseError {
     Unauthorized,
     NotInCombat,
+    /// External audit NN-AUD-083: a force-posture out of COMBAT signed
+    /// without the `unlock` role.
+    NeedsUnlock,
 }
 
 impl core::fmt::Display for AdminReleaseError {
@@ -938,6 +957,9 @@ impl core::fmt::Display for AdminReleaseError {
         match self {
             AdminReleaseError::Unauthorized => f.write_str("admin override not authorized"),
             AdminReleaseError::NotInCombat => f.write_str("posture is not in COMBAT"),
+            AdminReleaseError::NeedsUnlock => {
+                f.write_str("leaving COMBAT needs a signer holding the unlock role")
+            }
         }
     }
 }

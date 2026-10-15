@@ -388,8 +388,9 @@ pub fn run_shutdown(
 /// parse. Single signature (1-of-N quorum per §3.3). Required
 /// admin.pub role: `force-posture` (parsed by A5's allowlist).
 ///
-/// Allowed transitions: any → any (the agent's
-/// `admin_force_state_with_token` accepts every PostureKind). The
+/// Allowed transitions: any → any, except that leaving COMBAT also
+/// needs the `unlock` role on the signing key (external audit
+/// NN-AUD-083; otherwise `RoleDenied`). The
 /// design notes that this is **NOT** the preferred path out of
 /// COMBAT — use `nn-admin unlock` instead, which carries clearer
 /// audit semantics ("admin acknowledged COMBAT release") than a
