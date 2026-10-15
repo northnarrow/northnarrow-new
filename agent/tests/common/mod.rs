@@ -527,3 +527,149 @@ pub fn shutdown_signed(
         ))
     }
 }
+
+// ── External audit NN-AUD-227/228/234 — structured waits and barriers ──
+//
+// Added at the end of the file on purpose (other fixes touch the teardown
+// helpers above). A negative assertion is checked after a barrier — an
+// event observed to have gone through the same pipeline after the window
+// — never after a bare sleep, which a merely slow pipeline also passes.
+
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Poll `probe` every 100 ms until it returns `Some`, at most `timeout`.
+pub fn wait_until<T>(
+    timeout: std::time::Duration,
+    mut probe: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(v) = probe() {
+            return Some(v);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(WAIT_POLL);
+    }
+}
+
+/// The parsed rows of a JSONL chain log (blank or unparsable lines skipped).
+pub fn jsonl_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// The first row of `path` that `pred` accepts, waited for at most
+/// `timeout`; panics with every row seen.
+pub fn wait_jsonl_row(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+    what: &str,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    wait_until(timeout, || jsonl_rows(path).into_iter().find(|r| pred(r))).unwrap_or_else(|| {
+        panic!(
+            "no {what} in {} within {timeout:?}; rows: {:?}",
+            path.display(),
+            jsonl_rows(path)
+        )
+    })
+}
+
+/// The detection records of `rule_id` in `detections`.
+pub fn records_of(detections: &std::path::Path, rule_id: &str) -> Vec<serde_json::Value> {
+    jsonl_rows(detections)
+        .into_iter()
+        .filter(|r| r["rule_id"].as_str() == Some(rule_id))
+        .collect()
+}
+
+/// Exec barrier: a copy of `/bin/true` run from a fresh directory under
+/// `/tmp` (R001, or whichever exec rule matches first, records it), and its
+/// detection record waited for in `detections`. The agent's event loop
+/// handles one event at a time, in the order the sensors deliver them, so
+/// once that record is written every event delivered before the exec has
+/// been through the rule engine and its record, if any, written before it.
+/// Returns the barrier's record.
+pub fn exec_barrier(
+    detections: &std::path::Path,
+    timeout: std::time::Duration,
+) -> serde_json::Value {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix("nnbarrier")
+        .tempdir_in("/tmp")
+        .expect("barrier dir under /tmp");
+    let bin = dir.path().join("nn_barrier");
+    std::fs::copy("/bin/true", &bin).expect("copy /bin/true for the barrier");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod the barrier");
+    let mut child = Command::new(&bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("exec the barrier");
+    let pid = u64::from(child.id());
+    let _ = child.wait();
+    wait_jsonl_row(detections, timeout, "barrier exec record", |r| {
+        r["principal"]["pid"].as_u64() == Some(pid)
+            && r["exe"]
+                .as_str()
+                .is_some_and(|e| e.ends_with("/nn_barrier"))
+    })
+}
+
+/// The value `count` settles on: read every `window`, returned once two
+/// consecutive windows saw no change; panics if it is still moving after
+/// `timeout`. For an upper bound ("at most N rows"), which a pipeline still
+/// draining would pass vacuously after a fixed sleep.
+pub fn wait_count_stable(
+    window: std::time::Duration,
+    timeout: std::time::Duration,
+    mut count: impl FnMut() -> usize,
+) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = count();
+    let mut still = 0;
+    loop {
+        std::thread::sleep(window);
+        let now = count();
+        if now == last {
+            still += 1;
+            if still == 2 {
+                return now;
+            }
+        } else {
+            still = 0;
+            last = now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the count was still moving after {timeout:?} (last {now})"
+        );
+    }
+}
+
+/// `child`'s exit status, waited for at most `timeout`; `None` while it runs.
+pub fn wait_exit(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    wait_until(timeout, || child.try_wait().ok().flatten())
+}
+
+/// `pid` has exited: no `/proc` entry, or a zombie waiting for its reaper.
+pub fn pid_gone(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| matches!(state, "Z" | "X")),
+        Err(_) => true,
+    }
+}

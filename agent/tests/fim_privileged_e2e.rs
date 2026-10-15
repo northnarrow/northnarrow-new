@@ -715,21 +715,35 @@ fn fim_baseline_cache_suppresses_noop_modified() {
         assert!(status.success(), "touch failed for stamp {stamp}");
     }
 
-    // Wait long enough for the drain to have processed every
-    // kernel-side event (drain loop polls at ~1ms idle sleep +
-    // AsyncFd wakes immediately on ringbuf data; 1s is
-    // generous).
-    std::thread::sleep(Duration::from_millis(1000));
+    // External audit NN-AUD-228: not a fixed sleep (a drain slower than
+    // it passed vacuously) but a barrier: a real content change after the
+    // touches, its Modified row waited for. The drain reads its ring in
+    // order, so by then every touch has been judged. Since BUG-012 v2 the
+    // touches' opens leave no row to count, hence a write.
+    std::fs::write(&fx.watched_file, b"barrier-content\n").expect("barrier write");
+    common::wait_jsonl_row(
+        &fx.drift_log,
+        DRIFT_POLL_TIMEOUT,
+        "Modified row of the barrier write",
+        |r| {
+            r["path"].as_str() == Some(watched.as_str())
+                && r["op"].as_u64() == Some(OP_MODIFIED)
+                && r["new_sha256"] != r["baseline_sha256"]
+        },
+    );
 
+    // A no-op touch recorded as Modified would carry an unchanged hash.
     let rows = read_jsonl(&fx.drift_log);
-    let modified_rows: Vec<_> = rows
+    let noop_rows: Vec<_> = rows
         .iter()
-        .filter(|r| r["op"].as_u64() == Some(OP_MODIFIED))
+        .filter(|r| {
+            r["op"].as_u64() == Some(OP_MODIFIED) && r["new_sha256"] == r["baseline_sha256"]
+        })
         .collect();
     assert!(
-        modified_rows.is_empty(),
-        "expected ZERO Modified drift rows after no-op touches \
-         (cache suppression should fire); got {} rows: {modified_rows:?}",
-        modified_rows.len()
+        noop_rows.is_empty(),
+        "expected ZERO Modified drift rows for the no-op touches \
+         (cache suppression should fire); got {} rows: {noop_rows:?}",
+        noop_rows.len()
     );
 }

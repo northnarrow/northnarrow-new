@@ -2,9 +2,20 @@
 //!
 //! Drives the NN-L-FIM-024 bait files END-TO-END on a live kernel: a
 //! real agent watches the (real) `HONEYPOT_PATHS`, an EXTERNAL process
-//! tampers one, and we assert the Critical verdict + KillProcessTree +
-//! COMBAT posture transition. Also covers the boot integrity sweep
-//! (RFC Q5) and the PROTECTED_PIDS self-write negative.
+//! tampers one, and we assert, on ONE signed detection record, the
+//! Critical verdict, the KillProcessTree response carried out and the
+//! tamperer as its principal — and that the tamperer and its child died
+//! by SIGKILL. Also covers the boot integrity sweep (RFC Q5) and the
+//! PROTECTED_PIDS self-write negative.
+//!
+//! External audit NN-AUD-227: the assertions were three independent
+//! substring searches of the agent's log. Nothing tied `KillProcessTree`
+//! to the verdict, and `COMBAT` matched the boot line "COMBAT
+//! graduated-response ladder armed". The posture is not asserted: it
+//! moves on posture triggers, and none reads a FIM event, so a FIM-024
+//! verdict leaves it where it was although the rule's reasoning says
+//! "posture → COMBAT" (a product question, tracked apart). The record's
+//! `posture_at` is printed with every failure.
 //!
 //! The rule keys on the hard-coded `/etc/northnarrow/...`,
 //! `/var/lib/northnarrow/...`, `/run/northnarrow/...` paths, so unlike
@@ -12,10 +23,15 @@
 //! [`RealBaitGuard`] records which baits/dirs pre-existed and removes
 //! only those the test (or the agent's boot recreate) created.
 //!
-//! The tamper is performed by a DISPOSABLE `sh -c` child, never the test
+//! The tamper is performed by a DISPOSABLE child, never the test
 //! harness — the rule's KillProcessTree targets the modifier PID, which
 //! must not be us. (Mirrors the T10.6 D9 external-helper pattern + the
-//! post-hotfix path-safe install.)
+//! post-hotfix path-safe install.) The child is a `python3` that unlinks
+//! the bait itself and then waits ([`Tamperer`]): a `sh -c 'rm …'` child
+//! was gone before any response could reach it, so a kill could not be
+//! told from a kill recorded but never landed.
+//!
+//! Requires `python3` on the guest (as the net and D7 suites do).
 //!
 //! Run:
 //!   sudo -E env "PATH=$PATH" cargo test --release \
@@ -25,7 +41,8 @@
 
 #![cfg(feature = "test-privileged")]
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -190,15 +207,23 @@ fn sudo_rm(path: &str) {
 struct Fixture {
     _tempdir: tempfile::TempDir,
     agent_log: PathBuf,
+    /// Per-test detection chain (`--detections-file`): the assertions read
+    /// the signed records, not the log (external audit NN-AUD-227).
+    detections_log: PathBuf,
+    baseline_log: PathBuf,
+    drift_log: PathBuf,
+    /// A watched file that is not a bait, written by the barrier
+    /// ([`Self::assert_absent_after_barrier`]).
+    sentinel: PathBuf,
     _agent_guard: AgentGuard,
     _installed_agent: InstalledBin,
     _installed_admin: InstalledBin,
 }
 
 impl Fixture {
-    /// Spawn an agent watching the given `fim_watch_paths`. Empty
-    /// allow/blocklists; ADE off; COMBAT rules wired so a Critical
-    /// verdict drives the posture transition.
+    /// Spawn an agent watching the given `fim_watch_paths` and the
+    /// sentinel. Empty allow/blocklists; ADE off; COMBAT rules wired;
+    /// responses enforced (no `--detect-only`).
     fn setup(fim_watch_paths: &[&str]) -> Self {
         wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -240,8 +265,14 @@ impl Fixture {
         let combat = dir.join("combat-rules.v4");
         std::fs::copy(combat_rules_path(), &combat).expect("copy combat rules");
 
+        let sentinel = dir.join("sentinel.txt");
+        std::fs::write(&sentinel, b"sentinel\n").expect("seed the sentinel");
         let fim_paths_v1 = dir.join("fim-paths.v1");
-        let body: String = fim_watch_paths.iter().map(|p| format!("{p}\n")).collect();
+        let body: String = fim_watch_paths
+            .iter()
+            .map(|p| format!("{p}\n"))
+            .chain(std::iter::once(format!("{}\n", sentinel.display())))
+            .collect();
         std::fs::write(&fim_paths_v1, body).expect("write fim-paths.v1");
         let fim_paths_local = dir.join("fim-paths.local");
         std::fs::write(&fim_paths_local, "").expect("write fim-paths.local");
@@ -273,6 +304,9 @@ impl Fixture {
         let agent_log = dir.join("agent.log");
         let log_file = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_file_err = log_file.try_clone().expect("clone log handle");
+        let detections_log = dir.join("detections.jsonl");
+        let baseline_log = dir.join("fim_baseline.jsonl");
+        let drift_log = dir.join("fim_drift.jsonl");
 
         common::require_bpftool();
         let child = Command::new(REAL_SUDO)
@@ -291,14 +325,18 @@ impl Fixture {
             .arg(dir.join("agent.sig.key"))
             .arg("--shutdown-marker-file")
             .arg(dir.join("agent.shutdown_authorised"))
+            .arg("--detections-file")
+            .arg(&detections_log)
+            .arg("--status-events-file")
+            .arg(dir.join("status_events.jsonl"))
             .arg("--fim-paths-v1")
             .arg(&fim_paths_v1)
             .arg("--fim-paths-local")
             .arg(&fim_paths_local)
             .arg("--fim-baseline-file")
-            .arg(dir.join("fim_baseline.jsonl"))
+            .arg(&baseline_log)
             .arg("--fim-drift-file")
-            .arg(dir.join("fim_drift.jsonl"))
+            .arg(&drift_log)
             .arg("--canary-registry-file")
             .arg(dir.join("canaries.jsonl"))
             .arg("--canary-access-file")
@@ -338,6 +376,10 @@ impl Fixture {
         Self {
             _tempdir: tempdir,
             agent_log,
+            detections_log,
+            baseline_log,
+            drift_log,
+            sentinel,
             _agent_guard: guard,
             _installed_agent: installed_agent,
             _installed_admin: installed_admin,
@@ -380,11 +422,91 @@ impl Fixture {
         );
     }
 
-    fn assert_absent(&self, needle: &str, window: Duration) {
-        std::thread::sleep(window);
+    /// External audit NN-AUD-228: `rule_id` was asserted absent after a
+    /// bare sleep, which a slow pipeline passes as well as a correct one.
+    /// Now after a barrier through both pipelines a FIM-024 verdict comes
+    /// from: a write to the watched sentinel, waited for in the drift log
+    /// (the FIM drain is past the window, its ring is read in order), then
+    /// an exec barrier waited for in the detection log (the event loop has
+    /// handled what the drain forwarded before it).
+    fn assert_absent_after_barrier(&self, rule_id: &str) {
+        let sentinel = self.sentinel.to_string_lossy().into_owned();
+        // A write before the sentinel's first-boot baseline would be
+        // folded into it and leave no row.
+        common::wait_jsonl_row(
+            &self.baseline_log,
+            VERDICT_POLL_TIMEOUT,
+            "baseline row of the sentinel",
+            |r| r["path"].as_str() == Some(sentinel.as_str()),
+        );
+        let modified = || {
+            common::jsonl_rows(&self.drift_log)
+                .iter()
+                .filter(|r| r["path"].as_str() == Some(sentinel.as_str()) && r["op"] == 1)
+                .count()
+        };
+        let before = modified();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::fs::write(&self.sentinel, format!("barrier {stamp}\n")).expect("write the sentinel");
+        common::wait_until(VERDICT_POLL_TIMEOUT, || (modified() > before).then_some(()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no Modified drift row for the sentinel within {VERDICT_POLL_TIMEOUT:?}; rows: {:?}",
+                    common::jsonl_rows(&self.drift_log)
+                )
+            });
+        common::exec_barrier(&self.detections_log, VERDICT_POLL_TIMEOUT);
+        let records = common::records_of(&self.detections_log, rule_id);
+        assert!(records.is_empty(), "{rule_id} recorded: {records:?}");
         assert!(
-            !self.log_contains(needle),
-            "{needle:?} unexpectedly present in agent.log"
+            !self.log_contains(rule_id),
+            "{rule_id:?} unexpectedly present in agent.log"
+        );
+    }
+
+    /// External audit NN-AUD-227: the FIM-024 record of `tamperer`'s
+    /// tamper of `path`, asserted as one record — Critical, KillProcessTree
+    /// carried out (the bare action name, NN-AUD-234), the tamperer as its
+    /// principal — and the kill itself: the tamperer and its child died by
+    /// SIGKILL while the harness, their parent, runs on.
+    fn assert_tamper_contained(&self, tamperer: &mut Tamperer, path: &str) {
+        let pid = u64::from(tamperer.child.id());
+        let rec = common::wait_jsonl_row(
+            &self.detections_log,
+            VERDICT_POLL_TIMEOUT,
+            "FIM-024 record of the tamperer",
+            |r| {
+                r["rule_id"].as_str() == Some(VERDICT_ID)
+                    && r["principal"]["pid"].as_u64() == Some(pid)
+            },
+        );
+        assert_eq!(rec["severity"], "Critical", "record: {rec}");
+        assert_eq!(
+            rec["verdict"],
+            serde_json::json!({"Rule": "KillProcessTree"}),
+            "record: {rec}"
+        );
+        assert_eq!(rec["file"].as_str(), Some(path), "record: {rec}");
+        assert_eq!(rec["response"], "KillProcessTree", "record: {rec}");
+        let status =
+            common::wait_exit(&mut tamperer.child, VERDICT_POLL_TIMEOUT).unwrap_or_else(|| {
+                panic!("the tamperer still runs: the kill did not land; record: {rec}")
+            });
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the tamperer ended otherwise: {status:?}; record: {rec}"
+        );
+        let descendant = tamperer.descendant;
+        let child_gone = common::wait_until(Duration::from_secs(5), || {
+            common::pid_gone(descendant).then_some(())
+        });
+        assert!(
+            child_gone.is_some(),
+            "the tamperer's child {descendant} survived the tree kill; record: {rec}"
         );
     }
 }
@@ -438,20 +560,63 @@ fn seed_real_bait(path: &str) {
     assert!(c.wait().expect("tee wait").success(), "seed {path} failed");
 }
 
-/// Tamper a real bait from a DISPOSABLE external `sh -c` child (so the
-/// rule's KillProcessTree targets it, not the test harness).
-fn external_tamper(cmd: &str) {
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// The tamperer's program: start a child (the tree the kill must take
+/// with it), say its pid, unlink the bait, wait to be killed. The `sleep`
+/// ends by itself if nothing kills it.
+const TAMPER_PY: &str = "\
+import os, signal, subprocess, sys
+child = subprocess.Popen(['sleep', '60'])
+print(child.pid, flush=True)
+try:
+    os.unlink(sys.argv[1])
+except OSError as e:
+    print('unlink refused:', e, file=sys.stderr, flush=True)
+signal.pause()
+";
+
+/// External audit NN-AUD-227: a DISPOSABLE tamperer that stays alive until
+/// killed, so the test sees whether the rule's KillProcessTree landed on it
+/// (not on the test harness, its parent). Killed and reaped on drop if the
+/// agent did not. A refused unlink (the bait is in a directory the agent
+/// protects) does not end it: the attempt is the tamper FIM-024 answers.
+struct Tamperer {
+    child: Child,
+    /// The tamperer's own child.
+    descendant: u32,
+}
+
+impl Tamperer {
+    fn unlink(path: &str) -> Self {
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(TAMPER_PY)
+            .arg(path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the python3 tamperer");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("tamperer stdout"))
+            .read_line(&mut line)
+            .expect("read the tamperer's child pid");
+        let descendant = line
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("the tamperer said {line:?}"));
+        Self { child, descendant }
+    }
+}
+
+impl Drop for Tamperer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 const VERDICT_ID: &str = "NN-L-FIM-024_AntiTamperHoneypotModified";
 
-// NOTE on the tamper op: these tests use DELETE (`rm`) as the tamper —
+// NOTE on the tamper op: these tests use DELETE (unlink) as the tamper —
 // the canonical "disable NN" action (remove a fake kill-switch / lock)
 // AND the FIM op that fires deterministically on this kernel
 // (inode_unlink → FIM_OP_DELETED). chmod→Modified (inode_setattr) and
@@ -461,20 +626,21 @@ const VERDICT_ID: &str = "NN-L-FIM-024_AntiTamperHoneypotModified";
 // follow-up. Delete coverage across /etc, /var/lib and /run exercises
 // the rule on every bait dir.
 
-/// #1 — external DELETE of kill_switch.conf (/etc) → Critical verdict +
-/// KillProcessTree + COMBAT.
+/// #1 — external DELETE of kill_switch.conf (/etc) → one Critical
+/// record naming the tamperer, KillProcessTree carried out, the tamperer
+/// and its child killed. (Was `…_trips_fim024_combat`: its `COMBAT` check
+/// matched the boot line, see the module doc.)
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
-fn delete_kill_switch_conf_trips_fim024_combat() {
+fn delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer() {
     let _eni = EniIptablesGuard::install();
     let _baits = RealBaitGuard::capture();
     let path = "/etc/northnarrow/kill_switch.conf";
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
-    external_tamper(&format!("rm -f '{path}'"));
+    let mut tamperer = Tamperer::unlink(path);
+    fx.assert_tamper_contained(&mut tamperer, path);
     fx.wait_for(VERDICT_ID);
-    fx.wait_for("KillProcessTree");
-    fx.wait_for("COMBAT");
 }
 
 /// #2 — external DELETE of debug_disable.flag (second /etc bait).
@@ -495,8 +661,8 @@ fn delete_debug_disable_flag_trips_fim024() {
     let path = "/etc/northnarrow/debug_disable.flag";
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
-    external_tamper(&format!("rm -f '{path}'"));
-    fx.wait_for(VERDICT_ID);
+    let mut tamperer = Tamperer::unlink(path);
+    fx.assert_tamper_contained(&mut tamperer, path);
 }
 
 /// #3 — external DELETE of pause.flag (/run path coverage).
@@ -508,8 +674,8 @@ fn delete_pause_flag_trips_fim024() {
     let path = "/run/northnarrow/pause.flag";
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
-    external_tamper(&format!("rm -f '{path}'"));
-    fx.wait_for(VERDICT_ID);
+    let mut tamperer = Tamperer::unlink(path);
+    fx.assert_tamper_contained(&mut tamperer, path);
 }
 
 /// #4 — external DELETE of maintenance.mode (second /etc bait).
@@ -521,8 +687,8 @@ fn delete_maintenance_mode_trips_fim024() {
     let path = "/etc/northnarrow/maintenance.mode";
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
-    external_tamper(&format!("rm -f '{path}'"));
-    fx.wait_for(VERDICT_ID);
+    let mut tamperer = Tamperer::unlink(path);
+    fx.assert_tamper_contained(&mut tamperer, path);
 }
 
 /// #5 — the agent's own boot recreate (PROTECTED_PIDS) must NOT fire
@@ -552,7 +718,7 @@ fn agent_boot_recreate_does_not_trip_fim024() {
         "agent boot integrity must recreate the missing bait"
     );
     // The recreate is a PROTECTED_PIDS agent write — no Critical verdict.
-    fx.assert_absent(VERDICT_ID, Duration::from_secs(3));
+    fx.assert_absent_after_barrier(VERDICT_ID);
 }
 
 /// #6 — the boot integrity sweep RUNS and the agent's own bait writes
@@ -570,5 +736,5 @@ fn agent_boot_integrity_sweep_runs_without_self_trip() {
     // Matches both "…N/N present" (Info) and "…recreated N…" (Medium).
     fx.wait_for("Honeypot integrity:");
     // The sweep's own writes are PROTECTED_PIDS → no Critical verdict.
-    fx.assert_absent(VERDICT_ID, Duration::from_secs(2));
+    fx.assert_absent_after_barrier(VERDICT_ID);
 }
