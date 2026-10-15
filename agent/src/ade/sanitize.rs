@@ -1372,6 +1372,7 @@ mod tests {
             flags: 0,
             timestamp_ns: 0,
             path_from_user: false,
+            kernel_class: 0,
         }
     }
 

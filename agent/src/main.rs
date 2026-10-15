@@ -579,9 +579,11 @@ fn start_open_sensor(
     mode: FileOpenSensor,
     fim_attached: &[&str],
     carveout: &[String],
+    audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
 ) {
     use northnarrow_agent::sensors::open_sensor::{
-        pump, refresh, take_ringbuf, OpenSensorMaps, RuleInputs, RuleSet,
+        pump, refresh, take_ringbuf, DepthCapLog, OpenSensorMaps, RuleHealth, RuleInputs, RuleSet,
+        RULE_CAPACITY,
     };
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
@@ -603,11 +605,12 @@ fn start_open_sensor(
             return;
         }
     };
-    if let Err(e) = maps.apply(&rules, None) {
-        warn!(error = %e, "file-open sensor: writing the rules failed — keeping sys_enter_openat");
-        open_tracepoint_fallback(sensor);
-        return;
-    }
+    // External audit SNS-007: every rule that fits is written, the
+    // posture's own first; a refused rule degrades the sensor (ERROR, one
+    // signed `subsystem_degraded`) and is tried again at every refresh.
+    let applied = maps.apply(&rules, None);
+    let mut health = RuleHealth::default();
+    report_open_rules(&mut health, &applied, audit_log.as_ref(), true);
     let ring = match take_ringbuf(sensor.ebpf_mut()) {
         Ok(r) => r,
         Err(e) => {
@@ -644,27 +647,79 @@ fn start_open_sensor(
         child_rules = rules.children.len(),
         name_rules = rules.names.len(),
         runtime_dirs = rules.runtime.len(),
+        rules_failed = applied.failed,
+        capacity = ?RULE_CAPACITY,
         skipped = ?rules.skipped,
         sys_enter_openat_detached = detached,
         "file-open sensor armed on LSM file_open (Tappa 10.9 step 1)"
     );
     // New homes, runtime directories (logins) and paths created since:
-    // re-registered every minute.
+    // re-registered every minute, against what the maps really hold.
     let carveout = carveout.to_vec();
     let refresher = tokio::spawn(async move {
-        let mut current = rules;
+        let mut current = applied.in_maps;
+        let mut depth_cap = DepthCapLog::default();
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.tick().await;
         loop {
             tick.tick().await;
-            match refresh(&mut maps, &current, &carveout) {
-                Ok(Some(next)) => current = next,
-                Ok(None) => {}
-                Err(e) => warn!(error = %e, "file-open sensor: rule refresh failed"),
+            depth_cap.sample(&maps);
+            if let Some(applied) = refresh(&mut maps, &current, &carveout) {
+                report_open_rules(&mut health, &applied, audit_log.as_ref(), false);
+                current = applied.in_maps;
             }
         }
     });
     sensor.register_pump_handle("open_sensor_rules", refresher);
+}
+
+/// External audit SNS-007: the outcome of a rule write, said once per
+/// change — refused rules are an ERROR and one signed `subsystem_degraded`
+/// (not a WARN every minute), a different count while degraded a WARN, the
+/// recovery an INFO.
+fn report_open_rules(
+    health: &mut northnarrow_agent::sensors::open_sensor::RuleHealth,
+    applied: &northnarrow_agent::sensors::open_sensor::Applied,
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    at_boot: bool,
+) {
+    use northnarrow_agent::sensors::open_sensor::RuleHealthChange;
+    let first = applied.first_error.as_deref().unwrap_or("");
+    match health.note(applied) {
+        RuleHealthChange::Degraded => {
+            error!(
+                failed = applied.failed,
+                written = applied.inserted,
+                generation_failed = applied.generation_failed,
+                first_error = %first,
+                "file-open sensor: rules NOT all written — coverage is partial (the posture's own \
+                 paths go first; the rest is retried every minute)"
+            );
+            attest_degraded_at(
+                audit_log,
+                &format!(
+                    "file-open sensor rules partially written: {} refused, generation bump {}; \
+                     first error: {first}",
+                    applied.failed,
+                    if applied.generation_failed {
+                        "failed"
+                    } else {
+                        "done"
+                    }
+                ),
+                at_boot,
+            );
+        }
+        RuleHealthChange::Changed => warn!(
+            failed = applied.failed,
+            first_error = %first,
+            "file-open sensor: rules still partially written"
+        ),
+        RuleHealthChange::Recovered => {
+            info!("file-open sensor: every rule written again")
+        }
+        RuleHealthChange::Same => {}
+    }
 }
 
 #[tokio::main]
@@ -2503,6 +2558,7 @@ async fn main() -> Result<()> {
                     cli.file_open_sensor,
                     &fim_attached,
                     &open_sensor_carveout,
+                    audit_log.clone(),
                 );
                 // External audit ATP-013: the FIM observers and the file-open
                 // sensor were loaded after the BPF guard registered the
@@ -3693,6 +3749,20 @@ async fn process_event(
         } => {
             debug!(pid, comm = %comm, filename = %filename, "file open")
         }
+        Event::MassWrite {
+            pid,
+            comm,
+            count,
+            filename,
+            cgroup_window: true,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %comm,
+            overwrites = *count,
+            last = %filename,
+            "mass write: overwrite threshold crossed by the processes of one cgroup (counted in the kernel)"
+        ),
         Event::MassWrite {
             pid,
             comm,

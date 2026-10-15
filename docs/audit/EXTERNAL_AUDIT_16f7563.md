@@ -147,7 +147,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-101 | EBPF-004 | eBPF kernel | M | fixed (lab PR 112) |
 | NN-AUD-102 | EBPF-008 | eBPF kernel | S | fixed (lab PR 113) |
 | NN-AUD-103 | EBPF-009 | eBPF kernel | S | fixed (lab PR 129) |
-| NN-AUD-104 | EBPF-011 | eBPF kernel | M | open |
+| NN-AUD-104 | EBPF-011 | eBPF kernel | M | fixed (lab PR 137) |
 | NN-AUD-105 | EBPF-013 | eBPF kernel | M | fixed (lab PR 129) |
 | NN-AUD-106 | EBPF-014 | eBPF kernel | S | open |
 | NN-AUD-107 | EBPF-015 | eBPF kernel | M | open |
@@ -230,9 +230,9 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-184 | SNS-001 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-185 | SNS-002 | Sensors | S | fixed (lab PR 136) |
 | NN-AUD-186 | SNS-003 | Sensors | M | open |
-| NN-AUD-187 | SNS-005 | Sensors | S | open |
-| NN-AUD-188 | SNS-006 | Sensors | M | open |
-| NN-AUD-189 | SNS-007 | Sensors | M | open |
+| NN-AUD-187 | SNS-005 | Sensors | S | fixed (lab PR 137) |
+| NN-AUD-188 | SNS-006 | Sensors | M | fixed (lab PR 137) |
+| NN-AUD-189 | SNS-007 | Sensors | M | fixed (lab PR 137) |
 | NN-AUD-190 | SNS-008 | Sensors | S | fixed (lab PR 128) |
 | NN-AUD-191 | SNS-009 | Sensors | M | fixed (lab PR 128) |
 | NN-AUD-192 | WDG-006 | Watchdog tooling | S | already fixed (lab PR 89, with NN-AUD-069) |
@@ -3140,3 +3140,122 @@ the audit did not report, noted with the fix that takes them.
     `an_actor_does_not_vouch_for_a_staged_copy_or_another_uid` and
     `a_target_entry_still_exempts` are guards and pass on both.
   - Lab: Ubuntu 24.04, proc140-probe.sh on main and on this build. Order: `/var/tmp/insmod` R003 (Medium) → R011 (High), `~/.nnx140/bash` exit 0 with an R008 record → killed by R017, `/var/tmp/at` R003 kill on both. Miner: `xmrig-cleanup` killed by R007 → recorded (Log, High), the symlink `sysupd` → `xmrig` ran → killed (R007 on the executed file). socat: `/usr/bin/socat -V` killed → recorded ("installed by the distribution"), `socat … EXEC:/bin/sh` and a copy in `~/nnx140-bin` killed on both. dkms: `modprobe` in a package's postinst killed → recorded ("run under /usr/bin/dpkg"); `sudo modprobe` from the SSH session killed on both. Canary: an exec of a File decoy's path gave no verdict → NN-L-CANARY-001 KillProcessTree, Critical ("not the access this decoy expects"); the read stays a Low record. Network: a `/var/tmp` dropper's child connecting to 10.254.0.74:8080 (dummy interface) had no network verdict → NN-L-NET-008 KillProcess on the child (the record lands about 7 s after the connect, at the flow's close drain). DNS: a tunnel of 10 long base32 names → NN-L-NET-014 records and its corroborated kill on both, -014 now ahead of -004. Gate: Ubuntu 24.04 and Debian 12, 29 suites, 80 passed, 0 failed each; anti-tamper OK; host 1912 passed, 0 failed.
+- **NN-AUD-187 (SNS-005), NN-AUD-188 (SNS-006), NN-AUD-189 (SNS-007),
+  NN-AUD-104 (EBPF-011), lab PR 137.** Open-sensor path and classification
+  fidelity (batch F).
+  - SNS-005: a record whose filesystem root no mount of the agent's
+    namespace shows (a rootless container's overlay, a filesystem mounted
+    only in another namespace) kept its mount-relative path, which reads
+    as a host path. It is now `mnt[<major>:<minor>:<root inode>]<path>`
+    (a walk that never reached a root keeps its `…` prefix). As the triage
+    found, the real effect ran the other way: SENSITIVE, CRITICAL and
+    PERSIST are classed by host inode, but the triggers re-derived the
+    class from the path string, so a kernel-classed open under such a root
+    fired nothing. `Event::FileOpen` now carries the kernel's reason bits
+    (`kernel_class`, serde default 0); `sensitive_file_access`,
+    `critical_file_modification` and `persistence_mechanism` use them only
+    when the path is not exact (`open_sensor::path_is_exact`); an exact
+    path is judged by the path lists alone, as before, and BUG-018's
+    `/etc/passwd` read carve-out holds under an unplaced root.
+  - SNS-006: path slots hold 31 bytes and the kernel ignores the read's
+    result. Userland only (no kernel or ABI change): a 31-byte component
+    may be a longer name cut and ends in `…`; an empty slot (a failed read)
+    is `?` instead of `//`; either makes the path not exact, so the
+    consumers fall back on the kernel class. Fragment matches
+    (NN-L-FIM-011..017) are unchanged.
+  - SNS-007: `apply` stopped at the first refused insert, before the
+    removals and the generation bump, and the refresher kept a `current`
+    that was not in the maps, so a full map never freed itself. Now stale
+    rules are removed first, inode rules go in by priority (the posture's
+    paths, then homes, then runtime directories; a runtime owner only where
+    its directory rule went in), every map is written past an error, the
+    generation is always bumped, and `Applied { inserted, failed,
+    in_maps }` is what the next refresh diffs against. A refused rule is an
+    ERROR and one signed `subsystem_degraded` per change (`RuleHealth`),
+    not a WARN a minute; at boot the sensor arms with what fits instead of
+    falling back to `sys_enter_openat`. While rules are refused, every
+    refresh writes again and bumps the generation: the class cache is
+    rebuilt once a minute. `OPEN_RULES` 1024 → 4096,
+    `RUNTIME_UIDS` 256 → 4096 (one per runtime directory, which also
+    takes an inode rule), `CHILD_RULES` 256 → 1024 (posture paths missing
+    at registration; they do not grow with logins); `max_entries` only,
+    shared constants in `common::wire::open_sensor`.
+  - EBPF-011 (a): a second window per cgroup (`bpf_get_current_cgroup_id`;
+    a writer in the root cgroup, i.e. no cgroup v2 in use, is keyed by
+    uid and login uid) counts overwrites only — the per-process
+    discriminant, an existing file of at least 4 KiB (lab PR 127) — with
+    its threshold at 40 in 60 s and its own reason bit
+    (`MASS_OVERWRITE_CGROUP`). Builds: lab PR 127 measured up to 4
+    rewrites of 4 KiB or more per process in a cargo rebuild, and a build
+    runs one process per output (cc1's `.d`, a shell redirect to a `.cmd`,
+    two files per CMake `cmake_depends`), so a raw per-cgroup count would
+    fire on a `make -j` rebuild of a few dozen objects. A process's
+    overwrites therefore enter the cgroup window from its third in its own
+    window on (the first two then count too), and leave it once its own
+    threshold reported it (no second event for one rewriter). The
+    crossing is `Event::MassWrite` with `overwrites` and `cgroup_window`
+    set: ConfirmedIntrusion, file-system evidence that needs
+    corroboration for COMBAT (POS-001), package managers still exempt.
+    Residuals: a writer that forks a fresh process for every one or two
+    files has the shape of `make -j` and is not counted (accepted; exec,
+    lineage and the other arms remain); a user can move workers into
+    fresh cgroups of a delegated subtree (`systemd-run --user --scope`);
+    a busy multi-process service whose processes each rewrite three or
+    more large files (database backends opening relation files
+    read-write) can cross it, as the per-process window already can. The
+    window logic is two pure functions in `common` (`write_step`,
+    `cgroup_step`) that the kernel runs and the host tests drive. Both
+    windows run in a new global BPF function, `nn_open_count_write`, which
+    also emits the crossing's record (a record of its own; an open both
+    classed and crossing gives two records, the same two events).
+  - EBPF-011 (b): the ancestor walk goes 16 levels (was 8), inside the
+    global `nn_open_walk` (still a bounded loop); a walk that stops at the
+    cap before the root sets `DEPTH_CAPPED` in the cached class and counts
+    it in a per-CPU map (`OPEN_DEPTH_CAPPED`) that the rule refresher reads
+    every minute; the agent logs it (INFO, at most once per 10 minutes,
+    with the count). The original finding's memoised ancestor classes were
+    not needed.
+  - Lab-found, Ubuntu 22.04 (5.15.0-198): the first build of this change
+    was refused (`fim_file_open_sensor` past the verifier's million
+    instructions; the agent fell back on `sys_enter_openat`). The journal
+    showed a log cut at aya's 16 MB buffer, without the reason; a loader at
+    the STATS log level gave it, and `bpftrace` on `do_check_common`
+    (`env->insn_processed`) the count per variant. Main: 833,920 processed
+    instructions; depth 16 alone: 841,799. The cause was one line copying
+    `DEPTH_CAPPED` from the class into the record's `reason`: a later
+    branch on `reason` made the class bits precise back to the map read
+    and states stopped merging (over 1M even at depth 8). Folding the
+    count's result into `reason` cost 80,000 to 110,000 more as well (an
+    unknown there keeps alive the paths that report nothing), and the
+    per-tgid count inline with a cgroup call went past the million. The
+    fix: nothing derived from the class or the count goes into `reason`;
+    the count emits its own record; and the record writer is a global
+    function, `nn_open_emit`, verified once instead of once per state
+    reaching it. `fim_file_open_sensor`: 462,560 processed instructions
+    (main 833,920); `fim_file_cap_observe`: 8,024 (main 54,970; its
+    dentry goes in as a plain value read through the ctx array, the hook's
+    BTF pointer being refused by a global function). On the 22.04 guest:
+    "file-open sensor attached", "file-open sensor armed", nothing
+    refused; `open-sensor-check` 9 PASS; the probe's `fork10` gives one
+    cgroup crossing (40, ConfirmedIntrusion, ENGAGED), `single` one
+    per-process crossing (20) and no cgroup event, `fork2` nothing, and a
+    `make -j` rebuild (300 objects, 4.6 KiB `.d` files rewritten) no cgroup
+    crossing.
+  - Tests: `unresolved_root_is_marked`, `long_component_is_marked`,
+    `failed_component_read_is_marked`,
+    `apply_continues_and_bumps_generation_on_full_map`,
+    `removals_free_room_before_inserts`, `rule_health_reports_once_per_change`,
+    `rule_maps_hold_hundreds_of_runtime_directories`,
+    `cgroup_crossing_is_an_overwrite_mass_write`,
+    `unplaced_paths_fire_on_the_kernel_class`,
+    `passwd_carve_out_holds_under_an_unplaced_root`,
+    `cgroup_window_mass_write_is_file_system_evidence`, and in `common`
+    `fork_workers_cross_the_cgroup_window`,
+    `a_build_never_reaches_the_cgroup_window`,
+    `a_process_over_its_own_threshold_is_not_counted_twice`,
+    `windows_restart_after_sixty_seconds`; `records_become_the_events_consumers_read`
+    now expects the marker. With the original logic restored in place (no
+    markers, the relative path kept, a stop at the first error, inserts
+    before removals, no cgroup share, no class fallback) ten of the new
+    tests and the updated one fail.
+  - Lab: Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), opensens137 probes on main and on this build. `fork10` (ten processes, four overwrites each): no crossing on main → one cgroup crossing (40, `cgroup_window=true`, ConfirmedIntrusion, ENGAGED); `single`: one per-process crossing on both, no cgroup event; `depth`: a file nine levels below `~/.password-store` seen only to depth 8 on main → `…/h/i/secret.gpg` visible and one depth-cap log line; `make -j` rebuild (300 objects, 4.6 KiB `.d` files rewritten): one per-process crossing on both, no cgroup crossing. Gate: Ubuntu 24.04, Debian 12 and Ubuntu 22.04, 29 suites, 80 passed, 0 failed each (the first 22.04 run stalled: the recreated guest lacked `linux-tools-$(uname -r)`, so the canary e2e could not unprotect its agent — lab tooling, fixed in lab PR 153); anti-tamper suite OK; host 1879 passed, 0 failed.

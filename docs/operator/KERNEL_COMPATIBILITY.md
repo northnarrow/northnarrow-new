@@ -264,10 +264,29 @@ same rules or the 22.04 guest will refuse to load it:
    arguments only, which bpf-linker keeps as `linkage=global` in the BTF.
    The verifier checks it once, on its own, and the caller sees one
    unknown return value. The file-open sensor's eight-level ancestor walk
-   (`open_sensor::nn_open_walk`) took `fim_file_open_sensor` from over 1M
-   instructions to loading on 5.15. Rule 1 still applies: kernel
+   (`open_sensor::nn_open_walk`, sixteen levels since lab PR 137) took
+   `fim_file_open_sensor` from over 1M instructions to loading on 5.15.
+   Since lab PR 137 its write-open counts (`nn_open_count_write`) and its
+   record writer (`nn_open_emit`, whose sixteen-slot path walk inline was
+   verified once per state reaching it) are global functions too: 834,000
+   processed instructions on 5.15 became 463,000. A global function takes
+   no BTF-typed hook argument ("R4 is not a scalar"): pass a value read
+   through `bpf_probe_read_kernel`. Rule 1 still applies: kernel
    addresses go in as `u64`, never as pointers.
-7. **Bound any offset added to or subtracted from a hook argument** (all
+7. **Keep map-derived and helper-derived values out of a scalar that a
+   later branch tests.** On 5.15 a branch whose outcome the verifier knows
+   marks the tested register precise back to its sources; a class bit
+   from `DIR_CLASS` folded into the open sensor's `reason`, before a test
+   of another `reason` bit, made the class bits precise and the states
+   stopped merging: over 1M instructions from one line (lab PR 137). An
+   unknown folded into it (a global function's result) keeps alive the
+   paths that would have returned at `reason == 0`. Count such values
+   elsewhere (a map, a separate record) or store them only. The budget is
+   cumulative across the program and its global functions; measure it on
+   the 22.04 guest with `bpftrace` on `do_check_common`
+   (`((struct bpf_verifier_env *)arg0)->insn_processed` at return) —
+   aya's own log stops at 16 MB, before the verdict.
+8. **Bound any offset added to or subtracted from a hook argument** (all
    kernels, 6.8 included). An LSM hook's `struct inode *` argument is a
    BTF-typed pointer. `inode - off` with `off` read from `BTF_OFFSETS` (a
    full `u32`) fails with `value -4294967295 makes trusted_ptr_ pointer be

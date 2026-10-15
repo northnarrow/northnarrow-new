@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::posture_types::{EvidenceClass, TriggerType};
+use common::wire::open_sensor::open_reason;
 use common::Event;
 
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
@@ -759,17 +760,28 @@ fn looks_dga(name: &str) -> bool {
     digit_ratio >= 0.20 || vowel_ratio < 0.20
 }
 
+/// External audit SNS-005/SNS-006: the kernel classed the open `bit`
+/// (by inode) and its path cannot be compared with a host path — an
+/// unplaced mount root, a cut or unread component — so the path lists
+/// below cannot judge it. A path that can be compared is judged by the
+/// lists alone, as before.
+fn kernel_class_says(filename: &str, kernel_class: u32, bit: u32) -> bool {
+    kernel_class & bit != 0 && !crate::sensors::open_sensor::path_is_exact(filename)
+}
+
 fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     let Event::FileOpen {
         pid,
         uid,
         filename,
         flags,
+        kernel_class,
         ..
     } = focal
     else {
         return false;
     };
+    let by_kernel = kernel_class_says(filename, *kernel_class, open_reason::SENSITIVE);
     // root (uid=0) and system users (1..1000) are excluded — these
     // accesses are routine. We only flag when a regular user reaches
     // for the credential files.
@@ -820,10 +832,13 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
     //   - the binary signal is a tactical fix; the V2
     //     continuous-trust redesign (POSTURE_FSM_V2_REDESIGN.md §5.2)
     //     replaces it with a graded score.
-    if filename == "/etc/passwd" && !is_write_open(*flags) && auth.has_valid_loginuid(*pid) {
+    // A kernel-classed sensitive file under an unplaced root is named by
+    // its path's tail (`mnt[…]/@/etc/passwd`).
+    let is_passwd = filename == "/etc/passwd" || (by_kernel && filename.ends_with("/etc/passwd"));
+    if is_passwd && !is_write_open(*flags) && auth.has_valid_loginuid(*pid) {
         return false;
     }
-    SENSITIVE_FILES.iter().any(|f| filename == f)
+    SENSITIVE_FILES.iter().any(|f| filename == f) || by_kernel
 }
 
 fn lolbas_pattern(focal: &Event, recent: Recent<'_>) -> bool {
@@ -857,7 +872,10 @@ fn exploit_attempt(focal: &Event) -> bool {
 
 fn critical_file_modification(focal: &Event) -> bool {
     let Event::FileOpen {
-        filename, flags, ..
+        filename,
+        flags,
+        kernel_class,
+        ..
     } = focal
     else {
         return false;
@@ -868,6 +886,7 @@ fn critical_file_modification(focal: &Event) -> bool {
     CRITICAL_FILES_PREFIXES
         .iter()
         .any(|p| filename == p || filename.starts_with(p))
+        || kernel_class_says(filename, *kernel_class, open_reason::CRITICAL)
 }
 
 fn confirmed_intrusion(
@@ -907,6 +926,7 @@ fn confirmed_intrusion(
         count,
         timestamp_ns,
         overwrites,
+        cgroup_window,
         ..
     } = focal
     {
@@ -940,7 +960,14 @@ fn confirmed_intrusion(
                 focal_filename = %filename,
                 count_within_window = *count,
                 overwrites = *overwrites,
-                threshold = MASS_WRITE_MIN,
+                // External audit EBPF-011: the processes of the writer's
+                // cgroup together (`count` = their overwrites).
+                cgroup_window = *cgroup_window,
+                threshold = if *cgroup_window {
+                    common::wire::open_sensor::OPEN_CG_OVERWRITE_MIN as usize
+                } else {
+                    MASS_WRITE_MIN
+                },
                 window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
                 "mass-write threshold crossed (kernel count) — raising ConfirmedIntrusion (→ ENGAGED; COMBAT only with corroboration)"
             );
@@ -1116,6 +1143,7 @@ fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
         pid,
         filename,
         flags,
+        kernel_class,
         ..
     } = focal
     else {
@@ -1127,6 +1155,7 @@ fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
     if !PERSISTENCE_PREFIXES
         .iter()
         .any(|p| filename == p || filename.starts_with(p))
+        && !kernel_class_says(filename, *kernel_class, open_reason::PERSIST)
     {
         return false;
     }
@@ -1318,6 +1347,7 @@ pub(super) mod testutil {
             flags,
             timestamp_ns: ts,
             path_from_user: false,
+            kernel_class: 0,
         }
     }
 
@@ -2035,6 +2065,7 @@ mod tests {
             filename: "/home/u/docs/report.docx".into(),
             timestamp_ns: ts,
             overwrites,
+            cgroup_window: false,
         }
     }
 
@@ -2985,5 +3016,143 @@ mod tests {
                 .contains(&TriggerType::ExfiltrationPattern),
             "allowlisted v6 mirror traffic must be count-filtered (BUG-032 is family-aware)"
         );
+    }
+    // ── External audit SNS-005 / SNS-006 / EBPF-011 ────────────────
+
+    fn classed_open(pid: u32, uid: u32, filename: &str, flags: u32, class: u32) -> Event {
+        let mut e = file_open(pid, uid, filename, flags, 5);
+        if let Event::FileOpen { kernel_class, .. } = &mut e {
+            *kernel_class = class;
+        }
+        e
+    }
+
+    /// A kernel-classed open whose path cannot be compared with a host path
+    /// (a filesystem root no mount shows, a cut or unread component) fired
+    /// nothing: the path lists never matched it. It now fires on the
+    /// kernel's class. An exact path is judged by the lists alone, and an
+    /// unplaced path without a kernel class (tracepoint mode, a container's
+    /// own `/etc`) by nothing.
+    #[test]
+    fn unplaced_paths_fire_on_the_kernel_class() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(300, 1, "/home/u/tool", 1), &[]);
+        let fired = |e: &Event, t: TriggerType| det.detect(e, &[]).contains(&t);
+        let unplaced = "mnt[0:45:256]/@";
+        let persist = classed_open(
+            300,
+            0,
+            &format!("{unplaced}/etc/cron.d/job"),
+            1,
+            open_reason::PERSIST,
+        );
+        assert!(fired(&persist, TriggerType::PersistenceMechanism));
+        let critical = classed_open(
+            300,
+            0,
+            &format!("{unplaced}/root/.ssh/authorized_keys"),
+            1,
+            open_reason::CRITICAL,
+        );
+        assert!(fired(&critical, TriggerType::CriticalFileModification));
+        let shadow = classed_open(
+            300,
+            1000,
+            &format!("{unplaced}/etc/shadow"),
+            0,
+            open_reason::SENSITIVE,
+        );
+        assert!(fired(&shadow, TriggerType::SensitiveFileAccess));
+        // a cut directory name: the path is not exact, the class decides
+        let cut = classed_open(
+            300,
+            0,
+            "/etc/systemd/system/a-unit-directory-with-a-long-nam…/x.service",
+            1,
+            open_reason::PERSIST,
+        );
+        assert!(fired(&cut, TriggerType::PersistenceMechanism));
+        let unread = classed_open(300, 0, "/etc/?/x", 1, open_reason::PERSIST);
+        assert!(fired(&unread, TriggerType::PersistenceMechanism));
+        // no kernel class: an unplaced path matches no list
+        let plain = classed_open(300, 0, &format!("{unplaced}/etc/cron.d/job"), 1, 0);
+        assert!(!fired(&plain, TriggerType::PersistenceMechanism));
+        // an exact path: the lists judge, the class does not widen them
+        let exact = classed_open(300, 0, "/srv/elsewhere/job", 1, open_reason::PERSIST);
+        assert!(!fired(&exact, TriggerType::PersistenceMechanism));
+        // the class never turns a read into a write
+        let read = classed_open(
+            300,
+            0,
+            &format!("{unplaced}/etc/cron.d/job"),
+            0,
+            open_reason::PERSIST,
+        );
+        assert!(!fired(&read, TriggerType::PersistenceMechanism));
+    }
+
+    /// BUG-018's NSS carve-out still holds for `/etc/passwd` under an
+    /// unplaced root (a btrfs subvolume layout), and only for it.
+    #[test]
+    fn passwd_carve_out_holds_under_an_unplaced_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_loginuid_fixture(tmp.path(), 4242, 1000);
+        let det = detector_with_fixture_proc(tmp.path());
+        let passwd = classed_open(
+            4242,
+            1000,
+            "mnt[0:45:256]/@/etc/passwd",
+            0,
+            open_reason::SENSITIVE,
+        );
+        assert!(!det
+            .detect(&passwd, &[])
+            .contains(&TriggerType::SensitiveFileAccess));
+        let shadow = classed_open(
+            4242,
+            1000,
+            "mnt[0:45:256]/@/etc/shadow",
+            0,
+            open_reason::SENSITIVE,
+        );
+        assert!(det
+            .detect(&shadow, &[])
+            .contains(&TriggerType::SensitiveFileAccess));
+    }
+
+    /// External audit EBPF-011: the cgroup window's crossing (fork workers
+    /// rewriting files, each under its own threshold) raises
+    /// ConfirmedIntrusion as file-system evidence — it needs corroboration
+    /// for COMBAT — also inside an SSH session; a package manager stays
+    /// exempt.
+    #[test]
+    fn cgroup_window_mass_write_is_file_system_evidence() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(410, 300, "/home/u/worker", 3), &[]);
+        let mut e = mass_write(410, true, 10);
+        if let Event::MassWrite {
+            cgroup_window,
+            count,
+            ..
+        } = &mut e
+        {
+            *cgroup_window = true;
+            *count = common::wire::open_sensor::OPEN_CG_OVERWRITE_MIN;
+        }
+        let hits = det.detect(&e, &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        assert_eq!(
+            evidence_class(TriggerType::ConfirmedIntrusion, &e),
+            EvidenceClass::FileSystem
+        );
+        let _ = det.detect(&spawn_with_exe(700, 300, "/usr/bin/dpkg", 4), &[]);
+        if let Event::MassWrite { pid, .. } = &mut e {
+            *pid = 700;
+        }
+        assert!(!det
+            .detect(&e, &[])
+            .contains(&TriggerType::ConfirmedIntrusion));
     }
 }

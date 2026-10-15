@@ -275,6 +275,7 @@ mod tests {
             flags: 0,
             timestamp_ns: 1,
             path_from_user: false,
+            kernel_class: 0,
         }
     }
 
