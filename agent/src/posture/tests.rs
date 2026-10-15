@@ -1712,3 +1712,133 @@ fn an_unplaced_root_change_corroborates_nothing() {
         "nor another unplaced one"
     );
 }
+
+// ─── External audit POS-005 — containers of a login session ──────────
+
+/// `/proc/<pid>` of a process with user 1000's login uid whose cgroup is
+/// `cgroup`: the user's shell, or a rootless container the user started
+/// (Podman keeps the caller's login uid in the container).
+fn login_proc(dir: &std::path::Path, pid: u32, cgroup: &str) {
+    let d = dir.join(pid.to_string());
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+    std::fs::write(d.join("loginuid"), "1000").unwrap();
+}
+
+/// The cgroup of user 1000's rootless Podman container whose id is `c`
+/// repeated (64 hex digits), or of its conmon with `conmon`.
+fn rootless_podman(c: char, conmon: bool) -> String {
+    let id = c.to_string().repeat(64);
+    let kind = if conmon { "libpod-conmon" } else { "libpod" };
+    let base = "/user.slice/user-1000.slice/user@1000.service/user.slice";
+    if conmon {
+        format!("{base}/{kind}-{id}.scope")
+    } else {
+        format!("{base}/{kind}-{id}.scope/container")
+    }
+}
+
+const SHELL_SESSION: &str = "/user.slice/user-1000.slice/session-3.scope";
+
+/// Two containers one user started: an exploit tool in one, an
+/// exfiltration burst in the other. They used to share the user's login
+/// scope and reach COMBAT together; each is now an actor of its own.
+#[test]
+fn two_rootless_containers_of_one_user_do_not_corroborate() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    login_proc(tmp.path(), 900, &rootless_podman('a', false));
+    login_proc(tmp.path(), 950, &rootless_podman('b', false));
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(900, 1, "sh", "/usr/bin/sh", 1), &[]);
+    let _ = m.observe(&spawn(950, 1, "python3", "/usr/bin/python3", 2), &[]);
+    // `nc` exits at once: placed through the container's shell.
+    let _ = m.observe(&spawn(901, 900, "nc", "/usr/bin/nc", 3), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (ef, er) = exfil_burst(950);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// The user's shell runs an exploit tool, a container of theirs bursts:
+/// two actors. The shell's own burst still pairs with its tool. A
+/// container whose init has exited is placed through its conmon, not
+/// through the session that started it.
+#[test]
+fn a_container_and_its_users_shell_do_not_corroborate() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    login_proc(tmp.path(), 700, SHELL_SESSION);
+    login_proc(tmp.path(), 710, SHELL_SESSION);
+    login_proc(tmp.path(), 900, &rootless_podman('a', false));
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(700, 1, "bash", "/usr/bin/bash", 1), &[]);
+    let _ = m.observe(&spawn(710, 700, "python3", "/usr/bin/python3", 2), &[]);
+    let _ = m.observe(&spawn(900, 1, "python3", "/usr/bin/python3", 3), &[]);
+    let _ = m.observe(&spawn(701, 700, "nc", "/usr/bin/nc", 4), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (ef, er) = exfil_burst(900);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (ef, er) = exfil_burst(710);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(
+        m.current_kind(),
+        PostureKind::Combat,
+        "the shell's own pair"
+    );
+    assert!(!m.is_combat_locked());
+
+    // `podman run … nc`: the tool is the container's init, gone by the
+    // time its event is read; conmon (880) is its nearest running ancestor.
+    let tmp = tempfile::TempDir::new().unwrap();
+    login_proc(tmp.path(), 710, SHELL_SESSION);
+    login_proc(tmp.path(), 880, &rootless_podman('a', true));
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(710, 1, "python3", "/usr/bin/python3", 1), &[]);
+    let _ = m.observe(&spawn(880, 1, "conmon", "/usr/bin/conmon", 2), &[]);
+    let _ = m.observe(&spawn(890, 880, "nc", "/usr/bin/nc", 3), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (ef, er) = exfil_burst(710);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// Two signals inside one container still corroborate: in a rootless
+/// container (two of its processes), and in a container that runs its own
+/// systemd, whose units are the container's (no login uid: a daemon
+/// started it).
+#[test]
+fn two_signals_in_one_container_corroborate() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    for pid in [900, 902] {
+        login_proc(tmp.path(), pid, &rootless_podman('a', false));
+    }
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(900, 1, "sh", "/usr/bin/sh", 1), &[]);
+    let _ = m.observe(&spawn(902, 900, "python3", "/usr/bin/python3", 2), &[]);
+    let _ = m.observe(&spawn(901, 900, "nc", "/usr/bin/nc", 3), &[]);
+    let (ef, er) = exfil_burst(902);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(!m.is_combat_locked());
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let container = format!("/system.slice/docker-{}.scope", "c".repeat(64));
+    workload_proc(
+        tmp.path(),
+        400,
+        &format!("{container}/system.slice/cron.service"),
+    );
+    workload_proc(
+        tmp.path(),
+        410,
+        &format!("{container}/system.slice/app.service"),
+    );
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(400, 1, "cron", "/usr/sbin/cron", 1), &[]);
+    let _ = m.observe(&spawn(410, 1, "python3", "/usr/bin/python3", 2), &[]);
+    let _ = m.observe(&spawn(401, 400, "nc", "/usr/bin/nc", 3), &[]);
+    let (ef, er) = exfil_burst(410);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(!m.is_combat_locked());
+}

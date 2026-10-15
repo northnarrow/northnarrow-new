@@ -15,6 +15,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, posture scope of containers (Medium POS-005,
+  completed): a rootless container (Podman, rootless Docker) runs with the
+  login uid of the user who started it, so two containers of one user, or
+  a container and that user's shell, still shared one corroboration scope
+  and reached COMBAT together. A container is now an actor of its own
+  whoever started it — Podman, Docker, containerd and CRI-O scopes,
+  rootful or rootless, and the cgroupfs paths of Docker and Kubernetes —
+  and the units of a systemd running inside one belong to it; a container
+  whose init has exited is placed through its conmon. On a cgroup v1 host
+  the most specific of systemd's hierarchy and the cpu, memory and pids
+  controllers places a process (a rootless container there has no cgroup
+  of its own and stays in its user's scope). **Detection change:** an
+  attacker in a login session who runs part of an attack in a container
+  they start splits the evidence — the halves no longer corroborate; two
+  signals inside one container still do.
 - External audit, Wave 2, admin socket connections and roles (Medium
   ASK-002, ASK-003, ASK-004, ASK-010, ASK-011): the admin socket's accept
   loop ended on any `accept()` error — an EMFILE, which a root process

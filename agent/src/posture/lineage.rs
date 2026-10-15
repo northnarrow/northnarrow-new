@@ -429,14 +429,97 @@ fn in_agent_containment(path: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// External audit POS-005: the workload a cgroup path names — the path up
-/// to its deepest systemd unit (`….service`, `….scope`): a service together
-/// with the cgroups it delegates below it, a container's scope
-/// (`docker-<id>.scope`, `libpod-<id>.scope`, `cri-containerd-<id>.scope`,
-/// `crio-<id>.scope`), a `systemd-run` unit. A path that names no unit
-/// (the cgroupfs drivers' `/docker/<id>`, `/kubepods/…/<id>`, the root
-/// cgroup) is a workload of its own.
-fn workload_of_cgroup(path: &str) -> String {
+/// External audit POS-005: the workload a process runs in, as its cgroup
+/// path names it. It scopes the posture's corroboration ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workload {
+    /// The cgroup path up to the unit or container: the scope's key.
+    pub path: String,
+    /// The path names a container ([`container_of_cgroup`]). A container
+    /// is an actor of its own even when a login session started it.
+    pub container: bool,
+}
+
+/// Container runtimes' cgroup names for one container: `<prefix><id>.scope`
+/// with a systemd driver, `<prefix><id>` with a cgroupfs one (Podman's
+/// `/libpod_parent/libpod-<id>`, CRI-O's `…/pod<uid>/crio-<id>`).
+const CONTAINER_PREFIXES: &[&str] = &["libpod-", "docker-", "cri-containerd-", "crio-"];
+
+/// The cgroups of a runtime's monitor (conmon), which runs beside its
+/// container: `libpod-conmon-<id>.scope` next to `libpod-<id>.scope`.
+const CONTAINER_MONITOR_PREFIXES: &[&str] = &["libpod-conmon-", "crio-conmon-"];
+
+/// A container id as the runtimes write it in a cgroup name: 64 hex digits.
+fn is_container_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A pod's cgroup below `kubepods`: `pod<uid>` (cgroupfs driver) or
+/// `kubepods-<qos>-pod<uid>.slice` (systemd driver).
+fn is_pod_segment(seg: &str) -> bool {
+    let name = seg.strip_suffix(".slice").unwrap_or(seg);
+    name.strip_prefix("pod")
+        .or_else(|| name.rsplit_once("-pod").map(|(_, uid)| uid))
+        .is_some_and(|uid| {
+            !uid.is_empty()
+                && uid
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b'-' || b == b'_')
+        })
+}
+
+/// External audit POS-005: the deepest container a cgroup path names, as
+/// the path up to it, or `None`. A container is a runtime's scope
+/// ([`CONTAINER_PREFIXES`], rootful or below a user's `user@<uid>.service`
+/// for a rootless one), a bare id below `/docker` (Docker's cgroupfs
+/// driver) or below a pod, or a pod below `kubepods` when no container is
+/// named under it. A monitor's scope ([`CONTAINER_MONITOR_PREFIXES`])
+/// names its container's: a container whose init has exited is placed
+/// through conmon, its nearest running ancestor. Units inside a container
+/// (a systemd running in it) belong to the container.
+fn container_of_cgroup(path: &str) -> Option<String> {
+    let mut found = None;
+    let mut start = 0;
+    let mut under_kubepods = false;
+    let mut holds_ids = false;
+    for seg in path.split('/') {
+        let end = start + seg.len();
+        let name = seg.strip_suffix(".scope").unwrap_or(seg);
+        let pod = under_kubepods && is_pod_segment(seg);
+        let runtime = |prefixes: &[&str]| {
+            prefixes
+                .iter()
+                .any(|p| name.strip_prefix(p).is_some_and(is_container_id))
+        };
+        if runtime(CONTAINER_PREFIXES) || (holds_ids && is_container_id(name)) || pod {
+            found = Some(path[..end].to_string());
+        } else if runtime(CONTAINER_MONITOR_PREFIXES) {
+            found = Some(format!(
+                "{}{}",
+                &path[..start],
+                seg.replacen("-conmon-", "-", 1)
+            ));
+        }
+        under_kubepods |= seg.starts_with("kubepods");
+        holds_ids = seg == "docker" || pod;
+        start = end + 1;
+    }
+    found
+}
+
+/// External audit POS-005: the workload a cgroup path names. A container
+/// ([`container_of_cgroup`]) is the path up to it. Otherwise the path up to
+/// its deepest systemd unit (`….service`, `….scope`): a service together
+/// with the cgroups it delegates below it, a `systemd-run` unit, a login
+/// session's scope. A path that names neither (the root cgroup) is a
+/// workload of its own.
+fn workload_of_cgroup(path: &str) -> Workload {
+    if let Some(container) = container_of_cgroup(path) {
+        return Workload {
+            path: container,
+            container: true,
+        };
+    }
     let mut end = None;
     let mut at = 0;
     for seg in path.split('/') {
@@ -446,10 +529,48 @@ fn workload_of_cgroup(path: &str) -> String {
         }
         at += 1;
     }
-    match end {
-        Some(end) => path[..end].to_string(),
-        None => path.to_string(),
+    Workload {
+        path: end.map_or(path, |end| &path[..end]).to_string(),
+        container: false,
     }
+}
+
+/// External audit POS-005: the line of `/proc/<pid>/cgroup` that places a
+/// process. A unified host has one (`0::/…`). A v1 or hybrid host has one
+/// per hierarchy; read are systemd's own (`name=systemd`) and the resource
+/// controllers runtimes and systemd place a process in (`cpu`, `cpuacct`,
+/// `memory`, `pids`). The most specific wins: one that names a container,
+/// else the deepest (the unified line, then systemd's, on a tie); a path in
+/// the agent's containment slice only when no other line places the
+/// process (the caller then reads its parent). On v1 a rootless
+/// container gets no cgroup of its own (the controllers are not delegated
+/// to users): it stays in its user's session.
+fn placing_cgroup(text: &str) -> Option<&str> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?.trim());
+            let has = |wanted: &[&str]| controllers.split(',').any(|c| wanted.contains(&c));
+            let rank: u8 = if controllers.is_empty() {
+                2
+            } else if has(&["name=systemd"]) {
+                1
+            } else if has(&["cpu", "cpuacct", "memory", "pids"]) {
+                0
+            } else {
+                return None;
+            };
+            path.starts_with('/').then_some((rank, path))
+        })
+        .max_by_key(|&(rank, path)| {
+            (
+                !in_agent_containment(path),
+                container_of_cgroup(path).is_some(),
+                path.split('/').filter(|s| !s.is_empty()).count(),
+                rank,
+            )
+        })
+        .map(|(_, path)| path)
 }
 
 /// Mutex-shielded state. A single lock guards both the map and the
@@ -712,16 +833,18 @@ impl AuthSessionTracker {
         self.loginuid_of(self.nearest_running(pid)?)
     }
 
-    /// External audit POS-005: the workload `pid` runs in — the systemd
-    /// unit or container its cgroup names ([`workload_of_cgroup`]) — read
+    /// External audit POS-005: the workload `pid` runs in — the container
+    /// or systemd unit its cgroup names ([`workload_of_cgroup`]) — read
     /// from `/proc/<pid>/cgroup` of `pid` or, once it has exited, of its
     /// nearest running ancestor (a child starts in its parent's cgroup). A
     /// process the agent moved into its own containment cgroups
     /// ([`AGENT_CONTAINMENT_SLICE`]) no longer shows the workload it ran in:
     /// it is placed by its nearest running ancestor outside them. `None`
     /// when nothing running can be read (past PID 1, a cache miss, the
-    /// depth cap). Read only for an event that raised a trigger.
-    pub fn session_workload(&self, pid: u32) -> Option<String> {
+    /// depth cap). Read only for an event that raised a trigger, with or
+    /// without a login uid: a container a login session started is scoped
+    /// by itself.
+    pub fn session_workload(&self, pid: u32) -> Option<Workload> {
         let mut cur = pid;
         for _ in 0..LINEAGE_DEPTH_CAP {
             let live = self.nearest_running(cur)?;
@@ -743,23 +866,14 @@ impl AuthSessionTracker {
         None
     }
 
-    /// The cgroup path of `pid`: the unified hierarchy's (`0::/…`), or
-    /// systemd's own on a v1 host (`name=systemd`).
+    /// The cgroup path that places `pid` ([`placing_cgroup`]).
     fn cgroup_path(&self, pid: u32) -> Option<String> {
         if pid == 0 {
             return None;
         }
         let text =
             fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
-        let path = text
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .or_else(|| {
-                text.lines()
-                    .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p))
-            })?
-            .trim();
-        path.starts_with('/').then(|| path.to_string())
+        placing_cgroup(&text).map(str::to_string)
     }
 
     /// `PPid:` of `/proc/<pid>/status`.
@@ -2387,38 +2501,199 @@ mod tests {
         fs::write(pid_dir.join("cgroup"), format!("0::{path}\n")).unwrap();
     }
 
-    /// External audit POS-005: a workload is its unit — a service with
-    /// what it delegates below it, a container's scope — or, without a
-    /// unit in the path, the path itself.
+    /// The workload path `t` places `pid` in.
+    fn workload_path(t: &AuthSessionTracker, pid: u32) -> Option<String> {
+        t.session_workload(pid).map(|w| w.path)
+    }
+
+    /// Two container ids as the runtimes write them (64 hex digits).
+    fn ids() -> (String, String) {
+        ("0123456789abcdef".repeat(4), "fedcba9876543210".repeat(4))
+    }
+
+    /// External audit POS-005: without a container, a workload is its
+    /// unit — a service with what it delegates below it, a login session's
+    /// scope, a user's transient scope — or, without a unit in the path,
+    /// the path itself.
     #[test]
     fn a_cgroup_path_names_its_deepest_unit() {
         for (path, workload) in [
-            ("/system.slice/puppet.service", "/system.slice/puppet.service"),
+            (
+                "/system.slice/puppet.service",
+                "/system.slice/puppet.service",
+            ),
             (
                 "/system.slice/containerd.service/payload",
                 "/system.slice/containerd.service",
             ),
             (
+                "/user.slice/user-1000.slice/session-3.scope",
+                "/user.slice/user-1000.slice/session-3.scope",
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u12.scope",
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u12.scope",
+            ),
+            // Not a runtime's id: a unit like any other.
+            (
                 "/system.slice/docker-0123abcd.scope",
                 "/system.slice/docker-0123abcd.scope",
             ),
             (
-                "/machine.slice/libpod-0123abcd.scope/container",
-                "/machine.slice/libpod-0123abcd.scope",
+                "/kubepods.slice/kubepods-burstable.slice",
+                "/kubepods.slice/kubepods-burstable.slice",
             ),
-            (
-                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-ab.scope",
-                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-ab.scope",
-            ),
-            ("/docker/0123abcd", "/docker/0123abcd"),
             ("/", "/"),
         ] {
-            assert_eq!(workload_of_cgroup(path), workload, "{path}");
+            let w = workload_of_cgroup(path);
+            assert_eq!(w.path, workload, "{path}");
+            assert!(!w.container, "{path}");
+        }
+    }
+
+    /// External audit POS-005: the container runtimes' cgroups of the
+    /// workload-context design (§4.2), rootful and rootless: each names
+    /// its container, units inside a container belong to it, and a
+    /// runtime's monitor (conmon) names the container beside it.
+    #[test]
+    fn the_runtimes_cgroups_name_their_container() {
+        let (a, b) = ids();
+        let user = "/user.slice/user-1000.slice/user@1000.service/user.slice";
+        let pod = "kubepods-burstable-pod1f2e3d4c_5b6a_7980_a1b2_c3d4e5f60718.slice";
+        let kube = format!("/kubepods.slice/kubepods-burstable.slice/{pod}");
+        let pod_fs = "/kubepods/burstable/pod1f2e3d4c-5b6a-7980-a1b2-c3d4e5f60718";
+        for (path, workload) in [
+            // Podman, rootful and rootless (systemd driver), and its cgroupfs driver.
+            (
+                format!("/machine.slice/libpod-{a}.scope/container"),
+                format!("/machine.slice/libpod-{a}.scope"),
+            ),
+            (
+                format!("{user}/libpod-{a}.scope/container"),
+                format!("{user}/libpod-{a}.scope"),
+            ),
+            (
+                format!("{user}/libpod-conmon-{a}.scope"),
+                format!("{user}/libpod-{a}.scope"),
+            ),
+            (
+                format!("/libpod_parent/libpod-{a}"),
+                format!("/libpod_parent/libpod-{a}"),
+            ),
+            // Docker, rootful and rootless (systemd driver), and its cgroupfs driver.
+            (
+                format!("/system.slice/docker-{a}.scope"),
+                format!("/system.slice/docker-{a}.scope"),
+            ),
+            (
+                format!("{user}/docker-{a}.scope"),
+                format!("{user}/docker-{a}.scope"),
+            ),
+            (format!("/docker/{a}"), format!("/docker/{a}")),
+            // CRI: containerd and CRI-O (and CRI-O's conmon) in a pod.
+            (
+                format!("{kube}/cri-containerd-{a}.scope"),
+                format!("{kube}/cri-containerd-{a}.scope"),
+            ),
+            (
+                format!("{kube}/crio-{a}.scope"),
+                format!("{kube}/crio-{a}.scope"),
+            ),
+            (
+                format!("{kube}/crio-conmon-{a}.scope"),
+                format!("{kube}/crio-{a}.scope"),
+            ),
+            // Kubernetes' cgroupfs driver: the container below its pod, or the pod.
+            (format!("{pod_fs}/{a}"), format!("{pod_fs}/{a}")),
+            (format!("{pod_fs}/crio-{a}"), format!("{pod_fs}/crio-{a}")),
+            (pod_fs.to_string(), pod_fs.to_string()),
+            // A systemd running in a container: its units are the container's.
+            (
+                format!("/system.slice/docker-{a}.scope/system.slice/cron.service"),
+                format!("/system.slice/docker-{a}.scope"),
+            ),
+            (
+                format!("{user}/libpod-{a}.scope/container/system.slice/sshd.service"),
+                format!("{user}/libpod-{a}.scope"),
+            ),
+            // A container in a container: the inner one.
+            (
+                format!("/system.slice/docker-{a}.scope/docker/{b}"),
+                format!("/system.slice/docker-{a}.scope/docker/{b}"),
+            ),
+        ] {
+            let w = workload_of_cgroup(&path);
+            assert_eq!(w.path, workload, "{path}");
+            assert!(w.container, "{path}");
         }
         assert_ne!(
-            workload_of_cgroup("/system.slice/docker-aaaa.scope"),
-            workload_of_cgroup("/system.slice/docker-bbbb.scope"),
-            "two containers are two workloads"
+            workload_of_cgroup(&format!("{user}/libpod-{a}.scope/container")),
+            workload_of_cgroup(&format!("{user}/libpod-{b}.scope/container")),
+            "two containers of one user are two workloads"
+        );
+    }
+
+    /// External audit POS-005: on a v1 or hybrid host the most specific of
+    /// the unified line, systemd's and the cpu/memory/pids controllers'
+    /// places the process: a container first, then the deepest path, the
+    /// unified line and then systemd's on a tie. Other controllers are not
+    /// read; the agent's containment slice counts only when nothing else
+    /// places the process.
+    #[test]
+    fn a_v1_host_is_placed_by_its_most_specific_hierarchy() {
+        let (a, _) = ids();
+        let v1_container = format!(
+            "12:devices:/system.slice\n11:memory:/docker/{a}\n4:cpu,cpuacct:/docker/{a}\n\
+             1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n"
+        );
+        for (text, path) in [
+            (v1_container.clone(), format!("/docker/{a}")),
+            (
+                "9:memory:/\n4:cpu,cpuacct:/system.slice\n1:name=systemd:/system.slice/cron.service\n"
+                    .to_string(),
+                "/system.slice/cron.service".to_string(),
+            ),
+            (
+                "6:pids:/batch/nightly/job-7\n1:name=systemd:/system.slice/cron.service\n".to_string(),
+                "/batch/nightly/job-7".to_string(),
+            ),
+            (
+                "5:memory:/user.slice/user-1000.slice\n\
+                 1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n\
+                 0::/user.slice/user-1000.slice/session-3.scope\n"
+                    .to_string(),
+                "/user.slice/user-1000.slice/session-3.scope".to_string(),
+            ),
+            (
+                format!("3:freezer:/docker/{a}\n1:name=systemd:/system.slice/ssh.service\n"),
+                "/system.slice/ssh.service".to_string(),
+            ),
+            (
+                "1:name=systemd:/system.slice/nginx.service\n0::/northnarrow.slice/blocked.scope\n"
+                    .to_string(),
+                "/system.slice/nginx.service".to_string(),
+            ),
+            (
+                "0::/northnarrow.slice/blocked.scope\n".to_string(),
+                "/northnarrow.slice/blocked.scope".to_string(),
+            ),
+        ] {
+            assert_eq!(placing_cgroup(&text), Some(path.as_str()), "{text}");
+        }
+        assert_eq!(placing_cgroup("3:freezer:/x\n"), None);
+        assert_eq!(placing_cgroup(""), None);
+
+        let tmp = TempDir::new().unwrap();
+        let pid_dir = tmp.path().join("800");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("cgroup"), &v1_container).unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        assert_eq!(
+            t.session_workload(800),
+            Some(Workload {
+                path: format!("/docker/{a}"),
+                container: true
+            })
         );
     }
 
@@ -2435,11 +2710,11 @@ mod tests {
         t.ingest_spawn(301, 300, "/usr/bin/sh", 2); // exited
         t.ingest_spawn(400, 1, "/usr/bin/sh", 3); // exited, parent init
         assert_eq!(
-            t.session_workload(300).as_deref(),
+            workload_path(&t, 300).as_deref(),
             Some("/system.slice/salt-minion.service")
         );
         assert_eq!(
-            t.session_workload(301).as_deref(),
+            workload_path(&t, 301).as_deref(),
             Some("/system.slice/salt-minion.service")
         );
         assert_eq!(t.session_workload(400), None);
@@ -2453,7 +2728,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            t.session_workload(500).as_deref(),
+            workload_path(&t, 500).as_deref(),
             Some("/system.slice/cron.service")
         );
     }
@@ -2479,7 +2754,7 @@ mod tests {
         t.ingest_spawn(700, 1, "/usr/bin/sh", 3);
         for pid in [601, 602] {
             assert_eq!(
-                t.session_workload(pid).as_deref(),
+                workload_path(&t, pid).as_deref(),
                 Some("/system.slice/nginx.service"),
                 "{pid}"
             );

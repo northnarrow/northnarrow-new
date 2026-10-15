@@ -178,7 +178,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-132 | PROC-008 | Process rules | S | fixed (lab PR 140) |
 | NN-AUD-133 | PROC-009 | Process rules | S | fixed (lab PR 140) |
 | NN-AUD-134 | PROC-010 | Process rules | S | fixed (lab PR 140) |
-| NN-AUD-135 | POS-005 | Posture | M | partial (lab PR 141; interim scope, the workload-context steps 1–2 remain) |
+| NN-AUD-135 | POS-005 | Posture | M | fixed (lab PR 141, lab PR 161) |
 | NN-AUD-136 | POS-009 | Posture | M | fixed (lab PR 141) |
 | NN-AUD-137 | POS-015 | Posture | M | fixed (lab PR 141) |
 | NN-AUD-138 | CMB-004 | Combat response | L | fixed (lab PR 120) |
@@ -4504,3 +4504,68 @@ the audit did not report, noted with the fix that takes them.
     `e2e_failures_on_other_connections_do_not_rate_limit` replaces the
     ignored five-minute test.
   - Lab: Debian 12, adminconn138-probe.sh (run as root in the guest) on main and on this build. flood (a raw client sending ChallengeRequest in a loop while `nn-admin unlock` runs): unlocks 0/20 on main — the flood's failures tripped the agent-wide 5-minute rate limit, which then also refused the probe's force/rotate cases (so those two show the after side only, the unit tests the main side) — here 20/20. ratelimit (three wrong-key unlocks, then the right key): main RateLimited → here the right key succeeds (failures count per connection, three close it). slow (2,000 idle connections for 40 s): `status` answered on both, the agent's fds 2,146 on main → 175 then 144 here ("admin connection table full: closed the longest-waiting connections", max 32). force (a key holding only `force-posture`): into COMBAT allowed, out of COMBAT refused ("it needs the unlock role"). rotate (two `unlock,rotate-keys` keys asking for a key with `all` or `shutdown`): refused, "the new key would hold a role none of its signers holds". Debian gate of this change on its own: 30 suites, 80 passed, 0 failed. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.
+- **NN-AUD-135 (POS-005), lab PR 161.** The rest of the posture scope:
+  the containers of a login session, and cgroup v1. No kernel or wire
+  change.
+  - Lab PR 141 scoped the processes without a login uid. A rootless
+    container (Podman, rootless Docker) runs with the login uid of the
+    user who started it — Podman keeps it on purpose, for auditing, and
+    so does a rootful container started with `sudo podman` — so two
+    containers of one user, or a container and that user's shell, still
+    shared `Login(uid)` and corroborated each other. `scope_of` now reads
+    the workload for every event that raised a trigger (the same
+    `/proc/<pid>/cgroup` read, of the owner or its nearest running
+    ancestor outside the agent's containment); `session_workload` returns
+    `Workload { path, container }`, and a container is
+    `Scope::Workload(<path up to it>)` whatever its login uid. Outside a
+    container nothing changes: `Login(uid)`, else the deepest unit.
+  - A container (`container_of_cgroup`, the design's §4.2 table) is the
+    deepest of: a runtime's cgroup with a 64-hex id (`libpod-`, `docker-`,
+    `cri-containerd-`, `crio-`; `.scope` under a systemd driver, rootful
+    or below `user@<uid>.service`, none under a cgroupfs one), a bare id
+    below `/docker` or below a pod, a pod below `kubepods` with no
+    container named under it. Units inside a container are the
+    container's (a systemd running in one was split per unit). conmon's
+    scope (`libpod-conmon-<id>.scope`, `crio-conmon-<id>.scope`) names its
+    container's: a container whose init has exited, or was moved into the
+    agent's containment, is placed through conmon, its nearest running
+    ancestor, instead of the session that started it. An id that is not
+    64 hex digits is an ordinary unit.
+  - Risk, accepted as in the triage: an attacker in a login session
+    splits their evidence by running part of it in a container they start,
+    or in a cgroup of their delegated subtree named like one
+    (`systemd-run --user --scope --unit=libpod-<64 hex>`); the halves no
+    longer corroborate. Two signals inside one container still do, and so
+    do the session's own.
+  - cgroup v1 (`placing_cgroup`): the unified line, `name=systemd` and the
+    `cpu`, `cpuacct`, `memory` and `pids` controllers are read, and the
+    most specific path places the process: one that names a container,
+    else the deepest (the unified line, then systemd's, on a tie); a path
+    in the agent's containment slice only when nothing else places it (on
+    a hybrid host the v1 lines still name its workload). Other controllers
+    are not read. Limits: on v1 a rootless container gets no cgroup of its
+    own (the controllers are not delegated to users), so it stays in its
+    user's `Login(uid)`; a v1 controller path stops where systemd's
+    accounting is off (systemd's own line then answers); design Q4 keeps
+    v1 unsupported for the workload identity itself.
+  - Not done, a separate hardening the finding does not need: capturing
+    the cgroup id with the event (design §4.1, step 1 —
+    `bpf_get_current_cgroup_id` in every record, a wire and eBPF change,
+    with the userland cache of §4.2). The cgroup is still read after the
+    event, so a writer whose known ancestors have all exited is
+    `Unattributed` (it corroborates nothing, it never pools), and a
+    process that changes cgroup before the read is placed where it went
+    (root anywhere; a user only within their delegated subtree, the
+    splitting above). Neither case pools two actors; step 1 would place
+    short-lived processes, it would not change who corroborates whom.
+  - Tests: `two_rootless_containers_of_one_user_do_not_corroborate`,
+    `a_container_and_its_users_shell_do_not_corroborate` (with a container
+    placed through its conmon), `two_signals_in_one_container_corroborate`
+    (machine); `the_runtimes_cgroups_name_their_container`,
+    `a_v1_host_is_placed_by_its_most_specific_hierarchy`;
+    `a_cgroup_path_names_its_deepest_unit` now uses runtime-length ids (a
+    short one is an ordinary unit). Checked against main: the three
+    machine tests fail (the third through a container running its own
+    systemd); without the conmon mapping the second fails; main's cgroup
+    read (unified, else `name=systemd`) fails the v1 test.
+  - Lab: Ubuntu 24.04 with Podman 4.9 (an image imported from a local tar, no registry pull), poswl161-probe.sh on main and on this build. rootless: two containers of user nn (loginuid 1000) — one runs `nc` (ExploitAttempt), the other an exfiltration burst to 100.64.0.10–33:443 — main: both in `scope=login uid 1000`, the burst corroborated across containers → COMBAT and NEUTRALIZE; here each in its own `scope=workload …/user@1000.service/user.slice/libpod-<id>.scope`, the burst ENGAGED only (a later second signal inside the same container corroborates, as the control case shows: COMBAT on both builds). shell: nn's shell `nc` then a container's burst — main COMBAT in the login scope; here ENGAGED (shell `login uid 1000`, container its libpod scope). rootful (`sudo podman` from SSH keeps loginuid 1000): main placed the container in `login uid 1000`; here `/machine.slice/libpod-<id>.scope`. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 77 passed, the other two being lab PR 158's iptables guard self-tests (an iptables-nft 1.8.9 quirk, fixed there); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.

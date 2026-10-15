@@ -434,11 +434,13 @@ impl TriggerDetector {
 
     /// Corroboration scope of `event` (review `posture-ledger-scope-1`):
     /// the login uid of the owning pid, or of its nearest running ancestor
-    /// once it has exited. External audit POS-005: without a login uid,
-    /// the workload its cgroup names (a systemd unit, a container), so two
-    /// daemons or two containers are two actors; [`Scope::Unattributed`]
-    /// when neither can be read, or for an event with no owning pid. Read
-    /// only for an event that raised a trigger.
+    /// once it has exited. External audit POS-005: a container — with or
+    /// without a login uid — and, without a login uid, the systemd unit
+    /// are scoped by the workload their cgroup names, so two daemons, two
+    /// containers, or a container and the shell of the user who started it
+    /// are two actors; [`Scope::Unattributed`] when nothing can be read, or
+    /// for an event with no owning pid. Read only for an event that raised
+    /// a trigger.
     pub fn session_scope(&self, event: &Event) -> Scope {
         match event_owner_pid(event) {
             Some(pid) => self.scope_of(pid),
@@ -446,13 +448,20 @@ impl TriggerDetector {
         }
     }
 
+    /// External audit POS-005: a rootless container (Podman, Docker) runs
+    /// with the login uid of the user who started it, and used to share
+    /// that user's scope with the user's shell and every other container
+    /// of theirs. Residual risk: an attacker in a login session splits
+    /// their evidence by running part of it in a container they start (or
+    /// in a cgroup of their delegated subtree named like one); two signals
+    /// inside one container still corroborate.
     fn scope_of(&self, pid: u32) -> Scope {
-        if let Some(uid) = self.auth.session_loginuid(pid) {
-            return Scope::Login(uid);
-        }
-        match self.auth.session_workload(pid) {
-            Some(workload) => Scope::Workload(workload),
-            None => Scope::Unattributed,
+        let workload = self.auth.session_workload(pid);
+        match (workload, self.auth.session_loginuid(pid)) {
+            (Some(w), _) if w.container => Scope::Workload(w.path),
+            (_, Some(uid)) => Scope::Login(uid),
+            (Some(w), None) => Scope::Workload(w.path),
+            (None, None) => Scope::Unattributed,
         }
     }
 
