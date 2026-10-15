@@ -162,10 +162,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-116 | FIMR-007 | FIM rules | S | fixed (lab PR 111) |
 | NN-AUD-117 | FIMR-008 | FIM rules | M | fixed (lab PR 111) |
 | NN-AUD-118 | FIMR-009 | FIM rules | S | fixed (lab PR 111) |
-| NN-AUD-119 | FIMP-007 | FIM pipeline | S | open |
-| NN-AUD-120 | FIMP-008 | FIM pipeline | M | open |
-| NN-AUD-121 | FIMP-009 | FIM pipeline | M | open |
-| NN-AUD-122 | FIMP-010 | FIM pipeline | M | open |
+| NN-AUD-119 | FIMP-007 | FIM pipeline | S | fixed (lab PR 135) |
+| NN-AUD-120 | FIMP-008 | FIM pipeline | M | fixed (lab PR 135) |
+| NN-AUD-121 | FIMP-009 | FIM pipeline | M | fixed (lab PR 135) |
+| NN-AUD-122 | FIMP-010 | FIM pipeline | M | fixed (lab PR 135) |
 | NN-AUD-123 | FIMP-011 | FIM pipeline | S | fixed (lab PR 111) |
 | NN-AUD-124 | NETR-004 | Net rules | S | fixed (lab PR 125) |
 | NN-AUD-125 | NETR-005 | Net rules | M | fixed (lab PR 126) |
@@ -2838,3 +2838,108 @@ the audit did not report, noted with the fix that takes them.
   review, never a kill, a quarantine or a block. `NN_ADE_ENFORCE=1`
   restores the old behaviour and is a weakening variable (signed
   `integrity_drift` at every boot).
+- **NN-AUD-119 (FIMP-007), NN-AUD-120 (FIMP-008), NN-AUD-122 (FIMP-010),
+  NN-AUD-121 (FIMP-009), lab PR 135.** The FIM watch set: retry queues,
+  capacity, symlink targets, transient writes (batch B2 of wave 2,
+  group C).
+  - FIMP-007: `PENDING_ENROLL` (a `Vec`) took a path once per creation,
+    wave 1 added `PENDING_RENAME` without a cap either, and the retry pass
+    `stat`ed every entry under the queue's lock at the top of every loop
+    turn (since review 75, after every event that emits), on a runtime
+    worker. The drain's queues are one structure (`DrainQueues`): the
+    retry queues are keyed (path, inode, symlinked path) and capped at
+    1024 where they grow (`RetryQueue`; an entry over the cap is dropped,
+    counted, and a WARN once a minute names the queue). The pass runs at
+    most every 5 ms (`Pacer`), takes each queue out under the lock, does
+    its `stat`s inside `off_the_runtime`, and puts back what is still
+    pending. A runtime child renamed away no longer waits in the 256-slot
+    return list (a file put back in a watched directory is enrolled by the
+    directory's own event; `crontab`'s temporary files filled the list for
+    good). In tests the queues are per thread, so one test's retry pass no
+    longer settles another's entries against the wrong map.
+  - FIMP-008: every entry of the drain's map carries a class
+    (`WatchClass`: configured — the watch list, re-baselines, paths back
+    after a rename, the control-surface baits —, decoy, symlink hop,
+    runtime child). Runtime children are capped at 4096, half of
+    `WATCHED_PATHS`, the oldest out first, out of the kernel map too, and
+    a sweep every 60 s drops those whose file is gone (a Deleted event
+    lost in the ring left them watched for good). Found while fixing: a
+    file renamed within a watched directory (`tmp.X` to its final name)
+    was enrolled under the new name, then dropped when the rename of the
+    old name was settled; an inode named by another path since is kept.
+    A full kernel map makes
+    room by evicting the oldest runtime children (`watch_inode`); a
+    configured path, a hop or a decoy is never evicted, and a runtime
+    child never takes over an inode another class holds. An eviction or
+    a refusal is an ERROR at most once a minute and a signed
+    `subsystem_degraded` (`reason: fim_watch_map_full`, with the evicted
+    and refused totals and the child count) at most once an hour. `canary
+    deploy` watches the decoy before registering it and refuses the
+    deploy when it cannot be watched (map full of entries that are never
+    evicted, no kernel map, FIM not running): `UnknownOperation`, which
+    the CLI prints as "server rejected operation" (no wire change); the
+    decoy file already written is left in place and named in the
+    journal. The boot loop re-watching the decoys logs a refusal at
+    ERROR, and the refusal counts in the record above.
+  - FIMP-010: `SYMLINK_RESOLVE_DEPTH_HOPS` had no consumer; it is
+    replaced by `symlink_chain` (`fim/baseline.rs`): the links behind a
+    path and the final target, at most 8 links, a loop refused, a broken
+    chain ending at the missing name. `populate_watched_paths`,
+    `reenroll_path` (re-baseline) and the rename and return handling
+    (`enroll_path`) watch the path's own inode, each further link and the
+    final target, named by the configured path (`plan_path_watches`), so
+    the drain compares with that path's content row; the populate summary
+    counts them (`chain_entries`). A change of the target in place is
+    checked at once as a change of the path. A link or the target
+    unlinked, renamed or replaced: the chain is resolved again once the
+    change has landed (≤ 2 s), watched anew (the old hops let go), and
+    the path checked as a modification by the writer, as a file renamed
+    over a watched one is (FIMR-004). A chain whose target is missing is
+    looked at once a second and checked as a creation when it is whole
+    again (a re-created `/etc/alternatives/nc` touches no watched inode);
+    a symlinked path deleted takes its hops out of the watch until it is
+    back. A target behind two watched links (`iptables`, `ip6tables` →
+    `xtables-nft-multi`) is named by one of them and stays watched while
+    either uses it. The content row of a symlinked path records the
+    canonical target (`target`, absent when `None`, so rows written before
+    verify as they did). A re-point by `update-alternatives` in a package
+    transaction goes through the rules' existing package handling; a
+    directory symlink inside a path (`/bin` → `usr/bin`) is resolved by
+    the kernel and not watched.
+  - FIMP-009 (userland part): on a path `is_critical_rule_path` covers,
+    a content-class event whose re-hash finds the baseline content is a
+    drift row with `decision_engine_skipped: true` and `skip_reason:
+    content_restored`, without a verdict (the content matches), counted
+    per path (WARN at the 1st, 2nd, 4th, 8th… such write of a path);
+    elsewhere the no-op suppression against `touch` noise stays. The
+    kernel flag telling a write-close from a setattr (optional, eBPF) is
+    not done, so a `touch` of a critical binary also leaves such a row; a
+    reinstall of identical content leaves one per file.
+  - Tests: `pending_queues_are_deduplicated_and_capped`,
+    `retry_pass_runs_at_most_every_5ms`,
+    `configured_and_decoy_entries_are_never_evicted`,
+    `runtime_children_are_capped_and_gcd`,
+    `full_map_is_attested_once_per_hour`,
+    `a_decoy_watch_is_refused_only_when_nothing_can_make_room`,
+    `a_child_renamed_within_a_watched_directory_stays_watched`,
+    `symlink_chain_resolves_hops_and_rejects_loops`,
+    `populate_plan_enrolls_each_hop_and_target`,
+    `symlinked_content_row_records_its_target_and_old_rows_verify`,
+    `an_edit_of_the_target_behind_a_watched_link_is_drift_of_the_link`,
+    `a_repointed_link_in_the_chain_is_drift_of_the_watched_path`,
+    `a_target_shared_by_two_watched_links_stays_watched`,
+    `unchanged_hash_on_a_critical_path_is_still_recorded`,
+    `touch_on_a_non_critical_path_is_still_suppressed`. Each fails with
+    its fix taken out (checked by inverting it).
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `fimset135-probe.sh`, each on a
+    freshly started agent. The file behind `/etc/resolv.conf` (a symlink
+    to `/run/systemd/resolve/stub-resolv.conf`) edited in place: before
+    (main), nothing; after, `FIM DRIFT path=/etc/resolv.conf op=Modified`
+    by bash, the boot line counting `chain_entries=13`. A byte of
+    `/usr/bin/wget` changed and restored in one open: before, 0 rows;
+    after, one `content_restored` row with the writer and a WARN. 9,000
+    files kept in a watched directory: before, nothing reported; after,
+    `FIM WATCH SET FULL` and a signed `integrity_drift`
+    (`fim_watch_map_full`). Privileged gate: Ubuntu 24.04 and Debian 12,
+    29 suites, 80 passed, 0 failed each. The anti-tamper suite: OK. Host:
+    1875 passed, 0 failed.

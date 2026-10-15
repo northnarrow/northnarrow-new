@@ -1956,6 +1956,8 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&overlay_gate)),
     );
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
+    // External audit NN-AUD-120: a full FIM watch set is attested.
+    northnarrow_agent::fim::drain::set_audit_log(audit_log.clone());
     // External audit SNS-009: a security ring that loses events raises
     // ALERTED (TelemetryLoss), outside trusted-installer windows.
     northnarrow_agent::sensors::ring_drops::set_posture(
@@ -2708,7 +2710,13 @@ async fn main() -> Result<()> {
     if let Some(fim) = fim_admin_state.as_ref() {
         for path in &report.recreated {
             let watched = northnarrow_agent::fim::attach::key_for_path(std::path::Path::new(path))
-                .map(|key| fim.watch.watch(key, path));
+                .map(|key| {
+                    fim.watch.watch(
+                        key,
+                        path,
+                        northnarrow_agent::fim::drain::WatchClass::Configured,
+                    )
+                });
             if !matches!(watched, Ok(true)) {
                 warn!(
                     target: "fim.honeypot",
@@ -2892,10 +2900,17 @@ async fn main() -> Result<()> {
                                 );
                                 match (key, &fim_watch) {
                                     (Ok(key), Some(watch)) => {
-                                        if !watch.watch(key, path) {
-                                            warn!(
+                                        // External audit NN-AUD-120: a decoy is
+                                        // never evicted; a refusal is attested.
+                                        if !watch.watch(
+                                            key,
+                                            path,
+                                            northnarrow_agent::fim::drain::WatchClass::Decoy,
+                                        ) {
+                                            error!(
                                                 path,
-                                                "canary: the kernel watch map refused the decoy"
+                                                "canary: the kernel watch map refused the decoy \
+                                                 — its opens are not seen"
                                             );
                                         }
                                     }

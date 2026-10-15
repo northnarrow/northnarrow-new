@@ -43,7 +43,7 @@ use aya::{Btf, Ebpf};
 use common::wire::InodeKey;
 use tracing::{info, warn};
 
-use crate::fim::drain::InodePathMap;
+use crate::fim::drain::{InodePathMap, WatchClass};
 
 /// The FIM observe programs, paired with their LSM hook
 /// names. Names match the `#[lsm(hook = "...")]` attributes in
@@ -77,6 +77,11 @@ pub const OPEN_SENSOR_PROGRAM: &str = "fim_file_open_sensor";
 /// BPF map name for the pinned `WATCHED_PATHS` HashMap. Matches
 /// the `agent-ebpf/src/fim_watch.rs::WATCHED_PATHS` static.
 pub const WATCHED_PATHS_MAP: &str = "WATCHED_PATHS";
+
+/// Capacity of `WATCHED_PATHS`: `WATCHED_PATHS_MAX_ENTRIES` in
+/// `agent-ebpf/src/fim_watch.rs` (kept equal by hand — the eBPF crate is
+/// `no_std` and shares no constant with this one).
+pub const WATCHED_PATHS_CAPACITY: usize = 8192;
 
 /// BPF ringbuf name for the kernel→userland drift event channel.
 /// Matches the `agent-ebpf/src/fim_watch.rs::FS_FIM_EVENTS`
@@ -287,6 +292,7 @@ pub fn populate_watched_paths(
 
     let mut inserted = 0usize;
     let mut skipped = 0usize;
+    let mut chain_entries = 0usize;
     let mut registered: std::collections::HashSet<InodeKey> = std::collections::HashSet::new();
     // Credential-coverage accounting for the regression guard below.
     // `cred_*` count ONLY paths under a ProtectHome-maskable home root
@@ -304,8 +310,8 @@ pub fn populate_watched_paths(
         if mask_root.is_some() {
             cred_total += 1;
         }
-        let meta = match std::fs::symlink_metadata(path) {
-            Ok(m) => m,
+        let plan = match plan_path_watches(path) {
+            Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // A genuinely-absent path on a curated list is normal
                 // (debug) — the list names files not present on every
@@ -342,10 +348,8 @@ pub fn populate_watched_paths(
                 continue;
             }
         };
-        let key = InodeKey {
-            dev: stat_dev_to_kernel_dev(meta.dev()),
-            ino: meta.ino(),
-        };
+        let key = plan.own;
+        let path_str = path.to_string_lossy().into_owned();
         match hmap.insert(AyaInodeKey(key), 1u8, 0) {
             Ok(()) => {
                 inserted += 1;
@@ -353,7 +357,7 @@ pub fn populate_watched_paths(
                 if mask_root.is_some() {
                     cred_watched += 1;
                 }
-                inode_map.insert(key, path.to_string_lossy().into_owned());
+                inode_map.insert(key, path_str.clone());
             }
             Err(e) => {
                 warn!(
@@ -362,7 +366,38 @@ pub fn populate_watched_paths(
                     "fim populate_watched_paths: WATCHED_PATHS insert failed — skip"
                 );
                 skipped += 1;
+                continue;
             }
+        }
+        // External audit NN-AUD-122 (FIMP-010): behind a symlink, each
+        // further link and the final target are watched too, named by the
+        // configured path — an in-place change of `python3.12`, or a
+        // re-pointed `/etc/alternatives/nc`, touched no watched inode.
+        if let Some(e) = &plan.chain_error {
+            warn!(path = %path.display(), error = %e, "fim: the symlink chain behind a watched path is not followed");
+        }
+        let mut hops = Vec::new();
+        for (hop, hop_key) in &plan.hops {
+            match hmap.insert(AyaInodeKey(*hop_key), 1u8, 0) {
+                Ok(()) => {
+                    registered.insert(*hop_key);
+                    inode_map.insert_as(*hop_key, path_str.clone(), WatchClass::ChainHop);
+                    hops.push(*hop_key);
+                    chain_entries += 1;
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    path = %path.display(),
+                    hop = %hop.display(),
+                    "fim populate_watched_paths: WATCHED_PATHS insert of a symlink hop failed"
+                ),
+            }
+        }
+        if !plan.hops.is_empty() || plan.broken {
+            inode_map.set_chain(&path_str, hops);
+        }
+        if plan.broken {
+            crate::fim::drain::await_chain_repair(&path_str);
         }
     }
     // Review 57: WATCHED_PATHS is pinned and outlives the agent. A child a
@@ -381,6 +416,7 @@ pub fn populate_watched_paths(
     }
     info!(
         inserted,
+        chain_entries,
         skipped,
         stale_removed = stale.len(),
         configured = paths.len(),
@@ -417,6 +453,53 @@ pub fn populate_watched_paths(
     Ok(inode_map)
 }
 
+/// External audit NN-AUD-122 (FIMP-010): what is watched for a configured
+/// path that exists — its own inode and, behind a symlink, each further link
+/// and the final target ([`crate::fim::baseline::symlink_chain`]), all
+/// named by the configured path so a change there is compared with that
+/// path's content row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathWatchPlan {
+    /// The path's own inode (`lstat`: the link itself for a symlink).
+    pub own: InodeKey,
+    /// The links and the final target behind it, those that exist.
+    pub hops: Vec<(PathBuf, InodeKey)>,
+    /// The final target is missing: watched again once it is there.
+    pub broken: bool,
+    /// Why the chain was not followed (a loop, too many links).
+    pub chain_error: Option<String>,
+}
+
+/// Plan the watches of `path` ([`PathWatchPlan`]). `Err` when the path
+/// itself cannot be `lstat`ed.
+pub fn plan_path_watches(path: &Path) -> std::io::Result<PathWatchPlan> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let mut plan = PathWatchPlan {
+        own: InodeKey {
+            dev: stat_dev_to_kernel_dev(meta.dev()),
+            ino: meta.ino(),
+        },
+        hops: Vec::new(),
+        broken: false,
+        chain_error: None,
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(plan);
+    }
+    match crate::fim::baseline::symlink_chain(path) {
+        Ok(chain) => {
+            for hop in chain {
+                match key_for_path(&hop) {
+                    Ok(k) => plan.hops.push((hop, k)),
+                    Err(_) => plan.broken = true,
+                }
+            }
+        }
+        Err(e) => plan.chain_error = Some(format!("{e:#}")),
+    }
+    Ok(plan)
+}
+
 /// Take ownership of the `FS_FIM_EVENTS` ringbuf out of the
 /// `Ebpf` object so the drain task can wrap it in `AsyncFd` and
 /// own the poll loop. After this call the map is no longer
@@ -436,24 +519,68 @@ pub fn take_fs_fim_events_ringbuf(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>> {
 /// share with the drain loop — inserts are rare (only on a real drop
 /// into a watched directory), so a coarse mutex is fine.
 pub struct WatchedPathsHandle {
-    map: AyaHashMap<MapData, AyaInodeKey, u8>,
+    map: WatchedPathsBacking,
+}
+
+enum WatchedPathsBacking {
+    Kernel(AyaHashMap<MapData, AyaInodeKey, u8>),
+    /// A kernel map stand-in with the same full-map refusal, for tests.
+    #[cfg(test)]
+    Fake {
+        keys: std::collections::HashSet<InodeKey>,
+        capacity: usize,
+    },
 }
 
 impl WatchedPathsHandle {
     /// Enroll an inode into `WATCHED_PATHS` so the kernel observe
     /// programs start watching it directly. Returns `true` on success
     /// (or already-present), `false` if the insert failed — almost
-    /// always the 8192-entry cap. The caller logs the cap-exhaustion
-    /// with the offending path so a silently-dropped enrollment can't
-    /// masquerade as coverage (mirrors the credential-coverage WARN in
-    /// [`populate_watched_paths`]).
+    /// always the [`WATCHED_PATHS_CAPACITY`] cap. External audit
+    /// NN-AUD-120: callers go through [`crate::fim::drain::watch_inode`],
+    /// which makes room by evicting runtime children and reports a
+    /// refusal.
     pub fn enroll(&mut self, key: InodeKey) -> bool {
-        self.map.insert(AyaInodeKey(key), 1u8, 0).is_ok()
+        match &mut self.map {
+            WatchedPathsBacking::Kernel(m) => m.insert(AyaInodeKey(key), 1u8, 0).is_ok(),
+            #[cfg(test)]
+            WatchedPathsBacking::Fake { keys, capacity } => {
+                keys.contains(&key) || (keys.len() < *capacity && keys.insert(key))
+            }
+        }
     }
 
     /// Stop watching an inode whose file is gone (review 57).
     pub fn unenroll(&mut self, key: InodeKey) {
-        let _ = self.map.remove(&AyaInodeKey(key));
+        match &mut self.map {
+            WatchedPathsBacking::Kernel(m) => {
+                let _ = m.remove(&AyaInodeKey(key));
+            }
+            #[cfg(test)]
+            WatchedPathsBacking::Fake { keys, .. } => {
+                keys.remove(&key);
+            }
+        }
+    }
+
+    /// A stand-in for the kernel map holding at most `capacity` inodes.
+    #[cfg(test)]
+    pub(crate) fn fake(capacity: usize) -> Self {
+        Self {
+            map: WatchedPathsBacking::Fake {
+                keys: std::collections::HashSet::new(),
+                capacity,
+            },
+        }
+    }
+
+    /// Whether the stand-in holds `key`.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, key: &InodeKey) -> bool {
+        match &self.map {
+            WatchedPathsBacking::Fake { keys, .. } => keys.contains(key),
+            WatchedPathsBacking::Kernel(_) => false,
+        }
     }
 }
 
@@ -478,14 +605,18 @@ impl FimWatch {
         }
     }
 
-    /// Watch inode `key` as `path`. `false` when the kernel map refused
-    /// it (full, or absent): the drain can name it, the kernel will not
-    /// report it.
-    pub fn watch(&self, key: InodeKey, path: &str) -> bool {
-        self.path_map.insert(key, path.to_string());
+    /// Watch inode `key` as `path` of `class`. `false` when the kernel
+    /// map refused it (full of what is never evicted, or absent): the
+    /// kernel will not report it. External audit NN-AUD-120: a full map
+    /// makes room by evicting the oldest runtime child, and a refusal is
+    /// an ERROR and a signed `subsystem_degraded`.
+    pub fn watch(&self, key: InodeKey, path: &str, class: WatchClass) -> bool {
         match &self.watched_paths {
-            Some(wp) => wp.lock().enroll(key),
-            None => false,
+            Some(wp) => crate::fim::drain::watch_inode(key, path, class, &self.path_map, Some(wp)),
+            None => {
+                let _ = self.path_map.insert_as(key, path.to_string(), class);
+                false
+            }
         }
     }
 
@@ -512,7 +643,9 @@ pub fn take_watched_paths_map(ebpf: &mut Ebpf) -> Result<WatchedPathsHandle> {
         .ok_or_else(|| anyhow!("map `{WATCHED_PATHS_MAP}` missing from eBPF object"))?;
     let hmap = AyaHashMap::<MapData, AyaInodeKey, u8>::try_from(map)
         .with_context(|| format!("{WATCHED_PATHS_MAP} is not a HashMap<InodeKey, u8>"))?;
-    Ok(WatchedPathsHandle { map: hmap })
+    Ok(WatchedPathsHandle {
+        map: WatchedPathsBacking::Kernel(hmap),
+    })
 }
 
 /// Tappa 9 C8 — diagnostic helper. Stat a candidate path and
@@ -584,6 +717,84 @@ mod tests {
         // ext4 + zfs all have non-zero superblock dev numbers).
         assert!(k1.dev != 0);
         assert!(k1.ino != 0);
+    }
+
+    /// External audit NN-AUD-122 (FIMP-010): a symlinked configured path
+    /// is watched by its own inode, each further link and the final target;
+    /// a regular file by its own inode only; a broken chain says so.
+    #[test]
+    fn populate_plan_enrolls_each_hop_and_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir(d.join("alternatives")).unwrap();
+        std::fs::write(d.join("nc.openbsd"), b"ELF").unwrap();
+        std::os::unix::fs::symlink(d.join("nc.openbsd"), d.join("alternatives/nc")).unwrap();
+        std::os::unix::fs::symlink(d.join("alternatives/nc"), d.join("nc")).unwrap();
+        let plan = plan_path_watches(&d.join("nc")).unwrap();
+        assert_eq!(
+            plan.own,
+            key_for_path(&d.join("nc")).unwrap(),
+            "the link itself"
+        );
+        assert_eq!(
+            plan.hops,
+            vec![
+                (
+                    d.join("alternatives/nc"),
+                    key_for_path(&d.join("alternatives/nc")).unwrap()
+                ),
+                (
+                    d.join("nc.openbsd"),
+                    key_for_path(&d.join("nc.openbsd")).unwrap()
+                ),
+            ]
+        );
+        assert!(!plan.broken && plan.chain_error.is_none());
+        let regular = plan_path_watches(&d.join("nc.openbsd")).unwrap();
+        assert!(regular.hops.is_empty() && !regular.broken);
+        std::os::unix::fs::symlink(d.join("gone"), d.join("dangling")).unwrap();
+        let broken = plan_path_watches(&d.join("dangling")).unwrap();
+        assert!(broken.hops.is_empty() && broken.broken);
+        assert_eq!(
+            plan_path_watches(&d.join("absent")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// External audit NN-AUD-120 (FIMP-008): a decoy finds room in a full
+    /// watch map by evicting a runtime child, and is refused — which the
+    /// canary deploy reports — only when nothing can be evicted, or there
+    /// is no kernel map.
+    #[test]
+    fn a_decoy_watch_is_refused_only_when_nothing_can_make_room() {
+        let watch = FimWatch {
+            path_map: Arc::new(InodePathMap::with_child_cap(8)),
+            watched_paths: Some(Arc::new(parking_lot::Mutex::new(WatchedPathsHandle::fake(
+                2,
+            )))),
+        };
+        let k = |ino| InodeKey { dev: 1, ino };
+        assert!(watch.watch(k(1), "/etc/passwd", WatchClass::Configured));
+        assert!(crate::fim::drain::watch_inode(
+            k(2),
+            "/etc/cron.d/x",
+            WatchClass::RuntimeChild,
+            &watch.path_map,
+            watch.watched_paths.as_deref(),
+        ));
+        assert!(
+            watch.watch(k(3), "/home/u/decoy", WatchClass::Decoy),
+            "the child makes room"
+        );
+        assert!(watch.path_map.lookup(&k(2)).is_none());
+        assert!(
+            !watch.watch(k(4), "/home/u/decoy2", WatchClass::Decoy),
+            "nothing left to evict"
+        );
+        assert!(
+            !FimWatch::detached().watch(k(5), "/home/u/decoy3", WatchClass::Decoy),
+            "no kernel map"
+        );
     }
 
     /// Regression guard: the credential classifier must flag exactly

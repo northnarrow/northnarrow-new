@@ -15,6 +15,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, FIM watch set (Medium FIMP-007, FIMP-008,
+  FIMP-010, FIMP-009): the FIM drain's retry queues had no cap and no
+  de-duplication, and their pass (one `stat` per entry, under a lock, on a
+  runtime worker) ran after every emitted event, so a burst of short-lived
+  files in a watched directory slowed the only reader of the FIM ring
+  quadratically. Each queue now holds one entry per path or inode, at most
+  1024 (the rest counted), and the pass runs at most every 5 ms, off the
+  runtime's threads. Files enrolled at runtime were never let go, and a
+  full `WATCHED_PATHS` refused every new watch with a WARN: a canary
+  deploy still answered Success and its decoy never tripped. Runtime
+  children are now capped at 4096, oldest out, swept every minute once
+  their file is gone; a full map makes room by evicting them, never a
+  configured path, a symlink hop or a decoy; an eviction or a refusal is an
+  ERROR and a signed `subsystem_degraded` (`fim_watch_map_full`, at most
+  once an hour), and a canary whose decoy cannot be watched is refused. A
+  watched symlink was watched by the link's inode only: an in-place change
+  of the file behind it (`/usr/bin/python3` to `python3.12`) or a
+  re-pointed `/etc/alternatives/nc` touched no watched inode. Each link (at
+  most 8, a loop refused) and the final target are now watched under the
+  configured path, a change there is checked against that path's baseline
+  once it has landed, and the baseline row records the canonical target.
+  A write on a path a Critical rule guards whose re-hash found the
+  baseline content (a change undone before the drain looked) left no
+  trace; it is now a drift row flagged `content_restored`, without a
+  verdict.
 - External audit, Wave 2, ADE window, prefill, failure evidence, prompt
   (Medium LLMR-008, LLMR-017, LLMR-003, LLMP-013): an over-long prompt
   lost its head, which is the system prompt; the engine now drops the
