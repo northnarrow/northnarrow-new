@@ -42,11 +42,15 @@ if [ -e /etc/debian_version ]; then fmt=deb; else fmt=rpm; fi
 if [ "$fmt" = rpm ] && ! command -v rpmbuild >/dev/null 2>&1; then
     sudo dnf install -y rpm-build >/dev/null 2>&1 || { bad "dnf install rpm-build"; exit 1; }
 fi
-rm -rf /tmp/nnpkg
+# External audit LAB-008: the packages are installed as root from here: a
+# fresh directory of the lab user's, not a fixed /tmp path another user could
+# have created first to swap a package before the install.
+PKGDIR=$(mktemp -d) || { bad "mktemp"; exit 1; }
+trap 'rm -rf "$PKGDIR"' EXIT
 for r in 1 2 3; do
-    NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh /tmp/nnpkg >/dev/null || { bad "build release $r"; exit 1; }
+    NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
 done
-pkg() { ls /tmp/nnpkg/* | grep -E "[-_]0?[0-9.]+-$1[._]" | head -1; }
+pkg() { ls "$PKGDIR"/* | grep -E "[-_]0?[0-9.]+-$1[._]" | head -1; }
 if [ "$fmt" = deb ]; then
     # apt's timers (unattended-upgrades) take the dpkg lock now and then: a
     # purge once failed on "dpkg frontend lock was locked by another process"

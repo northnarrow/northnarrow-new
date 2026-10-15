@@ -18,6 +18,13 @@ AUDIT=$ETC/audit.log
 DETS=$STATE/detections/detections.jsonl
 ONLY=
 [[ "${1:-}" == "--only" ]] && ONLY=$2
+# External audit LAB-008: root's scratch files live in a fresh 0700
+# directory, never at a fixed /tmp name another user could create first (C14
+# would bind that user's directory over /etc/northnarrow, C24 sign that
+# user's overlay with the lab key). Still under /tmp: C21 needs an exec there.
+TMPD=$(mktemp -d /tmp/nn-tamper.XXXXXXXX) || { echo "anti-tamper: mktemp failed" >&2; exit 1; }
+export TMPD
+trap 'rm -rf "$TMPD"' EXIT
 
 fail=0
 rows=()
@@ -166,12 +173,12 @@ WAIT=40 run_case C25 "shadow the agent unit from /run/systemd/transient" allowed
 rm -f "$SHADOW"; systemctl daemon-reload
 systemctl daemon-reload
 # ── mounts ────────────────────────────────────────────────────────────────
-mkdir -p /mnt/nn-bpf2 /tmp/nn-fake-etc
+mkdir -p /mnt/nn-bpf2 "$TMPD/fake-etc"
 WAIT=40 run_case C13 "second bpffs mount" allowed "integrity_drift" 0 -- mount -t bpf bpf /mnt/nn-bpf2
 umount /mnt/nn-bpf2 2>/dev/null || true
 # mounted, held for one check, unmounted BEFORE the evidence is read: while
 # it is mounted the host's /etc/northnarrow/audit.log is the fake one
-run_case C14 "bind mount over /etc/northnarrow for 40 s" allowed "integrity_drift" 0 -- bash -c "mount --bind /tmp/nn-fake-etc $ETC && sleep 40; umount $ETC"
+run_case C14 "bind mount over /etc/northnarrow for 40 s" allowed "integrity_drift" 0 -- bash -c "mount --bind $TMPD/fake-etc $ETC && sleep 40; umount $ETC"
 # Review 53: hiding the kernel BTF keeps every LSM hook from attaching at
 # the agent's next start (which now refuses to start); the mount itself is
 # reported while the agent runs.
@@ -206,7 +213,7 @@ if [[ -w "$CGK" ]]; then
 fi
 # 20k execs to overflow the exec ring, one exec from /tmp hidden inside:
 # either the exec is caught (R001) or the loss itself is signed evidence.
-WAIT=12 run_case C21 "exec flood (20k) hiding an exec from /tmp" allowed "R001_ExecFromTmp|R009_RootExecFromUserPath|ringbuf_drop" 0 -- bash -c 'cp /bin/true /tmp/nn-sat-$$ && { for i in $(seq 1 20000); do /bin/true; done & sleep 2; /tmp/nn-sat-$$; wait; rm -f /tmp/nn-sat-$$; }'
+WAIT=12 run_case C21 "exec flood (20k) hiding an exec from /tmp" allowed "R001_ExecFromTmp|R009_RootExecFromUserPath|ringbuf_drop" 0 -- bash -c 'cp /bin/true "$TMPD/nn-sat" && { for i in $(seq 1 20000); do /bin/true; done & sleep 2; "$TMPD/nn-sat"; wait; rm -f "$TMPD/nn-sat"; }'
 # open + read + connect through an io_uring ring: no openat/connect syscall
 # from userland (the openat tracepoint is blind to it by construction).
 IOU_SRC="$(dirname "$0")/iouring-probe.c"
@@ -214,10 +221,10 @@ IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
 if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
     # RHEL 9 ships kernel.io_uring_disabled=2: no ring, not even for root.
     echo "C22 skipped: io_uring disabled on this host (kernel.io_uring_disabled=2)" >&2
-elif [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>/tmp/nn-iou-cc.log; then
+elif [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>"$TMPD/iou-cc.log"; then
     WAIT=8 run_case C22 "io_uring: openat + read + connect through a ring" allowed "NN-L-IOU-00[12]" 0 -- "$IOU_BIN" /etc/hostname 127.0.0.1 9
 else
-    echo "C22 skipped: cannot build the io_uring probe ($(head -1 /tmp/nn-iou-cc.log 2>/dev/null))" >&2
+    echo "C22 skipped: cannot build the io_uring probe ($(head -1 "$TMPD/iou-cc.log" 2>/dev/null))" >&2
 fi
 # ── signed overlays (Tappa 10.8) ──────────────────────────────────────────
 # An unsigned exemption appended to the allowlist overlay, then a restart:
@@ -226,8 +233,8 @@ WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unaut
 PID=$(agent_pid)
 # The same overlay stored the authorised way (lab key, config-manage),
 # then a restart: stored with its signature, accepted at boot.
-printf '+backupd\n' > /tmp/nn-ovl-allow
-WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file /tmp/nn-ovl-allow --key $ADMIN_KEY && restart_agent"
+printf '+backupd\n' > "$TMPD/ovl-allow"
+WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file $TMPD/ovl-allow --key $ADMIN_KEY && restart_agent"
 PID=$(agent_pid)
 # Review 62: after a restart the task deny hooks must still report. They
 # were reused from the pinned link, bound to the previous boot's ring, so
@@ -273,13 +280,13 @@ fi
 # taint the kernel. Livepatches are modules too and take the same check.
 ko=$(modinfo -n dummy 2>/dev/null)
 case "$ko" in
-    *.ko)     cp "$ko" /tmp/nn_signed_dummy.ko 2>/dev/null ;;
-    *.ko.zst) zstd -qdc "$ko" > /tmp/nn_signed_dummy.ko 2>/dev/null ;;
-    *.ko.xz)  xz -dc "$ko" > /tmp/nn_signed_dummy.ko 2>/dev/null ;;
-    *)        rm -f /tmp/nn_signed_dummy.ko ;;
+    *.ko)     cp "$ko" "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
+    *.ko.zst) zstd -qdc "$ko" > "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
+    *.ko.xz)  xz -dc "$ko" > "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
+    *)        rm -f "$TMPD/nn_signed_dummy.ko" ;;
 esac
-if (( ! KGAP )) && [[ -s /tmp/nn_signed_dummy.ko ]]; then
-    python3 - /tmp/nn_signed_dummy.ko /tmp/nn_unsigned_dummy.ko <<'PY'
+if (( ! KGAP )) && [[ -s "$TMPD/nn_signed_dummy.ko" ]]; then
+    python3 - "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko" <<'PY'
 import sys
 data = open(sys.argv[1], "rb").read()
 magic = b"~Module signature appended~\n"
@@ -292,7 +299,7 @@ PY
     run_case C27 "load an unsigned module (finit_module, lockdown: $LOCKDOWN)" denied "" 0 -- python3 -c '
 import ctypes, os
 libc = ctypes.CDLL(None, use_errno=True)
-fd = os.open("/tmp/nn_unsigned_dummy.ko", os.O_RDONLY)
+fd = os.open(os.environ["TMPD"] + "/nn_unsigned_dummy.ko", os.O_RDONLY)
 if libc.syscall(313, fd, b"", 0) != 0:
     print(os.strerror(ctypes.get_errno()))
 else:
@@ -300,7 +307,7 @@ else:
 '
     rmmod dummy 2>/dev/null
 fi
-rm -f /tmp/nn_signed_dummy.ko /tmp/nn_unsigned_dummy.ko
+rm -f "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko"
 
 # ── systemd as the relay (external audit EBPF-001) ───────────────────────
 # Outside a trusted-installer window PID 1's signals are refused like a root
@@ -335,7 +342,7 @@ PBF_SRC="$(dirname "$0")/bpf-handle-probe.c"
 PBF_LIB=/usr/local/libexec/nn-lab/nn-bpf-probe.so
 AGENT_BIN=${AGENT_EXE:-/usr/local/bin/northnarrow-agent}
 WATCHDOG_BIN=$(dirname "$AGENT_BIN")/northnarrow-watchdog
-if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -O2 -o "$PBF_LIB" "$PBF_SRC" 2>/tmp/nn-pbf-cc.log; then
+if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -O2 -o "$PBF_LIB" "$PBF_SRC" 2>"$TMPD/pbf-cc.log"; then
     env LD_PRELOAD="$PBF_LIB" NNX_SLEEP=20 "$AGENT_BIN" >/dev/null 2>&1 &
     FRESH=$!
     sleep 1
@@ -349,7 +356,7 @@ if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -
     # foreign root process got a writable handle on each.
     run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
-    echo "C34-C37 skipped: cannot build the probe library ($(head -1 /tmp/nn-pbf-cc.log 2>/dev/null))" >&2
+    echo "C34-C37 skipped: cannot build the probe library ($(head -1 "$TMPD/pbf-cc.log" 2>/dev/null))" >&2
 fi
 # The way in that stays open: a watchdog restarted inside a window is the
 # fresh successor of its role and registers itself (the agent's restart is
@@ -393,16 +400,16 @@ fi
 # EINVAL in observe mode).
 LNK_SRC="$(dirname "$0")/link-detach-probe.c"
 LNK_BIN=/usr/local/libexec/nn-lab/nn-link-probe
-if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BIN" "$LNK_SRC" 2>/tmp/nn-lnk-cc.log; then
+if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BIN" "$LNK_SRC" 2>"$TMPD/lnk-cc.log"; then
     long="$PINS/"
     while (( ${#long} < 280 )); do long+="./"; done
     long+="link_task_kill"
     run_case C39 "link handle through a $(( ${#long} ))-byte path to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" "$long"
-    ln -sfn "$PINS/link_task_kill" /tmp/nn-link-alias
-    run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" /tmp/nn-link-alias
-    rm -f /tmp/nn-link-alias
+    ln -sfn "$PINS/link_task_kill" "$TMPD/link-alias"
+    run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" "$TMPD/link-alias"
+    rm -f "$TMPD/link-alias"
 else
-    echo "C39-C40 skipped: cannot build the link probe ($(head -1 /tmp/nn-lnk-cc.log 2>/dev/null))" >&2
+    echo "C39-C40 skipped: cannot build the link probe ($(head -1 "$TMPD/lnk-cc.log" 2>/dev/null))" >&2
 fi
 
 # External audit EVD-001: the agent's private signing key — every evidence
@@ -419,11 +426,11 @@ run_case C42 "verify the audit chain from the public half" allowed "" 0 -- \
 # to the agent. ATP-008: the shipped `.v1` lists were mutation-denied only.
 FSX_SRC="$(dirname "$0")/fsxattr-probe.c"
 FSX_BIN=/usr/local/libexec/nn-lab/nn-fsxattr-probe
-if [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BIN" "$FSX_SRC" 2>/tmp/nn-fsx-cc.log; then
+if [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BIN" "$FSX_SRC" 2>"$TMPD/fsx-cc.log"; then
     run_case C44 "fsxattr: clear the immutable flag of the state directory" denied "op=ioctl" 0 -- "$FSX_BIN" "$STATE" -i
     run_case C45 "fsxattr: make audit.log append-only" denied "op=ioctl" 0 -- "$FSX_BIN" "$ETC/audit.log" +a
 else
-    echo "C44-C45 skipped: cannot build the fsxattr probe ($(head -1 /tmp/nn-fsx-cc.log 2>/dev/null))" >&2
+    echo "C44-C45 skipped: cannot build the fsxattr probe ($(head -1 "$TMPD/fsx-cc.log" 2>/dev/null))" >&2
 fi
 run_case C46 "append to the shipped netflow blocklist" denied "op=write" 0 -- \
     bash -c "echo '# nn-lab C46' >> $ETC/netflow-blocklist.v1"

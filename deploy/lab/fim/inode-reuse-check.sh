@@ -16,8 +16,13 @@ mark=$(date '+%Y-%m-%d %H:%M:%S'); sleep 1
 # The drop is a rename into the watched directory: the event fires once the
 # file is complete, so the drain always enrolls its inode (a create event
 # can be handled before the file exists, and then nothing is enrolled).
-# FIM-007 kills the moving process; the file stays.
-sudo sh -c "echo '# nn reuse check' > /var/tmp/.nn-reuse-src" && sudo sh -c "mv /var/tmp/.nn-reuse-src $W" 2>/dev/null
+# FIM-007 kills the moving process; the file stays. External audit LAB-008:
+# root writes the source under a name mktemp picks (a fixed /var/tmp name
+# could be another user's file, then moved into /etc/cron.d by root).
+src=$(sudo mktemp /var/tmp/.nn-reuse-src.XXXXXXXX) || { echo "FAIL  mktemp"; exit 1; }
+sudo chmod 0644 "$src"
+sudo sh -c "echo '# nn reuse check' > $src" && sudo sh -c "mv $src $W" 2>/dev/null
+sudo rm -f "$src"
 sleep 2
 ino=$(sudo stat -c %i "$W" 2>/dev/null)
 dev=$(sudo stat -c %d "$W" 2>/dev/null)
@@ -27,11 +32,13 @@ sleep 2
 # Same filesystem as /etc on the lab guests. Files go straight into /tmp,
 # as a compiler's temporaries do: ext4 allocates in the parent directory's
 # block group, and a fresh subdirectory would land in another one.
-pfx="/tmp/nn-reuse-$$"
+# An unpredictable prefix, and each file created exclusively (noclobber:
+# O_EXCL), so root never writes into a file another user placed there.
+pfx=$(mktemp -u /tmp/nn-reuse.XXXXXXXX)
 hit=""
 for i in $(seq 1 2000); do
     f="$pfx-$i"
-    sudo sh -c ": > '$f'"
+    sudo sh -c "set -C; : > '$f'" || { echo "FAIL  $f exists already"; sudo sh -c "rm -f $pfx-*"; exit 1; }
     if [[ $(sudo stat -c %i "$f") == "$ino" && $(sudo stat -c %d "$f") == "$dev" ]]; then
         hit=$f
         break

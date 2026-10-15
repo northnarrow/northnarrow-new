@@ -15,6 +15,40 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, lab host hygiene and lab supply chain (Medium
+  LAB-008, LAB-009, LAB-002, LAB-015; Low LAB-010): lab scripts that run as
+  root on a guest worked at fixed paths under `/tmp` and `/var/tmp` that any
+  user can create first: the overhead benchmark truncated whatever the
+  entries of `/var/tmp/nn-bench` pointed to, `pkg-check` and `pkgmgr-check`
+  installed packages from a directory another user could own, and the
+  anti-tamper suite bound a `/tmp` directory over `/etc/northnarrow` (C14)
+  and signed a `/tmp` file as an overlay with the lab key (C24). They now
+  work in directories `mktemp` creates (one user's, unpredictable names);
+  `nn-bench` refuses a work directory that is a link or open to other users
+  and does not follow links. The base images came from "current"/"latest"
+  URLs over plain `curl`, unchecked: `up` now checks each download against
+  the vendor's signed list (Ubuntu, AlmaLinux: keys pinned by fingerprint;
+  Debian signs none of its current cloud images: HTTPS only, recorded as
+  such), records the digest next to the image, and layers a new guest only
+  on an image that still matches it; `nn-lab.sh verify-image` checks an
+  image downloaded earlier against the lists the vendor still publishes.
+  The guests' rustup comes from a pinned `rustup-init` checked against its
+  pinned SHA-256 instead of `curl | sh`; the range's Sliver from Kali's apt
+  repository instead of `curl | sudo bash`; the Atomic Red Team pin is
+  fetched or the provisioning stops (a failed checkout used to be
+  ignored), and the installed versions are written down. `release-check`
+  passed `SHA256SUMS` when any listed file matched and extracted the
+  tarball as root with its owners and modes; it now checks the tarball's
+  own line before extracting plain files. The lab added roles to every key
+  in `admin.pub` (an unanchored `sed` inside a window, another after a
+  reboot with nothing protecting the file); it no longer edits `admin.pub`,
+  and a guest where no key has `trusted-installer` is refused, to be
+  recreated. The Tappa 7 debug script under `docs/debug/` (it detached
+  every LSM link on the host and left the state directory damaged) is
+  deleted. **Regression:** a new base image needs `gnupg` and `gpgv` on the
+  host and, once, the vendor's key from the network; an image downloaded
+  before is used with a warning until `verify-image` records it; a guest
+  installed before the `trusted-installer` role must be recreated.
 - External audit, Wave 2, response and detection assertions (Medium
   TST-018, TST-005, TST-008, TST-006): a detection record named the
   response's action even when it did not happen — a kill that found the

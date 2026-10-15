@@ -10,7 +10,10 @@
 # guest is put back as it was at the end (unmount, agent restarted).
 set -u
 DET=/var/lib/northnarrow/detections/detections.jsonl
-IMG=/var/tmp/nn-btrfs-check.img
+# External audit LAB-008: the loop image is created by mktemp (root's,
+# unpredictable name) just before use; a fixed /var/tmp name could be a link
+# planted by another user, and root truncates and formats it.
+IMG=
 MNT=/mnt/nn-btrfs-check
 fail=0
 say() { printf 'btrfs-check: %s\n' "$*"; }
@@ -54,7 +57,7 @@ restart_agent() {
 cleanup() {
     sudo umount /root/.aws 2>/dev/null
     sudo umount "$MNT" 2>/dev/null
-    sudo rm -f "$IMG"
+    [ -n "$IMG" ] && sudo rm -f "$IMG"
     if [ -d /root/.aws.nn-btrfs-check ]; then
         sudo rm -rf /root/.aws && sudo mv /root/.aws.nn-btrfs-check /root/.aws
     else
@@ -97,6 +100,7 @@ else
 fi
 sudo rm -rf /root/.aws
 
+IMG=$(sudo mktemp /var/tmp/nn-btrfs-check.XXXXXXXX) || { say "FAIL — mktemp"; exit 1; }
 sudo truncate -s 512M "$IMG" && sudo mkfs.btrfs -q -f "$IMG" || { say "FAIL — mkfs.btrfs"; exit 1; }
 sudo mkdir -p "$MNT" && sudo mount -o loop "$IMG" "$MNT" || { say "FAIL — mount"; exit 1; }
 sudo btrfs subvolume create "$MNT/sv" >/dev/null

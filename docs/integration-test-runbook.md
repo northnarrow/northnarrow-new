@@ -60,6 +60,35 @@ and shipped with its provenance stamp; the guest only builds userland,
 so `agent/build.rs`'s staleness guard still holds. `respawn-check` is
 the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
 
+**Base images are verified** (external audit LAB-009,
+`deploy/lab/lib/verify-download.sh`). `up` downloads an image only
+against the vendor's list: Ubuntu's `SHA256SUMS` signed by the UEC Image
+Automatic Signing Key (`D2EB4462…7DB87C81`), AlmaLinux's `CHECKSUM` signed
+by the AlmaLinux OS 9 key (`BF18AC28…B86B3716`). The keys are pinned by
+fingerprint in the script and cached in `~/.cache/nn-lab/keys/`; a list
+counts only with a good signature by the pinned primary key (an expired or
+revoked key is refused). Debian signs none of its current cloud images: its
+`SHA512SUMS` is taken over HTTPS only (Debian's documented method) and the
+record says `unsigned`. The image keeps its final name only once its digest
+matches the list, and the digest is recorded in
+`<image>.verified` next to it; a new guest disk (first `up`, or after
+`destroy`) is only layered on an image that still matches its record. An
+image downloaded before these checks is neither downloaded again nor
+deleted (the guests are layered on it): `up` warns, and
+
+```sh
+NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh verify-image   # host side, no guest needed
+```
+
+looks for its digest in the lists the vendor still publishes (the current
+build, then up to `NN_LAB_VERIFY_BUILDS`=40 dated builds for Ubuntu and
+Debian; AlmaLinux's `CHECKSUM` lists its recent builds) and writes the
+record when it finds it; otherwise it fails and says to download again. The
+nightly report names the image and its record. Host packages: `gnupg`,
+`gpgv`. In the guest, cloud-init runs a pinned `rustup-init` checked
+against its pinned SHA-256 (no `curl | sh`). The self-test runs without
+network or guest: `bash deploy/lab/lib/verify-download-test.sh`.
+
 ### Other guests: Debian 12, Ubuntu 22.04, AlmaLinux 9
 
 `NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh up` boots a separate guest;
@@ -162,7 +191,9 @@ deploy/lab/nn-lab.sh release-check /tmp/nn-release             # per guest (NN_L
 The Tappa 10.8 demo is the *same* tarball, built and attested by CI,
 installed and verified on every distribution. `release-check` copies the
 tarball and `SHA256SUMS` to the guest, stops the lab's source install and
-then checks, in order: the tarball against `SHA256SUMS`; that the release
+then checks, in order: the tarball against its own line in `SHA256SUMS`
+(exactly one; external audit LAB-010: nothing is extracted otherwise, and
+the archive's owners and modes are not kept); that the release
 binaries run on the guest's glibc (CI builds on Ubuntu 24.04; the only
 newer glibc symbols are weak); that `install.sh --tarball --sums` verifies
 the tree and records `"provenance": "checksums"`; that the agent boots,

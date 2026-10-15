@@ -56,7 +56,10 @@ elif command -v dnf >/dev/null; then
   sudo dnf -q makecache
 else
   echo "  fallback: sudo bash -c '30 writes'"
-  sudo bash -c 'mkdir -p /tmp/t713-B && for i in {1..30}; do echo $i > /tmp/t713-B/f_$i; done'
+  # External audit LAB-008: root writes into a directory mktemp creates (a
+  # fixed /tmp/t713-B could be another user's, with links in it).
+  WORKB=$(sudo mktemp -d /tmp/t713-B.XXXXXXXX)
+  sudo bash -c 'for i in {1..30}; do echo $i > "$1/f_$i"; done' _ "$WORKB"
 fi
 
 echo "[t=2s] waiting 65 s for mass-write window to populate"
@@ -76,7 +79,7 @@ sudo nn-admin status --json 2>/dev/null \
   | jq -r '"posture=" + .posture + "  isolation=" + (.network_isolation_engaged|tostring)'
 
 # Cleanup fallback workdir
-sudo rm -rf /tmp/t713-B 2>/dev/null
+[[ -n "${WORKB:-}" ]] && sudo rm -rf "$WORKB"
 
 # Assertion
 POSTURE=$(sudo nn-admin status --json 2>/dev/null | jq -r '.posture // empty')

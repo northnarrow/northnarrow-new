@@ -4,7 +4,11 @@
 # (utime+stime delta of its pid). Output: "<workload> <ops/s> <agent_cpu_ms>".
 set -euo pipefail
 BIN=${1:?usage: run.sh <nn-bench binary>}
-WORK=/var/tmp/nn-bench
+# External audit LAB-008: a fresh root-only directory (mktemp: 0700, an
+# unpredictable name). The fixed /var/tmp/nn-bench could be created first by
+# any user, with links that root's writes would follow.
+WORK=$(mktemp -d /var/tmp/nn-bench.XXXXXXXX)
+trap 'rm -rf "$WORK"' EXIT
 agent_ticks() {
     local p
     p=$(cat /run/northnarrow/agent.pid 2>/dev/null) || { echo 0; return; }
@@ -17,4 +21,3 @@ for w in "open 200000" "wopen 50000" "exec 2000" "connect 5000" "udp 200000" "dn
     t1=$(agent_ticks)
     echo "$r $(( (t1 - t0) * 1000 / hz ))"
 done
-rm -rf "$WORK"

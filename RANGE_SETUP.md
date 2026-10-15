@@ -190,7 +190,8 @@ sudo deploy/adversarial/bootstrap-target-prod.sh        # build+install prod, he
 sudo rm /etc/sudoers.d/forty-claude-session             # realistic privilege posture
 
 # ── attacker (kalidev) ──   (toolchain already installed; only on rebuild:)
-# deploy/adversarial/provision-kali.sh                   # NAT attached, then detach
+# ART_REF=<tag|commit> deploy/adversarial/provision-kali.sh   # NAT attached, then detach;
+#   Sliver from Kali's apt repo; versions → ~/nn-range-toolkit.versions (keep with the evidence)
 
 # ── host: ARM ──
 #   stop Tailscale on kalidev; detach NAT on both VMs (§5)

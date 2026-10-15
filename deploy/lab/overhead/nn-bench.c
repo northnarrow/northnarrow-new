@@ -21,6 +21,7 @@
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -45,7 +46,7 @@ static int bench_open(long n, const char *dir)
     char buf[64];
     for (int i = 0; i < 64; i++) {
         snprintf(path[i], sizeof path[i], "%s/f%02d", dir, i);
-        int fd = open(path[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = open(path[i], O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
         if (fd < 0 || write(fd, "northnarrow-bench-northnarrow-bench-northnarrow-bench-0123456789", 64) != 64)
             return -1;
         close(fd);
@@ -68,7 +69,7 @@ static int bench_wopen(long n, const char *dir)
     memset(block, 'n', sizeof block);
     snprintf(path, sizeof path, "%s/w", dir);
     for (long i = 0; i < n; i++) {
-        int fd = open(path, O_WRONLY | O_CREAT, 0644);
+        int fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW, 0644);
         if (fd < 0)
             return -1;
         if (pwrite(fd, block, sizeof block, 0) != (ssize_t)sizeof block)
@@ -124,6 +125,28 @@ static int bench_connect(long n)
     return 0;
 }
 
+/* External audit LAB-008: run as root, the benchmark creates and truncates
+ * files in its workdir. The workdir must be a real directory (not a link)
+ * owned by the caller and writable by no one else, so that no other user
+ * can have placed entries in it; the file opens do not follow links. */
+static int workdir_ok(const char *dir)
+{
+    struct stat st;
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        perror(dir);
+        return 0;
+    }
+    if (lstat(dir, &st) != 0) {
+        perror(dir);
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        fprintf(stderr, "%s: not a directory of uid %u closed to other users; refusing it\n", dir, (unsigned)geteuid());
+        return 0;
+    }
+    return 1;
+}
+
 /* One datagram per iteration from an unconnected socket. `dns`: a query
  * to port 53 (nothing listens: the kernel answers ICMP, rate-limited, and
  * the datagram is built and sent all the same); otherwise a bound receiver
@@ -170,7 +193,8 @@ int main(int argc, char **argv)
     }
     const char *mode = argv[1];
     long n = atol(argv[2]);
-    mkdir(argv[3], 0755);
+    if (!workdir_ok(argv[3]))
+        return 1;
     double t0 = now();
     int rc;
     if (!strcmp(mode, "open"))
