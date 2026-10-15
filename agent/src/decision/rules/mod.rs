@@ -1,4 +1,5 @@
-//! Hardcoded Tappa 2 rule set (R001..=R010).
+//! Hardcoded rule set: the process rules (R001..R018) and the FIM,
+//! canary, network and chain families.
 
 use std::sync::Arc;
 
@@ -73,9 +74,9 @@ pub use r016_debugger_service_uid::R016DebuggerServiceUid;
 pub use r017_shell_from_nonstandard_path::R017ShellFromNonstandardPath;
 pub use r018_kernel_module_load::R018KernelModuleLoad;
 
-/// Build the default rule set in evaluation order. R004 (proc/self/fd
-/// — fileless exec) and R007 (crypto miner) come early because their
-/// match implies high confidence. The Tappa 9 FIM rules
+/// Build the default rule set in evaluation order. The process rules
+/// are ordered by [`spawn_rules`]: every kill before any record. The
+/// Tappa 9 FIM rules
 /// (NN-L-FIM-001..014) APPEND at the bottom since they match on
 /// `Event::Fim` rather than `Event::ProcessSpawn` — the first-match
 /// short-circuit never affects them. Tappa 9.5 K5 canary rules
@@ -92,26 +93,11 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // of any lower-severity net rule. See `chain.rs` module docs.
     let chains = chain::chain_rule_set();
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
-    let tappa2: Vec<Box<dyn Rule>> = vec![
-        Box::new(R004ExecFromProcSelfFd::default()),
-        Box::new(R007CryptoMiner),
-        Box::new(R006ReverseShellTooling),
-        Box::new(R009RootExecFromUserPath::default()),
-        Box::new(R010BinaryInWebroot),
-        Box::new(R002ExecFromDevShm),
-        Box::new(R001ExecFromTmp),
-        Box::new(R003ExecFromVarTmp),
-        Box::new(R005NetcatExec),
-        Box::new(R008HiddenHomeBinary),
-    ];
-    rules.extend(tappa2);
-    // Tappa 10.5 (D2) — 7 NN process rules R011..R017 APPEND after
-    // the Tappa 2 R001..R010 block so existing process-rule routing
-    // (first-match-wins within `Event::ProcessSpawn`) is unchanged.
-    // Empty allowlist here; the production main.rs path constructs
-    // its engine via [`default_rules_with_net`] instead, threading
-    // the operator-loaded process-comm allowlist in.
-    rules.extend(process_rules_empty());
+    // The process rules (R001..R017), with an empty allowlist; the
+    // production main.rs path constructs its engine via
+    // [`default_rules_with_net`] instead, threading the operator-loaded
+    // process-comm allowlist in.
+    rules.extend(spawn_rules(Arc::new(CommAllowlist::default()), None));
     rules.extend(module_load_rules());
     // FIM-009 self-upgrade (§15.1): the non-production rule set has no
     // admin dispatcher to arm an override, so FIM-009 gets an inert one
@@ -134,7 +120,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
 /// Tappa 10 N9 / Tappa 10.5 D2 — production builder. Same shape as
 /// [`default_rules`] but threads operator-loaded state in: the
 /// blocklists into the 9 NN-L-NET rules (N9) and the process-comm
-/// allowlist into the 7 R011..R017 process rules (D2). `main.rs`
+/// allowlist into R006, R007 and R011..R017 (D2, PROC-010). `main.rs`
 /// calls this once at boot after loading
 /// `/etc/northnarrow/netflow-blocklist.{v1,local}` +
 /// `netflow-ja3-blocklist.{v1,local}` +
@@ -162,29 +148,20 @@ pub fn default_rules_with_net(
     // the chain.rs module docs for the ordering rationale).
     let chains = chain::chain_rule_set_with(Some(lineage.clone()));
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
-    let tappa2: Vec<Box<dyn Rule>> = vec![
-        Box::new(R004ExecFromProcSelfFd::new(lineage.clone())),
-        Box::new(R007CryptoMiner),
-        Box::new(R006ReverseShellTooling),
-        Box::new(R009RootExecFromUserPath::new(lineage.clone())),
-        Box::new(R010BinaryInWebroot),
-        Box::new(R002ExecFromDevShm),
-        Box::new(R001ExecFromTmp),
-        Box::new(R003ExecFromVarTmp),
-        Box::new(R005NetcatExec),
-        Box::new(R008HiddenHomeBinary),
-    ];
-    rules.extend(tappa2);
     // External audit NETR-003 class: the process allowlist judged on what
-    // the kernel executed — from the exec event itself for R011..R017,
-    // through the lineage cache for the io_uring and BPF rules.
+    // the kernel executed — from the exec event itself for R006, R007 and
+    // R011..R017, through the lineage cache for the io_uring and BPF rules
+    // and for the actors of R011..R017 (external audit PROC-008).
     let process_allowlist = Arc::new(
         process_allowlist
             .as_ref()
             .clone()
             .with_identity(lineage.clone()),
     );
-    rules.extend(process_rules(Arc::clone(&process_allowlist)));
+    rules.extend(spawn_rules(
+        Arc::clone(&process_allowlist),
+        Some(lineage.clone()),
+    ));
     rules.extend(module_load_rules());
     rules.extend(iouring::iouring_rules(Arc::clone(&process_allowlist)));
     rules.extend(bpf::bpf_rules(process_allowlist));
@@ -246,20 +223,100 @@ pub(crate) fn judge_spawn(
     allowlist.judge_exec(&id, comm)
 }
 
-/// Tappa 10.5 (D2) — build the 7 process rules R011..R017 sharing an
-/// operator-loaded `process-comm-allowlist`. Mirrors the Tappa 10 N6
-/// [`net::net_rules`] factory: production threads the loaded allowlist
-/// via `Arc`; tests + the empty-state boot path use
-/// [`process_rules_empty`].
-pub fn process_rules(allowlist: Arc<CommAllowlist>) -> Vec<Box<dyn Rule>> {
+/// External audit PROC-008: the response of R011, R012, R013 and R017 to
+/// an exec the allowlist did not exempt as the program run. The shipped
+/// entries name trusted ACTORS — package managers, configuration
+/// management: a root exec of a program in a root-owned system tree with
+/// one of them in its lineage ([`CommAllowlist::actor_of`]) is recorded
+/// instead of killed, as review 49 and PROC-007 record package
+/// transactions (DKMS running `modprobe` under apt).
+///
+/// The lineage vouches for nothing else: a program outside a system tree
+/// (a payload a maintainer script dropped in `/tmp`), or an exec by
+/// another uid (a pager's shell under a user's `apt changelog`), is
+/// judged as before. R014..R016 only record; they need no actor.
+pub(crate) fn judge_actor(allowlist: &CommAllowlist, event: &Event, verdict: Verdict) -> Verdict {
+    if verdict.action == ResponseAction::Log {
+        return verdict;
+    }
+    let Event::ProcessSpawn {
+        pid,
+        uid,
+        filename,
+        exe,
+        ..
+    } = event
+    else {
+        return verdict;
+    };
+    if *uid != 0 || !crate::posture::lineage::in_system_tree(exe.path_or(filename)) {
+        return verdict;
+    }
+    let Some(actor) = allowlist.actor_of(*pid) else {
+        return verdict;
+    };
+    Verdict {
+        action: ResponseAction::Log,
+        reasoning: format!(
+            "{} [run under {}, a trusted actor in process-comm-allowlist: recorded, not killed]",
+            verdict.reasoning,
+            actor.display()
+        ),
+        ..verdict
+    }
+}
+
+/// The `Event::ProcessSpawn` rules in evaluation order (first match wins),
+/// shared by both builders. External audit PROC-009: every rule that can
+/// kill comes before any that only records (and a High record before a
+/// Medium one), so a record never stands in for a kill (`/home/u/.x/bash`
+/// was R008's Log, not R017's kill), and the specific tool rules come
+/// before the staging rules they outrank (`/tmp/insmod` is R011, High,
+/// T1547.006 — it was R001, Medium).
+///
+/// - R004 (fileless, Critical) and R007's exact names (Critical) lead.
+/// - R009 stays ahead of the staging rules: its record of an
+///   administrator's session or a package transaction (PROC-007) is a
+///   deliberate exception to them.
+/// - R006 records only the distribution's `socat` (`/usr/bin`, `/bin`,
+///   `/usr/sbin`, `/sbin`), which no later rule kills.
+/// - R018 reads `Event::ModuleLoad`; its place does not matter.
+///
+/// `lineage` (production) lets R004 and R009 read a parent's identity;
+/// without it only PID 1 counts as systemd and no session is sanctioned.
+fn spawn_rules(
+    allowlist: Arc<CommAllowlist>,
+    lineage: Option<crate::posture::lineage::AuthSessionTracker>,
+) -> Vec<Box<dyn Rule>> {
+    let (r004, r009) = match lineage {
+        Some(l) => (
+            R004ExecFromProcSelfFd::new(l.clone()),
+            R009RootExecFromUserPath::new(l),
+        ),
+        None => Default::default(),
+    };
+    let al = || Arc::clone(&allowlist);
     vec![
-        Box::new(R011KernelModuleTooling::new(Arc::clone(&allowlist))),
-        Box::new(R012SetcapTooling::new(Arc::clone(&allowlist))),
-        Box::new(R013NamespaceEscapeTooling::new(Arc::clone(&allowlist))),
-        Box::new(R014AtBatchScheduling::new(Arc::clone(&allowlist))),
-        Box::new(R015EncodingToolingServiceUid::new(Arc::clone(&allowlist))),
-        Box::new(R016DebuggerServiceUid::new(Arc::clone(&allowlist))),
-        Box::new(R017ShellFromNonstandardPath::new(allowlist)),
+        // Kills (and R009's exceptions).
+        Box::new(r004),
+        Box::new(R007CryptoMiner::new(al())),
+        Box::new(R006ReverseShellTooling::new(al())),
+        Box::new(r009),
+        Box::new(R010BinaryInWebroot),
+        Box::new(R011KernelModuleTooling::new(al())),
+        Box::new(R012SetcapTooling::new(al())),
+        Box::new(R013NamespaceEscapeTooling::new(al())),
+        Box::new(R017ShellFromNonstandardPath::new(al())),
+        Box::new(R002ExecFromDevShm),
+        Box::new(R001ExecFromTmp),
+        Box::new(R003ExecFromVarTmp),
+        // Records, the High ones first.
+        Box::new(R005NetcatExec),
+        Box::new(R007CryptoMiner::name_fragments(al())),
+        Box::new(R008HiddenHomeBinary),
+        Box::new(R014AtBatchScheduling::new(al())),
+        Box::new(R015EncodingToolingServiceUid::new(al())),
+        Box::new(R016DebuggerServiceUid::new(al())),
     ]
 }
 
@@ -286,13 +343,6 @@ pub fn module_load_rules() -> Vec<Box<dyn Rule>> {
             .map(String::from),
     ));
     vec![Box::new(R018KernelModuleLoad::new(loader_allowlist))]
-}
-
-/// Empty-allowlist convenience for boot + tests, mirroring
-/// [`net::net_rules_empty`]. With no allowlisted comms, the 7 rules
-/// fire purely on their comm/filename/uid predicates.
-pub fn process_rules_empty() -> Vec<Box<dyn Rule>> {
-    process_rules(Arc::new(CommAllowlist::default()))
 }
 
 /// Demo rule set for Tappa 5. Returned only when the `demo-tappa5`

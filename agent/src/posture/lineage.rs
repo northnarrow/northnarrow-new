@@ -821,28 +821,88 @@ impl AuthSessionTracker {
         is_match: impl Fn(&Path) -> bool,
         max_up: usize,
     ) -> Option<bool> {
+        self.lineage_walk(pid, |hop| is_match(&hop.exe), max_up)
+            .map(|found| found.is_some())
+    }
+
+    /// The walk of [`Self::lineage_match`], by hop: the first hop
+    /// `is_match` accepts — `pid`'s own, or an ancestor's that ran its exe
+    /// before the process below it was forked. `Some(None)` when the walk
+    /// ends without one, `None` when a hop cannot be read.
+    fn lineage_walk(
+        &self,
+        pid: u32,
+        is_match: impl Fn(&Hop) -> bool,
+        max_up: usize,
+    ) -> Option<Option<Hop>> {
         if pid == 0 || pid == 1 {
-            return Some(false);
+            return Some(None);
         }
         let mut below = self.hop(pid)?;
-        if is_match(&below.exe) {
-            return Some(true);
+        if is_match(&below) {
+            return Some(Some(below));
         }
         for _ in 0..max_up.min(LINEAGE_DEPTH_CAP) {
             let ppid = below.ppid;
             if ppid == 0 || ppid == 1 || ppid == below.pid {
-                return Some(false);
+                return Some(None);
             }
             let up = self.hop(ppid)?;
             if !self.started_no_later(&up, &below) {
-                return Some(false);
+                return Some(None);
             }
-            if is_match(&up.exe) && self.ran_before(&up, &below) {
-                return Some(true);
+            if is_match(&up) && self.ran_before(&up, &below) {
+                return Some(Some(up));
             }
             below = up;
         }
-        Some(false)
+        Some(None)
+    }
+
+    /// External audit PROC-008: the nearest process in the lineage of
+    /// `pid` — `pid` itself or an ancestor, on the walk of
+    /// [`Self::is_system_daemon_mediated`] (an ancestor counts only if it
+    /// ran its program before the process below it was forked, POS-003) —
+    /// whose exec identity `is_actor` accepts; its executable. `None` when
+    /// there is none, or when the walk loses the chain first.
+    pub fn actor_in_lineage(
+        &self,
+        pid: u32,
+        is_actor: impl Fn(&ExecIdentity) -> bool,
+    ) -> Option<PathBuf> {
+        self.lineage_walk(
+            pid,
+            |hop| is_actor(&self.hop_identity(hop)),
+            LINEAGE_DEPTH_CAP,
+        )?
+        .map(|hop| hop.exe)
+    }
+
+    /// What the kernel executed for a hop: the spawn cache's record, else
+    /// `/proc` (`cmdline` names the script an interpreter runs).
+    fn hop_identity(&self, hop: &Hop) -> ExecIdentity {
+        let script = if hop.cached {
+            hop.script.as_deref().map(str::to_string)
+        } else {
+            self.proc_script(hop.pid, &hop.exe)
+        };
+        ExecIdentity {
+            exe: hop.exe.clone(),
+            script,
+        }
+    }
+
+    /// The script or module an interpreter `exe` runs as process `pid`,
+    /// from `/proc/<pid>/cmdline` ([`script_of`]).
+    fn proc_script(&self, pid: u32, exe: &Path) -> Option<String> {
+        let cmdline = fs::read(self.inner.proc_root.join(pid.to_string()).join("cmdline"))
+            .unwrap_or_default();
+        let argv: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        script_of(exe, &argv).map(String::from)
     }
 
     /// One hop of the walk: the spawn cache's record of `pid` while it
@@ -858,6 +918,7 @@ impl AuthSessionTracker {
                     pid,
                     ppid: e.ppid,
                     exe: e.exe,
+                    script: e.script,
                     cached: true,
                     spawn_ns: e.spawn_ns,
                     start_ns: e.start_ns,
@@ -869,6 +930,7 @@ impl AuthSessionTracker {
             pid,
             ppid,
             exe,
+            script: None,
             cached: false,
             spawn_ns: 0,
             start_ns: 0,
@@ -1071,18 +1133,11 @@ impl AuthSessionTracker {
                 });
             }
         }
-        let dir = self.inner.proc_root.join(pid.to_string());
-        let exe = fs::read_link(dir.join("exe")).ok()?;
+        let exe = fs::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         if exe.to_string_lossy().ends_with(" (deleted)") {
             return None;
         }
-        let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
-        let argv: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        let script = script_of(&exe, &argv).map(String::from);
+        let script = self.proc_script(pid, &exe);
         Some(ExecIdentity { exe, script })
     }
 
@@ -1150,6 +1205,8 @@ struct Hop {
     pid: u32,
     ppid: u32,
     exe: PathBuf,
+    /// Cached only: what an interpreter `exe` runs ([`Entry::script`]).
+    script: Option<Box<str>>,
     /// From the spawn cache (the exec was seen), else from `/proc`.
     cached: bool,
     /// Cached only: when it executed `exe`, and its start.

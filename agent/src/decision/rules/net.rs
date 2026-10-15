@@ -2290,7 +2290,9 @@ impl Rule for NnLNet014DnsTunnelEntropy {
 /// Evaluation order: Critical first (never throttled), then the D4
 /// High/Medium additions BEFORE the broad Tappa 10 catch-alls so the
 /// specific refinements win first-match (NN-L-NET-018 before -007,
-/// NN-L-NET-019 before -006 — §13 Q10 documented overlaps).
+/// NN-L-NET-019 before -006 — §13 Q10 documented overlaps). External
+/// audit PROC-009: within an event type, every rule that kills comes
+/// before any that only records — a record never stands in for a kill.
 #[allow(clippy::too_many_arguments)]
 pub fn net_rules(
     blocklist: Arc<NetBlocklist>,
@@ -2312,16 +2314,29 @@ pub fn net_rules(
         // D4 additions. FP-3: -004/-014 take the shared DNS cache for
         // forwarder-aware originator back-correlation.
         Box::new(NnLNet002OutboundToBlockedTld),
-        Box::new(NnLNet004SuspiciousDnsQname::new(Arc::clone(&dns_cache))),
-        Box::new(NnLNet005DnsBurst::new(burst_window)),
         // Tappa 4.1 DNS observability refit — entropy-based tunnelling
         // detector, unblocked now the kprobe extracts the QNAME.
-        Box::new(NnLNet014DnsTunnelEntropy::new(dns_cache)),
+        // External audit PROC-009 (the same class, in the network rules):
+        // ahead of -004 and -005, which only record. Behind -004 it never
+        // saw a name over 60 characters — most tunnels' — so its
+        // corroboration never reached the kill.
+        Box::new(NnLNet014DnsTunnelEntropy::new(Arc::clone(&dns_cache))),
+        Box::new(NnLNet004SuspiciousDnsQname::new(dns_cache)),
+        Box::new(NnLNet005DnsBurst::new(burst_window)),
         // Tappa 10.5 D4 additions — specific refinements ordered
         // BEFORE the broad Tappa 10 catch-alls (-006 / -007).
+        // External audit PROC-009: every NetFlow rule that kills (-010,
+        // -018, -008) before any that only records (-011, -013, -007,
+        // -009): a staging-dir process reaching port 21, an internal host
+        // or a beacon's period was recorded, not killed by -008, and a
+        // beacon to a lateral port, by -018.
         Box::new(NnLNet010OutboundToHighRiskC2Port::new(Arc::clone(
             &comm_allowlist,
         ))),
+        Box::new(NnLNet018Rfc1918LateralPort::new(Arc::clone(
+            &comm_allowlist,
+        ))),
+        Box::new(NnLNet008OutboundFromTmpExec::new(lineage)),
         Box::new(NnLNet011PlaintextCredService::new(Arc::clone(
             &comm_allowlist,
         ))),
@@ -2329,9 +2344,6 @@ pub fn net_rules(
             beacon_window,
             Arc::clone(&comm_allowlist),
         )),
-        Box::new(NnLNet018Rfc1918LateralPort::new(Arc::clone(
-            &comm_allowlist,
-        ))),
         Box::new(NnLNet019WildcardListener::new(Arc::clone(&comm_allowlist))),
         // Review 78: no comm allowlist — the kernel exempts the resolvers.
         Box::new(NnLNet020DnsQueryFlood::new()),
@@ -2343,7 +2355,6 @@ pub fn net_rules(
         Box::new(NnLNet007Rfc1918FromUnusualProc::new(Arc::clone(
             &comm_allowlist,
         ))),
-        Box::new(NnLNet008OutboundFromTmpExec::new(lineage)),
         Box::new(NnLNet009ByteAnomaly::new(comm_allowlist)),
     ]
 }
@@ -4058,5 +4069,111 @@ mod tests {
             .expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert!(v.reasoning.contains("something else"), "{}", v.reasoning);
+    }
+
+    // ── External audit PROC-009: no record stands in for a kill ────────
+
+    /// What first-match returns over `rules`, as the engine does.
+    fn first_match(rules: &[Box<dyn Rule>], e: &Event) -> Option<Verdict> {
+        rules.iter().find_map(|r| r.evaluate(e))
+    }
+
+    fn strength(v: &Verdict) -> (u8, u8) {
+        let action = match v.action {
+            ResponseAction::Log => 0,
+            ResponseAction::KillProcessTree => 2,
+            _ => 1,
+        };
+        (action, v.severity as u8)
+    }
+
+    /// External audit PROC-009 (the same class in the network rules): for
+    /// a flow, first match is the strongest verdict any one rule returns.
+    /// A staging-dir process reaching an internal host or port 21 was
+    /// NN-L-NET-007's or -011's record, not -008's kill.
+    #[test]
+    fn no_netflow_record_shadows_a_kill() {
+        for exe in ["/tmp/payload", "/dev/shm/payload", "/usr/bin/payload"] {
+            for dst in [v4(10, 0, 0, 5), v4(8, 8, 8, 8)] {
+                for port in [21, 23, 443, 445, 4444, 8080] {
+                    let mut e = flow(dst, port, "payload");
+                    if let Event::NetFlow(nf) = &mut e {
+                        nf.exe = Some(exe.to_string());
+                    }
+                    let got = first_match(&net_rules_empty(), &e);
+                    let strongest = net_rules_empty()
+                        .iter()
+                        .filter_map(|r| r.evaluate(&e))
+                        .map(|v| strength(&v))
+                        .max();
+                    assert_eq!(
+                        got.as_ref().map(strength),
+                        strongest,
+                        "{exe} -> {dst}:{port}: {:?}",
+                        got.map(|v| v.rule_id)
+                    );
+                }
+            }
+        }
+    }
+
+    /// External audit PROC-009: NN-L-NET-013 (a record) ran before -018:
+    /// once a process's flows to an internal SMB port fell into a period,
+    /// the beacon record replaced the lateral-movement kill.
+    #[test]
+    fn a_beacon_never_shadows_a_lateral_movement_kill() {
+        let rules = net_rules_empty();
+        for i in 0..10u64 {
+            let e = flow_pid(
+                4242,
+                v4(10, 0, 0, 5),
+                445,
+                "payload",
+                1 + i * 60_000_000_000,
+            );
+            let v = first_match(&rules, &e).expect("a verdict per flow");
+            assert_eq!(
+                v.action,
+                ResponseAction::KillProcess,
+                "flow {i}: {}",
+                v.rule_id
+            );
+        }
+    }
+
+    /// External audit PROC-009: NN-L-NET-004 (a record of any name over 60
+    /// characters) ran before -014, which therefore never saw most tunnels'
+    /// names, and its corroborated kill never came.
+    #[test]
+    fn a_tunnel_of_long_names_reaches_the_tunnel_kill() {
+        let rules = net_rules_empty();
+        let label = |i: usize| format!("{i:02}q7v3k9x2m4p8r6t1w5y0z3b7c9d2f4h6j8l0n");
+        let mut actions = Vec::new();
+        for i in 0..DNS_TUNNEL_DISTINCT_LABELS {
+            let q = format!("{}.t.attacker-tunnel.example", label(i));
+            assert!(q.len() > 60, "{q}");
+            let v = first_match(&rules, &dns_event(33, &q, 1)).expect("recorded");
+            actions.push((v.rule_id, v.action));
+        }
+        assert_eq!(
+            actions.last(),
+            Some(&(
+                "NN-L-NET-014_DnsTunnelEntropy".to_string(),
+                ResponseAction::KillProcess
+            )),
+            "{actions:?}"
+        );
+        // A long name without an encoded label is still -004's record.
+        let v = first_match(
+            &rules,
+            &dns_event(
+                34,
+                "www.internal-payments-api-production.eu-west-1.elb.amazonaws.com",
+                1,
+            ),
+        )
+        .expect("recorded");
+        assert_eq!(v.rule_id, "NN-L-NET-004_SuspiciousDnsQname");
+        assert_eq!(v.action, ResponseAction::Log);
     }
 }

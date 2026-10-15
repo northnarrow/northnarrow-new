@@ -15,6 +15,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, process and canary rule coverage (Medium
+  PROC-009, PROC-010, PROC-008, NETR-006): the first rule to match wins,
+  and records ran ahead of kills — a shell in a hidden home directory was
+  recorded, not killed; a staging-dir process reaching port 21 or an
+  internal host was recorded; a DNS tunnel with names over 60 characters
+  never reached its kill. Every rule that kills now comes first, and the
+  specific tool rules come before the staging ones: `/tmp/insmod` is R011
+  (High, T1547.006), not R001 (Medium). R007 killed the tree of any
+  process whose name contained a miner's (`xmrig-cleanup`), and R006
+  every `socat`, the distribution's included: both take the process
+  allowlist; R007 kills an exact miner name (in the process name or the
+  executed file's) and records a name that only contains one; R006
+  records the distribution's `socat` unless it runs a shell. The shipped
+  process allowlist names package managers and configuration management,
+  but the rules judged only the program run, so it never applied: a root
+  exec of a system-tree tool under one of them (DKMS running `modprobe`
+  under apt) is now recorded, not killed. A canary accessed in a way its
+  type does not expect — a File decoy's path executed — got no verdict
+  and was burned; any access now answers. **Regression:** rule ids and
+  severities change for these cases, a miner renamed `xmrig-something`
+  and the distribution's `socat` relaying to anything but a shell are only
+  recorded, and the engine holds R007 twice (73 rules, 72 ids).
 - External audit, Wave 2, admin read verbs (Medium ASK-006, ASK-007,
   ASK-008): `fim report`, `net flows` and `canary list` read the active
   file from its start and stopped at half a frame, so past about fifty rows
