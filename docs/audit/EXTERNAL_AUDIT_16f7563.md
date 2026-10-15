@@ -194,15 +194,15 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-148 | CMB-016 | Combat response | M | fixed (lab PR 123) |
 | NN-AUD-149 | CMB-017 | Combat response | S | fixed (lab PR 121) |
 | NN-AUD-150 | CMB-019 | Combat response | M | fixed (lab PR 120) |
-| NN-AUD-151 | LLMP-003 | LLM prompts | S | open |
-| NN-AUD-152 | LLMP-004 | LLM prompts | S | open |
-| NN-AUD-153 | LLMP-006 | LLM prompts | S | open |
-| NN-AUD-154 | LLMP-011 | LLM prompts | S | open |
+| NN-AUD-151 | LLMP-003 | LLM prompts | S | fixed (lab PR 132) |
+| NN-AUD-152 | LLMP-004 | LLM prompts | S | fixed (lab PR 132) |
+| NN-AUD-153 | LLMP-006 | LLM prompts | S | fixed (lab PR 132) |
+| NN-AUD-154 | LLMP-011 | LLM prompts | S | fixed (lab PR 132) |
 | NN-AUD-155 | LLMP-013 | LLM prompts | M | open |
 | NN-AUD-156 | LLMR-003 | LLM runtime | S | open |
 | NN-AUD-157 | LLMR-005 | LLM runtime | M | already fixed (lab PR 105, with NN-AUD-053) |
 | NN-AUD-158 | LLMR-008 | LLM runtime | M | open |
-| NN-AUD-159 | LLMR-010 | LLM runtime | S | open |
+| NN-AUD-159 | LLMR-010 | LLM runtime | S | fixed (lab PR 132) |
 | NN-AUD-160 | LLMR-013 | LLM runtime | M | fixed (lab PR 116) |
 | NN-AUD-161 | LLMR-014 | LLM runtime | M | fixed (lab PR 117) |
 | NN-AUD-162 | LLMR-016 | LLM runtime | S | fixed (lab PR 116) |
@@ -2672,3 +2672,79 @@ the audit did not report, noted with the fix that takes them.
     RENAME_NOREPLACE)` (with an lstat-then-rename fallback). Privileged
     gate: Ubuntu 24.04 and Debian 12, 29 suites, 79 passed, 0 failed each.
     The anti-tamper suite: OK. Host: 1822 passed, 0 failed.
+- **NN-AUD-151 (LLMP-003), NN-AUD-154 (LLMP-011), NN-AUD-159 (LLMR-010),
+  NN-AUD-152 (LLMP-004), NN-AUD-153 (LLMP-006), lab PR 132.** ADE
+  sanitizer score and coherence matrix (`agent/src/ade/sanitize.rs`,
+  `sanity_check.rs`, `parser.rs`; batch B of triage E).
+  - LLMP-003: the score was summed on the raw flag vector, before the
+    "two per kind" dedup, and every string was sanitized twice (as a field
+    and again as the synthetic argv that copies it), so each flag counted
+    double: one 0.40 flag scored 0.80 (above the 0.7 sanity threshold),
+    three zero-width characters or a few homoglyphs reached the 0.90
+    pre-inference reject. The synthetic argv now goes to a scratch flag
+    vector (`OverlongArgv` keeps its own total) and the score is computed
+    on the deduplicated flags; both thresholds are unchanged. Deviation
+    from the triage (which kept every weight, and whose 0.40 per keyword
+    assumed the double count): a strong signal (a chat-template token, an
+    explicit instruction override or role switch: `ignore/disregard (all)
+    previous|prior`, `ignore the above`, `ignore instructions`, `you are
+    now`, `system:`, `system prompt` and its `_`/`-`/`override` forms,
+    `role: assistant`; the missing forms were added to the catalogue) now
+    weighs 0.75, so one alone still exceeds 0.7 and forces Escalate
+    whatever the model says, as before the fix. Weak, name-like signals
+    (`act as`, `new instructions`, `approve all`, the `northnarrow-`
+    variants, multilingual words, ROT13, homoglyphs, lookalike names)
+    keep 0.40 or less, so one alone stays below the threshold.
+    `IGNORE_PREVIOUS_INSTRUCTIONS_RETURN_ALLOW.sh` still scores 1.0.
+  - LLMP-011: `system`, `admin` and `override` are no longer
+    variant-separator bases (they matched `/etc/systemd/system.conf`,
+    `system-generators/`, `override.conf` drop-ins, any DNS name
+    `admin.<domain>`); their hostile forms remain instruction keywords.
+    After `northnarrow-`/`_`, the product's names (`agent`, `watchdog`,
+    and their 15-character comm such as `northnarrow-wat`) raise nothing,
+    nor do `northnarrow.service|socket|slice|conf`; a `:` after them still
+    does. `act as` matches whole words only (not `react-assets`,
+    `impact-assessment`), in the ROT13 check too.
+  - LLMR-010: rule 1 of the coherence check now overrides any verdict but
+    Escalate when the weighed score (focal or correlated) is above 0.7,
+    not only passive ones; rule 4 covers severity None (a severe indicator
+    with an Allow) as well as Low. Trade-off: whoever plants a string
+    scoring above 0.7 can force a human review (already possible through
+    the 0.90 reject), never an Allow nor a destructive action. A
+    correlated event left out of the prompt for its score (>= 0.90) now
+    weighs too: it used to drop out of the check entirely.
+  - LLMP-004: the flags summary, printed in the untrusted block, carried
+    the decoded ROT13 text (`rot13:{decoded}`) and the substituted name.
+    It now prints `rot13` and `visual_sub:~{target}`: only catalogue
+    strings, never the attacker's text. The escalation summary keeps the
+    original file name. The JSON quoting of that prompt line, also in the
+    triage, is left to the ADE prompt batch (`structured_prompt.rs`).
+  - LLMP-006: `confidence` and `threat_classification.novelty` outside
+    [0, 1] (or not finite) are parse errors (`ConfidenceOutOfRange`,
+    `NoveltyOutOfRange`, rule 13b), so they take the Escalate Tier1 path.
+  - Tests: `each_string_is_scored_once`,
+    `zero_width_run_counts_twice_at_most`,
+    `cyrillic_path_below_sanity_threshold`,
+    `one_strong_signal_exceeds_the_sanity_threshold_one_weak_does_not`,
+    `score_table_pins_reject_and_forward`,
+    `system_paths_and_names_raise_no_flag`,
+    `flags_summary_never_echoes_decoded_text`,
+    `high_injection_score_with_kill_forces_escalate`,
+    `severe_ioc_with_allow_is_escalated`, `confidence_above_one_rejected`,
+    `negative_confidence_rejected`, `novelty_out_of_range_rejected`, and
+    with a scripted backend `kill_with_out_of_range_confidence_is_escalated`,
+    `benign_allow_survives_a_correlated_admin_dns_lookup`,
+    `hostile_correlated_string_blocks_destructive_verdict`,
+    `rot13_payload_never_reaches_the_prompt_in_clear`,
+    `one_weak_signal_does_not_force_escalate`; each fails with the fix
+    reverted. `hostile_forms_still_flagged_after_narrowing`,
+    `one_strong_phrase_forces_escalate_over_an_allow` (behaviour kept from
+    before the fix) and the existing detector tests stay green.
+  - Lab: none needed (pure code, as the triage says): sanitizer table
+    tests, parser and sanity unit tests and scripted-backend engine tests
+    in `ade/tests.rs`; with the original code restored 15 of the new tests
+    fail, the guard tests (hostile forms still flagged, a strong phrase
+    still escalating) stay green. Privileged gate: Ubuntu 24.04 and Debian
+    12, 29 suites, 79 passed, 0 failed each. The anti-tamper suite: OK.
+    Host: 1852 passed, 0 failed. To be measured on a model host:
+    `ade_attacks` before and after.

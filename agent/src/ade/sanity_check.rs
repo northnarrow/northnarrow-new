@@ -58,18 +58,26 @@ pub fn verify_verdict_coherence(
     verdict: &AdeVerdict,
     sanitized: &SanitizedEvent,
 ) -> SanityCheckResult {
-    // 1. High injection score + passive verdict ⇒ assume the model
-    //    swallowed the bait. Force Escalate Tier1.
-    if sanitized.injection_score > 0.7 && is_passive_action(verdict.verdict) {
+    // 1. High injection score ⇒ assume the model may have swallowed the
+    //    bait. Force Escalate Tier1.
+    //
+    //    External audit LLMR-010: any verdict but Escalate, not only the
+    //    passive ones. Since LLMP-002 the score also weighs the correlated
+    //    events, so a hostile string in another process's event could sit
+    //    behind a Kill of the focal one. Trade-off: whoever can plant a
+    //    string scoring above 0.7 can force a human review (already
+    //    possible through the 0.90 pre-inference reject), never an Allow
+    //    and never a destructive action.
+    if sanitized.injection_score > 0.7 && verdict.verdict != AdeAction::Escalate {
         return SanityCheckResult::AnomalyDetected {
             reason: format!(
-                "injection_score={:.2} but verdict={} (passive). Treating as compromised verdict.",
+                "injection_score={:.2} but verdict={}. Treating as compromised verdict.",
                 sanitized.injection_score, verdict.verdict
             ),
             forced_verdict: synthetic_escalate(
                 verdict,
-                "high_injection_score_passive_verdict",
-                "Sanity check: high prompt-injection score paired with a non-acting verdict — possible successful injection.",
+                "high_injection_score_verdict",
+                "Sanity check: high prompt-injection score paired with a non-Escalate verdict — possible successful injection.",
             ),
         };
     }
@@ -108,12 +116,15 @@ pub fn verify_verdict_coherence(
     }
 
     // 4. IoC matched in evidence (ransomware/miner/rootkit) but
-    //    severity is Low ⇒ contradictory.
-    if has_severe_indicator(verdict) && verdict.severity == AdeSeverity::Low {
+    //    severity is Low ⇒ contradictory. External audit LLMR-010:
+    //    severity None too, which is the severity of an Allow.
+    if has_severe_indicator(verdict)
+        && matches!(verdict.severity, AdeSeverity::None | AdeSeverity::Low)
+    {
         return SanityCheckResult::AnomalyDetected {
             reason: format!(
-                "primary_indicators={:?} include severe IoC but severity=Low",
-                verdict.evidence.primary_indicators
+                "primary_indicators={:?} include severe IoC but severity={}",
+                verdict.evidence.primary_indicators, verdict.severity
             ),
             forced_verdict: synthetic_escalate(
                 verdict,
@@ -495,6 +506,59 @@ mod tests {
         match verify_verdict_coherence(&v, &s) {
             SanityCheckResult::InconsistencyFlagged { .. } => {}
             other => panic!("expected flag, got {:?}", other),
+        }
+    }
+
+    /// External audit LLMR-010: a high score blocks a destructive verdict
+    /// too, not only a passive one.
+    #[test]
+    fn high_injection_score_with_kill_forces_escalate() {
+        let s = sanitize_event_for_ade(&spawn("/home/u/disregard_previous.sh"));
+        assert!(s.injection_score > 0.7 && s.injection_score < 0.9);
+        for action in [
+            AdeAction::Kill,
+            AdeAction::KillTree,
+            AdeAction::Quarantine,
+            AdeAction::Throttle,
+            AdeAction::BlockNetwork,
+        ] {
+            let v = baseline(action, AdeSeverity::High, 0.95);
+            match verify_verdict_coherence(&v, &s) {
+                SanityCheckResult::AnomalyDetected { forced_verdict, .. } => {
+                    assert_eq!(forced_verdict.verdict, AdeAction::Escalate);
+                    assert_eq!(
+                        forced_verdict.escalation_tier,
+                        Some(EscalationTier::Tier1Review)
+                    );
+                }
+                other => panic!("{action}: expected anomaly, got {:?}", other),
+            }
+        }
+    }
+
+    /// External audit LLMR-010: an Escalate stays as the model wrote it.
+    #[test]
+    fn high_injection_score_keeps_an_escalate() {
+        let s = sanitize_event_for_ade(&spawn("/home/u/disregard_previous.sh"));
+        let v = baseline(AdeAction::Escalate, AdeSeverity::High, 0.5);
+        assert!(!matches!(
+            verify_verdict_coherence(&v, &s),
+            SanityCheckResult::AnomalyDetected { .. }
+        ));
+    }
+
+    /// External audit LLMR-010: a severe IoC with an Allow (severity
+    /// None) is replaced, not only flagged.
+    #[test]
+    fn severe_ioc_with_allow_is_escalated() {
+        let s = sanitize_event_for_ade(&spawn("/usr/local/bin/x"));
+        let mut v = baseline(AdeAction::Allow, AdeSeverity::None, 0.7);
+        v.evidence.primary_indicators = vec!["xmrig cryptominer".into()];
+        match verify_verdict_coherence(&v, &s) {
+            SanityCheckResult::AnomalyDetected { forced_verdict, .. } => {
+                assert_eq!(forced_verdict.verdict, AdeAction::Escalate);
+            }
+            other => panic!("expected anomaly, got {:?}", other),
         }
     }
 }
