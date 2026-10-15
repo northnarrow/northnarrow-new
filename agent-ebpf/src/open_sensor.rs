@@ -50,6 +50,7 @@ use northnarrow_common::wire::{InodeKey, FIM_OP_OPENED};
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_FLAGS_OFFSET,
     FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
+    INODE_I_SIZE_OFFSET,
     INODE_I_SB_OFFSET, PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
 };
@@ -59,6 +60,14 @@ const FMODE_WRITE: u32 = 0x2;
 /// `FMODE_CREATED` (include/linux/fs.h, `1 << 20` since 4.19): this open
 /// created the file. Set before `security_file_open` runs.
 const FMODE_CREATED: u32 = 0x10_0000;
+
+/// An overwrite counts only for an existing file of at least this size,
+/// read at open (before `O_TRUNC` empties it). Encryption in place is the
+/// shape of documents; a build rewrites its own small outputs — a full
+/// workspace rebuild in the lab (lab PR 127): up to 17 overwrites per
+/// cargo process in all, at most 4 of 4 KiB or more — and a cargo build,
+/// counted as ransomware, was killed and cargo and rustc quarantined.
+const OVERWRITE_MIN_BYTES: u64 = 4096;
 /// `OpenWriteWindow::fired` bits: the threshold already reported.
 const FIRED_WRITES: u32 = 1;
 const FIRED_OVERWRITES: u32 = 2;
@@ -545,7 +554,8 @@ pub unsafe fn on_open(file: *const u8) {
     // socket opened for writing (`> /dev/null` in a script loop, systemd
     // writing `/dev/console` at shutdown) does not count.
     let regular = (win_u32(iw, INODE_WIN, inode, off!(INODE_I_MODE_OFFSET)) as u16) & S_IFMT == S_IFREG;
-    observe(&key, watched, watched, mode, flags, dentry, regular);
+    let size = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SIZE_OFFSET));
+    observe(&key, watched, watched, mode, flags, dentry, regular, size);
 }
 
 /// The sensor proper. `family_checked`: the caller already knows the
@@ -559,6 +569,7 @@ unsafe fn observe(
     flags: u32,
     dentry: *const u8,
     regular: bool,
+    size: u64,
 ) {
     let write = mode & FMODE_WRITE != 0;
     if dentry.is_null() {
@@ -647,7 +658,7 @@ unsafe fn observe(
     // threshold (once per window).
     let mut count = 0u32;
     if write && regular {
-        let (bits, n) = count_write(&cls, mode & FMODE_CREATED == 0);
+        let (bits, n) = count_write(&cls, mode & FMODE_CREATED == 0 && size >= OVERWRITE_MIN_BYTES);
         reason |= bits;
         count = n;
     }

@@ -6,6 +6,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- A build rewriting its own outputs (`cargo build`: fingerprints,
+  timestamps, `.d` files) was counted as encryption in place: with another
+  alert in the session it reached COMBAT, which killed cargo and
+  quarantined `cargo` and `rustc`. An overwrite counts only for an existing
+  file of at least 4 KiB (its size read at open).
 - External audit, Wave 2, network rule state and addressing (Medium
   NETR-005, NETR-007, NETR-008): NN-L-NET-008 (outbound from a staged
   binary) never fired — no flow row carried the process's executable. The
