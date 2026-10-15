@@ -258,7 +258,8 @@ fn synth_verdict(event: &Event, model_id: &str, quantization: &str) -> AdeVerdic
         }
         Event::TcpConnect { pid, comm, .. }
         | Event::DnsQuery { pid, comm, .. }
-        | Event::DnsFlood { pid, comm, .. } => {
+        | Event::DnsFlood { pid, comm, .. }
+        | Event::SensorFlood { pid, comm, .. } => {
             pid_for_pkg = *pid;
             filename_for_pkg = comm.clone();
         }

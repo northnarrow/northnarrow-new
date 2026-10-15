@@ -134,6 +134,7 @@ fn event_timestamp_ns(e: &Event) -> u64 {
         | Event::TcpConnect { timestamp_ns, .. }
         | Event::DnsQuery { timestamp_ns, .. }
         | Event::DnsFlood { timestamp_ns, .. }
+        | Event::SensorFlood { timestamp_ns, .. }
         | Event::FsProtectDenial { timestamp_ns, .. } => *timestamp_ns,
         // Tappa 9 (C4): FIM events carry timestamp_ns on the
         // inner FimEvent.
@@ -175,6 +176,7 @@ fn focal_keys(e: &Event) -> (u32, Option<u32>, Option<&str>) {
         Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }
         | Event::DnsFlood { pid, .. }
+        | Event::SensorFlood { pid, .. }
         | Event::FsProtectDenial { pid, .. } => (*pid, None, None),
         // Tappa 9 (C4): FIM drift keys off (modifier_pid, path).
         // No ppid info from the kernel hook.

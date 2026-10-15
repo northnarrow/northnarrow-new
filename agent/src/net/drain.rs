@@ -561,6 +561,17 @@ async fn process_listen_record(
         comm: comm_to_string(&raw.comm),
         exe: None,
     };
+    // External audit EBPF-013: listen() calls the kernel's record budgets
+    // held back since this process's previous record.
+    let floods = common::sensor_floods(
+        common::FloodSource::Listen,
+        raw.pid,
+        raw.uid,
+        &ev.comm,
+        raw.held,
+        raw.held_uid,
+        raw.timestamp_ns,
+    );
     if let Some(db) = listener_db {
         if let Err(e) = db.lock().append(&ev) {
             warn!(error = %e, "appending NetListenerEntry to listeners log failed");
@@ -568,6 +579,12 @@ async fn process_listen_record(
     }
     if event_tx.send(Event::NetListener(ev)).await.is_err() {
         // bus closed
+        return;
+    }
+    for flood in floods.into_iter().flatten() {
+        if event_tx.send(flood).await.is_err() {
+            return;
+        }
     }
 }
 

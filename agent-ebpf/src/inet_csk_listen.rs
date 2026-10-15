@@ -13,6 +13,16 @@
 //! BTF offsets in [`crate::btf_offsets`] (kernel 6.8.0-117,
 //! validated 2026-05-20). The runbook bumps these offsets on a
 //! kernel upgrade.
+//!
+//! External audit EBPF-013: an unprivileged loop of `listen()` on fresh
+//! sockets filled the 64 KiB ring and pushed other processes' listener
+//! records out, leaving only an anonymous drop counter. Every listener is
+//! still tracked within a record budget ([`crate::budget`]: per process
+//! [`TASK_BURST`], then 128 per second; per user [`UID_BURST`], then 256
+//! per second), which no real server reaches. Calls over it are held
+//! back, counted in the `listen_rate` slot, and the process's next record
+//! carries the count (`held`, `held_uid`), so the agent names the looping
+//! process (NN-L-NET-021).
 
 use aya_ebpf::{
     helpers::{
@@ -20,11 +30,12 @@ use aya_ebpf::{
         bpf_probe_read_kernel,
     },
     macros::{kprobe, map},
-    maps::RingBuf,
+    maps::{LruHashMap, RingBuf},
     programs::ProbeContext,
 };
 use northnarrow_common::wire::{NetListenRaw, ADDR_LEN, NET_LISTEN_EVENTS_BYTES, TASK_COMM_LEN};
 
+use crate::budget::{admit, saturate_u32, Budget, Limits};
 use crate::btf_offsets::{
     SOCK_SKC_FAMILY_OFFSET, SOCK_SKC_NUM_OFFSET, SOCK_SKC_RCV_SADDR_OFFSET,
     SOCK_SKC_V6_RCV_SADDR_OFFSET, SOCK_SK_PROTOCOL_OFFSET,
@@ -32,6 +43,27 @@ use crate::btf_offsets::{
 
 #[map]
 pub static NET_LISTEN_EVENTS: RingBuf = RingBuf::with_byte_size(NET_LISTEN_EVENTS_BYTES, 0);
+
+/// External audit EBPF-013: listener record budgets, per process (tgid)
+/// and per user.
+#[map]
+static LISTEN_TASK_BUDGET: LruHashMap<u32, Budget> = LruHashMap::with_max_entries(4096, 0);
+#[map]
+static LISTEN_UID_BUDGET: LruHashMap<u32, Budget> = LruHashMap::with_max_entries(1024, 0);
+
+/// Listener records a process may send in a burst (also its first ones).
+const TASK_BURST: u64 = 64;
+/// Records a user may send in a burst, across its processes.
+const UID_BURST: u64 = 512;
+
+const LISTEN_LIMITS: Limits = Limits {
+    task_burst: TASK_BURST,
+    // After a burst, 128 records per second.
+    task_refill_ns: 1_000_000_000 / 128,
+    uid_burst: UID_BURST,
+    // After a burst, 256 records per second.
+    uid_refill_ns: 1_000_000_000 / 256,
+};
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -78,6 +110,24 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
             Err(_) => return Ok(()),
         };
 
+    // External audit EBPF-013: the record budget, before the ring.
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let uid_gid = bpf_get_current_uid_gid();
+    let held = match unsafe {
+        admit(
+            &LISTEN_TASK_BUDGET,
+            &LISTEN_UID_BUDGET,
+            (pid_tgid >> 32) as u32,
+            (uid_gid & 0xFFFF_FFFF) as u32,
+            bpf_ktime_get_ns(),
+            LISTEN_LIMITS,
+            northnarrow_common::ring_drops::ring_slot::LISTEN_RATE,
+        )
+    } {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+
     // Reserve + populate.
     let mut entry = match NET_LISTEN_EVENTS.reserve::<NetListenRaw>(0) {
         Some(e) => e,
@@ -91,10 +141,10 @@ fn try_inet_csk_listen_start(ctx: &ProbeContext) -> Result<(), i64> {
         crate::zero::zero(raw_ptr);
     }
 
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let uid_gid = bpf_get_current_uid_gid();
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
     unsafe {
+        (*raw_ptr).held = saturate_u32(held.task);
+        (*raw_ptr).held_uid = saturate_u32(held.user);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         (*raw_ptr).pid = (pid_tgid >> 32) as u32;
         (*raw_ptr).uid = (uid_gid & 0xFFFF_FFFF) as u32;

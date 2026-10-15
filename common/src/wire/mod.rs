@@ -309,8 +309,10 @@ pub const FLOW_SOCK_MAP_MAX_ENTRIES: u32 = 4096;
 /// same pattern as `TcpConnectRaw`.
 ///
 /// Layout chosen for natural u64 alignment with no implicit
-/// padding before the trailing arrays: 8 + 4 + 4 + 1 + 1 + 2 + 2
-/// + 2 + 16 + 16 = 56 bytes, 8-aligned (struct alignment = u64).
+/// padding before the trailing arrays: 8 + 4 + 4 + 1 + 1 + 2 + 2 +
+/// 2 + 16 + 16 = 56 bytes, then the appended `held` / `held_uid`
+/// (external audit EBPF-013): 64 bytes, 8-aligned (struct alignment =
+/// u64).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -325,6 +327,14 @@ pub struct NetListenRaw {
     pub _pad1: [u8; 2],
     pub bind_addr: [u8; ADDR_LEN],
     pub comm: [u8; TASK_COMM_LEN],
+    /// External audit EBPF-013: `listen()` calls of this process the
+    /// kernel held back since its previous record (its own budget ran
+    /// out); saturates at `u32::MAX`. Appended: older fields keep their
+    /// offsets.
+    pub held: u32,
+    /// External audit EBPF-013: as `held`, for the budget of this
+    /// process's user (across its processes).
+    pub held_uid: u32,
 }
 
 impl NetListenRaw {
@@ -340,6 +350,8 @@ impl NetListenRaw {
             _pad1: [0; 2],
             bind_addr: [0; ADDR_LEN],
             comm: [0u8; TASK_COMM_LEN],
+            held: 0,
+            held_uid: 0,
         }
     }
 }
@@ -766,7 +778,8 @@ pub const fn io_uring_opcode_class(op: u8) -> u32 {
     }
 }
 
-/// Kernel→userland record of the io_uring sensor (48 bytes, no implicit padding).
+/// Kernel→userland record of the io_uring sensor (56 bytes, no implicit
+/// padding; 48 before the appended `held` / `held_uid`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -789,6 +802,14 @@ pub struct IoUringRaw {
     pub count: u32,
     /// Explicit tail padding: 44 → 48 bytes so `Pod` holds (8-byte alignment).
     pub _pad2: u32,
+    /// External audit EBPF-013: ring creations of this process the kernel
+    /// held back since its previous CREATE record (its own budget ran
+    /// out); saturates at `u32::MAX`. Always 0 on ACTIVITY records.
+    /// Appended: older fields keep their offsets.
+    pub held: u32,
+    /// External audit EBPF-013: as `held`, for the budget of this
+    /// process's user (across its processes).
+    pub held_uid: u32,
 }
 
 /// `ModuleLoadRaw.method` — `finit_module(2)` via the `kernel_read_file`
@@ -2002,14 +2023,35 @@ mod tests {
         );
     }
 
-    /// N2 test #3: [`NetListenRaw`] layout. 56 bytes, 8-aligned
+    /// N2 test #3: [`NetListenRaw`] layout. 64 bytes, 8-aligned
     /// — anchor the wire size so an inadvertent field reorder
     /// surfaces here before reaching the BPF verifier.
     #[test]
     fn net_listen_raw_layout_is_stable() {
-        // 8 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 16 + 16 = 56 bytes.
-        assert_eq!(size_of::<NetListenRaw>(), 56);
+        // 8 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 16 + 16 = 56 bytes, then the
+        // appended held counters (external audit EBPF-013) = 64.
+        assert_eq!(size_of::<NetListenRaw>(), 64);
         assert_eq!(align_of::<NetListenRaw>(), 8);
+        // The pre-EBPF-013 fields keep their offsets.
+        assert_eq!(core::mem::offset_of!(NetListenRaw, bind_port), 20);
+        assert_eq!(core::mem::offset_of!(NetListenRaw, bind_addr), 24);
+        assert_eq!(core::mem::offset_of!(NetListenRaw, comm), 40);
+        assert_eq!(core::mem::offset_of!(NetListenRaw, held), 56);
+        assert_eq!(core::mem::offset_of!(NetListenRaw, held_uid), 60);
+    }
+
+    /// External audit EBPF-013: [`IoUringRaw`] layout, with the held
+    /// counters appended after the former 48-byte record.
+    #[test]
+    fn io_uring_raw_layout_is_stable() {
+        assert_eq!(size_of::<IoUringRaw>(), 56);
+        assert_eq!(align_of::<IoUringRaw>(), 8);
+        assert_eq!(core::mem::offset_of!(IoUringRaw, comm), 16);
+        assert_eq!(core::mem::offset_of!(IoUringRaw, kind), 32);
+        assert_eq!(core::mem::offset_of!(IoUringRaw, classes), 36);
+        assert_eq!(core::mem::offset_of!(IoUringRaw, count), 40);
+        assert_eq!(core::mem::offset_of!(IoUringRaw, held), 48);
+        assert_eq!(core::mem::offset_of!(IoUringRaw, held_uid), 52);
     }
 
     /// N2 test #4: [`NetListenRaw`] bytemuck round-trip. The BPF
@@ -2029,10 +2071,14 @@ mod tests {
             _pad1: [0; 2],
             bind_addr: [0u8; ADDR_LEN],
             comm: *b"sshd\0\0\0\0\0\0\0\0\0\0\0\0",
+            held: 300,
+            held_uid: 7,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<NetListenRaw>());
         let restored: NetListenRaw = *bytemuck::from_bytes::<NetListenRaw>(bytes);
+        assert_eq!(restored.held, 300);
+        assert_eq!(restored.held_uid, 7);
         assert_eq!(restored.bind_port, original.bind_port);
         assert_eq!(restored.proto, original.proto);
         assert_eq!(restored.family, original.family);

@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 15;
+pub const RING_DROP_SLOTS: u32 = 18;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -35,6 +35,16 @@ pub mod ring_slot {
     /// Review 78: DNS queries over a process's budget, not recorded (not
     /// a ring overflow: the kernel holds them back before the ring).
     pub const DNS_RATE: u32 = 14;
+    /// External audit EBPF-009: a write-then-close marker the kernel could
+    /// not store (`FIM_DIRTY_INODES` full), so the close emits no
+    /// `Modified` for that inode.
+    pub const FIM_DIRTY_FULL: u32 = 15;
+    /// External audit EBPF-013: `listen()` calls over a process's or a
+    /// user's record budget, not recorded (held back before the ring).
+    pub const LISTEN_RATE: u32 = 16;
+    /// External audit EBPF-013: io_uring ring creations over a process's or
+    /// a user's record budget, not recorded (held back before the ring).
+    pub const IOURING_RATE: u32 = 17;
 }
 
 /// Human names, indexed by slot.
@@ -54,6 +64,9 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "bpf",
     "open_sensor",
     "dns_rate",
+    "fim_dirty_full",
+    "listen_rate",
+    "io_uring_rate",
 ];
 
 #[cfg(test)]
@@ -72,6 +85,49 @@ mod tests {
             "open_sensor"
         );
         assert_eq!(RING_DROP_NAMES[ring_slot::DNS_RATE as usize], "dns_rate");
-        assert_eq!(ring_slot::DNS_RATE + 1, RING_DROP_SLOTS);
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::FIM_DIRTY_FULL as usize],
+            "fim_dirty_full"
+        );
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::LISTEN_RATE as usize],
+            "listen_rate"
+        );
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::IOURING_RATE as usize],
+            "io_uring_rate"
+        );
+        assert_eq!(ring_slot::IOURING_RATE + 1, RING_DROP_SLOTS);
+    }
+
+    /// Slot order is wire-stable: the lab soak and older status readers
+    /// index the map by slot. A new ring goes at the end; this pins every
+    /// existing slot to its number and name.
+    #[test]
+    fn ring_drop_slots_append_only() {
+        let pinned: [(u32, &str); RING_DROP_SLOTS as usize] = [
+            (ring_slot::EXEC, "exec"),
+            (ring_slot::EXEC_CHECK, "exec_check"),
+            (ring_slot::FILE_OPEN, "file_open"),
+            (ring_slot::FIM, "fim"),
+            (ring_slot::LISTEN, "listen"),
+            (ring_slot::FS_PROTECT, "fs_protect"),
+            (ring_slot::MODULE_LOAD, "module_load"),
+            (ring_slot::TCP_CLOSE, "tcp_close"),
+            (ring_slot::TCP_CONNECT, "tcp_connect"),
+            (ring_slot::UDP, "udp"),
+            (ring_slot::DNS, "dns"),
+            (ring_slot::IOURING, "io_uring"),
+            (ring_slot::BPF, "bpf"),
+            (ring_slot::OPEN_SENSOR, "open_sensor"),
+            (ring_slot::DNS_RATE, "dns_rate"),
+            (ring_slot::FIM_DIRTY_FULL, "fim_dirty_full"),
+            (ring_slot::LISTEN_RATE, "listen_rate"),
+            (ring_slot::IOURING_RATE, "io_uring_rate"),
+        ];
+        for (i, (slot, name)) in pinned.iter().enumerate() {
+            assert_eq!(*slot as usize, i, "slot {name} moved");
+            assert_eq!(RING_DROP_NAMES[i], *name);
+        }
     }
 }

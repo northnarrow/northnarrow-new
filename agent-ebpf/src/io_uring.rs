@@ -7,7 +7,13 @@
 //! the gap:
 //!
 //! * `io_uring/io_uring_create` — a ring was set up: emitted once per
-//!   call (ring creation is rare and high-signal);
+//!   call (ring creation is rare and high-signal), within a record budget
+//!   (external audit EBPF-013: an unprivileged `io_uring_setup()` loop
+//!   pushed other processes' records out of the shared ring). Per process
+//!   [`CREATE_TASK_BURST`], then 128 per second; per user
+//!   [`CREATE_UID_BURST`], then 256 per second ([`crate::budget`]). Calls
+//!   over it are held back, counted in the `io_uring_rate` slot, and the
+//!   process's next CREATE record carries the count (NN-L-NET-021);
 //! * `io_uring/io_uring_submit_req` (`io_uring_submit_sqe` on ≤ 6.1) —
 //!   one firing per submission. Submissions can run at hundreds of
 //!   thousands per second on an io_uring-native server, so they are
@@ -31,6 +37,7 @@ use northnarrow_common::wire::{
     io_uring_opcode_class, IoUringRaw, IOURING_KIND_ACTIVITY, IOURING_KIND_CREATE,
 };
 
+use crate::budget::{admit, saturate_u32, Budget, Held, Limits};
 use crate::btf_offsets::{
     TP_IOURING_CREATE_FD_OFFSET, TP_IOURING_CREATE_FLAGS_OFFSET,
     TP_IOURING_CREATE_SQ_ENTRIES_OFFSET, TP_IOURING_SUBMIT_OPCODE_OFFSET,
@@ -57,6 +64,27 @@ pub static IOURING_EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024, 0);
 #[map]
 pub static IOURING_STATE: LruHashMap<u32, IoUringState> = LruHashMap::with_max_entries(4096, 0);
 
+/// External audit EBPF-013: ring-creation record budgets, per process
+/// (tgid) and per user.
+#[map]
+static IOURING_TASK_BUDGET: LruHashMap<u32, Budget> = LruHashMap::with_max_entries(4096, 0);
+#[map]
+static IOURING_UID_BUDGET: LruHashMap<u32, Budget> = LruHashMap::with_max_entries(1024, 0);
+
+/// Ring creations a process may record in a burst (also its first ones).
+const CREATE_TASK_BURST: u64 = 64;
+/// Ring creations a user may record in a burst, across its processes.
+const CREATE_UID_BURST: u64 = 512;
+
+const CREATE_LIMITS: Limits = Limits {
+    task_burst: CREATE_TASK_BURST,
+    // After a burst, 128 records per second.
+    task_refill_ns: 1_000_000_000 / 128,
+    uid_burst: CREATE_UID_BURST,
+    // After a burst, 256 records per second.
+    uid_refill_ns: 1_000_000_000 / 256,
+};
+
 /// Minimum interval between two ACTIVITY records of the same pid when no
 /// new class appears (1 s).
 const ACTIVITY_INTERVAL_NS: u64 = 1_000_000_000;
@@ -74,7 +102,22 @@ fn try_create(ctx: &TracePointContext) -> Result<(), i64> {
         unsafe { ctx.read_at::<u32>(off!(TP_IOURING_CREATE_SQ_ENTRIES_OFFSET)) }.unwrap_or(0);
     let flags: u32 = unsafe { ctx.read_at::<u32>(off!(TP_IOURING_CREATE_FLAGS_OFFSET)) }.unwrap_or(0);
     let _ = fd;
-    emit(IOURING_KIND_CREATE, flags, sq_entries, 0, 0)
+    // External audit EBPF-013: the record budget, before the ring.
+    let held = match unsafe {
+        admit(
+            &IOURING_TASK_BUDGET,
+            &IOURING_UID_BUDGET,
+            (bpf_get_current_pid_tgid() >> 32) as u32,
+            (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32,
+            bpf_ktime_get_ns(),
+            CREATE_LIMITS,
+            ring_slot::IOURING_RATE,
+        )
+    } {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    emit(IOURING_KIND_CREATE, flags, sq_entries, 0, 0, held)
 }
 
 /// Same program body for both tracepoint names; userland attaches
@@ -122,13 +165,27 @@ fn try_submit(ctx: &TracePointContext) -> Result<(), i64> {
         }
     }
     if emit_now {
-        return emit(IOURING_KIND_ACTIVITY, classes, pending, opcode, sq_thread);
+        return emit(
+            IOURING_KIND_ACTIVITY,
+            classes,
+            pending,
+            opcode,
+            sq_thread,
+            Held::NONE,
+        );
     }
     Ok(())
 }
 
 #[inline(always)]
-fn emit(kind: u8, classes: u32, count: u32, last_opcode: u8, sq_thread: u8) -> Result<(), i64> {
+fn emit(
+    kind: u8,
+    classes: u32,
+    count: u32,
+    last_opcode: u8,
+    sq_thread: u8,
+    held: Held,
+) -> Result<(), i64> {
     let mut entry = match IOURING_EVENTS.reserve::<IoUringRaw>(0) {
         Some(e) => e,
         None => {
@@ -151,6 +208,8 @@ fn emit(kind: u8, classes: u32, count: u32, last_opcode: u8, sq_thread: u8) -> R
         (*raw_ptr).sq_thread = sq_thread;
         (*raw_ptr).classes = classes;
         (*raw_ptr).count = count;
+        (*raw_ptr).held = saturate_u32(held.task);
+        (*raw_ptr).held_uid = saturate_u32(held.user);
     }
     entry.submit(0);
     Ok(())

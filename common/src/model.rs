@@ -326,6 +326,89 @@ pub enum Event {
         uid_level: bool,
         timestamp_ns: u64,
     },
+    /// External audit EBPF-013: records the kernel held back from one
+    /// process (its record budget for `source` ran out) or from its user
+    /// (`uid_level`: the user's budget ran out, across processes). Carried
+    /// by the process's next record of the same sensor, so the loss is
+    /// attributed: a process that loops `listen()` or `io_uring_setup()`
+    /// to push another process's records out of the ring is itself
+    /// flagged (NN-L-NET-021).
+    SensorFlood {
+        source: FloodSource,
+        pid: u32,
+        uid: u32,
+        comm: String,
+        /// Kernel-resolved `/proc/<pid>/exe` (best-effort).
+        #[serde(default)]
+        exe: Option<String>,
+        held: u32,
+        uid_level: bool,
+        timestamp_ns: u64,
+    },
+}
+
+/// External audit EBPF-013: the sensor whose kernel record budget held
+/// records back ([`Event::SensorFlood`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloodSource {
+    /// `inet_csk_listen_start` (TCP `listen()`).
+    Listen,
+    /// `io_uring_create` (`io_uring_setup()`).
+    IoUringCreate,
+}
+
+impl FloodSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Listen => "listen",
+            Self::IoUringCreate => "io_uring_create",
+        }
+    }
+}
+
+/// External audit EBPF-013: the [`Event::SensorFlood`]s a record carries —
+/// one for the process's held count, one for its user's, each only when
+/// nonzero.
+pub fn sensor_floods(
+    source: FloodSource,
+    pid: u32,
+    uid: u32,
+    comm: &str,
+    held: u32,
+    held_uid: u32,
+    timestamp_ns: u64,
+) -> [Option<Event>; 2] {
+    let flood = |held: u32, uid_level: bool| {
+        (held != 0).then(|| Event::SensorFlood {
+            source,
+            pid,
+            uid,
+            comm: comm.to_string(),
+            exe: None,
+            held,
+            uid_level,
+            timestamp_ns,
+        })
+    };
+    [flood(held, false), flood(held_uid, true)]
+}
+
+/// External audit EBPF-013: the floods an io_uring record carries (CREATE
+/// records only; ACTIVITY records are aggregated, not budgeted).
+pub fn io_uring_floods(raw: &crate::wire::IoUringRaw) -> [Option<Event>; 2] {
+    if raw.kind != crate::wire::IOURING_KIND_CREATE {
+        return [None, None];
+    }
+    sensor_floods(
+        FloodSource::IoUringCreate,
+        raw.pid,
+        raw.uid,
+        &crate::wire::cstr_lossy(&raw.comm),
+        raw.held,
+        raw.held_uid,
+        raw.timestamp_ns,
+    )
 }
 
 /// Std-side mirror of [`crate::wire::admin_signed_payload::
@@ -1280,6 +1363,70 @@ mod tests {
             }
             _ => panic!("expected ProcessSpawn"),
         }
+    }
+
+    /// External audit EBPF-013: a ring-creation record with held counts
+    /// carries one flood per budget; an ACTIVITY record or a record with
+    /// nothing held carries none.
+    #[test]
+    fn io_uring_create_record_carries_its_floods() {
+        let mut raw = crate::wire::IoUringRaw {
+            timestamp_ns: 9,
+            pid: 77,
+            uid: 1000,
+            comm: *b"looper\0\0\0\0\0\0\0\0\0\0",
+            kind: crate::wire::IOURING_KIND_CREATE,
+            last_opcode: 0,
+            sq_thread: 0,
+            _pad: 0,
+            classes: 0,
+            count: 8,
+            _pad2: 0,
+            held: 0,
+            held_uid: 0,
+        };
+        assert!(io_uring_floods(&raw).iter().all(Option::is_none));
+        raw.held = 300;
+        raw.held_uid = 5;
+        let [task, user] = io_uring_floods(&raw);
+        match task {
+            Some(Event::SensorFlood {
+                source: FloodSource::IoUringCreate,
+                pid: 77,
+                uid: 1000,
+                ref comm,
+                held: 300,
+                uid_level: false,
+                timestamp_ns: 9,
+                ..
+            }) if comm == "looper" => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            user,
+            Some(Event::SensorFlood {
+                held: 5,
+                uid_level: true,
+                ..
+            })
+        ));
+        raw.kind = crate::wire::IOURING_KIND_ACTIVITY;
+        assert!(io_uring_floods(&raw).iter().all(Option::is_none));
+    }
+
+    /// The new variant's wire form, and an old record without `exe`.
+    #[test]
+    fn sensor_flood_serde_round_trips() {
+        let [Some(e), None] = sensor_floods(FloodSource::Listen, 1, 2, "x", 3, 0, 4) else {
+            panic!("one flood expected");
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"listen\""));
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        let legacy = json.replace(",\"exe\":null", "");
+        assert_ne!(legacy, json);
+        assert!(serde_json::from_str::<Event>(&legacy).is_ok());
     }
 }
 

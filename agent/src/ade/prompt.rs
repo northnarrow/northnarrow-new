@@ -248,6 +248,19 @@ pub(crate) fn format_event_line(event: &Event) -> String {
             uid_level,
             ..
         } => format!("- dns_flood pid={pid} uid={uid} comm={comm} held={held} uid_level={uid_level}"),
+        Event::SensorFlood {
+            source,
+            pid,
+            uid,
+            comm,
+            held,
+            uid_level,
+            ..
+        } => format!(
+            "- sensor_flood source={} pid={pid} uid={uid} comm={comm} held={held} \
+             uid_level={uid_level}",
+            source.as_str()
+        ),
         Event::FsProtectDenial {
             pid,
             uid,

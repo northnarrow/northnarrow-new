@@ -51,6 +51,7 @@ use aya_ebpf::{
 };
 use northnarrow_common::wire::{dns_flags, DnsQueryRaw, ADDR_LEN, QNAME_LEN, TASK_COMM_LEN};
 
+use crate::budget::{admit, Budget, Limits};
 use crate::btf_offsets::{
     IOV_ITER_ITER_TYPE_OFFSET, IOV_ITER_UBUF_BASE_OFFSET, MSGHDR_MSG_ITER_OFFSET,
     MSGHDR_NAME_OFFSET, MSGHDR_NAMELEN_OFFSET, SOCK_SKC_DADDR_OFFSET, SOCK_SKC_DPORT_OFFSET,
@@ -80,18 +81,13 @@ pub(crate) static DNS_QUERY_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024
 /// queries out of the records is flagged for it; one that stays within
 /// its budget is recorded in full. The local resolvers' users
 /// ([`DNS_EXEMPT_UIDS`], filled by the agent) have no budget.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct DnsBudget {
-    last_ns: u64,
-    tokens: u64,
-    held: u64,
-}
-
+///
+/// External audit EBPF-013: the buckets live in [`crate::budget`], shared
+/// with the listener and io_uring sensors; DNS behaves as before.
 #[map]
-static DNS_TASK_BUDGET: LruHashMap<u32, DnsBudget> = LruHashMap::with_max_entries(8192, 0);
+static DNS_TASK_BUDGET: LruHashMap<u32, Budget> = LruHashMap::with_max_entries(8192, 0);
 #[map]
-static DNS_UID_BUDGET: LruHashMap<u32, DnsBudget> = LruHashMap::with_max_entries(1024, 0);
+static DNS_UID_BUDGET: LruHashMap<u32, Budget> = LruHashMap::with_max_entries(1024, 0);
 /// Uids of the local resolvers (systemd-resolved, unbound, named, …),
 /// written by the agent at start: their forwarded queries are not paced.
 #[map]
@@ -106,41 +102,17 @@ const UID_BURST: u64 = 2048;
 /// After a burst, one record per interval (1024 per second).
 const UID_REFILL_NS: u64 = 1_000_000_000 / 1024;
 
+const DNS_LIMITS: Limits = Limits {
+    task_burst: TASK_BURST,
+    task_refill_ns: TASK_REFILL_NS,
+    uid_burst: UID_BURST,
+    uid_refill_ns: UID_REFILL_NS,
+};
+
 /// What an admitted query's record carries ([`DnsQueryRaw::held`]).
 pub(crate) struct Admitted {
     pub held: u16,
     pub flags: u8,
-}
-
-#[inline(always)]
-unsafe fn refill(b: *mut DnsBudget, now: u64, burst: u64, refill_ns: u64) {
-    let steps = now.wrapping_sub((*b).last_ns) / refill_ns;
-    if steps == 0 {
-        return;
-    }
-    if (*b).tokens + steps >= burst {
-        (*b).tokens = burst;
-        (*b).last_ns = now;
-    } else {
-        (*b).tokens += steps;
-        (*b).last_ns += steps * refill_ns;
-    }
-}
-
-/// The budget entry of `key` in `map`, created full on first use; `None`
-/// when the map refuses it (the query is then recorded, unpaced).
-#[inline(always)]
-unsafe fn budget(map: &LruHashMap<u32, DnsBudget>, key: u32, now: u64, burst: u64) -> Option<*mut DnsBudget> {
-    if let Some(b) = map.get_ptr_mut(&key) {
-        return Some(b);
-    }
-    let fresh = DnsBudget {
-        last_ns: now,
-        tokens: burst,
-        held: 0,
-    };
-    let _ = map.insert(&key, &fresh, 0);
-    map.get_ptr_mut(&key)
 }
 
 /// `Some` when the current process may record one more DNS query (with the
@@ -155,40 +127,23 @@ pub(crate) unsafe fn dns_admit() -> Option<Admitted> {
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let now = bpf_ktime_get_ns();
-    let task = match budget(&DNS_TASK_BUDGET, tgid, now, TASK_BURST) {
-        Some(b) => b,
-        None => return Some(Admitted { held: 0, flags: 0 }),
-    };
-    let user = match budget(&DNS_UID_BUDGET, uid, now, UID_BURST) {
-        Some(b) => b,
-        None => return Some(Admitted { held: 0, flags: 0 }),
-    };
-    refill(task, now, TASK_BURST, TASK_REFILL_NS);
-    refill(user, now, UID_BURST, UID_REFILL_NS);
-    if (*task).tokens == 0 {
-        (*task).held += 1;
-        crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_RATE);
-        return None;
-    }
-    if (*user).tokens == 0 {
-        (*user).held += 1;
-        crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_RATE);
-        return None;
-    }
-    (*task).tokens -= 1;
-    (*user).tokens -= 1;
-    let task_held = (*task).held;
-    let user_held = (*user).held;
-    (*task).held = 0;
-    (*user).held = 0;
+    let held = admit(
+        &DNS_TASK_BUDGET,
+        &DNS_UID_BUDGET,
+        tgid,
+        uid,
+        now,
+        DNS_LIMITS,
+        northnarrow_common::ring_drops::ring_slot::DNS_RATE,
+    )?;
     let mut flags = 0u8;
-    if task_held != 0 {
+    if held.task != 0 {
         flags |= dns_flags::RATE_HELD;
     }
-    if user_held != 0 {
+    if held.user != 0 {
         flags |= dns_flags::RATE_HELD_UID;
     }
-    let total = task_held + user_held;
+    let total = held.task + held.user;
     Some(Admitted {
         held: if total > 0xFFFF { 0xFFFF } else { total as u16 },
         flags,

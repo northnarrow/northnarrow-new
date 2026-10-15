@@ -146,9 +146,9 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-100 | ATP-013 | Anti-tamper | S | fixed (lab PR 112) |
 | NN-AUD-101 | EBPF-004 | eBPF kernel | M | fixed (lab PR 112) |
 | NN-AUD-102 | EBPF-008 | eBPF kernel | S | fixed (lab PR 113) |
-| NN-AUD-103 | EBPF-009 | eBPF kernel | S | open |
+| NN-AUD-103 | EBPF-009 | eBPF kernel | S | fixed (lab PR 129) |
 | NN-AUD-104 | EBPF-011 | eBPF kernel | M | open |
-| NN-AUD-105 | EBPF-013 | eBPF kernel | M | open |
+| NN-AUD-105 | EBPF-013 | eBPF kernel | M | fixed (lab PR 129) |
 | NN-AUD-106 | EBPF-014 | eBPF kernel | S | open |
 | NN-AUD-107 | EBPF-015 | eBPF kernel | M | open |
 | NN-AUD-108 | EVD-002 | Evidence logs | L | open |
@@ -2493,3 +2493,55 @@ the audit did not report, noted with the fix that takes them.
     only. Privileged gate: Ubuntu 24.04 and Debian 12, 29 suites, 79
     passed, 0 failed each (the new `dead_sensor_pump_stops_the_agent`).
     The anti-tamper suite: OK. Host: 1805 passed, 0 failed.
+- **NN-AUD-103 (EBPF-009), NN-AUD-105 (EBPF-013), lab PR 129.** Telemetry
+  loss in the kernel: the FIM write-then-close markers and the listener and
+  io_uring records (batch D, kernel part).
+  - EBPF-009: `FIM_DIRTY_INODES` held 4096 entries against 8192 watched
+    inodes, and a refused insert was discarded. Holding 4096 other watched
+    files open for write filled it; the next in-place rewrite of a watched
+    file then produced no `Modified` at close and no counter. The map is
+    now sized from the same constant as `WATCHED_PATHS` (keys are watched
+    inodes only, so live markers can no longer fill it) and stays a plain
+    HashMap (an LRU could evict a pending marker before the map is full,
+    silently). A refused insert is counted in a new `RING_DROPS` slot
+    `fim_dirty_full` (slot 15, a security ring for `TelemetryLoss`).
+  - EBPF-013: `inet_csk_listen_start` and `io_uring_create` emitted one
+    record per call; an unprivileged loop could push another process's
+    listener or ring-creation records out of the ring, leaving an
+    anonymous counter. Review 78's DNS budget is now a shared module
+    (`agent-ebpf/src/budget.rs`; DNS keeps its limits and behaviour) and
+    applies to both: per process 64 records, then 128 per second (the
+    owner's sign-off on design Q6: it keeps every real listener); per user
+    512, then 256 per second (bounds a loop of `fork()`s). A call over
+    budget is held back, counted in the new `listen_rate` (16) or
+    `io_uring_rate` (17) slot, and the process's next record carries the
+    counts in `held` / `held_uid`, appended to `NetListenRaw` (56 → 64
+    bytes) and `IoUringRaw` (48 → 56). The agent turns them into
+    `Event::SensorFlood`, and the new NN-L-NET-021 (Log, High) names the
+    process once its held calls reach 256 within 10 s. One rule covers both
+    sensors (same mechanism, threshold and response; the verdict names the
+    sensor), apart from NN-L-NET-020, whose reasoning is DNS-specific.
+    Known limit: a fork loop that drains its user's budget also holds back
+    the listener records of that user's other processes; they are counted
+    and the user's flood is reported.
+  - Tests: `ring_drop_slots_append_only`,
+    `names_cover_every_slot_in_order`, `net_listen_raw_layout_is_stable`,
+    `net_listen_raw_round_trips_via_bytes`, `io_uring_raw_layout_is_stable`,
+    `io_uring_create_record_carries_its_floods`,
+    `sensor_flood_serde_round_trips`,
+    `net_021_names_the_listen_flooder_once_per_window`,
+    `net_021_sums_per_sensor_and_user`, `net_rules_builder_returns_17_rules`,
+    `default_engine_pins_all_seventy_two_rule_ids`.
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `lab129-probe.sh`. A user's loop of
+    `listen()` on fresh sockets for 20 s while the same user starts a
+    listener on port 18129. Before (main): 1,241,324 listen records lost,
+    the 18129 listener never recorded. After: the loop held by the budget
+    (1,303,456 counted as `listen_rate`), NN-L-NET-021 naming the looping
+    process, the 18129 listener recorded. An `io_uring_setup()` loop
+    beside one ring of another program: after, the other program's ring
+    recorded and NN-L-NET-021 for the loop (`io_uring_rate` 4,798,458);
+    before, no record was lost on this guest either. The FIM dirty-inode
+    map (EBPF-009) is covered by unit tests: the 5,000-open-file probe
+    needs a signed fim-paths overlay. Privileged gate: Ubuntu 24.04 and
+    Debian 12, 29 suites, 79 passed, 0 failed each (the programs load on
+    6.8 and 6.1). The anti-tamper suite: OK. Host: 1811 passed, 0 failed.

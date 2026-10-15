@@ -6,6 +6,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, kernel telemetry loss (Medium EBPF-009,
+  EBPF-013): holding 4096 watched files open for write filled the FIM
+  write-marker map, and the next in-place rewrite of a watched file left
+  no `Modified` event and no counter. The map now matches the watch set
+  and a refused marker is counted (`fim_dirty_full`). An unprivileged loop
+  of `listen()` or `io_uring_setup()` could push other processes' listener
+  and ring-creation records out of their ring: both now have DNS's
+  per-process and per-user record budgets (64, then 128/s per process),
+  the excess is counted (`listen_rate`, `io_uring_rate`) and carried by
+  the process's next record, and the new NN-L-NET-021 names the process
+  that floods.
 - External audit, Wave 2, telemetry loss (Medium SNS-001, SNS-008,
   SNS-009): a ring-buffer pump that died went unnoticed — the agent kept
   running blind on that sensor. Every telemetry task is now watched: one
