@@ -126,7 +126,7 @@ TasksMax=512
 # the host without making it unkillable (-1000 would turn a leak inside
 # MemoryMax into a memcg livelock). Root can still raise it through
 # /proc/<pid>/oom_score_adj: the self-integrity check reports that as
-# `integrity_drift` (limit_changed).
+# `integrity_drift` (limit_unexpected).
 OOMScoreAdjust=-500
 
 # Hardening — `ProtectSystem=strict` makes the entire filesystem

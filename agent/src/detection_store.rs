@@ -631,7 +631,48 @@ struct SinkInner {
     last_id: AtomicU64,
     /// Cumulative records dropped under backpressure.
     dropped: AtomicU64,
+    /// External audit NN-AUD-111: what was dropped since the last report
+    /// ([`DetectionSink::report_drops`]). Locked after `queue`, never
+    /// before.
+    drops: Mutex<DropWindow>,
     cap: usize,
+}
+
+/// Audit op of the signed record of queue drops (external audit NN-AUD-111).
+pub const DROPPED_AUDIT_OP: &str = "detections_dropped";
+
+/// Records dropped from the queue in one report window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DropWindow {
+    pub count: u64,
+    /// Id of the first and the last record dropped in the window (ids of
+    /// dropped records need not be contiguous).
+    pub first_id: u64,
+    pub last_id: u64,
+    pub lowest_id: u64,
+    pub highest_id: u64,
+    /// Dropped per severity: low, medium, high, critical.
+    pub by_severity: [u64; 4],
+    /// Dropped records of a response that ran.
+    pub acted: u64,
+}
+
+impl DropWindow {
+    fn note(&mut self, r: &DetectionRecord) {
+        if self.count == 0 {
+            self.first_id = r.id;
+            self.lowest_id = r.id;
+            self.highest_id = r.id;
+        }
+        self.count += 1;
+        self.last_id = r.id;
+        self.lowest_id = self.lowest_id.min(r.id);
+        self.highest_id = self.highest_id.max(r.id);
+        self.by_severity[usize::from(severity_rank(r.severity))] += 1;
+        if r.acted() {
+            self.acted += 1;
+        }
+    }
 }
 
 /// Cheap, cloneable handle the hot event path uses to record detections.
@@ -648,32 +689,110 @@ impl DetectionSink {
         self.inner.last_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Push `record` onto the bounded queue. If full, drop the OLDEST
-    /// queued record that was only logged and bump the dropped counter,
-    /// then enqueue the new one (freshest-wins). The record of a response
-    /// that ran goes only when every queued record is one: a flood of
-    /// logged verdicts can no longer evict the record of a kill (review
-    /// 75); then a logged record that finds no room is the one dropped.
-    /// Wakes the writer. Holds the queue lock only for the push — the
-    /// fsync happens on the writer task, never here.
+    /// Push `record` onto the bounded queue. If full, one record goes and
+    /// the dropped counter moves. The record of a response that ran goes
+    /// only when every queued record is one: a flood of logged verdicts
+    /// can no longer evict the record of a kill (review 75); then a logged
+    /// record that finds no room is the one dropped. Among logged-only
+    /// records the lowest severity goes first, oldest first within a
+    /// severity (external audit NN-AUD-111: a flood of Low verdicts used to
+    /// evict a High canary read queued before it); an incoming logged
+    /// record of a lower severity than every queued one is dropped itself.
+    /// Each drop is noted for the signed report. Wakes the writer. Holds
+    /// the queue lock only for the push — the fsync happens on the writer
+    /// task, never here.
     fn enqueue(&self, record: DetectionRecord) {
         {
             let mut q = self.inner.queue.lock();
             if q.len() >= self.inner.cap {
                 self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                match q.iter().position(|r| !r.acted()) {
-                    Some(i) => {
-                        q.remove(i);
+                let victim = q
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| !r.acted())
+                    .min_by_key(|(i, r)| (severity_rank(r.severity), *i))
+                    .map(|(i, r)| (i, severity_rank(r.severity)));
+                let gone = match victim {
+                    Some((i, rank)) if record.acted() || severity_rank(record.severity) >= rank => {
+                        q.remove(i)
                     }
-                    None if !record.acted() => return,
+                    Some(_) => None,
+                    None if !record.acted() => None,
+                    None => q.pop_front(),
+                };
+                let mut drops = self.inner.drops.lock();
+                match gone {
+                    Some(r) => drops.note(&r),
                     None => {
-                        q.pop_front();
+                        drops.note(&record);
+                        return;
                     }
                 }
             }
             q.push_back(record);
         }
         self.inner.notify.notify_one();
+    }
+
+    /// External audit NN-AUD-111: take what was dropped since the last
+    /// call, `None` when nothing was.
+    pub fn take_drops(&self) -> Option<DropWindow> {
+        let mut d = self.inner.drops.lock();
+        (d.count > 0).then(|| std::mem::take(&mut *d))
+    }
+
+    /// External audit NN-AUD-111: record in the signed audit chain what the
+    /// queue dropped since the last call (one entry per window, none when
+    /// nothing was dropped), so the missing ids are evidence, not only a
+    /// counter and a WARN. Called by the budget reporter every
+    /// [`crate::detection_budget::REPORT_SECS`].
+    pub fn report_drops(&self, audit_log: Option<&Mutex<crate::audit::AuditLog>>) {
+        let Some(d) = self.take_drops() else {
+            return;
+        };
+        let [low, medium, high, critical] = d.by_severity;
+        warn!(
+            target: "detection_store",
+            dropped = d.count,
+            first_id = d.first_id,
+            last_id = d.last_id,
+            low, medium, high, critical,
+            acted = d.acted,
+            "detection records dropped from a full queue (not in the detection chain)",
+        );
+        let Some(log) = audit_log else { return };
+        let draft = crate::audit::AuditEntryDraft {
+            op: DROPPED_AUDIT_OP.to_string(),
+            extra: serde_json::json!({
+                "window_secs": crate::detection_budget::REPORT_SECS,
+                "count": d.count,
+                "first_id": d.first_id,
+                "last_id": d.last_id,
+                "lowest_id": d.lowest_id,
+                "highest_id": d.highest_id,
+                "severities": {
+                    "low": low,
+                    "medium": medium,
+                    "high": high,
+                    "critical": critical,
+                },
+                "acted": d.acted,
+                "dropped_total": self.dropped(),
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+        };
+        if let Err(e) = log.lock().append(draft) {
+            warn!(
+                target: "detection_store",
+                error = format!("{e:#}"),
+                "detections-dropped audit entry failed"
+            );
+        }
     }
 
     /// Record a rule-path detection (off the hot path).
@@ -725,6 +844,7 @@ impl DetectionSink {
                 notify: Notify::new(),
                 last_id: AtomicU64::new(seed_last_id),
                 dropped: AtomicU64::new(0),
+                drops: Mutex::new(DropWindow::default()),
                 cap,
             }),
         }
@@ -760,6 +880,7 @@ pub fn open(
         notify: Notify::new(),
         last_id: AtomicU64::new(seed),
         dropped: AtomicU64::new(0),
+        drops: Mutex::new(DropWindow::default()),
         cap: queue_cap,
     });
     let handle = spawn_writer(log, Arc::clone(&inner));
@@ -1708,6 +1829,101 @@ mod tests {
         push(&kill, "KillProcess"); // 7: only kills → the oldest goes
         assert_eq!(sink.queue_snapshot(), vec![3, 5, 7]);
         assert_eq!(sink.dropped(), 4);
+    }
+
+    /// External audit NN-AUD-111: among logged-only records a full queue
+    /// evicts the lowest severity first (oldest first within it), and a
+    /// logged record below everything queued is dropped itself. Before the
+    /// fix the oldest logged record went whatever its severity (here the
+    /// High one, id 1).
+    #[test]
+    fn full_queue_evicts_lowest_severity_logged_record_first() {
+        let sink = DetectionSink::for_test(3, 0);
+        let logged = |sev: Severity| {
+            let mut v = sample_verdict();
+            v.action = ResponseAction::Log;
+            v.severity = sev;
+            v
+        };
+        let push = |v: &Verdict| {
+            sink.record_rule(
+                &sample_event(),
+                v,
+                PostureKind::Observing,
+                "none".to_string(),
+                0,
+            )
+        };
+        push(&logged(Severity::High)); // 1
+        push(&logged(Severity::Low)); // 2
+        push(&logged(Severity::Low)); // 3
+        push(&logged(Severity::Medium)); // 4: evicts 2 (Low, oldest)
+        assert_eq!(sink.queue_snapshot(), vec![1, 3, 4]);
+        push(&logged(Severity::Low)); // 5: evicts 3 (Low, same rank: freshest wins)
+        assert_eq!(sink.queue_snapshot(), vec![1, 4, 5]);
+        push(&logged(Severity::Critical)); // 6: evicts 5 (Low)
+        assert_eq!(sink.queue_snapshot(), vec![1, 4, 6]);
+        push(&logged(Severity::Low)); // 7: below everything queued: dropped
+        assert_eq!(sink.queue_snapshot(), vec![1, 4, 6]);
+        push(&sample_verdict()); // 8: a kill evicts the lowest logged (4, Medium)
+        assert_eq!(sink.queue_snapshot(), vec![1, 6, 8]);
+        assert_eq!(sink.dropped(), 5);
+        let d = sink.take_drops().expect("drops noted");
+        assert_eq!(d.count, 5);
+        assert_eq!((d.first_id, d.last_id), (2, 4));
+        assert_eq!((d.lowest_id, d.highest_id), (2, 7));
+        assert_eq!(d.by_severity, [4, 1, 0, 0]);
+        assert_eq!(d.acted, 0);
+    }
+
+    /// External audit NN-AUD-111: queue drops reach the signed audit chain,
+    /// one entry per report window that saw drops and none otherwise.
+    /// Before the fix a drop was only a WARN and a counter.
+    #[test]
+    fn queue_drops_are_attested_once_per_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.key")).unwrap();
+        let path = dir.path().join("audit.log");
+        let log = Mutex::new(crate::audit::AuditLog::open(&path, key, [0u8; 16]).unwrap());
+        let entries = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let sink = DetectionSink::for_test(2, 0);
+        let push = || {
+            sink.record_rule(
+                &sample_event(),
+                &sample_verdict(),
+                PostureKind::Observing,
+                "KillProcess".to_string(),
+                0,
+            )
+        };
+        sink.report_drops(Some(&log));
+        assert!(entries().is_empty(), "no drops, no entry");
+        for _ in 0..5 {
+            push();
+        }
+        sink.report_drops(Some(&log));
+        sink.report_drops(Some(&log));
+        let e = entries();
+        assert_eq!(e.len(), 1, "one entry for the window");
+        assert_eq!(e[0]["op"], DROPPED_AUDIT_OP);
+        assert_eq!(e[0]["extra"]["count"], 3);
+        assert_eq!(e[0]["extra"]["first_id"], 1);
+        assert_eq!(e[0]["extra"]["last_id"], 3);
+        assert_eq!(e[0]["extra"]["severities"]["medium"], 3);
+        assert_eq!(e[0]["extra"]["acted"], 3);
+        push();
+        sink.report_drops(Some(&log));
+        let e = entries();
+        assert_eq!(e.len(), 2, "a new window with drops, a new entry");
+        assert_eq!(e[1]["extra"]["count"], 1);
+        assert_eq!(e[1]["extra"]["first_id"], 4);
+        assert_eq!(e[1]["extra"]["dropped_total"], 4);
     }
 
     /// An anti-tamper denial is a Log verdict, but the kernel acted: it

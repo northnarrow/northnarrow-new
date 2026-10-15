@@ -6,6 +6,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Fixed
+- External audit, Wave 2, self-integrity and detection-store evidence
+  (Medium EVD-013, EVD-012, EVD-006): a drop-in reported once, removed and
+  put back identically was never reported again. The self-integrity check
+  now records a finding that goes away (`integrity_drift_cleared`, signed)
+  and reports it again when it comes back (at most once per 10 minutes,
+  with the count), capped at 64 findings per kind per round. Limits that
+  appear or vanish are drift, the agent's cgroup is checked, and when the
+  agent runs as its unit the first round compares the limits with the
+  unit's values (`limit_unexpected`), so a limit changed in the first 15 s
+  is no longer taken as normal. A full detection queue drops the lowest
+  severity logged-only record first, and drops are recorded in a signed
+  `detections_dropped` audit entry per minute.
 - External audit, Wave 2, kernel telemetry loss (Medium EBPF-009,
   EBPF-013): holding 4096 watched files open for write filled the FIM
   write-marker map, and the next in-place rewrite of a watched file left

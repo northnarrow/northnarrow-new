@@ -154,10 +154,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-108 | EVD-002 | Evidence logs | L | open |
 | NN-AUD-109 | EVD-003 | Evidence logs | M | open |
 | NN-AUD-110 | EVD-004 | Evidence logs | M | open |
-| NN-AUD-111 | EVD-006 | Evidence logs | M | open |
+| NN-AUD-111 | EVD-006 | Evidence logs | M | fixed (lab PR 130) |
 | NN-AUD-112 | EVD-009 | Evidence logs | M | open |
-| NN-AUD-113 | EVD-012 | Evidence logs | S | open |
-| NN-AUD-114 | EVD-013 | Evidence logs | M | open |
+| NN-AUD-113 | EVD-012 | Evidence logs | S | fixed (lab PR 130) |
+| NN-AUD-114 | EVD-013 | Evidence logs | M | fixed (lab PR 130) |
 | NN-AUD-115 | EVD-018 | Evidence logs | S | open |
 | NN-AUD-116 | FIMR-007 | FIM rules | S | fixed (lab PR 111) |
 | NN-AUD-117 | FIMR-008 | FIM rules | M | fixed (lab PR 111) |
@@ -2545,3 +2545,75 @@ the audit did not report, noted with the fix that takes them.
     needs a signed fim-paths overlay. Privileged gate: Ubuntu 24.04 and
     Debian 12, 29 suites, 79 passed, 0 failed each (the programs load on
     6.8 and 6.1). The anti-tamper suite: OK. Host: 1811 passed, 0 failed.
+- **NN-AUD-114 (EVD-013), NN-AUD-113 (EVD-012), NN-AUD-111 (EVD-006), lab
+  PR 130.** Self-integrity re-arm and store-drop evidence (batch B3 of
+  wave 2, group C).
+  - EVD-013: `self_integrity` kept every finding in a `seen` set that was
+    never cleared, so a drop-in reported, removed and put back identically
+    (same mtime, `touch -d`) was silent for the life of the process, and
+    every new overlay digest grew the set. What a round recomputes
+    (drop-ins, unit shadows, overlays, mounts, admin keys on the host,
+    limits) is now an active set diffed round to round: a finding that
+    appears is reported (ERROR + signed `integrity_drift`), one that goes
+    away is recorded (signed `integrity_drift_cleared`, WARN). A comeback
+    is reported again at most once per 10 min (`REREPORT_SECS`) with the
+    number of comebacks held back (`reappeared`); a finding still present
+    when the window ends is reported then, and comebacks of one that is
+    gone by then are recorded with its clearing. At most 64 findings per
+    kind per round (the first by detail, then one "N more" finding). The
+    one-shot findings (`weakening_env`, `shutdown_marker_rejected`,
+    `agent_stalled`) stay out of the diff and are never "cleared"; their
+    dedup set is bounded (1024).
+  - EVD-012: the limit comparison skipped a metric missing on either side
+    and took whatever it saw 15 s after start as the baseline. A limit
+    that appears or vanishes is now drift (`limit_appeared` /
+    `limit_removed`), and the agent's cgroup path is a metric (a move to
+    the root cgroup, where every cgroup file vanishes, is reported). When
+    the agent runs as its unit (in `/system.slice/northnarrow-agent.service`,
+    or moved out of it while that cgroup exists), the baseline holds what
+    the shipped units set, parsed from the unit files embedded with
+    `include_str!`: agent `oom_score_adj` -500, `memory.high` 9G,
+    `memory.max` 11G, `pids.max` 512, `cpu.max` `max 100000` (only when
+    the cpu controller shows it), watchdog `oom_score_adj` -900. A
+    difference, already at the boot round, is `limit_unexpected` (signed),
+    and it clears once the value is back. The watchdog's value is compared
+    when its pidfile first resolves; its absence (a restarting watchdog)
+    is not drift. A manual run outside the unit keeps the observed
+    baseline, adopting the watchdog's value when first seen; cgroup v1
+    hosts read no cgroup metrics, as before. Known limit: a legitimate
+    operator drop-in changing these limits gives `limit_unexpected` next
+    to its `unit_dropin` finding.
+  - EVD-006: a full detection queue evicted the oldest logged-only record
+    whatever its severity, and a drop was only a WARN and a counter. Among
+    logged-only records the lowest severity now goes first (oldest first
+    within it), and an incoming logged record below every queued one is
+    the one dropped; records of a response that ran keep review 75's
+    rule. Each drop is noted (count, first/last and lowest/highest id,
+    per-severity counts, how many had acted), and the budget reporter,
+    started now once the store exists, writes one signed
+    `detections_dropped` audit entry per 60-s window that saw drops.
+  - Tests: `a_finding_that_clears_and_reappears_is_reported_again`,
+    `weakening_env_is_reported_once_and_never_cleared`,
+    `findings_per_kind_are_capped`,
+    `limit_appearing_or_vanishing_after_baseline_is_reported`,
+    `expected_limits_match_the_shipped_units`,
+    `boot_limits_differing_from_the_unit_are_reported`,
+    `watchdog_oom_is_baselined_late_against_expected`,
+    `full_queue_evicts_lowest_severity_logged_record_first`,
+    `queue_drops_are_attested_once_per_window`.
+  - Found by the lab: the optional `cpu.max` vanished when systemd dropped
+    the cpu controller after a daemon-reload and was reported as
+    `limit_unexpected`; an optional limit's absence is not drift (a
+    different value still is).
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `selfint130-probe.sh`: the agent
+    restarted (a trusted-installer window) and `systemctl set-property
+    --runtime northnarrow-agent.service MemoryMax=1G` run 3 s after its
+    start, before the first self-integrity round. Before (main): no record
+    (the lowered limit became the baseline). After: a signed
+    `limit_unexpected`, `at_boot:true`, "expected 11811160064 (unit),
+    found 1073741824"; restoring it raised no other finding. (A direct
+    write to `memory.max` is undone by systemd when it re-applies the
+    unit's properties.) The per-severity drop of NN-AUD-111 and the
+    re-reporting of NN-AUD-114 are covered by unit tests. Privileged gate:
+    Ubuntu 24.04 and Debian 12, 29 suites, 79 passed, 0 failed each. The
+    anti-tamper suite: OK. Host: 1821 passed, 0 failed.
