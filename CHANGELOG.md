@@ -15,6 +15,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, DNS attribution identity (Medium NET-016,
+  NET-006): a connect took the last name its PID had asked for in the
+  past 300 s, whoever held the PID then. A process that inherited the PID
+  of one that resolved a `.onion` name — and that resolves through
+  Varlink, or connects to a bare address — was recorded in the signed
+  netflow row with that name and killed by NN-L-NET-002. The connect pump
+  now reads the connecting process's start (the exec's from the spawn
+  cache, else `/proc` less the host's suspended time), the row carries it
+  (`proc_start_ns`), and only the queries made since count. A forwarded
+  DNS leg went to the newest PID that had sent the same name, compared
+  case-sensitively and wherever it was sent: a process could choose whom
+  NN-L-NET-014's kill named. The originator must now have asked a loopback
+  stub resolver, the name matches ignoring case, and two such processes
+  are an ambiguous attribution — logged, not acted on.
 - External audit, Wave 2, netflow drain throughput and honest coverage
   (Medium NET-019, NET-012, NET-009): every TCP close was written to
   `netflow.jsonl` with its own fsync and handed to the rules before the

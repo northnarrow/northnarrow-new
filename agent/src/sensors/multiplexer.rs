@@ -750,6 +750,10 @@ fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) 
         // `None`, NN-L-NET-008 never fired in production, and a forked
         // child of a staged dropper (no exec event) went unjudged.
         exe: lineage.image_path(raw.pid),
+        // External audit NET-016: who holds the PID, read while the process
+        // runs; the DNS attribution at close ignores the queries older than
+        // it (an earlier holder's).
+        proc_start_ns: lineage.start_floor_ns(raw.pid).unwrap_or(0),
     }
 }
 
@@ -813,6 +817,8 @@ async fn pump_dns_query(
                         exe,
                         query_name,
                         query_type,
+                        dns_server,
+                        family,
                         timestamp_ns,
                         ..
                     } = &mut event
@@ -829,6 +835,7 @@ async fn pump_dns_query(
                                 *pid,
                                 query_name.clone(),
                                 *query_type,
+                                common::netaddr::canonical_ip(*family, dns_server),
                                 *timestamp_ns,
                             );
                         }
@@ -943,5 +950,35 @@ mod tests {
 
         raw.pid = 4301; // gone, never seen
         assert_eq!(tcp_connect_info_from_raw(&raw, &lineage).exe, None);
+    }
+
+    /// External audit NET-016: the connect carries the connecting
+    /// process's start (here from `/proc`: at most the start it shows) for
+    /// the DNS attribution at close; a process already gone carries 0.
+    #[test]
+    fn a_connect_carries_the_connecting_process_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("4242");
+        std::fs::create_dir(&dir).unwrap();
+        // starttime (field 22) far past any suspended time of the host
+        let ticks: u64 = 1_000_000_000;
+        std::fs::write(
+            dir.join("stat"),
+            format!("4242 (a b) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+        )
+        .unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let shown = ticks * (1_000_000_000 / hz);
+
+        let mut raw = TcpConnectRaw::zeroed();
+        raw.pid = 4242;
+        raw.family = common::netaddr::AF_INET;
+        let start = tcp_connect_info_from_raw(&raw, &lineage).proc_start_ns;
+        assert!(start > 0 && start <= shown, "{start} vs {shown}");
+
+        raw.pid = 4301; // gone
+        assert_eq!(tcp_connect_info_from_raw(&raw, &lineage).proc_start_ns, 0);
     }
 }

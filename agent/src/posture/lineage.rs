@@ -1110,10 +1110,51 @@ impl AuthSessionTracker {
         if !self.inner.live || start_ns == 0 {
             return None;
         }
+        Some(self.ticks_show_start(self.proc_start_ticks(pid)?, start_ns))
+    }
+
+    /// A `/proc` start of `ticks` (boot clock) is the monotonic start
+    /// `start_ns` ([`Self::started_at`]).
+    fn ticks_show_start(&self, ticks: u64, start_ns: u64) -> bool {
         let tick = tick_ns();
-        let shown = self.proc_start_ticks(pid)?.saturating_mul(tick);
+        let shown = ticks.saturating_mul(tick);
         let slack = 2 * tick;
-        Some(shown + slack >= start_ns && shown <= start_ns + self.suspended_ns() + slack)
+        shown + slack >= start_ns && shown <= start_ns + self.suspended_ns() + slack
+    }
+
+    /// External audit NET-016: a time no later than the start of the
+    /// process `pid` names now (`CLOCK_MONOTONIC` ns): nothing that process
+    /// did is older. Its exec's start when the spawn cache holds the
+    /// current process (live checks on); else the start `/proc/<pid>/stat`
+    /// shows, on the boot clock, less all the time the host has spent
+    /// suspended and two ticks of rounding. `None` when `/proc` does not
+    /// show the process (it has exited). Read at connect time, next to
+    /// [`Self::image_path`].
+    pub fn start_floor_ns(&self, pid: u32) -> Option<u64> {
+        if pid == 0 {
+            return None;
+        }
+        let ticks = self.proc_start_ticks(pid)?;
+        if self.inner.live {
+            let cached = {
+                let s = self.inner.state.read();
+                s.map
+                    .get(&pid)
+                    .or_else(|| s.daemons.get(&pid))
+                    .map(|e| e.start_ns)
+            };
+            // An earlier holder's exec passing the check started before
+            // this process: still a floor.
+            if let Some(start) = cached.filter(|s| *s != 0 && self.ticks_show_start(ticks, *s)) {
+                return Some(start);
+            }
+        }
+        let tick = tick_ns();
+        Some(
+            ticks
+                .saturating_mul(tick)
+                .saturating_sub(self.suspended_ns() + 2 * tick),
+        )
     }
 
     /// `pid` started before the agent did.
@@ -2059,6 +2100,37 @@ mod tests {
         t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
         write_started(tmp.path(), "100", 1, ticks(9000 * S));
         assert!(t.is_auth_mediated(100));
+    }
+
+    /// External audit NET-016: the start read at connect time is never
+    /// later than the process's own — the exec's start when the cache
+    /// holds the current process, else `/proc`'s less the suspended time
+    /// and two ticks — and it is later than anything an earlier holder of
+    /// the pid did, beyond that slack.
+    #[test]
+    fn the_start_floor_is_the_current_process_start_or_below_it() {
+        let tmp = TempDir::new().unwrap();
+        let ticks = |ns: u64| ns / tick_ns();
+        let t = AuthSessionTracker::live_on(tmp.path(), 0);
+        // the cached exec is the process pid 100 names: its exact start
+        t.ingest_exec(100, 1, "/usr/bin/curl", &[], 1000 * S + 5, 1000 * S + 3);
+        write_started(tmp.path(), "100", 1, ticks(1000 * S + 3));
+        assert_eq!(t.start_floor_ns(100), Some(1000 * S + 3));
+        // a fork took pid 100 at 2000 s (no exec event): /proc's start
+        write_started(tmp.path(), "100", 1, ticks(2000 * S));
+        let floor = t.start_floor_ns(100).unwrap();
+        assert!(
+            floor <= 2000 * S && floor >= 2000 * S - 3 * tick_ns(),
+            "{floor}"
+        );
+        // an hour suspended: the floor moves back by the hour
+        write_started(tmp.path(), "100", 1, ticks(10_000 * S));
+        let t = AuthSessionTracker::live_on(tmp.path(), 3600 * S);
+        assert_eq!(t.start_floor_ns(100), Some(6400 * S - 2 * tick_ns()));
+        // an exited process has no start to read
+        fs::remove_dir_all(tmp.path().join("100")).unwrap();
+        assert_eq!(t.start_floor_ns(100), None);
+        assert_eq!(t.start_floor_ns(0), None);
     }
 
     /// External audit POS-002: a credential read is the PAM stack's when

@@ -23,9 +23,17 @@
 //! Concurrency: the cache holds its hot map behind a
 //! `parking_lot::Mutex` so callers can share via `Arc<DnsCache>`
 //! across the multi-task drain loop the future commits land.
+//!
+//! External audit NET-016 (NN-AUD-167): a PID is not a process. The
+//! kernel hands a freed PID to the next process within the 300 s window,
+//! so [`DnsCache::lookup_for_connect`] takes the connecting process's
+//! start (read at connect time) and ignores the queries made before it —
+//! a previous holder's. External audit NET-006 (NN-AUD-164):
+//! [`DnsCache::originator_for`] names an originator only when exactly one
+//! process asked a local stub resolver for the name.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use parking_lot::Mutex;
 
@@ -98,6 +106,17 @@ struct RecentQuery {
     ts_ns: u64,
 }
 
+/// One FP-3 reverse-index observation.
+#[derive(Debug, Clone)]
+struct ReverseEntry {
+    qname: String,
+    pid: u32,
+    ts_ns: u64,
+    /// Where the query was sent (external audit NET-006): only a query to
+    /// a local stub resolver can be the originator of a forwarded leg.
+    server: IpAddr,
+}
+
 #[derive(Debug, Default)]
 struct DnsCacheInner {
     /// PID → recent queries, oldest at the front. Changed only through
@@ -108,16 +127,16 @@ struct DnsCacheInner {
     total: usize,
     /// Inserts since the last stale-pid prune (see [`PRUNE_EVERY`]).
     inserts_since_prune: u32,
-    /// FP-3 reverse index: recent `(qname, pid, ts_ns)` observations in
+    /// FP-3 reverse index: recent [`ReverseEntry`] observations in
     /// insertion order (≈ monotonic `ts_ns`, single-writer drain),
     /// pruned to [`REVERSE_RETAIN_SECS`] / [`REVERSE_MAX_ENTRIES`].
-    /// [`DnsCache::originator_for`] scans this back-to-front to find the
-    /// most-recent *other* PID that issued a given qname — the
+    /// [`DnsCache::originator_for`] scans this for the one *other* PID
+    /// that asked a local stub for a given qname — the
     /// forwarder-aware back-correlation that lets NN-L-NET-004/-014
     /// attribute a forwarded leg to the originating process instead of
     /// the resolver. Distinct from `by_pid` (forward, 300 s
     /// connect-attribution); this one is reverse + short-lived.
-    recent_by_time: VecDeque<(String, u32, u64)>,
+    recent_by_time: VecDeque<ReverseEntry>,
 }
 
 /// PID-keyed DNS query cache. Construct once at agent boot,
@@ -210,11 +229,10 @@ impl DnsCache {
         }
     }
 
-    /// Record a DNS query observation. Called by the future
-    /// drain loop on every `Event::DnsQuery` (Tappa 4 BPF
-    /// `dns_query` kprobe). FIFO eviction kicks in past
-    /// `max_per_pid`.
-    pub fn on_dns_query(&self, pid: u32, qname: String, qtype: u16, ts_ns: u64) {
+    /// Record a DNS query observation: `pid` sent `qname` to `server`
+    /// (the datagram's destination). Called by the DNS pump on every
+    /// `Event::DnsQuery`. FIFO eviction kicks in past `max_per_pid`.
+    pub fn on_dns_query(&self, pid: u32, qname: String, qtype: u16, server: IpAddr, ts_ns: u64) {
         let mut g = self.inner.lock();
         g.push(
             pid,
@@ -234,13 +252,14 @@ impl DnsCache {
             g.inserts_since_prune = 0;
             Self::prune_pids(&mut g, ts_ns, self.ttl_ns);
         }
-        g.recent_by_time.push_back((qname, pid, ts_ns));
+        g.recent_by_time.push_back(ReverseEntry {
+            qname,
+            pid,
+            ts_ns,
+            server: common::netaddr::canonical(server),
+        });
         let cutoff = ts_ns.saturating_sub(self.reverse_retain_ns);
-        while g
-            .recent_by_time
-            .front()
-            .is_some_and(|(_, _, t)| *t < cutoff)
-        {
+        while g.recent_by_time.front().is_some_and(|e| e.ts_ns < cutoff) {
             g.recent_by_time.pop_front();
         }
         while g.recent_by_time.len() > REVERSE_MAX_ENTRIES {
@@ -248,10 +267,9 @@ impl DnsCache {
         }
     }
 
-    /// FP-3 forwarder-aware back-correlation. Returns the most-recent
-    /// PID *other than* `exclude_pid` that issued `qname` within
-    /// `window_ns` of `now_ns`, or `None` if no such originator is on
-    /// record.
+    /// FP-3 forwarder-aware back-correlation. Returns the one PID *other
+    /// than* `exclude_pid` that asked a local stub resolver for `qname`
+    /// within `window_ns` of `now_ns`, or `None`.
     ///
     /// NN-L-NET-004/-014 call this when a tripped DnsQuery's *sender* is
     /// a known forwarder/stub resolver (e.g. `systemd-resolved`): the
@@ -260,11 +278,25 @@ impl DnsCache {
     /// of the same qname triggered the forward. `exclude_pid` drops the
     /// forwarder's own just-recorded entry from consideration.
     ///
+    /// External audit NET-006 (NN-AUD-164): the newest PID that sent the
+    /// same name used to win, so a process that made a chosen victim ask
+    /// for a name, then asked for it itself (or the other way round),
+    /// picked which PID the verdict named. A candidate now
+    /// - sent its query to a loopback address (a local stub; a query sent
+    ///   elsewhere did not go through the forwarder);
+    /// - matches the name ignoring ASCII case (DNS names are
+    ///   case-insensitive, and a forwarder using DNS 0x20 changes the
+    ///   case of its upstream leg);
+    /// - is the only one: two distinct PIDs is an ambiguous attribution,
+    ///   and `None` — the caller logs instead of acting.
+    ///
     /// `None` is the safe outcome — Varlink/`nss-resolve` (the
     /// originator never sent UDP/53), a host acting as a LAN resolver
-    /// (the client is remote, no local PID), or a cache miss all return
-    /// `None`, and the caller downgrades to `Log` rather than acting on
-    /// the resolver.
+    /// (the client is remote, no local PID), an originator in another
+    /// network namespace that reaches the resolver on a non-loopback
+    /// address, an ambiguous name, or a cache miss all return `None`,
+    /// and the caller downgrades to `Log` rather than acting on the
+    /// resolver.
     ///
     /// The `window_ns` is the caller's tight correlation window (≤2 s),
     /// kept far below the reverse-index retention so a stale same-qname
@@ -283,21 +315,26 @@ impl DnsCache {
         while g
             .recent_by_time
             .front()
-            .is_some_and(|(_, _, t)| *t < retain_cutoff)
+            .is_some_and(|e| e.ts_ns < retain_cutoff)
         {
             g.recent_by_time.pop_front();
         }
         let win_cutoff = now_ns.saturating_sub(window_ns);
-        // Back-to-front = most-recent first; the first qname match from a
-        // different PID inside the window is the strongest originator
-        // candidate.
-        g.recent_by_time
-            .iter()
-            .rev()
-            .find(|(q, pid, ts)| {
-                *ts >= win_cutoff && *ts <= now_ns && *pid != exclude_pid && q == qname
-            })
-            .map(|(_, pid, _)| *pid)
+        let mut originator = None;
+        for e in g.recent_by_time.iter().filter(|e| {
+            e.ts_ns >= win_cutoff
+                && e.ts_ns <= now_ns
+                && e.pid != exclude_pid
+                && is_local_stub(&e.server)
+                && e.qname.eq_ignore_ascii_case(qname)
+        }) {
+            match originator {
+                None => originator = Some(e.pid),
+                Some(pid) if pid == e.pid => {}
+                Some(_) => return None,
+            }
+        }
+        originator
     }
 
     /// V1.0 back-correlation lookup. Returns the qname of the
@@ -337,12 +374,20 @@ impl DnsCache {
         }
     }
 
-    pub fn lookup_for_connect(&self, pid: u32, now_ns: u64) -> Option<String> {
+    /// The name `pid` most recently asked for at or before `now_ns`
+    /// (the connect), within the TTL. `proc_start_ns` is the connecting
+    /// process's start, or a time before it (`CLOCK_MONOTONIC`, read at
+    /// connect time; 0 = unknown): a query older than that was made by an
+    /// earlier holder of the PID and is not this process's (external
+    /// audit NET-016, NN-AUD-167). With the start unknown (the process
+    /// gone before the connect was read) the PID alone decides, as before.
+    pub fn lookup_for_connect(&self, pid: u32, now_ns: u64, proc_start_ns: u64) -> Option<String> {
         let g = self.inner.lock();
         let q = g.by_pid.get(&pid)?;
         // Saturate on underflow (monotonic clock jitter on the dev VM can
-        // push `now_ns < ttl_ns`).
-        let cutoff = now_ns.saturating_sub(self.ttl_ns);
+        // push `now_ns < ttl_ns`). NET-016: nothing older than the
+        // process is its own.
+        let cutoff = now_ns.saturating_sub(self.ttl_ns).max(proc_start_ns);
         // External audit NET-005 (NN-AUD-059): the newest query at or
         // before the connect, walking back. The caller passes the
         // connect's time and looks up when the flow CLOSES, so a query
@@ -384,6 +429,12 @@ impl DnsCache {
             .map(|q| q.len())
             .unwrap_or(0)
     }
+}
+
+/// A local stub resolver's address: `127.0.0.0/8` or `::1` (external
+/// audit NET-006). `server` is canonical (an IPv4-mapped address folded).
+fn is_local_stub(server: &IpAddr) -> bool {
+    server.is_loopback()
 }
 
 // ── DNS reply parser (forward-compat utility for V1.1) ───────────────
@@ -596,16 +647,19 @@ mod tests {
     fn a_query_flood_stays_under_the_global_cap_and_spares_quiet_pids() {
         let c = DnsCache::new(300, DEFAULT_MAX_PER_PID);
         let long = "a".repeat(200);
-        c.on_dns_query(7, "quiet.example.com".into(), 1, 1);
+        c.on_dns_query(7, "quiet.example.com".into(), 1, STUB, 1);
         for pid in 1000..1100u32 {
             for k in 0..DEFAULT_MAX_PER_PID {
-                c.on_dns_query(pid, format!("{k}.{long}"), 1, 2 + k as u64);
+                c.on_dns_query(pid, format!("{k}.{long}"), 1, STUB, 2 + k as u64);
             }
         }
         let (counted, held) = c.totals();
         assert_eq!(counted, held);
         assert!(held <= MAX_TOTAL_ENTRIES, "{held}");
-        assert_eq!(c.lookup_for_connect(7, 5), Some("quiet.example.com".into()));
+        assert_eq!(
+            c.lookup_for_connect(7, 5, 0),
+            Some("quiet.example.com".into())
+        );
     }
 
     /// The count stays right when stale pids are pruned and when the pid
@@ -615,13 +669,13 @@ mod tests {
         let c = DnsCache::new(1, 4);
         for pid in 0..10u32 {
             for k in 0..6 {
-                c.on_dns_query(pid, format!("n{k}.example"), 1, 1);
+                c.on_dns_query(pid, format!("n{k}.example"), 1, STUB, 1);
             }
         }
         assert_eq!(c.totals(), (40, 40), "4 per pid kept");
         // two seconds on: the stale pids go at the next prune
         for k in 0..PRUNE_EVERY {
-            c.on_dns_query(99, format!("late{k}.example"), 1, 3_000_000_000);
+            c.on_dns_query(99, format!("late{k}.example"), 1, STUB, 3_000_000_000);
         }
         let (counted, held) = c.totals();
         assert_eq!(counted, held);
@@ -633,17 +687,17 @@ mod tests {
     #[test]
     fn lookup_ignores_queries_issued_after_the_connect() {
         let c = DnsCache::default();
-        c.on_dns_query(42, "c2.example".into(), 1, 10 * ONE_SEC_NS);
-        c.on_dns_query(42, "noise.example".into(), 1, 30 * ONE_SEC_NS);
+        c.on_dns_query(42, "c2.example".into(), 1, STUB, 10 * ONE_SEC_NS);
+        c.on_dns_query(42, "noise.example".into(), 1, STUB, 30 * ONE_SEC_NS);
         assert_eq!(
-            c.lookup_for_connect(42, 20 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(42, 20 * ONE_SEC_NS, 0).as_deref(),
             Some("c2.example")
         );
         assert_eq!(
-            c.lookup_for_connect(42, 31 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(42, 31 * ONE_SEC_NS, 0).as_deref(),
             Some("noise.example")
         );
-        assert_eq!(c.lookup_for_connect(42, 5 * ONE_SEC_NS), None);
+        assert_eq!(c.lookup_for_connect(42, 5 * ONE_SEC_NS, 0), None);
     }
 
     /// Soak 2026-10-11 regression: one short-lived pid per query must not
@@ -655,7 +709,7 @@ mod tests {
         let sec = 1_000_000_000u64;
         // 2000 distinct pids, one query each, 1 s apart (~33 min span)
         for i in 0..2000u64 {
-            c.on_dns_query(10_000 + i as u32, format!("h{i}.example"), 1, i * sec);
+            c.on_dns_query(10_000 + i as u32, format!("h{i}.example"), 1, STUB, i * sec);
         }
         // every pid older than 300 s is prunable; the opportunistic prune
         // runs every PRUNE_EVERY inserts, so the map is bounded by
@@ -667,7 +721,7 @@ mod tests {
         );
         // a pid whose newest query is within the TTL is still served
         assert_eq!(
-            c.lookup_for_connect(10_000 + 1999, 1999 * sec + sec),
+            c.lookup_for_connect(10_000 + 1999, 1999 * sec + sec, 0),
             Some("h1999.example".to_string())
         );
         // one well inside the TTL window but pruned by age is gone
@@ -681,7 +735,13 @@ mod tests {
         let c = DnsCache::new(300, 1024);
         let ms = 1_000_000u64;
         for i in 0..(DEFAULT_MAX_PIDS as u64 + 1000) {
-            c.on_dns_query(20_000 + i as u32, "same.example".to_string(), 1, i * ms);
+            c.on_dns_query(
+                20_000 + i as u32,
+                "same.example".to_string(),
+                1,
+                STUB,
+                i * ms,
+            );
         }
         assert!(c.tracked_pids() <= DEFAULT_MAX_PIDS, "{}", c.tracked_pids());
         let newest = 20_000 + DEFAULT_MAX_PIDS as u32 + 999;
@@ -692,6 +752,10 @@ mod tests {
     use std::thread;
 
     const ONE_SEC_NS: u64 = 1_000_000_000;
+    /// A local stub resolver (`systemd-resolved`'s listener).
+    const STUB: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53));
+    /// An upstream server: where a forwarder's leg, or a direct query, goes.
+    const UPSTREAM: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
 
     /// N4 test #1 — happy-path attribution. A DNS query at T,
     /// connect from the same PID within the 300 s window,
@@ -699,9 +763,9 @@ mod tests {
     #[test]
     fn dns_cache_resolves_pid_ip_to_domain_within_window() {
         let c = DnsCache::default();
-        c.on_dns_query(1234, "example.com".into(), 1, 1_000 * ONE_SEC_NS);
+        c.on_dns_query(1234, "example.com".into(), 1, STUB, 1_000 * ONE_SEC_NS);
         assert_eq!(
-            c.lookup_for_connect(1234, 1_001 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(1234, 1_001 * ONE_SEC_NS, 0).as_deref(),
             Some("example.com")
         );
     }
@@ -713,12 +777,12 @@ mod tests {
     #[test]
     fn dns_cache_misses_after_5min_ttl_expiry() {
         let c = DnsCache::default();
-        c.on_dns_query(1234, "example.com".into(), 1, 0);
+        c.on_dns_query(1234, "example.com".into(), 1, STUB, 0);
         let now = (DEFAULT_TTL_SECS + 1) * ONE_SEC_NS;
-        assert!(c.lookup_for_connect(1234, now).is_none());
+        assert!(c.lookup_for_connect(1234, now, 0).is_none());
         // a connect inside the window still finds it: the read kept it
         assert_eq!(
-            c.lookup_for_connect(1234, ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(1234, ONE_SEC_NS, 0).as_deref(),
             Some("example.com")
         );
     }
@@ -730,12 +794,12 @@ mod tests {
     fn dns_cache_evicts_oldest_when_per_pid_capacity_full() {
         let c = DnsCache::new(DEFAULT_TTL_SECS, 3);
         for (i, name) in ["a.com", "b.com", "c.com", "d.com"].iter().enumerate() {
-            c.on_dns_query(7, (*name).into(), 1, (i as u64 + 1) * ONE_SEC_NS);
+            c.on_dns_query(7, (*name).into(), 1, STUB, (i as u64 + 1) * ONE_SEC_NS);
         }
         assert_eq!(c.entries_for(7), 3, "FIFO must cap at max_per_pid");
         // Most-recent wins.
         assert_eq!(
-            c.lookup_for_connect(7, 10 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(7, 10 * ONE_SEC_NS, 0).as_deref(),
             Some("d.com")
         );
     }
@@ -776,8 +840,8 @@ mod tests {
             let c = c.clone();
             handles.push(thread::spawn(move || {
                 let name = format!("pid-{pid}.example.com");
-                c.on_dns_query(pid, name.clone(), 1, ONE_SEC_NS);
-                let got = c.lookup_for_connect(pid, 2 * ONE_SEC_NS);
+                c.on_dns_query(pid, name.clone(), 1, STUB, ONE_SEC_NS);
+                let got = c.lookup_for_connect(pid, 2 * ONE_SEC_NS, 0);
                 assert_eq!(got.as_deref(), Some(name.as_str()));
             }));
         }
@@ -794,17 +858,17 @@ mod tests {
     #[test]
     fn dns_cache_does_not_cross_contaminate_pids() {
         let c = DnsCache::default();
-        c.on_dns_query(100, "alice.example.com".into(), 1, ONE_SEC_NS);
-        c.on_dns_query(200, "bob.example.com".into(), 1, ONE_SEC_NS);
+        c.on_dns_query(100, "alice.example.com".into(), 1, STUB, ONE_SEC_NS);
+        c.on_dns_query(200, "bob.example.com".into(), 1, STUB, ONE_SEC_NS);
         assert_eq!(
-            c.lookup_for_connect(100, 2 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(100, 2 * ONE_SEC_NS, 0).as_deref(),
             Some("alice.example.com")
         );
         assert_eq!(
-            c.lookup_for_connect(200, 2 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(200, 2 * ONE_SEC_NS, 0).as_deref(),
             Some("bob.example.com")
         );
-        assert!(c.lookup_for_connect(300, 2 * ONE_SEC_NS).is_none());
+        assert!(c.lookup_for_connect(300, 2 * ONE_SEC_NS, 0).is_none());
     }
 
     /// N4 test #8 — most-recent qname wins the back-correlation
@@ -815,10 +879,10 @@ mod tests {
     #[test]
     fn dns_cache_most_recent_query_wins_back_correlation() {
         let c = DnsCache::default();
-        c.on_dns_query(42, "cdn.example.com".into(), 1, ONE_SEC_NS);
-        c.on_dns_query(42, "images.example.com".into(), 1, 2 * ONE_SEC_NS);
+        c.on_dns_query(42, "cdn.example.com".into(), 1, STUB, ONE_SEC_NS);
+        c.on_dns_query(42, "images.example.com".into(), 1, STUB, 2 * ONE_SEC_NS);
         assert_eq!(
-            c.lookup_for_connect(42, 3 * ONE_SEC_NS).as_deref(),
+            c.lookup_for_connect(42, 3 * ONE_SEC_NS, 0).as_deref(),
             Some("images.example.com")
         );
     }
@@ -834,9 +898,9 @@ mod tests {
         let c = DnsCache::default();
         let q = "ZGVhZGJlZWY.exfil.example.com";
         // Originator's stub query first…
-        c.on_dns_query(1000, q.into(), 1, 1_000 * ONE_SEC_NS);
+        c.on_dns_query(1000, q.into(), 1, STUB, 1_000 * ONE_SEC_NS);
         // …then the forwarder's upstream leg, microseconds later.
-        c.on_dns_query(673, q.into(), 1, 1_000 * ONE_SEC_NS + 5_000);
+        c.on_dns_query(673, q.into(), 1, UPSTREAM, 1_000 * ONE_SEC_NS + 5_000);
         // Excluding the forwarder, the originator is recovered.
         assert_eq!(
             c.originator_for(q, 1_000 * ONE_SEC_NS + 10_000, 2 * ONE_SEC_NS, 673),
@@ -853,7 +917,7 @@ mod tests {
     fn originator_for_returns_none_when_only_forwarder_issued() {
         let c = DnsCache::default();
         let q = "high-entropy-label.attacker.net";
-        c.on_dns_query(673, q.into(), 1, 5 * ONE_SEC_NS);
+        c.on_dns_query(673, q.into(), 1, UPSTREAM, 5 * ONE_SEC_NS);
         assert!(c
             .originator_for(q, 5 * ONE_SEC_NS + 1_000, 2 * ONE_SEC_NS, 673)
             .is_none());
@@ -867,27 +931,143 @@ mod tests {
     fn originator_for_ignores_stale_entry_outside_window() {
         let c = DnsCache::default();
         let q = "shared.example.com";
-        c.on_dns_query(1000, q.into(), 1, ONE_SEC_NS);
+        c.on_dns_query(1000, q.into(), 1, STUB, ONE_SEC_NS);
         // Forward leg now, 10 s later — well outside the 2 s window.
         let now = 11 * ONE_SEC_NS;
-        c.on_dns_query(673, q.into(), 1, now);
+        c.on_dns_query(673, q.into(), 1, UPSTREAM, now);
         assert!(c.originator_for(q, now, 2 * ONE_SEC_NS, 673).is_none());
     }
 
-    /// FP-3 #4 — most-recent OTHER PID wins. If two distinct local PIDs
-    /// issued the same qname inside the window, the later one is the
-    /// stronger originator candidate (most-recent-wins, mirroring the
-    /// forward cache's tie-break).
+    /// External audit NET-006 (NN-AUD-164): two distinct PIDs asked the
+    /// stub for the name inside the window — which one the forwarded leg
+    /// came from is unknown, and the newest no longer wins: `None`, and
+    /// the caller downgrades to `Log`. One PID asking twice (A + AAAA, a
+    /// retry) is still one originator.
     #[test]
-    fn originator_for_picks_most_recent_other_pid() {
+    fn ambiguous_originator_downgrades() {
         let c = DnsCache::default();
         let q = "dup.example.com";
-        c.on_dns_query(100, q.into(), 1, ONE_SEC_NS);
-        c.on_dns_query(200, q.into(), 1, ONE_SEC_NS + 500_000);
-        c.on_dns_query(673, q.into(), 1, ONE_SEC_NS + 600_000);
+        c.on_dns_query(100, q.into(), 1, STUB, ONE_SEC_NS);
+        c.on_dns_query(200, q.into(), 1, STUB, ONE_SEC_NS + 500_000);
+        c.on_dns_query(673, q.into(), 1, UPSTREAM, ONE_SEC_NS + 600_000);
         assert_eq!(
             c.originator_for(q, 2 * ONE_SEC_NS, 2 * ONE_SEC_NS, 673),
-            Some(200)
+            None
+        );
+
+        let one = DnsCache::default();
+        one.on_dns_query(100, q.into(), 1, STUB, ONE_SEC_NS);
+        one.on_dns_query(100, q.into(), 28, STUB, ONE_SEC_NS + 100_000);
+        one.on_dns_query(673, q.into(), 1, UPSTREAM, ONE_SEC_NS + 600_000);
+        assert_eq!(
+            one.originator_for(q, 2 * ONE_SEC_NS, 2 * ONE_SEC_NS, 673),
+            Some(100)
+        );
+    }
+
+    /// External audit NET-006: DNS names are case-insensitive, and a
+    /// forwarder using DNS 0x20 mixes the case of its upstream leg.
+    #[test]
+    fn originator_ignores_case() {
+        let c = DnsCache::default();
+        c.on_dns_query(
+            1000,
+            "zgvhzgjlzwy.exfil.example.com".into(),
+            1,
+            STUB,
+            ONE_SEC_NS,
+        );
+        let leg = "ZgVhZGjLzWy.ExFiL.eXaMpLe.CoM";
+        c.on_dns_query(673, leg.into(), 1, UPSTREAM, ONE_SEC_NS + 5_000);
+        assert_eq!(
+            c.originator_for(leg, ONE_SEC_NS + 10_000, 2 * ONE_SEC_NS, 673),
+            Some(1000)
+        );
+    }
+
+    /// External audit NET-006: only a query sent to a local stub resolver
+    /// can have caused the forwarder's leg. A process that sent the same
+    /// name straight upstream is not the originator — and does not make
+    /// the stub's one asker ambiguous either.
+    #[test]
+    fn originator_requires_a_stub_query() {
+        let q = "c2.example.com";
+        let c = DnsCache::default();
+        c.on_dns_query(1000, q.into(), 1, UPSTREAM, ONE_SEC_NS);
+        c.on_dns_query(673, q.into(), 1, UPSTREAM, ONE_SEC_NS + 5_000);
+        assert_eq!(
+            c.originator_for(q, ONE_SEC_NS + 10_000, 2 * ONE_SEC_NS, 673),
+            None
+        );
+
+        // the stub's asker is named; the direct one beside it does not count
+        let c = DnsCache::default();
+        c.on_dns_query(1000, q.into(), 1, STUB, ONE_SEC_NS);
+        c.on_dns_query(2000, q.into(), 1, UPSTREAM, ONE_SEC_NS + 1_000);
+        c.on_dns_query(673, q.into(), 1, UPSTREAM, ONE_SEC_NS + 5_000);
+        assert_eq!(
+            c.originator_for(q, ONE_SEC_NS + 10_000, 2 * ONE_SEC_NS, 673),
+            Some(1000)
+        );
+
+        // every loopback address is a local stub: 127.0.0.0/8, ::1 and the
+        // IPv4-mapped form
+        for stub in ["127.0.0.1", "127.0.0.54", "::1", "::ffff:127.0.0.53"] {
+            let c = DnsCache::default();
+            c.on_dns_query(1000, q.into(), 1, stub.parse().unwrap(), ONE_SEC_NS);
+            assert_eq!(
+                c.originator_for(q, ONE_SEC_NS + 10_000, 2 * ONE_SEC_NS, 673),
+                Some(1000),
+                "{stub}"
+            );
+        }
+    }
+
+    // ── External audit NET-016 (NN-AUD-167): the PID's holder ───────
+
+    /// The process that asked for `old.onion` exited and its PID went to
+    /// another process, which connects to an address it never resolved:
+    /// the connect is not attributed the previous holder's name. A query
+    /// the new holder made itself is.
+    #[test]
+    fn a_recycled_pid_does_not_inherit_queries() {
+        let c = DnsCache::default();
+        // previous holder of pid 4242
+        c.on_dns_query(4242, "old.onion".into(), 1, UPSTREAM, 10 * ONE_SEC_NS);
+        // the new holder started at 40 s and connects at 50 s
+        let new_start = 40 * ONE_SEC_NS;
+        assert_eq!(c.lookup_for_connect(4242, 50 * ONE_SEC_NS, new_start), None);
+        // its own query is its own
+        c.on_dns_query(4242, "own.example".into(), 1, STUB, 45 * ONE_SEC_NS);
+        assert_eq!(
+            c.lookup_for_connect(4242, 50 * ONE_SEC_NS, new_start)
+                .as_deref(),
+            Some("own.example")
+        );
+        // the previous holder's own connect (before the new start) still
+        // gets its name: the start passed is that process's
+        assert_eq!(
+            c.lookup_for_connect(4242, 11 * ONE_SEC_NS, 5 * ONE_SEC_NS)
+                .as_deref(),
+            Some("old.onion")
+        );
+    }
+
+    /// A query made at the start itself is the process's (a bound below
+    /// the start is what the caller passes); a start unknown (0) leaves
+    /// the PID alone to decide, as before.
+    #[test]
+    fn a_query_at_the_start_counts_and_an_unknown_start_falls_back() {
+        let c = DnsCache::default();
+        c.on_dns_query(7, "x.example".into(), 1, STUB, 40 * ONE_SEC_NS);
+        assert_eq!(
+            c.lookup_for_connect(7, 41 * ONE_SEC_NS, 40 * ONE_SEC_NS)
+                .as_deref(),
+            Some("x.example")
+        );
+        assert_eq!(
+            c.lookup_for_connect(7, 41 * ONE_SEC_NS, 0).as_deref(),
+            Some("x.example")
         );
     }
 

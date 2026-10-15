@@ -2456,6 +2456,7 @@ mod tests {
             uid: 1000,
             comm: comm.to_string(),
             exe: Some(format!("/usr/bin/{comm}")),
+            proc_start_ns: 0,
             bytes_sent: 1024,
             bytes_recv: 2048,
             resolved_hostname: None,
@@ -2885,7 +2886,7 @@ mod tests {
         let cache = Arc::new(DnsCache::default());
         let long = format!("{}.example.com", "a".repeat(80));
         // Originator (firefox, pid 5000) issued the stub query first.
-        cache.on_dns_query(5000, long.clone(), 1, 1_000);
+        cache.on_dns_query(5000, long.clone(), 1, [127, 0, 0, 53].into(), 1_000);
         let rule = NnLNet004SuspiciousDnsQname::new(Arc::clone(&cache));
         // The forwarder (systemd-resolved, pid 673) relays it upstream.
         let leg = dns_event_full(673, &long, 1, "systemd-resolved", Some(RESOLVER_EXE), 1_500);
@@ -2934,7 +2935,7 @@ mod tests {
     fn fp3_014_forwarded_leg_back_correlates_to_originator() {
         let cache = Arc::new(DnsCache::default());
         let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0.exfil.example.com";
-        cache.on_dns_query(8080, q.into(), 1, 4_000);
+        cache.on_dns_query(8080, q.into(), 1, [127, 0, 0, 53].into(), 4_000);
         let rule = NnLNet014DnsTunnelEntropy::new(Arc::clone(&cache));
         let leg = dns_event_full(673, q, 1, "systemd-resolved", Some(RESOLVER_EXE), 4_200);
         let v = rule.evaluate(&leg).expect("forwarded entropy leg surfaces");
@@ -3026,7 +3027,7 @@ mod tests {
         let long = format!("{}.example.com", "a".repeat(80));
         // Originator (getent, pid 1122) on record so the forwarded leg
         // back-correlates to it.
-        cache.on_dns_query(1122, long.clone(), 1, 0);
+        cache.on_dns_query(1122, long.clone(), 1, [127, 0, 0, 53].into(), 0);
         let rule = NnLNet004SuspiciousDnsQname::new(Arc::clone(&cache));
         // Direct leg — the originator's own stub query (sender = 1122, not
         // a resolver) → Act on 1122 → fires.
@@ -3658,6 +3659,7 @@ mod tests {
             uid: 1000,
             comm: comm.to_string(),
             exe: Some(format!("/usr/bin/{comm}")),
+            proc_start_ns: 0,
             bytes_sent: 1024,
             bytes_recv: 2048,
             resolved_hostname: None,

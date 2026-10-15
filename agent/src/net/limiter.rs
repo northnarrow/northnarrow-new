@@ -247,6 +247,7 @@ mod tests {
             tls_fingerprint: None,
             flow_id: "f".to_string(),
             close_reason: 0,
+            proc_start_ns: 0,
         }
     }
 

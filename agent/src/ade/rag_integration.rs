@@ -372,6 +372,7 @@ mod tests {
             uid: 1000,
             comm: "evilbin".into(),
             exe: Some("/usr/bin/evilbin".into()),
+            proc_start_ns: 0,
             bytes_sent: 4096,
             bytes_recv: 128,
             resolved_hostname: Some("exfil.example.org".into()),
