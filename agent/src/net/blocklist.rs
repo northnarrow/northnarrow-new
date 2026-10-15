@@ -24,6 +24,7 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
@@ -334,6 +335,62 @@ pub(crate) fn parse_blocklist_overlay_text(
 }
 
 // ── JA3 blocklist ────────────────────────────────────────────────────
+
+/// External audit NET-009 (BUG-025): no sensor captures a TLS ClientHello
+/// in this build — `tls_parser` has no caller and every flow row carries
+/// no fingerprint — so NN-L-NET-003 cannot match, whatever the JA3 list
+/// holds. Turned on by the change that adds the producer.
+pub const TLS_FINGERPRINT_PRODUCER: bool = false;
+
+/// JA3 entries loaded at boot, for [`inactive_net_rules`].
+static JA3_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+fn ja3_entries_phrase(entries: usize) -> String {
+    if entries == 1 {
+        "1 JA3 blocklist entry".to_string()
+    } else {
+        format!("{entries} JA3 blocklist entries")
+    }
+}
+
+/// External audit NET-009: the boot check. A JA3 list with entries and
+/// no fingerprint producer is coverage that does not exist; the returned
+/// text is the boot ERROR and the signed `subsystem_degraded` detail.
+/// `None` when the list is empty or a producer runs.
+pub fn ja3_coverage_gap(entries: usize, producer: bool) -> Option<String> {
+    (entries > 0 && !producer).then(|| {
+        format!(
+            "NN-L-NET-003 inactive: {} loaded, but no sensor produces TLS fingerprints in \
+             this build (BUG-025), so no flow can match them",
+            ja3_entries_phrase(entries)
+        )
+    })
+}
+
+/// Record the size of the JA3 list the boot loaded.
+pub fn note_ja3_entries(entries: usize) {
+    JA3_ENTRIES.store(entries, Ordering::Relaxed);
+}
+
+/// External audit NET-009: the network rules that cannot fire in this
+/// build, for `nn-admin net status`.
+pub fn inactive_net_rules() -> Vec<String> {
+    inactive_net_rules_with(
+        JA3_ENTRIES.load(Ordering::Relaxed),
+        TLS_FINGERPRINT_PRODUCER,
+    )
+}
+
+fn inactive_net_rules_with(entries: usize, producer: bool) -> Vec<String> {
+    if producer {
+        return Vec::new();
+    }
+    vec![format!(
+        "NN-L-NET-003 (JA3): no TLS fingerprint producer in this build (BUG-025); {} \
+         loaded, none can match",
+        ja3_entries_phrase(entries)
+    )]
+}
 
 /// JA3 fingerprint blocklist. JA3 hashes are 32-char lowercase
 /// hex strings (MD5 of the JA3 raw tuple, per Salesforce 2017
@@ -771,5 +828,30 @@ mod tests {
         // round-trip the case automatically — production
         // callers go through parse_ja3_hash via load().
         let _ = bl;
+    }
+    /// External audit NET-009: a JA3 list loaded with no fingerprint
+    /// producer is reported at boot (ERROR + signed `subsystem_degraded`);
+    /// an empty list, or a build with a producer, is not. `net status`
+    /// names NN-L-NET-003 as inactive either way while there is no
+    /// producer.
+    #[test]
+    fn a_ja3_list_without_a_fingerprint_producer_is_reported() {
+        let gap = ja3_coverage_gap(1, false).expect("reported");
+        assert!(gap.contains("NN-L-NET-003 inactive"), "{gap}");
+        assert!(gap.contains("1 JA3 blocklist entry loaded"), "{gap}");
+        assert!(ja3_coverage_gap(0, false).is_none());
+        assert!(ja3_coverage_gap(3, true).is_none());
+        let inactive = inactive_net_rules_with(2, false);
+        assert_eq!(inactive.len(), 1);
+        assert!(inactive[0].starts_with("NN-L-NET-003"), "{inactive:?}");
+        assert!(inactive[0].contains("2 JA3 blocklist entries"));
+        assert!(inactive_net_rules_with(2, true).is_empty());
+    }
+
+    /// The shipped `.v1` no longer says NN-L-NET-003 "stays functional".
+    #[test]
+    fn the_shipped_ja3_list_states_the_rule_is_inactive() {
+        assert!(!BUILTIN_JA3_BLOCKLIST_V1.contains("stays functional"));
+        assert!(BUILTIN_JA3_BLOCKLIST_V1.contains("BUG-025"));
     }
 }

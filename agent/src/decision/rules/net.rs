@@ -31,9 +31,11 @@
 //!
 //! NN-L-NET-001 + NN-L-NET-003 are tagged Critical with the
 //! "never throttled by the NetFlow rate limiter" invariant.
-//! The decision engine's bucketing path (§6.5, future commit)
-//! consults [`Rule::category`] for the tier; rules in the
-//! `"net_critical"` category bypass the bucket.
+//! External audit NET-019: the §6.5 pacing sits in the net drain, per
+//! uid, before any rule runs, so it cannot read a verdict's tier; it
+//! instead never holds back a flow that meets the predicate of a rule
+//! that kills ([`may_meet_a_kill_rule`]: NN-L-NET-001, -002, -003,
+//! -008, -010, -018) or of a process with a chain precursor.
 //!
 //! ## State-bearing rules
 //!
@@ -69,12 +71,12 @@ use crate::net::dns_cache::DnsCache;
 // ── Category tags ────────────────────────────────────────────────────
 
 /// Critical-tier NetFlow rules — NEVER throttled by the §6.5
-/// rate limiter per §13 Q4 lock-in. The future bucket-aware
-/// emitter checks for this category string.
+/// rate limiter per §13 Q4 lock-in (see the module docs for how the
+/// per-uid pacing keeps that).
 pub const CATEGORY_CRITICAL: &str = "net_critical";
-/// High-tier NetFlow rules — subject to the 200/min bucket.
+/// High-tier NetFlow rules.
 pub const CATEGORY_HIGH: &str = "net_high";
-/// Medium-tier NetFlow rules — subject to the 1000/min bucket.
+/// Medium-tier NetFlow rules.
 pub const CATEGORY_MEDIUM: &str = "net_medium";
 
 // ── Operator comm allowlist (per-family, §13 Q3) ─────────────────────
@@ -2278,6 +2280,40 @@ impl Rule for NnLNet014DnsTunnelEntropy {
     }
 }
 
+// ── NetFlow pacing guard (external audit NET-019) ───────────────────
+
+/// External audit NET-019: whether a flow meets the predicate of a
+/// NetFlow rule that kills — NN-L-NET-001 (blocklisted destination),
+/// -002 (blocked TLD), -003 (any TLS fingerprint), -008 (image in a
+/// staging directory), -010 (high-risk C2 port), -018 (internal host on
+/// a lateral-movement port) — allowlists and carve-outs aside, so a
+/// superset. The netflow drain never holds such a row back from the
+/// rules (`net::limiter`). Kept next to the rules so a change to one of
+/// these predicates is made here too; the test
+/// `every_killing_netflow_verdict_is_guarded` checks the superset.
+pub fn may_meet_a_kill_rule(nf: &common::wire::NetFlowEvent, blocklist: &NetBlocklist) -> bool {
+    if blocklist.contains(&nf.dst_addr) || nf.tls_fingerprint.is_some() {
+        return true;
+    }
+    if nf.resolved_hostname.as_deref().is_some_and(|h| {
+        let h = h.to_ascii_lowercase();
+        BLOCKED_TLDS.iter().any(|tld| h.ends_with(tld))
+    }) {
+        return true;
+    }
+    if HIGH_RISK_C2_PORTS.contains(&nf.dst_port) {
+        return true;
+    }
+    if LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) && common::netaddr::is_internal(nf.dst_addr) {
+        return true;
+    }
+    !TMP_EXEC_ALLOWED_PORTS.contains(&nf.dst_port)
+        && nf
+            .exe
+            .as_deref()
+            .is_some_and(crate::decision::rules::is_staging_path)
+}
+
 // ── Factory ──────────────────────────────────────────────────────────
 
 /// Build the NN-L-NET rules with operator-loaded blocklists, the
@@ -4175,5 +4211,91 @@ mod tests {
         .expect("recorded");
         assert_eq!(v.rule_id, "NN-L-NET-004_SuspiciousDnsQname");
         assert_eq!(v.action, ResponseAction::Log);
+    }
+
+    /// External audit NET-019: every NetFlow verdict that kills is on a
+    /// flow [`may_meet_a_kill_rule`] marks, so the netflow limiter never
+    /// holds one back from the rules. Each rule is run on its own (no
+    /// first match) over a grid of flows.
+    #[test]
+    fn every_killing_netflow_verdict_is_guarded() {
+        let bl = NetBlocklist::from_entries([crate::net::blocklist::NetBlocklistEntry::Cidr {
+            net: v4(198, 51, 100, 0),
+            prefix: 24,
+        }]);
+        let rules = net_rules(
+            Arc::new(bl.clone()),
+            Arc::new(Ja3Blocklist::from_entries(["aa".repeat(16)])),
+            Arc::new(Mutex::new(DnsBurstWindow::new())),
+            Arc::new(CommAllowlist::default()),
+            Arc::new(Mutex::new(BeaconWindow::new())),
+            Arc::new(DnsCache::default()),
+            None,
+        );
+        let addrs = [
+            v4(198, 51, 100, 7),
+            v4(10, 0, 0, 5),
+            v4(100, 64, 0, 1),
+            v4(8, 8, 8, 8),
+            v4(127, 0, 0, 1),
+            IpAddr::V6("fd00::5".parse().unwrap()),
+        ];
+        let ports = [21, 22, 53, 80, 443, 445, 1080, 3389, 4444, 5900, 8080, 9001];
+        let exes = [
+            Some("/usr/bin/curl"),
+            Some("/tmp/x"),
+            Some("/dev/shm/y"),
+            None,
+        ];
+        let hosts = [None, Some("a.ONION"), Some("example.com")];
+        let fp = TlsFingerprint {
+            ja3: "aa".repeat(16),
+            ja4: "t13d".to_string(),
+            ja3_raw: String::new(),
+            sni: None,
+            alpn: Vec::new(),
+        };
+        let (mut kills, mut guarded_only) = (0, 0);
+        let mut ts = 0u64;
+        for addr in addrs {
+            for port in ports {
+                for exe in exes {
+                    for host in hosts {
+                        for tls in [None, Some(fp.clone())] {
+                            ts += 1_000_000_000;
+                            let Event::NetFlow(mut nf) = flow(addr, port, "nnprobe") else {
+                                unreachable!()
+                            };
+                            nf.exe = exe.map(str::to_string);
+                            nf.resolved_hostname = host.map(str::to_string);
+                            nf.tls_fingerprint = tls;
+                            nf.start_ns = ts;
+                            nf.end_ns = ts + 1;
+                            let guarded = may_meet_a_kill_rule(&nf, &bl);
+                            let ev = Event::NetFlow(nf);
+                            let kill = rules.iter().filter_map(|r| r.evaluate(&ev)).any(|v| {
+                                matches!(
+                                    v.action,
+                                    ResponseAction::KillProcess | ResponseAction::KillProcessTree
+                                )
+                            });
+                            if kill {
+                                kills += 1;
+                                assert!(guarded, "{ev:?}");
+                            } else if guarded {
+                                guarded_only += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(kills > 100, "the grid reaches the killing rules: {kills}");
+        assert!(guarded_only < kills, "{guarded_only} vs {kills}");
+        // An ordinary flow is not guarded: the limiter may hold it back.
+        let Event::NetFlow(nf) = flow(v4(8, 8, 8, 8), 443, "curl") else {
+            unreachable!()
+        };
+        assert!(!may_meet_a_kill_rule(&nf, &bl));
     }
 }

@@ -1261,6 +1261,10 @@ fn dispatch(
             // External audit SNS-008: malformed records the pumps rejected.
             ringbuf_rejected_total: Some(crate::sensors::reject::total()),
             ringbuf_rejected: Some(crate::sensors::reject::snapshot()),
+            // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
+            netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
+            netflow_pending_evicted_total: Some(crate::net::flow_tracker::pending_evictions_total()),
+            net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
         }),
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
@@ -4711,6 +4715,9 @@ mod tests {
             combat_locked: None,
             ringbuf_rejected_total: None,
             ringbuf_rejected: None,
+            netflow_rows_skipped_total: None,
+            netflow_pending_evicted_total: None,
+            net_inactive_rules: None,
         });
         emit_audit_for(
             &status_req,

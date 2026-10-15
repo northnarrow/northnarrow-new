@@ -143,10 +143,13 @@ pub fn default_rules_with_net(
     // External audit DEC-005: the readers of whole trees the File and
     // Credential canary rules record instead of killing.
     canary_readers: crate::canary::readers::CanaryReaders,
+    // External audit NET-019: the chain rules' correlation store, shared
+    // with the netflow limiter.
+    correlation: Arc<Mutex<crate::decision::correlation::CorrelationStore>>,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
-    let chains = chain::chain_rule_set_with(Some(lineage.clone()));
+    let chains = chain::chain_rule_set_over(correlation, Some(lineage.clone()));
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
     // External audit NETR-003 class: the process allowlist judged on what
     // the kernel executed — from the exec event itself for R006, R007 and

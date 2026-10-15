@@ -649,6 +649,21 @@ pub struct StatusResponse {
     /// `(ring, rejected)` for the rings that rejected a record.
     #[serde(default)]
     pub ringbuf_rejected: Option<Vec<(String, u64)>>,
+    /// External audit NET-019: netflow rows held back from the rules by
+    /// the per-uid pacing since boot (written with
+    /// `decision_engine_skipped`). `None` from an agent older than the
+    /// field.
+    #[serde(default)]
+    pub netflow_rows_skipped_total: Option<u64>,
+    /// External audit NET-012: pending connects the flow tracker evicted
+    /// at capacity since boot. `None` from an agent older than the field.
+    #[serde(default)]
+    pub netflow_pending_evicted_total: Option<u64>,
+    /// External audit NET-009: the network rules that cannot fire in this
+    /// build, each with the reason. `None` from an agent older than the
+    /// field.
+    #[serde(default)]
+    pub net_inactive_rules: Option<Vec<String>>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -1299,6 +1314,9 @@ mod tests {
             combat_locked: None,
             ringbuf_rejected_total: None,
             ringbuf_rejected: None,
+            netflow_rows_skipped_total: None,
+            netflow_pending_evicted_total: None,
+            net_inactive_rules: None,
         }));
     }
 
@@ -1314,6 +1332,9 @@ mod tests {
             combat_locked: None,
             ringbuf_rejected_total: None,
             ringbuf_rejected: None,
+            netflow_rows_skipped_total: None,
+            netflow_pending_evicted_total: None,
+            net_inactive_rules: None,
         }));
     }
 
@@ -1477,6 +1498,9 @@ mod tests {
             combat_locked: Some(true),
             ringbuf_rejected_total: Some(3),
             ringbuf_rejected: Some(vec![("open_sensor".to_string(), 3)]),
+            netflow_rows_skipped_total: Some(5),
+            netflow_pending_evicted_total: Some(2),
+            net_inactive_rules: Some(vec!["NN-L-NET-003 (JA3)".to_string()]),
         }));
     }
 

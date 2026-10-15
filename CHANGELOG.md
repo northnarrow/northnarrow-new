@@ -15,6 +15,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, netflow drain throughput and honest coverage
+  (Medium NET-019, NET-012, NET-009): every TCP close was written to
+  `netflow.jsonl` with its own fsync and handed to the rules before the
+  next record was read, so one user's loop of short connections made the
+  kernel drop closes, other users' among them. Rows are now committed
+  together, one fsync at most every 100 ms (a crash of the host can lose
+  the last 100 ms, or tear the last row, which the next open cuts and
+  attests); the listener log too. The rows handed to the rules are paced
+  per uid (1,000, then 200 a second); a row held back is still written,
+  with `"decision_engine_skipped": true`, and is never one a killing rule
+  could match (NN-L-NET-001, -002, -003, -008, -010, -018) or one of a
+  process with a chain precursor, which keeps NN-L-CHAIN-* complete. The
+  flow tracker scanned up to 65,536 pending connects on every close and,
+  when full, evicted the oldest — the long session; a close is now O(1)
+  and the eviction takes the oldest connect of the process holding the
+  most, and a row built at close names its executable. No sensor
+  produces TLS fingerprints yet (BUG-025): a JA3 list with entries is now
+  an ERROR and a signed `subsystem_degraded` at boot instead of silent
+  coverage, the shipped `netflow-ja3-blocklist.v1` says NN-L-NET-003 is
+  inactive, and the new `nn-admin net status` shows the rows held back,
+  the evictions, the network rings' drops and the inactive rules.
 - External audit, Wave 2, posture scope and exemptions (Medium POS-005,
   POS-015, POS-009): every process without a login uid — each service,
   each container, a process already gone — shared one corroboration

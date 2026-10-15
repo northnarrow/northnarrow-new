@@ -118,6 +118,14 @@ pub struct StatusOutcome {
     /// (`None`: agent predates the counter).
     pub ringbuf_rejected_total: Option<u64>,
     pub ringbuf_rejected: Vec<(String, u64)>,
+    /// External audit NET-019: netflow rows held back from the rules since
+    /// boot (`None`: agent predates the counter).
+    pub netflow_rows_skipped_total: Option<u64>,
+    /// External audit NET-012: pending connects evicted at capacity.
+    pub netflow_pending_evicted_total: Option<u64>,
+    /// External audit NET-009: network rules that cannot fire, with why
+    /// (`None`: agent predates the field).
+    pub net_inactive_rules: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -247,6 +255,9 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         combat_locked: resp.combat_locked,
         ringbuf_rejected_total: resp.ringbuf_rejected_total,
         ringbuf_rejected: resp.ringbuf_rejected.unwrap_or_default(),
+        netflow_rows_skipped_total: resp.netflow_rows_skipped_total,
+        netflow_pending_evicted_total: resp.netflow_pending_evicted_total,
+        net_inactive_rules: resp.net_inactive_rules,
     })
 }
 
@@ -3172,6 +3183,9 @@ mod tests {
                     combat_locked: Some(true),
                     ringbuf_rejected_total: Some(2),
                     ringbuf_rejected: Some(vec![("open_sensor".to_string(), 2)]),
+                    netflow_rows_skipped_total: Some(7),
+                    netflow_pending_evicted_total: Some(0),
+                    net_inactive_rules: Some(vec!["NN-L-NET-003 (JA3)".to_string()]),
                 }),
             );
         });
@@ -3179,6 +3193,13 @@ mod tests {
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));
+        // External audit NET-019 / NET-009: the `net status` fields.
+        assert_eq!(out.netflow_rows_skipped_total, Some(7));
+        assert_eq!(out.netflow_pending_evicted_total, Some(0));
+        assert_eq!(
+            out.net_inactive_rules.as_deref(),
+            Some(&["NN-L-NET-003 (JA3)".to_string()][..])
+        );
         assert_eq!(out.ringbuf_rejected, vec![("open_sensor".to_string(), 2)]);
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);

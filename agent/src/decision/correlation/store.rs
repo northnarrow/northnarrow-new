@@ -424,6 +424,20 @@ impl CorrelationStore {
         false
     }
 
+    /// External audit NET-019: whether `pid` or one of its ancestors
+    /// holds a precursor of any kind within [`CORRELATION_WINDOW_NS`] of
+    /// `now_ns` — a flow of it could complete a chain, so the netflow
+    /// limiter never holds it back. Read-only: nothing is pruned.
+    pub fn has_precursor_in_lineage(&self, pid: u32, now_ns: u64) -> bool {
+        let cutoff = now_ns.saturating_sub(CORRELATION_WINDOW_NS);
+        let live = |key: &ProcKey| {
+            self.per_proc
+                .get(key)
+                .is_some_and(|q| q.iter().any(|p| p.ts_ns >= cutoff))
+        };
+        live(&self.current_key(pid)) || self.tree.get_ancestors(pid).iter().any(live)
+    }
+
     /// Read-only view of the ancestry tree (lineage queries / tests).
     pub fn ancestry(&self) -> &AncestryTree {
         &self.tree

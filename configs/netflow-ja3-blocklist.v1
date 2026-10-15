@@ -24,9 +24,15 @@
 #   legitimate clients share JA3 hashes with malware that targets the same
 #   TLS library / cipher-suite preference). Operators with their own feed
 #   know which fingerprints are load-bearing for their environment.
-# - The agent boots cleanly with an empty default; NN-L-NET-003 stays
-#   functional but matches nothing until the operator populates the
-#   `.local` overlay.
+# - The agent boots cleanly with an empty default.
+#
+# NOT ACTIVE IN THIS RELEASE (BUG-025, external audit NET-009): no sensor
+# captures the TLS ClientHello yet, so no flow carries a JA3 fingerprint and
+# NN-L-NET-003 cannot fire, whatever this list or the `.local` overlay holds.
+# A list with entries is reported at boot as an ERROR and a signed
+# `subsystem_degraded` audit entry, and `nn-admin net status` lists
+# NN-L-NET-003 as inactive. Entries are still parsed and kept, for the
+# release that adds the capture.
 #
 # See docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md §13 Q5 + §10 for
 # the rationale.

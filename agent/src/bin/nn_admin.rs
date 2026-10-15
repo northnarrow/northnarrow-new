@@ -816,6 +816,17 @@ impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
 /// Tappa 10 N7 — net subcommand surface (mirrors FimCmd shape).
 #[derive(Subcommand, Debug)]
 enum NetCmd {
+    /// What the network observation covers now: netflow rows held back
+    /// from the rules by the per-uid pacing, pending connects evicted,
+    /// the network rings' drops, and the network rules that cannot fire
+    /// in this build. Reads the unauthenticated `status` reply (no key).
+    Status {
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Stream the chained netflow log, newest rows first (rotated
     /// archives included). `--since-unix <ts>` filters server-side;
     /// the reply holds the newest rows that fit one frame.
@@ -1386,6 +1397,18 @@ fn main() -> ExitCode {
 
         // ── Tappa 10 N7 — net subcommands ─────────────────────────
         Cmd::Net {
+            sub: NetCmd::Status { socket, json },
+        } => match run_status(&socket) {
+            Ok(out) => {
+                print_net_status(&out, json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("net status: {e:#}");
+                ExitCode::from(5)
+            }
+        },
+        Cmd::Net {
             sub:
                 NetCmd::Flows {
                     key,
@@ -1854,6 +1877,75 @@ fn exit_from_unlock(outcome: UnlockOutcome) -> ExitCode {
             );
             ExitCode::from(4)
         }
+    }
+}
+
+/// External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
+fn print_net_status(out: &StatusOutcome, json: bool) {
+    let net_ring = |name: &str| {
+        matches!(
+            name,
+            "tcp_connect" | "tcp_close" | "udp" | "listen" | "listen_rate" | "dns" | "dns_rate"
+        )
+    };
+    let drops: Vec<&(String, u64)> = out
+        .ringbuf_drops
+        .iter()
+        .filter(|(n, _)| net_ring(n))
+        .collect();
+    let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
+    if json {
+        let drops: Vec<String> = drops
+            .iter()
+            .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
+            .collect();
+        let inactive: Vec<String> = out
+            .net_inactive_rules
+            .iter()
+            .flatten()
+            .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect();
+        println!(
+            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{}}}",
+            opt(out.netflow_rows_skipped_total),
+            opt(out.netflow_pending_evicted_total),
+            drops.join(","),
+            if out.net_inactive_rules.is_some() {
+                format!("[{}]", inactive.join(","))
+            } else {
+                "null".to_string()
+            },
+        );
+        return;
+    }
+    match out.netflow_rows_skipped_total {
+        Some(n) => println!(
+            "netflow rows held back from the rules : {n} (written with decision_engine_skipped; \
+             per-uid pacing)"
+        ),
+        None => println!("netflow rows held back from the rules : (agent predates the counter)"),
+    }
+    match out.netflow_pending_evicted_total {
+        Some(n) => println!("pending connects evicted at capacity  : {n}"),
+        None => println!("pending connects evicted at capacity  : (agent predates the counter)"),
+    }
+    if drops.is_empty() {
+        println!("network ring drops                    : none");
+    } else {
+        for (n, c) in drops {
+            println!("network ring drops                    : {n} {c}");
+        }
+    }
+    match &out.net_inactive_rules {
+        Some(rules) if rules.is_empty() => {
+            println!("inactive network rules                : none")
+        }
+        Some(rules) => {
+            for r in rules {
+                println!("inactive network rule                 : {r}");
+            }
+        }
+        None => println!("inactive network rules                : (agent predates the field)"),
     }
 }
 
