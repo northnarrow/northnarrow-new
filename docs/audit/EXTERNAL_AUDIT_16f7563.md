@@ -2263,3 +2263,21 @@ the audit did not report, noted with the fix that takes them.
     `net_outbound_connect_records_flow_with_dns_attribution`, which fails
     on main as well (2 of 3 runs on Debian): the network batch. The
     anti-tamper suite: OK. Host: 1758 passed, 0 failed.
+- **Lab-found, lab PR 124 (not an audit finding).** A TCP flow closed
+  abortively was recorded with source port 0.
+  - The TCP close fexit read the port from `skc_num`; an abortive close
+    (RST, `SO_LINGER` 0) reaches `tcp_set_state(TCP_CLOSE)` →
+    `inet_put_port` inside `tcp_close`, which zeroes it before the fexit
+    runs. The flow row, its `flow_id` input and the net rules saw port 0.
+    When `skc_num` is 0 the fexit now reads `inet_sock.inet_sport`
+    (network byte order, kept by the release): a new revalidated BTF offset
+    (`INET_SOCK_INET_SPORT_OFFSET`, byte 782 on 6.8, 804 on 6.1, resolved
+    at boot; slot 76, the enum and tracepoint slots after it renumbered).
+  - It was the "flaky" `net_outbound_connect_records_flow_with_dns_attribution`
+    of the privileged gate since lab PR 119.
+  - Lab: the failing test itself. Before (main): on Debian 12 it failed
+    in 2 of 3 runs and 3 of 3 in another series, on Ubuntu 24.04 in both
+    full gates of lab PR 120. After: Debian 12, 6 of 6 runs 7/7; privileged
+    gate Ubuntu 24.04 29 suites 77 passed 0 failed, Debian 12 29 suites 77
+    passed 0 failed — the first clean pair of this wave. The anti-tamper
+    suite: OK. Host: 1758 passed, 0 failed.

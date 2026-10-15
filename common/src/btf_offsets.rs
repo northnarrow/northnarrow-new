@@ -203,6 +203,13 @@ pub const SOCK_SKC_DPORT_OFFSET: usize = 12;
 /// sock_common = byte 14.
 pub const SOCK_SKC_NUM_OFFSET: usize = 14;
 
+/// `struct inet_sock.inet_sport` — the source port (NETWORK byte order).
+/// `bits_offset=6256` = byte 782 (6.8; 804 on 6.1, resolved at boot).
+/// The TCP close fexit reads it when `skc_num` is 0: an abortive close
+/// (`tcp_set_state(TCP_CLOSE)` → `inet_put_port`) zeroes `inet_num`
+/// before the fexit runs, and the flow was recorded with source port 0.
+pub const INET_SOCK_INET_SPORT_OFFSET: usize = 782;
+
 /// `struct sock.__sk_common.skc_family` — address family
 /// (`AF_INET=2` / `AF_INET6=10`). `bits_offset=128` in sock_common
 /// = byte 16.
@@ -1008,6 +1015,14 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    OffsetSpec {
+        name: "INET_SOCK_INET_SPORT_OFFSET",
+        struct_name: "inet_sock",
+        field_path: &["inet_sport"],
+        expected: INET_SOCK_INET_SPORT_OFFSET,
+        alt_paths: &[],
+        optional: false,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1110,16 +1125,17 @@ pub mod slot {
     pub const FDTABLE_FD_OFFSET: u32 = 73;
     pub const FILE_PRIVATE_DATA_OFFSET: u32 = 74;
     pub const BPF_LINK_ID_OFFSET: u32 = 75;
-    // enum slots 76–77 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 78;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 79;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 80;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 81;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 82;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 83;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 84;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 85;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 86;
+    pub const INET_SOCK_INET_SPORT_OFFSET: u32 = 76;
+    // enum slots 77–78 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 79;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 80;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 81;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 82;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 83;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 84;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 85;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 86;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 87;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -1200,6 +1216,7 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("FDTABLE_FD_OFFSET", 73),
     ("FILE_PRIVATE_DATA_OFFSET", 74),
     ("BPF_LINK_ID_OFFSET", 75),
+    ("INET_SOCK_INET_SPORT_OFFSET", 76),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1424,24 +1441,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 78),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 79),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 80),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 81),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 82),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 83),
-    ("TP_IOURING_CREATE_FD_OFFSET", 84),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 85),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 86),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 79),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 80),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 81),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 82),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 83),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 84),
+    ("TP_IOURING_CREATE_FD_OFFSET", 85),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 86),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 87),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 76), ("ITER_IOVEC_VALUE", 77)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 77), ("ITER_IOVEC_VALUE", 78)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 76;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 77;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 77;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 78;
 
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
@@ -1459,7 +1476,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 75, "REVALIDATE must cover all 75 offsets");
+        assert_eq!(REVALIDATE.len(), 76, "REVALIDATE must cover all 76 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1479,7 +1496,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 87);
+        assert_eq!(BTF_OFFSETS_SLOTS, 88);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1509,8 +1526,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 78);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 81);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 79);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 82);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 }
