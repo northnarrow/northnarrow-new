@@ -78,6 +78,7 @@ use crate::decision::correlation::{
 };
 use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
+use crate::posture::lineage::AuthSessionTracker;
 
 // ── verdict helper ───────────────────────────────────────────────────
 
@@ -158,6 +159,16 @@ fn is_on_host(addr: &IpAddr) -> bool {
                     .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
         }
     }
+}
+
+/// External audit NETR-008: the review-49 carve-out for the staging chains
+/// (CHAIN-002/005/007), now that their precursor covers `/var/tmp` (where
+/// package transactions stage scriptlets). A process descending from a
+/// package manager or system maintenance daemon gets no chain verdict;
+/// its flow falls through to the network rules (NN-L-NET-008 records it),
+/// so no blocking rule is shadowed by a downgraded one.
+fn package_mediated(lineage: Option<&AuthSessionTracker>, pid: u32) -> bool {
+    lineage.is_some_and(|l| l.is_system_daemon_mediated(pid))
 }
 
 // ── NN-L-CHAIN-001 — credential read → egress ────────────────────────
@@ -242,7 +253,8 @@ impl Rule for NnLChain001CredReadThenEgress {
 
 // ── NN-L-CHAIN-002 — /tmp exec → C2 egress ───────────────────────────
 
-/// A process executed from `/tmp/` (R001 shape) followed by a
+/// A process executed from a staging directory (`/tmp/`, `/var/tmp/`,
+/// `/dev/shm/`; R001–R003 shape) followed by a
 /// same-PID outbound flow to a non-DNS port within the window. MITRE
 /// T1059 (Command and Scripting Interpreter) → T1571 (Non-Standard
 /// Port) — a dropper calling home. Critical + KillProcessTree →
@@ -255,6 +267,7 @@ impl Rule for NnLChain001CredReadThenEgress {
 /// egress correlation is what escalates it to Critical.
 pub struct NnLChain002TmpExecThenEgress {
     buf: Arc<Mutex<CorrelationStore>>,
+    lineage: Option<AuthSessionTracker>,
 }
 
 impl NnLChain002TmpExecThenEgress {
@@ -263,7 +276,13 @@ impl NnLChain002TmpExecThenEgress {
     const DNS_PORT: u16 = 53;
 
     pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
-        Self { buf }
+        Self { buf, lineage: None }
+    }
+
+    /// With the package-manager carve-out ([`package_mediated`]).
+    pub fn with_lineage(mut self, lineage: Option<AuthSessionTracker>) -> Self {
+        self.lineage = lineage;
+        self
     }
 }
 
@@ -297,8 +316,9 @@ impl Rule for NnLChain002TmpExecThenEgress {
             } => {
                 let mut store = self.buf.lock();
                 store.observe_spawn(*pid, *ppid, *start_ns);
-                // Review 61: the file the kernel executed.
-                if exe.path_or(filename).starts_with("/tmp/") {
+                // Review 61: the file the kernel executed. External audit
+                // NETR-008: any staging directory, not `/tmp/` alone.
+                if crate::decision::rules::is_staging_path(exe.path_or(filename)) {
                     let key = ProcKey {
                         pid: *pid,
                         start_ns: *start_ns,
@@ -314,13 +334,15 @@ impl Rule for NnLChain002TmpExecThenEgress {
                     PrecursorKind::TmpExec,
                     nf.start_ns,
                     CORRELATION_WINDOW_NS,
-                ) {
+                ) || package_mediated(self.lineage.as_ref(), nf.pid)
+                {
                     return None;
                 }
                 Some(chain_verdict(
                     self,
                     nf,
-                    "Process executed from /tmp/ then opened an outbound flow \
+                    "Process executed from a staging directory (/tmp, /var/tmp, \
+                     /dev/shm) then opened an outbound flow \
                      to a non-DNS port within the correlation window — \
                      dropper C2 (T1059 → T1571); kill the process tree + \
                      posture → COMBAT",
@@ -463,12 +485,19 @@ impl Rule for NnLChain004CrossPidCredExfil {
 /// T1571): a dropper spawns a child that calls home. Reuses `TmpExec`.
 pub struct NnLChain005CrossPidTmpC2 {
     buf: Arc<Mutex<CorrelationStore>>,
+    lineage: Option<AuthSessionTracker>,
 }
 
 impl NnLChain005CrossPidTmpC2 {
     const DNS_PORT: u16 = 53;
     pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
-        Self { buf }
+        Self { buf, lineage: None }
+    }
+
+    /// With the package-manager carve-out ([`package_mediated`]).
+    pub fn with_lineage(mut self, lineage: Option<AuthSessionTracker>) -> Self {
+        self.lineage = lineage;
+        self
     }
 }
 
@@ -494,13 +523,14 @@ impl Rule for NnLChain005CrossPidTmpC2 {
             PrecursorKind::TmpExec,
             nf.start_ns,
             CORRELATION_WINDOW_NS,
-        ) {
+        ) || package_mediated(self.lineage.as_ref(), nf.pid)
+        {
             return None;
         }
         Some(chain_verdict(
             self,
             nf,
-            "A process ancestor executed from /tmp/ and a descendant then \
+            "A process ancestor executed from a staging directory and a descendant then \
              opened an outbound flow to a non-DNS port — cross-PID \
              dropper C2 (T1059 → T1571); kill the process tree + \
              posture → COMBAT",
@@ -562,11 +592,18 @@ impl Rule for NnLChain006CrossPidCanaryExfil {
 /// flow (the §13 Q10 specific-before-catch-all ordering).
 pub struct NnLChain007TmpCredExfilSequence {
     buf: Arc<Mutex<CorrelationStore>>,
+    lineage: Option<AuthSessionTracker>,
 }
 
 impl NnLChain007TmpCredExfilSequence {
     pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
-        Self { buf }
+        Self { buf, lineage: None }
+    }
+
+    /// With the package-manager carve-out ([`package_mediated`]).
+    pub fn with_lineage(mut self, lineage: Option<AuthSessionTracker>) -> Self {
+        self.lineage = lineage;
+        self
     }
 }
 
@@ -596,10 +633,14 @@ impl Rule for NnLChain007TmpCredExfilSequence {
                     store.note_egress(key, egress_note(nf));
                     return None;
                 }
+                drop(store);
+                if package_mediated(self.lineage.as_ref(), nf.pid) {
+                    return None;
+                }
                 Some(chain_verdict(
                     self,
                     nf,
-                    "Process executed from /tmp/, then read a credential store, \
+                    "Process executed from a staging directory, then read a credential store, \
                      then opened an outbound flow — three-step dropper → \
                      credential-access → exfil chain (T1059 → T1555 → T1041); \
                      kill the process tree + posture → COMBAT",
@@ -622,13 +663,16 @@ impl Rule for NnLChain007TmpCredExfilSequence {
                 ) {
                     return None;
                 }
+                if package_mediated(self.lineage.as_ref(), fe.modifier_pid) {
+                    return None;
+                }
                 let egress =
                     store.take_egress_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
                 store.record(key, PrecursorKind::CredRead, fe.timestamp_ns);
                 Some(late_chain_verdict(
                     self,
                     &egress,
-                    "Process executed from /tmp/, then read a credential store, \
+                    "Process executed from a staging directory, then read a credential store, \
                      then opened an outbound flow (the read was processed after \
                      the flow, in kernel order before it) — three-step dropper → \
                      credential-access → exfil chain (T1059 → T1555 → T1041); \
@@ -760,19 +804,31 @@ pub struct ChainRuleSet {
 /// [`ChainRuleSet::tail`] LAST (see the module docs); the
 /// `default_rules*` builders do both.
 pub fn chain_rule_set() -> ChainRuleSet {
+    chain_rule_set_with(None)
+}
+
+/// [`chain_rule_set`] with the lineage cache for the staging chains'
+/// package-manager carve-out (external audit NETR-008). Production passes
+/// the shared tracker.
+pub fn chain_rule_set_with(lineage: Option<AuthSessionTracker>) -> ChainRuleSet {
     let store = Arc::new(Mutex::new(CorrelationStore::new()));
     ChainRuleSet {
         head: vec![
             // CHAIN-007 (3-step same-PID) first: the richest verdict wins
             // first-match over the 2-step CHAIN-001/002 for the same flow.
-            Box::new(NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))),
+            Box::new(
+                NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))
+                    .with_lineage(lineage.clone()),
+            ),
             // Same-PID 2-step originals.
             Box::new(NnLChain001CredReadThenEgress::new(Arc::clone(&store))),
-            Box::new(NnLChain002TmpExecThenEgress::new(Arc::clone(&store))),
+            Box::new(
+                NnLChain002TmpExecThenEgress::new(Arc::clone(&store)).with_lineage(lineage.clone()),
+            ),
             Box::new(NnLChain003CanaryThenEgress::new(Arc::clone(&store))),
             // Cross-PID variants (strict ancestor — never shadow the above).
             Box::new(NnLChain004CrossPidCredExfil::new(Arc::clone(&store))),
-            Box::new(NnLChain005CrossPidTmpC2::new(Arc::clone(&store))),
+            Box::new(NnLChain005CrossPidTmpC2::new(Arc::clone(&store)).with_lineage(lineage)),
             Box::new(NnLChain006CrossPidCanaryExfil::new(Arc::clone(&store))),
         ],
         tail: vec![Box::new(NnLChain008CrossPidPrivEscExfil::new(Arc::clone(
@@ -1021,6 +1077,52 @@ mod tests {
         };
         r.evaluate(&non_tmp);
         assert!(r.evaluate(&flow(42, 4444, 10 * SEC + SEC)).is_none());
+    }
+
+    fn staged_spawn(pid: u32, filename: &str, ts_ns: u64) -> Event {
+        let mut e = tmp_spawn(pid, ts_ns);
+        if let Event::ProcessSpawn { filename: f, .. } = &mut e {
+            *f = filename.to_string();
+        }
+        e
+    }
+
+    /// External audit NETR-008: the precursor covers every staging
+    /// directory, not `/tmp/` alone; `/run/user` stays out.
+    #[test]
+    fn chain_002_records_var_tmp() {
+        for (i, path) in ["/var/tmp/stage", "/dev/shm/stage", "/tmp/stage"]
+            .iter()
+            .enumerate()
+        {
+            let r = chain002();
+            let pid = 50 + i as u32;
+            r.evaluate(&staged_spawn(pid, path, 10 * SEC));
+            let v = r
+                .evaluate(&flow(pid, 443, 11 * SEC))
+                .unwrap_or_else(|| panic!("{path} then egress fires"));
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
+        }
+        let r = chain002();
+        r.evaluate(&staged_spawn(60, "/run/user/1000/app", 10 * SEC));
+        assert!(r.evaluate(&flow(60, 443, 11 * SEC)).is_none());
+    }
+
+    /// External audit NETR-008: a package transaction's process staged in
+    /// /var/tmp gets no chain verdict (its flow falls through to the net
+    /// rules); anything else still does.
+    #[test]
+    fn chain_002_spares_a_package_transaction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(700, 1, "/usr/bin/rpm", 1);
+        lineage.ingest_spawn(701, 700, "/var/tmp/rpm-tmp.x", 2);
+        let r = NnLChain002TmpExecThenEgress::new(Arc::new(Mutex::new(CorrelationStore::new())))
+            .with_lineage(Some(lineage));
+        r.evaluate(&staged_spawn(701, "/var/tmp/rpm-tmp.x", 10 * SEC));
+        r.evaluate(&staged_spawn(702, "/var/tmp/stage2", 10 * SEC));
+        assert!(r.evaluate(&flow(701, 443, 11 * SEC)).is_none());
+        assert!(r.evaluate(&flow(702, 443, 11 * SEC)).is_some());
     }
 
     #[test]

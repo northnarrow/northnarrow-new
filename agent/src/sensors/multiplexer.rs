@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
+use crate::posture::lineage::AuthSessionTracker;
 
 /// eBPF object embedded once in [`crate::sensors::ebpf_object`] (the
 /// single embed site + boot preflight). Re-used here so this loader and
@@ -55,6 +56,9 @@ const CHANNEL_CAPACITY: usize = 4096;
 pub struct NetWiring {
     pub flow_tracker: Arc<Mutex<FlowTracker>>,
     pub dns_cache: Arc<DnsCache>,
+    /// External audit NETR-008: names the connecting process's image on
+    /// every TCP connect (the spawn cache, `/proc` as fallback).
+    pub lineage: crate::posture::lineage::AuthSessionTracker,
 }
 
 /// Tappa 10 N9 — ringbufs the multiplexer surfaces back to the
@@ -286,7 +290,9 @@ impl SensorMultiplexer {
         let bpf_syscall_rb = take_ringbuf(&mut ebpf, "BPF_SYSCALL_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
-        let flow_tracker_for_tcp = net.as_ref().map(|w| Arc::clone(&w.flow_tracker));
+        let flow_tracker_for_tcp = net
+            .as_ref()
+            .map(|w| (Arc::clone(&w.flow_tracker), w.lineage.clone()));
         let dns_cache_for_dns = net.as_ref().map(|w| Arc::clone(&w.dns_cache));
 
         let pumps = vec![
@@ -634,7 +640,7 @@ where
 
 fn spawn_tcp_connect_pump(
     rb: RingBuf<MapData>,
-    flow_tracker: Option<Arc<Mutex<FlowTracker>>>,
+    flow_tracker: Option<(Arc<Mutex<FlowTracker>>, AuthSessionTracker)>,
     tx: mpsc::Sender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -646,7 +652,7 @@ fn spawn_tcp_connect_pump(
 
 async fn pump_tcp_connect(
     rb: RingBuf<MapData>,
-    flow_tracker: Option<Arc<Mutex<FlowTracker>>>,
+    flow_tracker: Option<(Arc<Mutex<FlowTracker>>, AuthSessionTracker)>,
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = AsyncFd::new(rb)?;
@@ -667,8 +673,9 @@ async fn pump_tcp_connect(
                     // up the corr_id. The send-to-bus below is
                     // best-effort — losing it doesn't break flow
                     // correlation.
-                    if let Some(ft) = flow_tracker.as_ref() {
-                        let info = tcp_connect_info_from_raw(raw);
+                    if let Some((ft, lineage)) = flow_tracker.as_ref() {
+                        // Resolved before the tracker's lock is taken.
+                        let info = tcp_connect_info_from_raw(raw, lineage);
                         ft.lock().on_tcp_connect(&info);
                     }
                     if tx.send(Event::from(raw)).await.is_err() {
@@ -690,7 +697,7 @@ async fn pump_tcp_connect(
     }
 }
 
-fn tcp_connect_info_from_raw(raw: &TcpConnectRaw) -> TcpConnectInfo {
+fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) -> TcpConnectInfo {
     let comm_len = raw
         .comm
         .iter()
@@ -711,11 +718,11 @@ fn tcp_connect_info_from_raw(raw: &TcpConnectRaw) -> TcpConnectInfo {
         pid: raw.pid,
         uid: raw.uid,
         comm: String::from_utf8_lossy(&raw.comm[..comm_len]).into_owned(),
-        // `exe` resolution via /proc is a hot-path cost we skip
-        // here — N3 design says exe is best-effort; the field
-        // stays None until the future exe-resolver hook (N3.1
-        // or admin-CLI lazy lookup).
-        exe: None,
+        // External audit NETR-008: the image is named here, while the
+        // process is alive (a spawn-cache read, `/proc` on a miss). Left
+        // `None`, NN-L-NET-008 never fired in production, and a forked
+        // child of a staged dropper (no exec event) went unjudged.
+        exe: lineage.image_path(raw.pid),
     }
 }
 
@@ -857,5 +864,37 @@ mod module_path_tests {
             module_path_on_host(&mut mounts, (999_999, 7), "/lib/modules/6.8/kernel/x.ko"),
             "/(unplaced filesystem 999999:7)/lib/modules/6.8/kernel/x.ko"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// External audit NETR-008: the connect row names the connecting
+    /// process's image — the spawn cache first, `/proc` for a process with
+    /// no exec event (a forked child) — where it used to be `None`.
+    #[test]
+    fn a_connect_names_the_connecting_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("4242");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink("/dev/shm/dropper", dir.join("exe")).unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(4300, 1, "/usr/bin/curl", 1);
+
+        let mut raw = TcpConnectRaw::zeroed();
+        raw.pid = 4242;
+        raw.family = common::netaddr::AF_INET;
+        raw.dst_port = 8080;
+        let info = tcp_connect_info_from_raw(&raw, &lineage);
+        assert_eq!(info.exe.as_deref(), Some("/dev/shm/dropper"));
+
+        raw.pid = 4300;
+        let info = tcp_connect_info_from_raw(&raw, &lineage);
+        assert_eq!(info.exe.as_deref(), Some("/usr/bin/curl"));
+
+        raw.pid = 4301; // gone, never seen
+        assert_eq!(tcp_connect_info_from_raw(&raw, &lineage).exe, None);
     }
 }

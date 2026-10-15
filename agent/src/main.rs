@@ -1037,6 +1037,15 @@ async fn main() -> Result<()> {
     ));
     use common::wire::admin_signed_payload::OverlayKind;
 
+    // Process-lineage cache shared by the posture triggers and the FIM
+    // rules' package-manager carve-out (review 49): "does this writer
+    // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the
+    // posture trigger detector; reads /proc on a cache miss.
+    // External audit POS-003: every cached exec checked against the
+    // process its pid names now. External audit NETR-008: built before
+    // the sensors so the network pumps name each flow's image with it.
+    let lineage = AuthSessionTracker::for_host();
+
     // Tappa 10 N9 — build the shared net state BEFORE starting the
     // sensor multiplexer so the TcpConnect + DnsQuery pumps can
     // feed the FlowTracker / DnsCache the instant they start
@@ -1047,6 +1056,7 @@ async fn main() -> Result<()> {
     let net_wiring = northnarrow_agent::sensors::multiplexer::NetWiring {
         flow_tracker: Arc::clone(&flow_tracker),
         dns_cache: Arc::clone(&dns_cache),
+        lineage: lineage.clone(),
     };
     // Tappa 10.9 step 2: which exec sensor the multiplexer attaches.
     northnarrow_agent::sensors::exe_identity::want_lsm(cli.exec_sensor == ExecSensor::Lsm);
@@ -1240,14 +1250,6 @@ async fn main() -> Result<()> {
             northnarrow_agent::anti_tamper::prepare_pin_root().map(|p| p.to_path_buf()),
             None,
         );
-
-    // Process-lineage cache shared by the posture triggers and the FIM
-    // rules' package-manager carve-out (review 49): "does this writer
-    // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the
-    // posture trigger detector; reads /proc on a cache miss.
-    // External audit POS-003: every cached exec checked against the
-    // process its pid names now.
-    let lineage = AuthSessionTracker::for_host();
 
     #[cfg(feature = "demo-tappa5")]
     let engine = RuleEngine::with_default_rules_and_demo_tappa5();
@@ -3012,6 +3014,7 @@ async fn main() -> Result<()> {
             let listener_db = listener_db_opt;
             let flow_tracker_for_drain = Arc::clone(&flow_tracker);
             let dns_cache_for_drain = Arc::clone(&dns_cache);
+            let lineage_for_net = lineage.clone();
             let event_tx = sensor.event_tx();
             let close_rb = net_bufs.close_rb;
             let listen_rb = net_bufs.listen_rb;
@@ -3026,6 +3029,7 @@ async fn main() -> Result<()> {
                     dns_cache_for_drain,
                     netflow_db,
                     listener_db,
+                    lineage_for_net,
                     event_tx,
                 )
                 .await;

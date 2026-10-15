@@ -1086,6 +1086,26 @@ impl AuthSessionTracker {
         Some(ExecIdentity { exe, script })
     }
 
+    /// External audit NETR-008: the image `pid` runs, for a network row
+    /// filled at connect time: the spawn cache, else `/proc/<pid>/exe` as
+    /// the kernel reports it. Unlike [`Self::exec_identity`] a deleted
+    /// image is kept, with its ` (deleted)` suffix: a dropper that unlinks
+    /// itself is still judged by the directory it ran from. A forked child
+    /// that never exec'd has no cache entry and answers through `/proc`.
+    pub fn image_path(&self, pid: u32) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        {
+            let s = self.inner.state.read();
+            if let Some(e) = s.map.get(&pid).or_else(|| s.daemons.get(&pid)) {
+                return Some(e.exe.to_string_lossy().into_owned());
+            }
+        }
+        let exe = fs::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        Some(exe.to_string_lossy().into_owned())
+    }
+
     fn lookup_cache(&self, pid: u32) -> Option<(u32, PathBuf)> {
         let s = self.inner.state.read();
         s.map

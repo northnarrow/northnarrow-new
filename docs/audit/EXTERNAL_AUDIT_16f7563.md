@@ -168,10 +168,10 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-122 | FIMP-010 | FIM pipeline | M | open |
 | NN-AUD-123 | FIMP-011 | FIM pipeline | S | fixed (lab PR 111) |
 | NN-AUD-124 | NETR-004 | Net rules | S | fixed (lab PR 125) |
-| NN-AUD-125 | NETR-005 | Net rules | M | open |
+| NN-AUD-125 | NETR-005 | Net rules | M | fixed (lab PR 126) |
 | NN-AUD-126 | NETR-006 | Net rules | S | open |
-| NN-AUD-127 | NETR-007 | Net rules | S | open |
-| NN-AUD-128 | NETR-008 | Net rules | S | open |
+| NN-AUD-127 | NETR-007 | Net rules | S | fixed (lab PR 126) |
+| NN-AUD-128 | NETR-008 | Net rules | S | fixed (lab PR 126) |
 | NN-AUD-129 | NETR-009 | Net rules | M | fixed (lab PR 125) |
 | NN-AUD-130 | NETR-010 | Net rules | M | fixed (lab PR 125) |
 | NN-AUD-131 | PROC-006 | Process rules | M | already fixed (lab PR 87, with NN-AUD-055) |
@@ -2338,3 +2338,76 @@ the audit did not report, noted with the fix that takes them.
     suites, 78 passed, 0 failed each (with the new
     `a_really_reused_pid_is_dead_for_the_tree`, `ns_last_pid`). The
     anti-tamper suite: OK. Host: 1781 passed, 0 failed.
+- **NN-AUD-125 (NETR-005), NN-AUD-127 (NETR-007), NN-AUD-128 (NETR-008),
+  lab PR 126.** Network rule state and addressing.
+  - NETR-005: the NET-005 burst and NET-013 beacon windows had a soft cap
+    only — above 4096 keys every event swept the whole map and removed
+    nothing still in window, so a connection spray grew the beacon map for
+    an hour with a full scan per flow. Adjacent, same family: the NETR-002
+    tunnel corroboration (NET-014) returned 1 for any new pair once 4096
+    were held and ran a `retain` per call, so about 70 high-entropy queries
+    a second under distinct parent domains disabled the tunnel kill for
+    every other process. All three now have a hard cap enforced in O(1)
+    with `LazyLru` (`decision/bounded.rs`): the least recently updated key
+    goes, a key evicted while still in window is counted
+    (`net_window_evictions_total`, WARN at most once a minute); the idle
+    sweep runs every 256 observes only. Caps: 4096 PIDs (NET-005), 16,384
+    `(pid, dst)` keys (NET-013), 4096 pairs (NET-014). NET-013 also holds a
+    PID to 256 destinations: beyond it, the PID's own least recent
+    destination goes, sparing up to 8 keys with two samples or more (the
+    triage's "not tracked" would refuse a beacon started after a scan; this
+    evicts instead and counts). The tunnel corroboration evicts pairs of one
+    label before pairs of several; it never refuses a pair.
+  - NETR-007: `is_rfc1918` returned false for all IPv6, so SMB, RDP, WinRM
+    and VNC to a ULA or link-local peer drew neither NET-018's kill nor
+    NET-007's log. The posture's `is_internal` (BUG-039) moved to
+    `common::netaddr::is_internal` (RFC 1918, `fc00::/7`, `fe80::/10`, the
+    IPv4-mapped form folded) and serves the posture and NET-007/018. CGNAT
+    and `169.254/16` stay out (NET-011).
+  - NETR-008, worse than reported: NET-008 returned early on `exe: None`,
+    and no production row carried `exe` (TCP connect, UDP drain, rows
+    synthesised at close), so the rule never fired. The TCP connect pump and
+    the UDP drain now name the image (`AuthSessionTracker::image_path`: the
+    spawn cache, else `/proc/<pid>/exe` with a ` (deleted)` suffix kept);
+    NET-008 falls back to the same lookup for a row without one. A dropper
+    that forks before anything else leaves a child with no exec event (no
+    `TmpExec`, no edge): its egress from a staging directory is now killed.
+    One `STAGING_PREFIXES` set (`/tmp/`, `/var/tmp/`, `/dev/shm/`; not
+    `/run/user/`, not homes) for NET-008, CHAIN-002 (so CHAIN-005/007) and
+    the posture's exec arm. A process descending from a package manager
+    (`is_system_daemon_mediated`, review 49) gets a Log from NET-008 and no
+    verdict from CHAIN-002/005/007 — the flow falls through instead of a
+    downgraded chain verdict shadowing a kill rule further down.
+  - Not done: the eviction counters are not yet in `nn-admin status`; rows
+    synthesised at close still carry no `exe` (NET-012, B8; NET-008 looks
+    the PID up instead); the NET-004/014 dedup window still prunes with a
+    `retain` per suspicious query (bounded by the 2 s window and the DNS
+    budget). The shipped `netflow-comm-allowlist.v1` has no SMB/RDP client:
+    with NETR-007, an unlisted `smbclient` to a ULA peer is killed, as over
+    RFC 1918 — review with the owner.
+  - Tests: `beacon_window_is_bounded_with_live_keys`,
+    `dns_burst_window_keeps_the_active_pid_under_a_pid_spray`,
+    `beacon_window_quota_keeps_a_beacon_under_a_scan`,
+    `tunnel_corroboration_counts_a_tunnel_when_full`,
+    `tunnel_corroboration_evicts_single_label_pairs_first`,
+    `net_014_kills_a_tunnel_beside_a_parent_domain_spray`,
+    `net_018_fires_on_ula_lateral_port`, `net_007_fires_on_link_local`,
+    `internal_covers_rfc1918_ula_and_link_local`,
+    `net_008_judges_the_connecting_process_image`,
+    `net_008_covers_every_staging_directory`,
+    `net_008_spares_a_package_transaction`, `chain_002_records_var_tmp`,
+    `chain_002_spares_a_package_transaction`,
+    `confirmed_intrusion_fires_on_exec_from_every_staging_dir`,
+    `a_connect_names_the_connecting_image`.
+  - Lab: on Ubuntu 24.04 (QEMU/WHPX), `netrules126-probe.sh` (test
+    addresses 100.64.0.74 and fd00::2 on a dummy interface, outside the
+    shipped NET-001 blocklist). Before (main) → after: a fork-dropper's
+    child from `/tmp` connecting out — alive, no NET-008 → killed by
+    NET-008 (its parent, which never connects, is left to the exec rules);
+    an SMB client to a ULA peer — alive → killed (NET-018); a high-entropy
+    tunnel beside a 5,500-query parent-domain spray — logged only → killed
+    (NET-014); 10 minutes of SYN spray to 10.255/16 beside a 5 s beacon —
+    agent RSS 27→44 MB and 307 s CPU → flat at ~28 MB and 81 s CPU, the
+    beacon still logged by NET-013. Privileged gate: Ubuntu 24.04 and
+    Debian 12, 29 suites, 78 passed, 0 failed each. The anti-tamper
+    suite: OK. Host: 1797 passed, 0 failed.

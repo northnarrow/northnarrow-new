@@ -52,13 +52,16 @@
 //! empty blocklists + a fresh burst window for boot + tests.
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::bounded::{LazyLru, LossCounter};
 use crate::decision::Rule;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 use crate::net::dns_cache::DnsCache;
@@ -131,7 +134,7 @@ const LISTENER_COMMON_PORTS: &[u16] = &[22, 53, 80, 443, 8080, 8443];
 const BLOCKED_TLDS: &[&str] = &[".onion", ".bit"];
 
 /// NN-L-NET-008 — dst_port whitelist (DNS-only path is the
-/// LEGITIMATE outbound from /tmp/ — a dropper resolving
+/// LEGITIMATE outbound from a staging directory — a dropper resolving
 /// alongside its own DNS-tunneling). All other ports trip.
 const TMP_EXEC_ALLOWED_PORTS: &[u16] = &[53];
 
@@ -152,7 +155,7 @@ const HIGH_RISK_C2_PORTS: &[u16] = &[4444, 1080, 6667, 6697, 9001];
 const PLAINTEXT_CRED_PORTS: &[u16] = &[21, 23];
 
 /// NN-L-NET-018 — lateral-movement service ports reached over an
-/// internal RFC1918 destination: 445 SMB, 3389 RDP, 5985 WinRM,
+/// internal destination (RFC 1918, IPv6 ULA or link-local): 445 SMB, 3389 RDP, 5985 WinRM,
 /// 5900 VNC (T1021 Remote Services).
 const LATERAL_MOVEMENT_PORTS: &[u16] = &[445, 3389, 5985, 5900];
 
@@ -166,27 +169,162 @@ const DNS_QTYPE_NULL: u16 = 10;
 /// Sliding window for NN-L-NET-005.
 const DNS_BURST_WINDOW_NS: u64 = 60 * 1_000_000_000;
 
-/// Idle-key eviction cadence for the stateful windows below. The
-/// per-key `VecDeque`s are trimmed on every observe, but the OUTER
-/// map only ever gained keys (one per PID / per `(pid, dst)` flow):
-/// on a long-lived agent that is unbounded growth (audit
-/// `catchall-1`). Every N observes — or as soon as the map exceeds
-/// `STATEFUL_MAP_SOFT_CAP` keys — drop every key whose newest sample
-/// has already fallen out of its window. Amortised O(1) per observe.
+/// Idle-key sweep cadence for the stateful windows below: every N
+/// observes, drop every key whose newest sample has left its window
+/// (audit `catchall-1`).
+///
+/// External audit NETR-005: the sweep also ran on EVERY observe once a map
+/// held more than 4096 keys, and dropped only idle keys, so the "cap" was
+/// none: a connection spray by any user grew the map for an hour and made
+/// every flow pay a full scan under the rule's mutex. The sweep is now
+/// periodic only, and each window has a hard cap enforced in O(1) by a
+/// recency queue ([`LazyLru`]): at the cap the least recently updated key
+/// goes. An active beacon or burst refreshes its key on every sample, so a
+/// spray's one-shot keys go first; a key evicted while still inside its
+/// window is counted ([`LossCounter`]) and WARNed at most once a minute.
 const STATEFUL_EVICT_EVERY: u32 = 256;
-const STATEFUL_MAP_SOFT_CAP: usize = 4096;
 
-/// Drop every key whose most recent sample is older than `cutoff`.
-fn evict_idle_keys<K>(map: &mut HashMap<K, VecDeque<u64>>, cutoff: u64) {
-    map.retain(|_, q| q.back().is_some_and(|&t| t >= cutoff));
+/// NN-L-NET-005: PIDs tracked at once.
+pub const DNS_BURST_MAX_PIDS: usize = 4096;
+/// NN-L-NET-013: `(pid, dst)` pairs tracked at once.
+pub const BEACON_MAX_FLOWS: usize = 16_384;
+/// NN-L-NET-013: destinations tracked per PID. A process reaching hundreds
+/// of destinations within the hour is a scanner or a crawler, not a beacon;
+/// beyond the quota its own least recently used destination goes (and is
+/// counted), so it cannot push other processes' keys out.
+pub const BEACON_MAX_DSTS_PER_PID: usize = 256;
+/// NN-L-NET-013: at eviction, up to this many keys holding two samples or
+/// more (a beacon in the making) are moved to the back instead, so a
+/// spray of one-shot destinations goes first. Bounded: O(1) per insert.
+const BEACON_SECOND_CHANCES: usize = 8;
+
+static DNS_BURST_LIVE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static BEACON_LIVE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static BEACON_QUOTA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static DNS_TUNNEL_LIVE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// External audit NETR-005: keys still inside their window that the
+/// network rule windows evicted for room, process-wide (NN-L-NET-005,
+/// NN-L-NET-013, NN-L-NET-014's corroboration), plus NN-L-NET-013's
+/// per-process quota evictions.
+pub fn net_window_evictions_total() -> u64 {
+    DNS_BURST_LIVE_EVICTIONS.load(Ordering::Relaxed)
+        + BEACON_LIVE_EVICTIONS.load(Ordering::Relaxed)
+        + BEACON_QUOTA_EVICTIONS.load(Ordering::Relaxed)
+        + DNS_TUNNEL_LIVE_EVICTIONS.load(Ordering::Relaxed)
+}
+
+/// Per-key sliding windows of sample timestamps, in recency order.
+struct TimedWindows<K> {
+    map: HashMap<K, VecDeque<u64>>,
+    order: LazyLru<K>,
+}
+
+impl<K> Default for TimedWindows<K> {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: LazyLru::default(),
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash> TimedWindows<K> {
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// Drop every key whose newest sample is older than `cutoff`, telling
+    /// `on_drop` about each one.
+    fn sweep(&mut self, cutoff: u64, mut on_drop: impl FnMut(&K)) {
+        let Self { map, order } = self;
+        map.retain(|k, q| {
+            let keep = q.back().is_some_and(|&t| t >= cutoff);
+            if !keep {
+                order.remove(k);
+                on_drop(k);
+            }
+            keep
+        });
+    }
+
+    /// Remove the least recently sampled key; `true` with it when its
+    /// newest sample is still at or after `cutoff` (state that mattered).
+    fn pop_oldest(&mut self, cutoff: u64) -> Option<(K, bool)> {
+        let key = self.order.pop_oldest()?;
+        let live = self
+            .map
+            .remove(&key)
+            .is_some_and(|q| q.back().is_some_and(|&t| t >= cutoff));
+        Some((key, live))
+    }
+
+    fn remove(&mut self, key: &K) {
+        self.map.remove(key);
+        self.order.remove(key);
+    }
+
+    /// [`Self::pop_oldest`], but up to `chances` keys for which `keep`
+    /// holds are moved to the back first.
+    fn pop_oldest_sparing(
+        &mut self,
+        cutoff: u64,
+        chances: usize,
+        keep: impl Fn(&VecDeque<u64>) -> bool,
+    ) -> Option<(K, bool)> {
+        for _ in 0..chances {
+            let key = self.order.pop_oldest()?;
+            if self.map.get(&key).is_some_and(&keep) {
+                self.order.touch(key);
+            } else {
+                let live = self
+                    .map
+                    .remove(&key)
+                    .is_some_and(|q| q.back().is_some_and(|&t| t >= cutoff));
+                return Some((key, live));
+            }
+        }
+        self.pop_oldest(cutoff)
+    }
+
+    fn samples(&self, key: &K) -> usize {
+        self.map.get(key).map_or(0, VecDeque::len)
+    }
+
+    /// Add a sample for `key` at `ts_ns` (moving it to the back of the
+    /// recency order), drop its samples older than `cutoff`, and return
+    /// its window.
+    fn sample(&mut self, key: K, ts_ns: u64, cutoff: u64) -> &mut VecDeque<u64> {
+        self.order.touch(key);
+        let q = self.map.entry(key).or_default();
+        while q.front().is_some_and(|&t| t < cutoff) {
+            q.pop_front();
+        }
+        q.push_back(ts_ns);
+        q
+    }
 }
 
 /// 60-second per-PID TXT/NULL query counter. NN-L-NET-005 fires
 /// when `count > 50` for a given PID over a sliding 60s window.
-#[derive(Debug, Default)]
 pub struct DnsBurstWindow {
-    per_pid: HashMap<u32, VecDeque<u64>>,
+    per_pid: TimedWindows<u32>,
     observes: u32,
+    lost: LossCounter,
+}
+
+impl Default for DnsBurstWindow {
+    fn default() -> Self {
+        Self {
+            per_pid: TimedWindows::default(),
+            observes: 0,
+            lost: LossCounter::new(&DNS_BURST_LIVE_EVICTIONS),
+        }
+    }
 }
 
 impl DnsBurstWindow {
@@ -199,20 +337,36 @@ impl DnsBurstWindow {
     pub fn observe(&mut self, pid: u32, ts_ns: u64) -> usize {
         let cutoff = ts_ns.saturating_sub(DNS_BURST_WINDOW_NS);
         self.observes = self.observes.wrapping_add(1);
-        if self.observes % STATEFUL_EVICT_EVERY == 0 || self.per_pid.len() > STATEFUL_MAP_SOFT_CAP {
-            evict_idle_keys(&mut self.per_pid, cutoff);
+        if self.observes % STATEFUL_EVICT_EVERY == 0 {
+            self.per_pid.sweep(cutoff, |_| {});
         }
-        let q = self.per_pid.entry(pid).or_default();
-        while q.front().is_some_and(|&t| t < cutoff) {
-            q.pop_front();
+        if !self.per_pid.contains(&pid) {
+            while self.per_pid.len() >= DNS_BURST_MAX_PIDS {
+                let Some((victim, live)) = self.per_pid.pop_oldest(cutoff) else {
+                    break;
+                };
+                if live && self.lost.bump() {
+                    tracing::warn!(
+                        pid = victim,
+                        evicted = self.lost.count(),
+                        cap = DNS_BURST_MAX_PIDS,
+                        "NN-L-NET-005 window full: evicted a process still inside \
+                         its 60 s TXT/NULL window"
+                    );
+                }
+            }
         }
-        q.push_back(ts_ns);
-        q.len()
+        self.per_pid.sample(pid, ts_ns, cutoff).len()
     }
 
     /// Number of PIDs currently tracked (test/metrics hook).
     pub fn tracked_keys(&self) -> usize {
         self.per_pid.len()
+    }
+
+    /// Live keys evicted for room by this window.
+    pub fn live_evictions(&self) -> u64 {
+        self.lost.count()
     }
 }
 
@@ -245,15 +399,89 @@ const BEACON_MAX_CV: f64 = 0.15;
 /// Mirrors the [`DnsBurstWindow`] stateful-rule precedent (design
 /// §3.5-A): `&mut self` behind an `Arc<Mutex<_>>` shared by the
 /// single rule instance.
-#[derive(Debug, Default)]
 pub struct BeaconWindow {
-    per_flow: HashMap<(u32, IpAddr), VecDeque<u64>>,
+    per_flow: TimedWindows<(u32, IpAddr)>,
+    /// The destinations each PID holds in `per_flow`, in recency order
+    /// (external audit NETR-005: the per-process quota).
+    per_pid: HashMap<u32, LazyLru<IpAddr>>,
     observes: u32,
+    lost: LossCounter,
+    over_quota: LossCounter,
+}
+
+impl Default for BeaconWindow {
+    fn default() -> Self {
+        Self {
+            per_flow: TimedWindows::default(),
+            per_pid: HashMap::new(),
+            observes: 0,
+            lost: LossCounter::new(&BEACON_LIVE_EVICTIONS),
+            over_quota: LossCounter::new(&BEACON_QUOTA_EVICTIONS),
+        }
+    }
 }
 
 impl BeaconWindow {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Forget `dst` in `pid`'s quota, and the PID once it holds none.
+    fn forget_dst(per_pid: &mut HashMap<u32, LazyLru<IpAddr>>, pid: u32, dst: &IpAddr) {
+        if let Some(l) = per_pid.get_mut(&pid) {
+            l.remove(dst);
+            if l.is_empty() {
+                per_pid.remove(&pid);
+            }
+        }
+    }
+
+    /// Make room for a new `(pid, dst)` key: first within `pid`'s quota,
+    /// then under the global cap.
+    fn make_room(&mut self, pid: u32, cutoff: u64) {
+        if let Some(l) = self.per_pid.get_mut(&pid) {
+            while l.len() >= BEACON_MAX_DSTS_PER_PID {
+                let mut victim = None;
+                for _ in 0..=BEACON_SECOND_CHANCES {
+                    let Some(old) = l.pop_oldest() else { break };
+                    victim = Some(old);
+                    if self.per_flow.samples(&(pid, old)) < 2 {
+                        break;
+                    }
+                    l.touch(old);
+                }
+                let Some(old) = victim else { break };
+                l.remove(&old);
+                self.per_flow.remove(&(pid, old));
+                if self.over_quota.bump() {
+                    tracing::debug!(
+                        pid,
+                        evicted = self.over_quota.count(),
+                        quota = BEACON_MAX_DSTS_PER_PID,
+                        "NN-L-NET-013: a process over its destination quota \
+                         (scanner shape); its least recent destination dropped"
+                    );
+                }
+            }
+        }
+        while self.per_flow.len() >= BEACON_MAX_FLOWS {
+            let Some(((vpid, vdst), live)) =
+                self.per_flow
+                    .pop_oldest_sparing(cutoff, BEACON_SECOND_CHANCES, |q| q.len() >= 2)
+            else {
+                break;
+            };
+            Self::forget_dst(&mut self.per_pid, vpid, &vdst);
+            if live && self.lost.bump() {
+                tracing::warn!(
+                    pid = vpid,
+                    evicted = self.lost.count(),
+                    cap = BEACON_MAX_FLOWS,
+                    "NN-L-NET-013 window full: evicted a destination still inside \
+                     its one-hour window"
+                );
+            }
+        }
     }
 
     /// Record an outbound flow start for `(pid, dst)` at `ts_ns` and
@@ -263,15 +491,19 @@ impl BeaconWindow {
     pub fn observe(&mut self, pid: u32, dst: IpAddr, ts_ns: u64) -> bool {
         let cutoff = ts_ns.saturating_sub(BEACON_WINDOW_NS);
         self.observes = self.observes.wrapping_add(1);
-        if self.observes % STATEFUL_EVICT_EVERY == 0 || self.per_flow.len() > STATEFUL_MAP_SOFT_CAP
-        {
-            evict_idle_keys(&mut self.per_flow, cutoff);
+        if self.observes % STATEFUL_EVICT_EVERY == 0 {
+            let per_pid = &mut self.per_pid;
+            self.per_flow
+                .sweep(cutoff, |(p, d)| Self::forget_dst(per_pid, *p, d));
         }
-        let q = self.per_flow.entry((pid, dst)).or_default();
-        while q.front().is_some_and(|&t| t < cutoff) {
-            q.pop_front();
+        if !self.per_flow.contains(&(pid, dst)) {
+            self.make_room(pid, cutoff);
         }
-        q.push_back(ts_ns);
+        self.per_pid
+            .entry(pid)
+            .or_insert_with(|| LazyLru::with_compact_floor(4))
+            .touch(dst);
+        let q = self.per_flow.sample((pid, dst), ts_ns, cutoff);
         while q.len() > BEACON_MAX_SAMPLES {
             q.pop_front();
         }
@@ -284,6 +516,16 @@ impl BeaconWindow {
     /// Number of `(pid, dst)` flows currently tracked (test/metrics hook).
     pub fn tracked_keys(&self) -> usize {
         self.per_flow.len()
+    }
+
+    /// Live keys evicted under the global cap.
+    pub fn live_evictions(&self) -> u64 {
+        self.lost.count()
+    }
+
+    /// Keys dropped by the per-process quota.
+    pub fn quota_evictions(&self) -> u64 {
+        self.over_quota.count()
     }
 
     /// Low-jitter test over consecutive inter-arrival intervals:
@@ -683,7 +925,9 @@ pub const DNS_TUNNEL_WINDOW_NS: u64 = 60 * 1_000_000_000;
 /// process, within [`DNS_TUNNEL_WINDOW_NS`], that make a tunnel.
 pub const DNS_TUNNEL_DISTINCT_LABELS: usize = 8;
 /// Bound on the `(pid, parent)` pairs held at once.
-const DNS_TUNNEL_MAX_PAIRS: usize = 4096;
+pub const DNS_TUNNEL_MAX_PAIRS: usize = 4096;
+
+type TunnelPair = (u32, u64);
 
 /// External audit NETR-002: a DNS tunnel (iodine, dnscat2, exfiltration
 /// over DNS) carries its payload in a NEW label per query — dozens a
@@ -691,35 +935,113 @@ const DNS_TUNNEL_MAX_PAIRS: usize = 4096;
 /// or a hashed load-balancer name a handful of times: one high-entropy
 /// label is not a tunnel (the lab killed `python3` for
 /// `my-company-prod-backups-archive.s3.amazonaws.com`, 4.0 bits/char).
-#[derive(Default)]
+///
+/// External audit NETR-005: once 4096 pairs were held, a new pair was
+/// judged on its own (1) — and the map was swept on every call. About 70
+/// high-entropy queries a second under distinct parent domains kept it
+/// full, and NN-L-NET-014's kill never fired for anyone else. A new pair
+/// is never refused now: at the bound the least recently updated pair
+/// holding a single label goes first (a spray's one-shot pairs), then the
+/// least recently updated pair of several labels, counted. A tunnel
+/// refreshes its pair on every query.
 pub struct DnsTunnelCorroboration {
     /// `(attributed pid, parent-domain hash)` → `(first seen ns, label
     /// hash)` of the distinct labels in the window, at most
     /// [`DNS_TUNNEL_DISTINCT_LABELS`].
-    seen: HashMap<(u32, u64), Vec<(u64, u64)>>,
+    seen: HashMap<TunnelPair, Vec<(u64, u64)>>,
+    /// Pairs holding one label, in recency order.
+    single: LazyLru<TunnelPair>,
+    /// Pairs holding several labels, in recency order.
+    multi: LazyLru<TunnelPair>,
+    observes: u32,
+    lost: LossCounter,
+}
+
+impl Default for DnsTunnelCorroboration {
+    fn default() -> Self {
+        Self {
+            seen: HashMap::new(),
+            single: LazyLru::default(),
+            multi: LazyLru::default(),
+            observes: 0,
+            lost: LossCounter::new(&DNS_TUNNEL_LIVE_EVICTIONS),
+        }
+    }
 }
 
 impl DnsTunnelCorroboration {
     /// Record `label_hash` under `(pid, parent_hash)` at `ts_ns` and return
     /// how many distinct labels the pair has within the window, this one
-    /// included. A new pair beyond the bound is judged on its own (1).
+    /// included.
     pub fn observe(&mut self, pid: u32, parent_hash: u64, label_hash: u64, ts_ns: u64) -> usize {
-        self.seen.retain(|_, labels| {
-            labels.retain(|(t, _)| ts_ns.saturating_sub(*t) < DNS_TUNNEL_WINDOW_NS);
-            !labels.is_empty()
-        });
+        let in_window = |t: u64| ts_ns.saturating_sub(t) < DNS_TUNNEL_WINDOW_NS;
+        self.observes = self.observes.wrapping_add(1);
+        if self.observes % STATEFUL_EVICT_EVERY == 0 {
+            let Self {
+                seen,
+                single,
+                multi,
+                ..
+            } = self;
+            seen.retain(|k, labels| {
+                labels.retain(|(t, _)| in_window(*t));
+                let keep = !labels.is_empty();
+                if !keep {
+                    single.remove(k);
+                    multi.remove(k);
+                }
+                keep
+            });
+        }
         let key = (pid, parent_hash);
-        if !self.seen.contains_key(&key) && self.seen.len() >= DNS_TUNNEL_MAX_PAIRS {
-            return 1;
+        if !self.seen.contains_key(&key) {
+            while self.seen.len() >= DNS_TUNNEL_MAX_PAIRS {
+                let victim = match self.single.pop_oldest() {
+                    Some(k) => (k, false),
+                    None => match self.multi.pop_oldest() {
+                        Some(k) => (k, true),
+                        None => break,
+                    },
+                };
+                self.seen.remove(&victim.0);
+                if victim.1 && self.lost.bump() {
+                    tracing::warn!(
+                        pid = victim.0 .0,
+                        evicted = self.lost.count(),
+                        cap = DNS_TUNNEL_MAX_PAIRS,
+                        "NN-L-NET-014 corroboration full: evicted a process/domain \
+                         pair holding several high-entropy labels"
+                    );
+                }
+            }
         }
         let labels = self.seen.entry(key).or_default();
+        labels.retain(|(t, _)| in_window(*t));
         if !labels.iter().any(|(_, h)| *h == label_hash) {
             if labels.len() >= DNS_TUNNEL_DISTINCT_LABELS {
                 labels.remove(0);
             }
             labels.push((ts_ns, label_hash));
         }
-        labels.len()
+        let n = labels.len();
+        if n >= 2 {
+            self.single.remove(&key);
+            self.multi.touch(key);
+        } else {
+            self.multi.remove(&key);
+            self.single.touch(key);
+        }
+        n
+    }
+
+    /// Pairs currently held (test/metrics hook).
+    pub fn tracked_pairs(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Pairs of several labels evicted for room.
+    pub fn live_evictions(&self) -> u64 {
+        self.lost.count()
     }
 }
 
@@ -989,9 +1311,9 @@ impl Rule for NnLNet006UncommonListener {
 
 // ── NN-L-NET-007 — Outbound to RFC1918 from unusual process ──────────
 
-/// Outbound to RFC1918 (10/8, 172.16/12, 192.168/16) from a comm
-/// not in the internal-ops allowlist — lateral-movement
-/// indicator.
+/// Outbound to internal address space (RFC 1918 10/8, 172.16/12,
+/// 192.168/16; IPv6 ULA fc00::/7 and link-local fe80::/10) from a comm
+/// not in the internal-ops allowlist — lateral-movement indicator.
 pub struct NnLNet007Rfc1918FromUnusualProc {
     allowlist: Arc<CommAllowlist>,
 }
@@ -1001,16 +1323,11 @@ impl NnLNet007Rfc1918FromUnusualProc {
         Self { allowlist }
     }
 
-    fn is_rfc1918(addr: &IpAddr) -> bool {
-        match addr {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                o[0] == 10
-                    || (o[0] == 172 && (16..=31).contains(&o[1]))
-                    || (o[0] == 192 && o[1] == 168)
-            }
-            IpAddr::V6(_) => false,
-        }
+    /// External audit NETR-007: RFC 1918, IPv6 unique-local and
+    /// link-local — IPv6 used to be never internal, so lateral movement
+    /// over ULA or link-local drew neither this rule nor NN-L-NET-018.
+    fn is_internal(addr: &IpAddr) -> bool {
+        common::netaddr::is_internal(*addr)
     }
 }
 
@@ -1028,7 +1345,7 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        if !Self::is_rfc1918(&nf.dst_addr) {
+        if !Self::is_internal(&nf.dst_addr) {
             return None;
         }
         let judged = self.allowlist.judge(nf.pid, &nf.comm);
@@ -1040,8 +1357,8 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
                 self,
                 ResponseAction::Log,
                 Severity::Medium,
-                "Outbound to an internal RFC1918 destination from a comm \
-             outside the operator allowlist — possible lateral movement; \
+                "Outbound to an internal destination (RFC 1918, IPv6 ULA or \
+             link-local) from a comm outside the operator allowlist — possible lateral movement; \
              posture → ALERTED",
                 nf.pid,
                 nf.comm.clone(),
@@ -1052,19 +1369,41 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
     }
 }
 
-// ── NN-L-NET-008 — Outbound from /tmp/ exec ──────────────────────────
+// ── NN-L-NET-008 — Outbound from a staging-directory exec ───────────
 
-/// Exe under `/tmp/` outbound to a port other than 53. Pairs
-/// with R001 (exec from /tmp/) on the network side — a dropper
-/// reaching out for second-stage payload.
-pub struct NnLNet008OutboundFromTmpExec;
+/// The connecting process's image lies under a staging directory
+/// ([`STAGING_PREFIXES`](crate::decision::rules::STAGING_PREFIXES):
+/// `/tmp/`, `/var/tmp/`, `/dev/shm/`) and the flow goes to a port other
+/// than 53. Pairs with R001–R003 on the network side — a dropper reaching
+/// out for its second stage.
+///
+/// External audit NETR-008: no production flow row carried `exe`, so this
+/// rule returned at its first line and never fired, and it checked
+/// `/tmp/` only. R001–R003 kill the process that ran the exec, not its
+/// tree: a dropper that forks first leaves a child that never execs —
+/// no exec event, no `TmpExec` precursor — running the staged image, and
+/// its egress went unjudged. The image is now named at connect time
+/// (`AuthSessionTracker::image_path`, spawn cache then `/proc`), with the
+/// lineage cache as a fallback here for a row without one. A process that
+/// descends from a package manager or another system maintenance daemon
+/// (`is_system_daemon_mediated`, the review-49 carve-out) is recorded,
+/// not killed.
+pub struct NnLNet008OutboundFromTmpExec {
+    lineage: Option<crate::posture::lineage::AuthSessionTracker>,
+}
+
+impl NnLNet008OutboundFromTmpExec {
+    pub fn new(lineage: Option<crate::posture::lineage::AuthSessionTracker>) -> Self {
+        Self { lineage }
+    }
+}
 
 impl Rule for NnLNet008OutboundFromTmpExec {
     fn id(&self) -> &'static str {
         "NN-L-NET-008_OutboundFromTmpExec"
     }
     fn name(&self) -> &'static str {
-        "Outbound from /tmp/ exec to non-resolver"
+        "Outbound from a staging-directory exec to non-resolver"
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
@@ -1073,20 +1412,44 @@ impl Rule for NnLNet008OutboundFromTmpExec {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        let exe = nf.exe.as_deref()?;
-        if !exe.starts_with("/tmp/") {
-            return None;
-        }
         if TMP_EXEC_ALLOWED_PORTS.contains(&nf.dst_port) {
             return None;
+        }
+        let looked_up;
+        let exe = match nf.exe.as_deref() {
+            Some(exe) => exe,
+            None => {
+                looked_up = self.lineage.as_ref()?.image_path(nf.pid)?;
+                looked_up.as_str()
+            }
+        };
+        if !crate::decision::rules::is_staging_path(exe) {
+            return None;
+        }
+        if self
+            .lineage
+            .as_ref()
+            .is_some_and(|l| l.is_system_daemon_mediated(nf.pid))
+        {
+            return Some(net_verdict(
+                self,
+                ResponseAction::Log,
+                Severity::High,
+                "Process running from a staging directory (/tmp, /var/tmp, /dev/shm) \
+                 opened a non-DNS outbound flow; it descends from a package manager \
+                 or system maintenance daemon, so it is recorded, not killed",
+                nf.pid,
+                nf.comm.clone(),
+                nf.start_ns,
+            ));
         }
         Some(net_verdict(
             self,
             ResponseAction::KillProcess,
             Severity::High,
-            "Process executed from /tmp/ initiated outbound to a non-DNS \
-             port — likely dropper fetching second-stage payload; \
-             kill the process + posture → ENGAGED",
+            "Process running from a staging directory (/tmp, /var/tmp, /dev/shm) \
+             initiated outbound to a non-DNS port — likely dropper fetching \
+             second-stage payload; kill the process + posture → ENGAGED",
             nf.pid,
             nf.comm.clone(),
             nf.start_ns,
@@ -1406,8 +1769,9 @@ impl Rule for NnLNet013Beacon {
 
 // ── NN-L-NET-018 — RFC1918 outbound on a lateral-movement port ───────
 
-/// Outbound to an internal RFC1918 destination on a lateral-movement
-/// service port ([`LATERAL_MOVEMENT_PORTS`]) from a non-allowlisted
+/// Outbound to an internal destination (RFC 1918, IPv6 ULA or
+/// link-local; external audit NETR-007) on a lateral-movement service
+/// port ([`LATERAL_MOVEMENT_PORTS`]) from a non-allowlisted
 /// comm. MITRE T1021 (Remote Services). High + KillProcess — the
 /// port-specific High refinement of the broad Medium NN-L-NET-007
 /// (§13 Q10 documents the intentional overlap; this rule is ordered
@@ -1436,7 +1800,7 @@ impl Rule for NnLNet018Rfc1918LateralPort {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        if !NnLNet007Rfc1918FromUnusualProc::is_rfc1918(&nf.dst_addr) {
+        if !NnLNet007Rfc1918FromUnusualProc::is_internal(&nf.dst_addr) {
             return None;
         }
         if !LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) {
@@ -1451,8 +1815,8 @@ impl Rule for NnLNet018Rfc1918LateralPort {
                 self,
                 ResponseAction::KillProcess,
                 Severity::High,
-                "Outbound to an internal RFC1918 host on a lateral-movement \
-             port (445 SMB / 3389 RDP / 5985 WinRM / 5900 VNC) from a \
+                "Outbound to an internal host (RFC 1918, IPv6 ULA or link-local) \
+             on a lateral-movement port (445 SMB / 3389 RDP / 5985 WinRM / 5900 VNC) from a \
              non-allowlisted comm — lateral movement (T1021); kill the \
              process + posture → ENGAGED",
                 nf.pid,
@@ -1833,6 +2197,10 @@ pub fn net_rules(
     comm_allowlist: Arc<CommAllowlist>,
     beacon_window: Arc<Mutex<BeaconWindow>>,
     dns_cache: Arc<DnsCache>,
+    // External audit NETR-008: NN-L-NET-008's image fallback and its
+    // package-manager carve-out. `None` (tests, boot-before-load): no
+    // fallback and no carve-out.
+    lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 ) -> Vec<Box<dyn Rule>> {
     vec![
         // Critical first.
@@ -1870,7 +2238,7 @@ pub fn net_rules(
         Box::new(NnLNet007Rfc1918FromUnusualProc::new(Arc::clone(
             &comm_allowlist,
         ))),
-        Box::new(NnLNet008OutboundFromTmpExec),
+        Box::new(NnLNet008OutboundFromTmpExec::new(lineage)),
         Box::new(NnLNet009ByteAnomaly::new(comm_allowlist)),
     ]
 }
@@ -1894,6 +2262,7 @@ pub fn net_rules_empty() -> Vec<Box<dyn Rule>> {
         )),
         Arc::new(Mutex::new(BeaconWindow::new())),
         Arc::new(DnsCache::default()),
+        None,
     )
 }
 
@@ -2660,9 +3029,46 @@ mod tests {
         assert!(rule
             .evaluate(&flow(v4(8, 8, 8, 8), 443, "evilbin"))
             .is_none());
-        // IPv6 also doesn't match (V1.0 scope: RFC1918 is v4-only).
+        // IPv6 loopback is not internal address space.
         assert!(rule
             .evaluate(&flow(IpAddr::V6(Ipv6Addr::LOCALHOST), 443, "evilbin"))
+            .is_none());
+    }
+
+    // ── external audit NETR-007 — IPv6 internal space ──
+
+    #[test]
+    fn net_018_fires_on_ula_lateral_port() {
+        let rule = NnLNet018Rfc1918LateralPort::new(al());
+        for (dst, port) in [
+            ("fd00::2", 445),
+            ("fe80::1", 3389),
+            ("::ffff:10.0.0.5", 5985),
+        ] {
+            let v = rule
+                .evaluate(&flow(dst.parse().unwrap(), port, "evilbin"))
+                .unwrap_or_else(|| panic!("{dst}:{port} is lateral movement"));
+            assert_eq!(v.action, ResponseAction::KillProcess);
+        }
+        // a global IPv6 peer is not internal
+        assert!(rule
+            .evaluate(&flow("2606:4700::1".parse().unwrap(), 445, "evilbin"))
+            .is_none());
+    }
+
+    #[test]
+    fn net_007_fires_on_link_local() {
+        let rule = NnLNet007Rfc1918FromUnusualProc::new(al());
+        let v = rule
+            .evaluate(&flow("fe80::1".parse().unwrap(), 443, "evilbin"))
+            .expect("link-local is internal");
+        assert_eq!(v.severity, Severity::Medium);
+        assert!(rule
+            .evaluate(&flow("fd12:3456::7".parse().unwrap(), 8080, "evilbin"))
+            .is_some());
+        // CGNAT stays out (NET-011)
+        assert!(rule
+            .evaluate(&flow(v4(100, 64, 0, 1), 443, "evilbin"))
             .is_none());
     }
 
@@ -2670,7 +3076,7 @@ mod tests {
 
     #[test]
     fn net_008_fires_on_tmp_exec_outbound() {
-        let rule = NnLNet008OutboundFromTmpExec;
+        let rule = NnLNet008OutboundFromTmpExec::new(None);
         let mut e = flow(v4(1, 2, 3, 4), 443, "payload");
         if let Event::NetFlow(nf) = &mut e {
             nf.exe = Some("/tmp/payload".to_string());
@@ -2681,7 +3087,7 @@ mod tests {
 
     #[test]
     fn net_008_does_not_fire_on_tmp_exec_to_dns() {
-        let rule = NnLNet008OutboundFromTmpExec;
+        let rule = NnLNet008OutboundFromTmpExec::new(None);
         let mut e = flow(v4(1, 2, 3, 4), 53, "payload");
         if let Event::NetFlow(nf) = &mut e {
             nf.exe = Some("/tmp/payload".to_string());
@@ -2689,9 +3095,74 @@ mod tests {
         assert!(rule.evaluate(&e).is_none());
     }
 
+    fn flow_from(exe: Option<&str>, pid: u32, port: u16) -> Event {
+        let mut e = flow(v4(100, 64, 0, 9), port, "payload");
+        if let Event::NetFlow(nf) = &mut e {
+            nf.exe = exe.map(str::to_string);
+            nf.pid = pid;
+        }
+        e
+    }
+
+    /// External audit NETR-008: one staging set; `/run/user` and home stay out.
+    #[test]
+    fn net_008_covers_every_staging_directory() {
+        let rule = NnLNet008OutboundFromTmpExec::new(None);
+        for exe in ["/tmp/x", "/var/tmp/x", "/dev/shm/x", "/dev/shm/x (deleted)"] {
+            let v = rule
+                .evaluate(&flow_from(Some(exe), 1, 443))
+                .unwrap_or_else(|| panic!("{exe} fires"));
+            assert_eq!(v.action, ResponseAction::KillProcess);
+        }
+        for exe in ["/run/user/1000/x", "/home/u/x", "/usr/bin/x", "/tmpx/y"] {
+            assert!(
+                rule.evaluate(&flow_from(Some(exe), 1, 443)).is_none(),
+                "{exe}"
+            );
+        }
+    }
+
+    /// External audit NETR-008: production rows carried no `exe`, so the
+    /// rule never fired. A row without one is judged on the image the
+    /// lineage cache names — here a forked dropper child that never exec'd,
+    /// whose `/proc/<pid>/exe` is the (unlinked) staged image.
+    #[test]
+    fn net_008_judges_the_connecting_process_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("4242");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink("/dev/shm/dropper (deleted)", dir.join("exe")).unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage));
+        let v = rule
+            .evaluate(&flow_from(None, 4242, 8080))
+            .expect("the staged image connects");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.event_pid, 4242);
+        // DNS stays allowed; an unknown process is not guessed at
+        assert!(rule.evaluate(&flow_from(None, 4242, 53)).is_none());
+        assert!(rule.evaluate(&flow_from(None, 4243, 8080)).is_none());
+    }
+
+    /// External audit NETR-008: the review-49 carve-out — a package
+    /// transaction's scriptlet staged in /var/tmp is recorded, not killed.
+    #[test]
+    fn net_008_spares_a_package_transaction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(700, 1, "/usr/bin/dnf", 1);
+        lineage.ingest_spawn(701, 700, "/var/tmp/rpm-tmp.Ab12Cd", 2);
+        lineage.ingest_spawn(800, 1, "/var/tmp/stage2", 3);
+        let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage));
+        let v = rule.evaluate(&flow_from(None, 701, 443)).expect("recorded");
+        assert_eq!(v.action, ResponseAction::Log);
+        let v = rule.evaluate(&flow_from(None, 800, 443)).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
     #[test]
     fn net_008_does_not_fire_on_system_exec() {
-        let rule = NnLNet008OutboundFromTmpExec;
+        let rule = NnLNet008OutboundFromTmpExec::new(None);
         // /usr/bin/curl outbound — not /tmp/, doesn't fire.
         assert!(rule.evaluate(&flow(v4(1, 2, 3, 4), 443, "curl")).is_none());
     }
@@ -3184,25 +3655,7 @@ mod tests {
         }
     }
     #[test]
-    fn dns_burst_window_evicts_idle_pids() {
-        let mut w = DnsBurstWindow::new();
-        let t0: u64 = 1_000 * 1_000_000_000;
-        // 5000 distinct PIDs, one query each, all at t0: the soft cap
-        // (4096) is exceeded, so the next observe at t0 + 61 s must
-        // sweep every one of them (their newest sample is outside the
-        // 60 s window).
-        for pid in 1..=5_000u32 {
-            w.observe(pid, t0);
-        }
-        assert!(w.tracked_keys() >= 4096);
-        let later = t0 + 61 * 1_000_000_000;
-        w.observe(7, later);
-        assert_eq!(w.tracked_keys(), 1, "only the live PID must remain");
-        assert_eq!(w.observe(7, later + 1), 2);
-    }
-
-    #[test]
-    fn dns_burst_window_periodic_sweep_without_cap() {
+    fn dns_burst_window_periodic_sweep_drops_idle_pids() {
         let mut w = DnsBurstWindow::new();
         let t0: u64 = 1_000 * 1_000_000_000;
         for pid in 1..=100u32 {
@@ -3216,6 +3669,85 @@ mod tests {
             w.observe(42, later);
         }
         assert_eq!(w.tracked_keys(), 1);
+        assert_eq!(w.live_evictions(), 0, "idle keys are not losses");
+    }
+
+    // ── external audit NETR-005 — hard caps on the rule windows ──
+
+    /// A PID spray (one TXT query per fresh PID, all inside the window)
+    /// never grows the map past its cap, and the PID that keeps querying
+    /// keeps its count: it refreshes its key, the spray's keys go first.
+    /// Before the fix the map held every PID (the cap was soft) and each
+    /// observe swept it in full.
+    #[test]
+    fn dns_burst_window_keeps_the_active_pid_under_a_pid_spray() {
+        let mut w = DnsBurstWindow::new();
+        let t0: u64 = 1_000 * SEC;
+        let mut next = 10_000u32;
+        let mut count = 0;
+        for i in 0..60u64 {
+            count = w.observe(7, t0 + i * SEC / 2);
+            for _ in 0..1_000 {
+                w.observe(next, t0 + i * SEC / 2);
+                next += 1;
+            }
+            assert!(
+                w.tracked_keys() <= DNS_BURST_MAX_PIDS,
+                "{}",
+                w.tracked_keys()
+            );
+        }
+        assert_eq!(count, 60, "the active PID keeps all its queries");
+        assert!(w.live_evictions() > 0, "the spray's evictions are counted");
+    }
+
+    #[test]
+    fn beacon_window_is_bounded_with_live_keys() {
+        let mut w = BeaconWindow::new();
+        let t0: u64 = 10_000 * SEC;
+        // 20,000 live (pid, dst) keys from distinct PIDs, all inside the hour
+        for i in 0..20_000u32 {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0aff_0000 + i));
+            w.observe(100_000 + i, dst, t0 + u64::from(i));
+        }
+        assert_eq!(w.tracked_keys(), BEACON_MAX_FLOWS);
+        assert_eq!(w.live_evictions(), (20_000 - BEACON_MAX_FLOWS) as u64);
+        // the quota map follows the flows it indexes
+        assert_eq!(w.per_pid.len(), BEACON_MAX_FLOWS);
+    }
+
+    /// One process beacons every 60 s, then sprays 1,000 SYNs over a /16
+    /// after each beacon: its quota keeps it to BEACON_MAX_DSTS_PER_PID
+    /// keys, the beacon (two samples or more) is spared while the one-shot
+    /// destinations go, and other processes' keys are never pushed out.
+    #[test]
+    fn beacon_window_quota_keeps_a_beacon_under_a_scan() {
+        let mut w = BeaconWindow::new();
+        let t0: u64 = 10_000 * SEC;
+        let c2 = v4(100, 64, 0, 9);
+        let other = v4(100, 64, 0, 10);
+        w.observe(2, other, t0);
+        let mut target = 0u32;
+        let mut beacon = false;
+        for i in 0..6u64 {
+            let t = t0 + i * 60 * SEC;
+            beacon = w.observe(1, c2, t);
+            if i < 1 {
+                continue;
+            }
+            for _ in 0..1_000 {
+                target += 1;
+                let dst = IpAddr::V4(Ipv4Addr::from(0x0aff_0000 + target));
+                w.observe(1, dst, t + 1);
+            }
+        }
+        assert!(beacon, "the periodic C2 flow is still recognised");
+        assert!(w.tracked_keys() <= BEACON_MAX_DSTS_PER_PID + 1);
+        assert!(w.quota_evictions() > 0);
+        assert!(
+            w.per_flow.contains(&(2, other)),
+            "another process keeps its key"
+        );
     }
 
     #[test]
@@ -3226,10 +3758,65 @@ mod tests {
         for pid in 1..=5_000u32 {
             w.observe(pid, dst, t0);
         }
-        assert!(w.tracked_keys() >= 4096);
         let later = t0 + BEACON_WINDOW_NS + 1;
-        w.observe(1, dst, later);
+        for _ in 0..STATEFUL_EVICT_EVERY {
+            w.observe(1, dst, later);
+        }
         assert_eq!(w.tracked_keys(), 1, "only the live flow must remain");
+        assert_eq!(w.per_pid.len(), 1);
+    }
+
+    /// External audit NETR-005 (the NETR-002 corroboration): with the pair
+    /// bound reached, a new pair used to be judged on its own (1) forever.
+    #[test]
+    fn tunnel_corroboration_counts_a_tunnel_when_full() {
+        let mut c = DnsTunnelCorroboration::default();
+        for parent in 0..DNS_TUNNEL_MAX_PAIRS as u64 {
+            c.observe(1, parent, parent, 1);
+        }
+        assert_eq!(c.tracked_pairs(), DNS_TUNNEL_MAX_PAIRS);
+        let mut n = 0;
+        for label in 0..DNS_TUNNEL_DISTINCT_LABELS as u64 {
+            n = c.observe(2, 999_999, label, 2 + label);
+        }
+        assert_eq!(n, DNS_TUNNEL_DISTINCT_LABELS);
+        assert_eq!(c.tracked_pairs(), DNS_TUNNEL_MAX_PAIRS);
+    }
+
+    /// Single-label pairs go before pairs of several labels: a spray of
+    /// one-shot parents cannot reset a tunnel in progress.
+    #[test]
+    fn tunnel_corroboration_evicts_single_label_pairs_first() {
+        let mut c = DnsTunnelCorroboration::default();
+        assert_eq!(c.observe(9, 77, 1, 1), 1);
+        assert_eq!(c.observe(9, 77, 2, 2), 2);
+        for parent in 0..(3 * DNS_TUNNEL_MAX_PAIRS) as u64 {
+            c.observe(1, 1_000 + parent, parent, 3);
+        }
+        assert_eq!(c.observe(9, 77, 3, 4), 3, "the tunnel's labels survived");
+        assert_eq!(c.live_evictions(), 0);
+    }
+
+    /// The lab probe in a unit: one process keeps the corroboration full
+    /// with high-entropy labels under distinct parent domains while another
+    /// runs a tunnel. Before the fix the tunnel was recorded only (Log).
+    #[test]
+    fn net_014_kills_a_tunnel_beside_a_parent_domain_spray() {
+        let rule = net_014();
+        let label = |i: usize| format!("{i:05}q7v3k9x2m4p8r6t1w5y0z3b7c9d2f4h6j8l0n");
+        for i in 0..DNS_TUNNEL_MAX_PAIRS + 100 {
+            let q = format!("{}.p{i}.spray.example", label(i));
+            let v = rule.evaluate(&dns_event(40, &q, 1)).expect("recorded");
+            assert_eq!(v.action, ResponseAction::Log);
+        }
+        let mut last = None;
+        for i in 0..DNS_TUNNEL_DISTINCT_LABELS {
+            let q = format!("{}.t.attacker.example", label(90_000 + i));
+            last = rule.evaluate(&dns_event(41, &q, 1));
+        }
+        let v = last.expect("tunnel verdict");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.event_pid, 41);
     }
 
     // ── external audit NET-010 (NN-AUD-006) — allowlist by exec identity ──
