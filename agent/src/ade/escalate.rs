@@ -82,7 +82,8 @@ pub fn transform_to_escalate(
         }
         Event::TcpConnect { pid, comm, .. }
         | Event::DnsQuery { pid, comm, .. }
-        | Event::DnsFlood { pid, comm, .. } => (*pid, comm.clone()),
+        | Event::DnsFlood { pid, comm, .. }
+        | Event::SensorFlood { pid, comm, .. } => (*pid, comm.clone()),
         // FsProtectDenial is short-circuited before ADE in main.rs's
         // process_event; this arm is unreachable in practice. Kept
         // for exhaustiveness so the compiler doesn't bite if the

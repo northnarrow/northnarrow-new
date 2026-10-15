@@ -106,7 +106,11 @@ use crate::read_repeat::ReadSeenKey;
 /// must explicitly `ebpf.map_mut("WATCHED_PATHS").pin(<path>)`
 /// in its post-load path (C7 wires this).
 #[map]
-pub static WATCHED_PATHS: HashMap<InodeKey, u8> = HashMap::pinned(8192, 0);
+pub static WATCHED_PATHS: HashMap<InodeKey, u8> = HashMap::pinned(WATCHED_PATHS_MAX_ENTRIES, 0);
+
+/// Capacity of [`WATCHED_PATHS`], and of [`FIM_DIRTY_INODES`] (external
+/// audit EBPF-009).
+const WATCHED_PATHS_MAX_ENTRIES: u32 = 8192;
 
 /// Drift-event ringbuffer. 256 KiB ≈ ~3640 [`FimDriftRaw`]
 /// records at 72 bytes each. Userland's C4 drain loop polls
@@ -184,11 +188,19 @@ pub struct DirtyMeta {
 /// Inodes written-but-not-yet-closed (BUG-023 write-then-close).
 /// PROCESS-LOCAL (NOT pinned): purely per-boot transient state, same
 /// rationale as [`FS_FIM_EVENTS`] — a restart starts clean (any
-/// in-flight write re-marks on its next `write()`). Sized for the
-/// count of watched files concurrently open for write, which is
-/// tiny; 4096 is generous headroom.
+/// in-flight write re-marks on its next `write()`).
+///
+/// External audit EBPF-009: it held 4096 entries against 8192 watched
+/// inodes, so holding 4096 other watched files open for write filled it
+/// and the next marker was silently refused (no `Modified` at close).
+/// Keys are watched inodes only, so at the capacity of [`WATCHED_PATHS`]
+/// live markers can never fill it. A plain HashMap on purpose: an LRU
+/// could evict a pending marker under per-CPU LRU pressure before the map
+/// is full, turning a counted failure into a silent loss. A refused insert
+/// is counted in the `fim_dirty_full` drop slot.
 #[map]
-pub static FIM_DIRTY_INODES: HashMap<InodeKey, DirtyMeta> = HashMap::with_max_entries(4096, 0);
+pub static FIM_DIRTY_INODES: HashMap<InodeKey, DirtyMeta> =
+    HashMap::with_max_entries(WATCHED_PATHS_MAX_ENTRIES, 0);
 
 // ── Helpers (mirror inode_protect.rs idioms) ────────────────────────
 
@@ -733,8 +745,12 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
             if let Ok(comm) = bpf_get_current_comm() {
                 meta.comm = comm;
             }
-            // Best-effort; last writer wins. Map-full is silently fine.
-            let _ = FIM_DIRTY_INODES.insert(&key, &meta, 0);
+            // Last writer wins (an existing key is updated in place even
+            // when the map is full). External audit EBPF-009: a refused
+            // marker means no `Modified` at close, so it is counted.
+            if FIM_DIRTY_INODES.insert(&key, &meta, 0).is_err() {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM_DIRTY_FULL);
+            }
         }
     }
     0

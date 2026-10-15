@@ -1896,12 +1896,49 @@ impl Rule for NnLNet019WildcardListener {
 
 // ── NN-L-NET-020 — DNS query flood (review 78) ─────────────────────
 
-/// Window over which [`NnLNet020DnsQueryFlood`] sums held-back queries.
-const DNS_FLOOD_WINDOW_NS: u64 = 10 * 1_000_000_000;
-/// Held-back queries in a window that make it fire.
-const DNS_FLOOD_MIN_HELD: u64 = 256;
-/// Processes and users tracked at most; when full, ended windows go.
-const DNS_FLOOD_MAX_KEYS: usize = 4096;
+/// Window over which the flood rules sum held-back records.
+const FLOOD_WINDOW_NS: u64 = 10 * 1_000_000_000;
+/// Held-back records in a window that make a flood rule fire.
+const FLOOD_MIN_HELD: u64 = 256;
+/// Keys tracked at most per flood rule; when full, ended windows go.
+const FLOOD_MAX_KEYS: usize = 4096;
+
+/// Per-key sums of records a kernel budget held back, over
+/// [`FLOOD_WINDOW_NS`] windows (review 78; shared with NN-L-NET-021 since
+/// external audit EBPF-013). key → (window start, held, fired).
+struct HeldWindows<K> {
+    map: Mutex<HashMap<K, (u64, u64, bool)>>,
+}
+
+impl<K: Eq + Hash> HeldWindows<K> {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Add `held` to `key`'s window; `Some(sum)` the first time the window
+    /// reaches [`FLOOD_MIN_HELD`].
+    fn add(&self, key: K, held: u32, timestamp_ns: u64) -> Option<u64> {
+        let mut map = self.map.lock();
+        if map.len() >= FLOOD_MAX_KEYS && !map.contains_key(&key) {
+            map.retain(|_, w| timestamp_ns.saturating_sub(w.0) < FLOOD_WINDOW_NS);
+            if map.len() >= FLOOD_MAX_KEYS {
+                map.clear();
+            }
+        }
+        let w = map.entry(key).or_insert((timestamp_ns, 0, false));
+        if timestamp_ns.saturating_sub(w.0) >= FLOOD_WINDOW_NS {
+            *w = (timestamp_ns, 0, false);
+        }
+        w.1 += u64::from(held);
+        if w.2 || w.1 < FLOOD_MIN_HELD {
+            return None;
+        }
+        w.2 = true;
+        Some(w.1)
+    }
+}
 
 /// NN-L-NET-020 — a process, or a user across its processes, sent DNS
 /// queries well beyond the kernel's DNS budget (review 78). The queries
@@ -1911,17 +1948,15 @@ const DNS_FLOOD_MAX_KEYS: usize = 4096;
 /// per second per user) every query is recorded; beyond it, the process
 /// is reported here (MITRE T1071.004). The local resolvers' users are
 /// exempt in the kernel.
-/// (uid, pid — 0 for the user's budget) → (window start, held, fired).
-type HeldWindows = HashMap<(u32, u32), (u64, u64, bool)>;
-
 pub struct NnLNet020DnsQueryFlood {
-    held: Mutex<HeldWindows>,
+    /// (uid, pid — 0 for the user's budget).
+    held: HeldWindows<(u32, u32)>,
 }
 
 impl NnLNet020DnsQueryFlood {
     pub fn new() -> Self {
         Self {
-            held: Mutex::new(HashMap::new()),
+            held: HeldWindows::new(),
         }
     }
 }
@@ -1956,25 +1991,7 @@ impl Rule for NnLNet020DnsQueryFlood {
             return None;
         };
         let key = (*uid, if *uid_level { 0 } else { *pid });
-        let sum = {
-            let mut map = self.held.lock();
-            if map.len() >= DNS_FLOOD_MAX_KEYS && !map.contains_key(&key) {
-                map.retain(|_, w| timestamp_ns.saturating_sub(w.0) < DNS_FLOOD_WINDOW_NS);
-                if map.len() >= DNS_FLOOD_MAX_KEYS {
-                    map.clear();
-                }
-            }
-            let w = map.entry(key).or_insert((*timestamp_ns, 0, false));
-            if timestamp_ns.saturating_sub(w.0) >= DNS_FLOOD_WINDOW_NS {
-                *w = (*timestamp_ns, 0, false);
-            }
-            w.1 += u64::from(*held);
-            if w.2 || w.1 < DNS_FLOOD_MIN_HELD {
-                return None;
-            }
-            w.2 = true;
-            w.1
-        };
+        let sum = self.held.add(key, *held, *timestamp_ns)?;
         let scope = if *uid_level { "its user's" } else { "its own" };
         Some(net_verdict(
             self,
@@ -1984,6 +2001,91 @@ impl Rule for NnLNet020DnsQueryFlood {
                 "{comm} (pid {pid}, uid {uid}) sent at least {sum} DNS queries beyond {scope} \
                  DNS budget within 10 seconds: those queries were not recorded, so a DNS tunnel \
                  could hide among them (T1071.004)"
+            ),
+            *pid,
+            comm.clone(),
+            *timestamp_ns,
+        ))
+    }
+}
+
+// ── NN-L-NET-021 — listener / io_uring record flood (EBPF-013) ──────
+
+/// NN-L-NET-021 — external audit EBPF-013: a process, or a user across
+/// its processes, called `listen()` or `io_uring_setup()` well beyond the
+/// kernel's record budget for that sensor. Both sensors share a small ring
+/// with other records (the listener ring; the io_uring activity records),
+/// so an unprivileged loop could push another process's records out and
+/// leave only an anonymous drop counter. The kernel now records every
+/// call within the budget (64, then 128 per second, per process; 512,
+/// then 256 per second, per user), holds back the rest, and the next
+/// record carries the count. This rule names the process that floods
+/// (MITRE T1562.006, indicator blocking).
+///
+/// One rule for both sensors: the mechanism, the threshold and the
+/// response are the same, and the verdict names the sensor. Kept apart
+/// from NN-L-NET-020, whose reasoning is DNS-specific (a hidden tunnel).
+pub struct NnLNet021SensorRecordFlood {
+    /// (sensor, uid, pid — 0 for the user's budget).
+    held: HeldWindows<(common::FloodSource, u32, u32)>,
+}
+
+impl NnLNet021SensorRecordFlood {
+    pub fn new() -> Self {
+        Self {
+            held: HeldWindows::new(),
+        }
+    }
+}
+
+impl Default for NnLNet021SensorRecordFlood {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for NnLNet021SensorRecordFlood {
+    fn id(&self) -> &'static str {
+        "NN-L-NET-021_SensorRecordFlood"
+    }
+    fn name(&self) -> &'static str {
+        "listen() or io_uring_setup() calls beyond the kernel's record budget"
+    }
+    fn category(&self) -> &'static str {
+        CATEGORY_HIGH
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let Event::SensorFlood {
+            source,
+            pid,
+            uid,
+            comm,
+            held,
+            uid_level,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let key = (*source, *uid, if *uid_level { 0 } else { *pid });
+        let sum = self.held.add(key, *held, *timestamp_ns)?;
+        let scope = if *uid_level { "its user's" } else { "its own" };
+        let (calls, records) = match source {
+            common::FloodSource::Listen => ("listen() calls", "listener records"),
+            common::FloodSource::IoUringCreate => {
+                ("io_uring_setup() calls", "io_uring ring-creation records")
+            }
+        };
+        Some(net_verdict(
+            self,
+            ResponseAction::Log,
+            Severity::High,
+            &format!(
+                "{comm} (pid {pid}, uid {uid}) made at least {sum} {calls} beyond {scope} \
+                 record budget within 10 seconds: those calls were not recorded, and a flood \
+                 like this can push other processes' {records} out of the kernel ring \
+                 (T1562.006)"
             ),
             *pid,
             comm.clone(),
@@ -2233,6 +2335,9 @@ pub fn net_rules(
         Box::new(NnLNet019WildcardListener::new(Arc::clone(&comm_allowlist))),
         // Review 78: no comm allowlist — the kernel exempts the resolvers.
         Box::new(NnLNet020DnsQueryFlood::new()),
+        // External audit EBPF-013: no comm allowlist either — the budget
+        // keeps every real listener and ring creation.
+        Box::new(NnLNet021SensorRecordFlood::new()),
         // Broad Tappa 10 catch-alls last among the comm-gated rules.
         Box::new(NnLNet006UncommonListener::new(Arc::clone(&comm_allowlist))),
         Box::new(NnLNet007Rfc1918FromUnusualProc::new(Arc::clone(
@@ -3272,6 +3377,85 @@ mod tests {
             .is_some());
     }
 
+    fn sensor_flood(
+        source: common::FloodSource,
+        pid: u32,
+        uid: u32,
+        held: u32,
+        uid_level: bool,
+        ts: u64,
+    ) -> Event {
+        Event::SensorFlood {
+            source,
+            pid,
+            uid,
+            comm: "looper".to_string(),
+            exe: None,
+            held,
+            uid_level,
+            timestamp_ns: ts,
+        }
+    }
+
+    /// External audit EBPF-013: held-back listen() calls are summed per
+    /// process over 10 s; the rule names the looping process once per
+    /// window at 256.
+    #[test]
+    fn net_021_names_the_listen_flooder_once_per_window() {
+        use common::FloodSource::Listen;
+        const SEC: u64 = 1_000_000_000;
+        let rule = NnLNet021SensorRecordFlood::new();
+        assert!(rule
+            .evaluate(&sensor_flood(Listen, 30, 1000, 200, false, 0))
+            .is_none());
+        let v = rule
+            .evaluate(&sensor_flood(Listen, 30, 1000, 100, false, SEC))
+            .expect("300 held within 10 s");
+        assert_eq!(v.rule_id, "NN-L-NET-021_SensorRecordFlood");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.event_pid, 30);
+        assert!(v.reasoning.contains("300 listen() calls"));
+        assert!(v.reasoning.contains("its own"));
+        assert!(rule
+            .evaluate(&sensor_flood(Listen, 30, 1000, 500, false, 2 * SEC))
+            .is_none());
+        // A new window starts over.
+        assert!(rule
+            .evaluate(&sensor_flood(Listen, 30, 1000, 300, false, 12 * SEC))
+            .is_some());
+        // The rule ignores DNS floods (NN-L-NET-020's) and records.
+        assert!(rule
+            .evaluate(&dns_flood(30, 1000, 10_000, false, 13 * SEC))
+            .is_none());
+    }
+
+    /// The two sensors are summed apart, and the user's budget per user.
+    #[test]
+    fn net_021_sums_per_sensor_and_user() {
+        use common::FloodSource::{IoUringCreate, Listen};
+        let rule = NnLNet021SensorRecordFlood::new();
+        assert!(rule
+            .evaluate(&sensor_flood(Listen, 40, 1000, 200, false, 0))
+            .is_none());
+        assert!(rule
+            .evaluate(&sensor_flood(IoUringCreate, 40, 1000, 200, false, 1))
+            .is_none());
+        let v = rule
+            .evaluate(&sensor_flood(IoUringCreate, 40, 1000, 100, false, 2))
+            .expect("300 ring creations held");
+        assert!(v.reasoning.contains("io_uring_setup()"));
+        assert!(rule
+            .evaluate(&sensor_flood(Listen, 41, 1000, 150, true, 3))
+            .is_none());
+        let v = rule
+            .evaluate(&sensor_flood(Listen, 42, 1000, 150, true, 4))
+            .expect("300 held by the user's processes");
+        assert!(v.reasoning.contains("its user's"));
+        assert!(rule
+            .evaluate(&sensor_flood(Listen, 43, 1001, 150, true, 5))
+            .is_none());
+    }
+
     /// The user's budget is summed per user, whichever process reports it.
     #[test]
     fn net_020_user_budget_is_summed_per_user() {
@@ -3315,17 +3499,18 @@ mod tests {
 
     // ── Builder + invariants ────────────────────────────────────
 
-    /// Required builder test — the factory returns 16 net rules
+    /// Required builder test — the factory returns 17 net rules
     /// (Tappa 10 N6 shipped 9; Tappa 10.5 D4 adds 5:
-    /// NN-L-NET-010/011/013/018/019; review 78 adds NN-L-NET-020).
+    /// NN-L-NET-010/011/013/018/019; review 78 adds NN-L-NET-020;
+    /// external audit EBPF-013 adds NN-L-NET-021).
     /// Future rule additions must update this assertion.
     #[test]
-    fn net_rules_builder_returns_16_rules() {
+    fn net_rules_builder_returns_17_rules() {
         let rules = net_rules_empty();
         assert_eq!(
             rules.len(),
-            16,
-            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 = 16 net rules"
+            17,
+            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 + sensor flood 1 = 17 net rules"
         );
     }
 

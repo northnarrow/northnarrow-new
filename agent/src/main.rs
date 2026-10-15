@@ -3709,6 +3709,22 @@ async fn process_event(
             uid_level,
             ..
         } => debug!(pid, comm = %comm, held, uid_level, "dns_flood"),
+        // External audit EBPF-013: the rule (NN-L-NET-021) reports it.
+        Event::SensorFlood {
+            source,
+            pid,
+            comm,
+            held,
+            uid_level,
+            ..
+        } => debug!(
+            pid,
+            comm = %comm,
+            source = source.as_str(),
+            held,
+            uid_level,
+            "sensor_flood"
+        ),
         // Tappa 7: kernel-side LSM hook denied a tamper attempt on
         // protected state. The posture machine observed the event
         // at the top of this function and will route it through the

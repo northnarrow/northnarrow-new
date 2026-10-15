@@ -28,14 +28,15 @@ use super::{Rule, RuleEngine};
 /// NN-L-NET-014 DNS-tunnel entropy un-gated by the Tappa 4.1 DNS
 /// observability refit) — 67 before T9.5.1, 68 after, 69 after BUG-034
 /// R018 (module-load), 70 after NN-L-NET-020 (review 78), 71 after
-/// NN-L-FIM-025 (review 86). Each family matches a distinct `Event` variant
+/// NN-L-FIM-025 (review 86), 72 after NN-L-NET-021 (external audit
+/// EBPF-013). Each family matches a distinct `Event` variant
 /// set, so the first-match short-circuit is unaffected across families.
 #[test]
-fn default_engine_has_seventy_one_rules_across_all_families() {
+fn default_engine_has_seventy_two_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
     // chain 8 + tappa2 10 + process 7 + module-load 1 (R018, BUG-034)
-    //   + FIM 25 + canary 4 + net 16
-    assert_eq!(engine.rule_count(), 8 + 10 + 7 + 1 + 25 + 4 + 16);
+    //   + FIM 25 + canary 4 + net 17
+    assert_eq!(engine.rule_count(), 8 + 10 + 7 + 1 + 25 + 4 + 17);
 }
 
 #[test]
@@ -234,20 +235,21 @@ fn rule_ids_are_pinned() {
 /// (DNS-tunnel entropy). Tappa 10.6 D6 lifts 62 → 67 with the five new
 /// cross-PID / N-event chain rules NN-L-CHAIN-004..008. Tappa 9.5.1
 /// lifts 67 → 68 with NN-L-FIM-024 (anti-tamper bait); BUG-034 R018
-/// (module-load) lifts 68 → 69; NN-L-NET-020 → 70; NN-L-FIM-025 → 71.
+/// (module-load) lifts 68 → 69; NN-L-NET-020 → 70; NN-L-FIM-025 → 71;
+/// NN-L-NET-021 (external audit EBPF-013) → 72.
 #[test]
-fn default_engine_pins_all_seventy_one_rule_ids() {
+fn default_engine_pins_all_seventy_two_rule_ids() {
     let rules = super::rules::default_rules();
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        71,
-        "engine ships 71 rules after NN-L-FIM-025_FileCapabilityGranted (review 86)"
+        72,
+        "engine ships 72 rules after NN-L-NET-021_SensorRecordFlood (external audit EBPF-013)"
     );
     ids.sort_unstable();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 71, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 72, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -305,6 +307,7 @@ fn default_engine_pins_all_seventy_one_rule_ids() {
             "NN-L-NET-018_Rfc1918LateralPort",
             "NN-L-NET-019_WildcardListener",
             "NN-L-NET-020_DnsQueryFlood",
+            "NN-L-NET-021_SensorRecordFlood",
             "R001_ExecFromTmp",
             "R002_ExecFromDevShm",
             "R003_ExecFromVarTmp",

@@ -121,13 +121,16 @@ fn merge_sample(prev: &[u64], now: &[Option<u64>], failing: &mut [bool]) -> Vec<
 
 /// External audit SNS-009: the rings whose loss hides security evidence.
 /// A drop there raises `TriggerType::TelemetryLoss` (ALERTED).
-pub const SECURITY_RINGS: [u32; 6] = [
+pub const SECURITY_RINGS: [u32; 7] = [
     ring_slot::EXEC,
     ring_slot::FS_PROTECT,
     ring_slot::OPEN_SENSOR,
     ring_slot::FIM,
     ring_slot::MODULE_LOAD,
     ring_slot::BPF,
+    // External audit EBPF-009: a refused write-then-close marker hides an
+    // in-place modification of a watched file.
+    ring_slot::FIM_DIRTY_FULL,
 ];
 
 /// Events a security ring may lose within one sample before the posture
@@ -360,6 +363,8 @@ mod tests {
         assert_eq!(s.len(), RING_DROP_SLOTS as usize);
         assert_eq!(s[0].0, "exec");
         assert_eq!(s[10].0, "dns");
+        assert_eq!(s[15].0, "fim_dirty_full");
+        assert_eq!(s[17].0, "io_uring_rate");
         // totals start at zero in a fresh process
         assert!(snapshot_nonzero().is_empty());
         assert_eq!(total(), 0);

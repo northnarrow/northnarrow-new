@@ -474,7 +474,9 @@ fn extract_string_fields(event: &Event) -> (String, String, String) {
         Event::DnsQuery {
             comm, query_name, ..
         } => (String::new(), comm.clone(), query_name.clone()),
-        Event::DnsFlood { comm, .. } => (String::new(), comm.clone(), String::new()),
+        Event::DnsFlood { comm, .. } | Event::SensorFlood { comm, .. } => {
+            (String::new(), comm.clone(), String::new())
+        }
         Event::FsProtectDenial {
             comm, operation, ..
         } => (
@@ -540,7 +542,7 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
         Event::DnsQuery {
             comm, query_name, ..
         } => vec![comm.clone(), query_name.clone()],
-        Event::DnsFlood { comm, .. } => vec![comm.clone()],
+        Event::DnsFlood { comm, .. } | Event::SensorFlood { comm, .. } => vec![comm.clone()],
         Event::FsProtectDenial { comm, .. } => vec![comm.clone()],
         // Tappa 9 (C4): FIM drift synth-argv. C9 may refine.
         Event::Fim(fe) => vec![fe.modifier_comm.clone(), fe.path.clone()],

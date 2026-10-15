@@ -175,6 +175,7 @@ fn event_kind_label(e: &Event) -> &'static str {
         Event::TcpConnect { .. } => "tcp_connect",
         Event::DnsQuery { .. } => "dns_query",
         Event::DnsFlood { .. } => "dns_flood",
+        Event::SensorFlood { .. } => "sensor_flood",
         Event::FsProtectDenial { .. } => "fs_protect_denial",
         // Tappa 9 (C4): FIM event label. Doesn't appear in the
         // ADE structured prompt in V1.0.
@@ -273,6 +274,15 @@ fn kernel_details(e: &Event) -> String {
         Event::DnsFlood {
             held, uid_level, ..
         } => format!(" held={held} uid_level={uid_level}"),
+        Event::SensorFlood {
+            source,
+            held,
+            uid_level,
+            ..
+        } => format!(
+            " source={} held={held} uid_level={uid_level}",
+            source.as_str()
+        ),
         Event::FsProtectDenial {
             operation,
             target_dev,
@@ -318,6 +328,7 @@ fn pid_uid(e: &Event) -> (u32, u32) {
         | Event::TcpConnect { pid, uid, .. }
         | Event::DnsQuery { pid, uid, .. }
         | Event::DnsFlood { pid, uid, .. }
+        | Event::SensorFlood { pid, uid, .. }
         | Event::FsProtectDenial { pid, uid, .. } => (*pid, *uid),
         // Tappa 9 (C4): FIM modifier triple.
         Event::Fim(fe) => (fe.modifier_pid, fe.modifier_uid),

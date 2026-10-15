@@ -329,10 +329,7 @@ impl SensorMultiplexer {
                 "module_load",
                 spawn_module_load_pump(module_load_rb, tx.clone()),
             ),
-            (
-                "io_uring",
-                spawn_pump::<IoUringRaw>("io_uring", iouring_rb, tx.clone()),
-            ),
+            ("io_uring", spawn_iouring_pump(iouring_rb, tx.clone())),
             (
                 "bpf_syscall",
                 spawn_pump::<BpfSyscallRaw>("bpf_syscall", bpf_syscall_rb, tx.clone()),
@@ -572,7 +569,19 @@ where
     T: Pod,
     for<'a> Event: From<&'a T>,
 {
-    pump_with(label, rb, tx, |_, e| e).await
+    pump_with(label, rb, tx, |_, e| (e, [None, None])).await
+}
+
+/// External audit EBPF-013: io_uring records, followed by the
+/// [`Event::SensorFlood`]s a ring creation carries (creations the kernel's
+/// record budgets held back since the process's previous one).
+fn spawn_iouring_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let floods = |raw: &IoUringRaw, e: Event| (e, common::io_uring_floods(raw));
+        if let Err(e) = pump_with("io_uring", rb, tx, floods).await {
+            error!(label = "io_uring", error = %e, "ringbuf pump failed");
+        }
+    })
 }
 
 /// External audit PROC-005: module loads, their path made absolute — the
@@ -587,7 +596,7 @@ fn spawn_module_load_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> Join
                     *p = module_path_on_host(&mut mounts, (raw.root_dev, raw.root_ino), p);
                 }
             }
-            e
+            (e, [None, None])
         };
         if let Err(e) = pump_with("module_load", rb, tx, place).await {
             error!(label = "module_load", error = %e, "ringbuf pump failed");
@@ -614,7 +623,9 @@ async fn pump_with<T>(
     label: &'static str,
     rb: RingBuf<MapData>,
     tx: mpsc::Sender<Event>,
-    mut after: impl FnMut(&T, Event) -> Event,
+    // The record's event, then any events it carries (External audit
+    // EBPF-013: the floods a budgeted record reports).
+    mut after: impl FnMut(&T, Event) -> (Event, [Option<Event>; 2]),
 ) -> std::io::Result<()>
 where
     T: Pod,
@@ -631,8 +642,14 @@ where
             let bytes: &[u8] = item.as_ref();
             match bytemuck::try_from_bytes::<T>(bytes) {
                 Ok(raw) => {
-                    if tx.send(after(raw, Event::from(raw))).await.is_err() {
+                    let (event, carried) = after(raw, Event::from(raw));
+                    if tx.send(event).await.is_err() {
                         return Ok(());
+                    }
+                    for extra in carried.into_iter().flatten() {
+                        if tx.send(extra).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
                 Err(_e) => reject.record(label, std::mem::size_of::<T>(), bytes.len()),
