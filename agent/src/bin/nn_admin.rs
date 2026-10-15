@@ -643,11 +643,12 @@ enum FimCmd {
         socket: PathBuf,
     },
 
-    /// Stream the chained drift log to stdout. Signed payload,
-    /// single-sig `fim-read` role. `--since <unix-ts>` filters
-    /// server-side; missing returns the full chain (capped at
-    /// half MAX_FRAME_BODY — exit prints a truncation hint when
-    /// the cap fires).
+    /// Stream the chained drift log to stdout, newest rows first
+    /// (rotated archives included). Signed payload, single-sig
+    /// `fim-read` role. `--since <unix-ts>` filters server-side;
+    /// the reply holds the newest rows that fit half
+    /// MAX_FRAME_BODY — exit prints a truncation hint when older
+    /// rows were left out.
     Report {
         /// Path to the operator's `fim-read`-role admin
         /// private key.
@@ -702,9 +703,9 @@ enum CanaryCmd {
         socket: PathBuf,
     },
 
-    /// Stream the chained canary registry log (`canary-read`
-    /// role). Output mirrors `fim report`: JSONL on stdout, a
-    /// 1-line summary on stderr.
+    /// Stream the chained canary registry log, newest rows first
+    /// (`canary-read` role). Output mirrors `fim report`: JSONL on
+    /// stdout, a 1-line summary on stderr.
     List {
         #[arg(long)]
         key: PathBuf,
@@ -815,8 +816,9 @@ impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
 /// Tappa 10 N7 — net subcommand surface (mirrors FimCmd shape).
 #[derive(Subcommand, Debug)]
 enum NetCmd {
-    /// Stream the chained netflow log. `--since-unix <ts>`
-    /// filters server-side; missing = full chain (capped).
+    /// Stream the chained netflow log, newest rows first (rotated
+    /// archives included). `--since-unix <ts>` filters server-side;
+    /// the reply holds the newest rows that fit one frame.
     Flows {
         /// Path to the operator's `net-read`-role admin
         /// private key.
@@ -832,7 +834,9 @@ enum NetCmd {
         socket: PathBuf,
     },
 
-    /// Snapshot the in-process listener set.
+    /// Stream the listener log, newest rows first: one row per
+    /// `listen()` the agent observed. Listen events, not a snapshot
+    /// of the sockets open now (a closed listener stays listed).
     Listeners {
         #[arg(long)]
         key: PathBuf,
@@ -842,8 +846,10 @@ enum NetCmd {
         socket: PathBuf,
     },
 
-    /// DNS attribution lookup for a destination IP. V1.0 always
-    /// returns `qname: None` (V1.1 DNS-response observer wire-up).
+    /// The hostname the agent attributed to the newest retained
+    /// flow to this destination IP (netflow log), and when that
+    /// flow was recorded. Nothing printed when no retained flow to
+    /// it carries a name.
     Resolve {
         /// Target IP address (v4 or v6, string form).
         #[arg(long)]
@@ -856,7 +862,9 @@ enum NetCmd {
         socket: PathBuf,
     },
 
-    /// JA3/JA4 fingerprint dump for a flow_id.
+    /// The netflow rows of a flow_id, with their `ja3` / `ja4` /
+    /// `sni` (null: not captured — the ClientHello capture is not
+    /// wired yet). No row: the flow is not in the retained log.
     Fingerprint {
         /// 32-hex-char per-flow stable ID from a prior
         /// `net flows` row.
@@ -3170,9 +3178,7 @@ fn exit_from_net_resolve(outcome: NetResolveOutcome) -> ExitCode {
                     }
                 }
                 None => {
-                    eprintln!(
-                        "net resolve: no attribution available (V1.0: DNS-response observer is V1.1)"
-                    );
+                    eprintln!("net resolve: no retained flow to that address carries a hostname");
                 }
             }
             ExitCode::SUCCESS
@@ -3205,7 +3211,7 @@ fn exit_from_net_resolve(outcome: NetResolveOutcome) -> ExitCode {
             ExitCode::from(5)
         }
         NetResolveOutcome::UnknownOperation => {
-            eprintln!("net resolve: server rejected operation");
+            eprintln!("net resolve: server rejected operation (not an IP address?)");
             ExitCode::from(5)
         }
         NetResolveOutcome::ProtocolVersionUnsupported { server_version } => {

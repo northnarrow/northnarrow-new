@@ -255,6 +255,31 @@ pub struct ResponseAdminState {
     pub combat_stage: Arc<dyn Fn() -> Option<String> + Send + Sync>,
 }
 
+/// External audit NN-AUD-082 — the files the read verbs serve, from the
+/// agent's command line (`--fim-drift-file`, `--netflow-file`,
+/// `--netflow-listeners-file`); `fim report` and `net flows` used to read
+/// the built-in paths whatever the flags said. Always present, unlike
+/// [`FimAdminState`] (absent when FIM is down). `Default` is the built-in
+/// paths, for tests and the legacy serve entry points.
+#[derive(Debug, Clone)]
+pub struct AdminReadPaths {
+    pub fim_drift: PathBuf,
+    pub netflow: PathBuf,
+    pub netflow_listeners: PathBuf,
+}
+
+impl Default for AdminReadPaths {
+    fn default() -> Self {
+        Self {
+            fim_drift: PathBuf::from(crate::fim::drain::DEFAULT_DRIFT_LOG_PATH),
+            netflow: PathBuf::from(DEFAULT_NETFLOW_JSONL_PATH),
+            netflow_listeners: PathBuf::from(
+                crate::net::drain::DEFAULT_NETFLOW_LISTENERS_JSONL_PATH,
+            ),
+        }
+    }
+}
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a fatal listener error (`accept()` returning `Err`); the
 /// agent's main loop is expected to also exit on the same condition.
@@ -291,6 +316,7 @@ pub async fn serve(
         None,
         None,
         None,
+        Arc::default(),
     )
     .await
 }
@@ -323,6 +349,7 @@ pub async fn serve_with_audit_log(
         None,
         None,
         None,
+        Arc::default(),
     )
     .await
 }
@@ -359,6 +386,7 @@ pub async fn serve_with_fim_state(
         None,
         None,
         None,
+        Arc::default(),
     )
     .await
 }
@@ -393,6 +421,7 @@ pub async fn serve_with_canary_state(
         None,
         None,
         None,
+        Arc::default(),
     )
     .await
 }
@@ -427,6 +456,8 @@ pub async fn serve_with_marker_path(
     // External audit CMB-016: the response verbs' state. None on legacy /
     // test serve paths.
     response_state: Option<Arc<ResponseAdminState>>,
+    // External audit NN-AUD-082: the files the read verbs serve.
+    read_paths: Arc<AdminReadPaths>,
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
@@ -466,6 +497,7 @@ pub async fn serve_with_marker_path(
         let installer_override = installer_override.clone();
         let detection_state = detection_state.clone();
         let response_state = response_state.clone();
+        let read_paths = Arc::clone(&read_paths);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -480,6 +512,7 @@ pub async fn serve_with_marker_path(
                 installer_override.as_ref(),
                 detection_state.as_ref(),
                 response_state.as_ref(),
+                &read_paths,
             )
             .await
             {
@@ -517,6 +550,7 @@ async fn handle_connection(
     installer_override: Option<&Arc<TrustedInstallerOverride>>,
     detection_state: Option<&Arc<DetectionAdminState>>,
     response_state: Option<&Arc<ResponseAdminState>>,
+    read_paths: &AdminReadPaths,
 ) -> Result<()> {
     // Capture peer creds once per connection — the audit log
     // wants pid/uid/comm of the caller, and a single connection
@@ -541,6 +575,7 @@ async fn handle_connection(
             installer_override.map(|s| s.as_ref()),
             detection_state.map(|s| s.as_ref()),
             response_state.map(|s| s.as_ref()),
+            read_paths,
             &client,
             &mut matched_fps,
         );
@@ -1123,6 +1158,7 @@ fn dispatch(
     installer_override: Option<&TrustedInstallerOverride>,
     detection_state: Option<&DetectionAdminState>,
     response_state: Option<&ResponseAdminState>,
+    read_paths: &AdminReadPaths,
     client: &AuditClient,
     fps_out: &mut Vec<String>,
 ) -> AdminMessage {
@@ -1252,7 +1288,7 @@ fn dispatch(
         }
 
         AdminMessage::FimReportRequest(req) => {
-            AdminMessage::FimReportResponse(dispatch_fim_report(req, auth, fps_out))
+            AdminMessage::FimReportResponse(dispatch_fim_report(req, auth, read_paths, fps_out))
         }
 
         AdminMessage::FimStatusRequest(req) => {
@@ -1277,17 +1313,17 @@ fn dispatch(
 
         // Tappa 10 N7 — net admin ops.
         AdminMessage::NetFlowsRequest(req) => {
-            AdminMessage::NetFlowsResponse(dispatch_net_flows(req, auth, fps_out))
+            AdminMessage::NetFlowsResponse(dispatch_net_flows(req, auth, read_paths, fps_out))
         }
-        AdminMessage::NetListenersRequest(req) => {
-            AdminMessage::NetListenersResponse(dispatch_net_listeners(req, auth, fps_out))
-        }
+        AdminMessage::NetListenersRequest(req) => AdminMessage::NetListenersResponse(
+            dispatch_net_listeners(req, auth, read_paths, fps_out),
+        ),
         AdminMessage::NetResolveRequest(req) => {
-            AdminMessage::NetResolveResponse(dispatch_net_resolve(req, auth, fps_out))
+            AdminMessage::NetResolveResponse(dispatch_net_resolve(req, auth, read_paths, fps_out))
         }
-        AdminMessage::NetFingerprintRequest(req) => {
-            AdminMessage::NetFingerprintResponse(dispatch_net_fingerprint(req, auth, fps_out))
-        }
+        AdminMessage::NetFingerprintRequest(req) => AdminMessage::NetFingerprintResponse(
+            dispatch_net_fingerprint(req, auth, read_paths, fps_out),
+        ),
 
         // FIM-009 self-upgrade (§15.1) — signed trusted-installer grant.
         AdminMessage::TrustedInstallerGrantRequest(req) => {
@@ -2298,13 +2334,17 @@ fn count_and_last_ts_jsonl(path: &Path) -> (u32, String) {
 /// reads the drift log from disk, returns the chained JSONL
 /// body (or a truncation flag if the chain exceeds the wire
 /// frame budget). Filtering by `since_unix_ts` from the
-/// payload's extra is best-effort: the dispatcher walks the
-/// chain in order and yields entries whose `ts` field is `>=`
+/// payload's extra keeps entries whose `ts` field is `>=`
 /// the threshold (lexicographic ISO-8601 compare, valid
 /// because the format is fixed-width).
+///
+/// External audit NN-AUD-080/082: the drift log configured by
+/// `--fim-drift-file` (not the built-in path), newest rows first,
+/// rotated archives included ([`read_tail_jsonl`]).
 fn dispatch_fim_report(
     req: FimReportRequest,
     auth: &AdminAuth,
+    read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> FimReportResponse {
     use common::wire::admin_signed_payload::FimReportExtra;
@@ -2346,7 +2386,7 @@ fn dispatch_fim_report(
     };
 
     let (entries_jsonl, entries_count, entries_truncated) =
-        read_fim_drift_jsonl(crate::fim::drain::DEFAULT_DRIFT_LOG_PATH, since);
+        read_tail_jsonl(&read_paths.fim_drift, since, None, usize::MAX);
     info!(
         target: "admin.fim_report",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
@@ -2362,52 +2402,34 @@ fn dispatch_fim_report(
     }
 }
 
-/// Read the drift log at `path` and return `(jsonl_body,
-/// count, truncated_flag)`. Filter rule: keep entries whose
-/// `ts` field is lexicographically `>=` the supplied `since`
-/// (UNIX-ts encoded as ISO-8601, falls back to "include all"
-/// when `since` is None). Caps the wire-side body at half of
-/// MAX_FRAME_BODY so the rest of the FimReportResponse envelope
-/// fits comfortably in one frame. On overflow, sets
-/// `truncated=true` and stops appending; the operator can
-/// narrow via the CLI's `--since` flag.
-fn read_fim_drift_jsonl(path: &str, since: Option<u64>) -> (String, u32, bool) {
-    use std::io::{BufRead, BufReader};
-    const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
-    let f = match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(_) => return (String::new(), 0, false),
-    };
-    let reader = BufReader::new(f);
-    let since_str = since.map(format_iso8601_unix);
-    let mut out = String::new();
-    let mut count = 0u32;
-    let mut truncated = false;
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(threshold) = &since_str {
-            // Coarse pass: substring-match the first ts field
-            // rather than parse JSON. Format §4.2 puts ts as
-            // the first field, so the second `"` opens the
-            // ISO timestamp string.
-            if let Some(ts_value) = extract_ts_field(&line) {
-                if ts_value.as_str() < threshold.as_str() {
-                    continue;
-                }
-            }
-        }
-        if out.len() + line.len() + 1 > SOFT_CAP {
-            truncated = true;
-            break;
-        }
-        out.push_str(&line);
-        out.push('\n');
-        count += 1;
-    }
-    (out, count, truncated)
+/// Half a frame: the rest of a read verb's response fits in the other
+/// half.
+const READ_VERB_SOFT_CAP: usize = MAX_FRAME_BODY / 2;
+
+/// External audit NN-AUD-080: the body of a read verb — the newest rows
+/// of the chain log whose active file is `path` (the active file, then
+/// its rotated archives), newest first, within [`READ_VERB_SOFT_CAP`] and
+/// `max_rows`. With `since` (UNIX seconds), rows whose `ts` is earlier are
+/// left out. `keep` selects rows by their raw line. Returns `(jsonl_body,
+/// count, truncated)`; `truncated` means older matching rows were left
+/// out. The read bounds are in [`crate::chain_tail`].
+fn read_tail_jsonl(
+    path: &Path,
+    since: Option<u64>,
+    keep: Option<&dyn Fn(&str) -> bool>,
+    max_rows: usize,
+) -> (String, u32, bool) {
+    let since = since.map(format_iso8601_unix);
+    let tail = crate::chain_tail::read_chain_tail(
+        path,
+        &crate::chain_tail::TailQuery {
+            since: since.as_deref(),
+            keep,
+            soft_cap: READ_VERB_SOFT_CAP,
+            max_rows,
+        },
+    );
+    (tail.jsonl, tail.count, tail.truncated)
 }
 
 fn format_iso8601_unix(unix_ts: u64) -> String {
@@ -3058,7 +3080,9 @@ fn decoy_key(decoy: &std::fs::File) -> Result<common::wire::InodeKey> {
 /// dispatch_canary_list — verify 1-of-N quorum with
 /// `Role::CanaryRead`, read the chained registry log from
 /// disk, return the JSONL body with the standard truncation
-/// flag (same shape as `dispatch_fim_report`).
+/// flag (same shape as `dispatch_fim_report`). External audit
+/// NN-AUD-080: newest rows first, so a long history no longer
+/// hides the latest deploy, trip or burn.
 fn dispatch_canary_list(
     req: CanaryListRequest,
     auth: &AdminAuth,
@@ -3110,7 +3134,8 @@ fn dispatch_canary_list(
             };
         }
     };
-    let (entries_jsonl, entries_count, entries_truncated) = read_jsonl_chain(&log_path);
+    let (entries_jsonl, entries_count, entries_truncated) =
+        read_tail_jsonl(&log_path, None, None, usize::MAX);
     info!(
         target: "admin.canary_list",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
@@ -3124,38 +3149,6 @@ fn dispatch_canary_list(
         entries_count,
         entries_truncated,
     }
-}
-
-/// Generic chain reader matching the `dispatch_fim_report`
-/// truncation contract. Returns `(jsonl_body, count, truncated)`.
-/// Used for canary chains (no `--since` filter today;
-/// canary registries are small enough that operators always
-/// want the full chain).
-fn read_jsonl_chain(path: &std::path::Path) -> (String, u32, bool) {
-    use std::io::{BufRead, BufReader};
-    const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
-    let f = match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(_) => return (String::new(), 0, false),
-    };
-    let reader = BufReader::new(f);
-    let mut out = String::new();
-    let mut count = 0u32;
-    let mut truncated = false;
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.is_empty() {
-            continue;
-        }
-        if out.len() + line.len() + 1 > SOFT_CAP {
-            truncated = true;
-            break;
-        }
-        out.push_str(&line);
-        out.push('\n');
-        count += 1;
-    }
-    (out, count, truncated)
 }
 
 /// dispatch_canary_burn — verify 1-of-N quorum with
@@ -3315,9 +3308,11 @@ fn dispatch_canary_refresh(
 //   * Auth via `verify_signed_payload_quorum` (1-of-N per §13 Q6).
 //   * Op-extra-variant defensive check.
 //   * Emit audit-grade `info!` line with the matched signer fp.
-//   * V1.0 stubs for listener/resolve/fingerprint dispatches:
-//     return empty bodies. The wire shape ships now; the data
-//     sources are wired in N8 and beyond.
+//   * External audit NN-AUD-081: every verb answers from the
+//     chained logs the net drain writes (`netflow.jsonl`,
+//     `netflow_listeners.jsonl`, at the paths in
+//     [`AdminReadPaths`]); none answers an empty Success
+//     without having read them.
 
 /// Default on-disk location of the chained NetFlow log (design
 /// §4.4 + §10). The Tappa 10 N8 deploy commit drops a zero-byte
@@ -3326,9 +3321,13 @@ fn dispatch_canary_refresh(
 /// absent — returns empty body + 0 count without erroring.
 pub const DEFAULT_NETFLOW_JSONL_PATH: &str = "/var/lib/northnarrow/netflow.jsonl";
 
+/// `net flows`: the newest rows of the netflow log at
+/// `--netflow-file` (external audit NN-AUD-082), active file then
+/// archives, newest first (NN-AUD-080).
 fn dispatch_net_flows(
     req: NetFlowsRequest,
     auth: &AdminAuth,
+    read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFlowsResponse {
     use common::wire::admin_signed_payload::NetFlowsExtra;
@@ -3368,12 +3367,8 @@ fn dispatch_net_flows(
         }
     };
 
-    // Re-use the FIM-drift JSONL reader (same on-disk shape: one
-    // chained row per line, optional `ts` lexicographic filter).
-    // N3 emission into `netflow.jsonl` is wired in a future
-    // commit; until then, the read returns (empty, 0, false).
     let (entries_jsonl, entries_count, entries_truncated) =
-        read_fim_drift_jsonl(DEFAULT_NETFLOW_JSONL_PATH, since);
+        read_tail_jsonl(&read_paths.netflow, since, None, usize::MAX);
     info!(
         target: "admin.net_flows",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
@@ -3683,9 +3678,16 @@ fn dispatch_detection_set_status(
     }
 }
 
+/// `net listeners`: the newest rows of the listener log at
+/// `--netflow-listeners-file` — one row per `listen()` the agent saw
+/// (`inet_csk_listen_start`), newest first. Listen events, not a snapshot
+/// of the sockets open now: a closed listener stays in the log. External
+/// audit NN-AUD-081: this verb answered Success with an empty body while
+/// the log was being written.
 fn dispatch_net_listeners(
     req: NetListenersRequest,
     auth: &AdminAuth,
+    read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetListenersResponse {
     let server_now = now_unix_secs();
@@ -3720,27 +3722,50 @@ fn dispatch_net_listeners(
         };
     }
 
-    // V1.0 stub: the userland listener snapshot wiring is a
-    // future commit (the N2 BPF program emits into
-    // NET_LISTEN_EVENTS but no userland drain stores them
-    // for admin-CLI consumption yet). Return Success + empty
-    // body so the wire surface is exercised + audited.
+    let (entries_jsonl, entries_count, entries_truncated) =
+        read_tail_jsonl(&read_paths.netflow_listeners, None, None, usize::MAX);
     info!(
         target: "admin.net_listeners",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
-        "net listeners served (V1.0 empty stub)"
+        entries = entries_count,
+        truncated = entries_truncated,
+        "net listeners served"
     );
     NetListenersResponse {
         result: AdminResult::Success,
-        entries_jsonl: String::new(),
-        entries_count: 0,
-        entries_truncated: false,
+        entries_jsonl,
+        entries_count,
+        entries_truncated,
     }
 }
 
+/// The fields of a netflow row the `net resolve` / `net fingerprint`
+/// filters look at (serde ignores the others).
+#[derive(serde::Deserialize)]
+struct NetflowRowView {
+    #[serde(default)]
+    ts: String,
+    #[serde(default)]
+    flow_id: String,
+    #[serde(default)]
+    dst_addr: String,
+    resolved_hostname: Option<String>,
+}
+
+fn netflow_row_view(line: &str) -> Option<NetflowRowView> {
+    serde_json::from_str(line).ok()
+}
+
+/// `net resolve <ip>`: the hostname the agent attributed (DNS cache, same
+/// process) to the newest retained netflow row whose destination is `ip`,
+/// and when that row was written. External audit NN-AUD-081: this verb
+/// answered Success with no name without reading anything; it now answers
+/// from the netflow log, and `qname: None` means no retained flow to that
+/// address carries a name. An address that does not parse is refused.
 fn dispatch_net_resolve(
     req: NetResolveRequest,
     auth: &AdminAuth,
+    read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetResolveResponse {
     use common::wire::admin_signed_payload::NetResolveExtra;
@@ -3766,38 +3791,72 @@ fn dispatch_net_resolve(
     };
     *fps_out = matched_fps;
 
+    let refused = NetResolveResponse {
+        result: AdminResult::UnknownOperation,
+        qname: None,
+        queried_at_unix_ts: None,
+    };
     let ip_query = match &req.payload.extra {
         OperationExtra::NetResolve(NetResolveExtra { ip }) => ip.clone(),
         _ => {
             warn!("net-resolve payload extra is not NetResolve variant");
-            return NetResolveResponse {
-                result: AdminResult::UnknownOperation,
-                qname: None,
-                queried_at_unix_ts: None,
-            };
+            return refused;
         }
     };
-
-    // V1.0 stub: the back-correlation N4 cache doesn't index by
-    // resolved IP (no DNS-response observer yet — V1.1 ships
-    // that). Return Success + `qname = None`. The wire shape is
-    // ready; V1.1 plumbs DnsCache::lookup_for_ip into this slot.
+    let Ok(target) = ip_query.trim().parse::<std::net::IpAddr>() else {
+        warn!(ip = %ip_query, "net-resolve: not an IP address");
+        return refused;
+    };
+    let target = target.to_canonical();
+    // Substring pre-filter, then the parsed check (an IPv4 target also
+    // matches an IPv4-mapped IPv6 destination).
+    let needle = target.to_string();
+    let keep = |line: &str| {
+        line.contains(&needle)
+            && netflow_row_view(line).is_some_and(|r| {
+                r.dst_addr
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|a| a.to_canonical() == target)
+                    && r.resolved_hostname
+                        .as_deref()
+                        .is_some_and(|h| !h.is_empty())
+            })
+    };
+    let (body, _, _) = read_tail_jsonl(&read_paths.netflow, None, Some(&keep), 1);
+    let newest = body.lines().next().and_then(netflow_row_view);
+    let qname = newest.as_ref().and_then(|r| r.resolved_hostname.clone());
+    let queried_at_unix_ts = newest.as_ref().and_then(|r| {
+        chrono::DateTime::parse_from_rfc3339(&r.ts)
+            .ok()
+            .and_then(|t| u64::try_from(t.timestamp()).ok())
+    });
     info!(
         target: "admin.net_resolve",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
-        ip = %ip_query,
-        "net resolve served (V1.0: no V1.1 DNS-response observer)"
+        ip = %target,
+        found = qname.is_some(),
+        "net resolve served"
     );
     NetResolveResponse {
         result: AdminResult::Success,
-        qname: None,
-        queried_at_unix_ts: None,
+        qname,
+        queried_at_unix_ts,
     }
 }
 
+/// `net fingerprint <flow_id>`: the netflow rows of that flow (active
+/// file and archives, newest first), with their `ja3` / `ja4` / `sni`.
+/// External audit NN-AUD-081: this verb answered Success with an empty
+/// body without reading anything. The rows are returned whether or not
+/// they carry a fingerprint: the ClientHello capture that fills those
+/// fields is not wired (`FlowTracker::attach_tls`), so a filter on them
+/// would always answer empty. A null field says "not captured"; an empty
+/// body says the flow is not in the retained log. A flow id that is not
+/// 1 to 64 hex digits is refused.
 fn dispatch_net_fingerprint(
     req: NetFingerprintRequest,
     auth: &AdminAuth,
+    read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFingerprintResponse {
     use common::wire::admin_signed_payload::NetFingerprintExtra;
@@ -3824,33 +3883,42 @@ fn dispatch_net_fingerprint(
     };
     *fps_out = matched_fps;
 
+    let refused = NetFingerprintResponse {
+        result: AdminResult::UnknownOperation,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
+    };
     let flow_id = match &req.payload.extra {
         OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }) => flow_id.clone(),
         _ => {
             warn!("net-fingerprint payload extra is not NetFingerprint variant");
-            return NetFingerprintResponse {
-                result: AdminResult::UnknownOperation,
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
+            return refused;
         }
     };
-
-    // V1.0 stub. Future commit wires the N3 FlowTracker's
-    // in-process fingerprint cache (or reads netflow.jsonl
-    // rows whose `tls_fingerprint` is populated).
+    let flow_id = flow_id.trim().to_ascii_lowercase();
+    if flow_id.is_empty() || flow_id.len() > 64 || !flow_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        warn!(flow_id = %flow_id, "net-fingerprint: flow id is not hex");
+        return refused;
+    }
+    let keep = |line: &str| {
+        line.contains(&flow_id) && netflow_row_view(line).is_some_and(|r| r.flow_id == flow_id)
+    };
+    let (entries_jsonl, entries_count, entries_truncated) =
+        read_tail_jsonl(&read_paths.netflow, None, Some(&keep), usize::MAX);
     info!(
         target: "admin.net_fingerprint",
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
         flow_id = %flow_id,
-        "net fingerprint served (V1.0 empty stub)"
+        entries = entries_count,
+        truncated = entries_truncated,
+        "net fingerprint served"
     );
     NetFingerprintResponse {
         result: AdminResult::Success,
-        entries_jsonl: String::new(),
-        entries_count: 0,
-        entries_truncated: false,
+        entries_jsonl,
+        entries_count,
+        entries_truncated,
     }
 }
 
@@ -4162,8 +4230,19 @@ mod tests {
         let marker_c = marker_path.clone();
         let task = tokio::spawn(async move {
             let _ = serve_with_marker_path(
-                socket_c, auth_c, posture_c, isolator_c, marker_c, None, None, None, None, None,
-                None, None,
+                socket_c,
+                auth_c,
+                posture_c,
+                isolator_c,
+                marker_c,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Arc::default(),
             )
             .await;
         });
@@ -4419,6 +4498,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::default(),
             )
             .await;
         });
@@ -5647,8 +5727,7 @@ mod tests {
 
     /// N7 dispatch test #1 — `net flows` with a `net-read` key
     /// returns Success + empty body when `netflow.jsonl` is
-    /// absent (the V1.0 default — N3 emission into the file is
-    /// future scope). Exercises the auth + extra-parse + empty-
+    /// absent. Exercises the auth + extra-parse + empty-
     /// file-tolerance paths.
     #[test]
     fn dispatch_net_flows_returns_empty_success_when_log_absent() {
@@ -5667,10 +5746,9 @@ mod tests {
             signatures: vec![KeyedSignature { signature: sig }],
         };
         let mut fps = Vec::new();
-        let resp = dispatch_net_flows(req, &auth, &mut fps);
+        let empty = TempDir::new().unwrap();
+        let resp = dispatch_net_flows(req, &auth, &read_paths_in(empty.path()), &mut fps);
         assert!(matches!(resp.result, AdminResult::Success));
-        // V1.0: netflow.jsonl doesn't exist at the default path
-        // in this test env, so the body is empty.
         assert_eq!(resp.entries_count, 0);
         assert!(!resp.entries_truncated);
         assert!(!fps.is_empty(), "matched signer fp must be captured");
@@ -5696,8 +5774,310 @@ mod tests {
             signatures: vec![KeyedSignature { signature: sig }],
         };
         let mut fps = Vec::new();
-        let resp = dispatch_net_flows(req, &auth, &mut fps);
+        let resp = dispatch_net_flows(req, &auth, &AdminReadPaths::default(), &mut fps);
         assert!(matches!(resp.result, AdminResult::RoleDenied));
+    }
+
+    // ── External audit NN-AUD-080/081/082 — read verbs ─────────────
+
+    /// The read verbs' files, in `dir`.
+    fn read_paths_in(dir: &Path) -> AdminReadPaths {
+        AdminReadPaths {
+            fim_drift: dir.join("fim_drift.jsonl"),
+            netflow: dir.join("netflow.jsonl"),
+            netflow_listeners: dir.join("netflow_listeners.jsonl"),
+        }
+    }
+
+    fn append_lines(path: &Path, lines: impl IntoIterator<Item = String>) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+
+    /// `2026-10-15T10:MM:SS` for row `i` (one row per second).
+    fn row_ts(i: u64) -> String {
+        format!("2026-10-15T10:{:02}:{:02}", i / 60, i % 60)
+    }
+
+    fn row_unix(i: u64) -> u64 {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 10, 15, 10, 0, 0)
+            .unwrap()
+            .timestamp() as u64
+            + i
+    }
+
+    /// A netflow row in the drain's field order.
+    fn flow_row(i: u64, flow_id: &str, dst: &str, host: Option<&str>) -> String {
+        let host = host.map_or("null".to_string(), |h| format!("\"{h}\""));
+        format!(
+            "{{\"ts\":\"{}.000000Z\",\"flow_id\":\"{flow_id}\",\"start_ns\":{i},\"end_ns\":{i},\
+             \"family\":2,\"src_addr\":\"10.0.0.5\",\"src_port\":40000,\"dst_addr\":\"{dst}\",\
+             \"dst_port\":443,\"proto\":6,\"pid\":1000,\"uid\":1000,\"comm\":\"curl\",\"exe\":null,\
+             \"bytes_sent\":1,\"bytes_recv\":1,\"resolved_hostname\":{host},\"ja3\":null,\
+             \"ja4\":null,\"sni\":null,\"close_reason\":0,\"agent_id\":\"00\",\"fmt_ver\":2,\
+             \"prev_hash\":\"p\",\"entry_hash\":\"e{i}\",\"agent_sig\":\"s\"}}",
+            row_ts(i)
+        )
+    }
+
+    fn row_numbers(body: &str) -> Vec<u64> {
+        body.lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["start_ns"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// A key with `roles` and a fresh challenge nonce.
+    fn read_verb_key(roles: &str) -> (SigningKey, AdminAuth, TempDir, [u8; 16], [u8; 32]) {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x39; 16];
+        let (auth, dir) = build_auth_with_roles(&signing, roles, agent_id);
+        let nonce = auth.issue_challenge().unwrap();
+        (signing, auth, dir, agent_id, nonce)
+    }
+
+    fn one_sig(
+        payload: &common::wire::admin_signed_payload::SignedPayload,
+        signing: &SigningKey,
+    ) -> Vec<common::wire::admin_protocol::KeyedSignature> {
+        vec![common::wire::admin_protocol::KeyedSignature {
+            signature: common::wire::admin_signed_payload::sign(payload, signing).unwrap(),
+        }]
+    }
+
+    fn net_flows(dir: &Path, since: Option<u64>) -> NetFlowsResponse {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, since);
+        let req = NetFlowsRequest {
+            signatures: one_sig(&payload, &signing),
+            payload,
+        };
+        dispatch_net_flows(req, &auth, &read_paths_in(dir), &mut Vec::new())
+    }
+
+    fn fim_report(dir: &Path) -> FimReportResponse {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let (signing, auth, _k, agent_id, nonce) = read_verb_key("fim-read");
+        let payload = SignedPayload::new_fim_report(nonce, now_unix_secs(), agent_id, None);
+        let req = FimReportRequest {
+            signatures: one_sig(&payload, &signing),
+            payload,
+        };
+        dispatch_fim_report(req, &auth, &read_paths_in(dir), &mut Vec::new())
+    }
+
+    /// External audit NN-AUD-082: `fim report` reads `--fim-drift-file`,
+    /// not the built-in path.
+    #[test]
+    fn fim_report_reads_configured_path() {
+        let dir = TempDir::new().unwrap();
+        append_lines(
+            &dir.path().join("fim_drift.jsonl"),
+            (0..2).map(|i| format!("{{\"ts\":\"{}.000000Z\",\"start_ns\":{i}}}", row_ts(i))),
+        );
+        let resp = fim_report(dir.path());
+        assert!(matches!(resp.result, AdminResult::Success));
+        assert_eq!(resp.entries_count, 2);
+        assert_eq!(row_numbers(&resp.entries_jsonl), vec![1, 0]);
+    }
+
+    /// External audit NN-AUD-080: over half a frame, `fim report` keeps
+    /// the NEWEST rows, newest first, and says older ones were left out.
+    #[test]
+    fn fim_report_truncation_keeps_newest() {
+        let dir = TempDir::new().unwrap();
+        append_lines(
+            &dir.path().join("fim_drift.jsonl"),
+            (0..3000).map(|i| {
+                format!(
+                    "{{\"ts\":\"{}.000000Z\",\"start_ns\":{i},\"path\":\"/etc/watched-{i}\"}}",
+                    row_ts(i)
+                )
+            }),
+        );
+        let resp = fim_report(dir.path());
+        assert!(resp.entries_truncated);
+        let n = row_numbers(&resp.entries_jsonl);
+        assert_eq!(n.first(), Some(&2999), "the newest row comes first");
+        assert!(
+            n.windows(2).all(|w| w[0] == w[1] + 1),
+            "a contiguous newest run"
+        );
+        assert!(resp.entries_jsonl.len() <= READ_VERB_SOFT_CAP);
+    }
+
+    /// External audit NN-AUD-082: `net flows` reads `--netflow-file`.
+    #[test]
+    fn net_flows_reads_configured_path() {
+        let dir = TempDir::new().unwrap();
+        append_lines(
+            &dir.path().join("netflow.jsonl"),
+            (0..3).map(|i| flow_row(i, "aa", "192.0.2.1", None)),
+        );
+        let resp = net_flows(dir.path(), None);
+        assert!(matches!(resp.result, AdminResult::Success));
+        assert_eq!(row_numbers(&resp.entries_jsonl), vec![2, 1, 0]);
+        assert!(!resp.entries_truncated);
+    }
+
+    /// External audit NN-AUD-080: with `--since`, `net flows` goes on into
+    /// the rotated archive while its rows are recent enough.
+    #[test]
+    fn net_flows_since_reads_into_archives() {
+        let dir = TempDir::new().unwrap();
+        append_lines(
+            &dir.path().join("netflow.jsonl.000001"),
+            (0..5).map(|i| flow_row(i, "aa", "192.0.2.1", None)),
+        );
+        append_lines(
+            &dir.path().join("netflow.jsonl.000001"),
+            ["{\"rotate\":{\"fmt_ver\":2,\"this_seq\":1},\"ts\":\"x\"}".to_string()],
+        );
+        append_lines(
+            &dir.path().join("netflow.jsonl"),
+            (5..7).map(|i| flow_row(i, "aa", "192.0.2.1", None)),
+        );
+        let resp = net_flows(dir.path(), Some(row_unix(3)));
+        assert_eq!(row_numbers(&resp.entries_jsonl), vec![6, 5, 4, 3]);
+        assert!(!resp.entries_truncated);
+        let all = net_flows(dir.path(), None);
+        assert_eq!(row_numbers(&all.entries_jsonl), vec![6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    /// External audit NN-AUD-081: `net listeners` serves the listener log
+    /// (it answered Success with an empty body).
+    #[test]
+    fn net_listeners_serves_listener_log() {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let dir = TempDir::new().unwrap();
+        append_lines(
+            &dir.path().join("netflow_listeners.jsonl"),
+            (0..3).map(|i| {
+                format!(
+                    "{{\"ts\":\"{}.000000Z\",\"start_ns\":{i},\"bind_addr\":\"0.0.0.0\",\
+                     \"bind_port\":{}}}",
+                    row_ts(i),
+                    8765 + i
+                )
+            }),
+        );
+        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let payload = SignedPayload::new_net_listeners(nonce, now_unix_secs(), agent_id);
+        let req = NetListenersRequest {
+            signatures: one_sig(&payload, &signing),
+            payload,
+        };
+        let mut fps = Vec::new();
+        let resp = dispatch_net_listeners(req, &auth, &read_paths_in(dir.path()), &mut fps);
+        assert!(matches!(resp.result, AdminResult::Success));
+        assert_eq!(resp.entries_count, 3);
+        assert_eq!(row_numbers(&resp.entries_jsonl), vec![2, 1, 0]);
+        assert!(!fps.is_empty());
+    }
+
+    fn net_fingerprint(dir: &Path, flow_id: &str) -> NetFingerprintResponse {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let payload =
+            SignedPayload::new_net_fingerprint(nonce, now_unix_secs(), agent_id, flow_id.into());
+        let req = NetFingerprintRequest {
+            signatures: one_sig(&payload, &signing),
+            payload,
+        };
+        dispatch_net_fingerprint(req, &auth, &read_paths_in(dir), &mut Vec::new())
+    }
+
+    /// External audit NN-AUD-081: `net fingerprint` returns that flow's
+    /// rows from the active file and the archives (it answered Success with
+    /// an empty body); a malformed id is refused.
+    #[test]
+    fn net_fingerprint_finds_flow_by_id() {
+        let dir = TempDir::new().unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        append_lines(
+            &dir.path().join("netflow.jsonl.000001"),
+            [
+                flow_row(0, id, "192.0.2.1", None),
+                flow_row(1, "ff", "192.0.2.1", None),
+            ],
+        );
+        append_lines(
+            &dir.path().join("netflow.jsonl"),
+            [
+                flow_row(2, "ff", "192.0.2.1", None),
+                flow_row(3, id, "192.0.2.1", None),
+                // Another flow whose id contains this one is not it.
+                flow_row(4, &format!("{id}00"), "192.0.2.1", None),
+            ],
+        );
+        let resp = net_fingerprint(dir.path(), &id.to_ascii_uppercase());
+        assert!(matches!(resp.result, AdminResult::Success));
+        assert_eq!(row_numbers(&resp.entries_jsonl), vec![3, 0]);
+        let none = net_fingerprint(dir.path(), "abcd");
+        assert!(matches!(none.result, AdminResult::Success));
+        assert_eq!(none.entries_count, 0);
+        for bad in ["", "xyz", "../etc/shadow"] {
+            let r = net_fingerprint(dir.path(), bad);
+            assert!(matches!(r.result, AdminResult::UnknownOperation), "{bad:?}");
+        }
+    }
+
+    fn net_resolve(dir: &Path, ip: &str) -> NetResolveResponse {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let (signing, auth, _k, agent_id, nonce) = read_verb_key("net-read");
+        let payload = SignedPayload::new_net_resolve(nonce, now_unix_secs(), agent_id, ip.into());
+        let req = NetResolveRequest {
+            signatures: one_sig(&payload, &signing),
+            payload,
+        };
+        dispatch_net_resolve(req, &auth, &read_paths_in(dir), &mut Vec::new())
+    }
+
+    /// External audit NN-AUD-081: `net resolve` answers from the netflow
+    /// rows — the name of the newest retained flow to that address — and
+    /// refuses an address that does not parse (it answered Success with no
+    /// name without reading anything).
+    #[test]
+    fn net_resolve_answers_from_netflow_rows() {
+        let dir = TempDir::new().unwrap();
+        append_lines(
+            &dir.path().join("netflow.jsonl.000001"),
+            [
+                flow_row(0, "a0", "198.51.100.7", Some("old.example")),
+                flow_row(1, "a1", "::ffff:10.1.2.3", Some("mapped.example")),
+            ],
+        );
+        append_lines(
+            &dir.path().join("netflow.jsonl"),
+            [
+                flow_row(2, "a2", "198.51.100.7", Some("new.example")),
+                flow_row(3, "a3", "198.51.100.7", None),
+                flow_row(4, "a4", "198.51.100.70", Some("other.example")),
+            ],
+        );
+        let r = net_resolve(dir.path(), "198.51.100.7");
+        assert!(matches!(r.result, AdminResult::Success));
+        assert_eq!(r.qname.as_deref(), Some("new.example"));
+        assert_eq!(r.queried_at_unix_ts, Some(row_unix(2)));
+        let mapped = net_resolve(dir.path(), "10.1.2.3");
+        assert_eq!(mapped.qname.as_deref(), Some("mapped.example"));
+        let unknown = net_resolve(dir.path(), "203.0.113.9");
+        assert!(matches!(unknown.result, AdminResult::Success));
+        assert!(unknown.qname.is_none());
+        let bad = net_resolve(dir.path(), "not-an-ip");
+        assert!(matches!(bad.result, AdminResult::UnknownOperation));
     }
 
     // ── Tappa 9.0.b — detections read dispatch + auth-gating tests ──
@@ -6184,31 +6564,6 @@ mod tests {
         let mut fps = Vec::new();
         let resp = dispatch_trusted_installer_grant(req, &auth, None, &mut fps);
         assert!(matches!(resp, AdminResult::UnknownOperation));
-    }
-
-    /// N7 dispatch test #3 — `net resolve` returns Success +
-    /// `qname: None` for V1.0 (DNS-response observer is V1.1).
-    #[test]
-    fn dispatch_net_resolve_returns_none_qname_in_v1_0() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
-        let signing = SigningKey::generate(&mut OsRng);
-        let agent_id = [0xCC; 16];
-        let (auth, _dir) = build_auth_with_roles(&signing, "net-read", agent_id);
-        let nonce = auth.issue_challenge().unwrap();
-        let payload =
-            SignedPayload::new_net_resolve(nonce, now_unix_secs(), agent_id, "1.2.3.4".to_string());
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
-        let req = NetResolveRequest {
-            payload,
-            signatures: vec![KeyedSignature { signature: sig }],
-        };
-        let mut fps = Vec::new();
-        let resp = dispatch_net_resolve(req, &auth, &mut fps);
-        assert!(matches!(resp.result, AdminResult::Success));
-        assert!(resp.qname.is_none(), "V1.0 always returns qname=None");
     }
 
     /// N7 audit test — a successful NetFlowsRequest +

@@ -200,6 +200,10 @@ struct NetFixture {
     _tempdir: tempfile::TempDir,
     netflow_log: PathBuf,
     netflow_listeners_log: PathBuf,
+    admin_priv: PathBuf,
+    agent_id_file: PathBuf,
+    admin_socket: PathBuf,
+    nn_admin_path: PathBuf,
     _agent_guard: AgentGuard,
     _installed_agent: InstalledBin,
     _installed_admin: InstalledBin,
@@ -351,6 +355,10 @@ impl NetFixture {
             _tempdir: tempdir,
             netflow_log,
             netflow_listeners_log,
+            admin_priv,
+            agent_id_file: agent_id,
+            admin_socket,
+            nn_admin_path: installed_admin.path.clone(),
             _agent_guard: guard,
             _installed_agent: installed_agent,
             _installed_admin: installed_admin,
@@ -372,6 +380,34 @@ impl NetFixture {
         F: Fn(&serde_json::Value) -> bool,
     {
         wait_jsonl_matching(&self.netflow_listeners_log, n, predicate)
+    }
+
+    /// `nn-admin net <args>` against this agent with the fixture's key
+    /// (role `all`); the JSONL rows it printed.
+    fn nn_admin_net(&self, args: &[&str]) -> Vec<serde_json::Value> {
+        let sub = args.join(" ");
+        let out = Command::new(&self.nn_admin_path)
+            .arg("net")
+            .args(args)
+            .arg("--key")
+            .arg(&self.admin_priv)
+            .arg("--agent-id-file")
+            .arg(&self.agent_id_file)
+            .arg("--socket")
+            .arg(&self.admin_socket)
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("spawn nn-admin net");
+        assert!(
+            out.status.success(),
+            "nn-admin net {sub}: exit {:?}",
+            out.status
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("nn-admin net row is JSON"))
+            .collect()
     }
 }
 
@@ -607,6 +643,20 @@ s.close()
          (T4.1 DNS attribution); got {:?}",
         row["resolved_hostname"]
     );
+
+    // External audit NN-AUD-080/081/082: the operator verbs serve this
+    // row from `--netflow-file` (they read the built-in path), newest
+    // first, and `net fingerprint` finds it by id (it answered empty).
+    let flows = fx.nn_admin_net(&["flows"]);
+    assert!(
+        flows.iter().any(|r| r["flow_id"].as_str() == Some(flow_id)),
+        "`nn-admin net flows` must list flow {flow_id}"
+    );
+    let fp = fx.nn_admin_net(&["fingerprint", "--flow-id", flow_id]);
+    assert!(
+        !fp.is_empty() && fp.iter().all(|r| r["flow_id"].as_str() == Some(flow_id)),
+        "`nn-admin net fingerprint` must return the rows of flow {flow_id}: {fp:?}"
+    );
 }
 
 // ── Test 2: uncommon-port listener trips NN-L-NET-006 ──────────────
@@ -684,6 +734,18 @@ fn net_listener_on_uncommon_port_records_event() {
     // The N6 unit tests (22 in `agent/src/decision/rules/net.rs`)
     // pin the rule's match logic against this exact port-shape;
     // priv-e2e here pins the END-TO-END kernel-to-rule wire.
+
+    // External audit NN-AUD-081/082: the operator verb serves that row,
+    // from the file `--netflow-listeners-file` names (it answered
+    // Success with an empty body, and the flows verb read the built-in
+    // path).
+    let served = fx.nn_admin_net(&["listeners"]);
+    assert!(
+        served
+            .iter()
+            .any(|r| r["bind_port"].as_u64() == Some(LISTENER_PORT as u64)),
+        "`nn-admin net listeners` must list port {LISTENER_PORT}: {served:?}"
+    );
 }
 
 // ── Test 3: unconnected UDP sendto() records a flow row ─────────────
