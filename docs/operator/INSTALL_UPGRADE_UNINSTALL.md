@@ -18,6 +18,9 @@ with `rm -f` or `kill -9`, they are denied by design.
 
 All three assume `cargo xtask build --release` (or the release tarball)
 produced `target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}`.
+A tree built from source has no `MANIFEST.sha256`: `install.sh` installs it
+only with `--source-tree` (section 5.1), e.g.
+`sudo ./deploy/install.sh --source-tree --upgrade --grant-key <admin.key>`.
 The `.deb` / `.rpm` packages wrap the same steps for the package manager:
 see section 6.
 
@@ -61,8 +64,17 @@ What it does, in order:
 3. removes `/sys/fs/bpf/northnarrow`: the LSM programs survive agent
    restarts only through their pinned links, so dropping the pin root
    detaches them; the pin root is in the protected-inode set, so this
-   needs the window of step 2 (or a reboot); waits until `bpftool prog
-   show` reports 0 LSM programs (30 s budget, fails loudly otherwise);
+   needs the window of step 2 (or a reboot); waits until the agent's own
+   BPF programs are unloaded (30 s budget, `LSM_DRAIN_TIMEOUT`; fails
+   loudly, naming the ids, otherwise). The agent lists their ids in
+   `/run/northnarrow/bpf-own-ids` at every boot and the script reads the
+   file before the stop. Another product's BPF-LSM programs (Cilium,
+   Tetragon, another EDR) are not waited for — the old gate counted every
+   LSM program on the host and, on such a host, gave up with the units
+   already stopped (external audit DEP-006). Upgrading from an agent that
+   predates the list falls back to that count and names what is left;
+   without `bpftool` the script checks that the units' processes and the
+   pin root are gone and says the unload itself is not confirmed;
 4. runs the normal install (binaries, units, configs; `chattr +i` on the
    state dir is lifted and re-applied by the new agent at boot), then
    adopts the `*.local` overlays already present: each one without a valid
@@ -81,7 +93,8 @@ boot; it is the same window a reboot has.
 
 The lab verifies this path on every nightly (`nn-lab.sh upgrade-check`):
 refusal without the flag, pid change, new audit entry, identity files
-unchanged, ≥ 7 LSM programs and `PROTECTED_PIDS` re-pinned afterwards.
+unchanged, ≥ 7 of the new agent's own LSM programs, none of the old ones,
+no foreign LSM program lost, and `PROTECTED_PIDS` re-pinned afterwards.
 
 ## 3. Uninstall
 
@@ -94,7 +107,10 @@ Order: open the trusted-installer window (`--grant-key`, same key and
 role as the upgrade; without it the pin root cannot be removed and the
 script stops with the recovery line) → disable + stop watchdog then agent
 → drop the pin root and wait for
-the LSM set to drain → `chattr -R -i` on state and config → remove
+the agent's own BPF programs to unload (the ids in
+`/run/northnarrow/bpf-own-ids`, read before the stop, as in the upgrade;
+other products' LSM programs are left alone) → `chattr -R -i` on state and
+config → remove
 binaries, units, `journald@northnarrow.conf`, `/run/northnarrow` and the
 ten bait files → `daemon-reload`. Without `--purge` the admin key, the
 signed audit chain and the chain logs stay on disk: they are evidence and
@@ -106,8 +122,8 @@ If an unrelated NorthNarrow process (an e2e test, a manual
 and names the condition instead of leaving a half-removed host.
 
 The lab verifies `uninstall.sh --purge --yes` leaves no binary, unit, pin,
-LSM program, config, state or bait behind, then reinstalls
-(`nn-lab.sh uninstall-check`).
+NorthNarrow program, config, state or bait behind — and every foreign LSM
+program in place — then reinstalls (`nn-lab.sh uninstall-check`).
 
 ### 3.1 Host hardening checks (`nn-admin host-check`)
 
@@ -128,6 +144,7 @@ missing and how to fix it:
 | kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot; lockdown alone still lets a signed vendor kernel in through `kexec_file_load`, with any command line (one without `bpf` in `lsm=`, for instance). Since review 82 the running agent refuses every kexec image load itself (below); the setting still covers the time before the agent starts |
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
 | nftables | `nft` installed | the COMBAT soft egress block (INVESTIGATE) is an nftables rule: without `nft` the offender is not contained while the agent analyses it — the agent records the failure and shortens INVESTIGATE to 10 s |
+| Release verified at install | `provenance` `checksums` or `attested` in `install-manifest.json` | only these rest on something outside the installed tree (section 5.1); `manifest`, `source-tree`, `unverified` and `package` are reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
 22.04 / 5.15: every deny hook attached, and `tamper-check` saw kexec and
@@ -457,11 +474,28 @@ performs the checks and refuses to touch the host when one fails:
    into a refusal.
 
 The strongest level reached — `attested`, `checksums`, `manifest`,
-`source-tree` (no `MANIFEST.sha256`: a developer tree, the lab) or
-`unverified` (`--no-verify`) — is written with the SHA-256 of every
+`source-tree` or `unverified` — is written with the SHA-256 of every
 installed binary and of the eBPF object to
 `/etc/northnarrow/install-manifest.json`, which the anti-tamper hook
 protects like the rest of `/etc/northnarrow`.
+
+**No silent downgrade (external audit DEP-007).** The checks used to step
+down on their own: a tree without `MANIFEST.sha256` installed as a
+"source tree", so removing that one file from an altered release turned
+every check off. A level below `checksums` now needs an explicit flag,
+which is recorded in the manifest (`verify_override`) and shown by
+`nn-admin host-check` (§3.1):
+
+| Situation | Without a flag | Flag that accepts it | Recorded as |
+|---|---|---|---|
+| No `MANIFEST.sha256` (a build from source, the lab) | refused | `--source-tree` | `source-tree` |
+| Only the tree's own `MANIFEST.sha256` checked (no tarball + `SHA256SUMS`, no attestation) — it travels inside the tree it vouches for | refused | `--allow-manifest-only` | `manifest` |
+| Every release check skipped | — | `--no-verify` (development only) | `unverified` |
+
+`--source-tree` only permits a missing `MANIFEST.sha256`: on a tree that
+has one, it is ignored and the tree is verified as a release. Keep the
+tarball and `SHA256SUMS` next to the extracted tree (or pass `--tarball`
+and `--sums`) and a release installs with no flag.
 
 **At every boot the agent closes the loop**: it hashes its own executable,
 the watchdog and `nn-admin` under the recorded `bin_dir` and compares the
@@ -469,8 +503,40 @@ embedded eBPF object hash with the manifest. The result is written in the
 signed `agent_boot` audit entry (`binary_integrity`, `install_provenance`).
 A mismatch — the running file is not the one the installer verified — or
 an unreadable manifest refuses the boot (exit 78); `NN_ALLOW_UNVERIFIED_BINARY=1`
-turns that into a WARN on a development host. A binary started from
+turns that into a WARN on a development host (a weakening variable: the
+agent records it in the audit chain). A binary started from
 outside `bin_dir` (a test fixture) is not compared.
+
+**A removed manifest refuses the boot too (external audit DEP-009).**
+`install.sh` writes the manifest on every install, source trees and
+packages included, so once the signed audit chain holds an `agent_boot`
+with `binary_integrity` `verified`, a missing manifest means it was removed
+(in a trusted-installer window, from an offline disk) — it no longer
+switches the check off. The agent refuses to start (exit 78) and records
+`agent_boot` with result `refused`, `binary_integrity` `no-manifest`;
+re-run `install.sh` to write it again, or set
+`NN_ALLOW_UNVERIFIED_BINARY=1` on a development host. A chain that cannot
+be read counts the same way. A host whose chain has no verified boot (a
+developer run, an install older than the manifest) still starts, with an
+INFO. A host restored from a backup without the manifest is refused until
+`install.sh` runs again; `uninstall.sh --purge` resets the chain. Limit:
+deleting the audit chain as well makes the install look new — that shows
+as a chain restarting from genesis in `nn-admin audit verify`.
+
+**Recovering from a refused boot** (mismatch, unreadable or removed
+manifest). The refused agent has already attached and pinned its hooks, so
+`/etc/northnarrow` stays protected, and a trusted-installer window needs a
+running agent. Start it once with the override taken from the service
+manager's environment (the agent records it as a weakening variable),
+drop the override, then reinstall — `install.sh` restarts the agent
+without it:
+
+```sh
+sudo systemctl set-environment NN_ALLOW_UNVERIFIED_BINARY=1
+sudo systemctl start northnarrow-agent
+sudo systemctl unset-environment NN_ALLOW_UNVERIFIED_BINARY
+sudo ./deploy/install.sh --upgrade --grant-key /path/to/admin.key   # + --source-tree for a source build
+```
 
 ```sh
 tar xzf northnarrow-<ver>-x86_64-linux.tar.gz && cd northnarrow-<ver>-x86_64-linux

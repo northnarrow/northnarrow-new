@@ -135,7 +135,8 @@ log "Installing via deploy/install.sh..."
 # atomic replace — BUG-020 residual; only a reboot fully clears it). That is
 # NON-FATAL: the load-bearing artifacts (binaries + both units) are already in
 # place. So tolerate install.sh's exit and verify what actually matters.
-if ! bash deploy/install.sh; then
+# --source-tree: a build from source has no MANIFEST.sha256 (external audit DEP-007).
+if ! bash deploy/install.sh --source-tree; then
     warn "install.sh exited non-zero — verifying load-bearing artifacts landed..."
     { [ -x "$NN_BIN_DIR/northnarrow-agent" ] && [ -x "$NN_BIN_DIR/northnarrow-watchdog" ] \
       && [ -f "/etc/systemd/system/$NN_AGENT_UNIT" ] \

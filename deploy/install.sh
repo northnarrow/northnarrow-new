@@ -68,8 +68,9 @@ WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
 # covers the binaries, the units and /etc/northnarrow; task_kill denies
 # signals), so an in-place upgrade must: stop the watchdog FIRST (or it
 # respawns the agent), stop the agent, drop the bpffs pin root so the LSM
-# programs detach, wait for the kernel to report 0 LSM programs, install,
-# then start the units that were running. Keys, agent_id, the audit chain
+# programs detach, wait until the agent's own programs are unloaded
+# (wait_own_programs_unloaded), install, then start the units that were
+# running. Keys, agent_id, the audit chain
 # and every chain log are preserved — install.sh never touches them.
 UPGRADE=0
 GRANT_KEY=
@@ -90,6 +91,15 @@ MODE=full
 PKG_RESTART_FILE=${PKG_RESTART_FILE:-/run/northnarrow-pkg-restart}
 VERIFY=1
 REQUIRE_ATTESTATION=0
+# External audit DEP-007: the release checks no longer step down on their
+# own. A tree without MANIFEST.sha256 is refused unless --source-tree says it
+# is one; a tree vouched for only by its own MANIFEST.sha256 (no tarball +
+# SHA256SUMS, no attestation) is refused unless --allow-manifest-only. The
+# flag that accepted the lower level is recorded in the install manifest
+# (verify_override) and reported by `nn-admin host-check`.
+SOURCE_TREE=0
+ALLOW_MANIFEST_ONLY=0
+VERIFY_OVERRIDE=""
 TARBALL=""
 SUMS=""
 ATTEST_BUNDLE=""
@@ -104,9 +114,12 @@ while [[ $# -gt 0 ]]; do
         --sums) SUMS=$2; shift ;;
         --attestation) ATTEST_BUNDLE=$2; shift ;;
         --require-attestation) REQUIRE_ATTESTATION=1 ;;
+        --source-tree) SOURCE_TREE=1 ;;
+        --allow-manifest-only) ALLOW_MANIFEST_ONLY=1 ;;
         --no-verify) VERIFY=0 ;;
         -h|--help)
-            echo "usage: sudo $0 [--upgrade] [--tarball FILE] [--sums FILE] [--attestation BUNDLE] [--require-attestation] [--no-verify]"
+            echo "usage: sudo $0 [--upgrade] [--tarball FILE] [--sums FILE] [--attestation BUNDLE] [--require-attestation]"
+            echo "                 [--source-tree | --allow-manifest-only | --no-verify]"
             echo "  --upgrade              stop the running units, replace binaries/units/configs, restart them"
             echo "  --grant-key KEY        admin key with the trusted-installer role (opens the window an upgrade needs)"
             echo "  --admin-key-out PATH   fresh install: where to write the bootstrap admin PRIVATE key"
@@ -115,7 +128,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --sums FILE            SHA256SUMS of the release (default: next to the tarball)"
             echo "  --attestation BUNDLE   offline Sigstore bundle for the tarball (gh attestation download)"
             echo "  --require-attestation  fail unless the SLSA provenance attestation verifies"
+            echo "  --source-tree          the tree is a build from source (cargo xtask build --release), not a"
+            echo "                         release: install it without MANIFEST.sha256 (recorded as 'source-tree')"
+            echo "  --allow-manifest-only  accept a release tree checked only against its own MANIFEST.sha256"
+            echo "                         (no tarball + SHA256SUMS, no attestation; recorded as 'manifest')"
             echo "  --no-verify            skip every release check (dev only; recorded as 'unverified')"
+            echo "  The flag that accepted a level below 'checksums' is recorded in the install manifest"
+            echo "  and reported by nn-admin host-check."
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -222,7 +241,9 @@ COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 #      catches a tarball built elsewhere.
 # The strongest level reached is recorded in the install manifest and
 # the agent re-checks the installed hashes at every boot. A source tree
-# (no MANIFEST.sha256: the lab, a developer build) is "source-tree".
+# (no MANIFEST.sha256: the lab, a developer build) is "source-tree" and
+# needs --source-tree; a level below "checksums" needs an explicit flag
+# (external audit DEP-007, require_provenance_floor).
 REPO_SLUG="northnarrow/northnarrow-new"
 SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
 PROVENANCE="source-tree"
@@ -232,10 +253,12 @@ ATTEST_VERIFIED=0
 verify_release() {
     if (( ! VERIFY )); then
         PROVENANCE="unverified"
+        VERIFY_OVERRIDE="--no-verify"
         echo "install.sh: WARNING: --no-verify — release checks skipped, provenance recorded as 'unverified'" >&2
         return 0
     fi
     if [[ -f "$REPO_ROOT/MANIFEST.sha256" ]]; then
+        (( SOURCE_TREE )) && echo "install.sh: --source-tree ignored — the tree carries MANIFEST.sha256 and is verified as a release" >&2
         echo "install.sh: verifying the extracted tree against MANIFEST.sha256"
         if ! (cd "$REPO_ROOT" && sha256sum -c --quiet MANIFEST.sha256); then
             echo "install.sh: REFUSED — the extracted tree does not match MANIFEST.sha256 (corrupted or edited release)" >&2
@@ -243,7 +266,18 @@ verify_release() {
         fi
         PROVENANCE="manifest"
     else
-        echo "install.sh: no MANIFEST.sha256 — source tree, release checks not applicable (provenance: source-tree)"
+        # External audit DEP-007: removing this one file used to turn every
+        # check below off ("source tree"). Every release tree ships it
+        # (mk-tarball.sh), so its absence is a refusal unless the operator
+        # says the tree is a build from source.
+        if (( ! SOURCE_TREE )); then
+            echo "install.sh: REFUSED — no MANIFEST.sha256 in $REPO_ROOT. A release tree always carries one:" >&2
+            echo "install.sh: this one was altered, or it is a build from source. For a source build" >&2
+            echo "install.sh: (cargo xtask build --release) re-run with --source-tree (recorded as 'source-tree')." >&2
+            exit 1
+        fi
+        VERIFY_OVERRIDE="--source-tree"
+        echo "install.sh: WARNING: --source-tree — no MANIFEST.sha256, release checks not applicable (provenance: source-tree)" >&2
         return 0
     fi
     local tree_name tgz sums
@@ -300,6 +334,22 @@ verify_release() {
     fi
 }
 
+# External audit DEP-007: MANIFEST.sha256 travels inside the tree it vouches
+# for — whoever edits the tree can rewrite it. "manifest" (no SHA256SUMS
+# check of the tarball, no attestation) is therefore accepted only on
+# request. Separate from verify_release so the verifier itself is unchanged.
+require_provenance_floor() {
+    [[ $PROVENANCE == manifest ]] || return 0
+    if (( ! ALLOW_MANIFEST_ONLY )); then
+        echo "install.sh: REFUSED — only the tree's own MANIFEST.sha256 was checked, and it travels inside the" >&2
+        echo "install.sh: tree it vouches for. Keep the tarball and SHA256SUMS next to the tree (or pass --tarball" >&2
+        echo "install.sh: FILE --sums FILE), or re-run with --allow-manifest-only (recorded as 'manifest')." >&2
+        exit 1
+    fi
+    VERIFY_OVERRIDE="--allow-manifest-only"
+    echo "install.sh: WARNING: --allow-manifest-only — the release is vouched for only by its own MANIFEST.sha256 (provenance: manifest)" >&2
+}
+
 # Record what was installed: provenance level + sha256 of every installed
 # binary and of the eBPF object. The agent compares its own binary, the
 # watchdog, nn-admin and the embedded object hash against this file at
@@ -321,6 +371,7 @@ write_install_manifest() {
   "version": "${version:-unknown}",
   "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "provenance": "$PROVENANCE",
+  "verify_override": $([[ -n "$VERIFY_OVERRIDE" ]] && echo "\"$VERIFY_OVERRIDE\"" || echo null),
   "bin_dir": "$BIN_DIR",
   "files": {
     "northnarrow-agent": "$sha_agent",
@@ -393,6 +444,7 @@ if [[ $MODE != full ]]; then
     PROVENANCE="package"
 else
 verify_release
+require_provenance_floor
 require_file "$AGENT_BIN"    "run \`cargo xtask build --release\` first (xtask builds the eBPF object + userland atomically; a plain \`cargo build\` cannot produce an installable agent — agent/build.rs refuses a stale/unstamped eBPF object)"
 require_file "$WATCHDOG_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-watchdog\`)"
 require_file "$NN_ADMIN_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-agent --bin nn-admin\`)"
@@ -472,6 +524,78 @@ nn_unit_has_procs() {
     [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
 }
 
+# External audit DEP-006: the drain gate used to wait for "no LSM program on
+# the host", a count that includes every other product's BPF-LSM programs
+# (Cilium, Tetragon, another EDR): on such a host it never reached 0 and the
+# upgrade aborted with the units already stopped. The agent now lists the ids
+# of its own loaded programs in $OWN_IDS_FILE (anti_tamper/bpf_defense.rs,
+# next to its pid file); they are read before the stop and waited for one by
+# one. The ids come from the agent, not from the pins: in enforce mode a
+# foreign handle on a pinned link is refused.
+OWN_IDS_FILE=${OWN_IDS_FILE:-/run/northnarrow/bpf-own-ids}
+LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
+# Numeric first fields only: the list goes to bpftool as arguments.
+read_own_prog_ids() {
+    [[ -r "$OWN_IDS_FILE" ]] || return 0
+    awk '$1 ~ /^[0-9]+$/ {print $1}' "$OWN_IDS_FILE" | sort -un | tr '\n' ' '
+}
+# The ids among $1 still loaded. Only "No such file or directory" counts as
+# unloaded; any other bpftool error keeps the id on the list.
+own_progs_loaded() {
+    local id out left=()
+    for id in $1; do
+        if out=$(LC_ALL=C bpftool prog show id "$id" 2>&1); then
+            left+=("$id")
+        elif [[ "$out" != *"No such file or directory"* ]]; then
+            left+=("$id")
+        fi
+    done
+    echo "${left[*]:-}"
+}
+# Wait until NorthNarrow's programs are gone: the ids in $1, or — for an
+# agent that predates the list — every LSM program on the host, as before,
+# naming what is left. Without bpftool: the units' processes and the pin root
+# are the only holders; both are checked, and the unload itself is not.
+wait_own_programs_unloaded() {
+    local ids=$1 i left=$1 n=0
+    if ! command -v bpftool >/dev/null 2>&1; then
+        for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
+            nn_unit_has_procs northnarrow-agent || nn_unit_has_procs northnarrow-watchdog || break
+            sleep 1
+        done
+        if nn_unit_has_procs northnarrow-agent || nn_unit_has_procs northnarrow-watchdog \
+           || [[ -d /sys/fs/bpf/northnarrow ]]; then
+            echo "install.sh: a NorthNarrow unit still has processes, or the pin root is still there — stop them and re-run" >&2
+            return 1
+        fi
+        echo "install.sh: bpftool not found — the agent and watchdog exited and the pin root is gone (the only holders"
+        echo "install.sh: of the LSM programs); the unload itself cannot be confirmed"
+        return 0
+    fi
+    if [[ -n "$ids" ]]; then
+        echo "install.sh: waiting for NorthNarrow's BPF programs to unload (ids: $ids)"
+        for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
+            left=$(own_progs_loaded "$ids")
+            [[ -z "$left" ]] && return 0
+            sleep 1
+        done
+        echo "install.sh: NorthNarrow BPF program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s: ids $left" >&2
+        echo "install.sh: (bpftool prog show id <id>) — another NorthNarrow process holds them; stop it and re-run" >&2
+        return 1
+    fi
+    echo "install.sh: no $OWN_IDS_FILE (an agent older than the list) — waiting for every LSM program on the host to detach"
+    for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
+        n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+        [[ "$n" == 0 ]] && return 0
+        (( i == 0 )) && echo "install.sh: waiting for $n LSM program(s) to detach"
+        sleep 1
+    done
+    echo "install.sh: $n LSM program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s:" >&2
+    bpftool prog show 2>/dev/null | grep " lsm " | sed 's/^/install.sh:   /' >&2
+    echo "install.sh: if they are NorthNarrow's, another NorthNarrow process holds them: stop it and re-run" >&2
+    return 1
+}
+
 open_trusted_installer_window() {
     local key=$1
     [[ -r "$key" ]] || { echo "install.sh: --grant-key $key is not readable" >&2; return 1; }
@@ -544,22 +668,16 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     if [[ -n "$GRANT_KEY" ]]; then
         open_trusted_installer_window "$GRANT_KEY" || exit 1
     fi
+    # External audit DEP-006: the ids of the running agent's programs,
+    # read while it still runs.
+    own_ids=$(read_own_prog_ids)
     # Watchdog first: stopping the agent alone makes it respawn it.
     for u in northnarrow-watchdog northnarrow-agent; do
         echo "install.sh: stopping $u ($(systemctl is-active "$u.service" 2>/dev/null | tr -d '\n'))"
         stop_nn_unit "$u"
     done
     purge_pin_root || exit 1
-    if command -v bpftool >/dev/null 2>&1; then
-        for ((i = 0; i < 30; i++)); do
-            n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
-            [[ "$n" == 0 ]] && break
-            (( i == 0 )) && echo "install.sh: waiting for $n LSM program(s) to detach"
-            sleep 1
-        done
-        n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
-        [[ "$n" == 0 ]] || { echo "install.sh: $n LSM program(s) still loaded after 30s — another NorthNarrow process holds them; stop it and re-run" >&2; exit 1; }
-    fi
+    wait_own_programs_unloaded "$own_ids" || exit 1
 fi
 
 if (( ! ${#UNITS_TO_RESTART[@]} )) && [[ -d /sys/fs/bpf/northnarrow ]]; then

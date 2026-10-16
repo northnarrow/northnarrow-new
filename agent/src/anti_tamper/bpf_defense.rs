@@ -533,6 +533,51 @@ pub fn register_late_objects(ebpf: &mut Ebpf) -> Result<usize> {
     Ok(prog_ids.len() + link_ids.len())
 }
 
+/// External audit DEP-006: name of the file, next to the agent's pid file
+/// (the unit: `/run/northnarrow/bpf-own-ids`), that lists the ids of the
+/// agent's loaded BPF programs. `install.sh --upgrade` and `uninstall.sh`
+/// wait for exactly these to unload: their old gate waited for no LSM
+/// program at all on the host, which another product's BPF-LSM programs
+/// never reach, and gave up with the agent already stopped. Ids are read
+/// from the agent, not through the pins: in enforce mode a foreign handle
+/// on a pinned link is refused.
+pub const OWN_IDS_FILE_NAME: &str = "bpf-own-ids";
+
+/// Write the ids of every loaded program of `ebpf` to `path` (mode 0600,
+/// replaced atomically): one `<id> <name>` line each after a comment line.
+/// Called once the anti-tamper hooks are attached and again after the late
+/// programs (FIM observers, file-open sensor). The file outlives the agent
+/// on purpose: the pinned LSM programs do too, until the pin root goes.
+/// Returns how many ids were written.
+pub fn write_own_prog_ids(ebpf: &Ebpf, path: &Path) -> Result<usize> {
+    let mut progs: Vec<(u32, &str)> = Vec::new();
+    for (name, prog) in ebpf.programs() {
+        match prog.info() {
+            Ok(info) => progs.push((info.id(), name)),
+            Err(aya::programs::ProgramError::NotLoaded) => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("reading own program {name}"))
+            }
+        }
+    }
+    progs.sort_unstable();
+    let body = render_own_prog_ids(std::process::id(), &progs);
+    crate::atomic_file::replace(path, body.as_bytes(), 0o600)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(progs.len())
+}
+
+/// The body of the [`OWN_IDS_FILE_NAME`] file. The scripts read the first
+/// field of every line that starts with a digit.
+fn render_own_prog_ids(pid: u32, progs: &[(u32, &str)]) -> String {
+    let mut body = format!("# northnarrow-agent pid {pid}: loaded BPF programs (id name)\n");
+    for (id, name) in progs {
+        body.push_str(&format!("{id} {name}\n"));
+    }
+    body
+}
+
 /// Test builds only: keep the whole error chain (the verifier log can be
 /// tens of KB, which journald truncates) in `/run/northnarrow/verifier-<program>.log`
 /// so a kernel that rejects a program can be read from the lab.
@@ -890,5 +935,26 @@ mod tests {
             }
         }
         assert_eq!(Some(h), pin_name_key("link_task_kill"));
+    }
+
+    /// External audit DEP-006: install.sh and uninstall.sh take the first
+    /// field of every line that is a number; the comment line is skipped.
+    #[test]
+    fn own_prog_ids_file_lists_one_id_per_line() {
+        let body = render_own_prog_ids(4242, &[(17, "task_kill"), (305, "protected_open_deny")]);
+        let mut lines = body.lines();
+        assert!(lines
+            .next()
+            .unwrap()
+            .starts_with("# northnarrow-agent pid 4242"));
+        let ids: Vec<u32> = body
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|f| f.bytes().all(|b| b.is_ascii_digit()))
+            .map(|f| f.parse().unwrap())
+            .collect();
+        assert_eq!(ids, vec![17, 305]);
+        assert!(body.ends_with("305 protected_open_deny\n"));
+        assert_eq!(OWN_IDS_FILE_NAME, "bpf-own-ids");
     }
 }

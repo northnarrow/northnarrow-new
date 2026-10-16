@@ -570,7 +570,9 @@ cmd_install() {
     # hooks stay attached through the bpffs pins after the agent exits (by
     # design). Purge the operator way: trusted-installer window, stop, rm.
     lab_purge_pins
-    vcargo 'sudo ./deploy/install.sh && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
+    # External audit DEP-007: the lab installs its synced source tree (no
+    # MANIFEST.sha256), which install.sh now refuses without --source-tree.
+    vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
 }
 
 cmd_respawn_check() {
@@ -1128,13 +1130,19 @@ sudo test -e /etc/northnarrow/agent.sig.pub && idfiles="$idfiles /etc/northnarro
 fp_before=$(sudo sha256sum $idfiles | sha256sum | cut -c1-16)
 echo "before: agent pid=$pid_before audit_lines=$audit_before identity=$fp_before"
 # Without --upgrade the script must refuse (units active) — exit 1, no change.
-if at_tty sudo ./deploy/install.sh >/tmp/nn-upgrade-refuse.log 2>&1; then
+# (--source-tree: the synced tree has no MANIFEST.sha256, external audit DEP-007.)
+if at_tty sudo ./deploy/install.sh --source-tree >/tmp/nn-upgrade-refuse.log 2>&1; then
     echo "FAIL: install.sh without --upgrade succeeded while the units were active"; exit 1
 fi
 grep -q "Re-run with --upgrade" /tmp/nn-upgrade-refuse.log || { echo "FAIL: refusal message missing"; cat /tmp/nn-upgrade-refuse.log; exit 1; }
 echo "install.sh without --upgrade: refused as expected"
 key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
-at_tty sudo ./deploy/install.sh --upgrade --grant-key "$key" 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|window|PROTECTED|grant" | cut -c1-140
+# External audit DEP-006: the drain waits for the agent's own program ids;
+# another product's LSM programs (bpftrace in the lab) are left alone.
+own_before=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null | tr '\n' ' ')
+foreign_before=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^(${own_before// /|}x):" || true)
+echo "before: own program ids=[${own_before% }] foreign LSM programs=$foreign_before"
+at_tty sudo ./deploy/install.sh --source-tree --upgrade --grant-key "$key" 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|BPF program|window|PROTECTED|grant" | cut -c1-140
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
 audit_after=$(sudo wc -l < /etc/northnarrow/audit.log)
@@ -1146,8 +1154,20 @@ fail=0
 [[ "$pid_after" != "$pid_before" ]] || { echo "FAIL: agent pid unchanged — binary not restarted"; fail=1; }
 (( audit_after > audit_before )) || { echo "FAIL: no new audit entry (agent_boot) after upgrade"; fail=1; }
 [[ "$fp_after" == "$fp_before" ]] || { echo "FAIL: admin.pub / agent.sig.pub / agent_id changed across the upgrade"; fail=1; }
-n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
-(( n >= 7 )) || { echo "FAIL: only $n LSM programs after upgrade"; fail=1; }
+# the new agent's own LSM programs (its bpf-own-ids), not the host's
+own_after=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null)
+n=0
+for id in $own_after; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n=$((n + 1)); done
+(( n >= 7 )) || { echo "FAIL: only $n own LSM programs after upgrade (bpf-own-ids)"; fail=1; }
+for id in $own_before; do
+    if sudo bpftool prog show id "$id" >/dev/null 2>&1; then echo "FAIL: old program id $id still loaded"; fail=1; fi
+done
+foreign_after=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^($(echo $own_after | tr ' ' '|')|x):" || true)
+# (an agent older than the list counted its own programs as foreign before)
+if [[ -n "$own_before" ]] && (( foreign_after < foreign_before )); then
+    echo "FAIL: foreign LSM programs $foreign_before -> $foreign_after"; fail=1
+fi
+echo "after : own LSM programs=$n foreign LSM programs=$foreign_after"
 sudo ls /sys/fs/bpf/northnarrow/PROTECTED_PIDS >/dev/null || { echo "FAIL: PROTECTED_PIDS not re-pinned"; fail=1; }
 # External audit DEC-007: a template an earlier release shipped named the
 # product in every decoy rendered from it; the upgrade replaces it (an
@@ -1182,6 +1202,10 @@ at_tty() { script -qec "$*" /dev/null < /dev/null; }
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
 key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+# External audit DEP-006: the agent's own programs must go; another
+# product's LSM programs (bpftrace in the lab) must stay.
+own_ids=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null | tr '\n' ' ')
+foreign_before=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^(${own_ids// /|}x):" || true)
 at_tty sudo ./deploy/uninstall.sh --purge --yes --grant-key "$key" 2>&1 | grep -E "uninstall.sh:|FAIL" | cut -c1-140
 fail=0
 for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
@@ -1190,8 +1214,16 @@ for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /u
          /root/northnarrow-admin.key; do
     if sudo test -e "$f"; then echo "FAIL: $f still present"; fail=1; fi
 done
-n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
-[[ "$n" == 0 ]] || { echo "FAIL: $n LSM programs still loaded"; fail=1; }
+if [[ -n "$own_ids" ]]; then
+    for id in $own_ids; do
+        if sudo bpftool prog show id "$id" >/dev/null 2>&1; then echo "FAIL: own program id $id still loaded"; fail=1; fi
+    done
+    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+    (( n == foreign_before )) || { echo "FAIL: LSM programs $n after, $foreign_before foreign before"; fail=1; }
+else
+    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+    [[ "$n" == 0 ]] || { echo "FAIL: $n LSM programs still loaded (no bpf-own-ids: an agent older than the list)"; fail=1; }
+fi
 for u in northnarrow-agent northnarrow-watchdog; do
     st=$(systemctl is-active "$u" 2>/dev/null || true)
     [[ "$st" == inactive || "$st" == "" ]] || { echo "FAIL: $u is $st"; fail=1; }
@@ -1199,7 +1231,7 @@ done
 if pgrep -f "northnarrow-(agent|watchdog)" >/dev/null; then echo "FAIL: northnarrow process still running"; fail=1; fi
 (( fail == 0 )) && echo "uninstall-check: OK (host clean)"
 # Bring the guest back: fresh install (new keys — the purge removed them).
-sudo ./deploy/install.sh >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
+sudo ./deploy/install.sh --source-tree >/tmp/nn-reinstall.log 2>&1 || { echo "FAIL: reinstall after purge failed"; tail -20 /tmp/nn-reinstall.log; exit 1; }
 # External audit DEP-001: the bootstrap private key is written outside
 # /etc/northnarrow
 sudo test -s /root/northnarrow-admin.key || { echo "FAIL: no bootstrap key at /root/northnarrow-admin.key"; fail=1; }

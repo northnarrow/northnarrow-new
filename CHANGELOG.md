@@ -15,6 +15,53 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, install integrity fails closed (Medium DEP-007,
+  DEP-009, DEP-006): `install.sh` stepped its release checks down on its
+  own — a tree without `MANIFEST.sha256` installed as a "source tree", so
+  removing that one file from an altered release switched every check off.
+  A tree without it is now refused unless `--source-tree` is given, and a
+  tree vouched for only by its own `MANIFEST.sha256` (no tarball +
+  `SHA256SUMS`, no attestation) unless `--allow-manifest-only`; the flag is
+  recorded in `install-manifest.json` (`verify_override`), and a new
+  `nn-admin host-check` line warns below `checksums` (`package` included).
+  At boot a deleted install manifest switched the binary integrity check
+  off where an edited one refused the boot: once the signed audit chain
+  holds a verified boot of this install, a missing manifest refuses the
+  boot too (exit 78, `agent_boot` refused, `NN_ALLOW_UNVERIFIED_BINARY=1`
+  for a development host). The upgrade and uninstall drain waited for no
+  LSM program at all on the host, so a second BPF-LSM product made them
+  give up with the agent already stopped; the agent now lists its own
+  program ids in `/run/northnarrow/bpf-own-ids` and the scripts wait for
+  exactly those (an agent older than the list: the old count, naming what
+  is left). **Regression:** a scripted install from a source tree needs
+  `--source-tree` (the lab and the range bootstrap pass it); an extracted
+  release without its tarball and `SHA256SUMS` needs `--tarball`/`--sums`
+  or `--allow-manifest-only`; a host restored without its install manifest
+  does not start until `install.sh` runs again.
+- External audit, Wave 2, release trust chain and CI supply chain (Medium
+  SUP-001, SUP-002, SUP-005, SUP-017, DEP-008): an attestation check
+  accepted any ref, so the artefacts of a `workflow_dispatch` run on a
+  branch verified like a release. install.sh (gh and cosign), README, the
+  operator guide and the tarball's README-RELEASE now require the release
+  workflow at a `v*` tag (`--cert-identity-regex '…release\.yml@refs/tags/v'`,
+  `--deny-self-hosted-runners`). Every GitHub action is pinned by commit
+  SHA with its version as a comment, and cargo-cyclonedx (which writes the
+  attested SBOM) and cargo-fuzz by version; a test fails on a tag-pinned
+  action or an unpinned `cargo install`. `.cargo/config.toml` defaults to
+  `target-cpu=x86-64-v2`: `native` tied any build copied to another host to
+  the build CPU (SIGILL elsewhere) and is now an explicit opt-in. The
+  `.rpm` is signed on a tag by its own job with a key from a tag-restricted
+  environment, checked against the public key committed at the tag, and
+  verified (`rpm -K`) before it is attested; `rpm --import` + `rpm -K` or
+  dnf with `localpkg_gpgcheck=1` check it on the host. The `.deb`, which
+  dpkg and apt do not verify per file, is checked with the tag-bound
+  attestation before `dpkg -i` (operator guide §6.1); `dpkg --verify` and
+  `rpm -V` are no longer presented as an integrity check of the package's
+  origin. **Regression:** the artefacts of a dispatch run on a branch no
+  longer pass install.sh's attestation step (`--require-attestation`
+  refuses them); dev, lab and range builds decode with candle at the
+  x86-64-v2 ISA unless they opt into native; a tag release fails at
+  `rpm-sign` until the maintainer has created the rpm signing key.
 - External audit, Wave 2, C code in the agent (Medium MAIN-006): the ADE
   tokenizer split every prompt — strings the observed processes chose —
   with Oniguruma, a C regex library (`onig_sys`), inside the root agent,

@@ -13,8 +13,10 @@
 //! One implementation, three consumers: `nn-admin host-check` (table or
 //! JSON), the agent at boot (one WARN per failing check) and
 //! `install.sh` (prints the table after installing). Every check reads a
-//! file under `/sys` or `/proc`; [`run_in`] takes a root prefix so tests
-//! build a synthetic tree.
+//! file under `/sys` or `/proc`, except the admin key, `nft` and the
+//! install provenance (external audit DEP-007: how far `install.sh` could
+//! verify the release); [`run_in`] takes a root prefix so tests build a
+//! synthetic tree.
 
 use std::path::{Path, PathBuf};
 
@@ -64,7 +66,54 @@ pub fn run_in(root: &Path) -> Vec<Check> {
         bpffs_mounts(root),
         admin_key(root),
         nft_tool(root),
+        install_provenance(root),
     ]
+}
+
+/// External audit DEP-007: the install manifest `install.sh` writes,
+/// relative to the root.
+pub const INSTALL_MANIFEST_REL: &str = "etc/northnarrow/install-manifest.json";
+
+/// External audit DEP-007: how far `install.sh` could verify the release
+/// the installed binaries came from. Only `checksums` (the tarball against
+/// the release's `SHA256SUMS`) and `attested` (the SLSA attestation) rest
+/// on something outside the tree; `manifest` is the tree vouching for
+/// itself, and `source-tree`, `unverified` and `package` verified nothing
+/// on this host. The agent boots at every level (a lab or a developer host
+/// must keep working), so the level is reported here.
+fn install_provenance(root: &Path) -> Check {
+    let path = root.join(INSTALL_MANIFEST_REL);
+    let (status, value) = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            Status::Unknown,
+            "no install manifest (not installed by install.sh or a package)".to_string(),
+        ),
+        Err(e) => (Status::Warn, format!("install manifest unreadable: {e}")),
+        Ok(text) => match serde_json::from_str::<crate::install_manifest::InstallManifest>(&text) {
+            Err(e) => (Status::Warn, format!("install manifest unparsable: {e}")),
+            Ok(m) => {
+                let status = match m.provenance.as_str() {
+                    "attested" | "checksums" => Status::Ok,
+                    _ => Status::Warn,
+                };
+                let mut value = m.provenance.clone();
+                if m.provenance == "package" {
+                    value.push_str(" (origin not verified on this host)");
+                }
+                if let Some(flag) = m.verify_override.as_deref() {
+                    value.push_str(&format!(" (accepted with {flag})"));
+                }
+                (status, value)
+            }
+        },
+    };
+    Check {
+        id: "install_provenance",
+        name: "release verified at install",
+        status,
+        value,
+        fix: "install from the release tarball with its SHA256SUMS (next to the tree, or `--tarball` + `--sums`), and `gh` or `cosign` for the attestation: `manifest`, `source-tree`, `unverified` and `package` mean nothing outside the installed tree vouched for these binaries",
+    }
 }
 
 /// External audit CMB-014: where `nft` may be installed. The COMBAT
@@ -384,15 +433,55 @@ mod tests {
         // admin.pub only: the private key went offline
         w(r, "etc/northnarrow/admin.pub", b"ab unlock\n");
         w(r, "usr/sbin/nft", b"");
+        w(r, INSTALL_MANIFEST_REL, &manifest("checksums", None));
         let checks = run_in(r);
-        assert_eq!(checks.len(), 10);
+        assert_eq!(checks.len(), 11);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
         assert!(
             checks.iter().all(|c| c.status == Status::Ok),
             "{:?}",
             checks
         );
-        assert!(render_table(&checks).contains("10 check(s), 0 warning(s)"));
+        assert!(render_table(&checks).contains("11 check(s), 0 warning(s)"));
+    }
+
+    fn manifest(provenance: &str, verify_override: Option<&str>) -> Vec<u8> {
+        let ov = verify_override
+            .map(|f| format!(r#""verify_override":"{f}","#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"version":"0.0.1","provenance":"{provenance}",{ov}"bin_dir":"/usr/local/bin",
+                "files":{{"northnarrow-agent":"00"}},"tarball_sha256":null}}"#
+        )
+        .into_bytes()
+    }
+
+    /// External audit DEP-007: anything below `checksums` is a warning, and
+    /// the flag that accepted it is named.
+    #[test]
+    fn install_provenance_warns_below_checksums() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        assert_eq!(install_provenance(r).status, Status::Unknown);
+        for (prov, flag, status) in [
+            ("attested", None, Status::Ok),
+            ("checksums", None, Status::Ok),
+            ("manifest", Some("--allow-manifest-only"), Status::Warn),
+            ("source-tree", Some("--source-tree"), Status::Warn),
+            ("unverified", Some("--no-verify"), Status::Warn),
+            ("package", None, Status::Warn),
+            ("source-tree", None, Status::Warn),
+        ] {
+            w(r, INSTALL_MANIFEST_REL, &manifest(prov, flag));
+            let c = install_provenance(r);
+            assert_eq!(c.status, status, "{prov}");
+            assert!(c.value.starts_with(prov), "{}", c.value);
+            if let Some(f) = flag {
+                assert!(c.value.contains(f), "{}", c.value);
+            }
+        }
+        w(r, INSTALL_MANIFEST_REL, b"{not json");
+        assert_eq!(install_provenance(r).status, Status::Warn);
     }
 
     #[test]
@@ -421,6 +510,12 @@ mod tests {
         w(r, "proc/self/mountinfo", b"36 25 0:30 / /sys/fs/bpf rw shared:17 - bpf bpf rw\n37 25 0:32 / /mnt/bpf2 rw - bpf bpf rw\n");
         // the lab keeps the bootstrap key where install.sh used to write it
         w(r, "etc/northnarrow/admin.key", b"0123456789abcdef\n");
+        // and installs from its source tree
+        w(
+            r,
+            INSTALL_MANIFEST_REL,
+            &manifest("source-tree", Some("--source-tree")),
+        );
         let checks = run_in(r);
         let by_id = |id: &str| checks.iter().find(|c| c.id == id).unwrap().status;
         assert_eq!(by_id("bpf_lsm"), Status::Ok);
@@ -434,7 +529,8 @@ mod tests {
         assert_eq!(by_id("admin_key"), Status::Warn);
         // the Debian 12 lab image has no nftables (CMB-006 lab note)
         assert_eq!(by_id("nft"), Status::Warn);
-        assert_eq!(warn_count(&checks), 7);
+        assert_eq!(by_id("install_provenance"), Status::Warn);
+        assert_eq!(warn_count(&checks), 8);
         let table = render_table(&checks);
         assert!(table.contains("fix: boot with `lockdown=integrity`"));
         assert!(table.contains("mounted 2×"));

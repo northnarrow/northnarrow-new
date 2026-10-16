@@ -240,13 +240,13 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-194 | WDG-011 | Watchdog tooling | S | open |
 | NN-AUD-195 | WDG-R01 | Watchdog tooling | S | open |
 | NN-AUD-196 | DEP-004 | Deploy | S | open |
-| NN-AUD-197 | DEP-006 | Deploy | M | open |
-| NN-AUD-198 | DEP-007 | Deploy | M | open |
-| NN-AUD-199 | DEP-008 | Deploy | M | open |
-| NN-AUD-200 | DEP-009 | Deploy | M | open |
-| NN-AUD-201 | SUP-001 | Supply chain | S | open |
-| NN-AUD-202 | SUP-002 | Supply chain | S | open |
-| NN-AUD-203 | SUP-005 | Supply chain | S | open |
+| NN-AUD-197 | DEP-006 | Deploy | M | fixed (lab PR 148) |
+| NN-AUD-198 | DEP-007 | Deploy | M | fixed (lab PR 148) |
+| NN-AUD-199 | DEP-008 | Deploy | M | fixed (lab PR 150), residual: the rpm signing key and a signed apt repository (operational) |
+| NN-AUD-200 | DEP-009 | Deploy | M | fixed (lab PR 148) |
+| NN-AUD-201 | SUP-001 | Supply chain | S | fixed (lab PR 150) |
+| NN-AUD-202 | SUP-002 | Supply chain | S | fixed (lab PR 150) |
+| NN-AUD-203 | SUP-005 | Supply chain | S | fixed (lab PR 150) |
 | NN-AUD-204 | SUP-006 | Supply chain | S | fixed (lab PR 110) |
 | NN-AUD-205 | SUP-017 | Supply chain | S | open |
 | NN-AUD-206 | LAB-001 | Lab scripts | M | open |
@@ -3834,3 +3834,159 @@ the audit did not report, noted with the fix that takes them.
     with `read_to_string`, checked by inverting it),
     `an_unreadable_log_resets_the_floor`.
   - Lab: `cargo tree -p northnarrow-agent -e normal -i onig_sys` on main: `onig_sys` via `onig` ← `tokenizers` ← `candle-core`; here: not in the graph (the CI step fails on main and passes here), and the agent built in the Ubuntu 24.04 guest holds no `oniguruma` string. Gate: the integration tree of lab PRs 142–147 and 151, Ubuntu 24.04 and Debian 12, 29 suites, 87 passed, 0 failed each; anti-tamper suite OK; host 2023 passed, 0 failed.
+- **NN-AUD-201 (SUP-001), NN-AUD-202 (SUP-002), NN-AUD-203 (SUP-005),
+  NN-AUD-205 (SUP-017), NN-AUD-199 (DEP-008), lab PR 150.** The release
+  trust chain and the CI supply chain (batch 3 of the deploy and supply
+  triage). NN-AUD-204 (SUP-006) was fixed in lab PR 110; its job only had
+  its action pinned here.
+  - SUP-001: every attestation check accepted any ref. install.sh passed
+    `--signer-workflow` (the workflow path only) and gave cosign
+    `^https://github.com/<workflow>`; the documented command was `--repo`
+    only. A `workflow_dispatch` run of release.yml on any branch is
+    attested by `sign`, and its artefacts verified like a release's. Every
+    check now requires the certificate identity
+    `^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v`
+    (`--cert-identity-regex`, plus `--deny-self-hosted-runners`; the same
+    regexp for cosign): install.sh (`SIGNER_IDENTITY_REGEX`), README, the
+    operator guide §5, the release.yml header, the tarball's
+    README-RELEASE and the integration runbook. Dispatch runs still attest
+    (harmless once verification is tag-bound, as the triage allows).
+  - SUP-002: the 26 `uses:` lines of the four workflows are pinned by
+    commit SHA with the version as a comment, each SHA read from the tag
+    list of the official repository on 2026-10-15: `actions/checkout`
+    v7.0.1 `3d3c42e5aac5ba805825da76410c181273ba90b1`, `actions/cache`
+    v6.1.0 `55cc8345863c7cc4c66a329aec7e433d2d1c52a9`,
+    `actions/upload-artifact` v4.6.2
+    `ea165f8d65b6e75b540449e92b4886f43607fa02`, `actions/download-artifact`
+    v4.3.0 `d3f86a106a0bac45b974a628896c90dbdf5c8093`,
+    `actions/attest-build-provenance` v2.4.0
+    `e8998f949152b193b063cb0ec769d69d929409be` (each the commit its major
+    tag pointed to; majors unchanged). `rustsec/audit-check` was already
+    gone (lab PR 110). Dependabot's `github-actions` entry updates SHA and
+    comment together.
+  - SUP-005: `cargo-cyclonedx --version 0.5.9` (release.yml) and
+    `cargo-fuzz --version 0.13.2` (ci.yml), the versions the runs of
+    2026-10-15 resolved (job logs), both `--locked`; the mk-tarball hint
+    names the version.
+  - SUP-017: `.cargo/config.toml` defaults to `-C target-cpu=x86-64-v2`.
+    `native` is an opt-in for a binary that stays on its build host,
+    through `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which xtask
+    passes on and which leaves the eBPF build's flags alone. The release
+    keeps its explicit override and the qemu Nehalem start; btf-matrix and
+    kani keep their `RUSTFLAGS` (now equal to the default). CI's userland
+    jobs set `RUSTFLAGS=-D warnings`, which already replaced the config
+    value, so their builds do not change. Regression, as the triage says:
+    candle decode on dev, lab and range builds runs at the x86-64-v2 ISA
+    unless they opt in (docs/PERFORMANCE.md §1).
+  - DEP-008: the `.rpm` is signed. A new `rpm-sign` job, on `v*` tags only,
+    in the `release-signing` environment, `contents: read`, no OIDC token,
+    no build: it checks that the key in `RPM_SIGNING_KEY` is the private
+    half of the public key committed at the tag
+    (`deploy/release/RPM-GPG-KEY-northnarrow.asc`), signs with
+    `deploy/release/sign-rpm.sh` (rpmsign), checks the result against that
+    key only ("digests signatures OK"), rewrites the `.rpm` line of
+    `SHA256SUMS` and adds the public key to the release. `sign` attests the
+    signed file. A tag without the key, or without the committed public
+    key, fails there and nothing is attested or published; a dispatch run
+    attests the packages unsigned. The package job runs `sign-rpm.sh
+    selftest` on every run, pull requests included: with throwaway keys on
+    a copy, a signed package passes and an unsigned one, one signed by
+    another key and one altered after signing are refused. The `.deb` is
+    not signed (dpkg and apt check repository metadata, not a package
+    file): the operator guide §6.1 gives the tag-bound attestation check
+    before `dpkg -i`, and the `rpm --import`, `rpm -K` and
+    `dnf --setopt=localpkg_gpgcheck=1` steps for the `.rpm`. The wording
+    that presented `dpkg --verify` / `rpm -V` as the integrity story is
+    corrected (they compare installed files with the package database).
+    install.sh's package path is unchanged except for a line saying the
+    origin is not verified there, and why: the package's own scripts
+    cannot vouch for the package.
+  - Not closed (operational, for the maintainer): the rpm signing key does
+    not exist yet. Before the next tag: create it, commit its public half
+    at `deploy/release/RPM-GPG-KEY-northnarrow.asc`, publish its
+    fingerprint, store the private half as `RPM_SIGNING_KEY` (and
+    `RPM_SIGNING_PASSPHRASE` if any) in the `release-signing` environment
+    with deployments limited to `v*` tags, and protect `v*` tag creation
+    with a ruleset; until then a tag release stops at `rpm-sign`. A signed
+    apt repository for the `.deb`. The host-check WARN for
+    `provenance: package` belongs with the provenance check of NN-AUD-198.
+  - Tests: `xtask/tests/supply_chain.rs`, run by the CI test job:
+    `every_action_is_pinned_by_full_commit_sha`,
+    `every_cargo_install_names_a_version_and_is_locked`,
+    `repository_default_target_cpu_is_portable`,
+    `every_attestation_check_is_bound_to_a_release_tag`,
+    `rpm_is_signed_on_tags_by_its_own_job` fail on main;
+    `workflows_parse_as_yaml` is a guard and passes on both. `sign-rpm.sh
+    selftest` passed on the host with rpm 4.18.2; actionlint 1.7.12: no
+    finding. Lab `pkg-check` runs the selftest on the rpm guests (step S).
+  - Lab: @LAB150@
+- **NN-AUD-198 (DEP-007), NN-AUD-200 (DEP-009), NN-AUD-197 (DEP-006), lab
+  PR 148.** Install integrity fails closed (batch F1).
+  - DEP-007: `verify_release` no longer steps down on its own. A tree
+    without `MANIFEST.sha256` is refused unless `--source-tree` (on a tree
+    that has one the flag is ignored and the tree verified as a release);
+    a level of `manifest` (no tarball + `SHA256SUMS`, no attestation) is
+    refused unless `--allow-manifest-only` (`require_provenance_floor`,
+    kept apart from the verifier lot 150 touches). The flag is recorded in
+    `install-manifest.json` (`verify_override`, read back by
+    `InstallManifest`). `--no-verify` stays (explicit) and is recorded the
+    same way. Agent side, as the triage says: it boots at every level;
+    `nn-admin host-check` has an 11th check, `install_provenance`: OK for
+    `checksums`/`attested`, WARN otherwise with the flag named, `package`
+    included ("origin not verified on this host"; lot 150 may refine it
+    with DEP-008), n/a without a manifest. Not done: the optional
+    `min_provenance` enforced at boot. `--source-tree` passed by
+    `nn-lab.sh` (install, upgrade-check twice, uninstall-check reinstall),
+    `bootstrap-target-prod.sh` and the docs script `03_provision_…`;
+    `pkg-check` (package mode) and `release-check` (tarball + sums) need
+    nothing.
+  - DEP-009: `is_fatal` takes a `BootHistory`. `NoManifest` is fatal (exit
+    78, `boot_refused` with `no-manifest` and a detail naming the cause)
+    unless the chain shows no verified boot (`NeverVerified`) or
+    `NN_ALLOW_UNVERIFIED_BINARY=1`. The sentinel is the audit chain, as
+    proposed (ATP-004 pattern): `read_tail` now also notes an `agent_boot`
+    with result `success` and `binary_integrity` `verified`, exposed as
+    `audit::verified_boot_recorded`, a read-only scan run only when the
+    manifest is missing, before the decision (the shared log still opens
+    later; `boot_refused` opens it on its own as before). A chain that
+    cannot be read is `Unknown` and refuses too (fail-closed, same
+    override). Residual limit, documented: deleting `audit.log` in the
+    same window makes the install look new (visible as a chain restarting
+    from genesis). The pinned `missing_manifest_is_reported_not_fatal` is
+    replaced by the two tests the triage names. Side finding, older than
+    this fix: a refused boot leaves the refused agent's hooks pinned, so no
+    window can be opened to repair `/etc/northnarrow`; the runbook now
+    gives the recovery (`systemctl set-environment
+    NN_ALLOW_UNVERIFIED_BINARY=1`, start, unset, `install.sh --upgrade`).
+  - DEP-006: `bpf_defense::write_own_prog_ids` writes `<id> <name>` per
+    loaded program (0600, atomic) to `bpf-own-ids` next to `--pid-file`
+    (the unit: `/run/northnarrow/bpf-own-ids`), after the anti-tamper
+    attach and again after the late FIM/file-open programs; without
+    `--pid-file` (e2e fixtures) nothing is written, so a fixture never
+    overwrites the installed agent's list. The file is kept at stop (the
+    pinned programs outlive the process). `install.sh --upgrade` (and
+    `--package-stop`) and `uninstall.sh` read it before the stop and wait,
+    `LSM_DRAIN_TIMEOUT` (30 s), until `bpftool prog show id` answers "No
+    such file or directory" for each id (any other error keeps the id:
+    fail-closed), printing the ids. No file (an agent older than the
+    list): the old host-wide LSM count, now listing what is left. No
+    bpftool: the units' processes and the pin root are checked and the
+    message says the unload is not confirmed (install.sh used to skip the
+    gate). Lab checks follow: `upgrade-check` counts the new agent's own
+    LSM programs, checks the old ids are gone and no foreign LSM program
+    was lost; `uninstall-check` and `pkg-check` step 4 check the own ids.
+    Regression risk, as the triage says: an id missed (a downgrade on the
+    same boot leaves a stale list) ends the wait early and the copy fails
+    with EPERM — fail-closed.
+  - Tests: `missing_manifest_after_verified_boot_is_fatal`,
+    `missing_manifest_on_fresh_chain_is_not_fatal`,
+    `verify_override_is_optional`, `verified_boot_is_found_in_the_chain`,
+    `install_provenance_warns_below_checksums`,
+    `own_prog_ids_file_lists_one_id_per_line`; the two host-check table
+    tests count 11 checks. With the fix reverted the first and the chain
+    test fail. Shell: `bash -n` on every changed script (shellcheck not
+    available) and a mock harness for `verify_release` /
+    `require_provenance_floor` / the drain (16 cases) and `uninstall.sh`
+    under a user namespace (4 cases); on the base scripts the downgrade
+    and foreign-LSM cases fail.
+  - Lab: Ubuntu 24.04, install148-probe.sh on main and on this build. DEP-007: a release tree without `MANIFEST.sha256` installed silently as `source-tree` (rc 0) → refused (rc 1) unless `--source-tree`, recorded as `verify_override` and a host-check WARN; manifest-only provenance rc 0 → refused unless `--allow-manifest-only`. DEP-009: the install manifest moved away inside a window → boot `success no-manifest` → `refused no-manifest` ("removed after a verified boot of this install"), exit 78; the documented recovery verified. DEP-006 (Debian 12, a do-nothing `lsm/file_open` program of another vendor loaded with bpftool): main: with that program loaded, `upgrade-check` (rc 1, the drain gave up with the units stopped), `uninstall-check` (FAIL: binaries left) and `pkg-check` (FAIL) all failed; here all three OK and the foreign program still loaded after each. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
