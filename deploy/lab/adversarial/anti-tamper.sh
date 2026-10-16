@@ -822,7 +822,15 @@ run_case C09 "bpftool link show pinned (link handle)" "$BPF_EXPECT" "NN-L-BPF-00
 # ── BPF ecosystem ─────────────────────────────────────────────────────────
 run_case C10 "bpftool feature probe (loads test programs)" allowed "NN-L-BPF-001" 0 -- bash -c "bpftool feature probe kernel >/dev/null"
 # ── systemd ───────────────────────────────────────────────────────────────
-WAIT=40 run_case C11 "unit drop-in with a hostile Environment=" allowed "integrity_drift" 0 -- bash -c "mkdir -p /etc/systemd/system/northnarrow-agent.service.d && printf '[Service]\nEnvironment=NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n' > /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf"
+# External audit EBPF-015: where the agent registered its drop-in directory
+# at boot (install.sh makes it on Debian-family hosts) a new drop-in is
+# refused; elsewhere it is made beside the unit and reported.
+C11_EXP=allowed; C11_EV="integrity_drift"
+if journalctl --namespace=northnarrow _PID="$PID" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -qE "registered in PROTECTED_INODES path=/etc/systemd/system/northnarrow-agent\.service\.d( |$)"; then
+    C11_EXP=denied; C11_EV="op=create"
+fi
+WAIT=40 run_case C11 "unit drop-in with a hostile Environment=" "$C11_EXP" "$C11_EV" 0 -- bash -c "mkdir -p /etc/systemd/system/northnarrow-agent.service.d && printf '[Service]\nEnvironment=NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n' > /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf"
 rm -rf /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf; systemctl daemon-reload
 WAIT=40 run_case C12 "systemctl set-property --runtime MemoryMax (OOM path)" allowed "integrity_drift" 0 -- systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G
 # resetting the property still leaves an (empty) runtime drop-in behind
@@ -874,7 +882,8 @@ echo -500 > /proc/$PID/oom_score_adj 2>/dev/null || true
 # a fresh name each run: once the agent has seen an overlay it protects it,
 # so a leftover cannot be removed until the lab purges the pins
 OVL="$ETC/zz-tamper-$(date +%s).local"
-WAIT=40 run_case C19 "drop a .local overlay in /etc/northnarrow" allowed "integrity_drift" 0 -- bash -c "echo '+evil-implant' > $OVL"
+# External audit EBPF-015: a new entry in /etc/northnarrow is refused.
+run_case C19 "drop a .local overlay in /etc/northnarrow" denied "op=create" 0 -- bash -c "echo '+evil-implant' > $OVL"
 # ── kills nothing can refuse, saturation, io_uring ────────────────────────
 CGK=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.kill
 if [[ -w "$CGK" ]]; then
@@ -901,8 +910,10 @@ else
 fi
 # ── signed overlays (Tappa 10.8) ──────────────────────────────────────────
 # An unsigned exemption appended to the allowlist overlay, then a restart:
-# the agent must boot on the shipped defaults and record the refusal.
-WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unauthorized_overlay" 0 -- bash -c "echo '+evil-implant' >> $ETC/process-comm-allowlist.local && restart_agent"
+# the agent must boot on the shipped defaults and record the refusal. The
+# overlay is written inside a window (EBPF-015: a new file in the directory
+# is refused outside one), as a stopped agent's host would let it be.
+WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unauthorized_overlay" 0 -- bash -c "grant_window && echo '+evil-implant' >> $ETC/process-comm-allowlist.local && restart_agent"
 PID=$(agent_pid)
 # The same overlay stored the authorised way (lab key, config-manage),
 # then a restart: stored with its signature, accepted at boot.
@@ -1246,6 +1257,39 @@ fi
 POST=$(post post_same "$ETC/netflow-blocklist.v1" hash "$(nnpy fileid "$ETC/netflow-blocklist.v1" hash)") \
 run_case C46 "append to the shipped netflow blocklist" denied "op=write" 0 -- \
     bash -c "echo '# nn-lab C46' >> $ETC/netflow-blocklist.v1"
+
+# External audit EBPF-015: no new entry in the agent's directories — a
+# subdirectory, a symlink, a hard link, a FIFO, a file in the chain
+# sub-directory, a directory among the pins — and no extended attribute
+# changed on a protected inode (C19 is the plain file). Inside a
+# trusted-installer window the same is allowed (C54).
+PID=$(agent_pid)
+LSRC=/etc/.nn-lab-c49-src
+echo nn-lab > "$LSRC"
+run_case C47 "mkdir in /etc/northnarrow" denied "op=mkdir" 0 -- mkdir "$ETC/.nn-lab-c47"
+run_case C48 "symlink in /etc/northnarrow" denied "op=symlink" 0 -- ln -s /etc/hostname "$ETC/.nn-lab-c48"
+run_case C49 "hard link into /etc/northnarrow" denied "op=link" 0 -- ln "$LSRC" "$ETC/.nn-lab-c49"
+run_case C50 "FIFO in /etc/northnarrow" denied "op=mknod" 0 -- mkfifo "$ETC/.nn-lab-c50"
+run_case C51 "new file in the state chain directory" denied "op=create" 0 -- bash -c ": > $STATE/detections/.nn-lab-c51"
+run_case C52 "a directory among the bpffs pins" denied "op=mkdir" 0 -- mkdir "$PINS/nn-lab-c52"
+run_case C53 "user.* xattr on admin.pub" denied "op=xattr" 0 -- \
+    python3 -c "import os; os.setxattr('$ETC/admin.pub', 'user.nn_lab', b'1')"
+rm -f "$LSRC"
+if [[ -z "$ONLY" || ",$ONLY," == *",C54,"* ]]; then
+    t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
+    grant_window 30; sleep 2
+    out=$(bash -c "mkdir $ETC/.nn-lab-c54 && rmdir $ETC/.nn-lab-c54 && : > $ETC/.nn-lab-c54f \
+        && rm -f $ETC/.nn-lab-c54f && python3 -c \"import os; os.setxattr('$ETC', 'user.nn_lab', b'1'); os.removexattr('$ETC', 'user.nn_lab')\"" 2>&1); rc=$?
+    sleep 4; ev=$(evidence "$t0" "$a0" "$d0")
+    if (( rc == 0 )) && ! echo "$ev" | grep -qE "op=(create|mkdir|xattr|unlink|rmdir)"; then
+        v="OK"; st="allowed"
+    else
+        v="DEVIATION (refused inside the window: $(echo "$out" | head -1 | cut -c1-80))"; fail=1; st="denied"
+    fi
+    rows+=("| C54 | new entries and an xattr inside a trusted-installer window | $st | $ev | $v |")
+    echo "C54 new entries and an xattr inside a trusted-installer window → $st; $ev; $v" >&2
+    for i in $(seq 1 40); do window_open || break; sleep 1; done
+fi
 
 echo
 echo "| case | action | outcome | evidence | verdict |"

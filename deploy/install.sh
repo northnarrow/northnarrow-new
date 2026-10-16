@@ -861,9 +861,10 @@ fi
 # exemptions, off by default). This is a `.example`, never the live
 # `.local`, so it is safe to overwrite on every install — it documents
 # the current set of recommended container-runtime comms. Container
-# hosts activate it with:
-#   cp $ETC_DIR/process-comm-allowlist.local.example \
-#      $ETC_DIR/process-comm-allowlist.local
+# hosts activate it through the agent (a new file in $ETC_DIR is refused
+# outside a trusted-installer window, external audit EBPF-015):
+#   nn-admin config overlay set process-comm-allowlist \
+#      --file $ETC_DIR/process-comm-allowlist.local.example --key <key>
 # See docs/operator/CONTAINER_HOST_DEPLOY.md for the security tradeoff.
 if [[ -f "$PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC" ]]; then
     echo "install.sh: refreshing overlay template $ETC_DIR/process-comm-allowlist.local.example"
@@ -1195,17 +1196,16 @@ echo "     Overlays (*.local) are loaded only when signed by a key with the"
 echo "     config-manage role: write the overlay to a file, then"
 echo "       nn-admin config overlay set <kind> --file <file> --key <key>"
 echo "     (stored by the running agent; applies at its next start)."
-echo "     Optional: drop /etc/northnarrow/fim-paths.local to customise"
+echo "     (A file dropped into /etc/northnarrow by hand is refused while the"
+echo "     agent runs.) Optional: a fim-paths overlay to customise"
 echo "     the FIM watched-paths set (\`+/path\` add, \`-/path\` disable —"
 echo "     see docs/operator/TAPPA9_FIM_TRUST_MODEL.md §13 Q7)."
-echo "     Optional: drop /etc/northnarrow/netflow-blocklist.local +"
-echo "     /etc/northnarrow/netflow-ja3-blocklist.local to extend the"
-echo "     NetFlow blocklists from a threat-intel feed (\`+entry\` add,"
+echo "     Optional: netflow-blocklist + netflow-ja3-blocklist overlays to"
+echo "     extend the NetFlow blocklists from a threat-intel feed (\`+entry\` add,"
 echo "     \`-entry\` disable — same schema as fim-paths.local; see"
 echo "     docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md §10 + §13 Q5)."
-echo "     Optional: drop /etc/northnarrow/process-comm-allowlist.local +"
-echo "     /etc/northnarrow/netflow-comm-allowlist.local to tune the"
-echo "     Tappa 10.5 detection-rule comm exemptions (\`+comm\` add,"
+echo "     Optional: process-comm-allowlist + netflow-comm-allowlist overlays"
+echo "     to tune the Tappa 10.5 detection-rule comm exemptions (\`+comm\` add,"
 echo "     \`-comm\` re-enable detection on a default — same schema; see"
 echo "     docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md §13 Q3)."
 echo "     CONTAINER HOSTS: set process-comm-allowlist.local.example as the"

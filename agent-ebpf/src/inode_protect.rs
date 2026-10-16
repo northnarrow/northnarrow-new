@@ -1,12 +1,12 @@
 //! `inode_*` and `file_ioctl` LSM hooks — Tappa 7 filesystem
 //! protection.
 //!
-//! Five BPF-LSM programs guard the inodes registered by userland
-//! (the `/var/lib/northnarrow/` directory, plus future Tappa 8 state
-//! files). Each hook returns `-EPERM` to deny the operation and
-//! emits one [`FsProtectDenialRaw`] record into the
-//! [`FS_PROTECT_EVENTS`] ringbuffer for userland's audit log /
-//! posture trigger.
+//! BPF-LSM deny programs guard the inodes registered by userland (the
+//! agent's directories, its identity and state files, its binaries and
+//! units, its bpffs pins). Each hook returns `-EPERM` to deny the
+//! operation and emits one [`FsProtectDenialRaw`] record into the
+//! [`FS_PROTECT_EVENTS`] ringbuffer for userland's audit log / posture
+//! trigger.
 //!
 //! | Hook | Defends against |
 //! |---|---|
@@ -14,28 +14,30 @@
 //! | `inode_rmdir`  | `rmdir` of a protected directory |
 //! | `inode_rename` | `mv` involving a protected inode on either side |
 //! | `inode_setattr`| `chmod` / `chown` / `truncate` on a protected inode |
-//! | `file_ioctl`   | `chattr -i` / `chattr +i` via `FS_IOC_SETFLAGS` |
+//! | `file_ioctl`   | `chattr -i` / `chattr +i` via `FS_IOC_SETFLAGS` / `FS_IOC_FSSETXATTR` |
+//! | `file_open`    | a write-open of a WRITE-protected inode, any open of a READ-protected one |
+//! | `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`, `inode_link` | a new entry in a NOCREATE directory |
+//! | `inode_setxattr`, `inode_removexattr` (`inode_set_acl`, `inode_remove_acl` on 6.2+) | an extended attribute or ACL changed on a protected inode |
 //!
 //! Note: `chattr` does NOT go through `inode_setattr` — flag changes
 //! travel down the `ioctl(FS_IOC_SETFLAGS)` path, bypassing
 //! `notify_change()`. The `file_ioctl` hook is the only correct
 //! place to defeat `chattr -i` from BPF-LSM.
 //!
-//! Identity policy: each LSM-chain prev-retval is honoured at
-//! `arg(N)` where N = number of kernel args (2 / 2 / 4 / 3 / 3);
-//! a non-zero prior verdict is propagated unchanged. The
-//! [`FS_GRANT`] map is the Tappa 8 escape hatch
-//! (Ed25519-signed admin grant), shipped empty in the Tappa 7 ELF.
+//! No hook reads the LSM chain's previous verdict (see `task_kill.rs`).
+//! The [`FS_GRANT`] map is the trusted-installer window: while it is
+//! open, nothing is denied.
 
 use aya_ebpf::{
     cty::{c_int, c_uint, c_void},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_probe_read_kernel,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
     },
     macros::{lsm, map},
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
+    EbpfContext,
 };
 
 // Review 56: the zero-arg `bpf_printk!` diagnostic markers of the
@@ -46,9 +48,9 @@ use aya_ebpf::{
 // agent host. Do not put printk back in a hot hook; count in a map instead.
 
 use northnarrow_common::wire::{
-    FsGrant, FsProtectDenialRaw, InodeKey, FS_OP_IOCTL, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
-    FS_OP_SETATTR, FS_OP_UNLINK, FS_OP_WRITE, FS_PROTECT_MUTATE, FS_PROTECT_READ,
-    FS_PROTECT_WRITE, READ_PROTECTED_SLOTS,
+    fs_protect_required, FsGrant, FsProtectDenialRaw, InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
+    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
+    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS,
 };
 
 use crate::btf_offsets::{
@@ -83,8 +85,10 @@ const FS_IOC_FSSETXATTR: c_uint = northnarrow_common::wire::FS_IOC_FSSETXATTR;
 /// Inodes the userland loader has registered for protection. Up to
 /// 1024 entries. The value is an at-authz-1 flag-mask
 /// (`FS_PROTECT_MUTATE` bit0 = the legacy unlink/rmdir/rename/setattr/
-/// ioctl denies, set on every member; `FS_PROTECT_WRITE` bit1 = the new
-/// `file_open` write-open deny, set only on the secret/integrity subset).
+/// ioctl/xattr denies, set on every member; `FS_PROTECT_WRITE` bit1 = the
+/// `file_open` write-open deny, set only on the secret/integrity subset;
+/// `FS_PROTECT_READ` bit2 = the signing key; `FS_PROTECT_NOCREATE` bit3 =
+/// no new entry, set only on the agent's own directories).
 /// `deny_if_protected` reads it op-aware. Kept as `u8` (map node tiny).
 ///
 /// By-name pinned (Tappa 7 task 6 #2): the pinned `inode_*` hooks
@@ -312,23 +316,19 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
     };
     // at-authz-1: the map value is a flag-mask. An absent key is not
     // protected; a present key is denied for THIS op only if the op's
-    // bit is set. `FS_OP_WRITE` requires `FS_PROTECT_WRITE` (the
-    // secret/integrity subset); every other (mutation) op requires
-    // `FS_PROTECT_MUTATE`, which the loader sets on every member — so
-    // the five existing hooks keep their unchanged presence semantics.
+    // bit is set (`fs_protect_required`): `FS_PROTECT_WRITE` for a
+    // write-open, `FS_PROTECT_READ` for a read-open, `FS_PROTECT_NOCREATE`
+    // (the agent's own directories only) for a new entry, and
+    // `FS_PROTECT_MUTATE`, which the loader sets on every member, for
+    // every other op. `operation` is a constant at each call site, so the
+    // match folds away.
     let flags = match PROTECTED_INODES.get(&key) {
         Some(f) => *f,
         None => {
             return false;
         }
     };
-    let required = if operation == FS_OP_WRITE {
-        FS_PROTECT_WRITE
-    } else if operation == FS_OP_READ {
-        FS_PROTECT_READ
-    } else {
-        FS_PROTECT_MUTATE
-    };
+    let required = fs_protect_required(operation);
     if flags & required == 0 {
         return false;
     }
@@ -519,7 +519,7 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
 }
 
 /// at-authz-1 — write-open deny. The sixth deny hook in the
-/// inode_protect family. The existing five cover dir-entry mutation
+/// inode_protect family. The first five cover dir-entry mutation
 /// (unlink/rmdir/rename) and metadata (setattr/ioctl), but a root caller
 /// could still `open(O_WRONLY|O_APPEND)` + `write(2)` a protected file —
 /// an append/in-place pwrite touches no metadata, so `inode_setattr`
@@ -599,4 +599,152 @@ unsafe fn read_protected_ino(inode: *const c_void) -> bool {
         slot += 1;
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// External audit EBPF-015: new entries and extended attributes
+// ---------------------------------------------------------------------------
+//
+// The hooks above refuse removing or changing an entry of a protected
+// directory, not adding one: root could drop a file, a link, a symlink, a
+// device node or a subdirectory into `/etc/northnarrow`, the state
+// directory, the unit drop-in directory or the pin root, and change the
+// extended attributes of any protected inode. One program per hook, each
+// one map lookup like `inode_unlink`: nothing here loops.
+//
+// Argument positions, the same on 5.15, 6.1 and 6.8 (and 6.18):
+// `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink` take the
+// parent directory first; `inode_link` is `(old_dentry, dir, new_dentry)`;
+// `inode_setxattr` / `inode_removexattr` (5.12+) and `inode_set_acl` /
+// `inode_remove_acl` (6.2+) take a `user_namespace` / `mnt_idmap` first,
+// then the dentry, then the attribute name.
+
+/// A new entry in `dir`: refused when `dir` carries `FS_PROTECT_NOCREATE`
+/// (the agent's own directories only), outside the trusted-installer
+/// window, for a caller outside the agent's family.
+#[inline(always)]
+unsafe fn deny_new_entry(operation: u8, dir: *const c_void) -> i32 {
+    if deny_if_protected(operation, dir) {
+        -EPERM
+    } else {
+        0
+    }
+}
+
+/// `open(O_CREAT)`, `creat(2)`, `mknod(S_IFREG)`, a bpffs pin
+/// (`vfs_mkobj`). Kernel signature: `(dir, dentry, mode)`.
+#[lsm(hook = "inode_create")]
+pub fn protected_create_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_new_entry(FS_OP_CREATE, ctx.arg(0)) }
+}
+
+/// Kernel signature: `(dir, dentry, mode)`.
+#[lsm(hook = "inode_mkdir")]
+pub fn protected_mkdir_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_new_entry(FS_OP_MKDIR, ctx.arg(0)) }
+}
+
+/// A device node, FIFO or socket. Kernel signature: `(dir, dentry, mode,
+/// dev)`.
+#[lsm(hook = "inode_mknod")]
+pub fn protected_mknod_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_new_entry(FS_OP_MKNOD, ctx.arg(0)) }
+}
+
+/// Kernel signature: `(dir, dentry, old_name)`.
+#[lsm(hook = "inode_symlink")]
+pub fn protected_symlink_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_new_entry(FS_OP_SYMLINK, ctx.arg(0)) }
+}
+
+/// A hard link made in a NOCREATE directory — also the way an `O_TMPFILE`
+/// file (which no create hook sees) would get a name there. Kernel
+/// signature: `(old_dentry, dir, new_dentry)`. The source is not checked:
+/// the denies are keyed by inode, so a protected file linked elsewhere is
+/// as protected under its new name, and refusing it would only turn a
+/// backup's or a deduplicator's link into a COMBAT trigger.
+#[lsm(hook = "inode_link")]
+pub fn protected_link_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_new_entry(FS_OP_LINK, ctx.arg(1)) }
+}
+
+/// `security.selinux` with its terminator, as the three words a
+/// zero-filled 24-byte buffer holds once the name is read into it.
+const XATTR_SELINUX: [u64; 3] = [
+    u64::from_le_bytes(*b"security"),
+    u64::from_le_bytes(*b".selinux"),
+    0,
+];
+
+/// Argument `i` of the hook, read from the context's argument array
+/// without the verifier's BTF typing (the `const char *name` argument; see
+/// `open_sensor::raw_arg`).
+#[inline(always)]
+unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
+    let args = ctx.as_ptr() as *const u64;
+    bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
+}
+
+/// Whether the attribute `name` is exactly `security.selinux` — the one
+/// attribute left writable, so `restorecon` / `setfiles` (and rpm's
+/// labelling) relabel the agent's files on an SELinux host. A longer name
+/// leaves a non-zero byte in the third word; an unreadable one is not
+/// SELinux's.
+#[inline(always)]
+unsafe fn xattr_is_selinux(name: u64) -> bool {
+    if name == 0 {
+        return false;
+    }
+    let mut buf = [0u64; 3];
+    let bytes = core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, 24);
+    if bpf_probe_read_kernel_str_bytes(name as *const u8, bytes).is_err() {
+        return false;
+    }
+    buf[0] == XATTR_SELINUX[0] && buf[1] == XATTR_SELINUX[1] && buf[2] == XATTR_SELINUX[2]
+}
+
+/// An extended attribute set, removed or (6.2+) an ACL changed on a
+/// protected inode: arg 1 is the dentry, arg 2 the attribute name.
+#[inline(always)]
+unsafe fn deny_xattr(ctx: &LsmContext) -> i32 {
+    let dentry: *const c_void = ctx.arg(1);
+    let inode = match inode_from_dentry(dentry) {
+        Some(i) => i,
+        None => return 0,
+    };
+    if xattr_is_selinux(raw_arg(ctx, 2)) {
+        return 0;
+    }
+    if deny_if_protected(FS_OP_XATTR, inode) {
+        return -EPERM;
+    }
+    0
+}
+
+/// Kernel signature: `(mnt_userns | idmap, dentry, name, value, size,
+/// flags)`. On 5.15 and 6.1 a POSIX ACL (`setfacl`) comes this way too, as
+/// `system.posix_acl_*`.
+#[lsm(hook = "inode_setxattr")]
+pub fn protected_setxattr_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_xattr(&ctx) }
+}
+
+/// Kernel signature: `(mnt_userns | idmap, dentry, name)`.
+#[lsm(hook = "inode_removexattr")]
+pub fn protected_removexattr_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_xattr(&ctx) }
+}
+
+/// 6.2+: a POSIX ACL no longer passes `inode_setxattr`. Kernel signature:
+/// `(idmap, dentry, acl_name, kacl)`. Attached only where the kernel has
+/// the hook.
+#[lsm(hook = "inode_set_acl")]
+pub fn protected_set_acl_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_xattr(&ctx) }
+}
+
+/// 6.2+. Kernel signature: `(idmap, dentry, acl_name)`.
+#[lsm(hook = "inode_remove_acl")]
+pub fn protected_remove_acl_deny(ctx: LsmContext) -> i32 {
+    unsafe { deny_xattr(&ctx) }
 }

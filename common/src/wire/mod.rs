@@ -639,6 +639,25 @@ pub const FS_OP_KEXEC: u8 = 11;
 /// access included. Recorded, not a COMBAT trigger: a backup of `/etc`
 /// meets it too.
 pub const FS_OP_READ: u8 = 12;
+/// External audit EBPF-015: a new entry in a NOCREATE directory, refused
+/// by `inode_create` — `open(O_CREAT)`, `creat(2)`, `mknod(S_IFREG)`, a
+/// bpffs pin (`target_*` = the directory).
+pub const FS_OP_CREATE: u8 = 13;
+/// A hard link made in a NOCREATE directory (`inode_link`; `target_*` =
+/// the directory). Also how an `O_TMPFILE` file would get a name there.
+pub const FS_OP_LINK: u8 = 14;
+/// A symlink made in a NOCREATE directory (`inode_symlink`).
+pub const FS_OP_SYMLINK: u8 = 15;
+/// A subdirectory made in a NOCREATE directory (`inode_mkdir`).
+pub const FS_OP_MKDIR: u8 = 16;
+/// A device node, FIFO or socket made in a NOCREATE directory
+/// (`inode_mknod`).
+pub const FS_OP_MKNOD: u8 = 17;
+/// An extended attribute set or removed on a protected inode
+/// (`inode_setxattr` / `inode_removexattr`, and `inode_set_acl` /
+/// `inode_remove_acl` where the kernel has them). `security.selinux` is
+/// not refused: `restorecon` relabels the agent's files on SELinux hosts.
+pub const FS_OP_XATTR: u8 = 18;
 
 /// at-authz-1 PROTECTED_INODES value flag-mask. The map value (formerly an
 /// unused `1u8` presence sentinel) now records WHICH deny classes apply to
@@ -660,8 +679,31 @@ pub const FS_PROTECT_WRITE: u8 = 0b10;
 /// whose inode number also sits in `READ_PROTECTED_INOS` so the common
 /// read path pays no map lookup.
 pub const FS_PROTECT_READ: u8 = 0b100;
+/// `FS_PROTECT_NOCREATE` (bit3, external audit EBPF-015): no new entry —
+/// create, link, symlink, mkdir, mknod — in this directory. Set only on the
+/// agent's own directories (`/etc/northnarrow`, `/var/lib/northnarrow` and
+/// its chain sub-directory, the unit drop-in directory, the bpffs pin
+/// root), never on the ordinary parent of a protected file.
+pub const FS_PROTECT_NOCREATE: u8 = 0b1000;
 /// Slots of the `READ_PROTECTED_INOS` array (inode numbers; 0 = empty).
 pub const READ_PROTECTED_SLOTS: u32 = 4;
+
+/// The `PROTECTED_INODES` flag a denial of `operation` requires — the
+/// kernel deny's op-aware test (`deny_if_protected`), kept here so it is
+/// unit-tested once. A write-open needs `FS_PROTECT_WRITE`, a read-open
+/// `FS_PROTECT_READ`, a new entry `FS_PROTECT_NOCREATE` on the directory;
+/// every other operation (unlink, rmdir, rename, setattr, the flag ioctls,
+/// an extended attribute) `FS_PROTECT_MUTATE`, which every member has.
+pub const fn fs_protect_required(operation: u8) -> u8 {
+    match operation {
+        FS_OP_WRITE => FS_PROTECT_WRITE,
+        FS_OP_READ => FS_PROTECT_READ,
+        FS_OP_CREATE | FS_OP_LINK | FS_OP_SYMLINK | FS_OP_MKDIR | FS_OP_MKNOD => {
+            FS_PROTECT_NOCREATE
+        }
+        _ => FS_PROTECT_MUTATE,
+    }
+}
 
 /// Audit record emitted whenever a Tappa 7 inode-protection LSM hook
 /// returns `-EPERM`. The denial is the security event — userland
@@ -1709,6 +1751,78 @@ mod tests {
         assert_eq!(FS_IOC_SETFLAGS, 0x4008_6602);
         assert_eq!(FS_IOC32_SETFLAGS, 0x4004_6602);
         assert_eq!(FS_IOC_FSSETXATTR, 0x401c_5820);
+    }
+
+    /// External audit EBPF-015: a new entry is refused only in a NOCREATE
+    /// directory — never on the MUTATE bit every protected directory has,
+    /// which would refuse every file created next to a protected one — and
+    /// an extended attribute like any other change of a protected inode.
+    #[test]
+    fn fs_protect_required_matches_each_op_to_its_bit() {
+        for op in [
+            FS_OP_CREATE,
+            FS_OP_LINK,
+            FS_OP_SYMLINK,
+            FS_OP_MKDIR,
+            FS_OP_MKNOD,
+        ] {
+            assert_eq!(fs_protect_required(op), FS_PROTECT_NOCREATE, "op {op}");
+        }
+        for op in [
+            FS_OP_UNLINK,
+            FS_OP_RMDIR,
+            FS_OP_RENAME,
+            FS_OP_SETATTR,
+            FS_OP_IOCTL,
+            FS_OP_XATTR,
+        ] {
+            assert_eq!(fs_protect_required(op), FS_PROTECT_MUTATE, "op {op}");
+        }
+        assert_eq!(fs_protect_required(FS_OP_WRITE), FS_PROTECT_WRITE);
+        assert_eq!(fs_protect_required(FS_OP_READ), FS_PROTECT_READ);
+        let bits = [
+            FS_PROTECT_MUTATE,
+            FS_PROTECT_WRITE,
+            FS_PROTECT_READ,
+            FS_PROTECT_NOCREATE,
+        ];
+        for (i, a) in bits.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1);
+            for b in &bits[i + 1..] {
+                assert_eq!(a & b, 0, "flag bits overlap");
+            }
+        }
+    }
+
+    /// The denial codes are distinct: the record carries one byte.
+    #[test]
+    fn fs_op_codes_are_distinct() {
+        let ops = [
+            FS_OP_UNLINK,
+            FS_OP_RMDIR,
+            FS_OP_RENAME,
+            FS_OP_SETATTR,
+            FS_OP_IOCTL,
+            FS_OP_WRITE,
+            FS_OP_BPF_MAP,
+            FS_OP_BPF_LINK,
+            FS_OP_SIGNAL,
+            FS_OP_PTRACE,
+            FS_OP_KEXEC,
+            FS_OP_READ,
+            FS_OP_CREATE,
+            FS_OP_LINK,
+            FS_OP_SYMLINK,
+            FS_OP_MKDIR,
+            FS_OP_MKNOD,
+            FS_OP_XATTR,
+        ];
+        for (i, a) in ops.iter().enumerate() {
+            assert_ne!(*a, 0);
+            for b in &ops[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 NorthNarrow's anti-tamper layer makes the host actively resist changes to
 the agent: the binaries, the units and `/etc/northnarrow` are in
-`PROTECTED_INODES` (write/unlink/rename denied by LSM hooks), the agent
+`PROTECTED_INODES` (write/unlink/rename and extended attributes denied by
+LSM hooks, and no new file, link or directory in the agent's own
+directories), the agent
 and watchdog pids are in `PROTECTED_PIDS` (every userspace signal
 denied), and `/var/lib/northnarrow` carries `chattr +i`. That is the
 point of the product — and it means the three lifecycle operations must
@@ -251,7 +253,8 @@ was allowed (the PID-1 carve-out, since limited to the same window — §3.7),
 so `rm -rf /sys/fs/bpf/northnarrow`
 afterwards used to drop every hook — the two-command disable. The agent
 now registers the pin root and every pin in the protected-inode set:
-unlink, rmdir, rename and setattr are denied to any process that is not
+unlink, rmdir, rename and setattr — and a new pin or directory in the
+root (external audit EBPF-015) — are denied to any process that is not
 the agent or the watchdog, unless the **trusted-installer window** is open.
 That window is the authorised way to purge: `nn-admin
 trusted-installer-grant --key <key with the trusted-installer role>
@@ -299,11 +302,16 @@ in the unit environment changes the period; `0` disables the probe.
 ### 3.5 What root can still change, and how the agent proves it
 
 Some things root can do to the agent cannot be denied without breaking
-systemd: write a drop-in for the unit (`ExecStart=`, `Environment=`),
-`systemctl set-property` (MemoryMax, TasksMax, CPUQuota), raise the
-agent's `oom_score_adj`, bind-mount something over `/etc/northnarrow`,
-mount a second bpffs, drop a `.local` overlay that exempts a comm at the
-next restart, freeze the agent's cgroup. Every 30 s (±20 %) the agent
+systemd: write a drop-in for the unit (`ExecStart=`, `Environment=`) where
+the agent's drop-in directory does not exist, `systemctl set-property`
+(MemoryMax, TasksMax, CPUQuota), raise the agent's `oom_score_adj`,
+bind-mount something over `/etc/northnarrow`, mount a second bpffs, change
+an existing `.local` overlay in place, freeze the agent's cgroup. (A new
+file, link or directory in `/etc/northnarrow`, the state directory, the
+pin root or the Debian drop-in directory — a new overlay, a new drop-in,
+`systemctl edit` — is refused outside a trusted-installer window since
+external audit EBPF-015, like an extended attribute set on a protected
+file: see §3.8.) Every 30 s (±20 %) the agent
 compares these with what it saw at boot and with what `install.sh` laid
 down, and every new finding is an `INTEGRITY DRIFT` ERROR and a signed
 audit entry:
@@ -374,7 +382,7 @@ come (`rollback-floor`).
 | Command | Use |
 |---|---|
 | `nn-admin config overlay set <kind> --file F --key K` | sign over the agent's challenge and store through the running agent (it writes the overlay and its `.sig`); applies at its next start |
-| `nn-admin config overlay sign <kind> --file F --key K` | sign offline and write `F.sig` (upgrades, stopped agent) |
+| `nn-admin config overlay sign <kind> --file F --key K` | sign offline and write `F.sig` next to `F`, or `--out` (upgrades: install.sh runs it with the pins purged; a new `.sig` in `/etc/northnarrow` needs a trusted-installer window while hooks are attached, even with the agent stopped) |
 | `nn-admin config overlay status` | which overlays are present and whether the next start loads them (exit 1 if one does not) |
 
 Kinds: `fim-paths`, `process-comm-allowlist`, `netflow-comm-allowlist`,
@@ -421,6 +429,41 @@ keeps detecting through the rest of the shutdown, and both end with
 program, verified by its executable (`agent_stop` reason
 `system_shutdown`). The refused SIGTERM of the stop job is not reported as
 an attempt while systemd reports the host as `stopping`.
+
+### 3.8 No new entries in the agent's directories (external audit EBPF-015)
+
+The deny hooks used to refuse removing or changing an entry of a protected
+directory, not adding one. Root could drop a decoy overlay or a second key
+file next to the protected ones, plant a name the agent was about to
+create, add a drop-in to the agent's unit, or set extended attributes on
+the agent's files. Now, outside a trusted-installer window, a process that
+is neither the agent nor the watchdog gets `EPERM` for:
+
+- a new file (`open(O_CREAT)`, `creat`), subdirectory, symlink, hard link,
+  device node or FIFO in `/etc/northnarrow`, `/var/lib/northnarrow` and
+  its `detections/` directory, the agent's drop-in directory
+  `/etc/systemd/system/northnarrow-agent.service.d` (Debian family, where
+  install.sh makes it), and the bpffs pin root — `op=create`, `mkdir`,
+  `symlink`, `link`, `mknod`;
+- an extended attribute set or removed on any protected inode (`setfattr`,
+  `setcap`, `evmctl`, and `setfacl`, which 6.2+ kernels send through their
+  own ACL hooks) — `op=xattr`. `security.selinux` is not refused:
+  `restorecon` relabels the agent's files on SELinux hosts.
+
+Each refusal is an `ANTI-TAMPER DENIAL`, an `NN-L-AT-001` detection and a
+decisive tamper signal (COMBAT), like a refused unlink. What changes for an
+operator: overlays go through `nn-admin config overlay set` (the agent
+writes them); `systemctl edit northnarrow-agent`, `nn-admin config overlay
+sign` into `/etc/northnarrow`, `nn-admin init` creating a missing
+`admin.pub` and an editor's swap file need a window
+(`nn-admin trusted-installer-grant`) — editing those files in place was
+already refused (the rename or truncate). install.sh, the packages and
+uninstall.sh are unchanged: they open the window and purge the pins
+before writing.
+
+The agent registers itself in the pinned `PROTECTED_PIDS` before its boot
+creates anything, so a restarted agent is not refused the files and map
+pins it recreates by its predecessor's hooks.
 
 ## 4. What still needs a reboot
 

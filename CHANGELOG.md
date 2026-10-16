@@ -15,6 +15,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, new entries in the agent's directories (Medium
+  EBPF-015): the filesystem deny refused removing or renaming an entry of
+  `/etc/northnarrow`, the state directory or the pin root, not adding one —
+  root could drop a decoy overlay or a second key file beside the protected
+  ones, plant a pin, add a drop-in to the agent's unit (Debian), and set or
+  remove extended attributes of any protected file. A new file, link,
+  symlink, FIFO or directory in those directories, and any extended
+  attribute or (6.2+) ACL change but `security.selinux`, are now refused
+  outside a trusted-installer window and recorded (`op=create`, `mkdir`,
+  `mknod`, `symlink`, `link`, `xattr`). A restarted agent registers itself
+  before it recreates a missing file or map pin. **Regression:** an overlay
+  dropped into `/etc/northnarrow` by hand, `systemctl edit
+  northnarrow-agent` on a Debian host and `nn-admin config overlay sign`
+  writing its `.sig` there now need a window; overlays go through
+  `nn-admin config overlay set`.
 - External audit, Wave 2, posture scope of containers (Medium POS-005,
   completed): a rootless container (Podman, rootless Docker) runs with the
   login uid of the user who started it, so two containers of one user, or

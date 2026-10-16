@@ -358,6 +358,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
         Ok(b) => b,
         Err(e) => {
             return deny_shortfall(
+                LSM_DENY_HOOKS_EXPECTED,
                 0,
                 &[format!(
                     "vmlinux BTF unavailable ({e:#}) — no LSM hook can attach: kernel built \
@@ -418,10 +419,14 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     // means EVERY FS deny hook is absent, so it is counted as a deny
     // shortfall like a verifier reject of a single hook.
     let mut observe_failures: Vec<(&'static str, String)> = Vec::new();
+    // External audit EBPF-015: the optional deny hooks this kernel has
+    // count as expected ones.
+    let mut deny_expected = LSM_DENY_HOOKS_EXPECTED;
     match filesystem::attach(ebpf, &btf, pin_root) {
         Ok(fs) => {
             deny_failures.extend(fs.deny_failures);
             observe_failures.extend(fs.observe_failures);
+            deny_expected += fs.optional_present;
         }
         Err(e) => {
             warn!(error = %e, "anti-tamper FS: bootstrap failed — no FS deny hook attached");
@@ -487,12 +492,15 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
         ),
     }
 
-    report_lsm_health(&deny_failures, &observe_failures)
+    report_lsm_health(deny_expected, &deny_failures, &observe_failures)
 }
 
-/// Deny hooks expected on a healthy boot: task_kill + ptrace +
-/// the six `inode_protect` programs.
-const LSM_DENY_HOOKS_EXPECTED: usize = 2 + 6 + 1;
+/// Deny hooks expected on a healthy boot of every supported kernel:
+/// task_kill + ptrace, the `inode_protect` programs of
+/// [`filesystem::LSM_PROGRAMS`] (thirteen since external audit EBPF-015),
+/// and the BPF map guard. The optional ones a kernel has
+/// ([`filesystem::OPTIONAL_LSM_PROGRAMS`]) come on top.
+const LSM_DENY_HOOKS_EXPECTED: usize = 2 + filesystem::LSM_PROGRAMS.len() + 1;
 
 /// Escape hatch for a host where a deny hook is known not to attach
 /// (e.g. a kernel the eBPF half has not been validated against) and the
@@ -505,15 +513,15 @@ pub const ALLOW_DEGRADED_ENV: &str = "NN_ANTI_TAMPER_ALLOW_DEGRADED";
 /// [`ALLOW_DEGRADED_ENV`] is `1`. Missing OBSERVE hooks (module-load) are
 /// reported but never fatal — no protection is absent, only R018's input.
 fn report_lsm_health(
+    deny_expected: usize,
     deny_failures: &[(&'static str, String)],
     observe_failures: &[(&'static str, String)],
 ) -> Result<()> {
-    let deny_attached = LSM_DENY_HOOKS_EXPECTED.saturating_sub(deny_failures.len());
+    let deny_attached = deny_expected.saturating_sub(deny_failures.len());
     if deny_failures.is_empty() && observe_failures.is_empty() {
         info!(
             deny_attached,
-            deny_expected = LSM_DENY_HOOKS_EXPECTED,
-            "anti-tamper: all LSM hooks attached"
+            deny_expected, "anti-tamper: all LSM hooks attached"
         );
         return Ok(());
     }
@@ -525,25 +533,25 @@ fn report_lsm_health(
     if deny_failures.is_empty() {
         warn!(
             deny_attached,
-            deny_expected = LSM_DENY_HOOKS_EXPECTED,
+            deny_expected,
             observe_failed = ?failed,
             "anti-tamper: OBSERVE HOOK SHORTFALL — module-load telemetry absent (R018 blind)"
         );
         return Ok(());
     }
-    deny_shortfall(deny_attached, &failed)
+    deny_shortfall(deny_expected, deny_attached, &failed)
 }
 
 /// The fail-closed decision on a deny-hook shortfall, shared by the
 /// per-hook report and the no-BTF path (review 53): refuse to start
 /// unless [`ALLOW_DEGRADED_ENV`] is `1`.
-fn deny_shortfall(deny_attached: usize, failed: &[String]) -> Result<()> {
+fn deny_shortfall(deny_expected: usize, deny_attached: usize, failed: &[String]) -> Result<()> {
     let allow_degraded = std::env::var(ALLOW_DEGRADED_ENV)
         .map(|v| v == "1")
         .unwrap_or(false);
     error!(
         deny_attached,
-        deny_expected = LSM_DENY_HOOKS_EXPECTED,
+        deny_expected,
         failed = ?failed,
         allow_degraded,
         "anti-tamper: DENY HOOK SHORTFALL — a protection is silently absent"
@@ -552,7 +560,7 @@ fn deny_shortfall(deny_attached: usize, failed: &[String]) -> Result<()> {
         error!(
             "anti-tamper: running DEGRADED because {ALLOW_DEGRADED_ENV}=1 — \
              {} of {} deny hooks attached",
-            deny_attached, LSM_DENY_HOOKS_EXPECTED
+            deny_attached, deny_expected
         );
         return Ok(());
     }
@@ -560,7 +568,7 @@ fn deny_shortfall(deny_attached: usize, failed: &[String]) -> Result<()> {
         "anti-tamper deny hook shortfall: {} of {} attached ({}). Refusing to run with a \
          silently-absent protection; set {ALLOW_DEGRADED_ENV}=1 to start degraded.",
         deny_attached,
-        LSM_DENY_HOOKS_EXPECTED,
+        deny_expected,
         failed.join("; ")
     )
 }
@@ -841,6 +849,25 @@ fn evict_stale_pids(ebpf: &mut Ebpf, keep: &[ExeIdentity]) -> Result<usize> {
     Ok(evicted)
 }
 
+/// External audit EBPF-015: register this process in the pinned
+/// `PROTECTED_PIDS` before the boot creates anything. A restarted agent
+/// runs under its predecessor's pinned deny hooks until [`attach`], and
+/// these refuse a new entry in the agent's directories — a key, a log or
+/// an `agent_id` the boot recreates, or a map pin the eBPF load makes in
+/// the pin root (refused, it would keep the agent from starting until a
+/// reboot). `Ok(false)` when there is no pinned map: a first boot, no hook
+/// attached. The registration in [`attach`] stays the authoritative one
+/// (the stale-pid scan, the pin of this boot's map); the BPF guard lets
+/// the successor of an exited agent open the map only from its main
+/// thread in its first minute, which is where this is called.
+pub fn preregister_self(bpffs_root: &Path) -> Result<bool> {
+    if !bpffs_root.join(PROTECTED_PIDS_MAP_NAME).exists() {
+        return Ok(false);
+    }
+    register_protected_pid(Some(bpffs_root), std::process::id())?;
+    Ok(true)
+}
+
 /// Insert `pid` into the pinned `PROTECTED_PIDS` (a watchdog the agent
 /// verified). No bpffs ⇒ no pinned map ⇒ no-op.
 pub fn register_protected_pid(bpffs_root: Option<&Path>, pid: u32) -> Result<()> {
@@ -997,6 +1024,22 @@ mod tests {
     }
     use tempfile::TempDir;
 
+    /// External audit EBPF-015: the seven new-entry and xattr denies are
+    /// expected on every supported kernel — one that does not attach is a
+    /// shortfall, not a quiet gap — and the shortfall names the count this
+    /// kernel expects.
+    #[test]
+    fn deny_hooks_expected_include_the_new_entry_and_xattr_denies() {
+        assert_eq!(LSM_DENY_HOOKS_EXPECTED, 2 + 13 + 1);
+        if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
+            return;
+        }
+        let failed = [("protected_create_deny", "verifier rejected".to_string())];
+        let err = report_lsm_health(LSM_DENY_HOOKS_EXPECTED + 2, &failed, &[])
+            .expect_err("a missing create deny must refuse to start");
+        assert!(format!("{err:#}").contains("17 of 18"), "{err:#}");
+    }
+
     /// Review 53: the no-BTF path and a per-hook shortfall share one
     /// decision — refuse to start without the explicit degraded opt-in,
     /// naming the cause.
@@ -1005,8 +1048,12 @@ mod tests {
         if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
             return; // a dev shell that opted in; nothing to assert here
         }
-        let err = deny_shortfall(0, &["vmlinux BTF unavailable (test)".to_string()])
-            .expect_err("a deny-hook shortfall must refuse to start");
+        let err = deny_shortfall(
+            LSM_DENY_HOOKS_EXPECTED,
+            0,
+            &["vmlinux BTF unavailable (test)".to_string()],
+        )
+        .expect_err("a deny-hook shortfall must refuse to start");
         let msg = format!("{err:#}");
         assert!(msg.contains("0 of"), "{msg}");
         assert!(msg.contains("vmlinux BTF unavailable"), "{msg}");
