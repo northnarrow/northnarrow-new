@@ -928,6 +928,9 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             reader_dac_capable: r.uid != 0 && reader_dac_capable(r.pid),
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         }));
     }
     if r.reason & open_reason::FILE_CAP != 0 {
@@ -950,6 +953,9 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             reader_dac_capable: false,
             capability: Some(file_capability(r)),
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         }));
     }
     // External audit POS-002: one event per crossing; an open crossing

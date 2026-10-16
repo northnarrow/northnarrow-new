@@ -1715,6 +1715,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         });
         let r = DetectionRecord::from_rule(
             2,

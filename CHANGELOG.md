@@ -61,6 +61,43 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, FIM rules (Low FIMR-010 NN-AUD-284, FIMR-011
+  NN-AUD-285, FIMR-014 NN-AUD-288, FIMR-012 NN-AUD-286, FIMR-013
+  NN-AUD-287; lab PR 173). The FIM rules' package carve-out (review 49: a
+  write by dpkg, rpm, dnf or their children recorded at Low, not killed)
+  counted `mandb` as a package manager. `mandb` is not set-id, so any user
+  runs it with `LD_PRELOAD` and has it fork `crontab`: that user's crontab
+  install was Log + Low instead of NN-L-FIM-007's High + KillProcess. The
+  carve-out, and the drain's rate limiter, which paces only a package
+  transaction's drift, now trust the package managers proper
+  (`PACKAGE_MANAGER_EXES`: the list without `mandb`; the executable the
+  kernel ran, never `comm`) during their transaction only: the nearest one
+  in the writer's lineage runs now as the process the cache recorded, or
+  was last seen running (by a lineage walk; there is no exit feed) at most
+  30 s before the write, or — a short `dpkg -i` never seen running — was
+  executed at most 60 s before it. A process a finished transaction left
+  behind is judged like any other. The posture's triggers keep the wider
+  list (`mandb` rebuilds its caches in bulk). NN-L-FIM-007 coalesced every
+  cron write of one process in one cron directory for 2 s, so a second
+  drop-in drew no verdict: it now coalesces one edit, told by the file.
+  The FIM event carries the inode of the file it is about (`file_key`,
+  with `is_dir` for a watched directory's own event and `moved_in` for a
+  child renamed into one; optional on the wire, absent from rows written
+  before), a temporary file renamed into place keeps its inode, and two
+  drop-ins are two verdicts whatever their names; `crontab -e` stays one
+  verdict in each order the drain can read its files. A file entry of the
+  cron list matches only itself: `/etc/crontab.bak` no longer fires as
+  `/etc/crontab`. NN-L-FIM-011..014 fire on a cloud credential file
+  replaced by a rename over it, truncated by path, chmod'ed or chown'ed
+  (`Modified`, `AttrChanged`), not only on an open; the cloud's own CLI
+  stays exempt. NN-L-FIM-010 matches the ransomware extensions in any case
+  (`.LOCKED`, `.Crypted`). **Regressions:** a write by a maintainer
+  script's descendant more than 30 s after its package manager was last
+  seen running (more than 60 s after its exec if never seen) gets the
+  rule's full verdict; an editor that saves a new inode at each save
+  within 2 s gives one NN-L-FIM-007 verdict per inode; an in-place edit of
+  a watched cloud credential file by another program gives two High
+  verdicts (the open, then the change).
 - External audit, Wave 3, posture corroboration (Low POS-008 NN-AUD-305,
   POS-006 NN-AUD-303, POS-007 NN-AUD-304; Informational POS-013
   NN-AUD-430; lab PR 172). The COMBAT corroboration ledger kept one FIFO

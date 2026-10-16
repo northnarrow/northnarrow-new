@@ -39,10 +39,10 @@
 //! the whitelist exempts well-known signed-update tools by
 //! comm.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-use common::wire::{FimEvent, FimOp};
+use common::wire::{FimEvent, FimOp, InodeKey};
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
@@ -630,37 +630,75 @@ const CRON_DEDUP_WINDOW_NS: u64 = 2_000_000_000;
 
 /// Normalize a cron path to its dedup *bucket* — the [`CRON_DROPIN_PATHS`]
 /// root it falls under, trailing slash trimmed (`/var/spool/cron`,
-/// `/etc/cron.d`, `/etc/crontab`, …). One logical crontab edit is atomic
-/// yet touches THREE distinct paths — the temp file, the
-/// renamed-into-place crontab, and the spool directory itself, e.g.
-/// `/var/spool/cron/crontabs/tmp.AbC12`, `/var/spool/cron/crontabs/root`,
-/// and `/var/spool/cron/crontabs` — all of which share the
-/// `/var/spool/cron/` root. Keying the dedup on the bucket (not the exact
-/// path) collapses the trio to ONE `(pid, /var/spool/cron)` verdict.
-/// Returns `None` for a non-cron path, so this doubles as the rule's
-/// path-match check. The bucket is `&'static str` (it IS the matched
-/// root), so the dedup key never allocates.
+/// `/etc/cron.d`, `/etc/crontab`, …). Returns `None` for a non-cron path,
+/// so this doubles as the rule's path-match check. The bucket is
+/// `&'static str` (it IS the matched root), so the key never allocates.
+///
+/// External audit NN-AUD-288 (FIMR-014): a directory entry (it ends in
+/// `/`) covers what lies below it; a file entry (`/etc/crontab`) only
+/// itself. `/etc/crontab.bak` matched the file's prefix, fired the rule
+/// and shared the real crontab's bucket.
 fn cron_dedup_bucket(path: &str) -> Option<&'static str> {
     CRON_DROPIN_PATHS
         .iter()
         .copied()
-        .find(|root| path.starts_with(root))
+        .find(|root| {
+            if root.ends_with('/') {
+                path.starts_with(root)
+            } else {
+                path == *root
+            }
+        })
         .map(|root| root.strip_suffix('/').unwrap_or(root))
 }
 
-/// FP-4 dedup state for NN-L-FIM-007. A single `crontab -e` (or an
-/// editor's atomic-save of `/etc/crontab`) is atomic yet drives the
-/// kernel FIM hooks several times across the THREE distinct paths of one
-/// logical edit — the temp file, the renamed-into-place crontab, and the
-/// spool directory itself — so the drain emits ~6 `Event::Fim`s for one
-/// persistence event and the rule used to raise ~6 (FP-3: still ~3,
-/// one per path) identical KillProcess verdicts. Keying on the cron
-/// *directory bucket* ([`cron_dedup_bucket`]) rather than the exact path
-/// collapses all of them: the FIRST hit on a `(pid, bucket)` fires;
-/// repeats within [`CRON_DEDUP_WINDOW_NS`] are suppressed. A genuinely
-/// separate event — a distinct cron directory, a distinct pid, or the
-/// same pair after the window — still fires, so two real drop-ins never
-/// coalesce.
+/// External audit NN-AUD-285: the most fires [`CronEditWindow`] remembers
+/// at once. Beyond, the oldest is forgotten: a later event of its edit
+/// fires again (toward detection).
+const CRON_FIRES_MAX: usize = 1024;
+
+/// One NN-L-FIM-007 verdict fired, as [`CronEditWindow`] remembers it.
+#[derive(Debug)]
+struct CronFire {
+    pid: u32,
+    bucket: &'static str,
+    fired_ns: u64,
+    path: String,
+    /// The file it is about: the event's own, or — fired without one —
+    /// the first one a later event names for it.
+    file: Option<InodeKey>,
+    /// A watched directory's own event.
+    dir: bool,
+}
+
+/// FP-4 dedup state for NN-L-FIM-007, keyed on the file (external audit
+/// NN-AUD-285, FIMR-011). A single `crontab -e` (or an editor's atomic save
+/// of `/etc/crontab`) is atomic yet drives the kernel FIM hooks several
+/// times across the THREE distinct paths of one logical edit — the temp
+/// file, the renamed-into-place crontab, and the spool directory itself —
+/// so the drain emits ~6 `Event::Fim`s for one persistence event. Keying
+/// on `(pid, directory bucket)` collapsed them, and with them every other
+/// drop-in the same process wrote within the window: a second
+/// `/etc/cron.d/job-b` drew no verdict. The edit is now told by the file
+/// ([`FimEvent::file_key`]): the temporary file renamed into place keeps
+/// its inode, two drop-ins are two inodes, whatever their names.
+///
+/// Within [`CRON_DEDUP_WINDOW_NS`] of a fire for the same `(pid, bucket)`:
+/// - an event naming a file already fired for is part of that edit;
+/// - a watched directory's own event ([`FimEvent::is_dir`]) is part of the
+///   edit that changed it;
+/// - an event naming a new file is part of an edit fired without one when
+///   it is on that fire's path, or when the file was moved in
+///   ([`FimEvent::moved_in`]: the drain could not read the temporary file
+///   before it was renamed on);
+/// - an event whose file the drain could not tell is part of an edit on
+///   the same path, or, moved in, of any edit (the rename had not landed
+///   when the drain looked);
+/// - anything else fires: a new file created under a new name, by the same
+///   process, is a new drop-in.
+///
+/// The window is anchored on the FIRE (a suppressed repeat does NOT extend
+/// it), so a sustained drip still surfaces roughly every window.
 ///
 /// Stateful-rule precedent: mirrors NN-L-NET-005's
 /// [`DnsBurstWindow`](crate::decision::rules::net::DnsBurstWindow) —
@@ -669,10 +707,7 @@ fn cron_dedup_bucket(path: &str) -> Option<&'static str> {
 /// of the event + its own state).
 #[derive(Debug, Default)]
 pub struct CronEditWindow {
-    /// `(modifier_pid, cron-directory bucket)` → ns of the last verdict
-    /// we FIRED for it. The bucket is a `&'static str` from
-    /// [`CRON_DROPIN_PATHS`], so the key never allocates.
-    last_fired: HashMap<(u32, &'static str), u64>,
+    fires: VecDeque<CronFire>,
 }
 
 impl CronEditWindow {
@@ -680,27 +715,55 @@ impl CronEditWindow {
         Self::default()
     }
 
-    /// Record a cron-path hit for `(pid, bucket)` at `ts_ns` and report
-    /// whether NN-L-FIM-007 should FIRE for it. `true` for the first hit
-    /// on a pair (and the first after the window lapses); `false` for a
-    /// repeat inside the window. The window is anchored on the last FIRE
-    /// (a suppressed repeat does NOT extend it), so a sustained drip of
-    /// cron drops still surfaces roughly every [`CRON_DEDUP_WINDOW_NS`]
-    /// rather than being silenced outright. Prunes pairs whose last fire
-    /// has aged past the window on every call, so the map only ever
-    /// holds pairs touched in the last window (cron writes are rare — in
-    /// steady state it is empty).
-    pub fn observe(&mut self, pid: u32, bucket: &'static str, ts_ns: u64) -> bool {
-        // Drop pairs whose last fire is older than the window. This both
-        // bounds the map AND makes "present after prune ⇒ still within
-        // the window ⇒ suppress" hold, so the check below is a lookup.
-        self.last_fired
-            .retain(|_, &mut last| ts_ns.saturating_sub(last) < CRON_DEDUP_WINDOW_NS);
-        let key = (pid, bucket);
-        if self.last_fired.contains_key(&key) {
+    /// Record the cron event `fe`, in `bucket`, and report whether
+    /// NN-L-FIM-007 should FIRE for it (see [`CronEditWindow`]). Fires
+    /// older than the window are dropped on every call, so in steady state
+    /// (cron writes are rare) the window is empty.
+    pub fn observe(&mut self, fe: &FimEvent, bucket: &'static str) -> bool {
+        let ts_ns = fe.timestamp_ns;
+        self.fires
+            .retain(|f| ts_ns.saturating_sub(f.fired_ns) < CRON_DEDUP_WINDOW_NS);
+        let pid = fe.modifier_pid;
+        let mut same = self
+            .fires
+            .iter_mut()
+            .filter(|f| f.pid == pid && f.bucket == bucket)
+            .peekable();
+        let part_of_an_edit = if same.peek().is_none() {
+            false
+        } else if fe.is_dir {
+            true
+        } else if let Some(file) = fe.file_key {
+            let mut fires: Vec<&mut CronFire> = same.collect();
+            if fires.iter().any(|f| f.file == Some(file)) {
+                true
+            } else if let Some(open) = fires
+                .iter_mut()
+                .find(|f| !f.dir && f.file.is_none() && (f.path == fe.path || fe.moved_in))
+            {
+                open.file = Some(file);
+                true
+            } else {
+                false
+            }
+        } else {
+            let moved_in = fe.moved_in;
+            same.any(|f| moved_in || f.path == fe.path)
+        };
+        if part_of_an_edit {
             return false;
         }
-        self.last_fired.insert(key, ts_ns);
+        if self.fires.len() >= CRON_FIRES_MAX {
+            self.fires.pop_front();
+        }
+        self.fires.push_back(CronFire {
+            pid,
+            bucket,
+            fired_ns: ts_ns,
+            path: fe.path.clone(),
+            file: fe.file_key,
+            dir: fe.is_dir,
+        });
         true
     }
 }
@@ -708,15 +771,15 @@ impl CronEditWindow {
 /// `Created` op against any of the cron drop-in roots. High
 /// severity — MITRE T1053.003 (Cron) is the canonical
 /// scheduled-task persistence vector. Includes
-/// `/etc/crontab` as an exact-match path (it's a file, not
-/// a dir, so the `starts_with` check works both ways).
+/// `/etc/crontab` as an exact-match path (NN-AUD-288: equality, not a
+/// prefix).
 ///
 /// FP-3 dedup: a single logical crontab edit drives the FIM hooks
-/// several times (create + writes + setattr) on one `(pid, path)`,
-/// which previously raised ~6 identical KillProcess verdicts. The rule
-/// now holds a [`CronEditWindow`] and fires ONCE per
-/// `(modifier_pid, path)` per [`CRON_DEDUP_WINDOW_NS`]; distinct paths /
-/// pids, and the same pair after the window, still fire.
+/// several times (create + writes + setattr), which previously raised ~6
+/// identical KillProcess verdicts. The rule holds a [`CronEditWindow`] and
+/// fires ONCE per edit — per file, NN-AUD-285 — within
+/// [`CRON_DEDUP_WINDOW_NS`]; distinct files, pids and cron directories,
+/// and the same file after the window, still fire.
 pub struct NnLFim007CronDropInCreated {
     dedup: Arc<Mutex<CronEditWindow>>,
 }
@@ -757,15 +820,10 @@ impl Rule for NnLFim007CronDropInCreated {
         // FP-4: collapse the multi-FIM-op burst of ONE logical edit into a
         // single verdict. A crontab install is atomic but touches three
         // distinct paths — temp file, renamed-into-place crontab, and the
-        // spool directory — all sharing one cron-directory bucket, so we
-        // key on (modifier_pid, bucket): repeats within the window are
-        // suppressed; a distinct cron dir / pid, or the same pair after
-        // the window, still fires.
-        if !self
-            .dedup
-            .lock()
-            .observe(fe.modifier_pid, bucket, fe.timestamp_ns)
-        {
+        // spool directory. NN-AUD-285: one edit is one file (the temporary
+        // file renamed into place keeps its inode); a second drop-in by the
+        // same process is a second file and fires.
+        if !self.dedup.lock().observe(fe, bucket) {
             return None;
         }
         Some(fim_verdict(
@@ -935,6 +993,17 @@ const RANSOMWARE_EXTENSIONS: &[&str] = &[
     ".blackcat", // ALPHV/BlackCat
 ];
 
+/// One of the [`RANSOMWARE_EXTENSIONS`] ends `path`, in any case. External
+/// audit NN-AUD-287 (FIMR-013): the list is lowercase, and `.LOCKED` or
+/// `.Crypted` went unmatched. Compared on bytes: the extensions are ASCII.
+fn has_ransomware_extension(path: &str) -> bool {
+    let path = path.as_bytes();
+    RANSOMWARE_EXTENSIONS.iter().any(|ext| {
+        path.len() >= ext.len()
+            && path[path.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
+    })
+}
+
 /// Ransomware extension rename per legacy M14.4 NN-L-FIM-001,
 /// restored into the C5 architecture as NN-L-FIM-010.
 ///
@@ -982,11 +1051,8 @@ impl Rule for NnLFim010RansomwareExtensionRename {
         let dest_match = fe
             .dest_path
             .as_deref()
-            .map(|d| RANSOMWARE_EXTENSIONS.iter().any(|ext| d.ends_with(ext)))
-            .unwrap_or(false);
-        let src_match = RANSOMWARE_EXTENSIONS
-            .iter()
-            .any(|ext| fe.path.ends_with(ext));
+            .is_some_and(has_ransomware_extension);
+        let src_match = has_ransomware_extension(&fe.path);
         if !dest_match && !src_match {
             return None;
         }
@@ -1032,9 +1098,17 @@ const GCP_CLIENTS: &[&str] = &["gcloud", "gsutil", "bq"];
 const DOCKER_CLIENTS: &[&str] = &["docker", "dockerd", "containerd"];
 
 /// Common shape for the 4 cred-read rules — every rule
-/// follows the same `FimOp::Opened` + path-fragment +
-/// CLI-comm-exempt pattern. Extracted into a single helper so
+/// follows the same op + path-fragment pattern, the cloud's own CLI
+/// exempted by [`OwnClient`]. Extracted into a single helper so
 /// each rule body stays a 1-line config block.
+///
+/// External audit NN-AUD-286 (FIMR-012): an open of the file (a read, or
+/// a write in place: a write-open always reports `Opened`), and also a
+/// change that never opens it — the file replaced by a rename over it
+/// (`mv new ~/.aws/credentials`, reported as `Modified`), a truncate by
+/// path (`Modified`), a chmod or chown (`AttrChanged`). Those drew no
+/// verdict: swapping in an attacker's credentials, or opening the file to
+/// every user, went unremarked.
 fn evaluate_cred_read(
     rule: &dyn Rule,
     event: &Event,
@@ -1042,7 +1116,7 @@ fn evaluate_cred_read(
     reasoning: &str,
 ) -> Option<Verdict> {
     let fe = as_fim(event)?;
-    if fe.op != FimOp::Opened {
+    if !matches!(fe.op, FimOp::Opened | FimOp::Modified | FimOp::AttrChanged) {
         return None;
     }
     if !path_fragments.iter().any(|f| fe.path.contains(f)) {
@@ -1050,6 +1124,17 @@ fn evaluate_cred_read(
     }
     // Review 85: the cloud's own CLI is exempted by [`OwnClient`], which
     // reads what the kernel executed; this rule fires for every reader.
+    let changed;
+    let reasoning = if fe.op == FimOp::Opened {
+        reasoning
+    } else {
+        changed = format!(
+            "{reasoning} [the file was changed without being opened ({:?}): replaced by a \
+             rename over it, truncated, or its mode or owner changed]",
+            fe.op
+        );
+        changed.as_str()
+    };
     Some(fim_verdict(
         rule,
         fe,
@@ -2071,10 +2156,17 @@ impl Rule for NnLFim025FileCapabilityGranted {
 /// package behind, and it would break every unattended upgrade.
 ///
 /// When the writer is, or descends from, a package manager in
-/// [`crate::posture::lineage::SYSTEM_DAEMON_EXES`] (kernel-resolved exe,
-/// never `comm`), a destructive verdict of the wrapped rule becomes
-/// `Log` + `Low`. Rule id, category and reasoning are kept, so the write
-/// stays in the signed detection chain.
+/// [`crate::posture::lineage::PACKAGE_MANAGER_EXES`] (kernel-resolved exe,
+/// never `comm`) whose run covers the write, a destructive verdict of the
+/// wrapped rule becomes `Log` + `Low`. Rule id, category and reasoning are
+/// kept, so the write stays in the signed detection chain.
+///
+/// External audit NN-AUD-284 (FIMR-010): `mandb` is not on that list (any
+/// user runs it, and with `LD_PRELOAD` has it fork a `crontab`), and the
+/// exemption ends with the transaction: the package manager runs, or ran
+/// until shortly before the write
+/// ([`AuthSessionTracker::is_package_transaction_write`]). A process a
+/// finished transaction left behind gets the rule's verdict.
 ///
 /// Trust boundary: root can always install a malicious package through
 /// the real package manager, and that path is now logged instead of
@@ -2110,7 +2202,10 @@ impl Rule for PackageManaged {
         let Event::Fim(fe) = event else {
             return Some(verdict);
         };
-        if !self.lineage.is_system_daemon_mediated(fe.modifier_pid) {
+        if !self
+            .lineage
+            .is_package_transaction_write(fe.modifier_pid, fe.timestamp_ns)
+        {
             return Some(verdict);
         }
         Some(Verdict {
@@ -2451,6 +2546,7 @@ pub fn fim_rules_with_lineage(
 mod tests {
     use super::*;
     use common::wire::FimEvent;
+    use std::collections::HashMap;
 
     fn fim_event(op: FimOp, path: &str) -> Event {
         Event::Fim(FimEvent {
@@ -2472,6 +2568,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         })
     }
 
@@ -2505,6 +2604,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         })
     }
 
@@ -2531,6 +2633,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         })
     }
 
@@ -3195,53 +3300,222 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         })
+    }
+
+    /// A cron event as the drain reports it: the file it is about
+    /// (NN-AUD-285: `file`, an inode; `None` when the drain could not tell
+    /// it), whether the child was moved in, and whether the event is the
+    /// watched directory's own.
+    fn cron_file_event(
+        op: FimOp,
+        path: &str,
+        pid: u32,
+        ts_ns: u64,
+        file: Option<u64>,
+        moved_in: bool,
+        is_dir: bool,
+    ) -> Event {
+        let Event::Fim(mut fe) = cron_event(op, path, pid, ts_ns) else {
+            unreachable!()
+        };
+        fe.file_key = file.map(|ino| InodeKey { dev: 8, ino });
+        fe.moved_in = moved_in;
+        fe.is_dir = is_dir;
+        Event::Fim(fe)
     }
 
     /// FP-4: a single `crontab -e` install is atomic but fans out into
     /// several FIM ops across THREE distinct paths within milliseconds —
     /// the temp file, the renamed-into-place crontab, and the spool
-    /// directory itself. The per-path dedup (FP-3) collapsed each path's
-    /// own repeats but still emitted one verdict per path (~3); keying on
-    /// the cron-directory bucket must collapse the whole burst into
-    /// exactly ONE verdict.
+    /// directory itself — and must yield exactly ONE verdict. NN-AUD-285:
+    /// the temp file and the crontab are one inode (a rename keeps it), the
+    /// directory's own events are the directory's. The hooks fire before
+    /// the operation, so the drain may not see the temporary file yet, or
+    /// see it no more, or look at the final name before the rename lands:
+    /// each of those orders is still one verdict.
     #[test]
     fn fim007_dedups_single_edit_burst_into_one_verdict() {
-        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        const T: u64 = 0x7e; // the temporary file's inode, renamed into place
+        const D: u64 = 0xd1; // the spool directory
+        const OLD: u64 = 0x01d; // the crontab it replaces
         let pid = 909;
         let base = 1_700_000_000_000_000_000u64;
-        // The op-sequence of one `crontab -e` install: write a temp file,
-        // rename it into place (the drain normalizes the rename target to
-        // Created), and the spool directory gets a setattr — three
-        // DISTINCT paths, same pid, all a few ms apart, one logical edit.
         let tmp = "/var/spool/cron/crontabs/tmp.AbC123";
         let final_ = "/var/spool/cron/crontabs/root";
         let dir = "/var/spool/cron/crontabs";
-        let burst = [
-            (FimOp::Created, tmp, base),                 // mkstemp
-            (FimOp::Modified, tmp, base + 1_000_000),    // +1 ms write content
-            (FimOp::Created, final_, base + 5_000_000),  // +5 ms rename → final
-            (FimOp::Modified, dir, base + 5_000_000),    // +5 ms dir entry changed
-            (FimOp::Modified, final_, base + 8_000_000), // +8 ms setattr on final
-            (FimOp::Modified, dir, base + 10_000_000),   // +10 ms dir setattr
+        type Op = (FimOp, &'static str, u64, Option<u64>, bool, bool);
+        let orders: &[(&str, &[Op])] = &[
+            (
+                "every file read in time",
+                &[
+                    (FimOp::Created, tmp, 0, Some(T), false, false), // mkstemp
+                    (FimOp::Modified, tmp, 1, Some(T), false, false), // content
+                    (FimOp::Created, final_, 5, Some(T), true, false), // rename
+                    (FimOp::Modified, dir, 5, Some(D), false, true), // dir entry
+                    (FimOp::Modified, final_, 8, Some(T), false, false), // setattr
+                    (FimOp::Modified, dir, 10, Some(D), false, true), // dir setattr
+                ],
+            ),
+            (
+                "temporary file not created yet when read",
+                &[
+                    (FimOp::Created, tmp, 0, None, false, false),
+                    (FimOp::Modified, tmp, 1, Some(T), false, false),
+                    (FimOp::Created, final_, 5, Some(T), true, false),
+                    (FimOp::Modified, dir, 10, Some(D), false, true),
+                ],
+            ),
+            (
+                "temporary file already renamed when read",
+                &[
+                    (FimOp::Created, tmp, 0, None, false, false),
+                    (FimOp::Created, final_, 5, Some(T), true, false),
+                    (FimOp::Modified, final_, 6, Some(T), false, false), // replacement
+                    (FimOp::Modified, dir, 10, Some(D), false, true),
+                ],
+            ),
+            (
+                "final name read before the rename landed",
+                &[
+                    (FimOp::Created, tmp, 0, Some(T), false, false),
+                    (FimOp::Created, final_, 5, None, true, false),
+                    (FimOp::Modified, final_, 7, Some(T), false, false), // replacement
+                    (FimOp::Modified, dir, 10, Some(D), false, true),
+                ],
+            ),
+            (
+                "an in-place edit of an existing crontab",
+                &[
+                    (FimOp::Modified, final_, 0, Some(OLD), false, false),
+                    (FimOp::Modified, final_, 3, Some(OLD), false, false),
+                    (FimOp::Modified, dir, 4, Some(D), false, true),
+                ],
+            ),
         ];
-        let fired = burst
-            .iter()
-            .filter(|(op, path, ts)| r.evaluate(&cron_event(*op, path, pid, *ts)).is_some())
-            .count();
-        assert_eq!(
-            fired, 1,
-            "one logical edit (6 FIM ops across 3 paths in one cron dir) \
-             must yield exactly ONE verdict"
-        );
+        for (order, burst) in orders {
+            let r = NnLFim007CronDropInCreated::with_fresh_window();
+            let fired = burst
+                .iter()
+                .filter(|(op, path, ms, file, moved_in, is_dir)| {
+                    r.evaluate(&cron_file_event(
+                        *op,
+                        path,
+                        pid,
+                        base + ms * 1_000_000,
+                        *file,
+                        *moved_in,
+                        *is_dir,
+                    ))
+                    .is_some()
+                })
+                .count();
+            assert_eq!(fired, 1, "{order}: one logical edit, ONE verdict");
+        }
     }
 
-    /// The dedup key is now `(pid, cron-directory bucket)`, not
-    /// `(pid, exact path)`: one logical edit touches several paths in ONE
-    /// cron dir, so same-dir / same-pid hits inside the window coalesce.
-    /// But genuinely distinct persistence events are never swallowed: a
-    /// DIFFERENT cron directory, a DIFFERENT pid, and a re-edit of the same
-    /// dir AFTER the window all still fire.
+    /// External audit NN-AUD-285 (FIMR-011): two drop-ins written by one
+    /// process within the window are two files, two verdicts — with their
+    /// content writes, and whether or not the drain read each file when it
+    /// was created. On `main` the second was coalesced into the first.
+    #[test]
+    fn fim007_two_distinct_dropins_fire_twice() {
+        let base = 1_700_000_000_000_000_000u64;
+        let a = "/etc/cron.d/job-a";
+        let b = "/etc/cron.d/job-b";
+        type Op = (FimOp, &'static str, u64, Option<u64>);
+        let orders: &[&[Op]] = &[
+            &[
+                (FimOp::Created, a, 0, Some(0xa)),
+                (FimOp::Modified, a, 1, Some(0xa)),
+                (FimOp::Created, b, 2, Some(0xb)),
+                (FimOp::Modified, b, 3, Some(0xb)),
+            ],
+            &[
+                (FimOp::Created, a, 0, None),
+                (FimOp::Created, b, 1, None),
+                (FimOp::Modified, a, 2, Some(0xa)),
+                (FimOp::Modified, b, 3, Some(0xb)),
+            ],
+            &[
+                (FimOp::Created, a, 0, None),
+                (FimOp::Created, b, 1, Some(0xb)),
+            ],
+        ];
+        for burst in orders {
+            let r = NnLFim007CronDropInCreated::with_fresh_window();
+            let fired: Vec<String> = burst
+                .iter()
+                .filter_map(|(op, path, ms, file)| {
+                    r.evaluate(&cron_file_event(
+                        *op,
+                        path,
+                        5,
+                        base + ms * 1_000_000,
+                        *file,
+                        false,
+                        false,
+                    ))
+                })
+                .map(|v| v.event_filename)
+                .collect();
+            assert_eq!(fired, [a, b], "{burst:?}");
+        }
+    }
+
+    /// NN-AUD-285: names do not matter — two drop-ins named like a
+    /// temporary file (`tmp.*`) are still two files, and fire twice.
+    #[test]
+    fn fim007_tmp_named_dropins_fire_twice() {
+        let base = 1_700_000_000_000_000_000u64;
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        let fired = [("/etc/cron.d/tmp.1", 0x11), ("/etc/cron.d/tmp.2", 0x12)]
+            .iter()
+            .enumerate()
+            .filter(|(i, (path, ino))| {
+                r.evaluate(&cron_file_event(
+                    FimOp::Created,
+                    path,
+                    5,
+                    base + *i as u64 * 1_000_000,
+                    Some(*ino),
+                    false,
+                    false,
+                ))
+                .is_some()
+            })
+            .count();
+        assert_eq!(fired, 2);
+    }
+
+    /// NN-AUD-288 (FIMR-014): a directory entry covers what lies below it,
+    /// the `/etc/crontab` file entry only itself.
+    #[test]
+    fn cron_bucket_separates_file_and_dir_entries() {
+        assert_eq!(cron_dedup_bucket("/etc/crontab.bak"), None);
+        assert_eq!(cron_dedup_bucket("/etc/crontabs/x"), None);
+        assert_eq!(cron_dedup_bucket("/etc/crontab"), Some("/etc/crontab"));
+        assert_eq!(cron_dedup_bucket("/etc/cron.d/job"), Some("/etc/cron.d"));
+        assert_eq!(
+            cron_dedup_bucket("/var/spool/cron/crontabs/root"),
+            Some("/var/spool/cron")
+        );
+        let r = NnLFim007CronDropInCreated::with_fresh_window();
+        assert!(r
+            .evaluate(&fim_event(FimOp::Created, "/etc/crontab.bak"))
+            .is_none());
+        assert!(r
+            .evaluate(&fim_event(FimOp::Modified, "/etc/crontab"))
+            .is_some());
+    }
+
+    /// Genuinely distinct persistence events are never swallowed: a
+    /// second drop-in (NN-AUD-285), a DIFFERENT cron directory, a DIFFERENT
+    /// pid, and a re-edit of the same file AFTER the window all still fire;
+    /// a repeat on the same file inside the window does not.
     #[test]
     fn fim007_distinct_dirs_pids_and_post_window_edits_still_fire() {
         let r = NnLFim007CronDropInCreated::with_fresh_window();
@@ -3252,10 +3526,9 @@ mod tests {
                 .is_some(),
             "first distinct drop-in must fire"
         );
-        // A SECOND file in the SAME cron dir by the SAME pid within the
-        // window is part of one logical edit (temp + final + dir all share
-        // a directory) → coalesced. The KillProcess verdict already targets
-        // pid 5, so the shared actor is still neutralized.
+        // NN-AUD-285: a SECOND file in the SAME cron dir by the SAME pid
+        // within the window is a second drop-in, not part of the first
+        // edit (the drain could tell neither file here) → fires.
         assert!(
             r.evaluate(&cron_event(
                 FimOp::Created,
@@ -3263,8 +3536,8 @@ mod tests {
                 5,
                 base + 5_000_000
             ))
-            .is_none(),
-            "a second path in the same cron dir + pid + window must coalesce"
+            .is_some(),
+            "a second drop-in in the same cron dir + pid + window must fire"
         );
         // A DISTINCT cron directory (same pid + instant) → distinct key → fires.
         assert!(
@@ -3283,7 +3556,7 @@ mod tests {
                 .is_some(),
             "the same cron dir touched by a different pid is a distinct event — must fire"
         );
-        // A repeat on /etc/cron.d by pid 5 still inside the window → suppressed.
+        // A repeat on the same file by pid 5 still inside the window → suppressed.
         assert!(
             r.evaluate(&cron_event(
                 FimOp::Modified,
@@ -3292,7 +3565,7 @@ mod tests {
                 base + 100_000_000 // +100 ms
             ))
             .is_none(),
-            "a repeat on the same (pid, cron dir) inside the window must be suppressed"
+            "a repeat on the same file by the same pid inside the window must be suppressed"
         );
         // …and after the 2 s window lapses → fires again (a real 2nd edit).
         assert!(
@@ -3499,6 +3772,35 @@ mod tests {
         }
     }
 
+    /// External audit NN-AUD-287 (FIMR-013): the extension matches in any
+    /// case, on the source and on the destination.
+    #[test]
+    fn fim010_matches_extension_case_insensitively() {
+        let r = NnLFim010RansomwareExtensionRename;
+        for path in [
+            "/etc/foo.conf.LOCKED",
+            "/etc/foo.conf.Crypted",
+            "/usr/bin/sshd.LockBit",
+        ] {
+            let v = r
+                .evaluate(&fim_event(FimOp::Renamed, path))
+                .unwrap_or_else(|| panic!("expected fire on {path}"));
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
+        }
+        let Event::Fim(mut fe) = fim_event(FimOp::Renamed, "/etc/hosts") else {
+            unreachable!()
+        };
+        fe.dest_path = Some("/etc/hosts.ENCRYPTED".to_string());
+        assert!(r.evaluate(&Event::Fim(fe)).is_some());
+        // The negatives stay negative in any case.
+        for path in ["/run/dbus.LOCK", "/etc/passwd.BAK", "/home/u/LOCKED"] {
+            assert!(
+                r.evaluate(&fim_event(FimOp::Renamed, path)).is_none(),
+                "false positive on {path}"
+            );
+        }
+    }
+
     #[test]
     fn fim010_does_not_fire_on_legitimate_lock_or_temp_extensions() {
         let r = NnLFim010RansomwareExtensionRename;
@@ -3657,6 +3959,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         })
     }
 
@@ -3726,13 +4031,13 @@ mod tests {
     }
 
     #[test]
-    fn fim011_does_not_fire_on_non_opened_op_or_non_aws_path() {
+    fn fim011_does_not_fire_on_a_delete_or_non_aws_path() {
         let r = NnLFim011AwsCredsRead;
-        // Modified op of AWS creds is interesting (rare, but
-        // covered by other rules); 011 is Opened-only.
+        // A delete reads nothing and swaps nothing in; NN-AUD-286: a
+        // replacement, a truncate and a chmod do fire (below).
         assert!(r
             .evaluate(&fim_event_with_comm(
-                FimOp::Modified,
+                FimOp::Deleted,
                 "/root/.aws/credentials",
                 "evil"
             ))
@@ -3746,6 +4051,88 @@ mod tests {
                 "evil"
             ))
             .is_none());
+    }
+
+    /// External audit NN-AUD-286 (FIMR-012): the credentials replaced by a
+    /// rename over them (`mv new ~/.aws/credentials`: `Modified`, FIMR-004)
+    /// or truncated by path never open the watched inode, and drew no
+    /// verdict.
+    #[test]
+    fn fim011_fires_on_replaced_credentials() {
+        let v = NnLFim011AwsCredsRead
+            .evaluate(&fim_event_with_comm(
+                FimOp::Modified,
+                "/root/.aws/credentials",
+                "evil",
+            ))
+            .expect("a replacement fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcess, Severity::High)
+        );
+        assert!(
+            v.reasoning
+                .contains("changed without being opened (Modified)"),
+            "{}",
+            v.reasoning
+        );
+        for (rule, path) in [
+            (
+                &NnLFim012AzureCredsRead as &dyn Rule,
+                "/root/.azure/msal_token_cache.json",
+            ),
+            (
+                &NnLFim013GcpCredsRead,
+                "/root/.config/gcloud/credentials.db",
+            ),
+            (&NnLFim014DockerCredsRead, "/root/.docker/config.json"),
+        ] {
+            assert!(
+                rule.evaluate(&fim_event_with_comm(FimOp::Modified, path, "evil"))
+                    .is_some(),
+                "{}: {path}",
+                rule.id()
+            );
+        }
+    }
+
+    /// NN-AUD-286: a chmod or chown of the credentials (`AttrChanged`) —
+    /// `chmod o+r ~/.aws/credentials` hands them to every user.
+    #[test]
+    fn fim011_fires_on_chmod_widening() {
+        let v = NnLFim011AwsCredsRead
+            .evaluate(&fim_event_with_comm(
+                FimOp::AttrChanged,
+                "/home/alice/.aws/credentials",
+                "chmod",
+            ))
+            .expect("a chmod fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// NN-AUD-286: the cloud's own CLI rewriting its credentials (`aws
+    /// configure`) stays exempt, told by what the kernel executed.
+    #[test]
+    fn fim011_own_cli_modify_is_exempt() {
+        let (_tmp, lineage) = exec_fixture(&[
+            (
+                100,
+                "/usr/local/aws-cli/v2/2.17.0/dist/aws",
+                &["aws", "configure"],
+            ),
+            (101, "/usr/bin/python3.12", &["python3", "/tmp/x.py"]),
+        ]);
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-011_AwsCredsRead"];
+        for op in [FimOp::Modified, FimOp::AttrChanged] {
+            assert!(r
+                .evaluate(&written_by(op, "/root/.aws/credentials", 100, "aws"))
+                .is_none());
+            let v = r
+                .evaluate(&written_by(op, "/root/.aws/credentials", 101, "aws"))
+                .expect("python named aws fires");
+            assert_eq!(v.action, ResponseAction::KillProcess);
+        }
     }
 
     // ── NN-L-FIM-012 (Azure) ────────────────────────────────────
@@ -4247,7 +4634,9 @@ mod tests {
     // ── review 49 — package-manager writes are recorded, not killed ──
 
     /// A FIM event written by `pid`, against a lineage tracker whose
-    /// `/proc` is an empty temp dir (only the spawn cache answers).
+    /// `/proc` is a temp dir: the spawn cache answers the lineage, and
+    /// `/proc` shows only the package managers, running (NN-AUD-284: the
+    /// carve-out covers a write while the transaction runs).
     fn pkg_fixture() -> (tempfile::TempDir, AuthSessionTracker) {
         let tmp = tempfile::TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
@@ -4259,7 +4648,20 @@ mod tests {
         // an unrelated root shell (500) → cp (600)
         t.ingest_spawn(500, 1, "/usr/bin/bash", 5);
         t.ingest_spawn(600, 500, "/usr/bin/cp", 6);
+        running_proc(tmp.path(), 100, 1);
+        running_proc(tmp.path(), 200, 100);
         (tmp, t)
+    }
+
+    /// `/proc/<pid>` of a running process (state `S`).
+    fn running_proc(dir: &std::path::Path, pid: u32, ppid: u32) {
+        let pid_dir = dir.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(
+            pid_dir.join("stat"),
+            format!("{pid} (p) S {ppid} {pid} {pid} 0 -1 0\n"),
+        )
+        .unwrap();
     }
 
     fn written_by(op: FimOp, path: &str, pid: u32, comm: &str) -> Event {
@@ -4991,5 +5393,116 @@ mod tests {
         // a root shell with no sudo: stripped.
         let v = r.evaluate(&cap_set("/opt/x", 600, 1 << 7, false)).unwrap();
         assert_eq!(v.action, ResponseAction::StripFileCapability);
+    }
+
+    // ── external audit NN-AUD-284 — the package transaction proper ──
+
+    /// External audit NN-AUD-284 (FIMR-010): `mandb` is no package
+    /// manager. A user's process runs it (not set-id, so `LD_PRELOAD`
+    /// applies) and has it fork `crontab`: on `main` the user's crontab
+    /// install was Log + Low. The posture keeps its wider list.
+    #[test]
+    fn mandb_lineage_does_not_exempt_fim_rules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        // the user's shell (900) → mandb (910) → crontab (920)
+        lineage.ingest_spawn(900, 1, "/usr/bin/bash", 1);
+        lineage.ingest_spawn(910, 900, "/usr/bin/mandb", 2);
+        lineage.ingest_spawn(920, 910, "/usr/bin/crontab", 3);
+        running_proc(tmp.path(), 910, 900);
+        running_proc(tmp.path(), 920, 910);
+        let rules = rules_by_id(&lineage);
+        let mut e = written_by(
+            FimOp::Created,
+            "/var/spool/cron/crontabs/nn",
+            920,
+            "crontab",
+        );
+        if let Event::Fim(fe) = &mut e {
+            fe.modifier_uid = 1000;
+        }
+        let v = rules["NN-L-FIM-007_CronDropInCreated"]
+            .evaluate(&e)
+            .expect("the crontab install fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcess, Severity::High)
+        );
+        assert!(!v.reasoning.contains("package manager"), "{}", v.reasoning);
+        assert!(lineage.is_system_daemon_mediated(920));
+        assert!(!crate::posture::lineage::PACKAGE_MANAGER_EXES.contains(&"/usr/bin/mandb"));
+    }
+
+    /// NN-AUD-284: a process a finished transaction left behind is not
+    /// exempt for good. dpkg (200) found running covers its child's writes;
+    /// once it is gone they are covered for 30 s after it was last seen,
+    /// then the rule's verdict stands.
+    #[test]
+    fn descendant_outliving_the_transaction_is_not_exempt() {
+        let (tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-001_SystemBinaryModified"];
+        let at = |pid: u32, ts_ns: u64| {
+            let mut e = written_by(FimOp::Modified, "/usr/bin/rsync", pid, "sh");
+            if let Event::Fim(fe) = &mut e {
+                fe.timestamp_ns = ts_ns;
+            }
+            e
+        };
+        let t0 = 1_700_000_000_000_000_000u64;
+        let s = 1_000_000_000u64;
+        assert_eq!(
+            r.evaluate(&at(300, t0)).unwrap().action,
+            ResponseAction::Log
+        );
+        // dpkg exits; its child runs on
+        std::fs::remove_dir_all(tmp.path().join("200")).unwrap();
+        assert_eq!(
+            r.evaluate(&at(300, t0 + 20 * s)).unwrap().action,
+            ResponseAction::Log,
+            "within the grace after dpkg was last seen running"
+        );
+        let v = r.evaluate(&at(300, t0 + 120 * s)).unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical),
+            "two minutes after the transaction"
+        );
+        // apt-get (100) still runs, but the nearest package manager is the
+        // finished dpkg: no cover from it.
+        assert!(!lineage.is_package_transaction_write(300, t0 + 120 * s));
+        assert!(lineage.is_package_transaction_write(100, t0 + 120 * s));
+    }
+
+    /// NN-AUD-284: a short `dpkg -i` that exited before any walk found it
+    /// running covers what it and its children wrote within 60 s of its
+    /// exec, not later.
+    #[test]
+    fn short_dpkg_write_within_grace_is_exempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let exec_ns = 1_700_000_000_000_000_000u64;
+        lineage.ingest_spawn(200, 1, "/usr/bin/dpkg", exec_ns);
+        lineage.ingest_spawn(300, 200, "/bin/sh", exec_ns + 1_000);
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-009_SystemdUnitDropped"];
+        let at = |pid: u32, ts_ns: u64| {
+            let mut e = written_by(
+                FimOp::Created,
+                "/usr/lib/systemd/system/x.service",
+                pid,
+                "dpkg",
+            );
+            if let Event::Fim(fe) = &mut e {
+                fe.timestamp_ns = ts_ns;
+            }
+            e
+        };
+        let v = r.evaluate(&at(200, exec_ns + 2_000_000_000)).unwrap();
+        assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
+        let v = r.evaluate(&at(300, exec_ns + 59_000_000_000)).unwrap();
+        assert_eq!(v.action, ResponseAction::Log);
+        let v = r.evaluate(&at(300, exec_ns + 61_000_000_000)).unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcess);
     }
 }
