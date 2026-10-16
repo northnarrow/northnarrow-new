@@ -41,6 +41,9 @@ require_root "real systemd + LSM attach + chattr"
 require_cmd systemctl
 require_cmd bpftool
 require_cmd capsh
+# install.sh refuses a host without nft (the per-process outbound block,
+# lab PR 165); said here, before step 1 stops anything.
+command -v nft >/dev/null 2>&1 || die "nft not found — install nftables first (apt-get install nftables)"
 [ -d "$NN_REPO_DIR" ] || die "repo not found at $NN_REPO_DIR"
 cd "$NN_REPO_DIR"
 

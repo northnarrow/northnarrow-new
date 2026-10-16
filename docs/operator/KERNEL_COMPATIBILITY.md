@@ -33,7 +33,13 @@ the `BlockOutbound` response and the COMBAT soft egress block of
 INVESTIGATE are nftables rules. The lab's Debian 12 cloud image ships
 without it: there the block fails, the failure is recorded, INVESTIGATE is
 shortened to 10 s, and `nn-admin host-check` reports the host (external
-audit CMB-014, lab PR 119). Install the `nftables` package on such hosts.
+audit CMB-014, lab PR 119). Since lab PR 165 the install paths ask for it:
+the packages depend on `nftables`, `install.sh` refuses a host without
+`nft` unless `--without-nftables` (recorded in the install manifest), and
+the agent records a signed `subsystem_degraded` at boot when `nft` is not
+on its `PATH` ("block_outbound unavailable: nft missing"). The lab guests
+install it. See the Prerequisites of
+[`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md).
 
 **Not verified: kernels from 6.9.** Every lab guest runs 6.8 or older.
 See "Kernels from 6.9: `inode_setattr`" below before deploying on a newer

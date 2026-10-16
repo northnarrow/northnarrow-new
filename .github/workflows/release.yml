@@ -119,7 +119,9 @@ jobs:
         run: |
           set -e
           deb=$(ls dist/northnarrow_*_amd64.deb) rpm=$(ls dist/northnarrow-*.x86_64.rpm)
-          dpkg-deb --info "$deb" | grep -E "^ (Package|Version|Depends):"
+          dpkg-deb --info "$deb" | grep -E "^ (Package|Version|Pre-Depends|Depends):"
+          # the per-process outbound block needs nft (lab PR 165)
+          dpkg-deb -f "$deb" Pre-Depends | grep -qw nftables
           tmp=$(mktemp -d) && dpkg-deb -x "$deb" "$tmp" && dpkg-deb -e "$deb" "$tmp/DEBIAN"
           for f in usr/bin/northnarrow-agent usr/bin/northnarrow-watchdog usr/bin/nn-admin \
                    usr/lib/systemd/system/northnarrow-agent.service usr/share/northnarrow/deploy/install.sh; do
@@ -133,6 +135,7 @@ jobs:
           for s in preinst postinst prerm postrm; do sh -n "$tmp/DEBIAN/$s"; done
           rpm -qpi "$rpm" | grep -E "^(Name|Version|Release)"
           rpm -qpR "$rpm" | grep -qx 'glibc >= 2.34'
+          rpm -qpR "$rpm" | grep -qx nftables
           test "$(rpm -qp --scripts "$rpm" | grep -c 'scriptlet (using /bin/sh)')" = 4
           "$tmp/usr/bin/northnarrow-agent" --version
 

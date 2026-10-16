@@ -103,6 +103,11 @@ VERIFY_OVERRIDE=""
 TARBALL=""
 SUMS=""
 ATTEST_BUNDLE=""
+# Lab follow-up (lab PR 165): a host without nftables is refused unless
+# --without-nftables; the flag is recorded in the install manifest
+# (prerequisite_overrides) and reported by `nn-admin host-check`.
+WITHOUT_NFT=0
+PREREQ_OVERRIDES=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
@@ -117,9 +122,10 @@ while [[ $# -gt 0 ]]; do
         --source-tree) SOURCE_TREE=1 ;;
         --allow-manifest-only) ALLOW_MANIFEST_ONLY=1 ;;
         --no-verify) VERIFY=0 ;;
+        --without-nftables) WITHOUT_NFT=1 ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade] [--tarball FILE] [--sums FILE] [--attestation BUNDLE] [--require-attestation]"
-            echo "                 [--source-tree | --allow-manifest-only | --no-verify]"
+            echo "                 [--source-tree | --allow-manifest-only | --no-verify] [--without-nftables]"
             echo "  --upgrade              stop the running units, replace binaries/units/configs, restart them"
             echo "  --grant-key KEY        admin key with the trusted-installer role (opens the window an upgrade needs)"
             echo "  --admin-key-out PATH   fresh install: where to write the bootstrap admin PRIVATE key"
@@ -135,6 +141,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-verify            skip every release check (dev only; recorded as 'unverified')"
             echo "  The flag that accepted a level below 'checksums' is recorded in the install manifest"
             echo "  and reported by nn-admin host-check."
+            echo "  --without-nftables     install on a host without nft (nftables): the agent's per-process"
+            echo "                         outbound block then cannot work (recorded in the install manifest)"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -377,6 +385,7 @@ write_install_manifest() {
   "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "provenance": "$PROVENANCE",
   "verify_override": $([[ -n "$VERIFY_OVERRIDE" ]] && echo "\"$VERIFY_OVERRIDE\"" || echo null),
+  "prerequisite_overrides": $(prereq_overrides_json),
   "bin_dir": "$BIN_DIR",
   "files": {
     "northnarrow-agent": "$sha_agent",
@@ -391,6 +400,69 @@ EOT
     install -m 0644 -o root -g root "$tmp" "$manifest"
     rm -f "$tmp"
     echo "install.sh: install manifest written to $manifest (provenance: $PROVENANCE)"
+}
+
+# The flags that accepted a missing prerequisite, as a JSON array.
+prereq_overrides_json() {
+    local out="" o
+    for o in ${PREREQ_OVERRIDES[@]+"${PREREQ_OVERRIDES[@]}"}; do
+        out+="${out:+, }\"$o\""
+    done
+    echo "[$out]"
+}
+
+# Lab follow-up (lab PR 165): the agent's per-process outbound block (a
+# BlockOutbound verdict, the COMBAT soft egress block during INVESTIGATE) is
+# an nftables rule applied with `nft -f -`. Without `nft` the agent runs but
+# cannot drop an offender's traffic; Debian 12's cloud image ships without
+# it. install.sh installs no system package: it refuses and names the
+# command, or goes on with --without-nftables (recorded). The packages
+# depend on nftables, so in --package-configure a missing `nft` (a forced
+# install) is a warning: a failing post-unpack hook would leave the package
+# half-configured. NFT_DIRS is systemd's default PATH for a service, the
+# one the agent searches.
+NFT_DIRS=${NFT_DIRS:-"/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin"}
+find_nft() {
+    local d
+    for d in $NFT_DIRS; do
+        if [[ -f "$d/nft" && -x "$d/nft" ]]; then
+            echo "$d/nft"
+            return 0
+        fi
+    done
+    return 1
+}
+nft_install_hint() {
+    if command -v apt-get >/dev/null 2>&1; then echo "apt-get install nftables"
+    elif command -v dnf >/dev/null 2>&1; then echo "dnf install nftables"
+    elif command -v yum >/dev/null 2>&1; then echo "yum install nftables"
+    elif command -v zypper >/dev/null 2>&1; then echo "zypper install nftables"
+    else echo "install the distribution's nftables package"
+    fi
+}
+require_nft() {
+    local nft
+    if nft=$(find_nft); then
+        echo "install.sh: nftables present ($nft)"
+        return 0
+    fi
+    if [[ $MODE == configure ]]; then
+        echo "install.sh: WARNING: nft (nftables) not found although the package depends on it (a forced install?):" >&2
+        echo "install.sh: the agent's per-process outbound block will not work — $(nft_install_hint)" >&2
+        return 0
+    fi
+    if (( WITHOUT_NFT )); then
+        PREREQ_OVERRIDES+=("--without-nftables")
+        echo "install.sh: WARNING: --without-nftables — no nft on this host: a BlockOutbound verdict and the COMBAT" >&2
+        echo "install.sh: soft egress block will not drop an offender's traffic (recorded in the install manifest)" >&2
+        return 0
+    fi
+    echo "install.sh: REFUSED — nft (nftables) not found in: $NFT_DIRS" >&2
+    echo "install.sh: the agent's per-process outbound block (a BlockOutbound verdict, the COMBAT soft egress" >&2
+    echo "install.sh: block during INVESTIGATE) is an nftables rule: without nft it cannot contain an offender." >&2
+    echo "install.sh: install it first:  sudo $(nft_install_hint)" >&2
+    echo "install.sh: or re-run with --without-nftables (recorded in the install manifest, reported by nn-admin host-check)." >&2
+    exit 1
 }
 
 require_root() {
@@ -494,6 +566,8 @@ require_dir "$HONEYPOT_BAITS_SRC_DIR" "expected at $HONEYPOT_BAITS_SRC_DIR (Tapp
 for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag agent.legacy.conf shutdown.signal disable.token override.config pause.flag unload.signal; do
     require_file "$HONEYPOT_BAITS_SRC_DIR/$bait" "expected at $HONEYPOT_BAITS_SRC_DIR/$bait (Tappa 9.5.1 control-surface file)"
 done
+# Before anything on the host changes, a running install's stop included.
+require_nft
 fi
 
 # ── install ─────────────────────────────────────────────────────────

@@ -67,7 +67,8 @@ the fixes have their entries in `CHANGELOG.md` `[Unreleased]`.
 ## Follow-ups found in the lab (not audit findings)
 
 Defects and gaps found while fixing and verifying the findings. They are
-not in the report and are not counted above; each is open.
+not in the report and are not counted above; each is open unless its
+entry names the lab PR that fixed it.
 
 - **`inode_setattr` on kernel 6.9 and later.** From 6.9 the LSM hook
   receives `struct mnt_idmap *` as its first argument (`idmap, dentry,
@@ -102,9 +103,13 @@ not in the report and are not counted above; each is open.
   under its parent's name (lab PR 144).
 - **No `nft` on Debian 12.** The lab's Debian 12 cloud image ships without
   `nft`, so `block_outbound` and the COMBAT soft egress block (both
-  nftables) do not work there: the failure is recorded, INVESTIGATE is
+  nftables) did not work there: the failure is recorded, INVESTIGATE is
   shortened to 10 s and `nn-admin host-check` reports the host (lab PR
-  119).
+  119). Fixed in the install chain: the `.deb` pre-depends on and the
+  `.rpm` requires `nftables`, `install.sh` refuses a host without `nft`
+  unless `--without-nftables` (recorded in the install manifest), the
+  agent records a signed `subsystem_degraded` at boot, and the lab guests
+  install it (lab PR 165).
 - **A root dropper with a paused parent.** A root dropper launched from
   `/tmp` whose parent sat in `pause()` drew no R001 verdict in the lab.
   To be verified: the cause is not known yet.
@@ -4944,3 +4949,66 @@ the audit did not report, noted with the fix that takes them.
     only) is marked superseded. `selftest`: 10 adapter cases (a bridged or
     NAT adapter fails, intnet only passes).
   - Lab: Ubuntu 24.04, lab157-probe.sh with this build. LAB-006: the lab build answers `--build-features` with `debug-trigger,test-privileged` (refused by the bootstrap, which accepts only `none`; the shipped `cargo xtask build --release` prints `none`). LAB-016: `tests/repro/t713/run.sh` (as user nn, posture reset first) — scenarios A, B, C PASS, rc 0; with the posture forced to Alerted, scenario A exits 1 ("PRE-FIX BUG REPRODUCED"); run with the posture already Alerted, `run.sh` refuses at its preconditions (rc 1); the first run of the rewritten C found its outdated expectation (COMBAT from a /tmp exec alone), fixed above. LAB-017: btrfs not loaded (Ubuntu ships it as a module) → loaded with the agent stopped, control and btrfs subvolume both draw NN-L-FIM-011, PASS (it used to SKIP with exit 0); `fim-reuse-check` PASS (inode 2960 reused within the 5,000 tries); `tamper-check` OK, no case skipped on this guest. LAB-011: a 6-minute soak with agent and watchdog stopped through a window at 2 minutes → FAIL "agent down (11 consecutive sample(s) without a live agent, down at the end); watchdog missing (11 …)" (the old verdict read pid 0 rows as healthy). LAB-014/LAB-018 need the VirtualBox range: `verify-isolation.sh selftest` 10/10 (bridged, NAT, NAT network, another intnet, a second host-only NIC fail; intnet only passes), `guest` run on a networked host reports FAIL (a route to the public probe address). Gate: Ubuntu 24.04 and Debian 12, 36 suites, 76 passed, 0 failed each; anti-tamper suite OK; host 2112 passed, 0 failed.
+- **Lab follow-ups — nftables, lab PR 165.** The per-process outbound
+  block needs `nft`, and nothing in the install chain asked for it (the
+  follow-up "No `nft` on Debian 12" above).
+  - Packages (`mk-packages.sh`): the `.deb` gets `Pre-Depends: nftables`,
+    the `.rpm` `Requires: nftables`. `Pre-Depends`, not `Depends`: the
+    pre-unpack hook stops the running agent, and a missing `Depends`
+    fails only at configure time, after the unpack — the agent would stay
+    stopped with the package unconfigured. With `Pre-Depends` a bare
+    `dpkg -i` refuses before any hook runs, as `rpm -U` does for a
+    missing `Requires`; `apt-get install ./<deb>` and `dnf install
+    ./<rpm>` pull nftables in. Debian's nftables package neither enables
+    nor starts `nftables.service` (`dh_installsystemd --no-enable
+    --no-start`, checked in the bookworm source) and RHEL's is disabled
+    by preset: the dependency loads no ruleset.
+  - `install.sh`: `require_nft` looks for an executable `nft` in systemd's
+    default service `PATH` (the one the agent searches), at the end of the
+    pre-flight, before the running-install detection — an `--upgrade` is
+    refused before the units are stopped. Without it: REFUSED, with the
+    package manager's command; `--without-nftables` goes on with a
+    WARNING and is recorded in `install-manifest.json` as
+    `prerequisite_overrides` (a list, apart from `verify_override`, which
+    stays the release-verification flag; read back by `InstallManifest`).
+    In `--package-configure` a missing `nft` (a forced install) is a
+    warning: a failing post-unpack hook would leave the package
+    half-configured. The script installs no system package, as before.
+  - Agent: `block_outbound::nft_gap_at_boot` searches the agent's own
+    `PATH` as `Command::new("nft")` does (`/bin:/usr/bin` when unset); a
+    miss is one boot ERROR and one signed `subsystem_degraded`
+    ("block_outbound unavailable: nft missing (…) — a BlockOutbound
+    verdict and the COMBAT soft egress block cannot drop a process's
+    traffic; …"), recorded once the audit log is open, detect-only
+    included. What lab PR 119 added stays: the per-episode `soft egress:
+    <pid> FAILED` in the signed INVESTIGATE record and the 10 s window.
+  - `nn-admin host-check`: the `nft` line stays a WARN. The table has no
+    level above WARN — a missing BPF LSM or lockdown is a WARN too — and
+    its exit status (2) already marks the host; the refusal belongs to the
+    install paths. The line now names `--without-nftables` when the
+    manifest records it, and also searches `/usr/local/{sbin,bin}`.
+  - Lab and range: the three `user-data` templates install `nftables`;
+    `nn-lab.sh up` and `install` install it on a guest provisioned before
+    (`guest_provision_nftables`), `check` prints it; `pkg-check` step D
+    checks the dependency in the built package and stops when the guest
+    has no `nft` (`dpkg -i` / `rpm -U` would refuse every step);
+    `bootstrap-target-prod.sh` stops before step 1 without `nft`. The
+    release workflow's package smoke test checks `Pre-Depends` and
+    `Requires`.
+  - Tests: `a_missing_nft_is_reported_at_boot`,
+    `prerequisite_overrides_are_optional`,
+    `nft_check_names_the_install_override` (agent);
+    `the_packages_depend_on_nftables`,
+    `every_lab_guest_installs_nftables`,
+    `install_sh_refuses_a_host_without_nft_unless_told` (xtask, committed
+    files only) — the three xtask tests fail on the base files, the agent
+    tests do not build there. Shell: `bash -n` on every changed script
+    and a mock harness (11 cases: `require_nft` on its own, then the whole
+    `install.sh` under `unshare -r` with every system path redirected —
+    refused before any `systemctl` call or copy, recorded with the flag,
+    an `--upgrade` refused before the stop, `--package-configure`
+    warning): 11/11 here, 0/11 on the base script. A `.deb` built from a
+    scratch tree with this `mk-packages.sh`: `dpkg -i` on a database
+    without nftables answers "pre-dependency problem - not installing
+    northnarrow", nothing unpacked.
+  - Lab: Debian 12, nftdep165-probe.sh, nftables removed. `main`: `install.sh --upgrade` went through (the agent restarted, `nft` never asked), the `.deb` carried no nftables dependency and `apt-get -s` installed northnarrow alone. This build: `install.sh` refuses, fresh and `--upgrade`, before touching the host (agent pid unchanged, units active); `dpkg -i` refuses with "pre-dependency problem", nothing unpacked; `apt-get -s` pulls nftables in; `--without-nftables` installs, records `prerequisite_overrides: ["--without-nftables"]`, `host-check` names it, and the agent writes one ERROR and one signed `subsystem_degraded` at boot; with nftables installed an upgrade without the flag passes with no degraded row, and a process in `blocked.scope` gets EPERM on 5 of 5 UDP sends and no TCP connect while the control connects. The probe's optional root `cargo test` from `/home` was killed by the agent's R009 (no terminal), as designed: that test runs in the gate. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.

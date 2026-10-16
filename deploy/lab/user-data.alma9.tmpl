@@ -28,6 +28,9 @@ package_update: true
 package_upgrade: false
 packages:
   - iptables-nft
+  # nft: the agent's per-process outbound block; install.sh refuses a host
+  # without it (lab PR 165; Debian 12's cloud image has none)
+  - nftables
   - bpftool
   - gcc
   - make

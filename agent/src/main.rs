@@ -1639,6 +1639,13 @@ async fn main() -> Result<()> {
             "host hardening checks done (nn-admin host-check for the table)"
         );
     }
+    // Lab follow-up (lab PR 165): without `nft` the per-process outbound
+    // block cannot work. Said once here, and in the signed chain once the
+    // audit log is open (below), instead of only at the first block.
+    let nft_gap = northnarrow_agent::response::block_outbound::nft_gap_at_boot();
+    if let Some(gap) = &nft_gap {
+        error!("{gap}");
+    }
     info!(
         own_pid = executor.own_pid(),
         protected = executor.protected().len(),
@@ -2430,6 +2437,11 @@ async fn main() -> Result<()> {
     }
     // External audit NET-009: the JA3 list with no producer (see its load).
     if let Some(gap) = &ja3_gap {
+        attest_degraded(audit_log.as_ref(), gap);
+    }
+    // Lab follow-up (lab PR 165): no `nft` for the outbound block (see its
+    // check).
+    if let Some(gap) = &nft_gap {
         attest_degraded(audit_log.as_ref(), gap);
     }
     if let Some(detail) = &rag_refused {

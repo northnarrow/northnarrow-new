@@ -26,6 +26,24 @@ only with `--source-tree` (section 5.1), e.g.
 The `.deb` / `.rpm` packages wrap the same steps for the package manager:
 see section 6.
 
+**Prerequisites.** The host requirements of the agent itself (BTF, `bpf`
+in the LSM list, bpffs, `iptables-restore`, `/usr/bin/mountpoint`) are in
+[`KERNEL_COMPATIBILITY.md`](KERNEL_COMPATIBILITY.md). One more is checked
+by the install paths (lab PR 165): **nftables** (`nft`). The per-process
+outbound block — a BlockOutbound verdict, the COMBAT soft egress block of
+INVESTIGATE — is an nftables rule, and some cloud images (Debian 12) ship
+without the tool. The packages declare it (section 6). `install.sh` installs
+no system package: without `nft` it refuses before it changes anything —
+an `--upgrade` too, before the units are stopped — and names the command
+(`apt-get install nftables`, `dnf install nftables`). `--without-nftables`
+installs anyway; the flag is recorded in `install-manifest.json`
+(`prerequisite_overrides`) and named by `nn-admin host-check` (§3.1), and
+the agent records a signed `subsystem_degraded` at every boot while `nft`
+is missing ("block_outbound unavailable: nft missing"). Installing
+nftables adds the tool only: Debian's package does not enable or start
+`nftables.service`, RHEL's is disabled by preset, so no ruleset is
+loaded.
+
 Upgrading across the remediation of the external audit of `16f7563`
 (anything newer than `v0.0.1-tappa9.0`)? Read
 [`UPGRADE_NOTES_AUDIT_16f7563.md`](UPGRADE_NOTES_AUDIT_16f7563.md) first:
@@ -155,7 +173,7 @@ missing and how to fix it:
 | IMA | measurements > 0 | a replaced binary fails before it runs (appraise) or is at least measured |
 | kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot; lockdown alone still lets a signed vendor kernel in through `kexec_file_load`, with any command line (one without `bpf` in `lsm=`, for instance). Since review 82 the running agent refuses every kexec image load itself (below); the setting still covers the time before the agent starts |
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
-| nftables | `nft` installed | the COMBAT soft egress block (INVESTIGATE) is an nftables rule: without `nft` the offender is not contained while the agent analyses it — the agent records the failure and shortens INVESTIGATE to 10 s |
+| nftables | `nft` installed (systemd's default service `PATH`, `/usr/local` included) | a BlockOutbound verdict and the COMBAT soft egress block (INVESTIGATE) are nftables rules: without `nft` the offender is not contained while the agent analyses it — the agent records a signed `subsystem_degraded` at boot, and each episode records the failure and shortens INVESTIGATE to 10 s. Reported with `--without-nftables` when the install manifest records it (lab PR 165). A WARN like the other rows: the refusal is the installer's (Prerequisites, above) |
 | Release verified at install | `provenance` `checksums` or `attested` in `install-manifest.json` | only these rest on something outside the installed tree (section 5.1); `manifest`, `source-tree`, `unverified` and `package` are reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
@@ -662,10 +680,19 @@ modes, so every step and every refusal is the one described above.
 
 | Operation | Debian / Ubuntu | RHEL / AlmaLinux | Keeps keys / audit chain / state |
 |---|---|---|---|
-| Install | `sudo dpkg -i northnarrow_<ver>-<rel>_amd64.deb` | `sudo rpm -U northnarrow-<ver>-<rel>.x86_64.rpm` | n/a (bootstraps them) |
+| Install | `sudo apt-get install ./northnarrow_<ver>-<rel>_amd64.deb` (or `dpkg -i` with `nftables` installed) | `sudo dnf install ./northnarrow-<ver>-<rel>.x86_64.rpm` (or `rpm -U` with `nftables` installed) | n/a (bootstraps them) |
 | Upgrade | the same command with the newer package | the same | **yes** |
 | Remove | `sudo dpkg -r northnarrow` | `sudo rpm -e northnarrow` | **yes** |
 | Retire the host | `sudo dpkg -P northnarrow` | `rpm -e`, then `uninstall.sh --package --purge` from the tree | no |
+
+**Dependencies (lab PR 165).** Besides libc and systemd, the packages
+need `nftables` (`nft`, the per-process outbound block). The `.deb`
+declares it as `Pre-Depends`, the `.rpm` as `Requires`: `apt-get` and
+`dnf` install it with the package, while a bare `dpkg -i` or `rpm -U` on a
+host without it refuses before any package script runs — the running
+agent keeps running. A plain `Depends` would only fail after the unpack,
+with the agent already stopped by the pre-unpack hook and the package left
+unconfigured.
 
 A first install starts nothing: enable the units as in section 1. An
 installation made with `install.sh` is migrated when the package is

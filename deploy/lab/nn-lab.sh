@@ -239,6 +239,7 @@ EOF
     whpx_forward
     wait_ssh "${NN_LAB_BOOT_TIMEOUT:-900}"
     guest_provision_bpftool
+    guest_provision_nftables
     cmd_check
 }
 
@@ -331,6 +332,7 @@ cmd_up() {
         -daemonize -pidfile "$PIDFILE"
     wait_ssh "${NN_LAB_BOOT_TIMEOUT:-900}"
     guest_provision_bpftool
+    guest_provision_nftables
     cmd_check
 }
 
@@ -344,6 +346,7 @@ echo "lsm         : $(cat /sys/kernel/security/lsm)"
 grep -q '\bbpf\b' /sys/kernel/security/lsm && echo "bpf-lsm     : OK" || { echo "bpf-lsm     : MISSING"; exit 1; }
 mount | grep -q ' /sys/fs/bpf ' && echo "bpffs       : mounted" || echo "bpffs       : NOT mounted"
 command -v iptables-restore >/dev/null && echo "iptables    : $(iptables --version)" || { echo "iptables    : MISSING"; exit 1; }
+command -v nft >/dev/null && echo "nft         : $(nft --version 2>/dev/null)" || echo "nft         : MISSING (install.sh refuses; nn-lab.sh install provisions it)"
 # `command -v` is not enough: Ubuntu's bpftool is a wrapper that fails
 # without linux-tools-$(uname -r).
 if bv=$(sudo bpftool version 2>/dev/null) && [ -n "$bv" ]; then
@@ -375,6 +378,27 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeou
     || { sudo apt-get update -qq >/dev/null 2>&1 \
          && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$pkg" >/dev/null 2>&1; } \
     || echo "nn-lab: apt-get install $pkg failed" >&2
+exit 0
+REMOTE
+}
+
+# Lab follow-up (lab PR 165): install.sh refuses a host without `nft`. The
+# templates install nftables on a new guest; one provisioned before gets it
+# here (`up`, `install`). To check the refusal itself, remove the package
+# in the guest and run install.sh by hand.
+guest_provision_nftables() {
+    vssh bash -s <<'REMOTE'
+export PATH="$PATH:/usr/sbin:/sbin"
+command -v nft >/dev/null 2>&1 && exit 0
+echo "nn-lab: nft missing — installing nftables" >&2
+if command -v apt-get >/dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=120 nftables >/dev/null 2>&1 \
+        || { sudo apt-get update -qq >/dev/null 2>&1 \
+             && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=120 nftables >/dev/null 2>&1; } \
+        || echo "nn-lab: apt-get install nftables failed" >&2
+else
+    sudo dnf install -y -q nftables >/dev/null 2>&1 || echo "nn-lab: dnf install nftables failed" >&2
+fi
 exit 0
 REMOTE
 }
@@ -622,6 +646,7 @@ cmd_install() {
     # hooks stay attached through the bpffs pins after the agent exits (by
     # design). Purge the operator way: trusted-installer window, stop, rm.
     lab_purge_pins
+    guest_provision_nftables
     # External audit DEP-007: the lab installs its synced source tree (no
     # MANIFEST.sha256), which install.sh now refuses without --source-tree.
     vcargo 'sudo ./deploy/install.sh --source-tree && sudo systemctl daemon-reload && sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog && systemctl --no-pager status northnarrow-agent northnarrow-watchdog | grep -E "Active|Loaded"'
