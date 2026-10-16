@@ -34,6 +34,18 @@ use std::time::{Duration, Instant};
 // no-op. Same idempotency contract as
 // `agent/src/anti_tamper/network_isolate.rs::run_iptables_idempotent`.
 
+/// External audit LLMR-015 (NN-AUD-327, lab PR 168): the agent applies a
+/// `.v1` default list only when it is the copy it was built with, and the
+/// fixtures write their own — empty, or the paths a test watches. They
+/// start the agent with the escape hatch of unsigned configuration, which
+/// applies such a list anyway (an ERROR, a signed `default_list_modified`,
+/// a `weakening_env` finding). `sudo` resets the environment: the fixtures
+/// that start the agent through it pass the variable through `env`
+/// ([`OWN_DEFAULT_LISTS_ASSIGNMENT`]).
+pub const OWN_DEFAULT_LISTS_ENV: (&str, &str) = ("NN_OVERLAY_ALLOW_UNSIGNED", "1");
+/// [`OWN_DEFAULT_LISTS_ENV`] as an `env(1)` argument.
+pub const OWN_DEFAULT_LISTS_ASSIGNMENT: &str = "NN_OVERLAY_ALLOW_UNSIGNED=1";
+
 /// Base chains the agent's `NetworkIsolator` jumps from when it
 /// engages COMBAT (mirrors `network_isolate.rs::release` order
 /// — detach in INPUT/OUTPUT/FORWARD order, then -F, then -X).

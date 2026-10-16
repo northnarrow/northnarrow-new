@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 
-use crate::config::overlay::{load_defaults, DefaultsSource};
+use crate::config::overlay::{load_defaults, DefaultsSource, Shipped};
 use crate::config::overlay_auth::Verified;
 
 /// External audit LLMR-016: the shipped default lists, built in — used
@@ -39,6 +39,32 @@ pub const BUILTIN_NETFLOW_BLOCKLIST_V1: &str =
     include_str!("../../../configs/netflow-blocklist.v1");
 pub const BUILTIN_JA3_BLOCKLIST_V1: &str =
     include_str!("../../../configs/netflow-ja3-blocklist.v1");
+
+/// External audit LLMR-015 (NN-AUD-327): SHA-256 of every
+/// `netflow-blocklist.v1` an earlier release shipped (the history of
+/// `configs/`). The agent applies its built-in copy over one of these, and
+/// `install.sh` (`SHIPPED_V1_EARLIER`, kept equal by a test) replaces it.
+/// The first one still listed `100.64.0.0/10` and `198.18.0.0/15`, which
+/// NET-011 took out of this KillProcessTree list (lab PR 78): a host
+/// installed before that kept killing processes that talk to CGNAT,
+/// Tailscale, EKS or VPN addresses after every upgrade.
+pub const EARLIER_NETFLOW_BLOCKLIST_V1_SHA256: &[&str] = &[
+    // Tappa 10 N8 (562a79d), before NET-011
+    "b50d821782e5ab9d8ab3e27aa7c3dfb3ea0aec87001c16b2eea758d94e8a7866",
+];
+/// As [`EARLIER_NETFLOW_BLOCKLIST_V1_SHA256`], for `netflow-ja3-blocklist.v1`.
+pub const EARLIER_JA3_BLOCKLIST_V1_SHA256: &[&str] = &[
+    // Tappa 10 N8 (562a79d)
+    "0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24",
+];
+/// The shipped `netflow-blocklist.v1` (built-in copy, earlier ones).
+pub const NETFLOW_BLOCKLIST_SHIPPED: Shipped<'static> = Shipped::new(
+    BUILTIN_NETFLOW_BLOCKLIST_V1,
+    EARLIER_NETFLOW_BLOCKLIST_V1_SHA256,
+);
+/// The shipped `netflow-ja3-blocklist.v1` (built-in copy, earlier ones).
+pub const JA3_BLOCKLIST_SHIPPED: Shipped<'static> =
+    Shipped::new(BUILTIN_JA3_BLOCKLIST_V1, EARLIER_JA3_BLOCKLIST_V1_SHA256);
 
 /// Default deploy path for the IP / CIDR blocklist file.
 pub const DEFAULT_NETFLOW_BLOCKLIST_V1: &str = "/etc/northnarrow/netflow-blocklist.v1";
@@ -161,8 +187,9 @@ impl NetBlocklist {
         }
     }
 
-    /// Where the defaults came from: [`DefaultsSource::BuiltIn`] when the
-    /// `.v1` could not be read (the caller records it).
+    /// Where the defaults came from: the `.v1`, or the built-in copy and
+    /// why (unreadable, an earlier release's, edited — the caller records
+    /// the first and the last).
     pub fn defaults(&self) -> &DefaultsSource {
         &self.defaults
     }
@@ -182,19 +209,22 @@ impl NetBlocklist {
         self.entries.iter().any(|e| e.matches(addr))
     }
 
-    /// Production loader. Reads `v1_path` (or, when it cannot be read,
-    /// the built-in copy), applies the `.local` overlay's `+` / `-`
-    /// directives — `local` is the overlay as the signed-overlay gate
-    /// verified it (external audit LLMR-013) — and emits boot-time WARNs
-    /// for disabled defaults + unknown disables (mirrors the Tappa 9 C7
-    /// paths_config WARN pattern so operators see all suppressions).
+    /// Production loader. Takes the shipped defaults — `v1_path` when it
+    /// is the copy built into the agent, else that copy (external audit
+    /// LLMR-016, LLMR-015: [`load_defaults`]) — applies the `.local`
+    /// overlay's `+` / `-` directives — `local` is the overlay as the
+    /// signed-overlay gate verified it (external audit LLMR-013) — and
+    /// emits boot-time WARNs for disabled defaults + unknown disables
+    /// (mirrors the Tappa 9 C7 paths_config WARN pattern so operators see
+    /// all suppressions).
     pub fn load(v1_path: &Path, local: &Verified) -> Result<Self> {
-        let (defaults, source) = load_defaults(
-            "netflow blocklist",
-            v1_path,
-            BUILTIN_NETFLOW_BLOCKLIST_V1,
-            parse_v1_text,
-        );
+        Self::load_with(v1_path, NETFLOW_BLOCKLIST_SHIPPED, local)
+    }
+
+    /// [`Self::load`] with the shipped defaults given.
+    fn load_with(v1_path: &Path, shipped: Shipped<'_>, local: &Verified) -> Result<Self> {
+        let (defaults, source) =
+            load_defaults("netflow blocklist", v1_path, shipped, parse_v1_text);
         let (adds, disables) = overlay_entries(local, NetBlocklistEntry::parse);
 
         let mut disabled = BTreeSet::new();
@@ -437,12 +467,13 @@ impl Ja3Blocklist {
 
     /// Production loader: as [`NetBlocklist::load`], for JA3 hashes.
     pub fn load(v1_path: &Path, local: &Verified) -> Result<Self> {
-        let (defaults, source) = load_defaults(
-            "JA3 blocklist",
-            v1_path,
-            BUILTIN_JA3_BLOCKLIST_V1,
-            parse_ja3_v1_text,
-        );
+        Self::load_with(v1_path, JA3_BLOCKLIST_SHIPPED, local)
+    }
+
+    /// [`Self::load`] with the shipped defaults given.
+    fn load_with(v1_path: &Path, shipped: Shipped<'_>, local: &Verified) -> Result<Self> {
+        let (defaults, source) =
+            load_defaults("JA3 blocklist", v1_path, shipped, parse_ja3_v1_text);
         let (adds, disables) = overlay_entries(local, parse_ja3_hash);
         let mut hashes: BTreeSet<String> = defaults
             .iter()
@@ -557,6 +588,60 @@ mod tests {
         }
     }
 
+    /// Load `v1` as the list the agent was built with (its own content is
+    /// the built-in copy): these tests are about parsing and the overlay.
+    fn load_own(v1: &Path, local: &Verified) -> NetBlocklist {
+        let own = std::fs::read_to_string(v1).unwrap();
+        NetBlocklist::load_with(v1, Shipped::new(&own, &[]), local).expect("load")
+    }
+
+    /// As [`load_own`], for the JA3 list.
+    fn load_own_ja3(v1: &Path, local: &Verified) -> Ja3Blocklist {
+        let own = std::fs::read_to_string(v1).unwrap();
+        Ja3Blocklist::load_with(v1, Shipped::new(&own, &[]), local).expect("load")
+    }
+
+    /// External audit LLMR-015 (NN-AUD-327): a blocklist that still lists
+    /// the CGNAT and VPN ranges NET-011 removed — the list of a host
+    /// installed before lab PR 78, or one edited by hand — is not what
+    /// NN-L-NET-001 kills on: the built-in copy is, and the load says why.
+    #[test]
+    fn a_blocklist_left_over_with_cgnat_does_not_reach_the_kill_rule() {
+        let dir = TempDir::new().unwrap();
+        let stale = format!("{BUILTIN_NETFLOW_BLOCKLIST_V1}100.64.0.0/10\n198.18.0.0/15\n");
+        let v1 = write_file(&dir, "netflow-blocklist.v1", &stale);
+        let bl = NetBlocklist::load(&v1, &Verified::Missing).unwrap();
+        assert!(!bl.contains(&"100.64.0.1".parse().unwrap()));
+        assert!(!bl.contains(&"198.18.0.1".parse().unwrap()));
+        assert!(bl.contains(&"192.0.2.1".parse().unwrap()));
+        assert!(matches!(
+            bl.defaults(),
+            DefaultsSource::Modified {
+                loaded_anyway: false,
+                ..
+            }
+        ));
+        // the current shipped file is the one used
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs");
+        let bl =
+            NetBlocklist::load(&configs.join("netflow-blocklist.v1"), &Verified::Missing).unwrap();
+        assert_eq!(bl.defaults(), &DefaultsSource::Disk);
+        // an earlier release's copy is superseded
+        let earlier = "192.0.2.0/24\n100.64.0.0/10\n";
+        let sha = hex::encode(crate::config::overlay_auth::content_sha256(
+            earlier.as_bytes(),
+        ));
+        let v1 = write_file(&dir, "earlier.v1", earlier);
+        let bl = NetBlocklist::load_with(
+            &v1,
+            Shipped::new(BUILTIN_NETFLOW_BLOCKLIST_V1, &[sha.as_str()]),
+            &Verified::Missing,
+        )
+        .unwrap();
+        assert!(!bl.contains(&"100.64.0.1".parse().unwrap()));
+        assert_eq!(bl.defaults(), &DefaultsSource::Superseded { sha256: sha });
+    }
+
     /// External audit LLMR-016: with the `.v1` unreadable the blocklists
     /// are the shipped ones built into the agent (they used to be empty),
     /// and say so.
@@ -592,7 +677,7 @@ mod tests {
             "# header\n1.2.3.4\n10.0.0.0/8\n# comment\n2001:db8::/32\n",
         );
         let local = dir.path().join("netflow-blocklist.local");
-        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own(&v1, &verified(&local));
         assert_eq!(bl.len(), 3);
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(10, 50, 60, 70))));
@@ -608,7 +693,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\n");
         let local = write_file(&dir, "netflow-blocklist.local", "+2.2.2.2\n3.3.3.3\n");
-        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own(&v1, &verified(&local));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3))));
@@ -621,7 +706,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\n2.2.2.2\n");
         let local = write_file(&dir, "netflow-blocklist.local", "-1.1.1.1\n");
-        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own(&v1, &verified(&local));
         assert!(!bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
     }
@@ -635,7 +720,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let v1 = write_file(&dir, "netflow-blocklist.v1", "1.1.1.1\n");
         let local = write_file(&dir, "netflow-blocklist.local", "-9.9.9.9\n+2.2.2.2\n");
-        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own(&v1, &verified(&local));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(bl.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
         assert!(!bl.contains(&IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))));
@@ -707,7 +792,7 @@ mod tests {
             "netflow-blocklist.local",
             "+4.4.4.4\n+bad\n-1.1.1.1\n",
         );
-        let bl = NetBlocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own(&v1, &verified(&local));
         assert_eq!(bl.len(), 2, "2.2.2.2 and 4.4.4.4; 1.1.1.1 disabled");
         assert!(bl.contains(&"2.2.2.2".parse().unwrap()));
         assert!(bl.contains(&"4.4.4.4".parse().unwrap()));
@@ -727,7 +812,7 @@ mod tests {
             &format!("{good}\nnot-a-hash\n{other}\n"),
         );
         let local = dir.path().join("netflow-ja3-blocklist.local");
-        let bl = Ja3Blocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own_ja3(&v1, &verified(&local));
         assert_eq!(bl.len(), 2);
         assert!(bl.contains(&good) && bl.contains(&other));
         assert!(parse_ja3_overlay_text("x", "+zz\n").is_err());
@@ -747,7 +832,7 @@ mod tests {
             &format!("# header\n{valid}\n"),
         );
         let local = dir.path().join("netflow-ja3-blocklist.local");
-        let bl = Ja3Blocklist::load(&v1, &verified(&local)).expect("load");
+        let bl = load_own_ja3(&v1, &verified(&local));
         assert!(bl.contains(valid));
         assert!(!bl.contains("00000000000000000000000000000000"));
     }

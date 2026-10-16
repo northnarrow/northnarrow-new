@@ -211,6 +211,10 @@ impl FimFixture {
 
         common::require_bpftool();
         let child = Command::new(agent_bin())
+            .env(
+                common::OWN_DEFAULT_LISTS_ENV.0,
+                common::OWN_DEFAULT_LISTS_ENV.1,
+            )
             .arg("--combat-rules")
             .arg(&combat)
             .arg("--admin-pub")
@@ -570,6 +574,10 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
 
     common::require_bpftool();
     let child = Command::new(agent_bin())
+        .env(
+            common::OWN_DEFAULT_LISTS_ENV.0,
+            common::OWN_DEFAULT_LISTS_ENV.1,
+        )
         .arg("--combat-rules")
         .arg(&combat)
         .arg("--admin-pub")

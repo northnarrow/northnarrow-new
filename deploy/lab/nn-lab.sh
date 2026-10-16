@@ -1294,6 +1294,17 @@ for t in aws azure docker gcp generic; do
     m=$(sudo stat -c %a "$f"); [[ "$m" == 640 ]] || { echo "FAIL: $f mode $m (want 640)"; fail=1; }
 done
 m=$(sudo stat -c %a /etc/northnarrow/canary-templates); [[ "$m" == 750 ]] || { echo "FAIL: canary-templates mode $m (want 750)"; fail=1; }
+# External audit LLMR-015 (lab PR 168): the shipped `.v1` lists are the
+# release's after an upgrade (an edited one is kept as `.v1.operator`), and the
+# new agent reported none as edited or an earlier release's.
+for l in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist; do
+    sudo cmp -s "/etc/northnarrow/$l.v1" "configs/$l.v1" || { echo "FAIL: /etc/northnarrow/$l.v1 is not the shipped list after the upgrade"; fail=1; }
+    if sudo test -e "/etc/northnarrow/$l.v1.operator"; then echo "note: /etc/northnarrow/$l.v1.operator kept (an edited list, replaced)"; fi
+done
+if sudo journalctl --namespace=northnarrow -u northnarrow-agent _PID="$pid_after" --no-pager -o cat 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*m//g' | grep -qE 'DEFAULT LIST MODIFIED|the one an earlier release shipped'; then
+    echo "FAIL: the upgraded agent found a default list edited or left over from an earlier release"; fail=1
+fi
 (( fail == 0 )) && echo "upgrade-check: OK"
 exit $fail
 REMOTE

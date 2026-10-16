@@ -1407,7 +1407,7 @@ async fn main() -> Result<()> {
         northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
             "netflow-comm-allowlist",
             &cli.netflow_comm_allowlist_v1,
-            northnarrow_agent::config::comm_allowlist::BUILTIN_NETFLOW_COMM_ALLOWLIST_V1,
+            northnarrow_agent::config::comm_allowlist::NETFLOW_COMM_ALLOWLIST_SHIPPED,
             &overlay_gate.verified(
                 OverlayKind::NetflowCommAllowlist,
                 &cli.netflow_comm_allowlist_local,
@@ -1441,7 +1441,7 @@ async fn main() -> Result<()> {
         northnarrow_agent::config::comm_allowlist::load_comm_allowlist(
             "process-comm-allowlist",
             &cli.process_comm_allowlist_v1,
-            northnarrow_agent::config::comm_allowlist::BUILTIN_PROCESS_COMM_ALLOWLIST_V1,
+            northnarrow_agent::config::comm_allowlist::PROCESS_COMM_ALLOWLIST_SHIPPED,
             &overlay_gate.verified(
                 OverlayKind::ProcessCommAllowlist,
                 &cli.process_comm_allowlist_local,
@@ -5027,15 +5027,25 @@ fn drain_ended(
 
 /// External audit LLMR-016: a default list that could not be read, and
 /// gave way to the copy built into the agent, is recorded in the signed
-/// chain through the overlay gate (queued until the audit log is open).
+/// chain through the overlay gate (queued until the audit log is open);
+/// LLMR-015 (NN-AUD-327): so is one edited by hand, which is not applied.
+/// An earlier release's list, superseded by the built-in copy, is a WARN
+/// only: what is in force is what shipped.
 fn report_builtin_defaults(
     gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
     list: &str,
     v1: &std::path::Path,
     source: &northnarrow_agent::config::overlay::DefaultsSource,
 ) {
-    if let northnarrow_agent::config::overlay::DefaultsSource::BuiltIn(why) = source {
-        gate.report_default_unavailable(list, v1, why);
+    use northnarrow_agent::config::overlay::DefaultsSource;
+    match source {
+        DefaultsSource::BuiltIn(why) => gate.report_default_unavailable(list, v1, why),
+        DefaultsSource::Modified {
+            sha256,
+            builtin_sha256,
+            loaded_anyway,
+        } => gate.report_default_modified(list, v1, sha256, builtin_sha256, *loaded_anyway),
+        DefaultsSource::Disk | DefaultsSource::Superseded { .. } => {}
     }
 }
 

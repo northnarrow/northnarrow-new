@@ -185,9 +185,9 @@ JOURNALD_NS_CONF_SRC="$REPO_ROOT/deploy/systemd/journald@northnarrow.conf"
 EBPF_ARTIFACT="$REPO_ROOT/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf"
 EBPF_STAMP="$EBPF_ARTIFACT.buildhash"
 
-# Tappa 9 C7: default FIM watched-paths list. install.sh drops this
-# at /etc/northnarrow/fim-paths.v1 if missing; the agent loads it at
-# boot and merges any operator overlay at /etc/northnarrow/fim-paths.local.
+# Tappa 9 C7: default FIM watched-paths list. install.sh installs this
+# at /etc/northnarrow/fim-paths.v1 (install_shipped_v1); the agent loads it
+# at boot and merges any operator overlay at /etc/northnarrow/fim-paths.local.
 FIM_PATHS_V1_SRC="$REPO_ROOT/configs/fim-paths.v1"
 
 # Tappa 9.5 K7: canary content templates the K4 renderer reads at
@@ -208,9 +208,9 @@ CANARY_TEMPLATES_SRC_DIR="$REPO_ROOT/configs/canary-templates"
 HONEYPOT_BAITS_SRC_DIR="$REPO_ROOT/configs/honeypot-baits"
 
 # Tappa 10 N8: default NetFlow blocklists consumed by NN-L-NET-001
-# (IP / CIDR) + NN-L-NET-003 (JA3 fingerprint). install.sh drops
+# (IP / CIDR) + NN-L-NET-003 (JA3 fingerprint). install.sh installs
 # these at /etc/northnarrow/netflow-blocklist.v1 +
-# /etc/northnarrow/netflow-ja3-blocklist.v1 if missing; operators
+# /etc/northnarrow/netflow-ja3-blocklist.v1 (install_shipped_v1); operators
 # extend / narrow via the matching `.local` overlays. ETC_PROTECTED_FILES
 # (agent/src/anti_tamper/filesystem.rs) widens to cover the four
 # blocklist filenames so PROTECTED_INODES defends them against
@@ -222,8 +222,8 @@ NETFLOW_JA3_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-ja3-blocklist.v1"
 # exempts trusted actors from the process detection rules (R011..);
 # netflow-comm is the trusted-actor set the network rules suppress on
 # (seeded from the inline const sets formerly in net.rs). install.sh
-# drops both .v1 files if missing; operators tune via the matching
-# `.local` overlays. ETC_PROTECTED_FILES widens to cover all four
+# installs both .v1 files (install_shipped_v1); operators tune via the
+# matching `.local` overlays. ETC_PROTECTED_FILES widens to cover all four
 # filenames so PROTECTED_INODES defends them against tamper — the
 # same lock-in as fim-paths.v1 / netflow-blocklist.v1.
 PROCESS_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/process-comm-allowlist.v1"
@@ -546,6 +546,8 @@ require_file "$JOURNALD_NS_CONF_SRC" "expected at $JOURNALD_NS_CONF_SRC (NN jour
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
 require_file "$NETFLOW_BLOCKLIST_V1_SRC"     "expected at $NETFLOW_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow IP/CIDR blocklist)"
 require_file "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "expected at $NETFLOW_JA3_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow JA3 blocklist)"
+require_file "$PROCESS_COMM_ALLOWLIST_V1_SRC" "expected at $PROCESS_COMM_ALLOWLIST_V1_SRC (Tappa 10.5 D1 default process comm allowlist)"
+require_file "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "expected at $NETFLOW_COMM_ALLOWLIST_V1_SRC (Tappa 10.5 D1 default NetFlow comm allowlist)"
 
 require_dir() {
     local path=$1
@@ -866,27 +868,79 @@ fi
 # /etc/systemd/journald@northnarrow.conf.d/.
 install -m 644 -o root -g root "$JOURNALD_NS_CONF_SRC" "/etc/systemd/journald@northnarrow.conf"
 
-# Tappa 9 C7: ensure /etc/northnarrow/ exists and ship the default
-# FIM watched-paths list. Idempotent: if the operator has already
-# customised /etc/northnarrow/fim-paths.v1, we leave it alone (the
-# v1 file is operator-configuration once installed; v2 of the list
-# would ship at /etc/northnarrow/fim-paths.v2 when the schema bumps).
+# Tappa 9 C7: ensure /etc/northnarrow/ exists.
 echo "install.sh: ensuring $ETC_DIR (mode 0755, root:root)"
 install -d -m 0755 -o root -g root "$ETC_DIR"
 
-if [[ -f "$ETC_DIR/fim-paths.v1" ]]; then
-    echo "install.sh: $ETC_DIR/fim-paths.v1 already present — leaving operator copy untouched"
-else
-    echo "install.sh: copying default FIM watched-paths list to $ETC_DIR/fim-paths.v1"
-    install -m 0644 -o root -g root "$FIM_PATHS_V1_SRC" "$ETC_DIR/fim-paths.v1"
-fi
+# The shipped default lists (`.v1`): the FIM watched paths (Tappa 9 C7), the
+# NetFlow IP/CIDR and JA3 blocklists (Tappa 10 N8), the process and NetFlow
+# comm allowlists (Tappa 10.5 D1). External audit LLMR-015 (NN-AUD-327, lab
+# PR 168): they are the product's defaults, not operator configuration — an
+# operator tunes a list through its signed `.local` overlay (`nn-admin config
+# overlay set <list>`; the overlays are never shipped nor touched here). An
+# existing copy used to be left alone, on --upgrade too, so a host kept the
+# lists of its first install (NET-011, lab PR 78, took 100.64.0.0/10 and
+# 198.18.0.0/15 out of the blocklist of a KillProcessTree rule: a host
+# installed before kept killing on them) and a hand edit stayed in force.
+# The agent now applies the list it was built with whenever the file is not
+# that list (an edit: an ERROR and a signed `default_list_modified` at every
+# boot). Here: a missing, current or earlier-shipped copy is (re)installed;
+# any other content is kept as `<list>.v1.operator`, the shipped list
+# installed, and the difference printed with the command that moves it into
+# the overlay.
+# SHA-256 of the copies earlier releases shipped: the agent's
+# EARLIER_*_SHA256 tables next to each built-in copy (a unit test keeps the
+# two equal, config::overlay::tests::install_sh_knows_the_same_shipped_lists).
+declare -A SHIPPED_V1_EARLIER=(
+    [fim-paths.v1]="6baec5b5f0dfc92bdf91a0426b8d3693bd4b4a7b25df79e6ff9aa2298b906659 99e3364b81cf77ccd51cda88e80bc71a45b13e7b75c7ff480b195e157ab3011a"
+    [netflow-blocklist.v1]="b50d821782e5ab9d8ab3e27aa7c3dfb3ea0aec87001c16b2eea758d94e8a7866"
+    [netflow-ja3-blocklist.v1]="0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24"
+    [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"
+    [netflow-comm-allowlist.v1]="4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10"
+)
+install_shipped_v1() {
+    local name=$1 src=$2 what=$3 dst="$ETC_DIR/$1" on_disk keep
+    if [[ -L "$dst" || ( -e "$dst" && ! -f "$dst" ) ]]; then
+        # the agent reads no list through a link, nor from a FIFO
+        echo "install.sh: WARNING: $dst is not a regular file — replaced with the shipped $what" >&2
+        rm -f "$dst"
+    fi
+    if [[ ! -e "$dst" ]]; then
+        echo "install.sh: copying the shipped $what to $dst"
+        install -m 0644 -o root -g root "$src" "$dst"
+        return 0
+    fi
+    if cmp -s "$src" "$dst"; then
+        echo "install.sh: $dst is the shipped $what — current"
+        return 0
+    fi
+    on_disk=$(sha256sum "$dst" | cut -d' ' -f1)
+    if [[ " ${SHIPPED_V1_EARLIER[$name]:-} " == *" $on_disk "* ]]; then
+        echo "install.sh: replacing $dst — the $what an earlier release shipped"
+        install -m 0644 -o root -g root "$src" "$dst"
+        return 0
+    fi
+    keep="$dst.operator"
+    if [[ -e "$keep" ]] && ! cmp -s "$dst" "$keep"; then
+        keep="$dst.operator.$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    cp -p "$dst" "$keep"
+    install -m 0644 -o root -g root "$src" "$dst"
+    echo "install.sh: WARNING: $dst was no list NorthNarrow shipped (edited by hand?): kept as $keep," >&2
+    echo "install.sh:   the shipped $what installed — the agent applies only the shipped list. Move what you" >&2
+    echo "install.sh:   need into the signed overlay (+entry adds, -entry disables a shipped entry):" >&2
+    echo "install.sh:     nn-admin config overlay set ${name%.v1} --file <overlay> --key <config-manage key>" >&2
+    if command -v diff >/dev/null 2>&1; then
+        echo "install.sh:   shipped -> yours (+ yours only, - shipped entries you removed; first 40 lines):" >&2
+        diff -u "$src" "$keep" | sed -n '3,42{s/^/install.sh:     /;p}' >&2 || true
+    fi
+}
+install_shipped_v1 fim-paths.v1 "$FIM_PATHS_V1_SRC" "FIM watched-paths list"
+install_shipped_v1 netflow-blocklist.v1 "$NETFLOW_BLOCKLIST_V1_SRC" "NetFlow IP/CIDR blocklist"
+install_shipped_v1 netflow-ja3-blocklist.v1 "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "NetFlow JA3 blocklist"
+install_shipped_v1 process-comm-allowlist.v1 "$PROCESS_COMM_ALLOWLIST_V1_SRC" "process comm allowlist"
+install_shipped_v1 netflow-comm-allowlist.v1 "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "NetFlow comm allowlist"
 
-# Tappa 10 N8: ship the default NetFlow IP/CIDR + JA3 blocklists.
-# Same idempotency contract as fim-paths.v1 — existing operator
-# copies (likely customised from the threat-intel feed of choice)
-# are left untouched; only fresh installs receive the seed file.
-# The matching `.local` overlays are NOT shipped by install.sh
-# (operator-curated, deploy via configuration management).
 # COMBAT rulesets (iptables-restore bodies for the NORTHNARROW_COMBAT
 # chain, v4 + v6). Load-bearing beyond isolation: without a loadable
 # v4 ruleset the agent builds no NetworkIsolator, and the admin socket
@@ -905,32 +959,6 @@ for rules in combat-rules.v4 combat-rules.v6; do
     fi
 done
 
-if [[ -f "$ETC_DIR/netflow-blocklist.v1" ]]; then
-    echo "install.sh: $ETC_DIR/netflow-blocklist.v1 already present — leaving operator copy untouched"
-else
-    echo "install.sh: copying default NetFlow IP/CIDR blocklist to $ETC_DIR/netflow-blocklist.v1"
-    install -m 0644 -o root -g root "$NETFLOW_BLOCKLIST_V1_SRC" "$ETC_DIR/netflow-blocklist.v1"
-fi
-
-if [[ -f "$ETC_DIR/netflow-ja3-blocklist.v1" ]]; then
-    echo "install.sh: $ETC_DIR/netflow-ja3-blocklist.v1 already present — leaving operator copy untouched"
-else
-    echo "install.sh: copying default NetFlow JA3 blocklist to $ETC_DIR/netflow-ja3-blocklist.v1"
-    install -m 0644 -o root -g root "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "$ETC_DIR/netflow-ja3-blocklist.v1"
-fi
-
-# Tappa 10.5 D1: ship the default per-family comm allowlists. Same
-# idempotency contract as fim-paths.v1 — existing operator copies are
-# left untouched; only fresh installs receive the seed file. The
-# matching `.local` overlays are NOT shipped (operator-curated, deploy
-# via configuration management).
-if [[ -f "$ETC_DIR/process-comm-allowlist.v1" ]]; then
-    echo "install.sh: $ETC_DIR/process-comm-allowlist.v1 already present — leaving operator copy untouched"
-else
-    echo "install.sh: copying default process comm allowlist to $ETC_DIR/process-comm-allowlist.v1"
-    install -m 0644 -o root -g root "$PROCESS_COMM_ALLOWLIST_V1_SRC" "$ETC_DIR/process-comm-allowlist.v1"
-fi
-
 # Beta Step 3: refresh the opt-in overlay TEMPLATE (container-runtime
 # exemptions, off by default). This is a `.example`, never the live
 # `.local`, so it is safe to overwrite on every install — it documents
@@ -943,13 +971,6 @@ fi
 if [[ -f "$PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC" ]]; then
     echo "install.sh: refreshing overlay template $ETC_DIR/process-comm-allowlist.local.example"
     install -m 0644 -o root -g root "$PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC" "$ETC_DIR/process-comm-allowlist.local.example"
-fi
-
-if [[ -f "$ETC_DIR/netflow-comm-allowlist.v1" ]]; then
-    echo "install.sh: $ETC_DIR/netflow-comm-allowlist.v1 already present — leaving operator copy untouched"
-else
-    echo "install.sh: copying default NetFlow comm allowlist to $ETC_DIR/netflow-comm-allowlist.v1"
-    install -m 0644 -o root -g root "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "$ETC_DIR/netflow-comm-allowlist.v1"
 fi
 
 # Beta Step 4b: COMBAT management carve-out CIDR list. Empty default =

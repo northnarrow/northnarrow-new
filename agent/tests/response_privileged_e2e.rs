@@ -141,6 +141,10 @@ impl Fixture {
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_err = log.try_clone().expect("clone agent.log");
         let mut cmd = Command::new(agent_bin());
+        cmd.env(
+            common::OWN_DEFAULT_LISTS_ENV.0,
+            common::OWN_DEFAULT_LISTS_ENV.1,
+        );
         cmd.arg("--combat-rules")
             .arg(&combat)
             .arg("--admin-pub")

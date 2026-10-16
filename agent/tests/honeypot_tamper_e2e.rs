@@ -366,6 +366,8 @@ impl Fixture {
 
         common::require_bpftool();
         let child = Command::new(REAL_SUDO)
+            .arg("env")
+            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
             .arg(&installed_agent.path)
             .arg("--combat-rules")
             .arg(&combat)

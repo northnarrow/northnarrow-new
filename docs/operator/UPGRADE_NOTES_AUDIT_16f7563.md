@@ -30,6 +30,8 @@ and the tracker note have the details and the lab evidence.
 7. A parser or SIEM rule that reads the agent's journal lines: they carry
    no colour codes any more, and a value with a separator is quoted
    (§11).
+8. A `.v1` list edited by hand is no longer applied: move the change into
+   the list's signed `.local` overlay (§1).
 
 ## 1. Installation and upgrade
 
@@ -122,6 +124,30 @@ and the tracker note have the details and the lab evidence.
   PR 118). `NN_DETECT_ONLY=yes` or `true` is reported like `=1`, and an
   agent in detect-only mode no longer starts without a writable audit log
   unless `NN_AUDIT_ALLOW_UNWRITABLE=1` is set (its own override, reported).
+- **The shipped `.v1` lists are the release's** (NN-AUD-327 LLMR-015,
+  Wave 3, lab PR 168). `fim-paths`, `netflow-blocklist`,
+  `netflow-ja3-blocklist`, `process-comm-allowlist` and
+  `netflow-comm-allowlist` used to be applied as they stood in
+  `/etc/northnarrow`, and `install.sh` never replaced one that existed,
+  `--upgrade` and the packages included: an upgraded host kept the lists
+  of its first install. One installed before lab PR 78 still killed
+  processes talking to `100.64.0.0/10` (CGNAT, Tailscale, EKS) or
+  `198.18.0.0/15` (VPN clients), NN-L-NET-001. Now `install.sh` installs
+  the release's lists at every run; the agent applies the copy it was
+  built with, and the file only when it is that copy. An earlier
+  release's list is a WARN at boot; any other content is an ERROR and a
+  signed `integrity_drift` (`default_list_modified`, both SHA-256) at
+  every boot; a list that is a symbolic link or a FIFO is not read
+  (`default_list_unavailable`). `NN_OVERLAY_ALLOW_UNSIGNED=1` applies an
+  edited list anyway, still recorded. **Regression:** a `.v1` edited by
+  hand — the old `install.sh` comments called the blocklists "operator
+  copies" — is not applied by this agent. `install.sh --upgrade` keeps it
+  as `<list>.v1.operator`, installs the shipped list and prints the
+  difference (`+` your additions, `-` shipped entries you removed, the
+  overlay's own syntax) with the command to carry it over: `nn-admin
+  config overlay set <list> --file <overlay> --key <config-manage key>`
+  (applies at the next start). See
+  [INSTALL_UPGRADE_UNINSTALL.md §1](INSTALL_UPGRADE_UNINSTALL.md#1-fresh-install).
 - **A sensor that stops stops the agent** (NN-AUD-184 SNS-001, lab PR
   128). A telemetry task that ends is recorded in the signed audit log and
   the agent exits non-zero (`sensor_pump_exited`); the watchdog restarts

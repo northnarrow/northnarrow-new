@@ -28,7 +28,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
-use crate::config::overlay::{self, DefaultsSource, OverlayLoad};
+use crate::config::overlay::{self, DefaultsSource, OverlayLoad, Shipped};
 use crate::config::overlay_auth::Verified;
 
 /// Deploy location of the process-comm allowlist default + overlay.
@@ -45,6 +45,32 @@ pub const BUILTIN_PROCESS_COMM_ALLOWLIST_V1: &str =
     include_str!("../../../configs/process-comm-allowlist.v1");
 pub const BUILTIN_NETFLOW_COMM_ALLOWLIST_V1: &str =
     include_str!("../../../configs/netflow-comm-allowlist.v1");
+
+/// External audit LLMR-015 (NN-AUD-327): SHA-256 of every
+/// `process-comm-allowlist.v1` an earlier release shipped (the history of
+/// `configs/`). The agent applies its built-in copy over one of these, and
+/// `install.sh` (`SHIPPED_V1_EARLIER`, kept equal by a test) replaces it.
+pub const EARLIER_PROCESS_COMM_ALLOWLIST_V1_SHA256: &[&str] = &[
+    // Tappa 10.5 D1 (8fbf652)
+    "4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730",
+    // lab PR 87 (97c9e8a)
+    "e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94",
+];
+/// As [`EARLIER_PROCESS_COMM_ALLOWLIST_V1_SHA256`], for `netflow-comm-allowlist.v1`.
+pub const EARLIER_NETFLOW_COMM_ALLOWLIST_V1_SHA256: &[&str] = &[
+    // Tappa 10.5 D1 (8fbf652)
+    "4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10",
+];
+/// The shipped `process-comm-allowlist.v1` (built-in copy, earlier ones).
+pub const PROCESS_COMM_ALLOWLIST_SHIPPED: Shipped<'static> = Shipped::new(
+    BUILTIN_PROCESS_COMM_ALLOWLIST_V1,
+    EARLIER_PROCESS_COMM_ALLOWLIST_V1_SHA256,
+);
+/// The shipped `netflow-comm-allowlist.v1` (built-in copy, earlier ones).
+pub const NETFLOW_COMM_ALLOWLIST_SHIPPED: Shipped<'static> = Shipped::new(
+    BUILTIN_NETFLOW_COMM_ALLOWLIST_V1,
+    EARLIER_NETFLOW_COMM_ALLOWLIST_V1_SHA256,
+);
 
 /// An immutable set of allowlisted comms. Built once at boot from a
 /// family's `.v1` + `.local` files; the rule layer queries it with
@@ -119,8 +145,9 @@ impl CommAllowlist {
         }
     }
 
-    /// Where the defaults came from: [`DefaultsSource::BuiltIn`] when the
-    /// `.v1` could not be read (the caller records it).
+    /// Where the defaults came from: the `.v1`, or the built-in copy and
+    /// why (unreadable, an earlier release's, edited — the caller records
+    /// the first and the last).
     pub fn defaults(&self) -> &DefaultsSource {
         &self.defaults
     }
@@ -211,23 +238,24 @@ impl CommAllowlist {
     }
 }
 
-/// Load a comm allowlist family from its `.v1` (or `builtin`, the copy
-/// built into the agent, when it cannot be read) and its `.local` overlay
-/// as the signed-overlay gate verified it. `label` names the family in
+/// Load a comm allowlist family from its shipped defaults (the `.v1` when
+/// it is the copy built into the agent, else that copy:
+/// [`overlay::load_defaults`]) and its `.local` overlay as the
+/// signed-overlay gate verified it. `label` names the family in
 /// boot logs — see [`overlay::load_flat_list`]. (The convenience loaders
 /// that read both default paths themselves are gone: they read the
 /// overlay without the gate — external audit LLMR-013.)
 pub fn load_comm_allowlist(
     label: &str,
     v1_path: &Path,
-    builtin: &str,
+    shipped: Shipped<'_>,
     local: &Verified,
 ) -> Result<CommAllowlist> {
     let OverlayLoad {
         effective,
         defaults,
         ..
-    } = overlay::load_flat_list(label, v1_path, builtin, local, &validate_comm)?;
+    } = overlay::load_flat_list(label, v1_path, shipped, local, &validate_comm)?;
     Ok(CommAllowlist {
         entries: effective,
         identity: None,
@@ -266,34 +294,34 @@ mod tests {
     #[test]
     fn per_family_allowlist_files_load_clean() {
         let configs = concat!(env!("CARGO_MANIFEST_DIR"), "/../configs");
-        for (label, file, builtin) in [
+        for (label, file, shipped) in [
             (
                 "process-comm-allowlist",
                 "process-comm-allowlist.v1",
-                BUILTIN_PROCESS_COMM_ALLOWLIST_V1,
+                PROCESS_COMM_ALLOWLIST_SHIPPED,
             ),
             (
                 "netflow-comm-allowlist",
                 "netflow-comm-allowlist.v1",
-                BUILTIN_NETFLOW_COMM_ALLOWLIST_V1,
+                NETFLOW_COMM_ALLOWLIST_SHIPPED,
             ),
         ] {
             let v1 = Path::new(configs).join(file);
             // Overlay absent in the repo (operator-curated): the
             // v1-only path.
-            let out = load_comm_allowlist(label, &v1, builtin, &Verified::Missing)
+            let out = load_comm_allowlist(label, &v1, shipped, &Verified::Missing)
                 .unwrap_or_else(|e| panic!("{label}: shipped {file} must parse clean: {e}"));
             assert!(
                 !out.is_empty(),
                 "{label}: shipped {file} should ship a non-empty default set"
             );
             assert_eq!(out.defaults(), &DefaultsSource::Disk);
-            assert_eq!(std::fs::read_to_string(&v1).unwrap(), builtin);
+            assert_eq!(std::fs::read_to_string(&v1).unwrap(), shipped.builtin);
             // External audit LLMR-016: without the file, the same list.
             let without = load_comm_allowlist(
                 label,
                 &v1.with_extension("missing"),
-                builtin,
+                shipped,
                 &Verified::Missing,
             )
             .unwrap();
@@ -325,7 +353,8 @@ mod tests {
             path: dir.path().join("c.local"),
             text: "+rsync\n-nginx\n".to_string(),
         };
-        let al = load_comm_allowlist("test", &v1, "", &local).expect("load");
+        let al = load_comm_allowlist("test", &v1, Shipped::new("sshd\nnginx\n", &[]), &local)
+            .expect("load");
         assert!(al.contains("sshd"));
         assert!(al.contains("rsync"));
         assert!(!al.contains("nginx"), "disabled default must be absent");

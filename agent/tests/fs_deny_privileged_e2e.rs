@@ -174,6 +174,8 @@ impl Fixture {
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_err = log.try_clone().expect("clone log handle");
         let child = Command::new(REAL_SUDO)
+            .arg("env")
+            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
             .arg(&installed_agent.path)
             .arg("--combat-rules")
             .arg(&combat)

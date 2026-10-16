@@ -61,6 +61,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, the shipped default lists on disk (Low
+  NN-AUD-327 LLMR-015, wider than reported; lab PR 168): the five `.v1`
+  lists in `/etc/northnarrow` (`fim-paths`, `netflow-blocklist`,
+  `netflow-ja3-blocklist`, `process-comm-allowlist`,
+  `netflow-comm-allowlist`) were applied as they stood on disk, read
+  through a link and blocking on a FIFO, and `install.sh` never replaced
+  one that existed — `--upgrade` and the packages' configure step
+  included. An upgraded host kept the lists of its first install: one
+  installed before lab PR 78 still killed processes talking to
+  `100.64.0.0/10` (CGNAT, Tailscale, EKS) or `198.18.0.0/15` (VPN
+  clients) through NN-L-NET-001 (KillProcessTree). An offline edit — an
+  exemption added to an allowlist, a watched path or a blocked range
+  removed — took effect at the next boot without a word. The agent now
+  applies the copy it was built with: the file when it is that copy byte
+  for byte; over the copy an earlier release shipped (SHA-256 tables from
+  the history of `configs/`, `EARLIER_*_SHA256`) the built-in one, with a
+  WARN; over anything else the built-in one, with an ERROR and a signed
+  `integrity_drift` (`default_list_modified`, file and both SHA-256) at
+  every boot (`OverlayGate::report_default_modified`). The file is read
+  like an overlay (no link, no FIFO, at most 4 MiB); a link or a FIFO is
+  unavailable (`default_list_unavailable`, built-in copy).
+  `NN_OVERLAY_ALLOW_UNSIGNED=1`, the escape hatch of the unsigned
+  overlays, applies an edited list anyway, still recorded. `install.sh`
+  (`install_shipped_v1`; its `SHIPPED_V1_EARLIER` is the agent's table,
+  checked equal by a unit test, and each built-in copy's SHA-256 is
+  pinned) installs the shipped list over a missing, current,
+  earlier-shipped or non-regular one; an edited one is kept as
+  `<list>.v1.operator`, the
+  shipped list installed, and a WARNING prints the difference with the
+  `nn-admin config overlay set <list>` command that carries it into the
+  signed `.local` overlay. `nn-lab.sh upgrade-check` checks the five lists
+  after the upgrade. The privileged e2e fixtures, which write their own
+  lists, start the agent with `NN_OVERLAY_ALLOW_UNSIGNED=1`.
+  **Regression:** a `.v1` edited by hand is no longer applied, from the
+  first boot of this agent or the upgrade that installs it: move the
+  change into the list's signed `.local` overlay (`install.sh` keeps the
+  edited file as `.v1.operator` and prints the difference). A `.v1` that
+  is a symbolic link is not followed.
 - External audit, Wave 3, journal line injection (Low NN-AUD-413 LAB-023,
   and the cross-cutting finding of the Wave 3 triage; lab PR 167). The
   agent logged values another user names with `%` (Display) —
