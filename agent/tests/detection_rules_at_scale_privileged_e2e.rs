@@ -211,6 +211,9 @@ struct Fixture {
     netflow_log: PathBuf,
     netflow_listeners_log: PathBuf,
     drift_log: PathBuf,
+    /// Per-test detection chain (`--detections-file`): the barrier of the
+    /// absence checks waits for a record there (external audit NN-AUD-228).
+    detections_log: PathBuf,
     // Signed-op handles for runtime canary deploys (CHAIN-006).
     nn_admin_path: PathBuf,
     admin_priv: PathBuf,
@@ -318,6 +321,7 @@ impl Fixture {
         let netflow_log = dir.join("netflow.jsonl");
         let netflow_listeners_log = dir.join("netflow_listeners.jsonl");
         let agent_log = dir.join("agent.log");
+        let detections_log = dir.join("detections.jsonl");
 
         // Redirect the agent's stderr (tracing default sink) to a
         // file so the test can grep for VERDICT lines.
@@ -344,6 +348,10 @@ impl Fixture {
             .arg(&signing_key)
             .arg("--shutdown-marker-file")
             .arg(&marker)
+            .arg("--detections-file")
+            .arg(&detections_log)
+            .arg("--status-events-file")
+            .arg(dir.join("status_events.jsonl"))
             .arg("--fim-paths-v1")
             .arg(&fim_paths_v1)
             .arg("--fim-paths-local")
@@ -401,6 +409,7 @@ impl Fixture {
             netflow_log,
             netflow_listeners_log,
             drift_log,
+            detections_log,
             nn_admin_path: installed_admin.path.clone(),
             admin_priv,
             agent_id,
@@ -460,10 +469,19 @@ impl Fixture {
         );
     }
 
-    /// Assert `rule_id` is NOT logged within `window` (bounded
-    /// negative — proves a missing precursor/trigger doesn't fire).
-    fn assert_no_verdict(&self, rule_id: &str, window: Duration) {
-        std::thread::sleep(window);
+    /// Assert `rule_id` did NOT fire on what the test did before the call
+    /// (a missing precursor/trigger doesn't fire). External audit
+    /// NN-AUD-228: checked after an exec barrier ([`common::exec_barrier`]:
+    /// the event loop has handled every exec delivered before it), not
+    /// after a bare sleep, which a slow pipeline passes as well as a
+    /// correct one.
+    fn assert_no_verdict_after_barrier(&self, rule_id: &str) {
+        common::exec_barrier(&self.detections_log, VERDICT_POLL_TIMEOUT);
+        let records = common::records_of(&self.detections_log, rule_id);
+        assert!(
+            records.is_empty(),
+            "{rule_id} unexpectedly recorded (no precursor/trigger present): {records:?}"
+        );
         assert!(
             !self.log_contains(rule_id),
             "{rule_id} unexpectedly fired (no precursor/trigger present)"
@@ -930,22 +948,28 @@ fn process_systemd_executor_launch_exempt_from_r004() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
 
-    // Drive a few real systemd-executor launches inside the observation
-    // window. `--collect` reaps the transient unit after it exits.
+    // Drive a few real systemd-executor launches. `--wait` returns once
+    // the unit has run (its exec is then behind the barrier below);
+    // `--collect` reaps the transient unit after it exits.
     for i in 0..3 {
         let unit = format!("nnx-r004-exempt-{i}");
         let _ = Command::new("systemd-run")
-            .args(["--collect", &format!("--unit={unit}"), "/bin/sleep", "1"])
+            .args([
+                "--wait",
+                "--collect",
+                &format!("--unit={unit}"),
+                "/bin/sleep",
+                "1",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        std::thread::sleep(Duration::from_millis(200));
     }
 
-    // No R004 verdict may appear for any systemd-executor launch in this
-    // window (covers both our systemd-run units and ambient host service
-    // activity).
-    fx.assert_no_verdict("R004_ExecFromProcSelfFd", Duration::from_secs(4));
+    // No R004 verdict may appear for any systemd-executor launch before
+    // the barrier (covers both our systemd-run units and ambient host
+    // service activity).
+    fx.assert_no_verdict_after_barrier("R004_ExecFromProcSelfFd");
 }
 
 /// External audit PROC-001: R004 judges the file the kernel executed, not
@@ -960,20 +984,23 @@ fn process_user_shell_proc_self_fd_trips_r004() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
 
-    // A program on disk, through its fd: not fileless.
+    // A program on disk, through its fd: not fileless. External audit
+    // NN-AUD-228: no sleep here — the fileless exec below comes later on
+    // the same exec ring and is the barrier: once its record is written,
+    // this exec has been judged too, and exactly one R004 record may exist.
     let _ = Command::new("bash")
         .arg("-c")
         .arg("exec 3< /bin/true; exec -a evilname /proc/self/fd/3")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    fx.assert_no_verdict("R004_ExecFromProcSelfFd", Duration::from_secs(3));
 
     // A payload deleted once open, through its fd: fileless. Root-owned,
     // outside /tmp, so R001..R003 do not match first. R004 fires
-    // KillProcessTree on the subprocess; ignore its exit status.
+    // KillProcessTree on the subprocess (detect-only here); ignore its
+    // exit status. `bash` execs in place: the record's principal is its pid.
     let payload = install_to_priv_bin(Path::new("/bin/true"));
-    let _ = Command::new("bash")
+    let mut fileless = Command::new("bash")
         .arg("-c")
         .arg(format!(
             "exec 3< {p}; rm -f {p}; exec -a evilname /proc/self/fd/3",
@@ -981,9 +1008,28 @@ fn process_user_shell_proc_self_fd_trips_r004() {
         ))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+        .expect("spawn the fileless exec");
+    let fileless_pid = u64::from(fileless.id());
+    let _ = fileless.wait();
 
     fx.wait_for_verdict("R004_ExecFromProcSelfFd");
+    let positive = common::wait_jsonl_row(
+        &fx.detections_log,
+        VERDICT_POLL_TIMEOUT,
+        "R004 record of the fileless exec",
+        |r| {
+            r["rule_id"] == "R004_ExecFromProcSelfFd"
+                && r["principal"]["pid"].as_u64() == Some(fileless_pid)
+        },
+    );
+    let records = common::records_of(&fx.detections_log, "R004_ExecFromProcSelfFd");
+    assert_eq!(
+        records.len(),
+        1,
+        "only the fileless exec may fire R004 (the on-disk program reached through its fd \
+         must not); fileless: {positive}; all: {records:?}"
+    );
 }
 
 /// R004 still fires on a genuine T1620 fileless exec (memfd_create +
@@ -1223,7 +1269,7 @@ fn chain_tmp_exec_without_egress_does_not_trip_chain_002() {
     let _ = Command::new(&quiet).stdout(Stdio::null()).status();
 
     // No egress from that PID → CHAIN-002 must stay silent.
-    fx.assert_no_verdict("NN-L-CHAIN-002_TmpExecThenEgress", Duration::from_secs(3));
+    fx.assert_no_verdict_after_barrier("NN-L-CHAIN-002_TmpExecThenEgress");
 }
 
 // ════════════════════════════════════════════════════════════════════

@@ -270,14 +270,14 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-224 | TST-001 | Privileged tests | M | fixed (lab PR 153) |
 | NN-AUD-225 | TST-002 | Privileged tests | S | fixed (lab PR 153) |
 | NN-AUD-226 | TST-004 | Privileged tests | S | fixed (lab PR 111) |
-| NN-AUD-227 | TST-005 | Privileged tests | M | open |
-| NN-AUD-228 | TST-006 | Privileged tests | M | open |
-| NN-AUD-229 | TST-008 | Privileged tests | S | open |
+| NN-AUD-227 | TST-005 | Privileged tests | M | fixed (lab PR 155) |
+| NN-AUD-228 | TST-006 | Privileged tests | M | fixed (lab PR 155) |
+| NN-AUD-229 | TST-008 | Privileged tests | S | fixed (lab PR 155) |
 | NN-AUD-230 | TST-009 | Privileged tests | M | open |
 | NN-AUD-231 | TST-010 | Privileged tests | S | fixed (lab PR 153) |
 | NN-AUD-232 | TST-011 | Privileged tests | S | open |
 | NN-AUD-233 | TST-012 | Privileged tests | M | open |
-| NN-AUD-234 | TST-018 | Privileged tests | L | open |
+| NN-AUD-234 | TST-018 | Privileged tests | L | fixed (lab PR 155) |
 | NN-AUD-235 | TST-019 | Privileged tests | M | open |
 
 ## Notes on the fixes
@@ -4144,3 +4144,74 @@ the audit did not report, noted with the fix that takes them.
     line when enforce is not in effect, and at the eviction if the guard
     lets it through.
   - Lab: Ubuntu 24.04: `bpf_guard_enforce_refuses_protected_pids_write` passes in the gate (enforce-mode guard: `bpftool map delete` on PROTECTED_PIDS and `kill -9` from root refused with EPERM and an ANTI-TAMPER DENIAL each, the agent stopped by a signed 2-of-N shutdown, the guard returned to observe), the fixtures that followed it pass, no `quit_agent … still alive`; `nn-lab.sh respawn-check` OK. The case that started this lot — the recreated Ubuntu 22.04 guest without `linux-tools-$(uname -r)` — is now refused up front (`test-ignored`: "'sudo bpftool version' fails…") and the provisioning installs the package. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-234 (TST-018), NN-AUD-227 (TST-005), NN-AUD-229 (TST-008),
+  NN-AUD-228 (TST-006), lab PR 155.** Response and detection assertions
+  (batch F6), with the `describe_response` change of the cross-cutting
+  notes. TST-004 was lab PR 111.
+  - The record overstated the response: `describe_response` gave the
+    action name for `Killed`, `AlreadyGone`, `Refused`, `PermissionDenied`
+    and `Failed` alike (seen in the lab: `"response":"KillProcess"` for
+    processes gone before the kill). The bare name now means the action was
+    carried out; otherwise the outcome follows it in parentheses:
+    `KillProcess (already gone)`, `KillProcessTree (refused: <reason>)`,
+    `KillProcess (permission denied)`, `<Action> (failed: <error>, errno
+    N)`, and `KillProcessTree (partial: N not killed, N spared, walk
+    truncated)` when the root died and part of the tree did not.
+    `suppressed (detect-only)` and `none` are unchanged. Chosen over a new
+    `response_outcome` field: the field is already free text with
+    qualifiers (`denied in kernel (anti-tamper LSM hook)`, `advisory: …`),
+    readers see the truth without learning a field, and no schema
+    changes. Compatibility: the action stays the first word, so the
+    prefix match of `nn-lab.sh pkgmgr-check` (`"response":"(Kill|…`) still
+    counts a destructive verdict whatever its outcome; nn-admin prints the
+    line as stored; the XAI does not read the field; `acted()` compares
+    to `none` only; lines already written keep their text and verify as
+    before (each `entry_hash` covers the line as written). A reader
+    comparing to the bare name now counts only kills that happened.
+  - TST-018: new suite `response_privileged_e2e`, an agent without
+    `--detect-only`. `tmp_exec_kill_hits_the_offender_only`: a `/tmp` copy
+    of `sleep` (R001), beside a `sleep` sibling of the same name and
+    parent; its record names it (`principal.pid`, `exe`), `response` is the
+    verdict's action, it died by SIGKILL, the sibling and the harness run
+    on. Not e2e: a process spared by the host-critical guard. It would mean
+    passing a test process off as the watchdog (pidfile + `--watchdog-exe`,
+    which also puts it in `PROTECTED_PIDS`) or moving it into
+    `ssh.service` on the guest; covered by the unit test below, through the
+    real executor and guard.
+  - TST-005: the honeypot fixture writes a per-test `--detections-file`.
+    The tamperer is a `python3` that unlinks the bait itself, starts a
+    `sleep` child and waits (a `sh -c 'rm …'` child was gone before any
+    response could reach it). Tests #1–#4 assert one record: FIM-024,
+    Critical, verdict and response `KillProcessTree`, `file` the bait,
+    `principal.pid` the tamperer; then the tamperer's SIGKILL exit and its
+    child gone. #1 is renamed `…_trips_fim024_and_kills_the_tamperer`: its
+    `COMBAT` check was satisfied by the boot line "COMBAT graduated-response
+    ladder armed". Posture is not asserted: it moves on posture triggers
+    and none reads `Event::Fim`, so a FIM-024 verdict leaves it where it
+    was, although the rule's reasoning (and the FIM module doc) says
+    "posture → COMBAT". Left open as a product question for the FIM group.
+  - TST-008: the net fixture writes a per-test `--detections-file`; the
+    listener test waits for the NN-L-NET-006 record (Medium, `Log`,
+    `Network`, the test process as principal, its pid also the listener
+    row's) and keeps the row checks. A listener on allowlisted port 8443,
+    opened first, must leave no NET-006 record (skipped, said so, if the
+    port is taken).
+  - TST-006: absence checks wait for a barrier, helpers appended to
+    `agent/tests/common/mod.rs` (`wait_until`, `exec_barrier`,
+    `wait_count_stable`, …; nothing above them changed). Exec barrier: a
+    `/tmp` copy of `true` and its record — the event loop handles events
+    one at a time, in sensor order (D7 R004 systemd-run, now `--wait`;
+    CHAIN-002 negative). R004 through an fd: the fileless exec that follows
+    is the barrier, then exactly one R004 record. Honeypot #5/#6: a write
+    to a watched sentinel and its drift row (the FIM drain), then the exec
+    barrier. FIM no-op touches: the triage's "N Opened rows" cannot be
+    counted since BUG-012 v2 writes no row for a read; a content write
+    after the touches is the barrier, then no `Modified` row with an
+    unchanged hash. Net upper bounds: counted once the count is the same
+    over two 1 s windows.
+  - Tests: `response_names_the_outcome_when_the_action_did_not_happen`,
+    `response_reports_a_tree_kill_that_left_processes_running`,
+    `recorded_response_matches_what_the_executor_did` (fail on the old
+    `describe_response`), `response_of_an_action_carried_out_is_unchanged`
+    (a guard, passes on both). The privileged e2e above were not run here.
+  - Lab: Ubuntu 24.04, resp155-probe.sh on main and on this build (21 processes from a fresh `/tmp` directory, R001 KillProcess; 20 copies of `true` and one `sleep 60`): main 21 records "KillProcess", 20 of them for processes that had exited 0 on their own (overstated=20, FAIL); here 17 "KillProcess (already gone)", 4 "KillProcess" (the `sleep` killed with 137, one race), overstated=0 (PASS). The new e2e (`tmp_exec_kill_hits_the_offender_only`) and the rewritten honeypot, D7, net and FIM assertions pass in the gate; found by them on Debian: a bait in a directory the agent protects refuses the unlink, so the tamperer now stays alive after the refusal (the attempt is the tamper FIM-024 answers). Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.

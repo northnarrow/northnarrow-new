@@ -436,8 +436,10 @@ pub struct DetectionRecord {
     pub exe: Option<String>,
     /// Agent posture at the moment of detection.
     pub posture_at: PostureKind,
-    /// What the response layer actually did: a [`ResponseAction`] name,
-    /// `"suppressed (detect-only)"`, or `"none"`.
+    /// What the response layer actually did: a [`ResponseAction`] name
+    /// when the action was carried out, the name followed by the outcome
+    /// when it was not (`"KillProcess (already gone)"`, see
+    /// [`describe_response`]), `"suppressed (detect-only)"`, or `"none"`.
     pub response: String,
     /// Detection sub-type: the rule `category` (rule path) or the ADE
     /// threat-classification `kind` (ADE path).
@@ -609,14 +611,84 @@ fn severity_from_ade(s: AdeSeverity) -> Severity {
 /// Detect-only suppression ([`ExecutionOutcome::WouldExecute`]) is
 /// surfaced distinctly from a real action; a `Log` action (observe-only)
 /// is `"none"`.
+///
+/// External audit NN-AUD-234: the bare action name (`"KillProcess"`) means
+/// the action was carried out. It was also what a kill that found the
+/// process gone, was refused (a protected PID), was denied by the kernel or
+/// failed recorded, so the record claimed a containment that did not
+/// happen. Those now name the outcome after the action, in parentheses:
+/// `"KillProcess (already gone)"`, `"KillProcessTree (refused: <reason>)"`,
+/// `"KillProcess (permission denied)"`, `"Quarantine (failed: <error>)"`,
+/// and a tree kill that left part of the tree running
+/// `"KillProcessTree (partial: 1 not killed, 1 spared)"`. The action name
+/// stays the first word, so a reader keyed on it (a prefix match) still
+/// finds the action; records written before keep their text (the chain
+/// covers each line as written).
 pub fn describe_response(report: &ExecutionReport) -> String {
-    match report.primary {
-        ExecutionOutcome::WouldExecute { .. } => "suppressed (detect-only)".to_string(),
-        _ => match report.action {
-            ResponseAction::Log => "none".to_string(),
-            ref action => format!("{action:?}"),
-        },
+    let outcome = match &report.primary {
+        ExecutionOutcome::WouldExecute { .. } => return "suppressed (detect-only)".to_string(),
+        _ if report.action == ResponseAction::Log => return "none".to_string(),
+        ExecutionOutcome::Killed { .. }
+        | ExecutionOutcome::Blocked { .. }
+        | ExecutionOutcome::Quarantined { .. }
+        | ExecutionOutcome::Throttled { .. }
+        | ExecutionOutcome::CapabilityStripped { .. } => partial_outcome(&report.additional),
+        ExecutionOutcome::AlreadyGone { .. } => Some("already gone".to_string()),
+        ExecutionOutcome::Refused { reason, .. } => Some(format!("refused: {reason}")),
+        ExecutionOutcome::PermissionDenied { .. } => Some("permission denied".to_string()),
+        ExecutionOutcome::Failed { errno: 0, .. } => Some("failed".to_string()),
+        ExecutionOutcome::Failed { errno, .. } => Some(format!("failed: {}", errno_text(*errno))),
+        // Never a primary outcome today; reported, not hidden, if it becomes one.
+        ExecutionOutcome::TreeTruncated { .. } => Some("partial: walk truncated".to_string()),
+    };
+    let action = format!("{:?}", report.action);
+    match outcome {
+        Some(outcome) => format!("{action} ({outcome})"),
+        None => action,
     }
+}
+
+/// What a successful action left undone, from the outcomes beyond the
+/// primary one (the descendants of a `KillProcessTree`): those not killed,
+/// those the guard spared, a walk cut short. `None` when nothing was left.
+fn partial_outcome(additional: &[ExecutionOutcome]) -> Option<String> {
+    let not_killed = additional
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                ExecutionOutcome::Failed { .. } | ExecutionOutcome::PermissionDenied { .. }
+            )
+        })
+        .count();
+    let spared = additional
+        .iter()
+        .filter(|o| matches!(o, ExecutionOutcome::Refused { .. }))
+        .count();
+    let truncated = additional
+        .iter()
+        .any(|o| matches!(o, ExecutionOutcome::TreeTruncated { .. }));
+    let mut parts = Vec::new();
+    if not_killed > 0 {
+        parts.push(format!("{not_killed} not killed"));
+    }
+    if spared > 0 {
+        parts.push(format!("{spared} spared"));
+    }
+    if truncated {
+        parts.push("walk truncated".to_string());
+    }
+    (!parts.is_empty()).then(|| format!("partial: {}", parts.join(", ")))
+}
+
+/// `errno` as the system describes it, with its number: "Connection timed
+/// out, errno 110".
+fn errno_text(errno: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(errno).to_string();
+    let detail = text
+        .strip_suffix(&format!(" (os error {errno})"))
+        .unwrap_or(&text);
+    format!("{detail}, errno {errno}")
 }
 
 // ── sink + writer ───────────────────────────────────────────────────
@@ -1939,6 +2011,257 @@ mod tests {
         assert!(lines[1].ends_with(",\"suppressed_before\":7}"));
         let back: DetectionRecord = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(back.suppressed_before, Some(7));
+    }
+
+    fn report(
+        action: ResponseAction,
+        primary: ExecutionOutcome,
+        additional: Vec<ExecutionOutcome>,
+    ) -> ExecutionReport {
+        ExecutionReport {
+            action,
+            primary,
+            additional,
+            elapsed: std::time::Duration::from_micros(1),
+        }
+    }
+
+    /// External audit NN-AUD-234: a kill that did not happen was recorded
+    /// as the bare action name, the same as one that did.
+    #[test]
+    fn response_names_the_outcome_when_the_action_did_not_happen() {
+        use ResponseAction::*;
+        let cases = [
+            (
+                report(
+                    KillProcess,
+                    ExecutionOutcome::AlreadyGone { pid: 7 },
+                    vec![],
+                ),
+                "KillProcess (already gone)",
+            ),
+            (
+                report(
+                    KillProcessTree,
+                    ExecutionOutcome::Refused {
+                        pid: 7,
+                        reason: "ssh-service(sshd)",
+                    },
+                    vec![],
+                ),
+                "KillProcessTree (refused: ssh-service(sshd))",
+            ),
+            (
+                report(
+                    KillProcess,
+                    ExecutionOutcome::PermissionDenied {
+                        pid: 7,
+                        errno: libc::EPERM,
+                    },
+                    vec![],
+                ),
+                "KillProcess (permission denied)",
+            ),
+            (
+                report(
+                    KillProcess,
+                    ExecutionOutcome::Failed {
+                        pid: 7,
+                        errno: libc::ETIMEDOUT,
+                    },
+                    vec![],
+                ),
+                "KillProcess (failed: Connection timed out, errno 110)",
+            ),
+            (
+                report(
+                    Quarantine,
+                    ExecutionOutcome::Failed { pid: 7, errno: 0 },
+                    vec![],
+                ),
+                "Quarantine (failed)",
+            ),
+            (
+                report(
+                    FullNetworkIsolation,
+                    ExecutionOutcome::Refused {
+                        pid: 7,
+                        reason: "host-wide isolation is the COMBAT ladder's",
+                    },
+                    vec![],
+                ),
+                "FullNetworkIsolation (refused: host-wide isolation is the COMBAT ladder's)",
+            ),
+        ];
+        for (r, want) in cases {
+            assert_eq!(describe_response(&r), want, "{r:?}");
+        }
+    }
+
+    /// The tree's root killed and part of the tree still running is not a
+    /// tree killed.
+    #[test]
+    fn response_reports_a_tree_kill_that_left_processes_running() {
+        let killed = ExecutionOutcome::Killed { pid: 7 };
+        let r = report(
+            ResponseAction::KillProcessTree,
+            killed.clone(),
+            vec![
+                ExecutionOutcome::Killed { pid: 8 },
+                ExecutionOutcome::Refused {
+                    pid: 9,
+                    reason: "northnarrow-watchdog",
+                },
+                ExecutionOutcome::Failed {
+                    pid: 10,
+                    errno: libc::ETIMEDOUT,
+                },
+                ExecutionOutcome::PermissionDenied {
+                    pid: 11,
+                    errno: libc::EPERM,
+                },
+                ExecutionOutcome::TreeTruncated {
+                    pid: 7,
+                    limit: 4096,
+                },
+            ],
+        );
+        assert_eq!(
+            describe_response(&r),
+            "KillProcessTree (partial: 2 not killed, 1 spared, walk truncated)"
+        );
+        // descendants killed, or gone by themselves: the whole tree
+        let r = report(
+            ResponseAction::KillProcessTree,
+            killed,
+            vec![
+                ExecutionOutcome::Killed { pid: 8 },
+                ExecutionOutcome::AlreadyGone { pid: 9 },
+            ],
+        );
+        assert_eq!(describe_response(&r), "KillProcessTree");
+    }
+
+    /// The values readers already know keep their text: an action carried
+    /// out is its bare name, detect-only and `Log` are unchanged.
+    #[test]
+    fn response_of_an_action_carried_out_is_unchanged() {
+        use ResponseAction::*;
+        let cases = [
+            (
+                report(KillProcess, ExecutionOutcome::Killed { pid: 7 }, vec![]),
+                "KillProcess",
+            ),
+            (
+                report(KillProcessTree, ExecutionOutcome::Killed { pid: 7 }, vec![]),
+                "KillProcessTree",
+            ),
+            (
+                report(BlockOutbound, ExecutionOutcome::Blocked { pid: 7 }, vec![]),
+                "BlockOutbound",
+            ),
+            (
+                report(
+                    Quarantine,
+                    ExecutionOutcome::Quarantined {
+                        original_path: "/tmp/x".to_string(),
+                        vault_id: "00".repeat(16),
+                    },
+                    vec![],
+                ),
+                "Quarantine",
+            ),
+            (
+                report(
+                    ThrottleProcess,
+                    ExecutionOutcome::Throttled {
+                        pid: 7,
+                        cpu_max_pct: Some(10),
+                        io_weight: None,
+                        memory_high_bytes: None,
+                    },
+                    vec![],
+                ),
+                "ThrottleProcess",
+            ),
+            (
+                report(
+                    StripFileCapability,
+                    ExecutionOutcome::CapabilityStripped {
+                        path: "/usr/bin/x".to_string(),
+                    },
+                    vec![],
+                ),
+                "StripFileCapability",
+            ),
+            (
+                report(
+                    KillProcess,
+                    ExecutionOutcome::WouldExecute { pid: 7 },
+                    vec![],
+                ),
+                "suppressed (detect-only)",
+            ),
+            (
+                report(Log, ExecutionOutcome::WouldExecute { pid: 7 }, vec![]),
+                "suppressed (detect-only)",
+            ),
+            (
+                report(
+                    Log,
+                    ExecutionOutcome::Refused {
+                        pid: 7,
+                        reason: "Log action — no execution required",
+                    },
+                    vec![],
+                ),
+                "none",
+            ),
+        ];
+        for (r, want) in cases {
+            assert_eq!(describe_response(&r), want, "{r:?}");
+        }
+    }
+
+    /// The record says what the executor did to a real process: spared by
+    /// the host-critical guard (it still runs), killed, gone before the
+    /// kill. Only signals a child of the test: no privilege needed.
+    #[test]
+    fn recorded_response_matches_what_the_executor_did() {
+        use crate::response::{Executor, ExecutorConfig};
+        use std::os::unix::process::ExitStatusExt;
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = ExecutorConfig::for_test(tmp.path());
+        cfg.dry_run = false;
+
+        let guarded = Executor::with_config(cfg.clone());
+        guarded.set_tree_guard(std::sync::Arc::new(move |p: u32| {
+            (p == pid).then_some("ssh-service(sshd)")
+        }));
+        let r = guarded.execute(ResponseAction::KillProcess, pid);
+        assert_eq!(
+            describe_response(&r),
+            "KillProcess (refused: ssh-service(sshd))"
+        );
+        assert!(
+            sleeper.try_wait().unwrap().is_none(),
+            "a spared process runs"
+        );
+
+        let exec = Executor::with_config(cfg);
+        let r = exec.execute(ResponseAction::KillProcess, pid);
+        assert_eq!(describe_response(&r), "KillProcess");
+        assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL));
+
+        // A PID above any pid_max: nothing to kill.
+        let r = exec.execute(ResponseAction::KillProcess, 999_999_999);
+        assert_eq!(describe_response(&r), "KillProcess (already gone)");
     }
 
     #[tokio::test]

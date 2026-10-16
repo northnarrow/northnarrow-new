@@ -15,7 +15,8 @@
 //!   `FlowTracker` / `DnsCache`, and persists to the on-disk
 //!   chain;
 //! - the N6 rule layer fires NN-L-NET-006 on the uncommon-port
-//!   listener test.
+//!   listener test: its signed record is asserted in the per-test
+//!   `--detections-file` (external audit NN-AUD-229).
 //!
 //! Three §11.2 priv-e2e were originally listed; test #2
 //! (JA3 fingerprint) is DEFERRED to Tappa 11.5 per §13 Q2 packet-
@@ -78,6 +79,9 @@ const DNS_ATTRIBUTION_HOST: &str = "foo.northnarrow-e2etest.invalid";
 /// random ephemeral-range port to avoid collisions with other
 /// services running on a developer's VM.
 const LISTENER_PORT: u16 = 41999;
+/// Test #2's negative twin: a port in the NN-L-NET-006 allowlist.
+const ALLOWLISTED_PORT: u16 = 8443;
+const NET_006: &str = "NN-L-NET-006_UncommonListener";
 /// Test #3 — destination port of the unconnected UDP `sendto()`
 /// burst. Nothing listens there; the datagrams are dropped locally
 /// and ICMP-unreachable is irrelevant for the kprobe.
@@ -206,6 +210,8 @@ struct NetFixture {
     agent_id_file: PathBuf,
     admin_socket: PathBuf,
     nn_admin_path: PathBuf,
+    /// Per-test detection chain (`--detections-file`).
+    detections_log: PathBuf,
     _agent_guard: AgentGuard,
     _installed_agent: InstalledBin,
     _installed_admin: InstalledBin,
@@ -301,6 +307,7 @@ impl NetFixture {
         let canary_access = dir.join("canary_access.jsonl");
         let netflow_log = dir.join("netflow.jsonl");
         let netflow_listeners_log = dir.join("netflow_listeners.jsonl");
+        let detections_log = dir.join("detections.jsonl");
 
         common::require_bpftool();
         let child = Command::new("sudo")
@@ -319,6 +326,10 @@ impl NetFixture {
             .arg(&signing_key)
             .arg("--shutdown-marker-file")
             .arg(&marker)
+            .arg("--detections-file")
+            .arg(&detections_log)
+            .arg("--status-events-file")
+            .arg(dir.join("status_events.jsonl"))
             .arg("--fim-paths-v1")
             .arg(&fim_paths_v1)
             .arg("--fim-paths-local")
@@ -362,6 +373,7 @@ impl NetFixture {
             agent_id_file: agent_id,
             admin_socket,
             nn_admin_path: installed_admin.path.clone(),
+            detections_log,
             _agent_guard: guard,
             _installed_agent: installed_agent,
             _installed_admin: installed_admin,
@@ -669,10 +681,11 @@ s.close()
 /// allowlist {22, 53, 80, 443, 8080, 8443}); the agent's
 /// `inet_csk_listen_start` kprobe MUST fire, the drain loop
 /// MUST append a row to `netflow_listeners.jsonl`, and the
-/// matching NN-L-NET-006 rule MUST evaluate (the medium-severity
-/// posture transition is observable via the persisted row +
-/// the rule layer doesn't have a separate audit chain, so we
-/// pin on the row being present + matching shape).
+/// matching NN-L-NET-006 rule MUST fire: its signed record (Medium,
+/// Log, the test process as principal) is asserted in the detection
+/// chain. External audit NN-AUD-229: the rule was never asserted — the
+/// row alone stayed green with the rule removed. A listener on an
+/// allowlisted port opened first must not fire it.
 ///
 /// The rule's `Medium` severity → `posture→ALERTED` per N6, which
 /// does NOT install the iptables `NORTHNARROW_COMBAT` chain
@@ -684,6 +697,21 @@ s.close()
 fn net_listener_on_uncommon_port_records_event() {
     let _eni = EniIptablesGuard::install();
     let fx = NetFixture::setup();
+
+    // Negative twin first: a listener on an allowlisted port. The positive
+    // listener below comes later on the same ring and is its barrier.
+    // Skipped (said so) when the port is taken on this host.
+    let allowlisted = match TcpListener::bind(("127.0.0.1", ALLOWLISTED_PORT)) {
+        Ok(l) => {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(l);
+            true
+        }
+        Err(e) => {
+            eprintln!("127.0.0.1:{ALLOWLISTED_PORT} not bindable ({e}): negative twin skipped");
+            false
+        }
+    };
 
     // Open + drop a TCP listener. The `inet_csk_listen_start`
     // kprobe fires on the kernel-side listen() call (binding
@@ -729,14 +757,33 @@ fn net_listener_on_uncommon_port_records_event() {
         "agent_sig must be present on a chained row"
     );
 
-    // NN-L-NET-006 rule-fire verification: the rule layer doesn't
-    // expose a dedicated rule-trip audit chain (verdicts log via
-    // tracing!), but the very fact that the listeners-log row was
-    // appended + the agent's event loop saw the kernel event
-    // means the rule engine evaluated the `Event::NetListener`.
-    // The N6 unit tests (22 in `agent/src/decision/rules/net.rs`)
-    // pin the rule's match logic against this exact port-shape;
-    // priv-e2e here pins the END-TO-END kernel-to-rule wire.
+    // NN-L-NET-006 rule fire: the signed record of this listener. The
+    // record names no port; the principal is this test process, which
+    // opened it, and the listener row carries the same pid.
+    let me = u64::from(std::process::id());
+    assert_eq!(row["pid"].as_u64(), Some(me), "listener row: {row}");
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        JSONL_POLL_TIMEOUT,
+        "NN-L-NET-006 record",
+        |r| r["rule_id"] == NET_006 && r["principal"]["pid"].as_u64() == Some(me),
+    );
+    assert_eq!(rec["severity"], "Medium", "record: {rec}");
+    assert_eq!(
+        rec["verdict"],
+        serde_json::json!({"Rule": "Log"}),
+        "record: {rec}"
+    );
+    assert_eq!(rec["sensor"], "Network", "record: {rec}");
+    assert_eq!(rec["response"], "none", "record: {rec}");
+    if allowlisted {
+        let records = common::records_of(&fx.detections_log, NET_006);
+        assert_eq!(
+            records.len(),
+            1,
+            "a listener on allowlisted port {ALLOWLISTED_PORT} must not fire NN-L-NET-006: {records:?}"
+        );
+    }
 
     // External audit NN-AUD-081/082: the operator verb serves that row,
     // from the file `--netflow-listeners-file` names (it answered
@@ -822,15 +869,17 @@ s.close()
         "entry_hash should be 64 hex chars (SHA-256)"
     );
 
-    // Rate limit: give the drain a moment to flush, then count. The
-    // burst takes well under a second, so the kernel-side limiter
-    // admits 1 row (2 if the burst straddles a second boundary) —
-    // never one per datagram.
-    std::thread::sleep(Duration::from_secs(2));
-    let ours = read_jsonl(&fx.netflow_log)
-        .into_iter()
-        .filter(is_ours)
-        .count();
+    // Rate limit: count once the drain has settled (external audit
+    // NN-AUD-228: the same count over two windows, not a fixed sleep a
+    // slower drain passes vacuously). The burst takes well under a
+    // second, so the kernel-side limiter admits 1 row (2 if the burst
+    // straddles a second boundary) — never one per datagram.
+    let ours = common::wait_count_stable(Duration::from_secs(1), JSONL_POLL_TIMEOUT, || {
+        read_jsonl(&fx.netflow_log)
+            .into_iter()
+            .filter(is_ours)
+            .count()
+    });
     assert!(
         (1..=3).contains(&ours),
         "unconnected sendto burst of 40 must be rate-limited to ~1 row/s per (pid, dst); got {ours} rows"
@@ -891,11 +940,13 @@ s.close()
         r["proto"].as_u64() == Some(17) && r["dst_port"].as_u64() == Some(UDP6_MAPPED_PORT as u64)
     };
     fx.wait_netflow_matching(1, mapped);
-    std::thread::sleep(Duration::from_secs(2));
-    let n = read_jsonl(&fx.netflow_log)
-        .into_iter()
-        .filter(mapped)
-        .count();
+    // Counted once settled (NN-AUD-228), not after a fixed sleep.
+    let n = common::wait_count_stable(Duration::from_secs(1), JSONL_POLL_TIMEOUT, || {
+        read_jsonl(&fx.netflow_log)
+            .into_iter()
+            .filter(mapped)
+            .count()
+    });
     assert_eq!(
         n, 1,
         "an IPv4-mapped destination must give one row (udp_sendmsg), not one per hook"
@@ -967,7 +1018,14 @@ u.close()
         r["proto"].as_u64() == Some(17) && r["dst_port"].as_u64() == Some(UDP_BURST_PORT as u64)
     };
     fx.wait_netflow_matching(1, udp_row);
-    std::thread::sleep(Duration::from_secs(3));
+    // Read once the row count has settled (NN-AUD-228), not after a fixed
+    // sleep.
+    common::wait_count_stable(Duration::from_secs(1), JSONL_POLL_TIMEOUT, || {
+        read_jsonl(&fx.netflow_log)
+            .into_iter()
+            .filter(udp_row)
+            .count()
+    });
     let rows: Vec<serde_json::Value> = read_jsonl(&fx.netflow_log)
         .into_iter()
         .filter(udp_row)

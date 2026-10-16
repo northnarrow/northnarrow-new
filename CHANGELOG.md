@@ -15,6 +15,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, response and detection assertions (Medium
+  TST-018, TST-005, TST-008, TST-006): a detection record named the
+  response's action even when it did not happen — a kill that found the
+  process already gone, was refused (a protected process), denied or
+  failed read `"response":"KillProcess"`, like one that landed. The bare
+  action name now means it was carried out; otherwise the outcome follows
+  it: `KillProcess (already gone)`, `KillProcessTree (refused: <reason>)`,
+  `KillProcess (permission denied)`, `Quarantine (failed: <error>)`, and
+  `KillProcessTree (partial: 1 not killed, 1 spared)` for a tree killed in
+  part. The action stays the first word, so readers that key on it still
+  find it; `suppressed (detect-only)` and `none` are unchanged, and records
+  already written keep their text. The privileged e2e now check who the
+  response hits: a new suite runs an enforcing agent and asserts that a
+  `/tmp` offender is named by its record and dies by SIGKILL while a
+  same-named sibling runs on; the honeypot tests assert one signed record
+  (Critical, KillProcessTree carried out, the tamperer as principal) and
+  the death of the tamperer and its child, where three unrelated
+  substrings of the log passed before (`COMBAT` matched the boot banner);
+  the uncommon-port listener test asserts its NN-L-NET-006 record; and
+  absence checks wait for a barrier through the same pipeline (an exec, a
+  FIM write, a settled row count) instead of a fixed sleep.
 - External audit, Wave 2, the anti-tamper proved in enforce mode (Medium
   TST-001, TST-002, TST-010, LAB-001): every privileged fixture stops its
   agent by evicting it from `PROTECTED_PIDS` with bpftool, which only a
