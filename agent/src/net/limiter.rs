@@ -196,7 +196,7 @@ impl RuleGate {
             warn!(
                 uid = ev.uid,
                 pid = ev.pid,
-                comm = %ev.comm,
+                comm = %common::log_escape::Escaped(&ev.comm),
                 burst = self.pacer.burst,
                 per_sec = (Duration::from_secs(1).as_nanos()
                     / self.pacer.refill_every.as_nanos().max(1)) as u64,

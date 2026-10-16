@@ -1091,7 +1091,7 @@ fn staging_exec(
     }
     tracing::warn!(
         pid,
-        image = %image,
+        image = %common::log_escape::Escaped(image),
         unlinked,
         mass_wrote,
         "staging exec with a second factor — raising ConfirmedIntrusion"
@@ -1142,8 +1142,8 @@ fn confirmed_intrusion(
         if !*overwrites && auth.is_auth_mediated(*pid) {
             tracing::info!(
                 pid = *pid,
-                comm = %comm,
-                filename = %filename,
+                comm = %common::log_escape::Escaped(comm),
+                filename = %common::log_escape::Escaped(filename),
                 count_within_window = *count,
                 "mass write of new files inside an authenticated session — not counted (a build, \
                  a clone, an archive extracted); rewriting existing files would be"
@@ -1154,8 +1154,8 @@ fn confirmed_intrusion(
             tracing::warn!(
                 trigger = "ConfirmedIntrusion_MassWrite",
                 focal_pid = *pid,
-                focal_comm = %comm,
-                focal_filename = %filename,
+                focal_comm = %common::log_escape::Escaped(comm),
+                focal_filename = %common::log_escape::Escaped(filename),
                 count_within_window = *count,
                 overwrites = *overwrites,
                 // External audit EBPF-011: the processes of the writer's
@@ -1294,8 +1294,8 @@ fn confirmed_intrusion(
                     tracing::warn!(
                         trigger = "ConfirmedIntrusion_MassWrite",
                         focal_pid = *focal_pid,
-                        focal_comm = %focal_comm,
-                        focal_filename = %focal_filename,
+                        focal_comm = %common::log_escape::Escaped(focal_comm),
+                        focal_filename = %common::log_escape::Escaped(focal_filename),
                         count_within_window = count,
                         threshold = MASS_WRITE_MIN,
                         window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,

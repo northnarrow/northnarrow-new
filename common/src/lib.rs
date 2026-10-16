@@ -29,6 +29,11 @@ pub mod btf_offsets;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 
+/// Journal-safe log values and lines (external audit, Wave 3: journal
+/// line injection, lab PR 167).
+#[cfg(feature = "std")]
+pub mod log_escape;
+
 #[cfg(feature = "std")]
 mod model;
 #[cfg(feature = "std")]

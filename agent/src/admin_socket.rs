@@ -928,7 +928,7 @@ async fn handle_connection(
         if auth.exhausted() {
             warn!(
                 client_pid = client.pid,
-                client_comm = %client.comm,
+                client_comm = %common::log_escape::Escaped(&client.comm),
                 "admin connection closed after repeated signature failures"
             );
             return Ok(());
@@ -3054,7 +3054,7 @@ fn dispatch_response_release(
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
         pid,
         released,
-        detail = %message,
+        detail = %common::log_escape::Escaped(&message),
         "response release"
     );
     ResponseReleaseResponse {
@@ -3113,7 +3113,7 @@ fn dispatch_response_restore(
                 target: "admin.response_restore",
                 signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
                 vault_id = %extra.vault_id,
-                path = %path,
+                path = %common::log_escape::Escaped(&path),
                 "quarantined file restored by an administrator (mode 0600)"
             );
             ResponseRestoreResponse {
@@ -3440,7 +3440,7 @@ fn dispatch_canary_deploy(
         target: "admin.canary_deploy",
         signer_fp = %primary_fp,
         canary_id = %entry.canary_id,
-        canary_name = %entry.name,
+        canary_name = %common::log_escape::Escaped(&entry.name),
         "canary deployed"
     );
     CanaryDeployResponse {

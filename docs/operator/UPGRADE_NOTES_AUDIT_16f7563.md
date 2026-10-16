@@ -2,7 +2,7 @@
 
 What changes for an operator who upgrades from `v0.0.1-tappa9.0`, or from
 an earlier `main`, to a build that carries the fixes of the external audit
-of commit `16f7563` (Waves 0, 1 and 2; tracker:
+of commit `16f7563` (Waves 0, 1 and 2, and the Wave 3 items of §11; tracker:
 [`docs/audit/EXTERNAL_AUDIT_16f7563.md`](../audit/EXTERNAL_AUDIT_16f7563.md)).
 Every item below is a change of behaviour or a regression that
 [`CHANGELOG.md`](../../CHANGELOG.md) `[Unreleased]` declares, grouped by
@@ -27,6 +27,9 @@ and the tracker note have the details and the lab evidence.
    refuses a host without it unless `--without-nftables` (§1).
 6. Keep the trusted-installer key at hand: more operations on the agent's
    own directories need a window (§2).
+7. A parser or SIEM rule that reads the agent's journal lines: they carry
+   no colour codes any more, and a value with a separator is quoted
+   (§11).
 
 ## 1. Installation and upgrade
 
@@ -519,3 +522,31 @@ checked with its tag-bound attestation.
   would score the mock backend, and names the backend next to the rate.
 - **The range bootstrap** takes the rule count from the validation registry
   (76) instead of a fixed 69 (NN-AUD-217 LAB-012, lab PR 159).
+
+## 11. The journal: one event, one line (Wave 3)
+
+- **No forged lines** (NN-AUD-413 LAB-023 and the Wave 3 cross-cutting
+  finding, lab PR 167). A name another user chooses — a file in `/tmp`,
+  a `comm`, a DNS name — could hold a newline, and the journal showed
+  the rest as an entry of its own (a fake `ANTI-TAMPER DENIAL` or
+  `VERDICT`). Every event of the agent and the watchdog is now one
+  journal line. What the operator sees:
+  - **no ANSI colour codes** in the journal (they stay on a terminal);
+  - a value another user names is printed as it is when plain
+    (`comm=bash`, `target_filename=/tmp/x`), and **quoted** when it holds
+    a space, `"`, `=`, `\` or a control character, with those escaped:
+    `target_filename="/tmp/x\nANTI-TAMPER DENIAL …"`. **Regression:**
+    `reasoning` on `VERDICT (rule)` and `VERDICT (ADE)` lines is a
+    sentence, so it is always quoted now (`reasoning="…"`);
+  - a control character anywhere in a line (an error quoting a path)
+    reads `\n`, `\r`, `\t` or `\xNN`, and a line over 16 KiB ends in
+    `[cut: N more bytes]`.
+  The signed chains are the evidence; the journal is a convenience.
+- **NN-L-AT-001 records name the refused operation** in a new
+  `"operation"` field (`signal`, `ptrace`, `write`, `unlink`, `bpf_map`,
+  …), absent on every other record. **Regression:** an `nn-admin` older
+  than the agent reports those records as broken: upgrade the three
+  binaries together.
+- **Lab:** `tamper-check` reads its evidence from the signed records: the
+  column reads `deny=signal×1` (detections) where it read `op=signal×1`
+  (journal), and its journal part only `errors=`.

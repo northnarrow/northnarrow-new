@@ -573,7 +573,7 @@ async fn process_close_record(
                         debug!(
                             target: "net.drain",
                             pid = raw.pid,
-                            comm = %comm,
+                            comm = %common::log_escape::Escaped(&comm),
                             src = %src,
                             dst = %dst,
                             "net drain: TCP close without a connect-side flow (passive or pre-agent socket) — not recorded"
@@ -582,7 +582,7 @@ async fn process_close_record(
                         warn!(
                             target: "net.drain",
                             pid = raw.pid,
-                            comm = %comm,
+                            comm = %common::log_escape::Escaped(&comm),
                             src = %src,
                             dst = %dst,
                             corr_id = %hex::encode(raw.flow_id),

@@ -398,8 +398,8 @@ pub fn populate_watched_paths(
                 }
                 Err(e) => warn!(
                     error = %e,
-                    path = %path.display(),
-                    hop = %hop.display(),
+                    path = %common::log_escape::Escaped(path.display()),
+                    hop = %common::log_escape::Escaped(hop.display()),
                     "fim populate_watched_paths: WATCHED_PATHS insert of a symlink hop failed"
                 ),
             }
