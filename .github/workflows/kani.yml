@@ -18,7 +18,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # .cargo/config.toml asks for target-cpu=native; irrelevant for proofs.
+  # Same as the .cargo/config.toml default since external audit SUP-017;
+  # kept explicit. Irrelevant for proofs.
   RUSTFLAGS: -C target-cpu=x86-64-v2
 
 jobs:
@@ -27,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Kani (pinned)
         run: |

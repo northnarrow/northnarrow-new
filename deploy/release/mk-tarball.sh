@@ -49,7 +49,8 @@ Install:   sudo ./deploy/install.sh            then: systemctl enable --now nort
 Upgrade:   sudo ./deploy/install.sh --upgrade
 Uninstall: sudo ./deploy/uninstall.sh [--purge]
 Docs:      docs/operator/INSTALL_UPGRADE_UNINSTALL.md, docs/operator/COMBAT_RECOVERY.md
-Verify:    sha256sum -c SHA256SUMS; gh attestation verify <file> --repo northnarrow/northnarrow-new
+Verify:    sha256sum -c SHA256SUMS, then for each file (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5):
+           gh attestation verify <file> --repo northnarrow/northnarrow-new --deny-self-hosted-runners --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v'
 Build:     \$(git describe --always --dirty 2>/dev/null || echo unknown) — $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOT
 sed -i "s|\\\$(git describe --always --dirty 2>/dev/null \|\| echo unknown)|$(git describe --always --dirty 2>/dev/null || echo unknown)|" "$tree/README-RELEASE.md"
@@ -71,7 +72,7 @@ if cargo cyclonedx --version >/dev/null 2>&1; then
     done
     find . -maxdepth 2 -name "$name.sbom.json" -delete
 else
-    echo "mk-tarball: cargo-cyclonedx not installed — SBOM skipped (cargo install cargo-cyclonedx --locked)"
+    echo "mk-tarball: cargo-cyclonedx not installed — SBOM skipped (cargo install cargo-cyclonedx --version 0.5.9 --locked)"
 fi
 
 ( cd "$OUT" && sha256sum "$name.tar.gz" $(ls "$name".*.sbom.cdx.json 2>/dev/null) > SHA256SUMS && cat SHA256SUMS )

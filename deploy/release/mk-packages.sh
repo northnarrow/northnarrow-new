@@ -19,6 +19,11 @@
 # run when the package's own files are not on disk, so each carries an
 # inlined copy of the script it needs (@INSTALL_SH@ / @UNINSTALL_SH@).
 #
+# Nothing here is signed (external audit DEP-008): the release workflow signs
+# the .rpm afterwards, on a tag, in its rpm-sign job (sign-rpm.sh). A .deb
+# carries no signature dpkg or apt would check; its origin is the tag-bound
+# attestation (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §6.1).
+#
 # Usage: deploy/release/mk-packages.sh [out-dir]       (default: dist/)
 #   NN_PKG_FORMATS="deb rpm"   formats to build (rpm needs rpmbuild)
 #   NN_PKG_RELEASE=1           package release number

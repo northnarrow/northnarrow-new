@@ -237,8 +237,9 @@ COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 #      swapped tarball;
 #   3. the SLSA provenance attestation of the tarball, verified with
 #      `gh attestation verify` (online or with an offline --attestation
-#      bundle) or cosign, bound to THIS repository's release workflow —
-#      catches a tarball built elsewhere.
+#      bundle) or cosign, bound to THIS repository's release workflow run
+#      for a v* tag — catches a tarball built elsewhere, or by a dispatch
+#      run on a branch.
 # The strongest level reached is recorded in the install manifest and
 # the agent re-checks the installed hashes at every boot. A source tree
 # (no MANIFEST.sha256: the lab, a developer build) is "source-tree" and
@@ -246,6 +247,10 @@ COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 # (external audit DEP-007, require_provenance_floor).
 REPO_SLUG="northnarrow/northnarrow-new"
 SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
+# External audit SUP-001: the certificate identity must be the release
+# workflow at a v* tag. --signer-workflow accepted any ref, so the artefacts
+# of a workflow_dispatch run on a branch verified as well.
+SIGNER_IDENTITY_REGEX='^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v'
 PROVENANCE="source-tree"
 TARBALL_SHA256=""
 ATTEST_METHOD="none"
@@ -307,7 +312,7 @@ verify_release() {
     fi
     # attestation: gh (2.49+) online or with an offline bundle, else cosign
     if command -v gh >/dev/null 2>&1 && gh attestation --help >/dev/null 2>&1; then
-        local -a args=(attestation verify "$tgz" --repo "$REPO_SLUG" --signer-workflow "$SIGNER_WORKFLOW")
+        local -a args=(attestation verify "$tgz" --repo "$REPO_SLUG" --cert-identity-regex "$SIGNER_IDENTITY_REGEX" --deny-self-hosted-runners)
         [[ -n "$ATTEST_BUNDLE" ]] && args+=(--bundle "$ATTEST_BUNDLE")
         if gh "${args[@]}" >/dev/null 2>&1; then
             ATTEST_VERIFIED=1; ATTEST_METHOD=$([[ -n "$ATTEST_BUNDLE" ]] && echo gh-bundle || echo gh)
@@ -317,7 +322,7 @@ verify_release() {
         fi
     elif command -v cosign >/dev/null 2>&1 && [[ -n "$ATTEST_BUNDLE" ]]; then
         if cosign verify-blob-attestation --bundle "$ATTEST_BUNDLE" --new-bundle-format \
-            --certificate-identity-regexp "^https://github.com/$SIGNER_WORKFLOW" \
+            --certificate-identity-regexp "$SIGNER_IDENTITY_REGEX" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$tgz" >/dev/null 2>&1; then
             ATTEST_VERIFIED=1; ATTEST_METHOD=cosign
         else
@@ -441,7 +446,15 @@ require_fresh_ebpf() {
 
 require_root
 if [[ $MODE != full ]]; then
+    # External audit DEP-008: no check here can tell where the package came
+    # from — these are the package's own scripts, and a swapped package
+    # brings its own. The origin is checked before the package command:
+    # dnf/yum with gpgcheck=1 or `rpm -K` (the .rpm is signed), the
+    # tag-bound attestation for the .deb.
     PROVENANCE="package"
+    if [[ $MODE == configure ]]; then
+        echo "install.sh: package install — the package's origin is not verified by install.sh; check it before installing (rpm: signature, deb: attestation; docs/operator/INSTALL_UPGRADE_UNINSTALL.md §6.1)"
+    fi
 else
 verify_release
 require_provenance_floor
