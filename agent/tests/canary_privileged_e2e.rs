@@ -198,6 +198,8 @@ struct CanaryFixture {
     /// The registry chain and the audit log.
     canary_registry: PathBuf,
     audit_log: PathBuf,
+    /// Lab PR 163: the per-test detection chain (the verdicts' records).
+    detections_log: PathBuf,
     /// K8.1 R009 avoidance: the `/usr/local/bin/` installed
     /// nn-admin path. Every nn-admin subprocess spawn (deploy,
     /// refresh, init) routes through this path so R009 doesn't
@@ -215,6 +217,18 @@ struct CanaryFixture {
     _agent_guard: AgentGuard,
     _installed_agent: InstalledBin,
     _installed_admin: InstalledBin,
+}
+
+/// Lab PR 163: the agent stops before the fields drop. Fields drop in
+/// declaration order, so `_tempdir` went first, with the agent still up;
+/// since the records, flows and listeners live in the tempdir (signed
+/// chains the agent protects), the removal was an unlink of a protected
+/// inode by this test — a tamper the agent answered (COMBAT, the runner
+/// killed, the guest isolated: Debian 12 gate of the lab follow-ups).
+impl Drop for CanaryFixture {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl CanaryFixture {
@@ -331,6 +345,7 @@ impl CanaryFixture {
         let drift_log = dir.join("fim_drift.jsonl");
         let canary_registry = dir.join("canaries.jsonl");
         let canary_access = dir.join("canary_access.jsonl");
+        let detections_log = dir.join("detections.jsonl");
 
         // K8.1 R009 avoidance: spawn the installed /usr/local/bin/
         // agent via sudo. Mirrors `agent/tests/privileged_e2e.rs`
@@ -368,6 +383,16 @@ impl CanaryFixture {
             canary_access.clone().into_os_string(),
             "--canary-template-dir".into(),
             templates_dir.clone().into_os_string(),
+            // Lab PR 163: the records, flows and listeners of the test in
+            // its own directory (they went to the host's default paths).
+            "--detections-file".into(),
+            detections_log.clone().into_os_string(),
+            "--status-events-file".into(),
+            dir.join("status_events.jsonl").into_os_string(),
+            "--netflow-file".into(),
+            dir.join("netflow.jsonl").into_os_string(),
+            "--netflow-listeners-file".into(),
+            dir.join("netflow_listeners.jsonl").into_os_string(),
             "--no-ade".into(),
         ]
         .to_vec();
@@ -391,6 +416,7 @@ impl CanaryFixture {
             canary_access_log: canary_access,
             canary_registry,
             audit_log,
+            detections_log,
             nn_admin_path,
             agent_bin: installed_agent.path.clone(),
             agent_args,
@@ -524,6 +550,37 @@ impl CanaryFixture {
         assert!(
             out.status.success(),
             "nn-admin canary deploy process: exit {:?}, stdout {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout)
+        );
+        parse_canary_id(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Lab PR 163: submit a signed `nn-admin canary deploy network
+    /// --bind-addr <addr> --bind-port <port>`. Returns the canary_id.
+    fn deploy_network_canary(&self, name: &str, bind_addr: &str, bind_port: u16) -> String {
+        let out = Command::new(&self.nn_admin_path)
+            .arg("canary")
+            .arg("deploy")
+            .arg("--name")
+            .arg(name)
+            .arg("--key")
+            .arg(&self.admin_priv)
+            .arg("--agent-id-file")
+            .arg(&self.agent_id_file)
+            .arg("--socket")
+            .arg(&self.admin_socket)
+            .arg("network")
+            .arg("--bind-addr")
+            .arg(bind_addr)
+            .arg("--bind-port")
+            .arg(bind_port.to_string())
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("spawn nn-admin canary deploy network");
+        assert!(
+            out.status.success(),
+            "nn-admin canary deploy network: exit {:?}, stdout {:?}",
             out.status,
             String::from_utf8_lossy(&out.stdout)
         );
@@ -1037,4 +1094,159 @@ fn refresh_rearms_canary_for_repeat_trips() {
         row = rows[1]
     );
     assert_eq!(rows[1]["canary_id"].as_str(), Some(canary_id.as_str()));
+}
+
+// ── Test 4: network canary connect → access row, verdict, kill ─────
+
+/// A loopback port nothing listens on: bound, then released.
+fn unused_loopback_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    l.local_addr().expect("local addr").port()
+}
+
+/// A shell that connects to `addr:port` (bash's `/dev/tcp`; the connect
+/// is the shell's own, the redirection of a builtin), then waits
+/// `then_sleep` seconds. Returns the child.
+fn connect_from_a_shell(addr: &str, port: u16, then_sleep: u32) -> Child {
+    Command::new("/bin/bash")
+        .arg("-c")
+        .arg(format!(
+            "echo > /dev/tcp/{addr}/{port}; sleep {then_sleep}; exit 0"
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn bash for the network canary connect")
+}
+
+/// How `child` ended, waited for at most `timeout`; `None` if it still
+/// runs (then killed).
+fn wait_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return Some(status);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Lab PR 163 (NN-L-CANARY-003 could not fire: nothing produced a Network
+/// canary trip). A network canary is a decoy destination: a local process
+/// connecting to its address and port trips it (`canary::network`; the
+/// agent opens no listener, the connect kprobe names the process). Here
+/// the destination is a loopback port nothing listens on.
+///
+/// - a connect to another port first trips nothing (events are handled in
+///   order: a row for it would precede the trip's);
+/// - the trip: one signed access row (`NetworkConnect`, `first_trip`, the
+///   shell as the accessor), the registry's `trip` row naming it, the
+///   NN-L-CANARY-003 record (Critical, KillProcessTree) and the shell
+///   killed (SIGKILL) during its sleep;
+/// - a second connect is recorded with `first_trip = false` and, as every
+///   connect to a network canary (external audit NETR-006), killed;
+/// - the close of a trip's connection is not judged again: no
+///   NN-L-CHAIN-003 record (checked after an exec barrier).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn network_canary_connect_trips_canary_003_and_kills_the_connector() {
+    use std::os::unix::process::ExitStatusExt;
+    // NN-L-CANARY-003 is Critical; the guard restores the host's network
+    // whatever the posture does.
+    let _eni = EniIptablesGuard::install();
+    let fx = CanaryFixture::setup(&[]);
+    let port = unused_loopback_port();
+    let mut other = unused_loopback_port();
+    while other == port {
+        other = unused_loopback_port();
+    }
+    let canary_id = fx.deploy_network_canary("decoy-db", "127.0.0.1", port);
+    assert_eq!(canary_id.len(), 32);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Not the canary's port: refused, the shell exits 0 on its own.
+    let mut miss = connect_from_a_shell("127.0.0.1", other, 0);
+    let miss_pid = u64::from(miss.id());
+    let status = wait_exit(&mut miss, Duration::from_secs(10)).expect("the miss shell exits");
+    assert!(status.success(), "a connect to another port: {status:?}");
+
+    // The trip.
+    let mut shell = connect_from_a_shell("127.0.0.1", port, 30);
+    let shell_pid = u64::from(shell.id());
+    let rows = fx.wait_access(1);
+    let row = &rows[0];
+    assert_ne!(
+        row["accessor_pid"].as_u64(),
+        Some(miss_pid),
+        "a connect to another port tripped the canary: {rows:?}"
+    );
+    assert_eq!(row["canary_id"].as_str(), Some(canary_id.as_str()));
+    assert_eq!(row["canary_type"].as_str(), Some("Network"));
+    assert_eq!(row["access_kind"].as_str(), Some("NetworkConnect"));
+    assert_eq!(row["accessor_pid"].as_u64(), Some(shell_pid), "{row}");
+    assert_eq!(row["first_trip"].as_bool(), Some(true), "{row}");
+    assert_eq!(row["entry_hash"].as_str().unwrap_or("").len(), 64);
+
+    let rec = common::wait_jsonl_row(
+        &fx.detections_log,
+        ACCESS_LOG_POLL_TIMEOUT,
+        "NN-L-CANARY-003 record of the shell",
+        |r| {
+            r["rule_id"].as_str() == Some("NN-L-CANARY-003_NetworkConnect")
+                && r["principal"]["pid"].as_u64() == Some(shell_pid)
+        },
+    );
+    assert_eq!(rec["severity"], "Critical", "record: {rec}");
+    assert!(
+        rec["response"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("KillProcessTree")),
+        "record: {rec}"
+    );
+    let status = wait_exit(&mut shell, Duration::from_secs(10))
+        .expect("the connecting shell must be killed during its 30 s sleep");
+    assert_eq!(status.signal(), Some(9), "{status:?}");
+
+    let trips: Vec<_> = fx
+        .registry_rows(&canary_id)
+        .into_iter()
+        .filter(|r| r["action"].as_str() == Some("trip"))
+        .collect();
+    assert_eq!(trips.len(), 1, "one Trip row: {trips:?}");
+    assert_eq!(
+        trips[0]["first_trip_access_hash"].as_str(),
+        row["entry_hash"].as_str(),
+        "the Trip row names the access row of the first trip"
+    );
+
+    // A second connect: recorded, not a first trip; killed all the same.
+    let mut second = connect_from_a_shell("127.0.0.1", port, 30);
+    let second_pid = u64::from(second.id());
+    let rows = fx.wait_access(2);
+    assert_eq!(rows[1]["accessor_pid"].as_u64(), Some(second_pid));
+    assert_eq!(rows[1]["first_trip"].as_bool(), Some(false), "{rows:?}");
+    let status = wait_exit(&mut second, Duration::from_secs(10)).expect("killed");
+    assert_eq!(status.signal(), Some(9), "{status:?}");
+
+    // The closes of the trips' connections are not judged again.
+    common::exec_barrier(&fx.detections_log, ACCESS_LOG_POLL_TIMEOUT);
+    let chain: Vec<_> = common::records_of(&fx.detections_log, "NN-L-CHAIN-003_CanaryThenEgress")
+        .into_iter()
+        .filter(|r| {
+            let pid = r["principal"]["pid"].as_u64();
+            pid == Some(shell_pid) || pid == Some(second_pid)
+        })
+        .collect();
+    assert!(
+        chain.is_empty(),
+        "the trip's own connection drew NN-L-CHAIN-003: {chain:?}"
+    );
+    assert_eq!(
+        read_jsonl(&fx.canary_access_log).len(),
+        2,
+        "one row per connect to the canary"
+    );
 }

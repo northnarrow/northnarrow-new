@@ -41,6 +41,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-ups, network canaries and NN-L-NET-003 (lab PR 163):
+  NN-L-CANARY-003 could not fire — nothing consulted the network
+  canaries, so no Network canary ever tripped. A network canary is now a
+  decoy destination: a local process connecting to its address and port
+  (`nn-admin canary deploy network --bind-addr --bind-port`; `0.0.0.0` /
+  `::` is the port at any address of this host) trips it, reported by the
+  connect kprobe at the start of the connect — the signed access row with
+  `first_trip`, the registry's `trip` row and NN-L-CANARY-003 (Critical,
+  KillProcessTree on the connecting process). The agent opens no
+  listener: a connection from another host, a UDP datagram and the lure
+  of a port `ss -tlnp` shows are not covered (deception design §5.4). The
+  close of the trip's connection is recorded in the netflow log and not
+  judged again (NN-L-CHAIN-003 answered the same access a second time). A
+  network canary deploy is refused when its address is not an IP
+  address, its port is 0, or a listener on this host serves the port
+  (its clients would trip it). V2 campaign: `v2-rules.tsv` version 2 —
+  NN-L-NET-003 (no TLS fingerprint producer, BUG-025) leaves the Critical
+  sub-gate until BUG-025 and stays in the denominator; the sub-gate holds
+  25 rules, NN-L-CANARY-003 among them with a privileged e2e.
 - Lab follow-up, the rules that kill an exec whose executable is the
   payload itself kill its process tree (lab PR 166). A root dropper run
   from `/tmp` that forked at once and waited in `pause()` was killed by

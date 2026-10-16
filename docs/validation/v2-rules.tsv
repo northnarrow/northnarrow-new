@@ -1,6 +1,10 @@
 # NorthNarrow — V2 validation campaign — frozen rule denominator.
-# version: 1
+# version: 2
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217, NN-AUD-235).
+# version 2 (2026-10-16, lab PR 163, before any V2 run): NN-L-NET-003 leaves
+# the Critical sub-gate (gate -), inactive until BUG-025 (no sensor produces
+# a TLS fingerprint); it stays in the denominator. NN-L-CANARY-003 stays in
+# the sub-gate: a connect to a network canary now trips it.
 #
 # One row per rule the agent can record: the 76 rules the production engine
 # loads (decision::rules::default_rules_with_net) and NN-L-AT-001, which
@@ -18,7 +22,8 @@
 #            outside it
 #   gate     critical = in the 100 % Critical sub-gate: every rule design
 #            §13 Q1 names, and every other rule that can issue a Critical
-#            verdict; - otherwise
+#            verdict on the agent as built (NN-L-NET-003 cannot until
+#            BUG-025); - otherwise
 #   q1       yes = named by Q1 itself (FIM-001/002/008/010/021/022 and every
 #            CHAIN rule); - otherwise
 #   status   in = in the denominator; n/a:<reason> = left out, decided in a
@@ -81,7 +86,7 @@ NN-L-CANARY-003_NetworkConnect	canary	engine	critical	-	in
 NN-L-CANARY-004_CredentialRead	canary	engine	critical	-	in
 NN-L-NET-001_OutboundToBlockedIp	net	engine	critical	-	in
 NN-L-NET-002_OutboundToBlockedTld	net	engine	-	-	in
-NN-L-NET-003_BadJa3	net	engine	critical	-	in
+NN-L-NET-003_BadJa3	net	engine	-	-	in
 NN-L-NET-004_SuspiciousDnsQname	net	engine	-	-	in
 NN-L-NET-005_DnsTxtNullBurst	net	engine	-	-	in
 NN-L-NET-006_UncommonListener	net	engine	-	-	in

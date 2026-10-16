@@ -9,8 +9,10 @@
 //!   does.
 //! - `detector` (K3, follow-up) — inline `process_event` filter
 //!   that intercepts `Event::Fim` / `Event::ProcessSpawn` /
-//!   `Event::NetFlow` BEFORE the rule engine sees them (§12 Q9
+//!   `Event::TcpConnect` BEFORE the rule engine sees them (§12 Q9
 //!   OPTION B inline-filter lock-in).
+//! - `network` (lab PR 163) — what a Network canary covers (a decoy
+//!   address and port a local process connects to) and its deploy check.
 //! - `templates` (K4) — credential-canary content renderer
 //!   (5 cred families: AWS / GCP / Azure / SSH priv-key / Git
 //!   token) reading from `/etc/northnarrow/canary-templates/`.
@@ -19,6 +21,7 @@
 
 pub mod access_log;
 pub mod detector;
+pub mod network;
 pub mod path_policy;
 pub mod read_forward;
 pub mod readers;
