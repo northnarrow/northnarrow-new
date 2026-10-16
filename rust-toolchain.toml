@@ -1,4 +1,13 @@
+# External audit SUP-015: a fixed release, not `stable`, so every build of
+# this tree (CI, release, lab, a developer host) uses the same compiler and
+# a new stable — its lints under `-D warnings`, its codegen — arrives in a
+# reviewed PR of its own. Dependabot (`rust-toolchain`, monthly) proposes
+# the bump. 1.99.0 is the stable the last green CI on main used
+# (2026-10-16). The floor the workspace supports is `rust-version` in
+# Cargo.toml, checked by the `msrv` CI job; `agent-ebpf/` pins its own
+# nightly. rustup installs this channel on first use (`rustup toolchain
+# install` with no argument reads this file).
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

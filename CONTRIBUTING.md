@@ -30,13 +30,29 @@ Prima di aprire una PR, sul tuo branch:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --locked
 ```
 
 La CI esegue gli stessi controlli su Linux x86_64. Una PR rossa non si
 fonde.
+
+- `--locked` (audit esterno SUP-016): ogni build della CI e della release
+  usa il `Cargo.lock` così com'è committato. Una PR che cambia un
+  `Cargo.toml` committa anche il lockfile aggiornato — `Cargo.lock`,
+  `fuzz/Cargo.lock` (il fuzz harness compila l'agente) e
+  `agent-ebpf/Cargo.lock` se tocca quel crate — altrimenti la CI fallisce
+  con "cannot update the lock file … because --locked was passed".
+  `cargo xtask` si lancia come `cargo --locked xtask build --release
+  --locked`: il secondo `--locked` arriva alle build annidate.
+- Toolchain (SUP-015): `rust-toolchain.toml` fissa una release di Rust
+  (rustup la installa al primo `cargo`); Dependabot propone la successiva
+  in una PR a sé. `rust-version` in `Cargo.toml` è la MSRV reale (oggi
+  1.89, imposta da `uuid`): il job `msrv` compila con quella versione e
+  `xtask/tests/supply_chain.rs` fallisce se una dipendenza del lockfile ne
+  chiede una più alta. Chi aggiorna una dipendenza così alza `rust-version`
+  nella stessa PR.
 
 ## Stile
 

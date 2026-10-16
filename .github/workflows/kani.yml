@@ -16,6 +16,10 @@ on:
     - cron: "41 4 * * 1"
   workflow_dispatch:
 
+# External audit SUP-004: a read-only token, not left in .git/config.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Same as the .cargo/config.toml default since external audit SUP-017;
@@ -29,6 +33,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # External audit SUP-015/SUP-016: the pinned userland release
+      # (rust-toolchain.toml) builds kani-verifier; `cargo kani` has no
+      # --locked, so Cargo.lock is checked against the manifests first and
+      # must be unchanged after the proofs.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Lockfile is authoritative
+        run: cargo fetch --locked
 
       - name: Install Kani (pinned)
         run: |
@@ -50,3 +66,6 @@ jobs:
         run: >
           cargo kani -p northnarrow-common
           --harness quorum_accepts_only_enough_distinct_keys_carrying_every_role
+
+      - name: No lockfile changed during the proofs
+        run: git diff --exit-code -- Cargo.lock

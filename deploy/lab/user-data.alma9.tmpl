@@ -50,7 +50,8 @@ runcmd:
   # audit LAB-009: no `curl | sh`; a pinned rustup-init is checked against
   # its pinned SHA-256 before it runs (rustup then checks each toolchain
   # component against the channel manifest). The repository's
-  # rust-toolchain.toml (channel stable) applies once the tree is synced.
+  # rust-toolchain.toml (a pinned release since external audit SUP-015)
+  # applies once the tree is synced: rustup installs it on the first build.
   - >-
     su - nn -c 'set -e; d=$(mktemp -d);
     curl -fsSL --proto =https --tlsv1.2 -o "$d/rustup-init"

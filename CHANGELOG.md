@@ -61,6 +61,40 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, CI and build integrity (Low SUP-004 NN-AUD-392,
+  SUP-016 NN-AUD-401, SUP-022 NN-AUD-406, SUP-012 NN-AUD-397, SUP-015
+  NN-AUD-400, and the scheduled advisory check left over from SUP-006
+  NN-AUD-204; lab PR 171). `ci.yml` and `kani.yml` gave their jobs the
+  repository's default token: every workflow now starts at
+  `contents: read`, only release.yml's `sign` job may write, and no
+  checkout leaves the token in `.git/config` for the build scripts of the
+  dependency tree. No CI or release build was `--locked`, so a manifest
+  change was resolved again on the runner while `cargo audit` checked the
+  committed lockfile: every cargo build, test, clippy and check is locked,
+  `cargo xtask` takes `--locked` and passes it to its nested builds
+  (agent-ebpf included), and the fuzz and Kani jobs, whose tools have no
+  such flag, check their lockfile first and fail if it changed.
+  `fuzz/Cargo.lock` was already out of step with the agent's manifests
+  (procfs 0.17, no fancy-regex 0.14 — CI resolved it again on every run)
+  and is brought up to date. Cache restore keys no longer fall back to any
+  job's cache (`<os>-cargo-`). The cache prune script passed — "0 crates",
+  exit 0 — when `cargo metadata` failed, leaving restored workspace
+  artifacts in place: it now fails. `rust-toolchain.toml` pins Rust 1.99.0
+  (the release the last green CI used) instead of `stable`, every
+  workflow installs that pin, and Dependabot proposes the next release.
+  `rust-version` claimed 1.83 while `uuid 1.28.0` needs 1.89: it is 1.89
+  (the whole workspace, all targets, checks with 1.89.0), a new `msrv` CI
+  job builds with it, and a test fails when a locked dependency needs a
+  newer rustc (clippy, which reads that value, now proposes
+  `is_multiple_of` in the agent; that lint is allowed there until the
+  rewrite). `ci.yml` runs daily for the advisory job alone. New tests
+  in `xtask/tests/supply_chain.rs`. **Regression:** a PR that changes a
+  `Cargo.toml` must commit the updated `Cargo.lock`, `fuzz/Cargo.lock`
+  and, for that crate, `agent-ebpf/Cargo.lock`, or CI fails; a new Rust
+  release reaches CI, release and lab builds only through a reviewed bump
+  of `rust-toolchain.toml` (the first build on a host downloads the pinned
+  toolchain); each CI job installs the pinned toolchain (about a minute)
+  and the first runs after this change build with colder caches.
 - External audit, Wave 3, watchdog supervision (Low WDG-007 NN-AUD-358,
   WDG-010 NN-AUD-360, WDG-008 NN-AUD-359, WDG-015 NN-AUD-364,
   Informational WDG-019 NN-AUD-437; lab PR 170). Root could `rm

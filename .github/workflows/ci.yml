@@ -5,6 +5,18 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # External audit SUP-006 (residual): a new RustSEC advisory against an
+  # unchanged main is reported the next morning, not at the next push.
+  # The schedule runs the audit job only; every other job is skipped.
+  schedule:
+    - cron: "23 5 * * *"
+
+# External audit SUP-004: the token of every job reads the repository and
+# nothing else. No job here writes to it (the audit gate is its exit
+# status), and no checkout leaves the token in .git/config, where the build
+# scripts and proc-macros of the dependency tree could read it.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,6 +30,7 @@ env:
 jobs:
   userland:
     name: ${{ matrix.task }} (${{ matrix.os }})
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,6 +40,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -41,9 +56,11 @@ jobs:
           df -h / | tail -1
 
       - name: Install Rust toolchain
+        # rust-toolchain.toml: the pinned release with rustfmt and clippy
+        # (external audit SUP-015). No argument: rustup reads the file.
         run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup component add rustfmt clippy
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -55,7 +72,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ matrix.task }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.task }}-
-            ${{ runner.os }}-cargo-
 
       - name: Prune workspace crates from the restored cache
         run: |
@@ -65,28 +81,36 @@ jobs:
         if: matrix.task == 'fmt'
         run: cargo fmt --all --check
 
+      # External audit SUP-016: every cargo build, test, clippy and check
+      # here is --locked. A manifest change without its Cargo.lock fails
+      # ("cannot update the lock file … because --locked was passed")
+      # instead of being resolved again on the runner, from whatever the
+      # registry serves that day.
       - name: cargo clippy --workspace --exclude northnarrow-agent-ebpf --all-targets -- -D warnings
         if: matrix.task == 'clippy'
-        run: cargo clippy --workspace --exclude northnarrow-agent-ebpf --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude northnarrow-agent-ebpf --all-targets --locked -- -D warnings
 
       - name: cargo build --workspace
         if: matrix.task == 'build'
-        run: cargo build --workspace --exclude northnarrow-agent-ebpf --verbose
+        run: cargo build --workspace --exclude northnarrow-agent-ebpf --locked --verbose
 
       - name: cargo test --workspace
         # Integration tests that need root are #[ignore]d, so the
         # default `cargo test` run is unprivileged.
         if: matrix.task == 'test'
-        run: cargo test --workspace --exclude northnarrow-agent-ebpf --verbose
+        run: cargo test --workspace --exclude northnarrow-agent-ebpf --locked --verbose
 
   test-privileged:
     name: test-privileged (compile-only)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     # Tappa 3 ships ignored integration tests that actually kill
     # processes (need root or CAP_KILL). CI cannot run them, but it
     # still verifies they compile so they can never silently rot.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -101,9 +125,11 @@ jobs:
           df -h / | tail -1
 
       - name: Install Rust toolchain
+        # rust-toolchain.toml: the pinned release with rustfmt and clippy
+        # (external audit SUP-015). No argument: rustup reads the file.
         run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup component add rustfmt clippy
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -115,14 +141,13 @@ jobs:
           key: ${{ runner.os }}-cargo-test-privileged-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-privileged-
-            ${{ runner.os }}-cargo-
 
       - name: Prune workspace crates from the restored cache
         run: |
           .github/scripts/prune-workspace-cache.sh target
 
       - name: Compile workspace tests (including ignored)
-        run: cargo test --workspace --no-run --verbose
+        run: cargo test --workspace --no-run --locked --verbose
 
       # Tappa 7 task 7 / Tappa 8: agent/tests/privileged_e2e.rs is gated
       # behind --features test-privileged. Running it needs root +
@@ -130,7 +155,7 @@ jobs:
       # without executing — same bit-rot guard pattern as the rest of
       # this job.
       - name: Compile privileged_e2e module (test-privileged)
-        run: cargo test --workspace --no-run --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger --verbose
+        run: cargo test --workspace --no-run --locked --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger --verbose
 
       # External audit ASK-016 (lab PR 170): the wire's production
       # discriminants must not move with `debug-trigger` (a lab agent and a
@@ -143,10 +168,13 @@ jobs:
     # ever pulling a GGUF model or any C++ dependency. The default
     # `MockBackend` is the only backend on the build path.
     name: ade-build (ubuntu-latest)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -161,9 +189,11 @@ jobs:
           df -h / | tail -1
 
       - name: Install Rust toolchain
+        # rust-toolchain.toml: the pinned release with rustfmt and clippy
+        # (external audit SUP-015). No argument: rustup reads the file.
         run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
-          rustup component add clippy
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -175,27 +205,29 @@ jobs:
           key: ${{ runner.os }}-cargo-ade-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-ade-build-
-            ${{ runner.os }}-cargo-
 
       - name: Prune workspace crates from the restored cache
         run: |
           .github/scripts/prune-workspace-cache.sh target
 
       - name: cargo build (ADE module)
-        run: cargo build -p northnarrow-agent --lib --verbose
+        run: cargo build -p northnarrow-agent --lib --locked --verbose
 
       - name: cargo clippy (ADE-touched crates)
-        run: cargo clippy -p northnarrow-agent -p northnarrow-common --all-targets -- -D warnings
+        run: cargo clippy -p northnarrow-agent -p northnarrow-common --all-targets --locked -- -D warnings
 
   ade-unit-test:
     # Tappa 6 — runs every ADE unit test (parser validation, escalate
     # transform, prompt builder, mock backend, engine end-to-end with
     # mocks). NEVER downloads a model and NEVER hits the network.
     name: ade-unit-test (ubuntu-latest)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -210,8 +242,11 @@ jobs:
           df -h / | tail -1
 
       - name: Install Rust toolchain
+        # rust-toolchain.toml: the pinned release with rustfmt and clippy
+        # (external audit SUP-015). No argument: rustup reads the file.
         run: |
-          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -223,7 +258,6 @@ jobs:
           key: ${{ runner.os }}-cargo-ade-test-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-ade-test-
-            ${{ runner.os }}-cargo-
 
       - name: Prune workspace crates from the restored cache
         run: |
@@ -231,16 +265,19 @@ jobs:
 
       - name: cargo test (ADE + correlation + ade_types)
         run: |
-          cargo test -p northnarrow-agent --lib ade::
-          cargo test -p northnarrow-agent --lib correlation::
-          cargo test -p northnarrow-common --lib ade_types::
+          cargo test -p northnarrow-agent --lib --locked ade::
+          cargo test -p northnarrow-agent --lib --locked correlation::
+          cargo test -p northnarrow-common --lib --locked ade_types::
 
   ebpf-build:
     name: ebpf-build (ubuntu-latest)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
       # plus the candle/gemm build artefacts have pushed the 14 GB
@@ -267,7 +304,7 @@ jobs:
         # does not have to download it again at build time.
         run: |
           rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
-          rustup default stable
+          rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
 
       - name: Install bpf-linker (pinned)
         run: cargo install bpf-linker --version 0.10.3 --locked
@@ -289,8 +326,12 @@ jobs:
           .github/scripts/prune-workspace-cache.sh target
           (cd agent-ebpf && ../.github/scripts/prune-workspace-cache.sh target)
 
+      # The first --locked builds xtask itself against Cargo.lock; the
+      # second is xtask's, passed on to the nested agent-ebpf build (xtask
+      # clears the parent cargo's environment), so agent-ebpf/Cargo.lock
+      # is held to its manifest too.
       - name: cargo xtask build-ebpf
-        run: cargo xtask build-ebpf
+        run: cargo --locked xtask build-ebpf --locked
 
       - name: Verify eBPF object exists
         run: |
@@ -299,11 +340,14 @@ jobs:
 
   fuzz:
     name: fuzz (smoke, nightly)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Free disk space
         run: |
@@ -318,6 +362,7 @@ jobs:
       - name: Install nightly toolchain + cargo-fuzz (pinned)
         run: |
           rustup toolchain install nightly-2025-12-01 --profile minimal
+          rustup toolchain install   # the pinned release builds cargo-fuzz (rust-toolchain.toml)
           cargo install cargo-fuzz --version 0.13.2 --locked
 
       - name: Cache cargo registry and fuzz target
@@ -335,6 +380,12 @@ jobs:
         run: |
           .github/scripts/prune-workspace-cache.sh target
           (cd fuzz && ../.github/scripts/prune-workspace-cache.sh target)
+
+      # cargo-fuzz has no --locked: fuzz/Cargo.lock is checked against the
+      # harness's manifest (and the agent's, which it builds) first, and
+      # must be unchanged after the build (external audit SUP-016).
+      - name: fuzz/Cargo.lock is authoritative
+        run: cd fuzz && cargo +nightly-2025-12-01 fetch --locked
 
       # Every target must build; each then runs a short smoke so a
       # trivially reachable panic fails the PR. Long campaigns run from a
@@ -356,10 +407,43 @@ jobs:
             echo "fuzz: crash artefacts found"; ls -la fuzz/artifacts/*; exit 1
           fi
 
+      - name: No lockfile changed during the build
+        run: git diff --exit-code -- Cargo.lock fuzz/Cargo.lock agent-ebpf/Cargo.lock
+
+  msrv:
+    # External audit SUP-015: `rust-version` in Cargo.toml is a claim this
+    # job checks. It was 1.83 while uuid 1.28.0 needed 1.89, and nothing
+    # built with it. The version is read from Cargo.toml, so raising it
+    # needs no edit here. No cache (a check of the workspace takes minutes,
+    # and nothing restored can mark a crate fresh), and no -D warnings: the
+    # claim is that this rustc builds the tree; the lints are the pinned
+    # toolchain's job (clippy above).
+    name: msrv (rust-version, ubuntu-latest)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the toolchain of rust-version
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          [ -n "$msrv" ] || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+
+      - name: cargo +rust-version check --workspace --all-targets --locked
+        run: cargo +"$MSRV" check --workspace --all-targets --locked
+
   audit:
     # RustSEC advisory gate. Fails on a vulnerability;
     # `unmaintained`/`unsound` warnings are reported but do not fail the
-    # job (they are tracked by dependabot).
+    # job (they are tracked by dependabot). Runs on every push and pull
+    # request and, alone, on the daily schedule above.
     name: cargo audit (ubuntu-latest)
     runs-on: ubuntu-latest
     # cargo-audit itself, not rustsec/audit-check: the action reported
@@ -375,7 +459,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.2
+        run: |
+          rustup toolchain install   # the pinned release (rust-toolchain.toml)
+          cargo install cargo-audit --locked --version 0.22.2
       - name: Audit Cargo.lock, fuzz/Cargo.lock, agent-ebpf/Cargo.lock
         run: |
           rc=0
