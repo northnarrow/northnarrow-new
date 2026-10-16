@@ -431,6 +431,12 @@ struct Cli {
     )]
     netflow_listeners_file: PathBuf,
 
+    /// External audit NN-AUD-108 (lab PR 160): the signed head anchor of
+    /// the chains. Default: `chain_heads.json` next to `--audit-log-file`
+    /// (`/etc/northnarrow/chain_heads.json`).
+    #[arg(long = "chain-heads-file", value_name = "PATH")]
+    chain_heads_file: Option<PathBuf>,
+
     /// Tappa 10 N9: configurable path of the operator-curated
     /// NetFlow IP/CIDR blocklist (default — read at boot, feeds
     /// NN-L-NET-001).
@@ -530,6 +536,31 @@ struct Cli {
 }
 
 impl Cli {
+    /// `--chain-heads-file`, or `chain_heads.json` next to the audit log it
+    /// anchors (an agent run with its own audit log and key, as the
+    /// privileged tests do, never touches the installed agent's anchor).
+    fn resolved_chain_heads_file(&self) -> PathBuf {
+        self.chain_heads_file.clone().unwrap_or_else(|| {
+            self.audit_log_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(northnarrow_agent::chain_anchor::HEADS_FILE_NAME)
+        })
+    }
+
+    /// The chains the agent anchors, at the configured paths.
+    fn chain_paths(&self) -> northnarrow_agent::chain_anchor::ChainPaths {
+        northnarrow_agent::chain_anchor::ChainPaths {
+            audit: self.audit_log_file.clone(),
+            canary_registry: self.canary_registry_file.clone(),
+            canary_access: self.canary_access_file.clone(),
+            detections: self.detections_file.clone(),
+            status_events: self.status_events_file.clone(),
+            netflow: self.netflow_file.clone(),
+            fim_drift: self.fim_drift_file.clone(),
+        }
+    }
+
     /// `--watchdog-exe`, or the watchdog next to this agent (review 26).
     fn resolved_watchdog_exe(&self) -> PathBuf {
         self.watchdog_exe.clone().unwrap_or_else(|| {
@@ -924,6 +955,23 @@ async fn main() -> Result<()> {
         warn!(error = %e, "failed to raise RLIMIT_MEMLOCK; eBPF maps may fail to allocate");
     }
 
+    // External audit NN-AUD-108 / NN-AUD-109 / NN-AUD-174 (lab PR 160): the
+    // chains compared with their anchored heads and manifest checkpoints,
+    // before any writer opens them (O(1) per file). The findings are
+    // attested once the audit log is open; a cut audit chain resets the
+    // overlay rollback floor below.
+    let heads_file = cli.resolved_chain_heads_file();
+    let chain_targets = cli.chain_paths().targets();
+    let mut boot_chains =
+        match northnarrow_agent::chain_anchor::boot_verifying_key(&cli.signing_key_file) {
+            Some(pk) => {
+                northnarrow_agent::chain_anchor::boot_check(&chain_targets, &heads_file, &pk)
+            }
+            None => {
+                info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
+                northnarrow_agent::chain_anchor::BootCheck::default()
+            }
+        };
     // External audit LLMR-014: the signed overlays' rollback floor, from the
     // audit chain as this boot found it — verified, and read before the key
     // and the log below are bootstrapped (a log found missing must not look
@@ -932,6 +980,10 @@ async fn main() -> Result<()> {
         &cli.audit_log_file,
         &cli.signing_key_file,
     );
+    let rollback_floor = match boot_chains.audit_history_lost() {
+        Some(why) => rollback_floor.reset_because(why),
+        None => rollback_floor,
+    };
 
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
@@ -1070,6 +1122,15 @@ async fn main() -> Result<()> {
             path = %cli.canary_access_file.display(),
             "canary access log bootstrap failed pre-attach — file will be lazily \
              created on first trip (and unprotected this boot)"
+        );
+    }
+    // Lab PR 160: the head anchor, for the same inode-registration reason.
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_chain_heads(&heads_file) {
+        warn!(
+            error = %e,
+            path = %heads_file.display(),
+            "chain heads bootstrap failed pre-attach — the anchor is created at its first \
+             write (and protected from the next start)"
         );
     }
     // Tappa 10 N8: bootstrap the NetFlow chain log pre-attach for
@@ -2026,6 +2087,8 @@ async fn main() -> Result<()> {
     // signed transitions) and the admin socket (admin-op audit). A `None`
     // audit log (open/key failure) degrades to log-only, exactly as the
     // admin-op path already tolerates.
+    let mut chain_anchor: Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>> =
+        None;
     let audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>> =
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
             Ok(key) => {
@@ -2035,9 +2098,37 @@ async fn main() -> Result<()> {
                     // instead of failing silently at the first COMBAT
                     // transition. Fail-closed in enforcement mode.
                     Ok(mut log) => {
+                        // Lab PR 160: anchor the heads as this boot found
+                        // them before it appends anything (the snapshot is on
+                        // disk before the first numbered row of an upgrade).
+                        // A row-number break in the audit chain counts as
+                        // lost history there too (ATP-004 fails closed).
+                        for f in log.take_open_findings(&cli.audit_log_file) {
+                            boot_chains.findings.push(f);
+                        }
+                        chain_anchor = start_chain_anchor(
+                            &cli,
+                            &heads_file,
+                            &chain_targets,
+                            &mut boot_chains,
+                            agent_id,
+                            &log,
+                        );
                         // External audit LLMR-014: the rollback floor's
                         // reset / anchor come first in this boot's entries.
                         overlay_gate.attest_floor(&mut log);
+                        // Lab PR 160: what the chain checks found, then the
+                        // one-time record of where numbering starts.
+                        for f in &boot_chains.findings {
+                            f.attest(Some(&mut log));
+                        }
+                        if let Some(marker) =
+                            chain_anchor.as_ref().and_then(|a| a.lock().take_marker())
+                        {
+                            if let Err(e) = log.append(marker) {
+                                warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
+                            }
+                        }
                         match log.boot_probe(
                             detect_only_source.as_deref(),
                             integrity.label(),
@@ -2131,6 +2222,20 @@ async fn main() -> Result<()> {
         cli.watchdog_pidfile.clone(),
         Some(Arc::clone(&overlay_gate)),
     );
+    // Lab PR 160: the heads re-anchored as they move, and the bounded
+    // verification of the rotating logs in the background
+    // (external audit NN-AUD-108, NN-AUD-112).
+    if let Some(a) = &chain_anchor {
+        northnarrow_agent::chain_anchor::spawn(Arc::clone(a), audit_log.clone());
+    }
+    northnarrow_agent::chain_anchor::set_audit_log(audit_log.clone());
+    if let Some(pk) = northnarrow_agent::chain_anchor::boot_verifying_key(&cli.signing_key_file) {
+        northnarrow_agent::chain_anchor::spawn_boot_verify(
+            chain_targets.clone(),
+            pk,
+            audit_log.clone(),
+        );
+    }
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
     // External audit NN-AUD-120: a full FIM watch set is attested.
     northnarrow_agent::fim::drain::set_audit_log(audit_log.clone());
@@ -2393,6 +2498,11 @@ async fn main() -> Result<()> {
         };
     let rotation_on = state_protection.is_some();
     let cap = |bytes: u64| if rotation_on { bytes } else { u64::MAX };
+    // Lab PR 160: the head anchor is created inside the same dance when
+    // the state directory is already immutable.
+    if let Some(a) = &chain_anchor {
+        a.lock().set_protection(rotation_protection.clone());
+    }
     // Test/ops knob: NN_FIM_DRIFT_CAP_BYTES overrides the fim_drift active-file
     // rotation cap (default 32 MiB) so rotation can be validated without
     // generating 32 MiB of drift. Unset = default; still gated by rotation_on.
@@ -3019,6 +3129,7 @@ async fn main() -> Result<()> {
                             &cli.canary_registry_file,
                             r.take_open_findings(),
                         );
+                        attest_chain_findings(audit_log.as_ref(), r.take_chain_findings());
                         Some(Arc::new(parking_lot::Mutex::new(r)))
                     }
                     Err(e) => {
@@ -3043,6 +3154,7 @@ async fn main() -> Result<()> {
                             &cli.canary_access_file,
                             a.take_open_findings(),
                         );
+                        attest_chain_findings(audit_log.as_ref(), a.take_chain_findings());
                         Some(Arc::new(parking_lot::Mutex::new(a)))
                     }
                     Err(e) => {
@@ -3334,9 +3446,14 @@ async fn main() -> Result<()> {
                 }
                 // External audit ATP-004: the one-key bootstrap is over for
                 // good once the signed chain shows a second key was added.
+                // Lab PR 160: also when the head anchor carries it, or the
+                // audit chain was found cut (it could have held the add).
                 if audit_log
                     .as_ref()
                     .is_some_and(|l| l.lock().second_key_added())
+                    || chain_anchor
+                        .as_ref()
+                        .is_some_and(|a| a.lock().second_key_added())
                 {
                     auth.mark_bootstrap_consumed();
                 }
@@ -3628,6 +3745,21 @@ async fn main() -> Result<()> {
                 "audit: agent_stop entry appended"
             ),
             Err(e) => warn!(error = format!("{e:#}"), "audit: agent_stop entry failed"),
+        }
+    }
+    // Lab PR 160: the heads as this run leaves them, `agent_stop` included,
+    // so a file emptied or cut while the agent is down is found at the
+    // next start.
+    if let Some(a) = &chain_anchor {
+        let second = audit_log
+            .as_ref()
+            .is_some_and(|l| l.lock().second_key_added());
+        match a.lock().refresh(true, second) {
+            Ok(_) => info!("chain heads anchored at stop"),
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "chain heads: not anchored at stop"
+            ),
         }
     }
     if let Some(ade) = &ade_engine {
@@ -4760,6 +4892,64 @@ fn report_builtin_defaults(
 ) {
     if let northnarrow_agent::config::overlay::DefaultsSource::BuiltIn(why) = source {
         gate.report_default_unavailable(list, v1, why);
+    }
+}
+
+/// Lab PR 160: the head anchor of this run, written once now with the heads
+/// this boot found (before this boot appends anything). Reports a removed
+/// anchor first ([`northnarrow_agent::chain_anchor::BootCheck::heads_missing`]).
+fn start_chain_anchor(
+    cli: &Cli,
+    heads_file: &std::path::Path,
+    targets: &[northnarrow_agent::chain_anchor::ChainTarget],
+    boot: &mut northnarrow_agent::chain_anchor::BootCheck,
+    agent_id: [u8; 16],
+    log: &northnarrow_agent::audit::AuditLog,
+) -> Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>> {
+    boot.heads_missing(heads_file, log.anchoring_started());
+    let key =
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "chain heads: no signing key — heads not anchored"
+                );
+                return None;
+            }
+        };
+    let mut anchor = northnarrow_agent::chain_anchor::Anchor::new(
+        heads_file.to_path_buf(),
+        key,
+        agent_id,
+        targets.to_vec(),
+        boot.previous.clone(),
+        log.anchoring_started(),
+    );
+    let second = log.second_key_added() || boot.second_key_added();
+    match anchor.refresh(true, second) {
+        Ok(_) => info!(path = %heads_file.display(), "chain heads anchored at start"),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            path = %heads_file.display(),
+            "chain heads: not anchored at start (retried every few minutes)"
+        ),
+    }
+    Some(Arc::new(parking_lot::Mutex::new(anchor)))
+}
+
+/// Lab PR 160: what a chain's open verification found (external audit
+/// NN-AUD-174), in the signed audit chain.
+fn attest_chain_findings(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    findings: Vec<northnarrow_agent::chain_anchor::ChainFinding>,
+) {
+    if findings.is_empty() {
+        return;
+    }
+    let mut guard = audit_log.map(|l| l.lock());
+    for f in &findings {
+        f.attest(guard.as_deref_mut());
     }
 }
 

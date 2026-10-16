@@ -177,6 +177,18 @@ impl RollbackFloor {
         }
     }
 
+    /// External audit NN-AUD-108: the audit chain verified, but the head
+    /// anchor shows rows were cut from its end (or the anchor itself was
+    /// removed): the floor those rows raised may be gone, so it is reset
+    /// as for a broken chain.
+    pub fn reset_because(self, why: String) -> Self {
+        let why = match &self.reset {
+            Some(earlier) => format!("{earlier}; the audit chain lost rows at its end: {why}"),
+            None => format!("the audit chain lost rows at its end: {why}"),
+        };
+        self.reset_at(unix_now(), why)
+    }
+
     /// The newest accepted signature of `kind`: (sha256 hex, signed ts).
     pub fn recorded(&self, kind: OverlayKind) -> Option<&(String, u64)> {
         self.recorded.get(&kind)

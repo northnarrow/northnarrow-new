@@ -42,7 +42,6 @@ use chrono::{DateTime, Utc};
 use common::{CanaryAccessKind, CanaryTypeTag};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 
@@ -92,6 +91,12 @@ pub struct CanaryAccessEntry {
     pub first_trip: bool,
     /// Chain integrity (Tappa 8 B1 shape).
     pub agent_id: String,
+    /// External audit NN-AUD-174: the row's 0-based position in the file,
+    /// on rows written from lab PR 160 on (pre-image domain-tagged with
+    /// [`crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2`]); absent on older
+    /// rows, which keep their bytes and pre-image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub prev_hash: String,
     pub entry_hash: String,
     pub agent_sig: String,
@@ -128,7 +133,16 @@ pub struct CanaryAccessDb {
     last_hash: String,
     tail_repair: Option<crate::chainlog::TailRepair>,
     skipped_lines: usize,
+    /// External audit NN-AUD-174: rows in the file (the next `seq`) and
+    /// what the open's verification of the tail found.
+    rows: u64,
+    chain_findings: Vec<crate::chain_anchor::ChainFinding>,
 }
+
+/// External audit NN-AUD-174: rows verified at open, from the end. The log
+/// is never rotated, so a full check at every boot would grow with it;
+/// `nn-admin chain verify --log canary-access` checks it whole.
+pub const OPEN_VERIFY_ROWS: usize = 256;
 
 impl CanaryAccessDb {
     /// Open `path` for append, walk any existing rows to
@@ -143,16 +157,24 @@ impl CanaryAccessDb {
         let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
             serde_json::from_slice::<CanaryAccessEntry>(l).is_ok()
         })?;
-        let (last_hash, skipped_lines) = read_tail_hash(path)?;
+        let read = read_tail_hash(path, &key.verifying_key())?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now
             path: crate::anchored::anchor(path),
             key,
             agent_id,
-            last_hash,
+            last_hash: read.last_hash,
             tail_repair,
-            skipped_lines,
+            skipped_lines: read.skipped,
+            rows: read.rows,
+            chain_findings: read.findings,
         })
+    }
+
+    /// External audit NN-AUD-174: what the open's verification found, for
+    /// the caller to attest once.
+    pub fn take_chain_findings(&mut self) -> Vec<crate::chain_anchor::ChainFinding> {
+        std::mem::take(&mut self.chain_findings)
     }
 
     /// What the open found wrong, for the caller to attest once.
@@ -171,7 +193,13 @@ impl CanaryAccessDb {
     /// `Registry::mark_tripped(canary_id, access_hash)` for
     /// cross-chain reference).
     pub fn append(&mut self, draft: CanaryAccessDraft) -> Result<CanaryAccessEntry> {
-        let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
+        let entry = build_signed_entry(
+            &draft,
+            &self.key,
+            &self.agent_id,
+            &self.last_hash,
+            self.rows,
+        )?;
         let mut line = serde_json::to_string(&entry)
             .map_err(|e| anyhow!("serialising canary access entry: {e}"))?;
         line.push('\n');
@@ -191,6 +219,7 @@ impl CanaryAccessDb {
         f.sync_all()
             .with_context(|| format!("fsync {}", self.path.display()))?;
         self.last_hash = entry.entry_hash.clone();
+        self.rows += 1;
         Ok(entry)
     }
 
@@ -202,31 +231,107 @@ impl CanaryAccessDb {
 
 // ── chain helpers ───────────────────────────────────────────────────
 
-fn read_tail_hash(path: &Path) -> Result<(String, usize)> {
+/// What [`read_tail_hash`] recovers.
+struct TailRead {
+    last_hash: String,
+    skipped: usize,
+    rows: u64,
+    findings: Vec<crate::chain_anchor::ChainFinding>,
+}
+
+/// Walk the log for its tail, its row count and its row numbers (no
+/// signature work), then verify the last [`OPEN_VERIFY_ROWS`] rows: hash,
+/// signature, link (external audit NN-AUD-174). The chain continues from
+/// the newest row that verifies; what does not is reported.
+fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
+    let mut seq = crate::chain_anchor::RowSeq::default();
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((GENESIS_PREV_HASH.to_string(), 0));
+            return Ok(TailRead {
+                last_hash: GENESIS_PREV_HASH.to_string(),
+                skipped: 0,
+                rows: 0,
+                findings: Vec::new(),
+            });
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
     let reader = BufReader::new(f);
-    let mut last: Option<String> = None;
     let mut skipped = 0usize;
+    let mut first_break: Option<String> = None;
+    // (row, entry) of the last rows, oldest first.
+    let mut window: std::collections::VecDeque<(u64, CanaryAccessEntry)> =
+        std::collections::VecDeque::with_capacity(OPEN_VERIFY_ROWS);
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
             continue;
         }
         match serde_json::from_str::<CanaryAccessEntry>(&line) {
-            Ok(entry) => last = Some(entry.entry_hash),
-            Err(_) => skipped += 1,
+            Ok(entry) => {
+                let row = seq.rows();
+                if let Err(b) = seq.push(entry.seq) {
+                    first_break.get_or_insert_with(|| b.to_string());
+                }
+                if window.len() == OPEN_VERIFY_ROWS {
+                    window.pop_front();
+                }
+                window.push_back((row, entry));
+            }
+            Err(_) => {
+                skipped += 1;
+                seq.skip();
+            }
         }
     }
-    Ok((
-        last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
+    let mut last: Option<String> = None;
+    let mut unverified = 0usize;
+    let mut prev: Option<&str> = None;
+    for (row, entry) in &window {
+        if verify_row(entry, pubkey).is_err() {
+            unverified += 1;
+            continue;
+        }
+        if prev.is_some_and(|p| p != entry.prev_hash) {
+            first_break.get_or_insert_with(|| {
+                format!(
+                    "row {row} does not chain from the genuine row before it: rows were removed"
+                )
+            });
+        }
+        prev = Some(&entry.entry_hash);
+        last = Some(entry.entry_hash.clone());
+    }
+    let mut findings = Vec::new();
+    if unverified > 0 {
+        findings.push(crate::chain_anchor::ChainFinding::new(
+            "canary_access",
+            path,
+            "chain_lines_unverified",
+            format!(
+                "{unverified} of the last {} row(s) fail hash or signature verification",
+                window.len()
+            ),
+        ));
+    }
+    if let Some(why) = first_break {
+        findings.push(crate::chain_anchor::ChainFinding::new(
+            "canary_access",
+            path,
+            "chain_sequence_broken",
+            why,
+        ));
+    }
+    // Nothing in the window verifies: continue from the newest parsed row,
+    // as before (its failure is reported above).
+    let last = last.or_else(|| window.back().map(|(_, e)| e.entry_hash.clone()));
+    Ok(TailRead {
+        last_hash: last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         skipped,
-    ))
+        rows: seq.rows(),
+        findings,
+    })
 }
 
 fn build_signed_entry(
@@ -234,6 +339,7 @@ fn build_signed_entry(
     key: &AgentSigningKey,
     agent_id: &[u8; 16],
     prev_hash: &str,
+    seq: u64,
 ) -> Result<CanaryAccessEntry> {
     let ts = format_ts(Utc::now());
     let mut entry = CanaryAccessEntry {
@@ -248,6 +354,7 @@ fn build_signed_entry(
         accessor_exe: draft.accessor_exe.clone(),
         first_trip: draft.first_trip,
         agent_id: hex::encode(agent_id),
+        seq: Some(seq),
         prev_hash: prev_hash.to_string(),
         // Filled below — empty here so the pre-image
         // serialisation excludes them.
@@ -261,18 +368,55 @@ fn build_signed_entry(
     Ok(entry)
 }
 
+/// External audit NN-AUD-174: a numbered row (`seq` set) prefixes the
+/// pre-image with [`crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2`]; a row
+/// without `seq` keeps the pre-image it was signed with.
 fn compute_entry_hash(entry: &CanaryAccessEntry) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
-    let prev_bytes =
-        hex::decode(&entry.prev_hash).map_err(|e| anyhow!("prev_hash is not valid hex: {e}"))?;
     let body = serde_json::to_vec(entry)
         .map_err(|e| anyhow!("serialising canary access pre-image: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&prev_bytes);
-    hasher.update(&body);
-    let digest: [u8; 32] = hasher.finalize().into();
-    Ok(digest)
+    let domain = entry
+        .seq
+        .map(|_| crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2);
+    crate::chain_anchor::flat_digest(domain, &entry.prev_hash, &body)
+}
+
+/// External audit NN-AUD-174: one row's own hash and signature.
+fn verify_row(
+    entry: &CanaryAccessEntry,
+    pubkey: &VerifyingKey,
+) -> Result<(), AccessLogVerifyError> {
+    use ed25519_dalek::Verifier;
+    let idx = 0;
+    let mut stripped = entry.clone();
+    stripped.entry_hash.clear();
+    stripped.agent_sig.clear();
+    let recomputed =
+        compute_entry_hash(&stripped).map_err(|e| AccessLogVerifyError::MalformedField {
+            idx,
+            reason: e.to_string(),
+        })?;
+    if hex::encode(recomputed) != entry.entry_hash {
+        return Err(AccessLogVerifyError::EntryHashMismatch {
+            idx,
+            recomputed: hex::encode(recomputed),
+            stored: entry.entry_hash.clone(),
+        });
+    }
+    let sig = B64
+        .decode(&entry.agent_sig)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .ok_or(AccessLogVerifyError::SignatureInvalid { idx })?;
+    pubkey
+        .verify(&recomputed, &Signature::from_bytes(&sig))
+        .map_err(|_| AccessLogVerifyError::SignatureInvalid { idx })
+}
+
+/// External audit NN-AUD-174: whether one raw line is a genuine access row.
+pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
+    serde_json::from_slice::<CanaryAccessEntry>(line).is_ok_and(|e| verify_row(&e, pubkey).is_ok())
 }
 
 fn format_ts(t: DateTime<Utc>) -> String {
@@ -303,20 +447,31 @@ pub enum AccessLogVerifyError {
     SignatureInvalid { idx: usize },
     #[error("entry {idx}: malformed field — {reason}")]
     MalformedField { idx: usize, reason: String },
+    /// External audit NN-AUD-174: a numbered row out of place.
+    #[error("entry {idx}: {reason}")]
+    Sequence {
+        idx: usize,
+        reason: crate::chain_anchor::SeqBreak,
+    },
 }
 
 /// Replay `entries` in order, recomputing each `entry_hash`
 /// and checking each `agent_sig` against `pubkey`. Returns
-/// `Ok(())` on a fully-intact chain. Used by the agent's
-/// own [`CanaryAccessDb::open`] path (via test fixtures) and
-/// the future K6 `nn-admin canary verify-access` reader.
+/// `Ok(())` on a fully-intact chain. External audit NN-AUD-174: the full
+/// check (`nn-admin chain verify --log canary-access`);
+/// [`CanaryAccessDb::open`] verifies the last [`OPEN_VERIFY_ROWS`] rows.
+/// Rows without `seq` verify as before; from the first numbered row on,
+/// each must carry its position.
 pub fn verify_chain(
     entries: &[CanaryAccessEntry],
     pubkey: &VerifyingKey,
 ) -> Result<(), AccessLogVerifyError> {
     use ed25519_dalek::Verifier;
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
+    let mut seq = crate::chain_anchor::RowSeq::default();
     for (idx, entry) in entries.iter().enumerate() {
+        seq.push(entry.seq)
+            .map_err(|reason| AccessLogVerifyError::Sequence { idx, reason })?;
         if entry.prev_hash != expected_prev {
             return Err(AccessLogVerifyError::PrevHashMismatch {
                 idx,
@@ -433,5 +588,108 @@ mod tests {
             matches!(err, AccessLogVerifyError::EntryHashMismatch { idx: 0, .. }),
             "expected EntryHashMismatch on entry 0; got: {err:?}"
         );
+    }
+
+    // ── External audit NN-AUD-174 (lab PR 160) ──────────────────────
+
+    /// Before lab PR 160 the open only parsed rows. A row at the end that
+    /// does not verify is now reported, and the chain continues from the
+    /// last genuine row.
+    #[test]
+    fn access_log_open_flags_a_bad_tail_row() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canary_access.jsonl");
+        let first = {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+            db.append(sample_draft(1, true)).unwrap()
+        };
+        let mut forged = first.clone();
+        forged.seq = Some(1);
+        forged.accessor_comm = "not-the-attacker".to_string();
+        forged.prev_hash = first.entry_hash.clone();
+        forged.entry_hash = "cd".repeat(32);
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        body.push_str(&serde_json::to_string(&forged).unwrap());
+        body.push('\n');
+        std::fs::write(&log_path, body).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let found = db.take_chain_findings();
+        assert!(
+            found.iter().any(|f| f.kind == "chain_lines_unverified"),
+            "{found:?}"
+        );
+        assert_eq!(db.last_hash(), first.entry_hash);
+    }
+
+    /// Rows written before lab PR 160 open and verify as before;
+    /// numbering starts at their count.
+    #[test]
+    fn legacy_access_rows_verify_and_numbering_starts_after_them() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canary_access.jsonl");
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut body = String::new();
+        for i in 0..3 {
+            let mut e =
+                build_signed_entry(&sample_draft(i, i == 0), &key, &[0u8; 16], &prev, 0).unwrap();
+            e.seq = None;
+            e.entry_hash.clear();
+            e.agent_sig.clear();
+            let h = compute_entry_hash(&e).unwrap();
+            e.entry_hash = hex::encode(h);
+            e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+            body.push_str(&serde_json::to_string(&e).unwrap());
+            body.push('\n');
+            prev = e.entry_hash;
+        }
+        std::fs::write(&log_path, &body).unwrap();
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        assert!(db.take_chain_findings().is_empty());
+        let row = db.append(sample_draft(9, false)).unwrap();
+        assert_eq!(row.seq, Some(3));
+        let rows: Vec<CanaryAccessEntry> = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        verify_chain(&rows, &pk).expect("old rows then numbered rows verify");
+        // a numbered row cut from the middle is a sequence break
+        let mut cut = rows.clone();
+        cut.remove(2);
+        assert!(matches!(
+            verify_chain(&cut, &pk),
+            Err(AccessLogVerifyError::Sequence { .. })
+        ));
+    }
+
+    /// External audit NN-AUD-174: an access row hashed for the registry
+    /// domain is refused.
+    #[test]
+    fn an_access_row_signed_for_another_domain_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canary_access.jsonl");
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let good = db.append(sample_draft(1, true)).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut e = good.clone();
+        e.entry_hash.clear();
+        e.agent_sig.clear();
+        let body = serde_json::to_vec(&e).unwrap();
+        let h = crate::chain_anchor::flat_digest(
+            Some(crate::chain_anchor::CANARY_REGISTRY_DOMAIN_V2),
+            &e.prev_hash,
+            &body,
+        )
+        .unwrap();
+        e.entry_hash = hex::encode(h);
+        e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+        assert!(matches!(
+            verify_chain(&[e], &pk),
+            Err(AccessLogVerifyError::EntryHashMismatch { idx: 0, .. })
+        ));
     }
 }

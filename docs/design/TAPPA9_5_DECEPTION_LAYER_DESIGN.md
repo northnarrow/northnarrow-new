@@ -159,7 +159,14 @@ certainty within MILLISECONDS of the first probe.
 - Tappa 8 B1 chained audit log primitives + Tappa 9 C3
   `BaselineDb` shape — Tappa 9.5's `canaries.jsonl` +
   `canary_access.jsonl` chains directly reuse the
-  prev_hash / entry_hash / agent_sig triple.
+  prev_hash / entry_hash / agent_sig triple. (External audit
+  NN-AUD-174, lab PR 160: rows now carry `seq` and a
+  per-chain domain tag in their pre-image; `Registry::open`
+  verifies every row and does not apply one that fails — a
+  forged `Burn` leaves the canary armed — and
+  `CanaryAccessDb::open` verifies the last 256; both chains'
+  heads are anchored, see
+  `docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`.)
 - Tappa 9 C6 signed admin pipeline (FimBaselineRequest +
   FimReportRequest patterns) — Tappa 9.5's
   CanaryDeployRequest / CanaryListResponse / CanaryBurnRequest

@@ -1229,7 +1229,9 @@ fn audit_verify_e2e() {
     // (etc-readonly-audit-1), unlock success, unlock failure and
     // rotate_keys_add success — and whatever the agent attests about the
     // host it found (`integrity_drift`, external audit MAIN-003: on a lab
-    // guest, the installed agent's FIM baseline, signed by another key).
+    // guest, the installed agent's FIM baseline, signed by another key),
+    // the start of head anchoring and the background chain check (lab PR
+    // 160: `chain_numbering_started`, `chain_verify`).
     // Verify chain integrity via the CLI.
     let audit_body = std::fs::read_to_string(&paths.audit_log_file).expect("audit log readable");
     let entries: Vec<serde_json::Value> = audit_body
@@ -1239,7 +1241,10 @@ fn audit_verify_e2e() {
         .collect();
     let ops: Vec<(String, String)> = entries
         .iter()
-        .filter(|e| e["op"] != "integrity_drift")
+        .filter(|e| {
+            !["integrity_drift", "chain_numbering_started", "chain_verify"]
+                .contains(&e["op"].as_str().unwrap_or_default())
+        })
         .map(|e| {
             (
                 e["op"].as_str().unwrap_or_default().to_string(),

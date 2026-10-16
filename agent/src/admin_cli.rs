@@ -726,6 +726,20 @@ pub enum AuditVerifyOutcome {
     /// mismatch, entry_hash mismatch, signature invalid,
     /// malformed field). Exit code 8.
     ChainBroken(crate::audit::AuditVerifyError),
+    /// External audit NN-AUD-108: the chain verifies but does not reach a
+    /// head recorded earlier (`--expect-head`, `--min-seq`): rows were cut
+    /// from its end. Exit code 8.
+    HeadNotReached(String),
+}
+
+/// External audit NN-AUD-108: what `audit verify` must still find — a head
+/// taken earlier from the journal (`chain.head` lines) or an off-host copy.
+#[derive(Debug, Clone, Default)]
+pub struct ExpectedHead {
+    /// An `entry_hash` that must still be in the chain.
+    pub entry_hash: Option<String>,
+    /// The chain must hold a row numbered at least this.
+    pub min_seq: Option<u64>,
 }
 
 /// `nn-admin audit read` — stream the audit log to stdout. Reads
@@ -814,6 +828,47 @@ pub fn run_audit_read(log_path: &Path, since: Option<&str>, json: bool) -> Resul
 /// exit-8 contract per §5.3 is reserved for an *actually-broken*
 /// chain.
 pub fn run_audit_verify(from_path: &Path, pubkey: &VerifyingKey) -> Result<AuditVerifyOutcome> {
+    run_audit_verify_expecting(from_path, pubkey, &ExpectedHead::default())
+}
+
+/// [`run_audit_verify`], then the chain must still reach `expect`.
+pub fn run_audit_verify_expecting(
+    from_path: &Path,
+    pubkey: &VerifyingKey,
+    expect: &ExpectedHead,
+) -> Result<AuditVerifyOutcome> {
+    let outcome = run_audit_verify_chain(from_path, pubkey)?;
+    let AuditVerifyOutcome::Success { entries } = outcome else {
+        return Ok(outcome);
+    };
+    if expect.entry_hash.is_none() && expect.min_seq.is_none() {
+        return Ok(outcome);
+    }
+    let body = std::fs::read_to_string(from_path).unwrap_or_default();
+    let rows: Vec<crate::audit::AuditEntry> = body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if let Some(h) = &expect.entry_hash {
+        if !rows.iter().any(|r| &r.entry_hash == h) {
+            return Ok(AuditVerifyOutcome::HeadNotReached(format!(
+                "no entry has entry_hash {h}: the chain ends before that head"
+            )));
+        }
+    }
+    if let Some(min) = expect.min_seq {
+        let last = rows.iter().rev().find_map(|r| r.seq);
+        if last.is_none_or(|s| s < min) {
+            return Ok(AuditVerifyOutcome::HeadNotReached(format!(
+                "the last numbered row is {last:?}, below the expected {min}: rows were cut"
+            )));
+        }
+    }
+    Ok(AuditVerifyOutcome::Success { entries })
+}
+
+fn run_audit_verify_chain(from_path: &Path, pubkey: &VerifyingKey) -> Result<AuditVerifyOutcome> {
     use std::io::{BufRead, BufReader};
     let f = match std::fs::OpenOptions::new().read(true).open(from_path) {
         Ok(f) => f,
@@ -845,6 +900,72 @@ pub fn run_audit_verify(from_path: &Path, pubkey: &VerifyingKey) -> Result<Audit
         }),
         Err(e) => Ok(AuditVerifyOutcome::ChainBroken(e)),
     }
+}
+
+/// One chain's result in `nn-admin chain verify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainVerifyLine {
+    /// `audit`, `detections`, … or `heads` for the anchor comparison.
+    pub chain: String,
+    pub file: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// External audit NN-AUD-112: `nn-admin chain verify` — every chain in
+/// full (the rotating logs with [`crate::chainlog::verify_log_set`],
+/// archives, manifest and checkpoints included; the flat chains with their
+/// row numbers), then the files against the head anchor `heads` when it
+/// exists. `only`: chain names to check (empty: all).
+pub fn run_chain_verify(
+    paths: &crate::chain_anchor::ChainPaths,
+    heads: &Path,
+    only: &[String],
+    pubkey: &VerifyingKey,
+) -> Vec<ChainVerifyLine> {
+    let targets: Vec<_> = paths
+        .targets()
+        .into_iter()
+        .filter(|t| only.is_empty() || only.iter().any(|o| o == t.chain))
+        .collect();
+    let mut out: Vec<ChainVerifyLine> = targets
+        .iter()
+        .map(|t| {
+            let r = (t.full)(&t.path, pubkey);
+            ChainVerifyLine {
+                chain: t.chain.to_string(),
+                file: t.path.display().to_string(),
+                ok: r.is_ok(),
+                detail: r.unwrap_or_else(|e| e),
+            }
+        })
+        .collect();
+    let check = crate::chain_anchor::boot_check(&targets, heads, pubkey);
+    for f in &check.findings {
+        out.push(ChainVerifyLine {
+            chain: f.chain.clone(),
+            file: f.file.display().to_string(),
+            ok: false,
+            detail: format!("{}: {}", f.kind, f.detail),
+        });
+    }
+    let anchored = match &check.previous {
+        Some(s) => format!(
+            "{} head(s) anchored at {}, all reached",
+            s.heads.len(),
+            s.ts
+        ),
+        None => "no head anchor to compare with".to_string(),
+    };
+    if check.findings.is_empty() {
+        out.push(ChainVerifyLine {
+            chain: "heads".to_string(),
+            file: heads.display().to_string(),
+            ok: true,
+            detail: anchored,
+        });
+    }
+    out
 }
 
 /// Load an agent verifying key for `audit verify`. Prefers an
@@ -3590,9 +3711,49 @@ mod tests {
         let outcome = run_audit_verify(&log_path, &pubkey).unwrap();
         match outcome {
             AuditVerifyOutcome::Success { entries } => assert_eq!(entries, 4),
-            AuditVerifyOutcome::ChainBroken(e) => {
-                panic!("intact chain reported broken: {e:?}");
-            }
+            other => panic!("intact chain reported broken: {other:?}"),
+        }
+    }
+
+    /// External audit NN-AUD-108: a chain cut below a head recorded
+    /// earlier still verifies on its own; `--expect-head` / `--min-seq`
+    /// find the cut (exit 8). Before lab PR 160 `audit verify` had no way
+    /// to say what the chain must still reach.
+    #[test]
+    fn audit_verify_finds_a_cut_below_an_expected_head() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, log_path, pubkey, _) = build_audit_log(&dir, 6);
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let last: crate::audit::AuditEntry =
+            serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        let expect = ExpectedHead {
+            entry_hash: Some(last.entry_hash.clone()),
+            min_seq: last.seq,
+        };
+        assert!(matches!(
+            run_audit_verify_expecting(&log_path, &pubkey, &expect).unwrap(),
+            AuditVerifyOutcome::Success { entries: 6 }
+        ));
+        let kept: String = body.lines().take(4).map(|l| format!("{l}\n")).collect();
+        std::fs::write(&log_path, kept).unwrap();
+        assert!(matches!(
+            run_audit_verify(&log_path, &pubkey).unwrap(),
+            AuditVerifyOutcome::Success { entries: 4 }
+        ));
+        for expect in [
+            ExpectedHead {
+                entry_hash: Some(last.entry_hash.clone()),
+                min_seq: None,
+            },
+            ExpectedHead {
+                entry_hash: None,
+                min_seq: last.seq,
+            },
+        ] {
+            assert!(matches!(
+                run_audit_verify_expecting(&log_path, &pubkey, &expect).unwrap(),
+                AuditVerifyOutcome::HeadNotReached(_)
+            ));
         }
     }
 

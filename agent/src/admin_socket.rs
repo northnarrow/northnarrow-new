@@ -3924,12 +3924,20 @@ fn dispatch_detections(
             std::path::PathBuf::from(detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH),
         ),
     };
-    let records = detection_store::read_last_n_overlaid(
+    // External audit NN-AUD-112: the rows served are verified with the
+    // agent key (the status log holds it); a row that does not verify is
+    // left out, logged and recorded in the signed chain.
+    let pubkey = det_state.map(|s| s.status_log.lock().verifying_key());
+    let (records, unverified) = detection_store::read_last_n_overlaid_verified(
         &detections_path,
         &status_events_path,
         limit,
         &filter,
+        pubkey.as_ref(),
     );
+    if unverified > 0 {
+        crate::chain_anchor::report_unverified_rows("detections", &detections_path, unverified);
+    }
 
     // Serialise newest-first, bounding the body at the wire soft cap.
     // The records are already newest-first, so truncation drops the

@@ -595,6 +595,13 @@ agent re-install) over `entry_hash`. The agent's pubkey ships with
 the install binary so any auditor with the binary can verify the
 log without further key distribution.
 
+Lab PR 160 (external audit NN-AUD-108): rows written from then on also
+carry `"seq"` (just before `prev_hash`), their 0-based position in the
+log, and their `entry_hash` is `SHA-256("northnarrow/audit/v2\0" ‖
+prev_hash ‖ record)`. Rows written before carry no `seq`, keep their bytes
+and verify as above; numbering starts at their count. See
+`docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`.
+
 ### 9.2 Tamper evidence
 
 An attacker with root who wants to hide an unauthorised operation
@@ -612,6 +619,16 @@ must either:
   audit verify` recomputes the chain from genesis and flags any
   discontinuity.
 
+What the hooks do not cover — the boot window before they attach, a host
+running with them degraded — the chain did not either: a log cut at its
+end still verified (external audit EVD-002). Since lab PR 160 a row
+removed before the end breaks `seq`, and the log's head is anchored in the
+signed `/etc/northnarrow/chain_heads.json` (at start, every 5 minutes,
+at stop) and in the journal (`chain.head` lines): the next start reports a
+shorter log as a signed `integrity_drift` `chain_truncated`, and
+`nn-admin audit verify --expect-head <hash>` checks a head kept off the
+host.
+
 `audit-read` is itself an admin operation logged in the same chain
 (meta-auditing). The reading operator cannot make their own read
 disappear from the chain.
@@ -622,7 +639,8 @@ disappear from the chain.
 the chain in JSONL. Off-host verification:
 `nn-admin audit verify --from evidence.jsonl --agent-pubkey
 <hex>` recomputes hashes and verifies the per-entry agent
-signature. No live connection needed.
+signature. No live connection needed. `nn-admin chain verify` checks every
+signed chain on the host the same way (lab PR 160).
 
 ### 9.4 Article 13 (EU AI Act) cross-reference
 

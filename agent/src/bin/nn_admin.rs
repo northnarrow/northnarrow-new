@@ -35,14 +35,15 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use northnarrow_agent::admin_cli::{
-    load_audit_pubkey, run_audit_read, run_audit_verify, run_canary_burn, run_canary_deploy,
-    run_canary_list, run_canary_refresh, run_fim_baseline, run_fim_report, run_fim_status,
-    run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke, run_shutdown,
-    run_status, run_trusted_installer_grant, run_unlock, run_verify_keys, AuditVerifyOutcome,
-    CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome,
-    CanaryRefreshOutcome, DetectionSetStatusOutcome, FimBaselineOutcome, FimReportOutcome,
-    FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome, NetResolveOutcome, RotateKeysOutcome,
-    ShutdownOutcome, StatusOutcome, TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
+    load_audit_pubkey, run_audit_read, run_audit_verify_expecting, run_canary_burn,
+    run_canary_deploy, run_canary_list, run_canary_refresh, run_chain_verify, run_fim_baseline,
+    run_fim_report, run_fim_status, run_force_posture, run_init, run_rotate_keys_add,
+    run_rotate_keys_revoke, run_shutdown, run_status, run_trusted_installer_grant, run_unlock,
+    run_verify_keys, AuditVerifyOutcome, CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec,
+    CanaryListOutcome, CanaryRefreshOutcome, DetectionSetStatusOutcome, ExpectedHead,
+    FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome,
+    NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
+    TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
@@ -316,6 +317,18 @@ enum Cmd {
     Audit {
         #[command(subcommand)]
         sub: AuditCmd,
+    },
+
+    /// External audit NN-AUD-112 (lab PR 160) — verify every signed chain
+    /// in full, offline: the audit log and the canary chains (hashes,
+    /// signatures, links, row numbers), the rotating logs with their
+    /// archives, manifest and checkpoints, then the files against the
+    /// signed head anchor. Exits 8 when a chain is broken or shorter than
+    /// its anchored head, 0 when everything verifies. Reads the files
+    /// directly (root: they are 0600 or under 0700 directories).
+    Chain {
+        #[command(subcommand)]
+        sub: ChainCmd,
     },
 
     /// Tappa 9 C6 — FIM operator surface. `fim baseline` queues
@@ -623,6 +636,71 @@ enum AuditCmd {
         /// Local signing-key file the verifier derives the
         /// pubkey from when `--agent-pubkey` is not given. Mode
         /// 0400 — usually requires sudo.
+        #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
+        agent_sig_key: PathBuf,
+        /// External audit NN-AUD-108: an `entry_hash` the chain must still
+        /// hold (a head recorded earlier: a `chain.head` journal line
+        /// forwarded off the host, or `chain verify` output kept there).
+        /// Exit 8 when it is gone: rows were cut from the end.
+        #[arg(long = "expect-head")]
+        expect_head: Option<String>,
+        /// The chain must hold a row numbered at least this (`seq`).
+        #[arg(long = "min-seq")]
+        min_seq: Option<u64>,
+    },
+}
+
+/// The chains `nn-admin chain verify --log` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ChainName {
+    Audit,
+    CanaryRegistry,
+    CanaryAccess,
+    Detections,
+    StatusEvents,
+    Netflow,
+    FimDrift,
+    All,
+}
+
+impl ChainName {
+    fn key(self) -> Option<&'static str> {
+        Some(match self {
+            ChainName::Audit => "audit",
+            ChainName::CanaryRegistry => "canary_registry",
+            ChainName::CanaryAccess => "canary_access",
+            ChainName::Detections => "detections",
+            ChainName::StatusEvents => "status_events",
+            ChainName::Netflow => "netflow",
+            ChainName::FimDrift => "fim_drift",
+            ChainName::All => return None,
+        })
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ChainCmd {
+    /// Verify the chains in full (default: all of them).
+    Verify {
+        /// A chain to verify; repeat for several. Default: all.
+        #[arg(long = "log", value_enum)]
+        log: Vec<ChainName>,
+        /// The state directory holding the canary chains and the rotating
+        /// logs (`detections/` below it).
+        #[arg(long = "state-dir", default_value = "/var/lib/northnarrow")]
+        state_dir: PathBuf,
+        /// The audit log.
+        #[arg(long = "audit-log", default_value = DEFAULT_AUDIT_LOG_PATH)]
+        audit_log: PathBuf,
+        /// The head anchor (default: `chain_heads.json` next to
+        /// `--audit-log`).
+        #[arg(long = "heads")]
+        heads: Option<PathBuf>,
+        /// Explicit 64-hex-char agent pubkey (off-host verification).
+        #[arg(long = "agent-pubkey")]
+        agent_pubkey: Option<String>,
+        /// Signing-key file whose published `agent.sig.pub` (next to it)
+        /// gives the pubkey when `--agent-pubkey` is not set.
         #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
         agent_sig_key: PathBuf,
     },
@@ -1268,9 +1346,18 @@ fn main() -> ExitCode {
                     from,
                     agent_pubkey,
                     agent_sig_key,
+                    expect_head,
+                    min_seq,
                 },
         } => match load_audit_pubkey(agent_pubkey.as_deref(), &agent_sig_key) {
-            Ok(pubkey) => match run_audit_verify(&from, &pubkey) {
+            Ok(pubkey) => match run_audit_verify_expecting(
+                &from,
+                &pubkey,
+                &ExpectedHead {
+                    entry_hash: expect_head,
+                    min_seq,
+                },
+            ) {
                 Ok(AuditVerifyOutcome::Success { entries }) => {
                     println!("audit: {entries} entries, hash chain intact, all sigs valid");
                     ExitCode::SUCCESS
@@ -1281,6 +1368,10 @@ fn main() -> ExitCode {
                     // verification failed (hash chain broken)".
                     ExitCode::from(8)
                 }
+                Ok(AuditVerifyOutcome::HeadNotReached(why)) => {
+                    eprintln!("audit: chain cut — {why}");
+                    ExitCode::from(8)
+                }
                 Err(e) => {
                     eprintln!("audit: {e:#}");
                     ExitCode::from(1)
@@ -1288,6 +1379,68 @@ fn main() -> ExitCode {
             },
             Err(e) => {
                 eprintln!("audit: {e:#}");
+                ExitCode::from(1)
+            }
+        },
+        Cmd::Chain {
+            sub:
+                ChainCmd::Verify {
+                    log,
+                    state_dir,
+                    audit_log,
+                    heads,
+                    agent_pubkey,
+                    agent_sig_key,
+                },
+        } => match load_audit_pubkey(agent_pubkey.as_deref(), &agent_sig_key) {
+            Ok(pubkey) => {
+                let only: Vec<String> = if log.contains(&ChainName::All) {
+                    Vec::new()
+                } else {
+                    log.iter()
+                        .filter_map(|l| l.key())
+                        .map(str::to_string)
+                        .collect()
+                };
+                let det = state_dir.join("detections");
+                let paths = northnarrow_agent::chain_anchor::ChainPaths {
+                    audit: audit_log,
+                    canary_registry: state_dir.join("canaries.jsonl"),
+                    canary_access: state_dir.join("canary_access.jsonl"),
+                    detections: det.join("detections.jsonl"),
+                    status_events: det.join("status_events.jsonl"),
+                    netflow: state_dir.join("netflow.jsonl"),
+                    fim_drift: state_dir.join("fim_drift.jsonl"),
+                };
+                let heads = heads.unwrap_or_else(|| {
+                    paths
+                        .audit
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(northnarrow_agent::chain_anchor::HEADS_FILE_NAME)
+                });
+                let lines = run_chain_verify(&paths, &heads, &only, &pubkey);
+                let mut broken = 0;
+                for l in &lines {
+                    if l.ok {
+                        println!("OK      {:<16} {}: {}", l.chain, l.file, l.detail);
+                    } else {
+                        broken += 1;
+                        println!("BROKEN  {:<16} {}: {}", l.chain, l.file, l.detail);
+                    }
+                }
+                if broken > 0 {
+                    eprintln!(
+                        "chain: {broken} problem(s) — evidence missing or altered; see the \
+                         operator runbook (docs/operator/EVIDENCE_CHAINS.md)"
+                    );
+                    ExitCode::from(8)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                eprintln!("chain: {e:#}");
                 ExitCode::from(1)
             }
         },

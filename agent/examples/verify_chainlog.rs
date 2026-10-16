@@ -1,8 +1,9 @@
 //! Test/ops tool: verify an on-disk fim_drift chainlog end-to-end — every
 //! sealed archive + the active file, across the terminator/meta-chain
-//! boundaries (`verify_log_set`) — using the agent's signing key to recover
-//! the verifying key. Confirms BUG-026's signed-chain integrity on the real
-//! on-disk log.
+//! boundaries (`verify_log_set`). Superseded by `nn-admin chain verify`
+//! (external audit NN-AUD-112, lab PR 160), which covers every chain; kept
+//! for development. Reads the published public half (`agent.sig.pub` next
+//! to the key path), never the private key, and never mints one.
 //!
 //!   sudo cargo run -p northnarrow-agent --example verify_chainlog -- \
 //!       /var/lib/northnarrow/fim_drift.jsonl [/etc/northnarrow/agent.sig.key]
@@ -11,7 +12,6 @@
 
 use std::path::Path;
 
-use northnarrow_agent::audit::AgentSigningKey;
 use northnarrow_agent::chainlog::verify_log_set;
 use northnarrow_agent::fim::drain::FimDriftPayload;
 
@@ -24,16 +24,15 @@ fn main() {
         .next()
         .unwrap_or_else(|| "/etc/northnarrow/agent.sig.key".to_string());
 
-    // The key already exists in production; `load_or_bootstrap` just loads it.
-    let key = AgentSigningKey::load_or_bootstrap(Path::new(&key_path))
-        .unwrap_or_else(|e| panic!("loading signing key {key_path}: {e:#}"));
-    let pubkey = key.verifying_key();
+    let pub_path = northnarrow_agent::audit::verifying_key_path(Path::new(&key_path));
+    let pubkey = northnarrow_agent::audit::read_verifying_key(&pub_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e:#}", pub_path.display()));
 
     match verify_log_set::<FimDriftPayload>(Path::new(&active), &pubkey) {
         Ok(rep) => {
             println!(
-                "VERIFY OK  active={active}  earliest_retained_seq={}  archives_verified={}  total_records={}",
-                rep.earliest_retained_seq, rep.archives_verified, rep.total_records
+                "VERIFY OK  active={active}  earliest_retained_seq={}  archives_verified={}  total_records={}  checkpoints_verified={}",
+                rep.earliest_retained_seq, rep.archives_verified, rep.total_records, rep.checkpoints_verified
             );
         }
         Err(e) => {

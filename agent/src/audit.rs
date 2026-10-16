@@ -30,9 +30,10 @@
 //!   in-memory `prev_hash` advances on success.
 //! - [`verify_chain`] — replays a sequence of [`AuditEntry`]s,
 //!   recomputing `entry_hash` and checking `agent_sig` against a
-//!   supplied verifying key. Used by `AuditLog::open` to populate
-//!   the tail-hash and exposed for the off-host verifier the next
-//!   sub-sprint B commit will wire into `nn-admin audit verify`.
+//!   supplied verifying key. The verifier of `nn-admin audit verify`
+//!   and `nn-admin chain verify` (`AuditLog::open` does not call it; the
+//!   boot verification is the overlay floor scan, and lab PR 160's row
+//!   numbers and head anchor, `crate::chain_anchor`).
 //!
 //! ## What this commit (B1) deliberately does NOT ship
 //!
@@ -87,7 +88,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, SECRE
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 /// Default location of the tamper-evident audit log. Mirrors the
@@ -393,6 +393,13 @@ pub struct AuditEntry {
     /// Comm of the connecting client (best-effort read from
     /// `/proc/<pid>/comm`).
     pub client_comm: String,
+    /// External audit NN-AUD-108: the row's 0-based position in the log.
+    /// Absent on rows written before lab PR 160, which keep their exact
+    /// bytes and their untagged pre-image; present on every row after,
+    /// whose pre-image is prefixed with
+    /// [`crate::chain_anchor::AUDIT_DOMAIN_V2`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     /// Hex of the prior entry's `entry_hash`. First record uses
     /// [`GENESIS_PREV_HASH`].
     pub prev_hash: String,
@@ -490,6 +497,15 @@ pub struct AuditLog {
     key: AgentSigningKey,
     agent_id: [u8; 16],
     last_hash: String,
+    /// External audit NN-AUD-108: rows in the log, the `seq` of the next.
+    rows: u64,
+    /// A numbered row is already in the log.
+    numbered: bool,
+    /// The first row-number break the open found, reported once.
+    seq_break: Option<String>,
+    /// The chain holds the row recording that numbering and head anchoring
+    /// started ([`crate::chain_anchor::NUMBERING_STARTED_OP`]).
+    anchoring_started: bool,
 }
 
 impl AuditLog {
@@ -511,12 +527,7 @@ impl AuditLog {
         let repair = crate::chainlog::repair_torn_tail(path, |l| {
             serde_json::from_slice::<AuditEntry>(l).is_ok()
         })?;
-        let ChainTail {
-            last_hash,
-            previous_run,
-            second_key_added,
-            ..
-        } = read_tail(path)?;
+        let tail = read_tail(path)?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
         // `/etc/northnarrow/` install.
@@ -536,9 +547,13 @@ impl AuditLog {
             io_path: crate::anchored::anchor(path),
             key,
             agent_id,
-            last_hash,
-            previous_run,
-            second_key_added,
+            last_hash: tail.last_hash,
+            previous_run: tail.previous_run,
+            second_key_added: tail.second_key_added,
+            rows: tail.seq.rows(),
+            numbered: tail.seq.numbered(),
+            seq_break: tail.seq_break,
+            anchoring_started: tail.anchoring_started,
         };
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
@@ -614,6 +629,34 @@ impl AuditLog {
         self.second_key_added
     }
 
+    /// External audit NN-AUD-108: the log already holds a numbered row
+    /// (written by lab PR 160 or later).
+    pub fn numbered(&self) -> bool {
+        self.numbered
+    }
+
+    /// Rows in the log: the `seq` the next row carries.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// The chain records that head anchoring started (lab PR 160).
+    pub fn anchoring_started(&self) -> bool {
+        self.anchoring_started
+    }
+
+    /// What the open found wrong with the row numbers, for the caller to
+    /// attest once: rows removed or inserted before the end.
+    pub fn take_open_findings(&mut self, file: &Path) -> Vec<crate::chain_anchor::ChainFinding> {
+        self.seq_break
+            .take()
+            .map(|why| {
+                crate::chain_anchor::ChainFinding::new("audit", file, "chain_sequence_broken", why)
+            })
+            .into_iter()
+            .collect()
+    }
+
     /// `agent_stop` entry: the event loop is over and the process is about
     /// to exit on its own terms. `reason` is the path out of the loop.
     pub fn stop_entry(&mut self, reason: &str, uptime_secs: u64) -> Result<AuditEntry> {
@@ -638,7 +681,13 @@ impl AuditLog {
     /// the in-memory tail hash and returns the entry as
     /// persisted.
     pub fn append(&mut self, draft: AuditEntryDraft) -> Result<AuditEntry> {
-        let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
+        let entry = build_signed_entry(
+            &draft,
+            &self.key,
+            &self.agent_id,
+            &self.last_hash,
+            self.rows,
+        )?;
         let mut line =
             serde_json::to_string(&entry).map_err(|e| anyhow!("serialising audit entry: {e}"))?;
         line.push('\n');
@@ -653,6 +702,16 @@ impl AuditLog {
         f.sync_all()
             .with_context(|| format!("fsync {}", self.path.display()))?;
         self.last_hash = entry.entry_hash.clone();
+        self.rows += 1;
+        self.numbered = true;
+        // External audit ATP-004 / NN-AUD-108: the head anchor carries this
+        // flag; it must not wait for the next open to be seen.
+        if entry.op == "rotate_keys_add" && entry.result == "success" {
+            self.second_key_added = true;
+        }
+        if entry.op == crate::chain_anchor::NUMBERING_STARTED_OP {
+            self.anchoring_started = true;
+        }
         Ok(entry)
     }
 
@@ -775,11 +834,15 @@ pub fn verified_boot_recorded(path: &Path) -> Result<bool> {
     Ok(read_tail(path)?.verified_boot)
 }
 
-/// What one pass over the chain finds.
-struct ChainTail {
+/// What [`read_tail`] recovers from the log.
+struct TailState {
     last_hash: String,
     previous_run: PreviousRun,
     second_key_added: bool,
+    seq: crate::chain_anchor::RowSeq,
+    /// The first row-number break (NN-AUD-108), as a sentence.
+    seq_break: Option<String>,
+    anchoring_started: bool,
     /// External audit DEP-009, see [`verified_boot_recorded`].
     verified_boot: bool,
 }
@@ -790,14 +853,23 @@ struct ChainTail {
 /// signal A12's verify-on-read flow surfaces, but for the
 /// agent's write path the early failure is preferable to
 /// chaining off garbage.
-fn read_tail(path: &Path) -> Result<ChainTail> {
+///
+/// External audit NN-AUD-108: the walk also checks the row numbers (no
+/// signature work: a missing or extra row before the end is found at
+/// every open) and counts the rows, the `seq` of the next one.
+fn read_tail(path: &Path) -> Result<TailState> {
+    let mut seq = crate::chain_anchor::RowSeq::default();
+    let mut seq_break = None;
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ChainTail {
+            return Ok(TailState {
                 last_hash: GENESIS_PREV_HASH.to_string(),
                 previous_run: PreviousRun::None,
                 second_key_added: false,
+                seq,
+                seq_break,
+                anchoring_started: false,
                 verified_boot: false,
             });
         }
@@ -809,6 +881,7 @@ fn read_tail(path: &Path) -> Result<ChainTail> {
     let mut previous = PreviousRun::None;
     let mut second_key_added = false;
     let mut verified_boot = false;
+    let mut anchoring_started = false;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -816,6 +889,12 @@ fn read_tail(path: &Path) -> Result<ChainTail> {
         }
         let entry: AuditEntry = serde_json::from_str(&line)
             .with_context(|| format!("parsing audit-log line: {line}"))?;
+        if entry.op == crate::chain_anchor::NUMBERING_STARTED_OP {
+            anchoring_started = true;
+        }
+        if let Err(b) = seq.push(entry.seq) {
+            seq_break.get_or_insert_with(|| format!("{}: {b}", path.display()));
+        }
         match entry.op.as_str() {
             "agent_boot" => {
                 if entry.result == "success"
@@ -849,10 +928,13 @@ fn read_tail(path: &Path) -> Result<ChainTail> {
     if let PreviousRun::Abrupt { last_entry_at, .. } = &mut previous {
         *last_entry_at = last_ts;
     }
-    Ok(ChainTail {
+    Ok(TailState {
         last_hash: last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         previous_run: previous,
         second_key_added,
+        seq,
+        seq_break,
+        anchoring_started,
         verified_boot,
     })
 }
@@ -866,6 +948,7 @@ fn build_signed_entry(
     key: &AgentSigningKey,
     agent_id: &[u8; 16],
     prev_hash: &str,
+    seq: u64,
 ) -> Result<AuditEntry> {
     let ts = format_ts(Utc::now());
     let mut entry = AuditEntry {
@@ -879,6 +962,7 @@ fn build_signed_entry(
         client_pid: draft.client_pid,
         client_uid: draft.client_uid,
         client_comm: draft.client_comm.clone(),
+        seq: Some(seq),
         prev_hash: prev_hash.to_string(),
         // Filled below — empty here so they are excluded from the
         // hashed pre-image.
@@ -899,18 +983,23 @@ fn build_signed_entry(
 /// stays free of those fields' eventual contents — verifiers
 /// reproduce the same bytes by clearing those fields before
 /// recomputing.
+///
+/// External audit NN-AUD-108 / NN-AUD-174: a numbered row (`seq` set)
+/// prefixes the pre-image with [`crate::chain_anchor::AUDIT_DOMAIN_V2`];
+/// a row without `seq` keeps the pre-image it was signed with.
 pub(crate) fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
     debug_assert!(entry.entry_hash.is_empty());
     debug_assert!(entry.agent_sig.is_empty());
-    let prev_bytes =
-        hex::decode(&entry.prev_hash).map_err(|e| anyhow!("prev_hash is not valid hex: {e}"))?;
     let body =
         serde_json::to_vec(entry).map_err(|e| anyhow!("serialising audit pre-image: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&prev_bytes);
-    hasher.update(&body);
-    let digest: [u8; 32] = hasher.finalize().into();
-    Ok(digest)
+    let domain = entry.seq.map(|_| crate::chain_anchor::AUDIT_DOMAIN_V2);
+    crate::chain_anchor::flat_digest(domain, &entry.prev_hash, &body)
+}
+
+/// External audit NN-AUD-108: whether one raw line is a genuine audit row
+/// (decodes, its hash recomputes, its signature verifies).
+pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
+    serde_json::from_slice::<AuditEntry>(line).is_ok_and(|e| verify_entry(0, &e, pubkey).is_ok())
 }
 
 fn format_ts(t: DateTime<Utc>) -> String {
@@ -940,16 +1029,29 @@ pub enum AuditVerifyError {
     SignatureInvalid { idx: usize },
     #[error("entry {idx}: malformed field — {reason}")]
     MalformedField { idx: usize, reason: String },
+    /// External audit NN-AUD-108: a numbered row out of place.
+    #[error("entry {idx}: {reason}")]
+    Sequence {
+        idx: usize,
+        reason: crate::chain_anchor::SeqBreak,
+    },
 }
 
 /// Replay `entries` in order, recomputing each `entry_hash` and
 /// checking each `agent_sig` against `pubkey`. Returns `Ok(())` on
-/// a fully-intact chain. Used by the agent's own `AuditLog::open`
-/// path (which discards the result, since open is best-effort
-/// fast) and by the future `nn-admin audit verify` reader.
+/// a fully-intact chain. Used by `nn-admin audit verify` and
+/// `nn-admin chain verify` (`AuditLog::open` does not call it).
+///
+/// External audit NN-AUD-108: rows without `seq` (written before lab PR
+/// 160) verify as before; from the first numbered row on, every row must
+/// carry its position (`seq == idx`), so a row removed or inserted before
+/// the end breaks the chain even where the hashes would still link.
 pub fn verify_chain(entries: &[AuditEntry], pubkey: &VerifyingKey) -> Result<(), AuditVerifyError> {
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
+    let mut seq = crate::chain_anchor::RowSeq::default();
     for (idx, entry) in entries.iter().enumerate() {
+        seq.push(entry.seq)
+            .map_err(|reason| AuditVerifyError::Sequence { idx, reason })?;
         if entry.prev_hash != expected_prev {
             return Err(AuditVerifyError::PrevHashMismatch {
                 idx,
@@ -1407,5 +1509,149 @@ mod tests {
         let e = log.boot_probe(None, "verified", "attested").unwrap();
         assert_eq!(e.extra["detect_only"], false);
         assert!(e.extra["detect_only_source"].is_null());
+    }
+
+    // ── External audit NN-AUD-108 (lab PR 160) ──────────────────────
+
+    /// Rows as the code before lab PR 160 wrote them: no `seq`, untagged
+    /// pre-image (`SHA-256(prev ‖ row)`), same bytes on disk.
+    fn write_legacy_rows(path: &Path, key: &AgentSigningKey, n: u32) -> String {
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut body = String::new();
+        for i in 0..n {
+            let mut e = build_signed_entry(&sample_draft(i), key, &[0u8; 16], &prev, 0).unwrap();
+            e.seq = None;
+            e.entry_hash.clear();
+            e.agent_sig.clear();
+            let h = compute_entry_hash(&e).unwrap();
+            e.entry_hash = hex::encode(h);
+            e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+            let line = serde_json::to_string(&e).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(v.get("seq").is_none(), "a legacy row has no seq field");
+            body.push_str(&line);
+            body.push('\n');
+            prev = e.entry_hash;
+        }
+        fs::write(path, &body).unwrap();
+        prev
+    }
+
+    fn rows(path: &Path) -> Vec<AuditEntry> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// An existing chain (no `seq`) still verifies; numbering starts at
+    /// its row count and the whole chain verifies with both formats.
+    #[test]
+    fn legacy_rows_without_seq_verify_and_new_rows_are_numbered_after_them() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let legacy_tail = write_legacy_rows(&log_path, &key, 3);
+        let before = fs::read(&log_path).unwrap();
+        verify_chain(&rows(&log_path), &pk).expect("legacy chain verifies as before");
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        assert!(!log.numbered());
+        assert_eq!(log.rows(), 3);
+        let first = log.append(sample_draft(10)).unwrap();
+        log.append(sample_draft(11)).unwrap();
+        assert_eq!(first.seq, Some(3));
+        assert_eq!(first.prev_hash, legacy_tail);
+        assert!(
+            fs::read(&log_path).unwrap().starts_with(&before),
+            "old rows untouched"
+        );
+        let all = rows(&log_path);
+        verify_chain(&all, &pk).expect("old rows then numbered rows verify");
+        assert_eq!(
+            all.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            [None, None, None, Some(3), Some(4)]
+        );
+        assert!(AuditLog::open(
+            &log_path,
+            AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+            [0u8; 16]
+        )
+        .unwrap()
+        .take_open_findings(&log_path)
+        .is_empty());
+    }
+
+    /// External audit NN-AUD-108: a row removed before the end, or an
+    /// old-format row inserted after numbered ones, fails `verify_chain`
+    /// and is reported at the next open — where the hashes alone would
+    /// pass if the attacker re-linked them with the key.
+    #[test]
+    fn seq_gap_or_regression_fails_verify_chain_and_is_reported_at_open() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 0..4 {
+            log.append(sample_draft(i)).unwrap();
+        }
+        let intact = rows(&log_path);
+        let mut all = intact.clone();
+        all.remove(1);
+        assert!(matches!(
+            verify_chain(&all, &pk),
+            Err(AuditVerifyError::Sequence { idx: 1, .. })
+        ));
+        // the file itself, row 1 removed: the open names the break
+        let body = fs::read_to_string(&log_path).unwrap();
+        let kept: String = body
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| format!("{l}\n"))
+            .collect();
+        fs::write(&log_path, kept).unwrap();
+        let mut reopened = AuditLog::open(
+            &log_path,
+            AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+            [0u8; 16],
+        )
+        .unwrap();
+        let found = reopened.take_open_findings(&log_path);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, "chain_sequence_broken");
+        // an old-format row after numbered ones
+        let mut all = intact;
+        all[2].seq = None;
+        assert!(matches!(
+            verify_chain(&all, &pk),
+            Err(AuditVerifyError::Sequence { idx: 2, .. })
+        ));
+    }
+
+    /// External audit NN-AUD-108 / NN-AUD-174: a numbered row's hash is
+    /// domain-tagged; the same row hashed without the tag (or with another
+    /// chain's) does not verify.
+    #[test]
+    fn a_numbered_row_hashed_for_another_domain_is_rejected() {
+        let (_d, key_path, _log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let good =
+            build_signed_entry(&sample_draft(1), &key, &[0u8; 16], GENESIS_PREV_HASH, 0).unwrap();
+        verify_chain(std::slice::from_ref(&good), &pk).unwrap();
+        for domain in [None, Some(crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2)] {
+            let mut e = good.clone();
+            e.entry_hash.clear();
+            e.agent_sig.clear();
+            let body = serde_json::to_vec(&e).unwrap();
+            let h = crate::chain_anchor::flat_digest(domain, &e.prev_hash, &body).unwrap();
+            e.entry_hash = hex::encode(h);
+            e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+            assert!(matches!(
+                verify_chain(&[e], &pk),
+                Err(AuditVerifyError::EntryHashMismatch { idx: 0, .. })
+            ));
+        }
     }
 }

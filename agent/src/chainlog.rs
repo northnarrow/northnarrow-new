@@ -22,7 +22,8 @@
 //!   each ending in exactly one **terminator** line;
 //! - a **manifest** `<base>.manifest.jsonl` — itself a chain — with one
 //!   row per rotation ([`ManifestEvent::Rotated`]) and per retention
-//!   drop ([`ManifestEvent::Evicted`]).
+//!   drop ([`ManifestEvent::Evicted`]), and the active file's checkpoints
+//!   ([`ManifestEvent::ActiveCheckpoint`], external audit NN-AUD-109).
 //!
 //! Three line kinds, all chained + signed:
 //! - **data line** — [`ChainLine<P>`]: the payload `P` flattened inline
@@ -184,6 +185,18 @@ pub enum ManifestEvent {
         seq: u64,
         entry_type: String,
         bytes: u64,
+    },
+    /// External audit NN-AUD-109: the active file of generation `seq` (the
+    /// archive seq it becomes when sealed) held a line with `tail_hash`
+    /// ending at offset `bytes`. Written every [`CHECKPOINT_EVERY_RECORDS`]
+    /// records, every [`CHECKPOINT_EVERY_SECS`] while records arrive, and
+    /// when the log opens a non-empty active file. [`verify_log_set`] and
+    /// the boot check require each checkpoint to be reachable: an active
+    /// file deleted, emptied or cut below it is found.
+    ActiveCheckpoint {
+        seq: u64,
+        bytes: u64,
+        tail_hash: String,
     },
 }
 
@@ -511,8 +524,17 @@ pub struct RotatingChainLog<P> {
     unsynced: bool,
     /// fsyncs of the active file by this writer (introspection, tests).
     fsyncs: u64,
+    /// External audit NN-AUD-109: records appended since the last
+    /// [`ManifestEvent::ActiveCheckpoint`], and when it was written.
+    since_checkpoint: u64,
+    checkpoint_at: std::time::Instant,
     _marker: std::marker::PhantomData<P>,
 }
+
+/// External audit NN-AUD-109: a checkpoint after this many records...
+pub const CHECKPOINT_EVERY_RECORDS: u64 = 1000;
+/// ...or after this long with records appended since the last one.
+pub const CHECKPOINT_EVERY_SECS: u64 = 600;
 
 impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
     /// Open (or initialise) the log at `active_path`. Scans existing
@@ -559,6 +581,8 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             pending_seal: None,
             unsynced: false,
             fsyncs: 0,
+            since_checkpoint: 0,
+            checkpoint_at: std::time::Instant::now(),
             _marker: std::marker::PhantomData,
         };
 
@@ -634,12 +658,118 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         // advisory (it recounts independently — see `verify_one_file`). The
         // rotation trigger keys on `active_bytes` (recovered from the file
         // length), not on this count.
+        //
+        // External audit NN-AUD-109: anchor what this open found, unless the
+        // manifest already says exactly that. Non-fatal.
+        if log.pending_seal.is_none() && log.active_bytes > 0 {
+            let current = (log.next_seq, log.active_bytes, log.last_hash.clone());
+            let anchored = manifest_tail_events(&log.active_path, &pubkey)
+                .into_iter()
+                .find_map(|e| match e {
+                    ManifestEvent::ActiveCheckpoint {
+                        seq,
+                        bytes,
+                        tail_hash,
+                    } => Some((seq, bytes, tail_hash)),
+                    _ => None,
+                });
+            if anchored.as_ref() != Some(&current) {
+                if let Err(e) = log.checkpoint() {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        log = %log.active_path.display(),
+                        "chainlog: active checkpoint not written at open"
+                    );
+                }
+            }
+        }
         Ok(log)
     }
 
     /// Tail hash the next data line will chain off (test/introspection).
     pub fn last_hash(&self) -> &str {
         &self.last_hash
+    }
+
+    /// The verifying key of this log's signing key (the read path checks
+    /// rows with it, external audit NN-AUD-112).
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.key.verifying_key()
+    }
+
+    /// External audit NN-AUD-109: record the active file's head in the
+    /// manifest ([`ManifestEvent::ActiveCheckpoint`]). Nothing to record
+    /// for an empty active file.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.active_bytes == 0 || self.pending_seal.is_some() {
+            return Ok(());
+        }
+        // NET-019 group commit: the head recorded must be on disk first, or
+        // a power loss would leave a checkpoint naming a line that is gone
+        // (read at the next boot as a truncation).
+        self.sync()?;
+        self.ensure_manifest()?;
+        self.manifest_append(ManifestEvent::ActiveCheckpoint {
+            seq: self.next_seq,
+            bytes: self.active_bytes,
+            tail_hash: self.last_hash.clone(),
+        })?;
+        self.since_checkpoint = 0;
+        self.checkpoint_at = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Create the manifest if it does not exist yet, inside the `+i`
+    /// dance (a new name in the immutable state directory), and register
+    /// it. Must not be called from inside the dance (it takes it).
+    fn ensure_manifest(&mut self) -> Result<()> {
+        if fs::symlink_metadata(&self.manifest_path).is_ok() {
+            return Ok(());
+        }
+        let manifest = self.manifest_path.clone();
+        let mode = self.cfg.file_mode;
+        self.protection
+            .with_mutable_dir(&mut || match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(mode)
+                .open(&manifest)
+            {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(anyhow!(e).context(format!("creating {}", manifest.display()))),
+            })?;
+        if let Err(e) = self.protection.register_active(&self.manifest_path) {
+            warn!(
+                error = %format!("{e:#}"),
+                path = %self.manifest_path.display(),
+                "chainlog: could not register the manifest in PROTECTED_INODES"
+            );
+        }
+        Ok(())
+    }
+
+    /// A checkpoint is due after an append.
+    fn checkpoint_due(&self) -> bool {
+        self.since_checkpoint >= CHECKPOINT_EVERY_RECORDS
+            || (self.since_checkpoint > 0
+                && self.checkpoint_at.elapsed().as_secs() >= CHECKPOINT_EVERY_SECS)
+    }
+
+    /// Count one appended record and write a checkpoint when due
+    /// (non-fatal: the record is already on disk).
+    fn after_append(&mut self) {
+        self.since_checkpoint += 1;
+        if self.checkpoint_due() {
+            if let Err(e) = self.checkpoint() {
+                warn!(
+                    error = %format!("{e:#}"),
+                    log = %self.active_path.display(),
+                    "chainlog: active checkpoint not written"
+                );
+                self.checkpoint_at = std::time::Instant::now();
+            }
+        }
     }
 
     /// Append one payload as a signed data line, rotating first if it
@@ -727,12 +857,14 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             self.last_hash = line.entry_hash.clone();
             self.active_bytes += bytes.len() as u64;
             self.active_records += 1;
+            self.after_append();
             return Ok(line.entry_hash);
         }
         self.write_active(&bytes, durable)?;
         self.last_hash = line.entry_hash.clone();
         self.active_bytes += bytes.len() as u64;
         self.active_records += 1;
+        self.after_append();
         Ok(line.entry_hash)
     }
 
@@ -858,6 +990,9 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             self.active_records = 0;
             self.next_seq = seq + 1;
             self.pending_seal = None;
+            // The `Rotated` row anchors the sealed file.
+            self.since_checkpoint = 0;
+            self.checkpoint_at = std::time::Instant::now();
             // 3. Fresh empty active (O_EXCL: never truncate or follow a name
             //    that appeared after the rename) + register its inode.
             create_fresh_active(&active, file_mode)?;
@@ -1047,6 +1182,30 @@ pub fn sealed_files(active: &Path) -> Vec<PathBuf> {
         out.push(manifest);
     }
     out
+}
+
+/// The manifest of the log whose active file is `active`.
+pub fn manifest_path(active: &Path) -> PathBuf {
+    manifest_path_for(active)
+}
+
+/// The archive `seq` of the log whose active file is `active`.
+pub fn archive_path_for(active: &Path, seq: u64) -> PathBuf {
+    archive_path(active, seq)
+}
+
+/// External audit NN-AUD-109: the generation of the active file now — the
+/// archive seq it becomes when sealed (1 before any rotation).
+pub fn current_generation(active: &Path) -> u64 {
+    scan_max_archive_seq(active)
+        .ok()
+        .flatten()
+        .map_or(1, |m| m + 1)
+}
+
+/// Lowest archive seq on disk.
+pub fn earliest_archive(active: &Path) -> Option<u64> {
+    list_archive_seqs(active).ok()?.into_iter().min()
 }
 
 fn manifest_path_for(active: &Path) -> PathBuf {
@@ -1541,6 +1700,82 @@ fn check_active_line<P: Serialize + DeserializeOwned>(line: &[u8], pk: &Verifyin
     }
 }
 
+/// External audit NN-AUD-112: whether one raw line of an active file or
+/// archive is a genuine line of this log (data line or terminator: it
+/// decodes, its hash recomputes, its signature verifies). Its link to the
+/// line before is the verifier's.
+pub fn line_is_genuine<P: Serialize + DeserializeOwned>(line: &[u8], pk: &VerifyingKey) -> bool {
+    matches!(check_active_line::<P>(line, pk), LineCheck::Verified { .. })
+}
+
+/// Whether one raw manifest line is genuine.
+pub fn manifest_line_is_genuine(line: &[u8], pk: &VerifyingKey) -> bool {
+    matches!(check_manifest_line(line, pk), LineCheck::Verified { .. })
+}
+
+/// Bytes read from the end of a manifest by [`manifest_tail_events`].
+const MANIFEST_TAIL_WINDOW: u64 = 256 * 1024;
+
+/// External audit NN-AUD-109: the genuine events in the last
+/// [`MANIFEST_TAIL_WINDOW`] bytes of the manifest of `active`, newest
+/// first. Lines that do not verify are left out.
+pub fn manifest_tail_events(active: &Path, pk: &VerifyingKey) -> Vec<ManifestEvent> {
+    let path = manifest_path_for(active);
+    let mut f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(size) = f.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let start = size.saturating_sub(MANIFEST_TAIL_WINDOW);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&[u8]> = buf.split(|&c| c == b'\n').collect();
+    // The piece after the last newline is a fragment (or empty); the first
+    // piece is cut by the window unless it starts the file.
+    lines.pop();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines
+        .into_iter()
+        .rev()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let m: ManifestLine = serde_json::from_slice(l).ok()?;
+            manifest_line_is_genuine(l, pk).then_some(m.manifest.event)
+        })
+        .collect()
+}
+
+/// External audit NN-AUD-109: why the active file of `active` counts as
+/// deleted — it is absent while the newest archive's `Rotated` row is in
+/// the manifest (`tail`, from [`manifest_tail_events`]). The rotation
+/// creates the fresh active file before it writes that row, so only a
+/// crash between the rename and the create leaves no active file and no
+/// row; that state is not reported.
+pub fn active_missing(active: &Path, tail: &[ManifestEvent]) -> Option<String> {
+    if fs::symlink_metadata(active).is_ok() {
+        return None;
+    }
+    let newest = scan_max_archive_seq(active).ok().flatten()?;
+    tail.iter()
+        .any(|e| matches!(e, ManifestEvent::Rotated { seq, .. } if *seq == newest))
+        .then(|| {
+            format!(
+                "the active file is gone while archive {newest} was sealed and recorded: it was \
+                 deleted after the rotation"
+            )
+        })
+}
+
 /// Typed check of a manifest line.
 fn check_manifest_line(line: &[u8], pk: &VerifyingKey) -> LineCheck {
     let Ok(mut m) = serde_json::from_slice::<ManifestLine>(line) else {
@@ -1740,6 +1975,8 @@ pub struct LogSetReport {
     pub archives_verified: usize,
     /// Records across all verified files (data lines, excl. terminators).
     pub total_records: u64,
+    /// External audit NN-AUD-109: manifest checkpoints found reachable.
+    pub checkpoints_verified: usize,
 }
 
 /// Why a chainlog set failed verification.
@@ -1775,6 +2012,35 @@ pub enum LogSetError {
         idx: usize,
         reason: String,
     },
+    /// External audit NN-AUD-109: the active file is gone after a completed
+    /// rotation (see [`active_missing`]).
+    #[error("active file {file} is missing: {reason}")]
+    ActiveMissing { file: String, reason: String },
+    /// External audit NN-AUD-109: a manifest checkpoint names a line that
+    /// is no longer there — the file was deleted, emptied, cut or
+    /// rewritten below it.
+    #[error(
+        "file {file}: the manifest checkpoint of generation {seq} (line ending at byte {bytes}, \
+         entry_hash {tail_hash}) is unreachable: {reason}"
+    )]
+    CheckpointUnreachable {
+        file: String,
+        seq: u64,
+        bytes: u64,
+        tail_hash: String,
+        reason: String,
+    },
+}
+
+/// What a full read of the manifest yields for [`verify_log_set`].
+#[derive(Default)]
+struct ManifestFacts {
+    /// `Evicted` seq → attested terminator hash.
+    evicted: std::collections::BTreeMap<u64, String>,
+    /// Seqs with a `Rotated` row.
+    rotated: std::collections::BTreeSet<u64>,
+    /// `ActiveCheckpoint` rows: (generation, bytes, tail_hash).
+    checkpoints: Vec<(u64, u64, String)>,
 }
 
 /// Verify the entire rotation set for `active_path` end-to-end against
@@ -1782,6 +2048,13 @@ pub enum LogSetError {
 /// carrying `expected_prev` across terminator boundaries (GENESIS only
 /// for seq 0). A retention-evicted prefix is accepted **only** if the
 /// signed manifest carries an `Evicted` row for each missing seq.
+///
+/// External audit NN-AUD-109: the suffix is bounded too. The manifest is
+/// verified whole; every [`ManifestEvent::ActiveCheckpoint`] must name a
+/// line still there (by end offset and hash) in the archive or active file
+/// of its generation, and the active file may be absent only when the
+/// newest archive has no `Rotated` row yet (the crash window between the
+/// rename and the create).
 pub fn verify_log_set<P: Serialize + DeserializeOwned>(
     active_path: &Path,
     pubkey: &VerifyingKey,
@@ -1797,15 +2070,18 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
     // the ONLY genesis-rooted file). `earliest <= 1` ⇒ nothing was evicted
     // ⇒ the set roots at GENESIS. `earliest > 1` ⇒ seqs `1..earliest` were
     // retention-evicted; the SIGNED manifest (whose own chain + signatures
-    // are verified inside `verify_manifest_evictions`) must attest each
+    // are verified inside `verify_manifest`) must attest each
     // dropped seq, and the earliest retained archive is rooted on the
     // manifest's attested terminator hash of its now-absent predecessor —
     // NOT on the file's own claimed prev_hash (which would make the
     // first-line boundary check a tautology and let a forged predecessor
     // link slide through).
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
+    // External audit NN-AUD-109: the manifest is read whole every time —
+    // its checkpoints and `Rotated` rows bound the suffix of the set.
+    let facts = verify_manifest(active_path, pubkey)?;
+    let evicted = &facts.evicted;
     if earliest_retained_seq > 1 {
-        let evicted = verify_manifest_evictions(active_path, pubkey)?;
         for seq in 1..earliest_retained_seq {
             if !evicted.contains_key(&seq) {
                 return Err(LogSetError::UncorroboratedEviction { seq });
@@ -1819,6 +2095,31 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
     }
 
     let mut total_records = 0u64;
+    let active_gen = seqs.last().map_or(1, |m| m + 1);
+    let mut checkpoints_verified = 0usize;
+    // Checkpoints of generations past the active one: newer archives gone.
+    if let Some((seq, bytes, tail_hash)) =
+        facts.checkpoints.iter().find(|(g, _, _)| *g > active_gen)
+    {
+        return Err(LogSetError::CheckpointUnreachable {
+            file: active_path.display().to_string(),
+            seq: *seq,
+            bytes: *bytes,
+            tail_hash: tail_hash.clone(),
+            reason: format!(
+                "generation {seq} is past the active file's ({active_gen}): the newest archives \
+                 were removed"
+            ),
+        });
+    }
+    let checkpoints_of = |g: u64| -> Vec<(u64, String)> {
+        facts
+            .checkpoints
+            .iter()
+            .filter(|(cg, _, _)| *cg == g)
+            .map(|(_, b, h)| (*b, h.clone()))
+            .collect()
+    };
 
     // Sealed archives, ascending, contiguous.
     let mut prev_seq: Option<u64> = None;
@@ -1832,39 +2133,235 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
             }
         }
         let path = archive_path(active_path, seq);
-        let (term_hash, records) = verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq))?;
-        total_records += records;
-        expected_prev = term_hash.expect("sealed archive ends in a terminator");
+        let walk = verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq))?;
+        total_records += walk.records;
+        checkpoints_verified += reach_checkpoints(&path, seq, &checkpoints_of(seq), &walk)?;
+        expected_prev = walk
+            .terminator
+            .clone()
+            .expect("sealed archive ends in a terminator");
         prev_seq = Some(seq);
     }
 
-    // Active file (no terminator).
-    let (_tail, records) = verify_one_file::<P>(active_path, &expected_prev, pubkey, None)?;
-    total_records += records;
+    // Active file (no terminator). External audit NN-AUD-109: missing is an
+    // empty chain only when nothing says it existed.
+    if fs::symlink_metadata(active_path).is_err() {
+        let rotated_newest = seqs.last().is_some_and(|m| facts.rotated.contains(m));
+        if rotated_newest {
+            return Err(LogSetError::ActiveMissing {
+                file: active_path.display().to_string(),
+                reason: format!(
+                    "archive {} was sealed and recorded, so its successor was created",
+                    seqs.last().copied().unwrap_or_default()
+                ),
+            });
+        }
+    }
+    let walk = verify_one_file::<P>(active_path, &expected_prev, pubkey, None)?;
+    total_records += walk.records;
+    checkpoints_verified +=
+        reach_checkpoints(active_path, active_gen, &checkpoints_of(active_gen), &walk)?;
 
     Ok(LogSetReport {
         earliest_retained_seq,
         archives_verified: seqs.len(),
         total_records,
+        checkpoints_verified,
     })
 }
 
-/// Verify one file's chain from `expected_prev`. Returns
-/// `(terminator_hash_if_sealed, data_record_count)`. `archive_seq` is
-/// `Some` for sealed archives (asserts the terminator's `this_seq`).
+/// What [`verify_recent`] checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentReport {
+    /// Lines verified (data lines and a terminator).
+    pub lines: u64,
+    /// Bytes of the active file covered.
+    pub bytes: u64,
+    /// The window covered the whole active file (its first line's link to
+    /// the previous file was checked too, when that file is still there).
+    pub whole_file: bool,
+}
+
+/// External audit NN-AUD-112: the bounded check the agent runs on each
+/// rotating log after it starts — every line in the last `max_bytes` of
+/// the active file must verify (hash and signature) and link to the line
+/// before it. The full check of the set is [`verify_log_set`]
+/// (`nn-admin chain verify`).
+pub fn verify_recent<P: Serialize + DeserializeOwned>(
+    active: &Path,
+    pubkey: &VerifyingKey,
+    max_bytes: u64,
+) -> Result<RecentReport, LogSetError> {
+    let file = active.display().to_string();
+    let malformed = |idx: usize, reason: String| LogSetError::Malformed {
+        file: file.clone(),
+        idx,
+        reason,
+    };
+    let generation = current_generation(active);
+    let mut f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(active)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecentReport {
+                lines: 0,
+                bytes: 0,
+                whole_file: true,
+            })
+        }
+        Err(e) => return Err(malformed(0, e.to_string())),
+    };
+    let len = f.metadata().map_err(|e| malformed(0, e.to_string()))?.len();
+    let start = len.saturating_sub(max_bytes);
+    let mut buf = Vec::new();
+    f.seek(SeekFrom::Start(start))
+        .and_then(|_| f.read_to_end(&mut buf))
+        .map_err(|e| malformed(0, e.to_string()))?;
+    let mut body: &[u8] = &buf;
+    let mut at = start;
+    if start > 0 {
+        // The first piece is cut by the window.
+        let Some(nl) = body.iter().position(|&c| c == b'\n') else {
+            return Ok(RecentReport {
+                lines: 0,
+                bytes: 0,
+                whole_file: false,
+            });
+        };
+        at += nl as u64 + 1;
+        body = &body[nl + 1..];
+    }
+    let covered = len - at;
+    // The link of the first line, known only when the window starts the file
+    // and no rotation ran while it was read.
+    let mut expected: Option<String> = if start == 0 && current_generation(active) == generation {
+        if generation == 1 {
+            Some(GENESIS_PREV_HASH.to_string())
+        } else {
+            read_terminator_hash(&archive_path(active, generation - 1)).ok()
+        }
+    } else {
+        None
+    };
+    // Complete lines only: a last write cut short is the open's to repair.
+    let complete = body
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(&body[..0], |i| &body[..i]);
+    let mut lines = 0u64;
+    for (idx, line) in complete.split(|&c| c == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_slice(line)
+            .map_err(|e| malformed(idx, format!("line {idx} of the last {covered} bytes: {e}")))?;
+        let field = |k: &str| v.get(k).and_then(|h| h.as_str()).unwrap_or("").to_string();
+        let (prev, hash) = (field("prev_hash"), field("entry_hash"));
+        match check_active_line::<P>(line, pubkey) {
+            LineCheck::Verified { .. } => {}
+            LineCheck::BadSignature => {
+                return Err(LogSetError::SignatureInvalid {
+                    file: file.clone(),
+                    idx,
+                })
+            }
+            LineCheck::Invalid => {
+                return Err(malformed(
+                    idx,
+                    "the line does not decode or its entry_hash does not recompute".to_string(),
+                ))
+            }
+        }
+        if let Some(want) = &expected {
+            if &prev != want {
+                return Err(LogSetError::PrevHashMismatch {
+                    file: file.clone(),
+                    idx,
+                    got: prev,
+                    expected: want.clone(),
+                });
+            }
+        }
+        expected = Some(hash);
+        lines += 1;
+    }
+    Ok(RecentReport {
+        lines,
+        bytes: covered,
+        whole_file: start == 0,
+    })
+}
+
+/// External audit NN-AUD-109: every checkpoint of `generation` must name a
+/// line of `file` (by its end offset and hash). Returns how many did.
+fn reach_checkpoints(
+    file: &Path,
+    generation: u64,
+    checkpoints: &[(u64, String)],
+    walk: &FileWalk,
+) -> Result<usize, LogSetError> {
+    for (bytes, tail_hash) in checkpoints {
+        let found = walk.line_ends.binary_search_by_key(bytes, |(end, _)| *end);
+        let reason = match found {
+            Ok(i) if &walk.line_ends[i].1 == tail_hash => continue,
+            Ok(i) => format!("the line ending there is {}", walk.line_ends[i].1),
+            Err(_) if walk.len < *bytes => {
+                format!(
+                    "the file is {} bytes: it was emptied, deleted or cut",
+                    walk.len
+                )
+            }
+            Err(_) => "no line ends there: the file was rewritten".to_string(),
+        };
+        return Err(LogSetError::CheckpointUnreachable {
+            file: file.display().to_string(),
+            seq: generation,
+            bytes: *bytes,
+            tail_hash: tail_hash.clone(),
+            reason,
+        });
+    }
+    Ok(checkpoints.len())
+}
+
+/// What [`verify_one_file`] read.
+struct FileWalk {
+    /// Terminator `entry_hash` of a sealed archive.
+    terminator: Option<String>,
+    /// Data lines.
+    records: u64,
+    /// (offset past the line's newline, its `entry_hash`), ascending.
+    line_ends: Vec<(u64, String)>,
+    /// Bytes read (0 for a missing file).
+    len: u64,
+}
+
+/// Verify one file's chain from `expected_prev`: its terminator hash if
+/// sealed, its data record count, and where each line ends (for the
+/// manifest checkpoints). `archive_seq` is `Some` for sealed archives
+/// (asserts the terminator's `this_seq`).
 fn verify_one_file<P: Serialize + DeserializeOwned>(
     path: &Path,
     expected_prev: &str,
     pubkey: &VerifyingKey,
     archive_seq: Option<u64>,
-) -> Result<(Option<String>, u64), LogSetError> {
+) -> Result<FileWalk, LogSetError> {
     let file = path.display().to_string();
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && archive_seq.is_none() => {
-            // A never-created active file (fresh seq-0 deploy) is a
-            // valid empty chain.
-            return Ok((None, 0));
+            // A never-created active file (fresh seq-0 deploy, or the crash
+            // window between rename and create) is an empty chain; the
+            // caller has already ruled out a deleted one.
+            return Ok(FileWalk {
+                terminator: None,
+                records: 0,
+                line_ends: Vec::new(),
+                len: 0,
+            });
         }
         Err(e) => {
             return Err(LogSetError::Malformed {
@@ -1878,12 +2375,38 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
     let mut expected = expected_prev.to_string();
     let mut records = 0u64;
     let mut term_hash = None;
-    for (idx, line) in BufReader::new(f).lines().enumerate() {
-        let line = line.map_err(|e| LogSetError::Malformed {
-            file: file.clone(),
-            idx,
-            reason: e.to_string(),
-        })?;
+    let mut line_ends = Vec::new();
+    let mut offset = 0u64;
+    let mut reader = BufReader::new(f);
+    let mut raw = Vec::new();
+    let mut idx = 0usize;
+    loop {
+        raw.clear();
+        let n = reader
+            .read_until(b'\n', &mut raw)
+            .map_err(|e| LogSetError::Malformed {
+                file: file.clone(),
+                idx,
+                reason: e.to_string(),
+            })?;
+        if n == 0 {
+            break;
+        }
+        offset += n as u64;
+        let this = idx;
+        idx += 1;
+        let body = raw.strip_suffix(b"\n").unwrap_or(&raw);
+        let line = match std::str::from_utf8(body) {
+            Ok(l) => l.to_string(),
+            Err(e) => {
+                return Err(LogSetError::Malformed {
+                    file,
+                    idx: this,
+                    reason: e.to_string(),
+                })
+            }
+        };
+        let idx = this;
         if line.is_empty() {
             continue;
         }
@@ -1939,9 +2462,17 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
                 expected,
             });
         }
+        if raw.ends_with(b"\n") {
+            line_ends.push((offset, stored_hash.clone()));
+        }
         expected = stored_hash;
     }
-    Ok((term_hash, records))
+    Ok(FileWalk {
+        terminator: term_hash,
+        records,
+        line_ends,
+        len: offset,
+    })
 }
 
 fn recompute_hex<T: Serialize>(
@@ -2034,16 +2565,16 @@ fn first_line_prev_hash(path: &Path) -> Result<String> {
 /// branch of [`verify_log_set`] roots the earliest retained archive on
 /// these attested hashes, so this verification is load-bearing, not
 /// informational.
-fn verify_manifest_evictions(
+fn verify_manifest(
     active_path: &Path,
     pubkey: &VerifyingKey,
-) -> Result<std::collections::BTreeMap<u64, String>, LogSetError> {
+) -> Result<ManifestFacts, LogSetError> {
     let path = manifest_path_for(active_path);
     let file = path.display().to_string();
-    let mut evicted = std::collections::BTreeMap::new();
+    let mut facts = ManifestFacts::default();
     let f = match OpenOptions::new().read(true).open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(evicted),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(facts),
         Err(e) => {
             return Err(LogSetError::Malformed {
                 file,
@@ -2084,15 +2615,25 @@ fn verify_manifest_evictions(
             });
         }
         expected = stored;
-        if let ManifestEvent::Evicted {
-            seq,
-            terminator_hash,
-        } = entry.manifest.event
-        {
-            evicted.insert(seq, terminator_hash);
+        match entry.manifest.event {
+            ManifestEvent::Evicted {
+                seq,
+                terminator_hash,
+            } => {
+                facts.evicted.insert(seq, terminator_hash);
+            }
+            ManifestEvent::Rotated { seq, .. } => {
+                facts.rotated.insert(seq);
+            }
+            ManifestEvent::ActiveCheckpoint {
+                seq,
+                bytes,
+                tail_hash,
+            } => facts.checkpoints.push((seq, bytes, tail_hash)),
+            _ => {}
         }
     }
-    Ok(evicted)
+    Ok(facts)
 }
 
 #[cfg(test)]
@@ -2845,7 +3386,12 @@ mod tests {
             (1..=seqs.len() as u64).collect::<Vec<_>>(),
             "seqs must be contiguous — a re-rotation overwriting an archive would skip/reuse"
         );
-        // Every signed record survives across the archives + active.
+        // Every signed record survives across the archives + active. The
+        // verifier reads the manifest (NN-AUD-109) and refuses one that is
+        // not a file, so the set is checked as the operator would after
+        // clearing the obstruction.
+        assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
+        std::fs::remove_dir(manifest_path_for(&active)).unwrap();
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
         assert_eq!(
             report.total_records, 40,
@@ -3222,7 +3768,7 @@ mod tests {
         drop(log);
         assert!(manifest_events(&active).iter().any(|e| matches!(e,
             ManifestEvent::TornTailRepaired { role, .. } if role == "manifest")));
-        verify_manifest_evictions(&active, &pk).expect("manifest chain intact");
+        verify_manifest(&active, &pk).expect("manifest chain intact");
         assert_eq!(
             verify_log_set::<TestPayload>(&active, &pk)
                 .unwrap()
@@ -3503,5 +4049,160 @@ mod tests {
         assert_eq!(terminators, 1, "sealed exactly once");
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
         assert_eq!(report.total_records, i + 1);
+    }
+
+    // ── External audit NN-AUD-109 / NN-AUD-112 (lab PR 160) ──────────
+
+    fn checkpoints(active: &Path) -> Vec<(u64, u64, String)> {
+        manifest_events(active)
+            .into_iter()
+            .filter_map(|e| match e {
+                ManifestEvent::ActiveCheckpoint {
+                    seq,
+                    bytes,
+                    tail_hash,
+                } => Some((seq, bytes, tail_hash)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The open anchors a non-empty active file once, not again while
+    /// nothing changed; an empty one is not anchored.
+    #[test]
+    fn open_checkpoints_a_non_empty_active_file_once() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        drop(open_log(&active, &kp, 1 << 30));
+        assert!(checkpoints(&active).is_empty(), "nothing to anchor yet");
+        let mut log = open_log(&active, &kp, 1 << 30);
+        for i in 0..3 {
+            log.append(payload(i)).unwrap();
+        }
+        let tail = log.last_hash().to_string();
+        drop(log);
+        drop(open_log(&active, &kp, 1 << 30));
+        let len = fs::metadata(&active).unwrap().len();
+        assert_eq!(checkpoints(&active), vec![(1, len, tail.clone())]);
+        drop(open_log(&active, &kp, 1 << 30));
+        assert_eq!(checkpoints(&active).len(), 1, "unchanged: no new row");
+        let pk = key_at(&kp).verifying_key();
+        assert_eq!(
+            verify_log_set::<TestPayload>(&active, &pk)
+                .unwrap()
+                .checkpoints_verified,
+            1
+        );
+    }
+
+    /// External audit NN-AUD-109: before lab PR 160 an emptied active file
+    /// verified as an empty chain. The checkpoint names what was there.
+    #[test]
+    fn emptying_the_active_file_after_a_checkpoint_is_detected() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = open_log(&active, &kp, 1 << 30);
+        for i in 0..5 {
+            log.append(payload(i)).unwrap();
+        }
+        log.checkpoint().unwrap();
+        drop(log);
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        fs::write(&active, b"").unwrap();
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(
+            matches!(err, LogSetError::CheckpointUnreachable { seq: 1, .. }),
+            "{err:?}"
+        );
+        // cut, not emptied: same
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(9)).unwrap();
+        drop(log);
+        assert!(matches!(
+            verify_log_set::<TestPayload>(&active, &pk).unwrap_err(),
+            LogSetError::CheckpointUnreachable { .. }
+        ));
+    }
+
+    /// External audit NN-AUD-109: before lab PR 160 a deleted active file
+    /// verified as "a never-created active file".
+    #[test]
+    fn deleting_the_active_file_with_archives_is_detected() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = open_log(&active, &kp, 2000);
+        for i in 0..12 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        assert!(!list_archive_seqs(&active).unwrap().is_empty());
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        fs::remove_file(&active).unwrap();
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(matches!(err, LogSetError::ActiveMissing { .. }), "{err:?}");
+        let tail = manifest_tail_events(&active, &pk);
+        assert!(active_missing(&active, &tail).is_some());
+    }
+
+    /// The newest archive and the active file both removed: the manifest
+    /// still names what followed.
+    #[test]
+    fn deleting_the_newest_archive_and_the_active_is_detected() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = open_log(&active, &kp, 2000);
+        for i in 0..30 {
+            log.append(payload(i)).unwrap();
+        }
+        log.checkpoint().unwrap();
+        drop(log);
+        let seqs = list_archive_seqs(&active).unwrap();
+        assert!(seqs.len() >= 2);
+        fs::remove_file(archive_path(&active, *seqs.last().unwrap())).unwrap();
+        fs::remove_file(&active).unwrap();
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LogSetError::CheckpointUnreachable { .. } | LogSetError::ActiveMissing { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// External audit NN-AUD-112: the bounded boot check verifies the tail
+    /// of the active file and finds a line that does not verify.
+    #[test]
+    fn verify_recent_checks_the_tail_and_finds_a_forged_line() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = open_log(&active, &kp, 1 << 30);
+        for i in 0..20 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        let whole = verify_recent::<TestPayload>(&active, &pk, 1 << 20).unwrap();
+        assert_eq!((whole.lines, whole.whole_file), (20, true));
+        let part = verify_recent::<TestPayload>(&active, &pk, 600).unwrap();
+        assert!(!part.whole_file && part.lines < 20 && part.lines > 0);
+        // a fabricated detection-shaped line at the end
+        let forged = format!(
+            "{{\"ts\":\"x\",\"seq\":99,\"data\":\"forged\",\"fmt_ver\":2,\"prev_hash\":\"{}\",\
+             \"entry_hash\":\"{}\",\"agent_sig\":\"AAAA\"}}\n",
+            "00".repeat(32),
+            "11".repeat(32)
+        );
+        append_raw(&active, forged.as_bytes());
+        assert!(verify_recent::<TestPayload>(&active, &pk, 1 << 20).is_err());
+        assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
     }
 }
