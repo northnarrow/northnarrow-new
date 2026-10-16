@@ -274,7 +274,8 @@ Diagnosis mode: `NN_BPF_DEFENSE_OBSERVE=1` in the unit environment turns
 the guard into an observer (nothing denied, a `foreign_map_write` record
 instead); test builds (`debug-trigger`) run in that mode because the e2e
 fixtures unprotect pids with `bpftool`; `NN_BPF_DEFENSE_ENFORCE=1` forces
-the deny in a test build (lab checks of the deny path). The guard counts in the LSM
+the deny in a test build (lab checks of the deny path; the privileged e2e
+`bpf_guard_enforce_refuses_protected_pids_write` asserts it). The guard counts in the LSM
 health: if it does not attach the agent refuses to start like for any
 other deny hook (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` to override).
 

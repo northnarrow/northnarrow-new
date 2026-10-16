@@ -7,7 +7,10 @@
 
 #![allow(dead_code)]
 
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 // ── Tappa 10 hotfix — EniIptablesGuard ────────────────────────────────
 //
@@ -236,6 +239,64 @@ fn process_tree(pid: u32) -> Vec<u32> {
     seen
 }
 
+/// The agent's pinned `PROTECTED_PIDS` (every fixture uses the default
+/// pin root).
+pub fn protected_pids_pin() -> PathBuf {
+    Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT).join("PROTECTED_PIDS")
+}
+
+/// `pid` as the four little-endian key bytes `bpftool map … key` takes.
+pub fn pid_key_bytes(pid: u32) -> [String; 4] {
+    pid.to_le_bytes().map(|b| b.to_string())
+}
+
+/// A command's stderr (else stdout) on one line, for messages.
+fn brief(out: &std::process::Output) -> String {
+    let text = if out.stderr.iter().any(|b| !b.is_ascii_whitespace()) {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let line: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    line.join(" / ").chars().take(300).collect()
+}
+
+/// Refuse to start an agent this fixture could not stop.
+///
+/// Teardown evicts the agent from `PROTECTED_PIDS` with `bpftool`
+/// ([`unprotect_pid`]) before signalling it. On an Ubuntu 22.04 lab guest
+/// `bpftool` was only linux-tools-common's wrapper, without
+/// `linux-tools-$(uname -r)`: the eviction failed unnoticed, the SIGQUIT
+/// that followed was refused and counted as a tamper attempt by the test
+/// runner, and the agent (COMBAT) killed the runner, outlived it and
+/// killed the next test binaries (lab PR 153). Checked once per binary;
+/// call it before spawning an agent.
+pub fn require_bpftool() {
+    static CHECK: OnceLock<Result<(), String>> = OnceLock::new();
+    let res = CHECK.get_or_init(|| {
+        match Command::new("sudo")
+            .args(["bpftool", "version"])
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!("exit {:?}: {}", o.status.code(), brief(&o))),
+            Err(e) => Err(format!("could not run: {e}")),
+        }
+    });
+    if let Err(e) = res {
+        panic!(
+            "`sudo bpftool version` fails ({e}). The fixture's teardown evicts the agent \
+             from PROTECTED_PIDS with bpftool, so an agent started now could not be \
+             stopped: not starting one. On Ubuntu install linux-tools-$(uname -r)."
+        );
+    }
+}
+
 /// Remove `pid` AND every process below it from the pinned
 /// `PROTECTED_PIDS` map so a plain signal from the test runner reaches
 /// the agent. Since `task-kill-signals-1` the task_kill LSM hook denies
@@ -243,72 +304,226 @@ fn process_tree(pid: u32) -> Vec<u32> {
 /// the process itself, another protected pid or PID 1 with the armed
 /// nonce — the test runner is none of those. The fixtures spawn the
 /// agent through `sudo`, so `Child::id()` is sudo's pid and the agent is
-/// its child. Walking the descendants covers both shapes. Best effort:
-/// a missing pin or bpftool means the agent was never protected.
-#[allow(dead_code)]
-pub fn unprotect_pid(pid: u32) {
+/// its child. Walking the descendants covers both shapes.
+///
+/// This works only while the BPF guard observes (`debug-trigger` builds):
+/// in enforce mode the write handle on the map is refused, by design
+/// (`privileged_e2e::bpf_guard_enforce_refuses_protected_pids_write`).
+/// External audit TST-010: the outcome is returned, not dropped. `Ok`
+/// when every pid was evicted or was not in the map (sudo's own pid) or
+/// when there is no pin at all (nothing protected); `Err` names every pid
+/// bpftool could not evict and why.
+pub fn unprotect_pid(pid: u32) -> Result<(), String> {
+    let pin = protected_pids_pin();
+    match Command::new("sudo")
+        .arg("test")
+        .arg("-e")
+        .arg(&pin)
+        .status()
+    {
+        Ok(s) if !s.success() => return Ok(()),
+        Ok(_) => {}
+        Err(e) => return Err(format!("sudo test -e {}: {e}", pin.display())),
+    }
+    let mut errors = Vec::new();
     for p in process_tree(pid) {
-        let key_bytes = [
-            p & 0xFF,
-            (p >> 8) & 0xFF,
-            (p >> 16) & 0xFF,
-            (p >> 24) & 0xFF,
-        ]
-        .map(|b| b.to_string());
-        let _ = Command::new("sudo")
-            .args([
-                "bpftool",
-                "map",
-                "delete",
-                "pinned",
-                "/sys/fs/bpf/northnarrow/PROTECTED_PIDS",
-                "key",
-            ])
-            .args(key_bytes)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let out = Command::new("sudo")
+            .args(["bpftool", "map", "delete", "pinned"])
+            .arg(&pin)
+            .arg("key")
+            .args(pid_key_bytes(p))
+            .stdin(Stdio::null())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let msg = brief(&o);
+                // Not in the map: nothing to evict.
+                if !(msg.contains("delete failed") && msg.contains("No such file or directory")) {
+                    errors.push(format!("pid {p}: {msg}"));
+                }
+            }
+            Err(e) => errors.push(format!("pid {p}: bpftool could not run: {e}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
-/// Stop an agent the fixture spawned through `sudo` and reap it.
+/// `pid` still exists (signal 0: the task_kill hook lets it through).
+fn pid_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `child` has been reaped and none of `known` (its tree when the stop
+/// began) is left: an agent that outlived its sudo parent is not "stopped".
+fn tree_exited(child: &mut Child, known: &[u32]) -> Result<bool, String> {
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(known.iter().all(|&p| p == child.id() || !pid_alive(p))),
+        Ok(None) => Ok(false),
+        Err(e) => Err(format!("try_wait on pid {}: {e}", child.id())),
+    }
+}
+
+/// Poll [`tree_exited`] until `deadline`.
+fn wait_tree_exited(child: &mut Child, known: &[u32], deadline: Instant) -> Result<bool, String> {
+    loop {
+        if tree_exited(child, known)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How long [`quit_agent`] tries before it gives up.
+pub const QUIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Panic with `msg`, or only print it when this thread is already
+/// unwinding: a panic in `Drop` during an unwind aborts the whole test
+/// binary and hides the first failure.
+pub fn fail_teardown(msg: &str) {
+    if std::thread::panicking() {
+        eprintln!("{msg}");
+    } else {
+        panic!("{msg}");
+    }
+}
+
+/// Stop an agent the fixture spawned through `sudo` and reap it; panics
+/// (see [`fail_teardown`]) when it cannot, naming why. See
+/// [`try_quit_agent`].
+pub fn quit_agent(child: &mut Child) {
+    if let Err(msg) = try_quit_agent(child, QUIT_TIMEOUT) {
+        fail_teardown(&msg);
+    }
+}
+
+/// Evict the agent's tree from `PROTECTED_PIDS`, SIGQUIT it and wait,
+/// retried until `timeout`.
 ///
-/// SIGQUIT is the supported shutdown (the LSM hook denies SIGKILL and
-/// SIGTERM from userland). The signal is delivered to EVERY process in
-/// the `sudo` subtree, agent included, not only to `Child::id()` (the
-/// sudo pid): sudo 1.9.9 (Ubuntu 22.04) does not relay a signal sent
-/// by a process in its own process group — the test runner — while
-/// 1.9.15 (Ubuntu 24.04) does, so relying on the relay hung every
-/// fixture teardown in `wait4` on the 22.04 / 5.15 lab guest. The
-/// wait is bounded (10 s) so a teardown problem fails the test loudly
-/// instead of wedging the whole suite.
-#[allow(dead_code)]
-pub fn quit_agent(child: &mut std::process::Child) {
+/// SIGQUIT is delivered to EVERY process in the `sudo` subtree, agent
+/// included, not only to `Child::id()` (the sudo pid): sudo 1.9.9 (Ubuntu
+/// 22.04) does not relay a signal sent by a process in its own process
+/// group — the test runner — while 1.9.15 (Ubuntu 24.04) does.
+///
+/// External audit TST-010: this used to ignore the eviction's and the
+/// signal's outcome and, after 10 s, print a line and return with the
+/// agent still running. Now `Err` says why the agent survived. When the
+/// eviction fails no signal is sent: the hook would refuse it and count
+/// it as a tamper attempt by this test process, which an enforcing agent
+/// answers (COMBAT, then the runner is killed).
+pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String> {
     let root = child.id();
-    unprotect_pid(root);
-    // Leaves first, then sudo itself, so nothing is left to re-spawn.
-    for p in process_tree(root).into_iter().rev() {
-        unsafe {
-            libc::kill(p as i32, libc::SIGQUIT);
+    let mut known = process_tree(root);
+    let deadline = Instant::now() + timeout;
+    let mut eviction: Result<(), String>;
+    let mut refused: Option<(u32, std::io::Error)> = None;
+    let mut signalled = false;
+    loop {
+        if tree_exited(child, &known)? {
+            return Ok(());
+        }
+        eviction = unprotect_pid(root);
+        if eviction.is_ok() {
+            // Leaves first, then sudo itself, so nothing is left to re-spawn.
+            for p in process_tree(root).into_iter().rev() {
+                if !known.contains(&p) {
+                    known.push(p);
+                }
+                if unsafe { libc::kill(p as i32, libc::SIGQUIT) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::ESRCH) {
+                        refused = Some((p, e));
+                    }
+                }
+            }
+            signalled = true;
+        }
+        let step = (Instant::now() + Duration::from_millis(500)).min(deadline);
+        if wait_tree_exited(child, &known, step)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
         }
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Ok(None) => {
-                eprintln!(
-                    "quit_agent: sudo pid {root} still alive 10 s after SIGQUIT — leaving it"
-                );
-                return;
-            }
-            Err(e) => {
-                eprintln!("quit_agent: try_wait on pid {root} failed: {e}");
-                return;
-            }
-        }
+    let why = match (&eviction, &refused) {
+        (Err(e), _) => format!(
+            "its eviction from PROTECTED_PIDS failed ({e}); no signal was sent (the \
+             task_kill hook would refuse it)"
+        ),
+        (Ok(()), Some((p, e))) => format!(
+            "SIGQUIT to pid {p} refused ({e}): signal denied by the task_kill hook, the pid \
+             is still in PROTECTED_PIDS"
+        ),
+        (Ok(()), None) if signalled => "SIGQUIT was delivered but it did not exit".to_string(),
+        (Ok(()), None) => "no signal could be sent".to_string(),
+    };
+    Err(format!(
+        "quit_agent: the agent of sudo pid {root} (tree {known:?}) is still alive {timeout:?} \
+         into teardown: {why}. It keeps running: stop it with a signed `nn-admin shutdown` \
+         or restart the host before more privileged tests run (a leftover agent treats the \
+         next fixtures as an intrusion)."
+    ))
+}
+
+/// What a signed `nn-admin shutdown` needs: two distinct keys carrying
+/// the `shutdown` role (2-of-N quorum), the agent's id file and socket.
+pub struct SignedShutdown<'a> {
+    pub nn_admin: &'a Path,
+    pub key: &'a Path,
+    pub cosign_key: &'a Path,
+    pub agent_id_file: &'a Path,
+    pub socket: &'a Path,
+}
+
+/// Stop the agent the authorised way — the one stop an agent whose BPF
+/// guard enforces accepts from an unprotected process — and wait until
+/// `child` and every process below it are gone.
+pub fn shutdown_signed(
+    child: &mut Child,
+    s: &SignedShutdown<'_>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let known = process_tree(child.id());
+    if tree_exited(child, &known)? {
+        return Ok(());
+    }
+    let out = Command::new(s.nn_admin)
+        .arg("shutdown")
+        .arg("--key")
+        .arg(s.key)
+        .arg("--cosign-key")
+        .arg(s.cosign_key)
+        .arg("--agent-id-file")
+        .arg(s.agent_id_file)
+        .arg("--socket")
+        .arg(s.socket)
+        .args(["--grace-secs", "10"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawning nn-admin shutdown: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "nn-admin shutdown failed (exit {:?}): {}",
+            out.status.code(),
+            brief(&out)
+        ));
+    }
+    if wait_tree_exited(child, &known, Instant::now() + timeout)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "the agent of sudo pid {} (tree {known:?}) is still alive {timeout:?} after an \
+             acknowledged signed shutdown",
+            child.id()
+        ))
     }
 }

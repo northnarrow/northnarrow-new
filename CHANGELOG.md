@@ -15,6 +15,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, the anti-tamper proved in enforce mode (Medium
+  TST-001, TST-002, TST-010, LAB-001): every privileged fixture stops its
+  agent by evicting it from `PROTECTED_PIDS` with bpftool, which only a
+  test build's observing BPF guard allows, and no test showed the
+  production guard refusing it. A new e2e runs the guard in enforce mode
+  and asserts that root's eviction and `kill -9` are refused and recorded,
+  that the fixtures' teardown then fails and says why, and that the signed
+  shutdown stops the agent. That teardown used to ignore a failed eviction
+  and a refused signal and leave the agent running: it now fails the test,
+  sends no signal it knows will be refused, and no agent is started when
+  `bpftool` does not run (on an Ubuntu 22.04 lab guest without
+  `linux-tools-$(uname -r)` the refused signal sent the agent into COMBAT;
+  it killed the test runner, then the next test binaries). The runbook's
+  respawn test no longer publishes the eviction recipe (`systemctl kill`
+  inside a trusted-installer window instead), `nn-lab.sh respawn-check`
+  fails where it warned when a root `kill -9` or an out-of-window
+  `systemctl kill` succeeds, the lab installs and checks the guest's
+  bpftool before the test suites, and `docs/verify-2b.sh`, whose normal
+  stop was the eviction, is retired.
 - External audit, Wave 2, agent start and watchdog respawn; RAG and ADE
   tooling (Medium DEP-004, WDG-009, WDG-011, WDG-R01): the agent unit's
   bpffs pre-flight was a `ConditionPathIsMountPoint`. Without bpffs at

@@ -82,9 +82,10 @@ fn combat_rules_path() -> PathBuf {
         .join("combat-rules.v4")
 }
 
-/// SIGQUIT-on-drop guard (the agent's Tappa 7 LSM hook blocks
-/// SIGKILL + SIGTERM from userland; SIGQUIT is the documented
-/// shutdown signal — see `agent/src/anti_tamper/` docs).
+/// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
+/// from PROTECTED_PIDS, then SIGQUITs it; the task_kill hook refuses every
+/// signal from the test runner while the pid is protected). An agent that
+/// survives fails the test.
 struct AgentGuard(Option<Child>);
 
 impl Drop for AgentGuard {
@@ -208,6 +209,7 @@ impl FimFixture {
         let admin_socket = dir.join("admin.sock");
         let marker = dir.join("agent.shutdown_authorised");
 
+        common::require_bpftool();
         let child = Command::new(agent_bin())
             .arg("--combat-rules")
             .arg(&combat)
@@ -566,6 +568,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     let detections_log = dir.join("detections.jsonl");
     let status_events_log = dir.join("status_events.jsonl");
 
+    common::require_bpftool();
     let child = Command::new(agent_bin())
         .arg("--combat-rules")
         .arg(&combat)

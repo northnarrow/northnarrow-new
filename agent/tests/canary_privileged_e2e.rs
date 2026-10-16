@@ -87,8 +87,10 @@ fn canary_templates_dir() -> PathBuf {
         .join("canary-templates")
 }
 
-/// SIGQUIT-on-drop guard (Tappa 7 LSM blocks SIGKILL + SIGTERM from
-/// userland; SIGQUIT is the documented shutdown signal).
+/// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
+/// from PROTECTED_PIDS, then SIGQUITs it; the task_kill hook refuses every
+/// signal from the test runner while the pid is protected). An agent that
+/// survives fails the test.
 struct AgentGuard(Option<Child>);
 
 impl Drop for AgentGuard {
@@ -369,6 +371,7 @@ impl CanaryFixture {
             "--no-ade".into(),
         ]
         .to_vec();
+        common::require_bpftool();
         let child = Command::new("sudo")
             .arg(&installed_agent.path)
             .args(&agent_args)
@@ -413,6 +416,7 @@ impl CanaryFixture {
 
     /// Start the agent again after [`CanaryFixture::stop`].
     fn start(&mut self) {
+        common::require_bpftool();
         let child = Command::new("sudo")
             .arg(&self.agent_bin)
             .args(&self.agent_args)

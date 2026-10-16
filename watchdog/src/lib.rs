@@ -1391,7 +1391,6 @@ pub const STATUS_PING_CONSECUTIVE_TIMEOUT_THRESHOLD: u8 = 2;
 
 /// Per §4.1 recovery sequence: after SIGINT, wait this long
 /// for graceful exit before escalating to evict + SIGKILL.
-/// Matches `docs/verify-2b.sh` `HARDKILL_GRACE`.
 pub const STUCK_RECOVERY_HARDKILL_GRACE: Duration = Duration::from_secs(5);
 
 /// Outcome of one STATUS-ping tracker tick — pure value for
@@ -1601,18 +1600,17 @@ pub async fn ping_agent_status(socket_path: &Path, timeout: Duration) -> Result<
 
 /// Stuck-agent recovery sequence per design §4.1:
 ///
-/// 1. SIGINT through the pidfd — the only hook-passing stop
-///    (the agent's Tappa 7 LSM task_kill hook only denies
-///    SIGKILL + SIGTERM; SIGINT passes through and the agent
-///    re-armed it explicitly for graceful shutdown per
-///    `docs/verify-2b.sh:48-51`).
+/// 1. SIGINT through the pidfd: a graceful stop for the agent.
+///    The task_kill hook lets it through because the watchdog
+///    is itself in `PROTECTED_PIDS` (since `task-kill-signals-1`
+///    every other sender is refused, root included).
 /// 2. Wait `hardkill_grace` OR pidfd POLLIN, whichever first.
 ///    POLLIN → agent died gracefully, restart path takes over.
 ///    Timeout → agent is wedged past SIGINT response; escalate.
-/// 3. `ProtectedPidsHandle::evict(agent_pid)` — race-free
-///    hard-kill recipe from `docs/verify-2b.sh:57-63`. Without
-///    this, the LSM task_kill hook would deny the subsequent
-///    SIGKILL.
+/// 3. `ProtectedPidsHandle::evict(agent_pid)`, best effort: the
+///    hook already lets the watchdog's SIGKILL through while the
+///    watchdog is a protected pid; the eviction covers the case
+///    where it is not.
 /// 4. SIGKILL through the pidfd.
 /// 5. Wait for pidfd POLLIN — the kernel reaps the agent.
 ///

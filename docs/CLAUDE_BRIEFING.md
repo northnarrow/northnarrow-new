@@ -129,8 +129,9 @@ pins (logs `reused pinned LSM link`) or **purges-then-fresh-attaches**
 on corrupt pins (`purged stale pin and freshly attached`); LSM hooks
 keep **firing** through the agent death→respawn gap (the keystone
 property — see `agent/src/anti_tamper/mod.rs:469-555`); `verify-2b.sh`
-exercises the full sequence end-to-end on a real BPF-LSM kernel and
-emits a JSON verdict at `/tmp/2b_verdict.json`.
+exercised the full sequence end-to-end on a real BPF-LSM kernel and
+emitted a JSON verdict at `/tmp/2b_verdict.json` (retired in lab PR 153,
+external audit LAB-001: its stop path was the PROTECTED_PIDS eviction).
 
 The original WIP branch `tappa-7-task6-bpf-pinning-WIP` (single commit
 `53ecae7`) carried the same functionality plus an additional

@@ -47,8 +47,10 @@
 //! own type string, which the kernel reports as `tracing` for LSM
 //! attachments (the same format-assumption trap the 2a name lookup
 //! fell into). The behavioural gap proof (a sentinel PID protected
-//! by the still-firing hook while no agent is alive) lives in the
-//! #2b verification harness, not here.
+//! by the still-firing hook while no agent is alive) lived in the
+//! #2b verification harness, `docs/verify-2b.sh`, retired because its
+//! normal stop was the PROTECTED_PIDS eviction (external audit
+//! LAB-001); it is not re-implemented yet.
 //!
 //! ## Requirements (Hetzner verify box only)
 //!
@@ -113,11 +115,10 @@ fn combat_rules_path() -> PathBuf {
         .join("combat-rules.v4")
 }
 
-/// RAII guard: SIGQUIT-on-drop so a failed assertion never leaks a
-/// daemon. SIGKILL/SIGTERM are denied by the `task_kill` hook the
-/// agent attaches to its own PID, so we shell out `kill -QUIT`
-/// (SIGQUIT is not on the deny list — see `agent-ebpf/src/task_kill.rs`).
-/// Shelling out keeps this test free of any new dev-dependency.
+/// RAII guard: stops the agent on drop so a failed assertion never
+/// leaks a daemon (`stop_agent`: eviction from PROTECTED_PIDS, then
+/// SIGQUIT; the `task_kill` hook refuses every signal from the test
+/// runner while the pid is protected).
 struct AgentGuard(Option<Child>);
 
 /// How long `stop()` waits for the agent to exit before failing the
@@ -129,7 +130,7 @@ impl AgentGuard {
     /// Stop the agent and block until it has actually exited.
     fn stop(&mut self) {
         if let Some(c) = self.0.take() {
-            stop_agent(c, true);
+            stop_agent(c);
         }
     }
 }
@@ -137,7 +138,7 @@ impl AgentGuard {
 impl Drop for AgentGuard {
     fn drop(&mut self) {
         if let Some(c) = self.0.take() {
-            stop_agent(c, false);
+            stop_agent(c);
         }
     }
 }
@@ -148,27 +149,12 @@ impl Drop for AgentGuard {
 /// included, so a bare `kill -QUIT` from the (unprotected) test runner
 /// is refused with EPERM and the old unbounded `wait()` never returned:
 /// the first nightly after that change sat in this test for 6 h. Same
-/// recipe as `privileged_e2e::AgentGuard`.
-fn stop_agent(mut c: Child, must_exit: bool) {
-    let pid = c.id();
-    common::unprotect_pid(pid);
-    let status = Command::new("kill")
-        .args(["-QUIT", &pid.to_string()])
-        .status();
-    let deadline = Instant::now() + AGENT_EXIT_TIMEOUT;
-    while Instant::now() < deadline {
-        match c.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(_) => return,
-        }
-    }
-    if must_exit {
-        panic!(
-            "agent pid {pid} did not exit within {AGENT_EXIT_TIMEOUT:?} after SIGQUIT \
-             (kill status {status:?}) — signal denied by the task_kill hook? \
-             (the pid must be evicted from PROTECTED_PIDS first)"
-        );
+/// recipe as the other fixtures (`common::try_quit_agent`); an agent
+/// that survives it fails the test, from `Drop` too unless the test is
+/// already failing (external audit TST-010).
+fn stop_agent(mut c: Child) {
+    if let Err(msg) = common::try_quit_agent(&mut c, AGENT_EXIT_TIMEOUT) {
+        common::fail_teardown(&msg);
     }
 }
 
@@ -179,6 +165,7 @@ fn spawn_agent(tempdir: &Path) -> AgentGuard {
     let rules = tempdir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules into tempdir");
 
+    common::require_bpftool();
     let child = Command::new(env!("CARGO_BIN_EXE_northnarrow-agent"))
         .arg("--combat-rules")
         .arg(&rules)

@@ -355,7 +355,8 @@ pub fn attach_transient(
 ///
 /// `pin_root == None` (no bpffs) ⇒ [`attach_transient`]: works this
 /// boot, no persistence. The three success log messages are stable
-/// strings the #2b verification harness (`docs/verify-2b.sh`) greps.
+/// strings (an operator reads them in the journal; the retired #2b
+/// harness grepped them).
 pub fn attach_lsm(
     ebpf: &mut Ebpf,
     program_name: &str,

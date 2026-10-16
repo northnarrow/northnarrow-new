@@ -248,8 +248,8 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-202 | SUP-002 | Supply chain | S | fixed (lab PR 150) |
 | NN-AUD-203 | SUP-005 | Supply chain | S | fixed (lab PR 150) |
 | NN-AUD-204 | SUP-006 | Supply chain | S | fixed (lab PR 110) |
-| NN-AUD-205 | SUP-017 | Supply chain | S | open |
-| NN-AUD-206 | LAB-001 | Lab scripts | M | open |
+| NN-AUD-205 | SUP-017 | Supply chain | S | fixed (lab PR 150) |
+| NN-AUD-206 | LAB-001 | Lab scripts | M | fixed (lab PR 153) |
 | NN-AUD-207 | LAB-002 | Lab scripts | L | open |
 | NN-AUD-208 | LAB-003 | Lab scripts | S | open |
 | NN-AUD-209 | LAB-004 | Lab scripts | L | open |
@@ -267,14 +267,14 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-221 | LAB-016 | Lab scripts | S | open |
 | NN-AUD-222 | LAB-017 | Lab scripts | M | open |
 | NN-AUD-223 | LAB-018 | Lab scripts | S | open |
-| NN-AUD-224 | TST-001 | Privileged tests | M | open |
-| NN-AUD-225 | TST-002 | Privileged tests | S | open |
+| NN-AUD-224 | TST-001 | Privileged tests | M | fixed (lab PR 153) |
+| NN-AUD-225 | TST-002 | Privileged tests | S | fixed (lab PR 153) |
 | NN-AUD-226 | TST-004 | Privileged tests | S | fixed (lab PR 111) |
 | NN-AUD-227 | TST-005 | Privileged tests | M | open |
 | NN-AUD-228 | TST-006 | Privileged tests | M | open |
 | NN-AUD-229 | TST-008 | Privileged tests | S | open |
 | NN-AUD-230 | TST-009 | Privileged tests | M | open |
-| NN-AUD-231 | TST-010 | Privileged tests | S | open |
+| NN-AUD-231 | TST-010 | Privileged tests | S | fixed (lab PR 153) |
 | NN-AUD-232 | TST-011 | Privileged tests | S | open |
 | NN-AUD-233 | TST-012 | Privileged tests | M | open |
 | NN-AUD-234 | TST-018 | Privileged tests | L | open |
@@ -4066,3 +4066,81 @@ the audit did not report, noted with the fix that takes them.
     "BLOCKED+PARTIAL success rate: 100.0%" and exit 0; after, exit 1,
     "ADE backend is `mock`".
   - Lab: Ubuntu 24.04, wdg149-probe.sh on main and on this build. skip (a drop-in points the unit's bpffs check at `/mnt/nn149-not-a-mount`, then the agent is SIGKILLed through a trusted-installer window): main "skipped because of an unmet condition check (ConditionPathIsMountPoint…)", `ConditionResult=no`, the watchdog's respawn "opening pidfd … timed out", no hold record; here `ExecStartPre=/usr/bin/mountpoint` exits 32, "failed (Result: exit-code)", the agent in `systemctl --failed`, the watchdog "start job … queued, but no agent within 30 s" and a JSON line in `/run/northnarrow/watchdog.hold`; restore: a signed `integrity_drift` `watchdog_hold` (none on main). stall (agent and watchdog frozen 100 s, the watchdog thawed 12 s first): main two "STATUS ping failed" 2 s apart, threshold tripped, stuck recovery and a new agent pid; here one failed ping, the same pid. `nn-lab.sh respawn-check` OK. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-224 (TST-001), NN-AUD-231 (TST-010), NN-AUD-225 (TST-002),
+  NN-AUD-206 (LAB-001), lab PR 153.** Proof that the anti-tamper holds in
+  enforce mode (batch 4 of triage F). Test and lab code only, no product
+  change.
+  - TST-001: `privileged_e2e::bpf_guard_enforce_refuses_protected_pids_write`
+    (`debug-trigger` builds, a plain `#[test]` like the other admin e2e).
+    The installed agent runs through `sudo env NO_COLOR=1
+    NN_BPF_DEFENSE_ENFORCE=1 …` with `--detect-only` (the refused attempts
+    are tamper attempts and the agent goes to COMBAT; no response may act
+    on the runner) and `--pid-file` (written once the hooks are attached
+    and the pid is protected). Asserted: the registration line says
+    `mode="enforce"`; `bpftool map delete pinned …/PROTECTED_PIDS key <pid
+    LE>` and `kill -9` from root fail with EPERM; the agent is still alive
+    (the refused kill shows the pid is still in the map); `ANTI-TAMPER
+    DENIAL` `op=bpf_map` and `op=signal` in the agent log; the quorum-signed
+    shutdown stops it (`common::shutdown_signed`, the keys of
+    `shutdown_signed_round_trip`). The guard outlives the agent and keeps
+    enforcing, and the next fixture's agent (another installed copy,
+    another inode) would be refused its registration: the fixture's `Drop`
+    starts the same binary once more without the variable, the successor
+    the guard admits in its first minute, asserts `mode="observe"` and stops
+    it signed. If that fails the test fails, and `nn-lab.sh` recovers the
+    pin root by restarting the guest (`lab_purge_pins`). Not done here: the
+    tamper-check run against the CI release binary (the anti-tamper suite
+    is batch 5, LAB-004).
+  - TST-010: `common::try_quit_agent` retries eviction and SIGQUIT of the
+    sudo subtree for 10 s, succeeds only when sudo is reaped and nothing of
+    its tree is left, and otherwise returns why: the eviction failed
+    (bpftool's message), the SIGQUIT was refused (errno: still in
+    `PROTECTED_PIDS`), or it was delivered without effect. No signal is
+    sent after a failed eviction: the hook would refuse it and record a
+    tamper attempt by the runner. `quit_agent` panics unless the thread is
+    already unwinding (a panic in `Drop` then aborts the binary and hides
+    the first failure). `unprotect_pid` returns the outcome (a key not in
+    the map and a missing pin are not errors). `privileged_map_pin` stops
+    its agent the same way, from `Drop` too. `common::require_bpftool`,
+    once per binary, runs before every fixture spawns an agent: no agent is
+    started when `sudo bpftool version` fails. Not done: a signed-shutdown
+    fallback in the other fixtures, which hold one `all` key while a
+    shutdown needs two.
+  - TST-002: runbook Tests 2-4 rewritten. Test 2: `kill -9` and an
+    out-of-window `systemctl kill` must be refused, then
+    `trusted-installer-grant` and `systemctl kill --kill-who=main -s
+    SIGKILL` (no marker, the watchdog respawns); the eviction recipe is
+    gone, with a note on why it must not be used. Test 3 (BindsTo, gone
+    with `RefuseManualStop`) is the signed shutdown and the watchdog
+    standing down; Test 4 kills the watchdog inside a window. The manual
+    smoke sequence ended with `kill -QUIT`, refused since
+    task-kill-signals-1: now a signed shutdown. `respawn-check`: the two
+    WARNs are FAILs (the respawn is still checked after them), a missing
+    lab key is a FAIL.
+  - LAB-001: `docs/verify-2b.sh` deleted. Its kernel-id half is
+    `privileged_map_pin`; the refused eviction is asserted by the e2e
+    above. The comments that cited it are corrected (watchdog
+    `stuck_recovery` and `STUCK_RECOVERY_HARDKILL_GRACE`, `attach_lsm`,
+    the pid-file comment in `main.rs`, the watchdog design §4.1, the
+    briefing); ISSUE_002, resolved, keeps its history. Lost with it: the
+    gap proof (a sentinel pid protected while no agent runs), not
+    re-implemented.
+  - Lab-found (Ubuntu 22.04, kernel 5.15.0-198): `bpftool` was
+    linux-tools-common's wrapper without `linux-tools-$(uname -r)`, so
+    `bpftool version` failed and `unprotect_pid` failed silently;
+    `quit_agent` sent SIGQUIT to a protected pid (ANTI-TAMPER DENIAL), the
+    agent of `canary_privileged_e2e`
+    (`file_canary_deployed_at_runtime_survives_an_agent_restart`) went to
+    COMBAT, killed the test process, outlived it, killed every later test
+    binary (R009) and isolated the guest. `user-data.tmpl` installs
+    `linux-tools-$(uname -r)`; `nn-lab.sh up` installs it when `bpftool
+    version` fails (Ubuntu); `check` prints `bpftool : missing` (it printed
+    an empty value); `test-e2e` and `test-ignored` refuse to start without
+    it.
+  - Here (WSL2, no BPF-LSM) only the build checks ran: fmt, clippy
+    (workspace; agent with `test-privileged,debug-trigger`), the workspace
+    tests, `bash -n`. On main the e2e does not exist and the old
+    `quit_agent` returned nothing to assert on; the test fails at the mode
+    line when enforce is not in effect, and at the eviction if the guard
+    lets it through.
+  - Lab: Ubuntu 24.04: `bpf_guard_enforce_refuses_protected_pids_write` passes in the gate (enforce-mode guard: `bpftool map delete` on PROTECTED_PIDS and `kill -9` from root refused with EPERM and an ANTI-TAMPER DENIAL each, the agent stopped by a signed 2-of-N shutdown, the guard returned to observe), the fixtures that followed it pass, no `quit_agent … still alive`; `nn-lab.sh respawn-check` OK. The case that started this lot — the recreated Ubuntu 22.04 guest without `linux-tools-$(uname -r)` — is now refused up front (`test-ignored`: "'sudo bpftool version' fails…") and the provisioning installs the package. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.

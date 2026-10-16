@@ -35,7 +35,11 @@ CI compiles this module (bit-rot guard) but does **not** execute it
 `deploy/lab/nn-lab.sh` turns the prerequisites above into a repeatable
 guest: Ubuntu 24.04 cloud image, kernel 6.8, `lsm=…,bpf` set through
 cloud-init (one automatic reboot), iptables + bpftool + rustup inside,
-SSH on `127.0.0.1:2222`. WSL2 needs nested virtualization (`/dev/kvm`
+SSH on `127.0.0.1:2222`. On Ubuntu `/usr/sbin/bpftool` is only a wrapper
+around `linux-tools-$(uname -r)`: `up` installs that package (again after
+a kernel change), `check` reports `bpftool : missing` when `bpftool
+version` fails, and `test-e2e` / `test-ignored` refuse to start then —
+the fixtures stop their agents through bpftool (lab PR 153). WSL2 needs nested virtualization (`/dev/kvm`
 present) and the user in the `kvm` group.
 
 ```sh
@@ -47,7 +51,7 @@ deploy/lab/nn-lab.sh build         # guest-side cargo build --release --features
 deploy/lab/nn-lab.sh test-e2e      # the "Run" section below, as root, single-threaded
 deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test in the workspace
 deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
-deploy/lab/nn-lab.sh respawn-check # kill -9 the agent; asserts unit active, cgroup, CAP_KILL, watchdog alive
+deploy/lab/nn-lab.sh respawn-check # refused kill -9 / systemctl kill, then a death in a window; asserts unit active, cgroup, CAP_KILL, watchdog alive
 deploy/lab/nn-lab.sh snapshot clean   # (guest down) revert point before an attack run
 ```
 
@@ -412,9 +416,10 @@ Flags:
 - `--nocapture` is optional but very helpful — failures otherwise
   swallow the agent's stderr.
 
-Expected: **6 tests passing, 3 ignored** in ~90 s (the two COMBAT tests
-each wait for the graduated ladder to reach ISOLATE — ~30 s investigate
-window — before checking the iptables chain):
+Expected: **8 tests passing, 3 ignored** (the two COMBAT tests each wait
+for the graduated ladder to reach ISOLATE — ~30 s investigate window —
+before checking the iptables chain). The excerpt below predates the later
+tests:
 
 ```
 running 4 tests
@@ -423,6 +428,24 @@ test e2e_force_combat_then_unlock_via_cli ... ok
 test e2e_unlock_with_wrong_key ... ok
 test e2e_rate_limit_via_full_stack ... ignored, 5-min production rate-limit window too long for CI; run manually or after V1.1 adds a runtime override (see runbook)
 ```
+
+`bpf_guard_enforce_refuses_protected_pids_write` (external audit TST-001,
+TST-010) starts the agent with `NN_BPF_DEFENSE_ENFORCE=1` — the BPF guard
+as in production — and `--detect-only`, then asserts: the registration
+line says `mode="enforce"`; `bpftool map delete pinned …/PROTECTED_PIDS
+key <agent pid>` and `kill -9 <agent pid>` from root both fail with
+`Operation not permitted` and leave `ANTI-TAMPER DENIAL op=bpf_map` /
+`op=signal` in the agent log; the fixtures' own teardown
+(`common::try_quit_agent`: eviction, then SIGQUIT) fails and says the
+eviction was refused; a signed 2-of-N `nn-admin shutdown` stops the agent.
+The guard outlives the agent and would refuse the next fixture's agent (a
+different installed copy), so the test ends by starting the same binary
+without the variable, which re-arms the guard in observe mode, and stopping
+it. If that last step fails the test says so; `nn-lab.sh` then recovers the
+pin root by restarting the guest (`lab_purge_pins`). Every other fixture
+stops its agent with `common::quit_agent`, which only a `debug-trigger`
+build (guard in observe mode) allows, and which now fails the test when
+the agent survives (it used to print a line and leave the agent running).
 
 `e2e_rate_limit_via_full_stack` is `#[ignore]` because AdminAuth's
 production rate-limit window is hard-coded at 5 minutes with no
@@ -458,6 +481,13 @@ the end of the test body.
   jump rules from `INPUT`/`OUTPUT`/`FORWARD`). The agent's release
   path is idempotent; if you restart the test runner before
   cleanup, the next run will re-engage successfully.
+- **`` `sudo bpftool version` fails … not starting one ``** (panic before
+  the agent starts) or **`quit_agent: the agent of sudo pid … is still
+  alive`** — the fixtures evict their agent from `PROTECTED_PIDS` with
+  bpftool before signalling it. Install `linux-tools-$(uname -r)` (Ubuntu);
+  an agent left running is stopped with a signed `nn-admin shutdown` or by
+  restarting the host, never by more signals (each refused one is a tamper
+  attempt the agent answers).
 - **BPF-LSM not active** — the test module doesn't exercise the LSM
   hooks (it uses the debug posture override), so this isn't a
   blocker. If you want to verify LSM behaviour separately, check
@@ -503,8 +533,12 @@ sudo ./target/release/northnarrow-agent \
 ./target/release/nn-admin status --socket /tmp/nn-test/admin.sock
 sudo iptables -S NORTHNARROW_COMBAT  # → "No chain by that name"
 
-# Cleanup: SIGQUIT the agent (SIGKILL/SIGTERM are LSM-blocked).
-sudo kill -QUIT <agent pid>
+# Cleanup: the task_kill hook refuses every signal from a root shell,
+# SIGQUIT included. Stop it with a signed shutdown: two keys carrying the
+# `shutdown` role in admin.pub (`<hex> unlock,shutdown`, see
+# init_admin_keypair_with_roles in privileged_e2e.rs).
+./target/release/nn-admin shutdown --key /tmp/nn-test/admin.priv \
+  --cosign-key /tmp/nn-test/admin2.priv --socket /tmp/nn-test/admin.sock
 ```
 
 ## Future work (tracked, not blocking)
@@ -601,62 +635,88 @@ journalctl --namespace=northnarrow -u northnarrow-watchdog.service --since "1 mi
 
 #### Test 2 — Agent death → watchdog respawn (W3 + W4)
 
+The agent is in `PROTECTED_PIDS`: the task_kill hook refuses every
+signal from a root shell, and `systemctl kill` too unless a signed
+trusted-installer window is open (external audit EBPF-001). An
+unexpected death is produced the operator's way: the window, then the
+SIGKILL delivered by systemd. No shutdown marker is written (only a
+signed `nn-admin shutdown` writes one), so the watchdog treats it as a
+crash. `deploy/lab/nn-lab.sh respawn-check` runs this sequence and fails
+if either refusal is missing.
+
+Do not take the agent's pid out of `PROTECTED_PIDS` to kill it (the
+recipe this test used to publish). On a production build the BPF guard
+refuses the write (`Operation not permitted`, recorded as NN-L-AT-001);
+only a `debug-trigger` build, whose guard observes, lets it through, and
+the privileged e2e `bpf_guard_enforce_refuses_protected_pids_write`
+asserts the refusal (external audit TST-002).
+
 ```
 AGENT_PID=$(sudo cat /run/northnarrow/agent.pid)
 
-# Force-kill agent (only works because we test from the host —
-# in normal operation the LSM hook denies SIGKILL; we use the
-# unprotect+kill recipe from docs/verify-2b.sh)
-sudo bpftool map delete pinned /sys/fs/bpf/northnarrow/PROTECTED_PIDS \
-    key $(printf '%d %d %d %d' \
-        $((AGENT_PID & 255)) \
-        $(((AGENT_PID >> 8) & 255)) \
-        $(((AGENT_PID >> 16) & 255)) \
-        $(((AGENT_PID >> 24) & 255)))
-sudo kill -9 $AGENT_PID
+# Both refused (FAIL if either succeeds):
+sudo kill -9 "$AGENT_PID"            # → Operation not permitted
+sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service
+                                     # → Access denied
 
-# Expect within ~1s:
-journalctl --namespace=northnarrow -u northnarrow-watchdog.service --since "10 seconds ago"
+# The window (a key with the trusted-installer role), then systemd's kill:
+sudo nn-admin trusted-installer-grant --key <trusted-installer key> --window-secs 120
+sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-agent.service
+
+# Expect within a few seconds:
+journalctl --namespace=northnarrow -u northnarrow-watchdog.service --since "1 minute ago"
 # Look for, in order:
 #   "agent pidfd POLLIN — agent has exited"        (W3)
 #   "layer-2 evict complete"                       (W3)
 #   "no shutdown-authorisation marker"             (W4)
-#   "spawning agent"                               (W4)
-#   "new agent pidfile observed"                   (W4)
+#   "respawning agent"                             (W4)
 #   "defensive PROTECTED_PIDS reinsert complete"   (W4)
 
-# New agent PID published:
+# New agent PID published, under the agent's own unit; the respawned
+# agent boots with the window closed (grants are bound to its session):
 NEW_PID=$(sudo cat /run/northnarrow/agent.pid)
 [[ $NEW_PID != $AGENT_PID ]] && echo "OK: PID changed $AGENT_PID → $NEW_PID"
+systemctl is-active northnarrow-agent.service      # → active
+sudo kill -9 "$NEW_PID"                            # → Operation not permitted
 ```
 
-#### Test 3 — Operator stop → BindsTo stops watchdog too
+#### Test 3 — Authorised stop → the watchdog stands down
+
+The units refuse a manual stop (`RefuseManualStop=yes`); the watchdog no
+longer `BindsTo` the agent. The authorised stop is a 2-of-N signed
+shutdown: the agent writes the shutdown marker and exits, the watchdog
+verifies the marker against `admin.pub` and does not respawn.
 
 ```
 sudo systemctl stop northnarrow-agent.service
-sleep 2
-systemctl is-active northnarrow-watchdog.service
-# Expect: "inactive" (BindsTo brought it down WITH the agent —
-# no respawn loop)
+# → refused: "Operation refused, unit … may be requested by dependency only"
+sudo nn-admin shutdown --key <shutdown key A> --cosign-key <shutdown key B> --grace-secs 30
+sleep 5
+systemctl is-active northnarrow-agent.service       # → inactive
+journalctl --namespace=northnarrow -u northnarrow-watchdog.service --since "1 minute ago" \
+  | grep "watchdog standing down"
+# Expect: "admin-authorised shutdown verified against admin.pub — watchdog standing down"
 ```
 
-#### Test 4 — Watchdog crash → systemd respawns watchdog;
-####         agent's PROTECTED_PIDS entry survives
+#### Test 4 — Watchdog death → systemd restarts it; the agent stays protected
+
+The watchdog is a protected pid too: `kill -9` from a root shell is
+refused. Its death is produced like the agent's, inside a window.
 
 ```
 sudo systemctl start northnarrow-agent.service northnarrow-watchdog.service
 sleep 3
 OLD_WPID=$(sudo cat /run/northnarrow/watchdog.pid)
-sudo kill -9 $OLD_WPID            # the watchdog isn't in PROTECTED_PIDS
-                                  # from systemd's view; SIGKILL works
-sleep 4
+sudo kill -9 "$OLD_WPID"             # → Operation not permitted
+sudo nn-admin trusted-installer-grant --key <trusted-installer key> --window-secs 120
+sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-watchdog.service
+sleep 4                              # Restart=on-failure, RestartSec=2s
 NEW_WPID=$(sudo cat /run/northnarrow/watchdog.pid)
-[[ $NEW_WPID != $OLD_WPID ]] && echo "OK: watchdog respawned by systemd"
+[[ $NEW_WPID != $OLD_WPID ]] && echo "OK: watchdog restarted by systemd"
 
-# Agent still alive + still in PROTECTED_PIDS:
-sudo cat /run/northnarrow/agent.pid    # unchanged
-sudo bpftool map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_PIDS
-# Expect: agent_pid still there
+# Agent unchanged and still protected:
+sudo cat /run/northnarrow/agent.pid   # unchanged
+sudo kill -9 "$(sudo cat /run/northnarrow/agent.pid)"   # → Operation not permitted
 ```
 
 ### Future work (W8)

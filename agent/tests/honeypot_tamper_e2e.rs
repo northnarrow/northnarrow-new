@@ -94,7 +94,10 @@ fn install_to_priv_bin(src: &Path) -> InstalledBin {
     InstalledBin { path: dst }
 }
 
-/// SIGQUIT-on-drop (Tappa 7 LSM blocks SIGKILL/SIGTERM).
+/// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
+/// from PROTECTED_PIDS, then SIGQUITs it; the task_kill hook refuses every
+/// signal from the test runner while the pid is protected). An agent that
+/// survives fails the test.
 struct AgentGuard(Option<Child>);
 impl Drop for AgentGuard {
     fn drop(&mut self) {
@@ -271,6 +274,7 @@ impl Fixture {
         let log_file = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_file_err = log_file.try_clone().expect("clone log handle");
 
+        common::require_bpftool();
         let child = Command::new(REAL_SUDO)
             .arg(&installed_agent.path)
             .arg("--combat-rules")
