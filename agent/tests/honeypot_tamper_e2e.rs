@@ -18,10 +18,20 @@
 //! `posture_at` is printed with every failure.
 //!
 //! The rule keys on the hard-coded `/etc/northnarrow/...`,
-//! `/var/lib/northnarrow/...`, `/run/northnarrow/...` paths, so unlike
-//! the tempdir-based FIM tests this one touches the REAL filesystem.
-//! [`RealBaitGuard`] records which baits/dirs pre-existed and removes
-//! only those the test (or the agent's boot recreate) created.
+//! `/var/lib/northnarrow/...`, `/run/northnarrow/...` paths (the agent
+//! has no flag to move them), so unlike the tempdir-based FIM tests this
+//! one rewrites the REAL files. External audit NN-AUD-233: every test
+//! starts with [`RealBaitGuard::capture`], which refuses to run
+//! - without root;
+//! - on a host that is not an nn-lab guest (`/var/lib/nn-lab-provisioned`,
+//!   written by the lab's cloud-init) unless `NN_TEST_DISPOSABLE_HOST=1`
+//!   says the host can be thrown away;
+//! - while any NorthNarrow agent or watchdog runs (stop the units first;
+//!   `nn-lab.sh test-ignored` does). An installed, stopped agent is fine:
+//!   its baits are put back byte for byte, with mode, owner and mtime,
+//!   and checked, when the test ends, pass or fail.
+//!
+//! The suite does not touch the pin root.
 //!
 //! The tamper is performed by a DISPOSABLE child, never the test
 //! harness — the rule's KillProcessTree targets the modifier PID, which
@@ -126,68 +136,115 @@ impl Drop for AgentGuard {
     }
 }
 
-const BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
-fn wipe_pin_tree() {
-    let pin = Path::new(BPFFS_PIN_ROOT);
-    if let Ok(entries) = std::fs::read_dir(pin) {
-        for e in entries.flatten() {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-    let _ = std::fs::remove_dir(pin);
+/// The directories of the baits.
+const BAIT_DIRS: [&str; 3] = [
+    "/etc/northnarrow",
+    "/var/lib/northnarrow",
+    "/run/northnarrow",
+];
+
+/// RAII guard for the REAL bait files and their directories (external
+/// audit NN-AUD-233). `capture` refuses to run without root, on a host
+/// that is not disposable ([`common::require_disposable_host`]) or while a
+/// NorthNarrow agent or watchdog runs, and it refuses a bait that is not a
+/// regular file (the agent's boot sweep would replace it, and it could not
+/// be put back). It records each bait's content, mode, owner and mtime; on
+/// drop every bait that existed is put back and checked (recreated if it
+/// was deleted), and what the run created is removed.
+///
+/// It used to record only which baits existed and remove the others: a
+/// pre-existing bait (an installed, stopped agent's) was overwritten by
+/// [`seed_real_bait`] and deleted by the tamperer, and never put back. It
+/// also removed the pin root first, which on a host whose pins were not
+/// protected detached a stopped install's hooks; the suite no longer
+/// touches the pin root (a previous fixture's pins are protected anyway,
+/// review entry 39, and the next agent purges them at boot as a
+/// protected pid).
+struct RealBaitGuard {
+    baits: Vec<(&'static str, common::PathState)>,
+    dirs: Vec<(&'static str, bool)>,
 }
 
-/// RAII cleanup for the REAL bait files + their dirs. Records which of
-/// the 10 paths (and the three parent dirs) existed at construction;
-/// on drop removes only those the test/agent created, restoring the
-/// host. Robust against an interrupted run leaving inert config behind.
-struct RealBaitGuard {
-    preexisting_files: Vec<bool>,
-    preexisting_dirs: Vec<(PathBuf, bool)>,
-}
 impl RealBaitGuard {
     fn capture() -> Self {
-        // Clear any prior test's anti-tamper LSM FIRST. The LSM pins
-        // survive an agent SIGQUIT (anti-tamper persists by design), and
-        // a stale agent's PROTECTED_PIDS would -EPERM our seeding of the
-        // protected /etc + /var/lib northnarrow dirs (and block the next
-        // agent's own writes). Removing the pins detaches the dead
-        // agent's LSM. Called before any seed_real_bait.
-        wipe_pin_tree();
-        let dirs = [
-            "/etc/northnarrow",
-            "/var/lib/northnarrow",
-            "/run/northnarrow",
-        ];
+        let what = "rewrite the real honeypot baits";
+        common::require_root(what);
+        common::require_disposable_host(what);
+        common::refuse_if_northnarrow_running(what);
+        let baits: Vec<(&'static str, common::PathState)> = HONEYPOT_PATHS
+            .iter()
+            .map(|&p| {
+                let state = common::PathState::read(Path::new(p))
+                    .unwrap_or_else(|e| panic!("refusing to {what}: cannot read {p}: {e}"));
+                (p, state)
+            })
+            .collect();
+        for (p, state) in &baits {
+            if let common::PathState::Other(kind) = state {
+                panic!(
+                    "refusing to {what}: {p} is a {kind}, not a regular file; the agent's \
+                     boot sweep would replace it and it could not be restored"
+                );
+            }
+        }
         Self {
-            preexisting_files: HONEYPOT_PATHS
+            baits,
+            dirs: BAIT_DIRS
                 .iter()
-                .map(|p| Path::new(p).exists())
-                .collect(),
-            preexisting_dirs: dirs
-                .iter()
-                .map(|d| (PathBuf::from(d), Path::new(d).exists()))
+                .map(|&d| (d, Path::new(d).exists()))
                 .collect(),
         }
     }
 }
+
 impl Drop for RealBaitGuard {
     fn drop(&mut self) {
-        for (i, p) in HONEYPOT_PATHS.iter().enumerate() {
-            if !self.preexisting_files[i] {
-                let _ = Command::new(REAL_SUDO).arg("rm").arg("-f").arg(p).status();
-                // a Renamed test may have left <path>.moved
-                let _ = Command::new(REAL_SUDO)
-                    .arg("rm")
-                    .arg("-f")
-                    .arg(format!("{p}.moved"))
-                    .status();
+        // A running agent would answer the restore writes as a tamper of
+        // the baits it watches (FIM-024, the runner killed): restore
+        // nothing and say what is left to put back.
+        let running = common::northnarrow_daemons();
+        if !running.is_empty() {
+            let pending: Vec<String> = self
+                .baits
+                .iter()
+                .filter(|(p, s)| common::PathState::read(Path::new(p)).ok().as_ref() != Some(s))
+                .map(|(p, s)| format!("{p}: was {}", s.describe()))
+                .collect();
+            common::fail_teardown(&format!(
+                "honeypot baits NOT restored: NorthNarrow processes still run ({running:?}). \
+                 To put back by hand: {pending:?}"
+            ));
+            return;
+        }
+        let mut failed = Vec::new();
+        let mut left = Vec::new();
+        for (p, state) in &self.baits {
+            if let Err(e) = common::restore_path(Path::new(p), state) {
+                if *state == common::PathState::Absent {
+                    // A bait the run (or the agent's boot sweep) created:
+                    // the test agent's own protection of its state dir can
+                    // keep it until its pins are purged. Inert content,
+                    // the same an install writes.
+                    left.push(e);
+                } else {
+                    failed.push(format!("{e} (it was {})", state.describe()));
+                }
             }
         }
-        for (dir, existed) in &self.preexisting_dirs {
-            if !existed {
-                let _ = Command::new(REAL_SUDO).arg("rmdir").arg(dir).status();
+        for (dir, existed) in &self.dirs {
+            if !existed && Path::new(dir).exists() {
+                if let Err(e) = std::fs::remove_dir(dir) {
+                    left.push(format!("{dir}: {e}"));
+                }
             }
+        }
+        if !left.is_empty() {
+            eprintln!("honeypot suite: created by the run and left in place: {left:?}");
+        }
+        if !failed.is_empty() {
+            common::fail_teardown(&format!(
+                "honeypot baits that existed before the run were NOT restored: {failed:?}"
+            ));
         }
     }
 }
@@ -225,7 +282,6 @@ impl Fixture {
     /// sentinel. Empty allow/blocklists; ADE off; COMBAT rules wired;
     /// responses enforced (no `--detect-only`).
     fn setup(fim_watch_paths: &[&str]) -> Self {
-        wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
 

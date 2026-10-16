@@ -586,9 +586,15 @@ cmd_test_ignored() {
     # left behind: their pins stay protected, so its own purge is refused.
     # It runs first, alone, then the pins are purged again for the rest.
     local pin_test=protected_pids_kernel_id_is_stable_across_agent_restart rc=0
+    # The iptables guard's self-tests (external audit NN-AUD-232) need a
+    # filter table iptables can read: the agents of the suites that follow
+    # (the map-pin test's included) can leave it in a state iptables-nft
+    # reports as "incompatible". They run first, on a chain of their own.
+    local guard_tests="iptables::iptables_guard"
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test fixture_selftest $guard_tests -- --ignored --test-threads=1" || rc=1
     vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_map_pin $pin_test -- --ignored --test-threads=1" || rc=1
     lab_purge_pins >/dev/null
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1 --skip $pin_test$skip_args" || rc=1
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1 --skip $pin_test --skip $guard_tests$skip_args" || rc=1
     # The watchdog's privileged e2e are gated by its own feature, not by
     # #[ignore]: the run above compiled them out (0 tests), so they never
     # ran in the gate. Run them on their own, on a purged pin root.

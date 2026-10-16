@@ -1960,6 +1960,33 @@ mod tests {
         assert_eq!(stat_dev_to_kernel_dev(0x100801), 0x800101);
     }
 
+    /// External audit TST-009: the exported deny set is the hooks
+    /// `attach` counts — task_kill, ptrace, every `LSM_PROGRAMS` hook and
+    /// the map guard — each once.
+    #[test]
+    fn deny_hooks_are_the_hooks_attach_counts() {
+        use std::collections::BTreeSet;
+        let exported: BTreeSet<&str> = super::super::DENY_HOOKS.iter().copied().collect();
+        let mut attached: BTreeSet<&str> = LSM_PROGRAMS.iter().map(|(_, hook)| *hook).collect();
+        attached.insert(super::super::TASK_KILL_HOOK);
+        attached.insert(super::super::PTRACE_HOOK);
+        attached.insert(super::super::bpf_defense::GUARD_HOOK);
+        assert_eq!(exported, attached);
+        assert_eq!(
+            exported.len(),
+            super::super::DENY_HOOKS.len(),
+            "a hook listed twice"
+        );
+        assert_eq!(super::super::LSM_DENY_HOOKS_EXPECTED, 16);
+        let optional: BTreeSet<&str> = OPTIONAL_LSM_PROGRAMS
+            .iter()
+            .map(|(_, hook)| *hook)
+            .collect();
+        let exported_optional: BTreeSet<&str> =
+            super::super::OPTIONAL_DENY_HOOKS.iter().copied().collect();
+        assert_eq!(exported_optional, optional);
+    }
+
     // ── Tappa 8 A14 (B4) — /etc/northnarrow registration tests ─────
 
     /// A14 + C7 + N8 + Tappa 10.5 D1 test: `ETC_PROTECTED_FILES` is

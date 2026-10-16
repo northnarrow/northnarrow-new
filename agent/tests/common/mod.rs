@@ -41,7 +41,7 @@ const BASE_CHAINS: &[&str] = &["INPUT", "OUTPUT", "FORWARD"];
 
 /// Production combat chain name the agent installs. Mirrors
 /// `agent/src/anti_tamper/network_isolate.rs::COMBAT_CHAIN`.
-const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
+pub const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 
 /// RAII cleanup guard for the production `NORTHNARROW_COMBAT`
 /// iptables chain. Instantiate at the start of any privileged
@@ -57,7 +57,9 @@ const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 /// — the goal is "best-effort cleanup, never blame the guard for
 /// a downstream failure." Tests that need to assert a clean
 /// state can call [`Self::is_clean`] after construction.
-pub struct EniIptablesGuard;
+pub struct EniIptablesGuard {
+    chain: &'static str,
+}
 
 impl EniIptablesGuard {
     /// Install a Drop-on-scope-exit cleanup. Cheap to construct —
@@ -71,7 +73,17 @@ impl EniIptablesGuard {
     /// // chain.
     /// ```
     pub fn install() -> Self {
-        Self
+        Self {
+            chain: COMBAT_CHAIN,
+        }
+    }
+
+    /// The same cleanup for another chain: the guard's self-tests
+    /// (`fixture_selftest.rs`) exercise it on a chain of their own, never
+    /// on the production one (external audit NN-AUD-232).
+    #[allow(dead_code)]
+    pub fn install_for(chain: &'static str) -> Self {
+        Self { chain }
     }
 
     /// Probe `iptables -S NORTHNARROW_COMBAT` and return `true`
@@ -103,7 +115,7 @@ impl Drop for EniIptablesGuard {
         // referenced anywhere, so detach BEFORE flush/delete.
         for base in BASE_CHAINS {
             let _ = Command::new("iptables")
-                .args(["-D", base, "-j", COMBAT_CHAIN])
+                .args(["-D", base, "-j", self.chain])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -111,13 +123,13 @@ impl Drop for EniIptablesGuard {
         // Step 2: flush the chain's contents (so a future -X
         // succeeds even if the rules were partially built).
         let _ = Command::new("iptables")
-            .args(["-F", COMBAT_CHAIN])
+            .args(["-F", self.chain])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         // Step 3: delete the chain itself.
         let _ = Command::new("iptables")
-            .args(["-X", COMBAT_CHAIN])
+            .args(["-X", self.chain])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -126,97 +138,11 @@ impl Drop for EniIptablesGuard {
 
 // ── Self-tests ────────────────────────────────────────────────────────
 //
-// These tests verify Drop semantics under both panic and clean-state
-// paths. They REQUIRE root + iptables and run only under the
-// `test-privileged` feature gate. `#[ignore]` follows the same
-// runbook pattern as the FIM + canary priv-e2e tests — operators
-// run them with `--include-ignored` from `docs/integration-test-
-// runbook.md`. They do NOT run during `cargo test --workspace`
-// on a dev box.
-
-#[cfg(all(test, feature = "test-privileged"))]
-mod tests {
-    use super::*;
-
-    /// Manually install a fake `NORTHNARROW_COMBAT` chain (so the
-    /// test doesn't need a running agent), then drop the guard
-    /// inside `catch_unwind` to prove the cleanup runs even when
-    /// the surrounding test panics. The chain MUST be gone after
-    /// the drop regardless of the panic outcome.
-    #[test]
-    #[ignore = "requires sudo + iptables (run via integration runbook)"]
-    fn iptables_guard_drops_cleans_chain_even_on_panic() {
-        // Pre-install the chain + a jump rule so the guard has
-        // something to clean.
-        let new_chain = Command::new("iptables")
-            .args(["-N", COMBAT_CHAIN])
-            .status()
-            .expect("spawn iptables -N");
-        assert!(
-            new_chain.success(),
-            "iptables -N {COMBAT_CHAIN} failed (test precondition)"
-        );
-        let jump = Command::new("iptables")
-            .args(["-I", "INPUT", "-j", COMBAT_CHAIN])
-            .status()
-            .expect("spawn iptables -I INPUT");
-        assert!(jump.success(), "iptables -I INPUT failed (precondition)");
-
-        // Sanity: chain is present pre-drop.
-        assert!(
-            !EniIptablesGuard::is_clean(),
-            "test precondition: chain should be present before guard drop"
-        );
-
-        // Force a panic INSIDE the guard's scope so Drop runs on
-        // the unwind path, not the normal-return path.
-        let result = std::panic::catch_unwind(|| {
-            let _guard = EniIptablesGuard::install();
-            panic!("simulated test failure to exercise unwind-path Drop");
-        });
-        assert!(result.is_err(), "the inner closure should have panicked");
-
-        // Chain MUST be gone after guard drop (unwind-path
-        // cleanup completed).
-        assert!(
-            EniIptablesGuard::is_clean(),
-            "EniIptablesGuard::drop failed to clean NORTHNARROW_COMBAT \
-             after panic; iptables -S {COMBAT_CHAIN} still succeeds"
-        );
-    }
-
-    /// Drop the guard on an already-clean state. No iptables
-    /// chain exists; the three commands (`-D` / `-F` / `-X`)
-    /// each fail individually, and Drop must swallow those
-    /// failures rather than panic-on-drop (which would mask
-    /// the actual test failure).
-    #[test]
-    #[ignore = "requires sudo + iptables (run via integration runbook)"]
-    fn iptables_guard_idempotent_on_clean_state() {
-        // Ensure chain is gone (best-effort — already absent is
-        // fine; this is the test precondition).
-        let _ = Command::new("iptables")
-            .args(["-D", "INPUT", "-j", COMBAT_CHAIN])
-            .status();
-        let _ = Command::new("iptables").args(["-F", COMBAT_CHAIN]).status();
-        let _ = Command::new("iptables").args(["-X", COMBAT_CHAIN]).status();
-        assert!(
-            EniIptablesGuard::is_clean(),
-            "test precondition: chain must be absent at start"
-        );
-
-        // Construct + drop. No panic-on-drop, no test failure.
-        {
-            let _guard = EniIptablesGuard::install();
-        }
-
-        // Still clean afterwards.
-        assert!(
-            EniIptablesGuard::is_clean(),
-            "guard's idempotent drop should not have created a chain"
-        );
-    }
-}
+// External audit NN-AUD-232 (TST-011): the guard's two iptables self-tests
+// lived here, in a `#[cfg(test)]` module, so every test binary with
+// `mod common;` compiled and ran them (eight copies), and the clean-state
+// one deleted the production chain unconditionally. They are in
+// `fixture_selftest.rs` now, one binary, with the helpers below.
 
 /// `pid` plus every process below it (`pgrep -P`, breadth first), the
 /// root first. Best effort: a pid that exits mid-walk is simply skipped.
@@ -672,4 +598,350 @@ pub fn pid_gone(pid: u32) -> bool {
             .is_some_and(|state| matches!(state, "Z" | "X")),
         Err(_) => true,
     }
+}
+
+// ── External audit NN-AUD-232/233 — fixtures that change host state ──
+//
+// The iptables self-tests and the honeypot suite change state that is not
+// a tempdir's: the production `NORTHNARROW_COMBAT` chain and the real bait
+// files under /etc, /var/lib and /run. They refuse to start where that
+// state can belong to a running agent, the honeypot suite refuses a host
+// that is not a disposable lab guest, and it puts back the files it found.
+// Their self-tests are in `fixture_selftest.rs` (a `#[test]` in this file
+// runs in every binary with `mod common;`).
+
+/// Written by the lab's cloud-init (`deploy/lab/user-data*.tmpl`, every
+/// distro) once the guest is provisioned.
+pub const LAB_GUEST_MARKER: &str = "/var/lib/nn-lab-provisioned";
+
+/// `1` declares a host that is not an nn-lab guest disposable (a throwaway
+/// VM): the operator accepts that the suite rewrites real paths there.
+pub const DISPOSABLE_HOST_ENV: &str = "NN_TEST_DISPOSABLE_HOST";
+
+/// `Ok` on an nn-lab guest (`marker_present`) or with
+/// [`DISPOSABLE_HOST_ENV`] set to exactly `1`; `Err` says what is missing.
+pub fn disposable_host_verdict(marker_present: bool, opt_in: Option<&str>) -> Result<(), String> {
+    if marker_present || opt_in == Some("1") {
+        return Ok(());
+    }
+    Err(format!(
+        "{LAB_GUEST_MARKER} is missing (not an nn-lab guest) and {DISPOSABLE_HOST_ENV}=1 is not set"
+    ))
+}
+
+/// Panic unless this host is disposable ([`disposable_host_verdict`]).
+pub fn require_disposable_host(what: &str) {
+    let opt_in = std::env::var(DISPOSABLE_HOST_ENV).ok();
+    let marker = Path::new(LAB_GUEST_MARKER).exists();
+    if let Err(e) = disposable_host_verdict(marker, opt_in.as_deref()) {
+        panic!(
+            "refusing to {what}: {e}. Run it on an nn-lab guest (deploy/lab/nn-lab.sh \
+             test-ignored), or set {DISPOSABLE_HOST_ENV}=1 on a host you can throw away."
+        );
+    }
+}
+
+/// Panic unless the effective uid is 0: a fixture that must read and put
+/// back root-owned files cannot do it halfway.
+pub fn require_root(what: &str) {
+    if unsafe { libc::geteuid() } != 0 {
+        panic!(
+            "refusing to {what}: not root. Run the suite as its header says \
+             (sudo -E env \"PATH=$PATH\" cargo test …)."
+        );
+    }
+}
+
+/// A process is a NorthNarrow agent or watchdog: the installed binaries and
+/// the fixtures' copies (`northnarrow-agent-e2etest-…`), by the basename of
+/// `/proc/<pid>/exe` when it can be read, or by `comm`, which the kernel
+/// cuts to 15 bytes (`northnarrow-age`, `northnarrow-wat`). Either match
+/// counts: a false refusal costs a rerun, a miss costs the host's state.
+pub fn is_northnarrow_daemon(exe_name: Option<&str>, comm: &str) -> bool {
+    let exe = exe_name.is_some_and(|n| {
+        n.starts_with("northnarrow-agent") || n.starts_with("northnarrow-watchdog")
+    });
+    let comm = comm.trim_end();
+    exe || comm.starts_with("northnarrow-age") || comm.starts_with("northnarrow-wat")
+}
+
+/// Every live NorthNarrow agent or watchdog on the host, as `"<pid> <exe>"`
+/// (zombies excluded).
+pub fn northnarrow_daemons() -> Vec<String> {
+    let me = std::process::id();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let exe = std::fs::read_link(entry.path().join("exe")).ok();
+        let exe_name = exe
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str());
+        let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        if is_northnarrow_daemon(exe_name, &comm) && !pid_gone(pid) {
+            let what = exe.map_or_else(|| comm.trim_end().to_string(), |p| p.display().to_string());
+            found.push(format!("{pid} {what}"));
+        }
+    }
+    found
+}
+
+/// Panic when a NorthNarrow agent or watchdog runs: the state `what`
+/// changes may be its own (its COMBAT chain, the baits it watches), and a
+/// running agent answers the change as a tamper.
+pub fn refuse_if_northnarrow_running(what: &str) {
+    let found = northnarrow_daemons();
+    if !found.is_empty() {
+        panic!(
+            "refusing to {what}: NorthNarrow processes run on this host ({found:?}). Stop \
+             them first (nn-lab.sh test-ignored does, through lab_purge_pins); an agent \
+             left by an earlier fixture needs a signed `nn-admin shutdown` or a reboot."
+        );
+    }
+}
+
+/// `iptables -S NORTHNARROW_COMBAT`'s outcome read strictly: `Ok(true)`
+/// the chain exists, `Ok(false)` iptables said it does not, `Err` for any
+/// other answer (not root, iptables missing, killed). Unlike
+/// [`EniIptablesGuard::is_clean`], "could not ask" is never "absent".
+pub fn combat_chain_verdict(status: Option<i32>, stderr: &str) -> Result<bool, String> {
+    match status {
+        Some(0) => Ok(true),
+        Some(_) if stderr.contains("No chain/target/match by that name") => Ok(false),
+        _ => Err(format!(
+            "`iptables -S {COMBAT_CHAIN}` ended with {status:?}: {}",
+            stderr.trim()
+        )),
+    }
+}
+
+/// Whether the production COMBAT chain exists ([`combat_chain_verdict`]).
+pub fn combat_chain_present() -> Result<bool, String> {
+    chain_present(COMBAT_CHAIN)
+}
+
+/// Whether the iptables chain `chain` exists ([`combat_chain_verdict`]).
+/// iptables-nft 1.8.9 (Debian 12) answers `-S <chain>` for a chain that
+/// does not exist with "… is incompatible, use 'nft' tool" instead of "No
+/// chain/target/match by that name"; the listing of the whole table still
+/// reads, so the chain is looked for there (`-N <chain>`).
+pub fn chain_present(chain: &str) -> Result<bool, String> {
+    let out = Command::new("iptables")
+        .args(["-S", chain])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run iptables: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.to_ascii_lowercase().contains("incompatible") {
+        return combat_chain_verdict(out.status.code(), &stderr);
+    }
+    let table = Command::new("iptables")
+        .args(["-S"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run iptables: {e}"))?;
+    if !table.status.success() {
+        return Err(format!(
+            "`iptables -S {chain}`: {}; `iptables -S`: {}",
+            stderr.trim(),
+            String::from_utf8_lossy(&table.stderr).trim()
+        ));
+    }
+    let want = format!("-N {chain}");
+    Ok(String::from_utf8_lossy(&table.stdout)
+        .lines()
+        .any(|l| l.trim() == want))
+}
+
+/// What a real path held before a fixture changed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathState {
+    Absent,
+    /// A regular file: content, permission bits, owner, mtime.
+    File {
+        bytes: Vec<u8>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime: std::time::SystemTime,
+    },
+    /// Anything else, not followed (`"symlink"`, `"directory"`, …): it is
+    /// named, never restored.
+    Other(&'static str),
+}
+
+fn file_kind(t: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if t.is_symlink() {
+        "symlink"
+    } else if t.is_dir() {
+        "directory"
+    } else if t.is_fifo() {
+        "FIFO"
+    } else if t.is_socket() {
+        "socket"
+    } else if t.is_block_device() || t.is_char_device() {
+        "device"
+    } else {
+        "special file"
+    }
+}
+
+impl PathState {
+    /// The state of `path`, without following a symlink at its end.
+    pub fn read(path: &Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(m) => return Ok(Self::Other(file_kind(m.file_type()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::Absent),
+            Err(e) => return Err(e),
+        }
+        // O_NOFOLLOW: a link swapped in after the lstat is not read through.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let meta = f.metadata()?;
+        if !meta.file_type().is_file() {
+            return Ok(Self::Other(file_kind(meta.file_type())));
+        }
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        Ok(Self::File {
+            bytes,
+            mode: meta.mode() & 0o7777,
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mtime: meta.modified()?,
+        })
+    }
+
+    /// One line for messages: kind, mode, owner, size and sha256.
+    pub fn describe(&self) -> String {
+        use sha2::Digest;
+        match self {
+            Self::Absent => "absent".to_string(),
+            Self::File {
+                bytes,
+                mode,
+                uid,
+                gid,
+                ..
+            } => format!(
+                "file {mode:04o} {uid}:{gid}, {} bytes, sha256 {}",
+                bytes.len(),
+                hex::encode(sha2::Sha256::digest(bytes))
+            ),
+            Self::Other(kind) => format!("a {kind}"),
+        }
+    }
+}
+
+/// Put `path` back to `state` and check it: a file gets its content, mode,
+/// owner and mtime back (recreated if it was deleted, written in place
+/// otherwise; a symlink or other non-file found there is removed first,
+/// never written through); a path that was absent is removed. A directory
+/// is never removed, and an `Other` state is never recreated: both are
+/// `Err`. Nothing is written when the path already matches.
+pub fn restore_path(path: &Path, state: &PathState) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let shown = path.display();
+    let now = PathState::read(path).map_err(|e| format!("{shown}: reading it: {e}"))?;
+    if &now == state {
+        return Ok(());
+    }
+    if let PathState::Other(kind) = state {
+        return Err(format!("{shown} was a {kind} before the run: not restored"));
+    }
+    match &now {
+        PathState::Absent | PathState::File { .. } => {}
+        PathState::Other("directory") => {
+            return Err(format!(
+                "{shown} is a directory now ({} expected): not removed",
+                state.describe()
+            ))
+        }
+        PathState::Other(_) => {
+            std::fs::remove_file(path).map_err(|e| format!("{shown}: removing {now:?}: {e}"))?
+        }
+    }
+    match state {
+        PathState::Absent => {
+            if matches!(now, PathState::File { .. }) {
+                std::fs::remove_file(path).map_err(|e| format!("{shown}: removing it: {e}"))?;
+            }
+        }
+        PathState::File {
+            bytes,
+            mode,
+            uid,
+            gid,
+            mtime,
+        } => {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(*mode)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|e| format!("{shown}: opening it for the restore: {e}"))?;
+            f.write_all(bytes)
+                .map_err(|e| format!("{shown}: writing the content back: {e}"))?;
+            // Owner before mode: a chown clears the set-id bits.
+            std::os::unix::fs::fchown(&f, Some(*uid), Some(*gid))
+                .map_err(|e| format!("{shown}: chown {uid}:{gid}: {e}"))?;
+            f.set_permissions(std::fs::Permissions::from_mode(*mode))
+                .map_err(|e| format!("{shown}: chmod {mode:04o}: {e}"))?;
+            f.set_modified(*mtime)
+                .map_err(|e| format!("{shown}: setting the mtime back: {e}"))?;
+            f.sync_all().map_err(|e| format!("{shown}: fsync: {e}"))?;
+        }
+        PathState::Other(_) => unreachable!("refused above"),
+    }
+    let after = PathState::read(path).map_err(|e| format!("{shown}: re-reading it: {e}"))?;
+    if &after == state {
+        Ok(())
+    } else {
+        Err(format!(
+            "{shown} is {} after the restore, {} expected",
+            after.describe(),
+            state.describe()
+        ))
+    }
+}
+
+/// `s` without ANSI escape sequences (the agent colours its log unless
+/// `NO_COLOR` is set).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if ('@'..='~').contains(&d) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }

@@ -27,30 +27,37 @@
 //!    one) and that the *new* boot's LSM hooks are bound to that
 //!    same id. Equal ids ⇒ split brain closed.
 //!
-//! The in-kernel LSM hook is located by scanning loaded programs for
-//! the one whose `map_ids` references the pinned `PROTECTED_PIDS`
-//! object — *not* by program name (aya names programs after the
-//! truncated Rust fn symbol, not the `#[lsm]` hook, so a name lookup
-//! is brittle; see `find_lsm_prog_using_map`).
+//! The in-kernel LSM hooks are found through the agent's pins
+//! (`prog_<hook>`, named after the `#[lsm]` hook) — *not* by program
+//! name (aya names programs after the truncated Rust fn symbol, so a
+//! name lookup is brittle) — and a hook is bound when its pinned
+//! program's `map_ids` holds the pinned `PROTECTED_PIDS` id.
 //!
 //! ## Commit #2b extension
 //!
-//! #2b pins each of the seven LSM **programs** (`prog_<hook>`) and
-//! their **links** (`link_<hook>`) so a restarted agent reuses the
-//! prior boot's kernel objects instead of re-attaching. This test is
-//! extended (not replaced) to assert the strengthened invariant: not
-//! only the `PROTECTED_PIDS` map id but also the **set of LSM
-//! program ids** and the **set of LSM link ids** are unchanged
-//! across the restart, and the `prog_`/`link_` pin files survive the
-//! agent's exit. Link ids are found by cross-referencing each link's
-//! `prog <id>` against the LSM program id set — never by the link's
-//! own type string, which the kernel reports as `tracing` for LSM
-//! attachments (the same format-assumption trap the 2a name lookup
-//! fell into). The behavioural gap proof (a sentinel PID protected
-//! by the still-firing hook while no agent is alive) lived in the
-//! #2b verification harness, `docs/verify-2b.sh`, retired because its
-//! normal stop was the PROTECTED_PIDS eviction (external audit
-//! LAB-001); it is not re-implemented yet.
+//! #2b pins each anti-tamper LSM **program** (`prog_<hook>`) and its
+//! **link** (`link_<hook>`). The deny hooks are re-attached FRESH every
+//! boot since BUG-024 and review 62 (a reused link kept producing into
+//! the previous boot's ring); the `PROTECTED_PIDS` map is the object a
+//! restart must reuse.
+//!
+//! External audit NN-AUD-230 (TST-009): this used to count every LSM
+//! program and link on the HOST against `>= 7`, while the agent attaches
+//! nine deny hooks. Any seven LSM programs passed, a missing deny hook
+//! did not fail the test. It now reads the agent's own objects through
+//! its pins: for every hook of `anti_tamper::DENY_HOOKS`, `prog_<hook>`
+//! is an LSM program and `link_<hook>` is pinned (the agent's guard refuses
+//! a foreign handle on its links, so they are not opened); task_kill and
+//! ptrace are bound to the pinned `PROTECTED_PIDS`; the agent logged
+//! every deny hook attached (`deny_attached=N deny_expected=N`, N = the
+//! sixteen of `DENY_HOOKS` plus the optional ACL hooks the kernel has).
+//! The pins outlive boot 1 with the same objects behind them, and after
+//! the restart every deny hook has a fresh program. The behavioural gap
+//! proof (a sentinel PID protected by the still-firing hook while no
+//! agent is alive) lived in the #2b verification harness,
+//! `docs/verify-2b.sh`, retired because its normal stop was the
+//! PROTECTED_PIDS eviction (external audit LAB-001); it is not
+//! re-implemented yet.
 //!
 //! ## Requirements (Hetzner verify box only)
 //!
@@ -75,11 +82,14 @@
 
 #![cfg(feature = "test-privileged")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT;
+use northnarrow_agent::anti_tamper::{
+    lsm_pin_paths, DEFAULT_BPFFS_ROOT, DENY_HOOKS, OPTIONAL_DENY_HOOKS,
+};
 
 mod common;
 
@@ -95,12 +105,9 @@ const PIN_APPEAR_TIMEOUT: Duration = Duration::from_secs(20);
 const LSM_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POST_EXIT_SETTLE: Duration = Duration::from_millis(500);
-/// The seven anti-tamper LSM hooks: `task_kill`,
-/// `ptrace_access_check`, `inode_unlink`, `inode_rmdir`,
-/// `inode_rename`, `inode_setattr`, `file_ioctl`. #2b pins one
-/// program + one link per hook, so a fully-attached agent exposes
-/// exactly this many `type lsm` programs and LSM-driving links.
-const EXPECTED_LSM_HOOKS: usize = 7;
+/// The deny hooks that read `PROTECTED_PIDS` directly: their pinned
+/// programs must reference the pinned map's id.
+const PID_HOOKS: [&str; 2] = ["task_kill", "ptrace_access_check"];
 
 /// `<DEFAULT_BPFFS_ROOT>/PROTECTED_PIDS` — the map whose kernel-id
 /// stability across restart is the entire point of commit #2.
@@ -161,9 +168,12 @@ fn stop_agent(mut c: Child) {
 /// Spawn the real agent against per-test tempdir paths. Mirrors
 /// `privileged_e2e::spawn_agent`'s flag set; `--no-ade` keeps the
 /// model/inference path out of a test that only exercises eBPF load.
+/// Its log goes to `<tempdir>/agent.log`, uncoloured, for the attach line.
 fn spawn_agent(tempdir: &Path) -> AgentGuard {
     let rules = tempdir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules into tempdir");
+    let log = std::fs::File::create(agent_log(tempdir)).expect("create agent.log");
+    let log_err = log.try_clone().expect("clone the log handle");
 
     common::require_bpftool();
     let child = Command::new(env!("CARGO_BIN_EXE_northnarrow-agent"))
@@ -174,11 +184,16 @@ fn spawn_agent(tempdir: &Path) -> AgentGuard {
         .arg("--admin-socket")
         .arg(tempdir.join("admin.sock"))
         .arg("--no-ade")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()
         .expect("spawn northnarrow-agent");
     AgentGuard(Some(child))
+}
+
+fn agent_log(tempdir: &Path) -> PathBuf {
+    tempdir.join("agent.log")
 }
 
 /// Block until the `PROTECTED_PIDS` pin file exists, or panic with
@@ -227,32 +242,30 @@ fn pinned_map_id(pin: &Path) -> u64 {
 }
 
 /// One `bpftool prog show` record, reduced to the fields this test
-/// reasons about. `name` is captured for diagnostics **only** — it
-/// is deliberately never matched on (see `find_lsm_prog_using_map`).
+/// reasons about. No name: aya names a program after the truncated Rust
+/// symbol, so the pins, named after the hook, are what identifies it.
 #[derive(Debug)]
 struct ProgInfo {
     id: u64,
     prog_type: String,
-    name: Option<String>,
     map_ids: Vec<u64>,
 }
 
-/// Full `bpftool prog show` (every loaded program, plain text). We do
-/// **not** pass `--json`: parsing JSON would mean a new dev-dependency
-/// (`serde_json` is a normal dep of the crate, not reachable from an
-/// integration-test crate), and the module contract above is to stay
-/// dev-dependency-free. The plain-text record grammar is stable and
-/// trivially block-parseable, so it carries the same information.
-fn bpftool_prog_show_all() -> Result<String, String> {
+/// `bpftool <kind> show pinned <pin>` (plain text). We do **not** pass
+/// `--json`: the plain-text record grammar is stable and trivially
+/// block-parseable.
+fn show_pinned(kind: &str, pin: &Path) -> Result<String, String> {
     let out = Command::new("bpftool")
-        .args(["prog", "show"])
+        .args([kind, "show", "pinned"])
+        .arg(pin)
         .output()
-        .map_err(|e| format!("spawn `bpftool prog show`: {e} — is bpftool on PATH?"))?;
+        .map_err(|e| format!("spawn `bpftool {kind} show`: {e} — is bpftool on PATH?"))?;
     if !out.status.success() {
         return Err(format!(
-            "`bpftool prog show` exited {}: {}",
+            "`bpftool {kind} show pinned {}` exited {}: {}",
+            pin.display(),
             out.status,
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -261,7 +274,7 @@ fn bpftool_prog_show_all() -> Result<String, String> {
 /// Block-parse `bpftool prog show` plain text. A record starts at a
 /// line whose first token is `<id>:`; its `prog_type` is the next
 /// token; continuation lines (anything until the next header) may
-/// carry a `map_ids a,b,c` token and an optional `name <n>`.
+/// carry a `map_ids a,b,c` token.
 fn parse_progs(text: &str) -> Vec<ProgInfo> {
     let mut progs = Vec::new();
     let mut cur: Option<ProgInfo> = None;
@@ -277,15 +290,9 @@ fn parse_progs(text: &str) -> Vec<ProgInfo> {
                     progs.push(p);
                 }
                 let prog_type = toks.get(1).copied().unwrap_or_default().to_string();
-                let name = toks
-                    .iter()
-                    .position(|&t| t == "name")
-                    .and_then(|i| toks.get(i + 1))
-                    .map(|s| s.to_string());
                 cur = Some(ProgInfo {
                     id,
                     prog_type,
-                    name,
                     map_ids: Vec::new(),
                 });
                 continue;
@@ -310,259 +317,168 @@ fn parse_progs(text: &str) -> Vec<ProgInfo> {
     progs
 }
 
-/// Locate the loaded **LSM** program bound to the pinned
-/// `PROTECTED_PIDS` kernel object, identified by that object's map
-/// **id** (`map_id`, as returned by [`pinned_map_id`]).
-///
-/// Why by map id and not by program name: aya derives the kernel
-/// program name from the Rust function symbol, truncated to
-/// `BPF_OBJ_NAME_LEN-1` = 15 bytes — *not* from the `#[lsm(hook =
-/// …)]` attach point. `bpftool prog show name <X>` therefore can't
-/// be driven from the hook name, and hard-coding the truncated
-/// symbol is brittle (it silently rots if anyone renames the eBPF
-/// fn). Matching on `type == lsm` + `map_ids ∋ map_id` needs neither:
-/// it asks exactly the question the §4 invariant cares about — *is
-/// some in-kernel LSM hook actually wired to the pinned object?* —
-/// and is the genuine split-brain discriminator: a freshly-created
-/// (un-pinned) map would carry a different id, so a split-brained
-/// boot yields **no** match and the lookup fails loudly.
-///
-/// `PROTECTED_PIDS` is shared by three LSM hooks (`task_kill`,
-/// `ptrace_access_check`, and the `inode_*`/`file_ioctl` family);
-/// any one of them referencing the pinned id proves the binding, so
-/// the first match is returned.
-fn find_lsm_prog_using_map(map_id: u64) -> Result<ProgInfo, String> {
-    let text = bpftool_prog_show_all()?;
-    let progs = parse_progs(&text);
-
-    if let Some(p) = progs
-        .into_iter()
-        .find(|p| p.prog_type == "lsm" && p.map_ids.contains(&map_id))
-    {
-        return Ok(p);
-    }
-
-    // Re-parse for an actionable diagnostic: which LSM programs *are*
-    // loaded, and what maps do they point at?
-    let lsm: Vec<String> = parse_progs(&text)
-        .into_iter()
-        .filter(|p| p.prog_type == "lsm")
-        .map(|p| format!("  id={} name={:?} map_ids={:?}", p.id, p.name, p.map_ids))
-        .collect();
-    Err(format!(
-        "no loaded LSM program references pinned PROTECTED_PIDS id \
-         {map_id}. Either no anti-tamper hook attached (agent down / \
-         BPF-LSM not in lsm= chain) or the agent created a FRESH map \
-         instead of reusing the pinned one (split brain). LSM programs \
-         currently loaded:\n{}",
-        if lsm.is_empty() {
-            "  <none>".to_string()
-        } else {
-            lsm.join("\n")
-        }
-    ))
+/// `(link id, program id)` from `bpftool link show` plain text: the
+/// header `<id>: <type>  prog <prog_id>`. The kernel models an LSM
+/// attachment as a tracing link, so the type is not checked.
+fn parse_link_header(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let link = toks.first()?.strip_suffix(':')?.parse().ok()?;
+    let prog = toks
+        .iter()
+        .position(|&t| t == "prog")
+        .and_then(|i| toks.get(i + 1))
+        .and_then(|s| s.parse().ok())?;
+    Some((link, prog))
 }
 
-/// `bpftool link show` (every loaded BPF link, plain text). Same
-/// no-`--json` / no-dev-dependency rationale as
-/// [`bpftool_prog_show_all`].
-fn bpftool_link_show_all() -> Result<String, String> {
-    let out = Command::new("bpftool")
-        .args(["link", "show"])
-        .output()
-        .map_err(|e| format!("spawn `bpftool link show`: {e} — is bpftool on PATH?"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "`bpftool link show` exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// One deny hook's pinned kernel objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookPins {
+    prog: u64,
+    map_ids: Vec<u64>,
 }
 
-/// Sorted, de-duplicated kernel ids of every loaded `type lsm`
-/// program. `bpftool prog show` reliably tags LSM *programs* `lsm`
-/// (2a established this), so we lean on that rather than on program
-/// names. With #2b prog-pinning these ids are stable across an agent
-/// restart — the kernel object is reused via the `prog_<hook>` pin.
-fn lsm_prog_ids() -> Vec<u64> {
-    let Ok(text) = bpftool_prog_show_all() else {
-        return Vec::new();
-    };
-    let mut ids: Vec<u64> = parse_progs(&text)
-        .into_iter()
-        .filter(|p| p.prog_type == "lsm")
-        .map(|p| p.id)
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-/// Sorted, de-duplicated kernel ids of every BPF **link** that
-/// drives one of the loaded LSM programs.
-///
-/// This deliberately does **not** filter on the link's own type
-/// string: the kernel models an LSM attachment as a *tracing*-class
-/// link (`BPF_LINK_TYPE_TRACING` + `attach_type lsm_mac`), so
-/// `bpftool link show` prints `tracing`, not `lsm`, for these — the
-/// exact format assumption that bit the 2a name lookup. Instead a
-/// link is treated as an LSM-hook link iff its `prog <id>` is one of
-/// [`lsm_prog_ids`]. With #2b link-pinning these link ids are stable
-/// across restart (link object reused via `PinnedLink::from_pin`).
-fn lsm_link_ids() -> Vec<u64> {
-    let prog_ids: std::collections::HashSet<u64> = lsm_prog_ids().into_iter().collect();
-    let Ok(text) = bpftool_link_show_all() else {
-        return Vec::new();
-    };
-    let mut ids: Vec<u64> = Vec::new();
-    for line in text.lines() {
-        // `split_whitespace` already skips leading indentation.
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = toks.first() else { continue };
-        // Link record header: `<id>: <type> … prog <prog_id> …`.
-        let Some(id_str) = first.strip_suffix(':') else {
-            continue;
-        };
-        let Ok(link_id) = id_str.parse::<u64>() else {
-            continue;
-        };
-        let prog_id = toks
-            .iter()
-            .position(|&t| t == "prog")
-            .and_then(|i| toks.get(i + 1))
-            .and_then(|s| s.parse::<u64>().ok());
-        if prog_id.is_some_and(|pid| prog_ids.contains(&pid)) {
-            ids.push(link_id);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
-}
-
-/// Count pin files directly under [`DEFAULT_BPFFS_ROOT`] whose name
-/// starts with `prefix` (`"prog_"` or `"link_"`). The 2b mechanism
-/// creates one of each per hook; the six map pins carry no such
-/// prefix, so this isolates exactly the #3/#4 pins.
-fn count_pins(prefix: &str) -> usize {
-    let Ok(dir) = std::fs::read_dir(DEFAULT_BPFFS_ROOT) else {
-        return 0;
-    };
-    dir.filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(prefix))
-        })
-        .count()
-}
-
-/// 2b readiness gate. Strengthens the 2a "≥1 LSM prog bound to the
-/// pinned map" gate with the condition the extended invariant needs:
-/// that gate **and** all seven LSM programs **and** all seven
-/// LSM-driving links visible, so the cross-boot id-set snapshot is
-/// complete and apples-to-apples. Closes the race where the
-/// `PROTECTED_PIDS` pin appears at map-create time
-/// (`Ebpf::load_from_bytes`) but the per-hook `load()`/`attach()`/
-/// `pin()` calls have not all completed yet. Same deadline/poll
-/// shape as [`wait_for_pin`].
-/// The task deny hooks. Like the six `inode_protect` deny hooks and the
-/// two module-load observe hooks they are re-attached FRESH every boot
-/// (review 62, as BUG-024 for the inode hooks): they emit on the
-/// FS_PROTECT_EVENTS ring, and a reused link kept the previous boot's
-/// program producing into the previous boot's ring, so a restarted
-/// agent never saw a kill or ptrace attempt again. Their ids must change
-/// across a restart while they stay attached; the PROTECTED_PIDS map they
-/// read is the one object that must be reused.
-const TASK_DENY_HOOKS: &[&str] = &["task_kill", "ptrace_access_check"];
-
-/// Prog id of the loaded LSM program named `name`, if any.
-/// The kernel caps program names at 15 bytes (`BPF_OBJ_NAME_LEN - 1`).
-/// Recent bpftool prints the full function name taken from BTF func_info;
-/// the 5.15-era bpftool (Ubuntu 22.04 `linux-tools`) prints the truncated
-/// kernel name (`ptrace_access_c`). Accept both spellings.
-fn lsm_prog_id_by_name(name: &str) -> Option<u64> {
-    let short: String = name.chars().take(15).collect();
-    let text = bpftool_prog_show_all().ok()?;
-    parse_progs(&text)
-        .into_iter()
-        .find(|p| {
-            p.prog_type == "lsm" && p.name.as_deref().is_some_and(|n| n == name || n == short)
-        })
-        .map(|p| p.id)
-}
-
-/// Link id whose header references `prog_id`, if any.
-fn link_id_for_prog(prog_id: u64) -> Option<u64> {
-    let text = bpftool_link_show_all().ok()?;
-    for line in text.lines() {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        let Some(&first) = toks.first() else { continue };
-        let Some(id_str) = first.strip_suffix(':') else {
-            continue;
-        };
-        let Ok(link_id) = id_str.parse::<u64>() else {
-            continue;
-        };
-        let pid = toks
-            .iter()
-            .position(|&t| t == "prog")
-            .and_then(|i| toks.get(i + 1))
-            .and_then(|s| s.parse::<u64>().ok());
-        if pid == Some(prog_id) {
-            return Some(link_id);
-        }
-    }
-    None
-}
-
-/// `(prog_id, link_id)` for every [`TASK_DENY_HOOKS`] entry, polling
-/// briefly: links show up in `bpftool link show` a moment after the
-/// programs do (a 0-links read right after attach was observed on the
-/// lab guest).
-fn task_hook_ids() -> Vec<(&'static str, u64, u64)> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut out = Vec::new();
-        for name in TASK_DENY_HOOKS {
-            if let Some(pid) = lsm_prog_id_by_name(name) {
-                if let Some(lid) = link_id_for_prog(pid) {
-                    out.push((*name, pid, lid));
-                }
+/// The pinned objects of every [`DENY_HOOKS`] entry under the pin root:
+/// `prog_<hook>` is an LSM program and `link_<hook>` is pinned beside it. `Err` names each hook that falls short (pin missing, wrong
+/// program type, link bound to another program). Only the agent's own
+/// pins are read: other LSM programs on the host do not count.
+fn deny_hook_pins() -> Result<BTreeMap<&'static str, HookPins>, String> {
+    let root = Path::new(DEFAULT_BPFFS_ROOT);
+    let mut pins = BTreeMap::new();
+    let mut errors = Vec::new();
+    for hook in DENY_HOOKS {
+        let (prog_pin, link_pin) = lsm_pin_paths(root, hook);
+        let prog = match show_pinned("prog", &prog_pin).and_then(|t| {
+            parse_progs(&t)
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("no program parsed from {t:?}"))
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(format!("{hook}: prog_{hook}: {e}"));
+                continue;
             }
+        };
+        if prog.prog_type != "lsm" {
+            errors.push(format!(
+                "{hook}: prog_{hook} is {prog:?}, not an LSM program"
+            ));
+            continue;
         }
-        if out.len() == TASK_DENY_HOOKS.len() || Instant::now() >= deadline {
-            return out;
+        // The link pin is checked by its presence only: the agent's BPF
+        // guard refuses a foreign handle on its pinned links (that refusal
+        // is the protection), so `bpftool link show pinned` cannot open it
+        // while the hooks are attached. The attach line in the agent's log
+        // (`deny_attached=N`) attests the links.
+        if std::fs::symlink_metadata(&link_pin).is_err() {
+            errors.push(format!("{hook}: link_{hook} is not pinned"));
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        pins.insert(
+            hook,
+            HookPins {
+                prog: prog.id,
+                map_ids: prog.map_ids,
+            },
+        );
+    }
+    if errors.is_empty() {
+        Ok(pins)
+    } else {
+        Err(errors.join("; "))
     }
 }
 
-fn wait_for_full_lsm_attach(map_id: u64) -> Result<(), String> {
+/// The names under the pin root, for failure messages.
+fn pin_listing() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(DEFAULT_BPFFS_ROOT)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The agent's attach-health line with every deny hook attached: the
+/// `deny_attached=N deny_expected=N` fields release-check.sh reads, in
+/// "all LSM hooks attached" or in the observe-hook shortfall line (the
+/// module-load observe hooks are not this test's subject).
+fn logged_all_deny_hooks(log: &str) -> bool {
+    let wants: Vec<String> = (DENY_HOOKS.len()..=DENY_HOOKS.len() + OPTIONAL_DENY_HOOKS.len())
+        .map(|n| format!("deny_attached={n} deny_expected={n}"))
+        .collect();
+    log.lines()
+        .any(|l| l.contains("anti-tamper:") && wants.iter().any(|w| l.contains(w.as_str())))
+}
+
+/// The last lines of an agent log, ANSI-stripped, for failure messages.
+fn log_tail(log: &Path) -> String {
+    let text = common::strip_ansi(&std::fs::read_to_string(log).unwrap_or_default());
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(25)..].join("\n")
+}
+
+/// Readiness gate: the agent logged every deny hook attached, each deny
+/// hook has its pins ([`deny_hook_pins`]), task_kill and ptrace are bound
+/// to the pinned `PROTECTED_PIDS` (`map_id`), and — after a restart,
+/// `previous` given — every deny hook runs a program other than the
+/// previous boot's (re-attached fresh, BUG-024 / review 62). Until boot 2
+/// re-attaches, boot 1's pins still satisfy the rest, hence the poll.
+fn wait_for_deny_hooks(
+    map_id: u64,
+    log: &Path,
+    previous: Option<&BTreeMap<&'static str, HookPins>>,
+) -> Result<BTreeMap<&'static str, HookPins>, String> {
     let deadline = Instant::now() + LSM_ATTACH_TIMEOUT;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        match find_lsm_prog_using_map(map_id) {
-            Ok(_) => {
-                let np = lsm_prog_ids().len();
-                let nl = lsm_link_ids().len();
-                if np >= EXPECTED_LSM_HOOKS && nl >= EXPECTED_LSM_HOOKS {
-                    return Ok(());
+    let mut last;
+    loop {
+        let text = common::strip_ansi(&std::fs::read_to_string(log).unwrap_or_default());
+        last = match deny_hook_pins() {
+            Err(e) => e,
+            Ok(_) if !logged_all_deny_hooks(&text) => format!(
+                "no `deny_attached={n} deny_expected={n}` line in the agent log",
+                n = DENY_HOOKS.len()
+            ),
+            Ok(pins) => {
+                let unbound: Vec<&str> = PID_HOOKS
+                    .iter()
+                    .copied()
+                    .filter(|h| !pins[h].map_ids.contains(&map_id))
+                    .collect();
+                let reused: Vec<&str> = previous
+                    .map(|prev| {
+                        DENY_HOOKS
+                            .iter()
+                            .copied()
+                            .filter(|h| pins[h].prog == prev[h].prog)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if unbound.is_empty() && reused.is_empty() {
+                    return Ok(pins);
                 }
-                last = format!(
-                    "bound OK but only {np}/{EXPECTED_LSM_HOOKS} LSM progs \
-                     and {nl}/{EXPECTED_LSM_HOOKS} LSM links visible"
-                );
+                format!(
+                    "not bound to PROTECTED_PIDS id {map_id}: {unbound:?}; still the previous \
+                     boot's program (a reused link produces into the previous boot's ring, \
+                     review 62): {reused:?}; pins: {pins:?}"
+                )
             }
-            Err(e) => last = e,
+        };
+        if Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
     Err(format!(
-        "timeout after {LSM_ATTACH_TIMEOUT:?} waiting for full LSM attach \
-         (map_id {map_id}). Last state: {last}"
+        "after {LSM_ATTACH_TIMEOUT:?}: {last}\n--- pins under {DEFAULT_BPFFS_ROOT} ---\n{:?}\n\
+         --- agent log (tail) ---\n{}",
+        pin_listing(),
+        log_tail(log)
     ))
 }
 
@@ -591,43 +507,16 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
         pin.display()
     );
 
-    // ---- Boot 1: fresh load pins map + 7 progs + 7 links. -------
+    // ---- Boot 1: fresh load pins the map and every deny hook. ----
     let dir1 = tempfile::tempdir().expect("tempdir boot1");
     let mut agent1 = spawn_agent(dir1.path());
     wait_for_pin(&pin);
 
     let id1 = pinned_map_id(&pin);
-    wait_for_full_lsm_attach(id1).unwrap_or_else(|e| {
-        panic!(
-            "boot-1: full LSM attach never reached for pinned \
-             PROTECTED_PIDS id {id1} — relocation/binding broken.\n{e}"
-        )
-    });
+    let boot1 = wait_for_deny_hooks(id1, &agent_log(dir1.path()), None)
+        .unwrap_or_else(|e| panic!("boot-1: the deny hooks are not all attached and pinned.\n{e}"));
 
-    // 2b: snapshot the kernel object id sets while boot-1 is live.
-    let prog_ids1 = lsm_prog_ids();
-    let task1 = task_hook_ids();
-    assert!(
-        prog_ids1.len() >= EXPECTED_LSM_HOOKS,
-        "boot-1: {} LSM programs visible, expected ≥{EXPECTED_LSM_HOOKS}: {prog_ids1:?}",
-        prog_ids1.len()
-    );
-    assert_eq!(
-        task1.len(),
-        TASK_DENY_HOOKS.len(),
-        "boot-1: task deny hooks not all attached with a link: {task1:?}
---- bpftool link show ---
-{}",
-        bpftool_link_show_all().unwrap_or_else(|e| e)
-    );
-    let (p1, l1) = (count_pins("prog_"), count_pins("link_"));
-    assert!(
-        p1 >= EXPECTED_LSM_HOOKS && l1 >= EXPECTED_LSM_HOOKS,
-        "boot-1: expected ≥{EXPECTED_LSM_HOOKS} prog_ and ≥{EXPECTED_LSM_HOOKS} link_ \
-         pins under {DEFAULT_BPFFS_ROOT}, found prog_={p1} link_={l1}"
-    );
-
-    // ---- Stop boot 1; map + prog + link pins must outlive it. ---
+    // ---- Stop boot 1; the pins and the objects behind them stay. ----
     agent1.stop();
     std::thread::sleep(POST_EXIT_SETTLE);
     assert!(
@@ -636,16 +525,17 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
          pinned (the exact commit-#1 regression this fix targets)",
         pin.display()
     );
-    let (p_after, l_after) = (count_pins("prog_"), count_pins("link_"));
-    assert!(
-        p_after >= EXPECTED_LSM_HOOKS && l_after >= EXPECTED_LSM_HOOKS,
-        "prog_/link_ pins vanished when boot-1 exited (prog_={p_after} \
-         link_={l_after}) — links were NOT actually pinned; the hook \
-         would stop firing across the respawn gap (the #2b regression \
-         this guards)"
+    let after_exit = deny_hook_pins();
+    assert_eq!(
+        after_exit.as_ref(),
+        Ok(&boot1),
+        "the deny hooks' pins did not outlive boot 1 with the same objects behind them; \
+         the hooks would stop firing across the respawn gap (the #2b regression this \
+         guards). Pins: {:?}",
+        pin_listing()
     );
 
-    // ---- Boot 2: must REUSE the pinned kernel objects. ----------
+    // ---- Boot 2: must REUSE the pinned map, re-attach every hook. ----
     let dir2 = tempfile::tempdir().expect("tempdir boot2");
     let mut agent2 = spawn_agent(dir2.path());
     wait_for_pin(&pin);
@@ -658,57 +548,66 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
          pinned one — split brain NOT closed"
     );
 
-    wait_for_full_lsm_attach(id2).unwrap_or_else(|e| {
+    wait_for_deny_hooks(id2, &agent_log(dir2.path()), Some(&boot1)).unwrap_or_else(|e| {
         panic!(
-            "boot-2: full LSM attach never reached for reused pinned id \
-             {id2} — restarted agent is split-brained off its own \
-             protection map.\n{e}"
+            "boot-2: the deny hooks are not all re-attached fresh, pinned and bound to the \
+             reused PROTECTED_PIDS id {id2}.\n{e}"
         )
     });
 
-    // The shared state map is reused (asserted above); every deny hook
-    // is attached again, FRESH (BUG-024, review 62): task_kill and ptrace
-    // get new (prog, link) ids bound to this boot's ring, and the full
-    // hook complement is present after the restart.
-    let prog_ids2 = lsm_prog_ids();
-    assert!(
-        prog_ids2.len() >= EXPECTED_LSM_HOOKS,
-        "boot-2: {} LSM programs visible, expected ≥{EXPECTED_LSM_HOOKS}: {prog_ids2:?}",
-        prog_ids2.len()
-    );
-    // Boot 1's pinned programs still satisfy the full-attach wait above
-    // until boot 2 reattaches its own and purges their pins, and the
-    // lookup by name returns the oldest program first: wait for the new
-    // ones (bounded) before comparing.
-    let deadline = Instant::now() + LSM_ATTACH_TIMEOUT;
-    let task2 = loop {
-        let t = task_hook_ids();
-        let fresh = t.len() == TASK_DENY_HOOKS.len()
-            && t.iter()
-                .zip(&task1)
-                .all(|((_, p2, _), (_, p1, _))| p2 != p1);
-        if fresh || Instant::now() >= deadline {
-            break t;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    assert_eq!(
-        task2.len(),
-        TASK_DENY_HOOKS.len(),
-        "boot-2: task deny hooks not all attached with a link: {task2:?}"
-    );
-    for ((name, p1, _), (_, p2, _)) in task1.iter().zip(&task2) {
-        assert_ne!(
-            p1, p2,
-            "boot-2: {name} kept the previous boot's program {p1}: a reused link \
-             produces into the previous boot's ring (review 62)"
-        );
-    }
-
     agent2.stop();
     // Leave the pins in place: the verify protocol's subsequent
-    // `bpftool` / sentinel kill-9 sanity checks expect them. A later
-    // run's `purge_pin_root()` (or 2b teardown) reclaims them. The
-    // tempdirs are held to here so the agents' paths stay valid.
+    // `bpftool` sanity checks expect them. A later run's
+    // `purge_pin_root()` reclaims them. The tempdirs are held to here so
+    // the agents' paths stay valid.
     drop((dir1, dir2));
+}
+
+/// The parsers against `bpftool` 7.x plain-text output (no privilege
+/// needed; runs without `--ignored`).
+#[test]
+fn bpftool_pinned_output_parses() {
+    let prog = "\
+42: lsm  name task_kill  tag 0123456789abcdef  gpl
+\tloaded_at 2026-10-15T10:00:00+0000  uid 0
+\txlated 1024B  jited 640B  memlock 4096B  map_ids 7,9,12
+\tbtf_id 88
+\tpids northnarrow-age(1234)
+";
+    let p = parse_progs(prog);
+    assert_eq!(p.len(), 1);
+    assert_eq!((p[0].id, p[0].prog_type.as_str()), (42, "lsm"));
+    assert_eq!(p[0].map_ids, vec![7, 9, 12]);
+    let link = "\
+5: tracing  prog 42
+\tprog_type lsm  attach_type lsm_mac
+\ttarget_obj_id 1  target_btf_id 120345
+";
+    assert_eq!(parse_link_header(link), Some((5, 42)));
+    assert_eq!(parse_link_header("Error: bpf obj get: No such file"), None);
+}
+
+#[test]
+fn the_attach_line_must_count_every_deny_hook() {
+    let n = DENY_HOOKS.len();
+    let ok = format!(
+        "2026-10-15T10:00:00Z  INFO anti-tamper: all LSM hooks attached deny_attached={n} \
+         deny_expected={n}"
+    );
+    assert!(logged_all_deny_hooks(&ok));
+    let observe = format!(
+        "WARN anti-tamper: OBSERVE HOOK SHORTFALL — module-load telemetry absent (R018 blind) \
+         deny_attached={n} deny_expected={n} observe_failed=[\"x\"]"
+    );
+    assert!(logged_all_deny_hooks(&observe));
+    let short = format!(
+        "ERROR anti-tamper: DENY HOOK SHORTFALL deny_attached={} deny_expected={n}",
+        n - 1
+    );
+    assert!(!logged_all_deny_hooks(&short));
+    assert_eq!(n, 16, "sixteen deny hooks on every supported kernel");
+    let acl = DENY_HOOKS.len() + OPTIONAL_DENY_HOOKS.len();
+    assert!(logged_all_deny_hooks(&format!(
+        "INFO anti-tamper: all LSM hooks attached deny_attached={acl} deny_expected={acl}"
+    )));
 }
